@@ -1,0 +1,121 @@
+/* 主题 token（风格「精密」，2026-11-18 选定）。数值与 DESIGN.md 的 YAML 一致，改动时两边同步。 */
+:root {
+  --font-ui: "Inter Variable", var(--cjk);
+  --font-mono: "JetBrains Mono Variable", ui-monospace, monospace;
+  --fs: 13px;
+  --fs-sm: 12.5px;
+  --fs-xs: 11.5px;
+  --fs-lg: 14px;
+  --fs-headline: 20px;
+  --ctl-h: 28px;
+  --row-h: 28px;
+  --topbar-h: 46px;
+  --sidebar-w: 236px;
+  --inspector-w: 340px;
+  --radius: 8px;
+  --radius-sm: 6px;
+  --radius-lg: 12px;
+  --ic-stroke: 1.75;
+  --motion-state: 100ms ease-out;
+  --motion-enter: 160ms cubic-bezier(0.2, 0, 0, 1);
+  --motion-exit: 120ms cubic-bezier(0.3, 0, 1, 1);
+
+  /* 原始色值 */
+  --gray-0: oklch(0.99 0.002 270);
+  --gray-1: oklch(0.975 0.003 270);
+  --gray-2: oklch(0.955 0.004 270);
+  --gray-3: oklch(0.92 0.005 270);
+  --gray-4: oklch(0.64 0.01 270);
+  --gray-5: oklch(0.52 0.012 270);
+  --gray-6: oklch(0.4 0.012 270);
+  --gray-9: oklch(0.2 0.01 270);
+  --dk-0: oklch(0.155 0.005 270);
+  --dk-1: oklch(0.18 0.006 270);
+  --dk-2: oklch(0.205 0.007 270);
+  --dk-3: oklch(0.25 0.008 270);
+  --dk-4: oklch(0.51 0.01 270);
+  --dk-5: oklch(0.62 0.01 270);
+  --dk-6: oklch(0.76 0.008 270);
+  --dk-9: oklch(0.95 0.004 270);
+  --indigo-l: oklch(0.52 0.2 275);
+  --indigo-d: oklch(0.68 0.16 275);
+
+  --bg: light-dark(var(--gray-1), var(--dk-0));
+  --chrome: light-dark(var(--gray-0), var(--dk-1));
+  --panel: light-dark(var(--gray-0), var(--dk-1));
+  --surface: light-dark(white, var(--dk-2));
+  --surface-2: light-dark(var(--gray-1), var(--dk-1));
+  --surface-hover: light-dark(var(--gray-2), var(--dk-3));
+  --surface-active: light-dark(var(--gray-3), var(--dk-3));
+  --border: light-dark(var(--gray-3), oklch(0.26 0.008 270));
+  --border-strong: light-dark(var(--gray-4), var(--dk-4));
+  --text: light-dark(var(--gray-9), var(--dk-9));
+  --text-2: light-dark(var(--gray-6), var(--dk-6));
+  --text-3: light-dark(var(--gray-5), var(--dk-5));
+
+  --primary: light-dark(var(--indigo-l), oklch(0.56 0.18 275));
+  --on-primary: white;
+  --primary-hover: light-dark(oklch(0.47 0.2 275), oklch(0.51 0.18 275));
+  --focus: light-dark(var(--indigo-l), var(--indigo-d));
+  --primary-text: light-dark(var(--indigo-l), var(--indigo-d));
+  --primary-soft: light-dark(oklch(0.95 0.03 275), oklch(0.3 0.07 275 / 0.55));
+  --primary-ring: light-dark(oklch(0.52 0.2 275 / 0.2), oklch(0.68 0.16 275 / 0.3));
+
+  --ok: light-dark(oklch(0.55 0.14 155), oklch(0.72 0.15 155));
+  --ok-soft: light-dark(oklch(0.96 0.03 155), oklch(0.3 0.06 155 / 0.45));
+  --warn: light-dark(oklch(0.52 0.12 70), oklch(0.8 0.14 80));
+  --warn-soft: light-dark(oklch(0.96 0.04 85), oklch(0.32 0.06 80 / 0.5));
+  --danger: light-dark(oklch(0.55 0.2 25), oklch(0.7 0.17 25));
+  /* 实心危险按钮：两种配色都用较深的红，保证白字对比度 */
+  --danger-solid: oklch(0.55 0.2 25);
+  --danger-ring: light-dark(oklch(0.55 0.2 25 / 0.2), oklch(0.7 0.17 25 / 0.3));
+  --danger-soft: light-dark(oklch(0.96 0.03 25), oklch(0.32 0.08 25 / 0.5));
+
+  --pk: light-dark(oklch(0.55 0.13 70), oklch(0.8 0.13 80));
+  --fk: light-dark(var(--indigo-l), var(--indigo-d));
+  --enum: light-dark(oklch(0.52 0.15 320), oklch(0.75 0.12 320));
+  --me: oklch(0.55 0.18 275);
+  /* 协作者颜色：按加入顺序分配，避开强调色（靛蓝）和危险色（红） */
+  --peer-1: oklch(0.64 0.17 45);
+  --peer-2: oklch(0.6 0.12 185);
+  --peer-3: oklch(0.62 0.19 350);
+  --peer-4: oklch(0.62 0.15 145);
+  --peer-5: oklch(0.7 0.14 85);
+  --peer-6: oklch(0.6 0.13 235);
+  --peer-7: oklch(0.6 0.19 320);
+  --peer-8: oklch(0.66 0.15 120);
+  --peer: var(--peer-1);
+  --peer-ring: color-mix(in oklab, var(--peer) 25%, transparent);
+  --logo: var(--primary);
+
+  --canvas: light-dark(var(--gray-1), var(--dk-0));
+  --grid-dot: light-dark(oklch(0.82 0.005 270), oklch(0.32 0.008 270));
+  --grid: radial-gradient(var(--grid-dot) 1px, transparent 1.2px);
+  --node-bg: light-dark(white, var(--dk-1));
+  --node-head: light-dark(var(--gray-1), var(--dk-2));
+  --node-head-fg: var(--text);
+  --node-border: light-dark(var(--gray-3), oklch(0.3 0.008 270));
+  --edge: light-dark(var(--gray-4), var(--dk-4));
+
+  --shadow-sm: 0 1px 2px light-dark(oklch(0 0 0 / 0.06), oklch(0 0 0 / 0.4));
+  --shadow-node: 0 1px 3px light-dark(oklch(0 0 0 / 0.08), oklch(0 0 0 / 0.5));
+  --shadow-pop:
+    0 8px 24px -6px light-dark(oklch(0.2 0.01 270 / 0.18), oklch(0 0 0 / 0.6)),
+    0 0 0 1px light-dark(transparent, oklch(1 0 0 / 0.04));
+  --shadow-lg: 0 24px 48px -12px oklch(0 0 0 / 0.35);
+  --tooltip-bg: light-dark(var(--gray-9), oklch(0.32 0.008 270));
+  --tooltip-fg: light-dark(white, var(--dk-9));
+  --backdrop: light-dark(oklch(0.2 0.01 270 / 0.3), oklch(0 0 0 / 0.55));
+
+  --code-bg: light-dark(var(--gray-1), var(--dk-0));
+  --code-fg: var(--text);
+  --syn-kw: light-dark(oklch(0.5 0.18 275), oklch(0.75 0.13 275));
+  --syn-str: light-dark(oklch(0.5 0.13 150), oklch(0.78 0.13 150));
+  --syn-num: light-dark(oklch(0.55 0.13 50), oklch(0.8 0.12 60));
+  --syn-ty: light-dark(oklch(0.52 0.13 220), oklch(0.78 0.1 220));
+}
+
+/* 主按钮在深色下略提亮的阴影，突出唯一的主操作 */
+.btn.primary {
+  box-shadow: 0 0 0 1px oklch(1 0 0 / 0.08) inset;
+}

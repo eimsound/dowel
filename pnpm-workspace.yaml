@@ -1,0 +1,59 @@
+packages:
+  - packages/*
+  - apps/*
+
+allowBuilds:
+  cpu-features: false
+  protobufjs: false
+  ssh2: false
+
+catalog:
+  zod: ^4.6.7
+
+# 供应链防护
+# 新发布的版本至少放 7 天（单位：分钟）再允许解析进来：被盗号发布的恶意版本通常几小时到几天内就会被发现并撤下。
+# 紧急安全修复可以临时加进 minimumReleaseAgeExclude。与 .github/dependabot.yml 的 cooldown 保持一致。
+minimumReleaseAge: 10080
+# 没有满足年龄要求的版本时直接报错，而不是退回去装一个更新的版本
+minimumReleaseAgeStrict: true
+# 某个包的新版本信任证据（如 npm provenance / 可信发布）比旧版本弱时拒绝安装：发布渠道被劫持的常见信号
+trustPolicy: no-downgrade
+# 间接依赖不允许来自 git 仓库或任意 tarball 地址
+blockExoticSubdeps: true
+# 以下是加入这条规则时 lockfile 里已经锁定、但发布还不满 7 天的确切版本（2026-11-19 前发布，2026-11-24 后可以删掉这些条目）
+minimumReleaseAgeExclude:
+  - "axe-core@4.14.1"
+  - "bare-buffer@3.7.2"
+  - "bare-path@3.1.3"
+  - "bare-url@2.5.7"
+  - "@biomejs/biome@2.6.8"
+  - "@biomejs/cli-android-arm64@2.6.8"
+  - "@biomejs/cli-android-x64@2.6.8"
+  - "@biomejs/cli-darwin-arm64@2.6.8"
+  - "@biomejs/cli-darwin-x64@2.6.8"
+  - "@biomejs/cli-linux-arm64@2.6.8"
+  - "@biomejs/cli-linux-arm64-musl@2.6.8"
+  - "@biomejs/cli-linux-x64@2.6.8"
+  - "@biomejs/cli-linux-x64-musl@2.6.8"
+  - "@biomejs/cli-win32-arm64@2.6.8"
+  - "@biomejs/cli-win32-x64@2.6.8"
+  - "@codemirror/lint@6.9.8"
+  - "enhanced-resolve@5.27.0"
+  - "graceful-fs@4.2.12"
+  - "hono@4.13.19"
+  - "@hono/node-server@2.1.8"
+  - "i18next@27.1.3"
+  - "@jridgewell/resolve-uri@3.1.3"
+  - "lucide-react@1.73.0"
+  - "openid-client@6.9.0"
+  - "playwright@1.65.1"
+  - "playwright-core@1.65.1"
+  - "@playwright/test@1.65.1"
+  - "postcss@8.5.33"
+  - "react-i18next@18.0.2"
+  - "@rolldown/pluginutils@1.1.1"
+  - "tapable@2.3.4"
+  - "@tybys/wasm-util@0.10.5"
+  - "ws@8.23.0"
+  - "@xyflow/react@13.0.1"
+  - "@xyflow/system@1.0.0"

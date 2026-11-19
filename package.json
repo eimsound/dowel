@@ -1,0 +1,36 @@
+{
+  "name": "dowel",
+  "private": true,
+  "type": "module",
+  "packageManager": "pnpm@12.21.0",
+  "engines": {
+    "node": ">=26"
+  },
+  "scripts": {
+    "test": "vitest run",
+    "typecheck": "tsc --noEmit -p . && tsc --noEmit -p apps/web",
+    "lint": "biome check .",
+    "format": "biome check --write .",
+    "check": "pnpm lint && pnpm typecheck && pnpm test",
+    "dev": "node --run dev:server & pnpm --filter @dowel/web dev",
+    "dev:server": "node --watch apps/server/src/main.ts",
+    "build": "pnpm --filter @dowel/web build",
+    "start": "node apps/server/src/main.ts",
+    "e2e": "playwright test"
+  },
+  "devDependencies": {
+    "@axe-core/playwright": "^4.14.0",
+    "@biomejs/biome": "^2.6.8",
+    "@dowel/engines": "workspace:*",
+    "@dowel/executor": "workspace:*",
+    "@playwright/test": "^1.65.1",
+    "@testcontainers/postgresql": "^12.2.1",
+    "@types/node": "^26.6.6",
+    "fast-check": "^4.10.2",
+    "oauth2-mock-server": "^9.3.0",
+    "postgres": "^4.1.1",
+    "testcontainers": "^12.2.1",
+    "typescript": "^7.0.2",
+    "vitest": "^5.1.0"
+  }
+}

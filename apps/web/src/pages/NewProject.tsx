@@ -1,0 +1,737 @@
+// 新建项目向导（P3）：四步——基本信息 → 关联数据库（可跳过）→ 初始内容 → 确认。
+// 每一步都能后退，表单状态全在这个组件里，后退不会丢（不卸载）。
+// 创建是一个请求（POST /api/projects/wizard，SSE 推进度），完成后跳到项目概览。
+// 布局按 DESIGN.md 的“向导”：用外壳的内容区（没有侧面板），步骤指示在顶部，上一步 / 下一步在底部右侧。
+import type { GroupList, ProjectCreated, TargetInfo, WizardEvent, WizardStage } from '@dowel/api';
+import { useQuery, useQueryClient } from '@tanstack/react-query';
+import { useNavigate, useSearch } from '@tanstack/react-router';
+import { Check, CircleCheck, Database, FileUp, Plus, Trash2, TriangleAlert } from 'lucide-react';
+import { useRef, useState } from 'react';
+import { useTranslation } from 'react-i18next';
+import { api } from '../api.ts';
+import { AppShell, PageHeader } from '../components/Shell.tsx';
+import { Banner, cx, IconButton } from '../components/ui.tsx';
+import { useMe } from '../session.ts';
+import { readSse } from '../sse.ts';
+
+type Kind = 'blank' | 'database' | 'sql' | 'takeover';
+
+/** 向导里的一行数据库（还没保存，用的是本地 key） */
+interface EnvDraft {
+  key: string;
+  name: string;
+  url: string;
+  production: boolean;
+  allowSameInstance: boolean;
+  shadowUrl: string;
+  /** 连接检查的结果 / 错误（只影响显示，提交时按当前输入的值） */
+  result: TargetInfo | null;
+  error: string;
+  pending: boolean;
+}
+
+const STEPS = ['basics', 'database', 'content', 'confirm'] as const;
+/** 进度阶段的顺序（服务端可能跳过一些阶段，例如空白项目没有连接和读取） */
+const STAGES: WizardStage[] = ['connect', 'read', 'canonicalize', 'write', 'done'];
+
+const EMPTY_ENV = (key: string): EnvDraft => ({
+  key,
+  name: '',
+  url: '',
+  production: true,
+  allowSameInstance: false,
+  shadowUrl: '',
+  result: null,
+  error: '',
+  pending: false,
+});
+
+/** 由项目名生成 slug：小写、非字母数字换成 -、去掉首尾 -、最多 39 位（和服务的 slugSchema 一致） */
+const slugify = (name: string) =>
+  name
+    .trim()
+    .toLowerCase()
+    .replace(/[^a-z0-9]+/g, '-')
+    .replace(/^-+|-+$/g, '')
+    .slice(0, 39);
+
+/** 界面上的“全部”用 null 表示（与 projects.schemas 的含义一致）；一个都不选是无效状态，不能提交 */
+const scopeOf = (selected: string[], all: string[]) =>
+  all.length > 0 && selected.length === all.length ? null : selected;
+
+export const NewProject = () => {
+  const { t } = useTranslation();
+  const me = useMe().data;
+  const qc = useQueryClient();
+  const nav = useNavigate();
+  const { group: groupFromSearch } = useSearch({ from: '/new' });
+  const groups = useQuery({
+    queryKey: ['groups'],
+    queryFn: () => api<GroupList>('GET', '/api/groups'),
+  });
+
+  const [step, setStep] = useState(0);
+  const [groupId, setGroupId] = useState('');
+  const [name, setName] = useState('');
+  const [slug, setSlug] = useState('');
+  /** 用户改过 slug 之后就不再跟着名字变 */
+  const [slugTouched, setSlugTouched] = useState(false);
+  const [envs, setEnvs] = useState<EnvDraft[]>([]);
+  const [kind, setKind] = useState<Kind>('blank');
+  const [importEnv, setImportEnv] = useState('');
+  /** schema 勾选：记下是哪个环境的选择，换了环境就按新环境的 schema 重新全选 */
+  const [schemaSel, setSchemaSel] = useState<{ key: string; names: string[] } | null>(null);
+  const [sql, setSql] = useState('');
+  const [error, setError] = useState('');
+  const [stage, setStage] = useState<WizardStage | null>(null);
+  const [busy, setBusy] = useState(false);
+  const envSeq = useRef(0);
+  const fileInput = useRef<HTMLInputElement>(null);
+
+  const canCreateIn = (g: GroupList['groups'][number]) =>
+    me?.role === 'admin' || g.role === 'admin' || (g.role === 'member' && g.projectCreation === 'members');
+  const creatable = (groups.data?.groups ?? []).filter(canCreateIn);
+  // 地址里带的是组的 slug（/new?group=<slug>）：按 slug 匹配，没匹配到就用第一个能建项目的组
+  const groupFromUrl = creatable.find((g) => g.slug === groupFromSearch)?.id;
+  const selectedGroupId = groupId || groupFromUrl || creatable[0]?.id || '';
+  const group = creatable.find((g) => g.id === selectedGroupId);
+  const effectiveGroupId = group?.id ?? '';
+
+  /**
+   * 真正要提交的数据库：名字和连接串都填了才算（空卡片是“还没填完”，提交时忽略）。
+   * 名字统一 trim（到处都用这个列表，不再各自 trim）。
+   */
+  const filledEnvs = envs
+    .map((e) => ({ ...e, name: e.name.trim(), url: e.url.trim() }))
+    .filter((e) => e.name && e.url);
+  const sourceEnv = filledEnvs.find((e) => e.name === importEnv.trim()) ?? filledEnvs[0];
+  /** schema 勾选项来自“导入来源”那个环境的连接检查 */
+  const schemaList = sourceEnv?.result?.schemas ?? [];
+  const allSchemaNames = schemaList.map((s) => s.name);
+  // 内部状态永远是显式列表：某个环境还没选过时，默认全选它的 schema
+  const selectedNames =
+    schemaSel && schemaSel.key === (sourceEnv?.key ?? '') ? schemaSel.names : allSchemaNames;
+  const toggleSchema = (schema: string) => {
+    const key = sourceEnv?.key ?? '';
+    const next = selectedNames.includes(schema)
+      ? selectedNames.filter((x) => x !== schema)
+      : [...selectedNames, schema];
+    setSchemaSel({ key, names: next });
+  };
+
+  const patchEnv = (key: string, patch: Partial<EnvDraft>) =>
+    setEnvs((list) => list.map((e) => (e.key === key ? { ...e, ...patch } : e)));
+
+  const check = async (env: EnvDraft) => {
+    patchEnv(env.key, { pending: true, error: '', result: null });
+    try {
+      const r = await api<TargetInfo>('POST', '/api/connection-check', {
+        url: env.url.trim(),
+        groupId: effectiveGroupId,
+      });
+      patchEnv(env.key, { pending: false, result: r });
+    } catch (e) {
+      patchEnv(env.key, { pending: false, error: e instanceof Error ? e.message : String(e) });
+    }
+  };
+
+  const pickEnv = (name: string) => {
+    setImportEnv(name);
+    // 换了环境：勾选重置（会按新环境的 schema 全选）；没检查过就自动检查一次
+    setSchemaSel(null);
+    const next = filledEnvs.find((x) => x.name === name);
+    if (next && !next.result) void check(next);
+  };
+
+  const goto = (next: number) => {
+    setError('');
+    // 进入“初始内容”时，如果要从数据库导入而来源还没检查过，先自动检查一次（拿 schema 列表）
+    if (next === 2 && sourceEnv && !sourceEnv.result && !sourceEnv.pending) void check(sourceEnv);
+    if (next === 2 && !importEnv && filledEnvs[0]) setImportEnv(filledEnvs[0].name);
+    setStep(next);
+  };
+
+  const validBasics = name.trim().length > 0 && !!effectiveGroupId;
+  const envMissing = (kind === 'database' || kind === 'sql') && filledEnvs.length === 0;
+  // schema 勾选不能为空（不知道 schema 列表时不拦，交给服务端报错）
+  const schemaMissing = kind === 'database' && allSchemaNames.length > 0 && selectedNames.length === 0;
+  const validContent =
+    kind === 'blank'
+      ? true
+      : kind === 'sql'
+        ? filledEnvs.length > 0 && sql.trim().length > 0
+        : filledEnvs.length > 0 && !schemaMissing;
+
+  const canNext =
+    (step === 0 && validBasics) ||
+    step === 1 ||
+    (step === 2 && validContent) ||
+    (step === 3 && validBasics && validContent);
+
+  const create = async () => {
+    setBusy(true);
+    setError('');
+    setStage(null);
+    const body = {
+      name: name.trim(),
+      groupId: effectiveGroupId,
+      slug: slug.trim() || undefined,
+      // 名字在 filledEnvs 里已经 trim 过（界面上到处用的都是它）
+      environments: filledEnvs.map((e) => ({
+        name: e.name,
+        url: e.url,
+        production: e.production,
+        allowSameInstance: e.allowSameInstance,
+        shadowUrl: e.shadowUrl.trim() || null,
+      })),
+      // 勾选的正好是全部时存 null（“全部 schema”）；一个都不选时不能点创建，不会走到这里
+      schemas: kind === 'database' ? scopeOf(selectedNames, allSchemaNames) : null,
+      content: {
+        kind,
+        env: kind === 'database' ? sourceEnv?.name : undefined,
+        sql: kind === 'sql' ? sql : undefined,
+      },
+    };
+    let project = null as ProjectCreated | null; // 在 readSse 的回调里赋值，不加断言 TS 会把它收窄成 null
+    try {
+      const res = await fetch('/api/projects/wizard', {
+        method: 'POST',
+        headers: { 'content-type': 'application/json' },
+        body: JSON.stringify(body),
+      });
+      if (!res.ok) {
+        const data = (await res.json().catch(() => ({}))) as { error?: string };
+        setError(data.error ?? t('err.generic', { msg: res.statusText }));
+        setBusy(false);
+        return;
+      }
+      // 读 SSE：每条消息的 data 是一个 WizardEvent 的 JSON（解析见 sse.ts）
+      await readSse(res, (data) => {
+        const event = JSON.parse(data) as WizardEvent;
+        if (event.error) setError(event.error);
+        else setStage(event.stage);
+        if (event.project) project = event.project;
+      });
+    } catch (e) {
+      setError(e instanceof Error ? e.message : String(e));
+    }
+    setBusy(false);
+    if (!project) return;
+    await Promise.all([
+      qc.invalidateQueries({ queryKey: ['projects'] }),
+      qc.invalidateQueries({ queryKey: ['groups'] }),
+    ]);
+    await nav({
+      to: '/project/$owner/$project',
+      params: { owner: project.group.slug, project: project.slug },
+    });
+  };
+
+  if (!me) return null;
+
+  const stepTitle = t(`wiz.steps.${STEPS[step]}`);
+
+  return (
+    <AppShell me={me} groupSlug={group?.slug}>
+      <PageHeader
+        crumbs={[{ label: t('nav.myProjects'), to: '/' }, { label: t('wiz.title') }]}
+        center={
+          <ol className="flex items-center gap-1" aria-label={t('wiz.title')}>
+            {STEPS.map((key, i) => (
+              <li key={key} className="flex items-center gap-1">
+                {i > 0 && (
+                  <span aria-hidden="true" className="text-text-3">
+                    ›
+                  </span>
+                )}
+                <span
+                  aria-current={i === step ? 'step' : undefined}
+                  className={cx(
+                    'flex items-center gap-1.5 rounded-full px-2.5 py-1 text-xs',
+                    i === step
+                      ? 'bg-primary-soft font-medium text-primary-text'
+                      : i < step
+                        ? 'text-text-2'
+                        : 'text-text-3',
+                  )}
+                >
+                  <span
+                    aria-hidden="true"
+                    className={cx(
+                      'grid size-[18px] place-items-center rounded-full border text-[11px]',
+                      i === step
+                        ? 'border-primary bg-primary text-on-primary'
+                        : i < step
+                          ? 'border-primary text-primary-text'
+                          : 'border-border-strong',
+                    )}
+                  >
+                    {i < step ? <Check size={11} aria-hidden="true" /> : i + 1}
+                  </span>
+                  {t(`wiz.steps.${key}`)}
+                </span>
+              </li>
+            ))}
+          </ol>
+        }
+      />
+      <main className="min-h-0 flex-1 overflow-auto">
+        <div className="mx-auto max-w-[880px] px-6 py-6">
+          <h2 className="section-title mb-1">
+            {stepTitle}
+            <span className="count">{t('wiz.stepOf', { n: step + 1, total: STEPS.length })}</span>
+          </h2>
+
+          {step === 0 && (
+            <section className="mt-4 space-y-4">
+              <p className="hint">{t('wiz.basicsHint')}</p>
+              {!groups.isLoading && creatable.length === 0 && (
+                <Banner kind="info">{t('wiz.needGroup')}</Banner>
+              )}
+              <div className="grid grid-cols-2 gap-x-3 gap-y-2.5 max-[800px]:grid-cols-1">
+                <label className="field">
+                  <span className="label">{t('wiz.group')}</span>
+                  <select
+                    className="select"
+                    value={effectiveGroupId}
+                    onChange={(e) => setGroupId(e.target.value)}
+                    disabled={!creatable.length}
+                  >
+                    {creatable.map((g) => (
+                      <option key={g.id} value={g.id}>
+                        {g.name}
+                      </option>
+                    ))}
+                  </select>
+                  <span className="hint">{t('wiz.groupHint')}</span>
+                </label>
+                <label className="field">
+                  <span className="label">{t('wiz.name')}</span>
+                  <input
+                    className="input"
+                    value={name}
+                    placeholder={t('wiz.namePlaceholder')}
+                    onChange={(e) => {
+                      setName(e.target.value);
+                      if (!slugTouched) setSlug(slugify(e.target.value));
+                    }}
+                    required
+                  />
+                </label>
+                <label className="field">
+                  <span className="label">{t('wiz.slug')}</span>
+                  <input
+                    className="input font-mono"
+                    value={slug}
+                    onChange={(e) => {
+                      setSlug(e.target.value);
+                      setSlugTouched(true);
+                    }}
+                    placeholder={t('wiz.slugPlaceholder')}
+                    autoCapitalize="none"
+                    spellCheck={false}
+                  />
+                  <span className="hint">{t('wiz.slugHint')}</span>
+                </label>
+              </div>
+            </section>
+          )}
+
+          {step === 1 && (
+            <section className="mt-4 space-y-4">
+              <p className="hint">{t('wiz.databaseHint')}</p>
+              {envs.length === 0 && <p className="hint">{t('wiz.envEmpty')}</p>}
+              <ul className="m-0 list-none space-y-3 p-0">
+                {envs.map((env) => (
+                  <li key={env.key} className="space-y-2.5 rounded-md border border-border bg-panel p-4">
+                    <div className="grid grid-cols-2 gap-x-3 gap-y-2.5 max-[800px]:grid-cols-1">
+                      <label className="field">
+                        <span className="label">{t('wiz.envName')}</span>
+                        <input
+                          className="input"
+                          aria-label={t('wiz.envName')}
+                          value={env.name}
+                          placeholder="dev"
+                          onChange={(e) => patchEnv(env.key, { name: e.target.value })}
+                        />
+                      </label>
+                      <label className="field">
+                        <span className="label">{t('wiz.envUrl')}</span>
+                        <input
+                          className="input font-mono"
+                          aria-label={t('wiz.envUrl')}
+                          value={env.url}
+                          placeholder="postgres://user:password@host:5432/db"
+                          spellCheck={false}
+                          onChange={(e) =>
+                            // 连接串变了，之前的检查结果就作废
+                            patchEnv(env.key, { url: e.target.value, result: null, error: '' })
+                          }
+                        />
+                      </label>
+                      <label className="field col-span-2">
+                        <span className="label">{t('wiz.envShadowUrl')}</span>
+                        <input
+                          className="input font-mono"
+                          aria-label={t('wiz.envShadowUrl')}
+                          value={env.shadowUrl}
+                          spellCheck={false}
+                          onChange={(e) => patchEnv(env.key, { shadowUrl: e.target.value })}
+                        />
+                      </label>
+                      <div className="checks col-span-2">
+                        <label>
+                          <input
+                            type="checkbox"
+                            checked={env.production}
+                            onChange={(e) => patchEnv(env.key, { production: e.target.checked })}
+                          />
+                          {t('wiz.envProduction')}
+                        </label>
+                        <label>
+                          <input
+                            type="checkbox"
+                            checked={env.allowSameInstance}
+                            onChange={(e) => patchEnv(env.key, { allowSameInstance: e.target.checked })}
+                          />
+                          {t('wiz.envAllowSame')}
+                        </label>
+                      </div>
+                    </div>
+                    <div className="flex flex-wrap items-center gap-2">
+                      <button
+                        type="button"
+                        className="btn"
+                        disabled={env.pending || !env.url.trim() || !effectiveGroupId}
+                        aria-busy={env.pending}
+                        onClick={() => void check(env)}
+                      >
+                        {env.pending ? t('wiz.checking') : t('wiz.check')}
+                      </button>
+                      <IconButton
+                        label={t('wiz.removeEnv', { name: env.name || env.url || t('wiz.envName') })}
+                        onClick={() => setEnvs((list) => list.filter((x) => x.key !== env.key))}
+                      >
+                        <Trash2 size={16} aria-hidden="true" />
+                      </IconButton>
+                    </div>
+                    {env.error && (
+                      <Banner kind="danger" role="alert">
+                        {env.error}
+                      </Banner>
+                    )}
+                    {env.result && <CheckResult info={env.result} />}
+                  </li>
+                ))}
+              </ul>
+              <button
+                type="button"
+                className="btn"
+                onClick={() => setEnvs((list) => [...list, EMPTY_ENV(`env-${++envSeq.current}`)])}
+              >
+                <Plus size={16} aria-hidden="true" />
+                {t('wiz.addEnv')}
+              </button>
+            </section>
+          )}
+
+          {step === 2 && (
+            <section className="mt-4 space-y-4">
+              <fieldset className="m-0 space-y-2 border-0 p-0">
+                <legend className="label">{t('wiz.contentTitle')}</legend>
+                {(['blank', 'database', 'sql'] as const).map((k) => (
+                  <label
+                    key={k}
+                    className={cx(
+                      'flex cursor-pointer items-start gap-2.5 rounded-md border p-3',
+                      kind === k ? 'border-primary bg-primary-soft' : 'border-border bg-panel',
+                    )}
+                  >
+                    <input
+                      type="radio"
+                      name="content"
+                      className="mt-0.5"
+                      checked={kind === k}
+                      onChange={() => setKind(k)}
+                    />
+                    <span className="space-y-0.5">
+                      <span className="block text-sm font-medium">{t(`wiz.content${cap(k)}`)}</span>
+                      <span className="block text-xs text-text-2">{t(`wiz.content${cap(k)}Hint`)}</span>
+                    </span>
+                  </label>
+                ))}
+                <label className="flex items-start gap-2.5 rounded-md border border-border bg-panel p-3 opacity-60">
+                  <input type="radio" name="content" className="mt-0.5" disabled checked={false} readOnly />
+                  <span className="space-y-0.5">
+                    <span className="block text-sm font-medium">{t('wiz.contentTakeover')}</span>
+                    <span className="block text-xs text-text-2">{t('wiz.contentTakeoverHint')}</span>
+                  </span>
+                </label>
+              </fieldset>
+
+              {envMissing && (
+                <Banner kind="warn" role="alert">
+                  {t('wiz.envNeeded')}
+                </Banner>
+              )}
+
+              {kind === 'database' && filledEnvs.length > 0 && (
+                <div className="space-y-3 pt-4">
+                  <label className="field max-w-md">
+                    <span className="label">{t('wiz.pickEnv')}</span>
+                    <select
+                      className="select"
+                      value={sourceEnv?.name ?? ''}
+                      onChange={(e) => pickEnv(e.target.value)}
+                    >
+                      {filledEnvs.map((e) => (
+                        <option key={e.key} value={e.name}>
+                          {e.name}
+                        </option>
+                      ))}
+                    </select>
+                  </label>
+                  <div className="rounded-md border border-border bg-panel p-4">
+                    <div className="flex items-center gap-2">
+                      <span className="label mb-0">{t('wiz.pickSchemas')}</span>
+                      {sourceEnv?.pending && <span className="text-xs text-text-3">{t('wiz.checking')}</span>}
+                    </div>
+                    <p className="hint">{t('wiz.schemasHint')}</p>
+                    {schemaList.length === 0 ? (
+                      <p className="hint">{t('wiz.noSchemas')}</p>
+                    ) : (
+                      <div className="checks mt-1 flex-col items-start gap-1">
+                        {schemaList.map((s) => (
+                          <label key={s.name}>
+                            <input
+                              type="checkbox"
+                              checked={selectedNames.includes(s.name)}
+                              onChange={() => toggleSchema(s.name)}
+                            />
+                            <span className="font-mono text-xs">{s.name}</span>
+                            <span className="chip">{t('wiz.tables', { count: s.tables })}</span>
+                          </label>
+                        ))}
+                      </div>
+                    )}
+                    {schemaMissing && (
+                      <p className="hint error" role="alert">
+                        {t('wiz.schemaNeeded')}
+                      </p>
+                    )}
+                    {sourceEnv?.error && (
+                      <Banner kind="danger" role="alert">
+                        {sourceEnv.error}
+                      </Banner>
+                    )}
+                  </div>
+                </div>
+              )}
+
+              {kind === 'sql' && (
+                <div className="space-y-2">
+                  <label className="field">
+                    <span className="label">{t('wiz.sqlText')}</span>
+                    <textarea
+                      className="textarea h-64 font-mono"
+                      value={sql}
+                      placeholder={t('wiz.sqlPlaceholder')}
+                      spellCheck={false}
+                      onChange={(e) => setSql(e.target.value)}
+                    />
+                  </label>
+                  <div className="flex items-center gap-2">
+                    <button type="button" className="btn" onClick={() => fileInput.current?.click()}>
+                      <FileUp size={16} aria-hidden="true" />
+                      {t('wiz.sqlFile')}
+                    </button>
+                    <input
+                      ref={fileInput}
+                      type="file"
+                      accept=".sql,text/plain"
+                      className="sr-only"
+                      onChange={async (e) => {
+                        const file = e.target.files?.[0];
+                        if (!file) return;
+                        setSql(await file.text());
+                        e.target.value = '';
+                      }}
+                    />
+                    {kind === 'sql' && !sql.trim() && <span className="hint">{t('wiz.sqlNeeded')}</span>}
+                    {kind === 'sql' && filledEnvs.length === 0 && (
+                      <span className="hint">{t('wiz.sqlNeedsEnv')}</span>
+                    )}
+                  </div>
+                </div>
+              )}
+            </section>
+          )}
+
+          {step === 3 && (
+            <section className="mt-4 space-y-4">
+              <p className="hint">{t('wiz.confirmHint')}</p>
+              <dl className="grid grid-cols-[auto_1fr] gap-x-6 gap-y-2 rounded-md border border-border bg-panel px-4 py-3 text-sm">
+                <dt className="text-text-2">{t('wiz.sumBasics')}</dt>
+                <dd className="m-0">
+                  {name} · <span className="font-mono text-xs text-text-3">{slug || t('wiz.slugAuto')}</span>
+                  {group && <span className="ml-2 text-text-2">{group.name}</span>}
+                </dd>
+                <dt className="text-text-2">{t('wiz.sumEnvs')}</dt>
+                <dd className="m-0">
+                  {filledEnvs.length === 0 ? (
+                    <span className="text-text-2">{t('wiz.sumNoEnv')}</span>
+                  ) : (
+                    <span className="font-mono text-xs">{filledEnvs.map((e) => e.name).join('、')}</span>
+                  )}
+                </dd>
+                <dt className="text-text-2">{t('wiz.sumContent')}</dt>
+                <dd className="m-0">
+                  {t(`wiz.content${cap(kind)}`)}
+                  {kind === 'database' && sourceEnv && (
+                    <span className="ml-2 font-mono text-xs text-text-3">{sourceEnv.name}</span>
+                  )}
+                  {kind === 'sql' && (
+                    <div className="mt-1 max-h-40 overflow-auto rounded-sm border border-border bg-code-bg p-2 font-mono text-xs whitespace-pre-wrap">
+                      {sql.slice(0, 2000)}
+                    </div>
+                  )}
+                </dd>
+                <dt className="text-text-2">{t('wiz.sumSchemas')}</dt>
+                <dd className="m-0 font-mono text-xs">
+                  {kind === 'database' && allSchemaNames.length > 0
+                    ? (scopeOf(selectedNames, allSchemaNames) ?? [t('wiz.sumAll')]).join('、')
+                    : t('wiz.sumAll')}
+                </dd>
+              </dl>
+              {busy && <Progress stage={stage} />}
+              {error && (
+                <Banner kind="danger" role="alert" title={t('wiz.failed')}>
+                  {error}
+                </Banner>
+              )}
+            </section>
+          )}
+
+          {error && step !== 3 && (
+            <Banner kind="danger" role="alert">
+              {error}
+            </Banner>
+          )}
+
+          <div className="mt-6 flex items-center gap-2">
+            <button
+              type="button"
+              className="btn"
+              onClick={() => goto(step - 1)}
+              disabled={step === 0 || busy}
+            >
+              {t('wiz.back')}
+            </button>
+            <span className="flex-1" />
+            {step === 1 && (
+              <button type="button" className="btn" onClick={() => goto(2)} disabled={busy}>
+                {t('wiz.skip')}
+              </button>
+            )}
+            {step < 3 ? (
+              <button
+                type="button"
+                className="btn primary"
+                onClick={() => goto(step + 1)}
+                disabled={!canNext || busy}
+              >
+                {t('wiz.next')}
+              </button>
+            ) : (
+              <button
+                type="button"
+                className="btn primary"
+                onClick={() => void create()}
+                disabled={!canNext || busy}
+                aria-busy={busy}
+              >
+                {busy ? t('wiz.running') : t('wiz.create')}
+              </button>
+            )}
+          </div>
+        </div>
+      </main>
+    </AppShell>
+  );
+};
+
+const cap = (s: string) => s.charAt(0).toUpperCase() + s.slice(1);
+
+/** 连接检查的结果：版本、账号、权限、schema（每个带表数） */
+const CheckResult = ({ info }: { info: TargetInfo }) => {
+  const { t } = useTranslation();
+  const yesNo = (v: boolean) => (v ? t('wiz.yes') : t('wiz.no'));
+  return (
+    <div className="space-y-2 rounded-sm border border-border bg-surface-2 p-3 text-xs">
+      <p className="flex items-center gap-1.5 font-medium">
+        <CircleCheck size={14} aria-hidden="true" className="text-ok" />
+        {t('wiz.checkOk')}
+        <span className="text-text-2">{t('wiz.checkVersion', { version: info.version })}</span>
+      </p>
+      <dl className="grid grid-cols-[auto_1fr] gap-x-4 gap-y-1">
+        <dt className="text-text-2">{t('wiz.checkUser')}</dt>
+        <dd className="m-0 font-mono">{info.currentUser}</dd>
+        <dt className="text-text-2">{t('wiz.checkSuper')}</dt>
+        <dd className="m-0">
+          {yesNo(info.superuser)}
+          {!info.superuser && (
+            <span className="ml-3 text-text-2">
+              {t('wiz.checkCreateDb')}：{yesNo(info.canCreateDb)} · {t('wiz.checkCreateSchema')}：
+              {yesNo(info.canCreateSchema)}
+            </span>
+          )}
+        </dd>
+        <dt className="text-text-2">{t('wiz.schemasTitle')}</dt>
+        <dd className="m-0 flex flex-wrap items-center gap-1.5">
+          {info.schemas.length === 0 && <span className="text-text-2">{t('wiz.noSchemas')}</span>}
+          {info.schemas.map((s) => (
+            <span key={s.name} className="chip font-mono">
+              {s.name} · {t('wiz.tables', { count: s.tables })}
+            </span>
+          ))}
+          {info.dowelSchema && (
+            <span className="chip flex items-center gap-1 font-mono" title={t('wiz.schemasHint')}>
+              <TriangleAlert size={12} aria-hidden="true" />
+              dowel
+              {info.dowelMeta && <Database size={12} aria-hidden="true" />}
+            </span>
+          )}
+        </dd>
+      </dl>
+    </div>
+  );
+};
+
+/** 进度：阶段粒度（连接 / 读取结构 / 规范化 / 写入 / 完成） */
+const Progress = ({ stage }: { stage: WizardStage | null }) => {
+  const { t } = useTranslation();
+  const at = stage ? STAGES.indexOf(stage) : -1;
+  return (
+    <div className="rounded-md border border-border bg-panel p-4" role="status" aria-live="polite">
+      <p className="label">{t('wiz.progress')}</p>
+      <ol className="m-0 flex list-none flex-wrap items-center gap-2 p-0 text-xs">
+        {STAGES.map((s, i) => (
+          <li
+            key={s}
+            className={cx(
+              'flex items-center gap-1 rounded-full border px-2.5 py-1',
+              i < at
+                ? 'border-primary text-primary-text'
+                : i === at
+                  ? 'border-primary bg-primary-soft font-medium text-primary-text'
+                  : 'border-border text-text-3',
+            )}
+          >
+            {i < at ? <Check size={12} aria-hidden="true" /> : <span aria-hidden="true">{i + 1}</span>}
+            {t(`wiz.stage.${s}`)}
+          </li>
+        ))}
+      </ol>
+    </div>
+  );
+};

@@ -1,0 +1,26 @@
+# 依赖与构建产物
+node_modules/
+dist/
+.turbo/
+coverage/
+*.tsbuildinfo
+
+# 本地配置与密钥
+.env
+.env.*
+!.env.example
+.claude/settings.local.json
+
+# 测试与运行时产物
+playwright-report/
+test-results/
+*.log
+
+# 系统文件
+.DS_Store
+
+# 本地运行时数据（PGlite 平台库默认目录）
+data/
+
+# 本地规划文件
+ROADMAP.local.md

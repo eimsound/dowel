@@ -1,0 +1,39 @@
+# 依赖更新。cooldown 让新版本发布满 7 天后才提 PR，与 pnpm-workspace.yaml 的 minimumReleaseAge 一致：
+# 被盗号发布的恶意版本通常在几天内就会被发现并撤下。安全更新（Dependabot security updates）不受 cooldown 限制。
+version: 2
+updates:
+  - package-ecosystem: npm
+    directory: /
+    schedule:
+      interval: weekly
+      day: monday
+      timezone: Asia/Shanghai
+    cooldown:
+      default-days: 7
+    open-pull-requests-limit: 5
+    commit-message:
+      prefix: 依赖
+    groups:
+      # 开发工具（lint、测试、类型）一起升
+      dev:
+        dependency-type: development
+        update-types: [minor, patch]
+      # 运行时依赖的小版本和补丁一起升；大版本单独提 PR
+      prod:
+        dependency-type: production
+        update-types: [minor, patch]
+
+  # workflow 里的 action 按提交哈希引用，Dependabot 会同时更新哈希和后面的版本注释
+  - package-ecosystem: github-actions
+    directory: /
+    schedule:
+      interval: weekly
+      day: monday
+      timezone: Asia/Shanghai
+    cooldown:
+      default-days: 7
+    commit-message:
+      prefix: CI
+    groups:
+      actions:
+        patterns: ["*"]

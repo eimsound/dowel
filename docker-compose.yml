@@ -1,0 +1,17 @@
+# 自托管：启动 docker compose up -d，然后打开 http://localhost:4600
+# 平台数据默认存在卷 dowel-data 里的 SQLite 文件中；想用 PostgreSQL 时把 DOWEL_DB 设为 postgres://… 连接串。
+services:
+  dowel:
+    build: .
+    ports:
+      - "4600:4600"
+    environment:
+      # 加密保存的数据库连接信息用的主密钥：部署前改成一段随机字符串，之后不要再改
+      DOWEL_SECRET: change-me-to-a-long-random-string
+      # DOWEL_DB: postgres://user:pass@host:5432/dowel
+    volumes:
+      - dowel-data:/data
+    restart: unless-stopped
+
+volumes:
+  dowel-data:

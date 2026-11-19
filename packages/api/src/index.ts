@@ -1,0 +1,1058 @@
+// 前后端共享的接口契约：请求体 schema 和服务端响应类型。
+// 只依赖 zod；服务端用这些 schema 校验请求、给响应标注类型，前端从类型里取形状。
+import { z } from 'zod';
+
+// 项目角色：查看者 / 编辑者 / 项目管理员（GLOSSARY：项目角色）。旧的 owner 在迁移里映射成 admin。
+export const roleSchema = z.enum(['viewer', 'editor', 'admin']);
+export type Role = z.infer<typeof roleSchema>;
+
+/** 默认权限：组成员自动拥有的项目角色，none 表示没有 */
+export const defaultRoleSchema = z.enum(['none', 'viewer', 'editor', 'admin']);
+export type DefaultRole = z.infer<typeof defaultRoleSchema>;
+
+/** 组里的身份：组管理员 / 组成员 */
+export const groupRoleSchema = z.enum(['admin', 'member']);
+export type GroupRole = z.infer<typeof groupRoleSchema>;
+
+/** 组的项目由谁创建：所有组成员 / 只有组管理员 */
+export const projectCreationSchema = z.enum(['members', 'admins']);
+export type ProjectCreation = z.infer<typeof projectCreationSchema>;
+
+// ───── 账户与登录 ─────
+
+/**
+ * 用户名：小写字母、数字、`-`，1～39 位，不能以 `-` 开头或结尾（GLOSSARY 与 02-consensus 11.1）。
+ * 库里只存小写，所以**格式校验之前**先去掉首尾空白并转成小写：输入 `ZhangSan` 得到 `zhangsan`，
+ * 而不是报“只能用小写字母”。
+ */
+export const usernameSchema = z.preprocess(
+  (v) => (typeof v === 'string' ? v.trim().toLowerCase() : v),
+  z
+    .string()
+    .min(1, '用户名不能为空')
+    .max(39, '用户名最多 39 位')
+    .regex(/^[a-z0-9](?:[a-z0-9-]*[a-z0-9])?$/, '用户名只能用小写字母、数字和 -，且不能以 - 开头或结尾'),
+);
+
+export const displayNameSchema = z.string().trim().min(1, '名字不能为空').max(100, '名字最多 100 个字符');
+
+export const passwordSchema = z.string().min(8, '密码至少 8 位').max(200, '密码最多 200 个字符');
+
+/** 邮箱选填、不唯一、不验证，只作为资料里的一个字段 */
+export const emailFieldSchema = z.string().trim().max(200, '邮箱最多 200 个字符').nullable();
+
+export const instanceRoleSchema = z.enum(['admin', 'member']);
+export type InstanceRole = z.infer<typeof instanceRoleSchema>;
+
+export const userStatusSchema = z.enum(['active', 'disabled']);
+export type UserStatus = z.infer<typeof userStatusSchema>;
+
+/** 登录用用户名 + 密码；不在登录接口上校验用户名格式，免得泄露规则 */
+export const loginSchema = z.object({
+  username: z.string().min(1, '请输入用户名'),
+  password: z.string().min(1, '请输入密码'),
+});
+export type Login = z.infer<typeof loginSchema>;
+
+export const meSchema = z.object({
+  id: z.string(),
+  username: z.string(),
+  name: z.string(),
+  email: z.string().nullable(),
+  role: instanceRoleSchema,
+  status: userStatusSchema,
+  createdAt: z.string(),
+  lastLoginAt: z.string().nullable(),
+  /** 是否已经有密码：纯 OIDC 用户第一次设置密码时不需要旧密码 */
+  hasPassword: z.boolean(),
+});
+export type Me = z.infer<typeof meSchema>;
+
+// ───── 初始化与实例设置 ─────
+
+export const setupStatusSchema = z.object({ needsSetup: z.boolean() });
+export type SetupStatus = z.infer<typeof setupStatusSchema>;
+
+export const setupSchema = z.object({
+  token: z.string().min(1, '请输入初始化令牌'),
+  username: usernameSchema,
+  name: displayNameSchema,
+  password: passwordSchema,
+});
+export type Setup = z.infer<typeof setupSchema>;
+
+/** 登录页需要的信息；不需要登录就能读 */
+export const instanceInfoSchema = z.object({
+  name: z.string(),
+  /** 实际是否可用（设置关闭但设了 DOWEL_ALLOW_PASSWORD_LOGIN=1 时仍然是 true） */
+  passwordLogin: z.boolean(),
+  needsSetup: z.boolean(),
+  /** 启用的 OIDC 提供方（登录页显示“使用 XX 登录”） */
+  providers: z.array(z.object({ slug: z.string(), name: z.string() })),
+});
+export type InstanceInfo = z.infer<typeof instanceInfoSchema>;
+
+export const groupCreationSchema = z.enum(['all', 'admin']);
+export type GroupCreation = z.infer<typeof groupCreationSchema>;
+
+export const instanceSettingsSchema = z.object({
+  name: z.string(),
+  groupCreation: groupCreationSchema,
+  passwordLogin: z.boolean(),
+  /**
+   * 服务端可以替用户连接哪些地址（CIDR 或主机名）。空数组表示不限制。
+   * 服务端会主动去连用户给的数据库地址，所以这是防止 SSRF 的开关。
+   */
+  connectionAllowlist: z.array(z.string()),
+  /** 实例的唯一标识：首次启动时生成，之后不变，只读（写进目标库的历史里，用来识别由哪个实例执行） */
+  instanceId: z.string(),
+});
+export type InstanceSettings = z.infer<typeof instanceSettingsSchema>;
+
+export const instanceSettingsPatchSchema = z.object({
+  name: z.string().trim().min(1, '实例名称不能为空').max(100).optional(),
+  groupCreation: groupCreationSchema.optional(),
+  passwordLogin: z.boolean().optional(),
+  connectionAllowlist: z.array(z.string().trim().max(200)).max(200).optional(),
+});
+export type InstanceSettingsPatch = z.infer<typeof instanceSettingsPatchSchema>;
+
+// ───── 用户管理与邀请（只有实例管理员） ─────
+
+export const adminUserSchema = z.object({
+  id: z.string(),
+  username: z.string(),
+  name: z.string(),
+  email: z.string().nullable(),
+  role: instanceRoleSchema,
+  status: userStatusSchema,
+  createdAt: z.string(),
+  lastLoginAt: z.string().nullable(),
+});
+export type AdminUser = z.infer<typeof adminUserSchema>;
+
+export const adminUserCreateSchema = z.object({
+  username: usernameSchema,
+  name: displayNameSchema,
+  email: emailFieldSchema.optional(),
+  password: passwordSchema.optional(),
+  role: instanceRoleSchema.optional(),
+});
+export type AdminUserCreate = z.infer<typeof adminUserCreateSchema>;
+
+export const adminUserPatchSchema = z.object({
+  name: displayNameSchema.optional(),
+  role: instanceRoleSchema.optional(),
+  status: userStatusSchema.optional(),
+});
+export type AdminUserPatch = z.infer<typeof adminUserPatchSchema>;
+
+export const inviteCreateSchema = z.object({
+  /** 有效期天数，默认 7 天 */
+  expiresInDays: z.number().int().min(1).max(365).optional(),
+  /** 接受邀请后加入的组（组已经被删掉时跳过） */
+  groupIds: z.array(z.string()).max(100).optional(),
+});
+export type InviteCreate = z.infer<typeof inviteCreateSchema>;
+
+export const inviteCreatedSchema = z.object({
+  id: z.string(),
+  token: z.string(),
+  url: z.string(),
+  expiresAt: z.string(),
+});
+export type InviteCreated = z.infer<typeof inviteCreatedSchema>;
+
+export const inviteListItemSchema = z.object({
+  id: z.string(),
+  createdAt: z.string(),
+  expiresAt: z.string(),
+  createdBy: z.string().nullable(),
+  usedBy: z.string().nullable(),
+  usedAt: z.string().nullable(),
+  revokedAt: z.string().nullable(),
+  state: z.enum(['ok', 'used', 'revoked', 'expired']),
+});
+export type InviteListItem = z.infer<typeof inviteListItemSchema>;
+
+export const inviteInfoSchema = z.object({
+  valid: z.boolean(),
+  state: z.enum(['ok', 'used', 'revoked', 'expired', 'missing']),
+  instanceName: z.string(),
+  expiresAt: z.string().nullable(),
+});
+export type InviteInfo = z.infer<typeof inviteInfoSchema>;
+
+export const inviteAcceptSchema = z.object({
+  username: usernameSchema,
+  name: displayNameSchema,
+  password: passwordSchema,
+  email: emailFieldSchema.optional(),
+});
+export type InviteAccept = z.infer<typeof inviteAcceptSchema>;
+
+export const resetLinkSchema = z.object({ url: z.string(), token: z.string(), expiresAt: z.string() });
+export type ResetLink = z.infer<typeof resetLinkSchema>;
+
+export const resetPasswordSchema = z.object({ password: passwordSchema });
+export type ResetPassword = z.infer<typeof resetPasswordSchema>;
+
+// ───── 个人设置 ─────
+
+export const mePatchSchema = z.object({
+  username: usernameSchema.optional(),
+  name: displayNameSchema.optional(),
+  email: emailFieldSchema.optional(),
+});
+export type MePatch = z.infer<typeof mePatchSchema>;
+
+export const passwordChangeSchema = z.object({
+  /** 已经有密码时必填；纯 OIDC 用户第一次设置密码时不需要 */
+  oldPassword: z.string().min(1, '请输入旧密码').optional(),
+  newPassword: passwordSchema,
+});
+export type PasswordChange = z.infer<typeof passwordChangeSchema>;
+
+export const sessionInfoSchema = z.object({
+  id: z.string(),
+  createdAt: z.string(),
+  lastSeenAt: z.string(),
+  userAgent: z.string().nullable(),
+  ip: z.string().nullable(),
+  current: z.boolean(),
+});
+export type SessionInfo = z.infer<typeof sessionInfoSchema>;
+
+// ───── 组 ─────
+
+/** 组的 slug 与用户名规则相同（小写、数字、-，1～39 位），全实例唯一 */
+export const slugSchema = z.preprocess(
+  (v) => (typeof v === 'string' ? v.trim().toLowerCase() : v),
+  z
+    .string()
+    .min(1, '标识不能为空')
+    .max(39, '标识最多 39 位')
+    .regex(/^[a-z0-9](?:[a-z0-9-]*[a-z0-9])?$/, '标识只能用小写字母、数字和 -，且不能以 - 开头或结尾'),
+);
+
+export const groupCreateSchema = z.object({
+  slug: slugSchema,
+  name: z.string().trim().min(1, '组名不能为空').max(100, '组名最多 100 个字符'),
+  description: z.string().trim().max(1000).default(''),
+  defaultRole: defaultRoleSchema.optional(),
+  projectCreation: projectCreationSchema.optional(),
+});
+export type GroupCreate = z.infer<typeof groupCreateSchema>;
+
+export const groupPatchSchema = z.object({
+  name: z.string().trim().min(1, '组名不能为空').max(100).optional(),
+  description: z.string().trim().max(1000).optional(),
+  defaultRole: defaultRoleSchema.optional(),
+  projectCreation: projectCreationSchema.optional(),
+});
+export type GroupPatch = z.infer<typeof groupPatchSchema>;
+
+export const groupInfoSchema = z.object({
+  id: z.string(),
+  slug: z.string(),
+  name: z.string(),
+  description: z.string(),
+  defaultRole: defaultRoleSchema,
+  projectCreation: projectCreationSchema,
+  createdAt: z.string(),
+  /** 调用者在这个组里的身份；不是成员时为空 */
+  role: groupRoleSchema.nullable(),
+  memberCount: z.number(),
+  projectCount: z.number(),
+});
+export type GroupInfo = z.infer<typeof groupInfoSchema>;
+
+export const groupListSchema = z.object({
+  groups: z.array(groupInfoSchema),
+  /** 实例设置允许调用者建组（实例管理员始终可以） */
+  canCreate: z.boolean(),
+});
+export type GroupList = z.infer<typeof groupListSchema>;
+
+export const groupMemberSchema = z.object({
+  id: z.string(),
+  username: z.string(),
+  name: z.string(),
+  role: groupRoleSchema,
+});
+export type GroupMember = z.infer<typeof groupMemberSchema>;
+
+export const groupMemberAddSchema = z.object({
+  username: z.string().min(1, '请输入用户名'),
+  role: groupRoleSchema.default('member'),
+});
+export type GroupMemberAdd = z.infer<typeof groupMemberAddSchema>;
+
+export const groupMemberPatchSchema = z.object({ role: groupRoleSchema });
+export type GroupMemberPatch = z.infer<typeof groupMemberPatchSchema>;
+
+// ───── 项目 ─────
+
+/** schema 范围：导入、拉取、规范化只看这些 schema；空表示全部（dowel 永远排除） */
+export const schemaScopeSchema = z.array(z.string().trim().min(1).max(63)).max(200);
+
+/** 建项目必须指定组；slug 不给时由名字生成 */
+export const projectCreateSchema = z.object({
+  name: z.string().trim().min(1, '项目名不能为空').max(100),
+  groupId: z.string().min(1, '请选择组'),
+  slug: slugSchema.optional(),
+  /** 初始的 schema 范围（可空，空表示全部） */
+  schemas: schemaScopeSchema.nullable().optional(),
+});
+export type ProjectCreate = z.infer<typeof projectCreateSchema>;
+
+/** 项目的组信息（列表和详情里都带上，方便拼 /project/:owner/:project） */
+export const projectGroupSchema = z.object({
+  id: z.string(),
+  slug: z.string(),
+  name: z.string(),
+});
+export type ProjectGroup = z.infer<typeof projectGroupSchema>;
+
+export const projectListItemSchema = z.object({
+  id: z.string(),
+  name: z.string(),
+  slug: z.string(),
+  dialect: z.string(),
+  role: roleSchema,
+  createdAt: z.string(),
+  group: projectGroupSchema,
+});
+export type ProjectListItem = z.infer<typeof projectListItemSchema>;
+
+export const projectInfoSchema = z.object({
+  id: z.string(),
+  name: z.string(),
+  slug: z.string(),
+  role: roleSchema,
+  branch: z.string(),
+  group: projectGroupSchema,
+  /** 项目自己的默认权限；null 表示沿用组的默认权限 */
+  defaultRole: defaultRoleSchema.nullable(),
+  groupDefaultRole: defaultRoleSchema,
+  /** 调用者在这个项目的组里的身份；设置项目默认权限需要组管理员 */
+  groupRole: groupRoleSchema.nullable(),
+  /** schema 范围：null 表示全部（dowel 永远排除） */
+  schemas: schemaScopeSchema.nullable(),
+});
+export type ProjectInfo = z.infer<typeof projectInfoSchema>;
+
+export const projectCreatedSchema = z.object({
+  id: z.string(),
+  name: z.string(),
+  slug: z.string(),
+  role: roleSchema,
+  group: projectGroupSchema,
+});
+export type ProjectCreated = z.infer<typeof projectCreatedSchema>;
+
+export const projectPatchSchema = z.object({
+  name: z.string().trim().min(1, '项目名不能为空').max(100).optional(),
+  slug: slugSchema.optional(),
+  /** null 表示沿用组的默认权限（接口里要能显式传 null） */
+  defaultRole: defaultRoleSchema.nullable().optional(),
+  /** null 表示全部 schema（dowel 永远排除） */
+  schemas: schemaScopeSchema.nullable().optional(),
+});
+export type ProjectPatch = z.infer<typeof projectPatchSchema>;
+
+export const projectTransferSchema = z.object({ groupId: z.string().min(1, '请选择目标组') });
+export type ProjectTransfer = z.infer<typeof projectTransferSchema>;
+
+/** 删除项目：必须原样输入项目标识（slug），避免误删 */
+export const projectDeleteSchema = z.object({ confirm: z.string().min(1, '请输入项目标识') });
+export type ProjectDelete = z.infer<typeof projectDeleteSchema>;
+
+/** 按 /project/:owner/:project 解析；走的是旧路径时 redirected 为 true，前端据此替换地址 */
+export const resolvedProjectSchema = z.object({
+  id: z.string(),
+  name: z.string(),
+  slug: z.string(),
+  owner: z.string(),
+  groupName: z.string(),
+  redirected: z.boolean(),
+});
+export type ResolvedProject = z.infer<typeof resolvedProjectSchema>;
+
+// ───── 授权 ─────
+
+/** 授权对象：用户或组 */
+export const grantSubjectKindSchema = z.enum(['user', 'group']);
+export type GrantSubjectKind = z.infer<typeof grantSubjectKindSchema>;
+
+/**
+ * 授权范围。表结构里预留了 environment（以后给“执行者”用），接口现在只开放这三种。
+ */
+export const grantScopeKindSchema = z.enum(['instance', 'group', 'project']);
+export type GrantScopeKind = z.infer<typeof grantScopeKindSchema>;
+
+export const grantCreateSchema = z.object({
+  subjectKind: grantSubjectKindSchema,
+  subjectId: z.string().min(1),
+  role: roleSchema,
+});
+export type GrantCreate = z.infer<typeof grantCreateSchema>;
+
+export const grantPatchSchema = z.object({ role: roleSchema });
+export type GrantPatch = z.infer<typeof grantPatchSchema>;
+
+export const grantSubjectSchema = z.object({
+  kind: grantSubjectKindSchema,
+  id: z.string(),
+  /** 用户是显示名，组是组名 */
+  name: z.string(),
+  /** 用户是用户名，组是 slug */
+  slug: z.string(),
+});
+export type GrantSubject = z.infer<typeof grantSubjectSchema>;
+
+export const grantInfoSchema = z.object({
+  id: z.string(),
+  subject: grantSubjectSchema,
+  role: roleSchema,
+  scopeKind: grantScopeKindSchema,
+  scopeId: z.string(),
+  createdAt: z.string(),
+});
+export type GrantInfo = z.infer<typeof grantInfoSchema>;
+
+/** 通过组默认权限拿到角色的成员（只读，界面上单独列出来） */
+export const defaultAccessSchema = z.object({
+  userId: z.string(),
+  username: z.string(),
+  name: z.string(),
+  /** none 表示是组成员但没有默认权限 */
+  role: defaultRoleSchema,
+  groupAdmin: z.boolean(),
+});
+export type DefaultAccess = z.infer<typeof defaultAccessSchema>;
+
+/** 项目的成员与授权：直接授权 + 来自组默认权限的成员 */
+export const projectAccessSchema = z.object({
+  grants: z.array(grantInfoSchema),
+  defaultMembers: z.array(defaultAccessSchema),
+});
+export type ProjectAccess = z.infer<typeof projectAccessSchema>;
+
+// ───── 用户与组的选择器 ─────
+
+export const directoryEntrySchema = z.object({ id: z.string(), name: z.string(), slug: z.string() });
+export type DirectoryEntry = z.infer<typeof directoryEntrySchema>;
+
+export const directorySchema = z.object({
+  users: z.array(directoryEntrySchema),
+  groups: z.array(directoryEntrySchema),
+});
+export type Directory = z.infer<typeof directorySchema>;
+
+// ───── 版本、迁移与验证 ─────
+
+export const versionCreateSchema = z.object({ name: z.string().min(1).max(200) });
+export type VersionCreate = z.infer<typeof versionCreateSchema>;
+
+/** 冻结迁移里的一步：transactional=false 表示这一步不能放进事务（例如 CREATE INDEX CONCURRENTLY） */
+export const scriptStepSchema = z.object({ sql: z.string(), transactional: z.boolean() });
+export type ScriptStepInfo = z.infer<typeof scriptStepSchema>;
+
+export const versionInfoSchema = z.object({
+  id: z.string(),
+  name: z.string(),
+  /** 房间操作序号（发布时工作副本的 seq），不是版本号 */
+  seq: z.number(),
+  /** 版本在链上的序号：v0 基线是 0，之后 1、2…，项目内唯一 */
+  number: z.number(),
+  /** 链上的上一个版本；第一个版本为空 */
+  parentId: z.string().nullable(),
+  createdAt: z.string(),
+  createdBy: z.string().nullable(),
+  /** 在影子库里闭环验证通过的时间；null 表示未验证（没有影子库、或脚本被人工改过） */
+  verifiedAt: z.string().nullable(),
+  /** 冻结的脚本被人工改过 */
+  edited: z.boolean(),
+  /** 链上最新的版本：只有它的脚本可以编辑 */
+  latest: z.boolean(),
+});
+export type VersionInfo = z.infer<typeof versionInfoSchema>;
+
+export const versionCreatedSchema = z.object({
+  id: z.string(),
+  name: z.string(),
+  seq: z.number(),
+  number: z.number(),
+  /** 风险分析没有完成时的原因，只存原因本身（例如“执行超时…”），“风险分析没有完成”这个前缀由界面的标题 / i18n 模板提供；不影响 ok，但界面要如实显示，不能当成“没有风险” */
+  riskError: z.string().nullable(),
+  /** 是否已在影子库里验证通过；没有影子库时发布成功但未验证 */
+  verified: z.boolean(),
+  /** 未验证的原因（例如项目还没有环境）；已验证时为 null */
+  unverifiedReason: z.string().nullable(),
+});
+export type VersionCreated = z.infer<typeof versionCreatedSchema>;
+
+export const migrationStepSchema = z.object({
+  kind: z.string(),
+  target: z.string(),
+  sql: z.string(),
+  /** 冻结脚本里这一步的 transactional 标记（验证 / 重新验证的报告里的步骤带着它；规划器的预览里没有） */
+  transactional: z.boolean().optional(),
+});
+export type MigrationStep = z.infer<typeof migrationStepSchema>;
+
+export const migrationResultSchema = z.object({
+  up: z.array(migrationStepSchema),
+  down: z.array(migrationStepSchema),
+});
+export type MigrationResult = z.infer<typeof migrationResultSchema>;
+
+export const stepRiskSchema = z.object({
+  locks: z.array(z.object({ relation: z.string(), mode: z.string() })),
+  rewrites: z.array(z.string()),
+  scans: z.array(z.string()),
+  level: z.enum(['low', 'medium', 'high']),
+  /** 这一步没有做锁和重写分析的原因，是一个代码（界面按代码显示本地化的说明）；有它时不显示风险等级 */
+  note: z.enum(['nontransactional']).optional(),
+});
+export type StepRisk = z.infer<typeof stepRiskSchema>;
+
+export const verifyReportSchema = z.object({
+  ok: z.boolean(),
+  up: z.array(migrationStepSchema),
+  down: z.array(migrationStepSchema),
+  upDiff: z.array(z.string()),
+  downDiff: z.array(z.string()),
+  risks: z.array(stepRiskSchema),
+  /** 风险分析没有完成时的原因，只存原因本身（例如“执行超时…”），“风险分析没有完成”这个前缀由界面的标题 / i18n 模板提供；不影响 ok，但界面要如实显示，不能当成“没有风险” */
+  riskError: z.string().optional(),
+  error: z.object({ step: migrationStepSchema.nullable(), message: z.string() }).nullable(),
+});
+export type VerifyReport = z.infer<typeof verifyReportSchema>;
+
+export const verifyResponseSchema = verifyReportSchema.extend({ shadow: z.string() });
+export type VerifyResponse = z.infer<typeof verifyResponseSchema>;
+
+export const verifyRequestSchema = z.object({
+  from: z.string().default('empty'),
+  to: z.string().default('head'),
+  env: z.string().optional(),
+});
+export type VerifyRequest = z.infer<typeof verifyRequestSchema>;
+
+/** 存在版本里的验证报告：不含 up / down（它们就是冻结的脚本本身） */
+export const storedVerifyReportSchema = z.object({
+  ok: z.boolean(),
+  upDiff: z.array(z.string()),
+  downDiff: z.array(z.string()),
+  risks: z.array(stepRiskSchema),
+  /** 同上：只存原因本身，前缀由界面提供 */
+  riskError: z.string().optional(),
+  error: z.object({ step: migrationStepSchema.nullable(), message: z.string() }).nullable(),
+  /** 实际用的影子库 */
+  shadow: z.string(),
+  at: z.string(),
+});
+export type StoredVerifyReport = z.infer<typeof storedVerifyReportSchema>;
+
+export const versionDetailSchema = versionInfoSchema.extend({
+  upSteps: z.array(scriptStepSchema),
+  downSteps: z.array(scriptStepSchema),
+  checksum: z.string(),
+  /** 最近一次验证的报告；从没验证过为 null */
+  verifyReport: storedVerifyReportSchema.nullable(),
+});
+export type VersionDetail = z.infer<typeof versionDetailSchema>;
+
+/** 人工编辑冻结的脚本：整体替换 up 和 down（每步一个元素） */
+export const stepsPatchSchema = z.object({
+  up: z.array(scriptStepSchema.extend({ sql: z.string().max(1_000_000) })).max(5000),
+  down: z.array(scriptStepSchema.extend({ sql: z.string().max(1_000_000) })).max(5000),
+});
+export type StepsPatch = z.infer<typeof stepsPatchSchema>;
+
+/** 发布被拒绝（422）时附带的验证报告 */
+export const publishRejectedSchema = z.object({ error: z.string(), report: verifyResponseSchema.optional() });
+export type PublishRejected = z.infer<typeof publishRejectedSchema>;
+
+/** 重新验证的响应 */
+export const versionVerifyResponseSchema = z.object({
+  report: storedVerifyReportSchema,
+  /** 本次验证后版本的验证时间（失败时为 null） */
+  verifiedAt: z.string().nullable(),
+});
+export type VersionVerifyResponse = z.infer<typeof versionVerifyResponseSchema>;
+
+// ───── 导入 / 拉取 ─────
+
+export const importSchema = z.object({
+  sql: z.string().min(1).max(5_000_000),
+  env: z.string().optional(),
+});
+export type ImportRequest = z.infer<typeof importSchema>;
+
+export const modelUpdateSchema = z.object({ seq: z.number(), objects: z.number() });
+export type ModelUpdate = z.infer<typeof modelUpdateSchema>;
+
+// ───── 环境 ─────
+
+const postgresUrl = z.string().regex(/^postgres(ql)?:\/\//, '连接串必须以 postgres:// 开头');
+
+export const environmentCreateSchema = z.object({
+  name: z.string().trim().min(1).max(100),
+  url: postgresUrl,
+  production: z.boolean().default(true),
+  allowSameInstance: z.boolean().default(false),
+  shadowUrl: postgresUrl.nullable().default(null),
+});
+export type EnvironmentCreate = z.infer<typeof environmentCreateSchema>;
+
+/**
+ * 谁能执行（H6，P5 之前的过渡方案，设在环境上）：
+ * - editor：项目编辑者及以上；admin：项目管理员及以上；
+ * - executor：仅限执行者。P5 之前还没有“执行者”这个身份，等同于只有实例管理员（authz.ts 里留了扩展点）。
+ * 默认（环境没有设置时）：非生产 = editor，生产 = admin。
+ */
+export const execPolicySchema = z.enum(['editor', 'admin', 'executor']);
+export type ExecPolicy = z.infer<typeof execPolicySchema>;
+
+/** 漂移检测的结果：unknown 还没检查过，ok 没有漂移，drifted 线上结构与当前版本不一致，error 检查时连不上 / 读不出 */
+export const driftStatusSchema = z.enum(['unknown', 'ok', 'drifted', 'error']);
+export type DriftStatus = z.infer<typeof driftStatusSchema>;
+
+/** 差异列表的一项：线上结构 → 当前版本模型，需要做什么才能回到这个版本（plan 的一步） */
+export const driftItemSchema = z.object({ kind: z.string(), target: z.string(), sql: z.string() });
+export type DriftItem = z.infer<typeof driftItemSchema>;
+
+/**
+ * “需要人工修正”：上一次执行的读回校验失败（所有步骤都做完了，结构却不等于目标版本）。
+ * 方向和版本：升级是新版本，回滚是被回滚的版本；versionNumber 由服务端按版本链补上。
+ * 注意旧数据里 drift_summary 的 needsManual 可能是 `true`（早期格式），服务端读出时会丢掉不合格式的值。
+ */
+export const needsManualSchema = z.object({
+  direction: z.enum(['up', 'down', 'baseline']),
+  versionId: z.string().nullable(),
+  versionNumber: z.number().nullable().optional(),
+});
+export type NeedsManual = z.infer<typeof needsManualSchema>;
+
+export const driftSummarySchema = z.object({
+  /** 与哪个版本的模型比较（版本 ID 和序号；库里还没有历史时是链上第一个版本） */
+  versionId: z.string().nullable(),
+  versionNumber: z.number().nullable(),
+  /** 差异总数（items 最多 100 项） */
+  total: z.number(),
+  items: z.array(driftItemSchema),
+  /**
+   * 检查失败（status = error）时的原因，或者 drifted 时的补充说明（例如“上一次执行的读回校验失败留下的差异，需要人工修正”）；已脱敏。
+   * 文案已经说明真实原因，界面直接显示。
+   */
+  message: z.string().nullable(),
+  /** 检查失败的类别：connect 连不上目标库、database 目标库返回错误（权限等）、integrity 历史与版本链对不上、scope schema 范围有问题、history 读不了 dowel 历史、unexpected 其他 */
+  errorKind: z.enum(['connect', 'database', 'integrity', 'scope', 'history', 'unexpected']).optional(),
+  /** 差异是上一次“读回校验失败”的执行留下的：不能续跑，需要人工修正；说明是哪次执行、哪个版本 */
+  needsManual: needsManualSchema.optional(),
+  /** 库里还没有 Dowel 的历史：比较的是“基线 / 空库” */
+  firstRun: z.boolean().optional(),
+});
+export type DriftSummary = z.infer<typeof driftSummarySchema>;
+
+export const driftInfoSchema = z.object({
+  status: driftStatusSchema,
+  /** 最近一次检查的时间；从没检查过为 null */
+  checkedAt: z.string().nullable(),
+  summary: driftSummarySchema.nullable(),
+});
+export type DriftInfo = z.infer<typeof driftInfoSchema>;
+
+export const envVersionRefSchema = z.object({ id: z.string(), number: z.number(), name: z.string() });
+export type EnvVersionRef = z.infer<typeof envVersionRefSchema>;
+
+export const envPermissionsSchema = z.object({
+  /** 能否执行 / 回滚 / 写基线（按环境的执行档位） */
+  execute: z.boolean(),
+  /** 能否改连接串、影子库、生产标记、执行档位和删除环境 */
+  configure: z.boolean(),
+});
+export type EnvPermissions = z.infer<typeof envPermissionsSchema>;
+
+export const environmentInfoSchema = z.object({
+  id: z.string(),
+  name: z.string(),
+  url: z.string(),
+  production: z.boolean(),
+  allowSameInstance: z.boolean(),
+  shadowUrl: z.string().nullable(),
+  /** 环境上设置的执行档位；null 表示用默认（非生产 editor，生产 admin） */
+  execPolicy: execPolicySchema.nullable(),
+  /** 实际生效的执行档位 */
+  effectiveExecPolicy: execPolicySchema,
+  /** 环境当前版本（平台库缓存：最近一次读目标库历史 / 执行后的结果）；还没执行过为 null */
+  currentVersion: envVersionRefSchema.nullable(),
+  drift: driftInfoSchema,
+  permissions: envPermissionsSchema,
+});
+export type EnvInfo = z.infer<typeof environmentInfoSchema>;
+
+/** 修改环境：连接串 / 影子库 / 生产标记 / 执行档位都是特权操作，按环境的执行档位检查 */
+export const environmentPatchSchema = z.object({
+  url: postgresUrl.optional(),
+  shadowUrl: postgresUrl.nullable().optional(),
+  allowSameInstance: z.boolean().optional(),
+  production: z.boolean().optional(),
+  execPolicy: execPolicySchema.nullable().optional(),
+});
+export type EnvironmentPatch = z.infer<typeof environmentPatchSchema>;
+
+/** 环境状态里的一个版本（版本链按序号升序，每个版本相对这个环境的当前版本是已执行 / 当前 / 待执行） */
+export const envVersionSchema = z.object({
+  id: z.string(),
+  number: z.number(),
+  name: z.string(),
+  state: z.enum(['applied', 'current', 'pending']),
+  verified: z.boolean(),
+  edited: z.boolean(),
+  /** 升级 / 回滚脚本的步数 */
+  upSteps: z.number(),
+  downSteps: z.number(),
+  /** 升级脚本里有不能放进事务的步骤（CREATE INDEX CONCURRENTLY 等）：这个迁移不是原子的，失败后要从断点续跑 */
+  nonTransactional: z.boolean(),
+  /** 最近一次验证里升级脚本风险最高的一档；没有分析 / 没有验证为 null */
+  risk: z.enum(['low', 'medium', 'high']).nullable(),
+  /** 风险分析没有完成的原因 */
+  riskError: z.string().nullable(),
+  /** 这个版本在这个环境上执行过（目标库历史里有它） */
+  executedHere: z.boolean(),
+});
+export type EnvVersion = z.infer<typeof envVersionSchema>;
+
+export const envStatusSchema = z.object({
+  id: z.string(),
+  name: z.string(),
+  production: z.boolean(),
+  execPolicy: execPolicySchema.nullable(),
+  effectiveExecPolicy: execPolicySchema,
+  currentVersion: envVersionRefSchema.nullable(),
+  /** 链上全部版本（升序） */
+  versions: z.array(envVersionSchema),
+  /** 待执行的版本 ID（升序）：执行到最新版本需要依次执行它们 */
+  pending: z.array(z.string()),
+  drift: driftInfoSchema,
+  permissions: envPermissionsSchema,
+});
+export type EnvStatus = z.infer<typeof envStatusSchema>;
+
+/** 执行 / 回滚到指定版本。生产环境必须在 confirm 里填环境名（服务端校验） */
+export const executeRequestSchema = z.object({
+  to: z.string().min(1),
+  confirm: z.string().optional(),
+});
+export type ExecuteRequest = z.infer<typeof executeRequestSchema>;
+
+export const baselineRequestSchema = z.object({ confirm: z.string().optional() });
+export type BaselineRequest = z.infer<typeof baselineRequestSchema>;
+
+/** 执行进度的阶段：拿锁 → 完整性检查 → 漂移检查 → 计划 → 逐个迁移 → 完成 */
+export const execStageSchema = z.enum(['lock', 'integrity', 'drift', 'plan', 'migration', 'done']);
+export type ExecStage = z.infer<typeof execStageSchema>;
+
+export const execMigrationRefSchema = z.object({
+  versionId: z.string(),
+  number: z.number(),
+  name: z.string(),
+  direction: z.enum(['up', 'down', 'baseline']),
+  steps: z.number(),
+});
+
+/** 出错时的细节：漂移 / 读回不一致的差异、失败的是第几步、目标库是否已被部分改动 */
+export const execErrorDetailsSchema = z.object({
+  diff: z.array(driftItemSchema).optional(),
+  diffTotal: z.number().optional(),
+  problems: z.array(z.string()).optional(),
+  versionId: z.string().optional(),
+  number: z.number().optional(),
+  step: z.number().optional(),
+  partial: z.boolean().optional(),
+  needsManual: needsManualSchema.optional(),
+});
+export type ExecErrorDetails = z.infer<typeof execErrorDetailsSchema>;
+
+/** SSE 每条消息的负载（`data:` 后面是它的 JSON）；出错时最后一条带 error（HTTP 状态仍是 200） */
+export const execEventSchema = z.object({
+  stage: execStageSchema,
+  /** plan 阶段：先写基线 + 要执行的迁移 */
+  baseline: z.boolean().optional(),
+  migrations: z.array(execMigrationRefSchema).optional(),
+  /** migration 阶段 */
+  status: z.enum(['start', 'step', 'done']).optional(),
+  index: z.number().optional(),
+  total: z.number().optional(),
+  versionId: z.string().optional(),
+  number: z.number().optional(),
+  name: z.string().optional(),
+  direction: z.enum(['up', 'down', 'baseline']).optional(),
+  step: z.number().optional(),
+  steps: z.number().optional(),
+  resumed: z.boolean().optional(),
+  /** done 阶段：结束时的当前版本和本次执行的迁移数 */
+  current: envVersionRefSchema.nullable().optional(),
+  ran: z.number().optional(),
+  /** 出错：已脱敏的说明、错误代码和细节 */
+  error: z.string().optional(),
+  code: z.string().optional(),
+  details: execErrorDetailsSchema.optional(),
+});
+export type ExecEvent = z.infer<typeof execEventSchema>;
+
+/** 目标库历史里的一次执行记录（读目标库的 dowel.history） */
+export const runInfoSchema = z.object({
+  id: z.number(),
+  fromVersion: envVersionRefSchema.nullable(),
+  toVersion: envVersionRefSchema,
+  direction: z.enum(['baseline', 'up', 'down']),
+  status: z.enum(['running', 'done', 'failed']),
+  /** 已完成的最后一步（0 起）；null 表示没有断点 */
+  stepIndex: z.number().nullable(),
+  /** 已去掉内部标记的错误文本 */
+  error: z.string().nullable(),
+  /** 这次失败是“读回校验失败”（所有步骤都做完了，结构却不等于目标版本）：不能续跑，需要人工修正 */
+  readbackFailure: z.boolean(),
+  executedBy: z.string().nullable(),
+  /** 执行者的显示名（用户已被删除时为 null，界面回退到 id） */
+  executedByName: z.string().nullable(),
+  via: z.enum(['web', 'ci']),
+  startedAt: z.string(),
+  finishedAt: z.string().nullable(),
+});
+export type RunInfo = z.infer<typeof runInfoSchema>;
+
+export const envHistorySchema = z.object({
+  /** 目标库里有没有这个项目的 Dowel 历史 */
+  initialized: z.boolean(),
+  currentVersion: envVersionRefSchema.nullable(),
+  /** 上一次执行停在中途（目标库处于半途状态，必须先继续执行）；没有为 null */
+  unfinished: runInfoSchema.nullable(),
+  /** 最近的执行记录，新的在前（最多 100 条） */
+  runs: z.array(runInfoSchema),
+});
+export type EnvHistory = z.infer<typeof envHistorySchema>;
+
+/** 手动检查漂移的响应：skipped 有值表示这次没有检查（busy 正在执行、unfinished 上次停在中途、no_versions 项目还没有版本） */
+export const driftCheckResponseSchema = driftInfoSchema.extend({
+  skipped: z.enum(['busy', 'unfinished', 'no_versions']).nullable(),
+});
+export type DriftCheckResponse = z.infer<typeof driftCheckResponseSchema>;
+
+/** 目标库里的一个 schema：名字 + 表数（向导的勾选列表、schema 范围设置都用它） */
+export const schemaInfoSchema = z.object({ name: z.string(), tables: z.number() });
+export type SchemaInfo = z.infer<typeof schemaInfoSchema>;
+
+/**
+ * 检查目标库的结果（环境创建 / 测试连接 / 连接检查共用）。
+ * 只读：`inspectTarget` 不执行任何写语句。
+ */
+export const targetInfoSchema = z.object({
+  version: z.string(),
+  versionNum: z.number(),
+  database: z.string(),
+  canCreateDb: z.boolean(),
+  shadow: z.string(),
+  shadowExists: z.boolean(),
+  /** 当前连接使用的用户名 */
+  currentUser: z.string(),
+  superuser: z.boolean(),
+  /** 能否在当前库建 schema（`has_database_privilege(current_database(), 'CREATE')`） */
+  canCreateSchema: z.boolean(),
+  /** 非系统 schema（不含 dowel），每个带表数 */
+  schemas: z.array(schemaInfoSchema),
+  /** 已经有 dowel schema（P4 起 Dowel 在里面写迁移历史） */
+  dowelSchema: z.boolean(),
+  /** dowel schema 里有 meta 表（Dowel 自己的历史表） */
+  dowelMeta: z.boolean(),
+});
+export type TargetInfo = z.infer<typeof targetInfoSchema>;
+
+export const environmentCreatedSchema = targetInfoSchema.extend({ id: z.string() });
+export type EnvironmentCreated = z.infer<typeof environmentCreatedSchema>;
+
+/** 连接检查（向导第 2 步）：建项目之前检查一个连接串 */
+export const connectionCheckSchema = z.object({
+  url: postgresUrl,
+  /** 用这个组判断调用者有没有建项目的权限（复用 group.create_project） */
+  groupId: z.string().min(1, '请选择组'),
+});
+export type ConnectionCheck = z.infer<typeof connectionCheckSchema>;
+
+// ───── 新建项目向导（P3） ─────
+
+/** 初始内容：空白 / 从数据库导入 / 从 SQL 导入 / 接手（P4 才实现，现在返回 422） */
+export const projectContentKindSchema = z.enum(['blank', 'database', 'sql', 'takeover']);
+export type ProjectContentKind = z.infer<typeof projectContentKindSchema>;
+
+/** 基线版本的名称：导入完成后自动发布 v0（按 GLOSSARY 的“基线”） */
+export const BASELINE_VERSION_NAME = 'v0 · 基线';
+
+export const projectWizardSchema = z.object({
+  name: z.string().trim().min(1, '项目名不能为空').max(100),
+  groupId: z.string().min(1, '请选择组'),
+  slug: slugSchema.optional(),
+  /** 关联的数据库（可空）；和现有环境接口的字段一致 */
+  environments: z.array(environmentCreateSchema).max(20).default([]),
+  /** schema 范围（null / 空表示全部，dowel 永远排除） */
+  schemas: schemaScopeSchema.nullable().optional(),
+  content: z.object({
+    kind: projectContentKindSchema,
+    /** kind=database：从 environments 里的哪个环境导入（按名字） */
+    env: z.string().max(100).optional(),
+    /** kind=sql：要在影子库里执行的 DDL */
+    sql: z.string().min(1).max(5_000_000).optional(),
+  }),
+});
+export type ProjectWizard = z.infer<typeof projectWizardSchema>;
+
+/** 进度阶段：连接 → 读取结构 → 规范化 → 写入 → 完成 */
+export const wizardStageSchema = z.enum(['connect', 'read', 'canonicalize', 'write', 'done']);
+export type WizardStage = z.infer<typeof wizardStageSchema>;
+
+/** SSE 每条消息的负载（`data:` 后面是它的 JSON） */
+export const wizardEventSchema = z.object({
+  stage: wizardStageSchema,
+  /** 出错时的信息；这时不会建出项目 */
+  error: z.string().optional(),
+  /** 成功时给出建好的项目 */
+  project: projectCreatedSchema.optional(),
+});
+export type WizardEvent = z.infer<typeof wizardEventSchema>;
+
+// ───── OIDC（A7） ─────
+
+/** 登录页 / 邀请页只需要提供方的标识和显示名；管理接口另有 oidcProviderInfoSchema */
+export const oidcProviderPresetSchema = z.object({
+  key: z.string(),
+  name: z.string(),
+  issuer: z.string(),
+  /** 提供方的配置文档 */
+  docUrl: z.string(),
+  scopes: z.string(),
+});
+export type OidcProviderPreset = z.infer<typeof oidcProviderPresetSchema>;
+
+export const oidcProviderInfoSchema = z.object({
+  id: z.string(),
+  slug: z.string(),
+  name: z.string(),
+  issuer: z.string(),
+  clientId: z.string(),
+  scopes: z.string(),
+  enabled: z.boolean(),
+  autoProvision: z.boolean(),
+  /** 只说明是否已设置，绝不返回 secret 本身 */
+  hasSecret: z.boolean(),
+  /** 提供方后台里要填的回调地址（规则同 /api/auth/oidc/:slug/callback）；拿不到对外地址时为 null */
+  callbackUrl: z.string().nullable(),
+  createdAt: z.string(),
+});
+export type OidcProviderInfo = z.infer<typeof oidcProviderInfoSchema>;
+
+const oidcScopes = z.string().trim().min(1).max(500);
+const oidcIssuer = z.string().trim().min(1).max(500);
+
+export const oidcProviderCreateSchema = z.object({
+  slug: slugSchema,
+  name: z.string().trim().min(1, '显示名不能为空').max(100),
+  issuer: oidcIssuer,
+  clientId: z.string().trim().min(1, 'client_id 不能为空').max(500),
+  clientSecret: z.string().min(1, 'client_secret 不能为空').max(1000),
+  scopes: oidcScopes.default('openid profile email'),
+  enabled: z.boolean().default(true),
+  autoProvision: z.boolean().default(false),
+});
+export type OidcProviderCreate = z.infer<typeof oidcProviderCreateSchema>;
+
+export const oidcProviderPatchSchema = z.object({
+  slug: slugSchema.optional(),
+  name: z.string().trim().min(1, '显示名不能为空').max(100).optional(),
+  issuer: oidcIssuer.optional(),
+  clientId: z.string().trim().min(1, 'client_id 不能为空').max(500).optional(),
+  /** 不传表示不修改；传空字符串表示清除（不推荐） */
+  clientSecret: z.string().max(1000).optional(),
+  scopes: oidcScopes.optional(),
+  enabled: z.boolean().optional(),
+  autoProvision: z.boolean().optional(),
+});
+export type OidcProviderPatch = z.infer<typeof oidcProviderPatchSchema>;
+
+/** 用户名确认页（OIDC 首次开户时 preferred_username 冲突或不合法） */
+export const oidcConfirmInfoSchema = z.object({
+  providerName: z.string(),
+  username: z.string(),
+  name: z.string(),
+  email: z.string().nullable(),
+});
+export type OidcConfirmInfo = z.infer<typeof oidcConfirmInfoSchema>;
+
+export const oidcConfirmSchema = z.object({ username: usernameSchema });
+export type OidcConfirm = z.infer<typeof oidcConfirmSchema>;
+
+export const meIdentitySchema = z.object({
+  id: z.string(),
+  providerId: z.string(),
+  providerSlug: z.string(),
+  providerName: z.string(),
+  subject: z.string(),
+  createdAt: z.string(),
+  lastLoginAt: z.string(),
+});
+export type MeIdentity = z.infer<typeof meIdentitySchema>;
+
+// ───── 项目动态（操作日志） ─────
+
+/**
+ * 项目动态：谁、什么时候、做了什么。来自审计日志，只返回与这个项目有关的记录
+ * （项目本身、它的版本、它的环境）。权限是项目查看者。
+ */
+export const projectActivityEventSchema = z.object({
+  id: z.string(),
+  at: z.string(),
+  action: z.string(),
+  /** 操作者显示名；系统操作或用户已被删除时为空 */
+  actorName: z.string().nullable(),
+  actorUsername: z.string().nullable(),
+  data: z.unknown().nullable(),
+});
+export type ProjectActivityEvent = z.infer<typeof projectActivityEventSchema>;
+
+export const projectActivitySchema = z.object({ events: z.array(projectActivityEventSchema) });
+export type ProjectActivity = z.infer<typeof projectActivitySchema>;
+
+// ───── 审计查询（G7） ─────
+
+export const auditEventSchema = z.object({
+  id: z.string(),
+  at: z.string(),
+  actorKind: z.enum(['user', 'token', 'system']),
+  actorId: z.string().nullable(),
+  actorUsername: z.string().nullable(),
+  action: z.string(),
+  targetKind: z.string().nullable(),
+  targetId: z.string().nullable(),
+  ip: z.string().nullable(),
+  data: z.unknown().nullable(),
+});
+export type AuditEvent = z.infer<typeof auditEventSchema>;
+
+export const auditPageSchema = z.object({
+  events: z.array(auditEventSchema),
+  /** 传给下一次请求的 cursor；没有更多记录时为 null */
+  nextCursor: z.string().nullable(),
+});
+export type AuditPage = z.infer<typeof auditPageSchema>;
+
+// ───── 通用 ─────
+
+export const okSchema = z.object({ ok: z.literal(true) });
+export type Ok = z.infer<typeof okSchema>;
+
+export const apiErrorSchema = z.object({ error: z.string() });
+export type ApiErrorBody = z.infer<typeof apiErrorSchema>;
