@@ -4,21 +4,23 @@ import {
   type EnvironmentCreated,
   environmentCreateSchema,
   environmentPatchSchema,
+  importRequestSchema,
   type ModelUpdate,
   type Ok,
+  type PullPreview,
   type TargetInfo,
 } from '@dowel/api';
-import { newId } from '@dowel/core';
-import { reconcileIds } from '@dowel/engines';
+import { type Model, newId } from '@dowel/core';
+import { planDiff } from '@dowel/executor';
 import type { Hono } from 'hono';
 import { HTTPException } from 'hono/http-exception';
 import { audit } from '../audit.ts';
 import { can, type EnvAction, effectiveExecPolicy, isEnvAction, userActor } from '../authz.ts';
-import { type EnvRow, envResource, loadVersionMetas, toEnvInfo } from '../envs.ts';
-import { lockEnvIdle, settleClaims } from '../executions.ts';
+import { type EnvRow, envResource, loadEnv, loadVersionMetas, toEnvInfo, versionRef } from '../envs.ts';
+import { lockEnvIdle, readLive, settleClaims } from '../executions.ts';
 import { encrypt } from '../secrets.ts';
-import { CHECK_CONNECT_TIMEOUT, claimShadow, inspectTarget, pullSchema } from '../targets.ts';
-import { type AppContext, access, body, type Env, envAccess } from './context.ts';
+import { CHECK_CONNECT_TIMEOUT, claimShadow, inspectTarget } from '../targets.ts';
+import { type AppContext, access, body, connectionLimit, type Env, envAccess } from './context.ts';
 
 export const registerEnvironments = (app: Hono<Env>, ctx: AppContext) => {
   const { db, rooms, shadows, refresher } = ctx;
@@ -216,16 +218,82 @@ export const registerEnvironments = (app: Hono<Env>, ctx: AppContext) => {
     return c.json<TargetInfo>(await inspectTarget(env.url, CHECK_CONNECT_TIMEOUT, ctx.guard));
   });
 
-  // 从线上库读结构，替换当前工作副本（按名字沿用已有对象的 ID，只读项目的 schema 范围）
+  /**
+   * 保留线上的修改（ADR 0004 的出口一）：从环境读线上结构，按名字沿用工作副本里的对象 ID（reconcileIds），**覆盖**工作副本。
+   * 这是普通的模型编辑（项目编辑者即可），之后由用户检查、修改，按普通流程发布，再把环境“标记为已执行”到新版本。
+   * - 和检查漂移共用连接限速；
+   * - `{ preview: true }`：只读，返回覆盖会带来的差异（plan(工作副本, 线上结构)）、线上结构指纹，以及三种只警告、不拦截的情况：
+   *   环境落后于链头（覆盖会撤销中间版本的修改）、环境有半途失败的迁移、工作副本有未发布的修改（会被覆盖）；
+   * - 审计记来源环境和线上结构指纹。
+   */
   app.post('/api/projects/:pid/environments/:eid/pull', async (c) => {
     const a = await access(c, ctx, 'environment.pull');
-    const eid = c.req.param('eid');
-    const env = await shadows.env(a.pid, eid);
-    const pulled = reconcileIds(
-      (await rooms.model(a.branch)).model,
-      await pullSchema(env.url, env.schemas, ctx.guard),
-    );
-    await ctx.replace(a.branch, c.get('user').name, pulled, 'pullSchema');
+    const b = importRequestSchema.safeParse(await c.req.json().catch(() => ({})));
+    const preview = b.success && b.data.preview === true;
+    connectionLimit(c, ctx);
+    const env = await loadEnv(db, a.pid, c.req.param('eid')!);
+    await refresher.flush(a.branch);
+    const { model: working, seq: workingSeq } = await rooms.model(a.branch);
+    const live = await readLive(ctx.exec, env, a.schemas, working);
+    /** 预览：差异 + 指纹 + 三种只警告不拦截的情况 */
+    const previewOf = async (w = working, sq = workingSeq): Promise<PullPreview> => {
+      const metas = await loadVersionMetas(db, a.pid);
+      const head = metas.at(-1);
+      const cur = metas.find((m) => m.id === env.current_version_id);
+      const [headModel] = head
+        ? await db.query<{ model: Model }>('select model from versions where id = $1', [head.id])
+        : [];
+      const diff = planDiff(w, live.model);
+      return {
+        items: diff.items,
+        total: diff.total,
+        fingerprint: live.fingerprint,
+        workingSeq: sq,
+        warnings: {
+          // 环境落后于链头；从来没有执行过（没有当前版本）但链上已经有版本也算——覆盖同样不会带上任何中间版本
+          behindHead:
+            head && (!cur || cur.number < head.number)
+              ? { current: cur ? versionRef(cur) : null, head: versionRef(head) }
+              : null,
+          unfinished: live.state?.unfinished != null,
+          readbackFailure: live.state?.readbackFailure != null,
+          workingDirty: headModel ? planDiff(headModel.model, w).total > 0 : false,
+        },
+      };
+    };
+    if (preview) return c.json<PullPreview>(await previewOf());
+    // 确认覆盖时带着预览时的工作副本 seq：工作副本在预览之后被改过（别人又编辑了模型）→ 409 working_changed，带新的预览，不覆盖
+    const workingChanged = async () => {
+      if (!b.success || b.data.workingSeq === undefined) return null;
+      // 现在的工作副本（读线上结构要花时间，期间也可能被改）：和预览时的 seq 比
+      const now = await rooms.model(a.branch);
+      return now.seq === b.data.workingSeq
+        ? null
+        : c.json(
+            {
+              error: '工作副本在预览之后被改过，请重新确认差异',
+              code: 'working_changed',
+              preview: await previewOf(now.model, now.seq),
+            },
+            409,
+          );
+    };
+    const changedEarly = await workingChanged();
+    if (changedEarly) return changedEarly;
+    // 带着预览时的指纹：线上结构在预览之后变了（又有人改了库）就 409，带新的预览，让用户重新确认差异
+    if (b.success && b.data.fingerprint && b.data.fingerprint !== live.fingerprint)
+      return c.json(
+        {
+          error: '线上结构在预览之后变了，请重新确认差异',
+          code: 'live_changed',
+          preview: await previewOf(),
+        },
+        409,
+      );
+    // 覆盖之前再比一次（上面等线上结构的这段时间里工作副本也可能被改）；之后到 replace 之间没有 await 以外的窗口
+    const changedLate = await workingChanged();
+    if (changedLate) return changedLate;
+    await ctx.replace(a.branch, c.get('user').name, live.model, 'pullSchema');
     const { seq } = await rooms.model(a.branch);
     await audit(
       db,
@@ -235,12 +303,18 @@ export const registerEnvironments = (app: Hono<Env>, ctx: AppContext) => {
         actorKind: 'user',
         actorId: c.get('user').id,
         targetKind: 'environment',
-        targetId: eid,
+        targetId: env.id,
         projectId: a.pid,
-        data: { projectId: a.pid, seq, objects: Object.keys(pulled.objects).length },
+        data: {
+          projectId: a.pid,
+          environment: env.name,
+          fingerprint: live.fingerprint,
+          seq,
+          objects: Object.keys(live.model.objects).length,
+        },
       },
       ctx.security,
     );
-    return c.json<ModelUpdate>({ seq, objects: Object.keys(pulled.objects).length });
+    return c.json<ModelUpdate>({ seq, objects: Object.keys(live.model.objects).length });
   });
 };

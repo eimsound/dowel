@@ -102,7 +102,8 @@ test('生产环境：必须输入环境名才能确认执行', async ({ browser 
     await expect(confirm).toHaveAttribute('aria-disabled', 'true');
     // Playwright 的 click 会等 aria-disabled 的元素变成可用，这里要验证“点了也没有反应”，所以 force
     await confirm.click({ force: true });
-    await expect(dlg.getByRole('status')).toHaveCount(0); // 点了也没有开始
+    // 点了也没有开始：对话框里只有预演结果（role=status），没有执行进度
+    await expect(dlg.getByText(/正在获取项目锁|正在执行迁移|执行完成/)).toHaveCount(0);
     // 输错环境名仍然不可确认
     await typed.fill('prd');
     await expect(confirm).toHaveAttribute('aria-disabled', 'true');

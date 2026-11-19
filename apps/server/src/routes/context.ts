@@ -21,7 +21,7 @@ import type { OpaqueRefresher } from '../derive.ts';
 import type { DriftScheduler } from '../drift-scheduler.ts';
 import { type EnvRow, envResource, loadEnv } from '../envs.ts';
 import type { ExecContext } from '../executions.ts';
-import { groupBySlug, groupRoleOf } from '../groups.ts';
+import { groupById, groupBySlug, groupRoleOf } from '../groups.ts';
 import type { KeyedLimiter, LoginLimiter } from '../rate-limit.ts';
 import { effectiveRole, loadRoleContext, type ProjectRow, projectRow } from '../roles.ts';
 import type { Role, Rooms } from '../rooms.ts';
@@ -124,6 +124,40 @@ export const access = async (
   if (!can(userActor(user), action, { kind: 'project', role }))
     throw new HTTPException(403, { message: '没有权限' });
   return { ...p, pid: p.id, role };
+};
+
+/**
+ * 在这个组建项目的检查（group.create_project）：新建项目向导、连接检查、接手（检查和执行）共用。
+ * 组不存在 404，没有权限 403；返回组。
+ */
+export const createProjectGroup = async (c: Context<Env>, ctx: AppContext, groupId: string) => {
+  const u = c.get('user');
+  const g = await groupById(ctx.db, groupId);
+  if (!g) throw new HTTPException(404, { message: '组不存在' });
+  const groupRole = await groupRoleOf(ctx.db, g.id, u.id);
+  if (
+    !can(userActor(u), 'group.create_project', {
+      kind: 'group',
+      groupRole,
+      projectCreation: g.projectCreation,
+    })
+  )
+    throw new HTTPException(403, { message: '没有在这个组建项目的权限' });
+  return g;
+};
+
+/**
+ * 服务端替用户去连地址（连接检查、读历史、漂移检查、接手、接入、认领、向导）共用的限速：每个用户每分钟 10 次。
+ * times：这个请求要连几次（向导每个环境算一次）；超限时抛 429 + Retry-After，此时还没有开始任何写入。
+ */
+export const connectionLimit = (c: Context<Env>, ctx: AppContext, times = 1) => {
+  for (let i = 0; i < times; i++) {
+    const r = ctx.connectionLimiter.attempt(c.get('user').id);
+    if (!r.allowed) {
+      c.header('Retry-After', String(r.retryAfterSeconds));
+      throw new HTTPException(429, { message: `连接检查太频繁了，请 ${r.retryAfterSeconds} 秒后再试` });
+    }
+  }
 };
 
 /** 组接口的权限检查：组对所有人可见，管理动作看组里的身份 */

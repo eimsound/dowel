@@ -9,7 +9,12 @@ import { canonicalSteps, type ScriptStep, stepsChecksum } from '../steps.ts';
 import type { Db } from './db.ts';
 import { DOWEL_SCHEMA, normalize, type Snapshot } from './snapshot.ts';
 
-/** 当前代码写的格式版本；表结构变化时 +1，并在 ensureHistory 里加升级逻辑 */
+/**
+ * 当前代码写的格式版本。**只有破坏性变更**（旧版 Dowel 照旧读写会出错）才 +1，加列之类的兼容变更不动它，
+ * 靠建表语句的 `if not exists` / 幂等的 `add column if not exists` 处理。
+ * 读的一方（readHistoryFormat / ensureHistory / historyWriteProblem）从第一个发布版起就检查：库里的值比这个新、
+ * 或者不是整数，就拒绝执行和读历史（format_too_new）——这个检查事后补不上。目前还没有任何升级路径（发版之前不写）。
+ */
 export const HISTORY_FORMAT = 1;
 
 export type HistoryErrorCode =
@@ -19,7 +24,8 @@ export type HistoryErrorCode =
   | 'number_conflict'
   | 'lock_timeout'
   | 'run_not_running'
-  | 'invalid_steps';
+  | 'invalid_steps'
+  | 'claim_conflict';
 
 export class HistoryError extends Error {
   code: HistoryErrorCode;
@@ -39,6 +45,10 @@ export interface HistoryVersionRow {
   number: number;
   parentId: string | null;
   name: string;
+  /**
+   * 冻结这个版本时项目的 schema 范围（null = 全部；dowel 永远排除）。接手时直接取它恢复范围：读结构、判断空库都要按范围。
+   */
+  scope: string[] | null;
   upSteps: ScriptStep[];
   downSteps: ScriptStep[];
   /** stepsChecksum(upSteps, downSteps) */
@@ -51,7 +61,11 @@ export interface HistoryVersionRow {
   publishedBy: string | null;
 }
 
-export type RunDirection = 'baseline' | 'up' | 'down';
+/**
+ * 一次执行的方向：baseline 写入基线；up / down 执行升级 / 回滚脚本；
+ * mark **标记为已执行**：不执行任何 SQL，只记“这个环境已经到达 to 版本”（线上结构经核对等于 to 的模型），from 是标记前的版本。
+ */
+export type RunDirection = 'baseline' | 'up' | 'down' | 'mark';
 export type RunStatus = 'running' | 'done' | 'failed';
 export type RunVia = 'web' | 'ci';
 
@@ -79,13 +93,29 @@ export interface HistoryState {
   history: RunRow[];
 }
 
-/** 项目认领：记录这个项目由哪个 Dowel 实例拥有（认领流程在 P4 第三部分，这里只提供读写） */
+/**
+ * 项目认领：这个项目现在由哪个 Dowel 实例拥有。instanceId 是**当前认领它的实例**（执行时据此拒绝别的实例，见执行器的
+ * foreign_instance）；换手时 previousInstanceId 记下上一个实例，完整的换手事件在 dowel.claims（只追加）里。
+ */
 export interface ProjectRow {
   projectId: string;
   name: string | null;
   instanceId: string;
   claimedAt: string | null;
   claimedBy: string | null;
+  previousInstanceId: string | null;
+}
+
+/** 一次“认领”事件（dowel.claims，只追加）：哪个实例、什么时候、谁确认的、从哪个实例手里接过来的 */
+export interface ClaimRow {
+  id: number;
+  projectId: string;
+  instanceId: string;
+  previousInstanceId: string | null;
+  claimedBy: string | null;
+  claimedByName: string | null;
+  claimedAt: string;
+  note: string | null;
 }
 
 // ───── 建表 ─────
@@ -138,12 +168,31 @@ const GUARD_SQL = `do $do$ begin
      end if;
    end $do$;`;
 
-/**
- * 建 schema 和表，幂等。
- * - 没有建 schema 的权限时抛 no_schema_privilege（**不退回到业务 schema**）；
- * - 表里的 format_version 比当前代码新时抛 format_too_new。
- */
-export const ensureHistory = async (db: Db): Promise<void> => {
+/** claims 也是只追加的（认领事件是“谁在什么时候把这个库的项目接过去了”的证据）：不允许改、不允许删 */
+const CLAIMS_GUARD_SQL = `do $do$ begin
+     if to_regprocedure('${DOWEL_SCHEMA}.claims_guard()') is null then
+       create function ${DOWEL_SCHEMA}.claims_guard() returns trigger language plpgsql as $fn$
+       begin
+         raise exception 'dowel.claims 只追加，不允许修改或删除';
+       end $fn$;
+     end if;
+     if not exists (select 1 from pg_trigger
+                     where tgrelid = '${DOWEL_SCHEMA}.claims'::regclass and tgname = 'claims_guard') then
+       create trigger claims_guard before update or delete on ${DOWEL_SCHEMA}.claims
+         for each row execute function ${DOWEL_SCHEMA}.claims_guard();
+     end if;
+   end $do$;`;
+
+interface Priv {
+  role: string;
+  database: string;
+  exists: boolean;
+  canCreateSchema: boolean;
+  usage: boolean;
+  create: boolean;
+}
+
+const readPriv = async (db: Db): Promise<Priv> => {
   const [priv] = await db.query<{
     role: string;
     database: string;
@@ -160,9 +209,13 @@ export const ensureHistory = async (db: Db): Promise<void> => {
             coalesce(has_schema_privilege(current_user, to_regnamespace($1)::oid, 'CREATE'), false) as "create"`,
     [DOWEL_SCHEMA],
   );
-  const p = priv!;
+  return priv!;
+};
+
+/** 账号能不能在目标库里写迁移历史：只读检查，不建任何东西（预演用）；不能时返回 HistoryError，可以返回 null */
+const privProblem = (p: Priv): HistoryError | null => {
   if (!p.exists && !p.canCreateSchema)
-    throw new HistoryError(
+    return new HistoryError(
       'no_schema_privilege',
       `需要在目标库里建 \`${DOWEL_SCHEMA}\` schema 来存迁移历史（固定名字，不会退回到业务 schema），` +
         `但账号 ${p.role} 没有在库 ${p.database} 里建 schema 的权限。需要其一：` +
@@ -170,11 +223,57 @@ export const ensureHistory = async (db: Db): Promise<void> => {
         `或授予 \`GRANT CREATE ON DATABASE ${ident(p.database)} TO ${ident(p.role)};\` 后由 Dowel 自己建。`,
     );
   if (p.exists && !(p.usage && p.create))
-    throw new HistoryError(
+    return new HistoryError(
       'no_schema_privilege',
       `\`${DOWEL_SCHEMA}\` schema 已存在，但账号 ${p.role} 没有在里面建表和读写的权限。` +
         `需要 USAGE 和 CREATE：让 DBA 执行 \`${schemaGrantHint(p.role, true)}\``,
     );
+  return null;
+};
+
+/**
+ * 预演用：目标库里的迁移历史**能不能写**（有没有权限建 schema / 建表、格式是不是比当前代码新）。
+ * 只读，不建任何东西；有问题返回说明，没问题返回 null。
+ */
+export const historyWriteProblem = async (db: Db): Promise<HistoryError | null> => {
+  const p = await readPriv(db);
+  const priv = privProblem(p);
+  if (priv) return priv;
+  if (!p.exists || !(await historyExists(db))) return null;
+  const [meta] = await db.query<{ value: unknown }>(
+    `select value from ${DOWEL_SCHEMA}.meta where key = 'format_version'`,
+  );
+  const stored = meta ? Number(meta.value) : 1;
+  if (!Number.isInteger(stored) || stored > HISTORY_FORMAT)
+    return new HistoryError(
+      'format_too_new',
+      `目标库里的迁移历史是格式 ${JSON.stringify(meta?.value)}，当前 Dowel 只支持到 ${HISTORY_FORMAT}。请升级 Dowel`,
+    );
+  return null;
+};
+
+/**
+ * 读目标库里历史的格式版本（只读）：没有历史表返回 null。比当前代码新的格式抛 format_too_new——
+ * 读也不行（认得的表结构可能已经变了）。读历史、检查漂移、接手前先调用它。
+ */
+export const readHistoryFormat = async (db: Db): Promise<number | null> => {
+  if (!(await historyExists(db))) return null;
+  const [meta] = await db.query<{ value: unknown }>(
+    `select value from ${DOWEL_SCHEMA}.meta where key = 'format_version'`,
+  );
+  const stored = meta ? Number(meta.value) : 1;
+  if (!Number.isInteger(stored) || stored > HISTORY_FORMAT)
+    throw new HistoryError(
+      'format_too_new',
+      `目标库里的迁移历史是格式 ${JSON.stringify(meta?.value)}，当前 Dowel 只支持到 ${HISTORY_FORMAT}。请升级 Dowel`,
+    );
+  return stored;
+};
+
+export const ensureHistory = async (db: Db): Promise<void> => {
+  const p = await readPriv(db);
+  const priv = privProblem(p);
+  if (priv) throw priv;
 
   try {
     // schema 已经存在时不能再写 create schema（哪怕带 if not exists）：PG 会先检查库级 CREATE 权限，
@@ -192,7 +291,8 @@ export const ensureHistory = async (db: Db): Promise<void> => {
      name text,
      instance_id text not null,
      claimed_at timestamptz,
-     claimed_by text
+     claimed_by text,
+     previous_instance_id text
    );
    create table if not exists ${DOWEL_SCHEMA}.versions (
      project_id text not null,
@@ -200,6 +300,7 @@ export const ensureHistory = async (db: Db): Promise<void> => {
      number int not null,
      parent_id text,
      name text not null,
+     scope jsonb,
      up_steps jsonb not null,
      down_steps jsonb not null,
      checksum text not null,
@@ -215,7 +316,7 @@ export const ensureHistory = async (db: Db): Promise<void> => {
      project_id text not null,
      from_version text,
      to_version text not null,
-     direction text not null check (direction in ('baseline', 'up', 'down')),
+     direction text not null check (direction in ('baseline', 'up', 'down', 'mark')),
      status text not null check (status in ('running', 'done', 'failed')),
      step_index int,
      error text,
@@ -226,7 +327,19 @@ export const ensureHistory = async (db: Db): Promise<void> => {
      finished_at timestamptz
    );
    create index if not exists history_project_id on ${DOWEL_SCHEMA}.history (project_id, id);
-   ${GUARD_SQL}`);
+   create table if not exists ${DOWEL_SCHEMA}.claims (
+     id bigserial primary key,
+     project_id text not null,
+     instance_id text not null,
+     previous_instance_id text,
+     claimed_by text,
+     claimed_by_name text,
+     claimed_at timestamptz not null default now(),
+     note text
+   );
+   create index if not exists claims_project_id on ${DOWEL_SCHEMA}.claims (project_id, id);
+   ${GUARD_SQL}
+   ${CLAIMS_GUARD_SQL}`);
   } catch (e) {
     if ((e as { code?: unknown })?.code === '42501')
       // insufficient_privilege
@@ -255,7 +368,6 @@ export const ensureHistory = async (db: Db): Promise<void> => {
       'format_too_new',
       `目标库里的迁移历史是格式 ${JSON.stringify(meta.value)}，当前 Dowel 只支持到 ${HISTORY_FORMAT}。请升级 Dowel`,
     );
-  // stored < HISTORY_FORMAT：以后格式升级时在这里写升级逻辑（现在只有格式 1）
 };
 
 // ───── 读写 ─────
@@ -272,19 +384,27 @@ const readSteps = (value: unknown): ScriptStep[] => {
 const iso = (v: unknown): string => (v instanceof Date ? v.toISOString() : String(v));
 const isoOrNull = (v: unknown): string | null => (v === null || v === undefined ? null : iso(v));
 
-const toVersionRow = (r: Record<string, unknown>): HistoryVersionRow => ({
-  projectId: r.projectId as string,
-  versionId: r.versionId as string,
-  number: Number(r.number),
-  parentId: (r.parentId as string | null) ?? null,
-  name: r.name as string,
-  upSteps: readSteps(r.upSteps),
-  downSteps: readSteps(r.downSteps),
-  checksum: r.checksum as string,
-  model: r.model as Model,
-  fingerprint: r.fingerprint as string,
-  publishedAt: iso(r.publishedAt),
-  publishedBy: (r.publishedBy as string | null) ?? null,
+/** 时间戳统一成 ISO（to_jsonb 给的是 PG 的文本格式，和 postgres.js 读出的 Date 要一致） */
+const isoText = (v: unknown): string => new Date(String(v)).toISOString();
+
+/**
+ * 版本行：用 to_jsonb(v) 整行读出，**不点名列**；
+ * 读历史、检查漂移、接手都是只读的，整行读出来再按字段取（以后兼容地加列时，旧代码照样读得了）。
+ */
+const toVersionRow = (j: Record<string, unknown>): HistoryVersionRow => ({
+  projectId: j.project_id as string,
+  versionId: j.version_id as string,
+  number: Number(j.number),
+  parentId: (j.parent_id as string | null) ?? null,
+  name: j.name as string,
+  scope: Array.isArray(j.scope) && j.scope.length ? (j.scope as string[]) : null,
+  upSteps: readSteps(j.up_steps),
+  downSteps: readSteps(j.down_steps),
+  checksum: j.checksum as string,
+  model: j.model as Model,
+  fingerprint: j.fingerprint as string,
+  publishedAt: isoText(j.published_at),
+  publishedBy: (j.published_by as string | null) ?? null,
 });
 
 const toRunRow = (r: Record<string, unknown>): RunRow => ({
@@ -317,11 +437,8 @@ export const historyExists = async (db: Db): Promise<boolean> => {
 
 /** 当前版本 + 全部版本行 + 全部执行记录 */
 export const readHistory = async (db: Db, projectId: string): Promise<HistoryState> => {
-  const versions = await db.query(
-    `select project_id as "projectId", version_id as "versionId", number, parent_id as "parentId",
-            name, up_steps as "upSteps", down_steps as "downSteps", checksum, model, fingerprint,
-            published_at as "publishedAt", published_by as "publishedBy"
-       from ${DOWEL_SCHEMA}.versions where project_id = $1 order by number`,
+  const versions = await db.query<{ r: Record<string, unknown> }>(
+    `select to_jsonb(v) as r from ${DOWEL_SCHEMA}.versions v where v.project_id = $1 order by v.number`,
     [projectId],
   );
   const history = await db.query(
@@ -336,7 +453,7 @@ export const readHistory = async (db: Db, projectId: string): Promise<HistorySta
   const done = runs.filter((r) => r.status === 'done');
   return {
     currentVersion: done.length ? done[done.length - 1]!.toVersion : null,
-    versions: versions.map(toVersionRow),
+    versions: versions.map((v) => toVersionRow(v.r)),
     history: runs,
   };
 };
@@ -356,9 +473,10 @@ export const recordVersion = async (db: Db, row: HistoryVersionRow): Promise<voi
   try {
     inserted = await db.query<{ versionId: string }>(
       `insert into ${DOWEL_SCHEMA}.versions
-         (project_id, version_id, number, parent_id, name, up_steps, down_steps, checksum, model,
+         (project_id, version_id, number, parent_id, name, scope, up_steps, down_steps, checksum, model,
           fingerprint, published_at, published_by)
-       values ($1, $2, $3, $4, $5, $6::text::jsonb, $7::text::jsonb, $8, $9::text::jsonb, $10, $11, $12)
+       values ($1, $2, $3, $4, $5, $6::text::jsonb, $7::text::jsonb, $8::text::jsonb, $9, $10::text::jsonb,
+               $11, $12, $13)
        on conflict (project_id, version_id) do nothing
        returning version_id as "versionId"`,
       [
@@ -367,6 +485,7 @@ export const recordVersion = async (db: Db, row: HistoryVersionRow): Promise<voi
         row.number,
         row.parentId,
         row.name,
+        row.scope?.length ? JSON.stringify(row.scope) : null,
         JSON.stringify(canonicalSteps(row.upSteps)),
         JSON.stringify(canonicalSteps(row.downSteps)),
         row.checksum,
@@ -572,33 +691,158 @@ export const verifyChain = (rows: HistoryVersionRow[]): ChainProblem[] => {
   return out;
 };
 
-// ───── 项目认领（P4 第三部分实现流程，这里只读写） ─────
+// ───── 项目认领 ─────
 
+const toProjectRow = (j: Record<string, unknown>): ProjectRow => ({
+  projectId: j.project_id as string,
+  name: (j.name as string | null) ?? null,
+  instanceId: j.instance_id as string,
+  claimedAt: j.claimed_at ? isoText(j.claimed_at) : null,
+  claimedBy: (j.claimed_by as string | null) ?? null,
+  previousInstanceId: (j.previous_instance_id as string | null) ?? null,
+});
+
+/** 读项目的认领信息（整行读，兼容格式 1 没有 previous_instance_id 的表） */
 export const readProject = async (db: Db, projectId: string): Promise<ProjectRow | null> => {
-  const [r] = await db.query<Record<string, unknown>>(
-    `select project_id as "projectId", name, instance_id as "instanceId",
-            claimed_at as "claimedAt", claimed_by as "claimedBy"
-       from ${DOWEL_SCHEMA}.projects where project_id = $1`,
+  const [r] = await db.query<{ r: Record<string, unknown> }>(
+    `select to_jsonb(p) as r from ${DOWEL_SCHEMA}.projects p where p.project_id = $1`,
     [projectId],
   );
-  return r
-    ? {
-        projectId: r.projectId as string,
-        name: (r.name as string | null) ?? null,
-        instanceId: r.instanceId as string,
-        claimedAt: isoOrNull(r.claimedAt),
-        claimedBy: (r.claimedBy as string | null) ?? null,
-      }
-    : null;
+  return r ? toProjectRow(r.r) : null;
 };
 
-export const writeProject = async (db: Db, row: ProjectRow): Promise<void> => {
+/** 第一次执行到这个库时登记项目（instanceId 就是登记它的实例）；已经登记过的更新名字、认领信息 */
+export const writeProject = async (
+  db: Db,
+  row: Omit<ProjectRow, 'previousInstanceId'> & { previousInstanceId?: string | null },
+): Promise<void> => {
   await db.query(
-    `insert into ${DOWEL_SCHEMA}.projects (project_id, name, instance_id, claimed_at, claimed_by)
-     values ($1, $2, $3, $4, $5)
+    `insert into ${DOWEL_SCHEMA}.projects (project_id, name, instance_id, claimed_at, claimed_by, previous_instance_id)
+     values ($1, $2, $3, $4, $5, $6)
      on conflict (project_id) do update
        set name = excluded.name, instance_id = excluded.instance_id,
-           claimed_at = excluded.claimed_at, claimed_by = excluded.claimed_by`,
-    [row.projectId, row.name, row.instanceId, row.claimedAt, row.claimedBy],
+           claimed_at = excluded.claimed_at, claimed_by = excluded.claimed_by,
+           previous_instance_id = excluded.previous_instance_id`,
+    [row.projectId, row.name, row.instanceId, row.claimedAt, row.claimedBy, row.previousInstanceId ?? null],
   );
+};
+
+export interface ClaimInput {
+  projectId: string;
+  /** 认领的实例（本实例） */
+  instanceId: string;
+  /** 在平台上确认认领的用户（ID 和显示名；显示名只为了在目标库里留下可读的痕迹） */
+  claimedBy: string | null;
+  claimedByName: string | null;
+  /** 项目名（平台上的名字，更新 projects.name） */
+  name: string | null;
+  note?: string | null;
+}
+
+/**
+ * 认领：把这个库里项目的“当前认领实例”换成 `instanceId`。**必须在调用方的事务和项目锁里执行**（执行器的 claimInstance）。
+ * - 项目行：instance_id = 新实例，claimed_at / claimed_by 更新，previous_instance_id = 换手前的实例；
+ * - **同时在 dowel.claims 里追加一条事件**（history 表的方向 / 外键结构是给“执行”设计的，触发器也只允许改 running 的行，
+ *   事件另放一张只追加的表，见 04-ir-design.md 第 7 节）；
+ * - 已经是这个实例认领的：什么都不写，返回 changed = false（幂等）。
+ * 没有项目行（只有版本，行被手工删了）也能认领：当作上一个实例未知。
+ */
+export const claimProject = async (
+  db: Db,
+  input: ClaimInput,
+): Promise<{ changed: boolean; previousInstanceId: string | null }> => {
+  const [cur] = await db.query<{ r: Record<string, unknown> }>(
+    `select to_jsonb(p) as r from ${DOWEL_SCHEMA}.projects p where p.project_id = $1 for update`,
+    [input.projectId],
+  );
+  const prev = cur ? toProjectRow(cur.r) : null;
+  if (prev?.instanceId === input.instanceId)
+    return { changed: false, previousInstanceId: prev.previousInstanceId };
+  await writeProject(db, {
+    projectId: input.projectId,
+    name: input.name ?? prev?.name ?? null,
+    instanceId: input.instanceId,
+    claimedAt: new Date().toISOString(),
+    claimedBy: input.claimedBy,
+    previousInstanceId: prev?.instanceId ?? null,
+  });
+  await db.query(
+    `insert into ${DOWEL_SCHEMA}.claims
+       (project_id, instance_id, previous_instance_id, claimed_by, claimed_by_name, note)
+     values ($1, $2, $3, $4, $5, $6)`,
+    [
+      input.projectId,
+      input.instanceId,
+      prev?.instanceId ?? null,
+      input.claimedBy,
+      input.claimedByName,
+      input.note ?? null,
+    ],
+  );
+  return { changed: true, previousInstanceId: prev?.instanceId ?? null };
+};
+
+/** 认领事件（新的在后）；格式 1 的库没有这张表，返回空数组 */
+export const readClaims = async (db: Db, projectId: string): Promise<ClaimRow[]> => {
+  const [t] = await db.query<{ ok: boolean }>('select to_regclass($1) is not null as ok', [
+    `${DOWEL_SCHEMA}.claims`,
+  ]);
+  if (!t?.ok) return [];
+  const rows = await db.query<Record<string, unknown>>(
+    `select id::int as id, project_id as "projectId", instance_id as "instanceId",
+            previous_instance_id as "previousInstanceId", claimed_by as "claimedBy",
+            claimed_by_name as "claimedByName", claimed_at as "claimedAt", note
+       from ${DOWEL_SCHEMA}.claims where project_id = $1 order by id`,
+    [projectId],
+  );
+  return rows.map((r) => ({
+    id: Number(r.id),
+    projectId: r.projectId as string,
+    instanceId: r.instanceId as string,
+    previousInstanceId: (r.previousInstanceId as string | null) ?? null,
+    claimedBy: (r.claimedBy as string | null) ?? null,
+    claimedByName: (r.claimedByName as string | null) ?? null,
+    claimedAt: iso(r.claimedAt),
+    note: (r.note as string | null) ?? null,
+  }));
+};
+
+/** 接手向导里“这个库登记过哪些项目”的一行 */
+export interface HistoryProjectSummary {
+  projectId: string;
+  name: string | null;
+  instanceId: string;
+  claimedAt: string | null;
+  /** 库里记着的版本数、最新版本的序号 */
+  versions: number;
+  headNumber: number | null;
+  /** 这个库当前的版本序号（最后一条 done 的记录的目标版本）；没有执行过为 null */
+  currentNumber: number | null;
+  lastRunAt: string | null;
+}
+
+/** 目标库里登记过的项目（接手向导用）。只读，兼容格式 1。没有历史表返回空数组 */
+export const listHistoryProjects = async (db: Db): Promise<HistoryProjectSummary[]> => {
+  if (!(await historyExists(db))) return [];
+  const rows = await db.query<Record<string, unknown>>(
+    `select p.project_id as "projectId", p.name, p.instance_id as "instanceId", p.claimed_at as "claimedAt",
+            (select count(*)::int from ${DOWEL_SCHEMA}.versions v where v.project_id = p.project_id) as versions,
+            (select max(v.number) from ${DOWEL_SCHEMA}.versions v where v.project_id = p.project_id) as "headNumber",
+            (select v.number from ${DOWEL_SCHEMA}.history h
+               join ${DOWEL_SCHEMA}.versions v on v.project_id = h.project_id and v.version_id = h.to_version
+              where h.project_id = p.project_id and h.status = 'done' order by h.id desc limit 1) as "currentNumber",
+            (select max(coalesce(h.finished_at, h.started_at)) from ${DOWEL_SCHEMA}.history h
+              where h.project_id = p.project_id) as "lastRunAt"
+       from ${DOWEL_SCHEMA}.projects p order by p.name nulls last, p.project_id`,
+  );
+  return rows.map((r) => ({
+    projectId: r.projectId as string,
+    name: (r.name as string | null) ?? null,
+    instanceId: r.instanceId as string,
+    claimedAt: isoOrNull(r.claimedAt),
+    versions: Number(r.versions),
+    headNumber: r.headNumber === null || r.headNumber === undefined ? null : Number(r.headNumber),
+    currentNumber: r.currentNumber === null || r.currentNumber === undefined ? null : Number(r.currentNumber),
+    lastRunAt: isoOrNull(r.lastRunAt),
+  }));
 };

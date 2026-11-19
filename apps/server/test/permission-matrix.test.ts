@@ -49,6 +49,8 @@ type Access =
   | { kind: 'create-group'; statuses?: number[] }
   | { kind: 'group-create-project'; statuses?: number[] }
   | { kind: 'project'; min: Role; statuses?: number[] }
+  /** 项目可见（看不见 404）但操作只有实例管理员能做（其余 403，包括项目管理员） */
+  | { kind: 'project-instance-admin'; statuses?: number[] }
   | { kind: 'ws' };
 
 interface Ctx {
@@ -312,6 +314,11 @@ const matrix: Record<string, Spec> = {
     access: { kind: 'group-create-project', statuses: [422] },
     body: (ctx) => ({ url: 'postgres://127.0.0.1:1/matrix', groupId: ctx.groupId }),
   },
+  // 接手（P4c）：连接检查的兄弟，同样是组级动作 group.create_project；用连不上的地址只验证鉴权 / 限速这一层
+  'POST /api/takeover/inspect': {
+    access: { kind: 'group-create-project', statuses: [422] },
+    body: (ctx) => ({ url: 'postgres://127.0.0.1:1/matrix', groupId: ctx.groupId }),
+  },
   // 项目：可见性 404，权限不够 403
   'GET /api/projects': { access: { kind: 'authed', statuses: [200] } },
   'POST /api/projects': {
@@ -491,6 +498,38 @@ const matrix: Record<string, Spec> = {
       ctx.envId = await freshEnv(ctx.pid, ++unique);
     },
   },
+  // 接入已有历史（P4c）：配置类特权操作，至少项目管理员（freshEnv 之外的新环境：请求体不合法 → 400）
+  'POST /api/projects/:pid/environments/attach': {
+    access: { kind: 'project', min: 'admin', statuses: [400] },
+    path: () => `${P()}/environments/attach`,
+    body: () => ({}),
+  },
+  // 认领（P4c）：实例管理员；连不上目标库 → 422
+  'POST /api/projects/:pid/environments/:eid/claim': {
+    access: { kind: 'project-instance-admin', statuses: [422] },
+    path: (ctx) => `${P()}/environments/${ctx.envId}/claim`,
+    body: () => ({}),
+    prepare: async (ctx) => {
+      ctx.envId = await freshEnv(ctx.pid, ++unique);
+    },
+  },
+  // 标记为已执行（ADR 0004）：特权操作，按执行档位（freshEnv 是非生产、默认档位 = 编辑者）；请求体不合法 → 400
+  'POST /api/projects/:pid/environments/:eid/mark': {
+    access: { kind: 'project', min: 'editor', statuses: [400] },
+    path: (ctx) => `${P()}/environments/${ctx.envId}/mark`,
+    body: () => ({}),
+    prepare: async (ctx) => {
+      ctx.envId = await freshEnv(ctx.pid, ++unique);
+    },
+  },
+  // 修复脚本：只读平台库里缓存的漂移摘要，查看者就能看
+  'GET /api/projects/:pid/environments/:eid/repair-script': {
+    access: { kind: 'project', min: 'viewer', statuses: [200] },
+    path: (ctx) => `${P()}/environments/${ctx.envId}/repair-script`,
+    prepare: async (ctx) => {
+      ctx.envId = await freshEnv(ctx.pid, ++unique);
+    },
+  },
   'POST /api/projects/:pid/environments/:eid/baseline': {
     // 通过鉴权后进入 SSE，连不上目标库以 error 事件结束（HTTP 状态仍是 200）
     access: { kind: 'project', min: 'editor', statuses: [200] },
@@ -522,6 +561,9 @@ const expectedStatus = (access: Access, identity: Identity): number | number[] =
     case 'project':
       if (!identity.projectRole) return 404;
       return RANK[identity.projectRole] >= RANK[access.min] ? (access.statuses ?? [200]) : 403;
+    case 'project-instance-admin':
+      if (!identity.projectRole && !identity.instanceAdmin) return 404;
+      return identity.instanceAdmin ? (access.statuses ?? [200]) : 403;
     case 'ws':
       return 0;
   }

@@ -1,17 +1,25 @@
 // 读目标库里这个项目的历史状态（只读，不建任何东西）并做完整性检查。
 import {
   type ChainProblem,
+  type ClaimRow,
   type Db,
   type HistoryVersionRow,
-  historyExists,
   type ProjectRow,
   type RunRow,
+  readClaims,
   readHistory,
+  readHistoryFormat,
   readProject,
   verifyChain,
 } from '@dowel/engines';
 import { ExecutorError } from './errors.ts';
-import type { ChainVersion } from './types.ts';
+import type { ChainVersion, MigrationDirection } from './types.ts';
+
+/**
+ * 没有结束的执行记录（running / failed）：只可能是“执行”（up / down / baseline），不会是 mark——
+ * 标记在一个事务里写完（startRun + finishRun），要么 done 要么没有。类型上收窄，别处不用到处处理 mark。
+ */
+export type OpenRun = RunRow & { direction: MigrationDirection };
 
 /**
  * 读回校验失败的失败记录在 history.error 里的前缀标记。含非事务步骤的迁移，所有步骤都做完了、读回的结构却不等于目标版本：
@@ -36,7 +44,7 @@ export const stripReadbackMark = (error: string): string =>
  * 一个版本只要有过一次碰过目标库的执行，之后再来一次干净的失败，它仍然算执行过。
  */
 export const runTouched = (r: RunRow): boolean =>
-  r.status === 'done' || r.stepIndex !== null || isReadbackFailure(r.error);
+  (r.status === 'done' && r.direction !== 'mark') || r.stepIndex !== null || isReadbackFailure(r.error);
 
 /**
  * 这次执行动的是哪个版本：升级和基线是目标版本（toVersion），回滚是被回滚的版本（fromVersion）。
@@ -53,37 +61,42 @@ export interface TargetState {
   versions: HistoryVersionRow[];
   runs: RunRow[];
   project: ProjectRow | null;
+  /** 认领事件（dowel.claims），新的在后 */
+  claims: ClaimRow[];
   /**
    * 上一次执行停在中途：最后一条记录是 running（进程崩了），或者 failed 但已经有断点（有非事务步骤做完了 / 有事务段提交了）。
    * 这时目标库的结构处于“半途”状态，既不是旧版本也不是新版本：不做漂移检查，必须先把它跑完。
    */
-  unfinished: RunRow | null;
+  unfinished: OpenRun | null;
   /**
    * 最后一条记录是“读回校验失败”（见 READBACK_MARK）：库停在半途状态，**不能续跑**，需要人工修正。
    * 漂移检查会把它报成漂移（附上与当前版本模型的差异），执行 / 回滚在漂移检查处被拒绝。
    */
-  readbackFailure: RunRow | null;
+  readbackFailure: OpenRun | null;
 }
 
 export const readState = async (db: Db, projectId: string): Promise<TargetState> => {
-  if (!(await historyExists(db)))
+  // 历史比当前代码新就连读也不行（format_too_new）；没有历史表返回 null
+  if ((await readHistoryFormat(db)) === null)
     return {
       historyExists: false,
       current: null,
       versions: [],
       runs: [],
       project: null,
+      claims: [],
       unfinished: null,
       readbackFailure: null,
     };
   const h = await readHistory(db, projectId);
   const last = h.history.at(-1) ?? null;
-  const readbackFailure = last?.status === 'failed' && isReadbackFailure(last.error) ? last : null;
+  const readbackFailure =
+    last?.status === 'failed' && isReadbackFailure(last.error) ? (last as OpenRun) : null;
   const unfinished =
     !readbackFailure &&
     last &&
     (last.status === 'running' || (last.status === 'failed' && last.stepIndex !== null))
-      ? last
+      ? (last as OpenRun)
       : null;
   return {
     historyExists: true,
@@ -91,6 +104,7 @@ export const readState = async (db: Db, projectId: string): Promise<TargetState>
     versions: h.versions,
     runs: h.history,
     project: await readProject(db, projectId),
+    claims: await readClaims(db, projectId),
     unfinished,
     readbackFailure,
   };
@@ -104,6 +118,7 @@ export const asRows = (chain: ChainVersion[], projectId: string): HistoryVersion
     number: v.number,
     parentId: v.parentId,
     name: v.name,
+    scope: v.scope,
     upSteps: v.upSteps,
     downSteps: v.downSteps,
     checksum: v.checksum,
@@ -128,10 +143,26 @@ export const assertPlatformChain = (chain: ChainVersion[], projectId: string) =>
  * 目标库历史的完整性：
  * - 它自己的版本链要通过 verifyChain（序号、parent、**按内容重算的校验和**必须与记录一致——篡改校验和会在这里被发现）；
  * - 它记录的每个版本都必须在平台库的链上，且 id / 序号 / parent / 校验和一致；
- * - 这个项目的历史必须属于本实例（认领流程之后提供）。
+ * - **以认领信息为准**：目标库里 `dowel.projects` 记着“当前认领这个项目的实例”（claimProject 换手时写、第一次执行时登记），
+ *   不是本实例就拒绝（foreign_instance）。执行记录（history.instance_id）只说明“当时是谁执行的”，换手之后旧实例留下的记录
+ *   不影响本实例，所以不看它。只读的漂移检查、读历史不经过这里，不受影响。
  */
 export const assertTargetHistory = (state: TargetState, chain: ChainVersion[], instanceId: string) => {
   if (!state.historyExists) return;
+  // 认领放在最前面：被别的实例认领的库，第一句话就该是“要先认领”，而不是版本链对不上（换手之后对方可能已经往前走了）
+  if (state.project && state.project.instanceId !== instanceId)
+    throw new ExecutorError(
+      'foreign_instance',
+      `这个项目在目标库里的历史由另一个 Dowel 实例（${state.project.instanceId}）认领，本实例（${instanceId}）不能执行。` +
+        '需要由本实例的管理员“认领”它（之后原实例的执行会被拒绝）；只读的漂移检查和读历史不受影响',
+      {
+        claim: {
+          instanceId: state.project.instanceId,
+          claimedAt: state.project.claimedAt,
+          previousInstanceId: state.project.previousInstanceId,
+        },
+      },
+    );
   const problems = verifyChain(state.versions);
   if (problems.length)
     throw new ExecutorError(
@@ -158,9 +189,12 @@ export const assertTargetHistory = (state: TargetState, chain: ChainVersion[], i
     throw new ExecutorError('history_mismatch', `目标库历史与平台库的版本链对不上：${bad[0]}`, {
       problems: bad,
     });
-  if (state.project && state.project.instanceId !== instanceId)
-    throw new ExecutorError(
-      'foreign_instance',
-      `这个项目在目标库里的历史属于另一个 Dowel 实例（${state.project.instanceId}），本实例（${instanceId}）不能执行。接手现有库的认领流程在后续版本提供`,
-    );
 };
+
+/** 目标库里这个项目的认领情况：mine = 当前认领它的就是本实例；没有项目行（还没登记）算 mine（第一次执行会登记） */
+export const claimOf = (state: TargetState, instanceId: string) => ({
+  mine: !state.project || state.project.instanceId === instanceId,
+  instanceId: state.project?.instanceId ?? null,
+  claimedAt: state.project?.claimedAt ?? null,
+  previousInstanceId: state.project?.previousInstanceId ?? null,
+});

@@ -3,6 +3,9 @@
 import type { Model } from '@dowel/core';
 import type { Db, RunDirection, ScriptStep } from '@dowel/engines';
 
+/** 执行器真正“执行”的方向（不含 mark：标记不执行任何 SQL，见 mark.ts） */
+export type MigrationDirection = Exclude<RunDirection, 'mark'>;
+
 /** 平台库里版本链上的一个版本（已冻结） */
 export interface ChainVersion {
   id: string;
@@ -37,7 +40,7 @@ export interface DiffItem {
 export interface Migration {
   /** 执行哪个版本的脚本：up 是它的升级脚本，down 是它的回滚脚本，baseline 是写入基线的那个版本 */
   version: ChainVersion;
-  direction: RunDirection;
+  direction: MigrationDirection;
   /** 执行前的版本（第一次执行到空库时为 null） */
   from: ChainVersion | null;
   /** 执行后的版本：读回的结构必须等于它的模型 */
@@ -55,7 +58,7 @@ export type ExecutorEvent =
         versionId: string;
         number: number;
         name: string;
-        direction: RunDirection;
+        direction: MigrationDirection;
         steps: number;
       }[];
     }
@@ -68,7 +71,7 @@ export type ExecutorEvent =
       versionId: string;
       number: number;
       name: string;
-      direction: RunDirection;
+      direction: MigrationDirection;
       /** step 事件：刚执行完第几步（从 1 开始）/ 这个迁移一共几步 */
       step?: number;
       steps?: number;
@@ -114,6 +117,41 @@ export interface ExecuteOptions {
   onTouch?: (m: Migration) => void;
   /** 每个迁移成功提交后调用（更新平台库里的缓存）；这里抛错会被忽略（目标库已经提交，不能回头） */
   afterMigration?: (m: Migration) => void | Promise<void>;
+  /**
+   * 只预演、不执行：做完全部执行前检查（锁、完整性、认领、漂移、已验证、实例级语句、历史表能不能写），
+   * 通过就返回将要做的事（result.dryRun），**不写目标库**（连 dowel schema 都不建，不升级历史格式），
+   * 也不调用 beforeMigration / onTouch / afterMigration（平台库的登记一概不写）。检查失败照常抛 ExecutorError。
+   */
+  dryRun?: boolean;
+}
+
+/** 预演里的一个迁移：要执行的脚本和哪些步骤不在事务里 */
+export interface DryRunMigration {
+  versionId: string;
+  number: number;
+  name: string;
+  direction: MigrationDirection;
+  steps: { sql: string; transactional: boolean }[];
+  /** 不能放进事务的步骤数（含这些步骤的迁移不是原子的，中途失败要从断点续跑） */
+  nonTransactional: number;
+}
+
+/** 预演的结果：通过了全部检查，真执行时会做什么 */
+export interface DryRunPlan {
+  /** 目标库还没有这个项目的历史：baseline = 结构等于基线，只写基线；empty = 空库，执行第一个版本建库；null = 已有历史 */
+  firstRun: 'baseline' | 'empty' | null;
+  /** 会先写入基线（库里的结构等于第一个版本） */
+  baseline: boolean;
+  /** 执行前 / 执行后的版本 */
+  from: { id: string; number: number; name: string } | null;
+  to: { id: string; number: number; name: string } | null;
+  migrations: DryRunMigration[];
+  /** 上一次停在中途：会从哪个迁移的哪一步之后接着跑 */
+  resume: { versionId: string; direction: MigrationDirection; afterStep: number } | null;
+  /** 会在目标库里新建 dowel schema（第一次执行） */
+  createsHistory: boolean;
+  /** 通过了的检查（界面逐项列出） */
+  checks: ('lock' | 'integrity' | 'claim' | 'drift' | 'verified' | 'instance_level' | 'history_writable')[];
 }
 
 export interface ExecuteResult {
@@ -122,7 +160,9 @@ export interface ExecuteResult {
   /** 本次是否写入了基线 */
   baseline: boolean;
   /** 本次真正执行（或写入基线）的迁移，按顺序 */
-  ran: { versionId: string; number: number; direction: RunDirection; runId: number }[];
+  ran: { versionId: string; number: number; direction: MigrationDirection; runId: number }[];
   /** 结束时环境的当前版本 */
   current: string | null;
+  /** dryRun 时有值：将要做的事（没有写入任何东西） */
+  dryRun?: DryRunPlan;
 }

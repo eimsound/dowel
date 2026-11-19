@@ -608,14 +608,20 @@ describe.runIf(ADMIN)('新建项目向导', () => {
     expect(all2).not.toContain('dowel');
   });
 
-  test('takeover：P4 才实现，返回 422', async () => {
-    const r = await call('POST', '/api/projects/wizard', {
+  test('takeover：没有选项目 400；没有环境 422（完整的接手流程在 takeover.test.ts）', async () => {
+    const none = await call('POST', '/api/projects/wizard', {
       name: '接手',
       groupId,
       content: { kind: 'takeover' },
     });
-    expect(r.status).toBe(422);
-    expect(r.data.error as string).toContain('即将推出');
+    expect(none.status).toBe(400);
+    const noEnv = await call('POST', '/api/projects/wizard', {
+      name: '接手',
+      groupId,
+      content: { kind: 'takeover', projectId: 'whatever' },
+    });
+    expect(noEnv.status).toBe(422);
+    expect(noEnv.data.error as string).toContain('至少一个环境');
   });
 
   test('导入失败：平台库里没有残留的项目 / 环境 / 版本', async () => {

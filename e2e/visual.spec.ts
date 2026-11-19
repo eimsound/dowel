@@ -56,6 +56,9 @@ for (const scheme of ['light', 'dark'] as const) {
       .getByRole('link', { name: 'dev', exact: true })
       .click();
     await page.getByRole('button', { name: '从此库导入结构' }).click();
+    const imp = page.getByRole('dialog', { name: '把线上结构导入工作副本' });
+    await expect(imp).toContainText('覆盖会带来的变化', { timeout: 30_000 });
+    await imp.getByRole('button', { name: '覆盖工作副本' }).click();
     await page.getByRole('button', { name: '关闭通知' }).click();
 
     // 选中 orders、展开 total 列

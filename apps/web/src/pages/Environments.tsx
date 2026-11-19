@@ -1,12 +1,13 @@
 // 环境：侧面板是环境列表，主区域是列表 + 新建（管理员）或单个环境的详情。
 // 详情里可以测试连接、从目标库导入结构、删除环境；连接状态只在这里主动检查。
 import type {
+  AttachResult,
+  ClaimResult,
   DriftCheckResponse,
   EnvInfo,
   EnvStatus,
   EnvVersion,
   ExecPolicy,
-  ModelUpdate,
   RunInfo,
   TargetInfo,
 } from '@dowel/api';
@@ -25,18 +26,23 @@ import {
 } from 'lucide-react';
 import { useId, useState } from 'react';
 import { useTranslation } from 'react-i18next';
-import { api } from '../api.ts';
+import { ApiError, api } from '../api.ts';
+import { ClaimDialog } from '../components/ClaimDialog.tsx';
 import { DriftBadge, driftLabel, useDeniedHint } from '../components/EnvBits.tsx';
 import { DiffList, ExecDialog, type ExecKind } from '../components/ExecDialog.tsx';
+import { ImportDialog } from '../components/ImportDialog.tsx';
+import { MARK_TIP, MARK_TITLE, MarkDialog, markDirection } from '../components/MarkDialog.tsx';
 import { Confirm } from '../components/Modal.tsx';
 import { EmptyHint, ProjectPage, Row, Rows, Section } from '../components/ProjectPage.tsx';
+import { RepairDialog } from '../components/RepairDialog.tsx';
 import { PageHeader, useShellPanel } from '../components/Shell.tsx';
 import { useToast } from '../components/Toasts.tsx';
 import { Banner, IconButton } from '../components/ui.tsx';
-import { RiskNote, useVersionName, VersionBadges, VersionNumber } from '../components/VersionStatus.tsx';
+import { useVersionName, VersionBadges, VersionNumber } from '../components/VersionStatus.tsx';
 import { EXEC_POLICIES, useEnvHistory, useEnvStatus, useEnvs } from '../envs.ts';
 import { formatTime } from '../format.ts';
 import { useProject } from '../project.tsx';
+import { useMe } from '../session.ts';
 
 /**
  * 侧面板里的一个环境。漂移警告的说明不放进链接里（链接的名字要保持就是环境名），
@@ -123,19 +129,53 @@ const EnvPanel = ({ pid, activeId }: { pid: string; activeId?: string }) => {
 const EnvForm = ({ pid }: { pid: string }) => {
   const { t } = useTranslation();
   const qc = useQueryClient();
+  const toast = useToast();
+  const me = useMe().data;
   const empty = { name: '', url: '', production: true, allowSameInstance: false, shadowUrl: '' };
   const [form, setForm] = useState(empty);
-  const add = useMutation({
-    mutationFn: () =>
-      api('POST', `/api/projects/${pid}/environments`, {
-        ...form,
-        shadowUrl: form.shadowUrl.trim() || null,
-      }),
-    onSuccess: () => {
+  /** 接入这个库里已有的迁移历史（特权操作；由另一个实例认领的库要确认认领） */
+  const [attach, setAttach] = useState(false);
+  const [claimAsk, setClaimAsk] = useState<{ instanceId: string | null } | null>(null);
+  const claimRequiredOf = (e: Error | null) =>
+    e instanceof ApiError &&
+    e.status === 409 &&
+    (e.body as { code?: string } | undefined)?.code === 'claim_required';
+  const add = useMutation<unknown, Error, boolean>({
+    mutationFn: (claim) =>
+      attach
+        ? api<AttachResult>('POST', `/api/projects/${pid}/environments/attach`, {
+            ...form,
+            shadowUrl: form.shadowUrl.trim() || null,
+            claim,
+          })
+        : api('POST', `/api/projects/${pid}/environments`, {
+            ...form,
+            shadowUrl: form.shadowUrl.trim() || null,
+          }),
+    onSuccess: (r) => {
+      if (attach) {
+        const a = r as AttachResult;
+        toast(
+          (a.attached
+            ? t('tk.attachedOk', { name: form.name, number: a.currentVersion?.number ?? '—' })
+            : t('tk.attachedNone', { name: form.name })) + (a.claimed ? t('tk.attachedClaimed') : ''),
+        );
+        // 环境已经添加，但认领失败 / 同步失败：如实告诉用户（可以在环境页重试）
+        for (const w of a.warnings ?? []) toast(t('tk.attachedWarn', { msg: w }), 'error');
+      }
       setForm(empty);
+      setClaimAsk(null);
       void qc.invalidateQueries({ queryKey: ['envs', pid] });
+      void qc.invalidateQueries({ queryKey: ['versions', pid] });
+    },
+    onError: (e) => {
+      // 这个库里的项目由另一个实例认领：弹出认领确认（说明后果），确认后带 claim: true 重新提交
+      const body =
+        e instanceof ApiError ? (e.body as { code?: string; claim?: { instanceId?: string } }) : null;
+      if (claimRequiredOf(e)) setClaimAsk({ instanceId: body?.claim?.instanceId ?? null });
     },
   });
+  const isClaimRequired = claimRequiredOf(add.error);
   const set = (k: keyof typeof form) => (e: React.ChangeEvent<HTMLInputElement>) =>
     setForm({ ...form, [k]: e.target.type === 'checkbox' ? e.target.checked : e.target.value });
   return (
@@ -143,7 +183,7 @@ const EnvForm = ({ pid }: { pid: string }) => {
       className="space-y-3 rounded-md border border-border bg-panel p-4"
       onSubmit={(e) => {
         e.preventDefault();
-        add.mutate();
+        add.mutate(false);
       }}
     >
       <h2 className="section-title">{t('envp.add')}</h2>
@@ -192,8 +232,25 @@ const EnvForm = ({ pid }: { pid: string }) => {
             spellCheck={false}
           />
         </label>
+        <div className="checks col-span-2">
+          <label>
+            <input type="checkbox" checked={attach} onChange={(e) => setAttach(e.target.checked)} />
+            {t('tk.attachLabel')}
+          </label>
+          <p className="hint m-0 basis-full">{t('tk.attachHint')}</p>
+        </div>
       </div>
-      {add.error && (
+      <ClaimDialog
+        open={claimAsk !== null}
+        onClose={() => setClaimAsk(null)}
+        onConfirm={() => add.mutate(true)}
+        pending={add.isPending}
+        // 只有服务端明确返回 claim_required 才是“需要确认认领”（不算错误）；其他错误（包括别的 409，比如重名）照常显示在对话框里
+        error={add.error && !isClaimRequired ? add.error.message : undefined}
+        instanceId={claimAsk?.instanceId}
+        isAdmin={me?.role === 'admin'}
+      />
+      {add.error && !isClaimRequired && !claimAsk && (
         <Banner kind="danger" role="alert">
           {add.error.message}
         </Banner>
@@ -304,7 +361,12 @@ const VersionChain = ({
   );
 };
 
-const DIRECTION_KEY = { baseline: 'envx.dir.baseline', up: 'envx.dir.up', down: 'envx.dir.down' } as const;
+const DIRECTION_KEY = {
+  baseline: 'envx.dir.baseline',
+  up: 'envx.dir.up',
+  down: 'envx.dir.down',
+  mark: 'envx.dir.mark',
+} as const;
 const RUN_STATUS_KEY = {
   running: 'envx.run.running',
   done: 'envx.run.done',
@@ -345,7 +407,26 @@ const HistoryTable = ({ runs }: { runs: RunInfo[] }) => {
               <td className="px-3 py-2 whitespace-nowrap text-text-2">
                 <time dateTime={r.startedAt}>{formatTime(r.startedAt)}</time>
               </td>
-              <td className="px-3 py-2">{t(DIRECTION_KEY[r.direction])}</td>
+              <td className="px-3 py-2">
+                {r.direction === 'mark' && r.toVersion ? (
+                  // 标记：和按钮同一段说明（向后标记去掉“不能再编辑”那一句）
+                  <span
+                    title={t(
+                      r.fromVersion && r.toVersion.number === r.fromVersion.number
+                        ? 'dr.mark.tipStay'
+                        : r.fromVersion && r.toVersion.number < r.fromVersion.number
+                          ? 'dr.mark.tipBackward'
+                          : 'dr.mark.tip',
+                      { number: r.toVersion.number },
+                    )}
+                    className="cursor-help underline decoration-dotted underline-offset-2"
+                  >
+                    {t(DIRECTION_KEY.mark)}
+                  </span>
+                ) : (
+                  t(DIRECTION_KEY[r.direction])
+                )}
+              </td>
               <td className="px-3 py-2 font-mono">
                 {r.direction === 'baseline'
                   ? vlabel(r.toVersion)
@@ -462,9 +543,18 @@ const EnvironmentDetailView = ({ eid }: { eid: string }) => {
   const [dlg, setDlg] = useState<{ kind: ExecKind; to?: EnvVersion } | null>(null);
   const [execTo, setExecTo] = useState('');
   const [rollTo, setRollTo] = useState('');
+  const [claimOpen, setClaimOpen] = useState(false);
+  /** 漂移的两个出口：保留线上的修改（导入）/ 放弃线上的修改（修复脚本）；标记为已执行 */
+  const [importOpen, setImportOpen] = useState(false);
+  const [repairOpen, setRepairOpen] = useState(false);
+  const [markTo, setMarkTo] = useState('');
+  const [markDlg, setMarkDlg] = useState<EnvVersion | null>(null);
+  const me = useMe().data;
+  const isInstanceAdmin = me?.role === 'admin';
   const versionName = useVersionName();
   const execSelectId = useId();
   const rollSelectId = useId();
+  const markSelectId = useId();
   const canPull = project.role !== 'viewer';
 
   const refreshState = () => {
@@ -486,14 +576,6 @@ const EnvironmentDetailView = ({ eid }: { eid: string }) => {
       }),
     onError: (e) => setResult({ ok: false, text: e.message }),
   });
-  const pull = useMutation({
-    mutationFn: () => api<ModelUpdate>('POST', `/api/projects/${pid}/environments/${eid}/pull`),
-    onSuccess: (r) => {
-      void qc.invalidateQueries({ queryKey: ['project', pid] });
-      toast(t('dlg.envPulled', { count: r.objects }));
-    },
-    onError: (e) => setResult({ ok: false, text: e.message }),
-  });
   const checkDrift = useMutation({
     mutationFn: () => api<DriftCheckResponse>('POST', `/api/projects/${pid}/environments/${eid}/drift-check`),
     onSuccess: (r) => {
@@ -505,6 +587,14 @@ const EnvironmentDetailView = ({ eid }: { eid: string }) => {
       refreshState();
     },
     onError: (e) => toast(e.message, 'error'),
+  });
+  const claim = useMutation({
+    mutationFn: () => api<ClaimResult>('POST', `/api/projects/${pid}/environments/${eid}/claim`),
+    onSuccess: (r) => {
+      toast(r.changed ? t('tk.claimDone') : t('tk.claimNoop'));
+      setClaimOpen(false);
+      refreshState();
+    },
   });
   const remove = useMutation({
     mutationFn: () => api('DELETE', `/api/projects/${pid}/environments/${eid}`),
@@ -550,6 +640,14 @@ const EnvironmentDetailView = ({ eid }: { eid: string }) => {
   const showBaseline =
     !!status && !!history && !history.initialized && !current && status.versions[0]?.number === 0;
   const deniedText = status ? denied(status.effectiveExecPolicy) : '';
+  // 上一次执行没有结束（停在中途 / 读回校验失败）时，当前版本也可以作为标记目标：手工改回当前版本之后放弃那次未完成的运行
+  // “当前版本”以执行器读目标库历史得到的为准（history.currentVersion），不用平台缓存（缓存可能过期）；
+  // 未完成的运行同样用执行器给的 unfinished / readbackFailure，不从 runs 里推
+  const openRun = !!history?.unfinished || history?.readbackFailure === true;
+  const markCurrent = openRun ? (history?.currentVersion ?? current) : current;
+  const markTargets = (status?.versions ?? []).filter((v) => openRun || v.id !== markCurrent?.id);
+  const markTarget = markTargets.find((v) => v.id === markTo) ?? markTargets.at(-1);
+  const markDir = markTarget ? markDirection(markCurrent, markTarget) : 'forward';
   const run = (kind: ExecKind, to?: EnvVersion) => {
     if (!canExec) return;
     setDlg({ kind, to });
@@ -578,13 +676,7 @@ const EnvironmentDetailView = ({ eid }: { eid: string }) => {
               {t('dlg.envTest')}
             </button>
             {canPull && (
-              <button
-                type="button"
-                className="btn"
-                disabled={pull.isPending}
-                aria-busy={pull.isPending}
-                onClick={() => pull.mutate()}
-              >
+              <button type="button" className="btn" onClick={() => setImportOpen(true)}>
                 <FileInput size={16} aria-hidden="true" />
                 {t('dlg.envPull')}
               </button>
@@ -624,6 +716,24 @@ const EnvironmentDetailView = ({ eid }: { eid: string }) => {
                 direction: t(DIRECTION_KEY[manual.direction]),
                 number: manual.versionNumber ?? '?',
               })}
+            </Banner>
+          )}
+          {/* 这个库里的项目由另一个实例认领：本实例的执行会被拒绝（foreign_instance），只读的检查和历史不受影响 */}
+          {history?.claim && !history.claim.mine && (
+            <Banner kind="warn" title={t('tk.claimBannerTitle')} role="status">
+              <p className="m-0">{t('tk.claimBannerBody', { id: history.claim.instanceId ?? '?' })}</p>
+              <div className="mt-2 flex flex-wrap items-center gap-2">
+                <button
+                  type="button"
+                  className="btn"
+                  aria-disabled={!isInstanceAdmin || undefined}
+                  title={isInstanceAdmin ? undefined : t('tk.claimAdminOnly')}
+                  onClick={() => isInstanceAdmin && setClaimOpen(true)}
+                >
+                  {t('tk.claimButton')}
+                </button>
+                {!isInstanceAdmin && <span className="hint">{t('tk.claimAdminOnly')}</span>}
+              </div>
             </Banner>
           )}
           {history?.unfinished && (
@@ -726,6 +836,37 @@ const EnvironmentDetailView = ({ eid }: { eid: string }) => {
                       {t('envx.exec.rollbackButton')}
                     </button>
                   </div>
+                  {markTarget && (
+                    <div className="flex items-end gap-2">
+                      <div className="field">
+                        <label htmlFor={markSelectId} className="label">
+                          {t('dr.mark.toLabel')}
+                        </label>
+                        <select
+                          id={markSelectId}
+                          className="input w-auto"
+                          value={markTarget.id}
+                          onChange={(e) => setMarkTo(e.target.value)}
+                        >
+                          {markTargets.map((v) => (
+                            <option key={v.id} value={v.id}>
+                              v{v.number} {versionName(v)}
+                              {v.id === markCurrent?.id ? `（${t('dr.mark.currentTag')}）` : ''}
+                            </option>
+                          ))}
+                        </select>
+                      </div>
+                      <button
+                        type="button"
+                        className="btn"
+                        aria-disabled={!canExec || undefined}
+                        title={canExec ? t(MARK_TIP[markDir], { number: markTarget.number }) : deniedText}
+                        onClick={() => canExec && setMarkDlg(markTarget)}
+                      >
+                        {t(MARK_TITLE[markDir], { number: markTarget.number })}
+                      </button>
+                    </div>
+                  )}
                   {showBaseline && (
                     <div className="space-y-1">
                       <button
@@ -760,6 +901,33 @@ const EnvironmentDetailView = ({ eid }: { eid: string }) => {
                 {env.drift.summary.message && <p className="m-0 mt-1">{env.drift.summary.message}</p>}
               </Banner>
               <DiffList items={env.drift.summary.items} total={env.drift.summary.total} />
+              {/* 漂移的两个出口，不分主次（ADR 0004） */}
+              <div
+                className="space-y-2 rounded-md border border-border bg-panel p-3"
+                data-testid="drift-exits"
+              >
+                <h3 className="section-title">{t('dr.exitsTitle')}</h3>
+                <p className="hint m-0">{t('dr.exitsHint')}</p>
+                <div className="grid grid-cols-2 gap-3 max-[800px]:grid-cols-1">
+                  <div className="space-y-1.5">
+                    <button
+                      type="button"
+                      className="btn"
+                      aria-disabled={!canPull || undefined}
+                      onClick={() => canPull && setImportOpen(true)}
+                    >
+                      {t('dr.keep')}
+                    </button>
+                    <p className="hint m-0">{t('dr.keepHint')}</p>
+                  </div>
+                  <div className="space-y-1.5">
+                    <button type="button" className="btn" onClick={() => setRepairOpen(true)}>
+                      {t('dr.discard')}
+                    </button>
+                    <p className="hint m-0">{t('dr.discardHint')}</p>
+                  </div>
+                </div>
+              </div>
             </Section>
           )}
           {env.drift.status === 'error' && env.drift.summary?.message && (
@@ -814,6 +982,31 @@ const EnvironmentDetailView = ({ eid }: { eid: string }) => {
               <dd className="m-0 font-mono text-xs">{env.shadowUrl ?? t('envp.shadowNone')}</dd>
               <dt className="text-text-2">{t('envp.status')}</dt>
               <dd className="m-0 text-text-2">{t('envp.statusUnknown')}</dd>
+              {history && (
+                <>
+                  <dt className="text-text-2">{t('tk.claimRow')}</dt>
+                  <dd className="m-0" data-testid="claim-info">
+                    {!history.claim
+                      ? t('tk.claimNone')
+                      : history.claim.mine
+                        ? t('tk.claimMine')
+                        : t('tk.claimOther', { id: history.claim.instanceId ?? '?' })}
+                    {history.claims.length > 0 && (
+                      <ul className="m-0 mt-1 list-none space-y-0.5 p-0 text-xs text-text-3">
+                        {history.claims.map((c) => (
+                          <li key={c.id}>
+                            {t('tk.claimEvent', {
+                              time: formatTime(c.claimedAt),
+                              who: c.claimedByName ?? t('tk.unknownInstance'),
+                              prev: c.previousInstanceId ?? t('tk.unknownInstance'),
+                            })}
+                          </li>
+                        ))}
+                      </ul>
+                    )}
+                  </dd>
+                </>
+              )}
             </dl>
           </Section>
 
@@ -838,6 +1031,38 @@ const EnvironmentDetailView = ({ eid }: { eid: string }) => {
           onClose={() => setDlg(null)}
         />
       )}
+
+      {importOpen && <ImportDialog pid={pid} eid={eid} onClose={() => setImportOpen(false)} />}
+      {repairOpen && (
+        <RepairDialog
+          pid={pid}
+          eid={eid}
+          onClose={() => setRepairOpen(false)}
+          onRecheck={() => checkDrift.mutate(undefined, { onSuccess: () => setRepairOpen(false) })}
+          rechecking={checkDrift.isPending}
+        />
+      )}
+      {markDlg && status && (
+        <MarkDialog
+          pid={pid}
+          eid={eid}
+          envName={env.name}
+          production={env.production}
+          current={markCurrent}
+          to={markDlg}
+          onClose={() => setMarkDlg(null)}
+        />
+      )}
+
+      <ClaimDialog
+        open={claimOpen}
+        onClose={() => setClaimOpen(false)}
+        onConfirm={() => claim.mutate()}
+        pending={claim.isPending}
+        error={claim.error?.message}
+        instanceId={history?.claim?.instanceId}
+        isAdmin={isInstanceAdmin}
+      />
 
       <Confirm
         open={confirm}

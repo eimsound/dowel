@@ -24,6 +24,7 @@ import {
   finishRun,
   HistoryError,
   historyExists,
+  historyWriteProblem,
   markStep,
   pinSession,
   readSnapshot,
@@ -43,7 +44,16 @@ import {
   runVersionId,
   type TargetState,
 } from './state.ts';
-import type { ChainVersion, ExecuteOptions, ExecuteResult, ExecutorEvent, Migration } from './types.ts';
+import type {
+  ChainVersion,
+  DryRunPlan,
+  ExecuteOptions,
+  ExecuteResult,
+  ExecutorEvent,
+  Migration,
+} from './types.ts';
+
+type DryRunChecks = DryRunPlan['checks'];
 
 /** 这一步不能放进事务：冻结脚本里的标记，加上语句文本的判断（双保险） */
 export const isNonTx = (s: ScriptStep): boolean => !s.transactional || isNontransactionalSql(s.sql);
@@ -96,7 +106,7 @@ const label = (v: ChainVersion) => `v${v.number}「${v.name}」`;
  *   登记会留下，下一次同步发现目标库历史里已经有这个版本就会确认它；
  * - beforeCommit 在发出 COMMIT 之前调用（只有写基线用：它没有会失败的脚本，保持提交前报告）。
  */
-const inTx = async <T>(
+export const inTx = async <T>(
   conn: Db,
   fn: () => Promise<T>,
   hooks: { beforeCommit?: () => void; afterCommit?: () => void } = {},
@@ -207,6 +217,7 @@ const verifyAndRecord = async (conn: Db, c: Ctx, m: Migration) => {
     number: m.to.number,
     parentId: m.to.parentId,
     name: m.to.name,
+    scope: m.to.scope,
     upSteps: m.to.upSteps,
     downSteps: m.to.downSteps,
     checksum: m.to.checksum,
@@ -281,6 +292,7 @@ const writeBaseline = async (conn: Db, c: Ctx, m: Migration, snapshotFp: string)
         number: m.to.number,
         parentId: m.to.parentId,
         name: m.to.name,
+        scope: m.to.scope,
         upSteps: m.to.upSteps,
         downSteps: m.to.downSteps,
         checksum: m.to.checksum,
@@ -487,8 +499,12 @@ const locked = async (conn: Db, c: Ctx): Promise<ExecuteResult> => {
   const { chain } = o;
   const mode = o.mode ?? 'migrate';
   await c.emit({ type: 'phase', phase: 'integrity' });
-  // 历史已经存在时先过一遍 ensureHistory（只做格式版本检查，不改东西）：目标库里的历史比当前代码新就拒绝
-  if (await historyExists(conn)) await ensureHistoryMapped(conn);
+  // 历史已经存在时先过一遍 ensureHistory（格式版本检查；旧格式在这里升级——要改表，所以预演不做）：
+  // 目标库里的历史比当前代码新就拒绝。预演只读：用只读的检查代替，看得出真执行时会不会在这里失败
+  if (o.dryRun) {
+    const problem = await historyWriteProblem(conn);
+    if (problem) throw new ExecutorError(problem.code, scrubSecrets(problem.message));
+  } else if (await historyExists(conn)) await ensureHistoryMapped(conn);
   const state: TargetState = await readState(conn, o.projectId);
   assertTargetHistory(state, chain, o.instanceId);
 
@@ -574,8 +590,31 @@ const locked = async (conn: Db, c: Ctx): Promise<ExecuteResult> => {
         '这个库里已经有这个项目的 Dowel 历史，不需要再写基线',
       );
     migrations = route(chain, curIdx, tgtIdx);
-    if (!migrations.length)
-      return { mode, direction: 'none', baseline: false, ran: [], current: state.current };
+    if (!migrations.length) {
+      const cur = chain[curIdx];
+      const ref = cur ? { id: cur.id, number: cur.number, name: cur.name } : null;
+      return {
+        mode,
+        direction: 'none',
+        baseline: false,
+        ran: [],
+        current: state.current,
+        ...(o.dryRun
+          ? {
+              dryRun: {
+                firstRun: null,
+                baseline: false,
+                from: ref,
+                to: ref,
+                migrations: [],
+                resume: null,
+                createsHistory: false,
+                checks: ['lock', 'integrity', 'claim', 'history_writable'] as DryRunChecks,
+              },
+            }
+          : {}),
+      };
+    }
     await c.emit({ type: 'phase', phase: 'drift' });
     const cur = chain[curIdx]!;
     // 漂移检查用环境当前版本冻结时的 schema 范围
@@ -608,6 +647,41 @@ const locked = async (conn: Db, c: Ctx): Promise<ExecuteResult> => {
     );
   preflight(migrations);
   const direction = migrations[0]?.direction === 'down' ? 'down' : migrations.length ? 'up' : 'none';
+  if (o.dryRun) {
+    // 预演到此为止：检查全部通过，没有写目标库，也不调用任何平台库回调
+    const ref = (v: ChainVersion | undefined) => (v ? { id: v.id, number: v.number, name: v.name } : null);
+    const lastTo = migrations.at(-1)?.to ?? (baseline ? first : (chain[curIdx] ?? null));
+    return {
+      mode,
+      direction: direction as ExecuteResult['direction'],
+      baseline: baseline !== null,
+      ran: [],
+      current: state.current,
+      dryRun: {
+        firstRun: state.current === null && !state.unfinished ? (baseline ? 'baseline' : 'empty') : null,
+        baseline: baseline !== null,
+        from: ref(chain[curIdx]),
+        to: ref(lastTo ?? undefined),
+        migrations: migrations.map((m) => ({
+          versionId: m.version.id,
+          number: m.version.number,
+          name: m.version.name,
+          direction: m.direction,
+          steps: m.steps.map((s) => ({ sql: s.sql, transactional: !isNonTx(s) })),
+          nonTransactional: m.steps.filter(isNonTx).length,
+        })),
+        resume: state.unfinished
+          ? {
+              versionId: runVersionId(state.unfinished) ?? '',
+              direction: state.unfinished.direction,
+              afterStep: state.unfinished.stepIndex ?? -1,
+            }
+          : null,
+        createsHistory: !state.historyExists,
+        checks: ['lock', 'integrity', 'claim', 'drift', 'verified', 'instance_level', 'history_writable'],
+      },
+    };
+  }
   await c.emit({
     type: 'plan',
     baseline: baseline !== null,
@@ -699,7 +773,7 @@ const locked = async (conn: Db, c: Ctx): Promise<ExecuteResult> => {
   };
 };
 
-const ensureHistoryMapped = async (conn: Db) => {
+export const ensureHistoryMapped = async (conn: Db) => {
   try {
     await ensureHistory(conn);
   } catch (e) {
