@@ -478,6 +478,15 @@ test('每个应审计的动作都能在 audit_events 里找到', async () => {
     { action: 'environment.execute', run: () => directAudit('environment.execute', 'environment', 'e1') },
     { action: 'environment.rollback', run: () => directAudit('environment.rollback', 'environment', 'e1') },
     { action: 'environment.baseline', run: () => directAudit('environment.baseline', 'environment', 'e1') },
+    // P4c：接手、认领、接入已有历史（路由级覆盖在 takeover.test.ts）
+    { action: 'project.takeover', run: () => directAudit('project.takeover', 'project', 'p1') },
+    { action: 'project.claim', run: () => directAudit('project.claim', 'environment', 'e1') },
+    {
+      action: 'environment.attach_history',
+      run: () => directAudit('environment.attach_history', 'environment', 'e1'),
+    },
+    // 标记为已执行（路由级覆盖在 drift.test.ts）
+    { action: 'environment.mark', run: () => directAudit('environment.mark', 'environment', 'e1') },
     { action: 'model.import', run: () => directAudit('model.import', 'project', 'p1') },
     // OIDC 动作（路由级覆盖在 oidc.test.ts 里）
     { action: 'oidc.provider_create', run: () => directAudit('oidc.provider_create', 'oidc_provider', 'o1') },

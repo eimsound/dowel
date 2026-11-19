@@ -2,7 +2,7 @@
 // 术语见 GLOSSARY：版本、迁移、发布、影子库。
 import type { StoredVerifyReport, VerifyResponse, VersionInfo } from '@dowel/api';
 import { BASELINE_VERSION_NAME } from '@dowel/api';
-import { CircleCheck, CircleHelp, Pencil } from 'lucide-react';
+import { CircleCheck, CircleHelp, DatabaseBackup, Pencil } from 'lucide-react';
 import { useTranslation } from 'react-i18next';
 import { Banner } from './ui.tsx';
 
@@ -19,7 +19,11 @@ export const VersionNumber = ({ number }: { number: number }) => (
 );
 
 /** 已验证 / 未验证 / 人工编辑：脚本被人工改过时两个标记都显示（改过的脚本可能已重新验证） */
-export const VersionBadges = ({ v }: { v: Pick<VersionInfo, 'verifiedAt' | 'edited'> }) => {
+export const VersionBadges = ({
+  v,
+}: {
+  v: Pick<VersionInfo, 'verifiedAt' | 'edited'> & { restoredAt?: string | null };
+}) => {
   const { t } = useTranslation();
   return (
     <span className="inline-flex shrink-0 flex-wrap items-center gap-1.5">
@@ -38,6 +42,12 @@ export const VersionBadges = ({ v }: { v: Pick<VersionInfo, 'verifiedAt' | 'edit
         <span className="risk low inline-flex items-center gap-1">
           <Pencil size={12} aria-hidden="true" />
           {t('versions.edited')}
+        </span>
+      )}
+      {v.restoredAt && (
+        <span className="chip inline-flex items-center gap-1" title={t('tk.restoredHint')}>
+          <DatabaseBackup size={12} aria-hidden="true" />
+          {t('tk.restored')}
         </span>
       )}
     </span>

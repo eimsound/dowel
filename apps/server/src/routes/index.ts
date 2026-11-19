@@ -7,6 +7,7 @@ import { registerActivity } from './activity.ts';
 import { registerAdmin } from './admin.ts';
 import { registerAudit } from './audit.ts';
 import { registerAuth } from './auth.ts';
+import { registerClaims } from './claims.ts';
 import { registerConnection } from './connection.ts';
 import { type AppContext, type Env, requireInstanceAdmin, requireUser } from './context.ts';
 import { registerDirectory } from './directory.ts';
@@ -18,6 +19,7 @@ import { registerOidcAdmin, registerOidcAuth, registerOidcMe } from './oidc.ts';
 import { registerProjects } from './projects.ts';
 import { registerSetup } from './setup.ts';
 import { registerSync } from './sync.ts';
+import { registerTakeover } from './takeover.ts';
 import { registerVersions } from './versions.ts';
 import { registerWizard } from './wizard.ts';
 
@@ -69,10 +71,14 @@ export const registerRoutes = (app: Hono<Env>, ctx: AppContext) => {
   app.use('/api/connection-check', requireUser(ctx.db));
   registerConnection(app, ctx);
   registerWizard(app, ctx);
+  app.use('/api/takeover/*', requireUser(ctx.db));
+  registerTakeover(app, ctx);
   registerProjects(app, ctx);
   registerGrants(app, ctx);
   registerVersions(app, ctx);
   registerActivity(app, ctx);
+  // attach 要在 /environments/:eid 之前注册（否则 :eid 会吃掉 attach）
+  registerClaims(app, ctx);
   registerEnvironments(app, ctx);
   registerExecutions(app, ctx);
   registerSync(app, ctx);

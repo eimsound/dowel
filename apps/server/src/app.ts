@@ -2,7 +2,8 @@
 
 import type { ApiErrorBody } from '@dowel/api';
 import { type Model, PlanError } from '@dowel/core';
-import { ScopeError } from '@dowel/engines';
+import { HistoryError, ScopeError } from '@dowel/engines';
+import { ExecutorError } from '@dowel/executor';
 import { createNodeWebSocket } from '@hono/node-ws';
 import { Hono } from 'hono';
 import { HTTPException } from 'hono/http-exception';
@@ -117,7 +118,10 @@ export const createApp = (db: PlatformDb, options: AppOptions = {}) => {
       err instanceof PlanError ||
       err instanceof ShadowError ||
       err instanceof SecretError ||
-      err instanceof ScopeError
+      err instanceof ScopeError ||
+      err instanceof HistoryError ||
+      // 执行器的预期拒绝（历史对不上、被别的实例认领……）；意外错误（unexpected）仍然是 500
+      (err instanceof ExecutorError && err.code !== 'unexpected')
     )
       return fail(err.message, 422);
     console.error(err);

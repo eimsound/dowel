@@ -344,6 +344,8 @@ describe.each([
       await db.exec(`alter table versions drop column ${col}`);
     // P4b 的迁移（环境执行状态、versions.executed_at）也退回去：之后升级时会重新应用
     await db.exec('alter table versions drop column executed_at');
+    // P4c 的迁移（versions.restored_at）也退回去
+    await db.exec('alter table versions drop column restored_at');
     await db.exec('drop table environment_versions');
     for (const col of [
       'exec_policy',

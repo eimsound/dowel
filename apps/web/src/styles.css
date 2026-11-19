@@ -551,7 +551,8 @@ dialog::backdrop {
     padding: 0 6px;
     border-radius: 4px;
     background: var(--surface-active);
-    color: var(--text-3);
+    /* text-3 在深色下对比度只有 4.41（axe 要求 4.5）：用 text-2 */
+    color: var(--text-2);
     font-size: 10px;
     font-weight: 500;
     line-height: 16px;

@@ -1,11 +1,11 @@
 // 执行确认对话框：列出将要执行 / 回滚的迁移和风险摘要，生产环境必须输入环境名才能确认；
 // 确认后用 SSE 读进度，出错时显示原因（漂移时列出差异）。关闭时刷新环境的状态、历史和列表。
-import type { DriftItem, EnvStatus, EnvVersion, ExecEvent } from '@dowel/api';
+import type { DriftItem, DryRunResponse, EnvStatus, EnvVersion, ExecEvent } from '@dowel/api';
 import { useQueryClient } from '@tanstack/react-query';
 import { CircleCheck, CircleDashed, LoaderCircle } from 'lucide-react';
-import { useId, useRef, useState } from 'react';
+import { useEffect, useId, useRef, useState } from 'react';
 import { useTranslation } from 'react-i18next';
-import { ApiError } from '../api.ts';
+import { ApiError, api } from '../api.ts';
 import { streamExec } from '../envs.ts';
 import { Modal } from './Modal.tsx';
 import { Banner, Sql } from './ui.tsx';
@@ -67,6 +67,122 @@ export const DiffList = ({ items, total }: { items: DriftItem[]; total?: number 
   );
 };
 
+type DryState =
+  | { state: 'loading' }
+  | { state: 'done'; res: DryRunResponse }
+  | { state: 'error'; message: string };
+
+/**
+ * 预演结果：确认对话框打开时先调用 dryRun（做完全部执行前检查，不写目标库也不写平台库的登记），
+ * 把“现在执行会做什么 / 为什么会被拒绝”显示出来。
+ */
+const DryRunPanel = ({ dry, onRetry }: { dry: DryState; onRetry: () => void }) => {
+  const { t } = useTranslation();
+  const versionName = useVersionName();
+  if (dry.state === 'loading')
+    return (
+      <p role="status" className="m-0 inline-flex items-center gap-1.5 text-sm text-text-2">
+        <LoaderCircle size={14} aria-hidden="true" className="animate-spin" />
+        {t('tk.dry.running')}
+      </p>
+    );
+  if (dry.state === 'error')
+    return (
+      <Banner kind="warn" role="status" title={t('tk.dry.failTitle')}>
+        {dry.message}
+        <div className="mt-1.5">
+          <button type="button" className="btn" onClick={onRetry}>
+            {t('tk.dry.retry')}
+          </button>
+        </div>
+      </Banner>
+    );
+  const { res } = dry;
+  if (!res.ok || !res.plan)
+    return (
+      <div className="space-y-2" role="status">
+        <Banner kind="danger" title={t('tk.dry.failTitle')}>
+          <p className="m-0">{t('tk.dry.failBody')}</p>
+          <p className="m-0 mt-1" data-testid="dry-error">
+            {res.error}
+          </p>
+          <div className="mt-1.5">
+            <button type="button" className="btn" onClick={onRetry}>
+              {t('tk.dry.retry')}
+            </button>
+          </div>
+        </Banner>
+        {res.details?.diff && res.details.diff.length > 0 && (
+          <DiffList items={res.details.diff} total={res.details.diffTotal} />
+        )}
+        <p className="hint">{t('tk.dry.readonly')}</p>
+      </div>
+    );
+  const plan = res.plan;
+  return (
+    <div className="space-y-2" role="status" data-testid="dry-run">
+      <Banner kind="ok" title={t('tk.dry.okTitle')}>
+        {plan.migrations.length === 0 && !plan.baseline ? t('tk.dry.nothing') : t('tk.dry.okBody')}
+      </Banner>
+      {plan.firstRun === 'empty' && <p className="hint m-0">{t('tk.dry.firstRunEmpty')}</p>}
+      {plan.firstRun === 'baseline' && <p className="hint m-0">{t('tk.dry.firstRunBaseline')}</p>}
+      {plan.createsHistory && <p className="hint m-0">{t('tk.dry.createsHistory')}</p>}
+      {plan.resume && (
+        <p className="hint m-0">
+          {t('tk.dry.resume', {
+            number: plan.migrations.find((m) => m.versionId === plan.resume?.versionId)?.number ?? '?',
+            step: plan.resume.afterStep + 2,
+          })}
+        </p>
+      )}
+      <ul className="m-0 list-none space-y-1 p-0">
+        {plan.migrations.map((m) => (
+          <li
+            key={`${m.versionId}-${m.direction}`}
+            className="rounded-sm border border-border px-2 py-1.5 text-xs"
+          >
+            <div className="flex flex-wrap items-center gap-2">
+              <VersionNumber number={m.number} />
+              <span className="font-mono">{versionName(m)}</span>
+              <span className="text-text-3">{t('tk.dry.steps', { count: m.steps.length })}</span>
+              {m.nonTransactional > 0 && (
+                <span className="risk medium">{t('tk.dry.nonTx', { count: m.nonTransactional })}</span>
+              )}
+              {m.risk && (m.risk === 'high' || m.risk === 'medium') && (
+                <span className={`risk ${m.risk}`}>{t(`envx.exec.risk.${m.risk}`)}</span>
+              )}
+              {m.riskError && (
+                <span className="risk medium" title={m.riskError}>
+                  {t('envx.exec.riskError')}
+                </span>
+              )}
+              {!m.verified && <span className="risk medium">{t('tk.dry.unverified')}</span>}
+            </div>
+            <details className="mt-1">
+              <summary className="cursor-pointer text-text-2">{t('tk.dry.showSteps')}</summary>
+              <ol className="m-0 mt-1 list-none space-y-1 p-0">
+                {m.steps.map((st, i) => (
+                  // biome-ignore lint/suspicious/noArrayIndexKey: 步骤只读、顺序固定
+                  <li key={i}>
+                    <code className="block font-mono break-all whitespace-pre-wrap">
+                      <Sql text={st.sql} />
+                    </code>
+                    {!st.transactional && <span className="text-text-3">{t('envx.nonTxShort')}</span>}
+                  </li>
+                ))}
+              </ol>
+            </details>
+          </li>
+        ))}
+      </ul>
+      <p className="hint m-0">
+        {t('tk.dry.checks')}：{plan.checks.map((c) => t(`tk.dry.check.${c}`)).join('、')}
+      </p>
+      <p className="hint m-0">{t('tk.dry.readonly')}</p>
+    </div>
+  );
+};
+
 export const ExecDialog = ({
   pid,
   eid,
@@ -100,8 +216,26 @@ export const ExecDialog = ({
   const [result, setResult] = useState<ExecEvent | null>(null);
   const [error, setError] = useState<{ message: string; code?: string; event?: ExecEvent } | null>(null);
   const running = useRef(false);
+  const [dry, setDry] = useState<DryState>({ state: 'loading' });
+  const [dryTick, setDryTick] = useState(0);
   const mustType = production;
   const canConfirm = !mustType || typed.trim() === envName;
+
+  // 对话框打开（或点“重新预演”）时先预演：只读，不写目标库，也不写平台库的登记；
+  // 预演没通过不挡着确认按钮——真正的执行会被同样的原因拒绝，原因照样显示
+  // biome-ignore lint/correctness/useExhaustiveDependencies: dryTick 只用来触发重新预演
+  useEffect(() => {
+    let live = true;
+    setDry({ state: 'loading' });
+    const body = kind === 'baseline' ? { dryRun: true } : { to: to?.id, dryRun: true };
+    api<DryRunResponse>('POST', `/api/projects/${pid}/environments/${eid}/${kind}`, body).then(
+      (res) => live && setDry({ state: 'done', res }),
+      (e: unknown) => live && setDry({ state: 'error', message: e instanceof Error ? e.message : String(e) }),
+    );
+    return () => {
+      live = false;
+    };
+  }, [pid, eid, kind, to?.id, dryTick]);
 
   const refresh = () =>
     Promise.all([
@@ -244,6 +378,8 @@ export const ExecDialog = ({
             )}
           </>
         )}
+
+        {phase === 'confirm' && <DryRunPanel dry={dry} onRetry={() => setDryTick((n) => n + 1)} />}
 
         {mustType && phase === 'confirm' && (
           <div className="field">

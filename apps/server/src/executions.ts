@@ -8,7 +8,15 @@ import type {
   NeedsManual,
   RunInfo,
 } from '@dowel/api';
-import { type Db, HistoryError, ScopeError, withProjectLock } from '@dowel/engines';
+import type { Model } from '@dowel/core';
+import {
+  type Db,
+  fingerprint,
+  HistoryError,
+  readSnapshot,
+  ScopeError,
+  withProjectLock,
+} from '@dowel/engines';
 import {
   type ChainVersion,
   checkDrift,
@@ -17,7 +25,12 @@ import {
   ExecutorError,
   type ExecutorEvent,
   execute,
+  importLive,
   isReadbackFailure,
+  type MarkExpect,
+  type MarkPlan,
+  type MarkResult,
+  markApplied,
   readState,
   stripReadbackMark,
   type TargetState,
@@ -88,6 +101,8 @@ export interface ExecContext {
   locks: EnvLocks;
   /** 在目标库项目锁里读历史并同步缓存（默认 syncTarget）；测试里可以替换，验证关键状态不依赖结尾的同步 */
   syncTarget?: (db: PlatformDb, env: EnvRow, tdb: Db) => Promise<TargetState | null>;
+  /** 标记等目标库项目锁的毫秒数（默认 30 秒）；测试里调短，验证“锁被占用”的错误路径 */
+  lockTimeoutMs?: number;
 }
 
 /** 连目标库的连接（白名单在连接层检查）。postgres.js 是懒连接，URL 写错这里也可能同步抛错 */
@@ -103,6 +118,24 @@ const isConnectionFailure = (e: unknown): boolean => {
 };
 
 export type ErrorKind = NonNullable<DriftSummary['errorKind']>;
+
+/** 认领失败时给用户看的原因（已脱敏）：接入、接手共用 */
+export const claimFailure = (e: unknown, url: string): string =>
+  scrubSecrets(
+    e instanceof ExecutorError && e.code !== 'unexpected' ? e.message : classifyError(e, url).message,
+  );
+
+/**
+ * 连目标库 / 读历史 / 认领时抛出的错误 → 路由能直接映射成 4xx 的错误：预期的拒绝（HTTPException、HistoryError、
+ * ExecutorError 非 unexpected）原样返回；连接故障、权限不足（目标库返回的错误）转成带原因的 ConnectError（422，文案已脱敏）；
+ * 真正意外的原样返回（500，只记日志）。接入、认领、接手共用。
+ */
+export const toTargetError = (e: unknown, url: string): unknown => {
+  if (e instanceof HTTPException || e instanceof HistoryError) return e;
+  if (e instanceof ExecutorError && e.code !== 'unexpected') return e;
+  const k = classifyError(e, url);
+  return k.kind === 'unexpected' ? e : new ConnectError(k.message);
+};
 
 /**
  * 错误分类：给出准确的类别和文案，不把什么都说成“连接目标库失败”。文案已脱敏（url 是目标库的连接串，用来遮密码）。
@@ -152,11 +185,11 @@ export const toExecEvent = (e: ExecutorEvent): ExecEvent => {
 /** 错误 → 给客户端的 error 事件字段。预期的拒绝给原因（脱敏在发送时统一做），意外错误只记日志 */
 export const errorEvent = (e: unknown): { error: string; code?: string; details?: ExecEvent['details'] } => {
   if (e instanceof ExecutorError && e.code !== 'unexpected') {
-    const { diff, diffTotal, problems, versionId, number, step, partial, needsManual } = e.details;
+    const { diff, diffTotal, problems, versionId, number, step, partial, needsManual, claim } = e.details;
     return {
       error: e.message,
       code: e.code,
-      details: { diff, diffTotal, problems, versionId, number, step, partial, needsManual },
+      details: { diff, diffTotal, problems, versionId, number, step, partial, needsManual, claim },
     };
   }
   if (e instanceof HTTPException) return { error: e.message, code: 'rejected' };
@@ -298,6 +331,49 @@ const syncTarget = async (db: PlatformDb, env: EnvRow, tdb: Db): Promise<TargetS
   } catch (e) {
     if (e instanceof HistoryError && e.code === 'lock_timeout') return null;
     throw e;
+  }
+};
+
+/** 预演等目标库项目锁的时间：正在执行时报告“锁被占用”，而不是排队等 */
+export const DRY_RUN_LOCK_WAIT_MS = 3_000;
+
+/**
+ * 只预演：做完全部执行前检查（锁、完整性、认领、漂移、已验证、实例级语句、历史表能不能写），返回将要做的事。
+ * **不写目标库、不写平台库**：不取环境锁（不改平台库缓存）、不登记 claimed、不同步缓存。
+ * 检查没通过抛 ExecutorError（调用方转成 ok = false 的响应）。
+ */
+export const dryRunExecution = async (
+  x: ExecContext,
+  input: Omit<RunInput, 'onEvent' | 'userId'> & { userId: string },
+): Promise<ExecuteResult> => {
+  const { db } = x;
+  const env = await loadEnv(db, input.pid, input.env.id);
+  if (x.locks.busy(env.id))
+    throw new ExecutorError(
+      'lock_timeout',
+      '这个环境正在执行另一个操作，现在不能执行（预演检查的就是这一点）',
+    );
+  const conn = open(decrypt(env.url_enc), x.guard);
+  try {
+    const chain = await loadChain(db, input.pid);
+    if (!chain.length) throw new HTTPException(422, { message: '项目还没有发布任何版本' });
+    const settings = await readSettings(db);
+    return await execute({
+      db: conn.db,
+      projectId: input.pid,
+      projectName: input.projectName,
+      instanceId: settings.instanceId,
+      chain,
+      mode: input.mode,
+      to: input.to,
+      direction: input.direction,
+      executedBy: input.userId,
+      via: 'web',
+      lockTimeoutMs: DRY_RUN_LOCK_WAIT_MS,
+      dryRun: true,
+    });
+  } finally {
+    await conn.close().catch(() => {});
   }
 };
 
@@ -535,4 +611,172 @@ const recordError = async (
   };
   await setDrift(db, env.id, 'error', summary, at);
   return { status: 'error', checkedAt: at, summary, skipped: null };
+};
+
+// ───── 标记为已执行（ADR 0004） ─────
+
+export interface MarkInput {
+  pid: string;
+  projectName: string;
+  env: EnvRow;
+  /** 目标版本 ID */
+  to: string;
+  userId: string;
+  /** 向前标记：用户确认了“被跳过的版本里的脚本效果已经手工完成，或者不需要”（执行器在锁里检查，建 schema 之前） */
+  acknowledge?: boolean;
+  /** 预演时拿到的计划：确认绑定到它，不一致执行器拒绝（plan_changed） */
+  expect?: MarkExpect;
+}
+
+/**
+ * 标记为已执行：不执行 SQL，只写一条 direction = 'mark' 的历史。平台库的登记沿用执行的那一套（claimed → confirmed）：
+ * - 向前标记：目标版本和中间跳过的版本都算“执行过”——写前登记 claimed（不要求已验证：不跑脚本），**事务提交之后**
+ *   才确认（executed_at + confirmed）；目标库没被改动的失败撤销登记；崩溃留下的由下一次锁内的同步按目标库的**版本行**对齐；
+ * - 向后标记：不写 executed_at、不登记（这些版本本来就执行过，或者没有——标记不改变它）。
+ * 环境锁、目标库项目锁、拿到锁后重新读环境行，和 runExecution 一样。
+ * P5 扩展点：接审批以后，批准绑定“起止版本 + MarkPlan.fingerprint”，在 beforeMark 里核对；标记不受前置环境约束（不跑脚本），
+ * 豁免写进审计（路由层的审计数据里已经有 prerequisiteExempt）。
+ */
+export const runMark = async (x: ExecContext, input: MarkInput): Promise<MarkResult> => {
+  const { db } = x;
+  const { pid } = input;
+  const release = await x.locks.acquire(input.env.id);
+  let conn: ReturnType<typeof open> | null = null;
+  let env = input.env;
+  const claimed = new Set<string>();
+  const adopted = new Set<string>();
+  const touched = new Set<string>();
+  try {
+    env = await loadEnv(db, pid, input.env.id);
+    conn = open(decrypt(env.url_enc), x.guard);
+    const chain = await loadChain(db, pid);
+    if (!chain.length) throw new HTTPException(422, { message: '项目还没有发布任何版本' });
+    const settings = await readSettings(db);
+    return await markApplied({
+      db: conn.db,
+      projectId: pid,
+      projectName: input.projectName,
+      instanceId: settings.instanceId,
+      chain,
+      to: input.to,
+      executedBy: input.userId,
+      via: 'web',
+      lockTimeoutMs: x.lockTimeoutMs,
+      acknowledge: input.acknowledge,
+      expect: input.expect,
+      beforeMark: async (p: MarkPlan) => {
+        for (const v of p.skipped) {
+          // baseline = true：不要求已验证（标记不执行脚本）
+          const k = await claim(db, pid, env.id, v, true);
+          if (k === 'new') claimed.add(v.id);
+          else if (k === 'adopted') adopted.add(v.id);
+        }
+      },
+      onTouch: (p) => {
+        for (const v of p.skipped) touched.add(v.id);
+      },
+      afterMark: async (p) => {
+        for (const v of p.skipped) {
+          await confirmVersion(db, env.id, v.id);
+          claimed.delete(v.id);
+          adopted.delete(v.id);
+        }
+        await db.query('update environments set current_version_id = $2 where id = $1', [env.id, p.to.id]);
+        await setDrift(db, env.id, 'ok', null);
+      },
+    });
+  } finally {
+    for (const vid of claimed) {
+      try {
+        if (touched.has(vid)) await confirmVersion(db, env.id, vid);
+        else await releaseClaim(db, env.id, vid);
+      } catch (e) {
+        console.error('处理标记登记失败（下次同步会清理）', e instanceof Error ? scrubSecrets(e.message) : e);
+      }
+    }
+    for (const vid of adopted)
+      if (touched.has(vid))
+        await confirmVersion(db, env.id, vid).catch(logFailure('处理标记登记失败（下次同步会清理）'));
+    if (conn) {
+      try {
+        await (x.syncTarget ?? syncTarget)(db, env, conn.db);
+      } catch (e) {
+        console.error(
+          '读取目标库历史失败（下次读取历史时会重新同步）',
+          e instanceof Error ? scrubSecrets(e.message) : e,
+        );
+      }
+      await conn.close().catch(() => {});
+    }
+    release();
+  }
+};
+
+/** 标记的预演：核对线上结构、列出被跳过的版本；不写目标库、不写平台库的登记（不取环境锁，只等目标库项目锁几秒） */
+export const dryRunMark = async (
+  x: ExecContext,
+  input: Pick<MarkInput, 'pid' | 'projectName' | 'env' | 'to' | 'userId'>,
+): Promise<MarkResult> => {
+  const { db } = x;
+  const env = await loadEnv(db, input.pid, input.env.id);
+  if (x.locks.busy(env.id))
+    throw new ExecutorError(
+      'lock_timeout',
+      '这个环境正在执行另一个操作，现在不能标记（预演检查的就是这一点）',
+    );
+  const conn = open(decrypt(env.url_enc), x.guard);
+  try {
+    const chain = await loadChain(db, input.pid);
+    if (!chain.length) throw new HTTPException(422, { message: '项目还没有发布任何版本' });
+    return await markApplied({
+      db: conn.db,
+      projectId: input.pid,
+      projectName: input.projectName,
+      instanceId: (await readSettings(db)).instanceId,
+      chain,
+      to: input.to,
+      executedBy: input.userId,
+      lockTimeoutMs: DRY_RUN_LOCK_WAIT_MS,
+      dryRun: true,
+    });
+  } finally {
+    await conn.close().catch(() => {});
+  }
+};
+
+// ───── 保留线上的修改：导入 ─────
+
+export interface LiveRead {
+  /** 线上结构导入成的模型（对象 ID 已按名字沿用 base 里的） */
+  model: Model;
+  /** 线上结构的指纹 */
+  fingerprint: string;
+  /** 目标库历史（读不到时为 null：只影响警告，不挡着导入） */
+  state: TargetState | null;
+}
+
+/**
+ * 读出环境的线上结构（只读：SET + SELECT，只读 scope 范围内的），用 reconcileIds 按名字沿用 `base`（工作副本）里的对象 ID；
+ * 顺带读目标库历史，判断有没有半途失败的迁移（警告用）。
+ */
+export const readLive = async (
+  x: ExecContext,
+  env: EnvRow,
+  scope: string[] | null,
+  base: Model,
+): Promise<LiveRead> => {
+  const url = decrypt(env.url_enc);
+  const conn = open(url, x.guard, CHECK_CONNECT_TIMEOUT);
+  try {
+    const snapshot = await readSnapshot(conn.db, scope);
+    // 和漂移检查、标记的核对同一套规则（compare.ts 的 importLive：按名字沿用 base 里的对象 ID，忽略 public 的默认注释）
+    const model = importLive(snapshot, base);
+    const state = await readState(conn.db, env.project_id).catch(() => null);
+    return { model, fingerprint: fingerprint(snapshot), state };
+  } catch (e) {
+    if (e instanceof HTTPException) throw e;
+    throw new ConnectError(classifyError(e, url).message);
+  } finally {
+    await conn.close().catch(() => {});
+  }
 };

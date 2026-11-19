@@ -476,6 +476,11 @@ export const versionInfoSchema = z.object({
   edited: z.boolean(),
   /** 链上最新的版本：只有它的脚本可以编辑 */
   latest: z.boolean(),
+  /**
+   * 接手时从目标库的 dowel 历史恢复出来的时间（不是在本实例发布的）；null 表示本实例发布的。
+   * 恢复的版本一律是“未验证”（见 05-implementation.md P4c）：要执行或回滚它需要先在影子库里重新验证。
+   */
+  restoredAt: z.string().nullable(),
 });
 export type VersionInfo = z.infer<typeof versionInfoSchema>;
 
@@ -747,10 +752,43 @@ export type EnvStatus = z.infer<typeof envStatusSchema>;
 export const executeRequestSchema = z.object({
   to: z.string().min(1),
   confirm: z.string().optional(),
+  /** 只预演（见 DryRunResponse）：生产环境也不需要 confirm，因为什么都不会写 */
+  dryRun: z.boolean().optional(),
 });
 export type ExecuteRequest = z.infer<typeof executeRequestSchema>;
 
-export const baselineRequestSchema = z.object({ confirm: z.string().optional() });
+/**
+ * 标记为已执行（ADR 0004）：不执行任何 SQL，把环境记为已到达版本 `to`（链上任意版本，更新或更早都行）。
+ * 前提：线上结构等于 to 的模型。生产环境必须带环境名（confirm）；向前标记要带 acknowledge（确认被跳过的版本里
+ * 的脚本效果已经手工完成，或者不需要）。dryRun：只核对并返回计划，什么都不写。
+ */
+export const markExpectSchema = z.object({
+  from: z.string().nullable(),
+  to: z.string(),
+  skipped: z.array(z.string()),
+  fingerprint: z.string(),
+});
+export type MarkExpect = z.infer<typeof markExpectSchema>;
+
+export const markRequestSchema = z.object({
+  to: z.string().min(1),
+  confirm: z.string().optional(),
+  acknowledge: z.boolean().optional(),
+  /**
+   * 预演时拿到的计划（from、to、跳过的版本、线上结构指纹）：向前标记的确认必须绑定到它。执行器在锁里重新算出 plan，
+   * 任何一项不一致就拒绝（422，code = plan_changed，details.plan 是新的计划），什么都不写。
+   * 向前标记不带 expect 直接拒绝（expect_required）；向后标记和标记到当前版本可以不带。
+   */
+  expect: markExpectSchema.optional(),
+  dryRun: z.boolean().optional(),
+});
+export type MarkRequest = z.infer<typeof markRequestSchema>;
+
+export const baselineRequestSchema = z.object({
+  confirm: z.string().optional(),
+  /** 只预演：做完全部执行前检查、列出要做的事，不写目标库、不写平台库的登记 */
+  dryRun: z.boolean().optional(),
+});
 export type BaselineRequest = z.infer<typeof baselineRequestSchema>;
 
 /** 执行进度的阶段：拿锁 → 完整性检查 → 漂移检查 → 计划 → 逐个迁移 → 完成 */
@@ -765,6 +803,25 @@ export const execMigrationRefSchema = z.object({
   steps: z.number(),
 });
 
+/** 标记计划里的一个版本（向前标记被跳过的版本：脚本没有执行） */
+export const markVersionSchema = envVersionRefSchema.extend({
+  upSteps: z.array(scriptStepSchema),
+  downSteps: z.array(scriptStepSchema),
+});
+export type MarkVersion = z.infer<typeof markVersionSchema>;
+
+export const markPlanSchema = z.object({
+  /** current：目标就是当前版本（上一次执行没有结束、手工改回当前版本之后放弃那次未完成的运行） */
+  direction: z.enum(['forward', 'backward', 'current']),
+  from: envVersionRefSchema.nullable(),
+  to: envVersionRefSchema,
+  /** 向前：被记为已执行、但脚本没有执行的版本（from 之后到 to，含 to）；向后为空 */
+  skipped: z.array(markVersionSchema),
+  /** 读到的线上结构指纹 */
+  fingerprint: z.string(),
+});
+export type MarkPlanInfo = z.infer<typeof markPlanSchema>;
+
 /** 出错时的细节：漂移 / 读回不一致的差异、失败的是第几步、目标库是否已被部分改动 */
 export const execErrorDetailsSchema = z.object({
   diff: z.array(driftItemSchema).optional(),
@@ -775,6 +832,16 @@ export const execErrorDetailsSchema = z.object({
   step: z.number().optional(),
   partial: z.boolean().optional(),
   needsManual: needsManualSchema.optional(),
+  /** plan_changed：锁里重新算出的标记计划（预演之后目标库变了） */
+  plan: markPlanSchema.optional(),
+  /** foreign_instance：当前认领这个项目的实例 */
+  claim: z
+    .object({
+      instanceId: z.string(),
+      claimedAt: z.string().nullable(),
+      previousInstanceId: z.string().nullable(),
+    })
+    .optional(),
 });
 export type ExecErrorDetails = z.infer<typeof execErrorDetailsSchema>;
 
@@ -805,12 +872,27 @@ export const execEventSchema = z.object({
 });
 export type ExecEvent = z.infer<typeof execEventSchema>;
 
-/** 目标库历史里的一次执行记录（读目标库的 dowel.history） */
+/** 标记的预演（核对线上结构、列出被跳过的版本，不写任何东西）；核对没通过也是 200，ok = false，带差异 */
+export const markDryRunResponseSchema = z.object({
+  ok: z.boolean(),
+  plan: markPlanSchema.optional(),
+  error: z.string().optional(),
+  code: z.string().optional(),
+  details: execErrorDetailsSchema.optional(),
+});
+export type MarkDryRunResponse = z.infer<typeof markDryRunResponseSchema>;
+
+export const markResultSchema = z.object({
+  plan: markPlanSchema,
+  current: envVersionRefSchema,
+});
+export type MarkResult = z.infer<typeof markResultSchema>;
+
 export const runInfoSchema = z.object({
   id: z.number(),
   fromVersion: envVersionRefSchema.nullable(),
   toVersion: envVersionRefSchema,
-  direction: z.enum(['baseline', 'up', 'down']),
+  direction: z.enum(['baseline', 'up', 'down', 'mark']),
   status: z.enum(['running', 'done', 'failed']),
   /** 已完成的最后一步（0 起）；null 表示没有断点 */
   stepIndex: z.number().nullable(),
@@ -827,22 +909,164 @@ export const runInfoSchema = z.object({
 });
 export type RunInfo = z.infer<typeof runInfoSchema>;
 
+/**
+ * 目标库里这个项目的认领情况（dowel.projects）。mine = 当前认领它的就是本实例；
+ * 不是的话执行会被拒绝（foreign_instance），要由实例管理员“认领”；只读的漂移检查和读历史不受影响。
+ */
+export const claimInfoSchema = z.object({
+  mine: z.boolean(),
+  instanceId: z.string().nullable(),
+  claimedAt: z.string().nullable(),
+  previousInstanceId: z.string().nullable(),
+});
+export type ClaimInfo = z.infer<typeof claimInfoSchema>;
+
+/** 目标库里的一条认领事件（dowel.claims，只追加） */
+export const claimEventSchema = z.object({
+  id: z.number(),
+  instanceId: z.string(),
+  previousInstanceId: z.string().nullable(),
+  claimedByName: z.string().nullable(),
+  claimedAt: z.string(),
+});
+export type ClaimEvent = z.infer<typeof claimEventSchema>;
+
 export const envHistorySchema = z.object({
   /** 目标库里有没有这个项目的 Dowel 历史 */
   initialized: z.boolean(),
+  /** 认领情况；目标库还没有项目行（没执行过）时为 null */
+  claim: claimInfoSchema.nullable(),
+  /** 认领事件，新的在后 */
+  claims: z.array(claimEventSchema),
   currentVersion: envVersionRefSchema.nullable(),
   /** 上一次执行停在中途（目标库处于半途状态，必须先继续执行）；没有为 null */
   unfinished: runInfoSchema.nullable(),
+  /** 上一次执行读回校验失败（所有步骤做完了结构却不对，需要人工修正）：执行器读目标库历史得到的，界面不要从 runs 里推 */
+  readbackFailure: z.boolean(),
   /** 最近的执行记录，新的在前（最多 100 条） */
   runs: z.array(runInfoSchema),
 });
 export type EnvHistory = z.infer<typeof envHistorySchema>;
+
+// ───── 漂移的两个出口（ADR 0004） ─────
+
+/** 保留线上的修改：导入前的预览。覆盖工作副本前先给差异，并在三种情况下警告（不拦截） */
+export const importRequestSchema = z.object({
+  preview: z.boolean().optional(),
+  /**
+   * 确认覆盖时带上预览时拿到的线上结构指纹：服务端重新读线上结构，指纹不一致就 409（code = live_changed，带新的预览），
+   * 让用户重新确认差异。不带则不绑定（接口的旧用法）。
+   */
+  fingerprint: z.string().optional(),
+  /**
+   * 确认覆盖时带上预览时工作副本的 seq：覆盖之前在 rooms 里比对，工作副本在预览之后被改过就 409
+   * （code = working_changed，带新的预览），不覆盖。不带则不绑定。
+   */
+  workingSeq: z.number().optional(),
+});
+export type PullRequest = z.infer<typeof importRequestSchema>;
+
+export const pullPreviewSchema = z.object({
+  /** 线上结构 → 工作副本会变成的样子：plan(工作副本, 导入后) 的步骤 */
+  items: z.array(driftItemSchema),
+  total: z.number(),
+  /** 线上结构的指纹（也记进审计） */
+  fingerprint: z.string(),
+  /** 预览时工作副本的 seq：确认时带回来，绑定“覆盖的是我看过差异的那一份工作副本” */
+  workingSeq: z.number(),
+  warnings: z.object({
+    /** 环境落后于链头：覆盖会撤销中间版本的修改（导入的是它现在的结构） */
+    behindHead: z.object({ current: envVersionRefSchema.nullable(), head: envVersionRefSchema }).nullable(),
+    /** 环境有半途失败的迁移（停在中途） */
+    unfinished: z.boolean(),
+    /** 环境上一次执行读回校验失败（所有步骤做完了结构却不对） */
+    readbackFailure: z.boolean(),
+    /** 工作副本有未发布的修改（会被覆盖） */
+    workingDirty: z.boolean(),
+  }),
+});
+export type PullPreview = z.infer<typeof pullPreviewSchema>;
+
+/** 放弃线上的修改：修复脚本 plan(线上结构, 当前版本的模型)。只显示、可复制，Dowel 不代为执行 */
+export const repairScriptSchema = z.object({
+  versionNumber: z.number().nullable(),
+  /** 带会话设置的完整脚本（可以直接复制去执行）；没有可执行的步骤时为 null */
+  script: z.string().nullable(),
+  steps: z.array(driftItemSchema),
+  /** 模型表达不了的差异（unresolvable）：需要手工处理 */
+  manual: z.array(driftItemSchema),
+  total: z.number(),
+  /** 漂移摘要只保存前 100 项：脚本不完整，修完再检查一次 */
+  truncated: z.boolean(),
+  /** 风险提示（按规划器 step 的 kind 分类）：会删掉对象或数据的步骤数、去掉约束的步骤数、改列类型（可能重写整表）的步骤数 */
+  risks: z.object({
+    drops: z.number(),
+    constraints: z.number(),
+    rewrites: z.number(),
+    /** 重建（先 drop 再 create 同一个对象）的数量：不算删除 */
+    rebuilds: z.number(),
+  }),
+});
+export type RepairScript = z.infer<typeof repairScriptSchema>;
 
 /** 手动检查漂移的响应：skipped 有值表示这次没有检查（busy 正在执行、unfinished 上次停在中途、no_versions 项目还没有版本） */
 export const driftCheckResponseSchema = driftInfoSchema.extend({
   skipped: z.enum(['busy', 'unfinished', 'no_versions']).nullable(),
 });
 export type DriftCheckResponse = z.infer<typeof driftCheckResponseSchema>;
+
+// ───── 预演（dryRun） ─────
+
+/** 预演里的一个迁移：要执行的步骤、哪些不在事务里、验证时的风险摘要 */
+export const dryRunMigrationSchema = z.object({
+  versionId: z.string(),
+  number: z.number(),
+  name: z.string(),
+  direction: z.enum(['up', 'down', 'baseline']),
+  steps: z.array(scriptStepSchema),
+  /** 不在事务里的步骤数：含这些步骤的迁移不是原子的，中途失败要从断点续跑 */
+  nonTransactional: z.number(),
+  /** 发布 / 重新验证时影子库里分析的最高风险（只有升级脚本有）；没有分析为 null */
+  risk: z.enum(['low', 'medium', 'high']).nullable(),
+  riskError: z.string().nullable(),
+  verified: z.boolean(),
+});
+export type DryRunMigration = z.infer<typeof dryRunMigrationSchema>;
+
+export const dryRunPlanSchema = z.object({
+  mode: z.enum(['migrate', 'baseline']),
+  direction: z.enum(['up', 'down', 'none']),
+  /** 目标库还没有历史：baseline 只写基线，empty 在空库上建库；已有历史为 null */
+  firstRun: z.enum(['baseline', 'empty']).nullable(),
+  baseline: z.boolean(),
+  from: envVersionRefSchema.nullable(),
+  to: envVersionRefSchema.nullable(),
+  migrations: z.array(dryRunMigrationSchema),
+  /** 上一次停在中途：会从这个迁移的第 afterStep + 2 步接着跑 */
+  resume: z
+    .object({ versionId: z.string(), direction: z.enum(['up', 'down', 'baseline']), afterStep: z.number() })
+    .nullable(),
+  /** 会在目标库里新建 dowel schema */
+  createsHistory: z.boolean(),
+  /** 通过了的检查 */
+  checks: z.array(
+    z.enum(['lock', 'integrity', 'claim', 'drift', 'verified', 'instance_level', 'history_writable']),
+  ),
+});
+export type DryRunPlan = z.infer<typeof dryRunPlanSchema>;
+
+/**
+ * 预演的响应。检查没通过（漂移、未验证、被别的实例认领……）也是 200：ok = false，带原因，和执行时的错误事件同一个形状，
+ * 界面把它当作“如果现在执行会怎样”显示。**没有写目标库，也没有写平台库的登记。**
+ */
+export const dryRunResponseSchema = z.object({
+  ok: z.boolean(),
+  plan: dryRunPlanSchema.optional(),
+  error: z.string().optional(),
+  code: z.string().optional(),
+  details: execErrorDetailsSchema.optional(),
+});
+export type DryRunResponse = z.infer<typeof dryRunResponseSchema>;
 
 /** 目标库里的一个 schema：名字 + 表数（向导的勾选列表、schema 范围设置都用它） */
 export const schemaInfoSchema = z.object({ name: z.string(), tables: z.number() });
@@ -876,6 +1100,73 @@ export type TargetInfo = z.infer<typeof targetInfoSchema>;
 export const environmentCreatedSchema = targetInfoSchema.extend({ id: z.string() });
 export type EnvironmentCreated = z.infer<typeof environmentCreatedSchema>;
 
+// ───── 接入已有历史与认领（P4c） ─────
+
+/**
+ * 给已有项目添加环境，并接入这个库里已有的迁移历史。属于特权操作：适用环境的执行档位，且至少要项目管理员。
+ * claim：这个库里的项目由另一个实例认领时，确认认领（要实例管理员）；之后原实例的执行被拒绝。
+ */
+export const environmentAttachSchema = environmentCreateSchema.extend({
+  claim: z.boolean().default(false),
+});
+export type EnvironmentAttach = z.infer<typeof environmentAttachSchema>;
+
+export const attachResultSchema = environmentCreatedSchema.extend({
+  /** 这个库里有这个项目的历史并已接入；false 表示它只是一个新环境 */
+  attached: z.boolean(),
+  currentVersion: envVersionRefSchema.nullable(),
+  /** 这次是否认领了（换手） */
+  claimed: z.boolean(),
+  /** 环境已经建好，但有没做完的事（认领失败、同步目标库状态失败）：可以在环境页重试认领 / 读历史 */
+  warnings: z.array(z.string()).default([]),
+});
+export type AttachResult = z.infer<typeof attachResultSchema>;
+
+export const claimResultSchema = z.object({
+  /** false：本来就是本实例认领的，什么都没写 */
+  changed: z.boolean(),
+  previousInstanceId: z.string().nullable(),
+});
+export type ClaimResult = z.infer<typeof claimResultSchema>;
+
+// ───── 接手（P4c） ─────
+
+/** 接手向导第一步：连上一个库，看它登记过哪些项目 */
+export const takeoverInspectSchema = z.object({
+  url: postgresUrl,
+  /** 用这个组判断调用者有没有建项目的权限（接手相当于新建项目） */
+  groupId: z.string().min(1, '请选择组'),
+});
+export type TakeoverInspect = z.infer<typeof takeoverInspectSchema>;
+
+export const takeoverProjectSchema = z.object({
+  projectId: z.string(),
+  name: z.string().nullable(),
+  /** 当前认领它的实例；mine = 就是本实例（比如平台库没丢，只是项目被删了） */
+  claimedBy: z.string(),
+  mine: z.boolean(),
+  claimedAt: z.string().nullable(),
+  versions: z.number(),
+  headNumber: z.number().nullable(),
+  currentNumber: z.number().nullable(),
+  lastRunAt: z.string().nullable(),
+  /** 本实例里已经有同一个项目 ID 的项目：不能再接手（要接入新环境请用“添加环境”） */
+  existsHere: z.boolean(),
+  /** 已存在的那个项目调用者看不到：界面不给名字 / 归属，只说“已存在，请联系管理员” */
+  hidden: z.boolean(),
+});
+export type TakeoverProject = z.infer<typeof takeoverProjectSchema>;
+
+export const takeoverInspectResultSchema = z.object({
+  database: z.string(),
+  /** 这个库有没有 dowel 历史表 */
+  hasHistory: z.boolean(),
+  projects: z.array(takeoverProjectSchema),
+  /** 本实例的标识 */
+  instanceId: z.string(),
+});
+export type TakeoverInspectResult = z.infer<typeof takeoverInspectResultSchema>;
+
 /** 连接检查（向导第 2 步）：建项目之前检查一个连接串 */
 export const connectionCheckSchema = z.object({
   url: postgresUrl,
@@ -907,12 +1198,19 @@ export const projectWizardSchema = z.object({
     env: z.string().max(100).optional(),
     /** kind=sql：要在影子库里执行的 DDL */
     sql: z.string().min(1).max(5_000_000).optional(),
+    /** kind=takeover：要接手的项目（目标库 dowel.projects 里的 project_id）；`environments` 里每个库都必须有它的历史 */
+    projectId: z.string().min(1).max(200).optional(),
+    /**
+     * kind=takeover：确认认领。这些库里的项目由另一个实例认领时必须为 true，并且调用者是实例管理员；
+     * 后果：原实例之后执行会被拒绝，只读的漂移检查和读历史不受影响。
+     */
+    claim: z.boolean().optional(),
   }),
 });
 export type ProjectWizard = z.infer<typeof projectWizardSchema>;
 
 /** 进度阶段：连接 → 读取结构 → 规范化 → 写入 → 完成 */
-export const wizardStageSchema = z.enum(['connect', 'read', 'canonicalize', 'write', 'done']);
+export const wizardStageSchema = z.enum(['connect', 'read', 'canonicalize', 'write', 'claim', 'done']);
 export type WizardStage = z.infer<typeof wizardStageSchema>;
 
 /** SSE 每条消息的负载（`data:` 后面是它的 JSON） */
@@ -920,8 +1218,12 @@ export const wizardEventSchema = z.object({
   stage: wizardStageSchema,
   /** 出错时的信息；这时不会建出项目 */
   error: z.string().optional(),
+  /** 出错时的代码（接手：claim_required 需要确认认领、claim_forbidden 需要实例管理员、history_* 历史有问题、project_exists） */
+  code: z.string().optional(),
   /** 成功时给出建好的项目 */
   project: projectCreatedSchema.optional(),
+  /** 接手成功但有没做完的事（例如某个库认领失败：项目已经建好，可以在环境页重试认领） */
+  warnings: z.array(z.string()).optional(),
 });
 export type WizardEvent = z.infer<typeof wizardEventSchema>;
 

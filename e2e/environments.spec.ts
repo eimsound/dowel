@@ -45,12 +45,18 @@ test('添加环境、从数据库导入、在同实例影子库验证', async ({
       body: JSON.stringify({ error: '拉取失败' }),
     });
   await page.route(pullPattern, failPull);
+  // 导入先打开对话框预览（读线上结构）：预览失败在对话框里显示原因
   await page.getByRole('button', { name: '从此库导入结构' }).click();
-  await expect(page.getByText('拉取失败')).toHaveCount(1);
+  const imp = page.getByRole('dialog', { name: '把线上结构导入工作副本' });
+  await expect(imp.getByText('拉取失败')).toHaveCount(1);
   await page.unroute(pullPattern, failPull);
+  await imp.getByRole('button', { name: '取消' }).click();
 
+  // 重新打开：预览差异，确认后覆盖工作副本
   await page.getByRole('button', { name: '从此库导入结构' }).click();
-  await expect(page.getByText(/已从数据库导入/)).toBeVisible();
+  await expect(imp).toContainText('覆盖会带来的变化', { timeout: 30_000 });
+  await imp.getByRole('button', { name: '覆盖工作副本' }).click();
+  await expect(page.getByText(/已导入：工作副本现在是线上结构/)).toBeVisible();
 
   await gotoPage(page, '模型');
   await expect(

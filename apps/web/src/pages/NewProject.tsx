@@ -2,13 +2,21 @@
 // 每一步都能后退，表单状态全在这个组件里，后退不会丢（不卸载）。
 // 创建是一个请求（POST /api/projects/wizard，SSE 推进度），完成后跳到项目概览。
 // 布局按 DESIGN.md 的“向导”：用外壳的内容区（没有侧面板），步骤指示在顶部，上一步 / 下一步在底部右侧。
-import type { GroupList, ProjectCreated, TargetInfo, WizardEvent, WizardStage } from '@dowel/api';
+import type {
+  GroupList,
+  ProjectCreated,
+  TakeoverInspectResult,
+  TargetInfo,
+  WizardEvent,
+  WizardStage,
+} from '@dowel/api';
 import { useQuery, useQueryClient } from '@tanstack/react-query';
 import { useNavigate, useSearch } from '@tanstack/react-router';
 import { Check, CircleCheck, Database, FileUp, Plus, Trash2, TriangleAlert } from 'lucide-react';
 import { useRef, useState } from 'react';
 import { useTranslation } from 'react-i18next';
 import { api } from '../api.ts';
+import { ClaimDialog } from '../components/ClaimDialog.tsx';
 import { AppShell, PageHeader } from '../components/Shell.tsx';
 import { Banner, cx, IconButton } from '../components/ui.tsx';
 import { useMe } from '../session.ts';
@@ -33,6 +41,15 @@ interface EnvDraft {
 const STEPS = ['basics', 'database', 'content', 'confirm'] as const;
 /** 进度阶段的顺序（服务端可能跳过一些阶段，例如空白项目没有连接和读取） */
 const STAGES: WizardStage[] = ['connect', 'read', 'canonicalize', 'write', 'done'];
+/** 接手的阶段：读目标库历史、合并、写平台库，需要认领时最后认领 */
+const TAKEOVER_STAGES: WizardStage[] = ['connect', 'read', 'write', 'claim', 'done'];
+
+/** 接手：某个环境的库里登记过哪些项目（读取结果或错误） */
+interface TakeRead {
+  loading: boolean;
+  error: string;
+  data: TakeoverInspectResult | null;
+}
 
 const EMPTY_ENV = (key: string): EnvDraft => ({
   key,
@@ -83,6 +100,17 @@ export const NewProject = () => {
   const [schemaSel, setSchemaSel] = useState<{ key: string; names: string[] } | null>(null);
   const [sql, setSql] = useState('');
   const [error, setError] = useState('');
+  const [warnings, setWarningsState] = useState<string[]>([]);
+  const warningsRef = useRef<string[]>([]);
+  const setWarnings = (w: string[]) => {
+    warningsRef.current = w;
+    setWarningsState(w);
+  };
+  const [created, setCreated] = useState<ProjectCreated | null>(null);
+  /** 接手：每个环境（按本地 key）读到的项目、选中的项目、认领确认对话框 */
+  const [takeReads, setTakeReads] = useState<Record<string, TakeRead>>({});
+  const [takeProject, setTakeProject] = useState('');
+  const [claimOpen, setClaimOpen] = useState(false);
   const [stage, setStage] = useState<WizardStage | null>(null);
   const [busy, setBusy] = useState(false);
   const envSeq = useRef(0);
@@ -151,6 +179,57 @@ export const NewProject = () => {
     setStep(next);
   };
 
+  /** 接手：读每个环境的库，列出里面登记过的项目（只读） */
+  const readTakeover = async () => {
+    if (!effectiveGroupId) return;
+    setTakeReads(() =>
+      Object.fromEntries(filledEnvs.map((e) => [e.key, { loading: true, error: '', data: null }])),
+    );
+    await Promise.all(
+      filledEnvs.map(async (e) => {
+        try {
+          const data = await api<TakeoverInspectResult>('POST', '/api/takeover/inspect', {
+            url: e.url,
+            groupId: effectiveGroupId,
+          });
+          setTakeReads((m) => ({ ...m, [e.key]: { loading: false, error: '', data } }));
+        } catch (x) {
+          setTakeReads((m) => ({
+            ...m,
+            [e.key]: { loading: false, error: x instanceof Error ? x.message : String(x), data: null },
+          }));
+        }
+      }),
+    );
+  };
+  /** 各环境里出现过的项目（按项目 ID 合并），每个带上出现在哪些环境 */
+  const candidates = (() => {
+    const map = new Map<
+      string,
+      {
+        id: string;
+        name: string | null;
+        envs: { env: string; p: TakeoverInspectResult['projects'][number] }[];
+      }
+    >();
+    for (const e of filledEnvs) {
+      for (const p of takeReads[e.key]?.data?.projects ?? []) {
+        const c = map.get(p.projectId) ?? { id: p.projectId, name: p.name, envs: [] };
+        c.envs.push({ env: e.name, p });
+        map.set(p.projectId, c);
+      }
+    }
+    return [...map.values()];
+  })();
+  const takeCand = candidates.find((c) => c.id === takeProject);
+  const readsDone =
+    filledEnvs.length > 0 && filledEnvs.every((e) => takeReads[e.key] && !takeReads[e.key]!.loading);
+  const takeMissing = takeCand ? filledEnvs.filter((e) => !takeCand.envs.some((x) => x.env === e.name)) : [];
+  const takeExists = takeCand?.envs.some((x) => x.p.existsHere) ?? false;
+  /** 需要认领：有环境里这个项目由另一个实例认领 */
+  const takeClaim = takeCand?.envs.find((x) => !x.p.mine) ?? null;
+  const isInstanceAdmin = me?.role === 'admin';
+
   const validBasics = name.trim().length > 0 && !!effectiveGroupId;
   const envMissing = (kind === 'database' || kind === 'sql') && filledEnvs.length === 0;
   // schema 勾选不能为空（不知道 schema 列表时不拦，交给服务端报错）
@@ -160,7 +239,9 @@ export const NewProject = () => {
       ? true
       : kind === 'sql'
         ? filledEnvs.length > 0 && sql.trim().length > 0
-        : filledEnvs.length > 0 && !schemaMissing;
+        : kind === 'takeover'
+          ? !!takeCand && takeMissing.length === 0 && !takeExists && (!takeClaim || isInstanceAdmin)
+          : filledEnvs.length > 0 && !schemaMissing;
 
   const canNext =
     (step === 0 && validBasics) ||
@@ -168,9 +249,16 @@ export const NewProject = () => {
     (step === 2 && validContent) ||
     (step === 3 && validBasics && validContent);
 
-  const create = async () => {
+  const create = async (claimConfirmed = false) => {
+    // 接手别的实例认领的库：先弹出认领确认（说明后果），确认之后才提交
+    if (kind === 'takeover' && takeClaim && !claimConfirmed) {
+      setClaimOpen(true);
+      return;
+    }
+    setClaimOpen(false);
     setBusy(true);
     setError('');
+    setWarnings([]);
     setStage(null);
     const body = {
       name: name.trim(),
@@ -190,6 +278,8 @@ export const NewProject = () => {
         kind,
         env: kind === 'database' ? sourceEnv?.name : undefined,
         sql: kind === 'sql' ? sql : undefined,
+        projectId: kind === 'takeover' ? takeProject : undefined,
+        claim: kind === 'takeover' && takeClaim ? true : undefined,
       },
     };
     let project = null as ProjectCreated | null; // 在 readSse 的回调里赋值，不加断言 TS 会把它收窄成 null
@@ -211,6 +301,7 @@ export const NewProject = () => {
         if (event.error) setError(event.error);
         else setStage(event.stage);
         if (event.project) project = event.project;
+        if (event.warnings?.length) setWarnings(event.warnings);
       });
     } catch (e) {
       setError(e instanceof Error ? e.message : String(e));
@@ -221,6 +312,11 @@ export const NewProject = () => {
       qc.invalidateQueries({ queryKey: ['projects'] }),
       qc.invalidateQueries({ queryKey: ['groups'] }),
     ]);
+    // 项目建好了但有没做完的事（例如某个库认领失败）：先让用户看到，再进项目
+    if (warningsRef.current.length) {
+      setCreated(project);
+      return;
+    }
     await nav({
       to: '/project/$owner/$project',
       params: { owner: project.group.slug, project: project.slug },
@@ -439,7 +535,7 @@ export const NewProject = () => {
             <section className="mt-4 space-y-4">
               <fieldset className="m-0 space-y-2 border-0 p-0">
                 <legend className="label">{t('wiz.contentTitle')}</legend>
-                {(['blank', 'database', 'sql'] as const).map((k) => (
+                {(['blank', 'database', 'sql', 'takeover'] as const).map((k) => (
                   <label
                     key={k}
                     className={cx(
@@ -452,7 +548,12 @@ export const NewProject = () => {
                       name="content"
                       className="mt-0.5"
                       checked={kind === k}
-                      onChange={() => setKind(k)}
+                      onChange={() => {
+                        setKind(k);
+                        // 接手：选中就读一次各环境的库（还没读过的话）
+                        if (k === 'takeover' && filledEnvs.length > 0 && Object.keys(takeReads).length === 0)
+                          void readTakeover();
+                      }}
                     />
                     <span className="space-y-0.5">
                       <span className="block text-sm font-medium">{t(`wiz.content${cap(k)}`)}</span>
@@ -460,14 +561,120 @@ export const NewProject = () => {
                     </span>
                   </label>
                 ))}
-                <label className="flex items-start gap-2.5 rounded-md border border-border bg-panel p-3 opacity-60">
-                  <input type="radio" name="content" className="mt-0.5" disabled checked={false} readOnly />
-                  <span className="space-y-0.5">
-                    <span className="block text-sm font-medium">{t('wiz.contentTakeover')}</span>
-                    <span className="block text-xs text-text-2">{t('wiz.contentTakeoverHint')}</span>
-                  </span>
-                </label>
               </fieldset>
+
+              {kind === 'takeover' && (
+                <div className="space-y-3 rounded-md border border-border bg-panel p-4">
+                  <h3 className="section-title">{t('tk.wizTitle')}</h3>
+                  <p className="hint">{t('tk.wizHint')}</p>
+                  {filledEnvs.length === 0 ? (
+                    <Banner kind="warn" role="alert">
+                      {t('tk.needEnv')}
+                    </Banner>
+                  ) : (
+                    <>
+                      <div className="flex flex-wrap items-center gap-2">
+                        <button
+                          type="button"
+                          className="btn"
+                          disabled={Object.values(takeReads).some((r) => r.loading)}
+                          aria-busy={Object.values(takeReads).some((r) => r.loading) || undefined}
+                          onClick={() => void readTakeover()}
+                        >
+                          {Object.values(takeReads).some((r) => r.loading)
+                            ? t('tk.reading')
+                            : Object.keys(takeReads).length
+                              ? t('tk.reread')
+                              : t('tk.read')}
+                        </button>
+                      </div>
+                      {filledEnvs.map(
+                        (e) =>
+                          takeReads[e.key]?.error && (
+                            <Banner key={e.key} kind="danger" role="alert">
+                              {e.name}：{t('tk.readError', { msg: takeReads[e.key]!.error })}
+                            </Banner>
+                          ),
+                      )}
+                      {readsDone &&
+                        candidates.length === 0 &&
+                        !filledEnvs.some((e) => takeReads[e.key]?.error) && (
+                          <Banner kind="warn" role="status">
+                            {filledEnvs.every((e) => takeReads[e.key]?.data?.hasHistory === false)
+                              ? t('tk.noHistory')
+                              : t('tk.noProjects')}
+                          </Banner>
+                        )}
+                      {candidates.length > 0 && (
+                        <fieldset className="m-0 space-y-2 border-0 p-0">
+                          <legend className="label">{t('tk.pick')}</legend>
+                          {candidates.map((c) => {
+                            const first = c.envs[0]!.p;
+                            return (
+                              <label
+                                key={c.id}
+                                className={cx(
+                                  'flex cursor-pointer items-start gap-2.5 rounded-md border p-3',
+                                  takeProject === c.id
+                                    ? 'border-primary bg-primary-soft'
+                                    : 'border-border bg-bg',
+                                )}
+                              >
+                                <input
+                                  type="radio"
+                                  name="takeover-project"
+                                  className="mt-0.5"
+                                  checked={takeProject === c.id}
+                                  onChange={() => setTakeProject(c.id)}
+                                />
+                                <span className="space-y-0.5">
+                                  <span className="block text-sm font-medium">{c.name ?? c.id}</span>
+                                  <span className="block font-mono text-xs text-text-2">{c.id}</span>
+                                  <span className="block text-xs text-text-2">
+                                    {t('tk.versionsInfo', {
+                                      count: first.versions,
+                                      head: first.headNumber ?? '?',
+                                    })}
+                                    {' · '}
+                                    {first.currentNumber === null
+                                      ? t('tk.notExecuted')
+                                      : t('tk.currentInfo', { number: first.currentNumber })}
+                                    {' · '}
+                                    {c.envs.every((x) => x.p.mine)
+                                      ? t('tk.claimedMine')
+                                      : t('tk.claimedOther')}
+                                  </span>
+                                  <span className="block text-xs text-text-2">
+                                    {t('tk.inEnvs', { envs: c.envs.map((x) => x.env).join('、') })}
+                                  </span>
+                                </span>
+                              </label>
+                            );
+                          })}
+                        </fieldset>
+                      )}
+                      {takeCand && takeMissing.length > 0 && (
+                        <Banner kind="warn" role="alert">
+                          {t('tk.missingIn', { envs: takeMissing.map((e) => e.name).join('、') })}
+                        </Banner>
+                      )}
+                      {takeCand && takeExists && (
+                        <Banner kind="warn" role="alert">
+                          {takeCand.envs.some((x) => x.p.existsHere && !x.p.hidden)
+                            ? t('tk.existsHere')
+                            : t('tk.existsHidden')}
+                        </Banner>
+                      )}
+                      {takeCand && takeClaim && (
+                        <Banner kind="info" role="status">
+                          {isInstanceAdmin ? t('tk.needsClaim') : t('tk.claimNeedsAdmin')}
+                        </Banner>
+                      )}
+                      <p className="hint m-0">{t('tk.mergeHint')}</p>
+                    </>
+                  )}
+                </div>
+              )}
 
               {envMissing && (
                 <Banner kind="warn" role="alert">
@@ -586,7 +793,10 @@ export const NewProject = () => {
                 </dd>
                 <dt className="text-text-2">{t('wiz.sumContent')}</dt>
                 <dd className="m-0">
-                  {t(`wiz.content${cap(kind)}`)}
+                  {kind === 'takeover' && takeCand
+                    ? t('tk.sumTakeover', { name: takeCand.name ?? takeCand.id, id: takeCand.id })
+                    : t(`wiz.content${cap(kind)}`)}
+                  {kind === 'takeover' && takeClaim && <p className="hint m-0 mt-1">{t('tk.sumClaim')}</p>}
                   {kind === 'database' && sourceEnv && (
                     <span className="ml-2 font-mono text-xs text-text-3">{sourceEnv.name}</span>
                   )}
@@ -603,7 +813,30 @@ export const NewProject = () => {
                     : t('wiz.sumAll')}
                 </dd>
               </dl>
-              {busy && <Progress stage={stage} />}
+              {busy && <Progress stage={stage} stages={kind === 'takeover' ? TAKEOVER_STAGES : STAGES} />}
+              {created && warnings.length > 0 && (
+                <Banner kind="warn" title={t('tk.warnTitle')} role="alert">
+                  <ul className="m-0 list-disc pl-5">
+                    {warnings.map((w) => (
+                      <li key={w}>{w}</li>
+                    ))}
+                  </ul>
+                  <div className="mt-2">
+                    <button
+                      type="button"
+                      className="btn primary"
+                      onClick={() =>
+                        void nav({
+                          to: '/project/$owner/$project',
+                          params: { owner: created.group.slug, project: created.slug },
+                        })
+                      }
+                    >
+                      {t('tk.openProject')}
+                    </button>
+                  </div>
+                </Banner>
+              )}
               {error && (
                 <Banner kind="danger" role="alert" title={t('wiz.failed')}>
                   {error}
@@ -647,7 +880,7 @@ export const NewProject = () => {
                 type="button"
                 className="btn primary"
                 onClick={() => void create()}
-                disabled={!canNext || busy}
+                disabled={!canNext || busy || created !== null}
                 aria-busy={busy}
               >
                 {busy ? t('wiz.running') : t('wiz.create')}
@@ -656,6 +889,16 @@ export const NewProject = () => {
           </div>
         </div>
       </main>
+      <ClaimDialog
+        open={claimOpen}
+        onClose={() => setClaimOpen(false)}
+        onConfirm={() => void create(true)}
+        pending={busy}
+        error={undefined}
+        instanceId={takeClaim?.p.claimedBy}
+        isAdmin={isInstanceAdmin}
+        confirmLabel={t('tk.claimConfirmTakeover')}
+      />
     </AppShell>
   );
 };
@@ -708,14 +951,14 @@ const CheckResult = ({ info }: { info: TargetInfo }) => {
 };
 
 /** 进度：阶段粒度（连接 / 读取结构 / 规范化 / 写入 / 完成） */
-const Progress = ({ stage }: { stage: WizardStage | null }) => {
+const Progress = ({ stage, stages }: { stage: WizardStage | null; stages: WizardStage[] }) => {
   const { t } = useTranslation();
-  const at = stage ? STAGES.indexOf(stage) : -1;
+  const at = stage ? stages.indexOf(stage) : -1;
   return (
     <div className="rounded-md border border-border bg-panel p-4" role="status" aria-live="polite">
       <p className="label">{t('wiz.progress')}</p>
       <ol className="m-0 flex list-none flex-wrap items-center gap-2 p-0 text-xs">
-        {STAGES.map((s, i) => (
+        {stages.map((s, i) => (
           <li
             key={s}
             className={cx(

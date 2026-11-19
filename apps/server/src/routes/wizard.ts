@@ -25,10 +25,9 @@ import type { Hono } from 'hono';
 import { HTTPException } from 'hono/http-exception';
 import { streamSSE } from 'hono/streaming';
 import { audit } from '../audit.ts';
-import { can, userActor } from '../authz.ts';
 import { freezeBaseline } from '../chain.ts';
 import { insertGrant } from '../grants.ts';
-import { groupById, groupRoleOf, pickProjectSlug } from '../groups.ts';
+import { pickProjectSlug } from '../groups.ts';
 import { encrypt, SecretError, scrubSecrets } from '../secrets.ts';
 import { assertImportable, type Shadow, ShadowError, storedReport } from '../shadow.ts';
 import { prepareShadow } from '../shadows.ts';
@@ -40,7 +39,8 @@ import {
   inspectTarget,
   pullSchema,
 } from '../targets.ts';
-import { type AppContext, body, type Env } from './context.ts';
+import { type AppContext, body, connectionLimit, createProjectGroup, type Env } from './context.ts';
+import { runTakeover } from './takeover.ts';
 
 export const registerWizard = (app: Hono<Env>, ctx: AppContext) => {
   const { db } = ctx;
@@ -49,22 +49,11 @@ export const registerWizard = (app: Hono<Env>, ctx: AppContext) => {
     const u = c.get('user');
     const b = await body(c, projectWizardSchema);
 
-    const g = await groupById(db, b.groupId);
-    if (!g) throw new HTTPException(404, { message: '组不存在' });
-    const groupRole = await groupRoleOf(db, g.id, u.id);
-    if (
-      !can(userActor(u), 'group.create_project', {
-        kind: 'group',
-        groupRole,
-        projectCreation: g.projectCreation,
-      })
-    )
-      throw new HTTPException(403, { message: '没有在这个组建项目的权限' });
+    const g = await createProjectGroup(c, ctx, b.groupId);
 
     const kind = b.content.kind;
-    // 接手（takeover）P4 才实现：现在明确拒绝，不静默忽略
-    if (kind === 'takeover')
-      throw new HTTPException(422, { message: '“接手现有项目”暂时还没有实现，即将推出' });
+    // 接手：从目标库的 dowel 历史恢复整个项目（routes/takeover.ts）
+    if (kind === 'takeover') return runTakeover(c, ctx, b, g);
 
     // 环境名统一去首尾空白（界面上也 trim；这里兜底），去完不能为空、不能重复
     const environments = b.environments.map((e) => ({ ...e, name: e.name.trim() }));
@@ -95,15 +84,7 @@ export const registerWizard = (app: Hono<Env>, ctx: AppContext) => {
 
     // 限速（服务端替用户去连地址）：每个环境算一次，导入再算一次；超限时还没有开始任何写入
     const needed = environments.length + (kind === 'database' || kind === 'sql' ? 1 : 0);
-    for (let i = 0; i < needed; i++) {
-      const limit = ctx.connectionLimiter.attempt(u.id);
-      if (!limit.allowed) {
-        c.header('Retry-After', String(limit.retryAfterSeconds));
-        throw new HTTPException(429, {
-          message: `连接检查太频繁了，请 ${limit.retryAfterSeconds} 秒后再试`,
-        });
-      }
-    }
+    connectionLimit(c, ctx, needed);
 
     // 导入的 SQL 里有实例级语句就拒绝：在限速之后（扫描 SQL 也要花 CPU）、连接任何数据库和准备影子库之前，
     // 不建 {库名}_dowel、不拿锁、不执行；只在这里扫一遍，下游的 importSql 只接受检查过的类型（见 assertImportable）

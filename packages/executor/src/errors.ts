@@ -1,4 +1,5 @@
 import type { HistoryErrorCode } from '@dowel/engines';
+import type { MarkPlan } from './mark.ts';
 import type { DiffItem } from './types.ts';
 
 export type ExecutorErrorCode =
@@ -11,8 +12,14 @@ export type ExecutorErrorCode =
   | 'history_broken'
   /** 目标库历史与平台库的版本链对不上（版本不在链上、校验和不同……） */
   | 'history_mismatch'
-  /** 这个项目的历史属于另一个 Dowel 实例（认领流程之后提供） */
+  /** 这个项目在目标库里的“当前认领实例”不是本实例：执行被拒绝，要先认领（只读的检查不受影响） */
   | 'foreign_instance'
+  /** 接手 / 接入历史：目标库里没有这个项目的历史 */
+  | 'history_missing'
+  /** 接手 / 接入历史：同一个版本 ID 在不同环境里的内容不一致（checksum、模型、序号、parent……） */
+  | 'history_conflict'
+  /** 接手 / 接入历史：链分叉——两个环境在同一个父版本下有不同的子版本 */
+  | 'history_fork'
   /** 线上结构与环境当前版本的模型不一致 */
   | 'drift'
   /** 第一次执行到这个库，但它既不是基线结构、也不是空库 */
@@ -27,6 +34,16 @@ export type ExecutorErrorCode =
   | 'instance_level'
   /** 上一次执行停在中途，必须先接着把它跑完 */
   | 'unfinished_run'
+  /** 标记为已执行：向前标记没有带预演拿到的计划（expect）：确认必须绑定到预演结果 */
+  | 'expect_required'
+  /** 标记为已执行：锁里算出的计划和预演时不一样了（目标库在核对之后变了）：什么都没写，details.markPlan 是新的计划 */
+  | 'plan_changed'
+  /** 标记为已执行：向前标记没有确认“被跳过的版本里的脚本效果已经手工完成，或者不需要” */
+  | 'ack_required'
+  /** 标记为已执行：线上结构不等于目标版本的模型 */
+  | 'mark_mismatch'
+  /** 标记为已执行：环境已经记在目标版本 */
+  | 'mark_noop'
   /** 意料之外的错误（读结构失败、范围错误、连接断开……）：已记失败记录，原错误在 `cause` 里 */
   | 'unexpected'
   /** 某一步 SQL 报错 */
@@ -52,6 +69,10 @@ export interface ExecutorErrorDetails {
   comparedNumber?: number;
   /** 差异是上一次“读回校验失败”的执行留下的：不能续跑，需要人工修正 */
   needsManual?: { direction: 'up' | 'down' | 'baseline'; versionId: string | null };
+  /** foreign_instance：当前认领这个项目的实例，以及换手信息 */
+  claim?: { instanceId: string; claimedAt: string | null; previousInstanceId: string | null };
+  /** plan_changed：锁里重新算出的标记计划 */
+  markPlan?: MarkPlan;
   /** 出错时环境停在哪个版本（目标库历史里最后一条成功的记录） */
   reached?: string | null;
 }

@@ -550,6 +550,7 @@ describe.each([
       versions: [],
       runs: [],
       project: null,
+      claims: [],
       unfinished: null,
       readbackFailure: null,
       ...over,

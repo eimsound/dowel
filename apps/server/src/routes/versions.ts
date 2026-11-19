@@ -49,6 +49,7 @@ interface InfoRow {
   edited: boolean;
   createdAt: string;
   createdBy: string | null;
+  restoredAt: string | null;
 }
 
 /** 详情字段：模型、冻结脚本和验证报告 */
@@ -66,7 +67,7 @@ type VersionRow = InfoRow & Detail;
 
 /** 列表只要概要：不读模型和冻结脚本（模型可能很大，版本又多） */
 const INFO_COLUMNS = `v.id, v.name, v.seq, v.number, v.parent_id as "parentId", v.verified_at as "verifiedAt", v.edited,
-  v.created_at as "createdAt", u.name as "createdBy"`;
+  v.created_at as "createdAt", u.name as "createdBy", v.restored_at as "restoredAt"`;
 const ROW_COLUMNS = `${INFO_COLUMNS}, v.model, v.up_steps as "upSteps", v.down_steps as "downSteps", v.checksum,
   v.verify_report as "verifyReport", v.scope`;
 
@@ -110,6 +111,7 @@ const toInfo = (v: InfoRow, latestId: string | null): VersionInfo => ({
   verifiedAt: v.verifiedAt,
   edited: v.edited,
   latest: v.id === latestId,
+  restoredAt: v.restoredAt ? new Date(v.restoredAt).toISOString() : null,
 });
 
 const toDetail = (v: VersionRow, latestId: string | null): VersionDetail => ({

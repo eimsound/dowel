@@ -6,6 +6,7 @@ import { afterAll, describe, expect, test } from 'vitest';
 import { connect, createTestDb, dbUrl, PG_URL, useTestDb } from '../../../test/pg.ts';
 import { build, resetShadow } from '../../verifier/src/index.ts';
 import {
+  claimProject,
   type Db,
   ensureHistory,
   fingerprint,
@@ -14,9 +15,13 @@ import {
   HISTORY_FORMAT,
   HistoryError,
   type HistoryVersionRow,
+  historyWriteProblem,
   isNontransactionalSql,
+  listHistoryProjects,
   markStep,
+  readClaims,
   readHistory,
+  readHistoryFormat,
   readProject,
   readSnapshot,
   recordVersion,
@@ -83,6 +88,7 @@ const row = (
     number: n,
     parentId: parent,
     name: `v${n}`,
+    scope: null,
     upSteps,
     downSteps,
     checksum: stepsChecksum(upSteps, downSteps),
@@ -173,7 +179,7 @@ describe.skipIf(!PG_URL)('ensureHistory', () => {
     return { role, password };
   };
 
-  test('建 schema 和表，幂等（含并发）；format_version 从 1 开始', async () => {
+  test('建 schema 和表，幂等（含并发）；format_version 记在 meta 里', async () => {
     const t = await createTestDb('hist_ensure');
     try {
       await ensureHistory(t.db);
@@ -188,7 +194,7 @@ describe.skipIf(!PG_URL)('ensureHistory', () => {
       const tables = await t.db.query<{ table_name: string }>(
         `select table_name from information_schema.tables where table_schema = 'dowel' order by table_name`,
       );
-      expect(tables.map((x) => x.table_name)).toEqual(['history', 'meta', 'projects', 'versions']);
+      expect(tables.map((x) => x.table_name)).toEqual(['claims', 'history', 'meta', 'projects', 'versions']);
       const [meta] = await t.db.query<{ value: number }>(
         "select value from dowel.meta where key = 'format_version'",
       );
@@ -204,15 +210,30 @@ describe.skipIf(!PG_URL)('ensureHistory', () => {
     }
   });
 
-  test('目标库里的格式比代码新：报错，不动里面的数据', async () => {
+  test('格式比代码新（或不是整数）：执行和读历史都拒绝（format_too_new），不动里面的数据；当前格式是 1', async () => {
     const t = await createTestDb('hist_format');
     try {
+      expect(HISTORY_FORMAT).toBe(1);
       await ensureHistory(t.db);
-      await t.db.exec(`update dowel.meta set value = '2'::jsonb where key = 'format_version'`);
-      await expect(ensureHistory(t.db)).rejects.toMatchObject({ code: 'format_too_new' });
-      expect(await t.db.query("select value from dowel.meta where key = 'format_version'")).toEqual([
-        { value: 2 },
-      ]);
+      // 当前格式：一切正常，ensureHistory 幂等
+      expect(await readHistoryFormat(t.db)).toBe(1);
+      await ensureHistory(t.db);
+      for (const bad of ['2', '3', '"x"', '1.5']) {
+        await t.db.exec(`update dowel.meta set value = '${bad}'::jsonb where key = 'format_version'`);
+        await expect(ensureHistory(t.db), bad).rejects.toMatchObject({ code: 'format_too_new' });
+        // 读也不行（认得的表结构可能已经变了）；预演的写权限检查也提前报
+        await expect(readHistoryFormat(t.db), bad).rejects.toMatchObject({ code: 'format_too_new' });
+        await expect(
+          readHistory(t.db, 'p').then(() => readHistoryFormat(t.db)),
+          bad,
+        ).rejects.toMatchObject({
+          code: 'format_too_new',
+        });
+        expect(await historyWriteProblem(t.db), bad).toMatchObject({ code: 'format_too_new' });
+        expect(await t.db.query("select value from dowel.meta where key = 'format_version'"), bad).toEqual([
+          { value: JSON.parse(bad) },
+        ]);
+      }
     } finally {
       await t.close();
     }
@@ -409,6 +430,7 @@ describe.skipIf(!PG_URL)('版本行与执行记录', () => {
       instanceId: 'inst-a',
       claimedAt: null,
       claimedBy: null,
+      previousInstanceId: null,
     });
     await writeProject(db, {
       projectId: 'claim',
@@ -629,5 +651,183 @@ describe.skipIf(!PG_URL)('fingerprint', () => {
     const one = fingerprint(await build(conn(), m));
     const two = fingerprint(await build(conn(), m));
     expect(one).toBe(two);
+  });
+});
+
+// ───── P4c：scope、previous_instance_id、claims 与认领 ─────
+
+describe.skipIf(!PG_URL)('scope、认领与预演检查', () => {
+  test('direction 约束包含 mark（标记为已执行）；当前版本取最后一条 done 的 to_version，mark 也一样；其他方向仍被拒绝', async () => {
+    const t = await createTestDb('hist_mark');
+    try {
+      await ensureHistory(t.db);
+      const base = { projectId: 'pm', executedBy: 'u1', via: 'web' as const, instanceId: 'i1' };
+      const a = await startRun(t.db, { ...base, fromVersion: null, toVersion: 'v1', direction: 'up' });
+      await finishRun(t.db, a, 'done');
+      const m = await startRun(t.db, { ...base, fromVersion: 'v1', toVersion: 'v3', direction: 'mark' });
+      await finishRun(t.db, m, 'done');
+      const h = await readHistory(t.db, 'pm');
+      expect(h.currentVersion).toBe('v3');
+      expect(h.history.map((x) => x.direction)).toEqual(['up', 'mark']);
+      await expect(
+        t.db.query(
+          "insert into dowel.history (project_id, to_version, direction, status, via, instance_id) values ('pm', 'v', 'adopt', 'running', 'web', 'i')",
+        ),
+      ).rejects.toThrow();
+    } finally {
+      await t.close();
+    }
+  });
+
+  test('scope 随版本行存取：null 表示全部，列表原样返回', async () => {
+    const t = await createTestDb('hist_scope');
+    try {
+      await ensureHistory(t.db);
+      const a = { ...row(1, null, 'CREATE TABLE a (id int)', 'DROP TABLE a', 's'), scope: ['app'] };
+      const b = {
+        ...row(2, a.versionId, 'ALTER TABLE a ADD b int', 'ALTER TABLE a DROP b', 's'),
+        scope: null,
+      };
+      await recordVersion(t.db, a);
+      await recordVersion(t.db, b);
+      const h = await readHistory(t.db, 's');
+      expect(h.versions.map((v) => v.scope)).toEqual([['app'], null]);
+      // 往返之后 checksum / 链仍然完整
+      expect(verifyChain(h.versions)).toEqual([]);
+    } finally {
+      await t.close();
+    }
+  });
+
+  test('认领：换手写项目行 + 追加认领事件；本实例重复认领什么都不写；claims 只追加', async () => {
+    const t = await createTestDb('hist_claim');
+    try {
+      await ensureHistory(t.db);
+      await writeProject(t.db, {
+        projectId: 'c1',
+        name: '商城',
+        instanceId: 'inst-a',
+        claimedAt: null,
+        claimedBy: 'u-a',
+      });
+      const r1 = await claimProject(t.db, {
+        projectId: 'c1',
+        instanceId: 'inst-b',
+        claimedBy: 'u-b',
+        claimedByName: '李四',
+        name: '商城 B',
+      });
+      expect(r1).toEqual({ changed: true, previousInstanceId: 'inst-a' });
+      expect(await readProject(t.db, 'c1')).toMatchObject({
+        instanceId: 'inst-b',
+        previousInstanceId: 'inst-a',
+        claimedBy: 'u-b',
+        name: '商城 B',
+      });
+      expect((await readProject(t.db, 'c1'))!.claimedAt).not.toBeNull();
+      const again = await claimProject(t.db, {
+        projectId: 'c1',
+        instanceId: 'inst-b',
+        claimedBy: 'u-b',
+        claimedByName: '李四',
+        name: null,
+      });
+      expect(again.changed).toBe(false);
+      const claims = await readClaims(t.db, 'c1');
+      expect(claims).toHaveLength(1);
+      expect(claims[0]).toMatchObject({
+        instanceId: 'inst-b',
+        previousInstanceId: 'inst-a',
+        claimedByName: '李四',
+      });
+      // 只追加：改和删都被触发器拒绝
+      await expect(t.db.exec("update dowel.claims set instance_id = 'x'")).rejects.toThrow(/只追加/);
+      await expect(t.db.exec('delete from dowel.claims')).rejects.toThrow(/只追加/);
+      // 没有项目行（被手工删了）也能认领，上一个实例未知
+      await t.db.exec("delete from dowel.projects where project_id = 'c1'");
+      const lost = await claimProject(t.db, {
+        projectId: 'c1',
+        instanceId: 'inst-c',
+        claimedBy: null,
+        claimedByName: null,
+        name: null,
+      });
+      expect(lost).toEqual({ changed: true, previousInstanceId: null });
+    } finally {
+      await t.close();
+    }
+  });
+
+  test('listHistoryProjects：登记过的项目、版本数、当前版本序号；没有历史表返回空', async () => {
+    const t = await createTestDb('hist_list');
+    try {
+      expect(await listHistoryProjects(t.db)).toEqual([]);
+      expect(await readHistoryFormat(t.db)).toBeNull();
+      await ensureHistory(t.db);
+      const v1 = row(1, null, 'CREATE TABLE a (id int)', 'DROP TABLE a', 'pa');
+      const v2 = row(2, v1.versionId, 'ALTER TABLE a ADD b int', 'ALTER TABLE a DROP b', 'pa');
+      await recordVersion(t.db, v1);
+      await recordVersion(t.db, v2);
+      await writeProject(t.db, {
+        projectId: 'pa',
+        name: 'A 项目',
+        instanceId: 'inst-a',
+        claimedAt: null,
+        claimedBy: null,
+      });
+      await writeProject(t.db, {
+        projectId: 'pb',
+        name: 'B 项目',
+        instanceId: 'inst-b',
+        claimedAt: null,
+        claimedBy: null,
+      });
+      const run = await startRun(t.db, {
+        projectId: 'pa',
+        fromVersion: null,
+        toVersion: v1.versionId,
+        direction: 'up',
+        executedBy: null,
+        via: 'web',
+        instanceId: 'inst-a',
+      });
+      await finishRun(t.db, run, 'done');
+      const list = await listHistoryProjects(t.db);
+      expect(list.map((x) => [x.projectId, x.versions, x.headNumber, x.currentNumber])).toEqual([
+        ['pa', 2, 2, 1],
+        ['pb', 0, null, null],
+      ]);
+    } finally {
+      await t.close();
+    }
+  });
+
+  test('historyWriteProblem（预演）：没有 schema 且不能建时说明缺什么；不建任何东西', async () => {
+    const t = await createTestDb('hist_wp');
+    const admin = connect(PG_URL);
+    const role = `hist_w_${Math.random().toString(36).slice(2, 8)}`;
+    try {
+      await admin.db.exec(`CREATE ROLE ${role} LOGIN PASSWORD 'pw'`);
+      await t.db.exec(
+        `revoke create on database ${(await t.db.query<{ n: string }>('select current_database() as n'))[0]!.n} from public`,
+      );
+      const u = new URL(t.url);
+      u.username = role;
+      u.password = 'pw';
+      const limited = connect(u.toString());
+      try {
+        expect(await historyWriteProblem(limited.db)).toMatchObject({ code: 'no_schema_privilege' });
+      } finally {
+        await limited.close();
+      }
+      expect(await t.db.query("select 1 from pg_namespace where nspname = 'dowel'")).toEqual([]);
+      // 有权限、没有历史：没有问题，仍然什么都没建
+      expect(await historyWriteProblem(t.db)).toBeNull();
+      expect(await t.db.query("select 1 from pg_namespace where nspname = 'dowel'")).toEqual([]);
+    } finally {
+      await t.close();
+      await admin.db.exec(`DROP ROLE IF EXISTS ${role}`);
+      await admin.close();
+    }
   });
 });

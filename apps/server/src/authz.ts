@@ -28,17 +28,20 @@ export type ProjectAction =
  * 环境上的特权操作（02-consensus.md 11.3）：受环境的“谁能执行”档位约束（H6，P5 之前的过渡方案）。
  * 模型的编辑和发布不在其中。
  * - environment.execute / rollback / baseline：执行、回滚、写入基线；
- * - environment.resolve_drift：处理漂移（预留：“接受线上结构”还没做，先把动作和档位占住）；
+ * - environment.mark：标记为已执行（ADR 0004）——不执行 SQL，把环境记为已到达链上某个版本，前提是线上结构等于它的模型；
+ *   取代 P4b 预留的 resolve_drift。**CI 令牌不能标记**（P6 接入令牌时，令牌的 Actor 不能通过这个动作）；
  * - environment.change_connection：改连接串、影子库、是否允许同实例影子库；
  * - environment.unmark_production：取消“生产”标记；
  * - environment.set_policy：改执行档位本身；
  * - environment.delete：删除环境。
  */
 export type EnvAction =
+  /** 给已有项目添加环境并接入这个库里已有的历史（配置类：至少项目管理员，且满足执行档位） */
+  | 'environment.attach_history'
   | 'environment.execute'
   | 'environment.rollback'
   | 'environment.baseline'
-  | 'environment.resolve_drift'
+  | 'environment.mark'
   | 'environment.change_connection'
   | 'environment.unmark_production'
   | 'environment.set_policy'
@@ -55,6 +58,8 @@ export type GroupAction =
 
 /** 实例级动作（instance.create_group 的规则依赖实例设置，在 can() 里单独判断） */
 export type InstanceAction =
+  /** 认领：把目标库里一个项目的“当前认领实例”换成本实例（之后原实例的执行被拒绝）；只有实例管理员 */
+  | 'instance.claim_project'
   | 'instance.manage_users'
   | 'instance.manage_settings'
   | 'instance.invite'
@@ -117,6 +122,7 @@ const meetsPolicy = (r: Resource, policy: ExecPolicy): boolean => {
  * 档位只会收紧、不会放宽（非生产环境档位是 editor，也不能让编辑者去改连接串或删环境）。
  */
 const ENV_CONFIG_ACTIONS = new Set<EnvAction>([
+  'environment.attach_history',
   'environment.change_connection',
   'environment.unmark_production',
   'environment.set_policy',
@@ -124,10 +130,11 @@ const ENV_CONFIG_ACTIONS = new Set<EnvAction>([
 ]);
 
 export const ENV_ACTIONS: EnvAction[] = [
+  'environment.attach_history',
   'environment.execute',
   'environment.rollback',
   'environment.baseline',
-  'environment.resolve_drift',
+  'environment.mark',
   'environment.change_connection',
   'environment.unmark_production',
   'environment.set_policy',
@@ -182,6 +189,7 @@ export const GROUP_ADMIN_ACTIONS: GroupAction[] = [
 
 /** 实例级动作：实例管理员能做；instance.create_group 还要看实例设置 */
 export const INSTANCE_ACTIONS: InstanceAction[] = [
+  'instance.claim_project',
   'instance.manage_users',
   'instance.manage_settings',
   'instance.invite',

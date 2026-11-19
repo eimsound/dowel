@@ -150,3 +150,23 @@ export const openEnvironment = async (page: Page, name: string) => {
   await page.getByRole('navigation', { name: '环境列表' }).getByRole('link', { name, exact: true }).click();
   await expect(page.getByRole('heading', { name, exact: true })).toBeVisible();
 };
+
+/**
+ * 每个用例一个独立的实例管理员：连接检查 / 读历史 / 接手检查按用户限速（每分钟 10 次），
+ * 共用同一个管理员会在用例之间互相挤占额度。
+ */
+export const instanceAdmin = async (browser: Browser, scheme: 'light' | 'dark' = 'light') => {
+  const username = `admin-${Math.random().toString(36).slice(2, 8)}`;
+  const res = await (await adminPage(browser)).request.post('/api/admin/users', {
+    data: { username, name: '实例管理员', password: 'password123', role: 'admin' },
+  });
+  expect(res.ok(), await res.text()).toBe(true);
+  const ctx = await browser.newContext({ colorScheme: scheme });
+  const page = await ctx.newPage();
+  await page.goto('/login');
+  await page.getByLabel('用户名').fill(username);
+  await page.getByLabel('密码').fill('password123');
+  await page.getByRole('button', { name: '登录', exact: true }).click();
+  await expect(page.getByRole('heading', { name: '我的项目' })).toBeVisible();
+  return page;
+};

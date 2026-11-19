@@ -10,7 +10,7 @@ import {
   stepsChecksum,
   toScriptSteps,
 } from '@dowel/engines';
-import { type ChainVersion, execute } from '@dowel/executor';
+import { type ChainVersion, claimInstance, execute, mergeHistories, readState } from '@dowel/executor';
 import fc from 'fast-check';
 import { expect, test } from 'vitest';
 import { PG_URL, useTestDb } from '../../../test/pg.ts';
@@ -149,6 +149,52 @@ test.skipIf(!PG_URL)(
           ['up', 'done'],
           ['down', 'done'],
           ['up', 'done'],
+        ]);
+
+        // 新实例接手（P4c）：只靠目标库里的 dowel 历史恢复版本链——模型（含对象 ID）、冻结脚本、checksum 与原来的完全一致；
+        // 认领之后原实例被拒绝；新实例用恢复出来的链继续执行 / 回滚，每一步读回的结构仍然等于恢复出来的模型
+        const merged = mergeHistories([{ name: 'target', state: await readState(tdb, 'random') }]);
+        expect(merged.versions.map((r) => [r.versionId, r.number, r.parentId, r.checksum])).toEqual(
+          chain.map((v) => [v.id, v.number, v.parentId, v.checksum]),
+        );
+        for (const [i, r] of merged.versions.entries()) {
+          expect(r.model, `v${i + 1} 的模型（含对象 ID）`).toEqual(chain[i]!.model);
+          expect(r.upSteps).toEqual(chain[i]!.upSteps);
+          expect(r.downSteps).toEqual(chain[i]!.downSteps);
+        }
+        expect(merged.envs[0]).toMatchObject({ current: 'v2', behind: 0 });
+        const restored: ChainVersion[] = merged.versions.map((r) => ({
+          id: r.versionId,
+          number: r.number,
+          parentId: r.parentId,
+          name: r.name,
+          model: r.model,
+          upSteps: r.upSteps,
+          downSteps: r.downSteps,
+          checksum: r.checksum,
+          // 接手恢复的版本在平台上是“未验证”的；这里模拟用户在影子库里重新验证过
+          verified: true,
+          publishedAt: r.publishedAt,
+          publishedBy: r.publishedBy,
+          scope: r.scope?.length ? r.scope : null,
+        }));
+        const claimed = await claimInstance({
+          chain: restored,
+          db: tdb,
+          projectId: 'random',
+          projectName: null,
+          instanceId: 'random-instance-2',
+          claimedBy: null,
+          claimedByName: null,
+        });
+        expect(claimed).toEqual({ changed: true, previousInstanceId: 'random-instance' });
+        await expect(execute({ ...base, to: 'v1' })).rejects.toMatchObject({ code: 'foreign_instance' });
+        const b2 = { ...base, chain: restored, instanceId: 'random-instance-2' };
+        expect((await execute({ ...b2, to: 'v1' })).ran.map((r) => [r.number, r.direction])).toEqual([
+          [2, 'down'],
+        ]);
+        expect((await execute({ ...b2, to: 'v2' })).ran.map((r) => [r.number, r.direction])).toEqual([
+          [2, 'up'],
         ]);
       }),
       {
