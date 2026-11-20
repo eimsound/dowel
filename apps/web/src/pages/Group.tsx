@@ -8,6 +8,7 @@ import { useMemo, useState } from 'react';
 import { useTranslation } from 'react-i18next';
 import { api } from '../api.ts';
 import { Confirm } from '../components/Modal.tsx';
+import { PolicyLayerPanel } from '../components/PolicyEditor.tsx';
 import { Row, Rows, Section } from '../components/ProjectPage.tsx';
 import { PageHeader, useShellPanel } from '../components/Shell.tsx';
 import { useToast } from '../components/Toasts.tsx';
@@ -338,6 +339,16 @@ export const GroupPage = () => {
                   </button>
                 </div>
               </form>
+            </Section>
+          )}
+
+          {group.data && (
+            // 组层的执行策略（P5a）：所有人可看（组本来就对所有人可见），组管理员可改
+            <Section title={t('pol.title')}>
+              <PolicyLayerPanel
+                path={`/api/groups/${encodeURIComponent(slug)}/exec-policy`}
+                queryKey={['exec-policy', 'group', slug]}
+              />
             </Section>
           )}
 

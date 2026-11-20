@@ -3,6 +3,7 @@ import { describe, expect, test } from 'vitest';
 import {
   findInstanceLevelStatement,
   INSTANCE_LEVEL_DESCRIPTION,
+  isConcurrentDdlSql,
   isInstanceLevelSql,
   isNontransactionalSql,
 } from '../src/index.ts';
@@ -198,4 +199,55 @@ test('findInstanceLevelStatement 返回第一条实例级语句（压成一行�
     "ALTER SYSTEM SET a = ''",
   );
   expect(INSTANCE_LEVEL_DESCRIPTION).toContain('实例级语句不能放进迁移');
+});
+
+// 执行器据此不给 CONCURRENTLY 类的索引操作设 lock_timeout（它们不阻塞读写，等的是旧事务结束）；
+// DETACH PARTITION … CONCURRENTLY 不豁免（第二阶段要对分区拿 ACCESS EXCLUSIVE）
+describe('isConcurrentDdlSql', () => {
+  test.each([
+    'CREATE UNIQUE INDEX CONCURRENTLY "ix" ON "public"."t" ("x")',
+    '  create index concurrently if not exists ix on t (x)',
+    'DROP INDEX CONCURRENTLY IF EXISTS "public"."ix"',
+    'REINDEX INDEX CONCURRENTLY "public"."ix"',
+    'REINDEX (VERBOSE) TABLE CONCURRENTLY public.t',
+    // PG 14 起的括号选项写法
+    'REINDEX (CONCURRENTLY) TABLE t',
+    'reindex (concurrently, verbose) index public.ix',
+    'REINDEX (VERBOSE, CONCURRENTLY true) TABLE t',
+    'REINDEX (CONCURRENTLY ON) SCHEMA app',
+    'REINDEX (TABLESPACE fast, CONCURRENTLY 1) INDEX ix',
+    // 前导注释、末尾分号不影响识别
+    '-- 建索引，不锁表\nCREATE INDEX CONCURRENTLY ix ON t (x);',
+    '/* 说明 */ DROP INDEX CONCURRENTLY ix',
+  ])('是：%s', (sql) => expect(isConcurrentDdlSql(sql)).toBe(true));
+
+  test.each([
+    'CREATE INDEX "ix" ON "public"."t" ("x")',
+    // 注释、字符串、带引号的标识符里提到 concurrently 的普通语句不算
+    'CREATE INDEX ix ON t (x) -- 以后改成 concurrently',
+    '/* concurrently */ CREATE INDEX ix ON t (x)',
+    'CREATE INDEX "concurrently" ON t (x)',
+    "COMMENT ON TABLE t IS 'create index concurrently'",
+    'ALTER TABLE p DETACH PARTITION p1',
+    'ALTER TABLE p DETACH PARTITION p1 FINALIZE',
+    // DETACH PARTITION … CONCURRENTLY 的第二个事务要对分区拿 ACCESS EXCLUSIVE：照常受锁等待超时约束
+    'ALTER TABLE public.p DETACH PARTITION public.p1 CONCURRENTLY',
+    'alter table only "p" detach partition "p 2" concurrently;',
+    // 括号选项里明确关掉的不算；只有别的选项的也不算
+    'REINDEX (CONCURRENTLY false) TABLE t',
+    'REINDEX (VERBOSE, CONCURRENTLY off) INDEX ix',
+    'REINDEX (CONCURRENTLY 0) SCHEMA app',
+    'REINDEX (VERBOSE) TABLE t',
+    'REINDEX TABLE t',
+    'REFRESH MATERIALIZED VIEW CONCURRENTLY v',
+    // 和别的语句在同一步里：别的语句仍然要受锁等待超时约束
+    'CREATE INDEX CONCURRENTLY ix ON t (x); ALTER TABLE t ADD COLUMN y int',
+    '',
+  ])('不是：%s', (sql) => expect(isConcurrentDdlSql(sql)).toBe(false));
+
+  test('CONCURRENTLY 类（含 DETACH PARTITION … CONCURRENTLY）都被判成非事务步骤（执行器在事务外执行）', () => {
+    expect(isNontransactionalSql('ALTER TABLE public.p DETACH PARTITION public.p1 CONCURRENTLY')).toBe(true);
+    expect(isNontransactionalSql('REINDEX TABLE CONCURRENTLY public.t')).toBe(true);
+    expect(isNontransactionalSql('REINDEX (CONCURRENTLY) TABLE t')).toBe(true);
+  });
 });

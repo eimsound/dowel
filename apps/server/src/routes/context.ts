@@ -8,11 +8,9 @@ import { currentUser, type User } from '../auth.ts';
 import {
   can,
   type EnvAction,
-  effectiveExecPolicy,
   type GroupAction,
   type InstanceAction,
   isEnvAction,
-  isEnvConfigAction,
   type ProjectAction,
   userActor,
 } from '../authz.ts';
@@ -22,8 +20,16 @@ import type { DriftScheduler } from '../drift-scheduler.ts';
 import { type EnvRow, envResource, loadEnv } from '../envs.ts';
 import type { ExecContext } from '../executions.ts';
 import { groupById, groupBySlug, groupRoleOf } from '../groups.ts';
+import {
+  accessIn,
+  deniedMessage,
+  type EnvAuth,
+  envAuthOf,
+  loadPolicies,
+  type PolicyStore,
+} from '../policy.ts';
 import type { KeyedLimiter, LoginLimiter } from '../rate-limit.ts';
-import { effectiveRole, loadRoleContext, type ProjectRow, projectRow } from '../roles.ts';
+import type { ProjectRow, RoleContext } from '../roles.ts';
 import type { Role, Rooms } from '../rooms.ts';
 import type { SecurityConfig } from '../security.ts';
 import type { Shadows } from '../shadows.ts';
@@ -105,6 +111,8 @@ export const createUserOrConflict = async (db: Db, input: NewUser): Promise<User
 export interface ProjectAccessRow extends ProjectRow {
   pid: string;
   role: Role;
+  /** 调用者的角色上下文（组成员关系 + 授权）：判断执行者时复用，不再查一次 */
+  rc: RoleContext;
 }
 
 /**
@@ -116,14 +124,12 @@ export const access = async (
   ctx: AppContext,
   action: ProjectAction,
 ): Promise<ProjectAccessRow> => {
-  const pid = c.req.param('pid')!;
   const user = c.get('user');
-  const p = await projectRow(ctx.db, pid);
-  const role = p ? effectiveRole(await loadRoleContext(ctx.db, user), p) : null;
-  if (!p || !role) throw new HTTPException(404, { message: '项目不存在' });
+  // 项目行、角色上下文、项目角色：和锁内重新读用同一个函数（accessIn，看不见就 404）
+  const { project: p, rc, role } = await accessIn(ctx.db, user, c.req.param('pid')!);
   if (!can(userActor(user), action, { kind: 'project', role }))
     throw new HTTPException(403, { message: '没有权限' });
-  return { ...p, pid: p.id, role };
+  return { ...p, pid: p.id, role, rc };
 };
 
 /**
@@ -177,14 +183,6 @@ export const groupAccess = async (c: Context<Env>, ctx: AppContext, action: Grou
   return { ...g, groupRole };
 };
 
-/** 403 的说明：按环境的执行档位说清楚谁能做 */
-const denied = (action: EnvAction, r: EnvRow): string => {
-  const policy = effectiveExecPolicy({ production: r.production, execPolicy: r.exec_policy });
-  if (policy === 'executor') return '这个环境设置为“仅限执行者”：目前只有实例管理员可以做这个操作';
-  const need = policy === 'admin' || isEnvConfigAction(action) ? '项目管理员' : '项目编辑者';
-  return `这个环境需要${need}才能做这个操作`;
-};
-
 /**
  * 环境上的操作：先按项目权限看环境（看不见 404），再按环境的执行档位检查特权操作（H6）。
  * 非特权的项目动作（读、拉取、检查漂移）按项目角色。
@@ -194,16 +192,17 @@ export const envAccess = async (
   ctx: AppContext,
   action: EnvAction | ProjectAction,
   eid = c.req.param('eid')!,
-): Promise<ProjectAccessRow & { env: EnvRow }> => {
+): Promise<ProjectAccessRow & { env: EnvRow; auth: EnvAuth; store: PolicyStore }> => {
   const a = await access(c, ctx, 'environment.read');
   const env = await loadEnv(ctx.db, a.pid, eid);
+  const store = await loadPolicies(ctx.db, a);
+  const auth = envAuthOf(store, a.rc, a, env);
   const actor = userActor(c.get('user'));
-  const ok = isEnvAction(action)
-    ? can(actor, action, envResource(env, a.role))
-    : can(actor, action, { kind: 'project', role: a.role });
+  // 非特权的项目动作也用环境资源判断：执行者能检查漂移（见 can()），其余按项目角色
+  const ok = can(actor, action, envResource(env, a.role, auth));
   if (!ok)
     throw new HTTPException(403, {
-      message: isEnvAction(action) ? denied(action, env) : '没有权限',
+      message: isEnvAction(action) ? deniedMessage(action, auth) : '没有权限',
     });
-  return { ...a, env };
+  return { ...a, env, auth, store };
 };

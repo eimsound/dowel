@@ -1,0 +1,631 @@
+// 执行策略配置（P5a，E9）：实例（管理后台）、组、项目、环境四处共用。
+// 合并、严格程度、锁定都由服务端和这里共用的 @dowel/api 纯函数算（resolvePolicy / validateLayer）：
+// 编辑时在本地重新合并，立刻显示生效值和来源；上级设定的下限显示为“由 X 锁定”，比它宽的选项禁用。
+// 保存时服务端再校验一遍（只能收紧；放宽是特权操作），错误原样显示。
+import {
+  type ApprovalStage,
+  type Approver,
+  compareField,
+  type Directory,
+  type EffectiveValues,
+  type EnvPolicyPut,
+  type EnvPolicyView,
+  type ExecPolicy,
+  type LayerPolicy,
+  normalizeSettings,
+  type PolicyInput,
+  type PolicyLayer,
+  type PolicyLayerView,
+  type PolicyNames,
+  type PolicySettings,
+  type ResolvedField,
+  type ResolvedPolicy,
+  resolvePolicy,
+  validateLayer,
+} from '@dowel/api';
+import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query';
+import { Lock, Plus, Trash2 } from 'lucide-react';
+import { useEffect, useId, useMemo, useState } from 'react';
+import { useTranslation } from 'react-i18next';
+import { api } from '../api.ts';
+import { invalidatePolicyDependents } from '../policy-cache.ts';
+import { useToast } from './Toasts.tsx';
+import { Banner, IconButton } from './ui.tsx';
+
+const WHO: ExecPolicy[] = ['editor', 'admin', 'executor'];
+
+const KINDS: Approver['kind'][] = [
+  'project_admins',
+  'group_admins',
+  'executors',
+  'group_members',
+  'group_admins_of',
+  'users',
+];
+
+/** 把一层的设置拆回“上级输入 + 本层”，用来在本地重新合并（编辑时立刻显示生效值） */
+const upperFrom = (r: ResolvedPolicy): PolicyInput => {
+  const out: PolicyInput = {};
+  const put = <K extends keyof PolicySettings>(layer: PolicyLayer, key: K, v: PolicySettings[K]) => {
+    out[layer] = { ...(out[layer] ?? {}), [key]: v };
+  };
+  for (const f of ['whoCanExecute', 'allowTokens', 'statementTimeoutMs', 'lockTimeoutMs'] as const) {
+    const field = r[f] as ResolvedField<EffectiveValues[typeof f]>;
+    if (field.floor !== null && field.floorSource) put(field.floorSource, f, field.floor as never);
+  }
+  for (const s of r.approval.stages)
+    if (s.locked) put(s.source, 'approval', [...(out[s.source]?.approval ?? []), s.stage]);
+  return out;
+};
+
+const secondsOf = (ms: number | undefined) => (ms === undefined ? '' : String(ms / 1000));
+
+const useLabels = () => {
+  const { t } = useTranslation();
+  const value = <F extends keyof EffectiveValues>(f: F, v: EffectiveValues[F]) =>
+    f === 'whoCanExecute'
+      ? t(`pol.who.${v as ExecPolicy}`)
+      : f === 'allowTokens'
+        ? t(v ? 'pol.tokens.yes' : 'pol.tokens.no')
+        : v === 0
+          ? t('pol.unlimited')
+          : t('pol.seconds', { n: (v as number) / 1000 });
+  const source = (s: ResolvedField<unknown>['source']) => t(`pol.source.${s}`);
+  const layer = (l: PolicyLayer) => t(`pol.layer.${l}`);
+  return { t, value, source, layer };
+};
+
+/** 一个标量字段的生效值 / 来源 / 锁定说明 */
+const Effective = <F extends keyof EffectiveValues>({
+  field,
+  r,
+}: {
+  field: F;
+  r: ResolvedField<EffectiveValues[F]>;
+}) => {
+  const { t, value, source, layer } = useLabels();
+  return (
+    <span className="flex flex-wrap items-center gap-x-2 text-xs text-text-3">
+      <span>
+        {t('pol.effective', { value: value(field, r.value) })} · {source(r.source)}
+      </span>
+      {r.floor !== null && r.floorSource && (
+        <span className="chip inline-flex items-center gap-1" data-testid={`locked-${field}`}>
+          <Lock size={12} aria-hidden="true" />
+          {t('pol.lockedBy', { layer: layer(r.floorSource), value: value(field, r.floor) })}
+        </span>
+      )}
+    </span>
+  );
+};
+
+/** 审批人范围的显示 */
+const approverText = (t: ReturnType<typeof useTranslation>['t'], a: Approver, names: PolicyNames) => {
+  if (a.kind === 'group_members' || a.kind === 'group_admins_of')
+    return `${t(`pol.approval.kinds.${a.kind}`)} · ${names[a.groupId] ?? a.groupId}`;
+  if (a.kind === 'users')
+    return `${t('pol.approval.kinds.users')} · ${a.userIds.map((u) => names[u] ?? u).join('、')}`;
+  return t(`pol.approval.kinds.${a.kind}`);
+};
+
+const StageEditor = ({
+  stage,
+  index,
+  last,
+  onChange,
+  onRemove,
+  disabled,
+  dir,
+}: {
+  stage: ApprovalStage;
+  index: number;
+  last: boolean;
+  onChange: (s: ApprovalStage) => void;
+  onRemove: () => void;
+  disabled: boolean;
+  dir: Directory | undefined;
+}) => {
+  const { t } = useTranslation();
+  const id = useId();
+  const a = stage.approvers;
+  const setKind = (kind: Approver['kind']) => {
+    const g = dir?.groups[0]?.id ?? '';
+    const next: Approver =
+      kind === 'group_members' || kind === 'group_admins_of'
+        ? { kind, groupId: g }
+        : kind === 'users'
+          ? { kind, userIds: dir?.users[0] ? [dir.users[0].id] : [] }
+          : { kind };
+    onChange({ ...stage, approvers: next, count: 1 });
+  };
+  return (
+    <li className="flex flex-wrap items-end gap-2 rounded-md border border-border px-3 py-2">
+      <span className="pb-1.5 text-sm font-medium">{t('pol.approval.stage', { n: index + 1 })}</span>
+      <label className="field w-44" htmlFor={`${id}-k`}>
+        <span className="label">{t('pol.approval.approvers')}</span>
+        <select
+          id={`${id}-k`}
+          className="select"
+          value={a.kind}
+          disabled={disabled}
+          onChange={(e) => setKind(e.target.value as Approver['kind'])}
+        >
+          {KINDS.map((k) => (
+            <option key={k} value={k}>
+              {t(`pol.approval.kinds.${k}`)}
+            </option>
+          ))}
+        </select>
+      </label>
+      {(a.kind === 'group_members' || a.kind === 'group_admins_of') && (
+        <label className="field w-40" htmlFor={`${id}-g`}>
+          <span className="label">{t('pol.approval.group')}</span>
+          <select
+            id={`${id}-g`}
+            className="select"
+            value={a.groupId}
+            disabled={disabled}
+            onChange={(e) => onChange({ ...stage, approvers: { ...a, groupId: e.target.value } })}
+          >
+            {(dir?.groups ?? []).map((g) => (
+              <option key={g.id} value={g.id}>
+                {g.name}
+              </option>
+            ))}
+          </select>
+        </label>
+      )}
+      {a.kind === 'users' && (
+        <label className="field w-48" htmlFor={`${id}-u`}>
+          <span className="label">{t('pol.approval.users')}</span>
+          <select
+            id={`${id}-u`}
+            className="input"
+            multiple
+            size={3}
+            value={a.userIds}
+            disabled={disabled}
+            onChange={(e) =>
+              onChange({
+                ...stage,
+                approvers: { kind: 'users', userIds: [...e.target.selectedOptions].map((o) => o.value) },
+              })
+            }
+          >
+            {(dir?.users ?? []).map((u) => (
+              <option key={u.id} value={u.id}>
+                {u.name}（{u.slug}）
+              </option>
+            ))}
+          </select>
+        </label>
+      )}
+      <label className="field w-20" htmlFor={`${id}-n`}>
+        <span className="label">{t('pol.approval.count')}</span>
+        <input
+          id={`${id}-n`}
+          className="input"
+          type="number"
+          min={1}
+          max={10}
+          value={stage.count}
+          disabled={disabled}
+          onChange={(e) => onChange({ ...stage, count: Math.max(1, Number(e.target.value) || 1) })}
+        />
+      </label>
+      {last && (
+        <label className="flex items-center gap-1.5 pb-1.5 text-sm">
+          <input
+            type="checkbox"
+            checked={stage.lastApproverExecutes}
+            disabled={disabled}
+            onChange={(e) => onChange({ ...stage, lastApproverExecutes: e.target.checked })}
+          />
+          {t('pol.approval.last')}
+        </label>
+      )}
+      <IconButton
+        label={t('pol.approval.remove', { n: index + 1 })}
+        className="hover:!text-danger"
+        disabled={disabled}
+        onClick={onRemove}
+      >
+        <Trash2 size={16} aria-hidden="true" />
+      </IconButton>
+    </li>
+  );
+};
+
+/**
+ * 编辑一套设置（生产或非生产；环境层只有一套）。resolved 是服务端给出的“从这一层看”的生效策略，
+ * 用它拆出上级的下限，再和正在编辑的值在本地合并。
+ */
+export const PolicySetEditor = ({
+  title,
+  at,
+  production,
+  resolved,
+  value,
+  onChange,
+  disabled,
+  names,
+}: {
+  title?: string;
+  at: PolicyLayer;
+  production: boolean;
+  resolved: ResolvedPolicy;
+  value: PolicySettings;
+  onChange: (v: PolicySettings) => void;
+  disabled: boolean;
+  names: PolicyNames;
+}) => {
+  const { t, value: label, layer } = useLabels();
+  const id = useId();
+  const upper = useMemo(() => upperFrom(resolved), [resolved]);
+  const live = resolvePolicy({ ...upper, [at]: value }, production, at);
+  const problems = validateLayer(upper, value, production, at);
+  const dir = useQuery({
+    queryKey: ['directory', ''],
+    queryFn: () => api<Directory>('GET', '/api/directory?q='),
+    enabled: !disabled,
+  });
+  const set = <K extends keyof PolicySettings>(k: K, v: PolicySettings[K] | undefined) => {
+    const next = { ...value };
+    if (v === undefined) delete next[k];
+    else next[k] = v;
+    onChange(next);
+  };
+  const tooLoose = <F extends 'whoCanExecute' | 'allowTokens'>(f: F, v: EffectiveValues[F]) => {
+    const floor = live[f].floor as EffectiveValues[F] | null;
+    return floor !== null && compareField(f, v, floor) < 0;
+  };
+  const timeout = (f: 'statementTimeoutMs' | 'lockTimeoutMs', labelKey: string) => (
+    <div className="space-y-1">
+      <label className="field" htmlFor={`${id}-${f}`}>
+        <span className="label">{t(labelKey)}</span>
+        <input
+          id={`${id}-${f}`}
+          className="input w-40"
+          type="number"
+          min={0}
+          step="any"
+          inputMode="decimal"
+          placeholder={t('pol.inheritShort')}
+          value={secondsOf(value[f])}
+          disabled={disabled}
+          aria-describedby={`${id}-${f}-hint`}
+          onChange={(e) => {
+            const raw = e.target.value.trim();
+            const n = Number(raw);
+            set(f, raw === '' || !Number.isFinite(n) || n < 0 ? undefined : Math.round(n * 1000));
+          }}
+        />
+      </label>
+      <span id={`${id}-${f}-hint`} className="block">
+        <Effective field={f} r={live[f]} />
+      </span>
+    </div>
+  );
+  const own = value.approval ?? [];
+  const locked = live.approval.stages.filter((s) => s.locked);
+  return (
+    <fieldset className="space-y-4 rounded-md border border-border bg-panel px-4 py-3">
+      {title && <legend className="px-1 text-sm font-medium">{title}</legend>}
+      <div className="grid gap-4 sm:grid-cols-2">
+        <div className="space-y-1">
+          <label className="field" htmlFor={`${id}-who`}>
+            <span className="label">{t('pol.who.label')}</span>
+            <select
+              id={`${id}-who`}
+              className="select"
+              value={value.whoCanExecute ?? ''}
+              disabled={disabled}
+              onChange={(e) => set('whoCanExecute', (e.target.value || undefined) as ExecPolicy | undefined)}
+            >
+              <option value="">{t('pol.inherit')}</option>
+              {WHO.map((w) => (
+                <option key={w} value={w} disabled={tooLoose('whoCanExecute', w)}>
+                  {label('whoCanExecute', w)}
+                  {tooLoose('whoCanExecute', w) ? ` ${t('pol.tooLoose')}` : ''}
+                </option>
+              ))}
+            </select>
+          </label>
+          <Effective field="whoCanExecute" r={live.whoCanExecute} />
+        </div>
+        <div className="space-y-1">
+          <label className="field" htmlFor={`${id}-tok`}>
+            <span className="label">{t('pol.tokens.label')}</span>
+            <select
+              id={`${id}-tok`}
+              className="select"
+              value={value.allowTokens === undefined ? '' : String(value.allowTokens)}
+              disabled={disabled}
+              onChange={(e) =>
+                set('allowTokens', e.target.value === '' ? undefined : e.target.value === 'true')
+              }
+            >
+              <option value="">{t('pol.inherit')}</option>
+              <option value="true" disabled={tooLoose('allowTokens', true)}>
+                {t('pol.tokens.yes')}
+                {tooLoose('allowTokens', true) ? ` ${t('pol.tooLoose')}` : ''}
+              </option>
+              <option value="false">{t('pol.tokens.no')}</option>
+            </select>
+          </label>
+          <Effective field="allowTokens" r={live.allowTokens} />
+        </div>
+        {timeout('lockTimeoutMs', 'pol.lockTimeout')}
+        {timeout('statementTimeoutMs', 'pol.statementTimeout')}
+      </div>
+      <p className="hint">{t('pol.timeoutHint')}</p>
+
+      <div className="space-y-2">
+        <h3 className="text-sm font-medium">{t('pol.approval.label')}</h3>
+        <p className="hint">{t('pol.approval.note')}</p>
+        {locked.length === 0 && own.length === 0 && (
+          <p className="text-sm text-text-2">{t('pol.approval.default')}</p>
+        )}
+        <ol className="list-none space-y-1.5 p-0">
+          {locked.map((s, i) => (
+            <li
+              // biome-ignore lint/suspicious/noArrayIndexKey: 环节没有 ID，顺序就是身份
+              key={`l${i}`}
+              className="flex flex-wrap items-center gap-2 rounded-md border border-border bg-surface-2 px-3 py-2 text-sm text-text-2"
+            >
+              <Lock size={12} aria-hidden="true" />
+              <span>{t('pol.approval.stage', { n: i + 1 })}</span>
+              <span>{approverText(t, s.stage.approvers, names)}</span>
+              <span>· {t('pol.approval.countN', { n: s.stage.count })}</span>
+              <span className="chip">{t('pol.approval.lockedStage', { layer: layer(s.source) })}</span>
+            </li>
+          ))}
+        </ol>
+        <ol className="list-none space-y-1.5 p-0">
+          {own.map((s, i) => (
+            <StageEditor
+              // biome-ignore lint/suspicious/noArrayIndexKey: 环节没有 ID，顺序就是身份
+              key={i}
+              stage={s}
+              index={locked.length + i}
+              last={i === own.length - 1}
+              disabled={disabled}
+              dir={dir.data}
+              onChange={(n) =>
+                set(
+                  'approval',
+                  own.map((x, j) => (j === i ? n : x)),
+                )
+              }
+              onRemove={() => {
+                const rest = own.filter((_, j) => j !== i);
+                set(
+                  'approval',
+                  rest.length
+                    ? rest.map((x, j) => (j < rest.length - 1 ? { ...x, lastApproverExecutes: false } : x))
+                    : undefined,
+                );
+              }}
+            />
+          ))}
+        </ol>
+        {!disabled && (
+          <button
+            type="button"
+            className="btn sm"
+            onClick={() =>
+              set('approval', [
+                ...own.map((x) => ({ ...x, lastApproverExecutes: false })),
+                { approvers: { kind: 'project_admins' }, count: 1, lastApproverExecutes: false },
+              ])
+            }
+          >
+            <Plus size={14} aria-hidden="true" />
+            {t('pol.approval.add')}
+          </button>
+        )}
+      </div>
+      {problems.length > 0 && (
+        <Banner kind="warn" role="status">
+          {problems.map((p) => p.message).join('；')}
+        </Banner>
+      )}
+    </fieldset>
+  );
+};
+
+/** 实例 / 组 / 项目层的配置页：生产、非生产两套 */
+export const PolicyLayerPanel = ({ path, queryKey }: { path: string; queryKey: unknown[] }) => {
+  const { t } = useTranslation();
+  const qc = useQueryClient();
+  const toast = useToast();
+  const q = useQuery({ queryKey, queryFn: () => api<PolicyLayerView>('GET', path) });
+  const [draft, setDraft] = useState<LayerPolicy | null>(null);
+  useEffect(() => {
+    if (q.data) setDraft(q.data.settings);
+  }, [q.data]);
+  const save = useMutation({
+    mutationFn: (body: LayerPolicy) => api<PolicyLayerView>('PUT', path, body),
+    onSuccess: (v) => {
+      qc.setQueryData(queryKey, v);
+      void invalidatePolicyDependents(qc, queryKey);
+      toast(t('pol.saved'));
+    },
+  });
+  if (!q.data || !draft) return q.error ? <Banner kind="danger">{q.error.message}</Banner> : null;
+  const v = q.data;
+  const dirty =
+    JSON.stringify([normalizeSettings(draft.production), normalizeSettings(draft.nonProduction)]) !==
+    JSON.stringify([normalizeSettings(v.settings.production), normalizeSettings(v.settings.nonProduction)]);
+  return (
+    <div className="space-y-4">
+      <p className="hint">{t('pol.intro')}</p>
+      {!v.canEdit && <p className="hint">{t(`pol.readonly.${v.layer}`)}</p>}
+      {v.canEdit && v.loosenNote && (
+        <Banner kind="info" role="status">
+          {v.loosenNote}
+        </Banner>
+      )}
+      <PolicySetEditor
+        title={t('pol.production')}
+        at={v.layer}
+        production
+        resolved={v.resolved.production}
+        value={draft.production}
+        onChange={(p) => setDraft({ ...draft, production: p })}
+        disabled={!v.canEdit || save.isPending}
+        names={v.names}
+      />
+      <PolicySetEditor
+        title={t('pol.nonProduction')}
+        at={v.layer}
+        production={false}
+        resolved={v.resolved.nonProduction}
+        value={draft.nonProduction}
+        onChange={(p) => setDraft({ ...draft, nonProduction: p })}
+        disabled={!v.canEdit || save.isPending}
+        names={v.names}
+      />
+      {save.error && (
+        <Banner kind="danger" role="alert">
+          {save.error.message}
+        </Banner>
+      )}
+      {v.canEdit && (
+        <div className="flex gap-2">
+          <button
+            type="button"
+            className="btn primary"
+            disabled={!dirty || save.isPending}
+            onClick={() => save.mutate(draft)}
+          >
+            {t('pol.save')}
+          </button>
+          <button type="button" className="btn ghost" disabled={!dirty} onClick={() => setDraft(v.settings)}>
+            {t('pol.reset')}
+          </button>
+        </div>
+      )}
+    </div>
+  );
+};
+
+/** 环境层：环境自己的那一套 + 前置环境 */
+export const EnvPolicyPanel = ({ pid, eid }: { pid: string; eid: string }) => {
+  const { t } = useTranslation();
+  const qc = useQueryClient();
+  const toast = useToast();
+  const id = useId();
+  const path = `/api/projects/${pid}/environments/${eid}/exec-policy`;
+  const queryKey = ['env-policy', pid, eid];
+  const q = useQuery({ queryKey, queryFn: () => api<EnvPolicyView>('GET', path) });
+  const [draft, setDraft] = useState<EnvPolicyPut | null>(null);
+  useEffect(() => {
+    if (q.data) setDraft({ settings: q.data.settings, prerequisiteId: q.data.prerequisite?.id ?? null });
+  }, [q.data]);
+  const save = useMutation({
+    mutationFn: (body: EnvPolicyPut) => api<EnvPolicyView>('PUT', path, body),
+    onSuccess: (v) => {
+      qc.setQueryData(queryKey, v);
+      void invalidatePolicyDependents(qc, queryKey);
+      toast(t('pol.saved'));
+    },
+  });
+  if (!q.data || !draft) return q.error ? <Banner kind="danger">{q.error.message}</Banner> : null;
+  const v = q.data;
+  const disabled = !v.canEdit || save.isPending;
+  const dirty =
+    JSON.stringify(normalizeSettings(draft.settings)) !== JSON.stringify(normalizeSettings(v.settings)) ||
+    draft.prerequisiteId !== (v.prerequisite?.id ?? null);
+  const pre = v.prerequisite;
+  return (
+    <div className="space-y-3" data-testid="env-policy">
+      <p className="hint">{t('pol.envIntro')}</p>
+      {!v.canEdit && <p className="hint">{t('pol.readonly.environment')}</p>}
+      {v.canEdit && v.loosenNote && (
+        <Banner kind="info" role="status">
+          {t('pol.loosenEnv')} {v.loosenNote}
+        </Banner>
+      )}
+      <div className="space-y-1 rounded-md border border-border bg-panel px-4 py-3">
+        <label className="field" htmlFor={`${id}-pre`}>
+          <span className="label">{t('pol.prerequisite.label')}</span>
+          <select
+            id={`${id}-pre`}
+            className="select w-64"
+            value={draft.prerequisiteId ?? ''}
+            disabled={disabled}
+            aria-describedby={`${id}-pre-hint`}
+            onChange={(e) => setDraft({ ...draft, prerequisiteId: e.target.value || null })}
+          >
+            <option value="">{t('pol.prerequisite.none')}</option>
+            {v.candidates.map((c) => (
+              <option key={c.id} value={c.id} disabled={c.disabled !== null}>
+                {c.name}
+                {c.disabled ? `（${c.disabled}）` : ''}
+              </option>
+            ))}
+          </select>
+        </label>
+        <p id={`${id}-pre-hint`} className="hint">
+          {t('pol.prerequisite.hint')}
+          {pre &&
+            ` ${pre.missing ? t('pol.prerequisite.missing') : pre.currentVersion ? t('pol.prerequisite.current', { name: pre.name, n: pre.currentVersion.number }) : t('pol.prerequisite.never', { name: pre.name })}`}
+        </p>
+      </div>
+      <PolicySetEditor
+        title={t(v.production ? 'pol.envSetProd' : 'pol.envSetNonProd')}
+        at="environment"
+        production={v.production}
+        resolved={v.resolved}
+        value={draft.settings}
+        onChange={(s) => setDraft({ ...draft, settings: s })}
+        disabled={disabled}
+        names={v.names}
+      />
+      {save.error && (
+        <Banner kind="danger" role="alert">
+          {save.error.message}
+        </Banner>
+      )}
+      {v.canEdit && (
+        <div className="flex gap-2">
+          <button
+            type="button"
+            className="btn primary"
+            disabled={!dirty || save.isPending}
+            onClick={() => save.mutate(draft)}
+          >
+            {t('pol.save')}
+          </button>
+          <button
+            type="button"
+            className="btn ghost"
+            disabled={!dirty}
+            onClick={() => setDraft({ settings: v.settings, prerequisiteId: v.prerequisite?.id ?? null })}
+          >
+            {t('pol.reset')}
+          </button>
+        </div>
+      )}
+    </div>
+  );
+};
+
+/** 确认对话框里的生效策略摘要（一行） */
+export const PolicySummary = ({ policy }: { policy: ResolvedPolicy }) => {
+  const { t, value, source } = useLabels();
+  const stages = policy.approval.stages.length;
+  return (
+    <p className="text-sm text-text-2" data-testid="policy-summary">
+      {t('pol.summary', {
+        who: value('whoCanExecute', policy.whoCanExecute.value),
+        whoSource: source(policy.whoCanExecute.source),
+        lock: value('lockTimeoutMs', policy.lockTimeoutMs.value),
+        stmt: value('statementTimeoutMs', policy.statementTimeoutMs.value),
+      })}
+      {' · '}
+      {stages ? t('pol.approval.stagesN', { n: stages }) : t('pol.approval.defaultShort')}
+    </p>
+  );
+};

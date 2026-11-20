@@ -7,7 +7,7 @@
 // 顺序（和接手一致）：**先写平台库，提交之后再写目标库**——环境行（和审计）在一个平台事务里，认领在提交之后。
 // 认领失败环境照样保留，作为 warnings 返回，可以在环境页重试认领；同步目标库状态失败只记日志并附 warning，
 // 请求仍然成功（环境已经建好，不能让用户误以为接入失败）。认领在目标库的项目锁里重新比对版本链（claimInstance 的 chain）。
-import { type AttachResult, type ClaimResult, environmentAttachSchema } from '@dowel/api';
+import { type AttachResult, type ClaimResult, environmentAttachSchema, resolvePolicy } from '@dowel/api';
 import { newId } from '@dowel/core';
 import { claimInstance, inspectAttach } from '@dowel/executor';
 import type { Hono } from 'hono';
@@ -17,6 +17,7 @@ import { can, userActor } from '../authz.ts';
 import { isUniqueViolation } from '../db.ts';
 import { type EnvRow, loadChain, loadEnv, versionRef } from '../envs.ts';
 import { claimFailure, lockEnvIdle, readTargetState, toTargetError } from '../executions.ts';
+import { isExecutor, loadPolicies, upperInput } from '../policy.ts';
 import { decrypt, encrypt, scrubSecrets } from '../secrets.ts';
 import { readSettings } from '../settings.ts';
 import { CHECK_CONNECT_TIMEOUT, claimShadow, connectPg, inspectTarget } from '../targets.ts';
@@ -31,18 +32,25 @@ export const registerClaims = (app: Hono<Env>, ctx: AppContext) => {
     const b = await body(c, environmentAttachSchema);
     const user = c.get('user');
     const actor = userActor(user);
-    // 接入已有历史是特权操作：适用 P4b 的执行档位和项目管理员规则（配置类：至少项目管理员）。
-    // 环境还不存在，用请求里的“是否生产”和默认档位构造一个环境资源
+    // 接入已有历史是特权操作：适用执行策略和项目管理员规则（配置类：至少项目管理员）。
+    // 环境还不存在：按请求里的“是否生产”取上级三层合并出来的策略；执行者只看项目及以上范围的授权
+    const store = await loadPolicies(db, a);
+    const resolved = resolvePolicy(upperInput(store, b.production), b.production);
     if (
       !can(actor, 'environment.attach_history', {
         kind: 'environment',
         role: a.role,
         production: b.production,
-        execPolicy: null,
+        execPolicy: resolved.whoCanExecute.value,
+        isExecutor: isExecutor(
+          a.rc,
+          { groupId: a.groupId, projectId: a.pid },
+          b.production && resolved.whoCanExecute.value === 'executor',
+        ),
       })
     )
       throw new HTTPException(403, {
-        message: '接入已有历史需要项目管理员，并且要满足这个环境的执行档位',
+        message: '接入已有历史需要项目管理员，并且要满足这个环境的执行策略',
       });
     connectionLimit(c, ctx);
 

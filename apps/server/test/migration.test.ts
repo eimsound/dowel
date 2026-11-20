@@ -36,6 +36,13 @@ const EXPECTED = [
   { id: 'u5', username: 'wang', role: 'member' },
 ];
 
+/** 退回 P5a 审查后的前置环境约束（SQLite 的三个触发器；PG 是外键，drop 列时自动删掉） */
+const dropPrerequisiteConstraint = async (db: PlatformDb) => {
+  if (db.dialect === 'sqlite')
+    for (const t of ['delete', 'insert', 'update'])
+      await db.exec(`drop trigger if exists environments_prerequisite_${t}`);
+};
+
 const oldSql = (d: 'sqlite' | 'pg', i: number) => {
   const step = MIGRATIONS[i]!;
   const sql = typeof step === 'function' ? step(d) : step.sql?.(d);
@@ -347,13 +354,12 @@ describe.each([
     // P4c 的迁移（versions.restored_at）也退回去
     await db.exec('alter table versions drop column restored_at');
     await db.exec('drop table environment_versions');
-    for (const col of [
-      'exec_policy',
-      'current_version_id',
-      'last_drift_check',
-      'drift_status',
-      'drift_summary',
-    ])
+    // P5a 的迁移（执行策略表、前置环境；exec_policy 列已被它搬走并删掉）也退回去：之后升级时 P4b 重新加上 exec_policy，P5a 再搬走
+    await db.exec('drop table exec_policies');
+    // P5a 审查后的前置环境约束：SQLite 是触发器（引用了这一列，不先删掉就 drop 不了列），PG 的外键随列一起删掉
+    await dropPrerequisiteConstraint(db);
+    await db.exec('alter table environments drop column prerequisite_id');
+    for (const col of ['current_version_id', 'last_drift_check', 'drift_status', 'drift_summary'])
       await db.exec(`alter table environments drop column ${col}`);
     await db.query('delete from dowel_migrations where version > $1', [CHAIN_MIGRATION]);
     await db.exec("delete from instance_settings where key = 'instance_id'");

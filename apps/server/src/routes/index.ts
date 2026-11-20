@@ -16,6 +16,7 @@ import { registerExecutions } from './executions.ts';
 import { registerGrants } from './grants.ts';
 import { registerGroups } from './groups.ts';
 import { registerOidcAdmin, registerOidcAuth, registerOidcMe } from './oidc.ts';
+import { registerPolicy } from './policy.ts';
 import { registerProjects } from './projects.ts';
 import { registerSetup } from './setup.ts';
 import { registerSync } from './sync.ts';
@@ -49,6 +50,7 @@ export const registerRoutes = (app: Hono<Env>, ctx: AppContext) => {
     ['/api/admin/oidc', 'instance.manage_settings'],
     ['/api/admin/oidc/*', 'instance.manage_settings'],
     ['/api/admin/audit', 'instance.view_audit'],
+    ['/api/admin/exec-policy', 'instance.manage_policy'],
   ] as const)
     app.use(path, requireInstanceAdmin(action));
   registerAdmin(app, ctx);
@@ -81,5 +83,7 @@ export const registerRoutes = (app: Hono<Env>, ctx: AppContext) => {
   registerClaims(app, ctx);
   registerEnvironments(app, ctx);
   registerExecutions(app, ctx);
+  // 执行策略：实例层在 /api/admin 下（上面已要求实例管理员），组层在 /api/groups 下，项目 / 环境层在 /api/projects 下
+  registerPolicy(app, ctx);
   registerSync(app, ctx);
 };

@@ -487,6 +487,21 @@ test('每个应审计的动作都能在 audit_events 里找到', async () => {
     },
     // 标记为已执行（路由级覆盖在 drift.test.ts）
     { action: 'environment.mark', run: () => directAudit('environment.mark', 'environment', 'e1') },
+    // 执行策略（P5a）：四层共用一个动作，targetKind 是层；路由级覆盖（组 / 项目 / 环境层）在 policy-routes.test.ts
+    {
+      action: 'exec_policy.update',
+      run: async () =>
+        expect(
+          (
+            await call(
+              'PUT',
+              '/api/admin/exec-policy',
+              { production: { whoCanExecute: 'admin', lockTimeoutMs: 3000 } },
+              adminCookie,
+            )
+          ).status,
+        ).toBe(200),
+    },
     { action: 'model.import', run: () => directAudit('model.import', 'project', 'p1') },
     // OIDC 动作（路由级覆盖在 oidc.test.ts 里）
     { action: 'oidc.provider_create', run: () => directAudit('oidc.provider_create', 'oidc_provider', 'o1') },

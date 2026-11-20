@@ -108,6 +108,47 @@ export const isNontransactionalSql = (sql: string): boolean =>
   strip(sql).split(';').some(statementIsNontransactional);
 
 /**
+ * 单条语句（已经去掉注释、字符串等）是不是“只拿不阻塞读写的锁、等旧事务结束”的 CONCURRENTLY 操作：
+ * CREATE [UNIQUE] INDEX CONCURRENTLY、DROP INDEX CONCURRENTLY，
+ * REINDEX {INDEX|TABLE|SCHEMA|DATABASE|SYSTEM} CONCURRENTLY，以及 PG 14 起的括号选项写法 REINDEX (CONCURRENTLY [true|on|1], …) …
+ * （`(CONCURRENTLY false|off|0)` 不算）。它们拿的是 SHARE UPDATE EXCLUSIVE，不挡业务的读写，等的是已有事务结束。
+ *
+ * **ALTER TABLE … DETACH PARTITION … CONCURRENTLY 不在其中**：它的第二个事务要对分区拿 ACCESS EXCLUSIVE，
+ * 排队时一样会把访问这个分区的业务语句堵在后面，所以照常受锁等待超时约束（它仍然是非事务步骤，见 isNontransactionalSql）。
+ */
+const REINDEX =
+  /^\s*reindex\s*(?:\(([^)]*)\)\s*)?(?:index|table|schema|database|system)\b(\s+concurrently\b)?/i;
+
+/** REINDEX 的括号选项里有没有打开 CONCURRENTLY：`CONCURRENTLY`、`CONCURRENTLY true / on / 1` 算，`false / off / 0` 不算 */
+const reindexOptionConcurrently = (options: string): boolean =>
+  options.split(',').some((o) => {
+    const m = /^\s*concurrently(?:\s+(\S+))?\s*$/i.exec(o);
+    if (!m) return false;
+    const v = m[1]?.toLowerCase();
+    return v === undefined || v === 'true' || v === 'on' || v === '1';
+  });
+
+const statementIsConcurrentDdl = (s: string): boolean => {
+  if (/^\s*create\s+(?:unique\s+)?index\s+concurrently\b/i.test(s)) return true;
+  if (/^\s*drop\s+index\s+concurrently\b/i.test(s)) return true;
+  const r = REINDEX.exec(s);
+  return r !== null && (r[2] !== undefined || (r[1] !== undefined && reindexOptionConcurrently(r[1])));
+};
+
+/**
+ * 这一步是不是**只有** CONCURRENTLY 类的操作（见 statementIsConcurrentDdl）：执行器据此不给它设锁等待超时
+ * （lock_timeout 要防的是 DDL 排队时把业务语句堵在后面，这类操作不会；照设的话库里有长事务时会反复失败、留下 INVALID 索引）。
+ * 先去掉注释、字符串、带引号标识符和 $$ 函数体再判断：注释里提到 concurrently 的普通 CREATE INDEX 不算，前导注释不影响识别。
+ * 一步里还有别的语句时不算（别的语句仍然要受锁等待超时约束；实际上 CONCURRENTLY 本来也不能和别的语句放在一个多语句请求里）。
+ */
+export const isConcurrentDdlSql = (sql: string): boolean => {
+  const statements = strip(sql)
+    .split(';')
+    .filter((s) => s.trim() !== '');
+  return statements.length > 0 && statements.every(statementIsConcurrentDdl);
+};
+
+/**
  * 单条语句（已经去掉注释、字符串等）是不是实例级语句：作用于整个数据库实例，而不只是迁移的这个库——
  * CREATE / DROP / ALTER DATABASE、CREATE / DROP / ALTER TABLESPACE、ALTER SYSTEM、
  * CREATE / DROP / ALTER ROLE | USER | GROUP。

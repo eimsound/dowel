@@ -1,7 +1,14 @@
 // 权限判断：所有“谁能做什么”的规则集中在这里，路由只负责取出角色再调用 can()。
 // 角色来源：实例管理员（一切权限）、项目生效角色（viewer / editor / admin）、组里的身份（组管理员 / 组成员）。
 // 生效角色由 roles.ts 算出：实例管理员、组管理员、组默认权限、授权四项取最高，详见 02-consensus.md 11.2。
-import type { ExecPolicy, GroupCreation, GroupRole, ProjectCreation, Role } from '@dowel/api';
+import {
+  type ExecPolicy,
+  type GroupCreation,
+  type GroupRole,
+  POLICY_DEFAULTS,
+  type ProjectCreation,
+  type Role,
+} from '@dowel/api';
 
 /** 需要项目角色就能做的动作 */
 export type ProjectAction =
@@ -10,6 +17,8 @@ export type ProjectAction =
   | 'project.transfer'
   | 'project.settings'
   | 'project.delete'
+  /** 项目层的执行策略（P5a）：项目管理员；放宽另外要满足项目层改动前的“谁能执行”（routes/policy.ts） */
+  | 'project.set_policy'
   | 'version.publish'
   | 'version.edit'
   | 'version.verify'
@@ -25,14 +34,14 @@ export type ProjectAction =
   | 'sync.edit';
 
 /**
- * 环境上的特权操作（02-consensus.md 11.3）：受环境的“谁能执行”档位约束（H6，P5 之前的过渡方案）。
+ * 环境上的特权操作（02-consensus.md 11.3）：受环境生效的执行策略里“谁能执行”约束（P5a：四层合并，见 policy.ts）。
  * 模型的编辑和发布不在其中。
  * - environment.execute / rollback / baseline：执行、回滚、写入基线；
  * - environment.mark：标记为已执行（ADR 0004）——不执行 SQL，把环境记为已到达链上某个版本，前提是线上结构等于它的模型；
  *   取代 P4b 预留的 resolve_drift。**CI 令牌不能标记**（P6 接入令牌时，令牌的 Actor 不能通过这个动作）；
  * - environment.change_connection：改连接串、影子库、是否允许同实例影子库；
  * - environment.unmark_production：取消“生产”标记；
- * - environment.set_policy：改执行档位本身；
+ * - environment.set_policy：**放宽**环境层的执行策略（含去掉 / 换掉前置环境）；收紧只要项目管理员（routes/policy.ts）；
  * - environment.delete：删除环境。
  */
 export type EnvAction =
@@ -54,6 +63,8 @@ export type GroupAction =
   | 'group.manage_members'
   | 'group.manage_grants'
   | 'group.create_project'
+  /** 组层的执行策略（P5a）：组管理员；放宽另外要满足组层改动前的“谁能执行” */
+  | 'group.set_policy'
   | 'group.delete';
 
 /** 实例级动作（instance.create_group 的规则依赖实例设置，在 can() 里单独判断） */
@@ -64,6 +75,8 @@ export type InstanceAction =
   | 'instance.manage_settings'
   | 'instance.invite'
   | 'instance.manage_grants'
+  /** 实例层的执行策略（P5a） */
+  | 'instance.manage_policy'
   | 'instance.create_group'
   | 'instance.view_audit';
 
@@ -95,25 +108,32 @@ export interface Resource {
   projectCreation?: ProjectCreation;
   /** 环境是否生产：决定没有显式设置执行档位时的默认档位 */
   production?: boolean;
-  /** 环境上设置的执行档位；null / 未给出表示用默认（非生产 editor，生产 admin） */
+  /**
+   * 环境**生效的**“谁能执行”（四层合并之后，policy.ts 的 resolveEnv）；null / 未给出表示用默认（非生产 editor，生产 admin）。
+   */
   execPolicy?: ExecPolicy | null;
   /**
-   * 调用者是不是这个环境的“执行者”。P5 引入执行者授权之前一律为空（false）：
-   * “仅限执行者”档位等同于只有实例管理员。P5 在这里接上授权查询即可，can() 的规则不用改。
+   * 调用者是不是这个环境的“执行者”（P5a：执行者授权覆盖这个环境；“仅限执行者”的生产环境只认实例管理员授予的，
+   * 见 policy.ts 的 isExecutor）。can() 保持纯函数，由调用方算好放进来。
    */
   isExecutor?: boolean;
 }
 
-/** 没有显式设置时的执行档位：非生产由项目编辑者执行，生产由项目管理员执行（小公司开箱即用） */
-export const defaultExecPolicy = (production: boolean | undefined): ExecPolicy =>
-  production === false ? 'editor' : 'admin';
+/**
+ * Resource 里没给生效档位时（调用方没算执行策略）用的档位：默认值只有一处来源，@dowel/api 的 POLICY_DEFAULTS；
+ * 不知道是不是生产时按生产算（更严）。正常的路由都会先用 resolvePolicy 算好生效档位放进 execPolicy。
+ */
+const policyOf = (r: Resource): ExecPolicy =>
+  r.execPolicy ?? POLICY_DEFAULTS(r.production !== false).whoCanExecute;
 
-export const effectiveExecPolicy = (r: Pick<Resource, 'production' | 'execPolicy'>): ExecPolicy =>
-  r.execPolicy ?? defaultExecPolicy(r.production);
-
-/** 这一档谁能执行：角色够不够（executor 档看 isExecutor，P5 之前恒为 false） */
+/**
+ * 这一档谁能执行：
+ * - 执行者在任何档位下都能执行（执行者本来就是为这个环境单独授权的；执行者授权自带项目的只读可见性，role 至少是 viewer）；
+ * - 项目编辑者 / 项目管理员档位看项目角色；“仅限执行者”档位只有执行者（和实例管理员，can() 里先放行）。
+ */
 const meetsPolicy = (r: Resource, policy: ExecPolicy): boolean => {
-  if (policy === 'executor') return r.isExecutor === true && hasProjectRole(r.role, 'editor');
+  if (r.isExecutor === true && r.role != null) return true;
+  if (policy === 'executor') return false;
   return hasProjectRole(r.role, policy);
 };
 
@@ -162,6 +182,7 @@ export const ACTION_MIN_ROLE: Record<ProjectAction, Role> = {
   'project.transfer': 'admin',
   'project.settings': 'admin',
   'project.delete': 'admin',
+  'project.set_policy': 'admin',
   'version.publish': 'editor',
   // 编辑冻结脚本、重新验证：沿用发布的权限（编辑者）
   'version.edit': 'editor',
@@ -184,6 +205,7 @@ export const GROUP_ADMIN_ACTIONS: GroupAction[] = [
   'group.manage',
   'group.manage_members',
   'group.manage_grants',
+  'group.set_policy',
   'group.delete',
 ];
 
@@ -194,6 +216,7 @@ export const INSTANCE_ACTIONS: InstanceAction[] = [
   'instance.manage_settings',
   'instance.invite',
   'instance.manage_grants',
+  'instance.manage_policy',
   'instance.create_group',
   'instance.view_audit',
 ];
@@ -231,7 +254,7 @@ export const can = (actor: Actor, action: Action, resource: Resource): boolean =
   if (isInstanceAction(action)) return false;
   if (isEnvAction(action)) {
     if (resource.kind !== 'environment') return false;
-    if (!meetsPolicy(resource, effectiveExecPolicy(resource))) return false;
+    if (!meetsPolicy(resource, policyOf(resource))) return false;
     return !ENV_CONFIG_ACTIONS.has(action) || hasProjectRole(resource.role, 'admin');
   }
   if (isGroupAction(action)) {
@@ -243,6 +266,9 @@ export const can = (actor: Actor, action: Action, resource: Resource): boolean =
       return admin || (resource.groupRole === 'member' && resource.projectCreation === 'members');
     return admin;
   }
+  // 手动检查漂移只读目标库的结构；执行者本来就被信任去连这个库（他能执行），所以也能检查
+  if (action === 'environment.check_drift' && resource.kind === 'environment' && resource.isExecutor === true)
+    return resource.role != null;
   if (resource.kind === 'project' || resource.kind === 'environment')
     return hasProjectRole(resource.role, ACTION_MIN_ROLE[action as ProjectAction]);
   return false;

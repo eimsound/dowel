@@ -7,7 +7,6 @@ import type {
   EnvInfo,
   EnvStatus,
   EnvVersion,
-  ExecPolicy,
   RunInfo,
   TargetInfo,
 } from '@dowel/api';
@@ -33,13 +32,14 @@ import { DiffList, ExecDialog, type ExecKind } from '../components/ExecDialog.ts
 import { ImportDialog } from '../components/ImportDialog.tsx';
 import { MARK_TIP, MARK_TITLE, MarkDialog, markDirection } from '../components/MarkDialog.tsx';
 import { Confirm } from '../components/Modal.tsx';
+import { EnvPolicyPanel } from '../components/PolicyEditor.tsx';
 import { EmptyHint, ProjectPage, Row, Rows, Section } from '../components/ProjectPage.tsx';
 import { RepairDialog } from '../components/RepairDialog.tsx';
 import { PageHeader, useShellPanel } from '../components/Shell.tsx';
 import { useToast } from '../components/Toasts.tsx';
 import { Banner, IconButton } from '../components/ui.tsx';
 import { useVersionName, VersionBadges, VersionNumber } from '../components/VersionStatus.tsx';
-import { EXEC_POLICIES, useEnvHistory, useEnvStatus, useEnvs } from '../envs.ts';
+import { useEnvHistory, useEnvStatus, useEnvs } from '../envs.ts';
 import { formatTime } from '../format.ts';
 import { useProject } from '../project.tsx';
 import { useMe } from '../session.ts';
@@ -459,67 +459,6 @@ const HistoryTable = ({ runs }: { runs: RunInfo[] }) => {
           ))}
         </tbody>
       </table>
-    </div>
-  );
-};
-
-/** “谁能执行”档位：有 configure 权限的人可以改；默认值标明“默认” */
-const PolicySetting = ({ pid, env, status }: { pid: string; env: EnvInfo; status: EnvStatus }) => {
-  const { t } = useTranslation();
-  const qc = useQueryClient();
-  const toast = useToast();
-  const id = useId();
-  const save = useMutation({
-    mutationFn: (execPolicy: ExecPolicy | null) =>
-      api('PATCH', `/api/projects/${pid}/environments/${env.id}`, { execPolicy }),
-    onSuccess: () => {
-      void qc.invalidateQueries({ queryKey: ['envs', pid] });
-      void qc.invalidateQueries({ queryKey: ['env-status', pid, env.id] });
-      toast(t('envx.policy.saved'));
-    },
-  });
-  const def: ExecPolicy = env.production ? 'admin' : 'editor';
-  const can = status.permissions.configure;
-  return (
-    <div className="space-y-2 rounded-md border border-border bg-panel px-4 py-3 text-sm">
-      <div className="flex flex-wrap items-center gap-3">
-        <label htmlFor={id} className="text-text-2">
-          {t('envx.policy.label')}
-        </label>
-        {can ? (
-          <select
-            id={id}
-            className="input w-auto"
-            value={status.execPolicy ?? ''}
-            disabled={save.isPending}
-            onChange={(e) => save.mutate((e.target.value || null) as ExecPolicy | null)}
-          >
-            <option value="">{t('envx.policy.default', { policy: t(`envx.policy.${def}`) })}</option>
-            {EXEC_POLICIES.map((p) => (
-              <option key={p} value={p}>
-                {t(`envx.policy.${p}`)}
-              </option>
-            ))}
-          </select>
-        ) : (
-          <span id={id} className="font-medium">
-            {t(`envx.policy.${status.effectiveExecPolicy}`)}
-            {status.execPolicy === null && (
-              <span className="ml-1 text-text-3">{t('envx.policy.defaultTag')}</span>
-            )}
-          </span>
-        )}
-      </div>
-      <p className="hint m-0">{t('envx.policy.hint')}</p>
-      {status.effectiveExecPolicy === 'executor' && (
-        <p className="hint m-0">{t('envx.policy.executorNote')}</p>
-      )}
-      {!can && <p className="hint m-0">{t('envx.policy.readonly')}</p>}
-      {save.error && (
-        <Banner kind="danger" role="alert">
-          {save.error.message}
-        </Banner>
-      )}
     </div>
   );
 };
@@ -964,11 +903,10 @@ const EnvironmentDetailView = ({ eid }: { eid: string }) => {
             ) : null}
           </Section>
 
-          {status && (
-            <Section title={t('envx.policy.title')}>
-              <PolicySetting pid={pid} env={env} status={status} />
-            </Section>
-          )}
+          {/* 环境层的执行策略和前置环境（P5a）：上级的要求锁定显示，只能收紧 */}
+          <Section title={t('pol.title')}>
+            <EnvPolicyPanel pid={pid} eid={eid} />
+          </Section>
 
           <Section title={t('envp.config')}>
             <dl className="grid grid-cols-[auto_1fr] gap-x-6 gap-y-2 rounded-md border border-border bg-panel px-4 py-3 text-sm">

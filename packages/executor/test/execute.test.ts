@@ -1091,3 +1091,98 @@ const base = (db: Db, chain: ChainVersion[]) => ({
   chain,
   executedBy: null,
 });
+
+// ───── 执行策略的超时（P5a）：非事务步骤也生效，失败可识别，断点续跑语义不变 ─────
+
+test.skipIf(!PG_URL)(
+  '超时：CREATE INDEX CONCURRENTLY 等旧事务时不受 lock_timeout 约束（它不堵业务），旧事务结束后照常完成',
+  async () => {
+    const { models, chain } = await cicChain();
+    await withTarget(async (t) => {
+      await run(t.db, chain, 1);
+      // 另一个会话开着一个长事务（持有快照）：CIC 要等它结束。这种等待以前受 lock_timeout 约束，5 秒默认值会让它反复失败
+      const holder = connect(t.url);
+      const reserved = await holder.db.reserve!();
+      const timeouts = { statementMs: 0, lockMs: 300 };
+      try {
+        await reserved.exec('BEGIN ISOLATION LEVEL REPEATABLE READ');
+        await reserved.query('select count(*) from public.users');
+        const started = Date.now();
+        let settled = false;
+        const p = run(t.db, chain, 2, { timeouts }).finally(() => {
+          settled = true;
+        });
+        await new Promise((r) => setTimeout(r, 1500));
+        // 远超 lock_timeout（300ms）仍在等，没有失败
+        expect(settled).toBe(false);
+        await reserved.exec('ROLLBACK');
+        const r = await p;
+        expect(r.ran.map((x) => x.number)).toEqual([2]);
+        expect(Date.now() - started).toBeGreaterThanOrEqual(1500);
+      } finally {
+        await reserved.exec('ROLLBACK').catch(() => {});
+        reserved.release?.();
+        await holder.close();
+      }
+      await structureIs(t.db, models[1]!);
+    });
+  },
+);
+
+test.skipIf(!PG_URL)(
+  '超时：策略“不限”时不覆盖库端配置（ALTER ROLE … SET statement_timeout 仍然生效），步骤之后用 RESET 回到库端的值',
+  async () => {
+    const models = [await canon(m0()), await canon(withEmail(m0()))];
+    const chain = withSteps(chainOf(models), 2, [tx('SELECT pg_sleep(1)'), ...chainOf(models)[1]!.upSteps]);
+    const role = `exec_role_${Math.random().toString(36).slice(2, 8)}`;
+    const admin = connect(PG_URL);
+    await withTarget(async (t) => {
+      const dbName = new URL(t.url).pathname.slice(1);
+      await admin.db.exec(`CREATE ROLE ${role} LOGIN PASSWORD 'pw'`);
+      await admin.db.exec(`ALTER DATABASE ${dbName} OWNER TO ${role}`);
+      await admin.db.exec(`ALTER ROLE ${role} SET statement_timeout = '300ms'`);
+      const u = new URL(t.url);
+      u.username = role;
+      u.password = 'pw';
+      const conn = connect(u.toString());
+      try {
+        await run(conn.db, chain, 1, { timeouts: { statementMs: 0, lockMs: 5000 } });
+        // 策略不限：不 SET，角色上的 300ms 生效，慢步骤被库端取消——这不是执行策略的超时，按普通失败报告
+        const e = await fails(run(conn.db, chain, 2, { timeouts: { statementMs: 0, lockMs: 5000 } }));
+        expect(e.code).toBe('step_failed');
+        expect(e.details.timeout).toBeUndefined();
+        expect(e.message).toContain('statement timeout');
+        // 策略设了更长的语句超时：步骤期间用策略的值，慢步骤能跑完
+        const r = await run(conn.db, chain, 2, { timeouts: { statementMs: 3000, lockMs: 0 } });
+        expect(r.ran.map((x) => x.number)).toEqual([2]);
+        // 之后会话回到角色上的配置（RESET，不是 SET 成 0）
+        const [s] = await conn.db.query<{ st: string; lt: string }>(
+          "select current_setting('statement_timeout') as st, current_setting('lock_timeout') as lt",
+        );
+        expect(s).toEqual({ st: '300ms', lt: '0' });
+      } finally {
+        await conn.close();
+      }
+    });
+    await admin.db.exec(`DROP ROLE IF EXISTS ${role}`);
+    await admin.close();
+  },
+);
+
+test.skipIf(!PG_URL)(
+  '超时：事务步骤超过 statement_timeout → step_timeout（整体回滚、不是半途状态）',
+  async () => {
+    const models = [await canon(m0()), await canon(withEmail(m0()))];
+    const chain = withSteps(chainOf(models), 2, [tx('SELECT pg_sleep(1)'), ...chainOf(models)[1]!.upSteps]);
+    await withTarget(async (t) => {
+      await run(t.db, chain, 1);
+      const e = await fails(run(t.db, chain, 2, { timeouts: { statementMs: 200, lockMs: 0 } }));
+      expect(e.code).toBe('step_timeout');
+      expect(e.details).toMatchObject({ timeout: { kind: 'statement', ms: 200 }, step: 1, partial: false });
+      expect(e.message).toContain('整体回滚');
+      // 没有设超时时，同一个慢步骤照常执行（普通的 57014 不会被当成超时：只有设了语句超时才这么认）
+      const r = await run(t.db, chain, 2, { timeouts: { statementMs: 0, lockMs: 5000 } });
+      expect(r.ran.map((x) => x.number)).toEqual([2]);
+    });
+  },
+);

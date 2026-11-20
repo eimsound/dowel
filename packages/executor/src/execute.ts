@@ -13,6 +13,7 @@
 import {
   emptyBase,
   findInstanceLevelStep,
+  isConcurrentDdlSql,
   isNontransactionalSql,
   type Step,
   scrubSecrets,
@@ -64,16 +65,27 @@ const errText = (e: unknown, max = 2000): string => {
   return t.length > max ? `${t.slice(0, max)}…` : t;
 };
 
+/** 某一步执行时执行策略实际设下的超时（毫秒，0 = 这一步没有设，用库端原来的配置） */
+interface AppliedTimeouts {
+  statementMs: number;
+  lockMs: number;
+}
+
 class StepFailure extends Error {
   index: number;
   /** 只属于这一步失败的补充提示（例如没能识别 CREATE INDEX CONCURRENTLY 的索引名）；不会带到别的步骤的错误里 */
   hint: string;
-  constructor(index: number, cause: unknown, hint = '') {
+  /** 这一步实际设下的超时：据此判断失败是不是执行策略的超时 */
+  applied: AppliedTimeouts;
+  constructor(index: number, cause: unknown, hint = '', applied: AppliedTimeouts = NO_TIMEOUTS) {
     super(cause instanceof Error ? cause.message : String(cause), { cause });
     this.index = index;
     this.hint = hint;
+    this.applied = applied;
   }
 }
+
+const NO_TIMEOUTS: AppliedTimeouts = { statementMs: 0, lockMs: 0 };
 
 const upMigration = (chain: ChainVersion[], i: number): Migration => ({
   version: chain[i]!,
@@ -260,6 +272,20 @@ const wrap = (e: unknown, m: Migration, partial: boolean): ExecutorError => {
   if (e instanceof StepFailure) {
     const sql = m.steps[e.index]?.sql ?? '';
     const brief = sql.length > 160 ? `${sql.slice(0, 160)}…` : sql;
+    const timeout = timeoutOf(e.cause, e.applied);
+    if (timeout)
+      return new ExecutorError(
+        'step_timeout',
+        scrubSecrets(
+          `${label(m.version)}${m.direction === 'down' ? '的回滚' : ''}第 ${e.index + 1} 步${
+            timeout.kind === 'lock'
+              ? `等锁超过 ${seconds(timeout.ms)}（执行策略的锁等待超时）：要改的表正被其他会话占用。`
+              : `执行超过 ${seconds(timeout.ms)}（执行策略的语句超时）。`
+          }${partial ? '已完成的步骤保留，重试会从断点接着执行' : '这个迁移已整体回滚，可以稍后重试'}（${brief}）${e.hint}`,
+        ),
+        { ...details, step: e.index + 1, timeout },
+        e,
+      );
     return new ExecutorError(
       'step_failed',
       scrubSecrets(
@@ -273,13 +299,58 @@ const wrap = (e: unknown, m: Migration, partial: boolean): ExecutorError => {
   return new ExecutorError('unexpected', errText(e), details, e);
 };
 
-const execStep = async (conn: Db, steps: ScriptStep[], i: number, hint = '') => {
+const execStep = async (
+  conn: Db,
+  steps: ScriptStep[],
+  i: number,
+  hint = '',
+  applied: AppliedTimeouts = NO_TIMEOUTS,
+) => {
   try {
     await conn.exec(steps[i]!.sql);
   } catch (e) {
-    throw new StepFailure(i, e, hint);
+    throw new StepFailure(i, e, hint, applied);
   }
 };
+
+/**
+ * 迁移会话的超时（执行策略，P5a）：执行步骤之前设上，步骤做完（读回校验、写历史之前）用 RESET 恢复。
+ * - 策略是“不限”（0）的项**不 SET**：库端（角色 / 数据库级）已有的 statement_timeout、lock_timeout 照常生效；
+ * - 恢复用 RESET（回到会话的默认值，也就是角色 / 数据库级的配置），不是 SET 成 0：读回校验和写历史跑在原来的设置上；
+ * - concurrent：CONCURRENTLY 类的操作不设锁等待超时（见 @dowel/core 的 isConcurrentDdlSql）；
+ * - 在事务里 SET / RESET 随事务提交或回滚（失败时回滚就撤销了），在事务外由调用方在 finally 里恢复；结束时 RESET ALL 兜底。
+ * 值是校验过的整数毫秒，直接拼进语句。返回实际设下的值（恢复和判断超时都用它）。
+ */
+const applyTimeouts = async (
+  conn: Db,
+  t: ExecuteOptions['timeouts'],
+  concurrent = false,
+): Promise<AppliedTimeouts> => {
+  const ms = (n: number) => Math.max(0, Math.trunc(n));
+  const applied = { statementMs: t ? ms(t.statementMs) : 0, lockMs: t && !concurrent ? ms(t.lockMs) : 0 };
+  if (applied.statementMs > 0) await conn.exec(`SET statement_timeout = ${applied.statementMs}`);
+  if (applied.lockMs > 0) await conn.exec(`SET lock_timeout = ${applied.lockMs}`);
+  return applied;
+};
+
+const restoreTimeouts = async (conn: Db, applied: AppliedTimeouts) => {
+  if (applied.statementMs > 0) await conn.exec('RESET statement_timeout');
+  if (applied.lockMs > 0) await conn.exec('RESET lock_timeout');
+};
+
+/**
+ * PG 因为执行策略的超时取消了语句：55P03 = lock_not_available（lock_timeout），57014 = query_canceled（statement_timeout）。
+ * 只认这一步**执行策略实际设下**的超时：没设时同样的错误码来自库端配置或别人的 pg_cancel_backend，按普通失败报告。
+ */
+const timeoutOf = (e: unknown, t: AppliedTimeouts): ExecutorErrorDetails['timeout'] | undefined => {
+  const code = (e as { code?: unknown } | null)?.code;
+  if (code === '55P03' && t.lockMs > 0) return { kind: 'lock', ms: t.lockMs };
+  // 57014 也可能是别人 pg_cancel_backend：只有设了语句超时时才认为是超时
+  if (code === '57014' && t.statementMs > 0) return { kind: 'statement', ms: t.statementMs };
+  return undefined;
+};
+
+const seconds = (ms: number) => (ms % 1000 === 0 ? `${ms / 1000} 秒` : `${ms} 毫秒`);
 
 /** 只写基线：不执行任何 SQL；库里的结构已经等于基线模型 */
 const writeBaseline = async (conn: Db, c: Ctx, m: Migration, snapshotFp: string): Promise<number> => {
@@ -356,7 +427,9 @@ const runMigration = async (
         async () => {
           await pinSession(conn);
           const id = await startRun(conn, runBase(c, m));
-          for (let i = 0; i < steps.length; i++) await execStep(conn, steps, i);
+          const applied = await applyTimeouts(conn, c.o.timeouts);
+          for (let i = 0; i < steps.length; i++) await execStep(conn, steps, i, '', applied);
+          await restoreTimeouts(conn, applied);
           await verifyAndRecord(conn, c, m);
           await finishRun(conn, id, 'done');
           return id;
@@ -395,9 +468,18 @@ const runMigration = async (
           touched = true;
         }
         await pinSession(conn);
-        // 没能识别 CIC 的索引名时，这一步失败的信息里提示手工处理（只属于这一步，不会带到别的步骤的错误里）
-        const hint = (await dropLeftoverInvalidIndex(conn, steps[i]!.sql)) ? '' : CIC_HINT;
-        await execStep(conn, steps, i, hint);
+        // 超时也作用于非事务步骤（含清理遗留无效索引的 DROP INDEX CONCURRENTLY）；做完立刻恢复，写断点不受它约束。
+        // CONCURRENTLY 类的索引操作（CREATE / DROP INDEX、REINDEX … CONCURRENTLY）不设锁等待超时
+        // （它们不阻塞读写、等的是旧事务结束，见 @dowel/core 的 isConcurrentDdlSql）；DETACH PARTITION … CONCURRENTLY 不豁免
+        // （第二阶段要对分区拿 ACCESS EXCLUSIVE，排队时一样会挡住业务）
+        const applied = await applyTimeouts(conn, c.o.timeouts, isConcurrentDdlSql(steps[i]!.sql));
+        try {
+          // 没能识别 CIC 的索引名时，这一步失败的信息里提示手工处理（只属于这一步，不会带到别的步骤的错误里）
+          const hint = (await dropLeftoverInvalidIndex(conn, steps[i]!.sql)) ? '' : CIC_HINT;
+          await execStep(conn, steps, i, hint, applied);
+        } finally {
+          await restoreTimeouts(conn, applied).catch(() => {});
+        }
         await markStep(conn, runId, i);
         done = i;
         i++;
@@ -410,7 +492,9 @@ const runMigration = async (
           conn,
           async () => {
             await pinSession(conn);
-            for (let k = i; k < j; k++) await execStep(conn, steps, k);
+            const applied = await applyTimeouts(conn, c.o.timeouts);
+            for (let k = i; k < j; k++) await execStep(conn, steps, k, '', applied);
+            await restoreTimeouts(conn, applied);
             if (last) {
               await verifyAndRecord(conn, c, m);
               await markStep(conn, runId, j - 1);

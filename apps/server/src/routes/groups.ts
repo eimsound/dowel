@@ -23,6 +23,7 @@ import { can, userActor } from '../authz.ts';
 import { isUniqueViolation } from '../db.ts';
 import { deleteGrant, grantById, insertGrant, listGrants, subjectExists } from '../grants.ts';
 import { GROUP_COLUMNS, type GroupRow, groupById, groupCounts, groupRoleOf, slugTaken } from '../groups.ts';
+import { deletePolicies } from '../policy.ts';
 import { loadRoleContext, visibleProjects } from '../roles.ts';
 import { readSettings } from '../settings.ts';
 import { userByUsername } from '../users.ts';
@@ -162,6 +163,8 @@ export const registerGroups = (app: Hono<Env>, ctx: AppContext) => {
       // 授权表的 scope 是多态的，没有外键，手动清理（作为范围、作为对象两种都要删）
       await tx.query("delete from grants where scope_kind = 'group' and scope_id = $1", [g.id]);
       await tx.query("delete from grants where subject_kind = 'group' and subject_id = $1", [g.id]);
+      // 组层的执行策略（范围是多态的，没有外键）
+      await deletePolicies(tx, 'group', [g.id]);
       await tx.query('delete from group_members where group_id = $1', [g.id]);
       await tx.query('delete from groups where id = $1', [g.id]);
     });
@@ -326,15 +329,20 @@ export const registerGroups = (app: Hono<Env>, ctx: AppContext) => {
   app.post('/api/groups/:slug/grants', async (c) => {
     const g = await groupAccess(c, ctx, 'group.manage_grants');
     const b = await body(c, grantCreateSchema);
+    if (b.environmentId) throw new HTTPException(400, { message: '组级授权不能指定环境' });
     if (!(await subjectExists(db, b.subjectKind, b.subjectId)))
       throw new HTTPException(404, { message: '用户或组不存在' });
+    const instanceAdmin = userActor(c.get('user')).instanceAdmin === true;
     let id: string;
     try {
       id = await insertGrant(db, {
-        ...b,
+        subjectKind: b.subjectKind,
+        subjectId: b.subjectId,
+        role: b.role,
         scopeKind: 'group',
         scopeId: g.id,
         createdBy: c.get('user').id,
+        byInstanceAdmin: instanceAdmin,
       });
     } catch (e) {
       if (isUniqueViolation(e)) throw new HTTPException(409, { message: '这个对象已经有了相同的授权' });
@@ -350,7 +358,13 @@ export const registerGroups = (app: Hono<Env>, ctx: AppContext) => {
         actorId: c.get('user').id,
         targetKind: 'group',
         targetId: g.id,
-        data: { subjectKind: b.subjectKind, subjectId: b.subjectId, role: b.role, scope: 'group' },
+        data: {
+          subjectKind: b.subjectKind,
+          subjectId: b.subjectId,
+          role: b.role,
+          scope: 'group',
+          byInstanceAdmin: instanceAdmin,
+        },
       },
       ctx.security,
     );

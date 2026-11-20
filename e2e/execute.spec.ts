@@ -91,9 +91,10 @@ test('生产环境：必须输入环境名才能确认执行', async ({ browser 
     await publishTable(page, 'orders', 'v1', 1);
 
     await openEnv(page, 'prod');
-    // 生产环境默认档位：项目管理员（下拉里选中的是“默认”）
-    await expect(page.getByLabel('执行权限')).toHaveValue('');
-    await expect(page.getByLabel('执行权限').locator('option[value=""]')).toHaveText('默认（项目管理员）');
+    // 生产环境默认档位：项目管理员（P5a 起在“执行策略”里：环境层选中“继承”，生效值是默认的项目管理员）
+    const envPolicy = page.getByRole('group', { name: '本环境（生产）' });
+    await expect(envPolicy.getByLabel('谁能执行')).toHaveValue('');
+    await expect(envPolicy).toContainText('生效：项目管理员 · 默认值');
     await page.getByRole('button', { name: '执行迁移' }).click();
     const dlg = execDialog(page);
     const confirm = dlg.getByRole('button', { name: '确认执行' });

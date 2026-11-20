@@ -1,6 +1,16 @@
 // 前后端共享的接口契约：请求体 schema 和服务端响应类型。
 // 只依赖 zod；服务端用这些 schema 校验请求、给响应标注类型，前端从类型里取形状。
 import { z } from 'zod';
+import {
+  execPolicySchema,
+  type LayerPolicy,
+  layerPolicySchema,
+  type PolicySettings,
+  policySettingsSchema,
+  type ResolvedPolicy,
+} from './policy.ts';
+
+export * from './policy.ts';
 
 // 项目角色：查看者 / 编辑者 / 项目管理员（GLOSSARY：项目角色）。旧的 owner 在迁移里映射成 admin。
 export const roleSchema = z.enum(['viewer', 'editor', 'admin']);
@@ -386,18 +396,29 @@ export const grantSubjectKindSchema = z.enum(['user', 'group']);
 export type GrantSubjectKind = z.infer<typeof grantSubjectKindSchema>;
 
 /**
- * 授权范围。表结构里预留了 environment（以后给“执行者”用），接口现在只开放这三种。
+ * 授权范围：实例 / 组的全部项目 / 项目 / 环境。环境范围只用于“执行者”（项目角色只管模型，不按环境授）。
  */
-export const grantScopeKindSchema = z.enum(['instance', 'group', 'project']);
+export const grantScopeKindSchema = z.enum(['instance', 'group', 'project', 'environment']);
 export type GrantScopeKind = z.infer<typeof grantScopeKindSchema>;
+
+/**
+ * 授权的角色：项目角色（查看者 / 编辑者 / 项目管理员），或“执行者”（P5a，GLOSSARY：执行者）。
+ * 执行者能在授权范围内的环境上做特权操作，并且能只读查看这些项目；**不**因此获得模型的编辑权限。
+ * 同一个对象在同一个范围上可以同时有一个项目角色和一个执行者授权。
+ */
+export const grantRoleSchema = z.enum(['viewer', 'editor', 'admin', 'executor']);
+export type GrantRole = z.infer<typeof grantRoleSchema>;
 
 export const grantCreateSchema = z.object({
   subjectKind: grantSubjectKindSchema,
   subjectId: z.string().min(1),
-  role: roleSchema,
+  role: grantRoleSchema,
+  /** 只用于项目级的执行者授权：只授予这个环境（不填 = 整个项目） */
+  environmentId: z.string().min(1).optional(),
 });
 export type GrantCreate = z.infer<typeof grantCreateSchema>;
 
+/** 只能在项目角色之间改；执行者授权不能改成项目角色（反之亦然），删掉再授 */
 export const grantPatchSchema = z.object({ role: roleSchema });
 export type GrantPatch = z.infer<typeof grantPatchSchema>;
 
@@ -414,9 +435,16 @@ export type GrantSubject = z.infer<typeof grantSubjectSchema>;
 export const grantInfoSchema = z.object({
   id: z.string(),
   subject: grantSubjectSchema,
-  role: roleSchema,
+  role: grantRoleSchema,
   scopeKind: grantScopeKindSchema,
   scopeId: z.string(),
+  /** 环境范围的授权：环境名 */
+  environmentName: z.string().nullable().optional(),
+  /**
+   * 授权时授予者是不是实例管理员。执行策略为“仅限执行者”的生产环境上，只有实例管理员授予的执行者才有效
+   * （02-consensus.md 11.2 的例外），所以这个事实在授权时记下来，之后不随授予者的身份变化。
+   */
+  byInstanceAdmin: z.boolean(),
   createdAt: z.string(),
 });
 export type GrantInfo = z.infer<typeof grantInfoSchema>;
@@ -613,15 +641,6 @@ export const environmentCreateSchema = z.object({
 });
 export type EnvironmentCreate = z.infer<typeof environmentCreateSchema>;
 
-/**
- * 谁能执行（H6，P5 之前的过渡方案，设在环境上）：
- * - editor：项目编辑者及以上；admin：项目管理员及以上；
- * - executor：仅限执行者。P5 之前还没有“执行者”这个身份，等同于只有实例管理员（authz.ts 里留了扩展点）。
- * 默认（环境没有设置时）：非生产 = editor，生产 = admin。
- */
-export const execPolicySchema = z.enum(['editor', 'admin', 'executor']);
-export type ExecPolicy = z.infer<typeof execPolicySchema>;
-
 /** 漂移检测的结果：unknown 还没检查过，ok 没有漂移，drifted 线上结构与当前版本不一致，error 检查时连不上 / 读不出 */
 export const driftStatusSchema = z.enum(['unknown', 'ok', 'drifted', 'error']);
 export type DriftStatus = z.infer<typeof driftStatusSchema>;
@@ -674,6 +693,77 @@ export type DriftInfo = z.infer<typeof driftInfoSchema>;
 export const envVersionRefSchema = z.object({ id: z.string(), number: z.number(), name: z.string() });
 export type EnvVersionRef = z.infer<typeof envVersionRefSchema>;
 
+// ───── 执行策略（P5a） ─────
+
+/** 环境上的前置环境：名字和它（平台库缓存里）的当前版本 */
+export const prerequisiteRefSchema = z.object({
+  id: z.string(),
+  name: z.string(),
+  currentVersion: envVersionRefSchema.nullable(),
+  /** 设置了前置环境，但找不到那个环境（有外键，不应该发生；发生了执行一律拒绝） */
+  missing: z.boolean().optional(),
+});
+export type PrerequisiteRef = z.infer<typeof prerequisiteRefSchema>;
+
+/** 前置环境检查的结果（checkPrerequisite），确认对话框和预演显示 */
+export const prerequisiteResultSchema = z.object({
+  ok: z.boolean(),
+  /** 回滚 / 标记 / 写基线：不受前置环境约束 */
+  exempt: z.boolean(),
+  id: z.string(),
+  name: z.string(),
+  currentNumber: z.number().nullable(),
+  /** 没通过时的代码：prerequisite_behind 前置环境还没到目标版本；prerequisite_missing 前置环境不存在 */
+  code: z.enum(['prerequisite_behind', 'prerequisite_missing']).nullable().optional(),
+  /** 没通过时的说明 */
+  message: z.string().nullable(),
+});
+export type PrerequisiteResult = z.infer<typeof prerequisiteResultSchema>;
+
+/** 实例 / 组 / 项目层的执行策略：PUT 的请求体就是 LayerPolicy（整层替换，字段不出现 = 继承） */
+export const layerPolicyPutSchema = layerPolicySchema;
+
+/** 环境层：环境自己的那一套设置 + 前置环境 */
+export const envPolicyPutSchema = z
+  .object({
+    settings: policySettingsSchema,
+    /** 前置环境（同一个项目里的另一个环境）；null = 不设置 */
+    prerequisiteId: z.string().min(1).nullable(),
+  })
+  .strict();
+export type EnvPolicyPut = z.infer<typeof envPolicyPutSchema>;
+
+/** 审批人范围里引用的组 / 用户的显示名（id → 名字），配置页直接显示 */
+export type PolicyNames = Record<string, string>;
+
+/** 实例 / 组 / 项目层的执行策略配置页 */
+export interface PolicyLayerView {
+  layer: 'instance' | 'group' | 'project';
+  settings: LayerPolicy;
+  /** 从这一层看的生效策略（上级合并出来的下限 = 锁定） */
+  resolved: { production: ResolvedPolicy; nonProduction: ResolvedPolicy };
+  /** 能否修改这一层（实例管理员 / 组管理员 / 项目管理员）；放宽另有要求，见 canLoosen */
+  canEdit: boolean;
+  /** 能否放宽（放宽是特权操作：还要满足这一层当前生效的“谁能执行”）；不能时 loosenNote 说明原因 */
+  canLoosen: { production: boolean; nonProduction: boolean };
+  loosenNote: string | null;
+  names: PolicyNames;
+}
+
+/** 环境层的执行策略配置页 */
+export interface EnvPolicyView {
+  production: boolean;
+  settings: PolicySettings;
+  resolved: ResolvedPolicy;
+  prerequisite: PrerequisiteRef | null;
+  /** 可以选作前置环境的环境（同项目，不含自己）；会成环的带 disabled 说明 */
+  candidates: { id: string; name: string; production: boolean; disabled: string | null }[];
+  canEdit: boolean;
+  canLoosen: boolean;
+  loosenNote: string | null;
+  names: PolicyNames;
+}
+
 export const envPermissionsSchema = z.object({
   /** 能否执行 / 回滚 / 写基线（按环境的执行档位） */
   execute: z.boolean(),
@@ -693,6 +783,10 @@ export const environmentInfoSchema = z.object({
   execPolicy: execPolicySchema.nullable(),
   /** 实际生效的执行档位 */
   effectiveExecPolicy: execPolicySchema,
+  /** 生效的执行策略（四层合并，P5a）：每个字段的生效值、来源层、上级下限 */
+  policy: z.custom<ResolvedPolicy>(),
+  /** 前置环境（P5a）；没有设置为 null */
+  prerequisite: z.lazy(() => prerequisiteRefSchema).nullable(),
   /** 环境当前版本（平台库缓存：最近一次读目标库历史 / 执行后的结果）；还没执行过为 null */
   currentVersion: envVersionRefSchema.nullable(),
   drift: driftInfoSchema,
@@ -738,6 +832,8 @@ export const envStatusSchema = z.object({
   production: z.boolean(),
   execPolicy: execPolicySchema.nullable(),
   effectiveExecPolicy: execPolicySchema,
+  policy: z.custom<ResolvedPolicy>(),
+  prerequisite: z.lazy(() => prerequisiteRefSchema).nullable(),
   currentVersion: envVersionRefSchema.nullable(),
   /** 链上全部版本（升序） */
   versions: z.array(envVersionSchema),
@@ -834,6 +930,13 @@ export const execErrorDetailsSchema = z.object({
   needsManual: needsManualSchema.optional(),
   /** plan_changed：锁里重新算出的标记计划（预演之后目标库变了） */
   plan: markPlanSchema.optional(),
+  /** prerequisite_behind：前置环境和它的当前版本 */
+  prerequisite: z.lazy(() => prerequisiteResultSchema).optional(),
+  /**
+   * step_timeout：某一步因为执行策略的超时被取消。lock = 等锁超过 lock_timeout（表被别的会话占着），
+   * statement = 语句执行超过 statement_timeout。ms 是当时的设置
+   */
+  timeout: z.object({ kind: z.enum(['lock', 'statement']), ms: z.number() }).optional(),
   /** foreign_instance：当前认领这个项目的实例 */
   claim: z
     .object({
@@ -1062,6 +1165,11 @@ export type DryRunPlan = z.infer<typeof dryRunPlanSchema>;
 export const dryRunResponseSchema = z.object({
   ok: z.boolean(),
   plan: dryRunPlanSchema.optional(),
+  /** 前置环境检查的结果（没有设置前置环境为 null）；没通过时 ok = false、code = prerequisite_behind */
+  prerequisite: z
+    .lazy(() => prerequisiteResultSchema)
+    .nullable()
+    .optional(),
   error: z.string().optional(),
   code: z.string().optional(),
   details: execErrorDetailsSchema.optional(),
