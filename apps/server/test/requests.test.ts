@@ -927,6 +927,184 @@ describe.skipIf(!PG_URL)('第一轮审查的修复（目标库 PG）', () => {
   });
 });
 
+// ───── 中断申请巡检保护与重试限制（#18） ─────
+
+describe.skipIf(!PG_URL)('中断申请巡检保护与重试限制（#18）', () => {
+  const rowOf = async (rid: string) =>
+    (
+      await db.query<{
+        status: string;
+        status_reason: string | null;
+        result: { ok: boolean; code: string | null; current: { number: number } | null } | null;
+      }>('select status, status_reason, result from exec_requests where id = $1', [rid])
+    )[0]!;
+
+  test('多步迁移中途节点离线（环境当前版本已推进）后全量 sweep / recheck 保持 failed+interrupted，不发重复通知/Webhook，禁止误重试，且 finish() 兜底仍生效', async () => {
+    const pid = await newProject('interrupted-env-changed');
+    const prod = await realEnv(pid, 'prod');
+    const [v1, v2] = await publishChain(pid, 2);
+
+    const hooks: { type: string; requestId: unknown; status: unknown }[] = [];
+    const emit = created.webhooks.emit.bind(created.webhooks);
+    created.webhooks.emit = (gid, event) => {
+      hooks.push({ type: event.type, requestId: event.data.requestId, status: event.data.status });
+      emit(gid, event);
+    };
+
+    try {
+      const r = (await submit(pid, prod.eid, v2!.id, 'dev')).data as unknown as ExecRequestDetail;
+      expect(r.migrations.map((m) => m.number)).toEqual([1, 2]);
+      // 模拟：申请在重启前正在执行中，且第一步已完成推进了 environments.current_version_id = v1
+      await db.query('update environments set current_version_id = $2 where id = $1', [prod.eid, v1!.id]);
+      await db.query("update exec_requests set status = 'executing', updated_at = $2 where id = $1", [
+        r.id,
+        '2000-01-01T00:00:00.000Z',
+      ]);
+
+      // 全量巡检（runSweep({ all: true })）：先 recoverInterrupted 置为 failed/interrupted，紧接着的绑定巡检绝不能二次改写为 invalid
+      expect(await created.requests.sweep()).toBe(1);
+      expect(await rowOf(r.id)).toMatchObject({
+        status: 'failed',
+        status_reason: expect.stringContaining('结果未知'),
+        result: { ok: false, code: 'interrupted' },
+      });
+
+      // 再次全量巡检、按环境巡检、详情页 recheck 与详情接口均保持 failed/interrupted
+      expect(await created.requests.sweep()).toBe(0);
+      expect(await created.requests.sweep({ envIds: [prod.eid] })).toBe(0);
+      await created.requests.recheck(r.id);
+      const d = await detail(pid, r.id, 'pa');
+      expect(d.status).toBe('failed');
+      expect(d.result).toMatchObject({ ok: false, code: 'interrupted' });
+
+      // 仅 1 条执行失败通知与 1 条 request.executed Webhook（无 request.invalidated）
+      const notices = (await inbox('dev')).items.filter(
+        (i) => i.requestId === r.id && i.kind === 'request_result',
+      );
+      expect(notices).toHaveLength(1);
+      expect(notices[0]!.data).toMatchObject({ event: 'failed', status: 'failed' });
+      expect(hooks.filter((h) => h.requestId === r.id).map((h) => h.type)).toEqual([
+        'request.created',
+        'request.executed',
+      ]);
+
+      // 环境已变化的 interrupted 申请不可直接重试或撤回（actionsFor 与重试/撤回接口均拒绝，且不改写状态）
+      expect(d.actions).toMatchObject({
+        approve: false,
+        reject: false,
+        approveAndExecute: false,
+        execute: false,
+        withdraw: false,
+        note: expect.stringContaining('不能直接重试'),
+      });
+      expect((await detail(pid, r.id, 'dev')).actions).toMatchObject({
+        execute: false,
+        withdraw: false,
+      });
+      const retry = await executeReq(pid, r.id, 'pa');
+      expect(retry.status).toBe(409);
+      expect(retry.data.error).toContain('不能直接重试');
+      const withdraw = await call('POST', `/api/projects/${pid}/requests/${r.id}/withdraw`, {}, 'dev');
+      expect(withdraw.status).toBe(409);
+      expect(await rowOf(r.id)).toMatchObject({
+        status: 'failed',
+        result: { ok: false, code: 'interrupted' },
+      });
+
+      // 原副本只是心跳短暂超时恢复后调用 finish()：仍能成功覆盖回写为 executed 终态
+      await created.requests.finish(
+        null,
+        r.id,
+        { id: ids.pa!, name: 'pa' },
+        { ok: true, current: { id: v2!.id, number: 2, name: 'v2' }, error: null },
+      );
+      expect(await rowOf(r.id)).toMatchObject({
+        status: 'executed',
+        status_reason: null,
+        result: { ok: true, current: { number: 2 } },
+      });
+    } finally {
+      created.webhooks.emit = emit;
+    }
+  });
+
+  test('执行期间跨过 expires_at 后离线：sweep 与详情页 recheck 保持 failed+interrupted，不被改为 expired，且 finish() 仍可覆盖', async () => {
+    const pid = await newProject('interrupted-expired');
+    const prod = await realEnv(pid, 'prod');
+    const [v1] = await publishChain(pid, 1);
+
+    const hooks: { type: string; requestId: unknown }[] = [];
+    const emit = created.webhooks.emit.bind(created.webhooks);
+    created.webhooks.emit = (gid, event) => {
+      hooks.push({ type: event.type, requestId: event.data.requestId });
+      emit(gid, event);
+    };
+
+    try {
+      const r = (await submit(pid, prod.eid, v1!.id, 'dev')).data as unknown as ExecRequestDetail;
+      // 同时满足：执行期间已跨过 expires_at，且原执行节点已离线/重启
+      await db.query(
+        "update exec_requests set status = 'executing', expires_at = $2, updated_at = $2 where id = $1",
+        [r.id, '2000-01-01T00:00:00.000Z'],
+      );
+
+      expect(await created.requests.sweep()).toBe(1);
+      expect(await rowOf(r.id)).toMatchObject({
+        status: 'failed',
+        result: { ok: false, code: 'interrupted' },
+      });
+
+      // 详情页 recheck 与再次 sweep 均不改写为 expired
+      await created.requests.recheck(r.id);
+      const d = await detail(pid, r.id, 'pa');
+      expect(d.status).toBe('failed');
+      expect(d.result).toMatchObject({ ok: false, code: 'interrupted' });
+      expect(d.actions.execute).toBe(false);
+
+      const notices = (await inbox('dev')).items.filter(
+        (i) => i.requestId === r.id && i.kind === 'request_result',
+      );
+      expect(notices).toHaveLength(1);
+      expect(notices[0]!.data).toMatchObject({ event: 'failed', status: 'failed' });
+      expect(hooks.filter((h) => h.requestId === r.id).map((h) => h.type)).toEqual([
+        'request.created',
+        'request.executed',
+      ]);
+
+      // 重试接口拒绝且不把状态改成 expired
+      expect((await executeReq(pid, r.id, 'pa')).status).toBe(409);
+      expect(await rowOf(r.id)).toMatchObject({
+        status: 'failed',
+        result: { ok: false, code: 'interrupted' },
+      });
+
+      // 原节点恢复后 finish() 兜底回写仍生效
+      await created.requests.finish(
+        null,
+        r.id,
+        { id: ids.pa!, name: 'pa' },
+        { ok: true, current: { id: v1!.id, number: 1, name: 'v1' }, error: null },
+      );
+      expect(await rowOf(r.id)).toMatchObject({
+        status: 'executed',
+        result: { ok: true, current: { number: 1 } },
+      });
+
+      // 对照：普通执行失败（非 interrupted）在环境变化后仍正常由 sweep 转为 invalid
+      const rNormal = (await submit(pid, prod.eid, v1!.id, 'dev')).data as unknown as ExecRequestDetail;
+      await db.query("update exec_requests set status = 'failed', result = $2 where id = $1", [
+        rNormal.id,
+        JSON.stringify({ ok: false, code: 'internal', error: '执行失败', current: null }),
+      ]);
+      await db.query('update environments set current_version_id = $2 where id = $1', [prod.eid, v1!.id]);
+      expect(await created.requests.sweep()).toBe(1);
+      expect((await rowOf(rNormal.id)).status).toBe('invalid');
+    } finally {
+      created.webhooks.emit = emit;
+    }
+  });
+});
+
 // ───── 收件箱 SSE 实时流（#26） ─────
 
 describe('收件箱 SSE 实时流（#26）', () => {

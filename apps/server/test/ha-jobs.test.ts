@@ -953,4 +953,226 @@ describe.skipIf(!PG_URL)('P7 HA Wave 2B：持久化队列、分布式巡检、�
       await cluster.close();
     }
   });
+
+  test('8. 全量巡检保留 interrupted 申请不被二次改写为 invalid/expired，且原副本心跳恢复后 finish() 兜底仍生效（#18）', async () => {
+    const t = await createTestDb('ha_interrupted_preserve');
+    closers.push(t.close);
+    const dbA = await openPlatformDb(t.url);
+    const dbB = await openPlatformDb(t.url);
+    const haA = new HaCoordinator(dbA, { replicaId: 'int-node-a', ttlMs: 5000, heartbeatIntervalMs: 1000 });
+    const haB = new HaCoordinator(dbB, { replicaId: 'int-node-b', ttlMs: 5000, heartbeatIntervalMs: 1000 });
+    const busA = new EventBus(dbA, { replicaId: 'int-node-a' });
+    const busB = new EventBus(dbB, { replicaId: 'int-node-b' });
+    const whA = new Webhooks(dbA, { bus: busA, ha: haA });
+    const whB = new Webhooks(dbB, { bus: busB, ha: haB });
+    const security = securityConfigFromEnv();
+    const guard = async () => {};
+    const requestsA = new Requests(dbA, { db: dbA, guard, locks: new EnvLocks(dbA) }, whA, security, {
+      bus: busA,
+      ha: haA,
+    });
+    const requestsB = new Requests(dbB, { db: dbB, guard, locks: new EnvLocks(dbB) }, whB, security, {
+      bus: busB,
+      ha: haB,
+    });
+
+    const hooksB: { type: string; requestId: unknown; status: unknown }[] = [];
+    const origEmitB = whB.emit.bind(whB);
+    whB.emit = (gid, event) => {
+      hooksB.push({ type: event.type, requestId: event.data.requestId, status: event.data.status });
+      origEmitB(gid, event);
+    };
+
+    try {
+      await haA.start();
+      await haB.start();
+      await busA.start();
+      await busB.start();
+
+      const requester = await makeUser(dbA, 'int_dev', { name: '开发者' });
+      await dbA.query("insert into groups (id, slug, name) values ('g-int', 'g-int', '中断组')");
+      await dbA.query("insert into group_members (group_id, user_id, role) values ('g-int', $1, 'admin')", [
+        requester.id,
+      ]);
+      await dbA.query(
+        "insert into projects (id, name, group_id, slug) values ('p-int', '中断项目', 'g-int', 'p-int')",
+      );
+      await dbA.query("insert into branches (id, project_id, name) values ('b-int', 'p-int', 'main')");
+      const envUrlEnc = encrypt('postgres://u:p@127.0.0.1:5432/x');
+      await dbA.query(
+        `insert into environments (id, project_id, name, url_enc, production)
+         values ('e-int', 'p-int', 'prod', $1, true)`,
+        [envUrlEnc],
+      );
+      for (const [vid, seq, num] of [
+        ['v-int-1', 0, 1],
+        ['v-int-2', 1, 2],
+      ] as const) {
+        await dbA.query(
+          `insert into versions (id, project_id, branch_id, seq, name, model, number, up_steps, down_steps, checksum)
+           values ($1, 'p-int', 'b-int', $2, $3, $4::text::jsonb, $5, '[]'::jsonb, '[]'::jsonb, $6)`,
+          [vid, seq, `v${num}`, JSON.stringify(emptyModel()), num, `sum-${num}`],
+        );
+      }
+
+      const envConnHash = connHash({ url_enc: envUrlEnc });
+      const insertReq = async (
+        id: string,
+        opts: { status: string; workerId: string | null; expiresAt: Date; result?: unknown },
+      ) => {
+        await dbA.query(
+          `insert into exec_requests
+             (id, project_id, environment_id, requested_by, direction, from_version_id, to_version_id,
+              migrations, flow, conn_hash, production, status, expires_at, updated_at, worker_id, result)
+           values ($1, 'p-int', 'e-int', $2, 'up', null, 'v-int-2',
+                   '[]'::jsonb, $3::text::jsonb, $4, true, $5, $6, $7, $8, $9::text::jsonb)`,
+          [
+            id,
+            requester.id,
+            JSON.stringify({ implicit: true, stages: [] }),
+            envConnHash,
+            opts.status,
+            opts.expiresAt,
+            new Date(),
+            opts.workerId,
+            opts.result ? JSON.stringify(opts.result) : null,
+          ],
+        );
+      };
+
+      // 场景 1：多步迁移中途副本 A 已推进 environments.current_version_id = v1 后租约离线
+      await insertReq('req-int-env', {
+        status: 'executing',
+        workerId: requestsA.workerId!,
+        expiresAt: new Date(Date.now() + 3600_000),
+      });
+      await dbA.query("update environments set current_version_id = 'v-int-1' where id = 'e-int'");
+      // 同时放一条普通 failed（非 interrupted）申请，确认 PG 下 sweepWhere 只跳过 interrupted、不漏扫普通 failed
+      await insertReq('req-normal-failed', {
+        status: 'failed',
+        workerId: null,
+        expiresAt: new Date(Date.now() + 3600_000),
+        result: { ok: false, code: 'internal', error: '普通失败', current: null },
+      });
+
+      // 副本 A 心跳租约失效 → 副本 B 跑全量 sweep（runSweep({ all: true })）
+      await haA.stop();
+      // 1 条 recoverInterrupted（req-int-env）+ 1 条普通失败转为 invalid（req-normal-failed）
+      expect(await requestsB.sweep()).toBe(2);
+
+      const [envRow] = await dbB.query<RequestRow>("select * from exec_requests where id = 'req-int-env'");
+      expect(envRow!.status).toBe('failed');
+      expect(envRow!.result).toMatchObject({ ok: false, code: INTERRUPTED });
+      expect(envRow!.status_reason).toContain('结果未知');
+
+      const [normalRow] = await dbB.query<{ status: string }>(
+        "select status from exec_requests where id = 'req-normal-failed'",
+      );
+      expect(normalRow!.status).toBe('invalid');
+
+      // req-int-env 仅发 1 条执行失败通知与 1 条 request.executed Webhook（无 request.invalidated）
+      const envInbox = await dbB.query<{ data: { event: string; status?: string } }>(
+        "select data from inbox_items where request_id = 'req-int-env' and user_id = $1",
+        [requester.id],
+      );
+      expect(envInbox).toHaveLength(1);
+      expect(envInbox[0]!.data).toMatchObject({ event: 'failed', status: 'failed' });
+      expect(hooksB.filter((h) => h.requestId === 'req-int-env').map((h) => h.type)).toEqual([
+        'request.executed',
+      ]);
+
+      // 再次 sweep / recheck 不改写，且 actionsFor 拒绝直接重试
+      expect(await requestsB.sweep()).toBe(0);
+      await requestsB.recheck('req-int-env');
+      const [afterRecheck] = await dbB.query<RequestRow>(
+        "select * from exec_requests where id = 'req-int-env'",
+      );
+      expect(afterRecheck!.status).toBe('failed');
+      expect(afterRecheck!.result).toMatchObject({ ok: false, code: INTERRUPTED });
+      const scope = (await requestsB.scopeOf(dbB, afterRecheck!))!;
+      const actions = requestsB.actionsFor(
+        afterRecheck!,
+        {
+          userId: requester.id,
+          instanceAdmin: false,
+          groups: new Map([['g-int', 'admin']]),
+          grants: [],
+        },
+        requestsB.stageScope(scope, afterRecheck!),
+        [],
+      );
+      expect(actions).toMatchObject({ execute: false, withdraw: false });
+
+      // 副本 A 心跳短暂超时恢复后调用 finish()：仍能成功覆盖回写为 executed 终态
+      await requestsA.finish(
+        null,
+        'req-int-env',
+        { id: requester.id, name: '开发者' },
+        { ok: true, current: { id: 'v-int-2', number: 2, name: 'v2' }, error: null },
+      );
+      const [finishedEnv] = await dbB.query<RequestRow>(
+        "select * from exec_requests where id = 'req-int-env'",
+      );
+      expect(finishedEnv!.status).toBe('executed');
+      expect(finishedEnv!.result).toMatchObject({ ok: true, current: { number: 2 } });
+
+      // 等待 finish() 触发的按环境 kick 巡检在双副本排空，避免占用分布式锁干扰下一场景的 sweep
+      await new Promise((r) => setTimeout(r, 30));
+      await requestsA.drain();
+      await requestsB.drain();
+
+      // 场景 2：执行期间跨过 expires_at 后节点离线 → sweep 与 recheck 保持 failed/interrupted，且 finish() 仍生效
+      await dbA.query(
+        "insert into ha_leases (key, owner, expires_at) values ('node:expired-exec-node', 'expired-exec-node', $1)",
+        [new Date(Date.now() - 5000)],
+      );
+      await insertReq('req-int-exp', {
+        status: 'executing',
+        workerId: 'expired-exec-node',
+        expiresAt: new Date(Date.now() - 60_000),
+      });
+
+      expect(await requestsB.sweep()).toBe(1);
+      await requestsB.recheck('req-int-exp');
+      const [expRow] = await dbB.query<RequestRow>("select * from exec_requests where id = 'req-int-exp'");
+      expect(expRow!.status).toBe('failed');
+      expect(expRow!.result).toMatchObject({ ok: false, code: INTERRUPTED });
+
+      const expInbox = await dbB.query<{ data: { event: string; status?: string } }>(
+        "select data from inbox_items where request_id = 'req-int-exp' and user_id = $1",
+        [requester.id],
+      );
+      expect(expInbox).toHaveLength(1);
+      expect(expInbox[0]!.data).toMatchObject({ event: 'failed', status: 'failed' });
+      expect(hooksB.filter((h) => h.requestId === 'req-int-exp').map((h) => h.type)).toEqual([
+        'request.executed',
+      ]);
+
+      await requestsA.finish(
+        null,
+        'req-int-exp',
+        { id: requester.id, name: '开发者' },
+        { ok: true, current: { id: 'v-int-2', number: 2, name: 'v2' }, error: null },
+      );
+      const [finishedExp] = await dbB.query<RequestRow>(
+        "select * from exec_requests where id = 'req-int-exp'",
+      );
+      expect(finishedExp!.status).toBe('executed');
+      expect(finishedExp!.result).toMatchObject({ ok: true, current: { number: 2 } });
+    } finally {
+      whB.emit = origEmitB;
+      requestsA.stop();
+      requestsB.stop();
+      await requestsA.drain();
+      await requestsB.drain();
+      await whA.close();
+      await whB.close();
+      await busA.close();
+      await busB.close();
+      await haA.stop();
+      await haB.stop();
+      await dbA.close();
+      await dbB.close();
+    }
+  });
 });

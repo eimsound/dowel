@@ -32,6 +32,7 @@ import {
   eligibleFor,
   flowOf,
   hasExecRight,
+  isInterrupted,
   loadAudience,
   loadRequest,
   type RequestRow,
@@ -89,6 +90,11 @@ const decideIn = async (
   // 也不能撤回；要再来一次就重新发起紧急执行（实例管理员）或提交执行申请
   if (req.emergency)
     throw conflict('紧急执行的记录不能在这里重试或撤回：需要的话请重新发起紧急执行，或提交执行申请');
+  // 执行中被中断（结果未知）的申请不能直接重试或撤回：避免在状态未明时重复执行，也避免覆盖中断状态击穿原节点 finish() 兜底（#18）
+  if (isInterrupted(req))
+    throw conflict(
+      '执行中服务重启或执行节点离线，结果未知，不能直接重试或撤回：请到环境页查看执行历史后重新提交执行申请',
+    );
   if (op.kind === 'withdraw') {
     if (req.requested_by !== user.id) throw forbidden('只有申请人能撤回申请');
     if (req.status !== 'pending' && req.status !== 'approved' && req.status !== 'failed')
@@ -470,7 +476,10 @@ export const registerRequests = (app: Hono<Env>, ctx: AppContext) => {
     const a = await access(c, ctx, 'project.read');
     const rid = c.req.param('rid');
     let req = await loadRequest(db, a.pid, rid);
-    if (req.status === 'pending' || req.status === 'approved' || req.status === 'failed') {
+    if (
+      (req.status === 'pending' || req.status === 'approved' || req.status === 'failed') &&
+      !isInterrupted(req)
+    ) {
       await requests.recheck(req.id);
       req = await loadRequest(db, a.pid, rid);
     }

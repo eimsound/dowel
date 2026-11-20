@@ -444,11 +444,24 @@ export interface NoticeData {
   params?: Record<string, string | number | null>;
 }
 
+/** 服务重启或执行节点离线时被中断的执行（result.code） */
+export const INTERRUPTED = 'interrupted';
+
+/** 是否是执行中被中断（结果未知）的申请：不参与巡检/重检失效改写，也不允许直接重试，仅保留原节点 finish() 兜底覆盖 */
+export const isInterrupted = (req: Pick<RequestRow, 'status' | 'result'>): boolean =>
+  req.status === 'failed' && req.result?.code === INTERRUPTED;
+
 /**
- * 还要做绑定检查的申请：待审批、已通过、执行失败（可以重试）的**普通**申请。紧急执行的记录一旦失败 / 中断就是终态
- * （不能经申请的流程重试，第一轮审查），不再检查、不再转成失效 / 过期，也不再发通知和 Webhook（第二轮审查）。
+ * 还要做绑定检查的申请：待审批、已通过、执行失败（可以重试，不含中断）的**普通**申请。
+ * - 紧急执行的记录一旦失败 / 中断就是终态（不能经申请的流程重试，第一轮审查），不再检查、不再转成失效 / 过期，也不再发通知和 Webhook（第二轮审查）；
+ * - 执行中被中断（status = 'failed' 且 result.code = 'interrupted'）的申请结果未知，需保留中断原因供人工核对，
+ *   并保留原节点心跳抖动恢复后由 finish() 覆盖真实结果的能力，同样不再被巡检/重检改写为失效 / 过期（#18）。
  */
 const SWEEP_WHERE = "status in ('pending', 'approved', 'failed') and not emergency";
+const sweepWhere = (dialect: PlatformDb['dialect']): string => {
+  const codeExpr = dialect === 'pg' ? "result->>'code'" : "json_extract(result, '$.code')";
+  return `${SWEEP_WHERE} and (status <> 'failed' or coalesce(${codeExpr}, '') <> '${INTERRUPTED}')`;
+};
 
 /** 状态 → 审计动作 / 中文 */
 const STATUS_LABEL: Record<RequestStatus, string> = {
@@ -474,9 +487,6 @@ export interface SweepTarget {
   projectIds?: string[];
   groupIds?: string[];
 }
-
-/** 服务重启时被中断的执行（result.code） */
-export const INTERRUPTED = 'interrupted';
 
 /** 定时清理的默认间隔：30 秒（过期、失效的申请转成终态并通知申请人） */
 export const REQUEST_SWEEP_MS = 30_000;
@@ -809,29 +819,32 @@ export class Requests {
       if (!conds.length) return n;
     }
     const rows = await this.db.query<RequestRow>(
-      `select * from exec_requests where ${SWEEP_WHERE}${conds.length ? ` and (${conds.join(' or ')})` : ''}`,
+      `select * from exec_requests where ${sweepWhere(this.db.dialect)}${conds.length ? ` and (${conds.join(' or ')})` : ''}`,
       params,
     );
     const stale: string[] = [];
     const cache = newBindingCache();
     const now = new Date();
-    for (const r of rows) if (await bindingProblem(this.db, r, now, cache)) stale.push(r.id);
+    for (const r of rows) {
+      if (isInterrupted(r)) continue;
+      if (await bindingProblem(this.db, r, now, cache)) stale.push(r.id);
+    }
     if (!stale.length) return n;
     return n + (await this.closeStale(stale));
   }
 
   /** 锁内重新读、重新判断、条件更新：只读判断之后状态可能又变了（被执行、被撤回……） */
   private async closeStale(ids: string[]): Promise<number> {
+    const where = sweepWhere(this.db.dialect);
     const fx = await withPolicyLock(this.db, async (tx) => {
       const fx = Object.assign(new Effects(), { n: 0 });
       const cache = newBindingCache();
       const now = new Date();
       for (const id of ids) {
-        const [r] = await tx.query<RequestRow>(
-          `select * from exec_requests where id = $1 and ${SWEEP_WHERE}`,
-          [id],
-        );
-        if (!r) continue;
+        const [r] = await tx.query<RequestRow>(`select * from exec_requests where id = $1 and ${where}`, [
+          id,
+        ]);
+        if (!r || isInterrupted(r)) continue;
         const p = await bindingProblem(tx, r, now, cache);
         if (p && (await this.setStatus(tx, null, r, p.status, p.reason, null, fx, { onlyIf: r.status })))
           fx.n++;
@@ -861,6 +874,8 @@ export class Requests {
     // 紧急执行的记录只有“执行结束”（finish）和启动恢复会改它的状态，两者都带着结果；已经结束的紧急记录不再被别的路径改动
     // （第二轮审查：否则定时检查会把失败的紧急记录转成失效，再发一次通知和 Webhook）
     if (req.emergency && req.status !== 'executing' && !extra.result) return false;
+    // 执行中被中断（result.code = interrupted）的记录同样不能被巡检/重检改写为失效或过期，仅允许原节点 finish() 带真实结果覆盖（#18）
+    if (isInterrupted(req) && !extra.result) return false;
     const now = new Date().toISOString();
     // onlyIf：条件更新（状态仍是读到时的那个才改），没改到就什么副作用都不做
     const updated = await tx.query<{ id: string }>(
@@ -913,6 +928,7 @@ export class Requests {
     );
     req.status = status;
     req.status_reason = reason;
+    if (extra.result) req.result = extra.result;
     fx.requestsChanged = true;
     const ctx = await this.scopeOf(tx, req);
     if (!ctx) return true;
@@ -1252,7 +1268,7 @@ export class Requests {
         await withPolicyLock(this.db, async (tx) => {
           const [req] = await tx.query<RequestRow>('select * from exec_requests where id = $1', [rid]);
           if (!req) return;
-          const interrupted = req.status === 'failed' && req.result?.code === INTERRUPTED;
+          const interrupted = isInterrupted(req);
           if (req.status !== 'executing' && !interrupted) return;
           envId = req.environment_id;
           await tx.query('update exec_requests set executed_at = $2 where id = $1', [
@@ -1671,6 +1687,12 @@ export class Requests {
             ? '紧急执行失败后不能在这里重试：需要的话请重新发起紧急执行，或提交执行申请'
             : null,
       };
+    // 执行中被中断（结果未知）的申请不能直接重试或撤回：避免状态未明时重复执行或破坏原节点 finish() 兜底回写（#18）
+    if (isInterrupted(req))
+      return {
+        ...none,
+        note: '执行中服务重启或执行节点离线，结果未知，不能直接重试：请到环境页查看执行历史后重新提交执行申请',
+      };
     const mine = req.requested_by === rc.userId;
     const withdraw =
       mine && (req.status === 'pending' || req.status === 'approved' || req.status === 'failed');
@@ -1935,10 +1957,10 @@ export class Requests {
   async recheck(rid: string) {
     // 先只读判断（不拿全局锁，第一轮审查）；发现不成立再在锁内重新读、条件更新
     const [r] = await this.db.query<RequestRow>(
-      `select * from exec_requests where id = $1 and ${SWEEP_WHERE}`,
+      `select * from exec_requests where id = $1 and ${sweepWhere(this.db.dialect)}`,
       [rid],
     );
-    if (r && (await bindingProblem(this.db, r))) await this.closeStale([rid]);
+    if (r && !isInterrupted(r) && (await bindingProblem(this.db, r))) await this.closeStale([rid]);
   }
 
   /** 申请的有效期（小时 → 到期时间） */
