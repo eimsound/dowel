@@ -12,7 +12,14 @@ import type { PlatformDb } from './db.ts';
 import { OpaqueRefresher } from './derive.ts';
 import { DriftScheduler } from './drift-scheduler.ts';
 import { EnvLocks, type ExecContext } from './executions.ts';
-import { KeyedLimiter, type LoginLimiter, loginLimiterFromEnv } from './rate-limit.ts';
+import {
+  connectionLimiterFromEnv,
+  type KeyedLimiter,
+  type LoginLimiter,
+  loginLimiterFromEnv,
+  tokenFailLimiterFromEnv,
+  tokenLimiterFromEnv,
+} from './rate-limit.ts';
 import { Requests } from './requests.ts';
 import { effectiveProjectRole } from './roles.ts';
 import { Rooms } from './rooms.ts';
@@ -35,7 +42,7 @@ import { type WebhookOptions, Webhooks } from './webhooks.ts';
 export interface AppOptions {
   /** 可注入时钟 / 阈值的登录限速器（测试用） */
   loginLimiter?: LoginLimiter;
-  /** 可注入时钟 / 阈值的连接检查限速器（测试用）；默认每个用户每分钟 10 次 */
+  /** 可注入时钟 / 阈值的连接检查限速器（测试用）；默认 DOWEL_CONNECTION_LIMIT（10）次 / DOWEL_CONNECTION_WINDOW_MS（60000ms） */
   connectionLimiter?: KeyedLimiter;
   /** 安全相关配置；未给出的项从 DOWEL_TRUST_PROXY / DOWEL_PUBLIC_URL 读取 */
   security?: Partial<SecurityConfig>;
@@ -43,17 +50,11 @@ export interface AppOptions {
   allowPasswordLogin?: boolean;
   /** Webhook 投递的参数（测试里调短重试间隔） */
   webhooks?: WebhookOptions;
-  /** CI 令牌认证失败的限速（按 IP）；默认 DOWEL_TOKEN_FAIL_LIMIT（20）次 / 10 分钟 */
+  /** CI 令牌认证失败的限速（按 IP）；默认 DOWEL_TOKEN_FAIL_LIMIT（20）次 / DOWEL_TOKEN_FAIL_WINDOW_MS（600000ms） */
   tokenFailLimiter?: KeyedLimiter;
-  /** 每个 CI 令牌的请求限速；默认 DOWEL_TOKEN_RATE_LIMIT（120）次 / 分钟 */
+  /** 每个 CI 令牌的请求限速；默认 DOWEL_TOKEN_RATE_LIMIT（120）次 / DOWEL_TOKEN_RATE_WINDOW_MS（60000ms） */
   tokenLimiter?: KeyedLimiter;
 }
-
-/** 环境变量里的正整数（没设 / 不合法时用默认值） */
-const envInt = (name: string, fallback: number) => {
-  const n = Number(process.env[name]);
-  return Number.isInteger(n) && n > 0 ? n : fallback;
-};
 
 export const createApp = (db: PlatformDb, options: AppOptions = {}) => {
   const app = new Hono<Env>();
@@ -114,13 +115,9 @@ export const createApp = (db: PlatformDb, options: AppOptions = {}) => {
     shadows,
     refresher,
     loginLimiter: options.loginLimiter ?? loginLimiterFromEnv(),
-    connectionLimiter: options.connectionLimiter ?? new KeyedLimiter({ limit: 10, windowMs: 60_000 }),
-    tokenFailLimiter:
-      options.tokenFailLimiter ??
-      new KeyedLimiter({ limit: envInt('DOWEL_TOKEN_FAIL_LIMIT', 20), windowMs: 10 * 60_000 }),
-    tokenLimiter:
-      options.tokenLimiter ??
-      new KeyedLimiter({ limit: envInt('DOWEL_TOKEN_RATE_LIMIT', 120), windowMs: 60_000 }),
+    connectionLimiter: options.connectionLimiter ?? connectionLimiterFromEnv(),
+    tokenFailLimiter: options.tokenFailLimiter ?? tokenFailLimiterFromEnv(),
+    tokenLimiter: options.tokenLimiter ?? tokenLimiterFromEnv(),
     guard,
     exec,
     drift,

@@ -119,10 +119,10 @@ test('接手：读出库里的项目 → 认领确认 → 恢复版本链和环�
     await claim.getByRole('button', { name: '确认认领并接手' }).click();
     await expect(page.getByRole('heading', { name: '概览' })).toBeVisible({ timeout: 60_000 });
 
-    // 恢复了版本链：v2、v1，都标“接手恢复”和“未验证”
+    // ADR 0012：接手前经本实例影子库全链验证通过，恢复的版本链 v2、v1 均标“接手恢复”和“已验证”
     await expect(page.locator('.chip', { hasText: /^v2$/ })).toBeVisible();
     await expect(page.locator('.chip', { hasText: '接手恢复' })).toHaveCount(2);
-    await expect(page.locator('.risk', { hasText: '未验证' })).toHaveCount(2);
+    await expect(page.locator('.risk', { hasText: '已验证' })).toHaveCount(2);
     // 认领写进了目标库：项目行换手、claims 追加一条事件、history 里的执行记录没动
     const [row] = await db.sql<{ i: string; p: string }>(
       'select instance_id as i, previous_instance_id as p from dowel.projects',
@@ -200,6 +200,113 @@ test('接手：库里没有历史时有说明，不能继续', async ({ browser 
     await expect(page.getByRole('button', { name: '下一步' })).toBeDisabled();
   } finally {
     await empty.drop();
+  }
+});
+
+test('ADR 0012：生产环境接手配置独立影子库 + 接入领先环境（工作副本脏展示差异确认覆盖）', async ({
+  browser,
+}) => {
+  const dev = await newTargetDb('e2e_tk_ahead_dev');
+  const prod = await newTargetDb('e2e_tk_ahead_prod');
+  const shadow = await newTargetDb('e2e_tk_ahead_shd');
+  try {
+    const admin = await instanceAdmin(browser);
+    const group = await createGroup(admin);
+    const origName = `领先原项目 ${Math.random().toString(36).slice(2, 6)}`;
+    await createProjectIn(admin, origName, group.name);
+    await addEnv(admin, 'dev', dev.url, false);
+    await addEnv(admin, 'prod', prod.url, false);
+    await publishTable(admin, 'orders', 'v1', 1);
+    // dev 执行到 v1
+    await openEnv(admin, 'dev');
+    await executeAll(admin);
+    // 再发布 v2（customers），只执行到 prod（prod 领先 dev 一个版本）
+    await publishTable(admin, 'customers', 'v2', 2);
+    await openEnv(admin, 'prod');
+    await executeAll(admin);
+
+    // 删掉原项目并改认领实例为 old-instance，模拟另一个实例
+    const list = (await (await admin.request.get('/api/projects')).json()) as {
+      id: string;
+      name: string;
+      slug: string;
+    }[];
+    const p = list.find((x) => x.name === origName)!;
+    expect((await admin.request.delete(`/api/projects/${p.id}`, { data: { confirm: p.slug } })).ok()).toBe(
+      true,
+    );
+    await dev.sql("update dowel.projects set instance_id = 'old-instance'");
+    await prod.sql("update dowel.projects set instance_id = 'old-instance'");
+
+    // ① 接手 dev（设为生产环境、未勾选允许同实例，在第 3 步“接手现有项目”的影子库配置中填写独立影子库）
+    const page = await instanceAdmin(browser);
+    await page.goto('/new');
+    await page.getByRole('combobox', { name: /^组/ }).selectOption({ label: group.name });
+    await page.getByLabel('项目名').fill('接手并接入领先');
+    await page.getByRole('button', { name: '下一步' }).click();
+    await page.getByRole('button', { name: '添加数据库' }).click();
+    await page.getByRole('textbox', { name: /^名字/ }).fill('dev');
+    await page.getByLabel('连接串', { exact: true }).fill(dev.url);
+    await page.getByLabel('生产环境').check();
+    await page.getByLabel('允许在同一实例上建影子库').uncheck();
+    await page.getByRole('button', { name: '下一步' }).click();
+    await page.getByRole('radio', { name: /接手现有项目/ }).check();
+    await expect(page.getByText(/当前所有环境均为生产环境且未配置可用影子库/)).toBeVisible();
+    await page.getByRole('radio', { name: new RegExp(origName) }).check();
+    // 在接手面板里填写独立影子库连接串，警告消失
+    await page.getByLabel(/单独的影子库连接串/).fill(shadow.url);
+    await expect(page.getByText(/当前所有环境均为生产环境且未配置可用影子库/)).toHaveCount(0);
+    await page.getByRole('button', { name: '下一步' }).click();
+    await page.getByRole('button', { name: '创建项目' }).click();
+    const claim = page.getByRole('dialog', { name: '认领这个项目？' });
+    await expect(claim).toBeVisible();
+    await claim.getByRole('button', { name: '确认认领并接手' }).click();
+    await expect(page.getByRole('heading', { name: '概览' })).toBeVisible({ timeout: 60_000 });
+    await expect(page.locator('.risk', { hasText: '已验证' })).toHaveCount(1);
+
+    // ② 在画布中新建一张未发布表（使工作副本相对 v1 变脏）
+    await page.getByRole('navigation', { name: '实例与项目' }).getByRole('link', { name: '模型' }).click();
+    await expect(page.getByRole('navigation', { name: '对象' })).toBeVisible();
+    await page.getByRole('button', { name: '新建表' }).click();
+    await page.getByLabel('表名').fill('draft_table');
+    await page.getByLabel('表名').press('Enter');
+    await expect(
+      page.getByRole('navigation').getByRole('button', { name: 'draft_table', exact: true }),
+    ).toBeVisible();
+
+    // ③ 在环境页添加并接入领先的 prod（v2）→ 先认领确认 → 再弹出覆盖工作副本差异确认对话框
+    const page2 = await instanceAdmin(browser);
+    await page2.goto(page.url().replace(/\/model.*$/, '/environments'));
+    await page2.getByLabel('名字').fill('prod');
+    await page2.getByLabel('连接串', { exact: true }).fill(prod.url);
+    await page2.getByLabel('生产环境').uncheck();
+    await page2.getByLabel('允许在同一实例上建影子库').check();
+    await page2.getByLabel(/已经有这个项目的迁移历史/).check();
+    await page2.getByRole('button', { name: '添加环境' }).click();
+
+    const claimDlg = page2.getByRole('dialog', { name: '认领这个项目？' });
+    await expect(claimDlg).toBeVisible();
+    await claimDlg.getByRole('button', { name: '确认认领', exact: true }).click();
+
+    const overwriteDlg = page2.getByRole('dialog', { name: '确认覆盖工作副本并接入领先环境' });
+    await expect(overwriteDlg).toBeVisible({ timeout: 60_000 });
+    await expect(overwriteDlg).toContainText('v2 · v2');
+    await expect(overwriteDlg).toContainText('customers');
+    await expect(overwriteDlg).toContainText('draft_table');
+    await overwriteDlg.getByRole('button', { name: '确认覆盖并接入' }).click();
+    await expect(overwriteDlg).toBeHidden({ timeout: 60_000 });
+    await expect(page2.getByText(/已接入 prod：补齐 1 个领先版本/)).toBeVisible();
+
+    // 回到模型页：工作副本已覆盖到新链头 v2（有 customers，不再有未发布的 draft_table）
+    await page2.getByRole('navigation', { name: '实例与项目' }).getByRole('link', { name: '模型' }).click();
+    await expect(
+      page2.getByRole('navigation').getByRole('button', { name: 'customers', exact: true }),
+    ).toBeVisible();
+    await expect(
+      page2.getByRole('navigation').getByRole('button', { name: 'draft_table', exact: true }),
+    ).toHaveCount(0);
+  } finally {
+    await Promise.all([dev.drop(), prod.drop(), shadow.drop()]);
   }
 });
 

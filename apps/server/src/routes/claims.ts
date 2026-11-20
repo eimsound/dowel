@@ -7,24 +7,41 @@
 // 顺序（和接手一致）：**先写平台库，提交之后再写目标库**——环境行（和审计）在一个平台事务里，认领在提交之后。
 // 认领失败环境照样保留，作为 warnings 返回，可以在环境页重试认领；同步目标库状态失败只记日志并附 warning，
 // 请求仍然成功（环境已经建好，不能让用户误以为接入失败）。认领在目标库的项目锁里重新比对版本链（claimInstance 的 chain）。
-import { type AttachResult, type ClaimResult, environmentAttachSchema, resolvePolicy } from '@dowel/api';
-import { newId } from '@dowel/core';
-import { claimInstance, inspectAttach } from '@dowel/executor';
+import {
+  type AttachOverwritePreview,
+  type AttachResult,
+  type ClaimResult,
+  environmentAttachSchema,
+  resolvePolicy,
+  type StoredVerifyReport,
+} from '@dowel/api';
+import { type Model, newId } from '@dowel/core';
+import { claimInstance, inspectAttach, planDiff } from '@dowel/executor';
 import type { Hono } from 'hono';
 import { HTTPException } from 'hono/http-exception';
 import { audit, auditIn } from '../audit.ts';
 import { can, userActor } from '../authz.ts';
-import { isUniqueViolation } from '../db.ts';
+import { emptyBase } from '../chain.ts';
+import { inList, isUniqueViolation } from '../db.ts';
 import { type EnvRow, loadChain, loadEnv, versionRef } from '../envs.ts';
 import { claimFailure, lockEnvIdle, readTargetState, toTargetError } from '../executions.ts';
 import { isExecutor, loadPolicies, upperInput } from '../policy.ts';
 import { decrypt, encrypt, scrubSecrets } from '../secrets.ts';
 import { readSettings } from '../settings.ts';
-import { CHECK_CONNECT_TIMEOUT, claimShadow, connectPg, inspectTarget } from '../targets.ts';
+import type { Shadow } from '../shadow.ts';
+import type { ShadowSource } from '../shadows.ts';
+import { insertRestoredVersions, pickShadow, TakeoverRejected, verifyVersionChain } from '../takeover.ts';
+import {
+  CHECK_CONNECT_TIMEOUT,
+  claimShadow,
+  connectPg,
+  dropSameInstanceShadow,
+  inspectTarget,
+} from '../targets.ts';
 import { type AppContext, access, body, connectionLimit, type Env } from './context.ts';
 
 export const registerClaims = (app: Hono<Env>, ctx: AppContext) => {
-  const { db, refresher } = ctx;
+  const { db, rooms, refresher } = ctx;
 
   app.post('/api/projects/:pid/environments/attach', async (c) => {
     // 先按项目权限挡一道（看不见 404、不是项目管理员 403），再看请求里的“是否生产”对应的执行档位
@@ -60,7 +77,7 @@ export const registerClaims = (app: Hono<Env>, ctx: AppContext) => {
 
     const settings = await readSettings(db);
     const chain = await loadChain(db, a.pid);
-    // ① 只读：这个库的历史能不能接入（和平台的链、模型对得上）、认领情况。连接故障 / 权限不足 → 带原因的 422
+    // ① 只读：这个库的历史能不能接入（和平台的链、模型对得上，或者严格无分叉领先）、认领情况。连接故障 / 权限不足 → 带原因的 422
     const probe = connectPg(b.url, CHECK_CONNECT_TIMEOUT, ctx.guard);
     let ins: Awaited<ReturnType<typeof inspectAttach>>;
     try {
@@ -71,6 +88,7 @@ export const registerClaims = (app: Hono<Env>, ctx: AppContext) => {
       await probe.close().catch(() => {});
     }
     const hasHistory = ins.hasHistory;
+    const aheadVersions = ins.hasHistory ? ins.aheadVersions : [];
     const needClaim = ins.hasHistory && !ins.claim.mine;
     if (needClaim) {
       if (!can(actor, 'instance.claim_project', { kind: 'instance' }))
@@ -89,111 +107,276 @@ export const registerClaims = (app: Hono<Env>, ctx: AppContext) => {
         );
     }
 
-    // ② 平台事务：环境行 + 审计（重名在事务里检查，唯一约束再兜一层）。提交之前目标库一概不动
-    const id = newId();
+    // ② 目标库严格领先于平台链（ADR 0012）：
+    //    1) 先按顺序用影子库对全部领先版本做闭环验证（基线模型为原链头模型）；缺影子库或任一版本失败 → 422 拒绝
+    //    2) 检查当前工作副本是否有未发布修改；有且未确认 → 409 working_dirty_confirm，已确认但 seq 变了 → 409 working_changed
+    let verifiedReports = new Map<string, StoredVerifyReport>();
+    let createdShadow: { targetUrl: string; name: string } | null = null;
+    let committed = false;
+    const newHead = aheadVersions.at(-1) ?? null;
+
+    const cleanupShadow = async () => {
+      if (!committed && createdShadow) {
+        const s = createdShadow;
+        createdShadow = null;
+        await dropSameInstanceShadow(s.targetUrl, s.name, ctx.guard);
+      }
+    };
+
     try {
-      await db.transaction(async (tx) => {
-        const [dup] = await tx.query<{ id: string }>(
-          'select id from environments where project_id = $1 and name = $2',
-          [a.pid, b.name],
+      if (aheadVersions.length && newHead) {
+        const existingEnvs = await db.query<
+          Pick<EnvRow, 'name' | 'url_enc' | 'production' | 'allow_same_instance' | 'shadow_url_enc'>
+        >(
+          'select name, url_enc, production, allow_same_instance, shadow_url_enc from environments where project_id = $1 order by created_at',
+          [a.pid],
         );
-        if (dup) throw new HTTPException(409, { message: `环境“${b.name}”已经存在` });
-        await tx.query(
-          `insert into environments (id, project_id, name, url_enc, production, allow_same_instance, shadow_url_enc)
-           values ($1, $2, $3, $4, $5, $6, $7)`,
-          [
-            id,
-            a.pid,
-            b.name,
-            encrypt(b.url),
-            b.production,
-            b.allowSameInstance,
-            b.shadowUrl ? encrypt(b.shadowUrl) : null,
-          ],
-        );
-        await auditIn(
-          tx,
-          c,
+        const candidates: ShadowSource[] = [
           {
-            action: hasHistory ? 'environment.attach_history' : 'environment.create',
-            actorKind: 'user',
-            actorId: user.id,
-            targetKind: 'environment',
-            targetId: id,
-            projectId: a.pid,
-            data: { projectId: a.pid, name: b.name, claimRequested: needClaim },
+            name: b.name,
+            url: b.url,
+            production: b.production,
+            allowSameInstance: b.allowSameInstance,
+            shadowUrl: b.shadowUrl,
           },
-          ctx.security,
-        );
-      });
+          ...existingEnvs.map((e) => ({
+            name: e.name,
+            url: decrypt(e.url_enc),
+            production: e.production,
+            allowSameInstance: e.allow_same_instance,
+            shadowUrl: e.shadow_url_enc ? decrypt(e.shadow_url_enc) : null,
+          })),
+        ];
+        let shadow: Shadow | null = null;
+        try {
+          const scope = newHead.scope?.length ? newHead.scope : a.schemas;
+          const prepared = await pickShadow(candidates, scope, ctx.guard);
+          shadow = prepared.shadow;
+          createdShadow = prepared.created;
+          verifiedReports = await verifyVersionChain({
+            shadow,
+            shadowLabel: prepared.label,
+            versions: aheadVersions,
+            baseModel: chain.at(-1)?.model ?? null,
+          });
+        } catch (e) {
+          if (e instanceof TakeoverRejected) {
+            await cleanupShadow();
+            return c.json({ error: scrubSecrets(e.message), code: e.code }, 422);
+          }
+          throw e;
+        } finally {
+          await shadow?.close();
+        }
+
+        // 检查工作副本是否相对原链头有未发布的修改（与 pull 相同的并发保护）
+        await refresher.flush(a.branch);
+        const { model: working, seq: workingSeq } = await rooms.model(a.branch);
+        const baseHeadModel = chain.at(-1)?.model ?? emptyBase(working, a.schemas);
+        const isDirty = (w: Model) => planDiff(baseHeadModel, w).total > 0;
+        const previewOf = (w: Model, sq: number): AttachOverwritePreview => {
+          const diff = planDiff(w, newHead.model);
+          return {
+            aheadVersions: aheadVersions.map((v) => ({ id: v.versionId, number: v.number, name: v.name })),
+            items: diff.items,
+            total: diff.total,
+            workingSeq: sq,
+          };
+        };
+        if (isDirty(working)) {
+          if (!b.confirmOverwrite) {
+            await cleanupShadow();
+            return c.json(
+              {
+                error: '工作副本有未发布的修改，接入领先环境会将其覆盖到新链头，请先查看差异并确认',
+                code: 'working_dirty_confirm',
+                ...previewOf(working, workingSeq),
+              },
+              409,
+            );
+          }
+          if (b.workingSeq !== undefined && b.workingSeq !== workingSeq) {
+            await cleanupShadow();
+            return c.json(
+              {
+                error: '工作副本在预览之后被改过，请重新确认差异',
+                code: 'working_changed',
+                ...previewOf(working, workingSeq),
+              },
+              409,
+            );
+          }
+        } else if (b.confirmOverwrite && b.workingSeq !== undefined && b.workingSeq !== workingSeq) {
+          await cleanupShadow();
+          return c.json(
+            {
+              error: '工作副本在预览之后被改过，请重新确认差异',
+              code: 'working_changed',
+              ...previewOf(working, workingSeq),
+            },
+            409,
+          );
+        }
+      }
+
+      // ③ 平台事务：领先版本（若有）+ 环境行 + 审计（重名与链头并发在事务里检查）。提交之前目标库一概不动
+      const id = newId();
+      try {
+        await db.transaction(async (tx) => {
+          if (aheadVersions.length) {
+            if (db.dialect === 'pg')
+              await tx.query('select id from projects where id = $1 for update', [a.pid]);
+            const [headNow] = await tx.query<{ id: string }>(
+              'select id from versions where project_id = $1 order by number desc limit 1',
+              [a.pid],
+            );
+            if ((headNow?.id ?? null) !== (chain.at(-1)?.id ?? null))
+              throw new HTTPException(409, { message: '版本链刚刚发生了变化，请刷新后重试' });
+            const aheadIds = aheadVersions.map((v) => v.versionId);
+            const clash = await tx.query<{ id: string }>(
+              `select id from versions where id in (${inList(aheadIds)})`,
+              aheadIds,
+            );
+            if (clash.length)
+              throw new HTTPException(409, {
+                message: `本实例里已经有同一个版本（${clash[0]!.id}），不能重复接入`,
+              });
+            await insertRestoredVersions(tx, {
+              pid: a.pid,
+              branch: a.branch,
+              versions: aheadVersions,
+              verifiedReports,
+            });
+          }
+          const [dup] = await tx.query<{ id: string }>(
+            'select id from environments where project_id = $1 and name = $2',
+            [a.pid, b.name],
+          );
+          if (dup) throw new HTTPException(409, { message: `环境“${b.name}”已经存在` });
+          await tx.query(
+            `insert into environments (id, project_id, name, url_enc, production, allow_same_instance, shadow_url_enc)
+             values ($1, $2, $3, $4, $5, $6, $7)`,
+            [
+              id,
+              a.pid,
+              b.name,
+              encrypt(b.url),
+              b.production,
+              b.allowSameInstance,
+              b.shadowUrl ? encrypt(b.shadowUrl) : null,
+            ],
+          );
+          await auditIn(
+            tx,
+            c,
+            {
+              action: hasHistory ? 'environment.attach_history' : 'environment.create',
+              actorKind: 'user',
+              actorId: user.id,
+              targetKind: 'environment',
+              targetId: id,
+              projectId: a.pid,
+              data: {
+                projectId: a.pid,
+                name: b.name,
+                claimRequested: needClaim,
+                ...(aheadVersions.length ? { aheadVersions: aheadVersions.map((v) => v.number) } : {}),
+              },
+            },
+            ctx.security,
+          );
+        });
+      } catch (e) {
+        if (isUniqueViolation(e)) throw new HTTPException(409, { message: `环境“${b.name}”已经存在` });
+        throw e;
+      }
+      committed = true;
+
+      // 提交之后：若有领先版本，覆盖工作副本到新链头（记入 room_commits 操作历史）并重新加载合并后的完整链
+      let mergedChain = chain;
+      if (aheadVersions.length && newHead) {
+        await ctx.replace(a.branch, user.name, newHead.model, 'attachAhead');
+        mergedChain = await loadChain(db, a.pid);
+      } else {
+        refresher.schedule(a.branch);
+      }
+
+      // ④ 提交之后：认领（锁内拿最新合并后的链比对）。失败环境照样保留，作为 warning，可以在环境页重试
+      const warnings: string[] = [];
+      let claimed = false;
+      if (needClaim) {
+        const conn = connectPg(b.url, CHECK_CONNECT_TIMEOUT, ctx.guard);
+        try {
+          await claimInstance({
+            db: conn.db,
+            projectId: a.pid,
+            projectName: a.name,
+            instanceId: settings.instanceId,
+            claimedBy: user.id,
+            claimedByName: user.name,
+            chain: mergedChain,
+          });
+          claimed = true;
+          // 认领成功之后单独写审计（失败只记日志，不影响结果）
+          await audit(
+            db,
+            c,
+            {
+              action: 'project.claim',
+              actorKind: 'user',
+              actorId: user.id,
+              targetKind: 'environment',
+              targetId: id,
+              projectId: a.pid,
+              data: { projectId: a.pid, name: b.name, environment: b.name, via: 'attach' },
+            },
+            ctx.security,
+          );
+        } catch (e) {
+          console.error('接入：认领失败（环境已经添加）', e instanceof Error ? scrubSecrets(e.message) : e);
+          warnings.push(
+            `环境“${b.name}”已经添加，但认领失败：${claimFailure(e, b.url)}。可以在环境页重试认领`,
+          );
+        } finally {
+          await conn.close().catch(() => {});
+        }
+      }
+
+      // ⑤ 把目标库历史同步成平台库缓存（当前版本、执行过哪些版本，在目标库的项目锁里做）：失败只记日志 + warning
+      let current: ReturnType<typeof versionRef> | null = null;
+      if (hasHistory) {
+        try {
+          const state = await readTargetState(ctx.exec, await loadEnv(db, a.pid, id), true);
+          const cur = state.current ? mergedChain.find((v) => v.id === state.current) : undefined;
+          current = cur ? versionRef(cur) : null;
+          // P5b：同步改了这个环境的当前版本（新接入的环境上还没有申请，统一按“改了缓存就重检”处理）
+          ctx.requests.kick({ envIds: [id] });
+        } catch (e) {
+          console.error(
+            '接入：同步目标库状态失败（环境已经添加）',
+            e instanceof Error ? scrubSecrets(e.message) : e,
+          );
+          warnings.push(
+            `环境“${b.name}”已经添加，但同步目标库状态失败：${claimFailure(e, b.url)}。再读一次执行历史就会对齐`,
+          );
+        }
+      }
+      return c.json<AttachResult>(
+        {
+          id,
+          ...info,
+          attached: hasHistory,
+          currentVersion: current,
+          claimed,
+          aheadVersions: aheadVersions.map((v) => ({ id: v.versionId, number: v.number, name: v.name })),
+          warnings,
+        },
+        201,
+      );
     } catch (e) {
-      if (isUniqueViolation(e)) throw new HTTPException(409, { message: `环境“${b.name}”已经存在` });
+      await cleanupShadow();
       throw e;
     }
-    refresher.schedule(a.branch);
-
-    // ③ 提交之后：认领。失败环境照样保留，作为 warning，可以在环境页重试
-    const warnings: string[] = [];
-    let claimed = false;
-    if (needClaim) {
-      const conn = connectPg(b.url, CHECK_CONNECT_TIMEOUT, ctx.guard);
-      try {
-        await claimInstance({
-          db: conn.db,
-          projectId: a.pid,
-          projectName: a.name,
-          instanceId: settings.instanceId,
-          claimedBy: user.id,
-          claimedByName: user.name,
-          chain,
-        });
-        claimed = true;
-        // 认领成功之后单独写审计（失败只记日志，不影响结果）
-        await audit(
-          db,
-          c,
-          {
-            action: 'project.claim',
-            actorKind: 'user',
-            actorId: user.id,
-            targetKind: 'environment',
-            targetId: id,
-            projectId: a.pid,
-            data: { projectId: a.pid, name: b.name, environment: b.name, via: 'attach' },
-          },
-          ctx.security,
-        );
-      } catch (e) {
-        console.error('接入：认领失败（环境已经添加）', e instanceof Error ? scrubSecrets(e.message) : e);
-        warnings.push(`环境“${b.name}”已经添加，但认领失败：${claimFailure(e, b.url)}。可以在环境页重试认领`);
-      } finally {
-        await conn.close().catch(() => {});
-      }
-    }
-
-    // ④ 把目标库历史同步成平台库缓存（当前版本、执行过哪些版本，在目标库的项目锁里做）：失败只记日志 + warning
-    let current: ReturnType<typeof versionRef> | null = null;
-    if (hasHistory) {
-      try {
-        const state = await readTargetState(ctx.exec, await loadEnv(db, a.pid, id), true);
-        const cur = state.current ? chain.find((v) => v.id === state.current) : undefined;
-        current = cur ? versionRef(cur) : null;
-        // P5b：同步改了这个环境的当前版本（新接入的环境上还没有申请，统一按“改了缓存就重检”处理）
-        ctx.requests.kick({ envIds: [id] });
-      } catch (e) {
-        console.error(
-          '接入：同步目标库状态失败（环境已经添加）',
-          e instanceof Error ? scrubSecrets(e.message) : e,
-        );
-        warnings.push(
-          `环境“${b.name}”已经添加，但同步目标库状态失败：${claimFailure(e, b.url)}。再读一次执行历史就会对齐`,
-        );
-      }
-    }
-    return c.json<AttachResult>(
-      { id, ...info, attached: hasHistory, currentVersion: current, claimed, warnings },
-      201,
-    );
   });
 
   /**

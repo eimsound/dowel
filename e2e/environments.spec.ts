@@ -1,6 +1,7 @@
 // 需要 PG 作影子库（Testcontainers 或 DOWEL_TEST_PG，见 e2e/global-setup.ts），没有 Docker 时跳过
 import { expect, test } from '@playwright/test';
 import { connectPg } from '../apps/server/src/targets.ts';
+import { openEnv } from './exec-helpers.ts';
 import { createProject, gotoPage, newUser, openEnvironment } from './helpers.ts';
 
 const ADMIN = process.env.DOWEL_TEST_PG;
@@ -69,4 +70,47 @@ test('添加环境、从数据库导入、在同实例影子库验证', async ({
   await mig.getByRole('button', { name: '在影子库验证' }).click();
   await expect(mig.getByRole('status')).toContainText('验证通过', { timeout: 60_000 });
   await expect(mig.getByRole('status')).toContainText('影子库：dev：e2e_shop_dowel');
+});
+
+test('环境详情页：标记为生产环境与取消生产标记（二次确认 + 自动锁定原生产策略）', async ({ browser }) => {
+  const dbName = `e2e_prod_toggle_${Math.random().toString(36).slice(2, 6)}`;
+  const admin = connectPg(ADMIN!);
+  await admin.db.exec(`CREATE DATABASE ${dbName}`);
+  await admin.close();
+  const u = new URL(ADMIN!);
+  u.pathname = `/${dbName}`;
+  try {
+    const { page } = await newUser(browser, '环境管理员');
+    await createProject(page, '生产标记项目');
+    await gotoPage(page, '环境');
+    await page.getByLabel('名字').fill('app');
+    await page.getByLabel('连接串', { exact: true }).fill(u.toString());
+    await page.getByLabel('生产环境').check();
+    await page.getByLabel('允许在同一实例上建影子库').check();
+    await page.getByRole('button', { name: '添加环境' }).click();
+    await openEnv(page, 'app');
+
+    // 初始为生产环境：连接配置区提供“取消生产标记”按钮
+    await expect(page.getByRole('button', { name: '取消生产标记' })).toBeVisible();
+    await page.getByRole('button', { name: '取消生产标记' }).click();
+    const dlg = page.getByRole('dialog', { name: /取消 app 的生产环境标记/ });
+    await expect(dlg).toBeVisible();
+    await expect(dlg).toContainText('environment.unmark_production');
+    await expect(dlg).toContainText('不会悄悄放宽');
+    await dlg.getByRole('button', { name: '取消生产标记' }).click();
+    await expect(dlg).toBeHidden();
+    await expect(page.getByText('已取消环境 app 的生产环境标记')).toBeVisible();
+    // 取消后自动锁定原生产策略（谁能执行仍为项目管理员，而非悄悄放宽成编辑者）
+    const envPolicy = page.getByRole('group', { name: /本环境（非生产）/ });
+    await expect(envPolicy).toContainText('生效：项目管理员');
+
+    // 再重新标记为生产环境
+    await page.getByRole('button', { name: '标记为生产环境' }).click();
+    await expect(page.getByText('已将环境 app 标记为生产环境')).toBeVisible();
+    await expect(page.getByRole('button', { name: '取消生产标记' })).toBeVisible();
+  } finally {
+    const a = connectPg(ADMIN!);
+    for (const d of [dbName, `${dbName}_dowel`]) await a.db.exec(`DROP DATABASE IF EXISTS ${d} WITH (FORCE)`);
+    await a.close();
+  }
 });

@@ -245,6 +245,7 @@ export const permissionsOf = (
   return {
     execute: can(actor, 'environment.execute', res),
     configure: can(actor, 'environment.change_connection', res),
+    unmarkProduction: can(actor, 'environment.unmark_production', res),
     approvalRequired,
     request: can(actor, 'environment.request', res),
     emergency: approvalRequired && can(actor, 'instance.emergency_execute', { kind: 'instance' }),
