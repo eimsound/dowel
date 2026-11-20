@@ -7,7 +7,7 @@ import {
   Handle,
   MiniMap,
   type Node,
-  type NodeChangeset,
+  type NodeChange,
   type NodeProps,
   Panel,
   Position,
@@ -308,9 +308,9 @@ export const Canvas = ({
       });
   }, [model, tables, pos, selected]);
 
-  const onNodesChange = useCallback((changes: NodeChangeset<TableNode>) => {
-    for (const ch of changes.getByType('position'))
-      if (ch.position) setDragging((d) => ({ ...d, [ch.id]: ch.position! }));
+  const onNodesChange = useCallback((changes: NodeChange<TableNode>[]) => {
+    for (const ch of changes)
+      if (ch.type === 'position' && ch.position) setDragging((d) => ({ ...d, [ch.id]: ch.position! }));
   }, []);
 
   return (

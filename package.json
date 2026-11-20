@@ -20,10 +20,10 @@
   },
   "devDependencies": {
     "@axe-core/playwright": "^4.14.0",
-    "@biomejs/biome": "^2.6.8",
+    "@biomejs/biome": "^2.6.7",
     "@dowel/engines": "workspace:*",
     "@dowel/executor": "workspace:*",
-    "@playwright/test": "^1.65.1",
+    "@playwright/test": "^1.65.0",
     "@testcontainers/postgresql": "^12.2.1",
     "@types/node": "^26.6.6",
     "fast-check": "^4.10.2",
