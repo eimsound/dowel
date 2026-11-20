@@ -38,11 +38,10 @@ if (existsSync(web)) {
     c.req.path.startsWith('/api/') ? c.notFound() : c.html(readFileSync(`${web}/index.html`, 'utf8')),
   );
 }
-// HA1：先启动跨副本事件总线与副本心跳租约，再恢复申请状态与接受外部流量
-await bus.start();
+// HA：先启动副本心跳租约与跨副本事件总线，再恢复申请状态与接受外部流量
 await ha.start();
-// 执行申请：先把重启前就在“执行中”的申请记为中断（执行失败），再开始接受连接——之后开始的执行不会被误记（第一轮审查）；
-// 然后定时检查过期、失效的申请（单进程部署）
+await bus.start();
+// 执行申请：先按副本租约恢复已离线节点遗留的“执行中”申请，再开始接受连接；然后按间隔做分布式巡检
 await requests.start();
 
 const server = serve({ fetch: app.fetch, port }, (info) => {
@@ -62,11 +61,11 @@ const stop = async () => {
   server.close();
   drift.stop();
   requests.stop();
-  webhooks.close();
+  await webhooks.close();
   await rooms.flush();
   await shadows.close();
-  await ha.stop();
   await bus.close();
+  await ha.stop();
   await db.close();
   process.exit(0);
 };

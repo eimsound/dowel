@@ -99,6 +99,7 @@ export const createApp = (db: PlatformDb, options: AppOptions = {}) => {
         ]);
       },
     },
+    ha,
   );
   rooms.onCommit = (branchId) => refresher.schedule(branchId);
   /** 导入、拉取、恢复历史后替换模型：新模型就是引擎读出的，作为派生数据的基线 */
@@ -113,10 +114,10 @@ export const createApp = (db: PlatformDb, options: AppOptions = {}) => {
   // 执行 / 漂移检查：环境锁在单进程互斥之上叠加 PG 平台库 advisory lock 跨副本互斥
   const exec: ExecContext = { db, guard, locks: new EnvLocks(db) };
   // 定时漂移检查：这里只创建，不启动（main.ts 按配置启动；测试里不启动或调短间隔）
-  const drift = new DriftScheduler(db, exec);
-  // P5b：组级 Webhook（进程内队列）和执行申请（状态检查、通知、定时清理）
-  const webhooks = new Webhooks(db, options.webhooks);
-  const requests = new Requests(db, exec, webhooks, security);
+  const drift = new DriftScheduler(db, exec, ha);
+  // 组级 Webhook（持久化队列 webhook_jobs + EventBus 唤醒）和执行申请（状态检查、跨副本通知、分布式巡检）
+  const webhooks = new Webhooks(db, { bus, ha, ...options.webhooks });
+  const requests = new Requests(db, exec, webhooks, security, { bus, ha });
   drift.afterSweep = () => requests.kick({ all: true });
 
   const ctx: AppContext = {
