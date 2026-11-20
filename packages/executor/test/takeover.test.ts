@@ -501,24 +501,52 @@ describe.skipIf(!PG_URL)('认领（claimInstance）与接入检查（inspectAtta
     });
   });
 
-  test('inspectAttach：没有历史 → hasHistory false；对得上 → 当前版本和认领情况；对不上（模型不同）→ history_conflict', async () => {
+  test('inspectAttach：没有历史 → hasHistory false；对得上 → 当前版本和认领情况；严格领先 → 返回 aheadVersions；分叉或模型/scope不一致 → 拒绝', async () => {
+    const longModels = [m0(), withEmail(m0()), withNote(withEmail(m0()))];
+    const longChain = chainOf(longModels);
     await withTarget(async (t) => {
       expect(await inspectAttach(t.db, 'p1', chain, 'inst-B')).toEqual({ hasHistory: false });
-      await run(t.db, chain, 2);
-      const ok = await inspectAttach(t.db, 'p1', chain, 'inst-B');
+      await run(t.db, longChain, 3);
+      const ok = await inspectAttach(t.db, 'p1', longChain, 'inst-B');
       expect(ok).toMatchObject({
         hasHistory: true,
-        current: { id: 'v-2' },
+        current: { id: 'v-3' },
+        aheadVersions: [],
         claim: { mine: false, instanceId: 'inst-A' },
       });
-      expect(await inspectAttach(t.db, 'p1', chain, 'inst-A')).toMatchObject({ claim: { mine: true } });
+      expect(await inspectAttach(t.db, 'p1', longChain, 'inst-A')).toMatchObject({ claim: { mine: true } });
       // 平台的链里 v2 的模型不同（历史来自另一份项目副本）：checksum 相同但模型不同
-      const other = chain.map((v) => (v.number === 2 ? { ...v, model: withNote(v.model) } : v));
+      const other = longChain.map((v) => (v.number === 2 ? { ...v, model: withNote(v.model) } : v));
       await expect(inspectAttach(t.db, 'p1', other, 'inst-B')).rejects.toMatchObject({
         code: 'history_conflict',
       });
-      // 平台的链比库里的历史短（库里领先）：库里的版本不在平台的链上
-      await expect(inspectAttach(t.db, 'p1', chain.slice(0, 1), 'inst-B')).rejects.toMatchObject({
+      // 平台的链里 v2 的 scope 不同
+      const diffScope = longChain.map((v) => (v.number === 2 ? { ...v, scope: ['app'] } : v));
+      await expect(inspectAttach(t.db, 'p1', diffScope, 'inst-B')).rejects.toMatchObject({
+        code: 'history_conflict',
+      });
+      // 平台的链比库里的历史短（目标库严格领先且无分叉）：返回 aheadVersions（v2, v3）
+      const ahead = await inspectAttach(t.db, 'p1', longChain.slice(0, 1), 'inst-B');
+      expect(ahead).toMatchObject({
+        hasHistory: true,
+        current: { id: 'v-3' },
+        claim: { mine: false, instanceId: 'inst-A' },
+      });
+      if (ahead.hasHistory) expect(ahead.aheadVersions.map((v) => v.versionId)).toEqual(['v-2', 'v-3']);
+      // 分叉：平台链在 v1 之后是另一个 v2-fork，而目标库是 v1 -> v2 -> v3 → history_conflict
+      const forked = [longChain[0]!, { ...longChain[1]!, id: 'v-2-fork' }];
+      await expect(inspectAttach(t.db, 'p1', forked, 'inst-B')).rejects.toMatchObject({
+        code: 'history_conflict',
+      });
+      // 平台链较长但目标库最后版本不同（分叉，长度 <= 平台链）→ history_mismatch
+      const longerFork = [...longChain, { ...longChain[2]!, id: 'v-4', number: 4, parentId: 'v-3' }];
+      const mismatched = [
+        longerFork[0]!,
+        { ...longerFork[1]!, id: 'v-2-other' },
+        longerFork[2]!,
+        longerFork[3]!,
+      ];
+      await expect(inspectAttach(t.db, 'p1', mismatched, 'inst-B')).rejects.toMatchObject({
         code: 'history_mismatch',
       });
     });

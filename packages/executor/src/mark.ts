@@ -11,7 +11,7 @@
 // 登记 / 同步按版本行判断（见 apps/server/src/envs.ts 的 syncEnvCache）。
 //
 // P5 扩展点：接入审批以后，批准要绑定“起止版本 + 线上结构指纹”（MarkPlan.fingerprint），结构一变批准即失效；
-// 标记不受前置环境约束（它不跑脚本），豁免要记入审计——这些都在服务端，这里只提供指纹和计划。
+// 这些都在服务端，这里只提供指纹和计划。
 
 import { scrubSecrets } from '@dowel/core';
 import {

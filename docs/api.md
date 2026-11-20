@@ -2,7 +2,7 @@
 
 本文档说明如何使用 **CI 令牌**通过 HTTP API 查询项目状态并执行数据库迁移。所有面向流水线的接口都在 `/api/ci/…` 下，返回结构化 JSON 和机器可读的错误码。
 
-> GitHub Actions 用户可以直接使用仓库内置的 [actions/execute](../actions/execute/README.md)（纯 `bash` + `curl`，无第三方 Action 依赖）。
+> CI 流水线（含内网自建 Gitea Actions / Forgejo Actions / GitHub Enterprise Server，或 GitLab CI / Jenkins 等任意 shell 流水线）可以直接复用仓库内置的 [actions/execute](../actions/execute/README.md)（纯 `bash` + `curl`，无第三方 Action 依赖）。
 
 ---
 
@@ -20,9 +20,9 @@ Authorization: Bearer dwl_<43 位随机字符>
 - **能力范围固定为“只读 + 执行”**：令牌只能访问 `/api/ci/…` 且只能操作它所属的单个项目。携带 `Bearer dwl_…` 访问任何 `/api/ci/…` 之外的接口（包括编辑模型、发布版本、改策略、改连接串、标记为已执行、写基线、认领、接手、令牌管理本身）一律返回 `403 forbidden`，不会回落到 Cookie 会话。
 - **项目归属**：令牌属于项目，创建者离职或被停用不影响令牌继续工作。
 - **必须过期**：创建时必须指定有效天数（默认 90 天，最长 365 天）。过期和吊销均立即生效。
-- **限速**：
-  - 认证失败按来源 IP 限速（默认每 10 分钟最多 20 次失败，可用环境变量 `DOWEL_TOKEN_FAIL_LIMIT` 调整），防止爆破；成功请求不占失败额度。
-  - 已认证令牌按令牌 ID 限速（默认每分钟 120 次，可用 `DOWEL_TOKEN_RATE_LIMIT` 调整）；读取目标库历史另受连接限速约束（每分钟 10 次）。
+- **限速**（单副本进程内计数，HA 多副本下总配额约为设定值 × 副本数）：
+  - 认证失败按来源 IP 限速（默认每 10 分钟最多 20 次失败，可用 `DOWEL_TOKEN_FAIL_LIMIT` / `DOWEL_TOKEN_FAIL_WINDOW_MS` 调整），防止爆破；成功请求不占失败额度。
+  - 已认证令牌按令牌 ID 限速（默认每分钟 120 次，可用 `DOWEL_TOKEN_RATE_LIMIT` / `DOWEL_TOKEN_RATE_WINDOW_MS` 调整）；连接目标库的只读 / 检测接口（单环境实时状态、执行历史、漂移检测）另受连接限速约束（默认每分钟 10 次，可用 `DOWEL_CONNECTION_LIMIT` / `DOWEL_CONNECTION_WINDOW_MS` 调整）。
 
 ### 校验令牌是否有效
 
@@ -37,7 +37,7 @@ curl -fsS \
 ```json
 {
   "id": "01J...",
-  "name": "GitHub Actions",
+  "name": "CI Deploy",
   "prefix": "dwl_AbCdEfGh",
   "expiresAt": "2027-02-18T12:00:00.000Z",
   "project": {
@@ -75,7 +75,7 @@ curl -fsS -b cookies.txt \
   -X POST \
   -H "Content-Type: application/json" \
   -H "Origin: ${DOWEL_URL}" \
-  -d '{"name":"GitHub Actions","description":"staging 自动部署","expiresInDays":90}' \
+  -d '{"name":"CI Deploy","description":"staging 自动部署","expiresInDays":90}' \
   "${DOWEL_URL}/api/projects/${PROJECT_ID}/tokens"
 
 # 吊销令牌（项目管理员、组管理员、实例管理员或令牌创建者本人）
@@ -100,11 +100,13 @@ curl -fsS -b cookies.txt \
 
 ---
 
-## 3. CI 只读接口
+## 3. CI 只读与检测接口
 
 路径中的 `:owner/:project` 必须是令牌所属的项目（转组或改 slug 后的旧路径同样可用）；访问别的项目或不存在的项目一律返回 `404 project_not_found`。
 
-### 3.1 项目概要
+环境相关接口按职责和连接开销明确拆分为三类，**绝不返回可能过期的缓存状态**：
+
+### 3.1 项目与环境列表（纯平台配置，不连目标库）
 
 `GET /api/ci/projects/:owner/:project`
 
@@ -114,7 +116,21 @@ curl -fsS \
   "${DOWEL_URL}/api/ci/projects/acme/shop"
 ```
 
-返回项目基本信息、最新版本 `latest` 以及每个环境的当前版本、是否允许令牌执行（`tokenExecution`）、缓存的漂移状态与前置环境信息。
+返回项目基本信息（`id`、`name`、`slug`、`owner`）、最新版本 `latest`，以及各环境的**纯平台配置**（`name`、`production`、`tokenExecution`）：
+
+```json
+{
+  "id": "01J...",
+  "name": "商城",
+  "slug": "shop",
+  "owner": "acme",
+  "latest": { "id": "01J...", "number": 5, "name": "订单表加备注" },
+  "environments": [
+    { "name": "staging", "production": false, "tokenExecution": true },
+    { "name": "prod", "production": true, "tokenExecution": false }
+  ]
+}
+```
 
 ### 3.2 版本链
 
@@ -128,7 +144,7 @@ curl -fsS \
 
 按版本号升序返回项目所有已发布版本（`id`、`number`、`name`、`publishedAt`、`verified`、`checksum`）。
 
-### 3.3 环境状态（平台缓存，不连目标库）
+### 3.3 单环境实时状态（轻量连目标库读 `dowel.history`）
 
 `GET /api/ci/projects/:owner/:project/environments/:env`
 
@@ -138,9 +154,65 @@ curl -fsS \
   "${DOWEL_URL}/api/ci/projects/acme/shop/environments/staging"
 ```
 
-返回环境概要、版本链中每个版本的相对状态（`applied` / `current` / `pending`）以及待执行版本号列表 `pending`。
+受连接限速约束（按令牌计）。直连目标库读取 `dowel.history`（顺带同步平台库缓存），返回环境平台配置（`name`、`production`、`tokenExecution`）与实时 `currentVersion`、`unfinished`、版本链相对状态（`applied` / `current` / `pending`）和待执行版本号列表 `pending`：
 
-### 3.4 目标库执行历史
+```json
+{
+  "name": "staging",
+  "production": false,
+  "tokenExecution": true,
+  "currentVersion": { "id": "01J...", "number": 4, "name": "加索引" },
+  "unfinished": false,
+  "versions": [
+    { "id": "01J...", "number": 4, "name": "加索引", "state": "current", "verified": true },
+    { "id": "01J...", "number": 5, "name": "订单表加备注", "state": "pending", "verified": true }
+  ],
+  "pending": [5]
+}
+```
+
+目标库不可达返回 `502 target_unreachable`；历史格式过新、损坏或当前版本不在平台版本链上返回 `409 version_mismatch`。
+
+### 3.4 实时漂移检测（连目标库读全库结构快照比对）
+
+`POST /api/ci/projects/:owner/:project/environments/:env/drift`
+
+```bash
+curl -fsS \
+  -X POST \
+  -H "Authorization: Bearer ${DOWEL_TOKEN}" \
+  "${DOWEL_URL}/api/ci/projects/acme/shop/environments/staging/drift"
+```
+
+受连接限速约束（按令牌计），只读检测（不修改目标库，生产环境即使关闭 `tokenExecution` 也可调用）。直连目标库读取全库结构快照并与当前版本模型比对，同时刷新平台侧漂移状态：
+
+```json
+{
+  "environment": "staging",
+  "currentVersion": { "id": "01J...", "number": 4, "name": "加索引" },
+  "status": "drifted",
+  "checkedAt": "2026-11-21T02:00:00.000Z",
+  "summary": "检测到 1 处结构差异",
+  "total": 1,
+  "items": [
+    {
+      "kind": "dropColumn",
+      "target": "public.orders.hotfix_col",
+      "sql": "ALTER TABLE public.orders DROP COLUMN hotfix_col"
+    }
+  ],
+  "unresolvable": [],
+  "firstRun": false,
+  "needsManual": null
+}
+```
+
+- `status`：`clean`（无漂移）、`drifted`（存在漂移）、`unknown`（项目尚未发布任何版本，无法比对）。
+- `items`：差异项列表（最多返回 100 项；完整数量见 `total`）；`unresolvable`：`items` 中模型无法表达、需要人工核对的项。
+- `needsManual`：若差异来自上一次读回校验失败，返回 `{ direction, versionId, versionNumber }`，否则为 `null`。
+- 若环境正在执行返回 `423 lock_timeout`；上次执行停在中途返回 `409 unfinished_run`；目标库不可达或权限不足返回 `502 target_unreachable`；历史格式过新或当前版本不在链上返回 `409 version_mismatch`。
+
+### 3.5 目标库执行历史
 
 `GET /api/ci/projects/:owner/:project/environments/:env/history`
 
@@ -150,7 +222,7 @@ curl -fsS \
   "${DOWEL_URL}/api/ci/projects/acme/shop/environments/staging/history"
 ```
 
-直连目标库读取 `dowel.history`（最近 100 条，新记录在前），同时同步平台库缓存。
+受连接限速约束（按令牌计）。直连目标库读取 `dowel.history`（最近 100 条，新记录在前），同时同步平台库缓存。
 
 ---
 
@@ -172,7 +244,7 @@ curl -fsS \
 
 - **开关约束**：只看环境生效执行策略里的 **“允许令牌执行”**（四层逐层收紧；默认非生产开启、生产关闭）。**令牌执行不走审批**。
 - **不允许回滚**：目标版本早于环境当前版本时返回 `409 rollback_not_allowed`；回滚需在界面操作（受审批流程约束）。
-- **安全检查照常**：漂移检测、版本链与校验和完整性、目标库实例认领、迁移影子库验证、前置环境（`prerequisite`）、执行策略里的 `lock_timeout` / `statement_timeout` 全部照常生效，且在拿到环境锁后会复查令牌状态、开关与前置环境。
+- **安全检查照常**：漂移检测、版本链与校验和完整性、目标库实例认领、迁移影子库验证、执行策略里的 `lock_timeout` / `statement_timeout` 全部照常生效，且在拿到环境锁后会复查令牌状态与开关。
 - **并发与申请失效**：与界面执行、执行申请共享同一套环境锁与目标库项目锁；令牌执行结束后，该环境上受影响的待处理执行申请会自动失效。
 - **审计与通知**：每次非预演的执行请求都会写入审计日志（主体标明令牌名称、前缀与创建者），发送 `token.executed` 组级 Webhook 事件；对生产环境的执行（成功或失败）还会向项目管理员和该环境审批流程里的审批人发送站内收件箱通知。
 
@@ -233,7 +305,7 @@ curl -fsS \
 }
 ```
 
-> `reached` 在执行中途失败时表示环境停在的最后一个成功版本；`details` 仅在存在补充上下文（如 `diff`、`prerequisite`、`timeout`、`current`、`partial`）时返回。
+> `reached` 在执行中途失败时表示环境停在的最后一个成功版本；`details` 仅在存在补充上下文（如 `diff`、`timeout`、`current`、`partial`）时返回。
 
 | 错误码 (`code`)            | HTTP 状态码 | 含义与常见原因                                                                     |
 | -------------------------- | ----------- | ---------------------------------------------------------------------------------- |
@@ -252,8 +324,6 @@ curl -fsS \
 | `drift`                    | `409`       | 目标库结构与当前版本模型不一致，或首次执行时既非基线也非空库（`details.firstRun`） |
 | `unfinished_run`           | `409`       | 上一次含非事务步骤的执行停在中途，需先在界面处理                                   |
 | `foreign_instance`         | `409`       | 目标库里的该项目由其他 Dowel 实例认领                                              |
-| `prerequisite_behind`      | `409`       | 前置环境尚未执行到目标版本（`details.prerequisite`）                               |
-| `prerequisite_missing`     | `409`       | 配置的前置环境不存在                                                               |
 | `rejected`                 | `409`       | 其他执行前检查未通过（如含实例级语句、schema 范围不合法等，见 `details.reason`）   |
 | `version_not_found`        | `422`       | 目标版本不在项目版本链上，或项目尚未发布任何版本                                   |
 | `execution_failed`         | `422`       | 某一步 SQL 报错、语句 / 锁等待超时或读回校验不一致；环境停在 `reached`             |

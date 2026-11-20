@@ -35,10 +35,24 @@ import { type GroupRow, pickProjectSlug } from '../groups.ts';
 import { effectiveProjectRole, type RoleLookup } from '../roles.ts';
 import { encrypt, SecretError, scrubSecrets } from '../secrets.ts';
 import { readSettings } from '../settings.ts';
-import { ShadowError } from '../shadow.ts';
+import { type Shadow, ShadowError } from '../shadow.ts';
 import { sseSender } from '../sse.ts';
-import { readSource, restoreChain, TakeoverRejected } from '../takeover.ts';
-import { CHECK_CONNECT_TIMEOUT, claimShadow, connectPg, inspectTarget, scrubUrl } from '../targets.ts';
+import {
+  pickShadow,
+  readSource,
+  restoreChain,
+  TakeoverRejected,
+  unionScopes,
+  verifyVersionChain,
+} from '../takeover.ts';
+import {
+  CHECK_CONNECT_TIMEOUT,
+  claimShadow,
+  connectPg,
+  dropSameInstanceShadow,
+  inspectTarget,
+  scrubUrl,
+} from '../targets.ts';
 import { type AppContext, body, connectionLimit, createProjectGroup, type Env } from './context.ts';
 
 export const registerTakeover = (app: Hono<Env>, ctx: AppContext) => {
@@ -121,6 +135,8 @@ export const runTakeover = (c: Context<Env>, ctx: AppContext, b: ProjectWizard, 
     const send = sseSender<WizardEvent>(stream);
     let stage: WizardStage = 'connect';
     let committed = false;
+    let shadow: Shadow | null = null;
+    let createdShadow: { targetUrl: string; name: string } | null = null;
     const project: ProjectCreated = {
       id: projectId,
       name: b.name,
@@ -192,9 +208,26 @@ export const runTakeover = (c: Context<Env>, ctx: AppContext, b: ProjectWizard, 
           );
       }
 
+      // 强制全链影子库闭环验证（ADR 0012）：写入平台库事务之前，按版本顺序（v0 → v1 → … → vN）逐个验证。
+      // 找不到可用影子库或任一版本验证失败，直接拒绝接手（不写平台库，也不认领目标库）。
+      const head = merged.versions.at(-1)!;
+      stage = 'verify';
+      await send({ stage });
+      const prepared = await pickShadow(environments, unionScopes(merged.versions), ctx.guard);
+      shadow = prepared.shadow;
+      createdShadow = prepared.created;
+      const verifiedReports = await verifyVersionChain({
+        shadow,
+        shadowLabel: prepared.label,
+        versions: merged.versions,
+        baseModel: null,
+        onVersion: async (v, i, total) => {
+          await send({ stage: 'verify', detail: `v${v.number} (${i + 1}/${total})` });
+        },
+      });
+
       stage = 'write';
       await send({ stage });
-      const head = merged.versions.at(-1)!;
       const branch = newId();
       const envRows = environments.map((e) => ({
         id: newId(),
@@ -225,7 +258,7 @@ export const runTakeover = (c: Context<Env>, ctx: AppContext, b: ProjectWizard, 
           scopeId: projectId,
           createdBy: u.id,
         });
-        await restoreChain(tx, { pid: projectId, branch, merged, envs: envRows });
+        await restoreChain(tx, { pid: projectId, branch, merged, envs: envRows, verifiedReports });
       });
       committed = true;
 
@@ -359,6 +392,8 @@ export const runTakeover = (c: Context<Env>, ctx: AppContext, b: ProjectWizard, 
         await send({ stage: 'done', project });
         return;
       }
+      // 提交之前失败：清理本次新建的同实例影子库
+      if (createdShadow) await dropSameInstanceShadow(createdShadow.targetUrl, createdShadow.name, ctx.guard);
       let code: string | undefined;
       let message: string;
       if (e instanceof TakeoverRejected || (e instanceof ExecutorError && e.code !== 'unexpected')) {
@@ -378,6 +413,8 @@ export const runTakeover = (c: Context<Env>, ctx: AppContext, b: ProjectWizard, 
         message = '服务器内部错误';
       }
       await send({ stage, error: message, ...(code ? { code } : {}) });
+    } finally {
+      await shadow?.close();
     }
   });
 };

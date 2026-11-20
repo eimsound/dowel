@@ -1,4 +1,4 @@
-// 环境层执行策略的**唯一**写入路径（P5a 审查后）：PUT …/exec-policy（整套设置 + 前置环境）和
+// 环境层执行策略的**唯一**写入路径（P5a 审查后）：PUT …/exec-policy（整套设置）和
 // PATCH …/environments/:eid（只改“谁能执行”、改生产标记）都调用 applyEnvPolicy，校验、放宽检测、固定、写入是同一套。
 //
 // 必须在 withPolicyLock 的事务里调用（tx）：环境行、四层配置都在事务里重新读，读、校验、写之间不会插进别的写入。
@@ -6,10 +6,9 @@
 // 规则：
 // 1. 以**改动后的生产标记**对应的上级为准校验：这次明确改的字段不能比新下限宽（422）；
 // 2. 这次没改的字段，如果因为生产标记变了（换了一套上级）而变宽，把原来的生效值固定进环境层（pinLoosened）；
-// 3. 这次明确改的字段变宽、审批流程不再包含原流程、去掉或换掉前置环境 = 放宽，是特权操作：
+// 3. 这次明确改的字段变宽、审批流程不再包含原流程 = 放宽，是特权操作：
 //    要满足改动**前**生效的执行策略（environment.set_policy）；
-// 4. 前置环境：同项目的另一个环境（在事务里确认存在），不能成环；
-// 5. 审批人范围里引用的组 / 用户必须存在。
+// 4. 审批人范围里引用的组 / 用户必须存在。
 import {
   type ExecPolicy,
   loosenedFields,
@@ -17,7 +16,6 @@ import {
   type PolicyField,
   type PolicySettings,
   pinLoosened,
-  prerequisiteCycle,
   resolvePolicy,
   SCALAR_FIELDS,
   validateLayer,
@@ -45,8 +43,6 @@ export interface EnvPolicyChange {
   settings?: PolicySettings;
   /** 只改“谁能执行”（PATCH 的 execPolicy）；null = 改回继承 */
   whoCanExecute?: ExecPolicy | null;
-  /** 前置环境；undefined = 不改，null = 去掉 */
-  prerequisiteId?: string | null;
   /** 生产标记改成什么（PATCH）；undefined = 不改。生产标记这一列由调用方自己写 */
   production?: boolean;
 }
@@ -64,13 +60,11 @@ export interface EnvPolicyResult {
   authBefore: EnvAuth;
   ownBefore: PolicySettings;
   ownAfter: PolicySettings;
-  prerequisiteBefore: string | null;
-  prerequisiteAfter: string | null;
-  /** 放宽了哪些（含 prerequisite）；非空时已经检查过 environment.set_policy */
+  /** 放宽了哪些；非空时已经检查过 environment.set_policy */
   loosened: string[];
   /** 因为换了一套上级而被固定进环境层的字段 */
   pinned: PolicyField[];
-  /** 环境层的设置或前置环境有没有变 */
+  /** 环境层的设置有没有变 */
   changed: boolean;
 }
 
@@ -137,37 +131,14 @@ export const applyEnvPolicy = async (
     explicit,
   );
 
-  // 4. 前置环境
-  const prerequisiteBefore = env.prerequisite_id;
-  const prerequisiteAfter = change.prerequisiteId === undefined ? prerequisiteBefore : change.prerequisiteId;
-  if (prerequisiteAfter !== null && prerequisiteAfter !== prerequisiteBefore) {
-    if (prerequisiteAfter === env.id) throw new HTTPException(422, { message: '前置环境不能是自己' });
-    const all = await tx.query<{ id: string; prerequisite_id: string | null }>(
-      'select id, prerequisite_id from environments where project_id = $1',
-      [project.id],
-    );
-    if (!all.some((e) => e.id === prerequisiteAfter))
-      throw new HTTPException(422, { message: '前置环境必须是这个项目里的另一个环境' });
-    if (prerequisiteCycle(env.id, prerequisiteAfter, new Map(all.map((e) => [e.id, e.prerequisite_id]))))
-      throw new HTTPException(422, { message: '前置环境会形成循环：它（或它的前置环境）以这个环境为前置' });
-  }
-
-  // 3. 放宽：明确改的字段变宽、审批流程不再包含原流程、去掉或换掉前置环境
+  // 3. 放宽：明确改的字段变宽、审批流程不再包含原流程
   const after = resolvePolicy({ ...upperAfter, environment: ownAfter }, productionAfter);
   const loosened: string[] = loosenedFields(before, after);
-  if (prerequisiteBefore !== null && prerequisiteBefore !== prerequisiteAfter) loosened.push('prerequisite');
   if (loosened.length && !can(actor, 'environment.set_policy', envResource(env, role, authBefore)))
     throw new HTTPException(403, { message: deniedMessage('environment.set_policy', authBefore) });
 
-  const changed = !same(ownAfter, ownBefore) || prerequisiteAfter !== prerequisiteBefore;
-  if (input.write && changed) {
-    if (!same(ownAfter, ownBefore)) await saveLayer(tx, 'environment', env.id, ownAfter, input.user.id);
-    if (prerequisiteAfter !== prerequisiteBefore)
-      await tx.query('update environments set prerequisite_id = $2 where id = $1', [
-        env.id,
-        prerequisiteAfter,
-      ]);
-  }
+  const changed = !same(ownAfter, ownBefore);
+  if (input.write && changed) await saveLayer(tx, 'environment', env.id, ownAfter, input.user.id);
   return {
     project,
     rc,
@@ -177,8 +148,6 @@ export const applyEnvPolicy = async (
     authBefore,
     ownBefore,
     ownAfter: normalizeSettings(ownAfter),
-    prerequisiteBefore,
-    prerequisiteAfter,
     loosened,
     pinned,
     changed,

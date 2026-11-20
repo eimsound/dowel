@@ -527,6 +527,27 @@ test('每个应审计的动作都能在 audit_events 里找到', async () => {
     { action: 'webhook.delete', run: () => directAudit('webhook.delete', 'webhook', 'w1') },
     { action: 'webhook.test', run: () => directAudit('webhook.test', 'webhook', 'w1') },
     { action: 'model.import', run: () => directAudit('model.import', 'project', 'p1') },
+    {
+      action: 'model.restore',
+      run: async () => {
+        const p = (await call('GET', '/api/projects', undefined, adminCookie)).data as unknown as {
+          id: string;
+        }[];
+        // 前面 version.publish 已经向工作副本加了 orders 表（seq >= 1），取当前 workingSeq 后恢复到初始状态 seq = 0
+        const hist = (await call('GET', `/api/projects/${p[0]!.id}/history`, undefined, adminCookie))
+          .data as unknown as { currentSeq: number };
+        expect(
+          (
+            await call(
+              'POST',
+              `/api/projects/${p[0]!.id}/history/0/restore`,
+              { workingSeq: hist.currentSeq },
+              adminCookie,
+            )
+          ).status,
+        ).toBe(200);
+      },
+    },
     // P6：CI 令牌创建 / 吊销、谁能创建令牌规则
     {
       action: 'token_policy.update',

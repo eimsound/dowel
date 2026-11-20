@@ -1,4 +1,4 @@
-// 执行策略的纯函数（P5a）：严格程度比较、四层合并、写入校验、放宽检测、生产标记变化时的固定、前置环境检查。
+// 执行策略的纯函数（P5a）：严格程度比较、四层合并、写入校验、放宽检测、生产标记变化时的固定。
 // 随机测试：任意四层配置合并后的结果不弱于任一上级（标量字段不弱于每一个显式设置的值；审批流程包含每一层的生效流程）。
 // 轮数：POLICY_RUNS（默认 500，纯函数很快）。
 import fc from 'fast-check';
@@ -7,7 +7,6 @@ import {
   type ApprovalStage,
   approvalAtLeast,
   approvalStageSchema,
-  checkPrerequisite,
   compareField,
   type ExecPolicy,
   layerPolicySchema,
@@ -20,7 +19,6 @@ import {
   type PolicySettings,
   pinLoosened,
   policySettingsSchema,
-  prerequisiteCycle,
   resolvePolicy,
   SCALAR_FIELDS,
   validateLayer,
@@ -314,54 +312,6 @@ describe('写入校验、放宽检测', () => {
     expect(policySettingsSchema.safeParse({ who: 'admin' }).success).toBe(false);
     expect(policySettingsSchema.safeParse({ lockTimeoutMs: -1 }).success).toBe(false);
     expect(layerPolicySchema.parse({})).toEqual({ production: {}, nonProduction: {} });
-  });
-});
-
-describe('前置环境', () => {
-  const p = (currentNumber: number | null) => ({ id: 'stg', name: 'staging', currentNumber });
-  test('执行：目标不得高于前置环境的当前版本', () => {
-    expect(checkPrerequisite({ direction: 'up', targetNumber: 3, prerequisite: p(3) }).ok).toBe(true);
-    expect(checkPrerequisite({ direction: 'up', targetNumber: 2, prerequisite: p(3) }).ok).toBe(true);
-    const r = checkPrerequisite({ direction: 'up', targetNumber: 4, prerequisite: p(3) });
-    expect(r.ok).toBe(false);
-    if (!r.ok) {
-      expect(r.code).toBe('prerequisite_behind');
-      expect(r.message).toContain('staging');
-      expect(r.message).toContain('v3');
-    }
-    const never = checkPrerequisite({ direction: 'up', targetNumber: 0, prerequisite: p(null) });
-    expect(never.ok).toBe(false);
-  });
-  test('回滚、标记、写基线豁免；没设前置环境总是通过', () => {
-    for (const direction of ['down', 'mark', 'baseline'] as const) {
-      const r = checkPrerequisite({ direction, targetNumber: 9, prerequisite: p(1) });
-      expect(r).toMatchObject({ ok: true, exempt: true });
-    }
-    // 设置了却找不到前置环境：执行一律拒绝（宁可拒绝也不放宽），回滚照样豁免
-    const missing = { id: 'x', name: '（已不存在）', currentNumber: null, missing: true };
-    expect(checkPrerequisite({ direction: 'up', targetNumber: 0, prerequisite: missing })).toMatchObject({
-      ok: false,
-      code: 'prerequisite_missing',
-    });
-    expect(checkPrerequisite({ direction: 'down', targetNumber: 0, prerequisite: missing })).toMatchObject({
-      ok: true,
-      exempt: true,
-    });
-    expect(checkPrerequisite({ direction: 'up', targetNumber: 9, prerequisite: null })).toMatchObject({
-      ok: true,
-      exempt: false,
-    });
-  });
-  test('成环检测：不能是自己，不能绕回自己', () => {
-    const links = new Map<string, string | null>([
-      ['dev', null],
-      ['stg', 'dev'],
-      ['prod', 'stg'],
-    ]);
-    expect(prerequisiteCycle('prod', 'prod', links)).toBe(true);
-    expect(prerequisiteCycle('dev', 'prod', links)).toBe(true); // dev → prod → stg → dev
-    expect(prerequisiteCycle('prod', 'dev', links)).toBe(false);
-    expect(prerequisiteCycle('stg', 'dev', links)).toBe(false);
   });
 });
 

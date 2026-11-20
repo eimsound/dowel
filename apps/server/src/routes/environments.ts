@@ -17,16 +17,13 @@ import type { Hono } from 'hono';
 import { HTTPException } from 'hono/http-exception';
 import { audit, auditIn } from '../audit.ts';
 import { can, type EnvAction, isEnvAction, userActor } from '../authz.ts';
-import { isForeignKeyViolation } from '../db.ts';
 import { applyEnvPolicy, type EnvPolicyResult } from '../env-policy.ts';
 import {
   type EnvRow,
   envResource,
   loadEnv,
-  loadPrerequisite,
   loadVersionMetas,
   loadVersionRefs,
-  prerequisiteFromRows,
   toEnvInfo,
   type VersionRefRow,
   versionRef,
@@ -62,7 +59,6 @@ export const registerEnvironments = (app: Hono<Env>, ctx: AppContext) => {
         const cur = r.current_version_id ? versions.get(r.current_version_id) : undefined;
         return toEnvInfo(r, actor, a.role, envAuthOf(store, a.rc, a, r), {
           currentVersion: cur ? versionRef(cur) : null,
-          prerequisite: prerequisiteFromRows(r, rows, versions),
         });
       }),
     );
@@ -254,7 +250,7 @@ export const registerEnvironments = (app: Hono<Env>, ctx: AppContext) => {
     } finally {
       release?.();
     }
-    // 响应直接用锁内的结果：策略只换掉环境层（不再读四层），当前版本和前置环境各一条轻量查询
+    // 响应直接用锁内的结果：策略只换掉环境层（不再读四层），当前版本一条轻量查询
     const { r, row } = done;
     const environments = new Map(r.store.environments);
     environments.set(eid, r.ownAfter);
@@ -269,7 +265,6 @@ export const registerEnvironments = (app: Hono<Env>, ctx: AppContext) => {
     return c.json<EnvInfo>(
       toEnvInfo(row, actor, r.role, auth, {
         currentVersion: cur ? versionRef(cur) : null,
-        prerequisite: await loadPrerequisite(db, pid, row.prerequisite_id),
       }),
     );
   });
@@ -294,29 +289,11 @@ export const registerEnvironments = (app: Hono<Env>, ctx: AppContext) => {
         const auth = envAuthOf(await loadPolicies(tx, now.project), now.rc, now.project, row);
         if (!can(userActor(user), 'environment.delete', envResource(row, now.role, auth)))
           throw new HTTPException(403, { message: deniedMessage('environment.delete', auth) });
-        // 被别的环境当作前置环境时不能删：删掉会悄悄去掉那个环境的保护（先在它的设置里移除前置环境）。
-        // 在同一个事务（执行策略锁）里检查和删除；prerequisite_id 上还有外键兜底（见 db.ts），并发也删不掉
-        const dependents = await tx.query<{ name: string }>(
-          'select name from environments where project_id = $1 and prerequisite_id = $2 order by name',
-          [a.pid, eid],
-        );
-        if (dependents.length)
-          throw new HTTPException(409, {
-            message: `“${dependents.map((d) => d.name).join('”、“')}”把这个环境设为前置环境，请先在它们的执行策略里移除`,
-          });
         await settleClaims(tx, eid);
         // 环境层的策略和环境上的执行者授权（范围是多态的，没有外键）
         await deletePolicies(tx, 'environment', [eid]);
         await tx.query("delete from grants where scope_kind = 'environment' and scope_id = $1", [eid]);
-        try {
-          await tx.query('delete from environments where id = $1 and project_id = $2', [eid, a.pid]);
-        } catch (e) {
-          if (isForeignKeyViolation(e))
-            throw new HTTPException(409, {
-              message: '这个环境被别的环境设为前置环境，请先在它们的执行策略里移除',
-            });
-          throw e;
-        }
+        await tx.query('delete from environments where id = $1 and project_id = $2', [eid, a.pid]);
       });
       await shadows.forget(eid);
     } finally {

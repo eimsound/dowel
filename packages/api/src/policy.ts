@@ -2,8 +2,7 @@
 //
 // 这里只有纯函数和 schema，服务端（鉴权、执行时的超时、写入校验）和界面（配置页、确认对话框）共用同一份：
 // - resolvePolicy：输入四层配置，输出每个字段的生效值、来源层、上级给出的下限（“锁定”）；
-// - 严格程度比较（compareField / approvalAtLeast）、写入校验（validateLayer）、放宽检测（loosenedFields）；
-// - 前置环境检查（checkPrerequisite）：界面、服务端执行接口、预演共用，P6 的令牌执行也用它。
+// - 严格程度比较（compareField / approvalAtLeast）、写入校验（validateLayer）、放宽检测（loosenedFields）。
 //
 // **合并规则 = 逐层取更严**。每个字段都有明确的严格程度：
 // - 谁能执行：仅限执行者 > 项目管理员 > 项目编辑者（全序）；
@@ -459,78 +458,3 @@ export const pickSet = (
   l: LayerPolicy | null | undefined,
   production: boolean,
 ): PolicySettings | undefined => (l ? (production ? l.production : l.nonProduction) : undefined);
-
-// ───── 前置环境（E6） ─────
-
-export interface PrerequisiteInput {
-  /** 要做的事：up = 执行（向前），down = 回滚，mark / baseline 不跑脚本 */
-  direction: 'up' | 'down' | 'mark' | 'baseline';
-  /** 目标版本的链上序号 */
-  targetNumber: number;
-  /**
-   * 前置环境；没有设置为 null。missing：设置了，但找不到那个环境（不应该发生——有外键——但发生了也宁可拒绝，不当作没设置）
-   */
-  prerequisite: { id: string; name: string; currentNumber: number | null; missing?: boolean } | null;
-}
-
-export type PrerequisiteCheck =
-  | { ok: true; exempt: false; prerequisite: PrerequisiteInput['prerequisite'] }
-  /** 回滚 / 标记 / 写基线不受约束（豁免，写进审计） */
-  | { ok: true; exempt: true; prerequisite: NonNullable<PrerequisiteInput['prerequisite']> }
-  | {
-      ok: false;
-      code: 'prerequisite_behind' | 'prerequisite_missing';
-      message: string;
-      prerequisite: NonNullable<PrerequisiteInput['prerequisite']>;
-    };
-
-/**
- * 前置环境检查：执行到本环境时，目标版本的序号不得高于前置环境的当前版本（前置环境还没执行过任何版本时，一律不能执行）。
- * 回滚不受约束：回滚是事故时的出口，回到的是本环境之前已经到过的版本（当时它已经满足了这条规则），
- * 不应该被“前置环境也得先回滚”卡住；标记为已执行和写入基线不执行脚本（ADR 0004），同样豁免。
- * 服务端执行接口、预演、确认对话框和以后的令牌执行（P6）都用这一个函数。
- */
-export const checkPrerequisite = (i: PrerequisiteInput): PrerequisiteCheck => {
-  const p = i.prerequisite;
-  if (!p) return { ok: true, exempt: false, prerequisite: null };
-  if (i.direction !== 'up') return { ok: true, exempt: true, prerequisite: p };
-  if (p.missing)
-    return {
-      ok: false,
-      code: 'prerequisite_missing',
-      prerequisite: p,
-      message:
-        '这个环境设置的前置环境已经不存在：无法确认目标版本已经在前置环境执行过，已拒绝执行。请在执行策略里重新设置前置环境',
-    };
-  if (p.currentNumber !== null && i.targetNumber <= p.currentNumber)
-    return { ok: true, exempt: false, prerequisite: p };
-  return {
-    ok: false,
-    code: 'prerequisite_behind',
-    prerequisite: p,
-    message:
-      p.currentNumber === null
-        ? `前置环境“${p.name}”还没有执行过任何版本：要执行到 v${i.targetNumber}，请先在“${p.name}”上执行它`
-        : `前置环境“${p.name}”当前是 v${p.currentNumber}，目标版本 v${i.targetNumber} 比它新：请先在“${p.name}”上执行到 v${i.targetNumber}`,
-  };
-};
-
-/**
- * 前置环境不能成环、不能是自己：从候选的前置环境沿着各环境的前置环境往上走，走回自己就是环。
- * links：同一个项目里每个环境当前的前置环境（id → 前置环境 id）。
- */
-export const prerequisiteCycle = (
-  envId: string,
-  candidate: string,
-  links: Map<string, string | null>,
-): boolean => {
-  const seen = new Set<string>();
-  let cur: string | null | undefined = candidate;
-  while (cur) {
-    if (cur === envId) return true;
-    if (seen.has(cur)) return false; // 别处已有的环（不应出现），不算本次造成的
-    seen.add(cur);
-    cur = links.get(cur) ?? null;
-  }
-  return false;
-};

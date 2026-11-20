@@ -14,6 +14,7 @@ import { join, resolve } from 'node:path';
 import { promisify } from 'node:util';
 import {
   type AuditPage,
+  type CiDriftResult,
   type CiEnvironmentStatus,
   type CiErrorBody,
   type CiExecuteResult,
@@ -23,6 +24,9 @@ import {
   type CiTokenList,
   type CiTokenSelf,
   type CiVersion,
+  ciDriftResultSchema,
+  ciEnvironmentStatusSchema,
+  ciProjectSchema,
   effectiveTokenRules,
   type InboxList,
   type ProjectActivity,
@@ -603,20 +607,23 @@ describe.skipIf(!PG_URL)('CI 执行接口、错误码、审计通知与 GitHub A
           `/api/projects/${p.pid}/environments/${prod.eid}/exec-policy`,
           {
             settings: { approval: [{ approvers: { kind: 'project_admins' }, count: 1 }] },
-            prerequisiteId: stg.eid,
           },
           'admin',
         )
       ).status,
     ).toBe(200);
 
-    // 只读接口：项目概要 / 版本链 / 环境状态
+    // 只读接口：项目与环境列表（纯平台配置，不含缓存的 currentVersion / drift）
     const projRes = await ciCall(p.token, 'GET', `/api/ci/projects/${groupSlug}/${p.slug}`);
     expect(projRes.status).toBe(200);
-    const proj = projRes.data as unknown as CiProject;
+    const proj = ciProjectSchema.parse(projRes.data) as CiProject;
     expect(proj.latest).toMatchObject({ number: 2 });
-    expect(proj.environments.find((e) => e.name === 'staging')!.tokenExecution).toBe(true);
-    expect(proj.environments.find((e) => e.name === 'prod')!.tokenExecution).toBe(false);
+    const stgCfg = proj.environments.find((e) => e.name === 'staging')!;
+    const prodCfg = proj.environments.find((e) => e.name === 'prod')!;
+    expect(stgCfg).toEqual({ name: 'staging', production: false, tokenExecution: true });
+    expect(prodCfg).toEqual({ name: 'prod', production: true, tokenExecution: false });
+    expect('currentVersion' in stgCfg).toBe(false);
+    expect('drift' in stgCfg).toBe(false);
 
     const vers = (await ciCall(p.token, 'GET', `/api/ci/projects/${groupSlug}/${p.slug}/versions`))
       .data as unknown as CiVersion[];
@@ -675,11 +682,18 @@ describe.skipIf(!PG_URL)('CI 执行接口、错误码、审计通知与 GitHub A
     expect(noop.status).toBe(200);
     expect(noop.data as unknown as CiExecuteResult).toMatchObject({ ok: true, noop: true, migrations: [] });
 
-    // 环境状态与目标库执行历史
-    const st = (await ciCall(p.token, 'GET', `/api/ci/projects/${groupSlug}/${p.slug}/environments/staging`))
-      .data as unknown as CiEnvironmentStatus;
+    // 环境实时状态（直连目标库读 dowel.history，不含缓存 drift）与目标库执行历史
+    const stRes = await ciCall(
+      p.token,
+      'GET',
+      `/api/ci/projects/${groupSlug}/${p.slug}/environments/staging`,
+    );
+    expect(stRes.status).toBe(200);
+    const st = ciEnvironmentStatusSchema.parse(stRes.data) as CiEnvironmentStatus;
     expect(st.currentVersion).toMatchObject({ number: 1 });
+    expect(st.unfinished).toBe(false);
     expect(st.pending).toEqual([2]);
+    expect('drift' in st).toBe(false);
 
     const hist = (
       await ciCall(p.token, 'GET', `/api/ci/projects/${groupSlug}/${p.slug}/environments/staging/history`)
@@ -717,26 +731,11 @@ describe.skipIf(!PG_URL)('CI 执行接口、错误码、审计通知与 GitHub A
               allowTokens: true,
               approval: [{ approvers: { kind: 'project_admins' }, count: 1 }],
             },
-            prerequisiteId: stg.eid,
           },
           'admin',
         )
       ).status,
     ).toBe(200);
-
-    // prod 到 v2 被前置环境 staging（当前 v1）挡住：409 prerequisite_behind
-    const preBehind = await ciCall(
-      p.token,
-      'POST',
-      `/api/ci/projects/${groupSlug}/${p.slug}/environments/prod/execute`,
-      { to: 'latest' },
-    );
-    expect(preBehind.status).toBe(409);
-    expect(preBehind.data as unknown as CiErrorBody).toMatchObject({
-      ok: false,
-      code: 'prerequisite_behind',
-      details: { prerequisite: { name: 'staging', currentNumber: 1 } },
-    });
 
     // 先在 prod 上提交一个执行申请（v1），验证令牌执行后待处理申请失效
     const reqCreate = await call(
@@ -925,7 +924,7 @@ describe.skipIf(!PG_URL)('CI 执行接口、错误码、审计通知与 GitHub A
           await call(
             'PUT',
             `/api/projects/${p.pid}/environments/${dev.eid}/exec-policy`,
-            { settings: { allowTokens: false }, prerequisiteId: null },
+            { settings: { allowTokens: false } },
             'admin',
           )
         ).status,
@@ -943,7 +942,7 @@ describe.skipIf(!PG_URL)('CI 执行接口、错误码、审计通知与 GitHub A
         await call(
           'PUT',
           `/api/projects/${p.pid}/environments/${dev.eid}/exec-policy`,
-          { settings: {}, prerequisiteId: null },
+          { settings: {} },
           'admin',
         )
       ).status,
@@ -978,7 +977,7 @@ describe.skipIf(!PG_URL)('CI 执行接口、错误码、审计通知与 GitHub A
         await call(
           'PUT',
           `/api/projects/${p.pid}/environments/${dev.eid}/exec-policy`,
-          { settings: { statementTimeoutMs: 300 }, prerequisiteId: null },
+          { settings: { statementTimeoutMs: 300 } },
           'admin',
         )
       ).status,
@@ -1014,6 +1013,267 @@ describe.skipIf(!PG_URL)('CI 执行接口、错误码、审计通知与 GitHub A
     expect(unreach.status).toBe(502);
     expect(unreach.data).toMatchObject({ ok: false, code: 'target_unreachable' });
     expect(v1!.number).toBe(1);
+  }, 120_000);
+
+  test('CI 三接口拆分与零过期缓存：纯平台配置 / 实时环境状态 / 实时漂移检测', async () => {
+    const p = await newProject('ci-split');
+    const stg = await addRealEnv(p.pid, 'staging', false);
+    await addRealEnv(p.pid, 'prod', true);
+    // 加一个不可达环境，验证项目列表不连目标库
+    await db.query(
+      `insert into environments (id, project_id, name, url_enc, production)
+       values ($1, $2, 'dead', $3, false)`,
+      [`${p.pid}-dead`, p.pid, encrypt('postgres://u:p@127.0.0.1:1/dead')],
+    );
+
+    // 1. 项目还没有发布任何版本时：
+    //    - GET /api/ci/projects/:owner/:project 返回纯平台配置（即使存在 dead 环境也 200）
+    const proj0 = await ciCall(p.token, 'GET', `/api/ci/projects/${groupSlug}/${p.slug}`);
+    expect(proj0.status).toBe(200);
+    const parsedProj0 = ciProjectSchema.parse(proj0.data);
+    expect(parsedProj0.latest).toBeNull();
+    expect(parsedProj0.environments).toEqual([
+      { name: 'dead', production: false, tokenExecution: true },
+      { name: 'prod', production: true, tokenExecution: false },
+      { name: 'staging', production: false, tokenExecution: true },
+    ]);
+    for (const e of proj0.data.environments as Record<string, unknown>[]) {
+      expect('currentVersion' in e).toBe(false);
+      expect('drift' in e).toBe(false);
+    }
+
+    //    - POST .../drift 无版本时返回 status = unknown
+    const driftUnknownRes = await ciCall(
+      p.token,
+      'POST',
+      `/api/ci/projects/${groupSlug}/${p.slug}/environments/staging/drift`,
+    );
+    expect(driftUnknownRes.status, JSON.stringify(driftUnknownRes.data)).toBe(200);
+    const driftUnknown = ciDriftResultSchema.parse(driftUnknownRes.data) as CiDriftResult;
+    expect(driftUnknown).toMatchObject({
+      environment: 'staging',
+      currentVersion: null,
+      status: 'unknown',
+      total: 0,
+      items: [],
+      unresolvable: [],
+      firstRun: false,
+      needsManual: null,
+    });
+
+    // 2. 发布 v1 / v2 并执行 staging 到 v1
+    const [v1, v2] = await publishChain(p.pid, 2);
+    expect(
+      (
+        await ciCall(
+          p.token,
+          'POST',
+          `/api/ci/projects/${groupSlug}/${p.slug}/environments/staging/execute`,
+          {
+            to: 'v1',
+          },
+        )
+      ).status,
+    ).toBe(200);
+
+    // 故意把平台库缓存 current_version_id 清空，验证 GET .../environments/:env 实时读目标库而非过期缓存，并同步回平台库
+    await db.query('update environments set current_version_id = null where id = $1', [stg.eid]);
+    const liveStatusRes = await ciCall(
+      p.token,
+      'GET',
+      `/api/ci/projects/${groupSlug}/${p.slug}/environments/staging`,
+    );
+    expect(liveStatusRes.status, JSON.stringify(liveStatusRes.data)).toBe(200);
+    const liveStatus = ciEnvironmentStatusSchema.parse(liveStatusRes.data) as CiEnvironmentStatus;
+    expect(liveStatus).toMatchObject({
+      name: 'staging',
+      production: false,
+      tokenExecution: true,
+      currentVersion: { id: v1!.id, number: 1, name: 'v1' },
+      unfinished: false,
+      pending: [2],
+    });
+    expect(liveStatus.versions.map((v) => [v.number, v.state])).toEqual([
+      [1, 'current'],
+      [2, 'pending'],
+    ]);
+    expect('drift' in (liveStatusRes.data as Record<string, unknown>)).toBe(false);
+    const [cachedEnv] = await db.query<{ current_version_id: string | null }>(
+      'select current_version_id from environments where id = $1',
+      [stg.eid],
+    );
+    expect(cachedEnv!.current_version_id).toBe(v1!.id);
+
+    // 3. POST .../drift：无漂移返回 status = clean（包括 tokenExecution=false 的生产环境也可只读检测）
+    const cleanStg = await ciCall(
+      p.token,
+      'POST',
+      `/api/ci/projects/${groupSlug}/${p.slug}/environments/staging/drift`,
+    );
+    expect(cleanStg.status, JSON.stringify(cleanStg.data)).toBe(200);
+    expect(ciDriftResultSchema.parse(cleanStg.data)).toMatchObject({
+      environment: 'staging',
+      currentVersion: { id: v1!.id, number: 1, name: 'v1' },
+      status: 'clean',
+      total: 0,
+      items: [],
+      unresolvable: [],
+      firstRun: false,
+      needsManual: null,
+    });
+    const cleanProd = await ciCall(
+      p.token,
+      'POST',
+      `/api/ci/projects/${groupSlug}/${p.slug}/environments/prod/drift`,
+    );
+    expect(cleanProd.status, JSON.stringify(cleanProd.data)).toBe(200);
+    expect(ciDriftResultSchema.parse(cleanProd.data)).toMatchObject({
+      environment: 'prod',
+      currentVersion: null,
+      status: 'clean',
+      total: 0,
+    });
+
+    // 4. 目标库手工改动后：POST .../drift 实时检出漂移、刷新平台缓存，并使待处理执行申请失效
+    const reqCreate = await call(
+      'POST',
+      `/api/projects/${p.pid}/environments/${stg.eid}/requests`,
+      { kind: 'execute', to: v2!.id, reason: '升 v2' },
+      'editor',
+    );
+    expect(reqCreate.status, JSON.stringify(reqCreate.data)).toBe(201);
+    const reqId = reqCreate.data.id as string;
+
+    await stg.target.db.exec('ALTER TABLE public.orders ADD COLUMN ci_drift_col int');
+    const driftedRes = await ciCall(
+      p.token,
+      'POST',
+      `/api/ci/projects/${groupSlug}/${p.slug}/environments/staging/drift`,
+    );
+    expect(driftedRes.status, JSON.stringify(driftedRes.data)).toBe(200);
+    const drifted = ciDriftResultSchema.parse(driftedRes.data) as CiDriftResult;
+    expect(drifted).toMatchObject({
+      environment: 'staging',
+      currentVersion: { id: v1!.id, number: 1, name: 'v1' },
+      status: 'drifted',
+      firstRun: false,
+      needsManual: null,
+    });
+    expect(drifted.total).toBeGreaterThan(0);
+    expect(drifted.items.some((i) => i.sql.includes('ci_drift_col'))).toBe(true);
+    expect(drifted.unresolvable).toEqual([]);
+    const [driftRow] = await db.query<{ drift_status: string }>(
+      'select drift_status from environments where id = $1',
+      [stg.eid],
+    );
+    expect(driftRow!.drift_status).toBe('drifted');
+    // 触发了 ctx.requests.kick：待处理申请应失效
+    let reqStatus = '';
+    for (let i = 0; i < 40; i++) {
+      const r = await call('GET', `/api/projects/${p.pid}/requests/${reqId}`, undefined, 'pa');
+      reqStatus = r.data.status as string;
+      if (reqStatus === 'invalid') break;
+      await new Promise((x) => setTimeout(x, 50));
+    }
+    expect(reqStatus).toBe('invalid');
+    await stg.target.db.exec('ALTER TABLE public.orders DROP COLUMN ci_drift_col');
+
+    // 5. 错误映射：
+    //    - 不可达目标库：GET .../environments/dead 和 POST .../environments/dead/drift 均返回 502 target_unreachable
+    const deadStatus = await ciCall(
+      p.token,
+      'GET',
+      `/api/ci/projects/${groupSlug}/${p.slug}/environments/dead`,
+    );
+    expect(deadStatus.status).toBe(502);
+    expect(deadStatus.data).toMatchObject({ ok: false, code: 'target_unreachable' });
+    const deadDrift = await ciCall(
+      p.token,
+      'POST',
+      `/api/ci/projects/${groupSlug}/${p.slug}/environments/dead/drift`,
+    );
+    expect(deadDrift.status).toBe(502);
+    expect(deadDrift.data).toMatchObject({ ok: false, code: 'target_unreachable' });
+
+    //    - 环境锁被占用：POST .../drift 返回 423 lock_timeout
+    const release = await created.exec.locks.acquire(stg.eid, 5000);
+    try {
+      const busyDrift = await ciCall(
+        p.token,
+        'POST',
+        `/api/ci/projects/${groupSlug}/${p.slug}/environments/staging/drift`,
+      );
+      expect(busyDrift.status).toBe(423);
+      expect(busyDrift.data).toMatchObject({ ok: false, code: 'lock_timeout' });
+    } finally {
+      release();
+    }
+
+    //    - 历史格式过新：GET .../environments/:env 和 POST .../drift 均返回 409 version_mismatch
+    await stg.target.db.exec("UPDATE dowel.meta SET value = '999' WHERE key = 'format_version'");
+    try {
+      const tooNewStatus = await ciCall(
+        p.token,
+        'GET',
+        `/api/ci/projects/${groupSlug}/${p.slug}/environments/staging`,
+      );
+      expect(tooNewStatus.status).toBe(409);
+      expect(tooNewStatus.data).toMatchObject({
+        ok: false,
+        code: 'version_mismatch',
+        details: { reason: 'format_too_new' },
+      });
+      const tooNewDrift = await ciCall(
+        p.token,
+        'POST',
+        `/api/ci/projects/${groupSlug}/${p.slug}/environments/staging/drift`,
+      );
+      expect(tooNewDrift.status).toBe(409);
+      expect(tooNewDrift.data).toMatchObject({
+        ok: false,
+        code: 'version_mismatch',
+        details: { reason: 'format_too_new' },
+      });
+    } finally {
+      await stg.target.db.exec("UPDATE dowel.meta SET value = '1' WHERE key = 'format_version'");
+    }
+
+    // 6. connectionLimiter 限速：GET .../environments/:env 与 POST .../drift 均按 token:<id> 计入连接限速
+    const limitedApp = createApp(db, {
+      loginLimiter: new LoginLimiter({ limit: 10_000, ipLimit: 10_000 }),
+      connectionLimiter: new KeyedLimiter({ limit: 2, windowMs: 60_000 }),
+      tokenFailLimiter: new KeyedLimiter({ limit: 10_000, windowMs: 60_000 }),
+      tokenLimiter: new KeyedLimiter({ limit: 10_000, windowMs: 60_000 }),
+    });
+    try {
+      const limCall = async (method: string, path: string) => {
+        const res = await limitedApp.app.request(path, {
+          method,
+          headers: { authorization: `Bearer ${p.token}` },
+        });
+        return { status: res.status, data: (await res.json()) as Record<string, unknown> };
+      };
+      expect(
+        (await limCall('GET', `/api/ci/projects/${groupSlug}/${p.slug}/environments/staging`)).status,
+      ).toBe(200);
+      expect(
+        (await limCall('POST', `/api/ci/projects/${groupSlug}/${p.slug}/environments/staging/drift`)).status,
+      ).toBe(200);
+      const third = await limCall('GET', `/api/ci/projects/${groupSlug}/${p.slug}/environments/staging`);
+      expect(third.status).toBe(429);
+      expect(third.data).toMatchObject({ ok: false, code: 'rate_limited' });
+      const fourth = await limCall(
+        'POST',
+        `/api/ci/projects/${groupSlug}/${p.slug}/environments/staging/drift`,
+      );
+      expect(fourth.status).toBe(429);
+      expect(fourth.data).toMatchObject({ ok: false, code: 'rate_limited' });
+      // 纯平台配置的 GET /api/ci/projects/:owner/:project 不受 connectionLimiter 约束
+      expect((await limCall('GET', `/api/ci/projects/${groupSlug}/${p.slug}`)).status).toBe(200);
+    } finally {
+      await limitedApp.rooms.flush();
+      await limitedApp.shadows.close();
+    }
   }, 120_000);
 
   test('T4 GitHub Action 脚本（actions/execute/run.sh）：预演、执行、noop、失败退出码与 GITHUB_OUTPUT', async () => {

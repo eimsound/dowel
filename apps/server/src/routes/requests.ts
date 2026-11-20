@@ -9,7 +9,6 @@ import {
   emergencyExecuteSchema,
   type InboxEvent,
   type InboxList,
-  type PrerequisiteResult,
   requestApproveSchema,
   requestCreateSchema,
   requestExecuteSchema,
@@ -44,14 +43,7 @@ import {
 import { effectiveRole, loadRoleContext } from '../roles.ts';
 import { sseSender } from '../sse.ts';
 import { type AppContext, access, body, connectionLimit, type Env, envAccess } from './context.ts';
-import {
-  assertVersion,
-  confirmed,
-  dryRunFor,
-  execStream,
-  prerequisiteOf,
-  type RunAccess,
-} from './executions.ts';
+import { assertVersion, confirmed, dryRunFor, execStream, type RunAccess } from './executions.ts';
 
 /** 申请里的操作（都在执行策略锁里做） */
 type Op =
@@ -63,7 +55,6 @@ type Op =
 /** 执行需要的一切：在锁内、转成 executing 之前就准备好（第一轮审查：之后再做检查，失败会让申请停在 executing） */
 interface RunPlan {
   a: RunAccess;
-  prerequisite: PrerequisiteResult | null;
 }
 
 interface OpResult {
@@ -77,14 +68,6 @@ interface OpResult {
 const conflict = (message: string) => new HTTPException(409, { message });
 const forbidden = (message: string) => new HTTPException(403, { message });
 const unprocessable = (message: string) => new HTTPException(422, { message });
-
-/** 前置环境只约束执行（向前）；回滚豁免 */
-const prerequisiteGate = async (db: Db, req: RequestRow) => {
-  const env = await loadEnv(db, req.project_id, req.environment_id);
-  const p = await prerequisiteOf(db, { pid: req.project_id, env }, req.to_version_id, req.direction);
-  if (p && !p.ok) throw new HTTPException(422, { message: p.message ?? '前置环境检查没有通过' });
-  return { env, prerequisite: p };
-};
 
 /**
  * 审批 / 驳回 / 撤回 / 执行：锁内的全部判断。返回之后由调用方提交事务、发通知、（需要时）开始执行。
@@ -247,10 +230,9 @@ const decideIn = async (
   if (req.status !== 'approved' && req.status !== 'failed') throw conflict('申请还没有全部通过');
   if (!right) throw forbidden('你没有这个环境的执行权限：审批不会给执行权限，请让有执行权限的人执行');
   confirmed(s.env, startExecute!.confirm);
-  const { prerequisite } = await prerequisiteGate(tx, req);
   // 执行用到的项目、环境、生效策略（超时、执行者身份）都在这里、锁内读好
   const auth = envAuthOf(s.store, rc, project, s.env);
-  const run: RunPlan = { a: { pid: project.id, name: project.name, env: s.env, auth }, prerequisite };
+  const run: RunPlan = { a: { pid: project.id, name: project.name, env: s.env, auth } };
   const now = new Date().toISOString();
   await tx.query(
     "update exec_requests set status = 'executing', executed_by = $2, updated_at = $3, status_reason = null where id = $1",
@@ -280,7 +262,7 @@ const decideIn = async (
  * execStream 同步地返回 SSE 响应，执行器里的任何失败（包括拿环境锁、连目标库之前的错误）都由它的结束处理
  * （恰好一次，见 execStream）转成执行失败，申请不会停在 executing。
  */
-const runRequest = (c: Context<Env>, ctx: AppContext, req: RequestRow, { a, prerequisite }: RunPlan) => {
+const runRequest = (c: Context<Env>, ctx: AppContext, req: RequestRow, { a }: RunPlan) => {
   const user = c.get('user');
   const me = { id: user.id, name: user.name };
   return execStream(
@@ -289,7 +271,6 @@ const runRequest = (c: Context<Env>, ctx: AppContext, req: RequestRow, { a, prer
     a,
     req.direction === 'down' ? 'environment.rollback' : 'environment.execute',
     { mode: 'migrate', to: req.to_version_id, direction: req.direction },
-    prerequisite,
     {
       auditExtra: { requestId: req.id, ...(req.emergency ? { emergency: true, reason: req.reason } : {}) },
       expect: {
@@ -364,7 +345,7 @@ export const registerRequests = (app: Hono<Env>, ctx: AppContext) => {
   });
 
   /**
-   * 提交执行申请。先跑一次预演（和确认对话框同一个检查：完整性、漂移、前置环境、认领……），不通过不能提交；
+   * 提交执行申请。先跑一次预演（和确认对话框同一个检查：完整性、漂移、认领……），不通过不能提交；
    * dryRun = true 只返回预演结果（没有直接执行权限的人在对话框里看预演用这个）。
    */
   app.post('/api/projects/:pid/environments/:eid/requests', async (c) => {
@@ -373,9 +354,8 @@ export const registerRequests = (app: Hono<Env>, ctx: AppContext) => {
     const user = c.get('user');
     await assertVersion(db, a.pid, b.to);
     const direction = b.kind === 'rollback' ? 'down' : 'up';
-    const prerequisite = await prerequisiteOf(db, a, b.to, direction);
     connectionLimit(c, ctx);
-    const dry = await dryRunFor(ctx, a, user.id, { mode: 'migrate', to: b.to, direction }, prerequisite);
+    const dry = await dryRunFor(ctx, a, user.id, { mode: 'migrate', to: b.to, direction });
     if (b.dryRun) return c.json(dry);
     if (!dry.ok || !dry.plan)
       return c.json(
@@ -565,7 +545,7 @@ export const registerRequests = (app: Hono<Env>, ctx: AppContext) => {
   });
 
   /**
-   * 紧急执行（E5）：只有实例管理员；绕过审批流程，**不绕过**漂移、完整性、认领、前置环境等检查（先预演，不通过就拒绝）。
+   * 紧急执行（E5）：只有实例管理员；绕过审批流程，**不绕过**漂移、完整性、认领等检查（先预演，不通过就拒绝）。
    * 必填原因、生产环境要输入环境名；审计，通知这个环境审批流程里的所有审批人。记成一条 emergency = true 的申请（详情页有记录）。
    */
   app.post('/api/projects/:pid/environments/:eid/emergency', async (c) => {
@@ -576,19 +556,9 @@ export const registerRequests = (app: Hono<Env>, ctx: AppContext) => {
     const b = await body(c, emergencyExecuteSchema);
     await assertVersion(db, a.pid, b.to);
     const direction = b.kind === 'rollback' ? 'down' : 'up';
-    const prerequisite = await prerequisiteOf(db, a, b.to, direction);
-    if (prerequisite && !prerequisite.ok)
-      return c.json(
-        {
-          error: prerequisite.message,
-          code: prerequisite.code ?? 'prerequisite_behind',
-          details: { prerequisite },
-        },
-        422,
-      );
     confirmed(a.env, b.confirm);
     connectionLimit(c, ctx);
-    const dry = await dryRunFor(ctx, a, user.id, { mode: 'migrate', to: b.to, direction }, prerequisite);
+    const dry = await dryRunFor(ctx, a, user.id, { mode: 'migrate', to: b.to, direction });
     if (!dry.ok || !dry.plan)
       return c.json(
         {
@@ -606,10 +576,6 @@ export const registerRequests = (app: Hono<Env>, ctx: AppContext) => {
       const env = await loadEnv(tx, a.pid, a.env.id);
       if ((env.current_version_id ?? null) !== (plan.from?.id ?? null))
         throw conflict('环境的当前版本在检查之后变了，请重试');
-      // 前置环境和生产环境名在锁内用锁内读到的环境行再检查一次（第二轮审查：和普通申请的执行一致；
-      // 锁外检查之后前置环境可能回退了）
-      const pre = await prerequisiteOf(tx, { pid: a.pid, env }, b.to, direction);
-      if (pre && !pre.ok) return { rejected: pre, row: null, plan: null } as const;
       confirmed(env, b.confirm);
       const auth = envAuthOf(await loadPolicies(tx, project), rc, project, env);
       const migrations = await snapshotOf(tx, a.pid, plan);
@@ -673,22 +639,12 @@ export const registerRequests = (app: Hono<Env>, ctx: AppContext) => {
       });
       fx.requestsChanged = true;
       return {
-        rejected: null,
         row,
-        plan: { a: { pid: project.id, name: project.name, env, auth }, prerequisite: pre },
+        plan: { a: { pid: project.id, name: project.name, env, auth } },
       } as const;
     });
-    if (out.rejected)
-      return c.json(
-        {
-          error: out.rejected.message,
-          code: out.rejected.code ?? 'prerequisite_behind',
-          details: { prerequisite: out.rejected },
-        },
-        422,
-      );
     await requests.flushEffects(fx);
-    return runRequest(c, ctx, out.row!, out.plan!);
+    return runRequest(c, ctx, out.row, out.plan);
   });
 };
 

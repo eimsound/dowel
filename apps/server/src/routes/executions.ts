@@ -2,7 +2,6 @@
 // 特权操作按环境的“谁能执行”档位检查（H6，authz.ts 的 EnvAction）。
 import {
   baselineRequestSchema,
-  checkPrerequisite,
   type DriftCheckResponse,
   type DryRunResponse,
   type EnvHistory,
@@ -15,7 +14,6 @@ import {
   type MarkPlanInfo,
   type MarkResult as MarkResultInfo,
   markRequestSchema,
-  type PrerequisiteResult,
   type RepairScript,
 } from '@dowel/api';
 import { type Db, SESSION_SETTINGS } from '@dowel/engines';
@@ -29,7 +27,6 @@ import { inList } from '../db.ts';
 import {
   driftInfo,
   type EnvRow,
-  loadPrerequisite,
   loadVersionMetas,
   permissionsOf,
   toEnvVersion,
@@ -55,46 +52,6 @@ import { type AppContext, body, connectionLimit, type Env, envAccess } from './c
 export type EnvAccess = Awaited<ReturnType<typeof envAccess>>;
 /** 执行只用到这几项：执行申请在锁内准备好它们（P5b） */
 export type RunAccess = Pick<EnvAccess, 'pid' | 'name' | 'env' | 'auth'>;
-
-/**
- * 前置环境检查（E6）：执行（向前）时目标版本不得高于前置环境（平台库缓存里）的当前版本；回滚 / 标记 / 写基线豁免。
- * 判断本身是 @dowel/api 的 checkPrerequisite（界面、预演、P6 的令牌执行共用）。没有设置前置环境时返回 null。
- */
-export const prerequisiteOf = async (
-  db: Db,
-  a: Pick<EnvAccess, 'pid' | 'env'>,
-  to: string | null,
-  direction: 'up' | 'down' | 'mark' | 'baseline',
-): Promise<PrerequisiteResult | null> => {
-  // 只要序号：前置环境的名字和它当前版本（共用的轻量查询，悬空时是 missing）、目标版本的序号（不读脚本和验证报告）
-  const p = await loadPrerequisite(db, a.pid, a.env.prerequisite_id);
-  if (!p) return null;
-  const [t] = to
-    ? await db.query<{ number: number }>('select number from versions where id = $1 and project_id = $2', [
-        to,
-        a.pid,
-      ])
-    : await db.query<{ number: number }>('select min(number) as number from versions where project_id = $1', [
-        a.pid,
-      ]);
-  // 设置了前置环境却找不到它（有外键 / 触发器，不应该发生）：missing，checkPrerequisite 宁可拒绝也不放宽
-  const prerequisite = {
-    id: p.id,
-    name: p.name,
-    currentNumber: p.currentVersion?.number ?? null,
-    missing: p.missing === true,
-  };
-  const r = checkPrerequisite({ direction, targetNumber: t?.number ?? 0, prerequisite });
-  return {
-    ok: r.ok,
-    exempt: r.ok && r.exempt,
-    id: prerequisite.id,
-    name: prerequisite.name,
-    currentNumber: prerequisite.currentNumber,
-    code: r.ok ? null : r.code,
-    message: r.ok ? null : r.message,
-  };
-};
 
 /** 执行策略里给执行器的超时（生效值） */
 export const timeoutsOf = (a: Pick<EnvAccess, 'auth'>) => ({
@@ -130,23 +87,16 @@ export const execStream = (
   a: RunAccess,
   action: Extract<EnvAction, 'environment.execute' | 'environment.rollback' | 'environment.baseline'>,
   run: { mode: 'migrate' | 'baseline'; to?: string; direction?: 'up' | 'down' },
-  prerequisite: PrerequisiteResult | null,
   opts: StreamOptions = {},
 ) => {
   const { db } = ctx;
   const { env } = a;
   const user = c.get('user');
-  /** 审计里记下这次用的执行策略（谁能执行、超时）和前置环境（回滚 / 写基线是豁免） */
+  /** 审计里记下这次用的执行策略（谁能执行、超时） */
   const policyAudit = {
     whoCanExecute: a.auth.resolved.whoCanExecute.value,
     viaExecutor: a.auth.isExecutor,
     timeouts: timeoutsOf(a),
-    ...(prerequisite
-      ? {
-          prerequisite: { name: prerequisite.name, currentNumber: prerequisite.currentNumber },
-          ...(prerequisite.exempt ? { prerequisiteExempt: true } : {}),
-        }
-      : {}),
     ...opts.auditExtra,
   };
   const finish = async (r: StreamOutcome) => {
@@ -233,18 +183,8 @@ export const dryRunFor = async (
   a: Pick<EnvAccess, 'pid' | 'name' | 'env'>,
   userId: string,
   run: { mode: 'migrate' | 'baseline'; to?: string; direction?: 'up' | 'down' },
-  prerequisite: PrerequisiteResult | null,
 ): Promise<DryRunResponse> => {
   const { db } = ctx;
-  // 前置环境没满足：不用连目标库就知道会被拒绝，和真正执行时同一个代码和说明
-  if (prerequisite && !prerequisite.ok)
-    return {
-      ok: false,
-      error: prerequisite.message ?? '前置环境检查没有通过',
-      code: prerequisite.code ?? 'prerequisite_behind',
-      details: { prerequisite },
-      prerequisite,
-    };
   try {
     const result = await dryRunExecution(ctx.exec, {
       pid: a.pid,
@@ -260,7 +200,6 @@ export const dryRunFor = async (
     const ref = (v: { id: string; number: number; name: string } | null) => (v ? versionRef(v) : null);
     return {
       ok: true,
-      prerequisite,
       plan: {
         mode: result.mode,
         direction: result.direction,
@@ -294,7 +233,7 @@ export const dryRunFor = async (
     if (e instanceof HTTPException) throw e;
     const ev = errorEvent(e);
     // 连接不上等：errorEvent 会按 cause 分类；意外错误已经是“服务器内部错误”
-    return { ok: false, ...ev, prerequisite };
+    return { ok: false, ...ev };
   }
 };
 
@@ -351,7 +290,6 @@ export const registerExecutions = (app: Hono<Env>, ctx: AppContext) => {
       execPolicy: auth.resolved.whoCanExecute.own,
       effectiveExecPolicy: auth.resolved.whoCanExecute.value,
       policy: auth.resolved,
-      prerequisite: await loadPrerequisite(db, env.project_id, env.prerequisite_id),
       currentVersion: cur ? versionRef(cur) : null,
       versions,
       pending: versions.filter((v) => v.state === 'pending').map((v) => v.id),
@@ -427,37 +365,23 @@ export const registerExecutions = (app: Hono<Env>, ctx: AppContext) => {
     const a = await envAccess(c, ctx, 'environment.execute');
     const b = await body(c, executeRequestSchema);
     await assertVersion(db, a.pid, b.to);
-    const prerequisite = await prerequisiteOf(db, a, b.to, 'up');
     const run = { mode: 'migrate', to: b.to, direction: 'up' } as const;
-    if (b.dryRun) return c.json(await dryRunFor(ctx, a, c.get('user').id, run, prerequisite));
+    if (b.dryRun) return c.json(await dryRunFor(ctx, a, c.get('user').id, run));
     // 配置了审批环节：谁都不能直接执行（实例管理员也走审批，另有紧急执行），要提交执行申请（P5b）
     if (approvalRequired(a)) return c.json(APPROVAL_REQUIRED, 403);
-    // 前置环境没满足（还没到目标版本，或者设置的前置环境不存在）：422，什么都不做
-    // （也不写审计——和其他请求校验失败一样，没有开始执行）
-    if (prerequisite && !prerequisite.ok)
-      return c.json(
-        {
-          error: prerequisite.message,
-          code: prerequisite.code ?? 'prerequisite_behind',
-          details: { prerequisite },
-        },
-        422,
-      );
     confirmed(a.env, b.confirm);
-    return execStream(c, ctx, a, 'environment.execute', run, prerequisite);
+    return execStream(c, ctx, a, 'environment.execute', run);
   });
 
   app.post('/api/projects/:pid/environments/:eid/rollback', async (c) => {
     const a = await envAccess(c, ctx, 'environment.rollback');
     const b = await body(c, executeRequestSchema);
     await assertVersion(db, a.pid, b.to);
-    // 回滚不受前置环境约束（豁免记进审计），见 checkPrerequisite
-    const prerequisite = await prerequisiteOf(db, a, b.to, 'down');
     const run = { mode: 'migrate', to: b.to, direction: 'down' } as const;
-    if (b.dryRun) return c.json(await dryRunFor(ctx, a, c.get('user').id, run, prerequisite));
+    if (b.dryRun) return c.json(await dryRunFor(ctx, a, c.get('user').id, run));
     if (approvalRequired(a)) return c.json(APPROVAL_REQUIRED, 403);
     confirmed(a.env, b.confirm);
-    return execStream(c, ctx, a, 'environment.rollback', run, prerequisite);
+    return execStream(c, ctx, a, 'environment.rollback', run);
   });
 
   // ───── 标记为已执行（ADR 0004） ─────
@@ -506,8 +430,6 @@ export const registerExecutions = (app: Hono<Env>, ctx: AppContext) => {
       name: a.env.name,
       production: a.env.production,
       to: b.to,
-      // 标记不受前置环境约束（不跑脚本，ADR 0004），豁免写进审计；P5b 接入审批后批准绑定 from / to / fingerprint
-      prerequisiteExempt: true,
     };
     try {
       const r = await runMark(ctx.exec, {
@@ -609,11 +531,8 @@ export const registerExecutions = (app: Hono<Env>, ctx: AppContext) => {
   app.post('/api/projects/:pid/environments/:eid/baseline', async (c) => {
     const a = await envAccess(c, ctx, 'environment.baseline');
     const b = await body(c, baselineRequestSchema);
-    // 写基线不执行脚本（标记为已执行的特例），不受前置环境约束
-    const prerequisite = await prerequisiteOf(db, a, null, 'baseline');
-    if (b.dryRun)
-      return c.json(await dryRunFor(ctx, a, c.get('user').id, { mode: 'baseline' }, prerequisite));
+    if (b.dryRun) return c.json(await dryRunFor(ctx, a, c.get('user').id, { mode: 'baseline' }));
     confirmed(a.env, b.confirm);
-    return execStream(c, ctx, a, 'environment.baseline', { mode: 'baseline' }, prerequisite);
+    return execStream(c, ctx, a, 'environment.baseline', { mode: 'baseline' });
   });
 };

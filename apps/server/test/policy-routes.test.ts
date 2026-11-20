@@ -1,4 +1,4 @@
-// 执行策略（P5a）的接口场景：四层配置与“只能收紧”、放宽是特权操作、执行者授权、前置环境、语句超时与锁等待超时。
+// 执行策略（P5a）的接口场景：四层配置与“只能收紧”、放宽是特权操作、执行者授权、语句超时与锁等待超时。
 // 平台库用 SQLite；需要真正执行迁移的用例用测试 PG 当目标库 / 影子库（没有 Docker 时跳过这些用例）。
 // 默认策略下的现有行为由 exec-policy.test.ts 覆盖（未改动断言）。
 
@@ -6,7 +6,6 @@ import { mkdtempSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import type {
-  DryRunResponse,
   EnvInfo,
   EnvPolicyView,
   ExecEvent,
@@ -174,7 +173,7 @@ describe('四层配置：只能收紧、锁定显示、放宽是特权操作', (
         await call(
           'PUT',
           `/api/projects/${pid}/environments/${dev}/exec-policy`,
-          { settings: { whoCanExecute: 'editor' }, prerequisiteId: null },
+          { settings: { whoCanExecute: 'editor' } },
           'admin',
         )
       ).status,
@@ -230,7 +229,7 @@ describe('四层配置：只能收紧、锁定显示、放宽是特权操作', (
     const t = await call(
       'PUT',
       `/api/projects/${pid}/environments/${prod}/exec-policy`,
-      { settings: { whoCanExecute: 'executor', lockTimeoutMs: 2000 }, prerequisiteId: null },
+      { settings: { whoCanExecute: 'executor', lockTimeoutMs: 2000 } },
       'pa',
     );
     expect(t.status, JSON.stringify(t.data)).toBe(200);
@@ -244,7 +243,7 @@ describe('四层配置：只能收紧、锁定显示、放宽是特权操作', (
         await call(
           'PUT',
           `/api/projects/${pid}/environments/${prod}/exec-policy`,
-          { settings: { whoCanExecute: 'executor', lockTimeoutMs: 1000 }, prerequisiteId: null },
+          { settings: { whoCanExecute: 'executor', lockTimeoutMs: 1000 } },
           'editor',
         )
       ).status,
@@ -255,7 +254,7 @@ describe('四层配置：只能收紧、锁定显示、放宽是特权操作', (
         await call(
           'PUT',
           `/api/projects/${pid}/environments/${prod}/exec-policy`,
-          { settings: { whoCanExecute: 'executor', lockTimeoutMs: 1000 }, prerequisiteId: null },
+          { settings: { whoCanExecute: 'executor', lockTimeoutMs: 1000 } },
           'pa',
         )
       ).status,
@@ -263,7 +262,7 @@ describe('四层配置：只能收紧、锁定显示、放宽是特权操作', (
     const loosen = await call(
       'PUT',
       `/api/projects/${pid}/environments/${prod}/exec-policy`,
-      { settings: { whoCanExecute: 'executor' }, prerequisiteId: null },
+      { settings: { whoCanExecute: 'executor' } },
       'pa',
     );
     expect(loosen.status).toBe(403);
@@ -512,7 +511,6 @@ describe('四层配置：只能收紧、锁定显示、放宽是特权操作', (
       `/api/projects/${pid}/environments/${e}/exec-policy`,
       {
         settings: { approval: [{ approvers: { kind: 'group_members', groupId: 'no-such' }, count: 1 }] },
-        prerequisiteId: null,
       },
       'pa',
     );
@@ -524,7 +522,6 @@ describe('四层配置：只能收紧、锁定显示、放宽是特权操作', (
         settings: {
           approval: [{ approvers: { kind: 'group_members', groupId }, count: 2, lastApproverExecutes: true }],
         },
-        prerequisiteId: null,
       },
       'pa',
     );
@@ -537,66 +534,13 @@ describe('四层配置：只能收紧、锁定显示、放宽是特权操作', (
     expect(view.names[groupId]).toBe('策略组');
     // 删掉自己追加的环节 = 放宽（审批流程不再包含原流程），生产默认档位是项目管理员，pa 满足
     expect(
-      (
-        await call(
-          'PUT',
-          `/api/projects/${pid}/environments/${e}/exec-policy`,
-          { settings: {}, prerequisiteId: null },
-          'pa',
-        )
-      ).status,
+      (await call('PUT', `/api/projects/${pid}/environments/${e}/exec-policy`, { settings: {} }, 'pa'))
+        .status,
     ).toBe(200);
   });
 });
 
-describe('前置环境', () => {
-  test('同项目、不能是自己、不能成环；被引用的环境不能删', async () => {
-    const pid = await newProject('prereq-rules');
-    const dev = await fakeEnv(pid, 'dev', false);
-    const stg = await fakeEnv(pid, 'stg', false);
-    const prod = await fakeEnv(pid, 'prod', true);
-    const set = (eid: string, prerequisiteId: string | null, who = 'pa') =>
-      call(
-        'PUT',
-        `/api/projects/${pid}/environments/${eid}/exec-policy`,
-        { settings: {}, prerequisiteId },
-        who,
-      );
-    expect((await set(stg, dev)).status).toBe(200);
-    expect((await set(prod, stg)).status).toBe(200);
-    expect((await set(prod, prod)).status).toBe(422);
-    const cyc = await set(dev, prod);
-    expect(cyc.status).toBe(422);
-    expect(cyc.data.error).toContain('循环');
-    const other = await newProject('prereq-other');
-    const foreign = await fakeEnv(other, 'x', false);
-    expect((await set(prod, foreign)).status).toBe(422);
-    // 候选列表里会成环的标为不可选
-    const view = (
-      await call('GET', `/api/projects/${pid}/environments/${dev}/exec-policy`, undefined, 'viewer')
-    ).data as unknown as EnvPolicyView;
-    expect(view.candidates.find((c) => c.id === prod)!.disabled).toContain('循环');
-    expect(view.candidates.find((c) => c.id === stg)!.disabled).toContain('循环');
-    // 被引用的环境不能删
-    const del = await call('DELETE', `/api/projects/${pid}/environments/${stg}`, undefined, 'pa');
-    expect(del.status).toBe(409);
-    expect(del.data.error).toContain('prod');
-    // 数据库层面也不会悬空：直接删被引用的环境、或者把前置环境设成不存在的环境，都被约束拒绝（SQLite 触发器 / PG 外键）
-    await expect(db.query('delete from environments where id = $1', [stg])).rejects.toThrow(/FOREIGN KEY/);
-    await expect(
-      db.query("update environments set prerequisite_id = 'no-such-env' where id = $1", [prod]),
-    ).rejects.toThrow(/FOREIGN KEY/);
-    // 去掉前置环境是放宽：生产环境默认要项目管理员，编辑者不行（也不是项目管理员），pa 可以
-    expect((await set(prod, null, 'editor')).status).toBe(403);
-    expect((await set(prod, null)).status).toBe(200);
-    // 删项目时同一个项目里的环境互相引用也能整体删掉
-    expect((await set(stg, dev)).status).toBe(200);
-    const slug = (await call('GET', `/api/projects/${pid}`)).data.slug as string;
-    expect((await call('DELETE', `/api/projects/${pid}`, { confirm: slug })).status).toBe(200);
-  });
-});
-
-describe.skipIf(!PG_URL)('真实执行：执行者、前置环境、超时（目标库 PG）', () => {
+describe.skipIf(!PG_URL)('真实执行：执行者、超时（目标库 PG）', () => {
   /** 指向新建测试库的环境 */
   const realEnv = async (pid: string, name: string, production = false) => {
     const target = await createTestDb('pol_tgt');
@@ -640,18 +584,17 @@ describe.skipIf(!PG_URL)('真实执行：执行者、前置环境、超时（目
     extra = {},
   ) => call('POST', `/api/projects/${pid}/environments/${eid}/${action}`, { to, ...extra }, who);
 
-  test('仅限执行者：执行者真正执行成功；前置环境拒绝执行、预演给出同样的原因、回滚豁免', async () => {
+  test('仅限执行者：执行者真正执行与回滚成功，项目管理员被拒，审计记录超时和执行者身份', async () => {
     const pid = await newProject('real');
-    const dev = await realEnv(pid, 'dev');
     const prod = await realEnv(pid, 'prod', true);
     const [v1, v2] = await publishChain(pid, 2);
-    // prod：前置环境 dev，仅限执行者；dba 由实例管理员授予 prod 的执行者
+    // prod：仅限执行者；dba 由实例管理员授予 prod 的执行者
     expect(
       (
         await call(
           'PUT',
           `/api/projects/${pid}/environments/${prod.eid}/exec-policy`,
-          { settings: { whoCanExecute: 'executor' }, prerequisiteId: dev.eid },
+          { settings: { whoCanExecute: 'executor' } },
           'pa',
         )
       ).status,
@@ -666,47 +609,19 @@ describe.skipIf(!PG_URL)('真实执行：执行者、前置环境、超时（目
         )
       ).status,
     ).toBe(201);
-    // dev 还没执行过：prod 执行 v1 被前置环境拒绝（422，code）；预演 200 + ok:false，同一个代码和说明
-    const dry = await exec(pid, prod.eid, 'execute', v1!.id, 'dba', { dryRun: true });
-    expect(dry.status).toBe(200);
-    const d = dry.data as unknown as DryRunResponse;
-    expect(d).toMatchObject({ ok: false, code: 'prerequisite_behind' });
-    expect(d.prerequisite).toMatchObject({ ok: false, name: 'dev', currentNumber: null });
-    const rejected = await exec(pid, prod.eid, 'execute', v1!.id, 'dba', { confirm: 'prod' });
-    expect(rejected.status).toBe(422);
-    expect(rejected.data.code).toBe('prerequisite_behind');
-    expect(rejected.data.error).toContain('dev');
-    // 目标库没被碰过
-    expect((await prod.target.db.query("select 1 from pg_namespace where nspname = 'dowel'")).length).toBe(0);
-    // dev 执行到 v1（编辑者，默认档位）→ prod 可以到 v1，不能到 v2
-    expect(last((await exec(pid, dev.eid, 'execute', v1!.id, 'editor')).events)).toMatchObject({
-      stage: 'done',
-    });
-    // 项目编辑者 / 项目管理员在 prod 上被拒（仅限执行者）；执行者成功
+    // 项目管理员在 prod 上被拒（仅限执行者）；执行者成功
     expect((await exec(pid, prod.eid, 'execute', v1!.id, 'pa', { confirm: 'prod' })).status).toBe(403);
     const ok = await exec(pid, prod.eid, 'execute', v1!.id, 'dba', { confirm: 'prod' });
     expect(last(ok.events), JSON.stringify(last(ok.events))).toMatchObject({
       stage: 'done',
       current: { number: 1 },
     });
-    const toV2 = await exec(pid, prod.eid, 'execute', v2!.id, 'dba', { confirm: 'prod' });
-    expect(toV2.status).toBe(422);
-    const dry2 = (await exec(pid, prod.eid, 'execute', v2!.id, 'dba', { dryRun: true }))
-      .data as unknown as DryRunResponse;
-    expect(dry2.prerequisite).toMatchObject({ ok: false, currentNumber: 1 });
-    // dev 到 v2 后 prod 也能到 v2；然后 dev 回滚到 v1，prod 回滚到 v1 不受约束（豁免记进审计）
-    expect(last((await exec(pid, dev.eid, 'execute', v2!.id, 'editor')).events)).toMatchObject({
-      stage: 'done',
-    });
     expect(
       last((await exec(pid, prod.eid, 'execute', v2!.id, 'dba', { confirm: 'prod' })).events),
     ).toMatchObject({
       stage: 'done',
+      current: { number: 2 },
     });
-    expect(last((await exec(pid, dev.eid, 'rollback', v1!.id, 'editor')).events)).toMatchObject({
-      stage: 'done',
-    });
-    // 前置环境落后时，prod 再执行 v2 是空操作以外的事都会被拒——但回滚照常
     expect(
       last((await exec(pid, prod.eid, 'rollback', v1!.id, 'dba', { confirm: 'prod' })).events),
     ).toMatchObject({
@@ -720,7 +635,7 @@ describe.skipIf(!PG_URL)('真实执行：执行者、前置环境、超时（目
     const prodRuns = audits.filter((a) => a.data.name === 'prod');
     expect(prodRuns.at(-1)).toMatchObject({
       action: 'environment.rollback',
-      data: { ok: true, prerequisiteExempt: true, whoCanExecute: 'executor', viaExecutor: true },
+      data: { ok: true, whoCanExecute: 'executor', viaExecutor: true },
     });
     expect(prodRuns[0]!.data).toMatchObject({ timeouts: { lockMs: 5000, statementMs: 0 } });
   });
@@ -735,7 +650,7 @@ describe.skipIf(!PG_URL)('真实执行：执行者、前置环境、超时（目
         await call(
           'PUT',
           `/api/projects/${pid}/environments/${dev.eid}/exec-policy`,
-          { settings: { lockTimeoutMs: 800 }, prerequisiteId: null },
+          { settings: { lockTimeoutMs: 800 } },
           'pa',
         )
       ).status,
@@ -781,7 +696,7 @@ describe.skipIf(!PG_URL)('真实执行：执行者、前置环境、超时（目
         await call(
           'PUT',
           `/api/projects/${pid}/environments/${dev.eid}/exec-policy`,
-          { settings: { statementTimeoutMs: 500 }, prerequisiteId: null },
+          { settings: { statementTimeoutMs: 500 } },
           'pa',
         )
       ).status,
@@ -793,14 +708,8 @@ describe.skipIf(!PG_URL)('真实执行：执行者、前置环境、超时（目
     expect(ev.error).toContain('语句超时');
     // 去掉语句超时（放宽：非生产默认档位是编辑者，pa 满足）→ 重试成功
     expect(
-      (
-        await call(
-          'PUT',
-          `/api/projects/${pid}/environments/${dev.eid}/exec-policy`,
-          { settings: {}, prerequisiteId: null },
-          'pa',
-        )
-      ).status,
+      (await call('PUT', `/api/projects/${pid}/environments/${dev.eid}/exec-policy`, { settings: {} }, 'pa'))
+        .status,
     ).toBe(200);
     expect(last((await exec(pid, dev.eid, 'execute', v1!.id)).events)).toMatchObject({
       stage: 'done',
@@ -809,63 +718,7 @@ describe.skipIf(!PG_URL)('真实执行：执行者、前置环境、超时（目
   });
 });
 
-describe.skipIf(!PG_URL)('前置环境悬空时拒绝执行（目标库 PG）', () => {
-  test('前置环境行没了（绕过约束删掉）：执行 422 prerequisite_missing，预演同样拒绝，回滚不受影响', async () => {
-    const pid = await newProject('dangling');
-    const target = await createTestDb('pol_dangle');
-    targets.push(target);
-    const e = await call('POST', `/api/projects/${pid}/environments`, {
-      name: 'stg',
-      url: target.url,
-      production: false,
-      allowSameInstance: true,
-    });
-    expect(e.status).toBe(201);
-    const stg = e.data.id as string;
-    const dev = await fakeEnv(pid, 'dev', false);
-    await addTable(created.rooms, db, pid);
-    const v1 = (await call('POST', `/api/projects/${pid}/versions`, { name: 'v1' })).data as unknown as {
-      id: string;
-    };
-    expect(
-      (
-        await call(
-          'PUT',
-          `/api/projects/${pid}/environments/${stg}/exec-policy`,
-          { settings: {}, prerequisiteId: dev },
-          'pa',
-        )
-      ).status,
-    ).toBe(200);
-    // 模拟悬空：绕过约束（这个测试文件的平台库是 SQLite：先删掉触发器）直接删掉前置环境
-    for (const t of ['delete', 'insert', 'update'])
-      await db.exec(`drop trigger if exists environments_prerequisite_${t}`);
-    await db.query('delete from environments where id = $1', [dev]);
-    const r = await call('POST', `/api/projects/${pid}/environments/${stg}/execute`, { to: v1.id }, 'pa');
-    expect(r.status).toBe(422);
-    expect(r.data.code).toBe('prerequisite_missing');
-    expect(r.data.error).toContain('不存在');
-    const dry = (
-      await call(
-        'POST',
-        `/api/projects/${pid}/environments/${stg}/execute`,
-        { to: v1.id, dryRun: true },
-        'pa',
-      )
-    ).data as unknown as DryRunResponse;
-    expect(dry).toMatchObject({ ok: false, code: 'prerequisite_missing' });
-    // 环境状态里如实标出来（界面据此拒绝）
-    const st = (await call('GET', `/api/projects/${pid}/environments/${stg}/status`, undefined, 'pa'))
-      .data as unknown as {
-      prerequisite: { missing?: boolean } | null;
-    };
-    expect(st.prerequisite).toMatchObject({ missing: true });
-    // 目标库没被碰
-    expect((await target.db.query("select 1 from pg_namespace where nspname = 'dowel'")).length).toBe(0);
-  });
-});
-
-describe('平台库迁移：H6 的档位搬进执行策略的环境层', () => {
+describe('平台库迁移：H6 的档位搬进执行策略的环境层，且迁移 22 清理旧列与约束', () => {
   test.each([
     { platform: 'sqlite', skip: false },
     { platform: 'pg', skip: !PG_URL },
@@ -876,8 +729,7 @@ describe('平台库迁移：H6 的档位搬进执行策略的环境层', () => {
     const url = pg?.url ?? join(dir!, 'p.db');
     const fresh = await openPlatformDb(url);
     try {
-      // 退回到 P5a 之前：删掉新表 / 新列，加回 exec_policy，grants 的执行者授权先清掉（旧约束不认识它）
-      // P5b / P6 的迁移在 P5a 之后，一起退回去
+      // 退回到 P5a 之前：删掉新表，加回 exec_policy（旧列与约束在最新迁移 22 已清理，不需要再删）
       for (const t of [
         'ci_tokens',
         'token_policies',
@@ -889,13 +741,9 @@ describe('平台库迁移：H6 的档位搬进执行策略的环境层', () => {
       ])
         await fresh.exec(`drop table ${t}`);
       await fresh.exec('drop table exec_policies');
-      if (platform === 'sqlite')
-        for (const t of ['delete', 'insert', 'update'])
-          await fresh.exec(`drop trigger if exists environments_prerequisite_${t}`);
-      await fresh.exec('alter table environments drop column prerequisite_id');
       await fresh.exec('alter table environments add column exec_policy text');
-      // P5a 的两条迁移、P5b 的一条和 P6 的一条都退回去
-      await fresh.query('delete from dowel_migrations where version > $1', [MIGRATIONS.length - 4]);
+      // P5a 的两条迁移、P5b 的一条、P6 的一条和 P6.5 的一条都退回去
+      await fresh.query('delete from dowel_migrations where version > $1', [MIGRATIONS.length - 5]);
       await fresh.query("insert into groups (id, slug, name) values ('g1', 'g1', 'g')");
       await fresh.query("insert into projects (id, name, group_id, slug) values ('p1', 'p', 'g1', 'p')");
       for (const [id, pol] of [
@@ -927,7 +775,9 @@ describe('平台库迁移：H6 的档位搬进执行策略的环境层', () => {
           : (await upgraded.query<{ name: string }>('pragma table_info(environments)'))
               .filter((r) => r.name === 'exec_policy' || r.name === 'prerequisite_id')
               .map((r) => ({ c: r.name }));
-      expect(cols.map((c) => c.c)).toEqual(['prerequisite_id']);
+      expect(cols.map((c) => c.c)).toEqual([]);
+      // 删环境不会再被旧触发器或外键拦住
+      await upgraded.query("delete from environments where id = 'e1'");
     } finally {
       await upgraded.close();
       await pg?.close();

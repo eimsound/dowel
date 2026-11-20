@@ -232,7 +232,7 @@ export interface RunInput {
   expect?: ExecuteExpect;
   /**
    * 拿到环境锁、重新读出环境行之后、连接目标库之前的复查钩子（P6：CI 执行等锁期间令牌可能被吊销、
-   * 策略或前置环境可能被改）。可以返回锁内最新的超时设置；抛错直接中止并释放锁。
+   * 策略可能被改）。可以返回锁内最新的超时设置；抛错直接中止并释放锁。
    */
   beforeConnect?: (
     env: EnvRow,
@@ -598,18 +598,26 @@ export const runInfoOf = (
 
 // ───── 漂移检查 ─────
 
+export interface DriftCheckDetailed {
+  result: DriftCheckResponse;
+  /** 实时读到的目标库当前版本 ID（未跳过且未报错时有值；目标库尚无历史时为 null） */
+  currentVersionId?: string | null;
+  /** 检查出错时的原始错误（供 CI 接口精确映射错误码） */
+  error?: unknown;
+}
+
 /**
- * 检查一个环境的漂移并写进缓存。手动检查和定时检查共用。
+ * 检查一个环境的漂移并写进缓存，附带实时读到的当前版本 ID 与原始错误（供 CI 漂移接口精确映射）。
  * 正在执行 / 上次停在中途 / 项目没有版本时跳过（不改缓存）；检查失败记为 error，并按真实原因分类
  * （连不上、目标库返回错误、历史与版本链对不上、schema 范围有问题……），文案说明真实原因。
  */
-export const checkEnvDrift = async (x: ExecContext, given: EnvRow): Promise<DriftCheckResponse> => {
+export const checkEnvDriftDetailed = async (x: ExecContext, given: EnvRow): Promise<DriftCheckDetailed> => {
   const { db } = x;
   // 重新读一遍环境行：调用方（定时检查一轮里的后面几个环境）手里的可能已经过期（换了连接串、被删了：404）
   const env = await loadEnv(db, given.project_id, given.id);
   // 所有返回的漂移信息都经过 driftInfo（清洗旧格式）
   const current = (): DriftInfo => driftInfo(env);
-  if (x.locks.busy(env.id)) return { ...current(), skipped: 'busy' };
+  if (x.locks.busy(env.id)) return { result: { ...current(), skipped: 'busy' } };
   let url = '';
   let conn: ReturnType<typeof open> | null = null;
   try {
@@ -617,25 +625,30 @@ export const checkEnvDrift = async (x: ExecContext, given: EnvRow): Promise<Drif
     const chain = await loadChain(db, env.project_id);
     conn = open(url, x.guard, CHECK_CONNECT_TIMEOUT);
     const rep = await checkDrift({ db: conn.db, projectId: env.project_id, chain });
-    if (rep.status === 'skipped') return { ...current(), skipped: rep.reason };
+    if (rep.status === 'skipped') return { result: { ...current(), skipped: rep.reason } };
     // 检查期间如果开始了执行，结果作废（结构可能是半途状态）
-    if (x.locks.busy(env.id)) return { ...current(), skipped: 'busy' };
+    if (x.locks.busy(env.id)) return { result: { ...current(), skipped: 'busy' } };
     const at = new Date().toISOString();
+    const currentVersionId = rep.firstRun ? null : rep.version;
     if (rep.status === 'ok') {
       await setDrift(db, env.id, 'ok', null, at);
-      return { status: 'ok', checkedAt: at, summary: null, skipped: null };
+      return { result: { status: 'ok', checkedAt: at, summary: null, skipped: null }, currentVersionId };
     }
     const summary = summaryOf(rep, chain);
     await setDrift(db, env.id, 'drifted', summary, at);
-    return { status: 'drifted', checkedAt: at, summary, skipped: null };
+    return { result: { status: 'drifted', checkedAt: at, summary, skipped: null }, currentVersionId };
   } catch (e) {
     if (e instanceof HTTPException) throw e;
     const c = classifyError(e, url);
-    return recordError(db, env, c.kind, c.message);
+    return { result: await recordError(db, env, c.kind, c.message), error: e };
   } finally {
     await conn?.close().catch(() => {});
   }
 };
+
+/** 检查一个环境的漂移并写进缓存。手动检查和定时检查共用。 */
+export const checkEnvDrift = async (x: ExecContext, given: EnvRow): Promise<DriftCheckResponse> =>
+  (await checkEnvDriftDetailed(x, given)).result;
 
 const recordError = async (
   db: PlatformDb,
@@ -677,8 +690,7 @@ export interface MarkInput {
  *   才确认（executed_at + confirmed）；目标库没被改动的失败撤销登记；崩溃留下的由下一次锁内的同步按目标库的**版本行**对齐；
  * - 向后标记：不写 executed_at、不登记（这些版本本来就执行过，或者没有——标记不改变它）。
  * 环境锁、目标库项目锁、拿到锁后重新读环境行，和 runExecution 一样。
- * P5 扩展点：接审批以后，批准绑定“起止版本 + MarkPlan.fingerprint”，在 beforeMark 里核对；标记不受前置环境约束（不跑脚本），
- * 豁免写进审计（路由层的审计数据里已经有 prerequisiteExempt）。
+ * P5 扩展点：接审批以后，批准绑定“起止版本 + MarkPlan.fingerprint”，在 beforeMark 里核对。
  */
 export const runMark = async (x: ExecContext, input: MarkInput): Promise<MarkResult> => {
   const { db } = x;

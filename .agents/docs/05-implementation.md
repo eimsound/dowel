@@ -426,8 +426,8 @@ P3 审查后的修正（2026-11-19）：
   - **compare.ts 死代码**：约束类 kind 改成集合（`dropForeignKey / dropPrimaryKey / dropUnique / dropCheck`），语句文本模式只在 kind 不认识时兜底。
   - **环境页下拉**：有未完成运行时，“当前”、方向、“停在 vN”都用 `history.currentVersion`，不用 `/status` 的缓存。
   - **新增 / 更新测试**：`packages/executor/test/takeover.test.ts`（`mark` 辅助改成先预演再带 expect 确认；没有历史的库 ack / expect / plan_changed 且无 `dowel` schema；读结构失败包成 `unexpected` 带 `reached` 和 cause；`repairRisks` 索引变更 / 枚举去值 / 约束重建 drops 0、`rebuilds`）；`apps/server/test/drift.test.ts`（预演后被向后标记 → `plan_changed` 且 v3 没有 `executed_at`；`expect_required`；`working_changed`；unfinished / readbackFailure 两种预览警告和 `EnvHistory.readbackFailure`；readSnapshot 失败时审计 `from` = 实际当前版本）；`apps/server/test/takeover.test.ts`（`loadChain` 失败：每个环境一条 warning、库没被认领、漂移检查仍尝试）；e2e `drift.spec.ts`（`/status` 缓存过期时下拉的“当前”以 history 为准）。
-- **收尾结果**（2026-11-20，审查修复和漂移处理之后，全部在 Docker 可用的环境里跑）：`pnpm lint` 通过（只有 `.agents/docs/ui/mockups/*.css` 和一处 `db.ts` 里既有的告警）、`pnpm typecheck` 通过、`pnpm test` 44 个文件通过（2 个文件跳过）、1041 项通过（3 项跳过）、`pnpm build` 通过、`pnpm e2e` 63 项通过（第二轮审查修复之后的结果）。e2e 新增 `drift.spec.ts`（修复脚本；导入预览 → 覆盖 → 发布 → 标记，确认框必须勾选；核对不通过显示差异；axe 亮 / 暗各扫一遍）；`takeover.spec.ts` 的 a11y 扫描改回非生产环境（顺手修了 `.badge` 在深色下对比度 4.41 的既有问题：颜色改成 `--text-2`）；`environments.spec.ts` / `visual.spec.ts` 随“导入先打开预览对话框”改动。
-- **已知限制与没做完的**：① 处理漂移已按 ADR 0004 做完（见上）；已知限制：环境落后于链头时带着漂移不能往前执行，只能先按修复脚本改回当前版本；② 恢复的版本需要**手工逐个重新验证**（没有批量）；③ 接入已有历史不支持“库里领先于平台链”；④ 认领没有“撤销”入口（反向认领 = 原实例的实例管理员再认领一次）；⑥ 接手时某个库认领失败只作为 `warnings` 返回，重试只能在环境页的“认领”（实例管理员）；⑦ 多进程部署的限制沿用 P4b（环境锁是进程内的）；⑧ 平台库丢失后，画布布局、成员与授权、审计、未发布的草稿都丢失（目标库里只有已发布的版本和执行历史）；⑨ 预演里的风险摘要是发布 / 重新验证时的结果，不是现场重新分析（接手恢复的版本没有，要先重新验证）。
+- **收尾结果**（2026-11-20，第三轮审查修复和漂移处理之后，全部在 Docker 可用的环境里跑）：`pnpm lint` 通过（只有 `.agents/docs/ui/mockups/*.css` 和一处 `db.ts` 里既有的告警）、`pnpm typecheck` 通过、`pnpm test` 44 个文件通过（2 个文件跳过）、1049 项通过（3 项跳过）、`pnpm build` 通过、`pnpm e2e` 64 项通过。e2e 新增 `drift.spec.ts`（修复脚本；导入预览 → 覆盖 → 发布 → 标记，确认框必须勾选；核对不通过显示差异；axe 亮 / 暗各扫一遍）；`takeover.spec.ts` 的 a11y 扫描改回非生产环境（顺手修了 `.badge` 在深色下对比度 4.41 的既有问题：颜色改成 `--text-2`）；`environments.spec.ts` / `visual.spec.ts` 随“导入先打开预览对话框”改动。
+- **已知限制与没做完的**：① 处理漂移已按 ADR 0004 做完（见上）；已知限制：环境落后于链头时带着漂移不能往前执行，只能先按修复脚本改回当前版本；② ~~恢复的版本需要手工逐个重新验证~~（P6.5 按 ADR 0012 改为接手前强制全链影子库验证）；③ ~~接入已有历史不支持“库里领先于平台链”~~（P6.5 按 ADR 0012 支持无分叉领先延伸，经影子库验证后补齐版本链并带差异确认覆盖工作副本）；④ 认领没有“撤销”入口（反向认领 = 原实例的实例管理员再认领一次）；⑥ 接手时某个库认领失败只作为 `warnings` 返回，重试只能在环境页的“认领”（实例管理员）；⑦ 多进程部署的限制沿用 P4b（环境锁是进程内的）；⑧ 平台库丢失后，画布布局、成员与授权、审计、未发布的草稿都丢失（目标库里只有已发布的版本和执行历史）；⑨ 预演里的风险摘要是发布 / 重新验证时的结果，不是现场重新分析（P6.5 起接手与接入领先环境已写入影子库验证报告）。
 
 ### 产品化 P5a 执行策略与执行者（2026-11-20）
 
@@ -560,6 +560,25 @@ P3 审查后的修正（2026-11-19）：
 - **对抗性审查与修复**：独立审查共查出 7 项必须修与 7 项建议修并全部修复（`dryRun` 基线项丢失、`tokenFailLimiter` 并发预占竞态、`run.sh` 配置注入与前导零八进制、多迁移非 `ExecutorError` 丢失 `reached`、`beforeConnect` 审计/通知上下文同步、`no_schema_privilege` 映射 `502`、`from` 精确取值、生产 `noop` 通知去噪、前端组选择上限与脏草稿保护等）。
 - **收尾结果**（2026-11-20，Docker 可用，低负载）：`pnpm lint` 通过（29 条告警均为既有）、`pnpm typecheck` 通过、`pnpm test` 52 个文件通过（2 个跳过）、1204 项通过（3 项跳过）、`pnpm build` 通过、`pnpm e2e` 77 项通过。
 
+### 4.11 产品化 P6.5：收尾、清理与冒烟（2026-11-21）
+
+- **彻底移除前置环境（C1）**：新增迁移 22 删除 `environments.prerequisite_id` 列及 PG 外键 / SQLite 触发器；彻底移除策略模型、API schema、CI 错误码（`prerequisite_behind` / `prerequisite_missing`）、Web UI、测试与用户文档中的前置环境逻辑，明确不同环境彼此独立。
+- **CI 接口按职责拆清、零过期缓存（C2，ADR 0009 修订）**：
+  - `GET /api/ci/projects/:owner/:project` 仅返回项目信息、最新版本与各环境平台配置（`name` / `production` / `tokenExecution`），不连目标库、不返回缓存状态；
+  - `GET /api/ci/projects/:owner/:project/environments/:env` 受连接限速保护，轻量实时连目标库读 `dowel.history`（同步缓存）返回 `currentVersion`、`unfinished`、`versions` 与 `pending`，移除缓存 `drift`；
+  - 新增 `POST /api/ci/projects/:owner/:project/environments/:env/drift` 实时读目标库结构快照比对漂移并返回完整差异与是否需人工处理。
+- **接手与接入强制影子库验证 + 接入领先环境（C3，ADR 0012）**：
+  - 接手向导支持配置每个环境的独立影子库或勾选允许同实例影子库；写入平台事务前按序对整条历史链闭环验证，缺影子库（`shadow_unavailable`）或任一版本验证失败（`verify_failed`）即拒绝，不再产生未验证的恢复版本；
+  - `inspectAttach` 识别目标库对平台链的严格无分叉领先延伸（`aheadVersions`），接入前强制经影子库验证全部领先版本；若工作副本相对原链头存在未发布草稿，返回 `409 working_dirty_confirm`（含领先版本列表、`planDiff` 差异与 `workingSeq` 并发校验），经用户确认后补齐版本链并调用 `ctx.replace(..., 'attachAhead')` 覆盖工作副本。
+- **在线文档式画布修改历史（C4）**：基于 `room_snapshots`（每 200 步）与 `room_commits` 实现 `GET /api/projects/:pid/history`、`GET /api/projects/:pid/history/:seq` 与 `POST /api/projects/:pid/history/:seq/restore`（带 `workingSeq` 并发保护、`model.restore` 审计与新提交写入）；前端 `CanvasHistory.tsx` 提供时间线、本次修改 / 当时完整模型状态 / 与当前画布差异三维度预览及项目编辑者二次确认一键恢复。
+- **体验补漏、限流配置、文档清理与 Docker 冒烟（C5 / C6）**：
+  - 环境详情页补齐「修改 / 取消生产标记」入口（对接 `environment.unmark_production` 与策略锁定确认）；
+  - 全部 4 个限流器 / 9 个维度开放环境变量配置（补齐 `DOWEL_CONNECTION_LIMIT`、`DOWEL_CONNECTION_WINDOW_MS`、`DOWEL_TOKEN_FAIL_WINDOW_MS`、`DOWEL_TOKEN_RATE_WINDOW_MS`），在 `docker-compose.yml` 与 `docs/getting-started.md` / `docs/api.md` 注明 HA 多副本下总配额约为设定值 × 副本数；
+  - 通用化界面 CI 占位文案与 `docs/api.md` 示例、`actions/execute/README.md` 注明支持内网自建 Actions / 通用 shell 调用、`docs/execution.md` 补充不做单方面撤销认领与强制验证规则；补齐读回失败提示分流 E2E；
+  - Docker 容器端到端冒烟验证通过：`Dockerfile` 多阶段构建、`docker compose config`、SQLite 模式（无人值守初始化 + 全量限流环境变量 + SPA/静态资源 + 登录建组建项目）与外部 PG 模式（全部 22 条迁移 + 交互式 `setupToken` 初始化）。
+- **独立审查与修复**：Sonnet 5.5 审查未发现 Must-Fix，提出 5 项建议全部落实——`canvasHistoryRestoreSchema.workingSeq` 改为必填并在 `Rooms.replace` 中原子校验 `expectedSeq`（`WorkingChangedError`）、`attach` 确认覆盖强制携带 `workingSeq` 并将提交后同步工作副本包裹为 `warnings` 避免误报 500、`pickShadow` 取整条待验证版本链的 `unionScopes`、`envPositiveInt` 增加 `<= 2^31 - 1` 上限防定时器溢出。
+- **收尾结果**（2026-11-21）：`pnpm lint` 通过（0 errors）、`pnpm typecheck` 通过、`pnpm test` 53 个文件通过（2 个跳过）、1205 项通过（3 项跳过）、`pnpm build` 通过、`pnpm e2e` 80 项通过。
+
 ## 5. 下一步
 
-M2：SQLite（12 步重建表）、PG 多版本（14～18）与版本能力表、多环境分别验证、分区表编辑。
+P7 HA 高可用（纯平台 PG 多活，ADR 0011），随后进入 M2：SQLite（12 步重建表）、PG 多版本（14～18）与版本能力表、多环境分别验证、分区表编辑。

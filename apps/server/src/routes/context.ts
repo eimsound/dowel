@@ -69,8 +69,8 @@ export interface AppContext {
   setupToken: string | null;
   /** DOWEL_ALLOW_PASSWORD_LOGIN=1：设置里关了密码登录也能用密码登录的应急入口 */
   allowPasswordLogin: boolean;
-  /** 导入、拉取后替换模型；新模型就是引擎读出的，作为派生数据的基线 */
-  replace: (branch: string, user: string, model: Model, op: string) => Promise<void>;
+  /** 导入、拉取、恢复历史后替换模型；新模型就是引擎读出的，作为派生数据的基线；传入 expectedSeq 时原子校验当前 seq */
+  replace: (branch: string, user: string, model: Model, op: string, expectedSeq?: number) => Promise<void>;
   upgradeWebSocket: ReturnType<typeof import('@hono/node-ws').createNodeWebSocket>['upgradeWebSocket'];
 }
 

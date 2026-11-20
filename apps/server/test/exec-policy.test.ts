@@ -201,6 +201,7 @@ describe('接口：档位存在环境上，默认值、修改、特权操作', (
     expect(dev.permissions).toEqual({
       execute: true,
       configure: false,
+      unmarkProduction: false,
       approvalRequired: false,
       request: true,
       emergency: false,
@@ -287,6 +288,7 @@ describe('接口：档位存在环境上，默认值、修改、特权操作', (
     expect(prod.permissions).toEqual({
       execute: false,
       configure: false,
+      unmarkProduction: false,
       approvalRequired: false,
       request: true,
       emergency: false,
@@ -294,6 +296,7 @@ describe('接口：档位存在环境上，默认值、修改、特权操作', (
     expect(envs.find((e) => e.id === 'dev')!.permissions).toEqual({
       execute: true,
       configure: false,
+      unmarkProduction: false,
       approvalRequired: false,
       request: true,
       emergency: false,
@@ -303,6 +306,7 @@ describe('接口：档位存在环境上，默认值、修改、特权操作', (
     expect(asPa.find((e) => e.id === 'prod')!.permissions).toEqual({
       execute: true,
       configure: true,
+      unmarkProduction: true,
       approvalRequired: false,
       request: true,
       emergency: false,

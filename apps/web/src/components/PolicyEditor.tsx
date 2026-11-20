@@ -648,18 +648,17 @@ export const PolicyLayerPanel = ({ path, queryKey }: { path: string; queryKey: u
   );
 };
 
-/** 环境层：环境自己的那一套 + 前置环境 */
+/** 环境层：环境自己的那一套执行策略 */
 export const EnvPolicyPanel = ({ pid, eid }: { pid: string; eid: string }) => {
   const { t } = useTranslation();
   const qc = useQueryClient();
   const toast = useToast();
-  const id = useId();
   const path = `/api/projects/${pid}/environments/${eid}/exec-policy`;
   const queryKey = ['env-policy', pid, eid];
   const q = useQuery({ queryKey, queryFn: () => api<EnvPolicyView>('GET', path) });
   const [draft, setDraft] = useState<EnvPolicyPut | null>(null);
   useEffect(() => {
-    if (q.data) setDraft({ settings: q.data.settings, prerequisiteId: q.data.prerequisite?.id ?? null });
+    if (q.data) setDraft({ settings: q.data.settings });
   }, [q.data]);
   const save = useMutation({
     mutationFn: (body: EnvPolicyPut) => api<EnvPolicyView>('PUT', path, body),
@@ -673,9 +672,7 @@ export const EnvPolicyPanel = ({ pid, eid }: { pid: string; eid: string }) => {
   const v = q.data;
   const disabled = !v.canEdit || save.isPending;
   const dirty =
-    JSON.stringify(normalizeSettings(draft.settings)) !== JSON.stringify(normalizeSettings(v.settings)) ||
-    draft.prerequisiteId !== (v.prerequisite?.id ?? null);
-  const pre = v.prerequisite;
+    JSON.stringify(normalizeSettings(draft.settings)) !== JSON.stringify(normalizeSettings(v.settings));
   return (
     <div className="space-y-3" data-testid="env-policy">
       <p className="hint">{t('pol.envIntro')}</p>
@@ -685,39 +682,13 @@ export const EnvPolicyPanel = ({ pid, eid }: { pid: string; eid: string }) => {
           {t('pol.loosenEnv')} {v.loosenNote}
         </Banner>
       )}
-      <div className="space-y-1 rounded-md border border-border bg-panel px-4 py-3">
-        <label className="field" htmlFor={`${id}-pre`}>
-          <span className="label">{t('pol.prerequisite.label')}</span>
-          <select
-            id={`${id}-pre`}
-            className="select w-64"
-            value={draft.prerequisiteId ?? ''}
-            disabled={disabled}
-            aria-describedby={`${id}-pre-hint`}
-            onChange={(e) => setDraft({ ...draft, prerequisiteId: e.target.value || null })}
-          >
-            <option value="">{t('pol.prerequisite.none')}</option>
-            {v.candidates.map((c) => (
-              <option key={c.id} value={c.id} disabled={c.disabled !== null}>
-                {c.name}
-                {c.disabled ? `（${c.disabled}）` : ''}
-              </option>
-            ))}
-          </select>
-        </label>
-        <p id={`${id}-pre-hint`} className="hint">
-          {t('pol.prerequisite.hint')}
-          {pre &&
-            ` ${pre.missing ? t('pol.prerequisite.missing') : pre.currentVersion ? t('pol.prerequisite.current', { name: pre.name, n: pre.currentVersion.number }) : t('pol.prerequisite.never', { name: pre.name })}`}
-        </p>
-      </div>
       <PolicySetEditor
         title={t(v.production ? 'pol.envSetProd' : 'pol.envSetNonProd')}
         at="environment"
         production={v.production}
         resolved={v.resolved}
         value={draft.settings}
-        onChange={(s) => setDraft({ ...draft, settings: s })}
+        onChange={(s) => setDraft({ settings: s })}
         disabled={disabled}
         names={v.names}
       />
@@ -740,7 +711,7 @@ export const EnvPolicyPanel = ({ pid, eid }: { pid: string; eid: string }) => {
             type="button"
             className="btn ghost"
             disabled={!dirty}
-            onClick={() => setDraft({ settings: v.settings, prerequisiteId: v.prerequisite?.id ?? null })}
+            onClick={() => setDraft({ settings: v.settings })}
           >
             {t('pol.reset')}
           </button>

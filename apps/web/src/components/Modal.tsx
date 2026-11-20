@@ -40,7 +40,7 @@ export const Confirm = ({
       footer={
         <>
           <span className="flex-1" />
-          <button type="button" className="btn" onClick={onClose}>
+          <button type="button" className="btn" autoFocus onClick={onClose}>
             {t('dlg.cancel')}
           </button>
           <button type="button" className="btn danger solid" disabled={pending} onClick={onConfirm}>

@@ -36,13 +36,6 @@ const EXPECTED = [
   { id: 'u5', username: 'wang', role: 'member' },
 ];
 
-/** 退回 P5a 审查后的前置环境约束（SQLite 的三个触发器；PG 是外键，drop 列时自动删掉） */
-const dropPrerequisiteConstraint = async (db: PlatformDb) => {
-  if (db.dialect === 'sqlite')
-    for (const t of ['delete', 'insert', 'update'])
-      await db.exec(`drop trigger if exists environments_prerequisite_${t}`);
-};
-
 const oldSql = (d: 'sqlite' | 'pg', i: number) => {
   const step = MIGRATIONS[i]!;
   const sql = typeof step === 'function' ? step(d) : step.sql?.(d);
@@ -365,11 +358,8 @@ describe.each([
       'webhooks',
     ])
       await db.exec(`drop table ${t}`);
-    // P5a 的迁移（执行策略表、前置环境；exec_policy 列已被它搬走并删掉）也退回去：之后升级时 P4b 重新加上 exec_policy，P5a 再搬走
+    // P5a 的迁移（执行策略表；exec_policy 已在 P5a 删掉，environments 上的外键/触发器与旧列也已在最新迁移 22 清理）也退回去
     await db.exec('drop table exec_policies');
-    // P5a 审查后的前置环境约束：SQLite 是触发器（引用了这一列，不先删掉就 drop 不了列），PG 的外键随列一起删掉
-    await dropPrerequisiteConstraint(db);
-    await db.exec('alter table environments drop column prerequisite_id');
     for (const col of ['current_version_id', 'last_drift_check', 'drift_status', 'drift_summary'])
       await db.exec(`alter table environments drop column ${col}`);
     await db.query('delete from dowel_migrations where version > $1', [CHAIN_MIGRATION]);
@@ -541,6 +531,95 @@ describe.each([
         }
       } finally {
         await db.close().catch(() => {});
+      }
+    },
+  );
+});
+
+describe.each([
+  { platform: 'sqlite', skip: false },
+  { platform: 'pg', skip: !PG_URL },
+])('平台库升级：迁移 22 清理前置环境列与约束（$platform）', ({ platform, skip }) => {
+  const dirs: string[] = [];
+  const closers: (() => Promise<void>)[] = [];
+  afterAll(async () => {
+    for (const c of closers) await c();
+    for (const d of dirs) rmSync(d, { recursive: true, force: true });
+  });
+
+  test.skipIf(skip)(
+    '从 v21（含已引用的环境行与外键/触发器）升到最新后删列、删约束且可自由删环境',
+    async () => {
+      let url: string;
+      if (platform === 'sqlite') {
+        const dir = mkdtempSync(join(tmpdir(), 'dowel-m22-'));
+        dirs.push(dir);
+        url = join(dir, 'm22.db');
+      } else {
+        const t = await createTestDb('m22');
+        closers.push(t.close);
+        url = t.url;
+      }
+      const base = await openPlatformDb(url);
+      try {
+        // 回退迁移 22：加回旧列、旧外键/触发器，并写入互相引用的环境行模拟 v21 库
+        await base.exec('alter table environments add column prerequisite_id text');
+        if (platform === 'pg') {
+          await base.exec(
+            'alter table environments add constraint environments_prerequisite_fk foreign key (prerequisite_id) references environments (id)',
+          );
+        } else {
+          await base.exec(`create trigger environments_prerequisite_delete before delete on environments
+           when exists (select 1 from environments e where e.prerequisite_id = old.id and e.id <> old.id)
+           begin select raise(abort, 'FOREIGN KEY constraint failed: environments.prerequisite_id'); end;
+         create trigger environments_prerequisite_insert before insert on environments
+           when new.prerequisite_id is not null
+            and not exists (select 1 from environments e where e.id = new.prerequisite_id)
+           begin select raise(abort, 'FOREIGN KEY constraint failed: environments.prerequisite_id'); end;
+         create trigger environments_prerequisite_update before update of prerequisite_id on environments
+           when new.prerequisite_id is not null
+            and not exists (select 1 from environments e where e.id = new.prerequisite_id)
+           begin select raise(abort, 'FOREIGN KEY constraint failed: environments.prerequisite_id'); end;`);
+        }
+        await base.query('delete from dowel_migrations where version >= $1', [MIGRATIONS.length]);
+        await base.query("insert into groups (id, slug, name) values ('g1', 'g1', '组')");
+        await base.query("insert into projects (id, name, group_id, slug) values ('p1', 'p1', 'g1', 'p1')");
+        await base.query(
+          "insert into environments (id, project_id, name, url_enc, production) values ('e-dev', 'p1', 'dev', 'x', $1)",
+          [false],
+        );
+        await base.query(
+          "insert into environments (id, project_id, name, url_enc, production, prerequisite_id) values ('e-prod', 'p1', 'prod', 'x', $1, 'e-dev')",
+          [true],
+        );
+        // 升级前：删除被引用的 e-dev 会被外键 / 触发器拦住
+        await expect(base.query("delete from environments where id = 'e-dev'")).rejects.toThrow();
+      } finally {
+        await base.close();
+      }
+      const upgraded = await openPlatformDb(url);
+      try {
+        const [ver] = await upgraded.query<{ v: number }>('select max(version) as v from dowel_migrations');
+        expect(ver!.v).toBe(MIGRATIONS.length);
+        if (platform === 'pg') {
+          const cols = await upgraded.query<{ c: string }>(
+            "select column_name as c from information_schema.columns where table_name = 'environments' and column_name = 'prerequisite_id'",
+          );
+          expect(cols).toEqual([]);
+        } else {
+          const cols = (await upgraded.query<{ name: string }>('pragma table_info(environments)')).filter(
+            (r) => r.name === 'prerequisite_id',
+          );
+          expect(cols).toEqual([]);
+          const triggers = await upgraded.query<{ name: string }>(
+            "select name from sqlite_master where type = 'trigger' and name like 'environments_prerequisite_%'",
+          );
+          expect(triggers).toEqual([]);
+        }
+        // 升级后：删除原被引用的环境畅通无阻
+        await upgraded.query("delete from environments where id = 'e-dev'");
+      } finally {
+        await upgraded.close();
       }
     },
   );

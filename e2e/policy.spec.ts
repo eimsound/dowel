@@ -1,5 +1,5 @@
 // 执行策略（P5a）：各层配置页（含上级锁定的显示）、授予执行者（“仅限执行者 + 生产”时非实例管理员不能选）、
-// 确认对话框里的前置环境拒绝提示；相关页面的 axe 扫描（亮 / 暗）。
+// 项目层收紧后缓存失效；相关页面的 axe 扫描（亮 / 暗）。
 // 后两条需要 PG 作目标库（Testcontainers 或 DOWEL_TEST_PG），没有 Docker 时跳过。
 import AxeBuilder from '@axe-core/playwright';
 import { expect, type Page, test } from '@playwright/test';
@@ -175,62 +175,4 @@ test.describe('需要目标库', () => {
       await devDb.drop();
     }
   });
-
-  for (const scheme of ['light', 'dark'] as const)
-    test(`确认对话框：前置环境没执行到目标版本时显示拒绝原因、不能确认；执行之后通过（${scheme}）`, async ({
-      browser,
-    }) => {
-      const devDb = await newTargetDb('e2e_pre_dev');
-      const stgDb = await newTargetDb('e2e_pre_stg');
-      try {
-        const { page } = await newUser(browser, '前置环境', { colorScheme: scheme });
-        const group = await createGroup(page);
-        await createProjectIn(page, '前置项目', group.name);
-        await addEnv(page, 'dev', devDb.url, false);
-        await addEnv(page, 'stg', stgDb.url, false);
-        await publishTable(page, 'orders', 'v1', 1);
-
-        // stg 的前置环境设为 dev
-        await openEnv(page, 'stg');
-        await page.getByLabel('前置环境').selectOption({ label: 'dev' });
-        await page.getByRole('button', { name: '保存执行策略' }).click();
-        await expect(page.getByText('已保存执行策略')).toBeVisible();
-        await expect(page.getByText('“dev”还没有执行过任何版本。')).toBeVisible();
-
-        await page.getByRole('button', { name: '执行迁移' }).click();
-        const dlg = execDialog(page);
-        await expect(dlg.getByTestId('policy-summary')).toContainText('谁能执行：项目编辑者');
-        await expect(dlg.getByTestId('policy-summary')).toContainText('锁等待 5 秒');
-        await expect(dlg.getByRole('alert').filter({ hasText: '前置环境“dev”' })).toContainText(
-          '还没有执行过任何版本',
-        );
-        await expect(dlg.getByRole('button', { name: '确认执行' })).toHaveAttribute('aria-disabled', 'true');
-        // 预演（服务端）给出同样的代码和说明
-        await expect(dlg.getByTestId('dry-error')).toContainText('前置环境“dev”');
-        await scan(page, '确认对话框 · 前置环境拒绝');
-        await shoot(page, `policy-prerequisite-${scheme}`);
-        await dlg.getByRole('button', { name: '取消' }).click();
-        // stg 的目标库没有被碰
-        expect(
-          (await stgDb.sql<{ n: string | null }>("select to_regnamespace('dowel')::text as n"))[0]!.n,
-        ).toBeNull();
-
-        // dev 执行到 v1 之后，stg 通过
-        await openEnv(page, 'dev');
-        await page.getByRole('button', { name: '执行迁移' }).click();
-        await execDialog(page).getByRole('button', { name: '确认执行' }).click();
-        await expect(execDialog(page).getByRole('status')).toContainText('执行完成', { timeout: 60_000 });
-        await execDialog(page).getByRole('button', { name: '关闭', exact: true }).first().click();
-        await openEnv(page, 'stg');
-        await page.getByRole('button', { name: '执行迁移' }).click();
-        await expect(execDialog(page).getByTestId('prerequisite-check')).toContainText(
-          '前置环境“dev”当前 v1：通过',
-        );
-        await execDialog(page).getByRole('button', { name: '确认执行' }).click();
-        await expect(execDialog(page).getByRole('status')).toContainText('执行完成', { timeout: 60_000 });
-      } finally {
-        await devDb.drop();
-        await stgDb.drop();
-      }
-    });
 });

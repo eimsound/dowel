@@ -1,6 +1,6 @@
 // 执行申请与审批（P5b）的场景测试：平台库 SQLite，目标库 / 影子库用测试 PG（没有 Docker 时跳过）。
 // 表驱动的场景：默认单环节、多环节（含人数 > 1）、驳回、撤回、过期、环境状态变化失效（直接执行、漂移、链变化）、紧急执行、
-// 前置环境拒绝、“最后一个审批人即执行者”、同人多环节逐个确认、审批人资格被撤销、策略中途变化。
+// “最后一个审批人即执行者”、同人多环节逐个确认、审批人资格被撤销、策略中途变化。
 // 并发场景（平台库 PG）在 requests-concurrency.test.ts。
 import type {
   DryRunResponse,
@@ -530,25 +530,13 @@ describe.skipIf(!PG_URL)('执行申请：表驱动场景（目标库 PG）', () 
     expect(d3.statusReason).toContain('v2 的脚本');
   });
 
-  test('紧急执行：只有实例管理员、必填原因；绕过审批但不绕过前置环境；通知审批人、审计', async () => {
+  test('紧急执行：只有实例管理员、必填原因；绕过审批、通知审批人、审计', async () => {
     const pid = await newProject('emergency');
-    const dev = await realEnv(pid, 'dev', false);
     const prod = await realEnv(pid, 'prod');
     const [v1] = await publishChain(pid, 1);
     await setProjectPolicy(pid, {
       approval: [{ approvers: { kind: 'group_admins' }, count: 1, lastApproverExecutes: true }],
     });
-    // 前置环境：dev
-    expect(
-      (
-        await call(
-          'PUT',
-          `/api/projects/${pid}/environments/${prod.eid}/exec-policy`,
-          { settings: {}, prerequisiteId: dev.eid },
-          'pa',
-        )
-      ).status,
-    ).toBe(200);
     const path = `/api/projects/${pid}/environments/${prod.eid}/emergency`;
     expect(
       (await call('POST', path, { kind: 'execute', to: v1!.id, reason: '线上故障', confirm: 'prod' }, 'pa'))
@@ -558,21 +546,6 @@ describe.skipIf(!PG_URL)('执行申请：表驱动场景（目标库 PG）', () 
       (await call('POST', path, { kind: 'execute', to: v1!.id, reason: '', confirm: 'prod' }, 'admin'))
         .status,
     ).toBe(400);
-    // 前置环境不满足：紧急执行也拒绝（不绕过）
-    const blocked = await call(
-      'POST',
-      path,
-      { kind: 'execute', to: v1!.id, reason: '线上故障', confirm: 'prod' },
-      'admin',
-    );
-    expect(blocked.status).toBe(422);
-    expect(blocked.data.code).toBe('prerequisite_behind');
-    expect(
-      last(
-        (await call('POST', `/api/projects/${pid}/environments/${dev.eid}/execute`, { to: v1!.id }, 'dev'))
-          .events,
-      ),
-    ).toMatchObject({ stage: 'done' });
     // 生产要环境名
     expect(
       (await call('POST', path, { kind: 'execute', to: v1!.id, reason: '线上故障' }, 'admin')).status,
@@ -599,38 +572,6 @@ describe.skipIf(!PG_URL)('执行申请：表驱动场景（目标库 PG）', () 
       [pid],
     );
     expect(audit!.data).toMatchObject({ reason: '线上故障，紧急加表', name: 'prod' });
-  });
-
-  test('前置环境拒绝：前置环境还没到目标版本时提交申请被拒（预演不通过）', async () => {
-    const pid = await newProject('prereq');
-    const dev = await realEnv(pid, 'dev', false);
-    const prod = await realEnv(pid, 'prod');
-    const [v1] = await publishChain(pid, 1);
-    expect(
-      (
-        await call(
-          'PUT',
-          `/api/projects/${pid}/environments/${prod.eid}/exec-policy`,
-          { settings: {}, prerequisiteId: dev.eid },
-          'pa',
-        )
-      ).status,
-    ).toBe(200);
-    const s = await submit(pid, prod.eid, v1!.id, 'dev');
-    expect(s.status).toBe(422);
-    expect(s.data.code).toBe('prerequisite_behind');
-    // 申请提交之后前置环境回滚了：执行时再次检查，422，申请保持原状态
-    expect(
-      last(
-        (await call('POST', `/api/projects/${pid}/environments/${dev.eid}/execute`, { to: v1!.id }, 'dev'))
-          .events,
-      ),
-    ).toMatchObject({ stage: 'done' });
-    const r = (await submit(pid, prod.eid, v1!.id, 'dev')).data as unknown as ExecRequestDetail;
-    await db.query('update environments set current_version_id = null where id = $1', [dev.eid]);
-    const a = await approveAndExecute(pid, r.id, 0, 'pa');
-    expect(a.status).toBe(422);
-    expect((await detail(pid, r.id)).status).toBe('pending');
   });
 
   test('同一个人可以批多个环节，但每个环节单独确认', async () => {

@@ -9,6 +9,26 @@ services:
       # 加密保存的数据库连接信息用的主密钥：部署前改成一段随机字符串，之后不要再改
       DOWEL_SECRET: change-me-to-a-long-random-string
       # DOWEL_DB: postgres://user:pass@host:5432/dowel
+      #
+      # 以下 9 项为进程内限流配置（均为正整数；以下每项均为单副本进程内计数，HA 多副本部署下实际总配额约为设定值 × 副本数）：
+      # 登录失败（同一 IP + 账号）：单副本进程内计数，HA 多副本部署下实际总配额约为设定值 × 副本数
+      # DOWEL_LOGIN_LIMIT: 10
+      # 登录失败（同一 IP 总量）：单副本进程内计数，HA 多副本部署下实际总配额约为设定值 × 副本数
+      # DOWEL_LOGIN_IP_LIMIT: 30
+      # 登录失败窗口长度（毫秒，默认 10 分钟）：单副本进程内计数，HA 多副本部署下实际总配额约为设定值 × 副本数
+      # DOWEL_LOGIN_WINDOW_MS: 600000
+      # 连库探测上限（同一用户）：单副本进程内计数，HA 多副本部署下实际总配额约为设定值 × 副本数
+      # DOWEL_CONNECTION_LIMIT: 10
+      # 连库探测窗口长度（毫秒，默认 1 分钟）：单副本进程内计数，HA 多副本部署下实际总配额约为设定值 × 副本数
+      # DOWEL_CONNECTION_WINDOW_MS: 60000
+      # CI 令牌认证失败上限（同一 IP）：单副本进程内计数，HA 多副本部署下实际总配额约为设定值 × 副本数
+      # DOWEL_TOKEN_FAIL_LIMIT: 20
+      # CI 令牌认证失败窗口长度（毫秒，默认 10 分钟）：单副本进程内计数，HA 多副本部署下实际总配额约为设定值 × 副本数
+      # DOWEL_TOKEN_FAIL_WINDOW_MS: 600000
+      # CI 令牌请求速率上限（单个令牌）：单副本进程内计数，HA 多副本部署下实际总配额约为设定值 × 副本数
+      # DOWEL_TOKEN_RATE_LIMIT: 120
+      # CI 令牌请求速率窗口长度（毫秒，默认 1 分钟）：单副本进程内计数，HA 多副本部署下实际总配额约为设定值 × 副本数
+      # DOWEL_TOKEN_RATE_WINDOW_MS: 60000
     volumes:
       - dowel-data:/data
     restart: unless-stopped

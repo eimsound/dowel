@@ -706,40 +706,13 @@ export type EnvVersionRef = z.infer<typeof envVersionRefSchema>;
 
 // ───── 执行策略（P5a） ─────
 
-/** 环境上的前置环境：名字和它（平台库缓存里）的当前版本 */
-export const prerequisiteRefSchema = z.object({
-  id: z.string(),
-  name: z.string(),
-  currentVersion: envVersionRefSchema.nullable(),
-  /** 设置了前置环境，但找不到那个环境（有外键，不应该发生；发生了执行一律拒绝） */
-  missing: z.boolean().optional(),
-});
-export type PrerequisiteRef = z.infer<typeof prerequisiteRefSchema>;
-
-/** 前置环境检查的结果（checkPrerequisite），确认对话框和预演显示 */
-export const prerequisiteResultSchema = z.object({
-  ok: z.boolean(),
-  /** 回滚 / 标记 / 写基线：不受前置环境约束 */
-  exempt: z.boolean(),
-  id: z.string(),
-  name: z.string(),
-  currentNumber: z.number().nullable(),
-  /** 没通过时的代码：prerequisite_behind 前置环境还没到目标版本；prerequisite_missing 前置环境不存在 */
-  code: z.enum(['prerequisite_behind', 'prerequisite_missing']).nullable().optional(),
-  /** 没通过时的说明 */
-  message: z.string().nullable(),
-});
-export type PrerequisiteResult = z.infer<typeof prerequisiteResultSchema>;
-
 /** 实例 / 组 / 项目层的执行策略：PUT 的请求体就是 LayerPolicy（整层替换，字段不出现 = 继承） */
 export const layerPolicyPutSchema = layerPolicySchema;
 
-/** 环境层：环境自己的那一套设置 + 前置环境 */
+/** 环境层：环境自己的那一套设置 */
 export const envPolicyPutSchema = z
   .object({
     settings: policySettingsSchema,
-    /** 前置环境（同一个项目里的另一个环境）；null = 不设置 */
-    prerequisiteId: z.string().min(1).nullable(),
   })
   .strict();
 export type EnvPolicyPut = z.infer<typeof envPolicyPutSchema>;
@@ -766,9 +739,6 @@ export interface EnvPolicyView {
   production: boolean;
   settings: PolicySettings;
   resolved: ResolvedPolicy;
-  prerequisite: PrerequisiteRef | null;
-  /** 可以选作前置环境的环境（同项目，不含自己）；会成环的带 disabled 说明 */
-  candidates: { id: string; name: string; production: boolean; disabled: string | null }[];
   canEdit: boolean;
   canLoosen: boolean;
   loosenNote: string | null;
@@ -778,8 +748,10 @@ export interface EnvPolicyView {
 export const envPermissionsSchema = z.object({
   /** 能否执行 / 回滚 / 写基线（按环境的执行档位） */
   execute: z.boolean(),
-  /** 能否改连接串、影子库、生产标记、执行档位和删除环境 */
+  /** 能否改连接串、影子库、执行档位和删除环境 */
   configure: z.boolean(),
+  /** 能否取消“生产”标记（environment.unmark_production：至少项目管理员，且满足当前生效的“谁能执行”） */
+  unmarkProduction: z.boolean(),
   /** 生效的审批流程配置了环节（P5b）：执行 / 回滚要提交执行申请，谁都不能直接执行（execute 只表示满足“谁能执行”） */
   approvalRequired: z.boolean(),
   /** 能否提交执行申请（项目编辑者以上，或者执行者） */
@@ -802,8 +774,6 @@ export const environmentInfoSchema = z.object({
   effectiveExecPolicy: execPolicySchema,
   /** 生效的执行策略（四层合并，P5a）：每个字段的生效值、来源层、上级下限 */
   policy: z.custom<ResolvedPolicy>(),
-  /** 前置环境（P5a）；没有设置为 null */
-  prerequisite: z.lazy(() => prerequisiteRefSchema).nullable(),
   /** 环境当前版本（平台库缓存：最近一次读目标库历史 / 执行后的结果）；还没执行过为 null */
   currentVersion: envVersionRefSchema.nullable(),
   drift: driftInfoSchema,
@@ -850,7 +820,6 @@ export const envStatusSchema = z.object({
   execPolicy: execPolicySchema.nullable(),
   effectiveExecPolicy: execPolicySchema,
   policy: z.custom<ResolvedPolicy>(),
-  prerequisite: z.lazy(() => prerequisiteRefSchema).nullable(),
   currentVersion: envVersionRefSchema.nullable(),
   /** 链上全部版本（升序） */
   versions: z.array(envVersionSchema),
@@ -947,8 +916,6 @@ export const execErrorDetailsSchema = z.object({
   needsManual: needsManualSchema.optional(),
   /** plan_changed：锁里重新算出的标记计划（预演之后目标库变了） */
   plan: markPlanSchema.optional(),
-  /** prerequisite_behind：前置环境和它的当前版本 */
-  prerequisite: z.lazy(() => prerequisiteResultSchema).optional(),
   /**
    * step_timeout：某一步因为执行策略的超时被取消。lock = 等锁超过 lock_timeout（表被别的会话占着），
    * statement = 语句执行超过 statement_timeout。ms 是当时的设置
@@ -1184,11 +1151,6 @@ export type DryRunPlan = z.infer<typeof dryRunPlanSchema>;
 export const dryRunResponseSchema = z.object({
   ok: z.boolean(),
   plan: dryRunPlanSchema.optional(),
-  /** 前置环境检查的结果（没有设置前置环境为 null）；没通过时 ok = false、code = prerequisite_behind */
-  prerequisite: z
-    .lazy(() => prerequisiteResultSchema)
-    .nullable()
-    .optional(),
   error: z.string().optional(),
   code: z.string().optional(),
   details: execErrorDetailsSchema.optional(),
@@ -1232,11 +1194,23 @@ export type EnvironmentCreated = z.infer<typeof environmentCreatedSchema>;
 /**
  * 给已有项目添加环境，并接入这个库里已有的迁移历史。属于特权操作：适用环境的执行档位，且至少要项目管理员。
  * claim：这个库里的项目由另一个实例认领时，确认认领（要实例管理员）；之后原实例的执行被拒绝。
+ * confirmOverwrite / workingSeq：目标库历史领先于平台链且当前工作副本有未发布修改时，确认覆盖工作副本到新链头并绑定预览时的 seq。
  */
 export const environmentAttachSchema = environmentCreateSchema.extend({
   claim: z.boolean().default(false),
+  confirmOverwrite: z.boolean().default(false),
+  workingSeq: z.number().int().min(0).optional(),
 });
 export type EnvironmentAttach = z.infer<typeof environmentAttachSchema>;
+
+/** 接入领先环境时工作副本有未发布修改：409（working_dirty_confirm / working_changed）附带的预览 */
+export const attachOverwritePreviewSchema = z.object({
+  aheadVersions: z.array(envVersionRefSchema),
+  items: z.array(driftItemSchema),
+  total: z.number(),
+  workingSeq: z.number(),
+});
+export type AttachOverwritePreview = z.infer<typeof attachOverwritePreviewSchema>;
 
 export const attachResultSchema = environmentCreatedSchema.extend({
   /** 这个库里有这个项目的历史并已接入；false 表示它只是一个新环境 */
@@ -1244,6 +1218,8 @@ export const attachResultSchema = environmentCreatedSchema.extend({
   currentVersion: envVersionRefSchema.nullable(),
   /** 这次是否认领了（换手） */
   claimed: z.boolean(),
+  /** 目标库领先于平台链时本次补齐并验证通过的版本列表 */
+  aheadVersions: z.array(envVersionRefSchema).default([]),
   /** 环境已经建好，但有没做完的事（认领失败、同步目标库状态失败）：可以在环境页重试认领 / 读历史 */
   warnings: z.array(z.string()).default([]),
 });
@@ -1336,16 +1312,26 @@ export const projectWizardSchema = z.object({
 });
 export type ProjectWizard = z.infer<typeof projectWizardSchema>;
 
-/** 进度阶段：连接 → 读取结构 → 规范化 → 写入 → 完成 */
-export const wizardStageSchema = z.enum(['connect', 'read', 'canonicalize', 'write', 'claim', 'done']);
+/** 进度阶段：连接 → 读取结构 → 验证 / 规范化 → 写入 → 认领 → 完成 */
+export const wizardStageSchema = z.enum([
+  'connect',
+  'read',
+  'verify',
+  'canonicalize',
+  'write',
+  'claim',
+  'done',
+]);
 export type WizardStage = z.infer<typeof wizardStageSchema>;
 
 /** SSE 每条消息的负载（`data:` 后面是它的 JSON） */
 export const wizardEventSchema = z.object({
   stage: wizardStageSchema,
+  /** 可选进度详情（例如接手验证阶段当前正在验证的版本） */
+  detail: z.string().optional(),
   /** 出错时的信息；这时不会建出项目 */
   error: z.string().optional(),
-  /** 出错时的代码（接手：claim_required 需要确认认领、claim_forbidden 需要实例管理员、history_* 历史有问题、project_exists） */
+  /** 出错时的代码（接手：claim_required 需要确认认领、claim_forbidden 需要实例管理员、shadow_unavailable、verify_failed、history_* 历史有问题、project_exists） */
   code: z.string().optional(),
   /** 成功时给出建好的项目 */
   project: projectCreatedSchema.optional(),
@@ -1485,3 +1471,5 @@ export type Ok = z.infer<typeof okSchema>;
 
 export const apiErrorSchema = z.object({ error: z.string() });
 export type ApiErrorBody = z.infer<typeof apiErrorSchema>;
+
+export * from './canvas-history.ts';
