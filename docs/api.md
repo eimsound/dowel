@@ -2,7 +2,7 @@
 
 本文档说明如何使用 **CI 令牌**通过 HTTP API 查询项目状态并执行数据库迁移。所有面向流水线的接口都在 `/api/ci/…` 下，返回结构化 JSON 和机器可读的错误码。
 
-> GitHub Actions 用户可以直接使用仓库内置的 [actions/execute](../actions/execute/README.md)（纯 `bash` + `curl`，无第三方 Action 依赖）。
+> CI 流水线（含内网自建 Gitea Actions / Forgejo Actions / GitHub Enterprise Server，或 GitLab CI / Jenkins 等任意 shell 流水线）可以直接复用仓库内置的 [actions/execute](../actions/execute/README.md)（纯 `bash` + `curl`，无第三方 Action 依赖）。
 
 ---
 
@@ -20,9 +20,9 @@ Authorization: Bearer dwl_<43 位随机字符>
 - **能力范围固定为“只读 + 执行”**：令牌只能访问 `/api/ci/…` 且只能操作它所属的单个项目。携带 `Bearer dwl_…` 访问任何 `/api/ci/…` 之外的接口（包括编辑模型、发布版本、改策略、改连接串、标记为已执行、写基线、认领、接手、令牌管理本身）一律返回 `403 forbidden`，不会回落到 Cookie 会话。
 - **项目归属**：令牌属于项目，创建者离职或被停用不影响令牌继续工作。
 - **必须过期**：创建时必须指定有效天数（默认 90 天，最长 365 天）。过期和吊销均立即生效。
-- **限速**：
-  - 认证失败按来源 IP 限速（默认每 10 分钟最多 20 次失败，可用环境变量 `DOWEL_TOKEN_FAIL_LIMIT` 调整），防止爆破；成功请求不占失败额度。
-  - 已认证令牌按令牌 ID 限速（默认每分钟 120 次，可用 `DOWEL_TOKEN_RATE_LIMIT` 调整）；连接目标库的只读 / 检测接口（单环境实时状态、执行历史、漂移检测）另受连接限速约束（默认每分钟 10 次）。
+- **限速**（单副本进程内计数，HA 多副本下总配额约为设定值 × 副本数）：
+  - 认证失败按来源 IP 限速（默认每 10 分钟最多 20 次失败，可用 `DOWEL_TOKEN_FAIL_LIMIT` / `DOWEL_TOKEN_FAIL_WINDOW_MS` 调整），防止爆破；成功请求不占失败额度。
+  - 已认证令牌按令牌 ID 限速（默认每分钟 120 次，可用 `DOWEL_TOKEN_RATE_LIMIT` / `DOWEL_TOKEN_RATE_WINDOW_MS` 调整）；连接目标库的只读 / 检测接口（单环境实时状态、执行历史、漂移检测）另受连接限速约束（默认每分钟 10 次，可用 `DOWEL_CONNECTION_LIMIT` / `DOWEL_CONNECTION_WINDOW_MS` 调整）。
 
 ### 校验令牌是否有效
 
@@ -37,7 +37,7 @@ curl -fsS \
 ```json
 {
   "id": "01J...",
-  "name": "GitHub Actions",
+  "name": "CI Deploy",
   "prefix": "dwl_AbCdEfGh",
   "expiresAt": "2027-02-18T12:00:00.000Z",
   "project": {
@@ -75,7 +75,7 @@ curl -fsS -b cookies.txt \
   -X POST \
   -H "Content-Type: application/json" \
   -H "Origin: ${DOWEL_URL}" \
-  -d '{"name":"GitHub Actions","description":"staging 自动部署","expiresInDays":90}' \
+  -d '{"name":"CI Deploy","description":"staging 自动部署","expiresInDays":90}' \
   "${DOWEL_URL}/api/projects/${PROJECT_ID}/tokens"
 
 # 吊销令牌（项目管理员、组管理员、实例管理员或令牌创建者本人）

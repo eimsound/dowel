@@ -560,6 +560,24 @@ P3 审查后的修正（2026-11-19）：
 - **对抗性审查与修复**：独立审查共查出 7 项必须修与 7 项建议修并全部修复（`dryRun` 基线项丢失、`tokenFailLimiter` 并发预占竞态、`run.sh` 配置注入与前导零八进制、多迁移非 `ExecutorError` 丢失 `reached`、`beforeConnect` 审计/通知上下文同步、`no_schema_privilege` 映射 `502`、`from` 精确取值、生产 `noop` 通知去噪、前端组选择上限与脏草稿保护等）。
 - **收尾结果**（2026-11-20，Docker 可用，低负载）：`pnpm lint` 通过（29 条告警均为既有）、`pnpm typecheck` 通过、`pnpm test` 52 个文件通过（2 个跳过）、1204 项通过（3 项跳过）、`pnpm build` 通过、`pnpm e2e` 77 项通过。
 
+### 4.11 产品化 P6.5：收尾、清理与冒烟（2026-11-21）
+
+- **彻底移除前置环境（C1）**：新增迁移 22 删除 `environments.prerequisite_id` 列及 PG 外键 / SQLite 触发器；彻底移除策略模型、API schema、CI 错误码（`prerequisite_behind` / `prerequisite_missing`）、Web UI、测试与用户文档中的前置环境逻辑，明确不同环境彼此独立。
+- **CI 接口按职责拆清、零过期缓存（C2，ADR 0009 修订）**：
+  - `GET /api/ci/projects/:owner/:project` 仅返回项目信息、最新版本与各环境平台配置（`name` / `production` / `tokenExecution`），不连目标库、不返回缓存状态；
+  - `GET /api/ci/projects/:owner/:project/environments/:env` 受连接限速保护，轻量实时连目标库读 `dowel.history`（同步缓存）返回 `currentVersion`、`unfinished`、`versions` 与 `pending`，移除缓存 `drift`；
+  - 新增 `POST /api/ci/projects/:owner/:project/environments/:env/drift` 实时读目标库结构快照比对漂移并返回完整差异与是否需人工处理。
+- **接手与接入强制影子库验证 + 接入领先环境（C3，ADR 0012）**：
+  - 接手向导支持配置每个环境的独立影子库或勾选允许同实例影子库；写入平台事务前按序对整条历史链闭环验证，缺影子库（`shadow_unavailable`）或任一版本验证失败（`verify_failed`）即拒绝，不再产生未验证的恢复版本；
+  - `inspectAttach` 识别目标库对平台链的严格无分叉领先延伸（`aheadVersions`），接入前强制经影子库验证全部领先版本；若工作副本相对原链头存在未发布草稿，返回 `409 working_dirty_confirm`（含领先版本列表、`planDiff` 差异与 `workingSeq` 并发校验），经用户确认后补齐版本链并调用 `ctx.replace(..., 'attachAhead')` 覆盖工作副本。
+- **在线文档式画布修改历史（C4）**：基于 `room_snapshots`（每 200 步）与 `room_commits` 实现 `GET /api/projects/:pid/history`、`GET /api/projects/:pid/history/:seq` 与 `POST /api/projects/:pid/history/:seq/restore`（带 `workingSeq` 并发保护、`model.restore` 审计与新提交写入）；前端 `CanvasHistory.tsx` 提供时间线、本次修改 / 当时完整模型状态 / 与当前画布差异三维度预览及项目编辑者二次确认一键恢复。
+- **体验补漏、限流配置、文档清理与 Docker 冒烟（C5 / C6）**：
+  - 环境详情页补齐「修改 / 取消生产标记」入口（对接 `environment.unmark_production` 与策略锁定确认）；
+  - 全部 4 个限流器 / 9 个维度开放环境变量配置（补齐 `DOWEL_CONNECTION_LIMIT`、`DOWEL_CONNECTION_WINDOW_MS`、`DOWEL_TOKEN_FAIL_WINDOW_MS`、`DOWEL_TOKEN_RATE_WINDOW_MS`），在 `docker-compose.yml` 与 `docs/getting-started.md` / `docs/api.md` 注明 HA 多副本下总配额约为设定值 × 副本数；
+  - 通用化界面 CI 占位文案与 `docs/api.md` 示例、`actions/execute/README.md` 注明支持内网自建 Actions / 通用 shell 调用、`docs/execution.md` 补充不做单方面撤销认领与强制验证规则；补齐读回失败提示分流 E2E；
+  - Docker 容器端到端冒烟验证通过：`Dockerfile` 多阶段构建、`docker compose config`、SQLite 模式（无人值守初始化 + 全量限流环境变量 + SPA/静态资源 + 登录建组建项目）与外部 PG 模式（全部 22 条迁移 + 交互式 `setupToken` 初始化）。
+- **收尾结果**（2026-11-21）：`pnpm lint` 通过（0 errors）、`pnpm typecheck` 通过、`pnpm test` 53 个文件通过（2 个跳过）、1205 项通过（3 项跳过）、`pnpm build` 通过、`pnpm e2e` 80 项通过。
+
 ## 5. 下一步
 
-M2：SQLite（12 步重建表）、PG 多版本（14～18）与版本能力表、多环境分别验证、分区表编辑。
+P7 HA 高可用（纯平台 PG 多活，ADR 0011），随后进入 M2：SQLite（12 步重建表）、PG 多版本（14～18）与版本能力表、多环境分别验证、分区表编辑。

@@ -429,7 +429,7 @@ export const CanvasHistory = ({
           <h2 id={titleId} className="m-0 text-[length:var(--fs-lg)] font-semibold">
             {t('hist.title')}
           </h2>
-          {detail && (
+          {open && detail && (
             <div className="flex min-w-0 items-center gap-2 text-xs text-text-2">
               <span className="font-mono font-semibold text-text">#{detail.entry.seq}</span>
               <span className="truncate">{opText(detail.entry.opName)}</span>
@@ -443,8 +443,8 @@ export const CanvasHistory = ({
             </div>
           )}
           <span className="flex-1" />
-          {readOnly && <span className="chip">{t('ws.readonlyRole')}</span>}
-          {canRestore && (
+          {open && readOnly && <span className="chip">{t('ws.readonlyRole')}</span>}
+          {open && canRestore && (
             <button type="button" className="btn primary" onClick={openConfirm}>
               <RotateCcw size={15} aria-hidden="true" />
               {t('hist.restore')}
