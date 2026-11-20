@@ -7,6 +7,7 @@ import { registerActivity } from './activity.ts';
 import { registerAdmin } from './admin.ts';
 import { registerAudit } from './audit.ts';
 import { registerAuth } from './auth.ts';
+import { registerCanvasHistory } from './canvas-history.ts';
 import { registerCi, rejectTokens } from './ci.ts';
 import { registerClaims } from './claims.ts';
 import { registerConnection } from './connection.ts';
@@ -91,6 +92,7 @@ export const registerRoutes = (app: Hono<Env>, ctx: AppContext) => {
   registerProjects(app, ctx);
   registerGrants(app, ctx);
   registerVersions(app, ctx);
+  registerCanvasHistory(app, ctx);
   registerActivity(app, ctx);
   // attach 要在 /environments/:eid 之前注册（否则 :eid 会吃掉 attach）
   registerClaims(app, ctx);

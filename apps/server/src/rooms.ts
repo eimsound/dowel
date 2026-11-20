@@ -1,7 +1,7 @@
 // 同步房间的管理：每个分支一个房间，按需从数据库加载（最新快照 + 之后的操作日志），
 // 修改持久化后广播给房间里的所有连接；另外转发画布布局和在线状态这两类不进操作日志的消息。
 
-import type { Role } from '@dowel/api';
+import type { CanvasHistoryEntry, CanvasHistoryList, CanvasHistoryVersionRef, Role } from '@dowel/api';
 import type { Model, Obj } from '@dowel/core';
 import {
   type Commit,
@@ -14,13 +14,74 @@ import {
   type ToServer,
   type Versions,
 } from '@dowel/sync';
+import { HTTPException } from 'hono/http-exception';
 import type { User } from './auth.ts';
 import { inList, type PlatformDb } from './db.ts';
 import type { RoleLookup } from './roles.ts';
+import { atOf } from './time.ts';
 
 export type { Role } from '@dowel/api';
 
 const SNAPSHOT_EVERY = 200;
+const HISTORY_SUMMARY_LIMIT = 5;
+
+const TOP_LEVEL_KINDS = new Set<Obj['kind']>(['table', 'enum', 'sequence', 'opaque', 'extension', 'schema']);
+
+const objectLabel = (obj: Obj, objects: Record<string, Obj>): string => {
+  if ('parent' in obj && !TOP_LEVEL_KINDS.has(obj.kind)) {
+    const parent = objects[obj.parent];
+    if (parent) return `${parent.name}.${obj.name}`;
+  }
+  return obj.name;
+};
+
+const summarizeChanges = (
+  changes: Commit['changes'],
+  knownNames: Map<string, string>,
+  fallbackObjects: Record<string, Obj>,
+): string[] => {
+  const localObjects: Record<string, Obj> = { ...fallbackObjects };
+  for (const ch of changes) if (ch.obj) localObjects[ch.id] = ch.obj;
+
+  const top: string[] = [];
+  const sub: string[] = [];
+  const seen = new Set<string>();
+  const push = (bucket: string[], label: string | undefined) => {
+    if (!label || seen.has(label)) return;
+    seen.add(label);
+    bucket.push(label);
+  };
+
+  for (const ch of changes) {
+    if (ch.obj) {
+      if (ch.obj.kind === 'schema' && ch.obj.name === 'public' && changes.length > 1) continue;
+      const label = objectLabel(ch.obj, localObjects);
+      push(TOP_LEVEL_KINDS.has(ch.obj.kind) ? top : sub, label);
+    } else {
+      const known = knownNames.get(ch.id);
+      push(sub, known);
+    }
+  }
+  return [...top, ...sub].slice(0, HISTORY_SUMMARY_LIMIT);
+};
+
+const summarizeModel = (model: Model): { changeCount: number; summary: string[] } => {
+  const objs = Object.values(model.objects).filter((o) => o.kind !== 'schema');
+  if (!objs.length) return { changeCount: 0, summary: [] };
+  const top: string[] = [];
+  const sub: string[] = [];
+  const seen = new Set<string>();
+  const push = (bucket: string[], label: string) => {
+    if (seen.has(label)) return;
+    seen.add(label);
+    bucket.push(label);
+  };
+  for (const o of objs) {
+    const label = objectLabel(o, model.objects);
+    push(TOP_LEVEL_KINDS.has(o.kind) ? top : sub, label);
+  }
+  return { changeCount: objs.length, summary: [...top, ...sub].slice(0, HISTORY_SUMMARY_LIMIT) };
+};
 
 /** 画布布局：表 ID → 位置。同一张表后到的覆盖先到的，不检查冲突（拖动不应被拒绝） */
 export type Layout = Record<string, { x: number; y: number }>;
@@ -325,6 +386,207 @@ export class Rooms {
   async model(branchId: string): Promise<{ model: Model; seq: number }> {
     const r = await this.get(branchId);
     return { model: structuredClone(r.room.model), seq: r.room.seq };
+  }
+
+  /**
+   * 重建任意 seq（含 0）的完整模型：从不大于 seq 的最新快照出发，按序重放后续提交。
+   * seq < 0 或超过当前最新 seq 时抛 404。
+   */
+  async modelAt(branchId: string, seq: number): Promise<Model> {
+    const r = await this.get(branchId);
+    const currentSeq = r.room.seq;
+    if (!Number.isInteger(seq) || seq < 0 || seq > currentSeq)
+      throw new HTTPException(404, { message: `修改记录 #${seq} 不存在` });
+    if (seq === currentSeq) return structuredClone(r.room.model);
+    const [snap] = await this.db.query<{ seq: string | number; model: Model }>(
+      'select seq, model from room_snapshots where branch_id = $1 and seq <= $2 order by seq desc limit 1',
+      [branchId, seq],
+    );
+    if (!snap) throw new HTTPException(404, { message: `修改记录 #${seq} 缺少可用快照` });
+    const model = structuredClone(snap.model);
+    const snapSeq = Number(snap.seq);
+    if (snapSeq < seq) {
+      const commits = await this.db.query<{ seq: string | number; changes: Commit['changes'] }>(
+        'select seq, changes from room_commits where branch_id = $1 and seq > $2 and seq <= $3 order by seq',
+        [branchId, snapSeq, seq],
+      );
+      for (const c of commits) {
+        for (const ch of c.changes) {
+          if (ch.obj) model.objects[ch.id] = structuredClone(ch.obj);
+          else delete model.objects[ch.id];
+        }
+      }
+    }
+    return model;
+  }
+
+  private async versionsInRange(
+    branchId: string,
+    minSeq: number,
+    maxSeq: number,
+  ): Promise<Map<number, CanvasHistoryVersionRef>> {
+    const rows = await this.db.query<{ id: string; seq: string | number; number: number; name: string }>(
+      `select id, seq, number, name from versions
+        where branch_id = $1 and seq >= $2 and seq <= $3
+        order by number desc`,
+      [branchId, minSeq, maxSeq],
+    );
+    const map = new Map<number, CanvasHistoryVersionRef>();
+    for (const row of rows) {
+      const s = Number(row.seq);
+      if (!map.has(s)) map.set(s, { id: row.id, number: Number(row.number), name: row.name });
+    }
+    return map;
+  }
+
+  private async initialHistoryEntry(
+    branchId: string,
+    currentSeq: number,
+    versions: Map<number, CanvasHistoryVersionRef>,
+    modelOverride?: Model,
+  ): Promise<CanvasHistoryEntry> {
+    const [branch] = await this.db.query<{ created_at: unknown }>(
+      'select created_at from branches where id = $1',
+      [branchId],
+    );
+    let model = modelOverride;
+    if (!model) {
+      const [snap] = await this.db.query<{ model: Model }>(
+        'select model from room_snapshots where branch_id = $1 and seq = 0',
+        [branchId],
+      );
+      model = snap?.model;
+    }
+    const { changeCount, summary } = model ? summarizeModel(model) : { changeCount: 0, summary: [] };
+    return {
+      seq: 0,
+      at: branch ? atOf(branch.created_at) : new Date(0).toISOString(),
+      user: '',
+      opName: 'init',
+      changeCount,
+      summary,
+      isCurrent: currentSeq === 0,
+      version: versions.get(0) ?? null,
+    };
+  }
+
+  /** 分页倒序查询画布修改历史；翻到末尾时附带 seq = 0 初始状态，并匹配已发布版本标记 */
+  async listHistory(
+    branchId: string,
+    opts: { beforeSeq?: number; limit?: number } = {},
+  ): Promise<CanvasHistoryList> {
+    const r = await this.get(branchId);
+    const currentSeq = r.room.seq;
+    const limit = Math.min(100, Math.max(1, opts.limit ?? 30));
+    const beforeSeq = opts.beforeSeq;
+    if (beforeSeq !== undefined && beforeSeq <= 0) {
+      return { entries: [], currentSeq, nextBeforeSeq: null };
+    }
+
+    type CommitRow = {
+      seq: string | number;
+      user_name: string;
+      op_name: string | null;
+      changes: Commit['changes'];
+      created_at: unknown;
+    };
+    const rows =
+      beforeSeq !== undefined
+        ? await this.db.query<CommitRow>(
+            `select seq, user_name, op_name, changes, created_at
+               from room_commits
+              where branch_id = $1 and seq < $2
+              order by seq desc
+              limit $3`,
+            [branchId, beforeSeq, limit],
+          )
+        : await this.db.query<CommitRow>(
+            `select seq, user_name, op_name, changes, created_at
+               from room_commits
+              where branch_id = $1
+              order by seq desc
+              limit $2`,
+            [branchId, limit],
+          );
+
+    const includeInit = rows.length < limit;
+    const seqs = rows.map((row) => Number(row.seq));
+    if (includeInit) seqs.push(0);
+    const versions = seqs.length
+      ? await this.versionsInRange(branchId, Math.min(...seqs), Math.max(...seqs))
+      : new Map<number, CanvasHistoryVersionRef>();
+
+    // 从当前模型与本页提交收集对象名，便于为删除操作解析对象名称
+    const knownObjects: Record<string, Obj> = { ...r.room.model.objects };
+    for (const row of rows) for (const ch of row.changes) if (ch.obj) knownObjects[ch.id] = ch.obj;
+    const knownNames = new Map<string, string>();
+    for (const [id, obj] of Object.entries(knownObjects)) knownNames.set(id, objectLabel(obj, knownObjects));
+
+    const entries: CanvasHistoryEntry[] = rows.map((row) => {
+      const seq = Number(row.seq);
+      return {
+        seq,
+        at: atOf(row.created_at),
+        user: row.user_name,
+        opName: row.op_name ?? 'edit',
+        changeCount: row.changes.length,
+        summary: summarizeChanges(row.changes, knownNames, knownObjects),
+        isCurrent: seq === currentSeq,
+        version: versions.get(seq) ?? null,
+      };
+    });
+
+    if (includeInit) {
+      entries.push(await this.initialHistoryEntry(branchId, currentSeq, versions));
+    }
+
+    const lastSeq = entries.at(-1)?.seq ?? 0;
+    const nextBeforeSeq = !includeInit && lastSeq > 0 ? lastSeq : null;
+    return { entries, currentSeq, nextBeforeSeq };
+  }
+
+  /** 读取单条历史记录的元信息（用于详情接口；若提供 prevModel/targetModel 可精确解析被删对象名） */
+  async historyEntry(
+    branchId: string,
+    seq: number,
+    context?: { prevModel?: Model | null; targetModel?: Model; currentSeq?: number },
+  ): Promise<CanvasHistoryEntry> {
+    const r = await this.get(branchId);
+    const currentSeq = context?.currentSeq ?? r.room.seq;
+    if (!Number.isInteger(seq) || seq < 0 || seq > currentSeq)
+      throw new HTTPException(404, { message: `修改记录 #${seq} 不存在` });
+    const versions = await this.versionsInRange(branchId, seq, seq);
+    if (seq === 0) {
+      return this.initialHistoryEntry(branchId, currentSeq, versions, context?.targetModel);
+    }
+    const [row] = await this.db.query<{
+      seq: string | number;
+      user_name: string;
+      op_name: string | null;
+      changes: Commit['changes'];
+      created_at: unknown;
+    }>(
+      'select seq, user_name, op_name, changes, created_at from room_commits where branch_id = $1 and seq = $2',
+      [branchId, seq],
+    );
+    if (!row) throw new HTTPException(404, { message: `修改记录 #${seq} 不存在` });
+
+    const knownObjects: Record<string, Obj> = {
+      ...(context?.prevModel?.objects ?? {}),
+      ...(context?.targetModel?.objects ?? {}),
+    };
+    const knownNames = new Map<string, string>();
+    for (const [id, obj] of Object.entries(knownObjects)) knownNames.set(id, objectLabel(obj, knownObjects));
+    return {
+      seq,
+      at: atOf(row.created_at),
+      user: row.user_name,
+      opName: row.op_name ?? 'edit',
+      changeCount: row.changes.length,
+      summary: summarizeChanges(row.changes, knownNames, knownObjects),
+      isCurrent: seq === currentSeq,
+      version: versions.get(seq) ?? null,
+    };
   }
 
   /**
