@@ -579,6 +579,20 @@ P3 审查后的修正（2026-11-19）：
 - **独立审查与修复**：Sonnet 5.5 审查未发现 Must-Fix，提出 5 项建议全部落实——`canvasHistoryRestoreSchema.workingSeq` 改为必填并在 `Rooms.replace` 中原子校验 `expectedSeq`（`WorkingChangedError`）、`attach` 确认覆盖强制携带 `workingSeq` 并将提交后同步工作副本包裹为 `warnings` 避免误报 500、`pickShadow` 取整条待验证版本链的 `unionScopes`、`envPositiveInt` 增加 `<= 2^31 - 1` 上限防定时器溢出。
 - **收尾结果**（2026-11-21）：`pnpm lint` 通过（0 errors）、`pnpm typecheck` 通过、`pnpm test` 53 个文件通过（2 个跳过）、1205 项通过（3 项跳过）、`pnpm build` 通过、`pnpm e2e` 80 项通过。
 
+### 4.12 产品化 P7：HA 高可用——纯平台 PG 多活（2026-11-21，ADR 0011）
+
+- **底座与迁移（HA1 / HA4）**：
+  - 平台库新增迁移 23（`apps/server/src/db.ts`）：创建 `webhook_jobs`（持久化投递与重试队列，带 `webhook_jobs_due_idx` 索引）、`ha_leases`（副本心跳与任务租约），并为 `exec_requests` 新增 `worker_id` 列；扩展 `PlatformDb` 提供 PG `listen` / `notify`（7500 字节 UTF-8 安全截断保护、仅真实断线重连触发 `onReconnect`）与独占连接双 32 位哈希 `withAdvisoryLock`（SQLite 进程内等价回退）。
+  - 新增 `apps/server/src/bus.ts`（`EventBus`，强类型轻量 `ClusterEvent` 联合）与 `apps/server/src/ha.ts`（`HaCoordinator`，副本心跳租约续租、优雅停机清理、`isNodeAlive` 与 `tryWithJobLock`）。
+  - 跨副本 `EnvLocks`（`apps/server/src/executions.ts`）：PG 下叠加 `withAdvisoryLock('env:' + id)` 防止另一副本在执行期间改连接串或删环境；`setupToken` 持久化至 `instance_settings`（`ensureSetupToken`）并由 `POST /api/setup` 同事务清理，`autoSetup` 支持多副本并发冷启动幂等。
+- **无状态实时协作房间（HA2）**：
+  - `packages/sync/src/server.ts` 扩展 `applyExternalCommit` / `applyExternalRejection` 与事务级 `store` 透传；`apps/server/src/rooms.ts` 在 PG 下按分支行锁（`select id from branches where id = $1 for update`）串行化 `op` / `replace` / `patch`，锁内先追赶外部提交再同事务落库（回滚时标记 `dirty` 从库重建防内存污染），提交后经 `EventBus` 广播轻量 `room.commit`、`room.layout`、`room.presence`、`room.kick`、`room.refresh`，并在读前保鲜与 `LISTEN` 断线重连时自动追赶。
+- **持久化队列、分布式巡检与跨副本 SSE（HA3）**：
+  - `apps/server/src/webhooks.ts` 将异步投递与指数退避重试迁入 `webhook_jobs`（PG 上 `FOR UPDATE SKIP LOCKED` 认领 + 租约防重，重启不丢任务），并由 `webhooks.wake` 实时唤醒；
+  - `apps/server/src/requests.ts` 为执行中申请写入 `worker_id`，`recoverInterrupted` 结合 `HaCoordinator.isNodeAlive` 仅恢复已离线/租约过期节点的卡死申请（不误杀存活副本）；`sweepOnce`、`DriftScheduler`（`drift-scheduler.ts`）与 `OpaqueRefresher`（`derive.ts`）通过 `tryWithJobLock` 防多副本重复执行；收件箱未读数经 `inbox.changed` 跨副本推送至活跃 SSE 连接。
+- **真实 PG 双副本测试（HA5）**：新增 `apps/server/test/ha-foundation.test.ts`（15 项）、`apps/server/test/ha-rooms.test.ts`（7 项）与 `apps/server/test/ha-jobs.test.ts`（4 项），全面验证双副本并发协作、停用踢人与角色降级、断线重连追赶、Webhook 持久化防重与崩溃续投、跨副本收件箱 SSE、按租约恢复、跨副本环境锁与共享初始化令牌。
+- **收尾结果**（2026-11-21）：`pnpm lint` 通过（0 errors）、`pnpm typecheck` 通过、`pnpm test` 56 个文件通过（2 个跳过）、1231 项通过（3 项跳过）、`pnpm build` 通过、`pnpm e2e` 80 项通过。
+
 ## 5. 下一步
 
-P7 HA 高可用（纯平台 PG 多活，ADR 0011），随后进入 M2：SQLite（12 步重建表）、PG 多版本（14～18）与版本能力表、多环境分别验证、分区表编辑。
+M2：SQLite（12 步重建表）、PG 多版本（14～18）与版本能力表、多环境分别验证、分区表编辑。

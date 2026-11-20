@@ -63,6 +63,7 @@ const stop = async () => {
   requests.stop();
   await webhooks.close();
   await rooms.flush();
+  rooms.close();
   await shadows.close();
   await bus.close();
   await ha.stop();
