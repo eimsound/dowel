@@ -323,8 +323,6 @@ export const registerProjects = (app: Hono<Env>, ctx: AppContext) => {
           [a.pid],
         );
       await tx.query('delete from versions where project_id = $1', [a.pid]);
-      // 前置环境有约束（PG 外键 / SQLite 触发器）：同一个项目里的环境互相引用，先清掉再整体删除
-      await tx.query('update environments set prerequisite_id = null where project_id = $1', [a.pid]);
       await tx.query('delete from environments where project_id = $1', [a.pid]);
       await tx.query('delete from branches where project_id = $1', [a.pid]);
       await tx.query("delete from grants where scope_kind = 'project' and scope_id = $1", [a.pid]);

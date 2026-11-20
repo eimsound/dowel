@@ -83,10 +83,10 @@ describe.skipIf(!PG_URL)('执行策略写入串行化（平台库 PG）', () => 
     try {
       await holder.db.query('select pg_advisory_lock(hashtext($1))', [POLICY_LOCK_KEY]);
       // A：实例管理员把环境收紧成“仅限执行者”
-      const a = call('PUT', path, { settings: { whoCanExecute: 'executor' }, prerequisiteId: null }, 'admin');
+      const a = call('PUT', path, { settings: { whoCanExecute: 'executor' } }, 'admin');
       await waiters(holder, 1);
       // B：项目管理员看到的还是旧状态（没有“仅限执行者”），只想把锁等待改短——对收紧之后的状态来说，这是撤掉“仅限执行者”
-      const b = call('PUT', path, { settings: { lockTimeoutMs: 1000 }, prerequisiteId: null }, 'pa');
+      const b = call('PUT', path, { settings: { lockTimeoutMs: 1000 } }, 'pa');
       await waiters(holder, 2);
       await holder.db.query('select pg_advisory_unlock(hashtext($1))', [POLICY_LOCK_KEY]);
       const [ra, rb] = await Promise.all([a, b]);
@@ -228,7 +228,7 @@ describe.skipIf(!PG_URL)('执行策略写入串行化（平台库 PG）', () => 
       const envPut = call(
         'PUT',
         `/api/projects/${id}/environments/${eid}/exec-policy`,
-        { settings: { whoCanExecute: 'editor' }, prerequisiteId: null },
+        { settings: { whoCanExecute: 'editor' } },
         'pa',
       );
       await waiters(holder, 2);
@@ -370,7 +370,7 @@ describe.skipIf(!PG_URL)('执行策略写入串行化（平台库 PG）', () => 
       const tighten = call(
         'PUT',
         `/api/projects/${id}/environments/${eid}/exec-policy`,
-        { settings: { whoCanExecute: 'executor' }, prerequisiteId: null },
+        { settings: { whoCanExecute: 'executor' } },
         'admin',
       );
       await waiters(holder, 1);

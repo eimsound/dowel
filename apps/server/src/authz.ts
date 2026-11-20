@@ -48,7 +48,7 @@ export type ProjectAction =
  *   取代 P4b 预留的 resolve_drift。**CI 令牌不能标记**（P6 接入令牌时，令牌的 Actor 不能通过这个动作）；
  * - environment.change_connection：改连接串、影子库、是否允许同实例影子库；
  * - environment.unmark_production：取消“生产”标记；
- * - environment.set_policy：**放宽**环境层的执行策略（含去掉 / 换掉前置环境）；收紧只要项目管理员（routes/policy.ts）；
+ * - environment.set_policy：**放宽**环境层的执行策略；收紧只要项目管理员（routes/policy.ts）；
  * - environment.delete：删除环境。
  */
 export type EnvAction =
@@ -90,7 +90,7 @@ export type InstanceAction =
   | 'instance.manage_policy'
   /** 实例层的“谁能创建 CI 令牌”（P6） */
   | 'instance.manage_token_policy'
-  /** 紧急执行（P5b）：绕过审批流程（不绕过漂移、完整性、前置环境等检查），必填原因；只有实例管理员 */
+  /** 紧急执行（P5b）：绕过审批流程（不绕过漂移、完整性等检查），必填原因；只有实例管理员 */
   | 'instance.emergency_execute'
   | 'instance.create_group'
   | 'instance.view_audit';
@@ -105,7 +105,7 @@ export type TokenAction = 'token.create' | 'token.list' | 'token.revoke';
 
 /**
  * **只有 CI 令牌**能做的动作（P6，/api/ci/…）：令牌的能力只有“只读 + 执行”。
- * - ci.read：读项目的版本链、环境状态、执行历史；
+ * - ci.read：读项目的版本链、环境状态、执行历史、漂移检测；
  * - ci.execute：执行（和预演）到指定版本——只看环境生效的“允许令牌执行”（Resource.allowTokens），不看“谁能执行”、不走审批。
  * 令牌不能做任何别的动作（编辑模型、发布、改策略、改连接串、标记为已执行、写基线、处理漂移、认领、接手、令牌管理……）。
  */

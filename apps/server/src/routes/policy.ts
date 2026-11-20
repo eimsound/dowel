@@ -3,9 +3,9 @@
 // 谁能改：实例层 = 实例管理员；组层 = 组管理员；项目层 = 项目管理员；环境层 = 项目管理员。
 // 写入规则（都在写之前检查，拒绝时什么都不写）：
 // 1. 下级只能收紧：本层每个字段不能比上级合并出来的下限更宽（422，validateLayer）；审批流程只能在上级之后追加环节；
-// 2. **放宽是特权操作**：改动让本层的生效策略变宽（任一字段变宽、审批流程不再包含原流程、去掉 / 换掉前置环境）时，
+// 2. **放宽是特权操作**：改动让本层的生效策略变宽（任一字段变宽、审批流程不再包含原流程）时，
 //    操作者还要满足本层**改动前**生效的“谁能执行”（403）。理由见 policy.ts 开头：否则“仅限执行者”可以被非执行者自己撤掉；
-// 3. 审批流程里引用的组 / 用户必须存在（422）；前置环境必须是同项目的另一个环境，不能成环（422）。
+// 3. 审批流程里引用的组 / 用户必须存在（422）。
 // 所有修改写审计 exec_policy.update（层、范围、改动前后的设置、是否放宽、被固定的字段）。
 // **原子性**（审查后）：每次写入都在 withPolicyLock 的事务里重新读当前值 → 校验 / 放宽检测 → 写 → 严格审计（auditIn），
 // 一次收紧不会被另一个基于旧状态、没经过放宽检查的写入覆盖。环境层和 PATCH …/environments/:eid 共用 applyEnvPolicy。
@@ -22,7 +22,6 @@ import {
   type PolicyLayerView,
   type PolicySettings,
   pickSet,
-  prerequisiteCycle,
   type ResolvedPolicy,
   resolvePolicy,
   validateLayer,
@@ -34,7 +33,7 @@ import { HTTPException } from 'hono/http-exception';
 import { auditIn } from '../audit.ts';
 import { can, userActor } from '../authz.ts';
 import { applyEnvPolicy } from '../env-policy.ts';
-import { type EnvRow, envResource, loadPrerequisite } from '../envs.ts';
+import { type EnvRow, envResource } from '../envs.ts';
 import {
   accessIn,
   assertApproversExist,
@@ -347,8 +346,7 @@ export const registerPolicy = (app: Hono<Env>, ctx: AppContext) => {
   // ───── 环境层 ─────
 
   /**
-   * 环境层的视图：只用轻量查询（同项目环境的 id / 名字 / 生产标记 / 前置环境，加前置环境当前版本的序号），
-   * 不读版本的脚本和验证报告；store 由调用方给（GET 用 envAccess 读到的，PUT 用事务里写完的）。
+   * 环境层的视图：store 由调用方给（GET 用 envAccess 读到的，PUT 用事务里写完的）。
    */
   const envView = async (
     actorUser: { id: string; role: string },
@@ -357,17 +355,6 @@ export const registerPolicy = (app: Hono<Env>, ctx: AppContext) => {
     store: PolicyStore,
   ): Promise<EnvPolicyView> => {
     const auth = envAuthOf(store, a.rc, { id: a.pid, groupId: a.groupId }, env);
-    const all = await db.query<{
-      id: string;
-      name: string;
-      production: boolean;
-      prerequisite_id: string | null;
-    }>(
-      'select id, name, production, prerequisite_id from environments where project_id = $1 order by created_at',
-      [a.pid],
-    );
-    const links = new Map(all.map((e) => [e.id, e.prerequisite_id]));
-    const prerequisite = await loadPrerequisite(db, a.pid, env.prerequisite_id);
     const actor = userActor(actorUser);
     const canEdit = can(actor, 'environment.manage', { kind: 'project', role: a.role });
     const canLoosen = canEdit && can(actor, 'environment.set_policy', envResource(env, a.role, auth));
@@ -377,17 +364,6 @@ export const registerPolicy = (app: Hono<Env>, ctx: AppContext) => {
       production: env.production,
       settings,
       resolved: auth.resolved,
-      prerequisite,
-      candidates: all
-        .filter((e) => e.id !== env.id)
-        .map((e) => ({
-          id: e.id,
-          name: e.name,
-          production: e.production,
-          disabled: prerequisiteCycle(env.id, e.id, links)
-            ? '会形成循环：它（或它的前置环境）以这个环境为前置'
-            : null,
-        })),
       canEdit,
       canLoosen,
       loosenNote: canEdit && !canLoosen ? deniedMessage('environment.set_policy', auth) : null,
@@ -404,7 +380,7 @@ export const registerPolicy = (app: Hono<Env>, ctx: AppContext) => {
   });
 
   /**
-   * 环境层：整套设置 + 前置环境。和 PATCH …/environments/:eid 共用 applyEnvPolicy（校验、放宽检测、固定、写入），
+   * 环境层：整套设置。和 PATCH …/environments/:eid 共用 applyEnvPolicy（校验、放宽检测、固定、写入），
    * 在执行策略锁的事务里读、校验、写，审计同事务。写完直接用事务里的结果生成视图，不再跑一遍 envAccess。
    */
   app.put('/api/projects/:pid/environments/:eid/exec-policy', async (c) => {
@@ -421,7 +397,7 @@ export const registerPolicy = (app: Hono<Env>, ctx: AppContext) => {
         pid: a.pid,
         eid,
         user,
-        change: { settings: b.settings, prerequisiteId: b.prerequisiteId },
+        change: { settings: b.settings },
         write: true,
       });
       if (!can(actor, 'environment.manage', { kind: 'project', role: r.role }))
@@ -434,8 +410,8 @@ export const registerPolicy = (app: Hono<Env>, ctx: AppContext) => {
           {
             name: r.env.name,
             production: r.env.production,
-            before: { settings: r.ownBefore, prerequisiteId: r.prerequisiteBefore },
-            after: { settings: r.ownAfter, prerequisiteId: r.prerequisiteAfter },
+            before: { settings: r.ownBefore },
+            after: { settings: r.ownAfter },
             loosened: r.loosened,
           },
         );
@@ -446,12 +422,10 @@ export const registerPolicy = (app: Hono<Env>, ctx: AppContext) => {
     // P5b：策略变了，受影响范围里还没结束的执行申请重新检查（流程变严的会失效）
     ctx.requests.kick({ envIds: [r.env.id] });
     return c.json<EnvPolicyView>(
-      await envView(
-        user,
-        { pid: a.pid, groupId: r.project.groupId, role: r.role, rc: r.rc },
-        { ...r.env, prerequisite_id: r.prerequisiteAfter },
-        { ...r.store, environments },
-      ),
+      await envView(user, { pid: a.pid, groupId: r.project.groupId, role: r.role, rc: r.rc }, r.env, {
+        ...r.store,
+        environments,
+      }),
     );
   });
 };

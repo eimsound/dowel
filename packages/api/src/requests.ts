@@ -58,7 +58,7 @@ export const requestExecuteSchema = z
   .strict();
 export type RequestExecute = z.infer<typeof requestExecuteSchema>;
 
-/** 紧急执行（只有实例管理员）：绕过审批，不绕过漂移、完整性、前置环境等检查；必须写原因 */
+/** 紧急执行（只有实例管理员）：绕过审批，不绕过漂移、完整性等检查；必须写原因 */
 export const emergencyExecuteSchema = z
   .object({
     kind: z.enum(['execute', 'rollback']),

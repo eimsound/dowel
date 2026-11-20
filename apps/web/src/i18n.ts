@@ -425,7 +425,7 @@ const zh = {
     intro:
       '执行策略决定谁能对环境做特权操作（执行、回滚、处理漂移、改连接串等）、审批流程和迁移会话的超时。四层（实例 → 组 → 项目 → 环境）逐层取更严：上级设定的要求在下级锁定，下级只能收紧。没有设置的项继承上级，都没设置时用默认值。',
     envIntro:
-      '这个环境自己的执行策略（按它的生产标记合并上级的那一套）。上级的要求显示为锁定；放宽（任一项变宽、去掉审批环节或前置环境）是特权操作。',
+      '这个环境自己的执行策略（按它的生产标记合并上级的那一套）。上级的要求显示为锁定；放宽（任一项变宽、去掉审批环节）是特权操作。',
     envSetProd: '本环境（生产）',
     envSetNonProd: '本环境（非生产）',
     loosenEnv: '放宽这个环境的策略需要满足它当前的执行策略：',
@@ -490,17 +490,6 @@ const zh = {
         group_admins_of: '指定组的组管理员',
         users: '指定用户',
       },
-    },
-    prerequisite: {
-      label: '前置环境',
-      none: '不设置',
-      hint: '设了以后，执行到这个环境的目标版本不能高于前置环境的当前版本；回滚、标记为已执行不受约束。',
-      current: '“{{name}}”当前是 v{{n}}。',
-      never: '“{{name}}”还没有执行过任何版本。',
-      missing: '设置的前置环境已经不存在：执行会被拒绝，请重新选择前置环境。',
-      check: '前置环境检查没有通过',
-      ok: '前置环境“{{name}}”当前 v{{n}}：通过',
-      exempt: '前置环境“{{name}}”：回滚不受约束',
     },
     save: '保存执行策略',
     reset: '撤销修改',
@@ -1311,7 +1300,7 @@ const zh = {
       confirm: '紧急执行',
       warnTitle: '绕过审批',
       warnBody:
-        '紧急执行跳过审批流程，但漂移、完整性、前置环境等检查照常进行。会写进审计，并通知这个环境审批流程里的所有审批人。',
+        '紧急执行跳过审批流程，但漂移、完整性等检查照常进行。会写进审计，并通知这个环境审批流程里的所有审批人。',
       reason: '紧急执行的原因',
       ack: '我确认这是紧急情况，要绕过审批直接执行',
     },
@@ -2015,7 +2004,7 @@ const en: typeof zh = {
     intro:
       'The execution policy decides who can perform privileged operations on an environment (execute, roll back, resolve drift, change the connection…), the approval flow and the migration session timeouts. The four layers (instance → group → project → environment) are merged by taking the stricter value: requirements set above are locked below and can only be tightened. Unset items inherit; defaults apply when nothing is set.',
     envIntro:
-      'This environment’s own policy (merged with the set above that matches its production flag). Requirements from above are locked; loosening (anything looser, removing approval stages or the upstream environment) is a privileged operation.',
+      'This environment’s own policy (merged with the set above that matches its production flag). Requirements from above are locked; loosening (anything looser or removing approval stages) is a privileged operation.',
     envSetProd: 'This environment (production)',
     envSetNonProd: 'This environment (non-production)',
     loosenEnv: 'Loosening this environment’s policy requires satisfying its current policy:',
@@ -2082,17 +2071,6 @@ const en: typeof zh = {
         group_admins_of: 'Admins of a group',
         users: 'Specific users',
       },
-    },
-    prerequisite: {
-      label: 'Upstream environment',
-      none: 'None',
-      hint: 'When set, the target version executed here cannot be newer than the upstream environment’s current version; rollback and mark-as-applied are exempt.',
-      current: '“{{name}}” is at v{{n}}.',
-      never: '“{{name}}” has not executed any version yet.',
-      missing: 'The upstream environment no longer exists: execution is refused until you choose it again.',
-      check: 'Upstream environment check failed',
-      ok: 'Upstream “{{name}}” is at v{{n}}: passed',
-      exempt: 'Upstream “{{name}}”: rollback is exempt',
     },
     save: 'Save execution policy',
     reset: 'Discard changes',
@@ -2932,7 +2910,7 @@ const en: typeof zh = {
       confirm: 'Emergency execute',
       warnTitle: 'Bypasses approval',
       warnBody:
-        'Emergency execution skips the approval flow; drift, integrity and upstream environment checks still apply. It is audited and every approver of this environment is notified.',
+        'Emergency execution skips the approval flow; drift and integrity checks still apply. It is audited and every approver of this environment is notified.',
       reason: 'Reason for the emergency',
       ack: 'I confirm this is an emergency and want to bypass approval',
     },

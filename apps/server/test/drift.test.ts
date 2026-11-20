@@ -379,7 +379,6 @@ describe.skipIf(!PG_URL)('漂移的两个出口与标记为已执行', () => {
       to: v3.data.id,
       direction: 'forward',
       skipped: [3],
-      prerequisiteExempt: true,
     });
     expect(succeeded[0]!.fingerprint).toMatch(/^[0-9a-f]{64}$/);
     // 失败也记审计：线上结构不等于目标版本（标记回 v1，库其实是 v3 的样子）

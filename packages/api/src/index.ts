@@ -706,40 +706,13 @@ export type EnvVersionRef = z.infer<typeof envVersionRefSchema>;
 
 // ───── 执行策略（P5a） ─────
 
-/** 环境上的前置环境：名字和它（平台库缓存里）的当前版本 */
-export const prerequisiteRefSchema = z.object({
-  id: z.string(),
-  name: z.string(),
-  currentVersion: envVersionRefSchema.nullable(),
-  /** 设置了前置环境，但找不到那个环境（有外键，不应该发生；发生了执行一律拒绝） */
-  missing: z.boolean().optional(),
-});
-export type PrerequisiteRef = z.infer<typeof prerequisiteRefSchema>;
-
-/** 前置环境检查的结果（checkPrerequisite），确认对话框和预演显示 */
-export const prerequisiteResultSchema = z.object({
-  ok: z.boolean(),
-  /** 回滚 / 标记 / 写基线：不受前置环境约束 */
-  exempt: z.boolean(),
-  id: z.string(),
-  name: z.string(),
-  currentNumber: z.number().nullable(),
-  /** 没通过时的代码：prerequisite_behind 前置环境还没到目标版本；prerequisite_missing 前置环境不存在 */
-  code: z.enum(['prerequisite_behind', 'prerequisite_missing']).nullable().optional(),
-  /** 没通过时的说明 */
-  message: z.string().nullable(),
-});
-export type PrerequisiteResult = z.infer<typeof prerequisiteResultSchema>;
-
 /** 实例 / 组 / 项目层的执行策略：PUT 的请求体就是 LayerPolicy（整层替换，字段不出现 = 继承） */
 export const layerPolicyPutSchema = layerPolicySchema;
 
-/** 环境层：环境自己的那一套设置 + 前置环境 */
+/** 环境层：环境自己的那一套设置 */
 export const envPolicyPutSchema = z
   .object({
     settings: policySettingsSchema,
-    /** 前置环境（同一个项目里的另一个环境）；null = 不设置 */
-    prerequisiteId: z.string().min(1).nullable(),
   })
   .strict();
 export type EnvPolicyPut = z.infer<typeof envPolicyPutSchema>;
@@ -766,9 +739,6 @@ export interface EnvPolicyView {
   production: boolean;
   settings: PolicySettings;
   resolved: ResolvedPolicy;
-  prerequisite: PrerequisiteRef | null;
-  /** 可以选作前置环境的环境（同项目，不含自己）；会成环的带 disabled 说明 */
-  candidates: { id: string; name: string; production: boolean; disabled: string | null }[];
   canEdit: boolean;
   canLoosen: boolean;
   loosenNote: string | null;
@@ -802,8 +772,6 @@ export const environmentInfoSchema = z.object({
   effectiveExecPolicy: execPolicySchema,
   /** 生效的执行策略（四层合并，P5a）：每个字段的生效值、来源层、上级下限 */
   policy: z.custom<ResolvedPolicy>(),
-  /** 前置环境（P5a）；没有设置为 null */
-  prerequisite: z.lazy(() => prerequisiteRefSchema).nullable(),
   /** 环境当前版本（平台库缓存：最近一次读目标库历史 / 执行后的结果）；还没执行过为 null */
   currentVersion: envVersionRefSchema.nullable(),
   drift: driftInfoSchema,
@@ -850,7 +818,6 @@ export const envStatusSchema = z.object({
   execPolicy: execPolicySchema.nullable(),
   effectiveExecPolicy: execPolicySchema,
   policy: z.custom<ResolvedPolicy>(),
-  prerequisite: z.lazy(() => prerequisiteRefSchema).nullable(),
   currentVersion: envVersionRefSchema.nullable(),
   /** 链上全部版本（升序） */
   versions: z.array(envVersionSchema),
@@ -947,8 +914,6 @@ export const execErrorDetailsSchema = z.object({
   needsManual: needsManualSchema.optional(),
   /** plan_changed：锁里重新算出的标记计划（预演之后目标库变了） */
   plan: markPlanSchema.optional(),
-  /** prerequisite_behind：前置环境和它的当前版本 */
-  prerequisite: z.lazy(() => prerequisiteResultSchema).optional(),
   /**
    * step_timeout：某一步因为执行策略的超时被取消。lock = 等锁超过 lock_timeout（表被别的会话占着），
    * statement = 语句执行超过 statement_timeout。ms 是当时的设置
@@ -1184,11 +1149,6 @@ export type DryRunPlan = z.infer<typeof dryRunPlanSchema>;
 export const dryRunResponseSchema = z.object({
   ok: z.boolean(),
   plan: dryRunPlanSchema.optional(),
-  /** 前置环境检查的结果（没有设置前置环境为 null）；没通过时 ok = false、code = prerequisite_behind */
-  prerequisite: z
-    .lazy(() => prerequisiteResultSchema)
-    .nullable()
-    .optional(),
   error: z.string().optional(),
   code: z.string().optional(),
   details: execErrorDetailsSchema.optional(),

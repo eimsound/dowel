@@ -978,7 +978,7 @@ const EnvironmentDetailView = ({ eid }: { eid: string }) => {
             ) : null}
           </Section>
 
-          {/* 环境层的执行策略和前置环境（P5a）：上级的要求锁定显示，只能收紧 */}
+          {/* 环境层的执行策略（P5a）：上级的要求锁定显示，只能收紧 */}
           <Section title={t('pol.title')}>
             <EnvPolicyPanel pid={pid} eid={eid} />
           </Section>

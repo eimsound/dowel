@@ -1,11 +1,12 @@
 // 面向 CI 的 HTTP API（P6 T3，ADR 0009）：`Authorization: Bearer dwl_…` 认证，只读 + 执行，结构化的 JSON 错误。
 // - 只认令牌，不看 cookie，不校验 Origin（app.ts）；令牌访问 /api/ci 之外的任何接口都是 403（rejectTokens）。
 // - 令牌只能访问它所属的项目：路径里的项目不是它的项目时和不存在一样（404 project_not_found，不泄露存在）。
-// - 执行只受环境生效的“允许令牌执行”约束（不看“谁能执行”，不走审批）；漂移、完整性、认领、前置环境、超时等检查照常，
+// - 执行只受环境生效的“允许令牌执行”约束（不看“谁能执行”，不走审批）；漂移、完整性、认领、超时等检查照常，
 //   和界面执行共用同一套环境锁 / 目标库项目锁（runExecution）。目标版本必须显式给出（latest 或 v5），令牌不能回滚。
 // - 同步等待执行结束再返回 JSON（CI 里最简单）；错误码与 HTTP 状态码的对应见 @dowel/api 的 CI_ERROR_STATUS 和 docs/api.md。
 import {
   CI_ERROR_STATUS,
+  type CiDriftResult,
   type CiEnvironment,
   type CiEnvironmentStatus,
   type CiErrorBody,
@@ -27,8 +28,9 @@ import { HTTPException } from 'hono/http-exception';
 import type { ContentfulStatusCode } from 'hono/utils/http-status';
 import { audit } from '../audit.ts';
 import { can } from '../authz.ts';
-import { driftInfo, type EnvRow, iso, loadPrerequisite } from '../envs.ts';
+import { type EnvRow, iso } from '../envs.ts';
 import {
+  checkEnvDriftDetailed,
   classifyError,
   dryRunExecution,
   EnvBusyError,
@@ -50,7 +52,6 @@ import {
   tokenActor,
 } from '../tokens.ts';
 import type { AppContext, Env } from './context.ts';
-import { prerequisiteOf } from './executions.ts';
 
 /** CI 接口的预期错误：带机器可读的 code，HTTP 状态码由 code 决定 */
 export class CiError extends Error {
@@ -303,23 +304,18 @@ export const registerCi = (app: Hono<Env>, ctx: AppContext) => {
     return env;
   };
 
-  const envSummary = async (
-    p: ProjectRow,
-    env: EnvRow,
-    versions: Map<string, VersionLite>,
-    store: Awaited<ReturnType<typeof loadPolicies>>,
-  ): Promise<CiEnvironment> => {
-    const cur = env.current_version_id ? versions.get(env.current_version_id) : undefined;
-    const pre = await loadPrerequisite(db, p.id, env.prerequisite_id);
-    const d = driftInfo(env);
-    return {
-      name: env.name,
-      production: env.production,
-      currentVersion: cur ? ref(cur) : null,
-      tokenExecution: resolveEnv(store, env).allowTokens.value,
-      drift: { status: d.status, checkedAt: d.checkedAt },
-      prerequisite: pre ? { name: pre.name, currentNumber: pre.currentVersion?.number ?? null } : null,
-    };
+  const envConfig = (env: EnvRow, store: Awaited<ReturnType<typeof loadPolicies>>): CiEnvironment => ({
+    name: env.name,
+    production: env.production,
+    tokenExecution: resolveEnv(store, env).allowTokens.value,
+  });
+
+  const requireConnectionQuota = (c: Context<Env>, action: string) => {
+    const limited = ctx.connectionLimiter.attempt(`token:${c.get('token').id}`);
+    if (!limited.allowed)
+      throw new CiError('rate_limited', `${action}太频繁了，请 ${limited.retryAfterSeconds} 秒后再试`, {
+        reason: String(limited.retryAfterSeconds),
+      });
   };
 
   /** 令牌自己的信息（流水线自检：令牌有效、属于哪个项目、什么时候过期） */
@@ -340,13 +336,12 @@ export const registerCi = (app: Hono<Env>, ctx: AppContext) => {
     }),
   );
 
-  /** 项目概要：最新版本、各环境的当前版本 / 漂移状态 / 是否允许令牌执行 */
+  /** 项目与环境列表（纯平台配置，不连目标库，不返回缓存状态） */
   app.get(
     '/api/ci/projects/:owner/:project',
     wrap(async (c) => {
       const p = await projectOf(c);
       const versions = await loadVersions(db, p.id);
-      const byId = new Map(versions.map((v) => [v.id, v]));
       const store = await loadPolicies(db, p);
       const envs = await db.query<EnvRow>('select * from environments where project_id = $1 order by name', [
         p.id,
@@ -358,7 +353,7 @@ export const registerCi = (app: Hono<Env>, ctx: AppContext) => {
         slug: p.slug,
         owner: p.groupSlug,
         latest: head ? ref(head) : null,
-        environments: await Promise.all(envs.map((e) => envSummary(p, e, byId, store))),
+        environments: envs.map((e) => envConfig(e, store)),
       });
     }),
   );
@@ -379,16 +374,25 @@ export const registerCi = (app: Hono<Env>, ctx: AppContext) => {
     }),
   );
 
-  /** 环境状态（平台库缓存，不连目标库）：当前版本、每个版本是已执行 / 当前 / 待执行 */
+  /** 单环境实时状态：轻量连目标库读 dowel.history（顺带同步平台缓存），返回平台配置 + 实时当前版本、unfinished、版本链状态与待执行列表 */
   app.get(
     '/api/ci/projects/:owner/:project/environments/:env',
     wrap(async (c) => {
       const p = await projectOf(c);
       const env = await envOf(p, c.req.param('env')!);
+      requireConnectionQuota(c, '读取环境状态');
+      const state = await readTargetState(ctx.exec, env, true, { preserveHistoryError: true });
+      ctx.requests.kick({ envIds: [env.id] });
       const versions = await loadVersions(db, p.id);
       const byId = new Map(versions.map((v) => [v.id, v]));
+      const cur = state.current ? byId.get(state.current) : undefined;
+      if (state.current && !cur)
+        throw new CiError(
+          'version_mismatch',
+          `目标库历史里的当前版本 ${state.current} 不在平台库的版本链上`,
+          { reason: 'history_mismatch' },
+        );
       const store = await loadPolicies(db, p);
-      const cur = env.current_version_id ? byId.get(env.current_version_id) : undefined;
       const list = versions.map((v) => ({
         ...ref(v),
         state: (!cur || v.number > cur.number ? 'pending' : v.id === cur.id ? 'current' : 'applied') as
@@ -398,9 +402,87 @@ export const registerCi = (app: Hono<Env>, ctx: AppContext) => {
         verified: v.verifiedAt !== null && v.verifiedAt !== undefined,
       }));
       return c.json<CiEnvironmentStatus>({
-        ...(await envSummary(p, env, byId, store)),
+        ...envConfig(env, store),
+        currentVersion: cur ? ref(cur) : null,
+        unfinished: state.unfinished !== null,
         versions: list,
         pending: list.filter((v) => v.state === 'pending').map((v) => v.number),
+      });
+    }),
+  );
+
+  /** 实时漂移检测：连目标库读全库结构快照比对，顺带刷新平台侧漂移状态 */
+  app.post(
+    '/api/ci/projects/:owner/:project/environments/:env/drift',
+    wrap(async (c) => {
+      const p = await projectOf(c);
+      const env = await envOf(p, c.req.param('env')!);
+      requireConnectionQuota(c, '检查漂移');
+      const versions = await loadVersions(db, p.id);
+      const byId = new Map(versions.map((v) => [v.id, v]));
+      const refOf = (id: string | null | undefined) => {
+        const v = id ? byId.get(id) : undefined;
+        return v ? ref(v) : null;
+      };
+      const { result, currentVersionId, error } = await checkEnvDriftDetailed(ctx.exec, env);
+      ctx.requests.kick({ envIds: [env.id] });
+      if (error !== undefined) throw toCiError(error, refOf);
+      if (result.skipped === 'busy')
+        throw new CiError('lock_timeout', '这个环境正在执行另一个操作，暂时无法检查漂移');
+      if (result.skipped === 'unfinished')
+        throw new CiError('unfinished_run', '上一次执行停在中途，请先在界面上处理后再检查漂移');
+      if (result.skipped === 'no_versions')
+        return c.json<CiDriftResult>({
+          environment: env.name,
+          currentVersion: null,
+          status: 'unknown',
+          checkedAt: new Date().toISOString(),
+          summary: '项目还没有发布任何版本，无法检查漂移',
+          total: 0,
+          items: [],
+          unresolvable: [],
+          firstRun: false,
+          needsManual: null,
+        });
+      const currentVersion = refOf(currentVersionId);
+      const checkedAt = result.checkedAt ?? new Date().toISOString();
+      if (result.status === 'ok')
+        return c.json<CiDriftResult>({
+          environment: env.name,
+          currentVersion,
+          status: 'clean',
+          checkedAt,
+          summary: currentVersion
+            ? `目标库结构与当前版本 v${currentVersion.number} 一致`
+            : '目标库结构符合初始状态，无漂移',
+          total: 0,
+          items: [],
+          unresolvable: [],
+          firstRun: false,
+          needsManual: null,
+        });
+      const sum = result.summary;
+      const items = sum?.items ?? [];
+      const unresolvable = items.filter((i) => i.kind === 'unresolvable');
+      const total = sum?.total ?? items.length;
+      const needsManual = sum?.needsManual
+        ? {
+            direction: sum.needsManual.direction,
+            versionId: sum.needsManual.versionId,
+            versionNumber: sum.needsManual.versionNumber ?? null,
+          }
+        : null;
+      return c.json<CiDriftResult>({
+        environment: env.name,
+        currentVersion,
+        status: 'drifted',
+        checkedAt,
+        summary: sum?.message ?? `检测到 ${total} 处结构差异`,
+        total,
+        items,
+        unresolvable,
+        firstRun: sum?.firstRun === true,
+        needsManual,
       });
     }),
   );
@@ -411,11 +493,7 @@ export const registerCi = (app: Hono<Env>, ctx: AppContext) => {
     wrap(async (c) => {
       const p = await projectOf(c);
       const env = await envOf(p, c.req.param('env')!);
-      const limited = ctx.connectionLimiter.attempt(`token:${c.get('token').id}`);
-      if (!limited.allowed)
-        throw new CiError('rate_limited', `读取执行历史太频繁了，请 ${limited.retryAfterSeconds} 秒后再试`, {
-          reason: String(limited.retryAfterSeconds),
-        });
+      requireConnectionQuota(c, '读取执行历史');
       const state = await readTargetState(ctx.exec, env, true, { preserveHistoryError: true });
       ctx.requests.kick({ envIds: [env.id] });
       const byId = new Map((await loadVersions(db, p.id)).map((v) => [v.id, v]));
@@ -446,7 +524,7 @@ export const registerCi = (app: Hono<Env>, ctx: AppContext) => {
   );
 
   /**
-   * 执行（或预演）到指定版本。顺序：项目 / 环境 → 请求体 → 目标版本 → “允许令牌执行” → 前置环境 → 执行器（锁、完整性、认领、
+   * 执行（或预演）到指定版本。顺序：项目 / 环境 → 请求体 → 目标版本 → “允许令牌执行” → 执行器（锁、完整性、认领、
    * 漂移、已验证、实例级语句、超时）。不是预演时，从“允许令牌执行”这一步起，每次请求都写一条审计（成功、失败、被拒）。
    */
   app.post(
@@ -536,17 +614,6 @@ export const registerCi = (app: Hono<Env>, ctx: AppContext) => {
         throw err;
       }
 
-      // 前置环境（E6）：和界面、预演同一个 checkPrerequisite；不满足不连目标库
-      const pre = await prerequisiteOf(db, { pid: curProject.id, env: curEnv }, target.id, 'up');
-      if (pre && !pre.ok) {
-        const err = new CiError(pre.code ?? 'prerequisite_behind', pre.message ?? '前置环境检查没有通过', {
-          reason: pre.code ?? 'prerequisite_behind',
-          prerequisite: { name: pre.name, currentNumber: pre.currentNumber },
-        });
-        if (!b.dryRun) await writeAudit({ ok: false, code: err.code, error: err.message });
-        throw err;
-      }
-
       if (b.dryRun) {
         try {
           const r = await dryRunExecution(ctx.exec, {
@@ -626,7 +693,7 @@ export const registerCi = (app: Hono<Env>, ctx: AppContext) => {
             committed.push({ number: m.number, direction: m.direction === 'baseline' ? 'baseline' : 'up' });
             lastReachedId = m.toId;
           },
-          // 锁内重新检查：等锁期间令牌可能被吊销 / 过期，策略可能关闭了允许令牌执行，前置环境可能落后
+          // 锁内重新检查：等锁期间令牌可能被吊销 / 过期，策略可能关闭了允许令牌执行
           beforeConnect: async (freshEnv) => {
             curEnv = freshEnv;
             const st = await recheckToken(db, token.id);
@@ -655,21 +722,6 @@ export const registerCi = (app: Hono<Env>, ctx: AppContext) => {
               throw new CiError(
                 'token_execution_disabled',
                 `环境“${freshEnv.name}”的执行策略不允许令牌执行${freshEnv.production ? '（生产环境默认不允许）' : ''}`,
-              );
-            const freshPre = await prerequisiteOf(
-              db,
-              { pid: freshProject.id, env: freshEnv },
-              target.id,
-              'up',
-            );
-            if (freshPre && !freshPre.ok)
-              throw new CiError(
-                freshPre.code ?? 'prerequisite_behind',
-                freshPre.message ?? '前置环境检查没有通过',
-                {
-                  reason: freshPre.code ?? 'prerequisite_behind',
-                  prerequisite: { name: freshPre.name, currentNumber: freshPre.currentNumber },
-                },
               );
             return { timeouts: curTimeouts };
           },
@@ -731,7 +783,7 @@ export const registerCi = (app: Hono<Env>, ctx: AppContext) => {
         reached: err.reached?.id ?? null,
         ...(committed.length ? { ran: committed } : {}),
       });
-      // 锁内预检被拒（令牌失效、策略关闭、前置环境落后、资源不存在）且未动目标库时，与锁前拒绝保持一致，不发执行通知
+      // 锁内预检被拒（令牌失效、策略关闭、资源不存在）且未动目标库时，与锁前拒绝保持一致，不发执行通知
       const preCheckDenial =
         committed.length === 0 &&
         (
@@ -742,8 +794,6 @@ export const registerCi = (app: Hono<Env>, ctx: AppContext) => {
             'project_not_found',
             'environment_not_found',
             'token_execution_disabled',
-            'prerequisite_behind',
-            'prerequisite_missing',
           ] as CiErrorCode[]
         ).includes(err.code);
       if (!preCheckDenial)

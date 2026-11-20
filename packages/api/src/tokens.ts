@@ -184,10 +184,6 @@ export const CI_ERROR_STATUS = {
   unfinished_run: 409,
   /** 目标库里的这个项目由别的 Dowel 实例认领 */
   foreign_instance: 409,
-  /** 前置环境还没执行到目标版本 */
-  prerequisite_behind: 409,
-  /** 设置的前置环境不存在 */
-  prerequisite_missing: 409,
   /** 其他执行前检查没通过（实例级语句等），details.reason 是执行器的原因代码 */
   rejected: 409,
   /** 等执行锁超时（另一个执行正在进行） */
@@ -202,11 +198,12 @@ export const CI_ERROR_STATUS = {
 export type CiErrorCode = keyof typeof CI_ERROR_STATUS;
 export const CI_ERROR_CODES = Object.keys(CI_ERROR_STATUS) as CiErrorCode[];
 
-export interface CiVersionRef {
-  id: string;
-  number: number;
-  name: string;
-}
+export const ciVersionRefSchema = z.object({
+  id: z.string(),
+  number: z.number().int(),
+  name: z.string(),
+});
+export type CiVersionRef = z.infer<typeof ciVersionRefSchema>;
 
 export interface CiErrorBody {
   ok: false;
@@ -214,7 +211,7 @@ export interface CiErrorBody {
   /** 给人看的说明（已脱敏） */
   error: string;
   details?: {
-    /** 执行器 / 前置环境给出的原始原因代码 */
+    /** 执行器给出的原始原因代码 */
     reason?: string;
     /** 漂移 / 读回不一致的差异（最多 100 项）和总数 */
     diff?: { kind: string; target: string; sql: string }[];
@@ -226,7 +223,6 @@ export interface CiErrorBody {
     /** 失败时目标库已被部分改动（含非事务步骤的迁移停在中途） */
     partial?: boolean;
     timeout?: { kind: 'lock' | 'statement'; ms: number };
-    prerequisite?: { name: string; currentNumber: number | null };
     /** 回滚被拒绝时：环境的当前版本 */
     current?: CiVersionRef | null;
     problems?: string[];
@@ -292,24 +288,23 @@ export interface CiTokenSelf {
   createdBy: string | null;
 }
 
-export interface CiEnvironment {
-  name: string;
-  production: boolean;
-  currentVersion: CiVersionRef | null;
+export const ciEnvironmentSchema = z.object({
+  name: z.string(),
+  production: z.boolean(),
   /** 环境生效的执行策略是否允许令牌执行 */
-  tokenExecution: boolean;
-  drift: { status: 'unknown' | 'ok' | 'drifted' | 'error'; checkedAt: string | null };
-  prerequisite: { name: string; currentNumber: number | null } | null;
-}
+  tokenExecution: z.boolean(),
+});
+export type CiEnvironment = z.infer<typeof ciEnvironmentSchema>;
 
-export interface CiProject {
-  id: string;
-  name: string;
-  slug: string;
-  owner: string;
-  latest: CiVersionRef | null;
-  environments: CiEnvironment[];
-}
+export const ciProjectSchema = z.object({
+  id: z.string(),
+  name: z.string(),
+  slug: z.string(),
+  owner: z.string(),
+  latest: ciVersionRefSchema.nullable(),
+  environments: z.array(ciEnvironmentSchema),
+});
+export type CiProject = z.infer<typeof ciProjectSchema>;
 
 export interface CiVersion extends CiVersionRef {
   publishedAt: string;
@@ -317,11 +312,64 @@ export interface CiVersion extends CiVersionRef {
   checksum: string;
 }
 
-export interface CiEnvironmentStatus extends CiEnvironment {
+export const ciEnvironmentVersionSchema = ciVersionRefSchema.extend({
+  state: z.enum(['applied', 'current', 'pending']),
+  verified: z.boolean(),
+});
+export type CiEnvironmentVersion = z.infer<typeof ciEnvironmentVersionSchema>;
+
+export const ciEnvironmentStatusSchema = ciEnvironmentSchema.extend({
+  /** 实时读取的目标库当前版本；目标库尚无历史时为 null */
+  currentVersion: ciVersionRefSchema.nullable(),
+  /** 上一次执行是否停在中途（含非事务步骤的迁移） */
+  unfinished: z.boolean(),
   /** 链上每个版本相对当前版本的状态 */
-  versions: (CiVersionRef & { state: 'applied' | 'current' | 'pending'; verified: boolean })[];
-  pending: number[];
-}
+  versions: z.array(ciEnvironmentVersionSchema),
+  /** 待执行的版本号列表（升序） */
+  pending: z.array(z.number().int()),
+});
+export type CiEnvironmentStatus = z.infer<typeof ciEnvironmentStatusSchema>;
+
+export const ciDriftStatusSchema = z.enum(['clean', 'drifted', 'unknown']);
+export type CiDriftStatus = z.infer<typeof ciDriftStatusSchema>;
+
+export const ciDriftItemSchema = z.object({
+  kind: z.string(),
+  target: z.string(),
+  sql: z.string(),
+});
+export type CiDriftItem = z.infer<typeof ciDriftItemSchema>;
+
+export const ciDriftNeedsManualSchema = z.object({
+  direction: z.enum(['up', 'down', 'baseline']),
+  versionId: z.string().nullable(),
+  versionNumber: z.number().int().nullable(),
+});
+export type CiDriftNeedsManual = z.infer<typeof ciDriftNeedsManualSchema>;
+
+export const ciDriftResultSchema = z.object({
+  /** 环境名 */
+  environment: z.string(),
+  /** 实时读取的目标库当前版本；目标库尚无历史或项目尚无版本时为 null */
+  currentVersion: ciVersionRefSchema.nullable(),
+  /** 漂移检测结果：clean 无漂移；drifted 存在漂移；unknown 项目尚未发布任何版本、无法比对 */
+  status: ciDriftStatusSchema,
+  /** 本次检测完成时间（ISO 8601） */
+  checkedAt: z.string(),
+  /** 简明摘要说明 */
+  summary: z.string(),
+  /** 差异总数（可能大于 items 返回上限 100） */
+  total: z.number().int().nonnegative(),
+  /** 差异项列表（最多 100 项） */
+  items: z.array(ciDriftItemSchema),
+  /** 模型无法表达、需要人工核对的差异项（kind = unresolvable） */
+  unresolvable: z.array(ciDriftItemSchema),
+  /** 首次执行前目标库既非基线也非空库 */
+  firstRun: z.boolean(),
+  /** 差异是否来自上一次读回校验失败（需要手工修正）；否则为 null */
+  needsManual: ciDriftNeedsManualSchema.nullable(),
+});
+export type CiDriftResult = z.infer<typeof ciDriftResultSchema>;
 
 export interface CiHistoryRun {
   from: CiVersionRef | null;

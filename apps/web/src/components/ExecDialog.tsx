@@ -1,17 +1,15 @@
 // 执行确认对话框：列出将要执行 / 回滚的迁移和风险摘要，生产环境必须输入环境名才能确认；
 // 确认后用 SSE 读进度，出错时显示原因（漂移时列出差异）。关闭时刷新环境的状态、历史和列表。
-// P5a：显示生效的执行策略摘要和前置环境检查（本地用 checkPrerequisite 先算，预演回来后以服务端为准；没通过时不能确认）。
+// P5a：显示生效的执行策略摘要。
 // P5b：mode = request 时（无权直接执行，或环境要求审批）变成“提交执行申请”：预演不通过不能提交，可以写申请说明；
 // mode = emergency 是实例管理员的紧急执行：绕过审批，必填原因并二次确认（勾选确认 + 生产环境输入环境名）。
-import {
-  checkPrerequisite,
-  type DriftItem,
-  type DryRunResponse,
-  type EnvStatus,
-  type EnvVersion,
-  type ExecEvent,
-  type ExecRequestDetail,
-  type PrerequisiteResult,
+import type {
+  DriftItem,
+  DryRunResponse,
+  EnvStatus,
+  EnvVersion,
+  ExecEvent,
+  ExecRequestDetail,
 } from '@dowel/api';
 import { useQueryClient } from '@tanstack/react-query';
 import { CircleCheck, CircleDashed, LoaderCircle } from 'lucide-react';
@@ -247,36 +245,9 @@ export const ExecDialog = ({
   const isEmergency = mode === 'emergency';
   // 申请不执行任何东西，不用输入环境名（执行时再输入）；直接执行和紧急执行在生产环境要输入
   const mustType = production && !isRequest;
-  // 前置环境：先用缓存的状态在本地算（同一个函数），预演回来后用服务端的结果
-  const local = (() => {
-    const p = status.prerequisite;
-    if (!p) return null;
-    const r = checkPrerequisite({
-      direction: kind === 'execute' ? 'up' : kind === 'rollback' ? 'down' : 'baseline',
-      targetNumber: to?.number ?? 0,
-      prerequisite: {
-        id: p.id,
-        name: p.name,
-        currentNumber: p.currentVersion?.number ?? null,
-        missing: p.missing === true,
-      },
-    });
-    return {
-      ok: r.ok,
-      exempt: r.ok && r.exempt,
-      id: p.id,
-      name: p.name,
-      currentNumber: p.currentVersion?.number ?? null,
-      code: r.ok ? null : r.code,
-      message: r.ok ? null : r.message,
-    } satisfies PrerequisiteResult;
-  })();
-  const prerequisite = (dry.state === 'done' ? dry.res.prerequisite : undefined) ?? local;
-  const prerequisiteOk = !prerequisite || prerequisite.ok;
   const dryOk = dry.state === 'done' && dry.res.ok;
   const canConfirm =
     (!mustType || typed.trim() === envName) &&
-    prerequisiteOk &&
     // 申请：预演不通过不能提交（服务端同样会拒绝）
     (!isRequest || dryOk) &&
     // 紧急执行：必填原因 + 勾选确认（二次确认）
@@ -428,22 +399,6 @@ export const ExecDialog = ({
         {phase === 'confirm' && (
           <div className="space-y-1.5 rounded-md border border-border px-3 py-2">
             <PolicySummary policy={status.policy} />
-            {prerequisite &&
-              (prerequisite.ok ? (
-                <p className="text-sm text-text-2" data-testid="prerequisite-check">
-                  {prerequisite.exempt
-                    ? t('pol.prerequisite.exempt', { name: prerequisite.name })
-                    : t('pol.prerequisite.ok', { name: prerequisite.name, n: prerequisite.currentNumber })}
-                </p>
-              ) : (
-                <Banner
-                  kind="danger"
-                  role="alert"
-                  title={t('pol.prerequisite.check', { name: prerequisite.name })}
-                >
-                  <span data-testid="prerequisite-check">{prerequisite.message}</span>
-                </Banner>
-              ))}
           </div>
         )}
 

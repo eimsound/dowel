@@ -1000,6 +1000,24 @@ export const MIGRATIONS: MigrationStep[] = [
      primary key (scope_kind, scope_id)
    );`;
   },
+  // P6.5：移除「前置环境」功能（2026-11-21 修订，ADR 0005）：删除 environments.prerequisite_id 列及对应约束 / 触发器。
+  {
+    run: async (tx, d) => {
+      if (d === 'pg') {
+        await tx.exec(
+          `alter table environments drop constraint if exists environments_prerequisite_fk;
+           alter table environments drop column if exists prerequisite_id;`,
+        );
+        return;
+      }
+      await tx.exec(
+        `drop trigger if exists environments_prerequisite_delete;
+         drop trigger if exists environments_prerequisite_insert;
+         drop trigger if exists environments_prerequisite_update;
+         alter table environments drop column prerequisite_id;`,
+      );
+    },
+  },
 ];
 
 const migrate = async (db: PlatformDb) => {

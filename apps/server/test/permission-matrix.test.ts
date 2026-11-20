@@ -790,8 +790,17 @@ const matrix: Record<string, Spec> = {
     path: (ctx) => `/api/ci/projects/${ctx.groupSlug}/${ctx.projectSlug}/versions`,
   },
   'GET /api/ci/projects/:owner/:project/environments/:env': {
-    access: { kind: 'ci', tokenStatuses: [200] },
+    access: { kind: 'ci', tokenStatuses: [502] },
     path: (ctx) => `/api/ci/projects/${ctx.groupSlug}/${ctx.projectSlug}/environments/${ctx.envName}`,
+    prepare: async (ctx) => {
+      const e = await freshEnv(ctx.pid, ++unique);
+      ctx.envId = e.id;
+      ctx.envName = e.name;
+    },
+  },
+  'POST /api/ci/projects/:owner/:project/environments/:env/drift': {
+    access: { kind: 'ci', tokenStatuses: [502] },
+    path: (ctx) => `/api/ci/projects/${ctx.groupSlug}/${ctx.projectSlug}/environments/${ctx.envName}/drift`,
     prepare: async (ctx) => {
       const e = await freshEnv(ctx.pid, ++unique);
       ctx.envId = e.id;
