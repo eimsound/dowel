@@ -68,8 +68,8 @@ export const createApp = (db: PlatformDb, options: AppOptions = {}) => {
   const app = new Hono<Env>();
   const bus = new EventBus(db, options.bus);
   const ha = new HaCoordinator(db, { replicaId: bus.replicaId, ...options.ha });
-  // 房间和 HTTP 用同一套生效角色规则；join 复查时也要能算
-  const rooms = new Rooms(db, (user, pid, lookup) => effectiveProjectRole(db, user, pid, lookup));
+  // 房间和 HTTP 用同一套生效角色规则；join 复查时也要能算；多副本下经 EventBus 同步房间事件
+  const rooms = new Rooms(db, (user, pid, lookup) => effectiveProjectRole(db, user, pid, lookup), bus);
   // 所有目标库 / 影子库连接都要过的检查：实例的白名单（服务端替用户连地址 = SSRF 面）
   const guard: ConnectionGuard = async (url) => {
     const { connectionAllowlist } = await readSettings(db);

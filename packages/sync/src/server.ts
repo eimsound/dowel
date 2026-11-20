@@ -67,14 +67,20 @@ export class Room {
   }
 
   /** 处理一条消息；按到达顺序串行执行。返回要发出的消息。readOnly：只读成员，修改一律拒绝 */
-  handle(client: string, user: string, msg: ToServer, opts: { readOnly?: boolean } = {}): Promise<Out[]> {
-    return this.enqueue(() => this.process(client, user, msg, !!opts.readOnly));
+  handle(
+    client: string,
+    user: string,
+    msg: ToServer,
+    opts: { readOnly?: boolean; store?: RoomStore } = {},
+  ): Promise<Out[]> {
+    return this.enqueue(() => this.process(client, user, msg, !!opts.readOnly, opts.store ?? this.store));
   }
 
   /** 服务器以系统身份把模型整体替换成 next（如导入 DDL），作为一个普通提交广播 */
-  replace(user: string, next: Model, opName = 'replaceModel'): Promise<Out[]> {
+  replace(user: string, next: Model, opName = 'replaceModel', store?: RoomStore): Promise<Out[]> {
     return this.enqueue(async () => {
       const s = this.s;
+      const targetStore = store ?? this.store;
       const changes = [];
       for (const [id, o] of Object.entries(next.objects))
         if (!deepEqual(s.model.objects[id], o)) changes.push({ id, obj: structuredClone(o) });
@@ -82,7 +88,7 @@ export class Room {
         if (!(id in next.objects)) changes.push({ id, obj: null });
       const n = (s.processed.system ?? 0) + 1;
       const commit: Commit = { t: 'commit', seq: s.seq + 1, client: 'system', n, user, changes };
-      await this.store.append(commit, { client: 'system', n, name: opName, args: null, reads: [] });
+      await targetStore.append(commit, { client: 'system', n, name: opName, args: null, reads: [] });
       s.processed.system = n;
       this.commit(commit, structuredClone(next), user);
       return [{ to: '*', msg: commit }];
@@ -93,9 +99,16 @@ export class Room {
    * 服务器以系统身份更新一些对象（派生数据，如不透明对象的规范 DDL）。
    * expect：这些对象在派生计算开始时的版本；期间被别人改过的对象不写（避免用过期结果覆盖用户的修改）。
    */
-  patch(user: string, objects: Obj[], expect: Versions, opName = 'derive'): Promise<Out[]> {
+  patch(
+    user: string,
+    objects: Obj[],
+    expect: Versions,
+    opName = 'derive',
+    store?: RoomStore,
+  ): Promise<Out[]> {
     return this.enqueue(async () => {
       const s = this.s;
+      const targetStore = store ?? this.store;
       const changes = objects
         .filter((o) => o.id in s.model.objects && (s.versions[o.id] ?? 0) === (expect[o.id] ?? 0))
         .filter((o) => !deepEqual(s.model.objects[o.id], o))
@@ -105,11 +118,49 @@ export class Room {
       for (const c of changes) next.objects[c.id] = c.obj;
       const n = (s.processed.system ?? 0) + 1;
       const commit: Commit = { t: 'commit', seq: s.seq + 1, client: 'system', n, user, changes };
-      await this.store.append(commit, { client: 'system', n, name: opName, args: null, reads: [] });
+      await targetStore.append(commit, { client: 'system', n, name: opName, args: null, reads: [] });
       s.processed.system = n;
       this.commit(commit, next, user);
       return [{ to: '*', msg: commit }];
     });
+  }
+
+  /**
+   * 合并外部副本已持久化的提交到当前内存态（幂等：已应用过的 seq 直接忽略）。
+   * 调用方需保证与 handle/replace/patch 互斥并按 seq 严格递增传入。
+   */
+  applyExternalCommit(commit: Commit): boolean {
+    const s = this.s;
+    if (commit.seq <= s.seq) return false;
+    if (commit.seq !== s.seq + 1) {
+      throw new Error(`外部提交序号不连续：期望 ${s.seq + 1}，收到 ${commit.seq}`);
+    }
+    const next: Model = { ...s.model, objects: { ...s.model.objects } };
+    for (const c of commit.changes) {
+      if (c.obj) next.objects[c.id] = structuredClone(c.obj);
+      else delete next.objects[c.id];
+    }
+    if ((s.processed[commit.client] ?? 0) < commit.n) {
+      s.processed[commit.client] = commit.n;
+    }
+    this.commit(commit, next, commit.user);
+    return true;
+  }
+
+  /** 合并外部副本已持久化的拒绝记录到当前内存态（幂等：已存在的拒绝记录直接忽略） */
+  applyExternalRejection(client: string, r: Rejection): boolean {
+    const s = this.s;
+    const key = `${client}:${r.n}`;
+    if (this.outcome.get(key) === 'rejected') return false;
+    if ((s.processed[client] ?? 0) < r.n) {
+      s.processed[client] = r.n;
+    }
+    this.outcome.set(key, 'rejected');
+    const existing = s.rejections[client] ?? [];
+    if (!existing.some((x) => x.n === r.n)) {
+      s.rejections[client] = [...existing, { ...r }].sort((a, b) => a.n - b.n);
+    }
+    return true;
   }
 
   private enqueue<T>(fn: () => Promise<T>): Promise<T> {
@@ -132,7 +183,13 @@ export class Room {
     this.outcome.set(`${commit.client}:${commit.n}`, commit.seq);
   }
 
-  private async process(client: string, user: string, msg: ToServer, readOnly: boolean): Promise<Out[]> {
+  private async process(
+    client: string,
+    user: string,
+    msg: ToServer,
+    readOnly: boolean,
+    store: RoomStore,
+  ): Promise<Out[]> {
     const s = this.s;
     if (msg.t === 'hello') {
       const out: Out[] = [
@@ -165,7 +222,6 @@ export class Room {
     const done = s.processed[client] ?? 0;
     if (op.n <= done) return []; // 重复发送
     if (op.n !== done + 1) throw new Error(`修改乱序：期望 ${done + 1}，收到 ${op.n}`);
-    s.processed[client] = op.n;
     try {
       if (readOnly) throw new Reject('invalid', '你在这个项目里是查看者，不能修改');
       this.checkReads(op);
@@ -177,15 +233,17 @@ export class Room {
         throw e;
       }
       const commit: Commit = { t: 'commit', seq: s.seq + 1, client, n: op.n, user, changes: result.changes };
-      await this.store.append(commit, op);
+      await store.append(commit, op);
+      s.processed[client] = op.n;
       this.commit(commit, result.next, user);
       return [{ to: '*', msg: commit }];
     } catch (e) {
       if (!(e instanceof Reject)) throw e;
       const r: Rejection = { n: op.n, code: e.code, message: e.message };
+      await store.reject(client, r);
+      s.processed[client] = op.n;
       this.outcome.set(`${client}:${op.n}`, 'rejected');
       s.rejections[client] = [...(s.rejections[client] ?? []), r];
-      await this.store.reject(client, r);
       return [{ to: client, msg: { t: 'reject', ...r } }];
     }
   }
