@@ -116,6 +116,18 @@ interface Loaded {
   layoutTimer?: ReturnType<typeof setTimeout>;
 }
 
+/** 乐观并发冲突：replace 时工作副本的当前 seq 已不等于调用方期望的 seq */
+export class WorkingChangedError extends Error {
+  readonly currentSeq: number;
+  readonly currentModel: Model;
+  constructor(currentSeq: number, currentModel: Model) {
+    super('工作副本在操作期间已被修改');
+    this.name = 'WorkingChangedError';
+    this.currentSeq = currentSeq;
+    this.currentModel = currentModel;
+  }
+}
+
 export class Rooms {
   private rooms = new Map<string, Promise<Loaded>>();
   /** 有新的修改提交之后调用（用于安排派生数据的刷新） */
@@ -362,9 +374,11 @@ export class Rooms {
     }
   }
 
-  /** 服务器以系统身份替换整个模型（导入 DDL 等） */
-  async replace(branchId: string, user: string, next: Model, opName?: string) {
+  /** 服务器以系统身份替换整个模型（导入 DDL、恢复历史、接入领先环境等）；传入 expectedSeq 时原子校验当前 seq */
+  async replace(branchId: string, user: string, next: Model, opName?: string, expectedSeq?: number) {
     const r = await this.get(branchId);
+    if (expectedSeq !== undefined && r.room.seq !== expectedSeq)
+      throw new WorkingChangedError(r.room.seq, structuredClone(r.room.model));
     const outs = await r.room.replace(user, next, opName);
     for (const o of outs) for (const p of r.peers) p.send(o.msg);
     await this.maybeSnapshot(branchId, r.room);

@@ -12,6 +12,7 @@ import { planDiff } from '@dowel/executor';
 import type { Hono } from 'hono';
 import { HTTPException } from 'hono/http-exception';
 import { audit } from '../audit.ts';
+import { WorkingChangedError } from '../rooms.ts';
 import { type AppContext, access, body, type Env } from './context.ts';
 
 const DEFAULT_LIMIT = 30;
@@ -70,18 +71,18 @@ export const registerCanvasHistory = (app: Hono<Env>, ctx: AppContext) => {
     await refresher.flush(a.branch);
     const { model: currentModel, seq: currentSeq } = await rooms.model(a.branch);
     const targetModel = await rooms.modelAt(a.branch, seq);
-    const diffToCurrent = planDiff(currentModel, targetModel);
-    if (b.workingSeq !== undefined && b.workingSeq !== currentSeq) {
-      return c.json<CanvasHistoryConflict>(
+    const conflictOf = (curSeq: number, curModel: Model) =>
+      c.json<CanvasHistoryConflict>(
         {
           error: '工作副本在你查看期间已被修改，请确认最新差异后再恢复',
           code: 'working_changed',
-          currentSeq,
-          diffToCurrent,
+          currentSeq: curSeq,
+          diffToCurrent: planDiff(curModel, targetModel),
         },
         409,
       );
-    }
+    if (b.workingSeq !== currentSeq) return conflictOf(currentSeq, currentModel);
+    const diffToCurrent = planDiff(currentModel, targetModel);
     if (diffToCurrent.total === 0 && deepEqual(currentModel, targetModel)) {
       return c.json<ModelUpdate>({
         seq: currentSeq,
@@ -89,7 +90,12 @@ export const registerCanvasHistory = (app: Hono<Env>, ctx: AppContext) => {
       });
     }
     const fromSeq = currentSeq;
-    await ctx.replace(a.branch, c.get('user').name, targetModel, 'restoreHistory');
+    try {
+      await ctx.replace(a.branch, c.get('user').name, targetModel, 'restoreHistory', b.workingSeq);
+    } catch (e) {
+      if (e instanceof WorkingChangedError) return conflictOf(e.currentSeq, e.currentModel);
+      throw e;
+    }
     const next = await rooms.model(a.branch);
     await audit(
       db,

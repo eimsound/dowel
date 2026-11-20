@@ -37,7 +37,14 @@ import { encrypt, SecretError, scrubSecrets } from '../secrets.ts';
 import { readSettings } from '../settings.ts';
 import { type Shadow, ShadowError } from '../shadow.ts';
 import { sseSender } from '../sse.ts';
-import { pickShadow, readSource, restoreChain, TakeoverRejected, verifyVersionChain } from '../takeover.ts';
+import {
+  pickShadow,
+  readSource,
+  restoreChain,
+  TakeoverRejected,
+  unionScopes,
+  verifyVersionChain,
+} from '../takeover.ts';
 import {
   CHECK_CONNECT_TIMEOUT,
   claimShadow,
@@ -206,7 +213,7 @@ export const runTakeover = (c: Context<Env>, ctx: AppContext, b: ProjectWizard, 
       const head = merged.versions.at(-1)!;
       stage = 'verify';
       await send({ stage });
-      const prepared = await pickShadow(environments, head.scope?.length ? head.scope : null, ctx.guard);
+      const prepared = await pickShadow(environments, unionScopes(merged.versions), ctx.guard);
       shadow = prepared.shadow;
       createdShadow = prepared.created;
       const verifiedReports = await verifyVersionChain({

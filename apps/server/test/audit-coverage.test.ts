@@ -533,9 +533,18 @@ test('每个应审计的动作都能在 audit_events 里找到', async () => {
         const p = (await call('GET', '/api/projects', undefined, adminCookie)).data as unknown as {
           id: string;
         }[];
-        // 前面 version.publish 已经向工作副本加了 orders 表（seq >= 1），恢复到初始状态 seq = 0
+        // 前面 version.publish 已经向工作副本加了 orders 表（seq >= 1），取当前 workingSeq 后恢复到初始状态 seq = 0
+        const hist = (await call('GET', `/api/projects/${p[0]!.id}/history`, undefined, adminCookie))
+          .data as unknown as { currentSeq: number };
         expect(
-          (await call('POST', `/api/projects/${p[0]!.id}/history/0/restore`, {}, adminCookie)).status,
+          (
+            await call(
+              'POST',
+              `/api/projects/${p[0]!.id}/history/0/restore`,
+              { workingSeq: hist.currentSeq },
+              adminCookie,
+            )
+          ).status,
         ).toBe(200);
       },
     },

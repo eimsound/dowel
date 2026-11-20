@@ -58,6 +58,23 @@ export interface PreparedShadow {
 }
 
 /**
+ * 计算整条待验证版本链上全部版本 scope 的并集：任一版本为全量（null / 空）则返回 null（全部 schema），
+ * 否则返回去重后的 schema 列表（避免链头 scope 窄于早期版本导致影子库未覆盖早期 schema）。
+ */
+export const unionScopes = (
+  versions: { scope?: string[] | null }[],
+  fallback: string[] | null = null,
+): string[] | null => {
+  if (!versions.length) return fallback?.length ? [...fallback] : null;
+  const set = new Set<string>();
+  for (const v of versions) {
+    if (!v.scope?.length) return null;
+    for (const s of v.scope) set.add(s);
+  }
+  return set.size ? [...set] : fallback?.length ? [...fallback] : null;
+};
+
+/**
  * 从候选环境中挑选第一个可用的影子库：优先使用配置了独立 shadowUrl 的环境，其余按原顺序尝试。
  * 找不到可用影子库时抛 TakeoverRejected('shadow_unavailable', …)；白名单拒绝 / 密钥错误等非 ShadowError 原样抛出。
  */

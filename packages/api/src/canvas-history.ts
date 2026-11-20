@@ -63,10 +63,10 @@ export interface CanvasHistoryDetail<TModel = unknown> {
   currentSeq: number;
 }
 
-/** 恢复到此状态的请求体；传入 workingSeq 时服务端做乐观并发校验 */
+/** 恢复到此状态的请求体；必须传入查看时的 workingSeq 做乐观并发校验 */
 export const canvasHistoryRestoreSchema = z
   .object({
-    workingSeq: z.number().int().min(0).optional(),
+    workingSeq: z.number().int().min(0),
   })
   .strict();
 export type CanvasHistoryRestore = z.infer<typeof canvasHistoryRestoreSchema>;

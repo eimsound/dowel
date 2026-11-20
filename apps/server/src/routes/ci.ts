@@ -425,6 +425,7 @@ export const registerCi = (app: Hono<Env>, ctx: AppContext) => {
         return v ? ref(v) : null;
       };
       const { result, currentVersionId, error } = await checkEnvDriftDetailed(ctx.exec, env);
+      // 即使漂移检查报错，checkEnvDriftDetailed 也可能已更新平台侧漂移状态或缓存，因此统一触发待批申请重检
       ctx.requests.kick({ envIds: [env.id] });
       if (error !== undefined) throw toCiError(error, refOf);
       if (result.skipped === 'busy')

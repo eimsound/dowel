@@ -336,6 +336,9 @@ test('权限控制、workingSeq 并发冲突 409 与 replace 覆盖后找回草�
     true,
   );
 
+  // 缺少 workingSeq 被 400 拒绝（必须携带乐观并发校验序号）
+  expect((await call('POST', `/api/projects/${pid}/history/1/restore`, {}, editorCookie)).status).toBe(400);
+
   // 并发冲突：传入过期的 workingSeq = 1（当前已是 2），返回 409 working_changed + 最新 currentSeq + diffToCurrent
   const conflictRes = await call(
     'POST',

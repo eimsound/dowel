@@ -191,10 +191,13 @@ export class LoginLimiter {
   }
 }
 
-/** 环境变量里的正整数；没设置或不是正整数时返回 undefined（交给默认值） */
+/** 32 位有符号整数上限（Node 定时器与滑动窗口安全上界，约 24.8 天） */
+const MAX_LIMIT_INT = 2_147_483_647;
+
+/** 环境变量里的正整数（不超过 2^31 - 1）；没设置、非正整数或超上限时返回 undefined（交给默认值） */
 const envPositiveInt = (value: string | undefined) => {
   const n = Number(value);
-  return Number.isInteger(n) && n > 0 ? n : undefined;
+  return Number.isInteger(n) && n > 0 && n <= MAX_LIMIT_INT ? n : undefined;
 };
 
 /**

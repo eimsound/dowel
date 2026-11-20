@@ -26,11 +26,18 @@ import { inList, isUniqueViolation } from '../db.ts';
 import { type EnvRow, loadChain, loadEnv, versionRef } from '../envs.ts';
 import { claimFailure, lockEnvIdle, readTargetState, toTargetError } from '../executions.ts';
 import { isExecutor, loadPolicies, upperInput } from '../policy.ts';
+import { WorkingChangedError } from '../rooms.ts';
 import { decrypt, encrypt, scrubSecrets } from '../secrets.ts';
 import { readSettings } from '../settings.ts';
 import type { Shadow } from '../shadow.ts';
 import type { ShadowSource } from '../shadows.ts';
-import { insertRestoredVersions, pickShadow, TakeoverRejected, verifyVersionChain } from '../takeover.ts';
+import {
+  insertRestoredVersions,
+  pickShadow,
+  TakeoverRejected,
+  unionScopes,
+  verifyVersionChain,
+} from '../takeover.ts';
 import {
   CHECK_CONNECT_TIMEOUT,
   claimShadow,
@@ -70,6 +77,9 @@ export const registerClaims = (app: Hono<Env>, ctx: AppContext) => {
         message: '接入已有历史需要项目管理员，并且要满足这个环境的执行策略',
       });
     connectionLimit(c, ctx);
+
+    if (b.confirmOverwrite && b.workingSeq === undefined)
+      throw new HTTPException(400, { message: '确认覆盖工作副本时必须提供预览时的 workingSeq' });
 
     // 和添加环境同样的检查：连得上（白名单在连接层检查）、影子库能认领
     const info = await inspectTarget(b.url, CHECK_CONNECT_TIMEOUT, ctx.guard);
@@ -113,6 +123,7 @@ export const registerClaims = (app: Hono<Env>, ctx: AppContext) => {
     let verifiedReports = new Map<string, StoredVerifyReport>();
     let createdShadow: { targetUrl: string; name: string } | null = null;
     let committed = false;
+    let expectedWorkingSeq: number | undefined;
     const newHead = aheadVersions.at(-1) ?? null;
 
     const cleanupShadow = async () => {
@@ -149,7 +160,7 @@ export const registerClaims = (app: Hono<Env>, ctx: AppContext) => {
         ];
         let shadow: Shadow | null = null;
         try {
-          const scope = newHead.scope?.length ? newHead.scope : a.schemas;
+          const scope = unionScopes(aheadVersions, a.schemas);
           const prepared = await pickShadow(candidates, scope, ctx.guard);
           shadow = prepared.shadow;
           createdShadow = prepared.created;
@@ -217,6 +228,7 @@ export const registerClaims = (app: Hono<Env>, ctx: AppContext) => {
             409,
           );
         }
+        expectedWorkingSeq = b.confirmOverwrite ? b.workingSeq : workingSeq;
       }
 
       // ③ 平台事务：领先版本（若有）+ 环境行 + 审计（重名与链头并发在事务里检查）。提交之前目标库一概不动
@@ -292,17 +304,38 @@ export const registerClaims = (app: Hono<Env>, ctx: AppContext) => {
       }
       committed = true;
 
-      // 提交之后：若有领先版本，覆盖工作副本到新链头（记入 room_commits 操作历史）并重新加载合并后的完整链
+      // 提交之后：若有领先版本，尝试按期望 seq 覆盖工作副本到新链头（记入 room_commits 操作历史）并重新加载合并后的完整链。
+      // 事务已提交，此处若发生并发编辑冲突或异常不能返回 500（否则环境与版本已入库且跳过认领），记作 warning 提示用户在模型页处理。
+      const warnings: string[] = [];
       let mergedChain = chain;
       if (aheadVersions.length && newHead) {
-        await ctx.replace(a.branch, user.name, newHead.model, 'attachAhead');
-        mergedChain = await loadChain(db, a.pid);
+        try {
+          await ctx.replace(a.branch, user.name, newHead.model, 'attachAhead', expectedWorkingSeq);
+        } catch (e) {
+          if (e instanceof WorkingChangedError) {
+            warnings.push(
+              `环境“${b.name}”与领先版本已接入，但接入期间工作副本被他人修改，未自动覆盖工作副本；请在模型页核对并在需要时通过修改历史或从环境导入同步`,
+            );
+          } else {
+            console.error(
+              '接入：同步工作副本失败（环境与领先版本已入库）',
+              e instanceof Error ? scrubSecrets(e.message) : e,
+            );
+            warnings.push(
+              `环境“${b.name}”与领先版本已接入，但自动同步工作副本失败；请在模型页手动核对或从环境导入`,
+            );
+          }
+        }
+        try {
+          mergedChain = await loadChain(db, a.pid);
+        } catch (e) {
+          console.error('接入：重新加载版本链失败', e instanceof Error ? scrubSecrets(e.message) : e);
+        }
       } else {
         refresher.schedule(a.branch);
       }
 
       // ④ 提交之后：认领（锁内拿最新合并后的链比对）。失败环境照样保留，作为 warning，可以在环境页重试
-      const warnings: string[] = [];
       let claimed = false;
       if (needClaim) {
         const conn = connectPg(b.url, CHECK_CONNECT_TIMEOUT, ctx.guard);

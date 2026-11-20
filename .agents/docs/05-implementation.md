@@ -576,6 +576,7 @@ P3 审查后的修正（2026-11-19）：
   - 全部 4 个限流器 / 9 个维度开放环境变量配置（补齐 `DOWEL_CONNECTION_LIMIT`、`DOWEL_CONNECTION_WINDOW_MS`、`DOWEL_TOKEN_FAIL_WINDOW_MS`、`DOWEL_TOKEN_RATE_WINDOW_MS`），在 `docker-compose.yml` 与 `docs/getting-started.md` / `docs/api.md` 注明 HA 多副本下总配额约为设定值 × 副本数；
   - 通用化界面 CI 占位文案与 `docs/api.md` 示例、`actions/execute/README.md` 注明支持内网自建 Actions / 通用 shell 调用、`docs/execution.md` 补充不做单方面撤销认领与强制验证规则；补齐读回失败提示分流 E2E；
   - Docker 容器端到端冒烟验证通过：`Dockerfile` 多阶段构建、`docker compose config`、SQLite 模式（无人值守初始化 + 全量限流环境变量 + SPA/静态资源 + 登录建组建项目）与外部 PG 模式（全部 22 条迁移 + 交互式 `setupToken` 初始化）。
+- **独立审查与修复**：Sonnet 5.5 审查未发现 Must-Fix，提出 5 项建议全部落实——`canvasHistoryRestoreSchema.workingSeq` 改为必填并在 `Rooms.replace` 中原子校验 `expectedSeq`（`WorkingChangedError`）、`attach` 确认覆盖强制携带 `workingSeq` 并将提交后同步工作副本包裹为 `warnings` 避免误报 500、`pickShadow` 取整条待验证版本链的 `unionScopes`、`envPositiveInt` 增加 `<= 2^31 - 1` 上限防定时器溢出。
 - **收尾结果**（2026-11-21）：`pnpm lint` 通过（0 errors）、`pnpm typecheck` 通过、`pnpm test` 53 个文件通过（2 个跳过）、1205 项通过（3 项跳过）、`pnpm build` 通过、`pnpm e2e` 80 项通过。
 
 ## 5. 下一步

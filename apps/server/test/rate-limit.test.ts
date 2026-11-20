@@ -143,4 +143,15 @@ test('全部 4 个限流器 / 9 个环境变量默认值、合法覆盖与非法
   expect([bFail.limit, bFail.windowMs]).toEqual([20, 600_000]);
   const bRate = tokenLimiterFromEnv(badEnv);
   expect([bRate.limit, bRate.windowMs]).toEqual([120, 60_000]);
+
+  // 超出 32 位正整数上限的超大数值同样回退默认值（防定时器 / 窗口溢出）
+  const hugeEnv = {
+    DOWEL_LOGIN_LIMIT: '1e300',
+    DOWEL_LOGIN_WINDOW_MS: '2147483648',
+    DOWEL_CONNECTION_WINDOW_MS: '9999999999999',
+  };
+  const hLogin = loginLimiterFromEnv(hugeEnv);
+  expect([hLogin.limit, hLogin.windowMs]).toEqual([10, 600_000]);
+  const hConn = connectionLimiterFromEnv(hugeEnv);
+  expect(hConn.windowMs).toBe(60_000);
 });
