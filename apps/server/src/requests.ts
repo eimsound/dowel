@@ -1192,7 +1192,20 @@ export class Requests {
    * （生效角色非空，和其他地方同一个规则：roles.ts 的 visibleProjects）。prefix 是表别名（带点），start 是第一个参数的序号。
    */
   private async visibleFilter(db: Db, rc: RoleContext, prefix: string, start: number) {
-    const ids = (await visibleProjects(db, rc)).map((p) => p.id);
+    // 实例管理员看得到全部项目，不需要过滤（也避免把全实例的项目 id 展开成超长的 IN 列表）
+    if (rc.instanceAdmin) return { sql: 'true', params: [] as string[] };
+    // 只取这个用户的通知里出现过的项目，再与可见项目求交：IN 列表的长度受通知涉及的项目数约束，而不是可见项目总数
+    const mine = new Set(
+      (
+        await db.query<{ project_id: string }>(
+          'select distinct project_id from inbox_items where user_id = $1 and project_id is not null',
+          [rc.userId],
+        )
+      ).map((r) => r.project_id),
+    );
+    const ids = mine.size
+      ? (await visibleProjects(db, rc)).map((p) => p.id).filter((id) => mine.has(id))
+      : [];
     return {
       sql: ids.length
         ? `(${prefix}project_id is null or ${prefix}project_id in (${inList(ids, start)}))`
