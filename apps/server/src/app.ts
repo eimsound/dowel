@@ -76,7 +76,7 @@ export const createApp = (db: PlatformDb, options: AppOptions = {}) => {
     const { connectionAllowlist } = await readSettings(db);
     await assertUrlAllowed(url, connectionAllowlist);
   };
-  const shadows = new Shadows(db, guard);
+  const shadows = new Shadows(db, guard, bus);
   const refresher = new OpaqueRefresher(
     rooms,
     async (branchId) => {

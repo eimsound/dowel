@@ -346,6 +346,7 @@ export const registerProjects = (app: Hono<Env>, ctx: AppContext) => {
     // 3. 派生数据：取消挂起的刷新，丢掉已规范化的基线和重试计数。
     await rooms.kickBranches(deleted.branchIds, '项目已被删除');
     for (const eid of deleted.envIds) await shadows.forget(eid);
+    await shadows.forgetProject(a.pid);
     for (const branchId of deleted.branchIds) refresher.forget(branchId);
     ctx.activeTokens.forgetProject(a.pid);
     await ctx.bus.publish({ t: 'ci_tokens.changed' }).catch((e) => {

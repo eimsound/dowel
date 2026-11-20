@@ -3,10 +3,14 @@
 // 需要测试 PG（Testcontainers 或 DOWEL_TEST_PG），没有 Docker 时跳过。
 import { addColumn, createSchema, createTable, emptyModel, type Model } from '@dowel/core';
 import { analyze, InstanceLevelStatementError, NON_TRANSACTIONAL_NOTE, StepError } from '@dowel/verifier';
-import { afterAll, beforeAll, describe, expect, test } from 'vitest';
+import { afterAll, beforeAll, describe, expect, test, vi } from 'vitest';
 import { connect, createTestDb, dbUrl, PG_URL } from '../../../test/pg.ts';
-import { scrubSecrets } from '../src/secrets.ts';
+import { createApp } from '../src/app.ts';
+import { type ClusterEvent, EventBus } from '../src/bus.ts';
+import { openPlatformDb } from '../src/db.ts';
+import { encrypt, scrubSecrets } from '../src/secrets.ts';
 import { ShadowError, ShadowUnavailableError, toShadowError } from '../src/shadow.ts';
+import { Shadows } from '../src/shadows.ts';
 import {
   claimShadow,
   dropSameInstanceShadow,
@@ -15,6 +19,7 @@ import {
   SHADOW_MARK,
   shadowSetupError,
 } from '../src/targets.ts';
+import { makeUser, PASSWORD } from './support.ts';
 
 const ordersModel = (extra = false): Model => {
   const m = emptyModel();
@@ -550,5 +555,376 @@ describe.skipIf(!PG_URL)('同实例影子库并发创建与安全清理（真实
     await admin.db.exec(`CREATE DATABASE "${target.shadowName}"`);
     await dropSameInstanceShadow(target.url, target.shadowName);
     expect(await dbExists(target.shadowName)).toBe(true);
+  });
+});
+
+describe('Shadows 跨副本事件退化与订阅生命周期（单机 SQLite）', () => {
+  test('forget / forgetProject 广播 shadows.forget、忽略本副本回环并在 close 时取消订阅', async () => {
+    const db = await openPlatformDb(':memory:');
+    const bus = new EventBus(db, { replicaId: 'solo-1' });
+    const received: ClusterEvent[] = [];
+    const off = bus.onEvent((e) => {
+      received.push(e);
+    });
+    const shadows = new Shadows(db, undefined, bus);
+    try {
+      await bus.start();
+      await shadows.forget('env-x');
+      await shadows.forgetProject('proj-x');
+      expect(received).toEqual([
+        { t: 'shadows.forget', origin: 'solo-1', envIds: ['env-x'] },
+        { t: 'shadows.forget', origin: 'solo-1', projectId: 'proj-x' },
+      ]);
+
+      // close 后释放 bus 订阅（onEvent / onReconnect 不再保留监听器）
+      await shadows.close();
+      const before = received.length;
+      await bus.publish({ t: 'shadows.forget', envIds: ['env-y'] });
+      expect(received.length).toBe(before + 1);
+    } finally {
+      off();
+      await shadows.close();
+      await bus.close();
+      await db.close();
+    }
+  });
+});
+
+describe.skipIf(!PG_URL)('Shadows 配置指纹校验、跨副本事件失效与重连清理（真实 PG）', () => {
+  const admin = PG_URL ? connect(PG_URL) : (null as never);
+  const createdDbs: string[] = [];
+  const closers: (() => Promise<void>)[] = [];
+
+  const waitForAsync = async (
+    predicate: () => boolean | Promise<boolean>,
+    timeoutMs = 8_000,
+    stepMs = 25,
+  ) => {
+    const deadline = Date.now() + timeoutMs;
+    while (!(await predicate())) {
+      if (Date.now() >= deadline) throw new Error(`等待条件超时（${timeoutMs}ms）`);
+      await new Promise((r) => setTimeout(r, stepMs));
+    }
+  };
+
+  const createBareDb = async (prefix: string) => {
+    const name = `${prefix}_${Math.random().toString(36).slice(2, 8)}`;
+    await admin.db.exec(`CREATE DATABASE "${name}"`);
+    createdDbs.push(name, `${name}_dowel`);
+    return { name, url: dbUrl(name), shadowName: `${name}_dowel` };
+  };
+
+  const countDbConns = async (dbName: string) => {
+    const [r] = await admin.db.query<{ n: number }>(
+      'select count(*)::int as n from pg_stat_activity where datname = $1',
+      [dbName],
+    );
+    return r!.n;
+  };
+
+  const callJson = async (
+    app: ReturnType<typeof createApp>['app'],
+    method: string,
+    path: string,
+    json?: unknown,
+    cookie = '',
+  ) => {
+    const headers: Record<string, string> = {};
+    if (json !== undefined) headers['content-type'] = 'application/json';
+    if (cookie) headers.cookie = cookie;
+    const res = await app.request(path, {
+      method,
+      headers,
+      body: json === undefined ? undefined : JSON.stringify(json),
+    });
+    const text = await res.text();
+    let data: unknown = text;
+    try {
+      data = JSON.parse(text);
+    } catch {}
+    return {
+      status: res.status,
+      data: data as Record<string, unknown>,
+      cookie: res.headers.get('set-cookie')?.split(';')[0] ?? '',
+    };
+  };
+
+  afterAll(async () => {
+    if (!PG_URL) return;
+    for (const c of closers) await c();
+    for (const name of createdDbs) {
+      await admin.db.exec(`DROP DATABASE IF EXISTS "${name}" WITH (FORCE)`).catch(() => {});
+    }
+    await admin.close();
+  });
+
+  test('配置指纹强校验：标生产禁止同实例、修改 url/shadowUrl、删除环境后绝不复用旧影子库且关闭旧连接', async () => {
+    const prevSecret = process.env.DOWEL_SECRET;
+    process.env.DOWEL_SECRET = 'shadows-fingerprint-secret-16chars';
+    const platform = await createTestDb('shadows_fp_platform');
+    closers.push(platform.close);
+    const dbA = await openPlatformDb(platform.url);
+    const dbB = await openPlatformDb(platform.url);
+
+    // 不传 bus，模拟事件丢失或尚未送达时，纯靠配置指纹强校验与删库清理兜底
+    const shadowsB = new Shadows(dbB);
+
+    try {
+      const target1 = await createBareDb('sh_fp_t1');
+      const target2 = await createBareDb('sh_fp_t2');
+      const dedicated = await createBareDb('sh_fp_ded');
+      await claimShadow(dedicated.url);
+
+      await dbA.query("insert into groups (id, slug, name) values ('g-fp', 'g-fp', '组')");
+      await dbA.query(
+        "insert into projects (id, name, group_id, slug) values ('p-fp', '项目', 'g-fp', 'p-fp')",
+      );
+      await dbA.query(
+        `insert into environments (id, project_id, name, url_enc, production, allow_same_instance, shadow_url_enc)
+         values ('e-fp-1', 'p-fp', 'staging', $1, false, false, null)`,
+        [encrypt(target1.url)],
+      );
+      await dbA.query(
+        `insert into environments (id, project_id, name, url_enc, production, allow_same_instance, shadow_url_enc)
+         values ('e-fp-2', 'p-fp', 'extra', $1, false, false, null)`,
+        [encrypt(target2.url)],
+      );
+
+      // 1. 副本 B 缓存 e-fp-1 的同实例影子库，并执行一次 verify 建立真实 PG 常驻连接
+      const s1 = await shadowsB.forProject('p-fp', 'e-fp-1');
+      expect(s1.label).toBe(`staging：${target1.shadowName}`);
+      expect((await s1.shadow.verify(FROM, TO)).ok).toBe(true);
+      expect(await countDbConns(target1.shadowName)).toBeGreaterThanOrEqual(1);
+      const closeS1 = vi.spyOn(s1.shadow, 'close');
+
+      // 副本 A 将 e-fp-1 标为生产环境且不允许同实例（无独立 shadowUrl）
+      await dbA.query(
+        'update environments set production = true, allow_same_instance = false where id = $1',
+        ['e-fp-1'],
+      );
+
+      // 副本 B 再次 forProject：不得复用旧同实例影子库，应关闭旧连接并抛出 ShadowError（上层可 catch 返回 null）
+      await expect(shadowsB.forProject('p-fp', 'e-fp-1')).rejects.toThrow(ShadowError);
+      expect(await shadowsB.forProject('p-fp', 'e-fp-1').catch(() => null)).toBeNull();
+      expect(closeS1).toHaveBeenCalledTimes(1);
+      expect(shadowsB.has('e-fp-1')).toBe(false);
+      await waitForAsync(async () => (await countDbConns(target1.shadowName)) === 0);
+
+      // 2. 副本 A 为该生产环境配置独立 shadowUrl：副本 B 建立并缓存新独立影子库连接
+      await dbA.query('update environments set shadow_url_enc = $2 where id = $1', [
+        'e-fp-1',
+        encrypt(dedicated.url),
+      ]);
+      const s2 = await shadowsB.forProject('p-fp', 'e-fp-1');
+      expect(s2.shadow).not.toBe(s1.shadow);
+      expect(s2.label).toBe(`staging：${dedicated.name}`);
+      expect((await s2.shadow.verify(FROM, TO)).ok).toBe(true);
+      expect(await countDbConns(dedicated.name)).toBeGreaterThanOrEqual(1);
+      const closeS2 = vi.spyOn(s2.shadow, 'close');
+
+      // 副本 A 取消生产标记、清空独立 shadowUrl 并切换到 target2：副本 B 自动关闭旧独立影子库连接并切到 target2_dowel
+      await dbA.query(
+        'update environments set production = false, shadow_url_enc = null, url_enc = $2 where id = $1',
+        ['e-fp-1', encrypt(target2.url)],
+      );
+      const s3 = await shadowsB.forProject('p-fp', 'e-fp-1');
+      expect(s3.shadow).not.toBe(s2.shadow);
+      expect(s3.label).toBe(`staging：${target2.shadowName}`);
+      expect(closeS2).toHaveBeenCalledTimes(1);
+      expect((await s3.shadow.verify(FROM, TO)).ok).toBe(true);
+      await waitForAsync(async () => (await countDbConns(dedicated.name)) === 0);
+
+      // 3. 缓存另一个环境 e-fp-2 后，副本 A 从 DB 删除 e-fp-2；副本 B 调用 forProject('p-fp') 时顺带清理已删环境缓存
+      const sExtra = await shadowsB.forProject('p-fp', 'e-fp-2');
+      expect((await sExtra.shadow.verify(FROM, TO)).ok).toBe(true);
+      const closeExtra = vi.spyOn(sExtra.shadow, 'close');
+      expect(shadowsB.size).toBe(2);
+
+      await dbA.query("delete from environments where id = 'e-fp-2'");
+      const stillFirst = await shadowsB.forProject('p-fp');
+      expect(stillFirst.shadow).toBe(s3.shadow);
+      expect(closeExtra).toHaveBeenCalledTimes(1);
+      expect(shadowsB.has('e-fp-2')).toBe(false);
+      expect(shadowsB.size).toBe(1);
+
+      // 删除最后一个环境后，forProject('p-fp') 顺带关闭并移除残留条目再抛 ShadowError
+      const closeS3 = vi.spyOn(s3.shadow, 'close');
+      await dbA.query("delete from environments where id = 'e-fp-1'");
+      await expect(shadowsB.forProject('p-fp')).rejects.toThrow(ShadowError);
+      expect(closeS3).toHaveBeenCalledTimes(1);
+      expect(shadowsB.size).toBe(0);
+      await waitForAsync(async () => (await countDbConns(target2.shadowName)) === 0);
+    } finally {
+      await shadowsB.close();
+      await dbA.close();
+      await dbB.close();
+      if (prevSecret === undefined) delete process.env.DOWEL_SECRET;
+      else process.env.DOWEL_SECRET = prevSecret;
+    }
+  });
+
+  test('双副本真实 PG EventBus：改配置、删环境、删项目跨副本广播主动关闭缓存，且 onReconnect 清空全部旧连接', async () => {
+    const prevSecret = process.env.DOWEL_SECRET;
+    process.env.DOWEL_SECRET = 'shadows-ha-bus-secret-16chars';
+    const platform = await createTestDb('shadows_ha_bus');
+    closers.push(platform.close);
+    const dbA = await openPlatformDb(platform.url);
+    const dbB = await openPlatformDb(platform.url);
+
+    const appA = createApp(dbA, { bus: { replicaId: 'shadow-rep-a' } });
+    const appB = createApp(dbB, { bus: { replicaId: 'shadow-rep-b' } });
+
+    try {
+      await appA.bus.start();
+      await appB.bus.start();
+
+      const target1 = await createBareDb('sh_ha_t1');
+      const target2 = await createBareDb('sh_ha_t2');
+      const dedicated = await createBareDb('sh_ha_ded');
+      await claimShadow(dedicated.url);
+
+      // 用真实 HTTP 路由准备用户、组、项目和两个环境
+      await makeUser(dbA, 'admin', { role: 'admin' });
+      const login = await callJson(appA.app, 'POST', '/api/auth/login', {
+        username: 'admin',
+        password: PASSWORD,
+      });
+      expect(login.status).toBe(200);
+      const cookie = login.cookie;
+
+      const grp = await callJson(appA.app, 'POST', '/api/groups', { name: 'g', slug: 'g-ha' }, cookie);
+      expect(grp.status).toBe(201);
+      const proj = await callJson(
+        appA.app,
+        'POST',
+        '/api/projects',
+        { name: 'p-ha', groupId: grp.data.id },
+        cookie,
+      );
+      expect(proj.status).toBe(201);
+      const pid = proj.data.id as string;
+      const slug = proj.data.slug as string;
+
+      const env1Res = await callJson(
+        appA.app,
+        'POST',
+        `/api/projects/${pid}/environments`,
+        { name: 'dev1', url: target1.url, production: false, allowSameInstance: false },
+        cookie,
+      );
+      expect(env1Res.status).toBe(201);
+      const eid1 = env1Res.data.id as string;
+
+      const env2Res = await callJson(
+        appA.app,
+        'POST',
+        `/api/projects/${pid}/environments`,
+        { name: 'dev2', url: target2.url, production: false, allowSameInstance: false },
+        cookie,
+      );
+      expect(env2Res.status).toBe(201);
+      const eid2 = env2Res.data.id as string;
+
+      // 1. 副本 B 缓存 env1 并建连；副本 A 通过 HTTP PATCH 将 env1 标为生产环境
+      const s1 = await appB.shadows.forProject(pid, eid1);
+      expect((await s1.shadow.verify(FROM, TO)).ok).toBe(true);
+      expect(await countDbConns(target1.shadowName)).toBeGreaterThanOrEqual(1);
+      const closeS1 = vi.spyOn(s1.shadow, 'close');
+
+      const markProd = await callJson(
+        appA.app,
+        'PATCH',
+        `/api/projects/${pid}/environments/${eid1}`,
+        { production: true },
+        cookie,
+      );
+      expect(markProd.status).toBe(200);
+
+      // 副本 B 收到 shadows.forget 广播，主动关闭并移除缓存，且再次 forProject 拒绝复用同实例影子库
+      await waitForAsync(() => !appB.shadows.has(eid1));
+      expect(closeS1).toHaveBeenCalledTimes(1);
+      await waitForAsync(async () => (await countDbConns(target1.shadowName)) === 0);
+      await expect(appB.shadows.forProject(pid, eid1)).rejects.toThrow(ShadowError);
+
+      // 2. 副本 A 为 env1 配置独立 shadowUrl，副本 B 缓存之；随后副本 A 删除 env1，副本 B 自动关闭并清零缓存
+      const setDed = await callJson(
+        appA.app,
+        'PATCH',
+        `/api/projects/${pid}/environments/${eid1}`,
+        { shadowUrl: dedicated.url },
+        cookie,
+      );
+      expect(setDed.status).toBe(200);
+
+      const sDed = await appB.shadows.forProject(pid, eid1);
+      expect(sDed.label).toBe(`dev1：${dedicated.name}`);
+      expect((await sDed.shadow.verify(FROM, TO)).ok).toBe(true);
+      expect(await countDbConns(dedicated.name)).toBeGreaterThanOrEqual(1);
+      const closeDed = vi.spyOn(sDed.shadow, 'close');
+
+      const delEnv1 = await callJson(
+        appA.app,
+        'DELETE',
+        `/api/projects/${pid}/environments/${eid1}`,
+        undefined,
+        cookie,
+      );
+      expect(delEnv1.status).toBe(200);
+
+      await waitForAsync(() => appB.shadows.size === 0);
+      expect(closeDed).toHaveBeenCalledTimes(1);
+      await waitForAsync(async () => (await countDbConns(dedicated.name)) === 0);
+
+      // 3. 副本 B 缓存 env2 并建连；踢掉 LISTEN 连接触发 busB.onReconnect，副本 B 清理并关闭全部旧连接
+      const s2BeforeReconnect = await appB.shadows.forProject(pid, eid2);
+      expect((await s2BeforeReconnect.shadow.verify(FROM, TO)).ok).toBe(true);
+      expect(await countDbConns(target2.shadowName)).toBeGreaterThanOrEqual(1);
+      const closeBeforeReconnect = vi.spyOn(s2BeforeReconnect.shadow, 'close');
+
+      let reconnected = false;
+      const offReconnect = appB.bus.onReconnect(() => {
+        reconnected = true;
+      });
+      try {
+        await dbA.query(
+          `select pg_terminate_backend(pid)
+           from pg_stat_activity
+           where datname = current_database()
+             and pid <> pg_backend_pid()
+             and query ilike 'listen%'`,
+        );
+        await waitForAsync(() => reconnected && appB.shadows.size === 0, 10_000);
+        expect(closeBeforeReconnect).toHaveBeenCalledTimes(1);
+        await waitForAsync(async () => (await countDbConns(target2.shadowName)) === 0);
+      } finally {
+        offReconnect();
+      }
+
+      // 4. 重连恢复后：副本 B 重新缓存 env2 并建连；副本 A 删除整个项目，副本 B 收到广播主动关闭并清零缓存
+      const s2AfterReconnect = await appB.shadows.forProject(pid, eid2);
+      expect((await s2AfterReconnect.shadow.verify(FROM, TO)).ok).toBe(true);
+      expect(await countDbConns(target2.shadowName)).toBeGreaterThanOrEqual(1);
+      const closeAfterReconnect = vi.spyOn(s2AfterReconnect.shadow, 'close');
+
+      const delProj = await callJson(appA.app, 'DELETE', `/api/projects/${pid}`, { confirm: slug }, cookie);
+      expect(delProj.status).toBe(200);
+
+      await waitForAsync(() => appB.shadows.size === 0);
+      expect(closeAfterReconnect).toHaveBeenCalledTimes(1);
+      await waitForAsync(async () => (await countDbConns(target2.shadowName)) === 0);
+    } finally {
+      await appA.rooms.flush();
+      await appB.rooms.flush();
+      appA.rooms.close();
+      appB.rooms.close();
+      await appA.shadows.close();
+      await appB.shadows.close();
+      await appA.bus.close();
+      await appB.bus.close();
+      await dbA.close();
+      await dbB.close();
+      if (prevSecret === undefined) delete process.env.DOWEL_SECRET;
+      else process.env.DOWEL_SECRET = prevSecret;
+    }
   });
 });

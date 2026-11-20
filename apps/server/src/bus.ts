@@ -32,6 +32,13 @@ export type ClusterEvent =
   | { t: 'webhooks.wake'; origin: string }
   | { t: 'ci_tokens.changed'; origin: string }
   | {
+      t: 'shadows.forget';
+      origin: string;
+      all?: boolean;
+      envIds?: string[];
+      projectId?: string;
+    }
+  | {
       t: 'requests.kick';
       origin: string;
       all?: boolean;
@@ -141,6 +148,11 @@ export class EventBus {
           json = JSON.stringify(full);
         } else if (full.t === 'requests.kick') {
           full = { t: 'requests.kick', origin: this.replicaId, all: true };
+          json = JSON.stringify(full);
+        } else if (full.t === 'shadows.forget') {
+          full = full.projectId
+            ? { t: 'shadows.forget', origin: this.replicaId, projectId: full.projectId }
+            : { t: 'shadows.forget', origin: this.replicaId, all: true };
           json = JSON.stringify(full);
         } else {
           console.warn(
