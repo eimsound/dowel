@@ -1,0 +1,56 @@
+name: Dowel Execute Migration
+description: 通过 Dowel CI 令牌把指定项目与环境执行（或预演）到目标版本
+inputs:
+  url:
+    description: Dowel 服务地址（例如 https://dowel.example.com）
+    required: true
+  token:
+    description: 项目 CI 令牌（dwl_…，请放在 GitHub Secrets 里传入）
+    required: true
+  project:
+    description: 项目路径（owner/slug）
+    required: true
+  environment:
+    description: 环境名（例如 staging、prod）
+    required: true
+  to:
+    description: 目标版本（例如 latest、v5 或 5）
+    required: true
+  dry-run:
+    description: 是否只预演不写入目标库（true 或 false）
+    required: false
+    default: "false"
+  lock-timeout:
+    description: 等待执行锁的秒数（0～30，默认 30）
+    required: false
+    default: "30"
+outputs:
+  ok:
+    description: 执行或预演是否成功（true / false）
+    value: ${{ steps.run.outputs.ok }}
+  code:
+    description: 失败时的机器可读错误码（成功时为空）
+    value: ${{ steps.run.outputs.code }}
+  reached:
+    description: 结束时环境停在的版本（例如 v5；无版本时为空）
+    value: ${{ steps.run.outputs.reached }}
+  noop:
+    description: 是否已经在目标版本、未执行任何迁移（true / false）
+    value: ${{ steps.run.outputs.noop }}
+  response:
+    description: 服务端返回的完整 JSON 响应
+    value: ${{ steps.run.outputs.response }}
+runs:
+  using: composite
+  steps:
+    - id: run
+      shell: bash
+      env:
+        DOWEL_URL: ${{ inputs.url }}
+        DOWEL_TOKEN: ${{ inputs.token }}
+        DOWEL_PROJECT: ${{ inputs.project }}
+        DOWEL_ENVIRONMENT: ${{ inputs.environment }}
+        DOWEL_TO: ${{ inputs.to }}
+        DOWEL_DRY_RUN: ${{ inputs.dry-run }}
+        DOWEL_LOCK_TIMEOUT: ${{ inputs.lock-timeout }}
+      run: bash "${{ github.action_path }}/run.sh"

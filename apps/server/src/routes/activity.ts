@@ -22,9 +22,13 @@ export const registerActivity = (app: Hono<Env>, ctx: AppContext) => {
   app.get('/api/projects/:pid/activity', async (c) => {
     const a = await access(c, ctx, 'project.read');
     const rows = await db.query<Row>(
-      `select a.id, a.at, a.action, u.name as "actorName", u.username as "actorUsername", a.data
+      `select a.id, a.at, a.action,
+              coalesce(u.name, case when a.actor_kind = 'token' and ct.id is not null then ct.name || '（' || ct.prefix || '…）' end) as "actorName",
+              coalesce(u.username, case when a.actor_kind = 'token' then ct.prefix end) as "actorUsername",
+              a.data
          from audit_events a
-         left join users u on u.id = a.actor_id
+         left join users u on a.actor_kind = 'user' and u.id = a.actor_id
+         left join ci_tokens ct on a.actor_kind = 'token' and ct.id = a.actor_id
         where a.project_id = $1
         order by a.at desc, a.id desc
         limit ${LIMIT}`,

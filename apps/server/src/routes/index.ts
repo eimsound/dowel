@@ -7,6 +7,7 @@ import { registerActivity } from './activity.ts';
 import { registerAdmin } from './admin.ts';
 import { registerAudit } from './audit.ts';
 import { registerAuth } from './auth.ts';
+import { registerCi, rejectTokens } from './ci.ts';
 import { registerClaims } from './claims.ts';
 import { registerConnection } from './connection.ts';
 import { type AppContext, type Env, requireInstanceAdmin, requireUser } from './context.ts';
@@ -22,11 +23,16 @@ import { registerInbox, registerRequests } from './requests.ts';
 import { registerSetup } from './setup.ts';
 import { registerSync } from './sync.ts';
 import { registerTakeover } from './takeover.ts';
+import { registerTokens } from './tokens.ts';
 import { registerVersions } from './versions.ts';
 import { registerWebhooks } from './webhooks.ts';
 import { registerWizard } from './wizard.ts';
 
 export const registerRoutes = (app: Hono<Env>, ctx: AppContext) => {
+  // CI 令牌（P6）：只允许访问 /api/ci/…；带 Bearer dwl_… 访问其余任何接口一律 403，不回落到 cookie
+  app.use('/api/*', rejectTokens);
+  registerCi(app, ctx);
+
   // 公开接口：登录 / 退出、初始化与实例信息、接受邀请、重置密码
   registerAuth(app, ctx);
   registerOidcAuth(app, ctx);
@@ -55,6 +61,7 @@ export const registerRoutes = (app: Hono<Env>, ctx: AppContext) => {
     ['/api/admin/oidc/*', 'instance.manage_settings'],
     ['/api/admin/audit', 'instance.view_audit'],
     ['/api/admin/exec-policy', 'instance.manage_policy'],
+    ['/api/admin/token-policy', 'instance.manage_token_policy'],
   ] as const)
     app.use(path, requireInstanceAdmin(action));
   registerAdmin(app, ctx);
@@ -93,5 +100,7 @@ export const registerRoutes = (app: Hono<Env>, ctx: AppContext) => {
   registerPolicy(app, ctx);
   // 执行申请与审批、紧急执行（P5b）
   registerRequests(app, ctx);
+  // CI 令牌管理与三层“谁能创建令牌”规则（P6）
+  registerTokens(app, ctx);
   registerSync(app, ctx);
 };

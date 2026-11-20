@@ -539,6 +539,27 @@ P3 审查后的修正（2026-11-19）：
 - **第一轮审查修复后的收尾结果**（基于 `2085c81`，Docker 可用）：`pnpm lint` 通过（29 条告警都是既有的）、`pnpm typecheck` 通过、`pnpm test` 51 个文件通过（2 个跳过）、1189 项通过（3 项跳过）、`pnpm build` 通过、`pnpm e2e` 74 项通过。过程中：① `approvals.spec.ts` 的“组管理员未读数 2”改成 3（紧急执行现在开始、结束各通知一次，是修复带来的预期变化），并断言“紧急执行完成”这条通知；② 第一次全量单测时 `requests-concurrency.test.ts` 的“平台缓存落后”用例失败过一次：直接执行结束后后台按环境重检，和用例里手工改缓存交错，用例改成先 `await sweep({ envIds })` 等这一轮跑完再模拟；把这个文件和 `requests.test.ts` 各 4 份同时跑（模拟负载）都通过；“详情页不拿锁”的超时放宽到 10 秒。
 - **收尾结果**（2026-11-20，Docker 可用，低负载 load average 2 左右）：`pnpm lint` 通过（29 条告警都是既有的）、`pnpm typecheck` 通过、`pnpm test` 51 个文件通过（2 个跳过）、1180 项通过（3 项跳过）、`pnpm build` 通过、`pnpm e2e` 74 项通过。第一次全量 e2e 有 1 项失败：`policy.spec.ts` 断言“收紧成仅限执行者后执行按钮不可用”——P5b 之后没有执行权的人看到的是可用的“提交执行申请”，属于预期的行为变化，断言改成“没有‘执行迁移’按钮、有‘提交执行申请’”。
 
+### 4.10 产品化 P6：CI 令牌、三层创建规则、CI 执行接口、文档与 GitHub Action（2026-11-20）
+
+- **数据库与契约**：
+  - 平台库新增第 21 条迁移（`apps/server/src/db.ts`）：`ci_tokens`（项目归属、`prefix` 12 位、`token_hash` 唯一 SHA-256、`expires_at` 必填、`revoked_at` / `revoked_by`、`last_used_at` / `last_used_ip`）和 `token_policies`（`scope_kind in ('instance', 'group', 'project')`、`scope_id`、`rule` JSON）。`COLUMN_KINDS` 登记 `token_policies.rule` 为 `json`。
+  - `@dowel/api` 新增 `packages/api/src/tokens.ts`：令牌创建/列表/状态类型、三层“谁能创建令牌”纯函数 `effectiveTokenRules` / `tokenCreatorAllows`、`CI_ERROR_STATUS` 全部 24 个错误码与 HTTP 状态码映射、`ciExecuteSchema`、只读与执行响应类型；`webhooks.ts` 新增 `token.executed` 事件；`ProjectInfo` 增加 `canListTokens`。
+- **令牌、认证隔离与限速（T1，ADR 0009）**：
+  - `apps/server/src/tokens.ts`：生成 `dwl_` + 32 字节随机 base64url（43 字符，256 位熵），只存 SHA-256 哈希；创建者停用或删除不影响令牌；吊销与过期立即生效；`last_used_at` / `last_used_ip` 60 秒节流更新。
+  - `apps/server/src/routes/index.ts`：最前面挂 `rejectTokens` 中间件，携带 `Bearer dwl_…` 访问 `/api/ci/…` 之外的任意端点（含 WebSocket 升级、令牌管理本身、标记为已执行、修改策略等）一律 `403 forbidden`，不回落 Cookie。`/api/ci/*` 免 CSRF `Origin` 校验。
+  - `apps/server/src/rate-limit.ts`：`KeyedLimiter` 增加同步预占 + `refund()`，认证中间件在 `await authenticateToken` 前先同步 `attempt`、成功或 DB 异常时 `refund`，彻底消除并发绕过失败限速的竞态（默认 20 次 / 10 分钟，环境变量 `DOWEL_TOKEN_FAIL_LIMIT`）；令牌请求另受每令牌限速（默认 120 次 / 分钟，`DOWEL_TOKEN_RATE_LIMIT`）和历史读取连接限速约束。
+- **谁能创建令牌（T2，ADR 0010）**：
+  - `apps/server/src/token-rules.ts`、`roles.ts`、`routes/tokens.ts`：实例 / 组 / 项目三层规则逐层取与（AND），默认项目管理员；`baseRole` 与 `effectiveRole` 拆分避免循环依赖，满足组条件而被允许创建令牌的用户自动获得范围内项目的 `viewer` 只读可见性；修改规则后 `rooms.refreshLoaded()` 即时刷新在线角色；删项目、删组同步清理 `ci_tokens` 与 `token_policies`。
+- **CI 执行接口与通知（T3）**：
+  - `apps/server/src/routes/ci.ts`：提供 `/api/ci/token`、项目概要（兼容旧 slug 重定向）、版本链、环境状态、目标库历史和同步执行接口 `POST …/execute`（必填 `to`、支持 `dryRun` 与 `lockTimeoutSeconds`）。
+  - 执行复用 `EnvLocks` 与 `runExecution`（支持 `beforeConnect` 锁内复查令牌状态 / `allowTokens` / 前置环境 / 超时，以及 `onCommitted` 追踪多迁移中途出错的准确 `reached` 与已提交列表）；`ExecuteResult` 返回真实 `from`；禁止令牌回滚（`409 rollback_not_allowed` 带 `details.current`）；`no_schema_privilege` 映射为 `502 target_unreachable`。
+  - 审计与通知：每次非预演执行写 `environment.execute`（`actor_kind = 'token'`，`/api/admin/audit` 与 `/api/projects/:pid/activity` 均关联 `ci_tokens` 显示令牌名与前缀）；全部环境发 `token.executed` 组级 Webhook；生产环境非空跑（`!noop`）或失败时向项目管理员和审批人发 `token_execution` 收件箱通知，并触发待处理执行申请重检失效。
+- **界面、文档与 GitHub Action（T4）**：
+  - `apps/web/src/components/TokenSettings.tsx` 封装 `TokenPolicyPanel`（接入管理后台 `/admin/policy`、组页、项目设置，使用 `/api/groups` 突破目录 20 条上限，保护未保存草稿不被后台 refetch 覆盖）和 `ProjectTokensPanel`（创建后一次性展示明文 + 独立 `role="status"` 复制按钮、列表、确认吊销）；收件箱为 `token_execution` 增加 `CI 令牌` 标记与直达环境链接；审计日志筛选增加 `ci_token` 等对象类型。
+  - `docs/api.md` 编写完整 HTTP API 文档（含全部 `curl` 示例与 24 个错误码表）；`actions/execute/{action.yml,run.sh,README.md}` 提供纯 `bash` + `curl` 复合 Action（`env:` 传参、`--config -` 经 stdin 传令牌、`--proto '=http,https'` 与 `--` 隔离、严格校验输入防配置注入与前导零八进制错误、失败打印 `::error::[code]` 并退出码 1）。
+- **对抗性审查与修复**：独立审查共查出 7 项必须修与 7 项建议修并全部修复（`dryRun` 基线项丢失、`tokenFailLimiter` 并发预占竞态、`run.sh` 配置注入与前导零八进制、多迁移非 `ExecutorError` 丢失 `reached`、`beforeConnect` 审计/通知上下文同步、`no_schema_privilege` 映射 `502`、`from` 精确取值、生产 `noop` 通知去噪、前端组选择上限与脏草稿保护等）。
+- **收尾结果**（2026-11-20，Docker 可用，低负载）：`pnpm lint` 通过（29 条告警均为既有）、`pnpm typecheck` 通过、`pnpm test` 52 个文件通过（2 个跳过）、1204 项通过（3 项跳过）、`pnpm build` 通过、`pnpm e2e` 77 项通过。
+
 ## 5. 下一步
 
 M2：SQLite（12 步重建表）、PG 多版本（14～18）与版本能力表、多环境分别验证、分区表编辑。

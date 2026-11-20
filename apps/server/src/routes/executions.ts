@@ -367,15 +367,25 @@ export const registerExecutions = (app: Hono<Env>, ctx: AppContext) => {
     // 读历史并同步缓存：同步在目标库的项目锁里做（把镜像对齐到目标库历史；拿不到锁说明正在执行，只读不同步）
     const state = await readTargetState(ctx.exec, env, true);
     const refs = new Map((await loadVersionMetas(db, env.project_id)).map((m) => [m.id, m]));
-    // 执行者显示名：一次 where id in (...) 查完（用户被删除后回退到 id）
-    const ids = [...new Set(state.runs.map((r) => r.executedBy).filter((x): x is string => !!x))];
+    // 执行者显示名：一次 where id in (...) 查完（用户被删除后回退到 id）；CI 令牌执行的（via = ci）是令牌 ID，显示令牌名和前缀
+    const by = (via: 'web' | 'ci') => [
+      ...new Set(state.runs.filter((r) => r.via === via && r.executedBy).map((r) => r.executedBy as string)),
+    ];
     const names = new Map<string, string>();
+    const ids = by('web');
     if (ids.length)
       for (const u of await db.query<{ id: string; name: string }>(
         `select id, name from users where id in (${inList(ids)})`,
         ids,
       ))
         names.set(u.id, u.name);
+    const tokenIds = by('ci');
+    if (tokenIds.length)
+      for (const t of await db.query<{ id: string; name: string; prefix: string }>(
+        `select id, name, prefix from ci_tokens where id in (${inList(tokenIds)})`,
+        tokenIds,
+      ))
+        names.set(t.id, `${t.name}（${t.prefix}…）`);
     const runs = state.runs.map((r) => runInfoOf(r, refs, names));
     // P5b：读历史会把目标库的当前版本同步进缓存，可能和申请绑定的起点不一样了
     ctx.requests.kick({ envIds: [env.id] });

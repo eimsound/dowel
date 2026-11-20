@@ -15,8 +15,9 @@ import { serve } from '@hono/node-server';
 import { afterAll, beforeAll, expect, test } from 'vitest';
 import WebSocket from 'ws';
 import { createApp, openPlatformDb, type PlatformDb } from '../src/index.ts';
-import { LoginLimiter } from '../src/rate-limit.ts';
+import { KeyedLimiter, LoginLimiter } from '../src/rate-limit.ts';
 import { encrypt } from '../src/secrets.ts';
+import { newCiToken } from '../src/tokens.ts';
 import { makeUser, PASSWORD } from './support.ts';
 
 process.env.DOWEL_SECRET ??= 'matrix-test-secret-0123456789';
@@ -51,6 +52,8 @@ type Access =
   | { kind: 'project'; min: Role; statuses?: number[] }
   /** 项目可见（看不见 404）但操作只有实例管理员能做（其余 403，包括项目管理员） */
   | { kind: 'project-instance-admin'; statuses?: number[] }
+  /** CI 令牌端点（/api/ci/*）：无令牌的用户一律 401，持有效令牌返回 tokenStatuses */
+  | { kind: 'ci'; tokenStatuses: number[] }
   | { kind: 'ws' };
 
 interface Ctx {
@@ -62,6 +65,8 @@ interface Ctx {
   outsiderId: string;
   inviteToken: string;
   envId: string;
+  envName: string;
+  tokenId: string;
   versionId: string;
 }
 
@@ -81,10 +86,18 @@ let injectWebSocket: ReturnType<typeof createApp>['injectWebSocket'];
 
 const P = () => `/api/projects/${currentCtx.pid}`;
 let currentCtx: Ctx;
+let ciToken = '';
+let adminUserId = '';
 let unique = 0;
 
-const call = async (method: string, path: string, json?: unknown, cookie = '') => {
-  const headers: Record<string, string> = {};
+const call = async (
+  method: string,
+  path: string,
+  json?: unknown,
+  cookie = '',
+  extra: Record<string, string> = {},
+) => {
+  const headers: Record<string, string> = { ...extra };
   if (json !== undefined) headers['content-type'] = 'application/json';
   if (cookie) headers.cookie = cookie;
   const r = await app.request(path, {
@@ -121,10 +134,22 @@ const ensureGrant = async (id: string, subjectId: string, role: Role, scopeKind:
 
 const freshEnv = async (projectId: string, seq: number) => {
   const id = `matrix-env-${seq}`;
+  const name = `env-${seq}`;
   await db.query(
     `insert into environments (id, project_id, name, url_enc, production)
      values ($1, $2, $3, $4, false)`,
-    [id, projectId, `env-${seq}`, encrypt('postgres://127.0.0.1:1/matrix')],
+    [id, projectId, name, encrypt('postgres://127.0.0.1:1/matrix')],
+  );
+  return { id, name };
+};
+
+const freshToken = async (projectId: string, seq: number, createdBy: string) => {
+  const id = `matrix-tok-${seq}`;
+  const { hash, prefix } = newCiToken();
+  await db.query(
+    `insert into ci_tokens (id, project_id, name, description, prefix, token_hash, created_by, expires_at)
+     values ($1, $2, $3, '', $4, $5, $6, $7)`,
+    [id, projectId, `tok-${seq}`, prefix, hash, createdBy, new Date(Date.now() + 86400_000).toISOString()],
   );
   return id;
 };
@@ -233,7 +258,9 @@ const matrix: Record<string, Spec> = {
     access: { kind: 'project', min: 'viewer', statuses: [200] },
     path: (ctx) => `${P()}/environments/${ctx.envId}/exec-policy`,
     prepare: async (ctx) => {
-      ctx.envId = await freshEnv(ctx.pid, ++unique);
+      const e = await freshEnv(ctx.pid, ++unique);
+      ctx.envId = e.id;
+      ctx.envName = e.name;
     },
   },
   // 环境层：项目管理员（放宽另外要满足执行策略，在 policy-routes.test.ts 里验证）；请求体不合法 → 400
@@ -242,7 +269,9 @@ const matrix: Record<string, Spec> = {
     path: (ctx) => `${P()}/environments/${ctx.envId}/exec-policy`,
     body: () => ({}),
     prepare: async (ctx) => {
-      ctx.envId = await freshEnv(ctx.pid, ++unique);
+      const e = await freshEnv(ctx.pid, ++unique);
+      ctx.envId = e.id;
+      ctx.envName = e.name;
     },
   },
   'POST /api/admin/grants': { access: { kind: 'instance', statuses: [400] }, body: () => ({}) },
@@ -479,21 +508,27 @@ const matrix: Record<string, Spec> = {
     access: { kind: 'project', min: 'admin', statuses: [200] },
     path: (ctx) => `${P()}/environments/${ctx.envId}`,
     prepare: async (ctx) => {
-      ctx.envId = await freshEnv(ctx.pid, ++unique);
+      const e = await freshEnv(ctx.pid, ++unique);
+      ctx.envId = e.id;
+      ctx.envName = e.name;
     },
   },
   'POST /api/projects/:pid/environments/:eid/test': {
     access: { kind: 'project', min: 'viewer', statuses: [422] },
     path: (ctx) => `${P()}/environments/${ctx.envId}/test`,
     prepare: async (ctx) => {
-      ctx.envId = await freshEnv(ctx.pid, ++unique);
+      const e = await freshEnv(ctx.pid, ++unique);
+      ctx.envId = e.id;
+      ctx.envName = e.name;
     },
   },
   'POST /api/projects/:pid/environments/:eid/pull': {
     access: { kind: 'project', min: 'editor', statuses: [422] },
     path: (ctx) => `${P()}/environments/${ctx.envId}/pull`,
     prepare: async (ctx) => {
-      ctx.envId = await freshEnv(ctx.pid, ++unique);
+      const e = await freshEnv(ctx.pid, ++unique);
+      ctx.envId = e.id;
+      ctx.envName = e.name;
     },
   },
   // 环境的执行（P4b）。freshEnv 是非生产环境、没有显式设置执行档位 → 默认档位是项目编辑者；
@@ -504,28 +539,36 @@ const matrix: Record<string, Spec> = {
     path: (ctx) => `${P()}/environments/${ctx.envId}`,
     body: () => ({ execPolicy: 'admin' }),
     prepare: async (ctx) => {
-      ctx.envId = await freshEnv(ctx.pid, ++unique);
+      const e = await freshEnv(ctx.pid, ++unique);
+      ctx.envId = e.id;
+      ctx.envName = e.name;
     },
   },
   'GET /api/projects/:pid/environments/:eid/status': {
     access: { kind: 'project', min: 'viewer', statuses: [200] },
     path: (ctx) => `${P()}/environments/${ctx.envId}/status`,
     prepare: async (ctx) => {
-      ctx.envId = await freshEnv(ctx.pid, ++unique);
+      const e = await freshEnv(ctx.pid, ++unique);
+      ctx.envId = e.id;
+      ctx.envName = e.name;
     },
   },
   'GET /api/projects/:pid/environments/:eid/history': {
     access: { kind: 'project', min: 'viewer', statuses: [422] },
     path: (ctx) => `${P()}/environments/${ctx.envId}/history`,
     prepare: async (ctx) => {
-      ctx.envId = await freshEnv(ctx.pid, ++unique);
+      const e = await freshEnv(ctx.pid, ++unique);
+      ctx.envId = e.id;
+      ctx.envName = e.name;
     },
   },
   'POST /api/projects/:pid/environments/:eid/drift-check': {
     access: { kind: 'project', min: 'editor', statuses: [200] },
     path: (ctx) => `${P()}/environments/${ctx.envId}/drift-check`,
     prepare: async (ctx) => {
-      ctx.envId = await freshEnv(ctx.pid, ++unique);
+      const e = await freshEnv(ctx.pid, ++unique);
+      ctx.envId = e.id;
+      ctx.envName = e.name;
     },
   },
   'POST /api/projects/:pid/environments/:eid/execute': {
@@ -533,7 +576,9 @@ const matrix: Record<string, Spec> = {
     path: (ctx) => `${P()}/environments/${ctx.envId}/execute`,
     body: () => ({}),
     prepare: async (ctx) => {
-      ctx.envId = await freshEnv(ctx.pid, ++unique);
+      const e = await freshEnv(ctx.pid, ++unique);
+      ctx.envId = e.id;
+      ctx.envName = e.name;
     },
   },
   'POST /api/projects/:pid/environments/:eid/rollback': {
@@ -541,7 +586,9 @@ const matrix: Record<string, Spec> = {
     path: (ctx) => `${P()}/environments/${ctx.envId}/rollback`,
     body: () => ({}),
     prepare: async (ctx) => {
-      ctx.envId = await freshEnv(ctx.pid, ++unique);
+      const e = await freshEnv(ctx.pid, ++unique);
+      ctx.envId = e.id;
+      ctx.envName = e.name;
     },
   },
   // 接入已有历史（P4c）：配置类特权操作，至少项目管理员（freshEnv 之外的新环境：请求体不合法 → 400）
@@ -556,7 +603,9 @@ const matrix: Record<string, Spec> = {
     path: (ctx) => `${P()}/environments/${ctx.envId}/claim`,
     body: () => ({}),
     prepare: async (ctx) => {
-      ctx.envId = await freshEnv(ctx.pid, ++unique);
+      const e = await freshEnv(ctx.pid, ++unique);
+      ctx.envId = e.id;
+      ctx.envName = e.name;
     },
   },
   // 标记为已执行（ADR 0004）：特权操作，按执行档位（freshEnv 是非生产、默认档位 = 编辑者）；请求体不合法 → 400
@@ -565,7 +614,9 @@ const matrix: Record<string, Spec> = {
     path: (ctx) => `${P()}/environments/${ctx.envId}/mark`,
     body: () => ({}),
     prepare: async (ctx) => {
-      ctx.envId = await freshEnv(ctx.pid, ++unique);
+      const e = await freshEnv(ctx.pid, ++unique);
+      ctx.envId = e.id;
+      ctx.envName = e.name;
     },
   },
   // 修复脚本：只读平台库里缓存的漂移摘要，查看者就能看
@@ -573,7 +624,9 @@ const matrix: Record<string, Spec> = {
     access: { kind: 'project', min: 'viewer', statuses: [200] },
     path: (ctx) => `${P()}/environments/${ctx.envId}/repair-script`,
     prepare: async (ctx) => {
-      ctx.envId = await freshEnv(ctx.pid, ++unique);
+      const e = await freshEnv(ctx.pid, ++unique);
+      ctx.envId = e.id;
+      ctx.envName = e.name;
     },
   },
   'POST /api/projects/:pid/environments/:eid/baseline': {
@@ -582,7 +635,9 @@ const matrix: Record<string, Spec> = {
     path: (ctx) => `${P()}/environments/${ctx.envId}/baseline`,
     body: () => ({}),
     prepare: async (ctx) => {
-      ctx.envId = await freshEnv(ctx.pid, ++unique);
+      const e = await freshEnv(ctx.pid, ++unique);
+      ctx.envId = e.id;
+      ctx.envName = e.name;
     },
   },
   // 执行申请（P5b）：项目可见即可列表 / 看详情；提交要编辑者（或执行者）；审批类操作看得到项目就能进到申请
@@ -596,7 +651,9 @@ const matrix: Record<string, Spec> = {
     path: (ctx) => `${P()}/environments/${ctx.envId}/requests`,
     body: () => ({}),
     prepare: async (ctx) => {
-      ctx.envId = await freshEnv(ctx.pid, ++unique);
+      const e = await freshEnv(ctx.pid, ++unique);
+      ctx.envId = e.id;
+      ctx.envName = e.name;
     },
   },
   'GET /api/projects/:pid/requests/:rid': {
@@ -629,7 +686,9 @@ const matrix: Record<string, Spec> = {
     path: (ctx) => `${P()}/environments/${ctx.envId}/emergency`,
     body: () => ({}),
     prepare: async (ctx) => {
-      ctx.envId = await freshEnv(ctx.pid, ++unique);
+      const e = await freshEnv(ctx.pid, ++unique);
+      ctx.envId = e.id;
+      ctx.envName = e.name;
     },
   },
   // 收件箱（P5b）：每个人只看自己的
@@ -679,11 +738,91 @@ const matrix: Record<string, Spec> = {
     body: () => ({}),
     prepare: async (ctx) => matrixWebhook(ctx.groupId),
   },
+  // CI 令牌管理与三层“谁能创建令牌”规则（P6）
+  'GET /api/admin/token-policy': { access: { kind: 'instance', statuses: [200] } },
+  'PUT /api/admin/token-policy': {
+    access: { kind: 'instance', statuses: [200] },
+    body: () => ({ rule: null }),
+  },
+  'GET /api/groups/:slug/token-policy': {
+    access: { kind: 'group-read', statuses: [200] },
+    path: (ctx) => `/api/groups/${ctx.groupSlug}/token-policy`,
+  },
+  'PUT /api/groups/:slug/token-policy': {
+    access: { kind: 'group-admin', statuses: [200] },
+    path: (ctx) => `/api/groups/${ctx.groupSlug}/token-policy`,
+    body: () => ({ rule: null }),
+  },
+  'GET /api/projects/:pid/token-policy': {
+    access: { kind: 'project', min: 'viewer', statuses: [200] },
+    path: () => `${P()}/token-policy`,
+  },
+  'PUT /api/projects/:pid/token-policy': {
+    access: { kind: 'project', min: 'admin', statuses: [200] },
+    path: () => `${P()}/token-policy`,
+    body: () => ({ rule: null }),
+  },
+  'GET /api/projects/:pid/tokens': {
+    access: { kind: 'project', min: 'admin', statuses: [200] },
+    path: () => `${P()}/tokens`,
+  },
+  'POST /api/projects/:pid/tokens': {
+    access: { kind: 'project', min: 'admin', statuses: [400] },
+    path: () => `${P()}/tokens`,
+    body: () => ({}),
+  },
+  'POST /api/projects/:pid/tokens/:tid/revoke': {
+    access: { kind: 'project', min: 'admin', statuses: [200] },
+    path: (ctx) => `${P()}/tokens/${ctx.tokenId}/revoke`,
+    body: () => ({}),
+    prepare: async (ctx) => {
+      ctx.tokenId = await freshToken(ctx.pid, ++unique, adminUserId);
+    },
+  },
+  // CI 令牌专用端点（/api/ci/*）
+  'GET /api/ci/token': { access: { kind: 'ci', tokenStatuses: [200] } },
+  'GET /api/ci/projects/:owner/:project': {
+    access: { kind: 'ci', tokenStatuses: [200] },
+    path: (ctx) => `/api/ci/projects/${ctx.groupSlug}/${ctx.projectSlug}`,
+  },
+  'GET /api/ci/projects/:owner/:project/versions': {
+    access: { kind: 'ci', tokenStatuses: [200] },
+    path: (ctx) => `/api/ci/projects/${ctx.groupSlug}/${ctx.projectSlug}/versions`,
+  },
+  'GET /api/ci/projects/:owner/:project/environments/:env': {
+    access: { kind: 'ci', tokenStatuses: [200] },
+    path: (ctx) => `/api/ci/projects/${ctx.groupSlug}/${ctx.projectSlug}/environments/${ctx.envName}`,
+    prepare: async (ctx) => {
+      const e = await freshEnv(ctx.pid, ++unique);
+      ctx.envId = e.id;
+      ctx.envName = e.name;
+    },
+  },
+  'GET /api/ci/projects/:owner/:project/environments/:env/history': {
+    access: { kind: 'ci', tokenStatuses: [502] },
+    path: (ctx) => `/api/ci/projects/${ctx.groupSlug}/${ctx.projectSlug}/environments/${ctx.envName}/history`,
+    prepare: async (ctx) => {
+      const e = await freshEnv(ctx.pid, ++unique);
+      ctx.envId = e.id;
+      ctx.envName = e.name;
+    },
+  },
+  'POST /api/ci/projects/:owner/:project/environments/:env/execute': {
+    access: { kind: 'ci', tokenStatuses: [400] },
+    path: (ctx) => `/api/ci/projects/${ctx.groupSlug}/${ctx.projectSlug}/environments/${ctx.envName}/execute`,
+    body: () => ({}),
+    prepare: async (ctx) => {
+      const e = await freshEnv(ctx.pid, ++unique);
+      ctx.envId = e.id;
+      ctx.envName = e.name;
+    },
+  },
   'GET /api/projects/:pid/sync': { access: { kind: 'ws' } },
 };
 
 const expectedStatus = (access: Access, identity: Identity): number | number[] => {
   if (access.kind === 'public') return access.statuses;
+  if (access.kind === 'ci') return [401];
   if (!identity.active) return 401;
   switch (access.kind) {
     case 'authed':
@@ -711,7 +850,12 @@ const expectedStatus = (access: Access, identity: Identity): number | number[] =
 
 beforeAll(async () => {
   db = await openPlatformDb(':memory:');
-  const created = createApp(db, { loginLimiter: new LoginLimiter({ limit: 10_000, ipLimit: 10_000 }) });
+  const created = createApp(db, {
+    loginLimiter: new LoginLimiter({ limit: 10_000, ipLimit: 10_000 }),
+    connectionLimiter: new KeyedLimiter({ limit: 10_000, windowMs: 60_000 }),
+    tokenFailLimiter: new KeyedLimiter({ limit: 10_000, windowMs: 60_000 }),
+    tokenLimiter: new KeyedLimiter({ limit: 10_000, windowMs: 60_000 }),
+  });
   app = created.app;
   injectWebSocket = created.injectWebSocket;
   stop = async () => {
@@ -724,6 +868,7 @@ beforeAll(async () => {
   base = `http://127.0.0.1:${(server.address() as AddressInfo).port}`;
 
   const admin = await makeUser(db, 'admin', { role: 'admin' });
+  adminUserId = admin.id;
   const ga = await makeUser(db, 'ga', { name: '组管理员' });
   const gm = await makeUser(db, 'gm', { name: '组成员' });
   const pv = await makeUser(db, 'pv', { name: '直接查看者' });
@@ -824,6 +969,10 @@ beforeAll(async () => {
   const invite = await call('POST', '/api/admin/invites', {}, adminCookie);
   expect(invite.status).toBe(201);
 
+  const tok = await call('POST', `/api/projects/${pid}/tokens`, { name: 'matrix-ci' }, adminCookie);
+  expect(tok.status).toBe(201);
+  ciToken = tok.data.token as string;
+
   currentCtx = {
     pid,
     projectSlug,
@@ -833,6 +982,8 @@ beforeAll(async () => {
     outsiderId: outsider.id,
     inviteToken: invite.data.token as string,
     envId: '',
+    envName: '',
+    tokenId: '',
     versionId: 'matrix-version',
   };
   // 一个已发布的版本（直接写库）：版本端点的路径要用它
@@ -1004,4 +1155,38 @@ test('WebSocket：未登录 / 停用 / 无关用户被拒，查看者只读', as
   await until(() => client.notices.length > 0);
   expect(client.notices.at(-1)!.message).toContain('查看者');
   ws.close();
+});
+
+test('CI 令牌：访问所有非 /api/ci 端点一律 403 forbidden（不回落到 cookie），只允许访问 /api/ci/*', async () => {
+  const admin = byName.get('admin')!;
+  for (const route of app.routes.filter((r) => r.method !== 'ALL')) {
+    const key = `${route.method} ${route.path}`;
+    const spec = matrix[key]!;
+    if (spec.access.kind === 'ws') continue;
+    const ctx: Ctx = { ...currentCtx };
+    await spec.prepare?.(ctx, admin);
+    const path = spec.path?.(ctx) ?? route.path;
+    const res = await call(route.method, path, spec.body?.(ctx), admin.cookie, {
+      authorization: `Bearer ${ciToken}`,
+    });
+    if (spec.access.kind === 'ci') {
+      expect(spec.access.tokenStatuses, `${key} / ciToken 返回 ${res.status}`).toContain(res.status);
+    } else {
+      expect(res.status, `CI 令牌访问非允许端点 ${key} 应为 403`).toBe(403);
+      expect(res.data, key).toMatchObject({ ok: false, code: 'forbidden' });
+    }
+  }
+  // WebSocket 同步接口带 CI 令牌同样被 403 拒绝
+  const wsUrl = `${base.replace('http', 'ws')}/api/projects/${currentCtx.pid}/sync`;
+  const wsStatus = await new Promise<number>((resolve) => {
+    const ws = new WebSocket(wsUrl, {
+      headers: { authorization: `Bearer ${ciToken}`, cookie: admin.cookie },
+    });
+    ws.on('unexpected-response', (_req, res) => {
+      resolve(res.statusCode ?? 0);
+      res.resume();
+    });
+    ws.on('error', () => resolve(-1));
+  });
+  expect(wsStatus).toBe(403);
 });

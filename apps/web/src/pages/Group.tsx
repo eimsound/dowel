@@ -12,6 +12,7 @@ import { PolicyLayerPanel } from '../components/PolicyEditor.tsx';
 import { Row, Rows, Section } from '../components/ProjectPage.tsx';
 import { PageHeader, useShellPanel } from '../components/Shell.tsx';
 import { useToast } from '../components/Toasts.tsx';
+import { TokenPolicyPanel } from '../components/TokenSettings.tsx';
 import { Avatar, Banner, IconButton } from '../components/ui.tsx';
 import { WebhookSettings } from '../components/WebhookSettings.tsx';
 import { useMe } from '../session.ts';
@@ -76,6 +77,9 @@ export const GroupPage = () => {
     void qc.invalidateQueries({ queryKey: ['group', slug] });
     void qc.invalidateQueries({ queryKey: ['groups'] });
     void qc.invalidateQueries({ queryKey: ['projects'] });
+    void qc.invalidateQueries({ queryKey: ['project'] });
+    void qc.invalidateQueries({ queryKey: ['token-policy'] });
+    void qc.invalidateQueries({ queryKey: ['ci-tokens'] });
   };
 
   const addMember = useMutation({
@@ -349,6 +353,16 @@ export const GroupPage = () => {
               <PolicyLayerPanel
                 path={`/api/groups/${encodeURIComponent(slug)}/exec-policy`}
                 queryKey={['exec-policy', 'group', slug]}
+              />
+            </Section>
+          )}
+
+          {group.data && (
+            // 组层的“谁能创建 CI 令牌”（P6 T2）：所有人可看，组管理员可改
+            <Section title={t('tok.policy.title')}>
+              <TokenPolicyPanel
+                path={`/api/groups/${encodeURIComponent(slug)}/token-policy`}
+                queryKey={['token-policy', 'group', slug]}
               />
             </Section>
           )}

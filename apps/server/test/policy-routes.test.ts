@@ -877,8 +877,16 @@ describe('平台库迁移：H6 的档位搬进执行策略的环境层', () => {
     const fresh = await openPlatformDb(url);
     try {
       // 退回到 P5a 之前：删掉新表 / 新列，加回 exec_policy，grants 的执行者授权先清掉（旧约束不认识它）
-      // P5b 的迁移（执行申请、审批、收件箱、Webhook）在 P5a 之后，一起退回去
-      for (const t of ['inbox_items', 'exec_approvals', 'exec_requests', 'webhook_deliveries', 'webhooks'])
+      // P5b / P6 的迁移在 P5a 之后，一起退回去
+      for (const t of [
+        'ci_tokens',
+        'token_policies',
+        'inbox_items',
+        'exec_approvals',
+        'exec_requests',
+        'webhook_deliveries',
+        'webhooks',
+      ])
         await fresh.exec(`drop table ${t}`);
       await fresh.exec('drop table exec_policies');
       if (platform === 'sqlite')
@@ -886,8 +894,8 @@ describe('平台库迁移：H6 的档位搬进执行策略的环境层', () => {
           await fresh.exec(`drop trigger if exists environments_prerequisite_${t}`);
       await fresh.exec('alter table environments drop column prerequisite_id');
       await fresh.exec('alter table environments add column exec_policy text');
-      // P5a 的两条迁移（策略表 / 执行者 / 前置环境，和前置环境的约束）和之后 P5b 的一条都退回去
-      await fresh.query('delete from dowel_migrations where version > $1', [MIGRATIONS.length - 3]);
+      // P5a 的两条迁移、P5b 的一条和 P6 的一条都退回去
+      await fresh.query('delete from dowel_migrations where version > $1', [MIGRATIONS.length - 4]);
       await fresh.query("insert into groups (id, slug, name) values ('g1', 'g1', 'g')");
       await fresh.query("insert into projects (id, name, group_id, slug) values ('p1', 'p', 'g1', 'p')");
       for (const [id, pol] of [

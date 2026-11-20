@@ -90,6 +90,7 @@ const COLUMN_KINDS = new Map<string, ColumnKind>([
   ['webhooks.enabled', 'bool'],
   ['webhook_deliveries.ok', 'bool'],
   ['webhook_deliveries.test', 'bool'],
+  ['token_policies.rule', 'json'],
 ]);
 
 /** 登记新增表 / 列的转换规则（测试里也用这个造同名列不同表） */
@@ -966,6 +967,38 @@ export const MIGRATIONS: MigrationStep[] = [
      at ${ts} not null default ${now}
    );
    create index webhook_deliveries_hook on webhook_deliveries (webhook_id, at);`;
+  },
+  // P6：CI 令牌与“谁能创建令牌”的三层规则（ADR 0009 / 0010）。
+  // - ci_tokens：属于项目（创建者离职 / 停用不影响令牌），只存明文的 SHA-256（token_hash 唯一，按它查找）；
+  //   prefix 是明文的前 12 个字符（dwl_ + 8 位），只用来在列表里辨认；吊销写 revoked_at / revoked_by（行保留，列表和审计看得到）；
+  //   last_used_at / last_used_ip 最多 60 秒写一次。项目删除时级联删除（项目删除的事务里也显式删）；
+  // - token_policies：实例 / 组 / 项目每个范围一行（实例层 scope_id 为空串），rule 是 { roles, groups }；不设置 = 没有这一行。
+  (d) => {
+    const { ts, now, json } = types(d);
+    return `create table ci_tokens (
+     id text primary key,
+     project_id text not null references projects on delete cascade,
+     name text not null,
+     description text not null default '',
+     prefix text not null,
+     token_hash text not null unique,
+     created_by text references users on delete set null,
+     created_at ${ts} not null default ${now},
+     expires_at ${ts} not null,
+     revoked_at ${ts},
+     revoked_by text references users on delete set null,
+     last_used_at ${ts},
+     last_used_ip text
+   );
+   create index ci_tokens_project on ci_tokens (project_id);
+   create table token_policies (
+     scope_kind text not null check (scope_kind in ('instance', 'group', 'project')),
+     scope_id text not null,
+     rule ${json} not null,
+     updated_by text references users on delete set null,
+     updated_at ${ts} not null default ${now},
+     primary key (scope_kind, scope_id)
+   );`;
   },
 ];
 
