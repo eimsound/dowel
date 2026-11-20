@@ -38,12 +38,14 @@ import {
 } from './pages/Admin.tsx';
 import { EnvironmentDetail, Environments } from './pages/Environments.tsx';
 import { GroupPage } from './pages/Group.tsx';
+import { InboxPage } from './pages/Inbox.tsx';
 import { Login } from './pages/Login.tsx';
 import { Members } from './pages/Members.tsx';
 import { NewProject } from './pages/NewProject.tsx';
 import { Overview } from './pages/Overview.tsx';
 import { ProjectSettings } from './pages/ProjectSettings.tsx';
 import { Projects } from './pages/Projects.tsx';
+import { RequestDetail } from './pages/Request.tsx';
 import { VersionDetail, Versions } from './pages/Versions.tsx';
 import { Model } from './pages/Workspace.tsx';
 import { ProjectProvider } from './project.tsx';
@@ -219,6 +221,7 @@ const projectChildren = [
     path: 'environments/$eid',
     component: EnvironmentDetail,
   }),
+  createRoute({ getParentRoute: () => projectRoute, path: 'requests/$rid', component: RequestDetail }),
   createRoute({ getParentRoute: () => projectRoute, path: 'activity', component: ActivityPage }),
   createRoute({ getParentRoute: () => projectRoute, path: 'members', component: Members }),
   createRoute({ getParentRoute: () => projectRoute, path: 'settings', component: ProjectSettings }),
@@ -235,6 +238,23 @@ const GroupLayout = () => {
     </AppShell>
   );
 };
+
+/** 收件箱（P5b）：在外壳里，没有侧面板 */
+const InboxLayout = () => {
+  const me = useMe().data;
+  if (!me) return null;
+  return (
+    <AppShell me={me}>
+      <InboxPage />
+    </AppShell>
+  );
+};
+
+const inboxRoute = createRoute({
+  getParentRoute: () => rootRoute,
+  path: '/inbox',
+  component: InboxLayout,
+});
 
 const groupRoute = createRoute({
   getParentRoute: () => rootRoute,
@@ -320,6 +340,7 @@ const routes = [
   createRoute({ getParentRoute: () => rootRoute, path: '/oidc/confirm', component: OidcConfirm }),
   projectsRoute,
   newProjectRoute,
+  inboxRoute,
   groupRoute,
   projectRoute.addChildren(projectChildren),
   legacyRoute,

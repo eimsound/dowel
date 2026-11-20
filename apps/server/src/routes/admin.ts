@@ -51,6 +51,16 @@ export const registerAdmin = (app: Hono<Env>, ctx: AppContext) => {
         });
       b.connectionAllowlist = items;
     }
+    // Webhook 出站允许列表同样逐项校验（写错一项就放行不了想放行的内网接收端）
+    if (b.webhookAllowlist) {
+      const items = parseAllowlist(b.webhookAllowlist);
+      const bad = items.filter((x) => !validAllowlistEntry(x));
+      if (bad.length)
+        throw new HTTPException(422, {
+          message: `Webhook 出站允许列表里有不认识的写法：${bad.slice(0, 3).join('、')}（CIDR、IP 或主机名）`,
+        });
+      b.webhookAllowlist = items;
+    }
     // 没有任何 OIDC 提供方时关闭密码登录会把所有人锁在外面，直接拒绝
     if (b.passwordLogin === false && !(await hasOidcProvider(db)))
       throw new HTTPException(422, {

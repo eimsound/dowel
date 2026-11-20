@@ -36,6 +36,7 @@ import { api } from '../api.ts';
 import { groupColor, groupInitial } from '../avatar.ts';
 import { driftWarnings, useEnvs } from '../envs.ts';
 import i18n, { setLang } from '../i18n.ts';
+import { useInboxStream, useUnread } from '../requests.ts';
 import { useSignOut } from '../session.ts';
 import { getScheme, type Scheme, setScheme } from '../theme.ts';
 import { CommandPalette } from './CommandPalette.tsx';
@@ -214,6 +215,7 @@ const RailLink = ({
   currentValue = 'page',
   temp = false,
   warn,
+  badge,
   children,
 }: {
   to: string;
@@ -231,6 +233,8 @@ const RailLink = ({
    * 不改链接的名字（名字仍然只是 label），读屏软件读完名字后再读说明。
    */
   warn?: string;
+  /** 右上角的数字（收件箱未读数）；说明文字同样用 aria-describedby 关联 */
+  badge?: { count: number; text: string };
   children: ReactNode;
 }) => {
   const id = useId();
@@ -245,7 +249,7 @@ const RailLink = ({
         aria-current={active ? currentValue : undefined}
         data-current={active ? '' : undefined}
         data-temp={temp ? '' : undefined}
-        aria-describedby={warn ? warnId : undefined}
+        aria-describedby={warn || badge ? warnId : undefined}
         title={canHint ? undefined : text}
         {...(canHint ? { interestfor: id } : {})}
         className="rail-item"
@@ -253,9 +257,15 @@ const RailLink = ({
         {children}
         {warn && <span aria-hidden="true" className="rail-dot" />}
       </Link>
-      {warn && (
+      {/* 未读数放在链接外面（叠在图标右上角）：链接的可访问名字只是 label，数字由 aria-describedby 的说明读出 */}
+      {badge && badge.count > 0 && (
+        <span aria-hidden="true" className="rail-badge" data-testid="inbox-unread">
+          {badge.count > 99 ? '99+' : badge.count}
+        </span>
+      )}
+      {(warn || badge) && (
         <span id={warnId} className="sr-only">
-          {warn}
+          {warn ?? badge?.text}
         </span>
       )}
       {canHint && (
@@ -267,11 +277,22 @@ const RailLink = ({
   );
 };
 
-const RailButton = ({ label, children }: { label: string; children: ReactNode }) => (
-  <button type="button" className="rail-item" aria-label={label} title={label} disabled aria-disabled="true">
-    {children}
-  </button>
-);
+/** 收件箱入口：未读数实时更新（SSE，见 requests.ts 的 useInboxStream） */
+const InboxLink = ({ active }: { active: boolean }) => {
+  const { t } = useTranslation();
+  useInboxStream();
+  const unread = useUnread().data ?? 0;
+  return (
+    <RailLink
+      to="/inbox"
+      label={t('nav.inbox')}
+      active={active}
+      badge={{ count: unread, text: t('nav.inboxUnread', { count: unread }) }}
+    >
+      <Inbox size={16} aria-hidden="true" />
+    </RailLink>
+  );
+};
 
 /** 账户菜单：个人设置、管理后台、语言、配色、退出 */
 const UserMenu = ({ me }: { me: Me }) => {
@@ -356,6 +377,8 @@ export const pageFromPath = (path: string, project?: ShellProject): ShellPage | 
   const base = `/project/${project.owner}/${project.slug}`;
   if (path === base || path === `${base}/`) return 'overview';
   const rest = path.slice(base.length + 1).split('/')[0];
+  // 执行申请的详情页属于环境
+  if (rest === 'requests') return 'environments';
   return PROJECT_NAV.some((n) => n.key === rest) ? (rest as ShellPage) : null;
 };
 
@@ -582,9 +605,7 @@ export const AppShell = ({
             </>
           )}
           <span className="flex-1" />
-          <RailButton label={t('nav.inboxSoon')}>
-            <Inbox size={16} aria-hidden="true" />
-          </RailButton>
+          <InboxLink active={path === '/inbox'} />
           <UserMenu me={me} />
         </nav>
         {slot &&

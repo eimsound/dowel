@@ -502,6 +502,30 @@ test('每个应审计的动作都能在 audit_events 里找到', async () => {
           ).status,
         ).toBe(200),
     },
+    // P5b：执行申请的每一步、紧急执行（路由级覆盖在 requests.test.ts，需要真实目标库）
+    { action: 'exec_request.create', run: () => directAudit('exec_request.create', 'exec_request', 'r1') },
+    { action: 'exec_request.approve', run: () => directAudit('exec_request.approve', 'exec_request', 'r1') },
+    { action: 'exec_request.reject', run: () => directAudit('exec_request.reject', 'exec_request', 'r1') },
+    {
+      action: 'exec_request.withdraw',
+      run: () => directAudit('exec_request.withdraw', 'exec_request', 'r1'),
+    },
+    {
+      action: 'exec_request.invalidate',
+      run: () => directAudit('exec_request.invalidate', 'exec_request', 'r1'),
+    },
+    { action: 'exec_request.expire', run: () => directAudit('exec_request.expire', 'exec_request', 'r1') },
+    { action: 'exec_request.execute', run: () => directAudit('exec_request.execute', 'exec_request', 'r1') },
+    { action: 'exec_request.finish', run: () => directAudit('exec_request.finish', 'exec_request', 'r1') },
+    {
+      action: 'environment.emergency',
+      run: () => directAudit('environment.emergency', 'exec_request', 'r1'),
+    },
+    // P5b：组级 Webhook 的配置与发送测试（路由级覆盖在 webhooks.test.ts）
+    { action: 'webhook.create', run: () => directAudit('webhook.create', 'webhook', 'w1') },
+    { action: 'webhook.update', run: () => directAudit('webhook.update', 'webhook', 'w1') },
+    { action: 'webhook.delete', run: () => directAudit('webhook.delete', 'webhook', 'w1') },
+    { action: 'webhook.test', run: () => directAudit('webhook.test', 'webhook', 'w1') },
     { action: 'model.import', run: () => directAudit('model.import', 'project', 'p1') },
     // OIDC 动作（路由级覆盖在 oidc.test.ts 里）
     { action: 'oidc.provider_create', run: () => directAudit('oidc.provider_create', 'oidc_provider', 'o1') },

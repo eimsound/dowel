@@ -264,6 +264,8 @@ export const registerEnvironments = (app: Hono<Env>, ctx: AppContext) => {
           row.current_version_id,
         ])
       : [];
+    // P5b：连接串 / 生产标记 / 档位变了，这个环境上还没结束的执行申请重新检查
+    ctx.requests.kick({ envIds: [row.id] });
     return c.json<EnvInfo>(
       toEnvInfo(row, actor, r.role, auth, {
         currentVersion: cur ? versionRef(cur) : null,

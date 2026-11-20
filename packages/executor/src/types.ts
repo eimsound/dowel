@@ -109,6 +109,12 @@ export interface ExecuteOptions {
   timeouts?: { statementMs: number; lockMs: number };
   onEvent?: (e: ExecutorEvent) => void | Promise<void>;
   /**
+   * 执行申请的绑定（P5b，ADR 0006）：在目标库的项目锁里、写任何东西之前核对——
+   * 目标库历史里的当前版本必须等于 from，要执行的迁移（版本、方向、顺序）和每个版本的校验和必须和提交时一致，
+   * 否则抛 request_stale，什么都不写。平台库的缓存可能落后于目标库，所以这一步必须在锁里、按目标库的历史做。
+   */
+  expect?: ExecuteExpect;
+  /**
    * 每个迁移（含基线）开始前调用：平台库在这里登记“这个版本即将在这个环境执行”并再确认版本没被改过。
    * 抛错就中止执行（此时这个迁移还没有对目标库做任何事）。
    */
@@ -131,6 +137,12 @@ export interface ExecuteOptions {
   dryRun?: boolean;
 }
 
+/** 执行申请绑定的起点和迁移（见 ExecuteOptions.expect） */
+export interface ExecuteExpect {
+  from: string | null;
+  migrations: { versionId: string; direction: MigrationDirection; checksum: string }[];
+}
+
 /** 预演里的一个迁移：要执行的脚本和哪些步骤不在事务里 */
 export interface DryRunMigration {
   versionId: string;
@@ -140,6 +152,8 @@ export interface DryRunMigration {
   steps: { sql: string; transactional: boolean }[];
   /** 不能放进事务的步骤数（含这些步骤的迁移不是原子的，中途失败要从断点续跑） */
   nonTransactional: number;
+  /** 预演用的那一份版本链里这个版本的校验和（执行申请绑定它，P5b） */
+  checksum: string;
 }
 
 /** 预演的结果：通过了全部检查，真执行时会做什么 */

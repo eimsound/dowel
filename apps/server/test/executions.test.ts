@@ -238,7 +238,13 @@ describe.each([
       expect(st.drift.status).toBe('ok');
       const envs = (await call('GET', `/api/projects/${pid}/environments`)).data as unknown as EnvInfo[];
       expect(envs[0]).toMatchObject({ currentVersion: { number: 3 }, drift: { status: 'ok' } });
-      expect(envs[0]!.permissions).toEqual({ execute: true, configure: true });
+      expect(envs[0]!.permissions).toEqual({
+        execute: true,
+        configure: true,
+        approvalRequired: false,
+        request: true,
+        emergency: false,
+      });
 
       // 历史：读目标库的 dowel.history
       const h = await history(pid, eid);

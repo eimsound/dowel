@@ -10,7 +10,7 @@ import { DEFAULT_DRIFT_INTERVAL_MS } from './drift-scheduler.ts';
 import { autoSetup, needsSetup } from './setup.ts';
 
 const db = await openPlatformDb(process.env.DOWEL_DB || './data/dowel.db');
-const { app, injectWebSocket, rooms, shadows, drift, setupToken } = createApp(db);
+const { app, injectWebSocket, rooms, shadows, drift, requests, webhooks, setupToken } = createApp(db);
 const port = Number(process.env.PORT ?? 4600);
 
 // 无人值守初始化：设置了 DOWEL_ADMIN_USERNAME / DOWEL_ADMIN_PASSWORD 并且还没有用户时直接建管理员。
@@ -35,6 +35,10 @@ if (existsSync(web)) {
     c.req.path.startsWith('/api/') ? c.notFound() : c.html(readFileSync(`${web}/index.html`, 'utf8')),
   );
 }
+// 执行申请：先把重启前就在“执行中”的申请记为中断（执行失败），再开始接受连接——之后开始的执行不会被误记（第一轮审查）；
+// 然后定时检查过期、失效的申请（单进程部署）
+await requests.start();
+
 const server = serve({ fetch: app.fetch, port }, (info) => {
   console.log(`Dowel 已启动：http://localhost:${info.port}`);
   if (needsInit)
@@ -49,6 +53,8 @@ drift.start(driftMinutes === undefined ? DEFAULT_DRIFT_INTERVAL_MS : Number(drif
 const stop = async () => {
   server.close();
   drift.stop();
+  requests.stop();
+  webhooks.close();
   await rooms.flush();
   await shadows.close();
   await db.close();

@@ -240,6 +240,8 @@ export const registerPolicy = (app: Hono<Env>, ctx: AppContext) => {
 
   app.put('/api/admin/exec-policy', async (c) => {
     const r = await putLayer(c, 'instance', '', async () => ({ canLoosenOf: () => true, groupId: null }));
+    // P5b：策略变了，受影响范围里还没结束的执行申请重新检查（流程变严的会失效）
+    ctx.requests.kick({ all: true });
     return c.json<PolicyLayerView>(await layerView('instance', r.layers, r.own, true, () => true));
   });
 
@@ -277,6 +279,8 @@ export const registerPolicy = (app: Hono<Env>, ctx: AppContext) => {
         throw new HTTPException(403, { message: '需要组管理员' });
       return { groupId: g.id, canLoosenOf: groupCanLoosen(rc, g.id, groupRole) };
     });
+    // P5b：策略变了，受影响范围里还没结束的执行申请重新检查（流程变严的会失效）
+    ctx.requests.kick({ groupIds: [g.id] });
     return c.json<PolicyLayerView>(await layerView('group', r.layers, r.own, true, r.canLoosenOf));
   });
 
@@ -335,6 +339,8 @@ export const registerPolicy = (app: Hono<Env>, ctx: AppContext) => {
       },
       a.pid,
     );
+    // P5b：策略变了，受影响范围里还没结束的执行申请重新检查（流程变严的会失效）
+    ctx.requests.kick({ projectIds: [a.pid] });
     return c.json<PolicyLayerView>(await layerView('project', r.layers, r.own, true, r.canLoosenOf));
   });
 
@@ -437,6 +443,8 @@ export const registerPolicy = (app: Hono<Env>, ctx: AppContext) => {
     });
     const environments = new Map(r.store.environments);
     environments.set(r.env.id, r.ownAfter);
+    // P5b：策略变了，受影响范围里还没结束的执行申请重新检查（流程变严的会失效）
+    ctx.requests.kick({ envIds: [r.env.id] });
     return c.json<EnvPolicyView>(
       await envView(
         user,

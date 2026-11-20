@@ -1,6 +1,7 @@
 // 实例设置：键值表 instance_settings(key, value json)，值都是 JSON。
 // 项目见 02-consensus.md 11.1：实例名称、谁能建组、是否允许密码登录；
-// connection_allowlist 是 P3 加的 SSRF 开关（服务端替用户连数据库时能连到哪里）。
+// connection_allowlist 是 P3 加的 SSRF 开关（服务端替用户连数据库时能连到哪里）；
+// webhook_allowlist 是 P5b 加的 Webhook 出站额外放行列表（默认只允许公网地址，见 webhooks.ts）。
 import type { GroupCreation, InstanceSettings, InstanceSettingsPatch } from '@dowel/api';
 import type { Db } from '@dowel/engines';
 import { countEnabledProviders } from './oidc.ts';
@@ -11,6 +12,7 @@ export const SETTINGS_DEFAULTS: Omit<InstanceSettings, 'instanceId'> = {
   groupCreation: 'all',
   passwordLogin: true,
   connectionAllowlist: [],
+  webhookAllowlist: [],
 };
 
 /** 实例唯一标识的 key：由迁移在首次启动时写入，之后不变，不通过 writeSettings 修改 */
@@ -22,6 +24,7 @@ const KEYS = {
   groupCreation: 'group_creation',
   passwordLogin: 'password_login',
   connectionAllowlist: 'connection_allowlist',
+  webhookAllowlist: 'webhook_allowlist',
 } as const;
 
 /** 可以写的设置项（instanceId 只读，不在其中） */
@@ -44,6 +47,9 @@ export const readSettings = async (db: Db): Promise<InstanceSettings> => {
     connectionAllowlist: Array.isArray(stored.get(KEYS.connectionAllowlist))
       ? (stored.get(KEYS.connectionAllowlist) as unknown[]).filter((x): x is string => typeof x === 'string')
       : SETTINGS_DEFAULTS.connectionAllowlist,
+    webhookAllowlist: Array.isArray(stored.get(KEYS.webhookAllowlist))
+      ? (stored.get(KEYS.webhookAllowlist) as unknown[]).filter((x): x is string => typeof x === 'string')
+      : SETTINGS_DEFAULTS.webhookAllowlist,
     instanceId:
       typeof stored.get(INSTANCE_ID_KEY) === 'string' ? (stored.get(INSTANCE_ID_KEY) as string) : '',
   };

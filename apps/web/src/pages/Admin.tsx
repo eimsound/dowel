@@ -947,7 +947,7 @@ export const AdminSettings = () => {
     queryKey: ['admin-settings'],
     queryFn: () => api<InstanceSettings>('GET', '/api/admin/settings'),
   });
-  type Form = { name: string; groupCreation: 'all' | 'admin'; allowlist: string };
+  type Form = { name: string; groupCreation: 'all' | 'admin'; allowlist: string; webhookAllowlist: string };
   const [form, setForm] = useState<Form | null>(null);
   const value: Form | null =
     form ??
@@ -956,6 +956,7 @@ export const AdminSettings = () => {
           name: settings.data.name,
           groupCreation: settings.data.groupCreation,
           allowlist: settings.data.connectionAllowlist.join('\n'),
+          webhookAllowlist: settings.data.webhookAllowlist.join('\n'),
         }
       : null);
   const save = useMutation({
@@ -965,6 +966,8 @@ export const AdminSettings = () => {
         groupCreation: body.groupCreation,
         // 一行一项（逗号、空格也当分隔符）；空表示不限制
         connectionAllowlist: body.allowlist.split(/[\s,]+/).filter(Boolean),
+        // Webhook 出站额外放行的地址（默认只允许公网）
+        webhookAllowlist: body.webhookAllowlist.split(/[\s,]+/).filter(Boolean),
       }),
     onSuccess: (next) => {
       qc.setQueryData(['admin-settings'], next);
@@ -1017,6 +1020,17 @@ export const AdminSettings = () => {
               onChange={(e) => setForm({ ...value, allowlist: e.target.value })}
             />
             <span className="hint">{t('adm.settings.allowlistHint')}</span>
+          </label>
+          <label className="field max-w-md">
+            <span className="label">{t('adm.settings.webhookAllowlist')}</span>
+            <textarea
+              className="textarea h-28 font-mono"
+              value={value.webhookAllowlist}
+              spellCheck={false}
+              placeholder="10.1.2.0/24\nhooks.internal"
+              onChange={(e) => setForm({ ...value, webhookAllowlist: e.target.value })}
+            />
+            <span className="hint">{t('adm.settings.webhookAllowlistHint')}</span>
           </label>
           <label className="field max-w-md">
             <span className="label">{t('adm.settings.instanceId')}</span>

@@ -18,10 +18,12 @@ import { registerGroups } from './groups.ts';
 import { registerOidcAdmin, registerOidcAuth, registerOidcMe } from './oidc.ts';
 import { registerPolicy } from './policy.ts';
 import { registerProjects } from './projects.ts';
+import { registerInbox, registerRequests } from './requests.ts';
 import { registerSetup } from './setup.ts';
 import { registerSync } from './sync.ts';
 import { registerTakeover } from './takeover.ts';
 import { registerVersions } from './versions.ts';
+import { registerWebhooks } from './webhooks.ts';
 import { registerWizard } from './wizard.ts';
 
 export const registerRoutes = (app: Hono<Env>, ctx: AppContext) => {
@@ -36,6 +38,8 @@ export const registerRoutes = (app: Hono<Env>, ctx: AppContext) => {
   app.use('/api/me/*', requireUser(ctx.db));
   registerMe(app, ctx);
   registerOidcMe(app, ctx);
+  // 收件箱（P5b）
+  registerInbox(app, ctx);
 
   // 实例管理：先登录，再按各自的实例级动作要求实例管理员
   app.use('/api/admin/*', requireUser(ctx.db));
@@ -64,6 +68,8 @@ export const registerRoutes = (app: Hono<Env>, ctx: AppContext) => {
   app.use('/api/resolve/*', requireUser(ctx.db));
   registerGroups(app, ctx);
   registerDirectory(app, ctx);
+  // 组级 Webhook（P5b）：组管理员
+  registerWebhooks(app, ctx);
 
   // WebSocket 的 Origin 校验在登录检查之前（跨源升级一律 403）
   app.use('/api/projects/:pid/sync', wsOriginGuard(ctx.security));
@@ -85,5 +91,7 @@ export const registerRoutes = (app: Hono<Env>, ctx: AppContext) => {
   registerExecutions(app, ctx);
   // 执行策略：实例层在 /api/admin 下（上面已要求实例管理员），组层在 /api/groups 下，项目 / 环境层在 /api/projects 下
   registerPolicy(app, ctx);
+  // 执行申请与审批、紧急执行（P5b）
+  registerRequests(app, ctx);
   registerSync(app, ctx);
 };

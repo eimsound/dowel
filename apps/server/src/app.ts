@@ -13,6 +13,7 @@ import { OpaqueRefresher } from './derive.ts';
 import { DriftScheduler } from './drift-scheduler.ts';
 import { EnvLocks, type ExecContext } from './executions.ts';
 import { KeyedLimiter, type LoginLimiter, loginLimiterFromEnv } from './rate-limit.ts';
+import { Requests } from './requests.ts';
 import { effectiveProjectRole } from './roles.ts';
 import { Rooms } from './rooms.ts';
 import type { AppContext, Env } from './routes/context.ts';
@@ -29,6 +30,7 @@ import { newSetupToken } from './setup.ts';
 import { ShadowError } from './shadow.ts';
 import { Shadows } from './shadows.ts';
 import type { ConnectionGuard } from './targets.ts';
+import { type WebhookOptions, Webhooks } from './webhooks.ts';
 
 export interface AppOptions {
   /** 可注入时钟 / 阈值的登录限速器（测试用） */
@@ -39,6 +41,8 @@ export interface AppOptions {
   security?: Partial<SecurityConfig>;
   /** 强制允许密码登录（相当于 DOWEL_ALLOW_PASSWORD_LOGIN=1）；未给出时读环境变量 */
   allowPasswordLogin?: boolean;
+  /** Webhook 投递的参数（测试里调短重试间隔） */
+  webhooks?: WebhookOptions;
 }
 
 export const createApp = (db: PlatformDb, options: AppOptions = {}) => {
@@ -89,6 +93,10 @@ export const createApp = (db: PlatformDb, options: AppOptions = {}) => {
   const exec: ExecContext = { db, guard, locks: new EnvLocks() };
   // 定时漂移检查：这里只创建，不启动（main.ts 按配置启动；测试里不启动或调短间隔）
   const drift = new DriftScheduler(db, exec);
+  // P5b：组级 Webhook（进程内队列）和执行申请（状态检查、通知、定时清理）
+  const webhooks = new Webhooks(db, options.webhooks);
+  const requests = new Requests(db, exec, webhooks, security);
+  drift.afterSweep = () => requests.kick({ all: true });
 
   const ctx: AppContext = {
     db,
@@ -100,6 +108,8 @@ export const createApp = (db: PlatformDb, options: AppOptions = {}) => {
     guard,
     exec,
     drift,
+    requests,
+    webhooks,
     security,
     // 一次性初始化令牌只放内存里（服务重启会重新生成），启动时由 main.ts 打印
     setupToken: newSetupToken(),
@@ -134,5 +144,16 @@ export const createApp = (db: PlatformDb, options: AppOptions = {}) => {
 
   registerRoutes(app, ctx);
 
-  return { app, injectWebSocket, rooms, shadows, refresher, drift, exec, setupToken: ctx.setupToken };
+  return {
+    app,
+    injectWebSocket,
+    rooms,
+    shadows,
+    refresher,
+    drift,
+    exec,
+    requests,
+    webhooks,
+    setupToken: ctx.setupToken,
+  };
 };

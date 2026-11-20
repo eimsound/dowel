@@ -244,9 +244,13 @@ export const permissionsOf = (
   auth: EnvAuth,
 ): EnvPermissions => {
   const res = envResource(r, role, auth);
+  const approvalRequired = auth.resolved.approval.stages.length > 0;
   return {
     execute: can(actor, 'environment.execute', res),
     configure: can(actor, 'environment.change_connection', res),
+    approvalRequired,
+    request: can(actor, 'environment.request', res),
+    emergency: approvalRequired && can(actor, 'instance.emergency_execute', { kind: 'instance' }),
   };
 };
 

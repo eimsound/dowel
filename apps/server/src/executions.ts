@@ -21,6 +21,7 @@ import {
   type ChainVersion,
   checkDrift,
   type DriftReport,
+  type ExecuteExpect,
   type ExecuteResult,
   ExecutorError,
   type ExecutorEvent,
@@ -213,6 +214,8 @@ export interface RunInput {
   userId: string;
   /** 执行策略的超时（生效策略里的语句超时 / 锁等待超时，P5a）；预演不用 */
   timeouts?: { statementMs: number; lockMs: number };
+  /** 执行申请的绑定（P5b）：执行器在目标库锁里核对起点和迁移，不一致就 request_stale，什么都不写 */
+  expect?: ExecuteExpect;
   onEvent?: (e: ExecEvent) => void | Promise<void>;
 }
 
@@ -417,6 +420,7 @@ export const runExecution = async (
         executedBy: input.userId,
         via: 'web',
         timeouts: input.timeouts,
+        expect: input.expect,
         onEvent: emit,
         beforeMigration: async (m) => {
           const k = await claim(db, pid, env.id, m.version, m.direction === 'baseline');

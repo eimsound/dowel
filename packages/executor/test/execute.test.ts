@@ -1287,3 +1287,55 @@ test.skipIf(!PG_URL)(
     });
   },
 );
+
+test.skipIf(!PG_URL)(
+  '执行申请的绑定（P5b）：起始版本、迁移列表或校验和与提交时不同 → request_stale，什么都不写；一致时照常执行',
+  async () => {
+    const models = [
+      await canon(m0()),
+      await canon(withEmail(m0())),
+      await canon(withOrders(withEmail(m0()))),
+    ];
+    const chain = chainOf(models);
+    const bind = (from: string | null, numbers: number[], c = chain) => ({
+      from,
+      migrations: numbers.map((n) => ({
+        versionId: idOf(c, n),
+        direction: 'up' as const,
+        checksum: c.find((v) => v.number === n)!.checksum,
+      })),
+    });
+    await withTarget(async (t) => {
+      await run(t.db, chain, 1);
+      // 申请是在 v1 时提交的（执行 v2、v3）；v3 的脚本在提交之后被改过（还没在任何地方执行过，校验和不同）
+      const expect13 = bind(idOf(chain, 1), [2, 3]);
+      const edited = withSteps(chain, 3, [...chain[2]!.upSteps, tx('SELECT 1')]);
+      const e0 = await fails(run(t.db, edited, 3, { expect: expect13 }));
+      expect(e0.code).toBe('request_stale');
+      expect((await readHistory(t.db, 'p1')).currentVersion).toBe(idOf(chain, 1));
+      // 有人先直接执行到了 v2：起点变了
+      await run(t.db, chain, 2);
+      const e1 = await fails(run(t.db, chain, 3, { expect: expect13 }));
+      expect(e1.code).toBe('request_stale');
+      expect((await readHistory(t.db, 'p1')).currentVersion).toBe(idOf(chain, 2));
+      // 库已经在目标版本：也不能当作执行成功
+      await run(t.db, chain, 3);
+      const e2 = await fails(run(t.db, chain, 3, { expect: bind(idOf(chain, 2), [3]) }));
+      expect(e2.code).toBe('request_stale');
+      await run(t.db, chain, 2);
+      // 方向不一致（绑定的是回滚）
+      const e4 = await fails(
+        run(t.db, chain, 3, {
+          expect: {
+            from: idOf(chain, 2),
+            migrations: [{ ...bind(null, [3]).migrations[0]!, direction: 'down' }],
+          },
+        }),
+      );
+      expect(e4.code).toBe('request_stale');
+      // 一致：照常执行
+      const ok = await run(t.db, chain, 3, { expect: bind(idOf(chain, 2), [3]) });
+      expect(ok).toMatchObject({ direction: 'up', current: idOf(chain, 3) });
+    });
+  },
+);

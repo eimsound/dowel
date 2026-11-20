@@ -10,7 +10,7 @@ import { HTTPException } from 'hono/http-exception';
 const IPV4 = /^(\d{1,3})\.(\d{1,3})\.(\d{1,3})\.(\d{1,3})$/;
 
 /** IPv4 → 4 字节；非法返回 null */
-const v4Bytes = (ip: string): number[] | null => {
+export const v4Bytes = (ip: string): number[] | null => {
   const m = IPV4.exec(ip);
   if (!m) return null;
   const parts = m.slice(1).map(Number);
@@ -18,7 +18,7 @@ const v4Bytes = (ip: string): number[] | null => {
 };
 
 /** IPv6 → 16 字节（支持 :: 缩写和末尾的 IPv4 写法）；非法返回 null */
-const v6Bytes = (ip: string): number[] | null => {
+export const v6Bytes = (ip: string): number[] | null => {
   let s = ip.toLowerCase();
   if (s.startsWith('[') && s.endsWith(']')) s = s.slice(1, -1);
   const zone = s.indexOf('%');
@@ -50,17 +50,17 @@ const v6Bytes = (ip: string): number[] | null => {
   return [...head, ...new Array<number>(fill).fill(0), ...tail];
 };
 
-const bytesOf = (ip: string): number[] | null => v4Bytes(ip) ?? v6Bytes(ip);
+export const bytesOf = (ip: string): number[] | null => v4Bytes(ip) ?? v6Bytes(ip);
 
 /** IPv4-mapped IPv6（::ffff:1.2.3.4）按 IPv4 再看一遍 */
-const mappedV4 = (ip: string): string | null => {
+export const mappedV4 = (ip: string): string | null => {
   const b = v6Bytes(ip);
   if (b?.length !== 16) return null;
   if (!b.slice(0, 10).every((x) => x === 0) || b[10] !== 0xff || b[11] !== 0xff) return null;
   return b.slice(12).join('.');
 };
 
-const inCidr = (ip: string, cidr: string): boolean => {
+export const inCidr = (ip: string, cidr: string): boolean => {
   const [base, bitsText] = cidr.split('/');
   if (!base || bitsText === undefined) return false;
   const a = bytesOf(ip);

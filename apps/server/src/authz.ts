@@ -30,6 +30,11 @@ export type ProjectAction =
   | 'environment.manage'
   | 'environment.pull'
   | 'environment.check_drift'
+  /**
+   * 提交执行申请（P5b）：项目编辑者以上，或者这个环境的执行者。不是特权操作（不碰目标库，只读结构做预演），
+   * 也不要求满足“谁能执行”——申请本来就是给没有权限直接执行的人用的。
+   */
+  | 'environment.request'
   | 'sync.connect'
   | 'sync.edit';
 
@@ -65,6 +70,8 @@ export type GroupAction =
   | 'group.create_project'
   /** 组层的执行策略（P5a）：组管理员；放宽另外要满足组层改动前的“谁能执行” */
   | 'group.set_policy'
+  /** 组级 Webhook 的配置、投递记录和发送测试（P5b）：组管理员 */
+  | 'group.manage_webhooks'
   | 'group.delete';
 
 /** 实例级动作（instance.create_group 的规则依赖实例设置，在 can() 里单独判断） */
@@ -77,6 +84,8 @@ export type InstanceAction =
   | 'instance.manage_grants'
   /** 实例层的执行策略（P5a） */
   | 'instance.manage_policy'
+  /** 紧急执行（P5b）：绕过审批流程（不绕过漂移、完整性、前置环境等检查），必填原因；只有实例管理员 */
+  | 'instance.emergency_execute'
   | 'instance.create_group'
   | 'instance.view_audit';
 
@@ -196,6 +205,7 @@ export const ACTION_MIN_ROLE: Record<ProjectAction, Role> = {
   'environment.pull': 'editor',
   // 手动检查漂移：只读目标库的结构，但要连生产库，编辑者以上
   'environment.check_drift': 'editor',
+  'environment.request': 'editor',
   'sync.connect': 'viewer',
   'sync.edit': 'editor',
 };
@@ -206,6 +216,7 @@ export const GROUP_ADMIN_ACTIONS: GroupAction[] = [
   'group.manage_members',
   'group.manage_grants',
   'group.set_policy',
+  'group.manage_webhooks',
   'group.delete',
 ];
 
@@ -217,6 +228,7 @@ export const INSTANCE_ACTIONS: InstanceAction[] = [
   'instance.invite',
   'instance.manage_grants',
   'instance.manage_policy',
+  'instance.emergency_execute',
   'instance.create_group',
   'instance.view_audit',
 ];
@@ -267,7 +279,12 @@ export const can = (actor: Actor, action: Action, resource: Resource): boolean =
     return admin;
   }
   // 手动检查漂移只读目标库的结构；执行者本来就被信任去连这个库（他能执行），所以也能检查
-  if (action === 'environment.check_drift' && resource.kind === 'environment' && resource.isExecutor === true)
+  // 执行者也能提交执行申请（多环节流程里执行者自己执行也要先申请）
+  if (
+    (action === 'environment.check_drift' || action === 'environment.request') &&
+    resource.kind === 'environment' &&
+    resource.isExecutor === true
+  )
     return resource.role != null;
   if (resource.kind === 'project' || resource.kind === 'environment')
     return hasProjectRole(resource.role, ACTION_MIN_ROLE[action as ProjectAction]);

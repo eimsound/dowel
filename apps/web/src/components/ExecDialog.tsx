@@ -1,6 +1,8 @@
 // 执行确认对话框：列出将要执行 / 回滚的迁移和风险摘要，生产环境必须输入环境名才能确认；
 // 确认后用 SSE 读进度，出错时显示原因（漂移时列出差异）。关闭时刷新环境的状态、历史和列表。
 // P5a：显示生效的执行策略摘要和前置环境检查（本地用 checkPrerequisite 先算，预演回来后以服务端为准；没通过时不能确认）。
+// P5b：mode = request 时（无权直接执行，或环境要求审批）变成“提交执行申请”：预演不通过不能提交，可以写申请说明；
+// mode = emergency 是实例管理员的紧急执行：绕过审批，必填原因并二次确认（勾选确认 + 生产环境输入环境名）。
 import {
   checkPrerequisite,
   type DriftItem,
@@ -8,6 +10,7 @@ import {
   type EnvStatus,
   type EnvVersion,
   type ExecEvent,
+  type ExecRequestDetail,
   type PrerequisiteResult,
 } from '@dowel/api';
 import { useQueryClient } from '@tanstack/react-query';
@@ -22,6 +25,8 @@ import { Banner, Sql } from './ui.tsx';
 import { useVersionName, VersionNumber } from './VersionStatus.tsx';
 
 export type ExecKind = 'execute' | 'rollback' | 'baseline';
+/** direct：直接执行；request：提交执行申请；emergency：紧急执行（实例管理员，绕过审批） */
+export type ExecMode = 'direct' | 'request' | 'emergency';
 
 /** 这次要执行 / 回滚的版本（按执行顺序）：执行是从当前版本之后到目标；回滚是从当前版本往回到目标之后 */
 export const migrationsFor = (status: EnvStatus, kind: ExecKind, to?: EnvVersion): EnvVersion[] => {
@@ -202,6 +207,8 @@ export const ExecDialog = ({
   kind,
   to,
   onClose,
+  mode = 'direct',
+  onRequested,
 }: {
   pid: string;
   eid: string;
@@ -211,6 +218,9 @@ export const ExecDialog = ({
   kind: ExecKind;
   to?: EnvVersion;
   onClose: () => void;
+  mode?: ExecMode;
+  /** 申请提交成功（mode = request）：跳到申请详情 */
+  onRequested?: (r: ExecRequestDetail) => void;
 }) => {
   const { t } = useTranslation();
   const qc = useQueryClient();
@@ -228,7 +238,15 @@ export const ExecDialog = ({
   const running = useRef(false);
   const [dry, setDry] = useState<DryState>({ state: 'loading' });
   const [dryTick, setDryTick] = useState(0);
-  const mustType = production;
+  const reasonId = useId();
+  const ackId = useId();
+  const [reason, setReason] = useState('');
+  const [ack, setAck] = useState(false);
+  const [submitError, setSubmitError] = useState<string | null>(null);
+  const isRequest = mode === 'request';
+  const isEmergency = mode === 'emergency';
+  // 申请不执行任何东西，不用输入环境名（执行时再输入）；直接执行和紧急执行在生产环境要输入
+  const mustType = production && !isRequest;
   // 前置环境：先用缓存的状态在本地算（同一个函数），预演回来后用服务端的结果
   const local = (() => {
     const p = status.prerequisite;
@@ -255,7 +273,14 @@ export const ExecDialog = ({
   })();
   const prerequisite = (dry.state === 'done' ? dry.res.prerequisite : undefined) ?? local;
   const prerequisiteOk = !prerequisite || prerequisite.ok;
-  const canConfirm = (!mustType || typed.trim() === envName) && prerequisiteOk;
+  const dryOk = dry.state === 'done' && dry.res.ok;
+  const canConfirm =
+    (!mustType || typed.trim() === envName) &&
+    prerequisiteOk &&
+    // 申请：预演不通过不能提交（服务端同样会拒绝）
+    (!isRequest || dryOk) &&
+    // 紧急执行：必填原因 + 勾选确认（二次确认）
+    (!isEmergency || (reason.trim() !== '' && ack));
 
   // 对话框打开（或点“重新预演”）时先预演：只读，不写目标库，也不写平台库的登记；
   // 预演没通过不挡着确认按钮——真正的执行会被同样的原因拒绝，原因照样显示
@@ -264,14 +289,22 @@ export const ExecDialog = ({
     let live = true;
     setDry({ state: 'loading' });
     const body = kind === 'baseline' ? { dryRun: true } : { to: to?.id, dryRun: true };
-    api<DryRunResponse>('POST', `/api/projects/${pid}/environments/${eid}/${kind}`, body).then(
+    // 申请：没有直接执行权限的人也能预演（提交申请的接口带 dryRun）
+    const req = isRequest
+      ? api<DryRunResponse>('POST', `/api/projects/${pid}/environments/${eid}/requests`, {
+          kind,
+          to: to?.id,
+          dryRun: true,
+        })
+      : api<DryRunResponse>('POST', `/api/projects/${pid}/environments/${eid}/${kind}`, body);
+    req.then(
       (res) => live && setDry({ state: 'done', res }),
       (e: unknown) => live && setDry({ state: 'error', message: e instanceof Error ? e.message : String(e) }),
     );
     return () => {
       live = false;
     };
-  }, [pid, eid, kind, to?.id, dryTick]);
+  }, [pid, eid, kind, to?.id, dryTick, isRequest]);
 
   const refresh = () =>
     Promise.all([
@@ -281,15 +314,39 @@ export const ExecDialog = ({
       qc.invalidateQueries({ queryKey: ['versions', pid] }),
     ]);
 
+  const submitRequest = async () => {
+    if (!canConfirm || running.current) return;
+    running.current = true;
+    setSubmitError(null);
+    try {
+      const r = await api<ExecRequestDetail>('POST', `/api/projects/${pid}/environments/${eid}/requests`, {
+        kind,
+        to: to!.id,
+        reason: reason.trim(),
+      });
+      void qc.invalidateQueries({ queryKey: ['requests', pid] });
+      onRequested?.(r);
+    } catch (e) {
+      setSubmitError(e instanceof Error ? e.message : String(e));
+    } finally {
+      running.current = false;
+    }
+  };
+
   const start = async () => {
+    if (isRequest) return submitRequest();
     if (!canConfirm || running.current) return;
     running.current = true;
     setPhase('running');
     const base = `/api/projects/${pid}/environments/${eid}`;
-    const body = kind === 'baseline' ? { confirm: typed } : { to: to!.id, confirm: typed };
+    const body = isEmergency
+      ? { kind, to: to!.id, reason: reason.trim(), confirm: typed }
+      : kind === 'baseline'
+        ? { confirm: typed }
+        : { to: to!.id, confirm: typed };
     let last: ExecEvent | null = null;
     try {
-      await streamExec(`${base}/${kind}`, body, (e) => {
+      await streamExec(`${base}/${isEmergency ? 'emergency' : kind}`, body, (e) => {
         last = e;
         if (e.error) return;
         setStage(e.stage);
@@ -312,15 +369,22 @@ export const ExecDialog = ({
     } finally {
       running.current = false;
       void refresh();
+      void qc.invalidateQueries({ queryKey: ['requests', pid] });
     }
   };
 
-  const title =
-    kind === 'baseline'
-      ? t('envx.exec.titleBaseline', { name: envName })
-      : kind === 'execute'
-        ? t('envx.exec.titleExecute', { name: envName, number: to?.number })
-        : t('envx.exec.titleRollback', { name: envName, number: to?.number });
+  const title = isRequest
+    ? t(kind === 'rollback' ? 'req.dialog.titleRollback' : 'req.dialog.titleExecute', {
+        name: envName,
+        number: to?.number,
+      })
+    : isEmergency
+      ? t('req.emergency.title', { name: envName, number: to?.number })
+      : kind === 'baseline'
+        ? t('envx.exec.titleBaseline', { name: envName })
+        : kind === 'execute'
+          ? t('envx.exec.titleExecute', { name: envName, number: to?.number })
+          : t('envx.exec.titleRollback', { name: envName, number: to?.number });
   const details = error?.event?.details;
   const rows = plan?.migrations ?? [];
   const closeLabel = phase === 'confirm' ? t('dlg.cancel') : t('dlg.close');
@@ -340,17 +404,21 @@ export const ExecDialog = ({
           {phase !== 'done' && phase !== 'failed' && (
             <button
               type="button"
-              className={kind === 'rollback' ? 'btn danger solid' : 'btn primary'}
+              className={kind === 'rollback' || isEmergency ? 'btn danger solid' : 'btn primary'}
               aria-disabled={!canConfirm || phase === 'running' || undefined}
               aria-describedby={mustType && !canConfirm ? `${inputId}-hint` : undefined}
               aria-busy={phase === 'running' || undefined}
               onClick={() => void start()}
             >
-              {kind === 'baseline'
-                ? t('envx.exec.confirmBaseline')
-                : kind === 'execute'
-                  ? t('envx.exec.confirmExecute')
-                  : t('envx.exec.confirmRollback')}
+              {isRequest
+                ? t('req.dialog.submit')
+                : isEmergency
+                  ? t('req.emergency.confirm')
+                  : kind === 'baseline'
+                    ? t('envx.exec.confirmBaseline')
+                    : kind === 'execute'
+                      ? t('envx.exec.confirmExecute')
+                      : t('envx.exec.confirmRollback')}
             </button>
           )}
         </>
@@ -438,6 +506,60 @@ export const ExecDialog = ({
         )}
 
         {phase === 'confirm' && <DryRunPanel dry={dry} onRetry={() => setDryTick((n) => n + 1)} />}
+
+        {phase === 'confirm' && isRequest && (
+          <div className="space-y-2">
+            <p className="hint">{t('req.dialog.intro')}</p>
+            <div className="field">
+              <label htmlFor={reasonId} className="label">
+                {t('req.dialog.reason')}
+              </label>
+              <textarea
+                id={reasonId}
+                className="input min-h-[64px]"
+                maxLength={2000}
+                value={reason}
+                onChange={(e) => setReason(e.target.value)}
+              />
+            </div>
+            {dry.state === 'done' && !dry.res.ok && (
+              <p className="hint" role="note">
+                {t('req.dialog.dryFailed')}
+              </p>
+            )}
+            {submitError && (
+              <Banner kind="danger" role="alert">
+                {submitError}
+              </Banner>
+            )}
+          </div>
+        )}
+
+        {phase === 'confirm' && isEmergency && (
+          <div className="space-y-2">
+            <Banner kind="warn" title={t('req.emergency.warnTitle')}>
+              {t('req.emergency.warnBody')}
+            </Banner>
+            <div className="field">
+              <label htmlFor={reasonId} className="label">
+                {t('req.emergency.reason')}
+              </label>
+              <textarea
+                id={reasonId}
+                className="input min-h-[64px]"
+                maxLength={2000}
+                required
+                aria-required="true"
+                value={reason}
+                onChange={(e) => setReason(e.target.value)}
+              />
+            </div>
+            <label htmlFor={ackId} className="flex items-start gap-2 text-sm">
+              <input id={ackId} type="checkbox" checked={ack} onChange={(e) => setAck(e.target.checked)} />
+              {t('req.emergency.ack')}
+            </label>
+          </div>
+        )}
 
         {mustType && phase === 'confirm' && (
           <div className="field">

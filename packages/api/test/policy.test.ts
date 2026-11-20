@@ -12,6 +12,7 @@ import {
   type ExecPolicy,
   layerPolicySchema,
   loosenedFields,
+  MAX_REQUEST_TTL_HOURS,
   POLICY_DEFAULTS,
   POLICY_LAYERS,
   type PolicyInput,
@@ -57,6 +58,25 @@ describe('严格程度比较', () => {
     expect(compareField(f, 1, 0)).toBe(1);
     expect(compareField(f, 0, 0)).toBe(0);
   });
+  test('申请有效期（P5b）：越短越严，没有“不限”；写入不能超过上级、超出范围的值被 schema 拒绝', () => {
+    expect(compareField('requestTtlHours', 1, 24)).toBe(1);
+    expect(compareField('requestTtlHours', 48, 24)).toBe(-1);
+    expect(compareField('requestTtlHours', 24, 24)).toBe(0);
+    const r = resolvePolicy({ group: { requestTtlHours: 8 }, environment: { requestTtlHours: 72 } }, true);
+    expect(r.requestTtlHours).toMatchObject({ value: 8, source: 'group' });
+    expect(
+      validateLayer({ group: { requestTtlHours: 8 } }, { requestTtlHours: 72 }, true, 'environment').map(
+        (p) => p.field,
+      ),
+    ).toEqual(['requestTtlHours']);
+    expect(
+      validateLayer({ group: { requestTtlHours: 8 } }, { requestTtlHours: 2 }, true, 'environment'),
+    ).toEqual([]);
+    expect(policySettingsSchema.safeParse({ requestTtlHours: 0 }).success).toBe(false);
+    expect(policySettingsSchema.safeParse({ requestTtlHours: MAX_REQUEST_TTL_HOURS + 1 }).success).toBe(
+      false,
+    );
+  });
   test('审批流程：子序列偏序，空流程最宽', () => {
     const a = stage(1);
     const b = stage(2, 'executors');
@@ -80,12 +100,14 @@ describe('resolvePolicy：表驱动', () => {
       allowTokens: true,
       statementTimeoutMs: 0,
       lockTimeoutMs: 5000,
+      requestTtlHours: 24,
     });
     expect(D(true)).toEqual({
       whoCanExecute: 'admin',
       allowTokens: false,
       statementTimeoutMs: 0,
       lockTimeoutMs: 5000,
+      requestTtlHours: 24,
     });
     const r = resolvePolicy({}, true);
     expect(r.whoCanExecute).toEqual({
@@ -364,6 +386,8 @@ const settings: fc.Arbitrary<PolicySettings> = fc.record(
     allowTokens: fc.boolean(),
     statementTimeoutMs: timeout,
     lockTimeoutMs: timeout,
+    // P5b：申请有效期（越短越严，没有“不限”）
+    requestTtlHours: fc.integer({ min: 1, max: MAX_REQUEST_TTL_HOURS }),
   },
   { requiredKeys: [] },
 );
@@ -445,6 +469,7 @@ describe('随机测试：任意四层配置合并后的结果不弱于任一上�
           'allowTokens',
           'statementTimeoutMs',
           'lockTimeoutMs',
+          'requestTtlHours',
           'approval',
         ] as const),
         (a, b, production, explicitList) => {

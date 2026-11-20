@@ -1,5 +1,5 @@
 // 数据库连接信息的加密（Q12：环境变量提供主密钥）。AES-256-GCM，密文格式 v1:iv:tag:data（base64url）。
-import { createCipheriv, createDecipheriv, createHash, randomBytes } from 'node:crypto';
+import { createCipheriv, createDecipheriv, createHash, createHmac, randomBytes } from 'node:crypto';
 import { scrubSecrets } from '@dowel/core';
 
 export class SecretError extends Error {}
@@ -21,6 +21,15 @@ export const encrypt = (plain: string): string => {
     .map((x) => (typeof x === 'string' ? x : x.toString('base64url')))
     .join(':');
 };
+
+/**
+ * 带密钥的摘要：HMAC-SHA256，密钥由 DOWEL_SECRET 派生（再按用途 purpose 派生一次，不同用途的摘要互不相关）。
+ * 用在需要“判断是不是同一个值”、又不能让人离线撞出原文的地方（例如执行申请绑定的连接串指纹：连接串里有密码）。
+ */
+export const keyedDigest = (purpose: string, data: string): string =>
+  createHmac('sha256', createHmac('sha256', key()).update(`dowel:${purpose}`).digest())
+    .update(data)
+    .digest('hex');
 
 export const decrypt = (enc: string): string => {
   const [v, iv, tag, data] = enc.split(':');

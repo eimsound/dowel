@@ -13,6 +13,7 @@ import { Row, Rows, Section } from '../components/ProjectPage.tsx';
 import { PageHeader, useShellPanel } from '../components/Shell.tsx';
 import { useToast } from '../components/Toasts.tsx';
 import { Avatar, Banner, IconButton } from '../components/ui.tsx';
+import { WebhookSettings } from '../components/WebhookSettings.tsx';
 import { useMe } from '../session.ts';
 
 export const GroupPage = () => {
@@ -350,6 +351,11 @@ export const GroupPage = () => {
                 queryKey={['exec-policy', 'group', slug]}
               />
             </Section>
+          )}
+
+          {isAdmin && group.data && (
+            // 组级 Webhook（P5b）：只对组管理员 / 实例管理员显示（接口也只允许他们）
+            <WebhookSettings slug={slug} />
           )}
 
           {isAdmin && (

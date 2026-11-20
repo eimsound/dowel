@@ -348,6 +348,8 @@ export const registerProjects = (app: Hono<Env>, ctx: AppContext) => {
       },
       ctx.security,
     );
+    // P5b：换了组层策略，项目里还没结束的执行申请重新检查
+    ctx.requests.kick({ projectIds: [a.pid] });
     return c.json<Ok>({ ok: true });
   });
 
