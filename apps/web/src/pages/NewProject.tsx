@@ -41,8 +41,8 @@ interface EnvDraft {
 const STEPS = ['basics', 'database', 'content', 'confirm'] as const;
 /** 进度阶段的顺序（服务端可能跳过一些阶段，例如空白项目没有连接和读取） */
 const STAGES: WizardStage[] = ['connect', 'read', 'canonicalize', 'write', 'done'];
-/** 接手的阶段：读目标库历史、合并、写平台库，需要认领时最后认领 */
-const TAKEOVER_STAGES: WizardStage[] = ['connect', 'read', 'write', 'claim', 'done'];
+/** 接手的阶段：读目标库历史、合并、影子库全链验证、写平台库，需要认领时最后认领 */
+const TAKEOVER_STAGES: WizardStage[] = ['connect', 'read', 'verify', 'write', 'claim', 'done'];
 
 /** 接手：某个环境的库里登记过哪些项目（读取结果或错误） */
 interface TakeRead {
@@ -112,6 +112,7 @@ export const NewProject = () => {
   const [takeProject, setTakeProject] = useState('');
   const [claimOpen, setClaimOpen] = useState(false);
   const [stage, setStage] = useState<WizardStage | null>(null);
+  const [stageDetail, setStageDetail] = useState<string | null>(null);
   const [busy, setBusy] = useState(false);
   const envSeq = useRef(0);
   const fileInput = useRef<HTMLInputElement>(null);
@@ -230,6 +231,10 @@ export const NewProject = () => {
   const takeClaim = takeCand?.envs.find((x) => !x.p.mine) ?? null;
   const isInstanceAdmin = me?.role === 'admin';
 
+  /** 接手时是否至少有一个环境可以提供影子库（非生产、允许同实例，或配置了独立影子库） */
+  const hasTakeoverShadow = filledEnvs.some(
+    (e) => !e.production || e.allowSameInstance || e.shadowUrl.trim().length > 0,
+  );
   const validBasics = name.trim().length > 0 && !!effectiveGroupId;
   const envMissing = (kind === 'database' || kind === 'sql') && filledEnvs.length === 0;
   // schema 勾选不能为空（不知道 schema 列表时不拦，交给服务端报错）
@@ -260,6 +265,7 @@ export const NewProject = () => {
     setError('');
     setWarnings([]);
     setStage(null);
+    setStageDetail(null);
     const body = {
       name: name.trim(),
       groupId: effectiveGroupId,
@@ -299,7 +305,10 @@ export const NewProject = () => {
       await readSse(res, (data) => {
         const event = JSON.parse(data) as WizardEvent;
         if (event.error) setError(event.error);
-        else setStage(event.stage);
+        else {
+          setStage(event.stage);
+          setStageDetail(event.detail ?? null);
+        }
         if (event.project) project = event.project;
         if (event.warnings?.length) setWarnings(event.warnings);
       });
@@ -458,6 +467,8 @@ export const NewProject = () => {
                           aria-label={t('wiz.envUrl')}
                           value={env.url}
                           placeholder="postgres://user:password@host:5432/db"
+                          autoCapitalize="none"
+                          autoCorrect="off"
                           spellCheck={false}
                           onChange={(e) =>
                             // 连接串变了，之前的检查结果就作废
@@ -471,6 +482,8 @@ export const NewProject = () => {
                           className="input font-mono"
                           aria-label={t('wiz.envShadowUrl')}
                           value={env.shadowUrl}
+                          autoCapitalize="none"
+                          autoCorrect="off"
                           spellCheck={false}
                           onChange={(e) => patchEnv(env.key, { shadowUrl: e.target.value })}
                         />
@@ -670,6 +683,52 @@ export const NewProject = () => {
                           {isInstanceAdmin ? t('tk.needsClaim') : t('tk.claimNeedsAdmin')}
                         </Banner>
                       )}
+                      <div className="space-y-2.5 border-t border-border pt-3">
+                        <h4 className="section-title">{t('tk.shadowTitle')}</h4>
+                        <p className="hint m-0">{t('tk.shadowHint')}</p>
+                        {!hasTakeoverShadow && (
+                          <Banner kind="warn" role="alert">
+                            {t('tk.shadowMissingWarn')}
+                          </Banner>
+                        )}
+                        <div className="space-y-2">
+                          {filledEnvs.map((env) => (
+                            <fieldset
+                              key={env.key}
+                              className="m-0 space-y-2 rounded-sm border border-border bg-bg p-3"
+                            >
+                              <legend className="px-1 font-mono text-xs font-medium">
+                                {env.name}
+                                {env.production ? ` · ${t('wiz.envProduction')}` : ''}
+                              </legend>
+                              <label className="field">
+                                <span className="label">{t('wiz.envShadowUrl')}</span>
+                                <input
+                                  className="input font-mono"
+                                  value={env.shadowUrl}
+                                  placeholder="postgres://user:password@shadow-host:5432/empty_db"
+                                  autoCapitalize="none"
+                                  autoCorrect="off"
+                                  spellCheck={false}
+                                  onChange={(e) => patchEnv(env.key, { shadowUrl: e.target.value })}
+                                />
+                              </label>
+                              <div className="checks">
+                                <label>
+                                  <input
+                                    type="checkbox"
+                                    checked={env.allowSameInstance}
+                                    onChange={(e) =>
+                                      patchEnv(env.key, { allowSameInstance: e.target.checked })
+                                    }
+                                  />
+                                  {t('wiz.envAllowSame')}
+                                </label>
+                              </div>
+                            </fieldset>
+                          ))}
+                        </div>
+                      </div>
                       <p className="hint m-0">{t('tk.mergeHint')}</p>
                     </>
                   )}
@@ -796,6 +855,7 @@ export const NewProject = () => {
                   {kind === 'takeover' && takeCand
                     ? t('tk.sumTakeover', { name: takeCand.name ?? takeCand.id, id: takeCand.id })
                     : t(`wiz.content${cap(kind)}`)}
+                  {kind === 'takeover' && <p className="hint m-0 mt-1">{t('tk.sumVerify')}</p>}
                   {kind === 'takeover' && takeClaim && <p className="hint m-0 mt-1">{t('tk.sumClaim')}</p>}
                   {kind === 'database' && sourceEnv && (
                     <span className="ml-2 font-mono text-xs text-text-3">{sourceEnv.name}</span>
@@ -813,7 +873,13 @@ export const NewProject = () => {
                     : t('wiz.sumAll')}
                 </dd>
               </dl>
-              {busy && <Progress stage={stage} stages={kind === 'takeover' ? TAKEOVER_STAGES : STAGES} />}
+              {busy && (
+                <Progress
+                  stage={stage}
+                  detail={stageDetail}
+                  stages={kind === 'takeover' ? TAKEOVER_STAGES : STAGES}
+                />
+              )}
               {created && warnings.length > 0 && (
                 <Banner kind="warn" title={t('tk.warnTitle')} role="alert">
                   <ul className="m-0 list-disc pl-5">
@@ -950,8 +1016,16 @@ const CheckResult = ({ info }: { info: TargetInfo }) => {
   );
 };
 
-/** 进度：阶段粒度（连接 / 读取结构 / 规范化 / 写入 / 完成） */
-const Progress = ({ stage, stages }: { stage: WizardStage | null; stages: WizardStage[] }) => {
+/** 进度：阶段粒度（连接 / 读取结构 / 影子库验证 / 规范化 / 写入 / 认领 / 完成） */
+const Progress = ({
+  stage,
+  detail,
+  stages,
+}: {
+  stage: WizardStage | null;
+  detail: string | null;
+  stages: WizardStage[];
+}) => {
   const { t } = useTranslation();
   const at = stage ? stages.indexOf(stage) : -1;
   return (
@@ -972,6 +1046,7 @@ const Progress = ({ stage, stages }: { stage: WizardStage | null; stages: Wizard
           >
             {i < at ? <Check size={12} aria-hidden="true" /> : <span aria-hidden="true">{i + 1}</span>}
             {t(`wiz.stage.${s}`)}
+            {i === at && detail && <span className="font-mono text-text-2">· {detail}</span>}
           </li>
         ))}
       </ol>

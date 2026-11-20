@@ -338,3 +338,92 @@ test('上一次执行没结束时：当前版本也能作为标记目标（标�
     await db.drop();
   }
 });
+
+test('读回失败提示分流：含非事务步骤迁移执行后读回不一致，提示手工修正与修复脚本 / 标记为已执行（不提示从断点续跑）', async ({
+  browser,
+}) => {
+  const db = await newTargetDb('e2e_readback_split');
+  try {
+    const page = await instanceAdmin(browser);
+    const group = await createGroup(page);
+    await createProjectIn(page, '读回失败分流', group.name);
+    await addEnv(page, 'dev', db.url, false);
+    await publishTable(page, 'orders', 'v1', 1);
+    await openEnv(page, 'dev');
+    await executeAll(page); // 先执行到 v1
+
+    // 发布 v2（建 customers 表），然后把 v2 冻结脚本改为“空表时建表 + 非事务 VACUUM”并重新验证通过
+    await publishTable(page, 'customers', 'v2', 2);
+    const projects = (await (await page.request.get('/api/projects')).json()) as {
+      id: string;
+      name: string;
+    }[];
+    const pid = projects.find((x) => x.name === '读回失败分流')!.id;
+    const versions = (await (await page.request.get(`/api/projects/${pid}/versions`)).json()) as {
+      id: string;
+      number: number;
+    }[];
+    const v2Id = versions.find((v) => v.number === 2)!.id;
+    const v2Detail = (await (await page.request.get(`/api/projects/${pid}/versions/${v2Id}`)).json()) as {
+      upSteps: { sql: string; transactional: boolean }[];
+      downSteps: { sql: string; transactional: boolean }[];
+    };
+    const createSql = v2Detail.upSteps.map((s) => `${s.sql};`).join(' ');
+    const patched = await page.request.patch(`/api/projects/${pid}/versions/${v2Id}/steps`, {
+      data: {
+        up: [
+          {
+            sql: `DO $$ BEGIN IF (SELECT count(*) FROM public.orders) = 0 THEN ${createSql} END IF; END $$`,
+            transactional: true,
+          },
+          { sql: 'VACUUM "public"."orders"', transactional: false },
+        ],
+        down: v2Detail.downSteps,
+      },
+    });
+    expect(patched.ok(), await patched.text()).toBe(true);
+    // 影子库里 orders 为空，闭环验证通过
+    const verified = await page.request.post(`/api/projects/${pid}/versions/${v2Id}/verify`);
+    expect(verified.ok(), await verified.text()).toBe(true);
+    expect(((await verified.json()) as { verifiedAt: string | null }).verifiedAt).not.toBeNull();
+
+    // 在目标库插入业务数据（不改结构，漂移检查仍通过），使 v2 执行后未建 customers 表，触发读回校验失败
+    await db.sql('INSERT INTO public.orders (id) VALUES (1)');
+
+    await openEnv(page, 'dev');
+    await page.getByRole('button', { name: '执行迁移' }).click();
+    const dlg = execDialog(page);
+    await dlg.getByRole('button', { name: '确认执行' }).click();
+
+    // 对话框内提示分流：显示“所有步骤都执行完了但读回的结构不对：继续执行解决不了，需要手工修正目标库”，不显示“从断点接着跑”
+    await expect(dlg.getByText('执行失败')).toBeVisible({ timeout: 60_000 });
+    await expect(dlg).toContainText(
+      '所有步骤都执行完了但读回的结构不对：继续执行解决不了，需要手工修正目标库',
+    );
+    await expect(dlg).not.toContainText('从断点接着跑');
+    await expect(dlg).toContainText('customers');
+    await dlg.getByRole('button', { name: '关闭', exact: true }).first().click();
+    await expect(dlg).toBeHidden();
+
+    // 环境页提示分流：顶部出现“需要人工修正”红色横幅，引导用修复脚本或「标记为已执行」处理而非盲跑；不出现“上一次执行停在中途”
+    await expect(page.getByText('需要人工修正', { exact: true })).toBeVisible();
+    await expect(page.getByText(/使用下方修复脚本改回当前版本.*标记为已执行/)).toBeVisible();
+    await expect(page.getByText('上一次执行停在中途')).toHaveCount(0);
+    // 历史表标出“读回不一致，需要人工修正”
+    await expect(page.getByText('读回不一致，需要人工修正')).toBeVisible();
+    // 漂移出口可见（修复脚本）且“标记到版本”下拉含当前版本 v1（当前），可通过“标记为停在 v1”结束该状态
+    await expect(
+      page.getByTestId('drift-exits').getByRole('button', { name: '放弃线上的修改' }),
+    ).toBeVisible();
+    await page.getByLabel('标记到版本').selectOption({ label: 'v1 v1（当前）' });
+    await page.getByRole('button', { name: '标记为停在 v1（放弃未完成的迁移）' }).click();
+    const markDlg = page.getByRole('dialog', { name: '标记为停在 v1（放弃未完成的迁移）' });
+    await expect(markDlg.getByTestId('mark-plan')).toBeVisible({ timeout: 30_000 });
+    await markDlg.getByRole('button', { name: '确认标记' }).click();
+    await expect(markDlg).toContainText('已标记：环境当前版本是 v1');
+    await markDlg.getByRole('button', { name: '关闭', exact: true }).first().click();
+    await expect(page.getByText('需要人工修正', { exact: true })).toHaveCount(0);
+  } finally {
+    await db.drop();
+  }
+});

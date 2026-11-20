@@ -1,6 +1,7 @@
 // 环境：侧面板是环境列表，主区域是列表 + 新建（管理员）或单个环境的详情。
 // 详情里可以测试连接、从目标库导入结构、删除环境；连接状态只在这里主动检查。
 import type {
+  AttachOverwritePreview,
   AttachResult,
   ClaimResult,
   DriftCheckResponse,
@@ -32,7 +33,7 @@ import { DriftBadge, driftLabel, useDeniedHint } from '../components/EnvBits.tsx
 import { DiffList, ExecDialog, type ExecKind, type ExecMode } from '../components/ExecDialog.tsx';
 import { ImportDialog } from '../components/ImportDialog.tsx';
 import { MARK_TIP, MARK_TITLE, MarkDialog, markDirection } from '../components/MarkDialog.tsx';
-import { Confirm } from '../components/Modal.tsx';
+import { Confirm, Modal } from '../components/Modal.tsx';
 import { EnvPolicyPanel } from '../components/PolicyEditor.tsx';
 import { EmptyHint, ProjectPage, Row, Rows, Section } from '../components/ProjectPage.tsx';
 import { RepairDialog } from '../components/RepairDialog.tsx';
@@ -42,6 +43,7 @@ import { Banner, IconButton } from '../components/ui.tsx';
 import { useVersionName, VersionBadges, VersionNumber } from '../components/VersionStatus.tsx';
 import { useEnvHistory, useEnvStatus, useEnvs } from '../envs.ts';
 import { formatTime } from '../format.ts';
+import { invalidatePolicyDependents } from '../policy-cache.ts';
 import { useProject } from '../project.tsx';
 import { useEnvRequests } from '../requests.ts';
 import { useMe } from '../session.ts';
@@ -136,20 +138,29 @@ const EnvForm = ({ pid }: { pid: string }) => {
   const me = useMe().data;
   const empty = { name: '', url: '', production: true, allowSameInstance: false, shadowUrl: '' };
   const [form, setForm] = useState(empty);
-  /** 接入这个库里已有的迁移历史（特权操作；由另一个实例认领的库要确认认领） */
+  /** 接入这个库里已有的迁移历史（特权操作；由另一个实例认领的库要确认认领；领先于平台链且工作副本脏时需确认覆盖） */
   const [attach, setAttach] = useState(false);
   const [claimAsk, setClaimAsk] = useState<{ instanceId: string | null } | null>(null);
-  const claimRequiredOf = (e: Error | null) =>
-    e instanceof ApiError &&
-    e.status === 409 &&
-    (e.body as { code?: string } | undefined)?.code === 'claim_required';
-  const add = useMutation<unknown, Error, boolean>({
-    mutationFn: (claim) =>
+  const [claimConfirmed, setClaimConfirmed] = useState(false);
+  const [overwriteAsk, setOverwriteAsk] = useState<{
+    preview: AttachOverwritePreview;
+    changed: boolean;
+  } | null>(null);
+  const attachCodeOf = (e: Error | null) =>
+    e instanceof ApiError && e.status === 409 ? (e.body as { code?: string } | undefined)?.code : undefined;
+  const add = useMutation<
+    unknown,
+    Error,
+    { claim: boolean; confirmOverwrite?: boolean; workingSeq?: number }
+  >({
+    mutationFn: ({ claim, confirmOverwrite, workingSeq }) =>
       attach
         ? api<AttachResult>('POST', `/api/projects/${pid}/environments/attach`, {
             ...form,
             shadowUrl: form.shadowUrl.trim() || null,
             claim,
+            confirmOverwrite: confirmOverwrite ?? false,
+            ...(workingSeq !== undefined ? { workingSeq } : {}),
           })
         : api('POST', `/api/projects/${pid}/environments`, {
             ...form,
@@ -158,27 +169,78 @@ const EnvForm = ({ pid }: { pid: string }) => {
     onSuccess: (r) => {
       if (attach) {
         const a = r as AttachResult;
-        toast(
-          (a.attached
-            ? t('tk.attachedOk', { name: form.name, number: a.currentVersion?.number ?? '—' })
-            : t('tk.attachedNone', { name: form.name })) + (a.claimed ? t('tk.attachedClaimed') : ''),
-        );
+        const baseMsg = !a.attached
+          ? t('tk.attachedNone', { name: form.name })
+          : a.aheadVersions?.length
+            ? t('tk.attachedAheadOk', {
+                name: form.name,
+                count: a.aheadVersions.length,
+                number: a.currentVersion?.number ?? '—',
+              })
+            : t('tk.attachedOk', { name: form.name, number: a.currentVersion?.number ?? '—' });
+        toast(baseMsg + (a.claimed ? t('tk.attachedClaimed') : ''));
         // 环境已经添加，但认领失败 / 同步失败：如实告诉用户（可以在环境页重试）
         for (const w of a.warnings ?? []) toast(t('tk.attachedWarn', { msg: w }), 'error');
       }
       setForm(empty);
       setClaimAsk(null);
+      setClaimConfirmed(false);
+      setOverwriteAsk(null);
       void qc.invalidateQueries({ queryKey: ['envs', pid] });
       void qc.invalidateQueries({ queryKey: ['versions', pid] });
+      void qc.invalidateQueries({ queryKey: ['project', pid] });
     },
     onError: (e) => {
       // 这个库里的项目由另一个实例认领：弹出认领确认（说明后果），确认后带 claim: true 重新提交
       const body =
-        e instanceof ApiError ? (e.body as { code?: string; claim?: { instanceId?: string } }) : null;
-      if (claimRequiredOf(e)) setClaimAsk({ instanceId: body?.claim?.instanceId ?? null });
+        e instanceof ApiError
+          ? (e.body as {
+              code?: string;
+              claim?: { instanceId?: string };
+              aheadVersions?: AttachOverwritePreview['aheadVersions'];
+              items?: AttachOverwritePreview['items'];
+              total?: number;
+              workingSeq?: number;
+            })
+          : null;
+      const code = attachCodeOf(e);
+      if (code === 'claim_required') {
+        setOverwriteAsk(null);
+        setClaimAsk({ instanceId: body?.claim?.instanceId ?? null });
+        return;
+      }
+      if (
+        (code === 'working_dirty_confirm' || code === 'working_changed') &&
+        body?.aheadVersions &&
+        body?.items &&
+        typeof body.total === 'number' &&
+        typeof body.workingSeq === 'number'
+      ) {
+        setClaimAsk(null);
+        setOverwriteAsk({
+          preview: {
+            aheadVersions: body.aheadVersions,
+            items: body.items,
+            total: body.total,
+            workingSeq: body.workingSeq,
+          },
+          changed: code === 'working_changed',
+        });
+        return;
+      }
+      // 验证失败 / 影子库不可用（422）：关掉确认对话框，在表单中清晰展示失败版本和原因，方便直接改影子库配置
+      const errCode = e instanceof ApiError ? (e.body as { code?: string } | undefined)?.code : undefined;
+      if (errCode === 'shadow_unavailable' || errCode === 'verify_failed') {
+        setClaimAsk(null);
+        setOverwriteAsk(null);
+      }
     },
   });
-  const isClaimRequired = claimRequiredOf(add.error);
+  const pendingConfirmCode = attachCodeOf(add.error);
+  const isConfirmCode =
+    pendingConfirmCode === 'claim_required' ||
+    pendingConfirmCode === 'working_dirty_confirm' ||
+    pendingConfirmCode === 'working_changed';
   const set = (k: keyof typeof form) => (e: React.ChangeEvent<HTMLInputElement>) =>
     setForm({ ...form, [k]: e.target.type === 'checkbox' ? e.target.checked : e.target.value });
   return (
@@ -186,7 +248,8 @@ const EnvForm = ({ pid }: { pid: string }) => {
       className="space-y-3 rounded-md border border-border bg-panel p-4"
       onSubmit={(e) => {
         e.preventDefault();
-        add.mutate(false);
+        setClaimConfirmed(false);
+        add.mutate({ claim: false });
       }}
     >
       <h2 className="section-title">{t('envp.add')}</h2>
@@ -211,6 +274,8 @@ const EnvForm = ({ pid }: { pid: string }) => {
             value={form.url}
             onChange={set('url')}
             placeholder="postgres://user:password@host:5432/db"
+            autoCapitalize="none"
+            autoCorrect="off"
             spellCheck={false}
             required
           />
@@ -232,6 +297,8 @@ const EnvForm = ({ pid }: { pid: string }) => {
             aria-label={t('dlg.envShadowUrl')}
             value={form.shadowUrl}
             onChange={set('shadowUrl')}
+            autoCapitalize="none"
+            autoCorrect="off"
             spellCheck={false}
           />
         </label>
@@ -246,14 +313,83 @@ const EnvForm = ({ pid }: { pid: string }) => {
       <ClaimDialog
         open={claimAsk !== null}
         onClose={() => setClaimAsk(null)}
-        onConfirm={() => add.mutate(true)}
+        onConfirm={() => {
+          setClaimConfirmed(true);
+          add.mutate({ claim: true });
+        }}
         pending={add.isPending}
-        // 只有服务端明确返回 claim_required 才是“需要确认认领”（不算错误）；其他错误（包括别的 409，比如重名）照常显示在对话框里
-        error={add.error && !isClaimRequired ? add.error.message : undefined}
+        // 只有服务端明确返回确认类 409 才不算错误；其他错误（包括别的 409，比如重名）照常显示在对话框里
+        error={add.error && !isConfirmCode ? add.error.message : undefined}
         instanceId={claimAsk?.instanceId}
         isAdmin={me?.role === 'admin'}
       />
-      {add.error && !isClaimRequired && !claimAsk && (
+      <Modal
+        open={overwriteAsk !== null}
+        onClose={() => setOverwriteAsk(null)}
+        size="md"
+        title={t('tk.attachAheadTitle')}
+        footer={
+          <>
+            <span className="flex-1" />
+            <button type="button" className="btn" autoFocus onClick={() => setOverwriteAsk(null)}>
+              {t('dlg.cancel')}
+            </button>
+            <button
+              type="button"
+              className="btn danger solid"
+              disabled={add.isPending}
+              aria-busy={add.isPending || undefined}
+              onClick={() =>
+                overwriteAsk &&
+                add.mutate({
+                  claim: claimConfirmed,
+                  confirmOverwrite: true,
+                  workingSeq: overwriteAsk.preview.workingSeq,
+                })
+              }
+            >
+              {t('tk.attachAheadConfirm')}
+            </button>
+          </>
+        }
+      >
+        {overwriteAsk && (
+          <div className="space-y-3 text-sm">
+            <p className="m-0 text-text-2">{t('tk.attachAheadIntro')}</p>
+            {overwriteAsk.changed && (
+              <Banner kind="warn" role="alert">
+                {t('tk.attachWorkingChanged')}
+              </Banner>
+            )}
+            {add.error && !isConfirmCode && (
+              <Banner kind="danger" role="alert">
+                {add.error.message}
+              </Banner>
+            )}
+            <div className="space-y-1.5">
+              <h3 className="section-title">
+                {t('tk.attachAheadVersions')}
+                <span className="count">{overwriteAsk.preview.aheadVersions.length}</span>
+              </h3>
+              <ul className="m-0 list-none space-y-1 rounded-sm border border-border bg-bg p-2.5 font-mono text-xs">
+                {overwriteAsk.preview.aheadVersions.map((v) => (
+                  <li key={v.id}>
+                    v{v.number} · {v.name}
+                  </li>
+                ))}
+              </ul>
+            </div>
+            <div className="space-y-1.5">
+              <h3 className="section-title">
+                {t('tk.attachAheadDiff')}
+                <span className="count">{overwriteAsk.preview.total}</span>
+              </h3>
+              <DiffList items={overwriteAsk.preview.items} total={overwriteAsk.preview.total} />
+            </div>
+          </div>
+        )}
+      </Modal>
+      {add.error && !isConfirmCode && !claimAsk && !overwriteAsk && (
         <Banner kind="danger" role="alert">
           {add.error.message}
         </Banner>
@@ -482,6 +618,7 @@ const EnvironmentDetailView = ({ eid }: { eid: string }) => {
   const history = historyQ.data;
   const [result, setResult] = useState<{ ok: boolean; text: string } | null>(null);
   const [confirm, setConfirm] = useState(false);
+  const [unmarkConfirm, setUnmarkConfirm] = useState(false);
   const [dlg, setDlg] = useState<{ kind: ExecKind; to?: EnvVersion; mode: ExecMode } | null>(null);
   const requestsQ = useEnvRequests(pid, eid);
   const [execTo, setExecTo] = useState('');
@@ -539,6 +676,22 @@ const EnvironmentDetailView = ({ eid }: { eid: string }) => {
       refreshState();
     },
   });
+  const setProduction = useMutation<EnvInfo, Error, boolean>({
+    mutationFn: (production) =>
+      api<EnvInfo>('PATCH', `/api/projects/${pid}/environments/${eid}`, { production }),
+    onSuccess: (updated) => {
+      setUnmarkConfirm(false);
+      toast(
+        t(updated.production ? 'envp.markedProduction' : 'envp.unmarkedProduction', {
+          name: updated.name,
+        }),
+      );
+      void invalidatePolicyDependents(qc);
+    },
+    onError: (e, production) => {
+      if (production) toast(e.message, 'error');
+    },
+  });
   const remove = useMutation({
     mutationFn: () => api('DELETE', `/api/projects/${pid}/environments/${eid}`),
     onSuccess: () => {
@@ -574,6 +727,7 @@ const EnvironmentDetailView = ({ eid }: { eid: string }) => {
     );
 
   const canConfigure = env.permissions.configure;
+  const canUnmarkProduction = env.permissions.unmarkProduction;
   const canExec = status?.permissions.execute ?? env.permissions.execute;
   const pending = status?.versions.filter((v) => v.state === 'pending') ?? [];
   const current = status?.currentVersion ?? null;
@@ -988,7 +1142,35 @@ const EnvironmentDetailView = ({ eid }: { eid: string }) => {
               <dt className="text-text-2">{t('dlg.envUrl')}</dt>
               <dd className="m-0 truncate font-mono text-xs">{env.url}</dd>
               <dt className="text-text-2">{t('dlg.envProduction')}</dt>
-              <dd className="m-0">{env.production ? t('envp.production') : t('envp.notProduction')}</dd>
+              <dd className="m-0 flex flex-wrap items-center gap-2">
+                <span>{env.production ? t('envp.production') : t('envp.notProduction')}</span>
+                {project.role === 'admin' &&
+                  (env.production ? (
+                    <button
+                      type="button"
+                      className="btn"
+                      aria-disabled={!canUnmarkProduction || setProduction.isPending || undefined}
+                      title={canUnmarkProduction ? undefined : denied(env.effectiveExecPolicy)}
+                      onClick={() => {
+                        if (!canUnmarkProduction || setProduction.isPending) return;
+                        setProduction.reset();
+                        setUnmarkConfirm(true);
+                      }}
+                    >
+                      {t('envp.unmarkProduction')}
+                    </button>
+                  ) : (
+                    <button
+                      type="button"
+                      className="btn"
+                      disabled={setProduction.isPending}
+                      aria-busy={setProduction.isPending || undefined}
+                      onClick={() => setProduction.mutate(true)}
+                    >
+                      {t('envp.markProduction')}
+                    </button>
+                  ))}
+              </dd>
               <dt className="text-text-2">{t('dlg.envAllowSame')}</dt>
               <dd className="m-0">{env.allowSameInstance ? '✓' : '—'}</dd>
               <dt className="text-text-2">{t('envp.shadow')}</dt>
@@ -1082,6 +1264,18 @@ const EnvironmentDetailView = ({ eid }: { eid: string }) => {
         instanceId={history?.claim?.instanceId}
         isAdmin={isInstanceAdmin}
       />
+
+      <Confirm
+        open={unmarkConfirm}
+        onClose={() => setUnmarkConfirm(false)}
+        title={t('envp.unmarkTitle', { name: env.name })}
+        confirmLabel={t('envp.unmarkProduction')}
+        pending={setProduction.isPending}
+        error={setProduction.error?.message}
+        onConfirm={() => setProduction.mutate(false)}
+      >
+        {t('envp.unmarkHint')}
+      </Confirm>
 
       <Confirm
         open={confirm}

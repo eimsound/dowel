@@ -241,6 +241,7 @@ describe.each([
       expect(envs[0]!.permissions).toEqual({
         execute: true,
         configure: true,
+        unmarkProduction: true,
         approvalRequired: false,
         request: true,
         emergency: false,

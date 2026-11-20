@@ -778,8 +778,10 @@ export interface EnvPolicyView {
 export const envPermissionsSchema = z.object({
   /** 能否执行 / 回滚 / 写基线（按环境的执行档位） */
   execute: z.boolean(),
-  /** 能否改连接串、影子库、生产标记、执行档位和删除环境 */
+  /** 能否改连接串、影子库、执行档位和删除环境 */
   configure: z.boolean(),
+  /** 能否取消“生产”标记（environment.unmark_production：至少项目管理员，且满足当前生效的“谁能执行”） */
+  unmarkProduction: z.boolean(),
   /** 生效的审批流程配置了环节（P5b）：执行 / 回滚要提交执行申请，谁都不能直接执行（execute 只表示满足“谁能执行”） */
   approvalRequired: z.boolean(),
   /** 能否提交执行申请（项目编辑者以上，或者执行者） */
@@ -1232,11 +1234,23 @@ export type EnvironmentCreated = z.infer<typeof environmentCreatedSchema>;
 /**
  * 给已有项目添加环境，并接入这个库里已有的迁移历史。属于特权操作：适用环境的执行档位，且至少要项目管理员。
  * claim：这个库里的项目由另一个实例认领时，确认认领（要实例管理员）；之后原实例的执行被拒绝。
+ * confirmOverwrite / workingSeq：目标库历史领先于平台链且当前工作副本有未发布修改时，确认覆盖工作副本到新链头并绑定预览时的 seq。
  */
 export const environmentAttachSchema = environmentCreateSchema.extend({
   claim: z.boolean().default(false),
+  confirmOverwrite: z.boolean().default(false),
+  workingSeq: z.number().int().min(0).optional(),
 });
 export type EnvironmentAttach = z.infer<typeof environmentAttachSchema>;
+
+/** 接入领先环境时工作副本有未发布修改：409（working_dirty_confirm / working_changed）附带的预览 */
+export const attachOverwritePreviewSchema = z.object({
+  aheadVersions: z.array(envVersionRefSchema),
+  items: z.array(driftItemSchema),
+  total: z.number(),
+  workingSeq: z.number(),
+});
+export type AttachOverwritePreview = z.infer<typeof attachOverwritePreviewSchema>;
 
 export const attachResultSchema = environmentCreatedSchema.extend({
   /** 这个库里有这个项目的历史并已接入；false 表示它只是一个新环境 */
@@ -1244,6 +1258,8 @@ export const attachResultSchema = environmentCreatedSchema.extend({
   currentVersion: envVersionRefSchema.nullable(),
   /** 这次是否认领了（换手） */
   claimed: z.boolean(),
+  /** 目标库领先于平台链时本次补齐并验证通过的版本列表 */
+  aheadVersions: z.array(envVersionRefSchema).default([]),
   /** 环境已经建好，但有没做完的事（认领失败、同步目标库状态失败）：可以在环境页重试认领 / 读历史 */
   warnings: z.array(z.string()).default([]),
 });
@@ -1336,16 +1352,26 @@ export const projectWizardSchema = z.object({
 });
 export type ProjectWizard = z.infer<typeof projectWizardSchema>;
 
-/** 进度阶段：连接 → 读取结构 → 规范化 → 写入 → 完成 */
-export const wizardStageSchema = z.enum(['connect', 'read', 'canonicalize', 'write', 'claim', 'done']);
+/** 进度阶段：连接 → 读取结构 → 验证 / 规范化 → 写入 → 认领 → 完成 */
+export const wizardStageSchema = z.enum([
+  'connect',
+  'read',
+  'verify',
+  'canonicalize',
+  'write',
+  'claim',
+  'done',
+]);
 export type WizardStage = z.infer<typeof wizardStageSchema>;
 
 /** SSE 每条消息的负载（`data:` 后面是它的 JSON） */
 export const wizardEventSchema = z.object({
   stage: wizardStageSchema,
+  /** 可选进度详情（例如接手验证阶段当前正在验证的版本） */
+  detail: z.string().optional(),
   /** 出错时的信息；这时不会建出项目 */
   error: z.string().optional(),
-  /** 出错时的代码（接手：claim_required 需要确认认领、claim_forbidden 需要实例管理员、history_* 历史有问题、project_exists） */
+  /** 出错时的代码（接手：claim_required 需要确认认领、claim_forbidden 需要实例管理员、shadow_unavailable、verify_failed、history_* 历史有问题、project_exists） */
   code: z.string().optional(),
   /** 成功时给出建好的项目 */
   project: projectCreatedSchema.optional(),

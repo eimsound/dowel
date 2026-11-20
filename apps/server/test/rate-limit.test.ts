@@ -1,6 +1,13 @@
-// 登录限速：注入时钟，验证 IP+账号、IP 总量、原子性、成功撤销、窗口清扫和 key 上限。
+// 登录限速与全量限流环境变量：验证 IP+账号、IP 总量、原子性、成功撤销、窗口清扫、key 上限及 9 项环境变量读取。
 import { expect, test } from 'vitest';
-import { LoginLimiter, type LoginLimiterOptions } from '../src/rate-limit.ts';
+import {
+  connectionLimiterFromEnv,
+  LoginLimiter,
+  type LoginLimiterOptions,
+  loginLimiterFromEnv,
+  tokenFailLimiterFromEnv,
+  tokenLimiterFromEnv,
+} from '../src/rate-limit.ts';
 
 const setup = (options: LoginLimiterOptions = {}) => {
   let now = 0;
@@ -82,4 +89,58 @@ test('key 数量有上限', () => {
   const { limiter } = setup({ limit: 100, maxKeys: 3 });
   for (const account of ['a', 'b', 'c', 'd']) expect(limiter.attempt(null, account).allowed).toBe(true);
   expect(limiter.keyCount).toBeLessThanOrEqual(3);
+});
+
+test('全部 4 个限流器 / 9 个环境变量默认值、合法覆盖与非法值回退', () => {
+  // 默认值
+  const defLogin = loginLimiterFromEnv({});
+  expect([defLogin.limit, defLogin.ipLimit, defLogin.windowMs]).toEqual([10, 30, 600_000]);
+  const defConn = connectionLimiterFromEnv({});
+  expect([defConn.limit, defConn.windowMs]).toEqual([10, 60_000]);
+  const defFail = tokenFailLimiterFromEnv({});
+  expect([defFail.limit, defFail.windowMs]).toEqual([20, 600_000]);
+  const defRate = tokenLimiterFromEnv({});
+  expect([defRate.limit, defRate.windowMs]).toEqual([120, 60_000]);
+
+  // 合法正整数覆盖
+  const customEnv: NodeJS.ProcessEnv = {
+    DOWEL_LOGIN_LIMIT: '5',
+    DOWEL_LOGIN_IP_LIMIT: '15',
+    DOWEL_LOGIN_WINDOW_MS: '120000',
+    DOWEL_CONNECTION_LIMIT: '4',
+    DOWEL_CONNECTION_WINDOW_MS: '30000',
+    DOWEL_TOKEN_FAIL_LIMIT: '8',
+    DOWEL_TOKEN_FAIL_WINDOW_MS: '90000',
+    DOWEL_TOKEN_RATE_LIMIT: '60',
+    DOWEL_TOKEN_RATE_WINDOW_MS: '45000',
+  };
+  const cLogin = loginLimiterFromEnv(customEnv);
+  expect([cLogin.limit, cLogin.ipLimit, cLogin.windowMs]).toEqual([5, 15, 120_000]);
+  const cConn = connectionLimiterFromEnv(customEnv);
+  expect([cConn.limit, cConn.windowMs]).toEqual([4, 30_000]);
+  const cFail = tokenFailLimiterFromEnv(customEnv);
+  expect([cFail.limit, cFail.windowMs]).toEqual([8, 90_000]);
+  const cRate = tokenLimiterFromEnv(customEnv);
+  expect([cRate.limit, cRate.windowMs]).toEqual([60, 45_000]);
+
+  // 非法值（0、负数、小数、非数字）全部回退到默认值
+  const badEnv: NodeJS.ProcessEnv = {
+    DOWEL_LOGIN_LIMIT: '0',
+    DOWEL_LOGIN_IP_LIMIT: '-5',
+    DOWEL_LOGIN_WINDOW_MS: '1.5',
+    DOWEL_CONNECTION_LIMIT: 'abc',
+    DOWEL_CONNECTION_WINDOW_MS: '',
+    DOWEL_TOKEN_FAIL_LIMIT: '-1',
+    DOWEL_TOKEN_FAIL_WINDOW_MS: 'NaN',
+    DOWEL_TOKEN_RATE_LIMIT: '0',
+    DOWEL_TOKEN_RATE_WINDOW_MS: 'Infinity',
+  };
+  const bLogin = loginLimiterFromEnv(badEnv);
+  expect([bLogin.limit, bLogin.ipLimit, bLogin.windowMs]).toEqual([10, 30, 600_000]);
+  const bConn = connectionLimiterFromEnv(badEnv);
+  expect([bConn.limit, bConn.windowMs]).toEqual([10, 60_000]);
+  const bFail = tokenFailLimiterFromEnv(badEnv);
+  expect([bFail.limit, bFail.windowMs]).toEqual([20, 600_000]);
+  const bRate = tokenLimiterFromEnv(badEnv);
+  expect([bRate.limit, bRate.windowMs]).toEqual([120, 60_000]);
 });

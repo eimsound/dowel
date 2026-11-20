@@ -180,7 +180,13 @@ const wizard = async (inst: Inst, body: unknown, cookie = inst.admin) => {
 const takeover = (
   inst: Inst,
   projectId: string,
-  envs: { name: string; url: string; production?: boolean }[],
+  envs: {
+    name: string;
+    url: string;
+    production?: boolean;
+    allowSameInstance?: boolean;
+    shadowUrl?: string | null;
+  }[],
   extra: { claim?: boolean; name?: string } = {},
   cookie = inst.admin,
 ) =>
@@ -193,7 +199,8 @@ const takeover = (
         name: e.name,
         url: e.url,
         production: e.production ?? false,
-        allowSameInstance: true,
+        allowSameInstance: e.allowSameInstance ?? true,
+        shadowUrl: e.shadowUrl ?? null,
       })),
       content: { kind: 'takeover', projectId, claim: extra.claim },
     },
@@ -279,7 +286,14 @@ describe.skipIf(!PG_URL)('接手与认领（P4c）', () => {
     expect(done.last, JSON.stringify(done.events)).toMatchObject({ stage: 'done' });
     expect(done.last.warnings).toBeUndefined();
     expect(done.last.project!.id).toBe(pid);
-    expect(done.events.map((e) => e.stage)).toEqual(['connect', 'read', 'write', 'claim', 'done']);
+    expect([...new Set(done.events.map((e) => e.stage))]).toEqual([
+      'connect',
+      'read',
+      'verify',
+      'write',
+      'claim',
+      'done',
+    ]);
 
     // 版本链完整恢复：id、序号、parent、冻结脚本、checksum 一致，模型深度相等（对象 ID 完全相同）
     const rowsA = await A.db.query<Record<string, unknown>>(
@@ -294,12 +308,12 @@ describe.skipIf(!PG_URL)('接手与认领（P4c）', () => {
     // 工作副本 = 链头版本的模型
     expect(await modelOf(B, pid)).toEqual(await versionModel(A, chain[2]!.id));
     expect(await modelOf(B, pid)).toEqual(await versionModel(B, chain[2]!.id));
-    // 恢复的版本一律未验证、标了恢复时间；执行过的事实（executed_at）已经写上
+    // ADR 0012：接手前经本实例影子库全链验证通过，恢复的版本带 verifiedAt 与 verifyReport，并保留 restoredAt 标明来源
     const vs = (await B.call('GET', `/api/projects/${pid}/versions`)).data as unknown as VersionInfo[];
-    expect(vs.map((v) => [v.number, v.verifiedAt, v.restoredAt !== null])).toEqual([
-      [3, null, true],
-      [2, null, true],
-      [1, null, true],
+    expect(vs.map((v) => [v.number, v.verifiedAt !== null, v.restoredAt !== null])).toEqual([
+      [3, true, true],
+      [2, true, true],
+      [1, true, true],
     ]);
     for (const v of chain) expect(await versionExecutedAnywhere(B.db, v.id)).toBe(true);
     // 环境当前版本 = 目标库历史里最后完成的版本
@@ -366,25 +380,72 @@ describe.skipIf(!PG_URL)('接手与认领（P4c）', () => {
     expect(hB.claim).toMatchObject({ mine: true });
   });
 
-  test('恢复的版本未验证：不能回滚到它；重新验证（影子库）之后才行', async () => {
+  test('ADR 0012：接手强制全链影子库验证——无可用影子库拒绝、脚本验证失败拒绝、配独立影子库或验证通过后可直接回滚', async () => {
     const dev = await newTarget();
+    const shadowDb = await newTarget('tk_shd');
     const inst = await newInstance('C');
-    const pid = await project(A, '待验证');
+    const pid = await project(A, '强制验证');
     const eidA = await addEnv(A, pid, 'dev', dev.url);
     const chain = await publishN(A, pid, 2);
     await exec(A, pid, eidA, 'execute', chain[1]!.id);
-    expect((await takeover(inst, pid, [{ name: 'dev', url: dev.url }], { claim: true })).last).toMatchObject({
-      stage: 'done',
-    });
+
+    // 1) 生产环境未配独立影子库且未允许同实例 → shadow_unavailable，不写平台库也不认领目标库
+    const noShadow = await takeover(
+      inst,
+      pid,
+      [{ name: 'prod', url: dev.url, production: true, allowSameInstance: false, shadowUrl: null }],
+      { claim: true },
+    );
+    expect(noShadow.last).toMatchObject({ stage: 'verify', code: 'shadow_unavailable' });
+    expect((await inst.call('GET', '/api/projects')).data).toEqual([]);
+    expect(
+      (await dev.db.query<{ instance_id: string }>('select instance_id from dowel.projects'))[0]!.instance_id,
+    ).toBe(A.instanceId);
+
+    // 2) 篡改 v2 冻结脚本并重算 checksum（过得了 verifyChain，但在影子库验证必失败）→ verify_failed，指明版本号与原因，不写平台库也不认领
+    const [origV2] = await dev.db.query<{ up_steps: unknown; down_steps: unknown; checksum: string }>(
+      'select up_steps, down_steps, checksum from dowel.versions where version_id = $1',
+      [chain[1]!.id],
+    );
+    const badUp = [{ sql: 'ALTER TABLE public.orders ADD COLUMN wrong_col text', transactional: true }];
+    const badDown = [{ sql: 'ALTER TABLE public.orders DROP COLUMN wrong_col', transactional: true }];
+    const badSum = stepsChecksum(badUp, badDown);
+    await dev.db.query(
+      'update dowel.versions set up_steps = $2::text::jsonb, down_steps = $3::text::jsonb, checksum = $4 where version_id = $1',
+      [chain[1]!.id, JSON.stringify(badUp), JSON.stringify(badDown), badSum],
+    );
+    const badVerify = await takeover(
+      inst,
+      pid,
+      [{ name: 'prod', url: dev.url, production: true, allowSameInstance: false, shadowUrl: shadowDb.url }],
+      { claim: true },
+    );
+    expect(badVerify.last).toMatchObject({ stage: 'verify', code: 'verify_failed' });
+    expect(badVerify.last.error).toContain('v2');
+    expect((await inst.call('GET', '/api/projects')).data).toEqual([]);
+    expect(
+      (await dev.db.query<{ instance_id: string }>('select instance_id from dowel.projects'))[0]!.instance_id,
+    ).toBe(A.instanceId);
+
+    // 恢复 v2 原始脚本和 checksum
+    await dev.db.query(
+      'update dowel.versions set up_steps = $2::text::jsonb, down_steps = $3::text::jsonb, checksum = $4 where version_id = $1',
+      [chain[1]!.id, JSON.stringify(origV2!.up_steps), JSON.stringify(origV2!.down_steps), origV2!.checksum],
+    );
+
+    // 3) 生产环境配独立影子库 → 接手成功，版本全部带 verifiedAt 和 verifyReport，可直接回滚
+    const ok = await takeover(
+      inst,
+      pid,
+      [{ name: 'prod', url: dev.url, production: true, allowSameInstance: false, shadowUrl: shadowDb.url }],
+      { claim: true },
+    );
+    expect(ok.last, JSON.stringify(ok.events)).toMatchObject({ stage: 'done' });
+    const vs = (await inst.call('GET', `/api/projects/${pid}/versions`)).data as unknown as VersionInfo[];
+    expect(vs.every((v) => v.verifiedAt !== null && v.restoredAt !== null)).toBe(true);
     const [e] = await envs(inst, pid);
-    const rb = await exec(inst, pid, e!.id, 'rollback', chain[0]!.id);
-    expect(rb.last).toMatchObject({ code: 'unverified' });
-    // 重新验证 v2（版本页的“重新验证”）：恢复的 scope 用来建 from，通过后才能回滚
-    const re = await inst.call('POST', `/api/projects/${pid}/versions/${chain[1]!.id}/verify`);
-    expect(re.status, JSON.stringify(re.data)).toBe(200);
-    expect(re.data.verifiedAt).not.toBeNull();
-    const rb2 = await exec(inst, pid, e!.id, 'rollback', chain[0]!.id);
-    expect(rb2.last, JSON.stringify(rb2.events)).toMatchObject({ stage: 'done', ran: 1 });
+    const rb = await exec(inst, pid, e!.id, 'rollback', chain[0]!.id, { confirm: 'prod' });
+    expect(rb.last, JSON.stringify(rb.events)).toMatchObject({ stage: 'done', ran: 1 });
   });
 
   test('schema 范围随版本恢复：项目的范围 = 链头版本冻结时的范围', async () => {
@@ -826,7 +887,7 @@ describe.skipIf(!PG_URL)('接手与认领（P4c）', () => {
     const role = `tk_r_${Math.random().toString(36).slice(2, 8)}`;
     const admin = connect(PG_URL);
     try {
-      await admin.db.exec(`CREATE ROLE ${role} LOGIN PASSWORD 'pw'`);
+      await admin.db.exec(`CREATE ROLE ${role} LOGIN PASSWORD 'secret_pw_xyz'`);
     } finally {
       await admin.close();
     }
@@ -841,7 +902,7 @@ describe.skipIf(!PG_URL)('接手与认领（P4c）', () => {
       );
     const u = new URL(t.url);
     u.username = role;
-    u.password = 'pw';
+    u.password = 'secret_pw_xyz';
     return u.toString();
   };
 
@@ -878,7 +939,7 @@ describe.skipIf(!PG_URL)('接手与认领（P4c）', () => {
     const res1 = r1.data as unknown as AttachResult;
     expect(res1).toMatchObject({ attached: true, claimed: false, currentVersion: { number: 2 } });
     expect(res1.warnings.join('\n')).toContain('认领失败');
-    expect(res1.warnings.join('\n')).not.toContain('pw'); // 脱敏：不带密码
+    expect(res1.warnings.join('\n')).not.toContain('secret_pw_xyz'); // 脱敏：不带密码
     const envs1 = (await inst.call('GET', `/api/projects/${pid}/environments`)).data as unknown as EnvInfo[];
     expect(envs1.map((e) => e.name).sort()).toEqual(['dev', 'prod']);
     expect((await auditOf('environment.attach_history')).map((a) => a.target_id)).toContain(res1.id);
@@ -927,13 +988,13 @@ describe.skipIf(!PG_URL)('接手与认领（P4c）', () => {
     const bad = await attach({ name: 'bad', url: noRead, claim: true });
     expect(bad.status).toBe(422);
     expect(bad.data.error).toMatch(/目标库返回错误/);
-    expect(JSON.stringify(bad.data)).not.toContain('pw');
+    expect(JSON.stringify(bad.data)).not.toContain('secret_pw_xyz');
     // 连不上
     const unreachable = await attach({ name: 'x', url: 'postgres://127.0.0.1:1/none' });
     expect(unreachable.status).toBe(422);
   });
 
-  test('认领在锁里重新比对链：读到历史之后原实例又执行了 v4 → B 的接入 / 认领被拒绝（history_mismatch），A 之后仍然可以执行', async () => {
+  test('认领在锁里重新比对链：已接入环境在认领前原实例又执行了 v4 → /claim 拒绝（history_mismatch），A 之后仍可执行', async () => {
     const dev = await newTarget();
     const prod = await newTarget();
     const inst = await newInstance('V');
@@ -943,34 +1004,232 @@ describe.skipIf(!PG_URL)('接手与认领（P4c）', () => {
     const chain = await publishN(A, pid, 3);
     await exec(A, pid, eDev, 'execute', chain[2]!.id);
     await exec(A, pid, ePro, 'execute', chain[2]!.id);
-    // B 接手 dev：链是 v1~v3
+    // B 接手 dev（v1~v3）并接入 prod（v1~v3）后，再让 A 反向认领 prod 并推进到 v4
     expect((await takeover(inst, pid, [{ name: 'dev', url: dev.url }], { claim: true })).last.stage).toBe(
       'done',
     );
-    // B 读到 prod 的历史（v3）之后，A 发布 v4 并在 prod 上执行了
-    const v4 = (await publishN(A, pid, 1, 4))[0]!;
-    expect((await exec(A, pid, ePro, 'execute', v4.id)).last).toMatchObject({ stage: 'done' });
-    // B 接入 / 认领 prod：历史已经领先于 B 的链 → 拒绝，提示重新读取
-    const r = await inst.call('POST', `/api/projects/${pid}/environments/attach`, {
+    const attached = await inst.call('POST', `/api/projects/${pid}/environments/attach`, {
       name: 'prod',
       url: prod.url,
       production: false,
       allowSameInstance: true,
       claim: true,
     });
+    expect(attached.status).toBe(201);
+    const eidBProd = attached.data.id as string;
+    expect((await A.call('POST', `/api/projects/${pid}/environments/${ePro}/claim`)).status).toBe(200);
+    const v4 = (await publishN(A, pid, 1, 4))[0]!;
+    expect((await exec(A, pid, ePro, 'execute', v4.id)).last).toMatchObject({ stage: 'done' });
+    // B 尝试直接认领 prod（B 平台上只有 v1~v3）：锁内比对发现目标库领先于 B 的链 → 422 拒绝，提示重新读取
+    const r = await inst.call('POST', `/api/projects/${pid}/environments/${eidBProd}/claim`);
     expect(r.status).toBe(422);
     expect(r.data.error).toMatch(/不在平台库的版本链上|重新读取/);
-    expect(
-      (await inst.call('GET', `/api/projects/${pid}/environments`)).data as unknown as EnvInfo[],
-    ).toHaveLength(1);
     // 什么都没认领：A 仍然可以执行（回滚一步再执行回来）
     expect(
       (await prod.db.query<{ instance_id: string }>('select instance_id from dowel.projects'))[0]!
         .instance_id,
     ).toBe(A.instanceId);
-    expect(await prod.db.query('select 1 from dowel.claims')).toEqual([]);
     expect((await exec(A, pid, ePro, 'rollback', chain[2]!.id)).last).toMatchObject({ stage: 'done' });
     expect((await exec(A, pid, ePro, 'execute', v4.id)).last).toMatchObject({ stage: 'done' });
+  });
+
+  test('ADR 0012：接入严格领先环境——影子库验证（缺影子库/验证失败拒绝）、工作副本干净自动覆盖、工作副本脏 409 差异确认与 working_changed', async () => {
+    const dev = await newTarget();
+    const prod = await newTarget();
+    const prod2 = await newTarget();
+    const inst = await newInstance('AH');
+    const pid = await project(A, '接入领先');
+    const eDev = await addEnv(A, pid, 'dev', dev.url);
+    const ePro = await addEnv(A, pid, 'prod', prod.url);
+    const ePro2 = await addEnv(A, pid, 'prod2', prod2.url);
+    const chain = await publishN(A, pid, 2);
+    await exec(A, pid, eDev, 'execute', chain[1]!.id);
+    await exec(A, pid, ePro, 'execute', chain[1]!.id);
+    await exec(A, pid, ePro2, 'execute', chain[1]!.id);
+
+    // inst 先接手 dev（v1~v2），这里用生产环境但不允许同实例的设定不方便，直接用 dev（非生产）
+    expect((await takeover(inst, pid, [{ name: 'dev', url: dev.url }], { claim: true })).last.stage).toBe(
+      'done',
+    );
+    // A 继续发布 v3、v4 并在 prod 与 prod2 上执行到 v4（比 inst 领先 2 个版本）
+    const more = await publishN(A, pid, 2, 3);
+    expect((await exec(A, pid, ePro, 'execute', more[1]!.id)).last).toMatchObject({ stage: 'done' });
+    expect((await exec(A, pid, ePro2, 'execute', more[1]!.id)).last).toMatchObject({ stage: 'done' });
+
+    // 1) 无可用影子库测试（新建独立实例 instNoShadow 仅接手生产环境并配独立影子库后清除其影子库，再接入领先生产环境）
+    const instNoShadow = await newInstance('AH_NS');
+    const tmpShadow = await newTarget('ah_shd');
+    expect(
+      (
+        await takeover(
+          instNoShadow,
+          pid,
+          [
+            {
+              name: 'dev-prod',
+              url: dev.url,
+              production: true,
+              allowSameInstance: false,
+              shadowUrl: tmpShadow.url,
+            },
+          ],
+          { claim: true },
+        )
+      ).last.stage,
+    ).toBe('done');
+    // 清掉 dev-prod 的独立影子库，使其无法再提供影子库
+    const [nsEnv] = await envs(instNoShadow, pid);
+    expect(
+      (
+        await instNoShadow.call('PATCH', `/api/projects/${pid}/environments/${nsEnv!.id}`, {
+          shadowUrl: null,
+        })
+      ).status,
+    ).toBe(200);
+    const noShadowAttach = await instNoShadow.call('POST', `/api/projects/${pid}/environments/attach`, {
+      name: 'prod',
+      url: prod.url,
+      production: true,
+      allowSameInstance: false,
+      claim: true,
+    });
+    expect(noShadowAttach.status).toBe(422);
+    expect(noShadowAttach.data.code).toBe('shadow_unavailable');
+    expect(
+      (await instNoShadow.call('GET', `/api/projects/${pid}/versions`)).data as unknown as unknown[],
+    ).toHaveLength(2);
+
+    // 2) 领先版本影子库验证失败 → 422 verify_failed，不写平台库也不认领
+    const [origV3] = await prod.db.query<{ up_steps: unknown; down_steps: unknown; checksum: string }>(
+      'select up_steps, down_steps, checksum from dowel.versions where version_id = $1',
+      [more[0]!.id],
+    );
+    const badUp = [{ sql: 'ALTER TABLE public.orders ADD COLUMN bogus text', transactional: true }];
+    const badDown = [{ sql: 'ALTER TABLE public.orders DROP COLUMN bogus', transactional: true }];
+    await prod.db.query(
+      'update dowel.versions set up_steps = $2::text::jsonb, down_steps = $3::text::jsonb, checksum = $4 where version_id = $1',
+      [more[0]!.id, JSON.stringify(badUp), JSON.stringify(badDown), stepsChecksum(badUp, badDown)],
+    );
+    const badAttach = await inst.call('POST', `/api/projects/${pid}/environments/attach`, {
+      name: 'prod',
+      url: prod.url,
+      production: false,
+      allowSameInstance: true,
+      claim: true,
+    });
+    expect(badAttach.status).toBe(422);
+    expect(badAttach.data.code).toBe('verify_failed');
+    expect(badAttach.data.error).toContain('v3');
+    expect(
+      (await inst.call('GET', `/api/projects/${pid}/versions`)).data as unknown as unknown[],
+    ).toHaveLength(2);
+    expect(
+      (await prod.db.query<{ instance_id: string }>('select instance_id from dowel.projects'))[0]!
+        .instance_id,
+    ).toBe(A.instanceId);
+    // 还原 v3 脚本
+    await prod.db.query(
+      'update dowel.versions set up_steps = $2::text::jsonb, down_steps = $3::text::jsonb, checksum = $4 where version_id = $1',
+      [more[0]!.id, JSON.stringify(origV3!.up_steps), JSON.stringify(origV3!.down_steps), origV3!.checksum],
+    );
+
+    // 3) 工作副本有未发布修改（脏）→ 409 working_dirty_confirm，带 aheadVersions / items / total / workingSeq
+    await editModel(inst.created.rooms, inst.db, pid, (m) => {
+      addColumn(m, tableOf(m), { name: 'draft_col', type: 'text' });
+    });
+    const dirtyRes = await inst.call('POST', `/api/projects/${pid}/environments/attach`, {
+      name: 'prod',
+      url: prod.url,
+      production: false,
+      allowSameInstance: true,
+      claim: true,
+    });
+    expect(dirtyRes.status, JSON.stringify(dirtyRes.data)).toBe(409);
+    expect(dirtyRes.data.code).toBe('working_dirty_confirm');
+    expect((dirtyRes.data.aheadVersions as { number: number }[]).map((v) => v.number)).toEqual([3, 4]);
+    expect(dirtyRes.data.total as number).toBeGreaterThan(0);
+    const staleSeq = dirtyRes.data.workingSeq as number;
+    // 未确认时不写平台库也不认领
+    expect(
+      (await inst.call('GET', `/api/projects/${pid}/versions`)).data as unknown as unknown[],
+    ).toHaveLength(2);
+    expect(
+      (await prod.db.query<{ instance_id: string }>('select instance_id from dowel.projects'))[0]!
+        .instance_id,
+    ).toBe(A.instanceId);
+
+    // 4) 预览之后画布又被编辑 → 带旧 workingSeq 确认返回 409 working_changed
+    await editModel(inst.created.rooms, inst.db, pid, (m) => {
+      addColumn(m, tableOf(m), { name: 'draft_col_2', type: 'text' });
+    });
+    const changedRes = await inst.call('POST', `/api/projects/${pid}/environments/attach`, {
+      name: 'prod',
+      url: prod.url,
+      production: false,
+      allowSameInstance: true,
+      claim: true,
+      confirmOverwrite: true,
+      workingSeq: staleSeq,
+    });
+    expect(changedRes.status).toBe(409);
+    expect(changedRes.data.code).toBe('working_changed');
+    const freshSeq = changedRes.data.workingSeq as number;
+    expect(freshSeq).toBeGreaterThan(staleSeq);
+
+    // 5) 带最新 workingSeq + confirmOverwrite: true → 201，补齐 v3/v4（已验证 + restoredAt）、覆盖工作副本到 v4 并记 room_commits、认领 prod
+    const ok = await inst.call('POST', `/api/projects/${pid}/environments/attach`, {
+      name: 'prod',
+      url: prod.url,
+      production: false,
+      allowSameInstance: true,
+      claim: true,
+      confirmOverwrite: true,
+      workingSeq: freshSeq,
+    });
+    expect(ok.status, JSON.stringify(ok.data)).toBe(201);
+    const res = ok.data as unknown as AttachResult;
+    expect(res).toMatchObject({
+      attached: true,
+      claimed: true,
+      currentVersion: { number: 4 },
+    });
+    expect(res.aheadVersions.map((v) => v.number)).toEqual([3, 4]);
+    const vsAfter = (await inst.call('GET', `/api/projects/${pid}/versions`))
+      .data as unknown as VersionInfo[];
+    expect(vsAfter.map((v) => [v.number, v.verifiedAt !== null, v.restoredAt !== null])).toEqual([
+      [4, true, true],
+      [3, true, true],
+      [2, true, true],
+      [1, true, true],
+    ]);
+    // 工作副本已覆盖到 v4（不再含 draft_col），且 room_commits 记下 attachAhead 操作
+    expect(await modelOf(inst, pid)).toEqual(await versionModel(A, more[1]!.id));
+    const [bRow] = await inst.db.query<{ id: string }>('select id from branches where project_id = $1', [
+      pid,
+    ]);
+    const commits = await inst.db.query<{ op_name: string | null }>(
+      'select op_name from room_commits where branch_id = $1 order by seq desc limit 1',
+      [bRow!.id],
+    );
+    expect(commits[0]!.op_name).toBe('attachAhead');
+    expect(
+      (await prod.db.query<{ instance_id: string }>('select instance_id from dowel.projects'))[0]!
+        .instance_id,
+    ).toBe(inst.instanceId);
+
+    // 6) 工作副本干净时接入领先环境：再让 A 发布 v5 并执行到 prod2，然后 inst（画布干净）直接接入 prod2（无需 confirmOverwrite）
+    const v5 = (await publishN(A, pid, 1, 5))[0]!;
+    expect((await exec(A, pid, ePro2, 'execute', v5.id)).last).toMatchObject({ stage: 'done' });
+    const cleanAttach = await inst.call('POST', `/api/projects/${pid}/environments/attach`, {
+      name: 'prod2',
+      url: prod2.url,
+      production: false,
+      allowSameInstance: true,
+      claim: true,
+    });
+    expect(cleanAttach.status, JSON.stringify(cleanAttach.data)).toBe(201);
+    expect((cleanAttach.data as unknown as AttachResult).aheadVersions.map((v) => v.number)).toEqual([5]);
+    expect(await modelOf(inst, pid)).toEqual(await versionModel(A, v5.id));
   });
 
   test('接手检查的 existsHere：只查目标库列出的 ID；调用者看不到的项目标 hidden，不给名字 / 归属', async () => {

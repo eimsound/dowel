@@ -110,6 +110,13 @@ const zh = {
     shadowNone: '没有单独设置，使用同实例上的 {原库名}_dowel',
     production: '生产环境',
     notProduction: '非生产',
+    markProduction: '标记为生产环境',
+    unmarkProduction: '取消生产标记',
+    unmarkTitle: '取消 {{name}} 的生产环境标记？',
+    unmarkHint:
+      '这是特权操作（environment.unmark_production）。取消后环境将标记为非生产，但原生产执行策略中比非生产默认更严的字段会自动固定在环境层，不会悄悄放宽。',
+    markedProduction: '已将环境 {{name}} 标记为生产环境',
+    unmarkedProduction: '已取消环境 {{name}} 的生产环境标记',
     sameInstance: '允许在同一实例上建影子库',
     status: '连接状态',
     statusUnknown: '未测试',
@@ -148,7 +155,7 @@ const zh = {
     },
     manual: {
       title: '需要人工修正',
-      body: '上一次{{direction}} v{{number}} 的所有步骤都执行完了，但读回的结构与目标版本不一致，库停在半途状态。继续执行解决不了（脚本的结果本身就不对）：请手工修正目标库，让它回到当前版本的样子；漂移差异在下方。目前还没有“处理漂移”功能。',
+      body: '上一次{{direction}} v{{number}} 的所有步骤都执行完了，但读回的结构与目标版本不一致，库停在半途状态。继续执行解决不了（脚本的结果本身就不对）：请检查目标库和下方漂移差异，使用下方修复脚本改回当前版本，或在确认线上结构已符合目标版本后通过「标记为已执行」处理，不要重复盲跑。',
     },
     unfinished: {
       title: '上一次执行停在中途',
@@ -320,11 +327,17 @@ const zh = {
   },
   tk: {
     restored: '接手恢复',
-    restoredHint: '从目标库的 dowel 历史恢复，没有在本实例验证过：执行或回滚它之前先点“重新验证”。',
+    restoredHint: '从目标库的 dowel 历史恢复，已在本实例影子库闭环验证通过。',
     // 向导：接手
     wizTitle: '选择要接手的项目',
     wizHint:
       '给出项目所在的数据库（可以在“关联数据库”里添加多个环境，例如 dev 和 prod）。Dowel 读取库里 dowel schema 登记过的项目，选一个，从中恢复完整的版本链和环境。',
+    shadowTitle: '影子库验证配置',
+    shadowHint:
+      '接手会在写入平台前用本实例影子库逐版本闭环验证整条历史链。生产环境默认不在同实例建影子库，请为至少一个环境填写独立影子库连接串，或勾选允许同实例影子库。',
+    shadowMissingWarn:
+      '当前所有环境均为生产环境且未配置可用影子库：请先为至少一个环境填写独立影子库连接串，或勾选允许在同一实例上建影子库，否则接手会被拒绝。',
+    sumVerify: '写入平台前将在影子库按版本顺序逐个验证整条历史链；验证不通过会直接拒绝接手。',
     needEnv: '接手需要至少一个环境：先在上一步添加项目所在的数据库。',
     read: '读取库里的项目',
     reading: '正在读取…',
@@ -381,11 +394,19 @@ const zh = {
     // 添加环境：接入已有历史
     attachLabel: '这个库里已经有这个项目的迁移历史，接入它',
     attachHint:
-      '接入需要项目管理员，并且历史必须和本项目的版本链对得上；由另一个实例认领的库需要实例管理员确认认领。没有历史的库只是一个新环境。',
+      '接入需要项目管理员，并且历史必须与本项目的版本链一致或是无分叉领先延伸（领先版本会先在影子库验证，验证通过后补齐版本链并同步工作副本）；由另一个实例认领的库需要实例管理员确认认领。没有历史的库只是一个新环境。',
     attachedOk: '已接入 {{name}}：当前版本 v{{number}}。',
+    attachedAheadOk: '已接入 {{name}}：补齐 {{count}} 个领先版本，当前版本 v{{number}}。',
     attachedNone: '已添加 {{name}}（这个库里还没有这个项目的历史）。',
     attachedClaimed: '，并已认领。',
     attachedWarn: '环境已添加，但有没做完的事：{{msg}}',
+    attachAheadTitle: '确认覆盖工作副本并接入领先环境',
+    attachAheadIntro:
+      '目标库的历史严格领先于平台版本链，且所有领先版本已通过影子库验证。当前工作副本有未发布的修改，接入后将补齐版本链并把工作副本覆盖到新链头（被覆盖前的草稿可在画布修改历史中找回）。',
+    attachAheadVersions: '将补齐的领先版本',
+    attachAheadDiff: '覆盖工作副本会带来的变化（当前工作副本 → 新链头）',
+    attachAheadConfirm: '确认覆盖并接入',
+    attachWorkingChanged: '工作副本在预览之后被改过，下面是最新的差异，请重新确认。',
     // 预演
     dry: {
       title: '预演',
@@ -1037,6 +1058,7 @@ const zh = {
     stage: {
       connect: '连接',
       read: '读取结构',
+      verify: '影子库验证',
       canonicalize: '规范化',
       write: '写入',
       claim: '认领',
@@ -1405,7 +1427,7 @@ const zh = {
       '令牌属于项目，创建者离职或停用不影响使用。只能通过 /api/ci/… 读取项目状态和执行迁移（不走审批，受环境“允许令牌执行”开关约束）。',
     createTitle: '新建 CI 令牌',
     name: '名称',
-    namePlaceholder: '例如 GitHub Actions 部署',
+    namePlaceholder: '例如 CI 自动部署',
     description: '说明（选填）',
     descriptionPlaceholder: '用途或所属流水线',
     expiresInDays: '有效期（天）',
@@ -1675,6 +1697,13 @@ const en: typeof zh = {
     shadowNone: 'Not set separately; uses {database}_dowel on the same instance',
     production: 'Production',
     notProduction: 'Not production',
+    markProduction: 'Mark as production',
+    unmarkProduction: 'Unmark production',
+    unmarkTitle: 'Unmark {{name}} as production?',
+    unmarkHint:
+      'This is a privileged operation (environment.unmark_production). The environment will be marked non-production, and any stricter fields from the production execution policy are automatically pinned at the environment layer so protection is not silently loosened.',
+    markedProduction: 'Marked {{name}} as production',
+    unmarkedProduction: 'Unmarked {{name}} as production',
     sameInstance: 'Allow a shadow database on the same instance',
     status: 'Connection',
     statusUnknown: 'Not tested',
@@ -1713,7 +1742,7 @@ const en: typeof zh = {
     },
     manual: {
       title: 'Manual fix needed',
-      body: 'The last {{direction}} of v{{number}} ran all its steps, but the structure read back does not match the target version, so the database is left halfway. Resuming cannot fix it (the script itself produces the wrong result): fix the database by hand so it matches the current version again; the differences are below. There is no "resolve drift" feature yet.',
+      body: 'The last {{direction}} of v{{number}} ran all its steps, but the structure read back does not match the target version, so the database is left halfway. Resuming cannot fix it (the script itself produces the wrong result): inspect the target database and the drift differences below, then restore it with the repair script or use "Mark as applied" once the live structure matches—do not blindly re-run.',
     },
     unfinished: {
       title: 'The last execution stopped midway',
@@ -1906,10 +1935,17 @@ const en: typeof zh = {
   tk: {
     restored: 'Restored',
     restoredHint:
-      "Restored from the target database's dowel history and not verified on this instance: re-verify it before executing or rolling it back.",
+      "Restored from the target database's dowel history and verified in this instance's shadow database.",
     wizTitle: 'Choose the project to take over',
     wizHint:
       'Give the database(s) the project lives in (add several environments in "Databases", e.g. dev and prod). Dowel reads the projects registered in their dowel schema; pick one to restore its full version chain and environments.',
+    shadowTitle: 'Shadow database verification',
+    shadowHint:
+      'Takeover verifies every version in the chain in a shadow database before writing to the platform. Production environments do not use a same-instance shadow by default: provide a separate shadow connection string or allow a same-instance shadow for at least one environment.',
+    shadowMissingWarn:
+      'All environments are production without an available shadow database: provide a separate shadow connection string or allow a same-instance shadow for at least one environment, otherwise takeover will be rejected.',
+    sumVerify:
+      'The entire version chain will be verified in a shadow database before writing to the platform; any verification failure rejects the takeover.',
     needEnv: 'Taking over needs at least one environment: add the project’s database in the previous step.',
     read: 'Read projects in the database',
     reading: 'Reading…',
@@ -1969,11 +2005,20 @@ const en: typeof zh = {
     unknownInstance: 'unknown',
     attachLabel: 'This database already has migration history for this project: attach it',
     attachHint:
-      'Attaching needs a project admin, and the history must match this project’s version chain; a database claimed by another instance needs an instance admin to confirm the claim. A database without history is just a new environment.',
+      'Attaching needs a project admin, and the history must match this project’s version chain or extend it without forking (ahead versions are verified in a shadow database before extending the chain and updating the working copy); a database claimed by another instance needs an instance admin to confirm the claim. A database without history is just a new environment.',
     attachedOk: 'Attached {{name}}: current version v{{number}}.',
+    attachedAheadOk: 'Attached {{name}}: added {{count}} ahead version(s), current version v{{number}}.',
     attachedNone: 'Added {{name}} (no history of this project in that database yet).',
     attachedClaimed: ' and claimed it.',
     attachedWarn: 'The environment was added, but something is unfinished: {{msg}}',
+    attachAheadTitle: 'Confirm overwriting working copy to attach ahead environment',
+    attachAheadIntro:
+      'The target database is strictly ahead of the platform version chain, and all ahead versions passed shadow verification. Your working copy has unpublished changes and will be overwritten to the new chain head (previous drafts remain recoverable in canvas history).',
+    attachAheadVersions: 'Ahead versions to add',
+    attachAheadDiff: 'Changes to the working copy (working copy → new chain head)',
+    attachAheadConfirm: 'Overwrite and attach',
+    attachWorkingChanged:
+      'The working copy changed after the preview; the latest differences are shown below, please confirm again.',
     dry: {
       title: 'Dry run',
       running: 'Dry run: doing all pre-execution checks, writing nothing…',
@@ -2651,6 +2696,7 @@ const en: typeof zh = {
     stage: {
       connect: 'Connecting',
       read: 'Reading structure',
+      verify: 'Verifying in shadow',
       canonicalize: 'Normalizing',
       write: 'Writing',
       claim: 'Claiming',
@@ -3032,7 +3078,7 @@ const en: typeof zh = {
       'Tokens belong to the project, so disabling or removing their creator does not break pipelines. They can only read project state and execute migrations via /api/ci/… (skipping approval, gated by each environment’s “Allow token execution” setting).',
     createTitle: 'Create CI token',
     name: 'Name',
-    namePlaceholder: 'e.g. GitHub Actions deploy',
+    namePlaceholder: 'e.g. CI automated deploy',
     description: 'Description (optional)',
     descriptionPlaceholder: 'Purpose or pipeline',
     expiresInDays: 'Expires in (days)',

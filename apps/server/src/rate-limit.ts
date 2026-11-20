@@ -191,22 +191,55 @@ export class LoginLimiter {
   }
 }
 
-/** 环境变量里的正数；没设置或不是正数时返回 undefined（交给默认值） */
-const envPositive = (value: string | undefined) => {
+/** 环境变量里的正整数；没设置或不是正整数时返回 undefined（交给默认值） */
+const envPositiveInt = (value: string | undefined) => {
   const n = Number(value);
-  return Number.isFinite(n) && n > 0 ? n : undefined;
+  return Number.isInteger(n) && n > 0 ? n : undefined;
 };
 
 /**
- * 默认限速设置，可用环境变量覆盖：
+ * 登录失败限速（单副本进程内计数，HA 多副本部署下实际总配额约为设定值 × 副本数）：
  * - DOWEL_LOGIN_LIMIT：同一 IP + 账号在窗口内的尝试次数（默认 10）；
  * - DOWEL_LOGIN_IP_LIMIT：同一 IP 在窗口内的总尝试次数（默认 30；公司 NAT / 反向代理后很多人共用一个 IP 时调大）；
- * - DOWEL_LOGIN_WINDOW_MS：窗口长度（默认 10 分钟）。
+ * - DOWEL_LOGIN_WINDOW_MS：窗口长度（毫秒，默认 600000 = 10 分钟）。
  * e2e 会在一个 IP 上反复登录，所以 playwright.config.ts 里把它调大。
  */
 export const loginLimiterFromEnv = (env: NodeJS.ProcessEnv = process.env) =>
   new LoginLimiter({
-    limit: envPositive(env.DOWEL_LOGIN_LIMIT),
-    ipLimit: envPositive(env.DOWEL_LOGIN_IP_LIMIT),
-    windowMs: envPositive(env.DOWEL_LOGIN_WINDOW_MS),
+    limit: envPositiveInt(env.DOWEL_LOGIN_LIMIT),
+    ipLimit: envPositiveInt(env.DOWEL_LOGIN_IP_LIMIT),
+    windowMs: envPositiveInt(env.DOWEL_LOGIN_WINDOW_MS),
+  });
+
+/**
+ * 连库探测限速（单副本进程内计数，HA 多副本部署下实际总配额约为设定值 × 副本数）：
+ * - DOWEL_CONNECTION_LIMIT：单个用户在窗口内允许的连接检查 / 探测次数（默认 10）；
+ * - DOWEL_CONNECTION_WINDOW_MS：窗口长度（毫秒，默认 60000 = 1 分钟）。
+ */
+export const connectionLimiterFromEnv = (env: NodeJS.ProcessEnv = process.env) =>
+  new KeyedLimiter({
+    limit: envPositiveInt(env.DOWEL_CONNECTION_LIMIT) ?? 10,
+    windowMs: envPositiveInt(env.DOWEL_CONNECTION_WINDOW_MS) ?? 60_000,
+  });
+
+/**
+ * CI 令牌认证失败限速（按 IP；单副本进程内计数，HA 多副本部署下实际总配额约为设定值 × 副本数）：
+ * - DOWEL_TOKEN_FAIL_LIMIT：同一 IP 在窗口内允许的失败次数（默认 20）；
+ * - DOWEL_TOKEN_FAIL_WINDOW_MS：窗口长度（毫秒，默认 600000 = 10 分钟）。
+ */
+export const tokenFailLimiterFromEnv = (env: NodeJS.ProcessEnv = process.env) =>
+  new KeyedLimiter({
+    limit: envPositiveInt(env.DOWEL_TOKEN_FAIL_LIMIT) ?? 20,
+    windowMs: envPositiveInt(env.DOWEL_TOKEN_FAIL_WINDOW_MS) ?? 10 * 60_000,
+  });
+
+/**
+ * CI 令牌请求速率限速（按令牌；单副本进程内计数，HA 多副本部署下实际总配额约为设定值 × 副本数）：
+ * - DOWEL_TOKEN_RATE_LIMIT：单个令牌在窗口内允许的请求次数（默认 120）；
+ * - DOWEL_TOKEN_RATE_WINDOW_MS：窗口长度（毫秒，默认 60000 = 1 分钟）。
+ */
+export const tokenLimiterFromEnv = (env: NodeJS.ProcessEnv = process.env) =>
+  new KeyedLimiter({
+    limit: envPositiveInt(env.DOWEL_TOKEN_RATE_LIMIT) ?? 120,
+    windowMs: envPositiveInt(env.DOWEL_TOKEN_RATE_WINDOW_MS) ?? 60_000,
   });
