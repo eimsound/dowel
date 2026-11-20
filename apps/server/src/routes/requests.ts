@@ -723,35 +723,53 @@ export const registerInbox = (app: Hono<Env>, ctx: AppContext) => {
     c.header('X-Accel-Buffering', 'no');
     return streamSSE(c, async (s) => {
       const send = sseSender<InboxEvent>(s);
-      await send({ unread: await requests.unread(db, user.id) });
-      if (once) return;
+      if (once) {
+        await send({ unread: await requests.unread(db, user.id) });
+        return;
+      }
       const queue: InboxEvent[] = [];
       let wake: (() => void) | null = null;
-      let closed = false;
-      const off = requests.subscribe(user.id, (e) => {
-        queue.push(e);
-        wake?.();
-      });
-      s.onAbort(() => {
+      let closed = requests.isStopped() || s.aborted || s.closed;
+      const close = () => {
         closed = true;
         wake?.();
-      });
+      };
+      s.onAbort(close);
+      const off = requests.subscribe(
+        user.id,
+        (e) => {
+          if (closed) return;
+          queue.push(e);
+          wake?.();
+        },
+        close,
+      );
       try {
+        if (closed) return;
+        // 先订阅再查初始未读数：初始查询与首帧发送期间到达的事件先缓冲到 queue，随后立刻消费，消除丢通知窗口
+        const initialUnread = await requests.unread(db, user.id);
+        if (closed) return;
+        await send({ unread: initialUnread });
         while (!closed) {
           while (queue.length && !closed) await send(queue.shift()!);
+          if (closed) break;
           const ping = await new Promise<boolean>((r) => {
-            const t = setTimeout(() => r(true), 25_000);
+            const t = setTimeout(() => {
+              wake = null;
+              r(true);
+            }, 25_000);
+            t.unref?.();
             wake = () => {
               clearTimeout(t);
+              wake = null;
               r(false);
             };
           });
-          wake = null;
           if (ping && !closed) {
             const [u] = await db.query<{ status: string }>('select status from users where id = $1', [
               user.id,
             ]);
-            if (u?.status !== 'active') break;
+            if (closed || u?.status !== 'active') break;
             await s.write(': ping\n\n').catch(() => {
               closed = true;
             });

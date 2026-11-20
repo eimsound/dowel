@@ -506,6 +506,8 @@ export class Requests {
   readonly bus: EventBus | null;
   readonly ha: HaCoordinator | null;
   private listeners = new Map<string, Set<Listener>>();
+  private stopListeners = new Set<() => void>();
+  private stopped = false;
   private busUnsubs: (() => void)[] = [];
   private timer: ReturnType<typeof setInterval> | null = null;
   private kickTimer: ReturnType<typeof setTimeout> | null = null;
@@ -540,6 +542,11 @@ export class Requests {
   /** 当前副本 ID（写入 exec_requests.worker_id；无 HA 时为 null） */
   get workerId(): string | null {
     return this.ha?.replicaId ?? null;
+  }
+
+  /** 是否已调用 stop() 进入停机状态 */
+  isStopped(): boolean {
+    return this.stopped;
   }
 
   private attachBus(): void {
@@ -588,9 +595,10 @@ export class Requests {
    */
   async start(intervalMs = REQUEST_SWEEP_MS) {
     this.stop();
+    this.stopped = false;
     this.attachBus();
     await this.recoverInterrupted();
-    if (!(intervalMs > 0)) return;
+    if (this.stopped || !(intervalMs > 0)) return;
     this.timer = setInterval(() => void this.sweep(), intervalMs);
     this.timer.unref?.();
   }
@@ -652,11 +660,20 @@ export class Requests {
   }
 
   stop() {
+    this.stopped = true;
     if (this.timer) clearInterval(this.timer);
     this.timer = null;
     if (this.kickTimer) clearTimeout(this.kickTimer);
     this.kickTimer = null;
     this.detachBus();
+    const closers = [...this.stopListeners];
+    this.stopListeners.clear();
+    this.listeners.clear();
+    for (const close of closers) {
+      try {
+        close();
+      } catch {}
+    }
   }
 
   private enqueue(t: SweepTarget): number {
@@ -1393,13 +1410,19 @@ export class Requests {
 
   // ───── 实时推送（收件箱） ─────
 
-  subscribe(userId: string, fn: Listener): () => void {
+  subscribe(userId: string, fn: Listener, onClose?: () => void): () => void {
+    if (this.stopped) {
+      onClose?.();
+      return () => {};
+    }
     const set = this.listeners.get(userId) ?? new Set<Listener>();
     this.listeners.set(userId, set);
     set.add(fn);
+    if (onClose) this.stopListeners.add(onClose);
     return () => {
       set.delete(fn);
-      if (!set.size) this.listeners.delete(userId);
+      if (!set.size && this.listeners.get(userId) === set) this.listeners.delete(userId);
+      if (onClose) this.stopListeners.delete(onClose);
     };
   }
 

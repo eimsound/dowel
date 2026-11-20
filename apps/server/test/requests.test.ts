@@ -7,12 +7,13 @@ import type {
   ExecEvent,
   ExecRequestDetail,
   ExecRequestSummary,
+  InboxEvent,
   InboxList,
   PendingRequest,
   PolicySettings,
 } from '@dowel/api';
 import { addColumn, all, type Model } from '@dowel/core';
-import { afterAll, beforeAll, describe, expect, test } from 'vitest';
+import { afterAll, beforeAll, describe, expect, test, vi } from 'vitest';
 import { connect, createTestDb, PG_URL } from '../../../test/pg.ts';
 import { createApp, openPlatformDb, type PlatformDb } from '../src/index.ts';
 import { KeyedLimiter, LoginLimiter } from '../src/rate-limit.ts';
@@ -923,5 +924,212 @@ describe.skipIf(!PG_URL)('第一轮审查的修复（目标库 PG）', () => {
     expect(
       (await inbox('dev')).items.filter((i) => i.requestId === r.id && i.kind === 'request_result'),
     ).toHaveLength(1);
+  });
+});
+
+// ───── 收件箱 SSE 实时流（#26） ─────
+
+describe('收件箱 SSE 实时流（#26）', () => {
+  const createStreamEnv = async () => {
+    const memDb = await openPlatformDb(':memory:');
+    const appObj = createApp(memDb, {
+      loginLimiter: new LoginLimiter({ limit: 10_000, ipLimit: 10_000 }),
+      connectionLimiter: new KeyedLimiter({ limit: 10_000, windowMs: 60_000 }),
+    });
+    const user = await makeUser(memDb, 'sse_user', { name: 'SSE 用户', role: 'admin' });
+    const loginRes = await appObj.app.request('/api/auth/login', {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ username: 'sse_user', password: PASSWORD }),
+    });
+    expect(loginRes.status).toBe(200);
+    const cookie = (loginRes.headers.get('set-cookie') ?? '').split(';')[0]!;
+    const cleanup = async () => {
+      appObj.requests.stop();
+      await appObj.rooms.flush();
+      await appObj.shadows.close();
+      await memDb.close();
+    };
+    return { memDb, appObj, user, cookie, cleanup };
+  };
+
+  const openSseReader = (res: Response) => {
+    expect(res.status).toBe(200);
+    expect(res.headers.get('content-type')).toContain('text/event-stream');
+    const reader = res.body!.getReader();
+    const decoder = new TextDecoder();
+    let buf = '';
+    const events: InboxEvent[] = [];
+
+    const readNextChunk = async () => {
+      const { done, value } = await reader.read();
+      if (done) return true;
+      buf += decoder.decode(value, { stream: true });
+      const parts = buf.split('\n\n');
+      buf = parts.pop()!;
+      for (const part of parts) {
+        const line = part
+          .split('\n')
+          .map((l) => l.trim())
+          .find((l) => l.startsWith('data:'));
+        if (line) events.push(JSON.parse(line.replace(/^data:\s*/, '')) as InboxEvent);
+      }
+      return false;
+    };
+
+    const waitEvents = async (predicate: (list: InboxEvent[]) => boolean, timeoutMs = 3000) => {
+      const deadline = Date.now() + timeoutMs;
+      while (!predicate(events)) {
+        const left = deadline - Date.now();
+        if (left <= 0) throw new Error(`等待 SSE 事件超时，当前已收到: ${JSON.stringify(events)}`);
+        const done = await Promise.race([
+          readNextChunk(),
+          new Promise<never>((_, rej) =>
+            setTimeout(
+              () => rej(new Error(`等待 SSE 事件超时，当前已收到: ${JSON.stringify(events)}`)),
+              left,
+            ),
+          ),
+        ]);
+        if (done) break;
+      }
+      return events;
+    };
+
+    const waitDone = async (timeoutMs = 2000) => {
+      const deadline = Date.now() + timeoutMs;
+      while (true) {
+        const left = deadline - Date.now();
+        if (left <= 0) throw new Error('等待 SSE 流关闭超时');
+        const done = await Promise.race([
+          readNextChunk(),
+          new Promise<never>((_, rej) => setTimeout(() => rej(new Error('等待 SSE 流关闭超时')), left)),
+        ]);
+        if (done) return;
+      }
+    };
+
+    return { reader, events, waitEvents, waitDone };
+  };
+
+  test('建连瞬间初始 unread 查询返回前并发产生新通知时，SSE 流缓冲并推送最新未读数，不丢事件', async () => {
+    const { memDb, appObj, user, cookie, cleanup } = await createStreamEnv();
+    try {
+      const origUnread = appObj.requests.unread.bind(appObj.requests);
+      let intercepted = false;
+      let enteredInitial!: () => void;
+      const inInitial = new Promise<void>((r) => {
+        enteredInitial = r;
+      });
+      let releaseInitial!: () => void;
+      const holdInitial = new Promise<void>((r) => {
+        releaseInitial = r;
+      });
+
+      appObj.requests.unread = async (queryDb, uid, rc) => {
+        const count = await origUnread(queryDb, uid, rc);
+        if (!intercepted && uid === user.id) {
+          intercepted = true;
+          enteredInitial();
+          await holdInitial;
+        }
+        return count;
+      };
+
+      const res = await appObj.app.request('/api/me/inbox/stream', { headers: { cookie } });
+      await inInitial;
+
+      // 初始 unread 尚未返回/发送时并发写入新通知并推送未读数与申请变更
+      await memDb.query(
+        `insert into inbox_items (id, user_id, kind, data, created_at)
+         values ('inbox-race-1', $1, 'approval_needed', '{}', $2)`,
+        [user.id, new Date().toISOString()],
+      );
+      await appObj.requests.publishUnread(user.id);
+      appObj.requests.broadcast({ requests: true });
+
+      // 放行初始 unread（旧值 0），后续应立即消费缓冲队列里的 unread: 1 与 requests: true
+      releaseInitial();
+      const sse = openSseReader(res);
+      await sse.waitEvents(
+        (list) => list.some((e) => e.unread === 1) && list.some((e) => e.requests === true),
+      );
+      expect(sse.events).toEqual([{ unread: 0 }, { unread: 1 }, { requests: true }]);
+
+      appObj.requests.stop();
+      await sse.waitDone();
+    } finally {
+      await cleanup();
+    }
+  });
+
+  test('活跃 SSE 连接在服务端调用 requests.stop() 后立刻优雅结束，心跳定时器 unref 并在关闭时清理，重启后可重新订阅', async () => {
+    const { appObj, user, cookie, cleanup } = await createStreamEnv();
+    const origSetTimeout = globalThis.setTimeout;
+    const origClearTimeout = globalThis.clearTimeout;
+    let heartbeatTimer: ReturnType<typeof setTimeout> | null = null;
+    let unrefCalled = false;
+    let heartbeatCleared = false;
+    let heartbeatScheduled!: () => void;
+    const onHeartbeatScheduled = new Promise<void>((r) => {
+      heartbeatScheduled = r;
+    });
+
+    vi.spyOn(globalThis, 'setTimeout').mockImplementation(((
+      fn: (...args: unknown[]) => void,
+      ms?: number,
+      ...args: unknown[]
+    ) => {
+      const t = origSetTimeout(fn, ms, ...args);
+      if (ms === 25_000 && !heartbeatTimer) {
+        heartbeatTimer = t;
+        const origUnref = t.unref?.bind(t);
+        t.unref = () => {
+          unrefCalled = true;
+          return origUnref ? origUnref() : t;
+        };
+        heartbeatScheduled();
+      }
+      return t;
+    }) as typeof setTimeout);
+    vi.spyOn(globalThis, 'clearTimeout').mockImplementation(((id: ReturnType<typeof setTimeout>) => {
+      if (heartbeatTimer && id === heartbeatTimer) heartbeatCleared = true;
+      return origClearTimeout(id);
+    }) as typeof clearTimeout);
+
+    try {
+      const res = await appObj.app.request('/api/me/inbox/stream', { headers: { cookie } });
+      const sse = openSseReader(res);
+      await sse.waitEvents((list) => list.some((e) => e.unread === 0));
+      await onHeartbeatScheduled;
+      expect(unrefCalled).toBe(true);
+
+      // 调用 stop() 后，活跃流应立刻结束并清理心跳定时器，而不是挂起等待 25s 心跳
+      appObj.requests.stop();
+      expect(appObj.requests.isStopped()).toBe(true);
+      await sse.waitDone(1000);
+      expect(heartbeatCleared).toBe(true);
+
+      // 停机后新连上的流也应立即优雅结束
+      const afterStopRes = await appObj.app.request('/api/me/inbox/stream', { headers: { cookie } });
+      const afterStopSse = openSseReader(afterStopRes);
+      await afterStopSse.waitDone(1000);
+
+      // 重新 start() 后复位 stopped 状态，新建立的流可正常接收推送
+      await appObj.requests.start(0);
+      expect(appObj.requests.isStopped()).toBe(false);
+      const restartedRes = await appObj.app.request('/api/me/inbox/stream', { headers: { cookie } });
+      const restartedSse = openSseReader(restartedRes);
+      await restartedSse.waitEvents((list) => list.some((e) => e.unread === 0));
+      await appObj.requests.publishUnread(user.id, 3);
+      await restartedSse.waitEvents((list) => list.some((e) => e.unread === 3));
+      expect(restartedSse.events).toEqual([{ unread: 0 }, { unread: 3 }]);
+
+      appObj.requests.stop();
+      await restartedSse.waitDone(1000);
+    } finally {
+      vi.restoreAllMocks();
+      await cleanup();
+    }
   });
 });
