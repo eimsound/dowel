@@ -45,6 +45,8 @@ export type AdvisoryLockResult<T> = { acquired: true; value: T } | { acquired: f
 export interface OpenPlatformDbOptions {
   /** PG advisory lock 专用连接池最大连接数（默认 16，与主业务连接池隔离） */
   advisoryLockPoolMax?: number;
+  /** PG 模式下启动迁移等待 `platform:migrate` advisory lock 的超时时间（毫秒，默认 60_000） */
+  migrateLockTimeoutMs?: number;
   /** 仅用于测试：替换 PG advisory lock 解锁执行逻辑，用于模拟解锁抛错或返回非 true 时销毁连接防锁泄漏 */
   advisoryUnlock?: (conn: postgres.ReservedSql, k1: number, k2: number) => Promise<boolean>;
 }
@@ -1079,7 +1081,12 @@ export const MIGRATIONS: MigrationStep[] = [
   },
 ];
 
-const migrate = async (db: PlatformDb) => {
+/** PG 启动迁移使用的跨副本 advisory lock 键 */
+export const MIGRATE_LOCK_KEY = 'platform:migrate';
+/** PG 启动迁移等待锁的默认超时时间（毫秒） */
+export const DEFAULT_MIGRATE_LOCK_TIMEOUT_MS = 60_000;
+
+const runMigrations = async (db: PlatformDb) => {
   const { ts, now } = types(db.dialect);
   await db.exec(
     `create table if not exists dowel_migrations (version int primary key, applied_at ${ts} not null default ${now})`,
@@ -1108,6 +1115,19 @@ const migrate = async (db: PlatformDb) => {
     } finally {
       if (rebuild) await db.exec('pragma legacy_alter_table = off; pragma foreign_keys = on');
     }
+  }
+};
+
+const migrate = async (db: PlatformDb, options?: OpenPlatformDbOptions) => {
+  if (db.dialect !== 'pg') {
+    await runMigrations(db);
+    return;
+  }
+  const rawTimeout = options?.migrateLockTimeoutMs ?? DEFAULT_MIGRATE_LOCK_TIMEOUT_MS;
+  const timeoutMs = Number.isFinite(rawTimeout) ? Math.max(0, rawTimeout) : DEFAULT_MIGRATE_LOCK_TIMEOUT_MS;
+  const res = await db.withAdvisoryLock(MIGRATE_LOCK_KEY, () => runMigrations(db), { timeoutMs });
+  if (!res.acquired) {
+    throw new Error(`等待平台库迁移锁（${MIGRATE_LOCK_KEY}）超时（${timeoutMs}ms），未能完成数据库迁移`);
   }
 };
 
@@ -1488,7 +1508,9 @@ const openPg = (url: string, options?: OpenPlatformDbOptions): PlatformDb => {
       closing = true;
       const err = new Error('PG 平台库连接池已关闭');
       for (const w of slotWaiters.splice(0)) w.abort(err);
-      await Promise.all([sql.end(), lockSql ? lockSql.end() : Promise.resolve()]);
+      const results = await Promise.allSettled([sql.end(), lockSql ? lockSql.end() : Promise.resolve()]);
+      const rejected = results.find((r): r is PromiseRejectedResult => r.status === 'rejected');
+      if (rejected) throw rejected.reason;
     },
   };
 };
@@ -1529,7 +1551,14 @@ const fromRow = (
 const openSqlite = (path: string): PlatformDb => {
   if (path !== ':memory:') mkdirSync(dirname(path), { recursive: true });
   const conn = new DatabaseSync(path);
-  conn.exec('PRAGMA journal_mode = WAL; PRAGMA foreign_keys = ON; PRAGMA busy_timeout = 5000');
+  try {
+    conn.exec('PRAGMA journal_mode = WAL; PRAGMA foreign_keys = ON; PRAGMA busy_timeout = 5000');
+  } catch (e) {
+    try {
+      conn.close();
+    } catch {}
+    throw e;
+  }
   const raw: Db = {
     query: async <T>(q: string, params: unknown[] = []) => {
       const stmt = conn.prepare(toSqlite(q));
@@ -1627,6 +1656,11 @@ const openSqlite = (path: string): PlatformDb => {
  */
 export const openPlatformDb = async (url: string, options?: OpenPlatformDbOptions): Promise<PlatformDb> => {
   const db = /^postgres(ql)?:\/\//.test(url) ? openPg(url, options) : openSqlite(url);
-  await migrate(db);
-  return db;
+  try {
+    await migrate(db, options);
+    return db;
+  } catch (e) {
+    await db.close().catch(() => {});
+    throw e;
+  }
 };

@@ -5,11 +5,12 @@
 import { mkdtempSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
+import { DatabaseSync } from 'node:sqlite';
 import { afterAll, describe, expect, test } from 'vitest';
 import { createTestDb, PG_URL } from '../../../test/pg.ts';
 import { createApp } from '../src/app.ts';
 import { type ClusterEvent, EventBus } from '../src/bus.ts';
-import { MIGRATIONS, openPlatformDb, type PlatformDb } from '../src/db.ts';
+import { MIGRATE_LOCK_KEY, MIGRATIONS, openPlatformDb, type PlatformDb } from '../src/db.ts';
 import { EnvBusyError, EnvLocks, lockEnvIdle } from '../src/executions.ts';
 import { HaCoordinator } from '../src/ha.ts';
 import { encrypt } from '../src/secrets.ts';
@@ -154,11 +155,176 @@ describe.each([
             "select worker_id from exec_requests where id = 'req1'",
           ),
         ).toEqual([{ worker_id: 'replica-1' }]);
+        // 迁移 23 验证完毕
       } finally {
         await db.close();
       }
     },
   );
+});
+
+describe.skipIf(!PG_URL)('openPlatformDb：多副本并发冷启动迁移锁与失败关闭连接池（真实 PG）', () => {
+  const closers: (() => Promise<void>)[] = [];
+  afterAll(async () => {
+    for (const c of closers) await c();
+  });
+
+  const waitForAsync = async (predicate: () => Promise<boolean>, timeoutMs = 5_000, stepMs = 30) => {
+    const deadline = Date.now() + timeoutMs;
+    while (!(await predicate())) {
+      if (Date.now() >= deadline) throw new Error(`等待异步条件超时（${timeoutMs}ms）`);
+      await new Promise((r) => setTimeout(r, stepMs));
+    }
+  };
+
+  test('全新空 PG 库 4 副本并发 openPlatformDb 冷启动：全部成功且迁移版本一致无锁残留', async () => {
+    const t = await createTestDb('ha_cold_start');
+    closers.push(t.close);
+
+    const dbs = await Promise.all([
+      openPlatformDb(t.url),
+      openPlatformDb(t.url),
+      openPlatformDb(t.url),
+      openPlatformDb(t.url),
+    ]);
+
+    try {
+      expect(dbs).toHaveLength(4);
+      const versions = await Promise.all(
+        dbs.map(async (db) => {
+          const [row] = await db.query<{ count: number; max: number }>(
+            'select count(*)::int as count, max(version)::int as max from dowel_migrations',
+          );
+          return row!;
+        }),
+      );
+      for (const v of versions) {
+        expect(v).toEqual({ count: MIGRATIONS.length, max: MIGRATIONS.length });
+      }
+
+      // instance_id 唯一且所有副本读出一致
+      const ids = await Promise.all(
+        dbs.map(async (db) => {
+          const rows = await db.query<{ value: string }>(
+            "select value from instance_settings where key = 'instance_id'",
+          );
+          expect(rows).toHaveLength(1);
+          return rows[0]!.value;
+        }),
+      );
+      expect(new Set(ids).size).toBe(1);
+
+      // 迁移完成后无残留 advisory lock
+      const [locks] = await dbs[0]!.query<{ n: number }>(
+        `select count(*)::int as n from pg_locks
+         where locktype = 'advisory'
+           and database = (select oid from pg_database where datname = current_database())`,
+      );
+      expect(locks!.n).toBe(0);
+    } finally {
+      await Promise.all(dbs.map((db) => db.close()));
+    }
+  });
+
+  test('迁移锁超时或迁移 DDL 抛错时 openPlatformDb 抛出明确错误并干净关闭连接池', async () => {
+    // 1. 锁超时：另一副本长期持有 platform:migrate 锁，冷启动等待超时抛错且不泄漏连接
+    const tTimeout = await createTestDb('ha_migrate_timeout');
+    closers.push(tTimeout.close);
+    const dbHolder = await openPlatformDb(tTimeout.url);
+
+    const countConns = async (db: typeof tTimeout.db) => {
+      const [row] = await db.query<{ n: number }>(
+        'select count(*)::int as n from pg_stat_activity where datname = current_database()',
+      );
+      return row!.n;
+    };
+    const countAdvisoryLocks = async (db: typeof tTimeout.db) => {
+      const [row] = await db.query<{ n: number }>(
+        `select count(*)::int as n from pg_locks
+         where locktype = 'advisory'
+           and database = (select oid from pg_database where datname = current_database())`,
+      );
+      return row!.n;
+    };
+
+    try {
+      let entered!: () => void;
+      const inLock = new Promise<void>((r) => {
+        entered = r;
+      });
+      let releaseHold!: () => void;
+      const holding = new Promise<void>((r) => {
+        releaseHold = r;
+      });
+
+      const holdTask = dbHolder.withAdvisoryLock(MIGRATE_LOCK_KEY, async () => {
+        entered();
+        await holding;
+      });
+      await inLock;
+
+      const beforeConns = await countConns(tTimeout.db);
+      const t0 = Date.now();
+      await expect(openPlatformDb(tTimeout.url, { migrateLockTimeoutMs: 150 })).rejects.toThrow(
+        /platform:migrate.*超时/,
+      );
+      expect(Date.now() - t0).toBeGreaterThanOrEqual(100);
+
+      // 失败的 openPlatformDb 连接池（主池 + 锁池）均已关闭，会话数回落到调用前
+      await waitForAsync(async () => (await countConns(tTimeout.db)) === beforeConns);
+
+      releaseHold();
+      expect(await holdTask).toEqual({ acquired: true, value: undefined });
+    } finally {
+      await dbHolder.close();
+    }
+    // dbHolder 也关闭后，仅剩 tTimeout.db 自身的 1 条测试连接，证明无任何泄漏连接
+    await waitForAsync(async () => (await countConns(tTimeout.db)) === 1);
+    expect(await countAdvisoryLocks(tTimeout.db)).toBe(0);
+
+    // 2. 迁移 DDL 抛错：空库预先存在冲突表导致迁移 1 失败，抛错后连接池关闭且迁移锁释放
+    const tFail = await createTestDb('ha_migrate_fail');
+    closers.push(tFail.close);
+    await tFail.db.exec('create table users (id text)');
+    expect(await countConns(tFail.db)).toBe(1);
+
+    await expect(openPlatformDb(tFail.url)).rejects.toThrow();
+
+    // 主池和锁池均已干净关闭，且不残留 platform:migrate 锁
+    await waitForAsync(async () => (await countConns(tFail.db)) === 1);
+    expect(await countAdvisoryLocks(tFail.db)).toBe(0);
+  });
+});
+
+describe('openPlatformDb：SQLite 迁移失败时释放连接句柄', () => {
+  const dirs: string[] = [];
+  afterAll(() => {
+    for (const d of dirs) rmSync(d, { recursive: true, force: true });
+  });
+
+  test('迁移抛错时抛出错误并关闭 SQLite 连接', async () => {
+    const dir = mkdtempSync(join(tmpdir(), 'dowel-sqlite-fail-'));
+    dirs.push(dir);
+    const file = join(dir, 'conflict.db');
+    const pre = new DatabaseSync(file);
+    pre.exec('create table users (id text)');
+    pre.close();
+
+    await expect(openPlatformDb(file)).rejects.toThrow();
+
+    // 原失败连接已关闭，可以重新独占打开并清理冲突表后正常初始化
+    const fix = new DatabaseSync(file);
+    fix.exec('drop table users');
+    fix.close();
+
+    const db = await openPlatformDb(file);
+    try {
+      const [ver] = await db.query<{ v: number }>('select max(version) as v from dowel_migrations');
+      expect(ver!.v).toBe(MIGRATIONS.length);
+    } finally {
+      await db.close();
+    }
+  });
 });
 
 // ───── 2. withAdvisoryLock ─────
