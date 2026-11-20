@@ -235,8 +235,8 @@ const decideIn = async (
   const run: RunPlan = { a: { pid: project.id, name: project.name, env: s.env, auth } };
   const now = new Date().toISOString();
   await tx.query(
-    "update exec_requests set status = 'executing', executed_by = $2, updated_at = $3, status_reason = null where id = $1",
-    [req.id, user.id, now],
+    "update exec_requests set status = 'executing', executed_by = $2, updated_at = $3, status_reason = null, worker_id = $4 where id = $1",
+    [req.id, user.id, now, requests.workerId],
   );
   await auditIn(
     tx,
@@ -585,8 +585,8 @@ export const registerRequests = (app: Hono<Env>, ctx: AppContext) => {
       await tx.query(
         `insert into exec_requests (id, project_id, environment_id, requested_by, direction, from_version_id, to_version_id,
             migrations, dry_run, reason, flow, conn_hash, production, status, stage, expires_at, created_at, updated_at,
-            executed_by, emergency)
-         values ($1, $2, $3, $4, $5, $6, $7, $8::text::jsonb, null, $9, $10::text::jsonb, $11, $12, 'executing', $13, $14, $15, $15, $4, $16)`,
+            executed_by, emergency, worker_id)
+         values ($1, $2, $3, $4, $5, $6, $7, $8::text::jsonb, null, $9, $10::text::jsonb, $11, $12, 'executing', $13, $14, $15, $15, $4, $16, $17)`,
         [
           id,
           a.pid,
@@ -604,6 +604,7 @@ export const registerRequests = (app: Hono<Env>, ctx: AppContext) => {
           Requests.expiry(auth.resolved, now),
           now.toISOString(),
           true,
+          requests.workerId,
         ],
       );
       await auditIn(

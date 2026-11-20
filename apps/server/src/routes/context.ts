@@ -14,12 +14,14 @@ import {
   type ProjectAction,
   userActor,
 } from '../authz.ts';
+import type { EventBus } from '../bus.ts';
 import { isUniqueViolation, type PlatformDb } from '../db.ts';
 import type { OpaqueRefresher } from '../derive.ts';
 import type { DriftScheduler } from '../drift-scheduler.ts';
 import { type EnvRow, envResource, loadEnv } from '../envs.ts';
 import type { ExecContext } from '../executions.ts';
 import { groupById, groupBySlug, groupRoleOf } from '../groups.ts';
+import type { HaCoordinator } from '../ha.ts';
 import {
   accessIn,
   deniedMessage,
@@ -44,6 +46,12 @@ export type Env = { Variables: { user: User; token: CiTokenAuth } };
 
 export interface AppContext {
   db: PlatformDb;
+  /** 跨副本事件总线（PG LISTEN/NOTIFY，SQLite 进程内回调） */
+  bus: EventBus;
+  /** 副本租约与分布式任务协调器 */
+  ha: HaCoordinator;
+  /** 当前副本唯一 ID */
+  replicaId: string;
   rooms: Rooms;
   shadows: Shadows;
   refresher: OpaqueRefresher;
@@ -65,8 +73,10 @@ export interface AppContext {
   /** 组级 Webhook 的投递队列（P5b，进程内，重启丢失） */
   webhooks: Webhooks;
   security: SecurityConfig;
-  /** 一次性初始化令牌：只在内存里，初始化成功后置空（重启会重新生成） */
+  /** 一次性初始化令牌：多副本冷启动时由 ensureSetupToken 持久化到 instance_settings，初始化成功后置空 */
   setupToken: string | null;
+  /** 是否由单测显式注入了自定义 setupToken（优先于平台库中持久化的共享令牌） */
+  setupTokenCustom: boolean;
   /** DOWEL_ALLOW_PASSWORD_LOGIN=1：设置里关了密码登录也能用密码登录的应急入口 */
   allowPasswordLogin: boolean;
   /** 导入、拉取、恢复历史后替换模型；新模型就是引擎读出的，作为派生数据的基线；传入 expectedSeq 时原子校验当前 seq */

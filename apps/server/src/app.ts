@@ -8,10 +8,12 @@ import { createNodeWebSocket } from '@hono/node-ws';
 import { Hono } from 'hono';
 import { HTTPException } from 'hono/http-exception';
 import { assertUrlAllowed } from './allowlist.ts';
+import { EventBus, type EventBusOptions } from './bus.ts';
 import type { PlatformDb } from './db.ts';
 import { OpaqueRefresher } from './derive.ts';
 import { DriftScheduler } from './drift-scheduler.ts';
 import { EnvLocks, type ExecContext } from './executions.ts';
+import { HaCoordinator, type HaCoordinatorOptions } from './ha.ts';
 import {
   connectionLimiterFromEnv,
   type KeyedLimiter,
@@ -54,12 +56,20 @@ export interface AppOptions {
   tokenFailLimiter?: KeyedLimiter;
   /** 每个 CI 令牌的请求限速；默认 DOWEL_TOKEN_RATE_LIMIT（120）次 / DOWEL_TOKEN_RATE_WINDOW_MS（60000ms） */
   tokenLimiter?: KeyedLimiter;
+  /** 自定义一次性初始化令牌（测试用；未给出时在冷启动时生成并由 ensureSetupToken 跨副本共享） */
+  setupToken?: string;
+  /** 跨副本事件总线配置（测试可注入自定义 replicaId / channel） */
+  bus?: EventBusOptions;
+  /** 副本租约与分布式任务协调器配置 */
+  ha?: HaCoordinatorOptions;
 }
 
 export const createApp = (db: PlatformDb, options: AppOptions = {}) => {
   const app = new Hono<Env>();
-  // 房间和 HTTP 用同一套生效角色规则；join 复查时也要能算
-  const rooms = new Rooms(db, (user, pid, lookup) => effectiveProjectRole(db, user, pid, lookup));
+  const bus = new EventBus(db, options.bus);
+  const ha = new HaCoordinator(db, { replicaId: bus.replicaId, ...options.ha });
+  // 房间和 HTTP 用同一套生效角色规则；join 复查时也要能算；多副本下经 EventBus 同步房间事件
+  const rooms = new Rooms(db, (user, pid, lookup) => effectiveProjectRole(db, user, pid, lookup), bus);
   // 所有目标库 / 影子库连接都要过的检查：实例的白名单（服务端替用户连地址 = SSRF 面）
   const guard: ConnectionGuard = async (url) => {
     const { connectionAllowlist } = await readSettings(db);
@@ -89,6 +99,7 @@ export const createApp = (db: PlatformDb, options: AppOptions = {}) => {
         ]);
       },
     },
+    ha,
   );
   rooms.onCommit = (branchId) => refresher.schedule(branchId);
   /** 导入、拉取、恢复历史后替换模型：新模型就是引擎读出的，作为派生数据的基线 */
@@ -100,17 +111,20 @@ export const createApp = (db: PlatformDb, options: AppOptions = {}) => {
   const { injectWebSocket, upgradeWebSocket } = createNodeWebSocket({ app });
   const security: SecurityConfig = { ...securityConfigFromEnv(), ...options.security };
 
-  // 执行 / 漂移检查：环境锁是单进程内的互斥（跨进程由目标库上的项目锁保证）
-  const exec: ExecContext = { db, guard, locks: new EnvLocks() };
+  // 执行 / 漂移检查：环境锁在单进程互斥之上叠加 PG 平台库 advisory lock 跨副本互斥
+  const exec: ExecContext = { db, guard, locks: new EnvLocks(db) };
   // 定时漂移检查：这里只创建，不启动（main.ts 按配置启动；测试里不启动或调短间隔）
-  const drift = new DriftScheduler(db, exec);
-  // P5b：组级 Webhook（进程内队列）和执行申请（状态检查、通知、定时清理）
-  const webhooks = new Webhooks(db, options.webhooks);
-  const requests = new Requests(db, exec, webhooks, security);
+  const drift = new DriftScheduler(db, exec, ha);
+  // 组级 Webhook（持久化队列 webhook_jobs + EventBus 唤醒）和执行申请（状态检查、跨副本通知、分布式巡检）
+  const webhooks = new Webhooks(db, { bus, ha, ...options.webhooks });
+  const requests = new Requests(db, exec, webhooks, security, { bus, ha });
   drift.afterSweep = () => requests.kick({ all: true });
 
   const ctx: AppContext = {
     db,
+    bus,
+    ha,
+    replicaId: bus.replicaId,
     rooms,
     shadows,
     refresher,
@@ -124,8 +138,9 @@ export const createApp = (db: PlatformDb, options: AppOptions = {}) => {
     requests,
     webhooks,
     security,
-    // 一次性初始化令牌只放内存里（服务重启会重新生成），启动时由 main.ts 打印
-    setupToken: newSetupToken(),
+    // 一次性初始化令牌：冷启动时由 main.ts 调用 ensureSetupToken 跨副本共享；单测未调用时仍可直接用内存令牌
+    setupToken: options.setupToken ?? newSetupToken(),
+    setupTokenCustom: options.setupToken !== undefined,
     allowPasswordLogin: options.allowPasswordLogin ?? passwordLoginForced(),
     replace,
     upgradeWebSocket,
@@ -163,6 +178,9 @@ export const createApp = (db: PlatformDb, options: AppOptions = {}) => {
   return {
     app,
     injectWebSocket,
+    bus,
+    ha,
+    replicaId: bus.replicaId,
     rooms,
     shadows,
     refresher,

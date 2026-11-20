@@ -11,7 +11,7 @@
 // COLUMN_KINDS 里查；新增表 / 列时在下面的表里登记（测试表也用 registerColumnKind 登记）。
 // 旧的列名和 SQL 都不需要改。
 
-import { randomUUID } from 'node:crypto';
+import { createHash, randomUUID } from 'node:crypto';
 import { mkdirSync } from 'node:fs';
 import { dirname } from 'node:path';
 import { DatabaseSync, type SQLInputValue, type StatementColumnMetadata } from 'node:sqlite';
@@ -33,9 +33,32 @@ export type Dialect = 'sqlite' | 'pg';
 export const inList = (ids: readonly unknown[], startIndex = 1): string =>
   ids.map((_, i) => `$${startIndex + i}`).join(', ');
 
+export interface AdvisoryLockOptions {
+  /** 等待拿锁的超时时间（毫秒）；默认 0（不等待，等同 tryOnly） */
+  timeoutMs?: number;
+  /** 仅尝试一次，拿不到立刻返回 { acquired: false } */
+  tryOnly?: boolean;
+}
+
+export type AdvisoryLockResult<T> = { acquired: true; value: T } | { acquired: false };
+
 export interface PlatformDb extends Db {
   dialect: Dialect;
   transaction<T>(fn: (tx: Db) => Promise<T>): Promise<T>;
+  /** 订阅跨副本通知通道（PG 用 LISTEN，重连时触发 onReconnect；SQLite 为空操作） */
+  listen(
+    channel: string,
+    onPayload: (payload: string) => void,
+    onReconnect?: () => void,
+  ): Promise<() => Promise<void>>;
+  /** 发布跨副本通知（PG 用 NOTIFY 并做 < 7500 字节保护；SQLite 为空操作） */
+  notify(channel: string, payload: string): Promise<void>;
+  /** 获取跨副本会话级互斥锁（PG 用独占连接 + 双 32 位哈希 advisory lock；SQLite 用进程内互斥锁） */
+  withAdvisoryLock<T>(
+    key: string,
+    fn: () => Promise<T>,
+    options?: AdvisoryLockOptions,
+  ): Promise<AdvisoryLockResult<T>>;
   close(): Promise<void>;
 }
 
@@ -90,6 +113,7 @@ const COLUMN_KINDS = new Map<string, ColumnKind>([
   ['webhooks.enabled', 'bool'],
   ['webhook_deliveries.ok', 'bool'],
   ['webhook_deliveries.test', 'bool'],
+  ['webhook_jobs.payload', 'json'],
   ['token_policies.rule', 'json'],
 ]);
 
@@ -1018,6 +1042,34 @@ export const MIGRATIONS: MigrationStep[] = [
       );
     },
   },
+  // P7 HA（ADR 0011）：纯平台 PG 多活底座。
+  // - webhook_jobs：持久化 Webhook 投递与重试队列（HA3，FOR UPDATE SKIP LOCKED）；
+  // - ha_leases：副本活跃心跳（key = 'node:<replicaId>'）与分布式任务租约（key = 'job:<name>'）；
+  // - exec_requests.worker_id：记录正在执行该申请的副本 ID，用于按副本存活状态恢复真正中断的 executing 申请。
+  (d) => {
+    const { ts, now, json } = types(d);
+    return `create table webhook_jobs (
+     id text primary key,
+     webhook_id text not null references webhooks on delete cascade,
+     delivery_id text not null,
+     event_type text not null,
+     payload ${json} not null,
+     attempts int not null default 0,
+     max_retries int not null default 3,
+     next_run_at ${ts} not null default ${now},
+     locked_by text,
+     locked_until ${ts},
+     created_at ${ts} not null default ${now}
+   );
+   create index webhook_jobs_due_idx on webhook_jobs (next_run_at);
+   create table ha_leases (
+     key text primary key,
+     owner text not null,
+     expires_at ${ts} not null,
+     updated_at ${ts} not null default ${now}
+   );
+   alter table exec_requests add column worker_id text;`;
+  },
 ];
 
 const migrate = async (db: PlatformDb) => {
@@ -1052,6 +1104,32 @@ const migrate = async (db: PlatformDb) => {
   }
 };
 
+/** PG NOTIFY 单条消息硬上限为 8000 字节；留出余量防超限报错 */
+const MAX_NOTIFY_BYTES = 7500;
+/** PG advisory lock 轮询等待间隔（毫秒） */
+const ADVISORY_POLL_MS = 50;
+
+/** 把字符串锁键映射为双 32 位有符号整数，供 pg_try_advisory_lock(int4, int4) 使用（兼容所有 PG 版本且与 1-arg 项目锁空间隔离） */
+const advisoryKeyPair = (key: string): [number, number] => {
+  const h = createHash('sha256').update(`dowel:lock:${key}`).digest();
+  return [h.readInt32BE(0), h.readInt32BE(4)];
+};
+
+/** 按 UTF-8 字节长度安全截断字符串，不劈开多字节字符 */
+const truncateUtf8 = (str: string, maxBytes: number): string => {
+  const buf = Buffer.from(str, 'utf8');
+  if (buf.length <= maxBytes) return str;
+  let end = maxBytes;
+  while (end > 0 && (buf[end]! & 0xc0) === 0x80) end--;
+  return buf.subarray(0, end).toString('utf8');
+};
+
+const sleep = (ms: number) =>
+  new Promise<void>((resolve) => {
+    const timer = setTimeout(resolve, ms);
+    timer.unref?.();
+  });
+
 const openPg = (url: string): PlatformDb => {
   // bigint（seq）读成 number，与 SQLite 一致；序号不会超过 2^53
   const sql = postgres(url, {
@@ -1071,6 +1149,89 @@ const openPg = (url: string): PlatformDb => {
     dialect: 'pg',
     ...wrap(sql),
     transaction: (fn) => sql.begin((tx) => fn(wrap(tx))) as never,
+    listen: async (channel, onPayload, onReconnect) => {
+      // postgres.js 的第 3 参数回调在首次 LISTEN 成功与后续断线重连后都会触发；跳过首次，仅在真正重连时通知上层
+      let ready = false;
+      const handle = await sql.listen(
+        channel,
+        (payload) => {
+          try {
+            onPayload(payload);
+          } catch (e) {
+            console.error(`PG LISTEN 回调失败（${channel}）`, e);
+          }
+        },
+        () => {
+          if (!ready) {
+            ready = true;
+            return;
+          }
+          try {
+            onReconnect?.();
+          } catch (e) {
+            console.error(`PG LISTEN 重连回调失败（${channel}）`, e);
+          }
+        },
+      );
+      return async () => {
+        await handle.unlisten();
+      };
+    },
+    notify: async (channel, payload) => {
+      let safe = payload;
+      const bytes = Buffer.byteLength(payload, 'utf8');
+      if (bytes > MAX_NOTIFY_BYTES) {
+        console.warn(
+          `PG NOTIFY 负载超过 ${MAX_NOTIFY_BYTES} 字节上限（channel=${channel}, bytes=${bytes}），已截断`,
+        );
+        safe = truncateUtf8(payload, MAX_NOTIFY_BYTES);
+      }
+      await sql.notify(channel, safe);
+    },
+    withAdvisoryLock: async <T>(
+      key: string,
+      fn: () => Promise<T>,
+      options?: AdvisoryLockOptions,
+    ): Promise<AdvisoryLockResult<T>> => {
+      const [k1, k2] = advisoryKeyPair(key);
+      const tryOnly = options?.tryOnly === true;
+      const timeoutMs = tryOnly ? 0 : Math.max(0, options?.timeoutMs ?? 0);
+      const deadline = Date.now() + timeoutMs;
+      let reserved: postgres.ReservedSql | null = null;
+      for (;;) {
+        // 每次尝试独占一条连接；拿不到锁立即归还连接后再 sleep，避免多协程等锁耗尽连接池导致死锁
+        const conn = await sql.reserve();
+        let acquired = false;
+        try {
+          const rows = await conn.unsafe<{ ok: boolean }[]>(
+            'select pg_try_advisory_lock($1::int, $2::int) as ok',
+            [k1, k2],
+          );
+          acquired = rows[0]?.ok === true;
+        } catch (e) {
+          conn.release();
+          throw e;
+        }
+        if (acquired) {
+          reserved = conn;
+          break;
+        }
+        conn.release();
+        if (tryOnly) return { acquired: false };
+        const left = deadline - Date.now();
+        if (left <= 0) return { acquired: false };
+        await sleep(Math.min(ADVISORY_POLL_MS, left));
+      }
+      try {
+        const value = await fn();
+        return { acquired: true, value };
+      } finally {
+        await reserved.unsafe('select pg_advisory_unlock($1::int, $2::int) as ok', [k1, k2]).catch((e) => {
+          console.error(`释放 PG advisory lock 失败（${key}）`, e);
+        });
+        reserved.release();
+      }
+    },
     close: () => sql.end(),
   };
 };
@@ -1143,6 +1304,7 @@ const openSqlite = (path: string): PlatformDb => {
       release();
     }
   };
+  const advisoryLocks = new Map<string, Promise<void>>();
   return {
     dialect: 'sqlite',
     query: (q, params) => exclusive(() => raw.query(q, params)),
@@ -1159,6 +1321,45 @@ const openSqlite = (path: string): PlatformDb => {
           throw e;
         }
       }),
+    listen: async () => async () => {},
+    notify: async () => {},
+    withAdvisoryLock: async <T>(
+      key: string,
+      fn: () => Promise<T>,
+      options?: AdvisoryLockOptions,
+    ): Promise<AdvisoryLockResult<T>> => {
+      const tryOnly = options?.tryOnly === true;
+      const timeoutMs = tryOnly ? 0 : Math.max(0, options?.timeoutMs ?? 0);
+      const deadline = Date.now() + timeoutMs;
+      while (advisoryLocks.has(key)) {
+        if (tryOnly) return { acquired: false };
+        const left = deadline - Date.now();
+        if (left <= 0) return { acquired: false };
+        let timer: ReturnType<typeof setTimeout> | undefined;
+        await Promise.race([
+          advisoryLocks.get(key)!,
+          new Promise<void>((resolve) => {
+            timer = setTimeout(resolve, left);
+            timer.unref?.();
+          }),
+        ]);
+        clearTimeout(timer);
+      }
+      let release!: () => void;
+      advisoryLocks.set(
+        key,
+        new Promise<void>((resolve) => {
+          release = resolve;
+        }),
+      );
+      try {
+        const value = await fn();
+        return { acquired: true, value };
+      } finally {
+        advisoryLocks.delete(key);
+        release();
+      }
+    },
     close: () => exclusive(() => conn.close()),
   };
 };

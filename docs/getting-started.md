@@ -51,6 +51,15 @@ pnpm start        # 启动服务：http://localhost:4600
 | `DOWEL_TOKEN_RATE_WINDOW_MS`                    | `60000`           | CI 令牌请求速率限速的窗口长度（毫秒），默认 1 分钟（单副本进程内计数，HA 多副本部署下实际总配额约为设定值 × 副本数）                                                                 |
 | `DOWEL_DRIFT_INTERVAL_MINUTES`                  | `60`              | 定时漂移检查的间隔（分钟），逐个环境读目标库结构并与当前版本比较；`0` 关闭。见 [执行迁移、回滚与漂移](execution.md)                                                                  |
 
+### 多副本高可用部署（HA）
+
+使用外部 PostgreSQL 作为平台库（`DOWEL_DB=postgres://…`）且各副本配置相同 `DOWEL_SECRET` 时，可直接启动多个对等的 Dowel 副本实现高可用多活，**不需要引入 Redis**：
+
+- **无状态负载均衡**：普通轮询负载均衡即可（需支持 WebSocket 转发），不需要 Sticky Session（粘性路由）；
+- **跨副本同步与队列**：实时协作提交通过平台 PG 行锁串行化并经 `LISTEN/NOTIFY` 广播（含停用踢人、角色降级、收件箱 SSE 推送），Webhook 投递队列持久化在 `webhook_jobs` 表，定时巡检与环境锁通过平台 PG advisory lock 互斥，冷启动初始化共享同一份 `setup_token`；
+- **限流器**：各限流阈值在单副本进程内计数，多副本下实际总配额约为设定值 × 副本数（见上表环境变量）；
+- **SQLite 模式**：仅支持单机单副本部署。
+
 ### `connection_allowlist`（允许连接哪些地址）
 
 服务端会主动去连用户填的数据库地址（连接检查、建环境、导入结构），所以实例管理员可以在“管理后台 → 实例设置”里限制能连到哪里：

@@ -3,6 +3,7 @@
 
 import type { CanvasHistoryEntry, CanvasHistoryList, CanvasHistoryVersionRef, Role } from '@dowel/api';
 import type { Model, Obj } from '@dowel/core';
+import type { Db } from '@dowel/engines';
 import {
   type Commit,
   emptyRoomState,
@@ -10,12 +11,14 @@ import {
   type Rejection,
   Room,
   type RoomState,
+  type RoomStore,
   type ToClient,
   type ToServer,
   type Versions,
 } from '@dowel/sync';
 import { HTTPException } from 'hono/http-exception';
 import type { User } from './auth.ts';
+import type { ClusterEvent, ClusterEventPayload, EventBus } from './bus.ts';
 import { inList, type PlatformDb } from './db.ts';
 import type { RoleLookup } from './roles.ts';
 import { atOf } from './time.ts';
@@ -113,7 +116,13 @@ interface Loaded {
   room: Room;
   peers: Set<Peer>;
   layout: Layout;
+  /** 尚未落库的本地布局改动（PG 下用 jsonb || 增量合并，避免多副本互盖） */
+  pendingLayout: Layout;
   layoutTimer?: ReturnType<typeof setTimeout>;
+  /** 进程内按分支串行化的互斥队列（保护 catchUp / 事务写 / 失败重建不交错） */
+  lock: Promise<void>;
+  /** 上次事务回滚后重建失败时置为 true，下次操作前强制重载 */
+  dirty: boolean;
 }
 
 /** 乐观并发冲突：replace 时工作副本的当前 seq 已不等于调用方期望的 seq */
@@ -139,10 +148,25 @@ export class Rooms {
    * 和 HTTP 的 access() 是同一套规则。
    */
   private resolveRole: ResolveRole;
+  private bus?: EventBus;
+  private unsubBus: (() => void)[] = [];
 
-  constructor(db: PlatformDb, resolveRole: ResolveRole) {
+  constructor(db: PlatformDb, resolveRole: ResolveRole, bus?: EventBus) {
     this.db = db;
     this.resolveRole = resolveRole;
+    this.bus = bus;
+    if (bus) {
+      this.unsubBus.push(
+        bus.onEvent((event) => this.handleClusterEvent(event)),
+        bus.onReconnect(() => this.handleBusReconnect()),
+      );
+    }
+  }
+
+  /** 取消集群事件总线订阅（关闭实例或测试清理时调用） */
+  close() {
+    for (const off of this.unsubBus) off();
+    this.unsubBus = [];
   }
 
   /** 新建分支时写入初始模型（序号 0 的快照） */
@@ -163,7 +187,34 @@ export class Rooms {
     return r;
   }
 
-  private async load(branchId: string): Promise<Loaded> {
+  private makeStore(db: Db, branchId: string): RoomStore {
+    return {
+      append: async (commit, op) => {
+        await db.query(
+          `insert into room_commits (branch_id, seq, client, n, user_name, op_name, op_args, changes)
+           values ($1, $2, $3, $4, $5, $6, $7::text::jsonb, $8::text::jsonb)`,
+          [
+            branchId,
+            commit.seq,
+            commit.client,
+            commit.n,
+            commit.user,
+            op.name,
+            JSON.stringify(op.args ?? null),
+            JSON.stringify(commit.changes),
+          ],
+        );
+      },
+      reject: async (client, r) => {
+        await db.query(
+          'insert into room_rejections (branch_id, client, n, code, message) values ($1, $2, $3, $4, $5)',
+          [branchId, client, r.n, r.code, r.message],
+        );
+      },
+    };
+  }
+
+  private async loadRoom(branchId: string): Promise<Room> {
     const db = this.db;
     const [snap] = await db.query<{ seq: string; model: Model; versions: Versions }>(
       'select seq, model, versions from room_snapshots where branch_id = $1 order by seq desc limit 1',
@@ -196,7 +247,7 @@ export class Rooms {
       }
       state.seq = seq;
     }
-    // 最近的提交用于给重连的客户端补发
+    // 最近的提交用于给重连的客户端补发（限定 seq <= state.seq，防止并发写入导致 log 领先于 model）
     const recent = await db.query<{
       seq: string;
       client: string;
@@ -205,22 +256,22 @@ export class Rooms {
       changes: Commit['changes'];
     }>(
       `select seq, client, n, user_name, changes from
-         (select * from room_commits where branch_id = $1 order by seq desc limit 2000) x order by seq`,
-      [branchId],
+         (select * from room_commits where branch_id = $1 and seq <= $2 order by seq desc limit 2000) x order by seq`,
+      [branchId, state.seq],
     );
     state.log = recent.map((c) => ({
       t: 'commit',
       seq: Number(c.seq),
       client: c.client,
-      n: c.n,
+      n: Number(c.n),
       user: c.user_name,
       changes: c.changes,
     }));
     for (const r of await db.query<{ client: string; n: number }>(
       `select client, max(n) as n from (
-         select client, n from room_commits where branch_id = $1
+         select client, n from room_commits where branch_id = $1 and seq <= $2
          union all select client, n from room_rejections where branch_id = $1) x group by client`,
-      [branchId],
+      [branchId, state.seq],
     ))
       state.processed[r.client] = Number(r.n);
     for (const r of await db.query<{ client: string; n: number; code: Rejection['code']; message: string }>(
@@ -229,51 +280,256 @@ export class Rooms {
     ))
       state.rejections[r.client] = [
         ...(state.rejections[r.client] ?? []),
-        { n: r.n, code: r.code, message: r.message },
+        { n: Number(r.n), code: r.code, message: r.message },
       ];
 
-    const room = new Room(state, {
-      append: async (commit, op) => {
-        await db.query(
-          `insert into room_commits (branch_id, seq, client, n, user_name, op_name, op_args, changes)
-           values ($1, $2, $3, $4, $5, $6, $7::text::jsonb, $8::text::jsonb)`,
-          [
-            branchId,
-            commit.seq,
-            commit.client,
-            commit.n,
-            commit.user,
-            op.name,
-            JSON.stringify(op.args ?? null),
-            JSON.stringify(commit.changes),
-          ],
-        );
-      },
-      reject: async (client, r) => {
-        await db.query(
-          'insert into room_rejections (branch_id, client, n, code, message) values ($1, $2, $3, $4, $5)',
-          [branchId, client, r.n, r.code, r.message],
-        );
-      },
-    });
-    const [b] = await db.query<{ layout: Layout }>('select layout from branches where id = $1', [branchId]);
-    return { room, peers: new Set(), layout: b?.layout ?? {} };
+    return new Room(state, this.makeStore(db, branchId));
   }
 
-  /** 修改之后：每隔一段写一次快照，加快下次加载 */
-  private async maybeSnapshot(branchId: string, room: Room) {
-    if (room.seq % SNAPSHOT_EVERY !== 0) return;
-    await this.db.query(
+  private async load(branchId: string): Promise<Loaded> {
+    const room = await this.loadRoom(branchId);
+    const [b] = await this.db.query<{ layout: Layout }>('select layout from branches where id = $1', [
+      branchId,
+    ]);
+    return {
+      room,
+      peers: new Set(),
+      layout: b?.layout ?? {},
+      pendingLayout: {},
+      lock: Promise.resolve(),
+      dirty: false,
+    };
+  }
+
+  private async reloadLocked(branchId: string, r: Loaded) {
+    r.room = await this.loadRoom(branchId);
+    r.dirty = false;
+  }
+
+  /** 按分支在当前进程内串行执行，避免同一房间并发修改 / 追赶交错 */
+  private async withRoomLock<T>(r: Loaded, fn: () => Promise<T>): Promise<T> {
+    let release!: () => void;
+    const mine = new Promise<void>((resolve) => {
+      release = resolve;
+    });
+    const prev = r.lock;
+    r.lock = prev.then(() => mine);
+    await prev;
+    try {
+      return await fn();
+    } finally {
+      release();
+    }
+  }
+
+  /** 从给定连接（主库或事务 tx）读取比内存更新的提交与拒绝记录并合入内存态 */
+  private async catchUpFrom(db: Db, branchId: string, r: Loaded): Promise<Commit[]> {
+    const rows = await db.query<{
+      seq: string | number;
+      client: string;
+      n: number;
+      user_name: string;
+      changes: Commit['changes'];
+    }>(
+      'select seq, client, n, user_name, changes from room_commits where branch_id = $1 and seq > $2 order by seq',
+      [branchId, r.room.seq],
+    );
+    const applied: Commit[] = [];
+    for (const row of rows) {
+      const commit: Commit = {
+        t: 'commit',
+        seq: Number(row.seq),
+        client: row.client,
+        n: Number(row.n),
+        user: row.user_name,
+        changes: row.changes,
+      };
+      if (r.room.applyExternalCommit(commit)) applied.push(commit);
+    }
+    const rejections = await db.query<{
+      client: string;
+      n: number;
+      code: Rejection['code'];
+      message: string;
+    }>('select client, n, code, message from room_rejections where branch_id = $1 order by client, n', [
+      branchId,
+    ]);
+    for (const rej of rejections) {
+      r.room.applyExternalRejection(rej.client, {
+        n: Number(rej.n),
+        code: rej.code,
+        message: rej.message,
+      });
+    }
+    return applied;
+  }
+
+  private async catchUpLoaded(
+    branchId: string,
+    r: Loaded,
+    opts?: { excludePeer?: Peer; minSeq?: number },
+  ): Promise<Commit[]> {
+    const caughtUp = await this.withRoomLock(r, async () => {
+      if (opts?.minSeq !== undefined && !r.dirty && r.room.seq >= opts.minSeq) return [];
+      const missed: Commit[] = [];
+      if (r.dirty) {
+        const prevSeq = r.room.seq;
+        await this.reloadLocked(branchId, r);
+        if (r.room.seq > prevSeq) {
+          const rows = await this.db.query<{
+            seq: string | number;
+            client: string;
+            n: number;
+            user_name: string;
+            changes: Commit['changes'];
+          }>(
+            'select seq, client, n, user_name, changes from room_commits where branch_id = $1 and seq > $2 and seq <= $3 order by seq',
+            [branchId, prevSeq, r.room.seq],
+          );
+          for (const row of rows) {
+            missed.push({
+              t: 'commit',
+              seq: Number(row.seq),
+              client: row.client,
+              n: Number(row.n),
+              user: row.user_name,
+              changes: row.changes,
+            });
+          }
+        }
+      }
+      const fresh = await this.catchUpFrom(this.db, branchId, r);
+      return [...missed, ...fresh];
+    });
+    if (caughtUp.length) this.broadcastCommits(r, caughtUp, opts?.excludePeer);
+    return caughtUp;
+  }
+
+  /** 对已加载的房间从平台库追赶新提交与拒绝记录，并广播给本地在线连接 */
+  async catchUp(branchId: string, opts?: { minSeq?: number }): Promise<Commit[]> {
+    const pending = this.rooms.get(branchId);
+    if (!pending) return [];
+    const r = await pending.catch(() => null);
+    if (!r) return [];
+    return this.catchUpLoaded(branchId, r, opts);
+  }
+
+  /** 读取前确保内存态与平台库一致（PG 模式下追赶外部副本提交，SQLite 下仅在脏态时重载） */
+  private async getFresh(branchId: string): Promise<Loaded> {
+    const r = await this.get(branchId);
+    if (this.db.dialect === 'pg' || r.dirty) {
+      await this.catchUpLoaded(branchId, r);
+    }
+    return r;
+  }
+
+  /** 修改之后：每隔一段写一次快照，加快下次加载（传入事务 tx 以与 commit 同事务提交） */
+  private async maybeSnapshot(db: Db, branchId: string, room: Room) {
+    if (room.seq <= 0 || room.seq % SNAPSHOT_EVERY !== 0) return;
+    await db.query(
       'insert into room_snapshots (branch_id, seq, model, versions) values ($1, $2, $3::text::jsonb, $4::text::jsonb) on conflict do nothing',
       [branchId, room.seq, JSON.stringify(room.model), JSON.stringify(room.versions)],
     );
   }
 
+  private safeSend(peer: Peer, msg: ToClient | Extra) {
+    try {
+      peer.send(msg);
+    } catch {
+      // 连接可能正在关闭，忽略单个发送失败以免影响房间内其他连接
+    }
+  }
+
+  private broadcastCommits(r: Loaded, commits: Commit[], excludePeer?: Peer) {
+    for (const c of commits) {
+      for (const p of r.peers) {
+        if (p !== excludePeer) this.safeSend(p, c);
+      }
+    }
+  }
+
   private deliver(r: Loaded, from: Peer, outs: Out[]) {
     for (const o of outs) {
-      if (o.to === '*') for (const p of r.peers) p.send(o.msg);
-      else if (o.to === from.client) from.send(o.msg);
-      else for (const p of r.peers) if (p.client === o.to) p.send(o.msg);
+      if (o.to === '*') for (const p of r.peers) this.safeSend(p, o.msg);
+      else if (o.to === from.client) this.safeSend(from, o.msg);
+      else for (const p of r.peers) if (p.client === o.to) this.safeSend(p, o.msg);
+    }
+  }
+
+  private async publish(event: ClusterEventPayload) {
+    if (!this.bus) return;
+    try {
+      await this.bus.publish(event);
+    } catch (e) {
+      console.error(`发布集群房间事件失败（t=${event.t}）`, e);
+    }
+  }
+
+  private async handleClusterEvent(event: ClusterEvent) {
+    if (!this.bus || event.origin === this.bus.replicaId) return;
+    switch (event.t) {
+      case 'room.commit': {
+        if (!this.rooms.has(event.branchId)) return;
+        await this.catchUp(event.branchId, { minSeq: event.seq });
+        break;
+      }
+      case 'room.layout': {
+        const pending = this.rooms.get(event.branchId);
+        if (!pending) return;
+        const r = await pending.catch(() => null);
+        if (!r) return;
+        Object.assign(r.layout, event.positions);
+        for (const p of r.peers) this.safeSend(p, { t: 'layout', positions: event.positions });
+        break;
+      }
+      case 'room.presence': {
+        const pending = this.rooms.get(event.branchId);
+        if (!pending) return;
+        const r = await pending.catch(() => null);
+        if (!r) return;
+        for (const p of r.peers) {
+          if (p.client !== event.client) {
+            this.safeSend(p, { t: 'presence', client: event.client, user: event.user, data: event.data });
+          }
+        }
+        break;
+      }
+      case 'room.kick': {
+        await this.kickUserLocal(event.userId, event.reason);
+        break;
+      }
+      case 'room.refresh': {
+        await this.refreshLoadedLocal(event.branchIds);
+        break;
+      }
+    }
+  }
+
+  /** PG LISTEN 断线重连后：追赶所有已加载房间的提交与布局，并刷新权限（补齐断线期间错过的通知） */
+  private async handleBusReconnect() {
+    const branchIds = [...this.rooms.keys()];
+    for (const branchId of branchIds) {
+      try {
+        await this.catchUp(branchId);
+        const pending = this.rooms.get(branchId);
+        const r = pending ? await pending.catch(() => null) : null;
+        if (r) {
+          const [b] = await this.db.query<{ layout: Layout }>('select layout from branches where id = $1', [
+            branchId,
+          ]);
+          if (b?.layout) {
+            r.layout = { ...b.layout, ...r.pendingLayout };
+            for (const p of r.peers) this.safeSend(p, { t: 'layout', positions: r.layout });
+          }
+        }
+      } catch (e) {
+        console.error(`事件总线重连后追赶房间失败（branchId=${branchId}）`, e);
+      }
+    }
+    try {
+      await this.refreshLoadedLocal();
+    } catch (e) {
+      console.error('事件总线重连后刷新房间权限失败', e);
     }
   }
 
@@ -309,7 +565,7 @@ export class Rooms {
     if (!(await this.userActive(peer.user.id))) {
       r.peers.delete(peer);
       peer.close?.(4403, '账号已被停用');
-      for (const p of r.peers) p.send({ t: 'peers', peers: this.peerList(r) });
+      for (const p of r.peers) this.safeSend(p, { t: 'peers', peers: this.peerList(r) });
       return;
     }
     const projectId = await this.projectOfBranch(branchId);
@@ -317,21 +573,39 @@ export class Rooms {
     if (!role) {
       r.peers.delete(peer);
       peer.close?.(4403, '你在这个项目里已经没有权限');
-      for (const p of r.peers) p.send({ t: 'peers', peers: this.peerList(r) });
+      for (const p of r.peers) this.safeSend(p, { t: 'peers', peers: this.peerList(r) });
       return;
     }
     peer.role = role;
-    peer.send({ t: 'role', role });
-    peer.send({ t: 'layout', positions: r.layout });
+    this.safeSend(peer, { t: 'role', role });
+    this.safeSend(peer, { t: 'layout', positions: r.layout });
   }
 
   async leave(branchId: string, peer: Peer) {
-    // 分攴可能已经被删掉（项目删除）：加载失败就当没进过房间，不能抛出去
+    // 分支可能已经被删掉（项目删除）：加载失败就当没进过房间，不能抛出去
     const r = await this.get(branchId).catch(() => null);
     if (!r) return;
     // 已经被踢掉的连接走 onClose 时不用再广播一次
     if (!r.peers.delete(peer)) return;
-    for (const p of r.peers) p.send({ t: 'peers', peers: this.peerList(r) });
+    for (const p of r.peers) this.safeSend(p, { t: 'peers', peers: this.peerList(r) });
+  }
+
+  private async flushLayout(branchId: string, r: Loaded) {
+    if (this.db.dialect === 'pg') {
+      const pending = r.pendingLayout;
+      if (Object.keys(pending).length === 0) return;
+      r.pendingLayout = {};
+      await this.db.query(
+        "update branches set layout = coalesce(layout, '{}'::jsonb) || $2::text::jsonb where id = $1",
+        [branchId, JSON.stringify(pending)],
+      );
+      return;
+    }
+    r.pendingLayout = {};
+    await this.db.query('update branches set layout = $2::text::jsonb where id = $1', [
+      branchId,
+      JSON.stringify(r.layout),
+    ]);
   }
 
   async message(branchId: string, peer: Peer, msg: ToServer | ExtraIn) {
@@ -340,16 +614,68 @@ export class Rooms {
     if (!r.peers.has(peer)) return;
     if (msg.t === 'hello') {
       peer.client = msg.client;
-      for (const p of r.peers) p.send({ t: 'peers', peers: this.peerList(r) });
-    }
-    if (msg.t === 'hello' || msg.t === 'op') {
-      if (msg.t === 'op' && msg.op.client !== peer.client) return;
-      const outs = await r.room.handle(peer.client!, peer.user.name, msg, {
-        readOnly: peer.role === 'viewer',
+      for (const p of r.peers) this.safeSend(p, { t: 'peers', peers: this.peerList(r) });
+      const { caughtUp, outs } = await this.withRoomLock(r, async () => {
+        if (!r.peers.has(peer)) return { caughtUp: [] as Commit[], outs: [] as Out[] };
+        if (r.dirty) await this.reloadLocked(branchId, r);
+        const caughtUp = this.db.dialect === 'pg' ? await this.catchUpFrom(this.db, branchId, r) : [];
+        const outs = await r.room.handle(peer.client!, peer.user.name, msg, {
+          readOnly: peer.role === 'viewer',
+        });
+        return { caughtUp, outs };
       });
+      if (caughtUp.length) this.broadcastCommits(r, caughtUp, peer);
       this.deliver(r, peer, outs);
-      if (outs.some((o) => o.msg.t === 'commit')) this.onCommit(branchId);
-      await this.maybeSnapshot(branchId, r.room);
+      return;
+    }
+    if (msg.t === 'op') {
+      if (msg.op.client !== peer.client) return;
+      let caughtUp: Commit[] = [];
+      let result: { outs: Out[]; committed: boolean; seq: number } | null = null;
+      try {
+        result = await this.withRoomLock(r, async () => {
+          if (!r.peers.has(peer)) return null;
+          if (r.dirty) await this.reloadLocked(branchId, r);
+          let mutated = false;
+          try {
+            return await this.db.transaction(async (tx) => {
+              if (this.db.dialect === 'pg') {
+                const [locked] = await tx.query<{ id: string }>(
+                  'select id from branches where id = $1 for update',
+                  [branchId],
+                );
+                if (!locked) throw new Error(`分支 ${branchId} 不存在`);
+                caughtUp = await this.catchUpFrom(tx, branchId, r);
+              }
+              const store = this.makeStore(tx, branchId);
+              mutated = true;
+              const outs = await r.room.handle(peer.client!, peer.user.name, msg, {
+                readOnly: peer.role === 'viewer',
+                store,
+              });
+              const committed = outs.some((o) => o.msg.t === 'commit');
+              if (committed) await this.maybeSnapshot(tx, branchId, r.room);
+              return { outs, committed, seq: r.room.seq };
+            });
+          } catch (err) {
+            if (mutated) {
+              r.dirty = true;
+              await this.reloadLocked(branchId, r).catch(() => {});
+            }
+            throw err;
+          }
+        });
+      } catch (err) {
+        if (caughtUp.length) this.broadcastCommits(r, caughtUp);
+        throw err;
+      }
+      if (!result) return;
+      if (caughtUp.length) this.broadcastCommits(r, caughtUp);
+      this.deliver(r, peer, result.outs);
+      if (result.committed) {
+        this.onCommit(branchId);
+        await this.publish({ t: 'room.commit', branchId, seq: result.seq });
+      }
       return;
     }
     if (msg.t === 'layout') {
@@ -357,48 +683,132 @@ export class Rooms {
       // 处理过程中可能已经被踢出房间（以后这里加了 await 也不会漏）
       if (!r.peers.has(peer)) return;
       Object.assign(r.layout, msg.positions);
-      for (const p of r.peers) if (p !== peer) p.send({ t: 'layout', positions: msg.positions });
+      Object.assign(r.pendingLayout, msg.positions);
+      for (const p of r.peers) if (p !== peer) this.safeSend(p, { t: 'layout', positions: msg.positions });
+      await this.publish({ t: 'room.layout', branchId, positions: msg.positions });
       clearTimeout(r.layoutTimer);
       r.layoutTimer = setTimeout(() => {
         r.layoutTimer = undefined;
-        void this.db.query('update branches set layout = $2::text::jsonb where id = $1', [
-          branchId,
-          JSON.stringify(r.layout),
-        ]);
+        this.flushLayout(branchId, r).catch((e) => {
+          console.error(`保存画布布局失败（branchId=${branchId}）`, e);
+        });
       }, 500);
       return;
     }
     if (msg.t === 'presence' && peer.client) {
       for (const p of r.peers)
-        if (p !== peer) p.send({ t: 'presence', client: peer.client, user: peer.user.name, data: msg.data });
+        if (p !== peer)
+          this.safeSend(p, { t: 'presence', client: peer.client, user: peer.user.name, data: msg.data });
+      await this.publish({
+        t: 'room.presence',
+        branchId,
+        client: peer.client,
+        user: peer.user.name,
+        data: msg.data,
+      });
     }
   }
 
   /** 服务器以系统身份替换整个模型（导入 DDL、恢复历史、接入领先环境等）；传入 expectedSeq 时原子校验当前 seq */
   async replace(branchId: string, user: string, next: Model, opName?: string, expectedSeq?: number) {
     const r = await this.get(branchId);
-    if (expectedSeq !== undefined && r.room.seq !== expectedSeq)
-      throw new WorkingChangedError(r.room.seq, structuredClone(r.room.model));
-    const outs = await r.room.replace(user, next, opName);
-    for (const o of outs) for (const p of r.peers) p.send(o.msg);
-    await this.maybeSnapshot(branchId, r.room);
+    let caughtUp: Commit[] = [];
+    let result: { outs: Out[]; committed: boolean; seq: number };
+    try {
+      result = await this.withRoomLock(r, async () => {
+        if (r.dirty) await this.reloadLocked(branchId, r);
+        let mutated = false;
+        try {
+          return await this.db.transaction(async (tx) => {
+            if (this.db.dialect === 'pg') {
+              const [locked] = await tx.query<{ id: string }>(
+                'select id from branches where id = $1 for update',
+                [branchId],
+              );
+              if (!locked) throw new Error(`分支 ${branchId} 不存在`);
+              caughtUp = await this.catchUpFrom(tx, branchId, r);
+            }
+            if (expectedSeq !== undefined && r.room.seq !== expectedSeq) {
+              throw new WorkingChangedError(r.room.seq, structuredClone(r.room.model));
+            }
+            const store = this.makeStore(tx, branchId);
+            mutated = true;
+            const outs = await r.room.replace(user, next, opName, store);
+            const committed = outs.some((o) => o.msg.t === 'commit');
+            if (committed) await this.maybeSnapshot(tx, branchId, r.room);
+            return { outs, committed, seq: r.room.seq };
+          });
+        } catch (err) {
+          if (mutated) {
+            r.dirty = true;
+            await this.reloadLocked(branchId, r).catch(() => {});
+          }
+          throw err;
+        }
+      });
+    } catch (err) {
+      if (caughtUp.length) this.broadcastCommits(r, caughtUp);
+      throw err;
+    }
+    if (caughtUp.length) this.broadcastCommits(r, caughtUp);
+    for (const o of result.outs) for (const p of r.peers) this.safeSend(p, o.msg);
+    if (result.committed) {
+      await this.publish({ t: 'room.commit', branchId, seq: result.seq });
+    }
   }
 
   /** 服务器以系统身份更新派生数据（期间被别人改过的对象不写） */
   async patch(branchId: string, user: string, objects: Obj[], expect: Versions) {
     const r = await this.get(branchId);
-    const outs = await r.room.patch(user, objects, expect);
-    for (const o of outs) for (const p of r.peers) p.send(o.msg);
-    await this.maybeSnapshot(branchId, r.room);
+    let caughtUp: Commit[] = [];
+    let result: { outs: Out[]; committed: boolean; seq: number };
+    try {
+      result = await this.withRoomLock(r, async () => {
+        if (r.dirty) await this.reloadLocked(branchId, r);
+        let mutated = false;
+        try {
+          return await this.db.transaction(async (tx) => {
+            if (this.db.dialect === 'pg') {
+              const [locked] = await tx.query<{ id: string }>(
+                'select id from branches where id = $1 for update',
+                [branchId],
+              );
+              if (!locked) throw new Error(`分支 ${branchId} 不存在`);
+              caughtUp = await this.catchUpFrom(tx, branchId, r);
+            }
+            const store = this.makeStore(tx, branchId);
+            mutated = true;
+            const outs = await r.room.patch(user, objects, expect, 'derive', store);
+            const committed = outs.some((o) => o.msg.t === 'commit');
+            if (committed) await this.maybeSnapshot(tx, branchId, r.room);
+            return { outs, committed, seq: r.room.seq };
+          });
+        } catch (err) {
+          if (mutated) {
+            r.dirty = true;
+            await this.reloadLocked(branchId, r).catch(() => {});
+          }
+          throw err;
+        }
+      });
+    } catch (err) {
+      if (caughtUp.length) this.broadcastCommits(r, caughtUp);
+      throw err;
+    }
+    if (caughtUp.length) this.broadcastCommits(r, caughtUp);
+    for (const o of result.outs) for (const p of r.peers) this.safeSend(p, o.msg);
+    if (result.committed) {
+      await this.publish({ t: 'room.commit', branchId, seq: result.seq });
+    }
   }
 
   async state(branchId: string): Promise<{ model: Model; versions: Versions; seq: number }> {
-    const r = await this.get(branchId);
+    const r = await this.getFresh(branchId);
     return { model: structuredClone(r.room.model), versions: { ...r.room.versions }, seq: r.room.seq };
   }
 
   async model(branchId: string): Promise<{ model: Model; seq: number }> {
-    const r = await this.get(branchId);
+    const r = await this.getFresh(branchId);
     return { model: structuredClone(r.room.model), seq: r.room.seq };
   }
 
@@ -407,7 +817,7 @@ export class Rooms {
    * seq < 0 或超过当前最新 seq 时抛 404。
    */
   async modelAt(branchId: string, seq: number): Promise<Model> {
-    const r = await this.get(branchId);
+    const r = await this.getFresh(branchId);
     const currentSeq = r.room.seq;
     if (!Number.isInteger(seq) || seq < 0 || seq > currentSeq)
       throw new HTTPException(404, { message: `修改记录 #${seq} 不存在` });
@@ -489,7 +899,7 @@ export class Rooms {
     branchId: string,
     opts: { beforeSeq?: number; limit?: number } = {},
   ): Promise<CanvasHistoryList> {
-    const r = await this.get(branchId);
+    const r = await this.getFresh(branchId);
     const currentSeq = r.room.seq;
     const limit = Math.min(100, Math.max(1, opts.limit ?? 30));
     const beforeSeq = opts.beforeSeq;
@@ -565,7 +975,7 @@ export class Rooms {
     seq: number,
     context?: { prevModel?: Model | null; targetModel?: Model; currentSeq?: number },
   ): Promise<CanvasHistoryEntry> {
-    const r = await this.get(branchId);
+    const r = await this.getFresh(branchId);
     const currentSeq = context?.currentSeq ?? r.room.seq;
     if (!Number.isInteger(seq) || seq < 0 || seq > currentSeq)
       throw new HTTPException(404, { message: `修改记录 #${seq} 不存在` });
@@ -603,23 +1013,45 @@ export class Rooms {
     };
   }
 
+  /** 仅在当前副本踢出指定用户的所有在线连接 */
+  async kickUserLocal(userId: string, reason = '账号已被停用') {
+    for (const pending of this.rooms.values()) {
+      const r = await pending.catch(() => null);
+      if (!r) continue;
+      let removed = false;
+      for (const peer of [...r.peers]) {
+        if (peer.user.id !== userId) continue;
+        peer.close?.(4403, reason);
+        r.peers.delete(peer);
+        removed = true;
+      }
+      if (removed) for (const p of r.peers) this.safeSend(p, { t: 'peers', peers: this.peerList(r) });
+    }
+  }
+
+  /** 踢出指定用户的所有在线连接（本地立即断开并经事件总线广播给其他副本） */
+  async kickUser(userId: string, reason = '账号已被停用') {
+    await this.kickUserLocal(userId, reason);
+    await this.publish({ t: 'room.kick', userId, reason });
+  }
+
   /**
-   * 角色可能变了之后，重算**所有已经加载的房间**里每个在线 peer 的生效角色（G6）。
-   * 组成员、组 / 项目默认权限、授权、转组、删除组、停用或改实例角色之后都调用它。
+   * 仅在当前副本重算已加载房间（或指定分支子集）里每个在线 peer 的生效角色（G6）。
    *
    * - 只遍历 this.rooms：没人在线的分支不在里面，所以没有连接时整次刷新是零查询；
    * - 分支 → 项目用一条查询反查，角色上下文按用户缓存，整次刷新共享；
+   * - 分支已不存在（项目被删除）→ 4403 断开并移除房间缓存；
    * - 没有权限了 → 4403 断开（沿用停用账号的关闭码，客户端收到后不再重连）；
    * - 账号被停用 → 同样断开；
    * - 降级 / 升级 → 更新 peer.role 并发一条 role 消息，客户端切换只读。
    */
-  async refreshLoaded() {
-    if (this.rooms.size === 0) return;
-    const branchIds = [...this.rooms.keys()];
+  async refreshLoadedLocal(branchIds?: string[]) {
+    const targets = branchIds ? branchIds.filter((id) => this.rooms.has(id)) : [...this.rooms.keys()];
+    if (targets.length === 0) return;
     // 分支 → 项目只反查一次（同一个项目可能有多个分支的房间）
     const projects = await this.db.query<{ branchId: string; projectId: string }>(
-      `select id as "branchId", project_id as "projectId" from branches where id in (${inList(branchIds)})`,
-      branchIds,
+      `select id as "branchId", project_id as "projectId" from branches where id in (${inList(targets)})`,
+      targets,
     );
     const projectByBranch = new Map(projects.map((p) => [p.branchId, p.projectId]));
     // 整次刷新共用：用户当前状态（可能刚被停用 / 改了实例角色）+ 角色上下文 / 项目缓存
@@ -630,10 +1062,21 @@ export class Rooms {
       r.peers.delete(peer);
     };
 
-    for (const [branchId, pending] of this.rooms) {
-      const projectId = projectByBranch.get(branchId);
+    for (const branchId of targets) {
+      const pending = this.rooms.get(branchId);
+      if (!pending) continue;
       const r = await pending.catch(() => null);
-      if (!projectId || !r) continue;
+      if (!r) continue;
+      const projectId = projectByBranch.get(branchId);
+      if (!projectId) {
+        if (r.layoutTimer) {
+          clearTimeout(r.layoutTimer);
+          r.layoutTimer = undefined;
+        }
+        for (const peer of [...r.peers]) kick(r, peer, '项目已被删除');
+        this.rooms.delete(branchId);
+        continue;
+      }
       let removed = false;
       for (const peer of [...r.peers]) {
         let current = users.get(peer.user.id);
@@ -658,29 +1101,46 @@ export class Rooms {
         }
         if (role !== peer.role) {
           peer.role = role;
-          peer.send({ t: 'role', role });
+          this.safeSend(peer, { t: 'role', role });
         }
       }
       // 只给真正踢掉了人的房间广播在线列表
-      if (removed) for (const p of r.peers) p.send({ t: 'peers', peers: this.peerList(r) });
+      if (removed) for (const p of r.peers) this.safeSend(p, { t: 'peers', peers: this.peerList(r) });
     }
   }
 
   /**
+   * 角色可能变了之后，重算所有副本上已加载房间（或指定分支子集）里每个在线 peer 的生效角色。
+   * 组成员、组 / 项目默认权限、授权、转组、删除组、停用或改实例角色之后都调用它。
+   */
+  async refreshLoaded(branchIds?: string[]) {
+    await this.refreshLoadedLocal(branchIds);
+    await this.publish(branchIds ? { t: 'room.refresh', branchIds } : { t: 'room.refresh' });
+  }
+
+  /**
    * 分支被删掉（项目被删除）时立即断开里面所有连接：和“没有权限了”用同一个关闭码 4403，
-   * 客户端收到后不会再重连。房间从缓存里移除，避免继续拿着已经不存在的分支。
+   * 客户端收到后不会再重连。房间从缓存里移除，避免继续拿着已经不存在的分支，并通知其他副本清理。
    */
   async kickBranches(branchIds: string[], reason: string) {
     const gone = new Set(branchIds);
     for (const [branchId, pending] of this.rooms) {
       if (!gone.has(branchId)) continue;
       const r = await pending.catch(() => null);
-      if (r)
+      if (r) {
+        if (r.layoutTimer) {
+          clearTimeout(r.layoutTimer);
+          r.layoutTimer = undefined;
+        }
         for (const peer of [...r.peers]) {
           peer.close?.(4403, reason);
           r.peers.delete(peer);
         }
+      }
       this.rooms.delete(branchId);
+    }
+    if (branchIds.length > 0) {
+      await this.publish({ t: 'room.refresh', branchIds });
     }
   }
 
@@ -692,14 +1152,11 @@ export class Rooms {
   /** 立即写入所有挂起的布局（关闭服务和测试时用） */
   async flush() {
     for (const [branchId, p] of this.rooms) {
-      const r = await p;
-      if (!r.layoutTimer) continue;
+      const r = await p.catch(() => null);
+      if (!r?.layoutTimer) continue;
       clearTimeout(r.layoutTimer);
       r.layoutTimer = undefined;
-      await this.db.query('update branches set layout = $2::text::jsonb where id = $1', [
-        branchId,
-        JSON.stringify(r.layout),
-      ]);
+      await this.flushLayout(branchId, r);
     }
   }
 }

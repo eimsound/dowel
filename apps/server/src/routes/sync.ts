@@ -31,7 +31,9 @@ export const registerSync = (app: Hono<Env>, ctx: AppContext) => {
           peer = {
             user,
             role,
-            send: (msg) => ws.send(JSON.stringify(msg)),
+            send: (msg) => {
+              if (ws.readyState === 1) ws.send(JSON.stringify(msg));
+            },
             // 账号被停用、或项目权限被收回时由 rooms 调到这里
             close: (code, reason) => ws.close(code, reason),
           };
@@ -59,7 +61,10 @@ export const registerSync = (app: Hono<Env>, ctx: AppContext) => {
             });
         },
         onClose: () => {
-          if (peer && project) void rooms.leave(project.branch, peer);
+          if (peer && project) {
+            const p = peer;
+            chain = chain.then(() => rooms.leave(project.branch, p)).catch(() => {});
+          }
         },
       };
     }),

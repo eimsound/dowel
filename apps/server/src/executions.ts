@@ -54,7 +54,7 @@ import { decrypt, SecretError, scrubSecrets } from './secrets.ts';
 import { readSettings } from './settings.ts';
 import { CHECK_CONNECT_TIMEOUT, ConnectError, type ConnectionGuard, connectPg, scrubUrl } from './targets.ts';
 
-/** 同一个环境同一时间只做一件事（单进程内；跨进程由目标库上的项目锁保证）。默认等 30 秒 */
+/** 同一个环境同一时间只做一件事（单进程内互斥 + PG 多副本下平台库 advisory lock 跨副本互斥）。默认等 30 秒 */
 export const LOCK_WAIT_MS = 30_000;
 
 /** 等环境锁超时（409）：CI 接口据此返回 lock_timeout，其余接口照旧是 409 + 文案 */
@@ -66,19 +66,24 @@ export class EnvBusyError extends HTTPException {
 
 export class EnvLocks {
   private held = new Map<string, Promise<void>>();
-  /** 这个环境现在有没有正在执行的操作 */
+  private readonly db?: PlatformDb;
+  constructor(db?: PlatformDb) {
+    this.db = db;
+  }
+  /** 本副本上这个环境现在有没有正在执行的操作 */
   busy(id: string): boolean {
     return this.held.has(id);
   }
-  async acquire(id: string, timeoutMs = LOCK_WAIT_MS, busyMessage?: string): Promise<() => void> {
-    const deadline = Date.now() + timeoutMs;
+  async acquire(id: string, timeoutMs = LOCK_WAIT_MS, busyMessage?: string): Promise<() => Promise<void>> {
+    const deadline = Date.now() + Math.max(0, timeoutMs);
+    const makeBusyError = () =>
+      new EnvBusyError(
+        busyMessage ??
+          `这个环境正在执行另一个操作，等待 ${Math.round(timeoutMs / 1000)} 秒后超时。请稍后再试`,
+      );
     while (this.held.has(id)) {
       const left = deadline - Date.now();
-      if (left <= 0)
-        throw new EnvBusyError(
-          busyMessage ??
-            `这个环境正在执行另一个操作，等待 ${Math.round(timeoutMs / 1000)} 秒后超时。请稍后再试`,
-        );
+      if (left <= 0) throw makeBusyError();
       let timer: ReturnType<typeof setTimeout> | undefined;
       await Promise.race([
         this.held.get(id)!,
@@ -88,16 +93,71 @@ export class EnvLocks {
       ]);
       clearTimeout(timer);
     }
-    let release!: () => void;
+    let releaseLocal!: () => void;
     this.held.set(
       id,
       new Promise<void>((r) => {
-        release = r;
+        releaseLocal = r;
       }),
     );
-    return () => {
+    const freeLocal = () => {
       this.held.delete(id);
-      release();
+      releaseLocal();
+    };
+    if (this.db?.dialect !== 'pg') {
+      let released = false;
+      return async () => {
+        if (released) return;
+        released = true;
+        freeLocal();
+      };
+    }
+
+    // PG 多副本模式：叠加平台库 advisory lock('env:' + id)，防止另一副本并发改连接串或删环境
+    let unlockPg!: () => void;
+    const holdPg = new Promise<void>((r) => {
+      unlockPg = r;
+    });
+    let resolveReady!: (ok: boolean) => void;
+    const pgReady = new Promise<boolean>((r) => {
+      resolveReady = r;
+    });
+    const remaining = Math.max(0, deadline - Date.now());
+    const lockTask = this.db
+      .withAdvisoryLock(
+        `env:${id}`,
+        async () => {
+          resolveReady(true);
+          await holdPg;
+        },
+        timeoutMs <= 0 ? { tryOnly: true } : { timeoutMs: remaining },
+      )
+      .then((res) => {
+        if (!res.acquired) resolveReady(false);
+      });
+
+    let acquired = false;
+    try {
+      acquired = await Promise.race([pgReady, lockTask.then(() => false)]);
+    } catch (e) {
+      freeLocal();
+      throw e;
+    }
+    if (!acquired) {
+      freeLocal();
+      throw makeBusyError();
+    }
+
+    let released = false;
+    return async () => {
+      if (released) return;
+      released = true;
+      unlockPg();
+      try {
+        await lockTask;
+      } finally {
+        freeLocal();
+      }
     };
   }
 }
@@ -511,19 +571,17 @@ export const runExecution = async (
       }
       await conn.close().catch(() => {});
     }
-    release();
+    await release();
   }
 };
 
 /**
- * 改连接配置（连接串 / 影子库 / 是否允许同实例）、删除环境之前：**本进程**不能正在对这个环境执行。占住环境锁（拿不到立刻 409，
+ * 改连接配置（连接串 / 影子库 / 是否允许同实例）、删除环境之前：不能有任一副本正在对这个环境执行。占住环境锁（拿不到立刻 409，
  * “环境正在执行，稍后再改”，不等待，**不产生任何副作用**），改完（或失败）后调用返回的释放函数。
  * 先拿锁、再做 inspectTarget / claimShadow 这些外部检查：被 409 拒绝的请求不会碰任何数据库。
  * 锁也让“等锁的执行”在改完之后才开始，并且（runExecution 拿锁后重新读环境行）用新的 URL。
- * 同步（syncEnvCache）清理 claimed 残留，依赖“持有目标库项目锁 = 没有执行在进行”；这个前提**只在单进程部署下成立**
- * （EnvLocks 是进程内的），多进程部署是已知限制，见 05-implementation.md。
  */
-export const lockEnvIdle = (x: ExecContext, envId: string): Promise<() => void> =>
+export const lockEnvIdle = (x: ExecContext, envId: string): Promise<() => Promise<void>> =>
   x.locks.acquire(envId, 0, '环境正在执行，稍后再改');
 
 /**
@@ -763,7 +821,7 @@ export const runMark = async (x: ExecContext, input: MarkInput): Promise<MarkRes
       }
       await conn.close().catch(() => {});
     }
-    release();
+    await release();
   }
 };
 

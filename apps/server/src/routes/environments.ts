@@ -248,7 +248,7 @@ export const registerEnvironments = (app: Hono<Env>, ctx: AppContext) => {
       });
       await shadows.forget(eid);
     } finally {
-      release?.();
+      await release?.();
     }
     // 响应直接用锁内的结果：策略只换掉环境层（不再读四层），当前版本一条轻量查询
     const { r, row } = done;
@@ -297,7 +297,7 @@ export const registerEnvironments = (app: Hono<Env>, ctx: AppContext) => {
       });
       await shadows.forget(eid);
     } finally {
-      release();
+      await release();
     }
     // 环境上的执行者授权跟着删了：可能有人因此看不到这个项目
     await rooms.refreshLoaded();

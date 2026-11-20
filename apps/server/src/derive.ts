@@ -7,6 +7,7 @@
 // 以系统身份写回（期间被别人改过的对象不写）。
 import { deepEqual, type Model, type Obj } from '@dowel/core';
 import type { Versions } from '@dowel/sync';
+import type { HaCoordinator } from './ha.ts';
 import type { Rooms } from './rooms.ts';
 import type { Shadow } from './shadow.ts';
 
@@ -28,6 +29,7 @@ export class OpaqueRefresher {
     load(branchId: string): Promise<Model | null>;
     save(branchId: string, m: Model): Promise<void>;
   };
+  private ha: HaCoordinator | null;
   private good = new Map<string, Model>();
   private timers = new Map<string, ReturnType<typeof setTimeout>>();
   private running = new Map<string, Promise<void>>();
@@ -39,10 +41,12 @@ export class OpaqueRefresher {
     rooms: Rooms,
     shadowOf: (branchId: string) => Promise<Shadow | null>,
     store: OpaqueRefresher['store'],
+    ha?: HaCoordinator,
   ) {
     this.rooms = rooms;
     this.shadowOf = shadowOf;
     this.store = store;
+    this.ha = ha ?? null;
   }
 
   private async setGood(branchId: string, m: Model) {
@@ -102,8 +106,18 @@ export class OpaqueRefresher {
   }
 
   private async run(branchId: string) {
+    if (!this.ha) {
+      await this.runUnlocked(branchId);
+      return;
+    }
+    await this.ha.tryWithJobLock(`derive:${branchId}`, () => this.runUnlocked(branchId));
+  }
+
+  private async runUnlocked(branchId: string) {
     const { model: cur, versions } = await this.rooms.state(branchId);
-    const good = this.good.get(branchId) ?? (await this.store.load(branchId));
+    const good = this.ha
+      ? ((await this.store.load(branchId)) ?? this.good.get(branchId))
+      : (this.good.get(branchId) ?? (await this.store.load(branchId)));
     const shadow = await this.shadowOf(branchId);
     if (!good) {
       // 没有基线：从空模型开始规范化（相当于从零建出整个模型）
