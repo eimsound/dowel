@@ -105,9 +105,7 @@ export const createApp = (db: PlatformDb, options: AppOptions = {}) => {
   rooms.onCommit = (branchId) => refresher.schedule(branchId);
   /** 导入、拉取、恢复历史后替换模型：新模型就是引擎读出的，作为派生数据的基线 */
   const replace = async (branch: string, user: string, model: Model, op: string, expectedSeq?: number) => {
-    await refresher.flush(branch);
-    await rooms.replace(branch, user, model, op, expectedSeq);
-    await refresher.reset(branch, (await rooms.model(branch)).model);
+    await refresher.runWithReset(branch, model, () => rooms.replace(branch, user, model, op, expectedSeq));
   };
   const { injectWebSocket, upgradeWebSocket, wss } = createNodeWebSocket({ app });
   const security: SecurityConfig = { ...securityConfigFromEnv(), ...options.security };

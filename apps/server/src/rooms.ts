@@ -850,10 +850,15 @@ export class Rooms {
   }
 
   /** 服务器以系统身份更新派生数据（期间被别人改过的对象不写） */
-  async patch(branchId: string, user: string, objects: Obj[], expect: Versions) {
+  async patch(
+    branchId: string,
+    user: string,
+    objects: Obj[],
+    expect: Versions,
+  ): Promise<{ committed: boolean; rejected: boolean; seq: number }> {
     const r = await this.get(branchId);
     let caughtUp: Commit[] = [];
-    let result: { outs: Out[]; committed: boolean; seq: number };
+    let result: { outs: Out[]; committed: boolean; rejected: boolean; seq: number };
     try {
       result = await this.withRoomLock(r, async () => {
         if (r.dirty) await this.reloadLocked(branchId, r);
@@ -868,12 +873,15 @@ export class Rooms {
               if (!locked) throw new Error(`分支 ${branchId} 不存在`);
               caughtUp = await this.catchUpFrom(tx, branchId, r);
             }
+            const rejected = objects.some(
+              (o) => !(o.id in r.room.model.objects) || (r.room.versions[o.id] ?? 0) !== (expect[o.id] ?? 0),
+            );
             const store = this.makeStore(tx, branchId);
             mutated = true;
             const outs = await r.room.patch(user, objects, expect, 'derive', store);
             const committed = outs.some((o) => o.msg.t === 'commit');
             if (committed) await this.maybeSnapshot(tx, branchId, r.room);
-            return { outs, committed, seq: r.room.seq };
+            return { outs, committed, rejected, seq: r.room.seq };
           });
         } catch (err) {
           if (mutated) {
@@ -892,6 +900,7 @@ export class Rooms {
     if (result.committed) {
       await this.publish({ t: 'room.commit', branchId, seq: result.seq });
     }
+    return { committed: result.committed, rejected: result.rejected, seq: result.seq };
   }
 
   async state(branchId: string): Promise<{ model: Model; versions: Versions; seq: number }> {

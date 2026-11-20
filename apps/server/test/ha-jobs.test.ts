@@ -10,13 +10,13 @@ import { emptyModel, type Model, type Obj, runMutator } from '@dowel/core';
 import { afterAll, describe, expect, test } from 'vitest';
 import { createTestDb, PG_URL } from '../../../test/pg.ts';
 import { EventBus } from '../src/bus.ts';
-import { openPlatformDb } from '../src/db.ts';
+import { openPlatformDb, type PlatformDb } from '../src/db.ts';
 import { OpaqueRefresher } from '../src/derive.ts';
 import { DriftScheduler } from '../src/drift-scheduler.ts';
 import { EnvLocks, type ExecContext } from '../src/executions.ts';
 import { HaCoordinator } from '../src/ha.ts';
 import { connHash, Effects, INTERRUPTED, type RequestRow, Requests } from '../src/requests.ts';
-import type { Rooms } from '../src/rooms.ts';
+import { type Peer, Rooms } from '../src/rooms.ts';
 import { encrypt } from '../src/secrets.ts';
 import { securityConfigFromEnv } from '../src/security.ts';
 import type { Shadow } from '../src/shadow.ts';
@@ -515,20 +515,26 @@ describe.skipIf(!PG_URL)('P7 HA Wave 2B：持久化队列、分布式巡检、�
       expect(scansB).toBe(1);
       expect(afterB).toBe(1);
 
-      // 验证 OpaqueRefresher 的分布式防重锁：同分支并发刷新时仅一个副本调用 shadow.canonicalize
+      // 验证 OpaqueRefresher 的分布式锁与跨副本 flush：
+      // 副本 A 持锁跑 canonicalize 期间，副本 B 的 flush 会阻塞等待直至副本 A 写回并更新基线，且不重复调用 canonicalize
       const live: Model = emptyModel();
       runMutator(live, 'createSchema', { id: 's1', name: 'public' });
       runMutator(live, 'createTable', { id: 't1', schema: 's1', name: 'items' });
       runMutator(live, 'addColumn', { table: 't1', column: { id: 'c1', name: 'n', type: 'integer' } });
       runMutator(live, 'addCheck', { id: 'k1', table: 't1', expr: 'n > 0' });
 
+      let liveSeq = 1;
       const fakeRooms = {
-        state: async () => ({ model: structuredClone(live), versions: {}, seq: 1 }),
-        patch: async () => {},
+        state: async () => ({ model: structuredClone(live), versions: {}, seq: liveSeq }),
+        patch: async (_b: string, _u: string, objects: Obj[]) => {
+          for (const o of objects) live.objects[o.id] = o;
+          liveSeq++;
+          return { committed: true, rejected: false, seq: liveSeq };
+        },
       } as unknown as Rooms;
       let savedBaseline: Model | null = emptyModel();
       const store = {
-        load: async () => savedBaseline,
+        load: async () => (savedBaseline ? structuredClone(savedBaseline) : null),
         save: async (_b: string, m: Model) => {
           savedBaseline = structuredClone(m);
         },
@@ -545,18 +551,23 @@ describe.skipIf(!PG_URL)('P7 HA Wave 2B：持久化队列、分布式巡检、�
       let canonCountA = 0;
       let canonCountB = 0;
 
+      const canonicalizeChecks = (next: Model): Obj[] =>
+        Object.values(next.objects)
+          .filter((o) => o.kind === 'check' && !o.expr.startsWith('('))
+          .map((o) => ({ ...o, expr: `(${(o as { expr: string }).expr}::integer)` }) as Obj);
+
       const shadowA = {
-        canonicalize: async (): Promise<Obj[]> => {
+        canonicalize: async (_prev: Model, next: Model): Promise<Obj[]> => {
           canonCountA++;
           canonEnteredA();
           await holdCanonA;
-          return [];
+          return canonicalizeChecks(next);
         },
       } as unknown as Shadow;
       const shadowB = {
-        canonicalize: async (): Promise<Obj[]> => {
+        canonicalize: async (_prev: Model, next: Model): Promise<Obj[]> => {
           canonCountB++;
-          return [];
+          return canonicalizeChecks(next);
         },
       } as unknown as Shadow;
 
@@ -565,21 +576,381 @@ describe.skipIf(!PG_URL)('P7 HA Wave 2B：持久化队列、分布式巡检、�
       refA.delayMs = 1;
       refB.delayMs = 1;
 
-      refA.schedule('branch-ha-1');
-      const flushA = refA.flush('branch-ha-1');
-      await inCanonA;
+      try {
+        refA.schedule('branch-ha-1');
+        const flushA = refA.flush('branch-ha-1');
+        await inCanonA;
 
-      // 副本 B 在副本 A 持有 derive:branch-ha-1 锁期间刷新：被防重跳过
-      refB.schedule('branch-ha-1');
-      await refB.flush('branch-ha-1');
-      expect(canonCountB).toBe(0);
+        // 副本 B 在副本 A 持有 derive:branch-ha-1 锁期间 flush：必须阻塞等待，绝不 0ms 空返回
+        let flushBDone = false;
+        const flushB = refB.flush('branch-ha-1').then(() => {
+          flushBDone = true;
+        });
+        await new Promise((r) => setTimeout(r, 80));
+        expect(flushBDone).toBe(false);
+        expect(canonCountB).toBe(0);
 
-      canonReleaseA();
-      await flushA;
-      expect(canonCountA).toBe(1);
+        canonReleaseA();
+        await Promise.all([flushA, flushB]);
+        expect(flushBDone).toBe(true);
+        expect(canonCountA).toBe(1);
+        expect(canonCountB).toBe(0);
+        expect((live.objects.k1 as { expr: string }).expr).toBe('(n > 0::integer)');
+      } finally {
+        refA.stop();
+        refB.stop();
+      }
     } finally {
       await dbA.close();
       await dbB.close();
+    }
+  });
+
+  /** 构造真实 PG 双副本房间 + 持久化 branches.baseline + OpaqueRefresher 测试夹具 */
+  const setupRefresherCluster = async (
+    tag: string,
+    makeShadows: () => { shadowA: Shadow; shadowB: Shadow },
+  ) => {
+    const t = await createTestDb(tag);
+    closers.push(t.close);
+    const dbA = await openPlatformDb(t.url);
+    const dbB = await openPlatformDb(t.url);
+    const busA = new EventBus(dbA, { replicaId: `${tag}-a` });
+    const busB = new EventBus(dbB, { replicaId: `${tag}-b` });
+    const haA = new HaCoordinator(dbA, { replicaId: `${tag}-a` });
+    const haB = new HaCoordinator(dbB, { replicaId: `${tag}-b` });
+    await busA.start();
+    await busB.start();
+
+    const user = await makeUser(dbA, `${tag}_editor`, { name: '编辑者' });
+    const groupId = `g-${tag}`;
+    const projectId = `p-${tag}`;
+    const branchId = `b-${tag}`;
+    await dbA.query('insert into groups (id, slug, name) values ($1, $1, $2)', [groupId, tag]);
+    await dbA.query('insert into projects (id, name, group_id, slug) values ($1, $2, $3, $1)', [
+      projectId,
+      tag,
+      groupId,
+    ]);
+
+    const initial = emptyModel();
+    runMutator(initial, 'createSchema', { id: 's1', name: 'public' });
+    runMutator(initial, 'createTable', { id: 't1', schema: 's1', name: 'orders' });
+    runMutator(initial, 'addColumn', { table: 't1', column: { id: 'c1', name: 'n', type: 'integer' } });
+
+    await dbA.query(
+      "insert into branches (id, project_id, name, baseline) values ($1, $2, 'main', $3::text::jsonb)",
+      [branchId, projectId, JSON.stringify(initial)],
+    );
+
+    const resolveRole = async () => 'admin' as const;
+    const roomsA = new Rooms(dbA, resolveRole, busA);
+    const roomsB = new Rooms(dbB, resolveRole, busB);
+    await roomsA.init(branchId, initial);
+
+    const storeOf = (db: PlatformDb) => ({
+      load: async (b: string) =>
+        (await db.query<{ baseline: Model | null }>('select baseline from branches where id = $1', [b]))[0]
+          ?.baseline ?? null,
+      save: async (b: string, m: Model) => {
+        await db.query('update branches set baseline = $2::text::jsonb where id = $1', [
+          b,
+          JSON.stringify(m),
+        ]);
+      },
+    });
+
+    const { shadowA, shadowB } = makeShadows();
+    const refA = new OpaqueRefresher(roomsA, async () => shadowA, storeOf(dbA), haA);
+    const refB = new OpaqueRefresher(roomsB, async () => shadowB, storeOf(dbB), haB);
+    roomsA.onCommit = (b) => refA.schedule(b);
+    roomsB.onCommit = (b) => refB.schedule(b);
+
+    const peerA: Peer = { user, role: 'admin', send: () => {} };
+    const peerB: Peer = { user, role: 'admin', send: () => {} };
+    await roomsA.join(branchId, peerA);
+    await roomsA.message(branchId, peerA, { t: 'hello', client: 'cli-a', lastSeq: 0 });
+    await roomsB.join(branchId, peerB);
+    await roomsB.message(branchId, peerB, { t: 'hello', client: 'cli-b', lastSeq: 0 });
+
+    let nA = 0;
+    let nB = 0;
+    const addCheckOnA = (id: string, expr: string) =>
+      roomsA.message(branchId, peerA, {
+        t: 'op',
+        op: { client: 'cli-a', n: ++nA, name: 'addCheck', args: { id, table: 't1', expr }, reads: [] },
+      });
+    const addCheckOnB = (id: string, expr: string) =>
+      roomsB.message(branchId, peerB, {
+        t: 'op',
+        op: { client: 'cli-b', n: ++nB, name: 'addCheck', args: { id, table: 't1', expr }, reads: [] },
+      });
+
+    const readBaseline = async (db: PlatformDb = dbA) =>
+      (
+        await db.query<{ baseline: Model | null }>('select baseline from branches where id = $1', [branchId])
+      )[0]?.baseline ?? null;
+
+    const close = async () => {
+      await refA.drain();
+      await refB.drain();
+      roomsA.close();
+      roomsB.close();
+      await busA.close();
+      await busB.close();
+      await dbA.close();
+      await dbB.close();
+    };
+
+    return {
+      branchId,
+      initial,
+      dbA,
+      dbB,
+      roomsA,
+      roomsB,
+      refA,
+      refB,
+      addCheckOnA,
+      addCheckOnB,
+      readBaseline,
+      close,
+    };
+  };
+
+  const canonicalizeChecks = (next: Model): Obj[] =>
+    Object.values(next.objects)
+      .filter((o) => o.kind === 'check' && !o.expr.startsWith('('))
+      .map((o) => ({ ...o, expr: `(${(o as { expr: string }).expr}::integer)` }) as Obj);
+
+  test('5. 跨副本 OpaqueRefresher.flush：副本 A 防抖未触发或正在 canonicalize 期间，副本 B flush 阻塞等待/接手并看到规范化模型', async () => {
+    let canonCountA = 0;
+    let canonCountB = 0;
+    let gateA: { entered: () => void; hold: Promise<void> } | null = null;
+
+    const cluster = await setupRefresherCluster('ha_flush', () => ({
+      shadowA: {
+        canonicalize: async (_prev: Model, next: Model): Promise<Obj[]> => {
+          canonCountA++;
+          if (gateA) {
+            gateA.entered();
+            await gateA.hold;
+          }
+          return canonicalizeChecks(next);
+        },
+      } as unknown as Shadow,
+      shadowB: {
+        canonicalize: async (_prev: Model, next: Model): Promise<Obj[]> => {
+          canonCountB++;
+          return canonicalizeChecks(next);
+        },
+      } as unknown as Shadow,
+    }));
+
+    try {
+      const { branchId, roomsB, refA, refB, addCheckOnA } = cluster;
+
+      // (a) 副本 A 提交后尚在长防抖期（未触发 canonicalize），副本 B 内存无 timer/running 立即 flush → 接手完成规范化
+      refA.delayMs = 60_000;
+      refB.delayMs = 60_000;
+      await addCheckOnA('k1', 'n > 0');
+
+      await refB.flush(branchId);
+      const afterB1 = (await roomsB.model(branchId)).model;
+      expect((afterB1.objects.k1 as { expr: string }).expr).toBe('(n > 0::integer)');
+      expect(canonCountB).toBe(1);
+      expect(canonCountA).toBe(0);
+
+      // 随后在副本 A 上 flush：基线已由副本 B 写齐，副本 A 无需再调影子库
+      await refA.flush(branchId);
+      expect(canonCountA).toBe(0);
+
+      // (b) 副本 A 正在 canonicalize 持锁期间，副本 B 调用 flush → 必须阻塞等待副本 A 写回后再返回
+      let enteredA!: () => void;
+      const inCanonA = new Promise<void>((r) => {
+        enteredA = r;
+      });
+      let releaseA!: () => void;
+      const holdA = new Promise<void>((r) => {
+        releaseA = r;
+      });
+      gateA = { entered: enteredA, hold: holdA };
+
+      refA.delayMs = 5;
+      await addCheckOnA('k2', 'n > 1');
+      await inCanonA;
+
+      let flushBDone = false;
+      const flushB = refB.flush(branchId).then(() => {
+        flushBDone = true;
+      });
+      await new Promise((r) => setTimeout(r, 80));
+      expect(flushBDone).toBe(false);
+
+      releaseA();
+      await flushB;
+      expect(flushBDone).toBe(true);
+      const afterB2 = (await roomsB.model(branchId)).model;
+      expect((afterB2.objects.k2 as { expr: string }).expr).toBe('(n > 1::integer)');
+      expect(canonCountA).toBe(1);
+      // 副本 B 等待副本 A 完成后看到基线已追齐，不重复调用 shadowB.canonicalize
+      expect(canonCountB).toBe(1);
+    } finally {
+      await cluster.close();
+    }
+  });
+
+  test('6. 跨副本并发提交无漏刷：副本 A 规范化 seq=1 期间副本 B 提交 seq=2，两项最终均规范化', async () => {
+    let enteredFirst!: () => void;
+    const inFirstCanon = new Promise<void>((r) => {
+      enteredFirst = r;
+    });
+    let releaseFirst!: () => void;
+    const holdFirst = new Promise<void>((r) => {
+      releaseFirst = r;
+    });
+    let firstHeld = false;
+
+    const cluster = await setupRefresherCluster('ha_concurrent', () => ({
+      shadowA: {
+        canonicalize: async (_prev: Model, next: Model): Promise<Obj[]> => {
+          if (!firstHeld) {
+            firstHeld = true;
+            enteredFirst();
+            await holdFirst;
+          }
+          return canonicalizeChecks(next);
+        },
+      } as unknown as Shadow,
+      shadowB: {
+        canonicalize: async (_prev: Model, next: Model): Promise<Obj[]> => canonicalizeChecks(next),
+      } as unknown as Shadow,
+    }));
+
+    try {
+      const { branchId, roomsA, roomsB, refA, refB, addCheckOnA, addCheckOnB } = cluster;
+      refA.delayMs = 5;
+      refB.delayMs = 5;
+
+      // 副本 A 提交 seq=1（k1），进入 shadowA.canonicalize 持锁阻塞
+      await addCheckOnA('k1', 'n > 0');
+      await inFirstCanon;
+
+      // 持锁期间副本 B 提交 seq=2（k2），并让副本 B 的后台防抖在锁被占用期间触发（验证不会静默丢弃）
+      await addCheckOnB('k2', 'n > 10');
+      await new Promise((r) => setTimeout(r, 40));
+
+      // 放行副本 A 后，无需再手动 flush，后台追齐/重排必须自动完成两项规范化
+      releaseFirst();
+      await waitFor(async () => {
+        const m = (await roomsB.model(branchId)).model;
+        return (
+          (m.objects.k1 as { expr: string } | undefined)?.expr === '(n > 0::integer)' &&
+          (m.objects.k2 as { expr: string } | undefined)?.expr === '(n > 10::integer)'
+        );
+      });
+
+      const finalA = (await roomsA.model(branchId)).model;
+      const finalB = (await roomsB.model(branchId)).model;
+      expect((finalA.objects.k1 as { expr: string }).expr).toBe('(n > 0::integer)');
+      expect((finalA.objects.k2 as { expr: string }).expr).toBe('(n > 10::integer)');
+      expect((finalB.objects.k1 as { expr: string }).expr).toBe('(n > 0::integer)');
+      expect((finalB.objects.k2 as { expr: string }).expr).toBe('(n > 10::integer)');
+    } finally {
+      await cluster.close();
+    }
+  });
+
+  test('7. 跨副本 replace/reset 基线保护：旧 canonicalize 绝不覆盖新基线，且 replace 后并发新提交不污染基线', async () => {
+    let enteredOld!: () => void;
+    const inOldCanon = new Promise<void>((r) => {
+      enteredOld = r;
+    });
+    let releaseOld!: () => void;
+    const holdOld = new Promise<void>((r) => {
+      releaseOld = r;
+    });
+    let holdOnce = true;
+
+    const cluster = await setupRefresherCluster('ha_replace', () => ({
+      shadowA: {
+        canonicalize: async (_prev: Model, next: Model): Promise<Obj[]> => {
+          if (holdOnce) {
+            holdOnce = false;
+            enteredOld();
+            await holdOld;
+          }
+          return canonicalizeChecks(next);
+        },
+      } as unknown as Shadow,
+      shadowB: {
+        canonicalize: async (_prev: Model, next: Model): Promise<Obj[]> => canonicalizeChecks(next),
+      } as unknown as Shadow,
+    }));
+
+    try {
+      const { branchId, initial, roomsA, roomsB, refA, refB, addCheckOnA, readBaseline } = cluster;
+      refA.delayMs = 5;
+      refB.delayMs = 5;
+
+      // (a) 副本 A 正在 canonicalize 旧模型（含 k_old）期间，副本 B 执行 ctx.replace（runWithReset + rooms.replace）
+      await addCheckOnA('k_old', 'n > 0');
+      await inOldCanon;
+
+      const restored = structuredClone(initial);
+      runMutator(restored, 'addColumn', {
+        table: 't1',
+        column: { id: 'c_restored', name: 'restored_col', type: 'text' },
+      });
+
+      let replaceDone = false;
+      const replacePromise = refB
+        .runWithReset(branchId, restored, () =>
+          roomsB.replace(branchId, '管理员', restored, 'restoreHistory'),
+        )
+        .then(() => {
+          replaceDone = true;
+        });
+
+      // 副本 A 仍持锁期间，副本 B 的 replace 必须等待，防止旧 canonicalize 在之后覆盖新基线
+      await new Promise((r) => setTimeout(r, 80));
+      expect(replaceDone).toBe(false);
+
+      releaseOld();
+      await replacePromise;
+      await refA.flush(branchId);
+
+      expect(replaceDone).toBe(true);
+      expect((await roomsA.model(branchId)).model).toEqual(restored);
+      expect((await roomsB.model(branchId)).model).toEqual(restored);
+      expect(await readBaseline()).toEqual(restored);
+
+      // (b) replace 刚写完房间、尚未写 branches.baseline 的窗口内，副本 A 并发提交未规范化表达式 → 绝不污染基线
+      refA.delayMs = 60_000;
+      refB.delayMs = 60_000;
+      const imported = structuredClone(initial);
+      runMutator(imported, 'addColumn', {
+        table: 't1',
+        column: { id: 'c_imp', name: 'imported_col', type: 'text' },
+      });
+
+      await refB.runWithReset(branchId, imported, async () => {
+        await roomsB.replace(branchId, '管理员', imported, 'importSql');
+        // 模拟 rooms.replace 返回后、setGood 尚未写入基线之前的并发用户提交
+        await addCheckOnA('k_conc', 'n > 99');
+      });
+
+      // branches.baseline 严格等于 imported，不含并发提交 k_conc
+      const baselineAfterReplace = await readBaseline();
+      expect(baselineAfterReplace).toEqual(imported);
+      expect(baselineAfterReplace!.objects.k_conc).toBeUndefined();
+
+      // 后续 flush 必须能识别并规范化 k_conc（证明没有因为基线污染而被永久跳过）
+      await refB.flush(branchId);
+      const afterFlush = (await roomsB.model(branchId)).model;
+      expect((afterFlush.objects.k_conc as { expr: string }).expr).toBe('(n > 99::integer)');
+    } finally {
+      await cluster.close();
     }
   });
 });

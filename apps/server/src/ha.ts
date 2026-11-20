@@ -141,8 +141,24 @@ export class HaCoordinator {
     return new Set(rows.map((r) => r.owner));
   }
 
+  /** 当前协调器是否运行在跨副本分布式模式（PG 平台库） */
+  get isDistributed(): boolean {
+    return this.db.dialect === 'pg';
+  }
+
   /** 尝试独占运行一项分布式定时任务：拿不到锁立即跳过（不阻塞） */
   tryWithJobLock<T>(jobName: string, fn: () => Promise<T>): Promise<AdvisoryLockResult<T>> {
     return this.db.withAdvisoryLock(`${JOB_LOCK_PREFIX}${jobName}`, fn, { tryOnly: true });
+  }
+
+  /** 阻塞等待并独占运行一项分布式任务（超时未拿到锁时返回 { acquired: false }） */
+  withJobLock<T>(
+    jobName: string,
+    fn: () => Promise<T>,
+    options: { timeoutMs?: number } = {},
+  ): Promise<AdvisoryLockResult<T>> {
+    return this.db.withAdvisoryLock(`${JOB_LOCK_PREFIX}${jobName}`, fn, {
+      timeoutMs: options.timeoutMs ?? 30_000,
+    });
   }
 }
