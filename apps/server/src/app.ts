@@ -109,7 +109,7 @@ export const createApp = (db: PlatformDb, options: AppOptions = {}) => {
     await rooms.replace(branch, user, model, op, expectedSeq);
     await refresher.reset(branch, (await rooms.model(branch)).model);
   };
-  const { injectWebSocket, upgradeWebSocket } = createNodeWebSocket({ app });
+  const { injectWebSocket, upgradeWebSocket, wss } = createNodeWebSocket({ app });
   const security: SecurityConfig = { ...securityConfigFromEnv(), ...options.security };
 
   // 执行 / 漂移检查：环境锁在单进程互斥之上叠加 PG 平台库 advisory lock 跨副本互斥
@@ -185,6 +185,7 @@ export const createApp = (db: PlatformDb, options: AppOptions = {}) => {
   return {
     app,
     injectWebSocket,
+    wss,
     bus,
     ha,
     replicaId: bus.replicaId,

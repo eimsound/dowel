@@ -1241,11 +1241,27 @@ export class Rooms {
     return this.rooms.has(branchId);
   }
 
-  /** 立即写入所有挂起的布局（关闭服务和测试时用） */
+  /** 优雅断开本副本所有在线房间连接（停机时通知客户端重连，避免持久连接阻塞 HTTP 服务关闭） */
+  async disconnectAll(code = 1001, reason = '服务正在关闭') {
+    for (const pending of this.rooms.values()) {
+      const r = await pending.catch(() => null);
+      if (!r) continue;
+      for (const peer of [...r.peers]) {
+        r.peers.delete(peer);
+        try {
+          peer.close?.(code, reason);
+        } catch {}
+      }
+    }
+  }
+
+  /** 立即写入所有挂起的布局，并等待进行中的房间操作完成（关闭服务和测试时用） */
   async flush() {
     for (const [branchId, p] of this.rooms) {
       const r = await p.catch(() => null);
-      if (!r?.layoutTimer) continue;
+      if (!r) continue;
+      await r.lock.catch(() => {});
+      if (!r.layoutTimer) continue;
       clearTimeout(r.layoutTimer);
       r.layoutTimer = undefined;
       await this.flushLayout(branchId, r);

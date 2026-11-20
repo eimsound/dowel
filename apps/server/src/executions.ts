@@ -74,6 +74,16 @@ export class EnvLocks {
   busy(id: string): boolean {
     return this.held.has(id);
   }
+  /** 本副本当前持有中的环境锁数量 */
+  get activeCount(): number {
+    return this.held.size;
+  }
+  /** 等待所有当前持有中的环境锁释放完成（优雅停机排空用；循环检查直至无在途锁） */
+  async drain(): Promise<void> {
+    while (this.held.size > 0) {
+      await Promise.allSettled([...this.held.values()]);
+    }
+  }
   async acquire(id: string, timeoutMs = LOCK_WAIT_MS, busyMessage?: string): Promise<() => Promise<void>> {
     const deadline = Date.now() + Math.max(0, timeoutMs);
     const makeBusyError = () =>

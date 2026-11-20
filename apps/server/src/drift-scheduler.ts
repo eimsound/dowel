@@ -13,6 +13,7 @@ export const DEFAULT_DRIFT_INTERVAL_MS = 60 * 60 * 1000;
 export class DriftScheduler {
   private timer: ReturnType<typeof setInterval> | null = null;
   private running: Promise<number> | null = null;
+  private stopped = false;
   private db: PlatformDb;
   private x: ExecContext;
   private ha: HaCoordinator | null;
@@ -28,14 +29,21 @@ export class DriftScheduler {
   /** 按间隔开始定时检查；intervalMs <= 0 表示关闭。定时器不会阻止进程退出 */
   start(intervalMs: number = DEFAULT_DRIFT_INTERVAL_MS) {
     this.stop();
+    this.stopped = false;
     if (!(intervalMs > 0)) return;
     this.timer = setInterval(() => void this.runOnce(), intervalMs);
     this.timer.unref?.();
   }
 
   stop() {
+    this.stopped = true;
     if (this.timer) clearInterval(this.timer);
     this.timer = null;
+  }
+
+  /** 等待正在进行的一轮漂移巡检结束（优雅停机排空用） */
+  async drain(): Promise<void> {
+    if (this.running) await this.running.catch(() => {});
   }
 
   get started(): boolean {
@@ -61,6 +69,7 @@ export class DriftScheduler {
         // 没有版本的项目不用查（checkEnvDrift 里会跳过）；先取出行，检查期间环境被删了再查一次就找不到，忽略
         const rows = await this.db.query<EnvRow>('select * from environments order by created_at, id');
         for (const env of rows) {
+          if (this.stopped) break;
           try {
             const r = await checkEnvDrift(this.x, env);
             if (!r.skipped) n++;
@@ -71,7 +80,7 @@ export class DriftScheduler {
         }
         return n;
       } finally {
-        this.afterSweep?.();
+        if (!this.stopped) this.afterSweep?.();
       }
     };
     if (!this.ha) return run();

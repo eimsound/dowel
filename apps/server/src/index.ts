@@ -20,3 +20,12 @@ export { HaCoordinator, type HaCoordinatorOptions } from './ha.ts';
 export { readSettings, writeSettings } from './settings.ts';
 export { autoSetup, ensureSetupToken, needsSetup } from './setup.ts';
 export { type Shadow, ShadowError } from './shadow.ts';
+export {
+  type ClosableServer,
+  type ClosableWebSocket,
+  type ClosableWebSocketServer,
+  createShutdown,
+  DEFAULT_SHUTDOWN_TIMEOUT_MS,
+  gracefulShutdown,
+  type ShutdownDeps,
+} from './shutdown.ts';

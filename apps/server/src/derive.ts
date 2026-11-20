@@ -35,6 +35,7 @@ export class OpaqueRefresher {
   private running = new Map<string, Promise<void>>();
   /** 写回被拒绝后自动重试的次数（防止异常情况下无限重试） */
   private retries = new Map<string, number>();
+  private stopped = false;
   delayMs = 300;
 
   constructor(
@@ -62,14 +63,30 @@ export class OpaqueRefresher {
   }
 
   schedule(branchId: string) {
+    if (this.stopped) return;
     clearTimeout(this.timers.get(branchId));
-    this.timers.set(
-      branchId,
-      setTimeout(() => {
-        this.timers.delete(branchId);
-        void this.start(branchId);
-      }, this.delayMs),
-    );
+    const timer = setTimeout(() => {
+      this.timers.delete(branchId);
+      if (this.stopped) return;
+      void this.start(branchId);
+    }, this.delayMs);
+    timer.unref?.();
+    this.timers.set(branchId, timer);
+  }
+
+  /** 停止接收新防抖调度并清理尚未触发的定时器（优雅停机用） */
+  stop() {
+    this.stopped = true;
+    for (const timer of this.timers.values()) clearTimeout(timer);
+    this.timers.clear();
+  }
+
+  /** 停止新调度并等待所有已启动的刷新任务完成（优雅停机排空用） */
+  async drain(): Promise<void> {
+    this.stop();
+    while (this.running.size > 0) {
+      await Promise.allSettled([...this.running.values()]);
+    }
   }
 
   /**
@@ -100,7 +117,12 @@ export class OpaqueRefresher {
 
   private start(branchId: string): Promise<void> {
     const prev = this.running.get(branchId) ?? Promise.resolve();
-    const p = prev.then(() => this.run(branchId)).catch((e) => console.error('刷新不透明对象 DDL 失败', e));
+    const p = prev
+      .then(() => this.run(branchId))
+      .catch((e) => console.error('刷新不透明对象 DDL 失败', e))
+      .finally(() => {
+        if (this.running.get(branchId) === p) this.running.delete(branchId);
+      });
     this.running.set(branchId, p);
     return p;
   }

@@ -8,10 +8,24 @@ import { createApp } from './app.ts';
 import { openPlatformDb } from './db.ts';
 import { DEFAULT_DRIFT_INTERVAL_MS } from './drift-scheduler.ts';
 import { autoSetup, ensureSetupToken, needsSetup } from './setup.ts';
+import { createShutdown } from './shutdown.ts';
 
 const db = await openPlatformDb(process.env.DOWEL_DB || './data/dowel.db');
-const { app, injectWebSocket, bus, ha, rooms, shadows, drift, requests, webhooks, setupToken } =
-  createApp(db);
+const {
+  app,
+  injectWebSocket,
+  wss,
+  bus,
+  ha,
+  rooms,
+  shadows,
+  refresher,
+  drift,
+  exec,
+  requests,
+  webhooks,
+  setupToken,
+} = createApp(db);
 const port = Number(process.env.PORT ?? 4600);
 
 // 无人值守初始化：设置了 DOWEL_ADMIN_USERNAME / DOWEL_ADMIN_PASSWORD 并且还没有用户时直接建管理员。
@@ -57,18 +71,24 @@ injectWebSocket(server);
 const driftMinutes = process.env.DOWEL_DRIFT_INTERVAL_MINUTES;
 drift.start(driftMinutes === undefined ? DEFAULT_DRIFT_INTERVAL_MS : Number(driftMinutes) * 60_000);
 
-const stop = async () => {
-  server.close();
-  drift.stop();
-  requests.stop();
-  await webhooks.close();
-  await rooms.flush();
-  rooms.close();
-  await shadows.close();
-  await bus.close();
-  await ha.stop();
-  await db.close();
-  process.exit(0);
-};
-process.on('SIGINT', stop);
-process.on('SIGTERM', stop);
+const stop = createShutdown({
+  server,
+  wss,
+  drift,
+  requests,
+  refresher,
+  locks: exec.locks,
+  webhooks,
+  rooms,
+  shadows,
+  bus,
+  ha,
+  db,
+  onExit: (code) => process.exit(code),
+});
+process.on('SIGINT', () => {
+  void stop('SIGINT');
+});
+process.on('SIGTERM', () => {
+  void stop('SIGTERM');
+});

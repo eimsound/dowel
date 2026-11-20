@@ -517,6 +517,8 @@ export class Requests {
   private queued = 0;
   private done = 0;
   private draining: Promise<number> | null = null;
+  /** 正在执行收尾写库与通知（finish / afterDirectRun / afterTokenRun）的异步任务 */
+  private readonly inFlight = new Set<Promise<unknown>>();
   /**
    * 本进程开始的时间：无 HA 租约或历史无 worker_id 的记录仍据此区分重启前遗留与本进程刚发起的执行。
    * 在 createApp 里构造，早于开始接受连接。
@@ -676,6 +678,22 @@ export class Requests {
     }
   }
 
+  /** 等待正在进行的巡检与执行收尾任务全部完成（优雅停机排空用） */
+  async drain(): Promise<void> {
+    while (this.draining || this.inFlight.size > 0) {
+      const tasks: Promise<unknown>[] = [...this.inFlight];
+      if (this.draining) tasks.push(this.draining);
+      await Promise.allSettled(tasks);
+    }
+  }
+
+  private trackInFlight<T>(p: Promise<T>): Promise<T> {
+    this.inFlight.add(p);
+    const drop = () => this.inFlight.delete(p);
+    p.then(drop, drop);
+    return p;
+  }
+
   private enqueue(t: SweepTarget): number {
     this.pending ??= { all: false, envs: new Set(), projects: new Set(), groups: new Set() };
     const p = this.pending;
@@ -687,11 +705,13 @@ export class Requests {
   }
 
   private kickLocal(t: SweepTarget) {
+    if (this.stopped) return;
     this.enqueue(t);
     if (this.kickTimer) return;
     this.kickTimer = setTimeout(() => {
       this.kickTimer = null;
-      void this.drain();
+      if (this.stopped) return;
+      void this.drainPending();
     }, 0);
     this.kickTimer.unref?.();
   }
@@ -722,11 +742,11 @@ export class Requests {
   async sweep(t: SweepTarget = { all: true }): Promise<number> {
     const mine = this.enqueue(t);
     let n = 0;
-    while (this.done < mine) n += await this.drain();
+    while (this.done < mine) n += await this.drainPending();
     return n;
   }
 
-  private drain(): Promise<number> {
+  private drainPending(): Promise<number> {
     this.draining ??= (async () => {
       let n = 0;
       while (this.pending) {
@@ -738,12 +758,13 @@ export class Requests {
           return 0;
         });
         this.done = gen;
+        if (this.stopped) break;
       }
       return n;
     })().finally(() => {
       this.draining = null;
-      // 循环结束和这里之间又排进来的：再跑一轮，不能丢
-      if (this.pending) void this.drain();
+      // 循环结束和这里之间又排进来的：再跑一轮，不能丢（停机后不再续跑）
+      if (!this.stopped && this.pending) void this.drainPending();
     });
     return this.draining;
   }
@@ -1218,43 +1239,47 @@ export class Requests {
    * 在锁里条件更新：只接受仍是 executing 的申请，以及被启动恢复误记为“中断”的申请（result.code = interrupted，
    * 单进程下不应该发生；发生了就用真实结果覆盖）。
    */
-  async finish(
+  finish(
     c: Context | null,
     rid: string,
     user: { id: string; name: string },
     r: { ok: boolean; current: RequestVersionRef | null; error: { error: string; code?: string } | null },
-  ) {
-    const fx = new Effects();
-    let envId: string | null = null;
-    await withPolicyLock(this.db, async (tx) => {
-      const [req] = await tx.query<RequestRow>('select * from exec_requests where id = $1', [rid]);
-      if (!req) return;
-      const interrupted = req.status === 'failed' && req.result?.code === INTERRUPTED;
-      if (req.status !== 'executing' && !interrupted) return;
-      envId = req.environment_id;
-      await tx.query('update exec_requests set executed_at = $2 where id = $1', [
-        rid,
-        new Date().toISOString(),
-      ]);
-      const result = {
-        ok: r.ok,
-        code: r.error?.code ?? null,
-        error: r.error?.error ?? null,
-        current: r.current,
-      };
-      const status: RequestStatus = r.ok
-        ? 'executed'
-        : r.error?.code === 'request_stale'
-          ? 'invalid'
-          : 'failed';
-      await this.setStatus(tx, c, req, status, r.ok ? null : (r.error?.error ?? null), user, fx, {
-        result,
-        onlyIf: req.status,
-      });
-    });
-    await this.flushEffects(fx);
-    // 环境状态变了：同一个环境上别的申请要重新检查
-    if (envId) this.kick({ envIds: [envId] });
+  ): Promise<void> {
+    return this.trackInFlight(
+      (async () => {
+        const fx = new Effects();
+        let envId: string | null = null;
+        await withPolicyLock(this.db, async (tx) => {
+          const [req] = await tx.query<RequestRow>('select * from exec_requests where id = $1', [rid]);
+          if (!req) return;
+          const interrupted = req.status === 'failed' && req.result?.code === INTERRUPTED;
+          if (req.status !== 'executing' && !interrupted) return;
+          envId = req.environment_id;
+          await tx.query('update exec_requests set executed_at = $2 where id = $1', [
+            rid,
+            new Date().toISOString(),
+          ]);
+          const result = {
+            ok: r.ok,
+            code: r.error?.code ?? null,
+            error: r.error?.error ?? null,
+            current: r.current,
+          };
+          const status: RequestStatus = r.ok
+            ? 'executed'
+            : r.error?.code === 'request_stale'
+              ? 'invalid'
+              : 'failed';
+          await this.setStatus(tx, c, req, status, r.ok ? null : (r.error?.error ?? null), user, fx, {
+            result,
+            onlyIf: req.status,
+          });
+        });
+        await this.flushEffects(fx);
+        // 环境状态变了：同一个环境上别的申请要重新检查
+        if (envId) this.kick({ envIds: [envId] });
+      })(),
+    );
   }
 
   // ───── 直接执行之后 ─────
@@ -1263,7 +1288,7 @@ export class Requests {
    * 不经申请的直接执行 / 回滚 / 写基线结束之后：发 execution.finished 的 Webhook（执行和回滚），
    * 并让这个环境上还没结束的申请马上重新检查（环境状态变了的会失效）。
    */
-  async afterDirectRun(
+  afterDirectRun(
     user: { id: string; name: string },
     a: { pid: string; env: EnvRow },
     run: { mode: 'migrate' | 'baseline'; to?: string; direction?: 'up' | 'down' },
@@ -1273,42 +1298,51 @@ export class Requests {
       ran: number;
       error: { error: string; code?: string } | null;
     },
-  ) {
-    // 环境状态变了：这个环境上还没结束的申请要重新检查
-    this.kick({ envIds: [a.env.id] });
-    if (run.mode !== 'migrate') return;
-    const s = await this.scopeOf(this.db, { project_id: a.pid, environment_id: a.env.id });
-    if (!s) return;
-    const toRef = run.to
-      ? (
-          await this.db.query<RequestVersionRef>('select id, number, name from versions where id = $1', [
-            run.to,
-          ])
-        )[0]
-      : undefined;
-    const what = `${run.direction === 'down' ? '回滚' : '执行'}${toRef ? `到 v${toRef.number}` : ''}`;
-    this.webhooks.emit(s.project.groupId, {
-      type: 'execution.finished',
-      title: `${r.ok ? '执行完成' : '执行失败'}：${s.project.name} / ${s.env.name}`,
-      lines: [
-        `**项目**：${s.project.name}（${s.project.groupSlug}/${s.project.slug}）`,
-        `**环境**：${s.env.name}${s.env.production ? '（生产）' : ''}`,
-        `**操作**：${what}`,
-        `**操作人**：${user.name}`,
-        ...(r.ok ? [`**当前版本**：${r.current ? `v${r.current.number}` : '（无）'}`] : []),
-        ...(r.error ? [`**错误**：${scrubSecrets(r.error.error)}`] : []),
-      ],
-      url: null,
-      data: {
-        project: { id: s.project.id, name: s.project.name, slug: s.project.slug, group: s.project.groupSlug },
-        environment: { id: s.env.id, name: s.env.name, production: s.env.production },
-        direction: run.direction ?? 'up',
-        toVersionId: run.to ?? null,
-        actor: user.name,
-        ok: r.ok,
-        code: r.error?.code ?? null,
-      },
-    });
+  ): Promise<void> {
+    return this.trackInFlight(
+      (async () => {
+        // 环境状态变了：这个环境上还没结束的申请要重新检查
+        this.kick({ envIds: [a.env.id] });
+        if (run.mode !== 'migrate') return;
+        const s = await this.scopeOf(this.db, { project_id: a.pid, environment_id: a.env.id });
+        if (!s) return;
+        const toRef = run.to
+          ? (
+              await this.db.query<RequestVersionRef>('select id, number, name from versions where id = $1', [
+                run.to,
+              ])
+            )[0]
+          : undefined;
+        const what = `${run.direction === 'down' ? '回滚' : '执行'}${toRef ? `到 v${toRef.number}` : ''}`;
+        this.webhooks.emit(s.project.groupId, {
+          type: 'execution.finished',
+          title: `${r.ok ? '执行完成' : '执行失败'}：${s.project.name} / ${s.env.name}`,
+          lines: [
+            `**项目**：${s.project.name}（${s.project.groupSlug}/${s.project.slug}）`,
+            `**环境**：${s.env.name}${s.env.production ? '（生产）' : ''}`,
+            `**操作**：${what}`,
+            `**操作人**：${user.name}`,
+            ...(r.ok ? [`**当前版本**：${r.current ? `v${r.current.number}` : '（无）'}`] : []),
+            ...(r.error ? [`**错误**：${scrubSecrets(r.error.error)}`] : []),
+          ],
+          url: null,
+          data: {
+            project: {
+              id: s.project.id,
+              name: s.project.name,
+              slug: s.project.slug,
+              group: s.project.groupSlug,
+            },
+            environment: { id: s.env.id, name: s.env.name, production: s.env.production },
+            direction: run.direction ?? 'up',
+            toVersionId: run.to ?? null,
+            actor: user.name,
+            ok: r.ok,
+            code: r.error?.code ?? null,
+          },
+        });
+      })(),
+    );
   }
 
   // ───── CI 令牌执行之后（P6） ─────
@@ -1321,7 +1355,7 @@ export class Requests {
    *   和环境当前审批流程里每个环节现在有资格的审批人（没配环节时是有执行权限的人）。非生产不发站内通知（太频繁），只有 Webhook。
    * 自己的错误只记日志，不影响已经返回给 CI 的结果。
    */
-  async afterTokenRun(
+  afterTokenRun(
     token: { id: string; name: string; prefix: string; createdByName: string | null },
     a: { pid: string; env: EnvRow },
     target: RequestVersionRef,
@@ -1332,80 +1366,94 @@ export class Requests {
       ran: number[];
       error: { error: string; code: string } | null;
     },
-  ) {
-    this.kick({ envIds: [a.env.id] });
-    const s = await this.scopeOf(this.db, { project_id: a.pid, environment_id: a.env.id });
-    if (!s) return;
-    const who = `CI 令牌 ${token.name}（${token.prefix}…）`;
-    const where = `${s.project.name} / ${s.env.name}`;
-    this.webhooks.emit(s.project.groupId, {
-      type: 'token.executed',
-      title: `${r.ok ? 'CI 令牌执行完成' : 'CI 令牌执行失败'}：${where}`,
-      lines: [
-        `**项目**：${s.project.name}（${s.project.groupSlug}/${s.project.slug}）`,
-        `**环境**：${s.env.name}${s.env.production ? '（生产）' : ''}`,
-        `**操作**：执行到 v${target.number}${r.noop ? '（已在目标版本，无变更）' : ''}`,
-        `**令牌**：${token.name}（\`${token.prefix}…\`）${token.createdByName ? `，创建者 ${token.createdByName}` : ''}`,
-        ...(r.ok ? [`**当前版本**：${r.current ? `v${r.current.number}` : '（无）'}`] : []),
-        ...(r.error ? [`**错误**：${scrubSecrets(r.error.error)}`] : []),
-      ],
-      url: null,
-      data: {
-        project: { id: s.project.id, name: s.project.name, slug: s.project.slug, group: s.project.groupSlug },
-        environment: { id: s.env.id, name: s.env.name, production: s.env.production },
-        token: { id: token.id, name: token.name, prefix: token.prefix, createdBy: token.createdByName },
-        toVersion: target.number,
-        current: r.current?.number ?? null,
-        ran: r.ran,
-        noop: r.noop ?? false,
-        ok: r.ok,
-        code: r.error?.code ?? null,
-      },
-    });
-    // 生产环境无变更的幂等空跑（noop）不向收件箱刷屏
-    if (!s.env.production || (r.ok && r.noop)) return;
-    const fx = new Effects();
-    await this.db.transaction(async (tx) => {
-      const audience = await loadAudience(tx, s.project);
-      const scope: StageScope = {
-        project: s.project,
-        env: { id: s.env.id, production: s.env.production },
-        resolved: s.resolved,
-        direction: 'up',
-      };
-      const stages = stagesOf(flowOf(s.resolved));
-      const data = {
-        title: `${r.ok ? 'CI 令牌执行了生产环境' : 'CI 令牌执行生产环境失败'}：${where}`,
-        body: `${who} 执行到 v${target.number}${
-          r.ok
-            ? `，当前版本 ${r.current ? `v${r.current.number}` : '（无）'}`
-            : `：${scrubSecrets(r.error?.error ?? '')}`
-        }`,
-        event: r.ok ? 'token_executed' : 'token_failed',
-        actor: who,
-        params: {
-          project: s.project.name,
-          env: s.env.name,
-          to: target.number,
-          current: r.current?.number ?? null,
-          token: token.name,
-          prefix: token.prefix,
-          code: r.error?.code ?? null,
-        },
-      };
-      for (const u of audience.values()) {
-        const role = effectiveRole(u, s.project);
-        if (!role) continue;
-        if (role !== 'admin' && !stages.some((spec) => eligibleFor(u, spec, scope))) continue;
-        await tx.query(
-          `insert into inbox_items (id, user_id, kind, project_id, environment_id, request_id, data, created_at)
-           values ($1, $2, 'token_execution', $3, $4, null, $5::text::jsonb, $6)`,
-          [newId(), u.userId, s.project.id, s.env.id, JSON.stringify(data), new Date().toISOString()],
-        );
-        fx.users.add(u.userId);
-      }
-    });
-    await this.flushEffects(fx);
+  ): Promise<void> {
+    return this.trackInFlight(
+      (async () => {
+        this.kick({ envIds: [a.env.id] });
+        const s = await this.scopeOf(this.db, { project_id: a.pid, environment_id: a.env.id });
+        if (!s) return;
+        const who = `CI 令牌 ${token.name}（${token.prefix}…）`;
+        const where = `${s.project.name} / ${s.env.name}`;
+        this.webhooks.emit(s.project.groupId, {
+          type: 'token.executed',
+          title: `${r.ok ? 'CI 令牌执行完成' : 'CI 令牌执行失败'}：${where}`,
+          lines: [
+            `**项目**：${s.project.name}（${s.project.groupSlug}/${s.project.slug}）`,
+            `**环境**：${s.env.name}${s.env.production ? '（生产）' : ''}`,
+            `**操作**：执行到 v${target.number}${r.noop ? '（已在目标版本，无变更）' : ''}`,
+            `**令牌**：${token.name}（\`${token.prefix}…\`）${token.createdByName ? `，创建者 ${token.createdByName}` : ''}`,
+            ...(r.ok ? [`**当前版本**：${r.current ? `v${r.current.number}` : '（无）'}`] : []),
+            ...(r.error ? [`**错误**：${scrubSecrets(r.error.error)}`] : []),
+          ],
+          url: null,
+          data: {
+            project: {
+              id: s.project.id,
+              name: s.project.name,
+              slug: s.project.slug,
+              group: s.project.groupSlug,
+            },
+            environment: { id: s.env.id, name: s.env.name, production: s.env.production },
+            token: {
+              id: token.id,
+              name: token.name,
+              prefix: token.prefix,
+              createdBy: token.createdByName,
+            },
+            toVersion: target.number,
+            current: r.current?.number ?? null,
+            ran: r.ran,
+            noop: r.noop ?? false,
+            ok: r.ok,
+            code: r.error?.code ?? null,
+          },
+        });
+        // 生产环境无变更的幂等空跑（noop）不向收件箱刷屏
+        if (!s.env.production || (r.ok && r.noop)) return;
+        const fx = new Effects();
+        await this.db.transaction(async (tx) => {
+          const audience = await loadAudience(tx, s.project);
+          const scope: StageScope = {
+            project: s.project,
+            env: { id: s.env.id, production: s.env.production },
+            resolved: s.resolved,
+            direction: 'up',
+          };
+          const stages = stagesOf(flowOf(s.resolved));
+          const data = {
+            title: `${r.ok ? 'CI 令牌执行了生产环境' : 'CI 令牌执行生产环境失败'}：${where}`,
+            body: `${who} 执行到 v${target.number}${
+              r.ok
+                ? `，当前版本 ${r.current ? `v${r.current.number}` : '（无）'}`
+                : `：${scrubSecrets(r.error?.error ?? '')}`
+            }`,
+            event: r.ok ? 'token_executed' : 'token_failed',
+            actor: who,
+            params: {
+              project: s.project.name,
+              env: s.env.name,
+              to: target.number,
+              current: r.current?.number ?? null,
+              token: token.name,
+              prefix: token.prefix,
+              code: r.error?.code ?? null,
+            },
+          };
+          for (const u of audience.values()) {
+            const role = effectiveRole(u, s.project);
+            if (!role) continue;
+            if (role !== 'admin' && !stages.some((spec) => eligibleFor(u, spec, scope))) continue;
+            await tx.query(
+              `insert into inbox_items (id, user_id, kind, project_id, environment_id, request_id, data, created_at)
+               values ($1, $2, 'token_execution', $3, $4, null, $5::text::jsonb, $6)`,
+              [newId(), u.userId, s.project.id, s.env.id, JSON.stringify(data), new Date().toISOString()],
+            );
+            fx.users.add(u.userId);
+          }
+        });
+        await this.flushEffects(fx);
+      })(),
+    );
   }
 
   // ───── 实时推送（收件箱） ─────
