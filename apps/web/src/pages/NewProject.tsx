@@ -13,7 +13,7 @@ import type {
 import { useQuery, useQueryClient } from '@tanstack/react-query';
 import { useNavigate, useSearch } from '@tanstack/react-router';
 import { Check, CircleCheck, Database, FileUp, Plus, Trash2, TriangleAlert } from 'lucide-react';
-import { useRef, useState } from 'react';
+import { useEffect, useRef, useState } from 'react';
 import { useTranslation } from 'react-i18next';
 import { api } from '../api.ts';
 import { ClaimDialog } from '../components/ClaimDialog.tsx';
@@ -115,6 +115,10 @@ export const NewProject = () => {
   const [stageDetail, setStageDetail] = useState<string | null>(null);
   const [busy, setBusy] = useState(false);
   const envSeq = useRef(0);
+  /** 接手读取的代次（切组递增）与每环境序号（失效或重读递增），防止在途旧请求晚返回污染状态 */
+  const takeGroupGenRef = useRef(0);
+  const takeSeqRef = useRef(0);
+  const takeKeySeqRef = useRef<Record<string, number>>({});
   const fileInput = useRef<HTMLInputElement>(null);
 
   const canCreateIn = (g: GroupList['groups'][number]) =>
@@ -172,29 +176,53 @@ export const NewProject = () => {
     if (next && !next.result) void check(next);
   };
 
-  const goto = (next: number) => {
-    setError('');
-    // 进入“初始内容”时，如果要从数据库导入而来源还没检查过，先自动检查一次（拿 schema 列表）
-    if (next === 2 && sourceEnv && !sourceEnv.result && !sourceEnv.pending) void check(sourceEnv);
-    if (next === 2 && !importEnv && filledEnvs[0]) setImportEnv(filledEnvs[0].name);
-    setStep(next);
+  /** 切组时重置所有接手临时状态并作废所有在途读取请求 */
+  const resetTakeover = () => {
+    takeGroupGenRef.current += 1;
+    takeKeySeqRef.current = {};
+    setTakeReads({});
+    setTakeProject('');
+    setClaimOpen(false);
   };
 
-  /** 接手：读每个环境的库，列出里面登记过的项目（只读） */
-  const readTakeover = async () => {
-    if (!effectiveGroupId) return;
-    setTakeReads(() =>
-      Object.fromEntries(filledEnvs.map((e) => [e.key, { loading: true, error: '', data: null }])),
-    );
+  /** 环境 url 变更或删除时，精确失效该环境的接手读取缓存与在途请求 */
+  const invalidateTakeRead = (key: string) => {
+    takeKeySeqRef.current[key] = ++takeSeqRef.current;
+    setTakeReads((m) => {
+      if (!(key in m)) return m;
+      const next = { ...m };
+      delete next[key];
+      return next;
+    });
+  };
+
+  /** 接手：读指定环境（默认全部已填环境）的库，列出里面登记过的项目（只读） */
+  const readTakeover = async (targets: EnvDraft[] = filledEnvs, replace = true) => {
+    if (!effectiveGroupId || targets.length === 0) return;
+    const groupGen = takeGroupGenRef.current;
+    const seqs = new Map<string, number>();
+    for (const e of targets) {
+      const seq = ++takeSeqRef.current;
+      takeKeySeqRef.current[e.key] = seq;
+      seqs.set(e.key, seq);
+    }
+    setTakeReads((m) => {
+      const base: Record<string, TakeRead> = replace ? {} : { ...m };
+      for (const e of targets) base[e.key] = { loading: true, error: '', data: null };
+      return base;
+    });
     await Promise.all(
-      filledEnvs.map(async (e) => {
+      targets.map(async (e) => {
+        const seq = seqs.get(e.key)!;
         try {
           const data = await api<TakeoverInspectResult>('POST', '/api/takeover/inspect', {
             url: e.url,
             groupId: effectiveGroupId,
           });
+          if (takeGroupGenRef.current !== groupGen || takeKeySeqRef.current[e.key] !== seq) return;
           setTakeReads((m) => ({ ...m, [e.key]: { loading: false, error: '', data } }));
         } catch (x) {
+          if (takeGroupGenRef.current !== groupGen || takeKeySeqRef.current[e.key] !== seq) return;
           setTakeReads((m) => ({
             ...m,
             [e.key]: { loading: false, error: x instanceof Error ? x.message : String(x), data: null },
@@ -203,29 +231,52 @@ export const NewProject = () => {
       }),
     );
   };
-  /** 各环境里出现过的项目（按项目 ID 合并），每个带上出现在哪些环境 */
+
+  /** 自动补读：只读取尚未存在于 takeReads 中的已填环境 */
+  const readMissingTakeover = () => {
+    const missing = filledEnvs.filter((e) => !takeReads[e.key]);
+    if (missing.length > 0) void readTakeover(missing, false);
+  };
+
+  const goto = (next: number) => {
+    setError('');
+    // 进入“初始内容”时，如果要从数据库导入而来源还没检查过，先自动检查一次（拿 schema 列表）
+    if (next === 2 && sourceEnv && !sourceEnv.result && !sourceEnv.pending) void check(sourceEnv);
+    if (next === 2 && !importEnv && filledEnvs[0]) setImportEnv(filledEnvs[0].name);
+    // 进入“初始内容”且已选接手：自动补读尚未读取（新增或改 url 失效）的环境
+    if (next === 2 && kind === 'takeover') readMissingTakeover();
+    setStep(next);
+  };
+
+  /** 各环境里出现过的项目（按项目 ID 合并），每个带上出现在哪些环境（按稳定 key 关联） */
   const candidates = (() => {
     const map = new Map<
       string,
       {
         id: string;
         name: string | null;
-        envs: { env: string; p: TakeoverInspectResult['projects'][number] }[];
+        envs: { key: string; env: string; p: TakeoverInspectResult['projects'][number] }[];
       }
     >();
     for (const e of filledEnvs) {
       for (const p of takeReads[e.key]?.data?.projects ?? []) {
         const c = map.get(p.projectId) ?? { id: p.projectId, name: p.name, envs: [] };
-        c.envs.push({ env: e.name, p });
+        c.envs.push({ key: e.key, env: e.name, p });
         map.set(p.projectId, c);
       }
     }
     return [...map.values()];
   })();
   const takeCand = candidates.find((c) => c.id === takeProject);
+  const hasTakeCand = !!takeCand;
+  useEffect(() => {
+    if (takeProject && !hasTakeCand) setTakeProject('');
+  }, [takeProject, hasTakeCand]);
   const readsDone =
     filledEnvs.length > 0 && filledEnvs.every((e) => takeReads[e.key] && !takeReads[e.key]!.loading);
-  const takeMissing = takeCand ? filledEnvs.filter((e) => !takeCand.envs.some((x) => x.env === e.name)) : [];
+  const takeReading = filledEnvs.some((e) => takeReads[e.key]?.loading);
+  const hasAnyTakeRead = filledEnvs.some((e) => Boolean(takeReads[e.key]));
+  const takeMissing = takeCand ? filledEnvs.filter((e) => !takeCand.envs.some((x) => x.key === e.key)) : [];
   const takeExists = takeCand?.envs.some((x) => x.p.existsHere) ?? false;
   /** 需要认领：有环境里这个项目由另一个实例认领 */
   const takeClaim = takeCand?.envs.find((x) => !x.p.mine) ?? null;
@@ -245,7 +296,11 @@ export const NewProject = () => {
       : kind === 'sql'
         ? filledEnvs.length > 0 && sql.trim().length > 0
         : kind === 'takeover'
-          ? !!takeCand && takeMissing.length === 0 && !takeExists && (!takeClaim || isInstanceAdmin)
+          ? readsDone &&
+            !!takeCand &&
+            takeMissing.length === 0 &&
+            !takeExists &&
+            (!takeClaim || isInstanceAdmin)
           : filledEnvs.length > 0 && !schemaMissing;
 
   const canNext =
@@ -285,7 +340,7 @@ export const NewProject = () => {
         env: kind === 'database' ? sourceEnv?.name : undefined,
         sql: kind === 'sql' ? sql : undefined,
         projectId: kind === 'takeover' ? takeProject : undefined,
-        claim: kind === 'takeover' && takeClaim ? true : undefined,
+        claim: kind === 'takeover' && (claimConfirmed || !!takeClaim) ? true : undefined,
       },
     };
     let project = null as ProjectCreated | null; // 在 readSse 的回调里赋值，不加断言 TS 会把它收窄成 null
@@ -304,8 +359,14 @@ export const NewProject = () => {
       // 读 SSE：每条消息的 data 是一个 WizardEvent 的 JSON（解析见 sse.ts）
       await readSse(res, (data) => {
         const event = JSON.parse(data) as WizardEvent;
-        if (event.error) setError(event.error);
-        else {
+        if (event.error) {
+          // TOCTOU 或缓存陈旧时服务端可能在提交阶段才要求确认认领：管理员弹认领确认框，普通用户照常显示错误
+          if (event.code === 'claim_required' && isInstanceAdmin && !claimConfirmed) {
+            setClaimOpen(true);
+          } else {
+            setError(event.error);
+          }
+        } else {
           setStage(event.stage);
           setStageDetail(event.detail ?? null);
         }
@@ -399,7 +460,10 @@ export const NewProject = () => {
                   <select
                     className="select"
                     value={effectiveGroupId}
-                    onChange={(e) => setGroupId(e.target.value)}
+                    onChange={(e) => {
+                      setGroupId(e.target.value);
+                      resetTakeover();
+                    }}
                     disabled={!creatable.length}
                   >
                     {creatable.map((g) => (
@@ -470,10 +534,11 @@ export const NewProject = () => {
                           autoCapitalize="none"
                           autoCorrect="off"
                           spellCheck={false}
-                          onChange={(e) =>
-                            // 连接串变了，之前的检查结果就作废
-                            patchEnv(env.key, { url: e.target.value, result: null, error: '' })
-                          }
+                          onChange={(e) => {
+                            // 连接串变了，之前的检查结果和接手读取缓存都作废
+                            patchEnv(env.key, { url: e.target.value, result: null, error: '' });
+                            invalidateTakeRead(env.key);
+                          }}
                         />
                       </label>
                       <label className="field col-span-2">
@@ -519,7 +584,10 @@ export const NewProject = () => {
                       </button>
                       <IconButton
                         label={t('wiz.removeEnv', { name: env.name || env.url || t('wiz.envName') })}
-                        onClick={() => setEnvs((list) => list.filter((x) => x.key !== env.key))}
+                        onClick={() => {
+                          setEnvs((list) => list.filter((x) => x.key !== env.key));
+                          invalidateTakeRead(env.key);
+                        }}
                       >
                         <Trash2 size={16} aria-hidden="true" />
                       </IconButton>
@@ -563,9 +631,8 @@ export const NewProject = () => {
                       checked={kind === k}
                       onChange={() => {
                         setKind(k);
-                        // 接手：选中就读一次各环境的库（还没读过的话）
-                        if (k === 'takeover' && filledEnvs.length > 0 && Object.keys(takeReads).length === 0)
-                          void readTakeover();
+                        // 接手：选中时自动补读尚未读取的环境
+                        if (k === 'takeover') readMissingTakeover();
                       }}
                     />
                     <span className="space-y-0.5">
@@ -590,15 +657,11 @@ export const NewProject = () => {
                         <button
                           type="button"
                           className="btn"
-                          disabled={Object.values(takeReads).some((r) => r.loading)}
-                          aria-busy={Object.values(takeReads).some((r) => r.loading) || undefined}
-                          onClick={() => void readTakeover()}
+                          disabled={takeReading}
+                          aria-busy={takeReading || undefined}
+                          onClick={() => void readTakeover(filledEnvs, true)}
                         >
-                          {Object.values(takeReads).some((r) => r.loading)
-                            ? t('tk.reading')
-                            : Object.keys(takeReads).length
-                              ? t('tk.reread')
-                              : t('tk.read')}
+                          {takeReading ? t('tk.reading') : hasAnyTakeRead ? t('tk.reread') : t('tk.read')}
                         </button>
                       </div>
                       {filledEnvs.map(
@@ -666,7 +729,7 @@ export const NewProject = () => {
                           })}
                         </fieldset>
                       )}
-                      {takeCand && takeMissing.length > 0 && (
+                      {readsDone && takeCand && takeMissing.length > 0 && (
                         <Banner kind="warn" role="alert">
                           {t('tk.missingIn', { envs: takeMissing.map((e) => e.name).join('、') })}
                         </Banner>
@@ -922,7 +985,7 @@ export const NewProject = () => {
               type="button"
               className="btn"
               onClick={() => goto(step - 1)}
-              disabled={step === 0 || busy}
+              disabled={step === 0 || busy || created !== null}
             >
               {t('wiz.back')}
             </button>

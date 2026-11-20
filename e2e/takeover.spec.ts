@@ -310,6 +310,159 @@ test('ADR 0012：生产环境接手配置独立影子库 + 接入领先环境（
   }
 });
 
+test('接手：修改/增删环境与切组精确失效并自动补读，同名环境按 key 匹配', async ({ browser }) => {
+  const { db, admin, group, name } = await lostInstance(browser);
+  const empty = await newTargetDb('e2e_tk_cache_empty');
+  try {
+    // 准备第二个组，用于验证切组重置接手状态并重读
+    await admin.goto('/');
+    const group2 = await createGroup(admin);
+    const page = await instanceAdmin(browser);
+
+    await wizardToTakeover(page, group.name, '缓存失效回归', empty);
+    await expect(page.getByText('这个库里没有 Dowel 的迁移历史。')).toBeVisible();
+
+    // 修改环境连接串：缓存精确失效，回到第 2 步自动重读新库（无需点“重新读取”）
+    await page.getByRole('button', { name: '上一步' }).click();
+    await page.getByLabel('连接串', { exact: true }).fill(db.url);
+    await page.getByRole('button', { name: '下一步' }).click();
+    const pick = page.getByRole('radio', { name: new RegExp(name) });
+    await expect(pick).toBeVisible();
+    await pick.check();
+    await expect(page.getByRole('button', { name: '下一步' })).toBeEnabled();
+
+    // 新增一个同名环境（同样叫 dev，但指向空库）：自动补读且按 e.key 判缺失，不会被同名误判掩盖
+    await page.getByRole('button', { name: '上一步' }).click();
+    await page.getByRole('button', { name: '添加数据库' }).click();
+    await page.getByRole('textbox', { name: /^名字/ }).nth(1).fill('dev');
+    await page.getByLabel('连接串', { exact: true }).nth(1).fill(empty.url);
+    await page.getByLabel('生产环境').nth(1).uncheck();
+    await page.getByRole('button', { name: '下一步' }).click();
+    await expect(page.getByText('环境“dev”的库里没有这个项目的历史')).toBeVisible();
+    await expect(page.getByRole('button', { name: '下一步' })).toBeDisabled();
+
+    // 删除新增环境：同步清理该环境缓存，缺失提示消失并恢复可下一步
+    await page.getByRole('button', { name: '上一步' }).click();
+    await page.getByRole('button', { name: '移除 dev' }).nth(1).click();
+    await page.getByRole('button', { name: '下一步' }).click();
+    await expect(page.getByText('环境“dev”的库里没有这个项目的历史')).toHaveCount(0);
+    await expect(page.getByRole('button', { name: '下一步' })).toBeEnabled();
+
+    // 切组：清空 takeReads 与 takeProject，再进第 2 步自动重读且已选项目被清空
+    await page.getByRole('button', { name: '上一步' }).click();
+    await page.getByRole('button', { name: '上一步' }).click();
+    await page.getByRole('combobox', { name: /^组/ }).selectOption({ label: group2.name });
+    await page.getByRole('button', { name: '下一步' }).click();
+    const reread = page.waitForResponse(
+      (r) => r.url().includes('/api/takeover/inspect') && r.request().method() === 'POST',
+    );
+    await page.getByRole('button', { name: '下一步' }).click();
+    await reread;
+    const pickAfterGroup = page.getByRole('radio', { name: new RegExp(name) });
+    await expect(pickAfterGroup).toBeVisible();
+    await expect(pickAfterGroup).not.toBeChecked();
+    await expect(page.getByRole('button', { name: '下一步' })).toBeDisabled();
+  } finally {
+    await Promise.all([db.drop(), empty.drop()]);
+  }
+});
+
+test('接手：第 3 步遇 SSE claim_required（TOCTOU）弹出认领确认框并带 claim 成功认领', async ({ browser }) => {
+  const db = await newTargetDb('e2e_tk_toctou');
+  try {
+    const admin = await instanceAdmin(browser);
+    const group = await createGroup(admin);
+    const origName = `TOCTOU 原项目 ${Math.random().toString(36).slice(2, 6)}`;
+    await createProjectIn(admin, origName, group.name);
+    await addEnv(admin, 'dev', db.url, false);
+    await publishTable(admin, 'orders', 'v1', 1);
+    await openEnv(admin, 'dev');
+    await executeAll(admin);
+    // 删除项目，但保持目标库的 instance_id 为本实例（inspect 时 mine=true、takeClaim=null）
+    const list = (await (await admin.request.get('/api/projects')).json()) as {
+      id: string;
+      name: string;
+      slug: string;
+    }[];
+    const p = list.find((x) => x.name === origName)!;
+    expect((await admin.request.delete(`/api/projects/${p.id}`, { data: { confirm: p.slug } })).ok()).toBe(
+      true,
+    );
+
+    const page = await instanceAdmin(browser);
+    await wizardToTakeover(page, group.name, 'TOCTOU 接手项目', db);
+    const pick = page.getByRole('radio', { name: new RegExp(origName) });
+    await expect(pick).toBeVisible();
+    await expect(page.getByText('本实例认领')).toBeVisible();
+    await pick.check();
+    await page.getByRole('button', { name: '下一步' }).click();
+    await expect(page.getByRole('heading', { name: /^确认/ })).toBeVisible();
+    await expect(page.getByRole('main')).not.toContainText('会认领这些库里的项目');
+
+    // 提交前目标库被另一实例认领：触发服务端 SSE code=claim_required
+    await db.sql("update dowel.projects set instance_id = 'late-other-instance'");
+    await page.getByRole('button', { name: '创建项目' }).click();
+    const claim = page.getByRole('dialog', { name: '认领这个项目？' });
+    await expect(claim).toBeVisible();
+    await expect(page.getByText('创建失败')).toHaveCount(0);
+
+    // 确认认领：即便 takeClaim 为 null 也应携带 claim: true 完成接手并认领目标库
+    await claim.getByRole('button', { name: '确认认领并接手' }).click();
+    await expect(page.getByRole('heading', { name: '概览' })).toBeVisible({ timeout: 60_000 });
+    const [row] = await db.sql<{ i: string; p: string }>(
+      'select instance_id as i, previous_instance_id as p from dowel.projects',
+    );
+    expect(row!.i).not.toBe('late-other-instance');
+    expect(row!.p).toBe('late-other-instance');
+  } finally {
+    await db.drop();
+  }
+});
+
+test('接手：带 warnings 创建成功后停留在第 3 步并禁用「上一步」', async ({ browser }) => {
+  const { db, group, name } = await lostInstance(browser);
+  try {
+    const page = await instanceAdmin(browser);
+    await wizardToTakeover(page, group.name, '带警告接手项目', db);
+    await page.getByRole('radio', { name: new RegExp(name) }).check();
+    await page.getByRole('button', { name: '下一步' }).click();
+    await expect(page.getByRole('heading', { name: /^确认/ })).toBeVisible();
+
+    // 转发真实创建请求，为最终 done 事件附带一条 warning（稳定覆盖带 warnings 的前端状态机）
+    await page.route('**/api/projects/wizard', async (route) => {
+      const response = await route.fetch();
+      const raw = await response.text();
+      const patched = raw
+        .split('\n\n')
+        .map((frame) => {
+          if (!frame.startsWith('data: ')) return frame;
+          const payload = JSON.parse(frame.slice(6)) as { stage?: string; warnings?: string[] };
+          if (payload.stage === 'done') {
+            payload.warnings = ['环境“dev”认领失败：模拟网络波动，项目已经建好，可以在环境页重试认领'];
+          }
+          return `data: ${JSON.stringify(payload)}`;
+        })
+        .join('\n\n');
+      await route.fulfill({ response, body: patched });
+    });
+
+    await page.getByRole('button', { name: '创建项目' }).click();
+    const claim = page.getByRole('dialog', { name: '认领这个项目？' });
+    await expect(claim).toBeVisible();
+    await claim.getByRole('button', { name: '确认认领并接手' }).click();
+
+    await expect(page.getByText('项目已经建好，但有没做完的事')).toBeVisible({ timeout: 60_000 });
+    await expect(page.getByText(/模拟网络波动/)).toBeVisible();
+    await expect(page.getByRole('button', { name: '上一步' })).toBeDisabled();
+    await expect(page.getByRole('button', { name: '创建项目' })).toBeDisabled();
+
+    await page.getByRole('button', { name: '进入项目' }).click();
+    await expect(page.getByRole('heading', { name: '概览' })).toBeVisible();
+  } finally {
+    await db.drop();
+  }
+});
+
 for (const scheme of ['light', 'dark'] as const) {
   test(`无障碍（${scheme}）：接手向导选项目、认领确认、环境页的认领横幅`, async ({ browser }) => {
     const { db, admin: page, group, name } = await lostInstance(browser, scheme);
