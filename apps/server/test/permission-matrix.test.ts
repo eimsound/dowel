@@ -477,6 +477,20 @@ const matrix: Record<string, Spec> = {
     access: { kind: 'project', min: 'viewer', statuses: [200] },
     path: () => `${P()}/activity`,
   },
+  // 画布修改历史（C4）：查看者可读列表与详情，编辑者以上可恢复
+  'GET /api/projects/:pid/history': {
+    access: { kind: 'project', min: 'viewer', statuses: [200] },
+    path: () => `${P()}/history`,
+  },
+  'GET /api/projects/:pid/history/:seq': {
+    access: { kind: 'project', min: 'viewer', statuses: [200] },
+    path: () => `${P()}/history/0`,
+  },
+  'POST /api/projects/:pid/history/:seq/restore': {
+    access: { kind: 'project', min: 'editor', statuses: [400] },
+    path: () => `${P()}/history/0/restore`,
+    body: () => ({ workingSeq: -1 }),
+  },
   'POST /api/projects/:pid/versions': {
     access: { kind: 'project', min: 'editor', statuses: [400] },
     path: () => `${P()}/versions`,

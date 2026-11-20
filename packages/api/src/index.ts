@@ -1485,3 +1485,5 @@ export type Ok = z.infer<typeof okSchema>;
 
 export const apiErrorSchema = z.object({ error: z.string() });
 export type ApiErrorBody = z.infer<typeof apiErrorSchema>;
+
+export * from './canvas-history.ts';

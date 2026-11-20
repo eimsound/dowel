@@ -11,6 +11,7 @@ import {
   FileCode,
   FileInput,
   GitCompareArrows,
+  History,
   Network,
   PanelRight,
   PanelRightClose,
@@ -23,6 +24,7 @@ import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import { useTranslation } from 'react-i18next';
 import { api } from '../api.ts';
 import { Canvas } from '../components/Canvas.tsx';
+import { CanvasHistory } from '../components/CanvasHistory.tsx';
 import { ImportDialog, MigrationDialog, VersionDialog } from '../components/Dialogs.tsx';
 import { Inspector } from '../components/Inspector.tsx';
 import { PageHeader, useNarrow, useShellPanel } from '../components/Shell.tsx';
@@ -35,7 +37,7 @@ import { clearTables, SELECT_TABLE_EVENT, setCurrentTables } from '../current-ta
 import { useProject } from '../project.tsx';
 import { useWorkspace } from '../workspace.ts';
 
-type DialogKey = 'import' | 'publish' | 'migration' | null;
+type DialogKey = 'import' | 'publish' | 'migration' | 'history' | null;
 
 /** 属性面板的固定状态存在 localStorage（DESIGN.md：Layout） */
 const PIN_KEY = 'dowel.inspector';
@@ -201,6 +203,16 @@ export const Model = () => {
             </div>
             <span className="h-5 w-px bg-border" aria-hidden="true" />
             <div className="flex gap-1.5">
+              <button
+                type="button"
+                className="btn"
+                aria-label={t('hist.open')}
+                title={t('hist.open')}
+                onClick={() => setDialog('history')}
+              >
+                <History size={16} aria-hidden="true" />
+                <span className="max-[1080px]:hidden">{t('hist.open')}</span>
+              </button>
               {!readOnly && (
                 <button type="button" className="btn" onClick={() => setDialog('publish')}>
                   <BookmarkPlus size={16} aria-hidden="true" />
@@ -331,6 +343,13 @@ export const Model = () => {
       <ImportDialog pid={pid} open={dialog === 'import'} onClose={close} />
       <VersionDialog pid={pid} open={dialog === 'publish'} onClose={close} />
       <MigrationDialog pid={pid} open={dialog === 'migration'} onClose={close} />
+      <CanvasHistory
+        pid={pid}
+        open={dialog === 'history'}
+        onClose={close}
+        readOnly={readOnly}
+        layout={layout}
+      />
     </>
   );
 };
