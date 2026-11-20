@@ -253,6 +253,224 @@ describe.each([
   });
 });
 
+describe.skipIf(!PG_URL)('PlatformDb.withAdvisoryLock：独立锁池、满载超时与解锁失败销毁（真实 PG）', () => {
+  const closers: (() => Promise<void>)[] = [];
+  afterAll(async () => {
+    for (const c of closers) await c();
+  });
+
+  test('并发持有 12 个不同 key 锁时，锁内业务查询/事务与 HaCoordinator.renew() 均不死锁', async () => {
+    const t = await createTestDb('ha_lock_pool_isolation');
+    closers.push(t.close);
+    const db = await openPlatformDb(t.url);
+    const ha = new HaCoordinator(db, { replicaId: 'node-concurrent', ttlMs: 5_000 });
+    const count = 12; // 超过主连接池默认 max=10
+
+    try {
+      let entered = 0;
+      let allInLock!: () => void;
+      const allEntered = new Promise<void>((r) => {
+        allInLock = r;
+      });
+      let releaseAll!: () => void;
+      const holdAll = new Promise<void>((r) => {
+        releaseAll = r;
+      });
+
+      const tasks = Array.from({ length: count }, (_, i) =>
+        db.withAdvisoryLock(`concurrent:key:${i}`, async () => {
+          entered++;
+          if (entered === count) allInLock();
+          await holdAll;
+
+          // 在全部 12 个锁同时被持有期间并发执行主池查询、事务与心跳续租
+          const [ping] = await db.query<{ n: number }>('select $1::int as n', [i]);
+          const txVal = await db.transaction(async (tx) => {
+            const [r] = await tx.query<{ v: number }>('select $1::int + 100 as v', [i]);
+            return r!.v;
+          });
+          await ha.renew();
+          return { ping: ping!.n, txVal };
+        }),
+      );
+
+      // 等所有 12 个锁都真正进入回调后再放行，确保同时持有 12 条锁连接
+      await waitFor(() => entered === count, 10_000);
+      await allEntered;
+      // 在 12 个锁全部占用期间，外部直接调用 renew() 与查询也必须畅通
+      await ha.renew();
+      expect(await ha.isNodeAlive('node-concurrent')).toBe(true);
+
+      releaseAll();
+      const results = await Promise.all(tasks);
+      for (let i = 0; i < count; i++) {
+        expect(results[i]).toEqual({ acquired: true, value: { ping: i, txVal: i + 100 } });
+      }
+
+      const [locks] = await db.query<{ n: number }>(
+        `select count(*)::int as n from pg_locks
+         where locktype = 'advisory'
+           and database = (select oid from pg_database where datname = current_database())`,
+      );
+      expect(locks!.n).toBe(0);
+    } finally {
+      await ha.stop();
+      await db.close();
+    }
+  });
+
+  test('锁池满载时 tryOnly 与短 timeoutMs 在时限内返回 acquired=false，释放后恢复正常加锁', async () => {
+    const t = await createTestDb('ha_lock_pool_full');
+    closers.push(t.close);
+    const poolMax = 2;
+    const db = await openPlatformDb(t.url, { advisoryLockPoolMax: poolMax });
+
+    try {
+      const releases: (() => void)[] = [];
+      let entered = 0;
+      const holders = Array.from({ length: poolMax }, (_, i) =>
+        db.withAdvisoryLock(`full:hold:${i}`, async () => {
+          entered++;
+          await new Promise<void>((r) => {
+            releases.push(r);
+          });
+          return i;
+        }),
+      );
+      await waitFor(() => entered === poolMax, 5_000);
+
+      // 锁池满载：tryOnly 与默认 timeoutMs=0 立即返回 { acquired: false }，不挂起
+      const tTry = Date.now();
+      expect(await db.withAdvisoryLock('full:extra:try', async () => 'nope', { tryOnly: true })).toEqual({
+        acquired: false,
+      });
+      expect(Date.now() - tTry).toBeLessThan(500);
+
+      const tZero = Date.now();
+      expect(await db.withAdvisoryLock('full:extra:zero', async () => 'nope')).toEqual({
+        acquired: false,
+      });
+      expect(Date.now() - tZero).toBeLessThan(500);
+
+      // 锁池满载：带短 timeoutMs 在时限内返回 { acquired: false }，不会无限挂起
+      const tShort = Date.now();
+      expect(await db.withAdvisoryLock('full:extra:short', async () => 'nope', { timeoutMs: 120 })).toEqual({
+        acquired: false,
+      });
+      const elapsed = Date.now() - tShort;
+      expect(elapsed).toBeGreaterThanOrEqual(80);
+      expect(elapsed).toBeLessThan(1500);
+
+      // 带较长超时的等待者在其中一个持有者释放槽位后立即拿到锁
+      const waiting = db.withAdvisoryLock('full:extra:wait', async () => 'got-slot', { timeoutMs: 3_000 });
+      await new Promise((r) => setTimeout(r, 60));
+      releases[0]!();
+      expect(await waiting).toEqual({ acquired: true, value: 'got-slot' });
+
+      releases[1]!();
+      expect(await Promise.all(holders)).toEqual([
+        { acquired: true, value: 0 },
+        { acquired: true, value: 1 },
+      ]);
+
+      // 池全部释放后恢复正常并发加锁
+      expect(await db.withAdvisoryLock('full:after', async () => 'ok', { tryOnly: true })).toEqual({
+        acquired: true,
+        value: 'ok',
+      });
+    } finally {
+      await db.close();
+    }
+  });
+
+  test('解锁返回非 true、解锁抛错或持锁连接被强杀时均销毁连接，绝不泄漏会话级 advisory lock', async () => {
+    const t = await createTestDb('ha_lock_unlock_fail');
+    closers.push(t.close);
+    let mode: 'normal' | 'return-false' | 'throw' = 'normal';
+    const dbA = await openPlatformDb(t.url, {
+      advisoryLockPoolMax: 2,
+      advisoryUnlock: async (conn, k1, k2) => {
+        if (mode === 'return-false') return false;
+        if (mode === 'throw') throw new Error('模拟 pg_advisory_unlock 异常');
+        const rows = await conn.unsafe<{ ok: boolean }[]>(
+          'select pg_advisory_unlock($1::int, $2::int) as ok',
+          [k1, k2],
+        );
+        return rows[0]?.ok === true;
+      },
+    });
+    const dbB = await openPlatformDb(t.url);
+
+    const countAdvisoryLocks = async () => {
+      const [row] = await dbB.query<{ n: number }>(
+        `select count(*)::int as n from pg_locks
+         where locktype = 'advisory'
+           and database = (select oid from pg_database where datname = current_database())`,
+      );
+      return row!.n;
+    };
+
+    try {
+      // 1. 模拟 pg_advisory_unlock 返回 false（会话仍存活且真实持有 PG advisory lock）
+      mode = 'return-false';
+      const r1 = await dbA.withAdvisoryLock('leak:false', async () => {
+        expect(await countAdvisoryLocks()).toBe(1);
+        return 'done-false';
+      });
+      expect(r1).toEqual({ acquired: true, value: 'done-false' });
+      expect(await countAdvisoryLocks()).toBe(0);
+      expect(await dbB.withAdvisoryLock('leak:false', async () => 'b-ok', { tryOnly: true })).toEqual({
+        acquired: true,
+        value: 'b-ok',
+      });
+
+      // 2. 模拟 pg_advisory_unlock 抛错（会话仍存活且真实持有 PG advisory lock）
+      mode = 'throw';
+      const r2 = await dbA.withAdvisoryLock('leak:throw', async () => {
+        expect(await countAdvisoryLocks()).toBe(1);
+        return 'done-throw';
+      });
+      expect(r2).toEqual({ acquired: true, value: 'done-throw' });
+      expect(await countAdvisoryLocks()).toBe(0);
+      expect(await dbB.withAdvisoryLock('leak:throw', async () => 'b-ok-2', { tryOnly: true })).toEqual({
+        acquired: true,
+        value: 'b-ok-2',
+      });
+
+      // 3. 真实 PG：持锁期间后端被外部 pg_terminate_backend 强杀，解锁收到断连错误后可正常恢复
+      mode = 'normal';
+      const r3 = await dbA.withAdvisoryLock('leak:killed', async () => {
+        expect(await countAdvisoryLocks()).toBe(1);
+        await dbB.query(
+          `select pg_terminate_backend(pid)
+           from pg_locks
+           where locktype = 'advisory'
+             and database = (select oid from pg_database where datname = current_database())`,
+        );
+        return 'done-killed';
+      });
+      expect(r3).toEqual({ acquired: true, value: 'done-killed' });
+      expect(await countAdvisoryLocks()).toBe(0);
+
+      // 销毁损坏连接后，dbA 自身连接池仍可打开新连接正常加锁与解锁
+      expect(await dbA.withAdvisoryLock('leak:false', async () => 'a-recovered', { tryOnly: true })).toEqual({
+        acquired: true,
+        value: 'a-recovered',
+      });
+      expect(
+        await dbA.withAdvisoryLock('leak:throw', async () => 'a-recovered-2', { tryOnly: true }),
+      ).toEqual({
+        acquired: true,
+        value: 'a-recovered-2',
+      });
+      expect(await countAdvisoryLocks()).toBe(0);
+    } finally {
+      await dbA.close();
+      await dbB.close();
+    }
+  });
+});
+
 // ───── 3. EventBus（SQLite + PG LISTEN/NOTIFY 跨连接与重连） ─────
 
 describe('EventBus：SQLite 进程内回调', () => {

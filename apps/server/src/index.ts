@@ -11,6 +11,8 @@ export {
 export {
   type AdvisoryLockOptions,
   type AdvisoryLockResult,
+  DEFAULT_ADVISORY_LOCK_POOL_MAX,
+  type OpenPlatformDbOptions,
   openPlatformDb,
   type PlatformDb,
 } from './db.ts';

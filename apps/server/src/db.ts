@@ -42,6 +42,13 @@ export interface AdvisoryLockOptions {
 
 export type AdvisoryLockResult<T> = { acquired: true; value: T } | { acquired: false };
 
+export interface OpenPlatformDbOptions {
+  /** PG advisory lock 专用连接池最大连接数（默认 16，与主业务连接池隔离） */
+  advisoryLockPoolMax?: number;
+  /** 仅用于测试：替换 PG advisory lock 解锁执行逻辑，用于模拟解锁抛错或返回非 true 时销毁连接防锁泄漏 */
+  advisoryUnlock?: (conn: postgres.ReservedSql, k1: number, k2: number) => Promise<boolean>;
+}
+
 export interface PlatformDb extends Db {
   dialect: Dialect;
   transaction<T>(fn: (tx: Db) => Promise<T>): Promise<T>;
@@ -1108,6 +1115,12 @@ const migrate = async (db: PlatformDb) => {
 const MAX_NOTIFY_BYTES = 7500;
 /** PG advisory lock 轮询等待间隔（毫秒） */
 const ADVISORY_POLL_MS = 50;
+/** PG advisory lock 专用连接池默认上限（独立于主业务池，避免并发持锁占满业务连接引发自死锁） */
+export const DEFAULT_ADVISORY_LOCK_POOL_MAX = 16;
+/** PG advisory lock 专用连接空闲回收时间（秒） */
+const ADVISORY_LOCK_IDLE_TIMEOUT_SEC = 30;
+/** 解锁失败后强制销毁/终止连接时的上限等待时间（毫秒） */
+const ADVISORY_DESTROY_TIMEOUT_MS = 2_000;
 
 /** 把字符串锁键映射为双 32 位有符号整数，供 pg_try_advisory_lock(int4, int4) 使用（兼容所有 PG 版本且与 1-arg 项目锁空间隔离） */
 const advisoryKeyPair = (key: string): [number, number] => {
@@ -1130,7 +1143,54 @@ const sleep = (ms: number) =>
     timer.unref?.();
   });
 
-const openPg = (url: string): PlatformDb => {
+const isClosedConnError = (e: unknown): boolean => {
+  const code = (e as { code?: unknown } | null)?.code;
+  return (
+    code === 'CONNECTION_CLOSED' ||
+    code === 'CONNECTION_DESTROYED' ||
+    code === 'CONNECTION_ENDED' ||
+    code === '57P01'
+  );
+};
+
+/** 在 ms 毫秒内等待 promise 完成；超时后吞掉原 promise 迟到产生的 rejection，避免未处理异常 */
+const raceWithTimeout = <T>(
+  promise: Promise<T>,
+  ms: number,
+): Promise<{ timedOut: false; value: T } | { timedOut: true }> =>
+  new Promise((resolve, reject) => {
+    if (ms <= 0) {
+      promise.then(
+        () => {},
+        () => {},
+      );
+      resolve({ timedOut: true });
+      return;
+    }
+    let settled = false;
+    const timer = setTimeout(() => {
+      if (settled) return;
+      settled = true;
+      resolve({ timedOut: true });
+    }, ms);
+    timer.unref?.();
+    promise.then(
+      (value) => {
+        if (settled) return;
+        settled = true;
+        clearTimeout(timer);
+        resolve({ timedOut: false, value });
+      },
+      (err) => {
+        if (settled) return;
+        settled = true;
+        clearTimeout(timer);
+        reject(err);
+      },
+    );
+  });
+
+const openPg = (url: string, options?: OpenPlatformDbOptions): PlatformDb => {
   // bigint（seq）读成 number，与 SQLite 一致；序号不会超过 2^53
   const sql = postgres(url, {
     onnotice: () => {},
@@ -1138,6 +1198,171 @@ const openPg = (url: string): PlatformDb => {
       bigint: { to: 20, from: [20], serialize: (x: number) => String(x), parse: (x: string) => Number(x) },
     },
   });
+  const lockPoolMax = Math.max(1, Math.floor(options?.advisoryLockPoolMax ?? DEFAULT_ADVISORY_LOCK_POOL_MAX));
+  const advisoryUnlock = options?.advisoryUnlock;
+  // advisory lock 使用独立专用连接池（按需创建），彻底与主业务查询池/心跳续租池隔离
+  let lockSql: postgres.Sql | null = null;
+  let closing = false;
+  let activeLockSlots = 0;
+  type SlotWaiter = { grant: () => void; abort: (err: Error) => void };
+  const slotWaiters: SlotWaiter[] = [];
+
+  const getLockSql = () => {
+    if (!lockSql) {
+      lockSql = postgres(url, {
+        max: lockPoolMax,
+        idle_timeout: ADVISORY_LOCK_IDLE_TIMEOUT_SEC,
+        onnotice: () => {},
+        fetch_types: false,
+      });
+    }
+    return lockSql;
+  };
+
+  const releaseLockSlot = () => {
+    const next = slotWaiters.shift();
+    if (next) {
+      next.grant();
+      return;
+    }
+    activeLockSlots = Math.max(0, activeLockSlots - 1);
+  };
+
+  const acquireLockSlot = async (deadline: number, tryOnly: boolean): Promise<boolean> => {
+    if (closing) throw new Error('PG 平台库连接池已关闭');
+    if (activeLockSlots < lockPoolMax) {
+      activeLockSlots++;
+      return true;
+    }
+    if (tryOnly) return false;
+    const left = deadline - Date.now();
+    if (left <= 0) return false;
+    return await new Promise<boolean>((resolve, reject) => {
+      let settled = false;
+      const waiter: SlotWaiter = {
+        grant: () => {
+          if (settled) return;
+          settled = true;
+          clearTimeout(timer);
+          resolve(true);
+        },
+        abort: (err) => {
+          if (settled) return;
+          settled = true;
+          clearTimeout(timer);
+          reject(err);
+        },
+      };
+      const timer = setTimeout(() => {
+        if (settled) return;
+        settled = true;
+        const idx = slotWaiters.indexOf(waiter);
+        if (idx !== -1) slotWaiters.splice(idx, 1);
+        resolve(false);
+      }, left);
+      timer.unref?.();
+      slotWaiters.push(waiter);
+    });
+  };
+
+  const reserveLockConn = async (
+    deadline: number,
+    tryOnly: boolean,
+    hasTimeout: boolean,
+  ): Promise<postgres.ReservedSql | null> => {
+    const gotSlot = await acquireLockSlot(deadline, tryOnly);
+    if (!gotSlot) return null;
+
+    if (hasTimeout && deadline - Date.now() <= 0) {
+      releaseLockSlot();
+      return null;
+    }
+
+    let reservePromise: Promise<postgres.ReservedSql>;
+    try {
+      reservePromise = getLockSql().reserve();
+    } catch (e) {
+      releaseLockSlot();
+      throw e;
+    }
+
+    if (!hasTimeout) {
+      try {
+        return await reservePromise;
+      } catch (e) {
+        releaseLockSlot();
+        throw e;
+      }
+    }
+
+    const left = deadline - Date.now();
+    try {
+      const raced = await raceWithTimeout(reservePromise, left);
+      if (raced.timedOut) {
+        // 防止迟到拿到的 reserved 连接泄漏；等该次 reserve 真正落定后再归还槽位，避免并发数突破 lockPoolMax
+        reservePromise.then(
+          (lateConn) => {
+            lateConn.release();
+            releaseLockSlot();
+          },
+          () => {
+            releaseLockSlot();
+          },
+        );
+        return null;
+      }
+      return raced.value;
+    } catch (e) {
+      releaseLockSlot();
+      throw e;
+    }
+  };
+
+  /**
+   * 销毁异常/未确认解锁的 reserved 连接，防止携带会话级 advisory lock 的空闲连接被放回池中复用。
+   * postgres@4.1.1 的 reserved.release() 在连接处于非空闲事务状态（c.status !== 'I'）时会调用 c.close() 关闭底层连接；
+   * 先发 BEGIN 置为事务态，再通过主池 pg_terminate_backend 强杀并等待后端退出，最后 release() 彻底淘汰该连接。
+   */
+  const destroyReserved = async (
+    reserved: postgres.ReservedSql,
+    backendPid: number | null,
+    alreadyClosed: boolean,
+  ): Promise<void> => {
+    try {
+      if (!alreadyClosed) {
+        let closedByBegin = false;
+        try {
+          await raceWithTimeout(reserved.unsafe('begin'), ADVISORY_DESTROY_TIMEOUT_MS);
+        } catch (e) {
+          if (isClosedConnError(e)) closedByBegin = true;
+        }
+
+        if (!closedByBegin && backendPid !== null) {
+          try {
+            await raceWithTimeout(
+              sql.unsafe('select pg_terminate_backend($1::int, $2::bigint)', [
+                backendPid,
+                ADVISORY_DESTROY_TIMEOUT_MS,
+              ]),
+              ADVISORY_DESTROY_TIMEOUT_MS + 500,
+            );
+          } catch (e) {
+            // 兼容 PG < 14（无 2 参数重载 pg_terminate_backend(int, bigint)）
+            const code = (e as { code?: unknown } | null)?.code;
+            if (code === '42883') {
+              await raceWithTimeout(
+                sql.unsafe('select pg_terminate_backend($1::int)', [backendPid]),
+                ADVISORY_DESTROY_TIMEOUT_MS,
+              ).catch(() => {});
+            }
+          }
+        }
+      }
+    } finally {
+      reserved.release();
+    }
+  };
+
   const wrap = (s: postgres.Sql | postgres.TransactionSql): Db => ({
     query: async <T>(q: string, params?: unknown[]) =>
       (await s.unsafe(q, params as never[])) as unknown as T[],
@@ -1191,25 +1416,30 @@ const openPg = (url: string): PlatformDb => {
     withAdvisoryLock: async <T>(
       key: string,
       fn: () => Promise<T>,
-      options?: AdvisoryLockOptions,
+      lockOptions?: AdvisoryLockOptions,
     ): Promise<AdvisoryLockResult<T>> => {
       const [k1, k2] = advisoryKeyPair(key);
-      const tryOnly = options?.tryOnly === true;
-      const timeoutMs = tryOnly ? 0 : Math.max(0, options?.timeoutMs ?? 0);
+      const tryOnly = lockOptions?.tryOnly === true;
+      const timeoutMs = tryOnly ? 0 : Math.max(0, lockOptions?.timeoutMs ?? 0);
+      const hasTimeout = !tryOnly && timeoutMs > 0;
       const deadline = Date.now() + timeoutMs;
       let reserved: postgres.ReservedSql | null = null;
+      let backendPid: number | null = null;
       for (;;) {
-        // 每次尝试独占一条连接；拿不到锁立即归还连接后再 sleep，避免多协程等锁耗尽连接池导致死锁
-        const conn = await sql.reserve();
+        // 每次尝试从独立锁池独占一条连接；拿不到锁立即归还连接与槽位后再 sleep，避免等锁占用锁池容量
+        const conn = await reserveLockConn(deadline, tryOnly, hasTimeout);
+        if (!conn) return { acquired: false };
         let acquired = false;
         try {
-          const rows = await conn.unsafe<{ ok: boolean }[]>(
-            'select pg_try_advisory_lock($1::int, $2::int) as ok',
+          const rows = await conn.unsafe<{ ok: boolean; pid: number }[]>(
+            'select pg_try_advisory_lock($1::int, $2::int) as ok, pg_backend_pid() as pid',
             [k1, k2],
           );
           acquired = rows[0]?.ok === true;
+          backendPid = typeof rows[0]?.pid === 'number' ? rows[0].pid : null;
         } catch (e) {
-          conn.release();
+          await destroyReserved(conn, null, isClosedConnError(e));
+          releaseLockSlot();
           throw e;
         }
         if (acquired) {
@@ -1217,6 +1447,7 @@ const openPg = (url: string): PlatformDb => {
           break;
         }
         conn.release();
+        releaseLockSlot();
         if (tryOnly) return { acquired: false };
         const left = deadline - Date.now();
         if (left <= 0) return { acquired: false };
@@ -1226,13 +1457,39 @@ const openPg = (url: string): PlatformDb => {
         const value = await fn();
         return { acquired: true, value };
       } finally {
-        await reserved.unsafe('select pg_advisory_unlock($1::int, $2::int) as ok', [k1, k2]).catch((e) => {
-          console.error(`释放 PG advisory lock 失败（${key}）`, e);
-        });
-        reserved.release();
+        let unlocked = false;
+        let unlockClosedConn = false;
+        try {
+          if (advisoryUnlock) {
+            unlocked = (await advisoryUnlock(reserved, k1, k2)) === true;
+          } else {
+            const rows = await reserved.unsafe<{ ok: boolean }[]>(
+              'select pg_advisory_unlock($1::int, $2::int) as ok',
+              [k1, k2],
+            );
+            unlocked = rows[0]?.ok === true;
+          }
+          if (!unlocked) {
+            console.error(`释放 PG advisory lock 返回非 true（${key}），将销毁连接以防会话级锁泄漏`);
+          }
+        } catch (e) {
+          unlockClosedConn = isClosedConnError(e);
+          console.error(`释放 PG advisory lock 失败（${key}），将销毁连接以防会话级锁泄漏`, e);
+        }
+        if (unlocked) {
+          reserved.release();
+        } else {
+          await destroyReserved(reserved, backendPid, unlockClosedConn);
+        }
+        releaseLockSlot();
       }
     },
-    close: () => sql.end(),
+    close: async () => {
+      closing = true;
+      const err = new Error('PG 平台库连接池已关闭');
+      for (const w of slotWaiters.splice(0)) w.abort(err);
+      await Promise.all([sql.end(), lockSql ? lockSql.end() : Promise.resolve()]);
+    },
   };
 };
 
@@ -1368,8 +1625,8 @@ const openSqlite = (path: string): PlatformDb => {
  * url：`postgres://…` / `postgresql://…` 连接 PostgreSQL；`:memory:` 为内存中的 SQLite（重启即丢失）；
  * 其他值视为 SQLite 数据库文件的路径（目录不存在时自动创建）。
  */
-export const openPlatformDb = async (url: string): Promise<PlatformDb> => {
-  const db = /^postgres(ql)?:\/\//.test(url) ? openPg(url) : openSqlite(url);
+export const openPlatformDb = async (url: string, options?: OpenPlatformDbOptions): Promise<PlatformDb> => {
+  const db = /^postgres(ql)?:\/\//.test(url) ? openPg(url, options) : openSqlite(url);
   await migrate(db);
   return db;
 };
