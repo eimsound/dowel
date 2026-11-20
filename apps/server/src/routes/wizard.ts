@@ -117,6 +117,20 @@ export const registerWizard = (app: Hono<Env>, ctx: AppContext) => {
       // 本次请求新建的影子库：失败时清理（显式配置的影子库不删，那是用户的库）
       let createdShadow: { targetUrl: string; name: string } | null = null;
       let shadow: Shadow | null = null;
+      const closeShadow = async () => {
+        const s = shadow;
+        shadow = null;
+        await s?.close();
+      };
+      const cleanupShadow = async () => {
+        // 先关闭本请求自己的影子库连接，再尝试删库（不带 WITH (FORCE)，避免被自身连接阻塞）
+        await closeShadow();
+        if (!committed && createdShadow) {
+          const s = createdShadow;
+          createdShadow = null;
+          await dropSameInstanceShadow(s.targetUrl, s.name, ctx.guard);
+        }
+      };
       /** 验证报告里显示的影子库（与环境页的写法一致：环境名：库名） */
       let shadowLabel = '';
       let committed = false;
@@ -318,8 +332,7 @@ export const registerWizard = (app: Hono<Env>, ctx: AppContext) => {
           return;
         }
         // 提交之前失败：这次新建的影子库一并清理
-        if (createdShadow)
-          await dropSameInstanceShadow(createdShadow.targetUrl, createdShadow.name, ctx.guard);
+        await cleanupShadow();
         // 进度事件会发给客户端：预期的错误（校验、影子库、范围、密钥）给原因，先脱敏；
         // 意外错误（平台库约束冲突、代码错误）只记日志，和全局 onError 一样只告诉客户端“服务器内部错误”
         const expected =
@@ -331,7 +344,7 @@ export const registerWizard = (app: Hono<Env>, ctx: AppContext) => {
         const message = expected ? e.message : '服务器内部错误';
         await send({ stage, error: message });
       } finally {
-        await shadow?.close();
+        await closeShadow();
       }
     });
   });

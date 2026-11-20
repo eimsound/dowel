@@ -137,6 +137,20 @@ export const runTakeover = (c: Context<Env>, ctx: AppContext, b: ProjectWizard, 
     let committed = false;
     let shadow: Shadow | null = null;
     let createdShadow: { targetUrl: string; name: string } | null = null;
+    const closeShadow = async () => {
+      const s = shadow;
+      shadow = null;
+      await s?.close();
+    };
+    const cleanupShadow = async () => {
+      // 先关闭本请求自己的影子库连接，再尝试删库（不带 WITH (FORCE)，避免被自身连接阻塞）
+      await closeShadow();
+      if (!committed && createdShadow) {
+        const s = createdShadow;
+        createdShadow = null;
+        await dropSameInstanceShadow(s.targetUrl, s.name, ctx.guard);
+      }
+    };
     const project: ProjectCreated = {
       id: projectId,
       name: b.name,
@@ -393,7 +407,7 @@ export const runTakeover = (c: Context<Env>, ctx: AppContext, b: ProjectWizard, 
         return;
       }
       // 提交之前失败：清理本次新建的同实例影子库
-      if (createdShadow) await dropSameInstanceShadow(createdShadow.targetUrl, createdShadow.name, ctx.guard);
+      await cleanupShadow();
       let code: string | undefined;
       let message: string;
       if (e instanceof TakeoverRejected || (e instanceof ExecutorError && e.code !== 'unexpected')) {
@@ -414,7 +428,7 @@ export const runTakeover = (c: Context<Env>, ctx: AppContext, b: ProjectWizard, 
       }
       await send({ stage, error: message, ...(code ? { code } : {}) });
     } finally {
-      await shadow?.close();
+      await closeShadow();
     }
   });
 };

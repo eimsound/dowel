@@ -36,13 +36,18 @@ export type ShadowSetupStep = 'create' | 'claim' | 'claim-read' | 'check';
  *   · check：“检查影子库失败：…”。
  * 白名单拒绝（HTTPException）和已经是 ShadowError 的原样抛出。消息统一经 scrubSecrets：驱动错误里可能带着连接串。
  */
+const pgCode = (e: unknown): string | null => {
+  const code = (e as { code?: unknown } | null)?.code;
+  return typeof code === 'string' ? code : null;
+};
+
 export const shadowSetupError = (e: unknown, step: ShadowSetupStep): Error => {
   if (e instanceof HTTPException || e instanceof ShadowError) return e;
   const msg = pgError(e);
   if (isInfraFailure(e)) return new ShadowUnavailableError(msg);
   if (step === 'create') return new ShadowError(`建影子库失败：${msg}`);
   if (step === 'check') return new ShadowError(`检查影子库失败：${msg}`);
-  const noPrivilege = (e as { code?: unknown } | null)?.code === '42501';
+  const noPrivilege = pgCode(e) === '42501';
   if (step === 'claim-read')
     return new ShadowError(
       noPrivilege
@@ -212,9 +217,28 @@ export const inspectTarget = async (
   }
 };
 
+/** 维护库上同实例影子库生命周期锁（保护 CREATE / claim / DROP 互不干扰）的等待上限（毫秒） */
+const SHADOW_LIFECYCLE_LOCK_TIMEOUT_MS = 15_000;
+
+const tryShadowLifecycleLock = async (db: Db, name: string): Promise<boolean> => {
+  const [r] = await db.query<{ ok: boolean }>(
+    "select pg_try_advisory_lock(hashtext('dowel_shadow_lifecycle'), hashtext($1)) as ok",
+    [name],
+  );
+  return r?.ok === true;
+};
+
+const unlockShadowLifecycle = async (db: Db, name: string) => {
+  await db
+    .query("select pg_advisory_unlock(hashtext('dowel_shadow_lifecycle'), hashtext($1))", [name])
+    .catch(() => {});
+};
+
 /**
  * 确保目标实例上有影子库（没有就建），返回影子库的连接串。
- * `created` 表示这个库是本次调用新建的（平台库写入失败时可以把它删掉）。
+ * `created` 表示这个库是本次调用新建的（平台库写入失败时可以尝试清理）。
+ * 建库与认领受维护库上的会话级 advisory lock 保护；若仍遇到并发建库（42P04 / 23505），
+ * 回退到 claimShadow 复用并保持 created = false。
  */
 export const ensureSameInstanceShadow = async (
   targetUrl: string,
@@ -223,34 +247,89 @@ export const ensureSameInstanceShadow = async (
   const info = await inspectTarget(targetUrl, CHECK_CONNECT_TIMEOUT, guard);
   const url = withDb(targetUrl, info.shadow);
   let created = false;
-  if (!info.shadowExists) {
-    if (!info.canCreateDb)
-      throw new ShadowError(
-        `当前账号没有建库权限。请在目标实例上手动执行：CREATE DATABASE ${ident(info.shadow)} OWNER <Dowel 使用的账号>;`,
-      );
-    const c = connectPg(targetUrl, 10, guard);
-    try {
-      await c.db.exec(`CREATE DATABASE ${ident(info.shadow)}`);
-      created = true;
-    } catch (e) {
-      throw shadowSetupError(e, 'create');
-    } finally {
-      await c.close();
+  const c = connectPg(targetUrl, 10, guard);
+  let locked = false;
+  try {
+    const deadline = Date.now() + SHADOW_LIFECYCLE_LOCK_TIMEOUT_MS;
+    while (!(await tryShadowLifecycleLock(c.db, info.shadow))) {
+      if (Date.now() > deadline)
+        throw new ShadowUnavailableError('影子库正在被其他请求初始化或清理，请稍后再试');
+      await new Promise((r) => setTimeout(r, 100));
     }
+    locked = true;
+    const [ex] = await c.db.query<{ n: number }>(
+      'select count(*)::int as n from pg_database where datname = $1',
+      [info.shadow],
+    );
+    if ((ex?.n ?? 0) === 0) {
+      if (!info.canCreateDb)
+        throw new ShadowError(
+          `当前账号没有建库权限。请在目标实例上手动执行：CREATE DATABASE ${ident(info.shadow)} OWNER <Dowel 使用的账号>;`,
+        );
+      try {
+        await c.db.exec(`CREATE DATABASE ${ident(info.shadow)}`);
+        created = true;
+      } catch (e) {
+        const code = pgCode(e);
+        // 并发建库（如跨维护库或外部抢先建库）：回退到 claimShadow 复用，不记为本次新建
+        if (code !== '42P04' && code !== '23505') throw shadowSetupError(e, 'create');
+      }
+    }
+    await claimShadow(url, guard);
+  } catch (e) {
+    throw shadowSetupError(e, 'create');
+  } finally {
+    if (locked) await unlockShadowLifecycle(c.db, info.shadow);
+    await c.close().catch(() => {});
   }
-  await claimShadow(url, guard);
   return { url, shadow: info.shadow, created };
 };
 
-/** 删掉本次新建的影子库（平台库写入失败时清理用）；尽力而为，失败只记日志 */
+/**
+ * 删掉本次新建的影子库（平台库写入失败等预提交失败时清理用）；尽力而为，绝不强杀并发连接：
+ * - 非阻塞获取维护库生命周期锁：若正有其他请求在创建 / 认领 / 清理则安静跳过；
+ * - 校验目标库确实带有 SHADOW_MARK，绝不误删非影子库；
+ * - 连到影子库用非阻塞 advisory lock 确认当前无人持验证锁，有人在用则安静跳过；
+ * - 使用普通 DROP DATABASE IF EXISTS（不带 WITH (FORCE)），遇到 55006（object_in_use）安静跳过。
+ */
 export const dropSameInstanceShadow = async (targetUrl: string, name: string, guard?: ConnectionGuard) => {
   const c = connectPg(targetUrl, 10, guard);
+  let locked = false;
   try {
-    await c.db.exec(`DROP DATABASE IF EXISTS ${ident(name)} WITH (FORCE)`);
+    if (!(await tryShadowLifecycleLock(c.db, name))) return;
+    locked = true;
+    const [row] = await c.db.query<{ c: string | null }>(
+      "select shobj_description(oid, 'pg_database') as c from pg_database where datname = $1",
+      [name],
+    );
+    if (!row || row.c !== SHADOW_MARK) return;
+
+    const probe = connectPg(withDb(targetUrl, name), CHECK_CONNECT_TIMEOUT, guard);
+    let probeLocked = false;
+    try {
+      const [lk] = await probe.db.query<{ ok: boolean }>(
+        "select pg_try_advisory_lock(hashtext('dowel_shadow')) as ok",
+      );
+      if (!lk?.ok) return;
+      probeLocked = true;
+      if (!(await isMarked(probe.db))) return;
+    } catch (e) {
+      if (pgCode(e) === '3D000') return;
+      console.error('清理影子库前检查失败，跳过删除', name, pgError(e));
+      return;
+    } finally {
+      if (probeLocked)
+        await probe.db.query("select pg_advisory_unlock(hashtext('dowel_shadow'))").catch(() => {});
+      await probe.close().catch(() => {});
+    }
+
+    await c.db.exec(`DROP DATABASE IF EXISTS ${ident(name)}`);
   } catch (e) {
+    if (pgCode(e) === '55006') return;
     console.error('清理影子库失败', name, pgError(e));
   } finally {
-    await c.close();
+    if (locked) await unlockShadowLifecycle(c.db, name);
+    await c.close().catch(() => {});
   }
 };
 
@@ -271,7 +350,12 @@ export const claimShadow = async (url: string, guard?: ConnectionGuard) => {
       );
     const [d] = await c.db.query<{ d: string }>('select current_database() as d');
     phase = 'claim';
-    await c.db.exec(`COMMENT ON DATABASE ${ident(d!.d)} IS ${literal(SHADOW_MARK)}`);
+    try {
+      await c.db.exec(`COMMENT ON DATABASE ${ident(d!.d)} IS ${literal(SHADOW_MARK)}`);
+    } catch (e) {
+      if (pgCode(e) === 'XX000' && (await isMarked(c.db).catch(() => false))) return;
+      throw e;
+    }
   } catch (e) {
     throw shadowSetupError(e, phase);
   } finally {

@@ -121,12 +121,20 @@ export const registerClaims = (app: Hono<Env>, ctx: AppContext) => {
     //    1) 先按顺序用影子库对全部领先版本做闭环验证（基线模型为原链头模型）；缺影子库或任一版本失败 → 422 拒绝
     //    2) 检查当前工作副本是否有未发布修改；有且未确认 → 409 working_dirty_confirm，已确认但 seq 变了 → 409 working_changed
     let verifiedReports = new Map<string, StoredVerifyReport>();
+    let shadow: Shadow | null = null;
     let createdShadow: { targetUrl: string; name: string } | null = null;
     let committed = false;
     let expectedWorkingSeq: number | undefined;
     const newHead = aheadVersions.at(-1) ?? null;
 
+    const closeShadow = async () => {
+      const s = shadow;
+      shadow = null;
+      await s?.close();
+    };
     const cleanupShadow = async () => {
+      // 先关闭本请求自己的影子库连接，再尝试删库（不带 WITH (FORCE)，避免被自身连接阻塞）
+      await closeShadow();
       if (!committed && createdShadow) {
         const s = createdShadow;
         createdShadow = null;
@@ -158,7 +166,6 @@ export const registerClaims = (app: Hono<Env>, ctx: AppContext) => {
             shadowUrl: e.shadow_url_enc ? decrypt(e.shadow_url_enc) : null,
           })),
         ];
-        let shadow: Shadow | null = null;
         try {
           const scope = unionScopes(aheadVersions, a.schemas);
           const prepared = await pickShadow(candidates, scope, ctx.guard);
@@ -177,7 +184,7 @@ export const registerClaims = (app: Hono<Env>, ctx: AppContext) => {
           }
           throw e;
         } finally {
-          await shadow?.close();
+          await closeShadow();
         }
 
         // 检查工作副本是否相对原链头有未发布的修改（与 pull 相同的并发保护）

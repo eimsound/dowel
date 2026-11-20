@@ -7,7 +7,14 @@ import { afterAll, beforeAll, describe, expect, test } from 'vitest';
 import { connect, createTestDb, dbUrl, PG_URL } from '../../../test/pg.ts';
 import { scrubSecrets } from '../src/secrets.ts';
 import { ShadowError, ShadowUnavailableError, toShadowError } from '../src/shadow.ts';
-import { claimShadow, pgShadow, shadowSetupError } from '../src/targets.ts';
+import {
+  claimShadow,
+  dropSameInstanceShadow,
+  ensureSameInstanceShadow,
+  pgShadow,
+  SHADOW_MARK,
+  shadowSetupError,
+} from '../src/targets.ts';
 
 const ordersModel = (extra = false): Model => {
   const m = emptyModel();
@@ -415,4 +422,133 @@ describe('建 / 认领 / 检查影子库时的错误分类', () => {
       }
     },
   );
+});
+
+describe.skipIf(!PG_URL)('同实例影子库并发创建与安全清理（真实 PG）', () => {
+  const admin = PG_URL ? connect(PG_URL) : (null as never);
+  const createdDbs: string[] = [];
+
+  const createBareDb = async (prefix: string) => {
+    const name = `${prefix}_${Math.random().toString(36).slice(2, 8)}`;
+    await admin.db.exec(`CREATE DATABASE "${name}"`);
+    createdDbs.push(name, `${name}_dowel`);
+    return { name, url: dbUrl(name), shadowName: `${name}_dowel` };
+  };
+
+  const dbExists = async (name: string) =>
+    (
+      await admin.db.query<{ n: number }>('select count(*)::int as n from pg_database where datname = $1', [
+        name,
+      ])
+    )[0]!.n > 0;
+
+  afterAll(async () => {
+    if (!PG_URL) return;
+    for (const name of createdDbs) {
+      await admin.db.exec(`DROP DATABASE IF EXISTS "${name}" WITH (FORCE)`).catch(() => {});
+    }
+    await admin.close();
+  });
+
+  test('并发多次 ensureSameInstanceShadow 创建同名影子库：全部成功且仅一方 created === true', async () => {
+    const target = await createBareDb('shadow_race');
+    const results = await Promise.all([
+      ensureSameInstanceShadow(target.url),
+      ensureSameInstanceShadow(target.url),
+      ensureSameInstanceShadow(target.url),
+    ]);
+
+    expect(results.map((r) => r.shadow)).toEqual([target.shadowName, target.shadowName, target.shadowName]);
+    expect(results.filter((r) => r.created)).toHaveLength(1);
+    expect(results.filter((r) => !r.created)).toHaveLength(2);
+    expect(await dbExists(target.shadowName)).toBe(true);
+    const [mark] = await admin.db.query<{ c: string | null }>(
+      "select shobj_description(oid, 'pg_database') as c from pg_database where datname = $1",
+      [target.shadowName],
+    );
+    expect(mark?.c).toBe(SHADOW_MARK);
+  });
+
+  test('并发验证正在使用影子库时，dropSameInstanceShadow 绝不强杀连接，验证顺利完成', async () => {
+    const target = await createBareDb('shadow_busy_verify');
+    const prepared = await ensureSameInstanceShadow(target.url);
+    expect(prepared.created).toBe(true);
+
+    const shadow = pgShadow(prepared.url);
+    try {
+      // 在验证步骤中短暂停顿，制造真实的并发验证持锁窗口
+      const verifyPromise = shadow.verifyScripts(
+        FROM,
+        TO,
+        [step('SELECT pg_sleep(0.4)'), step('ALTER TABLE public.orders ADD COLUMN note text')],
+        [step('ALTER TABLE public.orders DROP COLUMN note')],
+      );
+
+      // 等到并发验证确实拿到 dowel_shadow 验证锁
+      const probe = connect(prepared.url);
+      try {
+        const deadline = Date.now() + 5_000;
+        let busy = false;
+        while (Date.now() < deadline) {
+          const [r] = await probe.db.query<{ ok: boolean }>(
+            "select pg_try_advisory_lock(hashtext('dowel_shadow')) as ok",
+          );
+          if (r!.ok) {
+            await probe.db.exec("select pg_advisory_unlock(hashtext('dowel_shadow'))");
+            await new Promise((res) => setTimeout(res, 20));
+          } else {
+            busy = true;
+            break;
+          }
+        }
+        expect(busy).toBe(true);
+      } finally {
+        await probe.close();
+      }
+
+      // 并发验证持锁期间触发清理：应快速安静跳过，不强杀连接
+      const t0 = Date.now();
+      await dropSameInstanceShadow(target.url, target.shadowName);
+      expect(Date.now() - t0).toBeLessThan(3_000);
+
+      // 并发验证必须顺利通过，不出现 57P01 等中断错误
+      const report = await verifyPromise;
+      expect(report.ok).toBe(true);
+      expect(report.error).toBeNull();
+      expect(await dbExists(target.shadowName)).toBe(true);
+    } finally {
+      await shadow.close();
+    }
+  });
+
+  test('有活跃连接（未持验证锁）时，dropSameInstanceShadow 遇到 55006 安静跳过，不强杀连接；断开后可正常清理', async () => {
+    const target = await createBareDb('shadow_active_conn');
+    const prepared = await ensureSameInstanceShadow(target.url);
+    expect(prepared.created).toBe(true);
+
+    // 模拟另一请求 / 缓存持有影子库上的活跃连接（未拿 dowel_shadow 验证锁）
+    const active = connect(prepared.url);
+    try {
+      expect(await active.db.query<{ x: number }>('select 1 as x')).toEqual([{ x: 1 }]);
+
+      await dropSameInstanceShadow(target.url, target.shadowName);
+
+      // 原活跃连接仍然可用，影子库未被删除
+      expect(await active.db.query<{ x: number }>('select 2 as x')).toEqual([{ x: 2 }]);
+      expect(await dbExists(target.shadowName)).toBe(true);
+    } finally {
+      await active.close();
+    }
+
+    // 无人使用后，dropSameInstanceShadow 能正常清理新建的同实例影子库
+    await dropSameInstanceShadow(target.url, target.shadowName);
+    expect(await dbExists(target.shadowName)).toBe(false);
+  });
+
+  test('没有 SHADOW_MARK 的数据库，dropSameInstanceShadow 绝不误删', async () => {
+    const target = await createBareDb('shadow_unmarked');
+    await admin.db.exec(`CREATE DATABASE "${target.shadowName}"`);
+    await dropSameInstanceShadow(target.url, target.shadowName);
+    expect(await dbExists(target.shadowName)).toBe(true);
+  });
 });
