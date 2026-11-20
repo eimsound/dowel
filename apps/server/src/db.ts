@@ -79,6 +79,17 @@ const COLUMN_KINDS = new Map<string, ColumnKind>([
   ['projects.schemas', 'json'],
   ['exec_policies.policy', 'json'],
   ['grants.by_instance_admin', 'bool'],
+  ['exec_requests.migrations', 'json'],
+  ['exec_requests.dry_run', 'json'],
+  ['exec_requests.flow', 'json'],
+  ['exec_requests.production', 'bool'],
+  ['exec_requests.emergency', 'bool'],
+  ['exec_requests.result', 'json'],
+  ['inbox_items.data', 'json'],
+  ['webhooks.events', 'json'],
+  ['webhooks.enabled', 'bool'],
+  ['webhook_deliveries.ok', 'bool'],
+  ['webhook_deliveries.test', 'bool'],
 ]);
 
 /** 登记新增表 / 列的转换规则（测试里也用这个造同名列不同表） */
@@ -864,6 +875,97 @@ export const MIGRATIONS: MigrationStep[] = [
           and not exists (select 1 from environments e where e.id = new.prerequisite_id)
          begin select raise(abort, 'FOREIGN KEY constraint failed: environments.prerequisite_id'); end;`);
     },
+  },
+  // 产品化 P5b：执行申请与审批、收件箱、组级 Webhook（ADR 0006、0007）。
+  // - exec_requests：一次执行申请。绑定“起止版本 + 各迁移校验和”（migrations 是快照：版本、方向、校验和、步数），
+  //   flow 是提交时生效审批流程的快照（审批按快照走，审批人资格按审批时的成员关系判断），conn_hash 是提交时连接设置的指纹
+  //   （DOWEL_SECRET 派生密钥的 HMAC，不是普通哈希——连接串里有密码，见 requests.ts 的 connHash）；
+  //   status：pending → approved → executing → executed / failed；rejected / withdrawn / invalid / expired 是终态。
+  //   stage 是当前环节（0 起；全部通过后等于环节数）。环境 / 项目删除时级联删除（审计里有完整记录）；
+  // - exec_approvals：每个环节每个人的一次决定（通过 / 驳回 + 意见），同一个人在同一个环节只能决定一次；
+  // - inbox_items：站内收件箱（待我审批、我的申请结果、紧急执行、P6 的令牌执行），data 是显示用的快照；
+  // - webhooks / webhook_deliveries：组级 Webhook 与最近的投递记录（URL 和签名密钥用 DOWEL_SECRET 加密）。
+  (d) => {
+    const { ts, now, json, bool, t, f } = types(d);
+    return `create table exec_requests (
+     id text primary key,
+     project_id text not null references projects on delete cascade,
+     environment_id text not null references environments on delete cascade,
+     requested_by text references users on delete set null,
+     direction text not null check (direction in ('up', 'down')),
+     from_version_id text,
+     to_version_id text not null,
+     migrations ${json} not null,
+     dry_run ${json},
+     reason text not null default '',
+     flow ${json} not null,
+     conn_hash text not null,
+     production ${bool} not null,
+     status text not null check (status in
+       ('pending', 'approved', 'executing', 'executed', 'failed', 'rejected', 'withdrawn', 'invalid', 'expired')),
+     stage integer not null default 0,
+     status_reason text,
+     expires_at ${ts} not null,
+     created_at ${ts} not null default ${now},
+     updated_at ${ts} not null default ${now},
+     executed_by text references users on delete set null,
+     executed_at ${ts},
+     emergency ${bool} not null default ${f},
+     result ${json}
+   );
+   create index exec_requests_env on exec_requests (environment_id, status);
+   create index exec_requests_status on exec_requests (status);
+   create table exec_approvals (
+     id text primary key,
+     request_id text not null references exec_requests on delete cascade,
+     stage integer not null,
+     user_id text references users on delete set null,
+     decision text not null check (decision in ('approve', 'reject')),
+     comment text not null default '',
+     at ${ts} not null default ${now},
+     unique (request_id, stage, user_id)
+   );
+   create table inbox_items (
+     id text primary key,
+     user_id text not null references users on delete cascade,
+     kind text not null check (kind in
+       ('approval_needed', 'request_result', 'emergency_execution', 'token_execution')),
+     project_id text references projects on delete cascade,
+     environment_id text references environments on delete cascade,
+     request_id text references exec_requests on delete cascade,
+     data ${json} not null,
+     created_at ${ts} not null default ${now},
+     read_at ${ts}
+   );
+   create index inbox_items_user on inbox_items (user_id, created_at);
+   create table webhooks (
+     id text primary key,
+     group_id text not null references groups on delete cascade,
+     name text not null,
+     format text not null check (format in ('json', 'dingtalk', 'feishu', 'wecom', 'slack')),
+     url_enc text not null,
+     secret_enc text,
+     events ${json} not null,
+     enabled ${bool} not null default ${t},
+     created_by text references users on delete set null,
+     created_at ${ts} not null default ${now},
+     updated_at ${ts} not null default ${now}
+   );
+   create index webhooks_group on webhooks (group_id);
+   create table webhook_deliveries (
+     id text primary key,
+     webhook_id text not null references webhooks on delete cascade,
+     delivery_id text not null,
+     event text not null,
+     attempt integer not null,
+     ok ${bool} not null,
+     status integer,
+     error text,
+     duration_ms integer,
+     test ${bool} not null default ${f},
+     at ${ts} not null default ${now}
+   );
+   create index webhook_deliveries_hook on webhook_deliveries (webhook_id, at);`;
   },
 ];
 

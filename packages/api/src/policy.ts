@@ -10,6 +10,7 @@
 // - 允许令牌执行：不允许 > 允许（全序）；
 // - 语句超时 / 锁等待超时：越短越严，0 表示不限、是最宽的（全序）——超时保护的是目标库上的业务：
 //   迁移等锁、跑长语句时排在它后面的业务语句都会被挡住，越早放弃对目标库越安全；
+// - 执行申请的有效期（P5b）：越短越严（全序，没有“不限”）——批准绑定的是提交时的环境状态，拖得越久越不可靠；
 // - 审批流程：没有自然的全序，用“子序列”偏序——F ⪯ G 当且仅当 F 的环节按原顺序全部出现在 G 里。
 //   每一层只能**追加**环节（存的是本层追加的环节），生效流程 = 各层环节按 实例 → 组 → 项目 → 环境 拼接，
 //   所以上级的生效流程一定是下级生效流程的前缀（前缀 ⇒ 子序列），下级不可能删掉或改动上级的环节。
@@ -66,6 +67,9 @@ export type ApprovalStage = z.infer<typeof approvalStageSchema>;
 
 const timeoutSchema = z.number().int().min(0).max(MAX_TIMEOUT_MS);
 
+/** 执行申请的有效期上限：30 天（小时） */
+export const MAX_REQUEST_TTL_HOURS = 720;
+
 /**
  * 一层的一套设置（生产或非生产；环境层只有它自己那一套）。字段不出现 = 未设置 = 继承上级。
  * approval 是**本层追加**的环节（空数组等同于未设置）。
@@ -80,6 +84,11 @@ export const policySettingsSchema = z
     statementTimeoutMs: timeoutSchema.optional(),
     /** 每个迁移会话的 lock_timeout（毫秒，0 = 不限） */
     lockTimeoutMs: timeoutSchema.optional(),
+    /**
+     * 执行申请的有效期（小时，P5b）：提交后多久没执行完就过期。越短越严（批准绑定的是提交时的环境状态，
+     * 拖得越久，审批人看到的东西和执行时的实际情况差得越远）；没有“不限”。
+     */
+    requestTtlHours: z.number().int().min(1).max(MAX_REQUEST_TTL_HOURS).optional(),
   })
   .strict()
   .refine(
@@ -99,7 +108,13 @@ export const layerPolicySchema = z
   .strict();
 export type LayerPolicy = z.infer<typeof layerPolicySchema>;
 
-export const SCALAR_FIELDS = ['whoCanExecute', 'allowTokens', 'statementTimeoutMs', 'lockTimeoutMs'] as const;
+export const SCALAR_FIELDS = [
+  'whoCanExecute',
+  'allowTokens',
+  'statementTimeoutMs',
+  'lockTimeoutMs',
+  'requestTtlHours',
+] as const;
 export type ScalarField = (typeof SCALAR_FIELDS)[number];
 export type PolicyField = ScalarField | 'approval';
 
@@ -108,6 +123,7 @@ export interface EffectiveValues {
   allowTokens: boolean;
   statementTimeoutMs: number;
   lockTimeoutMs: number;
+  requestTtlHours: number;
 }
 
 /**
@@ -117,13 +133,15 @@ export interface EffectiveValues {
  * - 锁等待超时 5 秒：DDL 要拿 ACCESS EXCLUSIVE 之类的强锁，拿不到时后面所有业务语句都排在它后面，
  *   等得越久业务停顿越久；5 秒对业务是可以容忍的停顿，又足以等过普通的短事务；失败可以直接重试（断点续跑语义不变）；
  * - 语句超时不限：建索引、改类型重写整表这类迁移在大表上本来就要很久，中途被杀既浪费也可能留下要清理的东西
- *   （例如无效索引），默认不限、需要时由上级显式收紧。
+ *   （例如无效索引），默认不限、需要时由上级显式收紧；
+ * - 执行申请 24 小时过期（02-consensus.md 11.3）。
  */
 export const POLICY_DEFAULTS = (production: boolean): EffectiveValues => ({
   whoCanExecute: production ? 'admin' : 'editor',
   allowTokens: !production,
   statementTimeoutMs: 0,
   lockTimeoutMs: 5000,
+  requestTtlHours: 24,
 });
 
 const WHO_RANK: Record<ExecPolicy, number> = { editor: 0, admin: 1, executor: 2 };
@@ -144,6 +162,9 @@ export const compareField = <F extends ScalarField>(
       return sign(WHO_RANK[a as ExecPolicy] - WHO_RANK[b as ExecPolicy]);
     case 'allowTokens':
       return a === b ? 0 : a === false ? 1 : -1;
+    case 'requestTtlHours':
+      // 有效期越短越严（没有 0 = 不限）
+      return sign((b as number) - (a as number));
     default: {
       const x = timeoutRank(a as number);
       const y = timeoutRank(b as number);
@@ -212,6 +233,7 @@ export interface ResolvedPolicy {
   allowTokens: ResolvedField<boolean>;
   statementTimeoutMs: ResolvedField<number>;
   lockTimeoutMs: ResolvedField<number>;
+  requestTtlHours: ResolvedField<number>;
   /** 生效的审批流程（各层追加的环节拼接）；空表示默认：单环节，有执行权限的人直接执行 */
   approval: { stages: ResolvedStage[]; own: ApprovalStage[] };
 }
@@ -266,6 +288,7 @@ export const resolvePolicy = (
     allowTokens: scalar('allowTokens'),
     statementTimeoutMs: scalar('statementTimeoutMs'),
     lockTimeoutMs: scalar('lockTimeoutMs'),
+    requestTtlHours: scalar('requestTtlHours'),
     approval: {
       // 拼接后只有最后一个环节的「最后一个审批人即执行者」生效
       stages: stages.map((s, i) =>
@@ -284,6 +307,7 @@ export const effectiveValues = (r: ResolvedPolicy): EffectiveValues => ({
   allowTokens: r.allowTokens.value,
   statementTimeoutMs: r.statementTimeoutMs.value,
   lockTimeoutMs: r.lockTimeoutMs.value,
+  requestTtlHours: r.requestTtlHours.value,
 });
 
 export interface PolicyProblem {
@@ -312,11 +336,15 @@ export const whoLabel = (w: ExecPolicy) => WHO_LABEL[w];
 export const timeoutLabel = (ms: number) =>
   ms === 0 ? '不限' : ms % 1000 === 0 ? `${ms / 1000} 秒` : `${ms} 毫秒`;
 
+/** 申请有效期的显示：整天显示天，否则小时 */
+export const ttlLabel = (h: number) => (h % 24 === 0 ? `${h / 24} 天` : `${h} 小时`);
+
 const FIELD_LABEL: Record<PolicyField, string> = {
   whoCanExecute: '谁能执行',
   allowTokens: '允许令牌执行',
   statementTimeoutMs: '语句超时',
   lockTimeoutMs: '锁等待超时',
+  requestTtlHours: '申请有效期',
   approval: '审批流程',
 };
 export const fieldLabel = (f: PolicyField) => FIELD_LABEL[f];
@@ -328,7 +356,9 @@ export const valueLabel = <F extends ScalarField>(field: F, v: EffectiveValues[F
       ? v
         ? '允许'
         : '不允许'
-      : timeoutLabel(v as number);
+      : field === 'requestTtlHours'
+        ? ttlLabel(v as number)
+        : timeoutLabel(v as number);
 
 /**
  * 写入校验：本层的设置不能比上级合并出来的下限更宽（下级只能收紧）。审批流程只能追加，天然满足，不在这里检查。
@@ -420,6 +450,7 @@ export const normalizeSettings = (s: PolicySettings | null | undefined): PolicyS
   if (s.allowTokens !== undefined) out.allowTokens = s.allowTokens;
   if (s.statementTimeoutMs !== undefined) out.statementTimeoutMs = s.statementTimeoutMs;
   if (s.lockTimeoutMs !== undefined) out.lockTimeoutMs = s.lockTimeoutMs;
+  if (s.requestTtlHours !== undefined) out.requestTtlHours = s.requestTtlHours;
   return out;
 };
 

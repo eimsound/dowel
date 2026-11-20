@@ -23,10 +23,11 @@ export interface AuditEntry {
 /**
  * 严格版：在调用方的事务里写审计，**失败就抛出**（不吞）——审计和被审计的写入同生共死。
  * 事务里不能用吞错的 audit()：PG 的事务里一条语句失败后整个事务已中止，吞掉错误只会让后面的语句和提交莫名其妙地失败。
+ * c 为 null：不是由请求触发的（定时清理过期 / 失效的执行申请等系统动作），没有来源 IP。
  */
 export const auditIn = async (
   db: Db,
-  c: Context,
+  c: Context | null,
   entry: AuditEntry,
   security: SecurityConfig = securityConfigFromEnv(),
 ): Promise<void> => {
@@ -41,7 +42,7 @@ export const auditIn = async (
       entry.targetKind ?? null,
       entry.targetId ?? null,
       entry.projectId ?? null,
-      clientIp(c, security),
+      c ? clientIp(c, security) : null,
       entry.data === undefined ? null : JSON.stringify(entry.data),
     ],
   );

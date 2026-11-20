@@ -125,5 +125,5 @@ test('图标栏只显示我的组；正在看的组不是我的组时临时显�
 
   // 组很多时组区域单独滚动，底部的收件箱始终可见
   await expect(rail.locator('.rail-orgs')).toHaveCSS('overflow-y', 'auto');
-  await expect(rail.getByRole('button', { name: '收件箱（即将推出）' })).toBeVisible();
+  await expect(rail.getByRole('link', { name: '收件箱', exact: true })).toBeVisible();
 });

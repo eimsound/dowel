@@ -11,6 +11,8 @@ import {
 } from './policy.ts';
 
 export * from './policy.ts';
+export * from './requests.ts';
+export * from './webhooks.ts';
 
 // 项目角色：查看者 / 编辑者 / 项目管理员（GLOSSARY：项目角色）。旧的 owner 在迁移里映射成 admin。
 export const roleSchema = z.enum(['viewer', 'editor', 'admin']);
@@ -114,6 +116,11 @@ export const instanceSettingsSchema = z.object({
    * 服务端会主动去连用户给的数据库地址，所以这是防止 SSRF 的开关。
    */
   connectionAllowlist: z.array(z.string()),
+  /**
+   * 组级 Webhook 额外允许发往哪些地址（CIDR 或主机名）。和 connectionAllowlist 语义相反：
+   * Webhook 默认只能发往公网地址（拒绝回环、私有、链路本地等），这里列出的内网地址额外放行。
+   */
+  webhookAllowlist: z.array(z.string()),
   /** 实例的唯一标识：首次启动时生成，之后不变，只读（写进目标库的历史里，用来识别由哪个实例执行） */
   instanceId: z.string(),
 });
@@ -124,6 +131,7 @@ export const instanceSettingsPatchSchema = z.object({
   groupCreation: groupCreationSchema.optional(),
   passwordLogin: z.boolean().optional(),
   connectionAllowlist: z.array(z.string().trim().max(200)).max(200).optional(),
+  webhookAllowlist: z.array(z.string().trim().max(200)).max(200).optional(),
 });
 export type InstanceSettingsPatch = z.infer<typeof instanceSettingsPatchSchema>;
 
@@ -769,6 +777,12 @@ export const envPermissionsSchema = z.object({
   execute: z.boolean(),
   /** 能否改连接串、影子库、生产标记、执行档位和删除环境 */
   configure: z.boolean(),
+  /** 生效的审批流程配置了环节（P5b）：执行 / 回滚要提交执行申请，谁都不能直接执行（execute 只表示满足“谁能执行”） */
+  approvalRequired: z.boolean(),
+  /** 能否提交执行申请（项目编辑者以上，或者执行者） */
+  request: z.boolean(),
+  /** 能否紧急执行（实例管理员；只在要求审批的环境上有意义） */
+  emergency: z.boolean(),
 });
 export type EnvPermissions = z.infer<typeof envPermissionsSchema>;
 
@@ -1129,6 +1143,8 @@ export const dryRunMigrationSchema = z.object({
   steps: z.array(scriptStepSchema),
   /** 不在事务里的步骤数：含这些步骤的迁移不是原子的，中途失败要从断点续跑 */
   nonTransactional: z.number(),
+  /** 预演时这个版本的校验和：执行申请绑定的就是它（P5b） */
+  checksum: z.string(),
   /** 发布 / 重新验证时影子库里分析的最高风险（只有升级脚本有）；没有分析为 null */
   risk: z.enum(['low', 'medium', 'high']).nullable(),
   riskError: z.string().nullable(),

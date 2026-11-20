@@ -641,6 +641,35 @@ const manualOf = (state: TargetState): Pick<ExecutorErrorDetails, 'needsManual'>
     : {};
 };
 
+/**
+ * 执行申请的绑定（P5b）：锁里读到的当前版本、算出的迁移和校验和必须与提交时一致。不一致时什么都还没写（调用点在开始写目标库之前）。
+ * 写基线那一步不在比较之内：它不执行脚本，第一次执行到导入来源库时预演和真执行都会先写基线。
+ */
+const assertExpected = (
+  expect: NonNullable<ExecuteOptions['expect']>,
+  current: string | null,
+  migrations: Migration[],
+) => {
+  const stale = (why: string) =>
+    new ExecutorError('request_stale', `环境状态和提交申请时不一样了：${why}。申请已失效，请重新提交`);
+  if (current !== expect.from) throw stale('目标库里的当前版本变了');
+  const got = migrations.map((m) => ({
+    versionId: m.version.id,
+    direction: m.direction,
+    checksum: m.version.checksum,
+  }));
+  if (
+    got.length !== expect.migrations.length ||
+    got.some((g, i) => {
+      const e = expect.migrations[i]!;
+      return g.versionId !== e.versionId || g.direction !== e.direction;
+    })
+  )
+    throw stale('要执行的迁移变了');
+  if (got.some((g, i) => g.checksum !== expect.migrations[i]!.checksum))
+    throw stale('相关版本的脚本被修改过');
+};
+
 const locked = async (conn: Db, c: Ctx): Promise<ExecuteResult> => {
   const { o } = c;
   const { chain } = o;
@@ -738,6 +767,8 @@ const locked = async (conn: Db, c: Ctx): Promise<ExecuteResult> => {
       );
     migrations = route(chain, curIdx, tgtIdx);
     if (!migrations.length) {
+      // 申请绑定了要执行的迁移，库却已经在目标版本（别人先执行了）：不能当作“执行成功”
+      if (o.expect) assertExpected(o.expect, state.current, migrations);
       const cur = chain[curIdx];
       const ref = cur ? { id: cur.id, number: cur.number, name: cur.name } : null;
       return {
@@ -793,6 +824,7 @@ const locked = async (conn: Db, c: Ctx): Promise<ExecuteResult> => {
         : `目标版本 ${label(target)} 比环境当前版本更新，这是执行，不是回滚`,
     );
   preflight(migrations);
+  if (o.expect) assertExpected(o.expect, state.current, migrations);
   const direction = migrations[0]?.direction === 'down' ? 'down' : migrations.length ? 'up' : 'none';
   if (o.dryRun) {
     // 预演到此为止：检查全部通过，没有写目标库，也不调用任何平台库回调
@@ -816,6 +848,7 @@ const locked = async (conn: Db, c: Ctx): Promise<ExecuteResult> => {
           direction: m.direction,
           steps: m.steps.map((s) => ({ sql: s.sql, transactional: !isNonTx(s) })),
           nonTransactional: m.steps.filter(isNonTx).length,
+          checksum: m.version.checksum,
         })),
         resume: state.unfinished
           ? {

@@ -14,6 +14,8 @@ export class DriftScheduler {
   private running: Promise<number> | null = null;
   private db: PlatformDb;
   private x: ExecContext;
+  /** 每一轮检查结束后调用（P5b：漂移会让执行申请失效，及时检查一遍） */
+  afterSweep: (() => void) | null = null;
 
   constructor(db: PlatformDb, x: ExecContext) {
     this.db = db;
@@ -44,6 +46,7 @@ export class DriftScheduler {
   runOnce(): Promise<number> {
     this.running ??= this.sweep().finally(() => {
       this.running = null;
+      this.afterSweep?.();
     });
     return this.running;
   }

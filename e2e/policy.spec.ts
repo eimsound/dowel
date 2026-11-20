@@ -163,13 +163,14 @@ test.describe('需要目标库', () => {
         '由项目锁定：至少 2 秒',
       );
 
-      // 再收紧成“仅限执行者”：回到环境页，执行按钮立刻不可用
+      // 再收紧成“仅限执行者”：回到环境页，立刻不能直接执行了——按钮变成“提交执行申请”（P5b：无权者提交申请）
       await gotoPage(page, '设置');
       await set(page, '非生产环境').getByLabel('谁能执行').selectOption('executor');
       await page.getByRole('button', { name: '保存执行策略' }).click();
       await expect(page.getByText('已保存执行策略').first()).toBeVisible();
       await openEnv(page, 'dev');
-      await expect(page.getByRole('button', { name: '执行迁移' })).toHaveAttribute('aria-disabled', 'true');
+      await expect(page.getByRole('button', { name: '执行迁移' })).toHaveCount(0);
+      await expect(page.getByRole('button', { name: '提交执行申请' })).toBeVisible();
     } finally {
       await devDb.drop();
     }

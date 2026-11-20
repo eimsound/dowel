@@ -561,6 +561,35 @@ dialog::backdrop {
     background: var(--danger-soft);
     color: var(--danger);
   }
+  /* 执行申请的状态（P5b） */
+  .badge.ok {
+    background: var(--ok-soft);
+    color: var(--text);
+  }
+  .badge.warn {
+    background: var(--warn-soft);
+    color: var(--warn);
+  }
+  /* 图标栏收件箱的未读数 */
+  .rail-badge {
+    position: relative;
+    /* 跟在链接后面（flex 列里），用负边距叠到图标右上角，不占位置 */
+    margin-top: -33px;
+    margin-bottom: 15px;
+    margin-left: 22px;
+    pointer-events: none;
+    min-width: 16px;
+    height: 16px;
+    padding: 0 4px;
+    border-radius: 999px;
+    background: var(--primary);
+    color: white;
+    box-shadow: 0 0 0 2px var(--bg);
+    font-size: 10px;
+    font-weight: 600;
+    line-height: 16px;
+    text-align: center;
+  }
   kbd {
     padding: 0 5px;
     border: 1px solid var(--border);

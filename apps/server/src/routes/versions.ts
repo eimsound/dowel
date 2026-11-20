@@ -340,6 +340,8 @@ export const registerVersions = (app: Hono<Env>, ctx: AppContext) => {
         ctx.security,
       );
     const v = await loadVersion(db, a.pid, vid);
+    // P5b：脚本变了（校验和变了），绑定了这个版本的执行申请会失效
+    ctx.requests.kick({ projectIds: [a.pid] });
     return c.json<VersionDetail>(toDetail(v, (await chainHead(db, a.pid))?.id ?? null));
   });
 

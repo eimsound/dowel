@@ -169,6 +169,8 @@ describe.each([
       passwordLogin: true,
       // P3：服务端能连到哪里（空表示不限制）；SSRF 的开关
       connectionAllowlist: [],
+      // P5b：Webhook 出站额外放行的地址（默认只允许公网）
+      webhookAllowlist: [],
       // P4a：实例唯一标识，首次启动时生成，只读
       instanceId: expect.stringMatching(/^[0-9a-f-]{36}$/),
     });

@@ -129,6 +129,15 @@ const freshEnv = async (projectId: string, seq: number) => {
   return id;
 };
 
+/** 权限矩阵用的 Webhook（127.0.0.1 会被出站限制拒绝，不会真的发请求） */
+const matrixWebhook = async (groupId: string) => {
+  await db.query(
+    `insert into webhooks (id, group_id, name, format, url_enc, events, enabled)
+     values ('matrix-webhook', $1, 'm', 'json', $2, $3::text::jsonb, true) on conflict do nothing`,
+    [groupId, encrypt('http://127.0.0.1:1/x'), JSON.stringify(['request.created'])],
+  );
+};
+
 const matrix: Record<string, Spec> = {
   // 公开端点
   'POST /api/auth/login': {
@@ -575,6 +584,100 @@ const matrix: Record<string, Spec> = {
     prepare: async (ctx) => {
       ctx.envId = await freshEnv(ctx.pid, ++unique);
     },
+  },
+  // 执行申请（P5b）：项目可见即可列表 / 看详情；提交要编辑者（或执行者）；审批类操作看得到项目就能进到申请
+  // 里的检查（不存在的申请 404；请求体不合法 400）；具体的资格规则在 requests.test.ts 里逐项验证
+  'GET /api/projects/:pid/requests': {
+    access: { kind: 'project', min: 'viewer', statuses: [200] },
+    path: () => `${P()}/requests`,
+  },
+  'POST /api/projects/:pid/environments/:eid/requests': {
+    access: { kind: 'project', min: 'editor', statuses: [400] },
+    path: (ctx) => `${P()}/environments/${ctx.envId}/requests`,
+    body: () => ({}),
+    prepare: async (ctx) => {
+      ctx.envId = await freshEnv(ctx.pid, ++unique);
+    },
+  },
+  'GET /api/projects/:pid/requests/:rid': {
+    access: { kind: 'project', min: 'viewer', statuses: [404] },
+    path: () => `${P()}/requests/no-such-request`,
+  },
+  'POST /api/projects/:pid/requests/:rid/approve': {
+    access: { kind: 'project', min: 'viewer', statuses: [400] },
+    path: () => `${P()}/requests/no-such-request/approve`,
+    body: () => ({}),
+  },
+  'POST /api/projects/:pid/requests/:rid/reject': {
+    access: { kind: 'project', min: 'viewer', statuses: [400] },
+    path: () => `${P()}/requests/no-such-request/reject`,
+    body: () => ({}),
+  },
+  'POST /api/projects/:pid/requests/:rid/withdraw': {
+    access: { kind: 'project', min: 'viewer', statuses: [404] },
+    path: () => `${P()}/requests/no-such-request/withdraw`,
+    body: () => ({}),
+  },
+  'POST /api/projects/:pid/requests/:rid/execute': {
+    access: { kind: 'project', min: 'viewer', statuses: [404] },
+    path: () => `${P()}/requests/no-such-request/execute`,
+    body: () => ({}),
+  },
+  // 紧急执行：只有实例管理员（项目看不见 404，其余 403）；请求体不合法 400
+  'POST /api/projects/:pid/environments/:eid/emergency': {
+    access: { kind: 'project-instance-admin', statuses: [400] },
+    path: (ctx) => `${P()}/environments/${ctx.envId}/emergency`,
+    body: () => ({}),
+    prepare: async (ctx) => {
+      ctx.envId = await freshEnv(ctx.pid, ++unique);
+    },
+  },
+  // 收件箱（P5b）：每个人只看自己的
+  'GET /api/me/inbox': { access: { kind: 'authed', statuses: [200] } },
+  'GET /api/me/inbox/pending': { access: { kind: 'authed', statuses: [200] } },
+  'GET /api/me/requests': { access: { kind: 'authed', statuses: [200] } },
+  'POST /api/me/inbox/read-all': { access: { kind: 'authed', statuses: [200] }, body: () => ({}) },
+  'POST /api/me/inbox/:id/read': {
+    access: { kind: 'authed', statuses: [404] },
+    path: () => '/api/me/inbox/no-such-item/read',
+    body: () => ({}),
+  },
+  'GET /api/me/inbox/stream': {
+    access: { kind: 'authed', statuses: [200] },
+    path: () => '/api/me/inbox/stream?once=1',
+  },
+  // 组级 Webhook（P5b）：组管理员 / 实例管理员
+  'GET /api/groups/:slug/webhooks': {
+    access: { kind: 'group-admin', statuses: [200] },
+    path: (ctx) => `/api/groups/${ctx.groupSlug}/webhooks`,
+  },
+  'POST /api/groups/:slug/webhooks': {
+    access: { kind: 'group-admin', statuses: [400] },
+    path: (ctx) => `/api/groups/${ctx.groupSlug}/webhooks`,
+    body: () => ({}),
+  },
+  'PATCH /api/groups/:slug/webhooks/:id': {
+    access: { kind: 'group-admin', statuses: [200] },
+    path: (ctx) => `/api/groups/${ctx.groupSlug}/webhooks/matrix-webhook`,
+    body: () => ({ name: 'x' }),
+    prepare: async (ctx) => matrixWebhook(ctx.groupId),
+  },
+  'DELETE /api/groups/:slug/webhooks/:id': {
+    access: { kind: 'group-admin', statuses: [200] },
+    path: (ctx) => `/api/groups/${ctx.groupSlug}/webhooks/matrix-webhook`,
+    prepare: async (ctx) => matrixWebhook(ctx.groupId),
+  },
+  'GET /api/groups/:slug/webhooks/:id/deliveries': {
+    access: { kind: 'group-admin', statuses: [200] },
+    path: (ctx) => `/api/groups/${ctx.groupSlug}/webhooks/matrix-webhook/deliveries`,
+    prepare: async (ctx) => matrixWebhook(ctx.groupId),
+  },
+  // 发送测试：127.0.0.1 被出站限制立即拒绝（不走网络），结果仍是 200 + ok:false
+  'POST /api/groups/:slug/webhooks/:id/test': {
+    access: { kind: 'group-admin', statuses: [200] },
+    path: (ctx) => `/api/groups/${ctx.groupSlug}/webhooks/matrix-webhook/test`,
+    body: () => ({}),
+    prepare: async (ctx) => matrixWebhook(ctx.groupId),
   },
   'GET /api/projects/:pid/sync': { access: { kind: 'ws' } },
 };

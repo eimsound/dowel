@@ -198,7 +198,13 @@ describe('接口：档位存在环境上，默认值、修改、特权操作', (
       effectiveExecPolicy: string;
     };
     expect(dev.effectiveExecPolicy).toBe('editor');
-    expect(dev.permissions).toEqual({ execute: true, configure: false });
+    expect(dev.permissions).toEqual({
+      execute: true,
+      configure: false,
+      approvalRequired: false,
+      request: true,
+      emergency: false,
+    });
     const prod = (await call('GET', `${env('prod')}/status`, undefined, 'editor')).data as {
       effectiveExecPolicy: string;
     };
@@ -278,10 +284,28 @@ describe('接口：档位存在环境上，默认值、修改、特权操作', (
       .data as unknown as EnvInfo[];
     const prod = envs.find((e) => e.id === 'prod')!;
     expect(prod).toMatchObject({ production: true, execPolicy: null, effectiveExecPolicy: 'admin' });
-    expect(prod.permissions).toEqual({ execute: false, configure: false });
-    expect(envs.find((e) => e.id === 'dev')!.permissions).toEqual({ execute: true, configure: false });
+    expect(prod.permissions).toEqual({
+      execute: false,
+      configure: false,
+      approvalRequired: false,
+      request: true,
+      emergency: false,
+    });
+    expect(envs.find((e) => e.id === 'dev')!.permissions).toEqual({
+      execute: true,
+      configure: false,
+      approvalRequired: false,
+      request: true,
+      emergency: false,
+    });
     const asPa = (await call('GET', `/api/projects/${pid}/environments`, undefined, 'pa'))
       .data as unknown as EnvInfo[];
-    expect(asPa.find((e) => e.id === 'prod')!.permissions).toEqual({ execute: true, configure: true });
+    expect(asPa.find((e) => e.id === 'prod')!.permissions).toEqual({
+      execute: true,
+      configure: true,
+      approvalRequired: false,
+      request: true,
+      emergency: false,
+    });
   });
 });

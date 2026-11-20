@@ -49,7 +49,13 @@ const upperFrom = (r: ResolvedPolicy): PolicyInput => {
   const put = <K extends keyof PolicySettings>(layer: PolicyLayer, key: K, v: PolicySettings[K]) => {
     out[layer] = { ...(out[layer] ?? {}), [key]: v };
   };
-  for (const f of ['whoCanExecute', 'allowTokens', 'statementTimeoutMs', 'lockTimeoutMs'] as const) {
+  for (const f of [
+    'whoCanExecute',
+    'allowTokens',
+    'statementTimeoutMs',
+    'lockTimeoutMs',
+    'requestTtlHours',
+  ] as const) {
     const field = r[f] as ResolvedField<EffectiveValues[typeof f]>;
     if (field.floor !== null && field.floorSource) put(field.floorSource, f, field.floor as never);
   }
@@ -67,9 +73,11 @@ const useLabels = () => {
       ? t(`pol.who.${v as ExecPolicy}`)
       : f === 'allowTokens'
         ? t(v ? 'pol.tokens.yes' : 'pol.tokens.no')
-        : v === 0
-          ? t('pol.unlimited')
-          : t('pol.seconds', { n: (v as number) / 1000 });
+        : f === 'requestTtlHours'
+          ? t('pol.hours', { n: v as number })
+          : v === 0
+            ? t('pol.unlimited')
+            : t('pol.seconds', { n: (v as number) / 1000 });
   const source = (s: ResolvedField<unknown>['source']) => t(`pol.source.${s}`);
   const layer = (l: PolicyLayer) => t(`pol.layer.${l}`);
   return { t, value, source, layer };
@@ -108,6 +116,110 @@ const approverText = (t: ReturnType<typeof useTranslation>['t'], a: Approver, na
   return t(`pol.approval.kinds.${a.kind}`);
 };
 
+/**
+ * 审批人里的“指定用户”：按名字 / 用户名搜索（目录接口），选中的显示成可以移除的标签（P5b，替换 P5a 的前 20 个用户多选）。
+ */
+const UserPicker = ({
+  value,
+  onChange,
+  disabled,
+  names,
+}: {
+  value: string[];
+  onChange: (ids: string[]) => void;
+  disabled: boolean;
+  names: PolicyNames;
+}) => {
+  const { t } = useTranslation();
+  const id = useId();
+  const [q, setQ] = useState('');
+  const [known, setKnown] = useState<Record<string, string>>({});
+  const term = q.trim();
+  const search = useQuery({
+    queryKey: ['directory', term],
+    queryFn: () => api<Directory>('GET', `/api/directory?q=${encodeURIComponent(term)}`),
+    enabled: !disabled && term.length > 0,
+  });
+  const nameOf = (u: string) => known[u] ?? names[u] ?? u;
+  const results = (search.data?.users ?? []).filter((u) => !value.includes(u.id)).slice(0, 8);
+  return (
+    <fieldset className="field min-w-56">
+      <legend className="label">{t('pol.approval.users')}</legend>
+      {value.length > 0 ? (
+        <ul className="flex list-none flex-wrap gap-1 p-0" aria-label={t('pol.approval.usersPicked')}>
+          {value.map((u) => (
+            <li key={u} className="chip">
+              {nameOf(u)}
+              {!disabled && (
+                <button
+                  type="button"
+                  className="text-text-3 hover:text-danger"
+                  aria-label={t('pol.approval.userRemove', { name: nameOf(u) })}
+                  onClick={() => onChange(value.filter((x) => x !== u))}
+                >
+                  ×
+                </button>
+              )}
+            </li>
+          ))}
+        </ul>
+      ) : (
+        <span className="hint">{t('pol.approval.usersNone')}</span>
+      )}
+      {!disabled && (
+        <>
+          <input
+            id={`${id}-q`}
+            className="input"
+            type="search"
+            value={q}
+            placeholder={t('pol.approval.userSearch')}
+            aria-label={t('pol.approval.userSearch')}
+            autoComplete="off"
+            onChange={(e) => setQ(e.target.value)}
+          />
+          {term && (
+            <ul className="list-none space-y-0.5 p-0" aria-label={t('pol.approval.userResults')}>
+              {results.map((u) => (
+                <li key={u.id}>
+                  <button
+                    type="button"
+                    className="btn sm"
+                    onClick={() => {
+                      setKnown((k) => ({ ...k, [u.id]: `${u.name}（${u.slug}）` }));
+                      onChange([...value, u.id]);
+                      setQ('');
+                    }}
+                  >
+                    {t('pol.approval.userAdd', { name: `${u.name}（${u.slug}）` })}
+                  </button>
+                </li>
+              ))}
+              {search.data && results.length === 0 && (
+                <li className="hint">{t('pol.approval.userNoMatch')}</li>
+              )}
+            </ul>
+          )}
+        </>
+      )}
+    </fieldset>
+  );
+};
+
+/**
+ * 两个环节的审批人范围可能重叠（P5b 配置页提示）：同一个人可以分别批这两个环节（每个环节单独确认）。
+ * 只列出明显的情况：范围相同、指定用户有交集、组管理员 ⊆ 项目管理员、同一个组的组管理员 ⊆ 组成员。
+ */
+export const approversOverlap = (a: Approver, b: Approver): boolean => {
+  if (a.kind === 'users' && b.kind === 'users') return a.userIds.some((u) => b.userIds.includes(u));
+  const g = (x: Approver) => ('groupId' in x ? x.groupId : null);
+  if (a.kind === b.kind) return g(a) === g(b);
+  const kinds = new Set([a.kind, b.kind]);
+  if (kinds.has('project_admins') && kinds.has('group_admins')) return true;
+  if (kinds.has('group_members') && kinds.has('group_admins_of')) return g(a) === g(b);
+  return false;
+};
+
 const StageEditor = ({
   stage,
   index,
@@ -116,6 +228,7 @@ const StageEditor = ({
   onRemove,
   disabled,
   dir,
+  names,
 }: {
   stage: ApprovalStage;
   index: number;
@@ -124,6 +237,7 @@ const StageEditor = ({
   onRemove: () => void;
   disabled: boolean;
   dir: Directory | undefined;
+  names: PolicyNames;
 }) => {
   const { t } = useTranslation();
   const id = useId();
@@ -134,7 +248,7 @@ const StageEditor = ({
       kind === 'group_members' || kind === 'group_admins_of'
         ? { kind, groupId: g }
         : kind === 'users'
-          ? { kind, userIds: dir?.users[0] ? [dir.users[0].id] : [] }
+          ? { kind, userIds: [] }
           : { kind };
     onChange({ ...stage, approvers: next, count: 1 });
   };
@@ -176,29 +290,12 @@ const StageEditor = ({
         </label>
       )}
       {a.kind === 'users' && (
-        <label className="field w-48" htmlFor={`${id}-u`}>
-          <span className="label">{t('pol.approval.users')}</span>
-          <select
-            id={`${id}-u`}
-            className="input"
-            multiple
-            size={3}
-            value={a.userIds}
-            disabled={disabled}
-            onChange={(e) =>
-              onChange({
-                ...stage,
-                approvers: { kind: 'users', userIds: [...e.target.selectedOptions].map((o) => o.value) },
-              })
-            }
-          >
-            {(dir?.users ?? []).map((u) => (
-              <option key={u.id} value={u.id}>
-                {u.name}（{u.slug}）
-              </option>
-            ))}
-          </select>
-        </label>
+        <UserPicker
+          value={a.userIds}
+          names={names}
+          disabled={disabled}
+          onChange={(userIds) => onChange({ ...stage, approvers: { kind: 'users', userIds } })}
+        />
       )}
       <label className="field w-20" htmlFor={`${id}-n`}>
         <span className="label">{t('pol.approval.count')}</span>
@@ -308,6 +405,11 @@ export const PolicySetEditor = ({
   );
   const own = value.approval ?? [];
   const locked = live.approval.stages.filter((s) => s.locked);
+  const all = [...locked.map((s) => s.stage), ...own];
+  const overlaps: [number, number][] = [];
+  for (let i = 0; i < all.length; i++)
+    for (let j = i + 1; j < all.length; j++)
+      if (approversOverlap(all[i]!.approvers, all[j]!.approvers)) overlaps.push([i + 1, j + 1]);
   return (
     <fieldset className="space-y-4 rounded-md border border-border bg-panel px-4 py-3">
       {title && <legend className="px-1 text-sm font-medium">{title}</legend>}
@@ -357,8 +459,38 @@ export const PolicySetEditor = ({
         </div>
         {timeout('lockTimeoutMs', 'pol.lockTimeout')}
         {timeout('statementTimeoutMs', 'pol.statementTimeout')}
+        <div className="space-y-1">
+          <label className="field" htmlFor={`${id}-ttl`}>
+            <span className="label">{t('pol.ttl')}</span>
+            <input
+              id={`${id}-ttl`}
+              className="input w-40"
+              type="number"
+              min={1}
+              max={720}
+              step={1}
+              inputMode="numeric"
+              placeholder={t('pol.inheritShort')}
+              value={value.requestTtlHours ?? ''}
+              disabled={disabled}
+              aria-describedby={`${id}-ttl-hint`}
+              onChange={(e) => {
+                const raw = e.target.value.trim();
+                const n = Number(raw);
+                set(
+                  'requestTtlHours',
+                  raw === '' || !Number.isInteger(n) || n < 1 ? undefined : Math.min(720, n),
+                );
+              }}
+            />
+          </label>
+          <span id={`${id}-ttl-hint`} className="block">
+            <Effective field="requestTtlHours" r={live.requestTtlHours} />
+          </span>
+        </div>
       </div>
       <p className="hint">{t('pol.timeoutHint')}</p>
+      <p className="hint">{t('pol.ttlHint')}</p>
 
       <div className="space-y-2">
         <h3 className="text-sm font-medium">{t('pol.approval.label')}</h3>
@@ -391,6 +523,7 @@ export const PolicySetEditor = ({
               last={i === own.length - 1}
               disabled={disabled}
               dir={dir.data}
+              names={names}
               onChange={(n) =>
                 set(
                   'approval',
@@ -409,6 +542,11 @@ export const PolicySetEditor = ({
             />
           ))}
         </ol>
+        {overlaps.length > 0 && (
+          <p className="hint" role="note" data-testid="approval-overlap">
+            {t('pol.approval.overlap', { pairs: overlaps.map(([x, y]) => `${x} / ${y}`).join('、') })}
+          </p>
+        )}
         {!disabled && (
           <button
             type="button"

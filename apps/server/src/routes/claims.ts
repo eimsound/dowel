@@ -178,6 +178,8 @@ export const registerClaims = (app: Hono<Env>, ctx: AppContext) => {
         const state = await readTargetState(ctx.exec, await loadEnv(db, a.pid, id), true);
         const cur = state.current ? chain.find((v) => v.id === state.current) : undefined;
         current = cur ? versionRef(cur) : null;
+        // P5b：同步改了这个环境的当前版本（新接入的环境上还没有申请，统一按“改了缓存就重检”处理）
+        ctx.requests.kick({ envIds: [id] });
       } catch (e) {
         console.error(
           '接入：同步目标库状态失败（环境已经添加）',
@@ -234,6 +236,8 @@ export const registerClaims = (app: Hono<Env>, ctx: AppContext) => {
       await readTargetState(ctx.exec, env, true).catch((e) =>
         console.error('认领后同步环境状态失败（忽略）', e instanceof Error ? e.message : e),
       );
+      // P5b：认领后的同步可能改了环境的当前版本，这个环境上还没结束的执行申请重新检查
+      ctx.requests.kick({ envIds: [env.id] });
     } finally {
       release();
     }

@@ -21,6 +21,7 @@ import {
   Plus,
   RotateCcw,
   ShieldAlert,
+  Siren,
   Trash2,
 } from 'lucide-react';
 import { useId, useState } from 'react';
@@ -28,7 +29,7 @@ import { useTranslation } from 'react-i18next';
 import { ApiError, api } from '../api.ts';
 import { ClaimDialog } from '../components/ClaimDialog.tsx';
 import { DriftBadge, driftLabel, useDeniedHint } from '../components/EnvBits.tsx';
-import { DiffList, ExecDialog, type ExecKind } from '../components/ExecDialog.tsx';
+import { DiffList, ExecDialog, type ExecKind, type ExecMode } from '../components/ExecDialog.tsx';
 import { ImportDialog } from '../components/ImportDialog.tsx';
 import { MARK_TIP, MARK_TITLE, MarkDialog, markDirection } from '../components/MarkDialog.tsx';
 import { Confirm } from '../components/Modal.tsx';
@@ -42,7 +43,9 @@ import { useVersionName, VersionBadges, VersionNumber } from '../components/Vers
 import { useEnvHistory, useEnvStatus, useEnvs } from '../envs.ts';
 import { formatTime } from '../format.ts';
 import { useProject } from '../project.tsx';
+import { useEnvRequests } from '../requests.ts';
 import { useMe } from '../session.ts';
+import { StatusBadge } from './Request.tsx';
 
 /**
  * 侧面板里的一个环境。漂移警告的说明不放进链接里（链接的名字要保持就是环境名），
@@ -479,7 +482,8 @@ const EnvironmentDetailView = ({ eid }: { eid: string }) => {
   const history = historyQ.data;
   const [result, setResult] = useState<{ ok: boolean; text: string } | null>(null);
   const [confirm, setConfirm] = useState(false);
-  const [dlg, setDlg] = useState<{ kind: ExecKind; to?: EnvVersion } | null>(null);
+  const [dlg, setDlg] = useState<{ kind: ExecKind; to?: EnvVersion; mode: ExecMode } | null>(null);
+  const requestsQ = useEnvRequests(pid, eid);
   const [execTo, setExecTo] = useState('');
   const [rollTo, setRollTo] = useState('');
   const [claimOpen, setClaimOpen] = useState(false);
@@ -587,10 +591,21 @@ const EnvironmentDetailView = ({ eid }: { eid: string }) => {
   const markTargets = (status?.versions ?? []).filter((v) => openRun || v.id !== markCurrent?.id);
   const markTarget = markTargets.find((v) => v.id === markTo) ?? markTargets.at(-1);
   const markDir = markTarget ? markDirection(markCurrent, markTarget) : 'forward';
+  // P5b：环境要求审批（配置了审批环节）或者自己没有执行权限时，执行 / 回滚变成“提交执行申请”
+  const perm = status?.permissions ?? env.permissions;
+  const direct = perm.execute && !perm.approvalRequired;
+  const viaRequest = !direct && perm.request;
+  const canRun = direct || viaRequest;
+  const runTitle = canRun ? undefined : deniedText;
   const run = (kind: ExecKind, to?: EnvVersion) => {
-    if (!canExec) return;
-    setDlg({ kind, to });
+    if (kind === 'baseline') {
+      if (canExec) setDlg({ kind, to, mode: 'direct' });
+      return;
+    }
+    if (!canRun) return;
+    setDlg({ kind, to, mode: direct ? 'direct' : 'request' });
   };
+  const openRequests = requestsQ.data ?? [];
 
   return (
     <>
@@ -737,13 +752,23 @@ const EnvironmentDetailView = ({ eid }: { eid: string }) => {
                     <button
                       type="button"
                       className="btn primary"
-                      aria-disabled={!canExec || !execTarget || undefined}
-                      title={canExec ? undefined : deniedText}
+                      aria-disabled={!canRun || !execTarget || undefined}
+                      title={runTitle}
                       onClick={() => execTarget && run('execute', execTarget)}
                     >
                       <Play size={16} aria-hidden="true" />
-                      {t('envx.exec.button')}
+                      {direct || !viaRequest ? t('envx.exec.button') : t('req.envButton.execute')}
                     </button>
+                    {perm.emergency && execTarget && (
+                      <button
+                        type="button"
+                        className="btn danger"
+                        onClick={() => setDlg({ kind: 'execute', to: execTarget, mode: 'emergency' })}
+                      >
+                        <Siren size={16} aria-hidden="true" />
+                        {t('req.envButton.emergency')}
+                      </button>
+                    )}
                   </div>
                   <div className="flex items-end gap-2">
                     <div className="field">
@@ -767,13 +792,23 @@ const EnvironmentDetailView = ({ eid }: { eid: string }) => {
                     <button
                       type="button"
                       className="btn"
-                      aria-disabled={!canExec || !rollTarget || undefined}
-                      title={canExec ? undefined : deniedText}
+                      aria-disabled={!canRun || !rollTarget || undefined}
+                      title={runTitle}
                       onClick={() => rollTarget && run('rollback', rollTarget)}
                     >
                       <RotateCcw size={16} aria-hidden="true" />
-                      {t('envx.exec.rollbackButton')}
+                      {direct || !viaRequest ? t('envx.exec.rollbackButton') : t('req.envButton.rollback')}
                     </button>
+                    {perm.emergency && rollTarget && (
+                      <button
+                        type="button"
+                        className="btn danger"
+                        onClick={() => setDlg({ kind: 'rollback', to: rollTarget, mode: 'emergency' })}
+                      >
+                        <Siren size={16} aria-hidden="true" />
+                        {t('req.envButton.emergencyRollback')}
+                      </button>
+                    )}
                   </div>
                   {markTarget && (
                     <div className="flex items-end gap-2">
@@ -823,9 +858,14 @@ const EnvironmentDetailView = ({ eid }: { eid: string }) => {
                 </div>
               )}
               {showBaseline && <p className="hint m-0">{t('envx.exec.baselineHint')}</p>}
-              {status && !canExec && (
+              {status && perm.approvalRequired && (
+                <p className="hint m-0" role="note" data-testid="approval-required">
+                  {t('req.envApprovalRequired')}
+                </p>
+              )}
+              {status && !perm.approvalRequired && !canExec && (
                 <p className="hint m-0" role="note">
-                  {deniedText}
+                  {viaRequest ? t('req.envNoRight', { denied: deniedText }) : deniedText}
                 </p>
               )}
             </div>
@@ -878,6 +918,41 @@ const EnvironmentDetailView = ({ eid }: { eid: string }) => {
               {env.drift.summary.message}
             </Banner>
           )}
+
+          {/* P5b：这个环境上还没结束的执行申请 */}
+          <Section title={t('req.envPending')} count={openRequests.length}>
+            {openRequests.length === 0 ? (
+              <EmptyHint>{t('req.envPendingEmpty')}</EmptyHint>
+            ) : (
+              <ul
+                className="m-0 list-none overflow-hidden rounded-md border border-border p-0"
+                data-testid="env-requests"
+              >
+                {openRequests.map((rq) => (
+                  <li
+                    key={rq.id}
+                    className="flex flex-wrap items-center gap-x-3 gap-y-1 px-3 py-2 text-sm not-first:border-t not-first:border-border"
+                  >
+                    <StatusBadge status={rq.status} />
+                    <Link to="/project/$owner/$project/requests/$rid" params={{ ...params, rid: rq.id }}>
+                      {t(rq.kind === 'rollback' ? 'req.envRowRollback' : 'req.envRowExecute', {
+                        to: rq.to.number,
+                      })}
+                    </Link>
+                    {rq.status === 'pending' && (
+                      <span className="text-xs text-text-2">
+                        {t('req.stageOf', { n: rq.stage + 1, total: rq.stageCount })}
+                      </span>
+                    )}
+                    <span className="flex-1" />
+                    <span className="text-xs text-text-3">
+                      {rq.requestedBy?.name ?? '?'} · {formatTime(rq.createdAt)}
+                    </span>
+                  </li>
+                ))}
+              </ul>
+            )}
+          </Section>
 
           <Section title={t('envx.chain')} count={status?.versions.length}>
             {status && status.versions.length === 0 ? (
@@ -966,7 +1041,13 @@ const EnvironmentDetailView = ({ eid }: { eid: string }) => {
           status={status}
           kind={dlg.kind}
           to={dlg.to}
+          mode={dlg.mode}
           onClose={() => setDlg(null)}
+          onRequested={(rq) => {
+            setDlg(null);
+            toast(t('req.submitted'));
+            void nav({ to: '/project/$owner/$project/requests/$rid', params: { ...params, rid: rq.id } });
+          }}
         />
       )}
 

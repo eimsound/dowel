@@ -354,6 +354,9 @@ describe.each([
     // P4c 的迁移（versions.restored_at）也退回去
     await db.exec('alter table versions drop column restored_at');
     await db.exec('drop table environment_versions');
+    // P5b 的迁移（执行申请、审批、收件箱、Webhook）也退回去
+    for (const t of ['inbox_items', 'exec_approvals', 'exec_requests', 'webhook_deliveries', 'webhooks'])
+      await db.exec(`drop table ${t}`);
     // P5a 的迁移（执行策略表、前置环境；exec_policy 列已被它搬走并删掉）也退回去：之后升级时 P4b 重新加上 exec_policy，P5a 再搬走
     await db.exec('drop table exec_policies');
     // P5a 审查后的前置环境约束：SQLite 是触发器（引用了这一列，不先删掉就 drop 不了列），PG 的外键随列一起删掉

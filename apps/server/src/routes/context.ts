@@ -29,12 +29,14 @@ import {
   type PolicyStore,
 } from '../policy.ts';
 import type { KeyedLimiter, LoginLimiter } from '../rate-limit.ts';
+import type { Requests } from '../requests.ts';
 import type { ProjectRow, RoleContext } from '../roles.ts';
 import type { Role, Rooms } from '../rooms.ts';
 import type { SecurityConfig } from '../security.ts';
 import type { Shadows } from '../shadows.ts';
 import type { ConnectionGuard } from '../targets.ts';
 import { createUser, type NewUser } from '../users.ts';
+import type { Webhooks } from '../webhooks.ts';
 
 export type Env = { Variables: { user: User } };
 
@@ -52,6 +54,10 @@ export interface AppContext {
   exec: ExecContext;
   /** 定时漂移检查（main.ts 启动；测试里不启动或调短间隔） */
   drift: DriftScheduler;
+  /** 执行申请、审批与收件箱（P5b）：申请的状态检查、通知、定时清理过期 / 失效的申请 */
+  requests: Requests;
+  /** 组级 Webhook 的投递队列（P5b，进程内，重启丢失） */
+  webhooks: Webhooks;
   security: SecurityConfig;
   /** 一次性初始化令牌：只在内存里，初始化成功后置空（重启会重新生成） */
   setupToken: string | null;
