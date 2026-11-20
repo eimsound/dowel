@@ -17,7 +17,15 @@ export type ClusterEvent =
       branchId: string;
       positions: Record<string, { x: number; y: number }>;
     }
-  | { t: 'room.presence'; origin: string; branchId: string; client: string; user: string; data: unknown }
+  | {
+      t: 'room.presence';
+      origin: string;
+      branchId: string;
+      userId?: string;
+      client: string;
+      user: string;
+      data: unknown;
+    }
   | { t: 'room.kick'; origin: string; userId: string; reason: string }
   | { t: 'room.refresh'; origin: string; branchIds?: string[] }
   | { t: 'inbox.changed'; origin: string; userIds: string[] }

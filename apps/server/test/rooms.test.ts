@@ -1,6 +1,7 @@
 // 房间的“踢人”语义：角色 / 状态在 join 之后变了（refreshLoaded）或被停用时，
 // 遗留连接上的消息一律丢弃；join 时也要再确认一次账号状态和生效角色。
-import { all, type Model, readsOf } from '@dowel/core';
+import { all, emptyModel, type Model, readsOf } from '@dowel/core';
+import { type Commit, SyncClient, type ToClient } from '@dowel/sync';
 import { afterAll, beforeAll, expect, test } from 'vitest';
 import type { User } from '../src/auth.ts';
 import { createApp, openPlatformDb, type PlatformDb } from '../src/index.ts';
@@ -180,4 +181,264 @@ test('refreshLoaded 只给真正踢掉了人的房间广播在线列表', async 
   expect((b.sent.at(-1) as { t: string }).t).toBe('peers');
   // 另一个房间没人被踢：什么都不发
   expect(c.sent.length).toBe(beforeC);
+});
+
+test('只读 viewer 冒用 editor 的 client 抢发 op：被拒绝且不推进 editor 的 processed，editor 后续同序号 op 正常生效', async () => {
+  const editorUser = await makeUser(db, 'sec-editor', { name: '编辑者' });
+  const viewerUser = await makeUser(db, 'sec-viewer', { name: '只读者' });
+  await db.query(
+    "insert into grants (id, scope_kind, scope_id, subject_kind, subject_id, role) values ($1, 'project', $2, 'user', $3, 'editor')",
+    ['g-sec-editor', pid, editorUser.id],
+  );
+  await db.query(
+    "insert into grants (id, scope_kind, scope_id, subject_kind, subject_id, role) values ($1, 'project', $2, 'user', $3, 'viewer')",
+    ['g-sec-viewer', pid, viewerUser.id],
+  );
+
+  const branchSec = `${branchId}-sec-viewer`;
+  await db.query("insert into branches (id, project_id, name) values ($1, $2, 'sec-viewer')", [
+    branchSec,
+    pid,
+  ]);
+  await rooms.init(branchSec, model);
+
+  const editor = peerOf(editorUser);
+  const viewer = peerOf(viewerUser);
+  await rooms.join(branchSec, editor.peer);
+  await rooms.join(branchSec, viewer.peer);
+  expect(viewer.peer.role).toBe('viewer');
+
+  const victimClient = 'tab-victim-1';
+  await rooms.message(branchSec, editor.peer, { t: 'hello', client: victimClient, lastSeq: 0 });
+  // editor 先提交 n=1
+  await rooms.message(branchSec, editor.peer, {
+    t: 'op',
+    op: {
+      client: victimClient,
+      n: 1,
+      name: 'createTable',
+      args: { id: 'tv_1', schema: schemaId, name: 'v_first' },
+      reads: [[schemaId, 0]],
+    },
+  });
+
+  // viewer 冒用同一个 client 握手并抢先发送 n=2
+  await rooms.message(branchSec, viewer.peer, { t: 'hello', client: victimClient, lastSeq: 0 });
+  const viewerWelcome = viewer.sent.find((m) => (m as { t: string }).t === 'welcome') as {
+    t: 'welcome';
+    lastProcessed: number;
+    rejected: unknown[];
+  };
+  // viewer 拿不到 editor 的 lastProcessed=1
+  expect(viewerWelcome.lastProcessed).toBe(0);
+
+  await rooms.message(branchSec, viewer.peer, {
+    t: 'op',
+    op: {
+      client: victimClient,
+      n: 2,
+      name: 'createTable',
+      args: { id: 'tv_spoof', schema: schemaId, name: 'spoofed' },
+      reads: [[schemaId, 0]],
+    },
+  });
+  expect(
+    viewer.sent.some((m) => {
+      const msg = m as { t: string; n?: number; code?: string };
+      return msg.t === 'reject' && msg.n === 2 && msg.code === 'invalid';
+    }),
+  ).toBe(true);
+  // room_rejections 不应落库
+  const rejRows = await db.query<{ client: string }>(
+    'select client from room_rejections where branch_id = $1',
+    [branchSec],
+  );
+  expect(rejRows).toHaveLength(0);
+
+  // editor 随后提交合法 n=2，不能被静默丢弃
+  await rooms.message(branchSec, editor.peer, {
+    t: 'op',
+    op: {
+      client: victimClient,
+      n: 2,
+      name: 'createTable',
+      args: { id: 'tv_2', schema: schemaId, name: 'v_second' },
+      reads: [[schemaId, 0]],
+    },
+  });
+  const latest = await rooms.model(branchSec);
+  expect(
+    all(latest.model, 'table')
+      .map((t) => t.name)
+      .sort(),
+  ).toEqual(['v_first', 'v_second']);
+});
+
+test('同项目另一名 editor 冒用受害者 client：不窃取 lastProcessed/rejected，不静默丢弃受害者编辑，且 SyncClient 确认互不干扰', async () => {
+  const victimUser = await makeUser(db, 'sec-victim', { name: '受害者' });
+  const attackerUser = await makeUser(db, 'sec-attacker', { name: '攻击者' });
+  await db.query(
+    "insert into grants (id, scope_kind, scope_id, subject_kind, subject_id, role) values ($1, 'project', $2, 'user', $3, 'editor')",
+    ['g-sec-victim', pid, victimUser.id],
+  );
+  await db.query(
+    "insert into grants (id, scope_kind, scope_id, subject_kind, subject_id, role) values ($1, 'project', $2, 'user', $3, 'editor')",
+    ['g-sec-attacker', pid, attackerUser.id],
+  );
+
+  const branchSpoof = `${branchId}-sec-spoof`;
+  await db.query("insert into branches (id, project_id, name) values ($1, $2, 'sec-spoof')", [
+    branchSpoof,
+    pid,
+  ]);
+  await rooms.init(branchSpoof, model);
+
+  const sharedClientId = 'tab-shared-id';
+  const victimClient = new SyncClient(sharedClientId, emptyModel());
+  const victimPeer = peerOf(victimUser);
+  const attackerPeer = peerOf(attackerUser);
+
+  const origVictimSend = victimPeer.peer.send;
+  victimPeer.peer.send = (m) => {
+    origVictimSend(m);
+    if (m.t === 'welcome' || m.t === 'snapshot' || m.t === 'commit' || m.t === 'reject') {
+      victimClient.receive(m as ToClient);
+    }
+  };
+  let victimChain = Promise.resolve();
+  victimClient.send = (m) => {
+    victimChain = victimChain.then(() => rooms.message(branchSpoof, victimPeer.peer, m));
+  };
+
+  await rooms.join(branchSpoof, victimPeer.peer);
+  await rooms.join(branchSpoof, attackerPeer.peer);
+
+  victimClient.connect();
+  await victimChain;
+  expect(victimClient.ready).toBe(true);
+
+  // 受害者连续发出两条带依赖关系的 op（测试 p:<client>:<n> 改写）
+  victimClient.mutate('createTable', { id: 'ts_1', schema: schemaId, name: 'victim_tbl' });
+  victimClient.mutate('addColumn', {
+    table: 'ts_1',
+    column: { id: 'cs_1', name: 'title', type: 'text' },
+  });
+  await victimChain;
+  expect(victimClient.pending).toHaveLength(0);
+
+  // 受害者产生一条被拒绝的 op（n=3，过期版本触发冲突），以便检验攻击者无法窃取 rejected
+  await rooms.message(branchSpoof, victimPeer.peer, {
+    t: 'op',
+    op: {
+      client: sharedClientId,
+      n: 3,
+      name: 'renameTable',
+      args: { id: 'ts_1', name: 'stale_name' },
+      reads: [['ts_1', 0]],
+    },
+  });
+
+  // 攻击者用相同 client ID 握手：必须看到自己的 lastProcessed=0、rejected=[]
+  await rooms.message(branchSpoof, attackerPeer.peer, {
+    t: 'hello',
+    client: sharedClientId,
+    lastSeq: 0,
+  });
+  const attackerWelcome = attackerPeer.sent.find((m) => (m as { t: string }).t === 'welcome') as {
+    t: 'welcome';
+    lastProcessed: number;
+    rejected: unknown[];
+  };
+  expect(attackerWelcome).toEqual({ t: 'welcome', lastProcessed: 0, rejected: [] });
+
+  // 攻击者抢发多条 op（覆盖 n=1..4），企图推高受害者的 processed
+  for (let n = 1; n <= 4; n++) {
+    await rooms.message(branchSpoof, attackerPeer.peer, {
+      t: 'op',
+      op: {
+        client: sharedClientId,
+        n,
+        name: 'createTable',
+        args: { id: `ta_${n}`, schema: schemaId, name: `attacker_${n}` },
+        reads: [[schemaId, 0]],
+      },
+    });
+  }
+
+  // 受害者收到的攻击者 commit 的 client 不能等于 sharedClientId，避免污染 pending
+  const attackerCommitsOnVictim = victimPeer.sent.filter(
+    (m): m is Commit => (m as { t: string }).t === 'commit' && (m as Commit).user === '攻击者',
+  );
+  expect(attackerCommitsOnVictim.length).toBe(4);
+  for (const c of attackerCommitsOnVictim) expect(c.client).not.toBe(sharedClientId);
+
+  // 受害者继续提交 n=4，正常提交生效（没有被攻击者的 n=4 静默丢弃）
+  await rooms.message(branchSpoof, victimPeer.peer, {
+    t: 'op',
+    op: {
+      client: sharedClientId,
+      n: 4,
+      name: 'addColumn',
+      args: { table: 'ts_1', column: { id: 'cs_2', name: 'after_attack', type: 'text' } },
+      reads: [['ts_1', 1]],
+    },
+  });
+  const latest = await rooms.model(branchSpoof);
+  expect(
+    all(latest.model, 'column')
+      .map((c) => c.name)
+      .sort(),
+  ).toEqual(['after_attack', 'title']);
+
+  // 同用户带相同 client 重连时踢掉旧连接，且保留自己的 lastProcessed=4
+  const victimReconn = peerOf(victimUser);
+  await rooms.join(branchSpoof, victimReconn.peer);
+  await rooms.message(branchSpoof, victimReconn.peer, {
+    t: 'hello',
+    client: sharedClientId,
+    lastSeq: 0,
+  });
+  expect(victimPeer.closed()).toBe(4409);
+  const reconnWelcome = victimReconn.sent.find((m) => (m as { t: string }).t === 'welcome') as {
+    t: 'welcome';
+    lastProcessed: number;
+    rejected: { n: number }[];
+  };
+  expect(reconnWelcome.lastProcessed).toBe(4);
+  expect(reconnWelcome.rejected.map((r) => r.n)).toEqual([3]);
+});
+
+test('禁止保留标识 system 与非法 client，无法干扰 replace / patch', async () => {
+  const user = await makeUser(db, 'sec-sys', { name: '系统测试' });
+  await db.query(
+    "insert into grants (id, scope_kind, scope_id, subject_kind, subject_id, role) values ($1, 'project', $2, 'user', $3, 'editor')",
+    ['g-sec-sys', pid, user.id],
+  );
+  const branchSys = `${branchId}-sec-sys`;
+  await db.query("insert into branches (id, project_id, name) values ($1, $2, 'sec-sys')", [branchSys, pid]);
+  await rooms.init(branchSys, model);
+
+  for (const badClient of ['system', 'SYSTEM', '', 'a'.repeat(129), 'a:b', 'bad\nclient']) {
+    const p = peerOf(user);
+    await rooms.join(branchSys, p.peer);
+    await rooms.message(branchSys, p.peer, { t: 'hello', client: badClient, lastSeq: 0 });
+    expect(p.closed()).toBe(4400);
+    expect(p.sent.some((m) => (m as { t: string }).t === 'welcome')).toBe(false);
+    // 后续 op 也被丢弃
+    await rooms.message(branchSys, p.peer, {
+      t: 'op',
+      op: {
+        client: badClient,
+        n: 1,
+        name: 'createTable',
+        args: { id: 't_sys_spoof', schema: schemaId, name: 'sys_spoof' },
+        reads: [[schemaId, 0]],
+      },
+    });
+  }
+
+  expect((await rooms.model(branchSys)).seq).toBe(0);
+  // 系统 replace 仍正常工作
+  await rooms.replace(branchSys, '系统测试', model, 'replaceModel', 0);
+  expect((await rooms.model(branchSys)).seq).toBe(1);
 });

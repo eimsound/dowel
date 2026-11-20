@@ -5,6 +5,7 @@ import {
   execute,
   type Op,
   type Rejection,
+  SYSTEM_CLIENT,
   type ToClient,
   type ToServer,
   type Versions,
@@ -86,10 +87,10 @@ export class Room {
         if (!deepEqual(s.model.objects[id], o)) changes.push({ id, obj: structuredClone(o) });
       for (const id of Object.keys(s.model.objects))
         if (!(id in next.objects)) changes.push({ id, obj: null });
-      const n = (s.processed.system ?? 0) + 1;
-      const commit: Commit = { t: 'commit', seq: s.seq + 1, client: 'system', n, user, changes };
-      await targetStore.append(commit, { client: 'system', n, name: opName, args: null, reads: [] });
-      s.processed.system = n;
+      const n = (s.processed[SYSTEM_CLIENT] ?? 0) + 1;
+      const commit: Commit = { t: 'commit', seq: s.seq + 1, client: SYSTEM_CLIENT, n, user, changes };
+      await targetStore.append(commit, { client: SYSTEM_CLIENT, n, name: opName, args: null, reads: [] });
+      s.processed[SYSTEM_CLIENT] = n;
       this.commit(commit, structuredClone(next), user);
       return [{ to: '*', msg: commit }];
     });
@@ -116,10 +117,10 @@ export class Room {
       if (!changes.length) return [];
       const next = structuredClone(s.model);
       for (const c of changes) next.objects[c.id] = c.obj;
-      const n = (s.processed.system ?? 0) + 1;
-      const commit: Commit = { t: 'commit', seq: s.seq + 1, client: 'system', n, user, changes };
-      await targetStore.append(commit, { client: 'system', n, name: opName, args: null, reads: [] });
-      s.processed.system = n;
+      const n = (s.processed[SYSTEM_CLIENT] ?? 0) + 1;
+      const commit: Commit = { t: 'commit', seq: s.seq + 1, client: SYSTEM_CLIENT, n, user, changes };
+      await targetStore.append(commit, { client: SYSTEM_CLIENT, n, name: opName, args: null, reads: [] });
+      s.processed[SYSTEM_CLIENT] = n;
       this.commit(commit, next, user);
       return [{ to: '*', msg: commit }];
     });
@@ -149,6 +150,7 @@ export class Room {
 
   /** 合并外部副本已持久化的拒绝记录到当前内存态（幂等：已存在的拒绝记录直接忽略） */
   applyExternalRejection(client: string, r: Rejection): boolean {
+    if (!client || client.toLowerCase() === SYSTEM_CLIENT) return false;
     const s = this.s;
     const key = `${client}:${r.n}`;
     if (this.outcome.get(key) === 'rejected') return false;
@@ -190,8 +192,12 @@ export class Room {
     readOnly: boolean,
     store: RoomStore,
   ): Promise<Out[]> {
+    if (!client || client.toLowerCase() === SYSTEM_CLIENT) {
+      throw new Error('无效的客户端标识');
+    }
     const s = this.s;
     if (msg.t === 'hello') {
+      if (msg.client !== client) return [];
       const out: Out[] = [
         {
           to: client,
@@ -219,11 +225,19 @@ export class Room {
     }
     const op = msg.op;
     if (op.client !== client) return [];
+    // 只读成员直接返回 reject，不推进 s.processed[client]、不落库 room_rejections，防止污染幂等状态
+    if (readOnly) {
+      return [
+        {
+          to: client,
+          msg: { t: 'reject', n: op.n, code: 'invalid', message: '你在这个项目里是查看者，不能修改' },
+        },
+      ];
+    }
     const done = s.processed[client] ?? 0;
     if (op.n <= done) return []; // 重复发送
     if (op.n !== done + 1) throw new Error(`修改乱序：期望 ${done + 1}，收到 ${op.n}`);
     try {
-      if (readOnly) throw new Reject('invalid', '你在这个项目里是查看者，不能修改');
       this.checkReads(op);
       let result: ReturnType<typeof execute>;
       try {
@@ -251,9 +265,13 @@ export class Room {
   /** 修改依据的对象如果之后被别人改过，就拒绝（先到先得） */
   private checkReads(op: Op) {
     const s = this.s;
+    const ownPendingPrefix = `p:${op.client}:`;
     for (const [id, seen] of op.reads) {
       let expected = seen;
       if (typeof seen === 'string') {
+        if (!seen.startsWith(ownPendingPrefix)) {
+          throw new Reject('dependency', '依赖的修改不存在');
+        }
         const o = this.outcome.get(seen.slice(2));
         if (o === 'rejected') throw new Reject('dependency', '依赖的上一个修改已被拒绝');
         if (o === undefined) throw new Reject('dependency', '依赖的修改不存在');

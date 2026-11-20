@@ -1,6 +1,27 @@
 // 同步协议的消息和公共函数（04-ir-design.md 第 2 节）。客户端和服务器共用。
 import { deepEqual, type Model, type Obj, readsOf, runMutator } from '@dowel/core';
 
+/** 系统提交（replace / patch）保留的客户端标识，普通连接禁止使用 */
+export const SYSTEM_CLIENT = 'system';
+export const MAX_CLIENT_ID_LENGTH = 128;
+
+const hasInvalidClientChar = (client: string): boolean => {
+  for (let i = 0; i < client.length; i++) {
+    const code = client.charCodeAt(i);
+    // 禁止 ASCII 控制字符、空格、DEL 与分隔符冒号（0x3a）
+    if (code <= 0x20 || code === 0x7f || code === 0x3a) return true;
+  }
+  return /\s/.test(client);
+};
+
+/** 校验客户端上报的 client 标识：非空、不过长、不含控制字符/空白/冒号，且不能使用保留值 system */
+export const isValidClientId = (client: unknown): client is string =>
+  typeof client === 'string' &&
+  client.length > 0 &&
+  client.length <= MAX_CLIENT_ID_LENGTH &&
+  client.toLowerCase() !== SYSTEM_CLIENT &&
+  !hasInvalidClientChar(client);
+
 /** 对象版本：已确认的是服务器序号（导入时已存在的对象为 0）；本地待确认修改写过的是 `p:{客户端}:{n}` */
 export type Ver = number | string;
 export type Versions = Record<string, Ver>;

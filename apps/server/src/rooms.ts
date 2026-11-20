@@ -7,11 +7,14 @@ import type { Db } from '@dowel/engines';
 import {
   type Commit,
   emptyRoomState,
+  isValidClientId,
+  type Op,
   type Out,
   type Rejection,
   Room,
   type RoomState,
   type RoomStore,
+  SYSTEM_CLIENT,
   type ToClient,
   type ToServer,
   type Versions,
@@ -27,6 +30,20 @@ export type { Role } from '@dowel/api';
 
 const SNAPSHOT_EVERY = 200;
 const HISTORY_SUMMARY_LIMIT = 5;
+
+/** 将客户端上报的 client 标识绑定到当前认证用户，在 Room 幂等表与持久化层跨副本彻底隔离不同用户 */
+const scopeClient = (userId: string, client: string): string => `${userId}:${client}`;
+
+/** 将客户端待确认版本引用 `p:${rawClient}:${n}` 改写为绑定用户后的 `p:${scopedClient}:${n}` */
+const rewriteReadsToScoped = (reads: Op['reads'], rawClient: string, scopedClient: string): Op['reads'] => {
+  const prefix = `p:${rawClient}:`;
+  return reads.map(([id, seen]) => {
+    if (typeof seen === 'string' && seen.startsWith(prefix)) {
+      return [id, `p:${scopedClient}:${seen.slice(prefix.length)}`];
+    }
+    return [id, seen];
+  });
+};
 
 const TOP_LEVEL_KINDS = new Set<Obj['kind']>(['table', 'enum', 'sequence', 'opaque', 'extension', 'schema']);
 
@@ -440,19 +457,41 @@ export class Rooms {
     }
   }
 
+  private syncClientOf(peer: Peer): string | null {
+    return peer.client ? scopeClient(peer.user.id, peer.client) : null;
+  }
+
+  /** 发给客户端前映射 commit.client：本连接自己的提交还原为原始 client，系统提交保持 system，他人提交不暴露内部键且不与本连接冲突 */
+  private forPeer(peer: Peer, msg: ToClient): ToClient {
+    if (msg.t !== 'commit') return msg;
+    const ownSync = this.syncClientOf(peer);
+    if (ownSync && msg.client === ownSync) {
+      return { ...msg, client: peer.client! };
+    }
+    if (msg.client === SYSTEM_CLIENT) return msg;
+    return { ...msg, client: '' };
+  }
+
   private broadcastCommits(r: Loaded, commits: Commit[], excludePeer?: Peer) {
     for (const c of commits) {
       for (const p of r.peers) {
-        if (p !== excludePeer) this.safeSend(p, c);
+        if (p !== excludePeer) this.safeSend(p, this.forPeer(p, c));
       }
     }
   }
 
   private deliver(r: Loaded, from: Peer, outs: Out[]) {
+    const fromSync = this.syncClientOf(from);
     for (const o of outs) {
-      if (o.to === '*') for (const p of r.peers) this.safeSend(p, o.msg);
-      else if (o.to === from.client) this.safeSend(from, o.msg);
-      else for (const p of r.peers) if (p.client === o.to) this.safeSend(p, o.msg);
+      if (o.to === '*') {
+        for (const p of r.peers) this.safeSend(p, this.forPeer(p, o.msg));
+      } else if (fromSync && o.to === fromSync) {
+        if (r.peers.has(from)) this.safeSend(from, this.forPeer(from, o.msg));
+      } else {
+        for (const p of r.peers) {
+          if (this.syncClientOf(p) === o.to) this.safeSend(p, this.forPeer(p, o.msg));
+        }
+      }
     }
   }
 
@@ -488,7 +527,10 @@ export class Rooms {
         const r = await pending.catch(() => null);
         if (!r) return;
         for (const p of r.peers) {
-          if (p.client !== event.client) {
+          const isSameSender = event.userId
+            ? p.user.id === event.userId && p.client === event.client
+            : p.client === event.client;
+          if (!isSameSender) {
             this.safeSend(p, { t: 'presence', client: event.client, user: event.user, data: event.data });
           }
         }
@@ -612,14 +654,39 @@ export class Rooms {
     const r = await this.get(branchId);
     // 不在房间里（例如账号刚被停用踢掉）就直接丢弃：不提交、不广播、不回消息
     if (!r.peers.has(peer)) return;
+    if (!msg || typeof msg !== 'object') return;
     if (msg.t === 'hello') {
+      const validLastSeq =
+        typeof msg.lastSeq === 'number' && Number.isInteger(msg.lastSeq) && msg.lastSeq >= 0;
+      if (!isValidClientId(msg.client) || !validLastSeq) {
+        const hadClient = Boolean(peer.client);
+        r.peers.delete(peer);
+        peer.close?.(4400, '无效的客户端标识');
+        if (hadClient) for (const p of r.peers) this.safeSend(p, { t: 'peers', peers: this.peerList(r) });
+        return;
+      }
+      if (peer.client !== undefined && peer.client !== msg.client) {
+        r.peers.delete(peer);
+        peer.close?.(4400, '客户端标识不可变更');
+        for (const p of r.peers) this.safeSend(p, { t: 'peers', peers: this.peerList(r) });
+        return;
+      }
+      // 同一用户带着相同 client 重连时，踢掉尚未触发 close 的旧连接，避免同键并发乱序
+      for (const other of [...r.peers]) {
+        if (other !== peer && other.user.id === peer.user.id && other.client === msg.client) {
+          r.peers.delete(other);
+          other.close?.(4409, '客户端已在其他连接重新建立');
+        }
+      }
       peer.client = msg.client;
+      const syncClient = scopeClient(peer.user.id, msg.client);
+      const scopedHello: ToServer = { t: 'hello', client: syncClient, lastSeq: msg.lastSeq };
       for (const p of r.peers) this.safeSend(p, { t: 'peers', peers: this.peerList(r) });
       const { caughtUp, outs } = await this.withRoomLock(r, async () => {
         if (!r.peers.has(peer)) return { caughtUp: [] as Commit[], outs: [] as Out[] };
         if (r.dirty) await this.reloadLocked(branchId, r);
         const caughtUp = this.db.dialect === 'pg' ? await this.catchUpFrom(this.db, branchId, r) : [];
-        const outs = await r.room.handle(peer.client!, peer.user.name, msg, {
+        const outs = await r.room.handle(syncClient, peer.user.name, scopedHello, {
           readOnly: peer.role === 'viewer',
         });
         return { caughtUp, outs };
@@ -629,12 +696,36 @@ export class Rooms {
       return;
     }
     if (msg.t === 'op') {
-      if (msg.op.client !== peer.client) return;
+      if (
+        !peer.client ||
+        !msg.op ||
+        typeof msg.op !== 'object' ||
+        msg.op.client !== peer.client ||
+        typeof msg.op.n !== 'number' ||
+        !Number.isInteger(msg.op.n) ||
+        msg.op.n < 1
+      ) {
+        return;
+      }
+      const rawClient = peer.client;
+      const syncClient = scopeClient(peer.user.id, rawClient);
+      const scopedMsg: ToServer = {
+        t: 'op',
+        op: {
+          ...msg.op,
+          client: syncClient,
+          reads: Array.isArray(msg.op.reads) ? rewriteReadsToScoped(msg.op.reads, rawClient, syncClient) : [],
+        },
+      };
       let caughtUp: Commit[] = [];
       let result: { outs: Out[]; committed: boolean; seq: number } | null = null;
       try {
         result = await this.withRoomLock(r, async () => {
           if (!r.peers.has(peer)) return null;
+          if (peer.role === 'viewer') {
+            const outs = await r.room.handle(syncClient, peer.user.name, scopedMsg, { readOnly: true });
+            return { outs, committed: false, seq: r.room.seq };
+          }
           if (r.dirty) await this.reloadLocked(branchId, r);
           let mutated = false;
           try {
@@ -649,7 +740,7 @@ export class Rooms {
               }
               const store = this.makeStore(tx, branchId);
               mutated = true;
-              const outs = await r.room.handle(peer.client!, peer.user.name, msg, {
+              const outs = await r.room.handle(syncClient, peer.user.name, scopedMsg, {
                 readOnly: peer.role === 'viewer',
                 store,
               });
@@ -702,6 +793,7 @@ export class Rooms {
       await this.publish({
         t: 'room.presence',
         branchId,
+        userId: peer.user.id,
         client: peer.client,
         user: peer.user.name,
         data: msg.data,
@@ -751,7 +843,7 @@ export class Rooms {
       throw err;
     }
     if (caughtUp.length) this.broadcastCommits(r, caughtUp);
-    for (const o of result.outs) for (const p of r.peers) this.safeSend(p, o.msg);
+    for (const o of result.outs) for (const p of r.peers) this.safeSend(p, this.forPeer(p, o.msg));
     if (result.committed) {
       await this.publish({ t: 'room.commit', branchId, seq: result.seq });
     }
@@ -796,7 +888,7 @@ export class Rooms {
       throw err;
     }
     if (caughtUp.length) this.broadcastCommits(r, caughtUp);
-    for (const o of result.outs) for (const p of r.peers) this.safeSend(p, o.msg);
+    for (const o of result.outs) for (const p of r.peers) this.safeSend(p, this.forPeer(p, o.msg));
     if (result.committed) {
       await this.publish({ t: 'room.commit', branchId, seq: result.seq });
     }

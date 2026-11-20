@@ -5,7 +5,9 @@ import fc from 'fast-check';
 import { describe, expect, test } from 'vitest';
 import {
   emptyRoomState,
+  isValidClientId,
   memoryStore,
+  type Rejection,
   Room,
   SyncClient,
   type ToClient,
@@ -217,6 +219,105 @@ describe('同步：固定场景', () => {
         .sort(),
     ).toEqual(['email', 'id', 'nickname', 'phone', 'years']);
     for (const c of [zhang, li]) expect(same(c.view, net.room.model)).toBe(true);
+  });
+
+  test('只读拒绝不推进 processed、不调用 store.reject，且禁止保留标识 system 与跨客户端依赖探测', async () => {
+    expect(isValidClientId('tab-123')).toBe(true);
+    expect(isValidClientId('')).toBe(false);
+    expect(isValidClientId('system')).toBe(false);
+    expect(isValidClientId('SYSTEM')).toBe(false);
+    expect(isValidClientId('a'.repeat(129))).toBe(false);
+    expect(isValidClientId('u1:tab-1')).toBe(false);
+    expect(isValidClientId('tab\n1')).toBe(false);
+
+    const rejectedCalls: { client: string; r: Rejection }[] = [];
+    const baseStore = memoryStore();
+    const store = {
+      append: baseStore.append,
+      reject: async (client: string, r: Rejection) => {
+        rejectedCalls.push({ client, r });
+      },
+    };
+    const m = emptyModel();
+    const room = new Room(emptyRoomState(m), store);
+    await room.handle('u1:c1', '张三', {
+      t: 'op',
+      op: { client: 'u1:c1', n: 1, name: 'createSchema', args: { id: 's', name: 'public' }, reads: [] },
+    });
+
+    // 保留标识 system 直接被 Room.handle 拒绝，无法干扰 replace
+    await expect(
+      room.handle('system', '攻击者', { t: 'hello', client: 'system', lastSeq: 0 }),
+    ).rejects.toThrow('无效的客户端标识');
+    const replaced = await room.replace('管理员', room.model, 'replaceModel');
+    expect(replaced[0]?.msg).toMatchObject({ t: 'commit', client: 'system', n: 1 });
+
+    // 只读拒绝绝不推进 processed、绝不写入 store.reject，连发多条也不报乱序
+    const ro1 = await room.handle(
+      'u1:c1',
+      '只读者',
+      {
+        t: 'op',
+        op: {
+          client: 'u1:c1',
+          n: 2,
+          name: 'createTable',
+          args: { id: 't_bad', schema: 's', name: 'bad' },
+          reads: [['s', 1]],
+        },
+      },
+      { readOnly: true },
+    );
+    expect(ro1).toEqual([
+      {
+        to: 'u1:c1',
+        msg: { t: 'reject', n: 2, code: 'invalid', message: '你在这个项目里是查看者，不能修改' },
+      },
+    ]);
+    const ro2 = await room.handle(
+      'u1:c1',
+      '只读者',
+      {
+        t: 'op',
+        op: {
+          client: 'u1:c1',
+          n: 5,
+          name: 'createTable',
+          args: { id: 't_bad2', schema: 's', name: 'bad2' },
+          reads: [['s', 1]],
+        },
+      },
+      { readOnly: true },
+    );
+    expect(ro2[0]?.msg).toMatchObject({ t: 'reject', n: 5, code: 'invalid' });
+    expect(rejectedCalls).toEqual([]);
+
+    // 合法编辑者随后提交 n=2 必须正常提交生效
+    const ok = await room.handle('u1:c1', '张三', {
+      t: 'op',
+      op: {
+        client: 'u1:c1',
+        n: 2,
+        name: 'createTable',
+        args: { id: 't_ok', schema: 's', name: 'orders' },
+        reads: [['s', 1]],
+      },
+    });
+    expect(ok[0]?.msg).toMatchObject({ t: 'commit', client: 'u1:c1', n: 2 });
+    expect(all(room.model, 'table').map((t) => t.name)).toEqual(['orders']);
+
+    // 跨客户端伪造 p:<他人client>:<n> 依赖引用必须被拒绝
+    const probe = await room.handle('u2:c2', '李四', {
+      t: 'op',
+      op: {
+        client: 'u2:c2',
+        n: 1,
+        name: 'createTable',
+        args: { id: 't_probe', schema: 's', name: 'probe' },
+        reads: [['t_ok', 'p:u1:c1:2']],
+      },
+    });
+    expect(probe[0]?.msg).toMatchObject({ t: 'reject', n: 1, code: 'dependency' });
   });
 });
 

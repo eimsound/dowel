@@ -686,6 +686,62 @@ describe.skipIf(!PG_URL)('P7 HA2：无状态实时协作房间（真实 PG 双�
       off();
     }
   });
+
+  test('7. 跨副本客户端标识隔离：不同用户在不同副本使用相同 client 互不干扰，且 system 被拒绝', async () => {
+    const f = await boot('client-isolation');
+    const peerA = makePeer(f.alice);
+    const peerB = makePeer(f.bob);
+    const sharedClient = 'tab-same-across-replicas';
+
+    await f.appA.rooms.join(f.branchId, peerA.peer);
+    await f.appB.rooms.join(f.branchId, peerB.peer);
+
+    // 保留字 system 被拒绝关闭
+    const peerSys = makePeer(f.bob);
+    await f.appB.rooms.join(f.branchId, peerSys.peer);
+    await f.appB.rooms.message(f.branchId, peerSys.peer, { t: 'hello', client: 'system', lastSeq: 0 });
+    expect(peerSys.closed()?.code).toBe(4400);
+
+    await f.appA.rooms.message(f.branchId, peerA.peer, { t: 'hello', client: sharedClient, lastSeq: 0 });
+    await f.appB.rooms.message(f.branchId, peerB.peer, { t: 'hello', client: sharedClient, lastSeq: 0 });
+
+    // 李四（副本 B）抢先用相同 client 提交 n=1
+    await f.appB.rooms.message(f.branchId, peerB.peer, {
+      t: 'op',
+      op: {
+        client: sharedClient,
+        n: 1,
+        name: 'createTable',
+        args: { id: 't_bob_iso', schema: f.schemaId, name: 'bob_iso' },
+        reads: [[f.schemaId, 0]],
+      },
+    });
+    await waitFor(() => peerA.sent.some((m) => m.t === 'commit' && m.seq === 1));
+
+    // 张三（副本 A）随后用相同 client 提交 n=1：绝不能被静默丢弃
+    await f.appA.rooms.message(f.branchId, peerA.peer, {
+      t: 'op',
+      op: {
+        client: sharedClient,
+        n: 1,
+        name: 'createTable',
+        args: { id: 't_alice_iso', schema: f.schemaId, name: 'alice_iso' },
+        reads: [[f.schemaId, 0]],
+      },
+    });
+    await waitFor(() => peerB.sent.some((m) => m.t === 'commit' && m.seq === 2));
+
+    const modelA = await f.appA.rooms.model(f.branchId);
+    const modelB = await f.appB.rooms.model(f.branchId);
+    expect(modelA.seq).toBe(2);
+    expect(modelB.seq).toBe(2);
+    expect(
+      all(modelA.model, 'table')
+        .map((t) => t.name)
+        .sort(),
+    ).toEqual(['alice_iso', 'bob_iso']);
+    expect(sameModel(modelA.model, modelB.model)).toBe(true);
+  });
 });
 
 describe('Room.applyExternalCommit / applyExternalRejection 单元测试', () => {
