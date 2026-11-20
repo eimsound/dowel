@@ -13,6 +13,7 @@
 import {
   emptyBase,
   findInstanceLevelStep,
+  isConcurrentDdlSql,
   isNontransactionalSql,
   type Step,
   scrubSecrets,
@@ -64,16 +65,27 @@ const errText = (e: unknown, max = 2000): string => {
   return t.length > max ? `${t.slice(0, max)}…` : t;
 };
 
+/** 某一步执行时执行策略实际设下的超时（毫秒，0 = 这一步没有设，用库端原来的配置） */
+interface AppliedTimeouts {
+  statementMs: number;
+  lockMs: number;
+}
+
 class StepFailure extends Error {
   index: number;
   /** 只属于这一步失败的补充提示（例如没能识别 CREATE INDEX CONCURRENTLY 的索引名）；不会带到别的步骤的错误里 */
   hint: string;
-  constructor(index: number, cause: unknown, hint = '') {
+  /** 这一步实际设下的超时：据此判断失败是不是执行策略的超时 */
+  applied: AppliedTimeouts;
+  constructor(index: number, cause: unknown, hint = '', applied: AppliedTimeouts = NO_TIMEOUTS) {
     super(cause instanceof Error ? cause.message : String(cause), { cause });
     this.index = index;
     this.hint = hint;
+    this.applied = applied;
   }
 }
+
+const NO_TIMEOUTS: AppliedTimeouts = { statementMs: 0, lockMs: 0 };
 
 const upMigration = (chain: ChainVersion[], i: number): Migration => ({
   version: chain[i]!,
@@ -177,6 +189,65 @@ export const parseCreateIndexConcurrently = (
 const CIC_HINT =
   '（如果这条语句失败后在库里留下了无效索引，而 Dowel 没能识别出它，请先手工 DROP INDEX CONCURRENTLY 再重试）';
 
+/** 在 s 的 i 位置读一个带 schema 的名字（schema.name）；没写 schema 返回 null */
+const qualifiedAt = (s: string, from: number): { schema: string; name: string; end: number } | null => {
+  const first = identAt(s, from);
+  if (!first || s[first.end] !== '.') return null;
+  const second = identAt(s, first.end + 1);
+  return second ? { schema: first.name, name: second.name, end: second.end } : null;
+};
+
+const DETACH_HEAD = /^\s*alter\s+table\s+(?:if\s+exists\s+)?(?:only\s+)?/i;
+
+/**
+ * 解析 ALTER TABLE [IF EXISTS] [ONLY] schema.父表 [*] DETACH PARTITION schema.分区 CONCURRENTLY；
+ * 不是这种语句返回 null，是但解析不了（没写 schema、带注释等）返回 'unparsed'。
+ */
+export const parseDetachConcurrently = (
+  sql: string,
+): { parentSchema: string; parent: string; schema: string; partition: string } | 'unparsed' | null => {
+  if (!/\bdetach\s+partition\b[\s\S]*\bconcurrently\b/i.test(sql)) return null;
+  const head = DETACH_HEAD.exec(sql);
+  if (!head) return 'unparsed';
+  const parent = qualifiedAt(sql, head[0].length);
+  if (!parent) return 'unparsed';
+  const mid = /^(?:\s*\*)?\s+detach\s+partition\s+/i.exec(sql.slice(parent.end));
+  if (!mid) return 'unparsed';
+  const part = qualifiedAt(sql, parent.end + mid[0].length);
+  if (!part) return 'unparsed';
+  if (!/^\s+concurrently\s*;?\s*$/i.test(sql.slice(part.end))) return 'unparsed';
+  return { parentSchema: parent.schema, parent: parent.name, schema: part.schema, partition: part.name };
+};
+
+const DETACH_HINT =
+  '（如果分区停在了 detach pending 状态，而 Dowel 没能识别这条语句，请先手工执行 ALTER TABLE … DETACH PARTITION … FINALIZE 再处理）';
+
+/**
+ * DETACH PARTITION … CONCURRENTLY 分两个事务：第一个事务把分区标成 detach pending 并提交，之后要等所有可能用到父表的旧事务结束，
+ * 第二个事务再对分区拿 ACCESS EXCLUSIVE 完成分离。等旧事务和拿锁都受 lock_timeout 约束（执行策略照常设锁等待超时：
+ * 第二阶段排队会挡业务）。第一个事务提交之后超时，分区就停在 detach pending，重跑原语句会报 “already pending detach”，
+ * 迁移会卡死。所以执行（续跑）这一步之前先看目标分区是不是已经 detach pending：是就改为执行
+ * `ALTER TABLE 父表 DETACH PARTITION 分区 FINALIZE`（同样受超时约束，可以反复重试），效果相同。
+ * 返回要执行的语句（null = 照原样执行）和识别不了时的提示。
+ */
+const detachFinalizeFor = async (conn: Db, sql: string): Promise<{ sql: string | null; hint: string }> => {
+  const p = parseDetachConcurrently(sql);
+  if (p === null) return { sql: null, hint: '' };
+  if (p === 'unparsed') return { sql: null, hint: DETACH_HINT };
+  const [row] = await conn.query<{ parent: string; partition: string }>(
+    `select format('%I.%I', pn.nspname, pc.relname) as parent, format('%I.%I', cn.nspname, cc.relname) as partition
+       from pg_inherits i
+       join pg_class cc on cc.oid = i.inhrelid join pg_namespace cn on cn.oid = cc.relnamespace
+       join pg_class pc on pc.oid = i.inhparent join pg_namespace pn on pn.oid = pc.relnamespace
+      where i.inhdetachpending and cc.relname = $1 and cn.nspname = $2 and pc.relname = $3 and pn.nspname = $4`,
+    [p.partition, p.schema, p.parent, p.parentSchema],
+  );
+  return {
+    sql: row ? `ALTER TABLE ${row.parent} DETACH PARTITION ${row.partition} FINALIZE` : null,
+    hint: '',
+  };
+};
+
 /** 返回这条 CIC 语句能不能被识别（识别不了时失败信息里要提示手工处理） */
 const dropLeftoverInvalidIndex = async (conn: Db, sql: string): Promise<boolean> => {
   const p = parseCreateIndexConcurrently(sql);
@@ -260,6 +331,20 @@ const wrap = (e: unknown, m: Migration, partial: boolean): ExecutorError => {
   if (e instanceof StepFailure) {
     const sql = m.steps[e.index]?.sql ?? '';
     const brief = sql.length > 160 ? `${sql.slice(0, 160)}…` : sql;
+    const timeout = timeoutOf(e.cause, e.applied);
+    if (timeout)
+      return new ExecutorError(
+        'step_timeout',
+        scrubSecrets(
+          `${label(m.version)}${m.direction === 'down' ? '的回滚' : ''}第 ${e.index + 1} 步${
+            timeout.kind === 'lock'
+              ? `等锁超过 ${seconds(timeout.ms)}（执行策略的锁等待超时）：要改的表正被其他会话占用。`
+              : `执行超过 ${seconds(timeout.ms)}（执行策略的语句超时）。`
+          }${partial ? '已完成的步骤保留，重试会从断点接着执行' : '这个迁移已整体回滚，可以稍后重试'}（${brief}）${e.hint}`,
+        ),
+        { ...details, step: e.index + 1, timeout },
+        e,
+      );
     return new ExecutorError(
       'step_failed',
       scrubSecrets(
@@ -273,13 +358,60 @@ const wrap = (e: unknown, m: Migration, partial: boolean): ExecutorError => {
   return new ExecutorError('unexpected', errText(e), details, e);
 };
 
-const execStep = async (conn: Db, steps: ScriptStep[], i: number, hint = '') => {
+const execStep = async (
+  conn: Db,
+  steps: ScriptStep[],
+  i: number,
+  hint = '',
+  applied: AppliedTimeouts = NO_TIMEOUTS,
+  /** 实际执行的语句（续跑时把停在 detach pending 的 DETACH … CONCURRENTLY 换成 FINALIZE）；默认就是这一步的语句 */
+  sql = steps[i]!.sql,
+) => {
   try {
-    await conn.exec(steps[i]!.sql);
+    await conn.exec(sql);
   } catch (e) {
-    throw new StepFailure(i, e, hint);
+    throw new StepFailure(i, e, hint, applied);
   }
 };
+
+/**
+ * 迁移会话的超时（执行策略，P5a）：执行步骤之前设上，步骤做完（读回校验、写历史之前）用 RESET 恢复。
+ * - 策略是“不限”（0）的项**不 SET**：库端（角色 / 数据库级）已有的 statement_timeout、lock_timeout 照常生效；
+ * - 恢复用 RESET（回到会话的默认值，也就是角色 / 数据库级的配置），不是 SET 成 0：读回校验和写历史跑在原来的设置上；
+ * - concurrent：CONCURRENTLY 类的操作不设锁等待超时（见 @dowel/core 的 isConcurrentDdlSql）；
+ * - 在事务里 SET / RESET 随事务提交或回滚（失败时回滚就撤销了），在事务外由调用方在 finally 里恢复；结束时 RESET ALL 兜底。
+ * 值是校验过的整数毫秒，直接拼进语句。返回实际设下的值（恢复和判断超时都用它）。
+ */
+const applyTimeouts = async (
+  conn: Db,
+  t: ExecuteOptions['timeouts'],
+  concurrent = false,
+): Promise<AppliedTimeouts> => {
+  const ms = (n: number) => Math.max(0, Math.trunc(n));
+  const applied = { statementMs: t ? ms(t.statementMs) : 0, lockMs: t && !concurrent ? ms(t.lockMs) : 0 };
+  if (applied.statementMs > 0) await conn.exec(`SET statement_timeout = ${applied.statementMs}`);
+  if (applied.lockMs > 0) await conn.exec(`SET lock_timeout = ${applied.lockMs}`);
+  return applied;
+};
+
+const restoreTimeouts = async (conn: Db, applied: AppliedTimeouts) => {
+  if (applied.statementMs > 0) await conn.exec('RESET statement_timeout');
+  if (applied.lockMs > 0) await conn.exec('RESET lock_timeout');
+};
+
+/**
+ * PG 因为执行策略的超时取消了语句：55P03 = lock_not_available（lock_timeout），57014 = query_canceled（statement_timeout）。
+ * 只认这一步**执行策略实际设下**的超时：没设时同样的错误码来自库端配置或别人的 pg_cancel_backend，按普通失败报告。
+ */
+const timeoutOf = (e: unknown, t: AppliedTimeouts): ExecutorErrorDetails['timeout'] | undefined => {
+  const code = (e as { code?: unknown } | null)?.code;
+  if (code === '55P03' && t.lockMs > 0) return { kind: 'lock', ms: t.lockMs };
+  // 57014 也可能是别人 pg_cancel_backend：只有设了语句超时时才认为是超时
+  if (code === '57014' && t.statementMs > 0) return { kind: 'statement', ms: t.statementMs };
+  return undefined;
+};
+
+const seconds = (ms: number) => (ms % 1000 === 0 ? `${ms / 1000} 秒` : `${ms} 毫秒`);
 
 /** 只写基线：不执行任何 SQL；库里的结构已经等于基线模型 */
 const writeBaseline = async (conn: Db, c: Ctx, m: Migration, snapshotFp: string): Promise<number> => {
@@ -356,7 +488,9 @@ const runMigration = async (
         async () => {
           await pinSession(conn);
           const id = await startRun(conn, runBase(c, m));
-          for (let i = 0; i < steps.length; i++) await execStep(conn, steps, i);
+          const applied = await applyTimeouts(conn, c.o.timeouts);
+          for (let i = 0; i < steps.length; i++) await execStep(conn, steps, i, '', applied);
+          await restoreTimeouts(conn, applied);
           await verifyAndRecord(conn, c, m);
           await finishRun(conn, id, 'done');
           return id;
@@ -395,9 +529,20 @@ const runMigration = async (
           touched = true;
         }
         await pinSession(conn);
-        // 没能识别 CIC 的索引名时，这一步失败的信息里提示手工处理（只属于这一步，不会带到别的步骤的错误里）
-        const hint = (await dropLeftoverInvalidIndex(conn, steps[i]!.sql)) ? '' : CIC_HINT;
-        await execStep(conn, steps, i, hint);
+        // 超时也作用于非事务步骤（含清理遗留无效索引的 DROP INDEX CONCURRENTLY）；做完立刻恢复，写断点不受它约束。
+        // CONCURRENTLY 类的索引操作（CREATE / DROP INDEX、REINDEX … CONCURRENTLY）不设锁等待超时
+        // （它们不阻塞读写、等的是旧事务结束，见 @dowel/core 的 isConcurrentDdlSql）；DETACH PARTITION … CONCURRENTLY 不豁免
+        // （第二阶段要对分区拿 ACCESS EXCLUSIVE，排队时一样会挡住业务）
+        const applied = await applyTimeouts(conn, c.o.timeouts, isConcurrentDdlSql(steps[i]!.sql));
+        try {
+          // 没能识别 CIC 的索引名时，这一步失败的信息里提示手工处理（只属于这一步，不会带到别的步骤的错误里）
+          const hint = (await dropLeftoverInvalidIndex(conn, steps[i]!.sql)) ? '' : CIC_HINT;
+          // 上一次停在 detach pending 的 DETACH PARTITION … CONCURRENTLY：续跑时改为 FINALIZE（见 detachFinalizeFor）
+          const detach = await detachFinalizeFor(conn, steps[i]!.sql);
+          await execStep(conn, steps, i, hint + detach.hint, applied, detach.sql ?? undefined);
+        } finally {
+          await restoreTimeouts(conn, applied).catch(() => {});
+        }
         await markStep(conn, runId, i);
         done = i;
         i++;
@@ -410,7 +555,9 @@ const runMigration = async (
           conn,
           async () => {
             await pinSession(conn);
-            for (let k = i; k < j; k++) await execStep(conn, steps, k);
+            const applied = await applyTimeouts(conn, c.o.timeouts);
+            for (let k = i; k < j; k++) await execStep(conn, steps, k, '', applied);
+            await restoreTimeouts(conn, applied);
             if (last) {
               await verifyAndRecord(conn, c, m);
               await markStep(conn, runId, j - 1);

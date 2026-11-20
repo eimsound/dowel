@@ -114,7 +114,7 @@ const ensureGrant = async (id: string, subjectId: string, role: Role, scopeKind:
   await db.query(
     `insert into grants (id, subject_kind, subject_id, role, scope_kind, scope_id)
      values ($1, 'user', $2, $3, $4, $5)
-     on conflict (subject_kind, subject_id, scope_kind, scope_id) do nothing`,
+     on conflict do nothing`,
     [id, subjectId, role, scopeKind, scopeId],
   );
 };
@@ -199,6 +199,43 @@ const matrix: Record<string, Spec> = {
     body: () => ({}),
   },
   'GET /api/admin/grants': { access: { kind: 'instance', statuses: [200] } },
+  // 执行策略（P5a）：实例层只有实例管理员能看和改；空的整层替换是合法请求（全部继承）
+  'GET /api/admin/exec-policy': { access: { kind: 'instance', statuses: [200] } },
+  'PUT /api/admin/exec-policy': { access: { kind: 'instance', statuses: [200] }, body: () => ({}) },
+  'GET /api/groups/:slug/exec-policy': {
+    access: { kind: 'group-read', statuses: [200] },
+    path: (ctx) => `/api/groups/${ctx.groupSlug}/exec-policy`,
+  },
+  'PUT /api/groups/:slug/exec-policy': {
+    access: { kind: 'group-admin', statuses: [200] },
+    path: (ctx) => `/api/groups/${ctx.groupSlug}/exec-policy`,
+    body: () => ({}),
+  },
+  'GET /api/projects/:pid/exec-policy': {
+    access: { kind: 'project', min: 'viewer', statuses: [200] },
+    path: () => `${P()}/exec-policy`,
+  },
+  'PUT /api/projects/:pid/exec-policy': {
+    access: { kind: 'project', min: 'admin', statuses: [200] },
+    path: () => `${P()}/exec-policy`,
+    body: () => ({}),
+  },
+  'GET /api/projects/:pid/environments/:eid/exec-policy': {
+    access: { kind: 'project', min: 'viewer', statuses: [200] },
+    path: (ctx) => `${P()}/environments/${ctx.envId}/exec-policy`,
+    prepare: async (ctx) => {
+      ctx.envId = await freshEnv(ctx.pid, ++unique);
+    },
+  },
+  // 环境层：项目管理员（放宽另外要满足执行策略，在 policy-routes.test.ts 里验证）；请求体不合法 → 400
+  'PUT /api/projects/:pid/environments/:eid/exec-policy': {
+    access: { kind: 'project', min: 'admin', statuses: [400] },
+    path: (ctx) => `${P()}/environments/${ctx.envId}/exec-policy`,
+    body: () => ({}),
+    prepare: async (ctx) => {
+      ctx.envId = await freshEnv(ctx.pid, ++unique);
+    },
+  },
   'POST /api/admin/grants': { access: { kind: 'instance', statuses: [400] }, body: () => ({}) },
   'DELETE /api/admin/grants/:id': {
     access: { kind: 'instance', statuses: [404] },

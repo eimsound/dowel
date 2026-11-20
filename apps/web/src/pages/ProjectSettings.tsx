@@ -6,9 +6,11 @@ import { useNavigate } from '@tanstack/react-router';
 import { useEffect, useRef, useState } from 'react';
 import { useTranslation } from 'react-i18next';
 import { api } from '../api.ts';
+import { PolicyLayerPanel } from '../components/PolicyEditor.tsx';
 import { ProjectPage, Section } from '../components/ProjectPage.tsx';
 import { useToast } from '../components/Toasts.tsx';
 import { Banner } from '../components/ui.tsx';
+import { invalidatePolicyDependents } from '../policy-cache.ts';
 import { useProject } from '../project.tsx';
 
 export const ProjectSettings = () => {
@@ -67,6 +69,8 @@ export const ProjectSettings = () => {
         qc.invalidateQueries({ queryKey: ['groups'] }),
         qc.invalidateQueries({ queryKey: ['group'] }),
         qc.invalidateQueries({ queryKey: ['projects'] }),
+        // 组层换了：环境的生效策略、配置页的锁定都要重取（转组时变宽的字段被固定进环境层）
+        invalidatePolicyDependents(qc),
       ]);
       toast(t('pset.saved'));
       void nav({
@@ -185,6 +189,14 @@ export const ProjectSettings = () => {
 
         <Section title={t('pset.schemaSection')}>
           <SchemaScope pid={pid} project={project} canManage={canManage} />
+        </Section>
+
+        {/* 项目层的执行策略（P5a）：项目成员都能看，项目管理员可改；环境自己的那一层在环境页 */}
+        <Section title={t('pol.title')}>
+          <PolicyLayerPanel
+            path={`/api/projects/${pid}/exec-policy`}
+            queryKey={['exec-policy', 'project', pid]}
+          />
         </Section>
 
         {canManage && (

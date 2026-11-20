@@ -1032,11 +1032,9 @@ describe.each([
     try {
       const r = await call('PATCH', `/api/projects/${pid}/environments/${eid}`, { execPolicy: 'admin' });
       expect(r.status).toBe(200);
-      const update = sqls.find((q) => /^\s*update environments set/i.test(q))!;
-      expect(update).toContain('exec_policy');
-      expect(update).not.toContain('url_enc');
-      expect(update).not.toContain('allow_same_instance');
-      expect(update).not.toContain('production');
+      // P5a：档位存在执行策略的环境层（exec_policies），改档位根本不写 environments 行（更不会回写连接串）
+      expect(sqls.some((q) => /insert into exec_policies/i.test(q))).toBe(true);
+      expect(sqls.find((q) => /^\s*update environments set/i.test(q))).toBeUndefined();
       sqls.length = 0;
       const r2 = await call('PATCH', `/api/projects/${pid}/environments/${eid}`, { production: true });
       expect(r2.status).toBe(200);

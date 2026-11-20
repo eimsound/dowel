@@ -7,6 +7,7 @@ import {
   importRequestSchema,
   type ModelUpdate,
   type Ok,
+  type PolicySettings,
   type PullPreview,
   type TargetInfo,
 } from '@dowel/api';
@@ -14,13 +15,34 @@ import { type Model, newId } from '@dowel/core';
 import { planDiff } from '@dowel/executor';
 import type { Hono } from 'hono';
 import { HTTPException } from 'hono/http-exception';
-import { audit } from '../audit.ts';
-import { can, type EnvAction, effectiveExecPolicy, isEnvAction, userActor } from '../authz.ts';
-import { type EnvRow, envResource, loadEnv, loadVersionMetas, toEnvInfo, versionRef } from '../envs.ts';
+import { audit, auditIn } from '../audit.ts';
+import { can, type EnvAction, isEnvAction, userActor } from '../authz.ts';
+import { isForeignKeyViolation } from '../db.ts';
+import { applyEnvPolicy, type EnvPolicyResult } from '../env-policy.ts';
+import {
+  type EnvRow,
+  envResource,
+  loadEnv,
+  loadPrerequisite,
+  loadVersionMetas,
+  loadVersionRefs,
+  prerequisiteFromRows,
+  toEnvInfo,
+  type VersionRefRow,
+  versionRef,
+} from '../envs.ts';
 import { lockEnvIdle, readLive, settleClaims } from '../executions.ts';
+import {
+  accessIn,
+  deletePolicies,
+  deniedMessage,
+  envAuthOf,
+  loadPolicies,
+  withPolicyLock,
+} from '../policy.ts';
 import { encrypt } from '../secrets.ts';
 import { CHECK_CONNECT_TIMEOUT, claimShadow, inspectTarget } from '../targets.ts';
-import { type AppContext, access, body, connectionLimit, type Env, envAccess } from './context.ts';
+import { type AppContext, access, body, connectionLimit, type Env } from './context.ts';
 
 export const registerEnvironments = (app: Hono<Env>, ctx: AppContext) => {
   const { db, rooms, shadows, refresher } = ctx;
@@ -31,9 +53,19 @@ export const registerEnvironments = (app: Hono<Env>, ctx: AppContext) => {
       'select * from environments where project_id = $1 order by created_at',
       [a.pid],
     );
-    const versions = new Map((await loadVersionMetas(db, a.pid)).map((v) => [v.id, v]));
+    const versions = await loadVersionRefs(db, a.pid);
     const actor = userActor(c.get('user'));
-    return c.json<EnvInfo[]>(rows.map((r) => toEnvInfo(r, actor, a.role, versions)));
+    // 四层配置一次读出，每个环境按自己的生产标记合并
+    const store = await loadPolicies(db, a);
+    return c.json<EnvInfo[]>(
+      rows.map((r) => {
+        const cur = r.current_version_id ? versions.get(r.current_version_id) : undefined;
+        return toEnvInfo(r, actor, a.role, envAuthOf(store, a.rc, a, r), {
+          currentVersion: cur ? versionRef(cur) : null,
+          prerequisite: prerequisiteFromRows(r, rows, versions),
+        });
+      }),
+    );
   });
 
   app.post('/api/projects/:pid/environments', async (c) => {
@@ -75,79 +107,108 @@ export const registerEnvironments = (app: Hono<Env>, ctx: AppContext) => {
     return c.json<EnvironmentCreated>({ id, ...info }, 201);
   });
 
-  // 修改环境：连接串 / 影子库 / 生产标记 / 执行档位都是特权操作（H6），按环境的执行档位检查
+  // 修改环境：连接串 / 影子库 / 取消生产标记是特权操作（按环境生效的执行策略检查）。
+  // execPolicy（环境层的“谁能执行”）和生产标记都会改环境层的执行策略：和 PUT …/exec-policy 走同一个 applyEnvPolicy
+  // （按改动后的生产标记校验、没改的字段变宽时固定、放宽是特权操作），在执行策略锁的事务里读、校验、写。
+  // **这次改了什么、要哪些权限，都以锁内读到的环境行、策略和角色为准**（decide）：锁外只做一次预检（在连外部库之前拒绝），
+  // 等锁期间别人改了生产标记、转了组、改了策略，锁内会按新状态重新判断——例如请求带着 production: false，而锁内的行已经被
+  // 别人标成了生产，这次就是“取消生产标记”，要 environment.unmark_production 并走固定；锁内值和请求相同时不写这一列。
   app.patch('/api/projects/:pid/environments/:eid', async (c) => {
-    const { env, ...a } = await envAccess(c, ctx, 'environment.read');
+    // 先按项目权限挡一道（看不见项目 404）；环境存不存在、权限够不够由下面的预检（applyEnvPolicy）判断
+    const a = await access(c, ctx, 'environment.read');
     const b = await body(c, environmentPatchSchema);
-    const eid = env.id;
-    const actor = userActor(c.get('user'));
-    const need = new Set<EnvAction | 'environment.manage'>();
-    const fields: string[] = [];
-    const changed = <T>(next: T | undefined, cur: T) => next !== undefined && next !== cur;
-    if (b.url !== undefined) {
-      need.add('environment.change_connection');
-      fields.push('url');
-    }
-    if (b.shadowUrl !== undefined) {
-      need.add('environment.change_connection');
-      fields.push('shadowUrl');
-    }
-    if (changed(b.allowSameInstance, env.allow_same_instance)) {
-      need.add('environment.change_connection');
-      fields.push('allowSameInstance');
-    }
-    if (changed(b.production, env.production)) {
-      // 取消“生产”标记是特权操作；标成生产是收紧，项目管理员就能做
-      need.add(b.production ? 'environment.manage' : 'environment.unmark_production');
-      fields.push('production');
-    }
-    if (b.execPolicy !== undefined && b.execPolicy !== env.exec_policy) {
-      need.add('environment.set_policy');
-      fields.push('execPolicy');
-    }
-    if (!fields.length) throw new HTTPException(400, { message: '没有要修改的内容' });
-    for (const action of need) {
-      const ok = isEnvAction(action)
-        ? can(actor, action, envResource(env, a.role))
-        : can(actor, 'environment.manage', { kind: 'project', role: a.role });
-      if (!ok)
-        throw new HTTPException(403, {
-          message:
-            effectiveExecPolicy({ production: env.production, execPolicy: env.exec_policy }) === 'executor'
-              ? '这个环境设置为“仅限执行者”：目前只有实例管理员可以修改它'
-              : '修改这个环境需要项目管理员，并且要满足它的执行档位',
-        });
-    }
+    const eid = c.req.param('eid')!;
+    const pid = a.pid;
+    const user = c.get('user');
+    const actor = userActor(user);
+    /** 按某个时刻的环境行和环境层设置，算出这次请求实际要改的字段和需要的权限 */
+    const decide = (row: EnvRow, own: PolicySettings) => {
+      const need = new Set<EnvAction | 'environment.manage'>();
+      const fields: string[] = [];
+      const changed = <T>(next: T | undefined, cur: T) => next !== undefined && next !== cur;
+      if (b.url !== undefined) {
+        need.add('environment.change_connection');
+        fields.push('url');
+      }
+      if (b.shadowUrl !== undefined) {
+        need.add('environment.change_connection');
+        fields.push('shadowUrl');
+      }
+      if (changed(b.allowSameInstance, row.allow_same_instance)) {
+        need.add('environment.change_connection');
+        fields.push('allowSameInstance');
+      }
+      if (changed(b.production, row.production)) {
+        // 取消“生产”标记是特权操作；标成生产是收紧，项目管理员就能做
+        need.add(b.production ? 'environment.manage' : 'environment.unmark_production');
+        fields.push('production');
+      }
+      if (b.execPolicy !== undefined && b.execPolicy !== (own.whoCanExecute ?? null)) {
+        // 收紧要项目管理员；放宽另外要满足改动前的执行策略（applyEnvPolicy 里检查）
+        need.add('environment.manage');
+        fields.push('execPolicy');
+      }
+      return { need, fields };
+    };
+    const checkNeed = (need: Set<EnvAction | 'environment.manage'>, r: EnvPolicyResult) => {
+      for (const action of need) {
+        const ok = isEnvAction(action)
+          ? can(actor, action, envResource(r.env, r.role, r.authBefore))
+          : can(actor, 'environment.manage', { kind: 'project', role: r.role });
+        if (!ok)
+          throw new HTTPException(403, {
+            message: isEnvAction(action) ? deniedMessage(action, r.authBefore) : '修改这个环境需要项目管理员',
+          });
+      }
+    };
+    // 生产标记总是交给 applyEnvPolicy：它拿锁内的行比较，没变就不算改动，变了就走固定
+    const policyInput = (write: boolean) => ({
+      pid,
+      eid,
+      user,
+      change: {
+        ...(b.execPolicy !== undefined ? { whoCanExecute: b.execPolicy } : {}),
+        ...(b.production !== undefined ? { production: b.production } : {}),
+      },
+      write,
+    });
+    // 预检：在连任何外部库、拿环境锁之前就拒绝没权限 / 不合法 / 没有改动的请求（真正的判断在锁里再做一次）
+    const pre = await applyEnvPolicy(db, policyInput(false));
+    const preDecision = decide(pre.env, pre.ownBefore);
+    if (!preDecision.fields.length) throw new HTTPException(400, { message: '没有要修改的内容' });
+    checkNeed(preDecision.need, pre);
     // 连接配置（连接串 / 影子库 / 是否允许同实例）：本进程不能正在对这个环境执行。**先拿环境锁**（409 的请求不对任何数据库产生副作用），
     // 再做外部检查，最后在一个平台库事务里改。环境上残留的 claimed（崩溃留下的）保守处理，不会把环境锁死，见 settleClaims
-    const connection = fields.some((f) => f === 'url' || f === 'shadowUrl' || f === 'allowSameInstance');
+    const isConnection = (f: string) => f === 'url' || f === 'shadowUrl' || f === 'allowSameInstance';
+    const connection = preDecision.fields.some(isConnection);
     const release = connection ? await lockEnvIdle(ctx.exec, eid) : null;
+    let done: { r: EnvPolicyResult; row: EnvRow };
     try {
       // 外部检查在写库之前：新连接串要连得上（白名单在连接层检查），影子库要能认领
       if (b.url !== undefined) await inspectTarget(b.url, CHECK_CONNECT_TIMEOUT, ctx.guard);
       if (b.shadowUrl) await claimShadow(b.shadowUrl, ctx.guard);
-      // 取消生产标记时，没有显式设置过档位的环境把当前生效的档位固定下来：
-      // 改标记不能悄悄把“项目管理员才能执行”放宽成“编辑者就能执行”
-      const productionOff = b.production === false && env.production;
-      const policy =
-        b.execPolicy !== undefined
-          ? b.execPolicy
-          : productionOff && env.exec_policy === null
-            ? effectiveExecPolicy({ production: env.production, execPolicy: null })
-            : undefined;
-      // 只写改动的列：不拿旧行的值回写没改的列（尤其是并发改了连接串时）
-      const vals: unknown[] = [eid];
-      const sets: string[] = [];
-      const set = (col: string, v: unknown) => {
-        vals.push(v);
-        sets.push(`${col} = $${vals.length}`);
-      };
-      if (b.url !== undefined) set('url_enc', encrypt(b.url));
-      if (b.shadowUrl !== undefined) set('shadow_url_enc', b.shadowUrl ? encrypt(b.shadowUrl) : null);
-      if (b.allowSameInstance !== undefined) set('allow_same_instance', b.allowSameInstance);
-      if (b.production !== undefined) set('production', b.production);
-      if (policy !== undefined) set('exec_policy', policy);
-      await db.transaction(async (tx) => {
+      done = await withPolicyLock(db, async (tx) => {
+        // 锁内重新读环境行、四层配置、项目当前的组和调用者的角色，按它们重新决定改什么、重新检查权限
+        const r = await applyEnvPolicy(tx, policyInput(true));
+        const { need, fields } = decide(r.env, r.ownBefore);
+        // 连接类的改动要先占住环境锁（不能在执行进行中改连接配置），而环境锁是按预检的结果拿的：锁内才出现的连接类改动
+        // （例如等锁期间别人改了“允许同实例影子库”，请求里的值和锁内的值不一样了）这次没有环境锁保护，拒绝，让用户刷新后重试
+        if (!connection && fields.some(isConnection))
+          throw new HTTPException(409, {
+            message: '环境的连接设置在你提交期间被别人修改了，请刷新后重试',
+          });
+        checkNeed(need, r);
+        // 只写改动的列：不拿旧行的值回写没改的列（尤其是并发改了连接串时）；生产标记和锁内值相同时不写
+        const vals: unknown[] = [eid];
+        const sets: string[] = [];
+        const set = (col: string, v: unknown) => {
+          vals.push(v);
+          sets.push(`${col} = $${vals.length}`);
+        };
+        if (b.url !== undefined) set('url_enc', encrypt(b.url));
+        if (b.shadowUrl !== undefined) set('shadow_url_enc', b.shadowUrl ? encrypt(b.shadowUrl) : null);
+        if (fields.includes('allowSameInstance')) set('allow_same_instance', b.allowSameInstance);
+        if (fields.includes('production')) set('production', b.production);
         if (connection) await settleClaims(tx, eid);
         if (sets.length) await tx.query(`update environments set ${sets.join(', ')} where id = $1`, vals);
         // 连接串换了：缓存的当前版本和漂移结果属于旧的库，作废（版本“执行过”的永久事实记在 versions.executed_at，不受影响；镜像由之后的同步对齐）
@@ -156,44 +217,111 @@ export const registerEnvironments = (app: Hono<Env>, ctx: AppContext) => {
             "update environments set current_version_id = null, drift_status = 'unknown', drift_summary = null, last_drift_check = null where id = $1",
             [eid],
           );
+        // 等锁期间别人已经改成了一样的值：什么都没变，不写审计
+        if (fields.length)
+          await auditIn(
+            tx,
+            c,
+            {
+              action: 'environment.update',
+              actorKind: 'user',
+              actorId: user.id,
+              targetKind: 'environment',
+              targetId: eid,
+              projectId: pid,
+              data: {
+                projectId: pid,
+                name: r.env.name,
+                fields,
+                ...(r.changed
+                  ? {
+                      policy: {
+                        before: r.ownBefore,
+                        after: r.ownAfter,
+                        pinned: r.pinned,
+                        loosened: r.loosened,
+                      },
+                    }
+                  : {}),
+              },
+            },
+            ctx.security,
+          );
+        const [row] = await tx.query<EnvRow>('select * from environments where id = $1', [eid]);
+        return { r, row: row! };
       });
       await shadows.forget(eid);
     } finally {
       release?.();
     }
-    await audit(
-      db,
-      c,
-      {
-        action: 'environment.update',
-        actorKind: 'user',
-        actorId: c.get('user').id,
-        targetKind: 'environment',
-        targetId: eid,
-        projectId: a.pid,
-        data: { projectId: a.pid, name: env.name, fields },
-      },
-      ctx.security,
+    // 响应直接用锁内的结果：策略只换掉环境层（不再读四层），当前版本和前置环境各一条轻量查询
+    const { r, row } = done;
+    const environments = new Map(r.store.environments);
+    environments.set(eid, r.ownAfter);
+    const auth = envAuthOf({ ...r.store, environments }, r.rc, r.project, row);
+    const [cur] = row.current_version_id
+      ? await db.query<VersionRefRow>('select id, number, name from versions where id = $1', [
+          row.current_version_id,
+        ])
+      : [];
+    return c.json<EnvInfo>(
+      toEnvInfo(row, actor, r.role, auth, {
+        currentVersion: cur ? versionRef(cur) : null,
+        prerequisite: await loadPrerequisite(db, pid, row.prerequisite_id),
+      }),
     );
-    const [row] = await db.query<EnvRow>('select * from environments where id = $1', [eid]);
-    const versions = new Map((await loadVersionMetas(db, a.pid)).map((v) => [v.id, v]));
-    return c.json<EnvInfo>(toEnvInfo(row!, actor, a.role, versions));
   });
 
   app.delete('/api/projects/:pid/environments/:eid', async (c) => {
-    const a = await envAccess(c, ctx, 'environment.delete');
-    const eid = a.env.id;
+    // 锁外只做轻量检查（看不见项目 / 环境不存在 404），不读执行策略；删除受执行策略约束，权限只在执行策略锁里判断一次（和 PATCH 一致）
+    const a = await access(c, ctx, 'environment.read');
+    const eid = (await loadEnv(db, a.pid, c.req.param('eid')!)).id;
+    const user = c.get('user');
     // 本进程正在执行时不能删（409，见 lockEnvIdle）；残留的 claimed 保守处理（settleClaims）：版本算执行过，然后照常删
     const release = await lockEnvIdle(ctx.exec, eid);
     try {
-      await db.transaction(async (tx) => {
+      await withPolicyLock(db, async (tx) => {
+        // 删除环境受执行策略约束：锁内重新读项目当前的组、调用者的角色、环境行和四层策略再判断
+        // （等锁期间别人可能把它收紧成了“仅限执行者”，或者转了组）
+        const now = await accessIn(tx, user, a.pid);
+        const [row] = await tx.query<EnvRow>('select * from environments where id = $1 and project_id = $2', [
+          eid,
+          a.pid,
+        ]);
+        if (!row) throw new HTTPException(404, { message: '环境不存在' });
+        const auth = envAuthOf(await loadPolicies(tx, now.project), now.rc, now.project, row);
+        if (!can(userActor(user), 'environment.delete', envResource(row, now.role, auth)))
+          throw new HTTPException(403, { message: deniedMessage('environment.delete', auth) });
+        // 被别的环境当作前置环境时不能删：删掉会悄悄去掉那个环境的保护（先在它的设置里移除前置环境）。
+        // 在同一个事务（执行策略锁）里检查和删除；prerequisite_id 上还有外键兜底（见 db.ts），并发也删不掉
+        const dependents = await tx.query<{ name: string }>(
+          'select name from environments where project_id = $1 and prerequisite_id = $2 order by name',
+          [a.pid, eid],
+        );
+        if (dependents.length)
+          throw new HTTPException(409, {
+            message: `“${dependents.map((d) => d.name).join('”、“')}”把这个环境设为前置环境，请先在它们的执行策略里移除`,
+          });
         await settleClaims(tx, eid);
-        await tx.query('delete from environments where id = $1 and project_id = $2', [eid, a.pid]);
+        // 环境层的策略和环境上的执行者授权（范围是多态的，没有外键）
+        await deletePolicies(tx, 'environment', [eid]);
+        await tx.query("delete from grants where scope_kind = 'environment' and scope_id = $1", [eid]);
+        try {
+          await tx.query('delete from environments where id = $1 and project_id = $2', [eid, a.pid]);
+        } catch (e) {
+          if (isForeignKeyViolation(e))
+            throw new HTTPException(409, {
+              message: '这个环境被别的环境设为前置环境，请先在它们的执行策略里移除',
+            });
+          throw e;
+        }
       });
       await shadows.forget(eid);
     } finally {
       release();
     }
+    // 环境上的执行者授权跟着删了：可能有人因此看不到这个项目
+    await rooms.refreshLoaded();
     await audit(
       db,
       c,

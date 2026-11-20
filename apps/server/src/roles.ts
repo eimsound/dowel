@@ -54,13 +54,20 @@ export const projectRows = (db: Db, scope?: { groupId: string }): Promise<Projec
     scope ? [scope.groupId] : [],
   );
 
-/** 授权的最小形状（roles.ts 只用来算角色，不关心是谁在什么时候授的） */
+/**
+ * 授权的最小形状（roles.ts 只用来算角色，不关心是谁在什么时候授的）。
+ * role = executor 是“执行者”授权（P5a）：只给项目的只读可见性（查看者），特权操作由 policy.ts 的 isExecutor 判断。
+ * 环境范围的授权只有执行者；envProjectId 是那个环境所属的项目（可见性按项目算）。
+ */
 export interface GrantRow {
   subjectKind: 'user' | 'group';
   subjectId: string;
-  role: Role;
+  role: Role | 'executor';
   scopeKind: 'instance' | 'group' | 'project' | 'environment';
   scopeId: string;
+  /** 授权时授予者是实例管理员（“仅限执行者”的生产环境只认这种执行者） */
+  byInstanceAdmin?: boolean;
+  envProjectId?: string | null;
 }
 
 /** 一个用户的角色输入：组成员关系 + 和他有关的授权；算多个项目时只读一次 */
@@ -79,12 +86,14 @@ export const loadRoleContext = async (db: Db, user: { id: string; role: string }
   );
   // 组授权的范围是“这个用户所在的任一组”，用子查询一次拿到，不用在 JS 里拼 IN 列表
   const grants = await db.query<GrantRow>(
-    `select subject_kind as "subjectKind", subject_id as "subjectId", role,
-            scope_kind as "scopeKind", scope_id as "scopeId"
-       from grants
-      where (subject_kind = 'user' and subject_id = $1)
-         or (subject_kind = 'group'
-             and subject_id in (select group_id from group_members where user_id = $1))`,
+    `select gr.subject_kind as "subjectKind", gr.subject_id as "subjectId", gr.role,
+            gr.scope_kind as "scopeKind", gr.scope_id as "scopeId", gr.by_instance_admin as "byInstanceAdmin",
+            e.project_id as "envProjectId"
+       from grants gr
+       left join environments e on gr.scope_kind = 'environment' and e.id = gr.scope_id
+      where (gr.subject_kind = 'user' and gr.subject_id = $1)
+         or (gr.subject_kind = 'group'
+             and gr.subject_id in (select group_id from group_members where user_id = $1))`,
     [user.id],
   );
   return {
@@ -122,10 +131,13 @@ export const effectiveRole = (rc: RoleContext, p: ProjectRoleInput): Role | null
     const inScope =
       g.scopeKind === 'instance' ||
       (g.scopeKind === 'group' && g.scopeId === p.groupId) ||
-      (g.scopeKind === 'project' && g.scopeId === p.id);
+      (g.scopeKind === 'project' && g.scopeId === p.id) ||
+      // 环境范围只有执行者授权：按环境所属的项目给可见性
+      (g.scopeKind === 'environment' && g.role === 'executor' && g.envProjectId === p.id);
     if (!inScope) continue;
     const applies = g.subjectKind === 'user' ? g.subjectId === rc.userId : rc.groups.has(g.subjectId);
-    if (applies) raise(g.role);
+    // 执行者不因此获得模型的编辑权限，只能只读查看项目（查看者）：它要看得到环境、版本和脚本才能执行
+    if (applies) raise(g.role === 'executor' ? 'viewer' : g.role);
   }
   return best;
 };

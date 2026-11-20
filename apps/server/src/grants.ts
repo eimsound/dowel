@@ -1,6 +1,6 @@
-// 授权：角色 × 范围（实例 / 组 / 项目的全部项目）× 对象（用户 / 组）。
-// 表里还允许 scope=environment（以后给“执行者”用），接口现在不开放这一层。
-import type { DefaultAccess, GrantInfo, GrantScopeKind, GrantSubjectKind, Role } from '@dowel/api';
+// 授权：角色 × 范围（实例 / 组的全部项目 / 项目 / 环境）× 对象（用户 / 组）。
+// 角色是项目角色（查看者 / 编辑者 / 项目管理员）或“执行者”（P5a）；环境范围只用于执行者。
+import type { DefaultAccess, GrantInfo, GrantRole, GrantScopeKind, GrantSubjectKind, Role } from '@dowel/api';
 import { newId } from '@dowel/core';
 import type { Db } from '@dowel/engines';
 import { defaultRoleOf, type GrantRow, type ProjectRow } from './roles.ts';
@@ -8,25 +8,31 @@ import { defaultRoleOf, type GrantRow, type ProjectRow } from './roles.ts';
 export interface GrantInput {
   subjectKind: GrantSubjectKind;
   subjectId: string;
-  role: Role;
+  role: GrantRole;
   scopeKind: GrantScopeKind;
   scopeId: string;
   createdBy?: string | null;
+  /** 授予者此刻是不是实例管理员（“仅限执行者”的生产环境只认这种执行者，见 policy.ts 的 isExecutor） */
+  byInstanceAdmin?: boolean;
 }
 
 /** subject 的信息一起查出来，界面直接显示名字（用户显示名 / 组名） */
 const SELECT = `select gr.id, gr.subject_kind as "subjectKind", gr.subject_id as "subjectId", gr.role,
     gr.scope_kind as "scopeKind", gr.scope_id as "scopeId", gr.created_at as "createdAt",
+    gr.by_instance_admin as "byInstanceAdmin", e.name as "environmentName",
     coalesce(u.name, g.name) as "subjectName", coalesce(u.username, g.slug) as "subjectSlug"
   from grants gr
   left join users u on gr.subject_kind = 'user' and u.id = gr.subject_id
-  left join groups g on gr.subject_kind = 'group' and g.id = gr.subject_id`;
+  left join groups g on gr.subject_kind = 'group' and g.id = gr.subject_id
+  left join environments e on gr.scope_kind = 'environment' and e.id = gr.scope_id`;
 
 type GrantRowWithSubject = Pick<GrantRow, 'subjectKind' | 'subjectId' | 'role' | 'scopeKind' | 'scopeId'> & {
   id: string;
   createdAt: string;
   subjectName: string | null;
   subjectSlug: string | null;
+  byInstanceAdmin: boolean;
+  environmentName: string | null;
 };
 
 const toInfo = (r: GrantRowWithSubject): GrantInfo => ({
@@ -39,9 +45,10 @@ const toInfo = (r: GrantRowWithSubject): GrantInfo => ({
     slug: r.subjectSlug ?? r.subjectId,
   },
   role: r.role,
-  // 接口不开放 environment 范围，这里只会是这三种
-  scopeKind: r.scopeKind as GrantScopeKind,
+  scopeKind: r.scopeKind,
   scopeId: r.scopeId,
+  environmentName: r.environmentName ?? null,
+  byInstanceAdmin: r.byInstanceAdmin === true,
   createdAt: r.createdAt,
 });
 
@@ -57,6 +64,17 @@ export const listGrants = async (
   return rows.map(toInfo);
 };
 
+/** 项目的授权：项目范围的，加上这个项目各环境上的执行者授权 */
+export const listProjectGrants = async (db: Db, pid: string): Promise<GrantInfo[]> => {
+  const rows = await db.query<GrantRowWithSubject>(
+    `${SELECT} where (gr.scope_kind = 'project' and gr.scope_id = $1)
+        or (gr.scope_kind = 'environment' and e.project_id = $1)
+      order by gr.created_at, gr.id`,
+    [pid],
+  );
+  return rows.map(toInfo);
+};
+
 export const grantById = async (db: Db, id: string): Promise<GrantInfo | null> => {
   const [row] = await db.query<GrantRowWithSubject>(`${SELECT} where gr.id = $1`, [id]);
   return row ? toInfo(row) : null;
@@ -65,8 +83,8 @@ export const grantById = async (db: Db, id: string): Promise<GrantInfo | null> =
 export const insertGrant = async (db: Db, input: GrantInput): Promise<string> => {
   const id = newId();
   await db.query(
-    `insert into grants (id, subject_kind, subject_id, role, scope_kind, scope_id, created_by)
-     values ($1, $2, $3, $4, $5, $6, $7)`,
+    `insert into grants (id, subject_kind, subject_id, role, scope_kind, scope_id, created_by, by_instance_admin)
+     values ($1, $2, $3, $4, $5, $6, $7, $8)`,
     [
       id,
       input.subjectKind,
@@ -75,6 +93,7 @@ export const insertGrant = async (db: Db, input: GrantInput): Promise<string> =>
       input.scopeKind,
       input.scopeId,
       input.createdBy ?? null,
+      input.byInstanceAdmin === true,
     ],
   );
   return id;

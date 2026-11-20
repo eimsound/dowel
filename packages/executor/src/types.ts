@@ -101,6 +101,12 @@ export interface ExecuteOptions {
   via?: 'web' | 'ci';
   /** 等项目锁的时间，默认 30 秒 */
   lockTimeoutMs?: number;
+  /**
+   * 迁移会话的超时（P5a，来自执行策略）：执行每个迁移的步骤时设置 `statement_timeout` / `lock_timeout`（毫秒，0 = 不限），
+   * 事务步骤和非事务步骤都生效；读回校验、写历史不受它约束（步骤做完就恢复成不限）。不给 = 不设置（执行器本身没有默认值）。
+   * 因超时失败的步骤报 `step_timeout`（details.timeout 说明是哪一种），断点续跑的语义不变。
+   */
+  timeouts?: { statementMs: number; lockMs: number };
   onEvent?: (e: ExecutorEvent) => void | Promise<void>;
   /**
    * 每个迁移（含基线）开始前调用：平台库在这里登记“这个版本即将在这个环境执行”并再确认版本没被改过。

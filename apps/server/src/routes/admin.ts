@@ -199,12 +199,17 @@ export const registerAdmin = (app: Hono<Env>, ctx: AppContext) => {
 
   app.post('/api/admin/grants', async (c) => {
     const b = await body(c, grantCreateSchema);
+    if (b.environmentId) throw new HTTPException(400, { message: '实例级授权不能指定环境' });
     if (!(await subjectExists(db, b.subjectKind, b.subjectId)))
       throw new HTTPException(404, { message: '用户或组不存在' });
     let id: string;
     try {
       id = await insertGrant(db, {
-        ...b,
+        subjectKind: b.subjectKind,
+        subjectId: b.subjectId,
+        role: b.role,
+        // 只有实例管理员能到这里
+        byInstanceAdmin: true,
         // 实例范围的 scope_id 固定为空串：唯一约束里 NULL 在 PG 不算冲突，空串更简单
         scopeKind: 'instance',
         scopeId: '',

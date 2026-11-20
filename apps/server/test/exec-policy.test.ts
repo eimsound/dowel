@@ -1,16 +1,15 @@
-// H6 基础执行权限（P5 之前的过渡方案）：谁能执行三档——项目编辑者 / 项目管理员 / 仅限执行者；
-// 默认非生产为编辑者、生产为项目管理员；档位存在环境上；“仅限执行者”在 P5 之前等同于只有实例管理员。
+// H6 基础执行权限：谁能执行三档——项目编辑者 / 项目管理员 / 仅限执行者；
+// 默认非生产为编辑者、生产为项目管理员；档位存在环境上（P5a 起是执行策略的环境层，存在 exec_policies）。
+// 这里的用户都不是执行者，所以“仅限执行者”只有实例管理员能过；执行者授权的场景见 policy.test.ts。
 // 特权操作：执行 / 回滚 / 写基线、改连接串和影子库、删除环境、取消“生产”标记（以及改档位本身）。
 // 模型的编辑和发布不受约束。不需要真实 PG：环境直接写库，授权检查在连接目标库之前。
-import type { EnvInfo, ExecPolicy, Role } from '@dowel/api';
+import { type EnvInfo, type ExecPolicy, POLICY_DEFAULTS, type Role, resolvePolicy } from '@dowel/api';
 import { afterAll, beforeAll, describe, expect, test } from 'vitest';
 import {
   type Actor,
   can,
-  defaultExecPolicy,
   ENV_ACTIONS,
   type EnvAction,
-  effectiveExecPolicy,
   isEnvConfigAction,
   type Resource,
 } from '../src/authz.ts';
@@ -24,6 +23,9 @@ process.env.DOWEL_SECRET ??= 'policy-test-secret-0123456789';
 const ROLES: (Role | null)[] = ['viewer', 'editor', 'admin', null];
 const POLICIES: (ExecPolicy | null)[] = [null, 'editor', 'admin', 'executor'];
 const RANK: Record<Role, number> = { viewer: 0, editor: 1, admin: 2 };
+/** 只有环境层设置时的生效档位（和服务端同一个 resolvePolicy） */
+const effective = (production: boolean, policy: ExecPolicy | null): ExecPolicy =>
+  resolvePolicy({ environment: policy ? { whoCanExecute: policy } : {} }, production).whoCanExecute.value;
 
 describe('can()：环境上的特权操作按执行档位', () => {
   const user: Actor = { kind: 'user', id: 'u', instanceAdmin: false };
@@ -36,13 +38,15 @@ describe('can()：环境上的特权操作按执行档位', () => {
   });
 
   test('默认值：非生产为项目编辑者，生产为项目管理员', () => {
-    expect(defaultExecPolicy(false)).toBe('editor');
-    expect(defaultExecPolicy(true)).toBe('admin');
-    // 不知道是不是生产时按严的算
-    expect(defaultExecPolicy(undefined)).toBe('admin');
-    expect(effectiveExecPolicy({ production: false, execPolicy: null })).toBe('editor');
-    expect(effectiveExecPolicy({ production: true, execPolicy: null })).toBe('admin');
-    expect(effectiveExecPolicy({ production: true, execPolicy: 'editor' })).toBe('editor');
+    // 默认值只有一处来源：@dowel/api 的 POLICY_DEFAULTS / resolvePolicy（审查后删掉了 authz.ts 里 H6 的那一份）
+    expect(POLICY_DEFAULTS(false).whoCanExecute).toBe('editor');
+    expect(POLICY_DEFAULTS(true).whoCanExecute).toBe('admin');
+    expect(effective(false, null)).toBe('editor');
+    expect(effective(true, null)).toBe('admin');
+    expect(effective(true, 'editor')).toBe('editor');
+    // can() 里没给生效档位、也不知道是不是生产时按严的算（项目编辑者被拒）
+    expect(can(user, 'environment.execute', { kind: 'environment', role: 'editor' })).toBe(false);
+    expect(can(user, 'environment.execute', { kind: 'environment', role: 'admin' })).toBe(true);
   });
 
   test.each(
@@ -52,7 +56,7 @@ describe('can()：环境上的特权操作按执行档位', () => {
       ),
     ),
   )('$action · 生产=$production · 档位=$policy · 角色=$role', ({ action, production, policy, role }) => {
-    const eff = effectiveExecPolicy({ production, execPolicy: policy });
+    const eff = effective(production, policy);
     // 实例管理员永远可以
     expect(can(instanceAdmin, action, res(role, production, policy))).toBe(true);
     // 档位：editor / admin 看角色；executor（P5 之前没有执行者）普通用户一律不行
@@ -63,14 +67,17 @@ describe('can()：环境上的特权操作按执行档位', () => {
     expect(can(user, action, res(role, production, policy))).toBe(want);
   });
 
-  test('“仅限执行者”留了扩展点：isExecutor 为真（P5 接上执行者授权后）且至少是编辑者才行', () => {
+  test('执行者（P5a）：isExecutor 为真就能执行（执行者授权自带查看者可见性，不需要编辑者）', () => {
     const r = (role: Role | null, isExecutor: boolean): Resource => ({
       ...res(role, true, 'executor'),
       isExecutor,
     });
     const user: Actor = { kind: 'user', id: 'u', instanceAdmin: false };
     expect(can(user, 'environment.execute', r('editor', true))).toBe(true);
-    expect(can(user, 'environment.execute', r('viewer', true))).toBe(false);
+    // P5a 改了这一条：执行者不需要模型编辑权限（02-consensus 11.2 / 执行者不自动获得编辑权限）
+    expect(can(user, 'environment.execute', r('viewer', true))).toBe(true);
+    // 看不见项目（没有角色）一律不行
+    expect(can(user, 'environment.execute', r(null, true))).toBe(false);
     expect(can(user, 'environment.execute', r('admin', false))).toBe(false);
     // 配置类操作仍然要项目管理员
     expect(can(user, 'environment.delete', r('editor', true))).toBe(false);
@@ -114,12 +121,18 @@ describe('接口：档位存在环境上，默认值、修改、特权操作', (
     return { status: r.status, data };
   };
 
+  // P5a：档位存在执行策略的环境层（exec_policies），不再是 environments.exec_policy 列
   const addEnv = async (id: string, production: boolean, policy: ExecPolicy | null = null) => {
     await db.query(
-      `insert into environments (id, project_id, name, url_enc, production, exec_policy)
-       values ($1, $2, $1, $3, $4, $5)`,
-      [id, pid, encrypt('postgres://u:p@127.0.0.1:1/x'), production, policy],
+      `insert into environments (id, project_id, name, url_enc, production)
+       values ($1, $2, $1, $3, $4)`,
+      [id, pid, encrypt('postgres://u:p@127.0.0.1:1/x'), production],
     );
+    if (policy)
+      await db.query(
+        "insert into exec_policies (scope_kind, scope_id, policy) values ('environment', $1, $2::text::jsonb)",
+        [id, JSON.stringify({ whoCanExecute: policy })],
+      );
     return id;
   };
   const env = (id: string) => `/api/projects/${pid}/environments/${id}`;
@@ -202,11 +215,11 @@ describe('接口：档位存在环境上，默认值、修改、特权操作', (
     expect(r.status).toBe(200);
     expect(r.data).toMatchObject({ execPolicy: 'editor', effectiveExecPolicy: 'editor' });
     expect(await tryExecute(e1, 'editor')).toBe(404);
-    const [row] = await db.query<{ exec_policy: string }>(
-      'select exec_policy from environments where id = $1',
+    const [row] = await db.query<{ policy: { whoCanExecute?: string } }>(
+      "select policy from exec_policies where scope_kind = 'environment' and scope_id = $1",
       [e1],
     );
-    expect(row!.exec_policy).toBe('editor');
+    expect(row!.policy.whoCanExecute).toBe('editor');
     // 改回默认（null）
     expect((await call('PATCH', env(e1), { execPolicy: null }, 'pa')).data).toMatchObject({
       execPolicy: null,

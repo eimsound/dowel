@@ -77,6 +77,8 @@ const COLUMN_KINDS = new Map<string, ColumnKind>([
   ['oidc_providers.enabled', 'bool'],
   ['oidc_providers.auto_provision', 'bool'],
   ['projects.schemas', 'json'],
+  ['exec_policies.policy', 'json'],
+  ['grants.by_instance_admin', 'bool'],
 ]);
 
 /** 登记新增表 / 列的转换规则（测试里也用这个造同名列不同表） */
@@ -98,6 +100,15 @@ export const isUniqueViolation = (err: unknown): boolean => {
   if (typeof e.message === 'string' && e.message.includes('UNIQUE constraint failed')) return true;
   // 有的客户端会把底层错误包一层
   return e.cause === undefined ? false : isUniqueViolation(e.cause);
+};
+
+/** 外键冲突（PG 23503；SQLite errcode 787 / “FOREIGN KEY constraint failed”）：删除被引用的行时转成 409 */
+export const isForeignKeyViolation = (err: unknown): boolean => {
+  if (!err || typeof err !== 'object') return false;
+  const e = err as { code?: unknown; errcode?: unknown; message?: unknown; cause?: unknown };
+  if (e.code === '23503' || e.errcode === 787) return true;
+  if (typeof e.message === 'string' && e.message.includes('FOREIGN KEY constraint failed')) return true;
+  return e.cause === undefined ? false : isForeignKeyViolation(e.cause);
 };
 
 /**
@@ -752,6 +763,108 @@ export const MIGRATIONS: MigrationStep[] = [
   (d) => `alter table environment_versions add column state text not null default 'confirmed';`,
   // 产品化 P4c：接手时从目标库历史恢复出来的版本记下恢复时间（null = 在本实例发布的）。恢复的版本一律未验证
   (d) => `alter table versions add column restored_at ${types(d).ts};`,
+  // 产品化 P5a：执行策略四层（实例 → 组 → 项目 → 环境）、执行者授权、前置环境（ADR 0005）。
+  // - exec_policies：每个范围一行，policy 是 JSON。实例 / 组 / 项目层是 { production, nonProduction }，环境层是它自己的那一套；
+  //   字段不出现 = 继承。实例层的 scope_id 是空串（和 grants 一致）。范围是多态的，没有外键：删组 / 项目 / 环境时手动清理；
+  // - 原来 environments.exec_policy（H6 的档位）搬进环境层的 whoCanExecute，然后删掉这一列（只留一个事实来源）；
+  // - environments.prerequisite_id：前置环境（同项目的另一个环境）。不加外键：删除被引用的环境时由接口拒绝（409）；
+  // - grants：role 加 executor；同一个对象在同一个范围上可以同时有一个项目角色和一个执行者授权，所以唯一约束改成
+  //   (对象, 范围, 是不是执行者)；by_instance_admin 记下授权时授予者是不是实例管理员（“仅限执行者”的生产环境只认这种）。
+  //   SQLite 改不了 CHECK / UNIQUE，重建 grants；PG 原地改约束。
+  {
+    sqliteRebuild: true,
+    sql: (d) => {
+      const { ts, now, json, bool, f } = types(d);
+      const common = `create table if not exists exec_policies (
+     scope_kind text not null check (scope_kind in ('instance', 'group', 'project', 'environment')),
+     scope_id text not null,
+     policy ${json} not null,
+     updated_by text references users on delete set null,
+     updated_at ${ts} not null default ${now},
+     primary key (scope_kind, scope_id)
+   );
+   alter table environments add column prerequisite_id text;`;
+      const index = `create unique index if not exists grants_subject_scope
+     on grants (subject_kind, subject_id, scope_kind, scope_id, (role = 'executor'));`;
+      if (d === 'sqlite')
+        return `${common}
+   create table grants_new (
+     id text primary key,
+     subject_kind text not null check (subject_kind in ('user', 'group')),
+     subject_id text not null,
+     role text not null check (role in ('viewer', 'editor', 'admin', 'executor')),
+     scope_kind text not null check (scope_kind in ('instance', 'group', 'project', 'environment')),
+     scope_id text not null,
+     created_by text references users on delete set null,
+     created_at ${ts} not null default ${now},
+     by_instance_admin ${bool} not null default ${f}
+   );
+   insert into grants_new (id, subject_kind, subject_id, role, scope_kind, scope_id, created_by, created_at)
+     select id, subject_kind, subject_id, role, scope_kind, scope_id, created_by, created_at from grants;
+   drop table grants;
+   alter table grants_new rename to grants;
+   ${index}`;
+      // PG：自动生成的约束名不保证（截断规则），按定义找出 grants 上的唯一约束和 role 的 CHECK 再删
+      return `${common}
+   alter table grants add column if not exists by_instance_admin ${bool} not null default ${f};
+   do $$
+   declare r record;
+   begin
+     for r in select conname from pg_constraint
+               where conrelid = 'grants'::regclass
+                 and (contype = 'u' or (contype = 'c' and pg_get_constraintdef(oid) like '%(role %'))
+     loop
+       execute format('alter table grants drop constraint %I', r.conname);
+     end loop;
+   end $$;
+   alter table grants add constraint grants_role_check check (role in ('viewer', 'editor', 'admin', 'executor'));
+   ${index}`;
+    },
+    run: async (tx) => {
+      const rows = await tx.query<{ id: string; exec_policy: string }>(
+        'select id, exec_policy from environments where exec_policy is not null',
+      );
+      for (const r of rows)
+        if (r.exec_policy === 'editor' || r.exec_policy === 'admin' || r.exec_policy === 'executor')
+          await tx.query(
+            "insert into exec_policies (scope_kind, scope_id, policy) values ('environment', $1, $2::text::jsonb)",
+            [r.id, JSON.stringify({ whoCanExecute: r.exec_policy })],
+          );
+      await tx.exec('alter table environments drop column exec_policy');
+    },
+  },
+  // 产品化 P5a 审查后：前置环境不能悬空（悬空时执行一律拒绝，见 checkPrerequisite；这里从数据库层面杜绝）。
+  // - PG：同表自引用外键（默认 NO ACTION，语句结束时检查：删整个项目的环境的那一条 delete 不受影响）；
+  // - SQLite：不能给已有列加约束（只能重建整张 environments 表），而且带外键 / 触发器的列以后也不能 drop；
+  //   用两个触发器实现同样的约束：删除被引用的环境、或者把前置环境设成不存在的环境，都 abort。删项目时先清掉前置环境再删环境。
+  // 已有的悬空值（只可能来自 P5a 第一版里删除和设置并发的窗口，开发期数据）清成 null 才能建约束。
+  {
+    run: async (tx, d) => {
+      await tx.exec(
+        `update environments set prerequisite_id = null
+          where prerequisite_id is not null
+            and not exists (select 1 from environments p where p.id = environments.prerequisite_id)`,
+      );
+      if (d === 'pg') {
+        await tx.exec(
+          `alter table environments add constraint environments_prerequisite_fk
+             foreign key (prerequisite_id) references environments (id)`,
+        );
+        return;
+      }
+      await tx.exec(`create trigger environments_prerequisite_delete before delete on environments
+         when exists (select 1 from environments e where e.prerequisite_id = old.id and e.id <> old.id)
+         begin select raise(abort, 'FOREIGN KEY constraint failed: environments.prerequisite_id'); end;
+       create trigger environments_prerequisite_insert before insert on environments
+         when new.prerequisite_id is not null
+          and not exists (select 1 from environments e where e.id = new.prerequisite_id)
+         begin select raise(abort, 'FOREIGN KEY constraint failed: environments.prerequisite_id'); end;
+       create trigger environments_prerequisite_update before update of prerequisite_id on environments
+         when new.prerequisite_id is not null
+          and not exists (select 1 from environments e where e.id = new.prerequisite_id)
+         begin select raise(abort, 'FOREIGN KEY constraint failed: environments.prerequisite_id'); end;`);
+    },
+  },
 ];
 
 const migrate = async (db: PlatformDb) => {

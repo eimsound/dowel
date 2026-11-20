@@ -7,6 +7,7 @@ import type {
   AuditPage,
   Directory,
   GrantInfo,
+  GrantRole,
   GrantSubjectKind,
   InstanceRole,
   InstanceSettings,
@@ -15,13 +16,13 @@ import type {
   OidcProviderInfo,
   OidcProviderPreset,
   ResetLink,
-  Role,
   UserStatus,
 } from '@dowel/api';
 import { useInfiniteQuery, useMutation, useQuery, useQueryClient } from '@tanstack/react-query';
 import { Link, Outlet, useRouterState } from '@tanstack/react-router';
 import {
   Copy,
+  Gauge,
   KeyRound,
   MailPlus,
   ScrollText,
@@ -36,6 +37,7 @@ import { useTranslation } from 'react-i18next';
 import { actionText } from '../activity.ts';
 import { api } from '../api.ts';
 import { Confirm } from '../components/Modal.tsx';
+import { PolicyLayerPanel } from '../components/PolicyEditor.tsx';
 import { Row, Rows, Section } from '../components/ProjectPage.tsx';
 import { SettingsNav } from '../components/SettingsNav.tsx';
 import { AppShell, PageHeader, useShellPanel } from '../components/Shell.tsx';
@@ -50,6 +52,7 @@ const SECTIONS = [
   { to: '/admin/sign-in', label: 'adm.navSignIn', icon: KeyRound },
   { to: '/admin/settings', label: 'adm.navSettings', icon: SettingsIcon },
   { to: '/admin/grants', label: 'adm.navGrants', icon: ShieldCheck },
+  { to: '/admin/policy', label: 'pol.title', icon: Gauge },
   { to: '/admin/audit', label: 'adm.navAudit', icon: ScrollText },
 ] as const;
 
@@ -1036,13 +1039,23 @@ export const AdminSettings = () => {
   );
 };
 
+/** 实例层的执行策略（P5a）：组、项目、环境各层都在它之下，只能收紧 */
+export const AdminPolicy = () => {
+  const { t } = useTranslation();
+  return (
+    <Section title={t('pol.title')}>
+      <PolicyLayerPanel path="/api/admin/exec-policy" queryKey={['exec-policy', 'instance']} />
+    </Section>
+  );
+};
+
 export const AdminGrants = () => {
   const { t } = useTranslation();
   const qc = useQueryClient();
   const toast = useToast();
   const [q, setQ] = useState('');
   const [subject, setSubject] = useState<{ kind: GrantSubjectKind; id: string; name: string } | null>(null);
-  const [role, setRole] = useState<Role>('viewer');
+  const [role, setRole] = useState<GrantRole>('viewer');
   const grants = useQuery({
     queryKey: ['admin-grants'],
     queryFn: () => api<GrantInfo[]>('GET', '/api/admin/grants'),
@@ -1123,9 +1136,9 @@ export const AdminGrants = () => {
               className="select w-32"
               aria-label={t('dlg.role')}
               value={role}
-              onChange={(e) => setRole(e.target.value as Role)}
+              onChange={(e) => setRole(e.target.value as GrantRole)}
             >
-              {(['viewer', 'editor', 'admin'] as const).map((r) => (
+              {(['viewer', 'editor', 'admin', 'executor'] as const).map((r) => (
                 <option key={r} value={r}>
                   {t(`projects.role.${r}`)}
                 </option>

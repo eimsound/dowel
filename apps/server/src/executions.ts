@@ -185,11 +185,12 @@ export const toExecEvent = (e: ExecutorEvent): ExecEvent => {
 /** 错误 → 给客户端的 error 事件字段。预期的拒绝给原因（脱敏在发送时统一做），意外错误只记日志 */
 export const errorEvent = (e: unknown): { error: string; code?: string; details?: ExecEvent['details'] } => {
   if (e instanceof ExecutorError && e.code !== 'unexpected') {
-    const { diff, diffTotal, problems, versionId, number, step, partial, needsManual, claim } = e.details;
+    const { diff, diffTotal, problems, versionId, number, step, partial, needsManual, claim, timeout } =
+      e.details;
     return {
       error: e.message,
       code: e.code,
-      details: { diff, diffTotal, problems, versionId, number, step, partial, needsManual, claim },
+      details: { diff, diffTotal, problems, versionId, number, step, partial, needsManual, claim, timeout },
     };
   }
   if (e instanceof HTTPException) return { error: e.message, code: 'rejected' };
@@ -210,6 +211,8 @@ export interface RunInput {
   to?: string;
   direction?: 'up' | 'down';
   userId: string;
+  /** 执行策略的超时（生效策略里的语句超时 / 锁等待超时，P5a）；预演不用 */
+  timeouts?: { statementMs: number; lockMs: number };
   onEvent?: (e: ExecEvent) => void | Promise<void>;
 }
 
@@ -413,6 +416,7 @@ export const runExecution = async (
         direction: input.direction,
         executedBy: input.userId,
         via: 'web',
+        timeouts: input.timeouts,
         onEvent: emit,
         beforeMigration: async (m) => {
           const k = await claim(db, pid, env.id, m.version, m.direction === 'baseline');

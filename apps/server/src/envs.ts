@@ -9,15 +9,16 @@ import type {
   EnvPermissions,
   EnvVersion,
   EnvVersionRef,
-  ExecPolicy,
+  PrerequisiteRef,
 } from '@dowel/api';
 import { needsManualSchema } from '@dowel/api';
 import type { Model } from '@dowel/core';
 import type { Db, ScriptStep } from '@dowel/engines';
 import { type ChainVersion, isNonTx, runTouched, runVersionId, type TargetState } from '@dowel/executor';
 import { HTTPException } from 'hono/http-exception';
-import { can, effectiveExecPolicy, type Resource } from './authz.ts';
+import { can, type Resource } from './authz.ts';
 import { inList } from './db.ts';
+import type { EnvAuth } from './policy.ts';
 import type { Role } from './rooms.ts';
 import { decrypt, maskUrl } from './secrets.ts';
 
@@ -33,7 +34,8 @@ export interface EnvRow {
   production: boolean;
   allow_same_instance: boolean;
   shadow_url_enc: string | null;
-  exec_policy: ExecPolicy | null;
+  /** 前置环境（P5a，同项目的另一个环境）；执行策略本身在 exec_policies（policy.ts） */
+  prerequisite_id: string | null;
   current_version_id: string | null;
   last_drift_check: unknown;
   drift_status: DriftStatus;
@@ -226,15 +228,22 @@ export const driftInfo = (r: EnvRow): DriftInfo => ({
   summary: sanitizeSummary(r.drift_summary),
 });
 
-export const envResource = (r: EnvRow, role: Role): Resource => ({
+/** 环境资源：生效的“谁能执行”和调用者是不是执行者由 policy.ts 算好（envAuthOf） */
+export const envResource = (r: EnvRow, role: Role, auth: EnvAuth): Resource => ({
   kind: 'environment',
   role,
   production: r.production,
-  execPolicy: r.exec_policy,
+  execPolicy: auth.resolved.whoCanExecute.value,
+  isExecutor: auth.isExecutor,
 });
 
-export const permissionsOf = (actor: Parameters<typeof can>[0], r: EnvRow, role: Role): EnvPermissions => {
-  const res = envResource(r, role);
+export const permissionsOf = (
+  actor: Parameters<typeof can>[0],
+  r: EnvRow,
+  role: Role,
+  auth: EnvAuth,
+): EnvPermissions => {
+  const res = envResource(r, role, auth);
   return {
     execute: can(actor, 'environment.execute', res),
     configure: can(actor, 'environment.change_connection', res),
@@ -255,27 +264,90 @@ export const versionRef = (m: { id: string; number: number; name: string }): Env
   name: m.name,
 });
 
+/** 版本的轻量引用（id / 序号 / 名字），不读脚本、模型和验证报告 */
+export type VersionRefRow = { id: string; number: number; name: string };
+
+export const loadVersionRefs = async (db: Db, pid: string): Promise<Map<string, VersionRefRow>> =>
+  new Map(
+    (await db.query<VersionRefRow>('select id, number, name from versions where project_id = $1', [pid])).map(
+      (v) => [v.id, v],
+    ),
+  );
+
+/**
+ * 设置了前置环境却找不到它（PG 有外键、SQLite 有触发器，不应该发生）：如实标出来，执行一律拒绝（checkPrerequisite），
+ * 不当作“没设置”。三处共用这一份兜底：环境列表、环境状态 / 配置页（loadPrerequisite）、执行前检查。
+ */
+export const missingPrerequisite = (id: string): PrerequisiteRef => ({
+  id,
+  name: '（已不存在）',
+  currentVersion: null,
+  missing: true,
+});
+
+/** 前置环境的引用：名字和它（平台库缓存里）的当前版本。一条轻量查询：只读环境名和当前版本的 id / 序号 / 名字 */
+export const loadPrerequisite = async (
+  db: Db,
+  pid: string,
+  prerequisiteId: string | null,
+): Promise<PrerequisiteRef | null> => {
+  if (!prerequisiteId) return null;
+  const [p] = await db.query<{
+    id: string;
+    name: string;
+    vid: string | null;
+    number: number | null;
+    vname: string | null;
+  }>(
+    `select e.id, e.name, v.id as vid, v.number, v.name as vname
+       from environments e left join versions v on v.id = e.current_version_id
+      where e.id = $1 and e.project_id = $2`,
+    [prerequisiteId, pid],
+  );
+  if (!p) return missingPrerequisite(prerequisiteId);
+  return {
+    id: p.id,
+    name: p.name,
+    currentVersion:
+      p.vid !== null && p.number !== null ? { id: p.vid, number: p.number, name: p.vname ?? '' } : null,
+  };
+};
+
+/** 环境列表：同项目的环境行已经在内存里，从里面找前置环境（兜底同 missingPrerequisite） */
+export const prerequisiteFromRows = (
+  r: Pick<EnvRow, 'prerequisite_id'>,
+  all: EnvRow[],
+  versions: Map<string, VersionRefRow>,
+): PrerequisiteRef | null => {
+  if (!r.prerequisite_id) return null;
+  const p = all.find((e) => e.id === r.prerequisite_id);
+  if (!p) return missingPrerequisite(r.prerequisite_id);
+  const cur = p.current_version_id ? versions.get(p.current_version_id) : undefined;
+  return { id: p.id, name: p.name, currentVersion: cur ? versionRef(cur) : null };
+};
+
+/** 环境信息（列表、PATCH 的响应）：当前版本和前置环境由调用方给（各自用最便宜的方式读） */
 export const toEnvInfo = (
   r: EnvRow,
   actor: Parameters<typeof can>[0],
   role: Role,
-  versions: Map<string, VersionMeta>,
-): EnvInfo => {
-  const cur = r.current_version_id ? versions.get(r.current_version_id) : undefined;
-  return {
-    id: r.id,
-    name: r.name,
-    url: safeMask(r.url_enc),
-    production: r.production,
-    allowSameInstance: r.allow_same_instance,
-    shadowUrl: r.shadow_url_enc ? safeMask(r.shadow_url_enc) : null,
-    execPolicy: r.exec_policy,
-    effectiveExecPolicy: effectiveExecPolicy({ production: r.production, execPolicy: r.exec_policy }),
-    currentVersion: cur ? versionRef(cur) : null,
-    drift: driftInfo(r),
-    permissions: permissionsOf(actor, r, role),
-  };
-};
+  auth: EnvAuth,
+  refs: { currentVersion: EnvVersionRef | null; prerequisite: PrerequisiteRef | null },
+): EnvInfo => ({
+  id: r.id,
+  name: r.name,
+  url: safeMask(r.url_enc),
+  production: r.production,
+  allowSameInstance: r.allow_same_instance,
+  shadowUrl: r.shadow_url_enc ? safeMask(r.shadow_url_enc) : null,
+  execPolicy: auth.resolved.whoCanExecute.own,
+  effectiveExecPolicy: auth.resolved.whoCanExecute.value,
+  policy: auth.resolved,
+  prerequisite: refs.prerequisite,
+  currentVersion: refs.currentVersion,
+  drift: driftInfo(r),
+  permissions: permissionsOf(actor, r, role, auth),
+});
 
 const LEVELS = { low: 0, medium: 1, high: 2 } as const;
 

@@ -18,9 +18,11 @@ import type { Hono } from 'hono';
 import { HTTPException } from 'hono/http-exception';
 import { audit } from '../audit.ts';
 import { can, userActor } from '../authz.ts';
-import { isUniqueViolation } from '../db.ts';
+import { inList, isUniqueViolation } from '../db.ts';
+import { pinForTransfer } from '../env-policy.ts';
 import { insertGrant } from '../grants.ts';
 import { groupById, groupBySlug, groupRoleOf, pickProjectSlug, projectSlugTaken } from '../groups.ts';
+import { accessIn, deletePolicies, withPolicyLock } from '../policy.ts';
 import { effectiveRole, loadRoleContext, projectRow, projectRows, visibleProjects } from '../roles.ts';
 import { assertImportable } from '../shadow.ts';
 import { type AppContext, access, body, type Env } from './context.ts';
@@ -206,7 +208,10 @@ export const registerProjects = (app: Hono<Env>, ctx: AppContext) => {
     return c.json<ProjectInfo>(await info(c, after));
   });
 
-  // 转组：需要同时是源组和目标组的组管理员，或者实例管理员；旧路径写跳转
+  // 转组：需要同时是源组和目标组的组管理员，或者实例管理员；旧路径写跳转。
+  // 转组会换掉组层的执行策略：每个环境按新的组层重新合并，变宽的字段固定成原来的生效值写进环境层
+  // （和改生产标记同一条规则，pinForTransfer），在执行策略锁的事务里和改 group_id 一起做；审计记下被固定的字段。
+  // 注意：原组范围的执行者授权（scope = 原组）对这个项目不再有效，目标组范围的开始有效——授权本来就跟着范围走。
   app.post('/api/projects/:pid/transfer', async (c) => {
     const a = await access(c, ctx, 'project.transfer');
     const b = await body(c, projectTransferSchema);
@@ -223,12 +228,31 @@ export const registerProjects = (app: Hono<Env>, ctx: AppContext) => {
     if (await projectSlugTaken(db, target.id, a.slug))
       throw new HTTPException(409, { message: '目标组里已经有相同的标识' });
 
+    let pinned: Awaited<ReturnType<typeof pinForTransfer>> = [];
+    /** 锁内读到的项目当前所属的组和 slug：跳转记录和审计都用它 */
+    let moved = { from: a.groupId, slug: a.slug };
     try {
-      await db.transaction(async (tx) => {
+      await withPolicyLock(db, async (tx) => {
+        // 锁内重新读项目当前所属的组、slug 和调用者的角色上下文（accessIn）：锁外的检查、固定用的源组层、旧地址跳转都以它为前提。
+        // 等锁期间项目已经被别人转走了（组变了）就 409，让用户刷新后重来，不在新的源组上沿用旧组的检查结果
+        const now = await accessIn(tx, u, a.id);
+        if (now.project.groupId !== a.groupId)
+          throw new HTTPException(409, { message: '项目在你提交期间已经被转到了别的组，请刷新后重试' });
+        // 管理身份也按锁内的组成员关系重新判断：等锁期间可能被撤掉了源组或目标组的组管理员
+        const inSource = now.rc.groups.get(now.project.groupId) ?? null;
+        const inTarget = now.rc.groups.get(target.id) ?? null;
+        if (
+          !can(actor, 'project.transfer', { kind: 'project', role: now.role }) ||
+          (!actor.instanceAdmin && !(inSource === 'admin' && inTarget === 'admin'))
+        )
+          throw new HTTPException(403, { message: '需要同时是源组和目标组的组管理员' });
+        moved = { from: now.project.groupId, slug: now.project.slug };
+        pinned = await pinForTransfer(tx, now.project, target.id, u.id);
+        // 旧地址跳转用锁内读到的组 slug 和项目 slug
         await tx.query(
           `insert into project_redirects (owner_slug, project_slug, project_id) values ($1, $2, $3)
            on conflict (owner_slug, project_slug) do update set project_id = excluded.project_id`,
-          [a.groupSlug, a.slug, a.id],
+          [now.project.groupSlug, now.project.slug, a.id],
         );
         await tx.query('update projects set group_id = $2 where id = $1', [a.id, target.id]);
       });
@@ -249,7 +273,13 @@ export const registerProjects = (app: Hono<Env>, ctx: AppContext) => {
         targetKind: 'project',
         targetId: a.id,
         projectId: a.id,
-        data: { from: a.groupId, to: target.id, slug: a.slug },
+        data: {
+          from: moved.from,
+          to: target.id,
+          slug: moved.slug,
+          // 执行策略：换了组层后会变宽、因此被固定进环境层的字段（环境 → 字段）
+          ...(pinned.length ? { policyPinned: pinned } : {}),
+        },
       },
       ctx.security,
     );
@@ -280,9 +310,19 @@ export const registerProjects = (app: Hono<Env>, ctx: AppContext) => {
           [a.pid],
         );
       await tx.query('delete from versions where project_id = $1', [a.pid]);
+      // 前置环境有约束（PG 外键 / SQLite 触发器）：同一个项目里的环境互相引用，先清掉再整体删除
+      await tx.query('update environments set prerequisite_id = null where project_id = $1', [a.pid]);
       await tx.query('delete from environments where project_id = $1', [a.pid]);
       await tx.query('delete from branches where project_id = $1', [a.pid]);
       await tx.query("delete from grants where scope_kind = 'project' and scope_id = $1", [a.pid]);
+      // 环境上的执行者授权、项目层和环境层的执行策略（范围是多态的，没有外键）
+      if (envIds.length)
+        await tx.query(
+          `delete from grants where scope_kind = 'environment' and scope_id in (${inList(envIds)})`,
+          envIds,
+        );
+      await deletePolicies(tx, 'environment', envIds);
+      await deletePolicies(tx, 'project', [a.pid]);
       await tx.query('delete from project_redirects where project_id = $1', [a.pid]);
       await tx.query('delete from projects where id = $1', [a.pid]);
       return { branchIds, envIds };

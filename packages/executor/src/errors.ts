@@ -48,6 +48,11 @@ export type ExecutorErrorCode =
   | 'unexpected'
   /** 某一步 SQL 报错 */
   | 'step_failed'
+  /**
+   * 某一步因为执行策略的超时被 PG 取消（lock_timeout：55P03；statement_timeout：57014）。和 step_failed 一样会留下失败记录、
+   * 能重试 / 续跑；单独一个代码是为了让用户知道这不是脚本本身的错误（details.timeout 说明是哪一种、当时的设置）
+   */
+  | 'step_timeout'
   /** 迁移执行完，读回的结构与目标版本的模型不一致 */
   | 'readback_mismatch';
 
@@ -75,6 +80,8 @@ export interface ExecutorErrorDetails {
   markPlan?: MarkPlan;
   /** 出错时环境停在哪个版本（目标库历史里最后一条成功的记录） */
   reached?: string | null;
+  /** step_timeout：lock = 等锁超过 lock_timeout，statement = 语句超过 statement_timeout；ms 是当时的设置 */
+  timeout?: { kind: 'lock' | 'statement'; ms: number };
 }
 
 export class ExecutorError extends Error {

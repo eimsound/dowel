@@ -1,6 +1,6 @@
 // 成员与授权：直接授权、来自组默认权限的成员、项目默认权限（只有组管理员能改）。
-// 内容原来在“成员与授权”对话框里，P2 改成页面。
-import type { Directory, GrantInfo, GrantSubjectKind, ProjectAccess, Role } from '@dowel/api';
+// 内容原来在“成员与授权”对话框里，P2 改成页面。P5a 起可以授予“执行者”（整个项目或某个环境）。
+import type { Directory, GrantInfo, GrantRole, GrantSubjectKind, ProjectAccess, Role } from '@dowel/api';
 import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query';
 import { Trash2 } from 'lucide-react';
 import { useState } from 'react';
@@ -8,9 +8,11 @@ import { useTranslation } from 'react-i18next';
 import { api } from '../api.ts';
 import { ProjectPage, Section } from '../components/ProjectPage.tsx';
 import { Avatar, Banner, IconButton } from '../components/ui.tsx';
+import { useEnvs } from '../envs.ts';
 import { useProject } from '../project.tsx';
 
 const ROLE_OPTIONS = ['viewer', 'editor', 'admin'] as const;
+const GRANT_OPTIONS = [...ROLE_OPTIONS, 'executor'] as const;
 
 export const Members = () => {
   const { t } = useTranslation();
@@ -25,7 +27,15 @@ export const Members = () => {
   });
   const [q, setQ] = useState('');
   const [subject, setSubject] = useState<{ kind: GrantSubjectKind; id: string; name: string } | null>(null);
-  const [role, setRole] = useState<Role>('editor');
+  const [role, setRole] = useState<GrantRole>('editor');
+  /** 执行者授权的范围：空 = 整个项目，否则是环境 ID */
+  const [scopeEnv, setScopeEnv] = useState('');
+  const envs = useEnvs(pid);
+  const instanceAdmin = me.role === 'admin';
+  // “仅限执行者”的生产环境：执行者只能由实例管理员授予（服务端同样拒绝），非实例管理员不能选，并说明原因
+  const executorOnlyProd = (envs.data ?? []).filter(
+    (e) => e.production && e.policy.whoCanExecute.value === 'executor',
+  );
   const dir = useQuery({
     queryKey: ['directory', q],
     queryFn: () => api<Directory>('GET', `/api/directory?q=${encodeURIComponent(q)}`),
@@ -43,10 +53,12 @@ export const Members = () => {
         subjectKind: subject!.kind,
         subjectId: subject!.id,
         role,
+        ...(role === 'executor' && scopeEnv ? { environmentId: scopeEnv } : {}),
       }),
     onSuccess: () => {
       setSubject(null);
       setQ('');
+      setScopeEnv('');
       refresh();
     },
   });
@@ -119,9 +131,11 @@ export const Members = () => {
                   <span className="block truncate text-base">{g.subject.name}</span>
                   <span className="block truncate font-mono text-xs text-text-3">
                     {g.subject.slug} · {t(g.subject.kind === 'user' ? 'dlg.subjectUser' : 'dlg.subjectGroup')}
+                    {g.role === 'executor' &&
+                      ` · ${g.scopeKind === 'environment' ? t('pol.executor.env', { name: g.environmentName ?? g.scopeId }) : t('pol.executor.wholeProject')}${g.byInstanceAdmin ? ` · ${t('pol.executor.byAdmin')}` : ''}`}
                   </span>
                 </span>
-                {canManage ? (
+                {canManage && g.role !== 'executor' ? (
                   <select
                     aria-label={t('dlg.roleOf', { name: g.subject.name })}
                     className="select w-32"
@@ -175,14 +189,33 @@ export const Members = () => {
                     aria-label={t('dlg.role')}
                     className="select w-32"
                     value={role}
-                    onChange={(e) => setRole(e.target.value as Role)}
+                    onChange={(e) => setRole(e.target.value as GrantRole)}
                   >
-                    {ROLE_OPTIONS.map((r) => (
+                    {GRANT_OPTIONS.map((r) => (
                       <option key={r} value={r}>
                         {t(`projects.role.${r}`)}
                       </option>
                     ))}
                   </select>
+                  {role === 'executor' && (
+                    <select
+                      aria-label={t('pol.executor.scope')}
+                      className="select w-48"
+                      value={scopeEnv}
+                      onChange={(e) => setScopeEnv(e.target.value)}
+                    >
+                      <option value="">{t('pol.executor.wholeProject')}</option>
+                      {(envs.data ?? []).map((e) => {
+                        const blocked = !instanceAdmin && executorOnlyProd.some((x) => x.id === e.id);
+                        return (
+                          <option key={e.id} value={e.id} disabled={blocked}>
+                            {t('pol.executor.env', { name: e.name })}
+                            {blocked ? `（${t('pol.executor.prodOnlyAdmin')}）` : ''}
+                          </option>
+                        );
+                      })}
+                    </select>
+                  )}
                   <button
                     type="button"
                     className="btn primary"
@@ -191,6 +224,18 @@ export const Members = () => {
                   >
                     {t('dlg.addGrantRun')}
                   </button>
+                  {role === 'executor' && (
+                    <div className="w-full space-y-1">
+                      <p className="hint m-0">{t('pol.executor.hint')}</p>
+                      {!instanceAdmin && executorOnlyProd.length > 0 && (
+                        <p className="hint m-0" data-testid="executor-prod-note">
+                          {t('pol.executor.prodNote', {
+                            names: executorOnlyProd.map((e) => e.name).join('、'),
+                          })}
+                        </p>
+                      )}
+                    </div>
+                  )}
                 </div>
               ) : (
                 <>

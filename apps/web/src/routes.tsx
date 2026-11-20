@@ -31,6 +31,7 @@ import {
   AdminGrants,
   AdminInvites,
   AdminLayout,
+  AdminPolicy,
   AdminSettings,
   AdminSignIn,
   AdminUsers,
@@ -343,6 +344,7 @@ const routes = [
     createRoute({ getParentRoute: () => adminRoute, path: 'sign-in', component: AdminSignIn }),
     createRoute({ getParentRoute: () => adminRoute, path: 'settings', component: AdminSettings }),
     createRoute({ getParentRoute: () => adminRoute, path: 'grants', component: AdminGrants }),
+    createRoute({ getParentRoute: () => adminRoute, path: 'policy', component: AdminPolicy }),
     createRoute({ getParentRoute: () => adminRoute, path: 'audit', component: AdminAudit }),
   ]),
 ];
