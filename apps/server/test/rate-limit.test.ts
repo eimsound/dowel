@@ -1,7 +1,8 @@
-// 登录限速与全量限流环境变量：验证 IP+账号、IP 总量、原子性、成功撤销、窗口清扫、key 上限及 9 项环境变量读取。
+// 登录限速、KeyedLimiter 精确退回与全量限流环境变量：验证 IP+账号、IP 总量、原子性、成功撤销、窗口清扫、精确退回、key 上限及 9 项环境变量读取。
 import { expect, test } from 'vitest';
 import {
   connectionLimiterFromEnv,
+  KeyedLimiter,
   LoginLimiter,
   type LoginLimiterOptions,
   loginLimiterFromEnv,
@@ -154,4 +155,170 @@ test('全部 4 个限流器 / 9 个环境变量默认值、合法覆盖与非法
   expect([hLogin.limit, hLogin.windowMs]).toEqual([10, 600_000]);
   const hConn = connectionLimiterFromEnv(hugeEnv);
   expect(hConn.windowMs).toBe(60_000);
+});
+
+const setupKeyed = (options: { limit?: number; windowMs?: number; maxKeys?: number } = {}) => {
+  let now = 0;
+  const limiter = new KeyedLimiter({
+    limit: 2,
+    windowMs: 10_000,
+    now: () => now,
+    ...options,
+  });
+  return {
+    limiter,
+    setNow: (ms: number) => {
+      now = ms;
+    },
+    advance: (ms: number) => {
+      now += ms;
+    },
+  };
+};
+
+test('KeyedLimiter 精确退回：并发同 key 请求 A(t1) 退回只删 t1、保留 B(t2) 且按 t2 计算过期时间', () => {
+  const { limiter, setNow } = setupKeyed({ limit: 2, windowMs: 10_000 });
+
+  setNow(0);
+  const a = limiter.attempt('ip:1');
+  expect(a.allowed).toBe(true);
+
+  setNow(4_000);
+  const b = limiter.attempt('ip:1');
+  expect(b.allowed).toBe(true);
+
+  // A 认证成功退回，应精确删除 t1=0，保留 B 的 t2=4_000
+  setNow(4_500);
+  if (a.allowed) a.refund();
+  expect(limiter.keyCount).toBe(1);
+
+  // C 在 t3=5_000 预占，此时窗口内为 [4_000, 5_000] 达到上限 2
+  setNow(5_000);
+  const c = limiter.attempt('ip:1');
+  expect(c.allowed).toBe(true);
+
+  // t=10_000 已超过 t1+10_000，但未到 t2+10_000（14_000），不能提前放行
+  setNow(10_000);
+  const blocked = limiter.attempt('ip:1');
+  expect(blocked.allowed).toBe(false);
+  if (!blocked.allowed) expect(blocked.retryAfterSeconds).toBe(4);
+
+  setNow(13_999);
+  const stillBlocked = limiter.attempt('ip:1');
+  expect(stillBlocked.allowed).toBe(false);
+  if (!stillBlocked.allowed) expect(stillBlocked.retryAfterSeconds).toBe(1);
+
+  // 到达 t2+10_000 后 B 过期，重新允许
+  setNow(14_000);
+  const d = limiter.attempt('ip:1');
+  expect(d.allowed).toBe(true);
+
+  // 退回剩余所有未过期记录后，应从 map 清理空 key
+  if (c.allowed) c.refund();
+  if (d.allowed) d.refund();
+  expect(limiter.keyCount).toBe(0);
+});
+
+test('KeyedLimiter 精确退回：慢请求 A 跨过 windowMs 后调用 refund 不误删新窗口内 B 的记录', () => {
+  const { limiter, setNow } = setupKeyed({ limit: 1, windowMs: 10_000 });
+
+  setNow(0);
+  const a = limiter.attempt('ip:slow');
+  expect(a.allowed).toBe(true);
+
+  // 跨过整个窗口，B 在新窗口插入记录（A 的旧记录已过期清扫）
+  setNow(10_000);
+  const b = limiter.attempt('ip:slow');
+  expect(b.allowed).toBe(true);
+
+  // 慢请求 A 此时才完成并退回，必须是安全 no-op，绝不误删 B
+  setNow(10_500);
+  if (a.allowed) a.refund();
+  expect(limiter.keyCount).toBe(1);
+
+  const blocked = limiter.attempt('ip:slow');
+  expect(blocked.allowed).toBe(false);
+  if (!blocked.allowed) expect(blocked.retryAfterSeconds).toBe(10);
+
+  // B 自己退回后才会释放配额并清理 key
+  if (b.allowed) b.refund();
+  expect(limiter.keyCount).toBe(0);
+  expect(limiter.attempt('ip:slow').allowed).toBe(true);
+});
+
+test('KeyedLimiter 精确退回：重复调用同一次 refund 幂等且不误删其他记录', () => {
+  const { limiter, setNow } = setupKeyed({ limit: 2, windowMs: 10_000 });
+
+  setNow(0);
+  const a = limiter.attempt('ip:dup');
+  setNow(1_000);
+  const b = limiter.attempt('ip:dup');
+  expect(a.allowed).toBe(true);
+  expect(b.allowed).toBe(true);
+  expect(limiter.attempt('ip:dup').allowed).toBe(false);
+
+  // 多次重复调用 a.refund() 只删 A，不影响 B
+  if (a.allowed) {
+    a.refund();
+    a.refund();
+    a.refund();
+  }
+  expect(limiter.keyCount).toBe(1);
+
+  // 此时仅剩 B，还能再放行 1 次，之后达到上限 2
+  setNow(2_000);
+  const c = limiter.attempt('ip:dup');
+  expect(c.allowed).toBe(true);
+  expect(limiter.attempt('ip:dup').allowed).toBe(false);
+
+  // 再次重复调用 a.refund() 依然不删 B 或 C
+  if (a.allowed) a.refund();
+  expect(limiter.attempt('ip:dup').allowed).toBe(false);
+
+  if (b.allowed) b.refund();
+  if (c.allowed) c.refund();
+  expect(limiter.keyCount).toBe(0);
+});
+
+test('KeyedLimiter 精确退回：attempt(key, count) 多计数预占精确退回与边界校验', () => {
+  const { limiter, setNow } = setupKeyed({ limit: 5, windowMs: 10_000 });
+
+  setNow(0);
+  const batchA = limiter.attempt('k:batch', 3);
+  expect(batchA.allowed).toBe(true);
+
+  setNow(2_000);
+  const batchB = limiter.attempt('k:batch', 2);
+  expect(batchB.allowed).toBe(true);
+  expect(limiter.attempt('k:batch', 1).allowed).toBe(false);
+
+  // 精确退回 batchA 的 3 条记录，保留 batchB 的 2 条（at=2_000）
+  setNow(3_000);
+  if (batchA.allowed) batchA.refund();
+  expect(limiter.keyCount).toBe(1);
+
+  // 剩余 3 槽：申请 4 槽应被拒，且按 batchB 的 at=2_000 计算等待 9 秒
+  const tooMany = limiter.attempt('k:batch', 4);
+  expect(tooMany.allowed).toBe(false);
+  if (!tooMany.allowed) expect(tooMany.retryAfterSeconds).toBe(9);
+
+  // 申请 3 槽应允许（总计 5 槽）
+  const batchC = limiter.attempt('k:batch', 3);
+  expect(batchC.allowed).toBe(true);
+  expect(limiter.attempt('k:batch', 1).allowed).toBe(false);
+
+  // 退回 batchB（2 条）后保留 batchC（3 条），再退回 batchC 后空桶清理
+  if (batchB.allowed) batchB.refund();
+  expect(limiter.check('k:batch', 2).allowed).toBe(true);
+  expect(limiter.check('k:batch', 3).allowed).toBe(false);
+  if (batchC.allowed) batchC.refund();
+  expect(limiter.keyCount).toBe(0);
+
+  // 单次请求超过 limit 安全拒绝不崩溃；非法 count 抛出 RangeError
+  const overLimit = limiter.attempt('k:over', 6);
+  expect(overLimit.allowed).toBe(false);
+  if (!overLimit.allowed) expect(overLimit.retryAfterSeconds).toBe(10);
+  expect(() => limiter.attempt('k:bad', 0)).toThrow(RangeError);
+  expect(() => limiter.attempt('k:bad', -1)).toThrow(RangeError);
+  expect(() => limiter.attempt('k:bad', 1.5)).toThrow(RangeError);
 });

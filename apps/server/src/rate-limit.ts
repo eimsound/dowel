@@ -13,6 +13,15 @@ export interface LoginLimiterOptions {
 
 export type LimitResult = { allowed: true } | { allowed: false; retryAfterSeconds: number };
 
+export type KeyedLimitResult =
+  | { allowed: true; refund: () => void }
+  | { allowed: false; retryAfterSeconds: number };
+
+interface KeyedHit {
+  at: number;
+  id: number;
+}
+
 /**
  * 通用滑动窗口限速器：一个 key（例如用户 ID）在窗口内最多 N 次。
  * 与登录限速同一个思路（同步记一次尝试，避免并发请求突破上限）。
@@ -23,8 +32,9 @@ export class KeyedLimiter {
   readonly windowMs: number;
   readonly maxKeys: number;
   private readonly now: () => number;
-  private hits = new Map<string, number[]>();
+  private hits = new Map<string, KeyedHit[]>();
   private lastSweep = Number.NEGATIVE_INFINITY;
+  private nextId = 1;
 
   constructor(options: { limit?: number; windowMs?: number; now?: () => number; maxKeys?: number } = {}) {
     this.limit = options.limit ?? 10;
@@ -38,62 +48,108 @@ export class KeyedLimiter {
     return this.hits.size;
   }
 
+  private validateCount(count: number) {
+    if (!Number.isInteger(count) || count < 1) {
+      throw new RangeError('KeyedLimiter count 必须是正整数');
+    }
+  }
+
   private sweep(t: number) {
     if (t - this.lastSweep < this.windowMs) return;
     for (const [key, arr] of this.hits) {
-      const keep = arr.filter((at) => t - at < this.windowMs);
+      const keep = arr.filter((h) => t - h.at < this.windowMs);
       if (keep.length) this.hits.set(key, keep);
       else this.hits.delete(key);
     }
     this.lastSweep = t;
   }
 
-  /** 检查上限并立即记一次；超过上限时返回还要等多少秒 */
-  attempt(key: string): LimitResult {
-    const r = this.check(key);
-    if (!r.allowed) return r;
-    this.record(key);
-    return r;
+  private recent(key: string, t: number): KeyedHit[] {
+    const cur = this.hits.get(key);
+    if (!cur) return [];
+    const arr = cur.filter((h) => t - h.at < this.windowMs);
+    if (arr.length) this.hits.set(key, arr);
+    else this.hits.delete(key);
+    return arr;
   }
 
-  /**
-   * 只检查、不记录（只按失败计数的场景：CI 令牌认证先 check，失败了才 record，成功的请求不占额度）。
-   * check 和随后的 record 之间没有 await 时仍是同步的，不会被并发请求穿插。
-   */
-  check(key: string): LimitResult {
-    const t = this.now();
-    this.sweep(t);
-    const arr = (this.hits.get(key) ?? []).filter((at) => t - at < this.windowMs);
-    if (arr.length >= this.limit) {
-      this.hits.set(key, arr);
-      const retry = Math.max(0, arr[arr.length - this.limit]! + this.windowMs - t);
-      return { allowed: false, retryAfterSeconds: Math.max(1, Math.ceil(retry / 1000)) };
-    }
-    return { allowed: true };
+  private deniedResult(
+    arr: KeyedHit[],
+    count: number,
+    t: number,
+  ): { allowed: false; retryAfterSeconds: number } | null {
+    const need = arr.length + count - this.limit;
+    if (need <= 0) return null;
+    const pivot = arr[need - 1];
+    const retry = pivot ? Math.max(0, pivot.at + this.windowMs - t) : this.windowMs;
+    return { allowed: false, retryAfterSeconds: Math.max(1, Math.ceil(retry / 1000)) };
   }
 
-  /** 记一次（不检查上限） */
-  record(key: string): void {
-    const t = this.now();
-    const arr = (this.hits.get(key) ?? []).filter((at) => t - at < this.windowMs);
+  private insert(key: string, count: number, t: number, arr: KeyedHit[]): () => void {
     if (!this.hits.has(key) && this.hits.size >= this.maxKeys) {
       for (const k of this.hits.keys()) {
         this.hits.delete(k);
         if (this.hits.size < this.maxKeys) break;
       }
     }
-    arr.push(t);
+    const firstId = this.nextId;
+    for (let i = 0; i < count; i++) {
+      arr.push({ at: t, id: this.nextId++ });
+    }
+    const lastId = this.nextId - 1;
     this.hits.set(key, arr);
+    let refunded = false;
+    return () => {
+      if (refunded) return;
+      refunded = true;
+      this.removeRange(key, firstId, lastId);
+    };
+  }
+
+  private removeRange(key: string, firstId: number, lastId: number): void {
+    const arr = this.hits.get(key);
+    if (!arr?.length) return;
+    const keep = arr.filter((h) => h.id < firstId || h.id > lastId);
+    if (keep.length === arr.length) return;
+    if (keep.length) this.hits.set(key, keep);
+    else this.hits.delete(key);
   }
 
   /**
-   * 退回最近一次预占（同步 attempt 后，异步校验成功时调用，避免 check → await → record 的并发竞态）。
+   * 检查上限并立即记 count 次（默认 1）。
+   * 允许时返回精确退回句柄 refund（只退回本次预占插入的记录，幂等且不误删并发或跨窗口的其他记录）；
+   * 超过上限时返回还要等多少秒。
    */
-  refund(key: string): void {
-    const arr = this.hits.get(key);
-    if (!arr?.length) return;
-    arr.pop();
-    if (!arr.length) this.hits.delete(key);
+  attempt(key: string, count = 1): KeyedLimitResult {
+    this.validateCount(count);
+    const t = this.now();
+    this.sweep(t);
+    const arr = this.recent(key, t);
+    const denied = this.deniedResult(arr, count, t);
+    if (denied) return denied;
+    const refund = this.insert(key, count, t, arr);
+    return { allowed: true, refund };
+  }
+
+  /**
+   * 只检查、不记录（只按失败计数的场景：可先 check，失败了才 record，成功的请求不占额度）。
+   * check 和随后的 record 之间没有 await 时仍是同步的，不会被并发请求穿插。
+   */
+  check(key: string, count = 1): LimitResult {
+    this.validateCount(count);
+    const t = this.now();
+    this.sweep(t);
+    const arr = this.recent(key, t);
+    return this.deniedResult(arr, count, t) ?? { allowed: true };
+  }
+
+  /** 记 count 次（默认 1，不检查上限），返回精确退回本次记录的 refund 句柄 */
+  record(key: string, count = 1): () => void {
+    this.validateCount(count);
+    const t = this.now();
+    this.sweep(t);
+    const arr = this.recent(key, t);
+    return this.insert(key, count, t, arr);
   }
 }
 

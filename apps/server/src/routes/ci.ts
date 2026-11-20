@@ -249,10 +249,9 @@ export const registerCi = (app: Hono<Env>, ctx: AppContext) => {
     const ip = clientIp(c, ctx.security);
     const ipKey = `ip:${ip ?? 'unknown'}`;
     const hash = hashToken(raw);
-    const blocked = ctx.tokenFailLimiter.attempt(ipKey);
-    const reserved = blocked.allowed;
+    const gate = ctx.tokenFailLimiter.attempt(ipKey);
 
-    if (!reserved) {
+    if (!gate.allowed) {
       let isActive: boolean;
       try {
         isActive = await ctx.activeTokens.hasActive(hash);
@@ -265,8 +264,8 @@ export const registerCi = (app: Hono<Env>, ctx: AppContext) => {
       if (!isActive)
         return ciJson(
           c,
-          new CiError('rate_limited', `令牌认证失败次数太多，请 ${blocked.retryAfterSeconds} 秒后再试`, {
-            reason: String(blocked.retryAfterSeconds),
+          new CiError('rate_limited', `令牌认证失败次数太多，请 ${gate.retryAfterSeconds} 秒后再试`, {
+            reason: String(gate.retryAfterSeconds),
           }),
         );
     }
@@ -275,7 +274,7 @@ export const registerCi = (app: Hono<Env>, ctx: AppContext) => {
     try {
       r = await authenticateToken(db, raw, ip);
     } catch (e) {
-      if (reserved) ctx.tokenFailLimiter.refund(ipKey);
+      if (gate.allowed) gate.refund();
       return ciJson(
         c,
         toCiError(e, () => null),
@@ -291,7 +290,7 @@ export const registerCi = (app: Hono<Env>, ctx: AppContext) => {
       }[r.code];
       return ciJson(c, new CiError(r.code, msg));
     }
-    if (reserved) ctx.tokenFailLimiter.refund(ipKey);
+    if (gate.allowed) gate.refund();
     ctx.activeTokens.remember(hash, {
       id: r.token.id,
       projectId: r.token.projectId,
