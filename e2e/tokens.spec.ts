@@ -25,6 +25,7 @@ for (const scheme of ['light', 'dark'] as const) {
     const admin = await instanceAdmin(browser, scheme);
     await admin.goto('/admin/policy');
     await expect(admin.getByRole('heading', { name: '谁能创建 CI 令牌' })).toBeVisible();
+    await expect(admin.getByTestId('token-policy-panel')).toContainText('不受“谁能执行”策略与审批流程限制');
     await scan(admin, `/admin/policy (${scheme})`);
 
     // 建业务组、流水线组（另一位用户加入流水线组）和项目
@@ -56,6 +57,7 @@ for (const scheme of ['light', 'dark'] as const) {
     await gotoPage(ga, '设置');
     await expect(ga.getByTestId('token-policy-locked-group')).toContainText('由组锁定');
     const tokPanel = ga.getByTestId('ci-tokens-panel');
+    await expect(tokPanel).toContainText('不受“谁能执行”策略与审批流程限制');
     await tokPanel.getByLabel('名称').fill('GitHub 部署');
     await tokPanel.getByLabel('说明（选填）').fill('自动迁移');
     await tokPanel.getByLabel('有效期（天）').fill('30');

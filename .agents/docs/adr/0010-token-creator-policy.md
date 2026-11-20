@@ -16,3 +16,8 @@
 3. `effectiveRole(rc, project)` 在 `baseRole` 为空且存在组条件且 `canCreateToken` 为真时返回 `'viewer'`。
 
 因为角色条件（`editor` / `admin`）本来就要求 `baseRole` 非空，只有组条件会让原本不可见的用户获得 `viewer` 可见性；规则里没有任何组条件时 `effectiveRole` 直接短路，不增加额外开销。同时，`requests.ts` 的 `loadAudience` 也把规则里涉及的组成员纳入受众，保证他们能正常进入审批 / 通知等受众计算，且修改任意一层的令牌创建规则后会调用 `rooms.refreshLoaded()` 让在线 WebSocket 角色即时生效。
+
+**权限传导与安全边界。** `/api/ci/…/execute`（`ci.execute`）只校验目标环境生效执行策略的 `allowTokens === true`（非生产环境默认开启、生产环境默认关闭），不受环境执行策略中的 `whoCanExecute`（如 `admin` / `executor`）与审批流程限制。因此，满足三层“谁能创建 CI 令牌”规则的成员——即使原本仅通过组条件获得项目 `viewer` 只读权限，或在界面上受 `whoCanExecute` / 审批流程约束——均可通过签发 CI 令牌间接获得范围内所有 `allowTokens = true` 环境的免审批向前执行权（不能回滚、不能改模型或环境配置，且漂移 / 完整性 / 影子库验证 / 超时等安全检查照常生效）。基于这一传导关系：
+
+- “谁能创建 CI 令牌”默认仅限项目管理员，并采用三层逐层取与防止下级放宽；
+- 规则配置面板（`TokenPolicyPanel`）、项目令牌管理页（`ProjectTokensPanel`）与用户文档（`docs/api.md`）均显式警示该权限传导边界，提醒管理员对需要强制执行 `whoCanExecute` 或审批的非生产环境显式关闭“允许 CI 令牌执行”，或收紧令牌创建规则。

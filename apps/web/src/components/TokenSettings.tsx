@@ -405,6 +405,7 @@ export const TokenPolicyPanel = ({ path, queryKey }: { path: string; queryKey: u
         </span>
       </div>
       <p className="hint">{t('tok.policy.visibilityHint')}</p>
+      <Banner kind="warn">{t('tok.policy.execWarn')}</Banner>
 
       {save.error && (
         <Banner kind="danger" role="alert">

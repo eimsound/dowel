@@ -1416,7 +1416,7 @@ const zh = {
   tok: {
     title: 'CI 令牌',
     intro:
-      '令牌属于项目，创建者离职或停用不影响使用。只能通过 /api/ci/… 读取项目状态和执行迁移（不走审批，受环境“允许令牌执行”开关约束）。',
+      '令牌属于项目，创建者离职或停用不影响使用。只能通过 /api/ci/… 读取项目状态和向前执行迁移：仅受环境“允许 CI 令牌执行”开关约束（非生产环境默认开启、生产环境默认关闭），不受“谁能执行”策略与审批流程限制。',
     createTitle: '新建 CI 令牌',
     name: '名称',
     namePlaceholder: '例如 CI 自动部署',
@@ -1489,6 +1489,8 @@ const zh = {
       effectiveLabel: '当前生效：',
       andJoin: '，且 ',
       visibilityHint: '被组条件允许创建令牌的用户，会自动获得范围内项目的只读可见权限。',
+      execWarn:
+        '权限边界：被允许创建 CI 令牌的成员，可通过签发令牌对范围内开启“允许 CI 令牌执行”（非生产环境默认开启）的环境直接向前执行迁移，不受“谁能执行”策略与审批流程限制。',
       save: '保存创建规则',
       saved: '已保存令牌创建规则',
     },
@@ -3140,7 +3142,7 @@ const en: typeof zh = {
   tok: {
     title: 'CI tokens',
     intro:
-      'Tokens belong to the project, so disabling or removing their creator does not break pipelines. They can only read project state and execute migrations via /api/ci/… (skipping approval, gated by each environment’s “Allow token execution” setting).',
+      'Tokens belong to the project, so disabling or removing their creator does not break pipelines. They can only read project state and execute forward migrations via /api/ci/…: gated solely by each environment’s “Allow CI token execution” setting (on by default for non-production, off for production), bypassing “Who can execute” and approval workflows.',
     createTitle: 'Create CI token',
     name: 'Name',
     namePlaceholder: 'e.g. CI automated deploy',
@@ -3215,6 +3217,8 @@ const en: typeof zh = {
       andJoin: ', AND ',
       visibilityHint:
         'Users allowed by a group condition automatically gain read-only visibility on projects in scope.',
+      execWarn:
+        'Permission boundary: anyone allowed to create CI tokens can issue a token to execute forward migrations directly on environments in scope with “Allow CI token execution” enabled (on by default for non-production), bypassing “Who can execute” and approval workflows.',
       save: 'Save creation rule',
       saved: 'Token creation rule saved',
     },
