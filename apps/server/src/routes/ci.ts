@@ -19,6 +19,7 @@ import {
   type CiVersion,
   type CiVersionRef,
   ciExecuteSchema,
+  TOKEN_PATTERN,
 } from '@dowel/api';
 import type { Db } from '@dowel/engines';
 import { HistoryError, ScopeError } from '@dowel/engines';
@@ -27,6 +28,7 @@ import type { Context, Hono, MiddlewareHandler } from 'hono';
 import { HTTPException } from 'hono/http-exception';
 import type { ContentfulStatusCode } from 'hono/utils/http-status';
 import { audit } from '../audit.ts';
+import { hashToken } from '../auth.ts';
 import { can } from '../authz.ts';
 import { type EnvRow, iso } from '../envs.ts';
 import {
@@ -229,31 +231,58 @@ export const registerCi = (app: Hono<Env>, ctx: AppContext) => {
   const { db } = ctx;
 
   /**
-   * 令牌认证（/api/ci/*）：先同步预占来源 IP 的失败计数（防并发绕过限速），认证成功后退回；
-   * 数据库异常也按 CiErrorBody 返回并退回失败预占。认证通过后再按令牌限速。
+   * 令牌认证（/api/ci/*）：
+   * - 缺头（token_missing）或格式不符 TOKEN_PATTERN（token_invalid）直接在内存拒绝，不查库、不消耗失败限流桶；
+   * - 格式合法的令牌：按来源 IP 同步预占失败计数（防并发绕过限速），认证成功或数据库异常时退回；
+   * - 来源 IP 触及失败上限时，先查询进程内活跃令牌哈希快照（惰性加载、短 TTL 复用）：
+   *   - 未命中活跃快照的无效 / 过期 / 吊销 / 随机爆破令牌直接 429 rate_limited（不再打数据库）；
+   *   - 命中活跃快照的合法令牌仍进入 authenticateToken 做数据库强校验（吊销和过期立即生效），
+   *     避免共享 NAT / 代理下某条错误流水线或爆破流量阻断同 IP 合法流水线。
+   * - 认证通过后再按令牌 ID 限速。
    */
   app.use('/api/ci/*', async (c, next) => {
+    const raw = ciAuthHeader(c.req.header('authorization'));
+    if (raw === null)
+      return ciJson(c, new CiError('token_missing', '缺少令牌：请求头需要 Authorization: Bearer dwl_…'));
+    if (!TOKEN_PATTERN.test(raw)) return ciJson(c, new CiError('token_invalid', '令牌无效'));
+
     const ip = clientIp(c, ctx.security);
     const ipKey = `ip:${ip ?? 'unknown'}`;
+    const hash = hashToken(raw);
     const blocked = ctx.tokenFailLimiter.attempt(ipKey);
-    if (!blocked.allowed)
-      return ciJson(
-        c,
-        new CiError('rate_limited', `令牌认证失败次数太多，请 ${blocked.retryAfterSeconds} 秒后再试`, {
-          reason: String(blocked.retryAfterSeconds),
-        }),
-      );
+    const reserved = blocked.allowed;
+
+    if (!reserved) {
+      let isActive: boolean;
+      try {
+        isActive = await ctx.activeTokens.hasActive(hash);
+      } catch (e) {
+        return ciJson(
+          c,
+          toCiError(e, () => null),
+        );
+      }
+      if (!isActive)
+        return ciJson(
+          c,
+          new CiError('rate_limited', `令牌认证失败次数太多，请 ${blocked.retryAfterSeconds} 秒后再试`, {
+            reason: String(blocked.retryAfterSeconds),
+          }),
+        );
+    }
+
     let r: Awaited<ReturnType<typeof authenticateToken>>;
     try {
-      r = await authenticateToken(db, ciAuthHeader(c.req.header('authorization')), ip);
+      r = await authenticateToken(db, raw, ip);
     } catch (e) {
-      ctx.tokenFailLimiter.refund(ipKey);
+      if (reserved) ctx.tokenFailLimiter.refund(ipKey);
       return ciJson(
         c,
         toCiError(e, () => null),
       );
     }
     if (!r.ok) {
+      ctx.activeTokens.forgetHash(hash);
       const msg = {
         token_missing: '缺少令牌：请求头需要 Authorization: Bearer dwl_…',
         token_invalid: '令牌无效',
@@ -262,7 +291,12 @@ export const registerCi = (app: Hono<Env>, ctx: AppContext) => {
       }[r.code];
       return ciJson(c, new CiError(r.code, msg));
     }
-    ctx.tokenFailLimiter.refund(ipKey);
+    if (reserved) ctx.tokenFailLimiter.refund(ipKey);
+    ctx.activeTokens.remember(hash, {
+      id: r.token.id,
+      projectId: r.token.projectId,
+      expiresAtMs: Date.parse(r.token.expiresAt),
+    });
     const limited = ctx.tokenLimiter.attempt(`token:${r.token.id}`);
     if (!limited.allowed)
       return ciJson(

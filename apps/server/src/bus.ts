@@ -22,6 +22,7 @@ export type ClusterEvent =
   | { t: 'room.refresh'; origin: string; branchIds?: string[] }
   | { t: 'inbox.changed'; origin: string; userIds: string[] }
   | { t: 'webhooks.wake'; origin: string }
+  | { t: 'ci_tokens.changed'; origin: string }
   | {
       t: 'requests.kick';
       origin: string;

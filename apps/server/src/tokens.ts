@@ -27,6 +27,147 @@ export interface CiTokenAuth {
   expiresAt: string;
 }
 
+export interface ActiveTokenCacheOptions {
+  /** 活跃令牌哈希快照的刷新间隔（毫秒）；默认 15 秒 */
+  ttlMs?: number;
+  /** 内存缓存的活跃令牌哈希上限；默认 10_000 */
+  maxEntries?: number;
+  /** 时钟（测试可注入） */
+  now?: () => number;
+}
+
+interface CachedTokenEntry {
+  id: string;
+  projectId: string;
+  expiresAtMs: number;
+}
+
+/**
+ * 进程内活跃 CI 令牌哈希缓存（仅供来源 IP 触发失败限流时判断是否放行，绝不替代数据库强校验）：
+ * - 正常流量（IP 未超失败上限）完全惰性，不查库、不占内存；
+ * - 当某 IP 触发失败限流后，惰性加载一次未吊销且未过期的 token_hash 快照并在 ttlMs 内复用（并发去重）；
+ * - 合法活跃令牌（含首次使用的冷态令牌）命中快照后仍进入 authenticateToken 做数据库校验，避免被同 IP 的异常流量阻断；
+ * - 无效 / 过期 / 已吊销 / 随机爆破令牌未命中快照，直接返回 429，不继续打数据库。
+ */
+export class ActiveTokenCache {
+  readonly ttlMs: number;
+  readonly maxEntries: number;
+  private readonly db: Db;
+  private readonly now: () => number;
+  private entries: Map<string, CachedTokenEntry> | null = null;
+  private lastLoadedAt = Number.NEGATIVE_INFINITY;
+  private dirty = false;
+  private loading: Promise<void> | null = null;
+
+  constructor(db: Db, options: ActiveTokenCacheOptions = {}) {
+    this.db = db;
+    this.ttlMs = options.ttlMs ?? 15_000;
+    this.maxEntries = options.maxEntries ?? 10_000;
+    this.now = options.now ?? Date.now;
+  }
+
+  /** 是否在活跃令牌快照中且未过期（仅在来源 IP 已超失败限流上限时调用） */
+  async hasActive(tokenHash: string): Promise<boolean> {
+    const t = this.now();
+    if (this.entries === null || this.dirty || t - this.lastLoadedAt >= this.ttlMs) {
+      await this.refresh();
+      // 若在刷新查询进行期间又发生了创建 / 吊销 / 删项目等变更，再补刷一次保证立即生效
+      if (this.dirty) await this.refresh();
+    }
+    const entry = this.entries?.get(tokenHash);
+    if (!entry) return false;
+    if (entry.expiresAtMs <= this.now()) {
+      this.entries!.delete(tokenHash);
+      return false;
+    }
+    return true;
+  }
+
+  /** 记录新创建或刚通过校验的活跃令牌（仅在快照已初始化时维护；若正在刷新则标记脏等待重刷） */
+  remember(tokenHash: string, entry: CachedTokenEntry): void {
+    if (this.loading !== null) this.dirty = true;
+    if (this.entries === null) return;
+    if (entry.expiresAtMs <= this.now()) {
+      this.entries.delete(tokenHash);
+      return;
+    }
+    this.entries.delete(tokenHash);
+    if (this.entries.size >= this.maxEntries) {
+      for (const k of this.entries.keys()) {
+        this.entries.delete(k);
+        if (this.entries.size < this.maxEntries) break;
+      }
+    }
+    this.entries.set(tokenHash, entry);
+  }
+
+  /** 按哈希移除（认证失败返回无效 / 过期 / 吊销时立即清理） */
+  forgetHash(tokenHash: string): void {
+    if (this.loading !== null) this.dirty = true;
+    this.entries?.delete(tokenHash);
+  }
+
+  /** 按令牌 ID 移除（吊销后立即清理） */
+  forgetId(tokenId: string): void {
+    if (this.loading !== null) this.dirty = true;
+    if (!this.entries) return;
+    for (const [hash, entry] of this.entries) {
+      if (entry.id === tokenId) this.entries.delete(hash);
+    }
+  }
+
+  /** 按项目移除（删项目后立即清理其令牌） */
+  forgetProject(projectId: string): void {
+    if (this.loading !== null) this.dirty = true;
+    if (!this.entries) return;
+    for (const [hash, entry] of this.entries) {
+      if (entry.projectId === projectId) this.entries.delete(hash);
+    }
+  }
+
+  /** 标记快照过期（多副本收到集群变更事件或断线重连时调用） */
+  markStale(): void {
+    if (this.entries !== null || this.loading !== null) this.dirty = true;
+  }
+
+  private async refresh(): Promise<void> {
+    if (this.loading) return this.loading;
+    this.loading = (async () => {
+      this.dirty = false;
+      const started = this.now();
+      const rows = await this.db.query<{
+        tokenHash: string;
+        id: string;
+        projectId: string;
+        expiresAt: unknown;
+      }>(
+        `select token_hash as "tokenHash", id, project_id as "projectId", expires_at as "expiresAt"
+           from ci_tokens
+          where revoked_at is null and expires_at > $1
+          order by coalesce(last_used_at, created_at) desc
+          limit $2`,
+        [new Date(started).toISOString(), this.maxEntries],
+      );
+      const next = new Map<string, CachedTokenEntry>();
+      // 倒序写入，让最近活跃的排在 Map 尾部，超出上限时优先淘汰头部最久未活跃的条目
+      for (let i = rows.length - 1; i >= 0; i--) {
+        const r = rows[i]!;
+        const expiresAtMs = Date.parse(iso(r.expiresAt)!);
+        if (expiresAtMs > started) {
+          next.set(r.tokenHash, { id: r.id, projectId: r.projectId, expiresAtMs });
+        }
+      }
+      this.entries = next;
+      this.lastLoadedAt = started;
+    })();
+    try {
+      await this.loading;
+    } finally {
+      this.loading = null;
+    }
+  }
+}
+
 export const tokenActor = (t: Pick<CiTokenAuth, 'id' | 'projectId'>): Actor => ({
   kind: 'token',
   id: t.id,

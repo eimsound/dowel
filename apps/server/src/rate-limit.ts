@@ -226,8 +226,8 @@ export const connectionLimiterFromEnv = (env: NodeJS.ProcessEnv = process.env) =
   });
 
 /**
- * CI 令牌认证失败限速（按 IP；单副本进程内计数，HA 多副本部署下实际总配额约为设定值 × 副本数）：
- * - DOWEL_TOKEN_FAIL_LIMIT：同一 IP 在窗口内允许的失败次数（默认 20）；
+ * CI 令牌认证失败限速（按来源 IP，仅计格式合法的失败尝试且不阻断活跃有效令牌；单副本进程内计数，HA 多副本部署下实际总配额约为设定值 × 副本数）：
+ * - DOWEL_TOKEN_FAIL_LIMIT：同一 IP 在窗口内允许的格式合法但认证失败次数（默认 20）；
  * - DOWEL_TOKEN_FAIL_WINDOW_MS：窗口长度（毫秒，默认 600000 = 10 分钟）。
  */
 export const tokenFailLimiterFromEnv = (env: NodeJS.ProcessEnv = process.env) =>

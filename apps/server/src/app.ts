@@ -39,6 +39,7 @@ import { newSetupToken } from './setup.ts';
 import { ShadowError } from './shadow.ts';
 import { Shadows } from './shadows.ts';
 import type { ConnectionGuard } from './targets.ts';
+import { ActiveTokenCache } from './tokens.ts';
 import { type WebhookOptions, Webhooks } from './webhooks.ts';
 
 export interface AppOptions {
@@ -52,7 +53,7 @@ export interface AppOptions {
   allowPasswordLogin?: boolean;
   /** Webhook 投递的参数（测试里调短重试间隔） */
   webhooks?: WebhookOptions;
-  /** CI 令牌认证失败的限速（按 IP）；默认 DOWEL_TOKEN_FAIL_LIMIT（20）次 / DOWEL_TOKEN_FAIL_WINDOW_MS（600000ms） */
+  /** CI 令牌认证失败的限速（按来源 IP，仅计格式合法的失败尝试且不阻断活跃有效令牌）；默认 DOWEL_TOKEN_FAIL_LIMIT（20）次 / DOWEL_TOKEN_FAIL_WINDOW_MS（600000ms） */
   tokenFailLimiter?: KeyedLimiter;
   /** 每个 CI 令牌的请求限速；默认 DOWEL_TOKEN_RATE_LIMIT（120）次 / DOWEL_TOKEN_RATE_WINDOW_MS（60000ms） */
   tokenLimiter?: KeyedLimiter;
@@ -119,6 +120,11 @@ export const createApp = (db: PlatformDb, options: AppOptions = {}) => {
   const webhooks = new Webhooks(db, { bus, ha, ...options.webhooks });
   const requests = new Requests(db, exec, webhooks, security, { bus, ha });
   drift.afterSweep = () => requests.kick({ all: true });
+  const activeTokens = new ActiveTokenCache(db);
+  bus.onEvent((event) => {
+    if (event.t === 'ci_tokens.changed' && event.origin !== bus.replicaId) activeTokens.markStale();
+  });
+  bus.onReconnect(() => activeTokens.markStale());
 
   const ctx: AppContext = {
     db,
@@ -131,6 +137,7 @@ export const createApp = (db: PlatformDb, options: AppOptions = {}) => {
     loginLimiter: options.loginLimiter ?? loginLimiterFromEnv(),
     connectionLimiter: options.connectionLimiter ?? connectionLimiterFromEnv(),
     tokenFailLimiter: options.tokenFailLimiter ?? tokenFailLimiterFromEnv(),
+    activeTokens,
     tokenLimiter: options.tokenLimiter ?? tokenLimiterFromEnv(),
     guard,
     exec,

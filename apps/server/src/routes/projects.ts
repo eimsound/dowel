@@ -347,6 +347,10 @@ export const registerProjects = (app: Hono<Env>, ctx: AppContext) => {
     await rooms.kickBranches(deleted.branchIds, '项目已被删除');
     for (const eid of deleted.envIds) await shadows.forget(eid);
     for (const branchId of deleted.branchIds) refresher.forget(branchId);
+    ctx.activeTokens.forgetProject(a.pid);
+    await ctx.bus.publish({ t: 'ci_tokens.changed' }).catch((e) => {
+      console.error('广播项目删除的 CI 令牌清理事件失败', e);
+    });
     await audit(
       db,
       c,

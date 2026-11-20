@@ -21,7 +21,7 @@ Authorization: Bearer dwl_<43 位随机字符>
 - **项目归属**：令牌属于项目，创建者离职或被停用不影响令牌继续工作。
 - **必须过期**：创建时必须指定有效天数（默认 90 天，最长 365 天）。过期和吊销均立即生效。
 - **限速**（单副本进程内计数，HA 多副本下总配额约为设定值 × 副本数）：
-  - 认证失败按来源 IP 限速（默认每 10 分钟最多 20 次失败，可用 `DOWEL_TOKEN_FAIL_LIMIT` / `DOWEL_TOKEN_FAIL_WINDOW_MS` 调整），防止爆破；成功请求不占失败额度。
+  - 认证失败按来源 IP 限速（默认每 10 分钟最多 20 次格式合法但校验失败的尝试，可用 `DOWEL_TOKEN_FAIL_LIMIT` / `DOWEL_TOKEN_FAIL_WINDOW_MS` 调整），防止爆破；缺头或格式非法的请求直接在内存拒绝且不占失败额度，成功请求不占失败额度，且来源 IP 触及失败上限后仅拦截无效 / 过期 / 已吊销令牌，不阻断同 IP 下的有效活跃令牌。
   - 已认证令牌按令牌 ID 限速（默认每分钟 120 次，可用 `DOWEL_TOKEN_RATE_LIMIT` / `DOWEL_TOKEN_RATE_WINDOW_MS` 调整）；连接目标库的只读 / 检测接口（单环境实时状态、执行历史、漂移检测）另受连接限速约束（默认每分钟 10 次，可用 `DOWEL_CONNECTION_LIMIT` / `DOWEL_CONNECTION_WINDOW_MS` 调整）。
 
 ### 校验令牌是否有效

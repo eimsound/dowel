@@ -163,6 +163,10 @@ export const registerTokens = (app: Hono<Env>, ctx: AppContext) => {
        values ($1, $2, $3, $4, $5, $6, $7, $8, $9)`,
       [id, a.pid, b.name, b.description, prefix, hash, user.id, now.toISOString(), expiresAt],
     );
+    ctx.activeTokens.remember(hash, { id, projectId: a.pid, expiresAtMs: Date.parse(expiresAt) });
+    await ctx.bus.publish({ t: 'ci_tokens.changed' }).catch((e) => {
+      console.error('广播 CI 令牌创建事件失败', e);
+    });
     await audit(
       db,
       c,
@@ -201,6 +205,10 @@ export const registerTokens = (app: Hono<Env>, ctx: AppContext) => {
       [tid, a.pid, new Date().toISOString(), user.id],
     );
     if (!done.length) throw new HTTPException(409, { message: '令牌已经吊销了' });
+    ctx.activeTokens.forgetId(tid);
+    await ctx.bus.publish({ t: 'ci_tokens.changed' }).catch((e) => {
+      console.error('广播 CI 令牌吊销事件失败', e);
+    });
     await audit(
       db,
       c,

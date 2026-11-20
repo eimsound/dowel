@@ -37,7 +37,7 @@ import type { Role, Rooms } from '../rooms.ts';
 import type { SecurityConfig } from '../security.ts';
 import type { Shadows } from '../shadows.ts';
 import type { ConnectionGuard } from '../targets.ts';
-import type { CiTokenAuth } from '../tokens.ts';
+import type { ActiveTokenCache, CiTokenAuth } from '../tokens.ts';
 import { createUser, type NewUser } from '../users.ts';
 import type { Webhooks } from '../webhooks.ts';
 
@@ -58,8 +58,10 @@ export interface AppContext {
   loginLimiter: LoginLimiter;
   /** 连接检查的限速（每个用户每分钟 10 次）：服务端替用户去连地址 */
   connectionLimiter: KeyedLimiter;
-  /** CI 令牌认证失败的限速（按来源 IP，防爆破；P6）：只记失败，成功的请求不占额度 */
+  /** CI 令牌认证失败的限速（按来源 IP，防爆破；P6）：只计格式合法但校验失败的尝试，成功与缺头 / 非法格式不占额度，且不阻断活跃有效令牌 */
   tokenFailLimiter: KeyedLimiter;
+  /** 活跃 CI 令牌哈希缓存：仅在来源 IP 触发失败限流时放行有效令牌做数据库强校验，阻断无效令牌继续打库 */
+  activeTokens: ActiveTokenCache;
   /** 每个 CI 令牌的请求限速（P6） */
   tokenLimiter: KeyedLimiter;
   /** 连接目标库 / 影子库之前统一跑的检查（SSRF 白名单） */

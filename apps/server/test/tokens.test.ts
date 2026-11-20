@@ -44,6 +44,7 @@ import { hashToken } from '../src/auth.ts';
 import { createApp, openPlatformDb, type PlatformDb } from '../src/index.ts';
 import { KeyedLimiter, LoginLimiter } from '../src/rate-limit.ts';
 import { encrypt } from '../src/secrets.ts';
+import { ActiveTokenCache } from '../src/tokens.ts';
 import { addTable, editModel, makeUser, PASSWORD } from './support.ts';
 
 process.env.DOWEL_SECRET ??= 'tokens-test-secret-0123456789';
@@ -81,6 +82,79 @@ describe('谁能创建令牌：三层逐层取与（纯函数）', () => {
       project: { roles: ['editor' as const], groups: [{ groupId: 'sec', role: 'member' as const }] },
     };
     expect(tokenCreatorAllows(layers, { role: 'admin', groups: groups([['sec', 'admin']]) })).toBe(false);
+  });
+});
+
+describe('ActiveTokenCache（活跃令牌快照缓存）', () => {
+  test('惰性加载、TTL 复用、自然过期即刻失效、markStale 补刷、forget 清理与容量淘汰', async () => {
+    let now = 1_000_000;
+    let queryCalls = 0;
+    let rows: { tokenHash: string; id: string; projectId: string; expiresAt: string }[] = [
+      { tokenHash: 'h1', id: 't1', projectId: 'p1', expiresAt: new Date(now + 5_000).toISOString() },
+      { tokenHash: 'h2', id: 't2', projectId: 'p2', expiresAt: new Date(now + 60_000).toISOString() },
+    ];
+    let releaseFirst: (() => void) | null = null;
+    let blockNextQuery = false;
+
+    const fakeDb = {
+      query: async () => {
+        queryCalls++;
+        const snapshot = rows.map((r) => ({ ...r }));
+        if (blockNextQuery) {
+          blockNextQuery = false;
+          await new Promise<void>((r) => {
+            releaseFirst = r;
+          });
+        }
+        return snapshot;
+      },
+    } as unknown as PlatformDb;
+
+    const cache = new ActiveTokenCache(fakeDb, { ttlMs: 15_000, maxEntries: 3, now: () => now });
+
+    // 未调用 hasActive 前不查库
+    expect(queryCalls).toBe(0);
+    expect(await cache.hasActive('h1')).toBe(true);
+    expect(queryCalls).toBe(1);
+
+    // TTL 内复用快照，不重复查库
+    expect(await cache.hasActive('h2')).toBe(true);
+    expect(await cache.hasActive('missing')).toBe(false);
+    expect(queryCalls).toBe(1);
+
+    // 时钟越过 h1 过期时间，无需刷新快照即刻失效
+    now += 5_000;
+    expect(await cache.hasActive('h1')).toBe(false);
+    expect(queryCalls).toBe(1);
+
+    // remember 与容量上限淘汰（maxEntries=3）
+    cache.remember('h3', { id: 't3', projectId: 'p1', expiresAtMs: now + 60_000 });
+    cache.remember('h4', { id: 't4', projectId: 'p1', expiresAtMs: now + 60_000 });
+    cache.remember('h5', { id: 't5', projectId: 'p1', expiresAtMs: now + 60_000 });
+    // 最旧的 h2 已被淘汰
+    expect(await cache.hasActive('h2')).toBe(false);
+    expect(await cache.hasActive('h5')).toBe(true);
+
+    // forgetId / forgetProject / forgetHash 立即生效
+    cache.forgetId('t3');
+    expect(await cache.hasActive('h3')).toBe(false);
+    cache.forgetProject('p1');
+    expect(await cache.hasActive('h4')).toBe(false);
+    expect(await cache.hasActive('h5')).toBe(false);
+
+    // 刷新查询进行期间收到 markStale（模拟并发创建 / 吊销）时，结束后会补刷一次反映最新数据
+    now += 20_000;
+    blockNextQuery = true;
+    const pending = cache.hasActive('h_new');
+    // 在第一次查询尚未返回时，数据库新增了 h_new 且触发了 markStale
+    rows = [
+      ...rows,
+      { tokenHash: 'h_new', id: 't_new', projectId: 'p1', expiresAt: new Date(now + 60_000).toISOString() },
+    ];
+    cache.markStale();
+    releaseFirst!();
+    expect(await pending).toBe(true);
+    expect(queryCalls).toBe(3);
   });
 });
 
@@ -284,7 +358,7 @@ describe('CI 令牌生命周期、权限、三层创建规则与限速（T1 / T2
     expect(afterRevoke.data).toMatchObject({ ok: false, code: 'token_revoked' });
   });
 
-  test('过期令牌立即返回 401 token_expired；缺失 / 非法头分别返回 token_missing / token_invalid；失败认证触发限速', async () => {
+  test('过期令牌立即返回 401 token_expired；缺失 / 非法头不耗失败额度；格式合法失败触发限速且不阻断同 IP 合法令牌', async () => {
     const t = (await call('POST', `/api/projects/${pid}/tokens`, { name: '快过期' }, 'ga'))
       .data as unknown as CiTokenCreated;
     await db.query('update ci_tokens set expires_at = $2 where id = $1', [
@@ -292,27 +366,146 @@ describe('CI 令牌生命周期、权限、三层创建规则与限速（T1 / T2
       new Date(Date.now() - 1000).toISOString(),
     ]);
 
-    // 用独立 X-Forwarded-For 或不依赖限速器的新 app 测限速（本测试 app 的 tokenFailLimiter = 3 次）
-    // 先测同一个 app 下的失败分类与限速
+    // 预先创建一个从未请求过（冷态）的合法令牌，验证不会被同 IP 失败流量阻断
+    const goodCold = (await call('POST', `/api/projects/${pid}/tokens`, { name: '同 IP 冷态合法令牌' }, 'ga'))
+      .data as unknown as CiTokenCreated;
+
+    // 缺失头与格式不符 TOKEN_PATTERN 的请求在内存拒绝，不消耗失败限流额度（远超 limit=4 也不触发 429）
+    for (let i = 0; i < 6; i++) {
+      const missing = await call('GET', '/api/ci/token', undefined, null);
+      expect(missing.status).toBe(401);
+      expect(missing.data).toMatchObject({ ok: false, code: 'token_missing' });
+
+      const malformed = await call('GET', '/api/ci/token', undefined, null, {
+        authorization: i % 2 === 0 ? 'Bearer not-a-dwl-token' : 'Bearer dwl_invalid',
+      });
+      expect(malformed.status).toBe(401);
+      expect(malformed.data).toMatchObject({ ok: false, code: 'token_invalid' });
+    }
+
+    // 上一个测试吊销令牌已消费 1 次，此处用格式合法的过期 / 不存在令牌继续触发至上限 4 次
     const r1 = await call('GET', '/api/ci/token', undefined, null, { authorization: `Bearer ${t.token}` });
     expect(r1.status).toBe(401);
     expect(r1.data).toMatchObject({ ok: false, code: 'token_expired' });
 
-    const r2 = await call('GET', '/api/ci/token', undefined, null);
+    const r2 = await call('GET', '/api/ci/token', undefined, null, {
+      authorization: `Bearer dwl_${'A'.repeat(43)}`,
+    });
     expect(r2.status).toBe(401);
-    expect(r2.data).toMatchObject({ ok: false, code: 'token_missing' });
+    expect(r2.data).toMatchObject({ ok: false, code: 'token_invalid' });
 
     const r3 = await call('GET', '/api/ci/token', undefined, null, {
-      authorization: 'Bearer not-a-dwl-token',
+      authorization: `Bearer dwl_${'B'.repeat(43)}`,
     });
     expect(r3.status).toBe(401);
     expect(r3.data).toMatchObject({ ok: false, code: 'token_invalid' });
 
-    // 第 4 次被 IP 失败限速拦住（429 + Retry-After）
-    const r4 = await call('GET', '/api/ci/token', undefined, null, { authorization: 'Bearer dwl_invalid' });
+    // 达到上限 4 次后，后续无效 / 过期令牌被 IP 失败限速拦住（429 + Retry-After）
+    const r4 = await call('GET', '/api/ci/token', undefined, null, {
+      authorization: `Bearer ${t.token}`,
+    });
     expect(r4.status).toBe(429);
     expect(r4.data).toMatchObject({ ok: false, code: 'rate_limited' });
     expect(Number(r4.headers.get('retry-after'))).toBeGreaterThanOrEqual(1);
+
+    // 同 IP（含无 trustProxy 时回落 ip:unknown）下从未调用过的冷态合法令牌依然正常 200
+    const goodRes = await call('GET', '/api/ci/token', undefined, null, {
+      authorization: `Bearer ${goodCold.token}`,
+    });
+    expect(goodRes.status).toBe(200);
+    expect(goodRes.data).toMatchObject({ id: goodCold.info.id, name: '同 IP 冷态合法令牌' });
+
+    // IP 已处于限速状态后新创建的令牌也立即可用（200），吊销后立即被拦截（429，绝不放行）
+    const createdAfterBlock = (
+      await call('POST', `/api/projects/${pid}/tokens`, { name: '限流后新建令牌' }, 'ga')
+    ).data as unknown as CiTokenCreated;
+    const afterCreateRes = await call('GET', '/api/ci/token', undefined, null, {
+      authorization: `Bearer ${createdAfterBlock.token}`,
+    });
+    expect(afterCreateRes.status).toBe(200);
+    expect(afterCreateRes.data).toMatchObject({ id: createdAfterBlock.info.id });
+
+    expect(
+      (await call('POST', `/api/projects/${pid}/tokens/${createdAfterBlock.info.id}/revoke`, {}, 'ga'))
+        .status,
+    ).toBe(200);
+    const afterRevokeBlocked = await call('GET', '/api/ci/token', undefined, null, {
+      authorization: `Bearer ${createdAfterBlock.token}`,
+    });
+    expect(afterRevokeBlocked.status).toBe(429);
+    expect(afterRevokeBlocked.data).toMatchObject({ ok: false, code: 'rate_limited' });
+  });
+
+  test('共享 NAT IP 爆破防护：随机令牌超限后 429 且不持续打库、并发预占防竞态、同 IP 冷态与并发合法令牌全放行', async () => {
+    const natApp = createApp(db, {
+      security: { trustProxy: true },
+      loginLimiter: new LoginLimiter({ limit: 10_000, ipLimit: 10_000 }),
+      connectionLimiter: new KeyedLimiter({ limit: 10_000, windowMs: 60_000 }),
+      tokenFailLimiter: new KeyedLimiter({ limit: 4, windowMs: 60_000 }),
+      tokenLimiter: new KeyedLimiter({ limit: 1000, windowMs: 60_000 }),
+    });
+    try {
+      const ciReq = async (ip: string, auth?: string) => {
+        const headers: Record<string, string> = { 'x-forwarded-for': ip };
+        if (auth !== undefined) headers.authorization = auth;
+        const res = await natApp.app.request('/api/ci/token', { method: 'GET', headers });
+        return {
+          status: res.status,
+          data: (await res.json()) as Record<string, unknown>,
+          retryAfter: res.headers.get('retry-after'),
+        };
+      };
+
+      const coldValid = (await call('POST', `/api/projects/${pid}/tokens`, { name: 'NAT 冷态合法' }, 'ga'))
+        .data as unknown as CiTokenCreated;
+      const fakeToken = (n: number) => `dwl_${String(n).padStart(43, 'x')}`;
+
+      // 1. 并发 20 个不同随机合法格式无效令牌：同步预占确保严格只放行 4 次查库（401），其余 16 次 429
+      const burstInvalid = await Promise.all(
+        Array.from({ length: 20 }, (_, i) => ciReq('198.51.100.10', `Bearer ${fakeToken(100 + i)}`)),
+      );
+      expect(burstInvalid.filter((r) => r.status === 401)).toHaveLength(4);
+      expect(burstInvalid.filter((r) => r.status === 429)).toHaveLength(16);
+
+      // 2. 触顶后继续发 30 个不同随机无效令牌：全部 429，且不再继续打数据库（快照已缓存，查询次数为 0）
+      let queries = 0;
+      const origQuery = db.query.bind(db);
+      db.query = ((...args: Parameters<typeof db.query>) => {
+        queries++;
+        return origQuery(...args);
+      }) as typeof db.query;
+      try {
+        for (let i = 0; i < 30; i++) {
+          const r = await ciReq('198.51.100.10', `Bearer ${fakeToken(200 + i)}`);
+          expect(r.status).toBe(429);
+          expect(r.data).toMatchObject({ ok: false, code: 'rate_limited' });
+          expect(Number(r.retryAfter)).toBeGreaterThanOrEqual(1);
+        }
+        expect(queries).toBe(0);
+      } finally {
+        db.query = origQuery;
+      }
+
+      // 3. 同一被限流的 NAT IP 上，冷态合法令牌（并发 20 次）全部 200 通过
+      const burstValidOnBlockedIp = await Promise.all(
+        Array.from({ length: 20 }, () => ciReq('198.51.100.10', `Bearer ${coldValid.token}`)),
+      );
+      expect(burstValidOnBlockedIp.every((r) => r.status === 200)).toBe(true);
+
+      // 4. 全新未限流 IP 上并发 20 次合法令牌请求，也不会因预占临时触及 limit=4 而误报 429
+      const burstValidOnFreshIp = await Promise.all(
+        Array.from({ length: 20 }, () => ciReq('198.51.100.20', `Bearer ${coldValid.token}`)),
+      );
+      expect(burstValidOnFreshIp.every((r) => r.status === 200)).toBe(true);
+
+      // 5. 不同 IP 互不影响：198.51.100.30 的首次无效令牌仍是 401 token_invalid
+      const otherIp = await ciReq('198.51.100.30', `Bearer ${fakeToken(999)}`);
+      expect(otherIp.status).toBe(401);
+      expect(otherIp.data).toMatchObject({ ok: false, code: 'token_invalid' });
+    } finally {
+      await natApp.rooms.flush();
+      await natApp.shadows.close();
+    }
   });
 
   test('T2 三层“谁能创建令牌”与组条件自动只读可见性', async () => {
