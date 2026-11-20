@@ -1,7 +1,20 @@
 export type { VerifyReport } from '@dowel/api';
-export { createApp } from './app.ts';
+export { type AppOptions, createApp } from './app.ts';
 export { hashPassword, verifyPassword } from './auth.ts';
-export { openPlatformDb, type PlatformDb } from './db.ts';
+export {
+  CLUSTER_EVENTS_CHANNEL,
+  type ClusterEvent,
+  type ClusterEventPayload,
+  EventBus,
+  type EventBusOptions,
+} from './bus.ts';
+export {
+  type AdvisoryLockOptions,
+  type AdvisoryLockResult,
+  openPlatformDb,
+  type PlatformDb,
+} from './db.ts';
+export { HaCoordinator, type HaCoordinatorOptions } from './ha.ts';
 export { readSettings, writeSettings } from './settings.ts';
-export { autoSetup, needsSetup } from './setup.ts';
+export { autoSetup, ensureSetupToken, needsSetup } from './setup.ts';
 export { type Shadow, ShadowError } from './shadow.ts';

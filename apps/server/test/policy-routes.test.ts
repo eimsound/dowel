@@ -731,6 +731,8 @@ describe('平台库迁移：H6 的档位搬进执行策略的环境层，且迁�
     try {
       // 退回到 P5a 之前：删掉新表，加回 exec_policy（旧列与约束在最新迁移 22 已清理，不需要再删）
       for (const t of [
+        'ha_leases',
+        'webhook_jobs',
         'ci_tokens',
         'token_policies',
         'inbox_items',
@@ -742,8 +744,8 @@ describe('平台库迁移：H6 的档位搬进执行策略的环境层，且迁�
         await fresh.exec(`drop table ${t}`);
       await fresh.exec('drop table exec_policies');
       await fresh.exec('alter table environments add column exec_policy text');
-      // P5a 的两条迁移、P5b 的一条、P6 的一条和 P6.5 的一条都退回去
-      await fresh.query('delete from dowel_migrations where version > $1', [MIGRATIONS.length - 5]);
+      // P5a 的两条迁移、P5b 的一条、P6 的一条、P6.5 的一条和 P7 HA 的一条都退回去
+      await fresh.query('delete from dowel_migrations where version > $1', [MIGRATIONS.length - 6]);
       await fresh.query("insert into groups (id, slug, name) values ('g1', 'g1', 'g')");
       await fresh.query("insert into projects (id, name, group_id, slug) values ('p1', 'p', 'g1', 'p')");
       for (const [id, pol] of [

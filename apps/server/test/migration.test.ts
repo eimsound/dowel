@@ -347,8 +347,10 @@ describe.each([
     // P4c 的迁移（versions.restored_at）也退回去
     await db.exec('alter table versions drop column restored_at');
     await db.exec('drop table environment_versions');
-    // P5b / P6 的迁移（执行申请、审批、收件箱、Webhook、CI 令牌）也退回去
+    // P5b / P6 / P7 HA 的迁移（执行申请、审批、收件箱、Webhook、队列、租约、CI 令牌）也退回去
     for (const t of [
+      'ha_leases',
+      'webhook_jobs',
       'ci_tokens',
       'token_policies',
       'inbox_items',
@@ -562,7 +564,10 @@ describe.each([
       }
       const base = await openPlatformDb(url);
       try {
-        // 回退迁移 22：加回旧列、旧外键/触发器，并写入互相引用的环境行模拟 v21 库
+        // 回退迁移 22 与迁移 23：删掉 HA 表与 worker_id，加回旧列、旧外键/触发器，并写入互相引用的环境行模拟 v21 库
+        await base.exec('drop table ha_leases');
+        await base.exec('drop table webhook_jobs');
+        await base.exec('alter table exec_requests drop column worker_id');
         await base.exec('alter table environments add column prerequisite_id text');
         if (platform === 'pg') {
           await base.exec(
@@ -581,7 +586,7 @@ describe.each([
             and not exists (select 1 from environments e where e.id = new.prerequisite_id)
            begin select raise(abort, 'FOREIGN KEY constraint failed: environments.prerequisite_id'); end;`);
         }
-        await base.query('delete from dowel_migrations where version >= $1', [MIGRATIONS.length]);
+        await base.query('delete from dowel_migrations where version >= $1', [MIGRATIONS.length - 1]);
         await base.query("insert into groups (id, slug, name) values ('g1', 'g1', '组')");
         await base.query("insert into projects (id, name, group_id, slug) values ('p1', 'p1', 'g1', 'p1')");
         await base.query(

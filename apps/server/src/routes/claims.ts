@@ -455,7 +455,7 @@ export const registerClaims = (app: Hono<Env>, ctx: AppContext) => {
       // P5b：认领后的同步可能改了环境的当前版本，这个环境上还没结束的执行申请重新检查
       ctx.requests.kick({ envIds: [env.id] });
     } finally {
-      release();
+      await release();
     }
     if (result.changed)
       await audit(
