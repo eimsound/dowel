@@ -42,6 +42,7 @@ import { Row, Rows, Section } from '../components/ProjectPage.tsx';
 import { SettingsNav } from '../components/SettingsNav.tsx';
 import { AppShell, PageHeader, useShellPanel } from '../components/Shell.tsx';
 import { useToast } from '../components/Toasts.tsx';
+import { TokenPolicyPanel } from '../components/TokenSettings.tsx';
 import { Avatar, Banner, Empty, IconButton } from '../components/ui.tsx';
 import { formatTime } from '../format.ts';
 import { useMe } from '../session.ts';
@@ -1053,13 +1054,18 @@ export const AdminSettings = () => {
   );
 };
 
-/** 实例层的执行策略（P5a）：组、项目、环境各层都在它之下，只能收紧 */
+/** 实例层的执行策略（P5a）和“谁能创建 CI 令牌”规则（P6）：组、项目、环境各层都在它之下，只能收紧 */
 export const AdminPolicy = () => {
   const { t } = useTranslation();
   return (
-    <Section title={t('pol.title')}>
-      <PolicyLayerPanel path="/api/admin/exec-policy" queryKey={['exec-policy', 'instance']} />
-    </Section>
+    <>
+      <Section title={t('pol.title')}>
+        <PolicyLayerPanel path="/api/admin/exec-policy" queryKey={['exec-policy', 'instance']} />
+      </Section>
+      <Section title={t('tok.policy.title')}>
+        <TokenPolicyPanel path="/api/admin/token-policy" queryKey={['token-policy', 'instance']} />
+      </Section>
+    </>
   );
 };
 
@@ -1214,6 +1220,9 @@ const TARGET_KINDS = [
   'group',
   'version',
   'environment',
+  'exec_request',
+  'webhook',
+  'ci_token',
   'invite',
   'session',
   'oidc_provider',

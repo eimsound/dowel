@@ -9,6 +9,7 @@ import { api } from '../api.ts';
 import { PolicyLayerPanel } from '../components/PolicyEditor.tsx';
 import { ProjectPage, Section } from '../components/ProjectPage.tsx';
 import { useToast } from '../components/Toasts.tsx';
+import { ProjectTokensPanel, TokenPolicyPanel } from '../components/TokenSettings.tsx';
 import { Banner } from '../components/ui.tsx';
 import { invalidatePolicyDependents } from '../policy-cache.ts';
 import { useProject } from '../project.tsx';
@@ -198,6 +199,21 @@ export const ProjectSettings = () => {
             queryKey={['exec-policy', 'project', pid]}
           />
         </Section>
+
+        {/* 项目层的“谁能创建 CI 令牌”（P6 T2）：项目成员可看，项目管理员可改 */}
+        <Section title={t('tok.policy.title')}>
+          <TokenPolicyPanel
+            path={`/api/projects/${pid}/token-policy`}
+            queryKey={['token-policy', 'project', pid]}
+          />
+        </Section>
+
+        {/* CI 令牌管理（P6 T1）：项目管理员和被允许创建令牌的人可见 */}
+        {(project.canListTokens || canManage) && (
+          <Section title={t('tok.title')}>
+            <ProjectTokensPanel pid={pid} />
+          </Section>
+        )}
 
         {canManage && (
           <Section title={t('pset.transfer')}>

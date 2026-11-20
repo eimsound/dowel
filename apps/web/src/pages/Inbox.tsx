@@ -67,6 +67,14 @@ const NoticeRow = ({ n, onRead }: { n: InboxItem; onRead: (id: string) => void }
       >
         {title}
       </Link>
+    ) : n.project && n.environment ? (
+      <Link
+        to="/project/$owner/$project/environments/$eid"
+        params={{ owner: n.project.groupSlug, project: n.project.slug, eid: n.environment.id }}
+        onClick={() => unread && onRead(n.id)}
+      >
+        {title}
+      </Link>
     ) : (
       <span>{title}</span>
     );
@@ -77,6 +85,7 @@ const NoticeRow = ({ n, onRead }: { n: InboxItem; onRead: (id: string) => void }
     >
       <div className="flex flex-wrap items-center gap-2">
         {unread && <span className="badge warn">{t('inbox.unread')}</span>}
+        {n.kind === 'token_execution' && <span className="chip">{t('inbox.tokenBadge')}</span>}
         <span className={unread ? 'font-medium' : ''}>{link}</span>
         <span className="flex-1" />
         <span className="text-xs text-text-3">{formatTime(n.createdAt)}</span>

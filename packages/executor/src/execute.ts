@@ -822,6 +822,7 @@ const locked = async (conn: Db, c: Ctx): Promise<ExecuteResult> => {
       routeDir === 'down'
         ? `目标版本 ${label(target)} 比环境当前版本更早，这是回滚，不是执行`
         : `目标版本 ${label(target)} 比环境当前版本更新，这是执行，不是回滚`,
+      { versionId: target.id, reached: state.current },
     );
   preflight(migrations);
   if (o.expect) assertExpected(o.expect, state.current, migrations);
@@ -835,6 +836,7 @@ const locked = async (conn: Db, c: Ctx): Promise<ExecuteResult> => {
       direction: direction as ExecuteResult['direction'],
       baseline: baseline !== null,
       ran: [],
+      from: state.current,
       current: state.current,
       dryRun: {
         firstRun: state.current === null && !state.unfinished ? (baseline ? 'baseline' : 'empty') : null,
@@ -949,6 +951,7 @@ const locked = async (conn: Db, c: Ctx): Promise<ExecuteResult> => {
     direction: direction as ExecuteResult['direction'],
     baseline: baseline !== null,
     ran,
+    from: state.current,
     current,
   };
 };

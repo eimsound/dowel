@@ -28,6 +28,7 @@ import { loadRoleContext, visibleProjects } from '../roles.ts';
 import { readSettings } from '../settings.ts';
 import { userByUsername } from '../users.ts';
 import { type AppContext, body, type Env, groupAccess } from './context.ts';
+import { deleteTokenPolicies } from './tokens.ts';
 
 const info = async (db: Db, g: GroupRow, role: GroupRole | null): Promise<GroupInfo> => ({
   ...g,
@@ -163,8 +164,9 @@ export const registerGroups = (app: Hono<Env>, ctx: AppContext) => {
       // 授权表的 scope 是多态的，没有外键，手动清理（作为范围、作为对象两种都要删）
       await tx.query("delete from grants where scope_kind = 'group' and scope_id = $1", [g.id]);
       await tx.query("delete from grants where subject_kind = 'group' and subject_id = $1", [g.id]);
-      // 组层的执行策略（范围是多态的，没有外键）
+      // 组层的执行策略与令牌创建规则（范围是多态的，没有外键）
       await deletePolicies(tx, 'group', [g.id]);
+      await deleteTokenPolicies(tx, 'group', [g.id]);
       await tx.query('delete from group_members where group_id = $1', [g.id]);
       await tx.query('delete from groups where id = $1', [g.id]);
     });

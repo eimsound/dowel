@@ -43,7 +43,17 @@ export interface AppOptions {
   allowPasswordLogin?: boolean;
   /** Webhook 投递的参数（测试里调短重试间隔） */
   webhooks?: WebhookOptions;
+  /** CI 令牌认证失败的限速（按 IP）；默认 DOWEL_TOKEN_FAIL_LIMIT（20）次 / 10 分钟 */
+  tokenFailLimiter?: KeyedLimiter;
+  /** 每个 CI 令牌的请求限速；默认 DOWEL_TOKEN_RATE_LIMIT（120）次 / 分钟 */
+  tokenLimiter?: KeyedLimiter;
 }
+
+/** 环境变量里的正整数（没设 / 不合法时用默认值） */
+const envInt = (name: string, fallback: number) => {
+  const n = Number(process.env[name]);
+  return Number.isInteger(n) && n > 0 ? n : fallback;
+};
 
 export const createApp = (db: PlatformDb, options: AppOptions = {}) => {
   const app = new Hono<Env>();
@@ -105,6 +115,12 @@ export const createApp = (db: PlatformDb, options: AppOptions = {}) => {
     refresher,
     loginLimiter: options.loginLimiter ?? loginLimiterFromEnv(),
     connectionLimiter: options.connectionLimiter ?? new KeyedLimiter({ limit: 10, windowMs: 60_000 }),
+    tokenFailLimiter:
+      options.tokenFailLimiter ??
+      new KeyedLimiter({ limit: envInt('DOWEL_TOKEN_FAIL_LIMIT', 20), windowMs: 10 * 60_000 }),
+    tokenLimiter:
+      options.tokenLimiter ??
+      new KeyedLimiter({ limit: envInt('DOWEL_TOKEN_RATE_LIMIT', 120), windowMs: 60_000 }),
     guard,
     exec,
     drift,
@@ -138,9 +154,12 @@ export const createApp = (db: PlatformDb, options: AppOptions = {}) => {
     return fail('服务器内部错误', 500);
   });
 
-  // 安全响应头对所有响应生效；变更请求校验 Origin（没有 Origin 头的放行，便于 CI 用 curl）
+  // 安全响应头对所有响应生效；变更请求校验 Origin（没有 Origin 头的放行，便于 CI 用 curl）。
+  // CI 令牌接口（/api/ci/…）不校验：令牌请求不带 cookie，没有 CSRF 的前提（P6）
   app.use('*', securityHeaders);
-  app.use('/api/*', mutationOriginGuard(security));
+  app.use('/api/*', async (c, next) =>
+    c.req.path.startsWith('/api/ci/') ? next() : mutationOriginGuard(security)(c, next),
+  );
 
   registerRoutes(app, ctx);
 

@@ -181,6 +181,8 @@ export interface ExecuteResult {
   baseline: boolean;
   /** 本次真正执行（或写入基线）的迁移，按顺序 */
   ran: { versionId: string; number: number; direction: MigrationDirection; runId: number }[];
+  /** 执行前目标库历史里的当前版本（没有执行过为 null） */
+  from?: string | null;
   /** 结束时环境的当前版本 */
   current: string | null;
   /** dryRun 时有值：将要做的事（没有写入任何东西） */

@@ -14,7 +14,8 @@ export type WebhookFormat = z.infer<typeof webhookFormatSchema>;
  * - request.invalidated：申请失效（环境状态变了、审批流程变严……）或过期；
  * - request.executed：申请执行结束（成功或失败，data.ok）；
  * - execution.finished：不经申请的直接执行 / 回滚结束（成功或失败）；
- * - emergency.executed：实例管理员的紧急执行（绕过审批）结束。
+ * - emergency.executed：实例管理员的紧急执行（绕过审批）结束；
+ * - token.executed：CI 令牌的执行结束（成功或失败，data.ok；P6）。令牌执行不经审批，单独一个事件方便只订阅它。
  */
 export const WEBHOOK_EVENTS = [
   'request.created',
@@ -25,6 +26,7 @@ export const WEBHOOK_EVENTS = [
   'request.executed',
   'execution.finished',
   'emergency.executed',
+  'token.executed',
 ] as const;
 export const webhookEventSchema = z.enum(WEBHOOK_EVENTS);
 export type WebhookEventType = z.infer<typeof webhookEventSchema>;

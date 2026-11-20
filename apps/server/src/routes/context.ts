@@ -35,10 +35,12 @@ import type { Role, Rooms } from '../rooms.ts';
 import type { SecurityConfig } from '../security.ts';
 import type { Shadows } from '../shadows.ts';
 import type { ConnectionGuard } from '../targets.ts';
+import type { CiTokenAuth } from '../tokens.ts';
 import { createUser, type NewUser } from '../users.ts';
 import type { Webhooks } from '../webhooks.ts';
 
-export type Env = { Variables: { user: User } };
+/** 请求上挂的身份：登录用户（会话 cookie），或者 CI 令牌（只在 /api/ci/… 上，见 routes/ci.ts） */
+export type Env = { Variables: { user: User; token: CiTokenAuth } };
 
 export interface AppContext {
   db: PlatformDb;
@@ -48,6 +50,10 @@ export interface AppContext {
   loginLimiter: LoginLimiter;
   /** 连接检查的限速（每个用户每分钟 10 次）：服务端替用户去连地址 */
   connectionLimiter: KeyedLimiter;
+  /** CI 令牌认证失败的限速（按来源 IP，防爆破；P6）：只记失败，成功的请求不占额度 */
+  tokenFailLimiter: KeyedLimiter;
+  /** 每个 CI 令牌的请求限速（P6） */
+  tokenLimiter: KeyedLimiter;
   /** 连接目标库 / 影子库之前统一跑的检查（SSRF 白名单） */
   guard: ConnectionGuard;
   /** 执行 / 漂移检查共用的上下文（平台库、白名单、环境锁） */
@@ -75,11 +81,13 @@ export const body = async <T extends z.ZodType>(c: Context, schema: T): Promise<
   return parsed.data;
 };
 
-/** 登录后再访问项目接口：目前只认会话 cookie（Bearer 令牌以后加在这里） */
+/**
+ * 登录后再访问的接口：只认会话 cookie。CI 令牌（Authorization: Bearer dwl_…）在更前面就被 rejectTokens 拒绝（403），
+ * 不会走到这里，也不会回落到 cookie——令牌只能访问 /api/ci/…（P6，routes/ci.ts）。
+ */
 export const requireUser =
   (db: PlatformDb): MiddlewareHandler<Env> =>
   async (c, next) => {
-    // TODO(P6)：先解析 Authorization: Bearer，用令牌认证后再回落到会话 cookie
     const u = await currentUser(db, c);
     if (!u) throw new HTTPException(401, { message: '未登录' });
     c.set('user', u);

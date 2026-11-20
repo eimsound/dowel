@@ -23,9 +23,17 @@ import { pinForTransfer } from '../env-policy.ts';
 import { insertGrant } from '../grants.ts';
 import { groupById, groupBySlug, groupRoleOf, pickProjectSlug, projectSlugTaken } from '../groups.ts';
 import { accessIn, deletePolicies, withPolicyLock } from '../policy.ts';
-import { effectiveRole, loadRoleContext, projectRow, projectRows, visibleProjects } from '../roles.ts';
+import {
+  canCreateToken,
+  effectiveRole,
+  loadRoleContext,
+  projectRow,
+  projectRows,
+  visibleProjects,
+} from '../roles.ts';
 import { assertImportable } from '../shadow.ts';
 import { type AppContext, access, body, type Env } from './context.ts';
+import { deleteTokenPolicies } from './tokens.ts';
 
 export const registerProjects = (app: Hono<Env>, ctx: AppContext) => {
   const { db, rooms, shadows, refresher } = ctx;
@@ -121,6 +129,11 @@ export const registerProjects = (app: Hono<Env>, ctx: AppContext) => {
       groupDefaultRole: a.groupDefaultRole,
       groupRole: await groupRoleOf(db, a.groupId, c.get('user').id),
       schemas: a.schemas ?? null,
+      canListTokens: can(userActor(c.get('user')), 'token.list', {
+        kind: 'project',
+        role: a.role,
+        tokenCreator: canCreateToken(a.rc, a),
+      }),
     }) satisfies ProjectInfo;
 
   app.get('/api/projects/:pid', async (c) => {
@@ -323,6 +336,8 @@ export const registerProjects = (app: Hono<Env>, ctx: AppContext) => {
         );
       await deletePolicies(tx, 'environment', envIds);
       await deletePolicies(tx, 'project', [a.pid]);
+      await tx.query('delete from ci_tokens where project_id = $1', [a.pid]);
+      await deleteTokenPolicies(tx, 'project', [a.pid]);
       await tx.query('delete from project_redirects where project_id = $1', [a.pid]);
       await tx.query('delete from projects where id = $1', [a.pid]);
       return { branchIds, envIds };

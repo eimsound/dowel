@@ -116,6 +116,15 @@ describe.each([
       `insert into project_redirects (owner_slug, project_slug, project_id) values ($1, $2, $3)`,
       [group.data.slug as string, 'old-name', pid],
     );
+    // 一个 CI 令牌和一条项目层令牌创建规则（删除项目时一并清理）
+    expect((await call(adminCookie, 'POST', `/api/projects/${pid}/tokens`, { name: 'ci' })).status).toBe(201);
+    expect(
+      (
+        await call(adminCookie, 'PUT', `/api/projects/${pid}/token-policy`, {
+          rule: { roles: ['admin'], groups: [] },
+        })
+      ).status,
+    ).toBe(200);
     return { adminCookie, viewerCookie, pid, slug, gid, envId: `env-${mark}` };
   };
 
@@ -189,6 +198,12 @@ describe.each([
       await count("select count(*) as n from grants where scope_kind = 'project' and scope_id = $1", [pid]),
     ).toBe(0);
     expect(await count('select count(*) as n from project_redirects where project_id = $1', [pid])).toBe(0);
+    expect(await count('select count(*) as n from ci_tokens where project_id = $1', [pid])).toBe(0);
+    expect(
+      await count("select count(*) as n from token_policies where scope_kind = 'project' and scope_id = $1", [
+        pid,
+      ]),
+    ).toBe(0);
     // 审计记录保留，动作是 project.delete
     const audit = await db.query<{ action: string; projectId: string | null }>(
       `select action, project_id as "projectId" from audit_events

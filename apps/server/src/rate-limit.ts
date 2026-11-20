@@ -50,6 +50,17 @@ export class KeyedLimiter {
 
   /** 检查上限并立即记一次；超过上限时返回还要等多少秒 */
   attempt(key: string): LimitResult {
+    const r = this.check(key);
+    if (!r.allowed) return r;
+    this.record(key);
+    return r;
+  }
+
+  /**
+   * 只检查、不记录（只按失败计数的场景：CI 令牌认证先 check，失败了才 record，成功的请求不占额度）。
+   * check 和随后的 record 之间没有 await 时仍是同步的，不会被并发请求穿插。
+   */
+  check(key: string): LimitResult {
     const t = this.now();
     this.sweep(t);
     const arr = (this.hits.get(key) ?? []).filter((at) => t - at < this.windowMs);
@@ -58,6 +69,13 @@ export class KeyedLimiter {
       const retry = Math.max(0, arr[arr.length - this.limit]! + this.windowMs - t);
       return { allowed: false, retryAfterSeconds: Math.max(1, Math.ceil(retry / 1000)) };
     }
+    return { allowed: true };
+  }
+
+  /** 记一次（不检查上限） */
+  record(key: string): void {
+    const t = this.now();
+    const arr = (this.hits.get(key) ?? []).filter((at) => t - at < this.windowMs);
     if (!this.hits.has(key) && this.hits.size >= this.maxKeys) {
       for (const k of this.hits.keys()) {
         this.hits.delete(k);
@@ -66,7 +84,16 @@ export class KeyedLimiter {
     }
     arr.push(t);
     this.hits.set(key, arr);
-    return { allowed: true };
+  }
+
+  /**
+   * 退回最近一次预占（同步 attempt 后，异步校验成功时调用，避免 check → await → record 的并发竞态）。
+   */
+  refund(key: string): void {
+    const arr = this.hits.get(key);
+    if (!arr?.length) return;
+    arr.pop();
+    if (!arr.length) this.hits.delete(key);
   }
 }
 

@@ -3,12 +3,15 @@ import { describe, expect, test } from 'vitest';
 import {
   ACTION_MIN_ROLE,
   type Actor,
+  CI_ACTIONS,
   can,
+  ENV_ACTIONS,
   GROUP_ADMIN_ACTIONS,
   type GroupAction,
   INSTANCE_ACTIONS,
   type ProjectAction,
   type Resource,
+  TOKEN_ACTIONS,
   userActor,
 } from '../src/authz.ts';
 import type { Role } from '../src/rooms.ts';
@@ -102,5 +105,59 @@ describe('can() 实例动作', () => {
     expect(userActor({ id: 'u2', role: 'member' }).instanceAdmin).toBe(false);
     // 大小写不匹配不算管理员
     expect(userActor({ id: 'u3', role: 'Admin' }).instanceAdmin).toBe(false);
+  });
+});
+
+describe('can() CI 令牌与令牌管理（P6）', () => {
+  const token: Actor = { kind: 'token', id: 't1', projectId: 'p1' };
+
+  test('令牌只能做本项目的 ci.read 和允许的 ci.execute，其余动作一律拒绝（含 mark 与令牌管理）', () => {
+    expect(can(token, 'ci.read', { kind: 'project', projectId: 'p1' })).toBe(true);
+    expect(can(token, 'ci.read', { kind: 'environment', projectId: 'p1' })).toBe(true);
+    expect(can(token, 'ci.read', { kind: 'project', projectId: 'p2' })).toBe(false);
+    expect(can(token, 'ci.execute', { kind: 'environment', projectId: 'p1', allowTokens: true })).toBe(true);
+    expect(can(token, 'ci.execute', { kind: 'environment', projectId: 'p1', allowTokens: false })).toBe(
+      false,
+    );
+    expect(can(token, 'ci.execute', { kind: 'environment', projectId: 'p2', allowTokens: true })).toBe(false);
+    expect(can(token, 'ci.execute', { kind: 'project', projectId: 'p1', allowTokens: true })).toBe(false);
+
+    for (const action of [
+      ...actions,
+      ...ENV_ACTIONS,
+      ...GROUP_ADMIN_ACTIONS,
+      ...INSTANCE_ACTIONS,
+      ...TOKEN_ACTIONS,
+    ])
+      expect(
+        can(token, action, {
+          kind: 'environment',
+          projectId: 'p1',
+          role: 'admin',
+          allowTokens: true,
+          tokenCreator: true,
+          tokenOwner: true,
+        }),
+        `令牌不应被允许 ${action}`,
+      ).toBe(false);
+  });
+
+  test('登录用户（含实例管理员）不能走 ci.* 动作；令牌管理按 tokenCreator / admin / tokenOwner 判断', () => {
+    for (const action of CI_ACTIONS) {
+      expect(can(user, action, { kind: 'environment', projectId: 'p1', allowTokens: true })).toBe(false);
+      expect(can(admin, action, { kind: 'environment', projectId: 'p1', allowTokens: true })).toBe(false);
+    }
+    expect(can(user, 'token.create', { kind: 'project', role: 'viewer', tokenCreator: true })).toBe(true);
+    expect(can(user, 'token.create', { kind: 'project', role: 'admin', tokenCreator: false })).toBe(false);
+    expect(can(admin, 'token.create', { kind: 'project', role: null, tokenCreator: false })).toBe(true);
+
+    expect(can(user, 'token.list', { kind: 'project', role: 'admin', tokenCreator: false })).toBe(true);
+    expect(can(user, 'token.list', { kind: 'project', role: 'viewer', tokenCreator: true })).toBe(true);
+    expect(can(user, 'token.list', { kind: 'project', role: 'editor', tokenCreator: false })).toBe(false);
+
+    expect(can(user, 'token.revoke', { kind: 'project', role: 'admin', tokenOwner: false })).toBe(true);
+    expect(can(user, 'token.revoke', { kind: 'project', role: 'viewer', tokenOwner: true })).toBe(true);
+    expect(can(user, 'token.revoke', { kind: 'project', role: null, tokenOwner: true })).toBe(false);
+    expect(can(user, 'token.revoke', { kind: 'project', role: 'editor', tokenOwner: false })).toBe(false);
   });
 });

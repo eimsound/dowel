@@ -61,6 +61,7 @@ import {
 import type { Role } from './rooms.ts';
 import { decrypt, keyedDigest, scrubSecrets } from './secrets.ts';
 import type { SecurityConfig } from './security.ts';
+import { loadTokenRules, tokenRulesFor } from './token-rules.ts';
 import type { Webhooks } from './webhooks.ts';
 
 // ───── 审批流程快照 ─────
@@ -181,6 +182,8 @@ export const loadRoleContexts = async (db: Db, ids: string[]): Promise<Map<strin
              and gr.subject_id in (select group_id from group_members where user_id in (${list})))`,
     ids,
   );
+  // “谁能创建令牌”的规则（P6）：所有用户共用一份，被允许创建令牌的人对项目有只读可见性
+  const tokenRules = await loadTokenRules(db);
   const out = new Map<string, UserContext>();
   for (const u of users)
     out.set(u.id, {
@@ -188,6 +191,7 @@ export const loadRoleContexts = async (db: Db, ids: string[]): Promise<Map<strin
       instanceAdmin: u.role === 'admin',
       groups: new Map(),
       grants: [],
+      tokenRules,
       name: u.name,
     });
   for (const m of members) out.get(m.userId)?.groups.set(m.groupId, m.role);
@@ -222,10 +226,20 @@ export const loadAudience = async (
              or (gr.scope_kind = 'project' and gr.scope_id = $2) or e.project_id = $2)`,
     [p.groupId, p.id],
   );
-  return loadRoleContexts(
-    db,
-    rows.map((r) => r.id),
-  );
+  // P6：“谁能创建令牌”的组条件也给只读可见性——这些组的成员也是受众（最终是否看得到仍由 effectiveRole 判断）
+  const rules = await loadTokenRules(db);
+  const groupIds = [
+    ...new Set(
+      Object.values(tokenRulesFor(rules, p)).flatMap((r) => (r ? r.groups.map((g) => g.groupId) : [])),
+    ),
+  ];
+  const extra = groupIds.length
+    ? await db.query<{ id: string }>(
+        `select user_id as id from group_members where group_id in (${inList(groupIds)})`,
+        groupIds,
+      )
+    : [];
+  return loadRoleContexts(db, [...new Set([...rows, ...extra].map((r) => r.id))]);
 };
 
 /** 判断资格需要的环境信息：项目、环境、当前生效策略、方向 */
@@ -992,6 +1006,7 @@ export class Requests {
         extra.ok === false || extra.status === 'failed' ? '执行申请执行失败' : '执行申请已执行',
       'execution.finished': extra.ok === false ? '执行失败' : '执行完成',
       'emergency.executed': extra.ok === false || extra.status === 'failed' ? '紧急执行失败' : '紧急执行完成',
+      'token.executed': extra.ok === false ? 'CI 令牌执行失败' : 'CI 令牌执行完成',
     };
     const lines = [
       `**项目**：${s.project.name}（${s.project.groupSlug}/${s.project.slug}）`,
@@ -1140,6 +1155,103 @@ export class Requests {
         code: r.error?.code ?? null,
       },
     });
+  }
+
+  // ───── CI 令牌执行之后（P6） ─────
+
+  /**
+   * CI 令牌的执行结束之后（成功或失败；预演不算）：
+   * - 这个环境上还没结束的执行申请马上重新检查（环境状态变了的会失效，P5b 的规则）；
+   * - 组级 Webhook 发 token.executed（所有环境）；
+   * - **生产环境**给收件箱发 token_execution：项目管理员（含组管理员、实例管理员，和审批人范围里的“项目管理员”同一个定义）
+   *   和环境当前审批流程里每个环节现在有资格的审批人（没配环节时是有执行权限的人）。非生产不发站内通知（太频繁），只有 Webhook。
+   * 自己的错误只记日志，不影响已经返回给 CI 的结果。
+   */
+  async afterTokenRun(
+    token: { id: string; name: string; prefix: string; createdByName: string | null },
+    a: { pid: string; env: EnvRow },
+    target: RequestVersionRef,
+    r: {
+      ok: boolean;
+      noop?: boolean;
+      current: RequestVersionRef | null;
+      ran: number[];
+      error: { error: string; code: string } | null;
+    },
+  ) {
+    this.kick({ envIds: [a.env.id] });
+    const s = await this.scopeOf(this.db, { project_id: a.pid, environment_id: a.env.id });
+    if (!s) return;
+    const who = `CI 令牌 ${token.name}（${token.prefix}…）`;
+    const where = `${s.project.name} / ${s.env.name}`;
+    this.webhooks.emit(s.project.groupId, {
+      type: 'token.executed',
+      title: `${r.ok ? 'CI 令牌执行完成' : 'CI 令牌执行失败'}：${where}`,
+      lines: [
+        `**项目**：${s.project.name}（${s.project.groupSlug}/${s.project.slug}）`,
+        `**环境**：${s.env.name}${s.env.production ? '（生产）' : ''}`,
+        `**操作**：执行到 v${target.number}${r.noop ? '（已在目标版本，无变更）' : ''}`,
+        `**令牌**：${token.name}（\`${token.prefix}…\`）${token.createdByName ? `，创建者 ${token.createdByName}` : ''}`,
+        ...(r.ok ? [`**当前版本**：${r.current ? `v${r.current.number}` : '（无）'}`] : []),
+        ...(r.error ? [`**错误**：${scrubSecrets(r.error.error)}`] : []),
+      ],
+      url: null,
+      data: {
+        project: { id: s.project.id, name: s.project.name, slug: s.project.slug, group: s.project.groupSlug },
+        environment: { id: s.env.id, name: s.env.name, production: s.env.production },
+        token: { id: token.id, name: token.name, prefix: token.prefix, createdBy: token.createdByName },
+        toVersion: target.number,
+        current: r.current?.number ?? null,
+        ran: r.ran,
+        noop: r.noop ?? false,
+        ok: r.ok,
+        code: r.error?.code ?? null,
+      },
+    });
+    // 生产环境无变更的幂等空跑（noop）不向收件箱刷屏
+    if (!s.env.production || (r.ok && r.noop)) return;
+    const fx = new Effects();
+    await this.db.transaction(async (tx) => {
+      const audience = await loadAudience(tx, s.project);
+      const scope: StageScope = {
+        project: s.project,
+        env: { id: s.env.id, production: s.env.production },
+        resolved: s.resolved,
+        direction: 'up',
+      };
+      const stages = stagesOf(flowOf(s.resolved));
+      const data = {
+        title: `${r.ok ? 'CI 令牌执行了生产环境' : 'CI 令牌执行生产环境失败'}：${where}`,
+        body: `${who} 执行到 v${target.number}${
+          r.ok
+            ? `，当前版本 ${r.current ? `v${r.current.number}` : '（无）'}`
+            : `：${scrubSecrets(r.error?.error ?? '')}`
+        }`,
+        event: r.ok ? 'token_executed' : 'token_failed',
+        actor: who,
+        params: {
+          project: s.project.name,
+          env: s.env.name,
+          to: target.number,
+          current: r.current?.number ?? null,
+          token: token.name,
+          prefix: token.prefix,
+          code: r.error?.code ?? null,
+        },
+      };
+      for (const u of audience.values()) {
+        const role = effectiveRole(u, s.project);
+        if (!role) continue;
+        if (role !== 'admin' && !stages.some((spec) => eligibleFor(u, spec, scope))) continue;
+        await tx.query(
+          `insert into inbox_items (id, user_id, kind, project_id, environment_id, request_id, data, created_at)
+           values ($1, $2, 'token_execution', $3, $4, null, $5::text::jsonb, $6)`,
+          [newId(), u.userId, s.project.id, s.env.id, JSON.stringify(data), new Date().toISOString()],
+        );
+        fx.users.add(u.userId);
+      }
+    });
+    await this.flushEffects(fx);
   }
 
   // ───── 实时推送（收件箱） ─────

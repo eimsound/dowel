@@ -19,6 +19,8 @@ export type ProjectAction =
   | 'project.delete'
   /** 项目层的执行策略（P5a）：项目管理员；放宽另外要满足项目层改动前的“谁能执行”（routes/policy.ts） */
   | 'project.set_policy'
+  /** 项目层的“谁能创建 CI 令牌”（P6）：项目管理员。逐层取与，下级结构上放宽不了上级（ADR 0010） */
+  | 'project.set_token_policy'
   | 'version.publish'
   | 'version.edit'
   | 'version.verify'
@@ -72,6 +74,8 @@ export type GroupAction =
   | 'group.set_policy'
   /** 组级 Webhook 的配置、投递记录和发送测试（P5b）：组管理员 */
   | 'group.manage_webhooks'
+  /** 组层的“谁能创建 CI 令牌”（P6）：组管理员 */
+  | 'group.set_token_policy'
   | 'group.delete';
 
 /** 实例级动作（instance.create_group 的规则依赖实例设置，在 can() 里单独判断） */
@@ -84,19 +88,39 @@ export type InstanceAction =
   | 'instance.manage_grants'
   /** 实例层的执行策略（P5a） */
   | 'instance.manage_policy'
+  /** 实例层的“谁能创建 CI 令牌”（P6） */
+  | 'instance.manage_token_policy'
   /** 紧急执行（P5b）：绕过审批流程（不绕过漂移、完整性、前置环境等检查），必填原因；只有实例管理员 */
   | 'instance.emergency_execute'
   | 'instance.create_group'
   | 'instance.view_audit';
 
+/**
+ * CI 令牌的管理（P6）：不是单纯按项目角色判断，调用方把“能不能创建令牌”“是不是令牌的创建者”算好放进 Resource。
+ * - token.create：满足三层“谁能创建令牌”规则（roles.ts 的 canCreateToken）；
+ * - token.list：项目管理员，或者能创建令牌的人；
+ * - token.revoke：项目管理员（含组管理员、实例管理员），或者令牌的创建者本人（还看得到项目时）。
+ */
+export type TokenAction = 'token.create' | 'token.list' | 'token.revoke';
+
+/**
+ * **只有 CI 令牌**能做的动作（P6，/api/ci/…）：令牌的能力只有“只读 + 执行”。
+ * - ci.read：读项目的版本链、环境状态、执行历史；
+ * - ci.execute：执行（和预演）到指定版本——只看环境生效的“允许令牌执行”（Resource.allowTokens），不看“谁能执行”、不走审批。
+ * 令牌不能做任何别的动作（编辑模型、发布、改策略、改连接串、标记为已执行、写基线、处理漂移、认领、接手、令牌管理……）。
+ */
+export type CiAction = 'ci.read' | 'ci.execute';
+
 /** 当前服务端实际用到的动作；新增端点时先在这里加动作，再到规则表登记 */
-export type Action = ProjectAction | EnvAction | GroupAction | InstanceAction;
+export type Action = ProjectAction | EnvAction | GroupAction | InstanceAction | TokenAction | CiAction;
 
 /** 发起操作的主体：用户、CI 令牌或服务器自己（导入、派生数据刷新等） */
 export interface Actor {
   kind: 'user' | 'token' | 'system';
   /** 用户 ID 或令牌 ID；系统操作为 null */
   id: string | null;
+  /** 令牌所属的项目（kind = token）：令牌只能作用于这一个项目 */
+  projectId?: string;
   /** 实例管理员：拥有一切权限 */
   instanceAdmin?: boolean;
 }
@@ -126,6 +150,14 @@ export interface Resource {
    * 见 policy.ts 的 isExecutor）。can() 保持纯函数，由调用方算好放进来。
    */
   isExecutor?: boolean;
+  /** 资源所属的项目（CI 令牌只能作用于它自己的项目，can() 里核对） */
+  projectId?: string;
+  /** 环境生效的执行策略是否“允许令牌执行”（P6，ci.execute） */
+  allowTokens?: boolean;
+  /** 调用者能不能创建这个项目的 CI 令牌（roles.ts 的 canCreateToken，token.create / token.list） */
+  tokenCreator?: boolean;
+  /** 调用者是不是这个令牌的创建者（token.revoke） */
+  tokenOwner?: boolean;
 }
 
 /**
@@ -192,6 +224,7 @@ export const ACTION_MIN_ROLE: Record<ProjectAction, Role> = {
   'project.settings': 'admin',
   'project.delete': 'admin',
   'project.set_policy': 'admin',
+  'project.set_token_policy': 'admin',
   'version.publish': 'editor',
   // 编辑冻结脚本、重新验证：沿用发布的权限（编辑者）
   'version.edit': 'editor',
@@ -217,6 +250,7 @@ export const GROUP_ADMIN_ACTIONS: GroupAction[] = [
   'group.manage_grants',
   'group.set_policy',
   'group.manage_webhooks',
+  'group.set_token_policy',
   'group.delete',
 ];
 
@@ -228,6 +262,7 @@ export const INSTANCE_ACTIONS: InstanceAction[] = [
   'instance.invite',
   'instance.manage_grants',
   'instance.manage_policy',
+  'instance.manage_token_policy',
   'instance.emergency_execute',
   'instance.create_group',
   'instance.view_audit',
@@ -245,6 +280,11 @@ const isInstanceAction = (action: Action): action is InstanceAction =>
 
 const isGroupAction = (action: Action): action is GroupAction => GROUP_ACTION_SET.has(action as GroupAction);
 
+export const TOKEN_ACTIONS: TokenAction[] = ['token.create', 'token.list', 'token.revoke'];
+const isTokenAction = (action: Action): action is TokenAction => (TOKEN_ACTIONS as Action[]).includes(action);
+export const CI_ACTIONS: CiAction[] = ['ci.read', 'ci.execute'];
+const isCiAction = (action: Action): action is CiAction => (CI_ACTIONS as Action[]).includes(action);
+
 const hasProjectRole = (role: Role | null | undefined, need: Role): boolean =>
   role != null && ROLE_RANK[role] >= ROLE_RANK[need];
 
@@ -259,7 +299,23 @@ const hasProjectRole = (role: Role | null | undefined, need: Role): boolean =>
  */
 export const can = (actor: Actor, action: Action, resource: Resource): boolean => {
   if (actor.kind === 'system') return true;
+  // CI 令牌：只读 + 执行，只能作用于自己的项目；别的动作一律不行（包括标记为已执行、令牌管理本身）
+  if (actor.kind === 'token') {
+    if (!actor.projectId || resource.projectId !== actor.projectId) return false;
+    if (action === 'ci.read') return resource.kind === 'project' || resource.kind === 'environment';
+    if (action === 'ci.execute') return resource.kind === 'environment' && resource.allowTokens === true;
+    return false;
+  }
+  // 令牌专用的动作：用户（包括实例管理员）不走 /api/ci
+  if (isCiAction(action)) return false;
   if (actor.instanceAdmin) return true;
+  if (isTokenAction(action)) {
+    if (resource.kind !== 'project') return false;
+    if (action === 'token.create') return resource.tokenCreator === true;
+    if (action === 'token.list')
+      return resource.tokenCreator === true || hasProjectRole(resource.role, 'admin');
+    return hasProjectRole(resource.role, 'admin') || (resource.tokenOwner === true && resource.role != null);
+  }
   // 建组是实例级动作，但规则取决于实例设置，由调用方把设置放进 resource
   if (action === 'instance.create_group')
     return resource.kind === 'instance' && resource.groupCreation === 'all';

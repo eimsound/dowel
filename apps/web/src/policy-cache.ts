@@ -2,7 +2,14 @@
 import type { QueryClient } from '@tanstack/react-query';
 
 /** 依赖生效策略的查询（按前缀） */
-export const POLICY_DEPENDENT_KEYS = ['envs', 'env-status', 'env-policy', 'exec-policy'] as const;
+export const POLICY_DEPENDENT_KEYS = [
+  'envs',
+  'env-status',
+  'env-policy',
+  'exec-policy',
+  'token-policy',
+  'ci-tokens',
+] as const;
 
 /**
  * 生效策略变了之后（任何一层的策略保存、项目转组——转组换掉了组层，可能有字段被固定进环境层），所有依赖生效策略的查询

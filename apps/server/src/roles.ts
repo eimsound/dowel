@@ -3,12 +3,20 @@
 // 2. 项目所属组的组管理员 → admin；
 // 3. 项目所属组的成员 → 项目的 default_role（没设就用组的 default_role，none 表示没有）；
 // 4. 授权：对象是这个用户或他所在的任一组，范围是这个项目、这个组或整个实例。
+// 以上都没有时，5. 被允许创建这个项目的 CI 令牌的人（P6，“谁能创建令牌”的组条件）→ viewer（只读可见，02-consensus.md 11.4）。
 //
 // 计算放在 JS 里做：每个用户的组成员关系和授权都很小（自托管、单公司），
 // 一次读出来可以同时用于项目列表里的所有项目，也比在两种方言里拼一段等价的 SQL 更好读。
-import type { DefaultRole, GroupRole, ProjectListItem, Role } from '@dowel/api';
+import {
+  type DefaultRole,
+  type GroupRole,
+  type ProjectListItem,
+  type Role,
+  tokenCreatorAllows,
+} from '@dowel/api';
 import type { Db } from '@dowel/engines';
 import type { PlatformDb } from './db.ts';
+import { hasGroupCondition, loadTokenRules, type TokenRuleStore, tokenRulesFor } from './token-rules.ts';
 
 /** 项目的关键列：生效角色计算要用组的默认权限，路径要用组的 slug */
 export interface ProjectRow {
@@ -77,6 +85,11 @@ export interface RoleContext {
   /** group id → admin / member */
   groups: Map<string, GroupRole>;
   grants: GrantRow[];
+  /**
+   * “谁能创建 CI 令牌”的三层规则（P6）：满足规则的人自动能只读查看项目。所有用户共用同一份（表很小）；
+   * 没给出时不计算这一项（只有手工构造的测试上下文会这样，两个加载函数都会填上）。
+   */
+  tokenRules?: TokenRuleStore;
 }
 
 export const loadRoleContext = async (db: Db, user: { id: string; role: string }): Promise<RoleContext> => {
@@ -101,6 +114,7 @@ export const loadRoleContext = async (db: Db, user: { id: string; role: string }
     instanceAdmin: user.role === 'admin',
     groups: new Map(memberships.map((m) => [m.groupId, m.role])),
     grants,
+    tokenRules: await loadTokenRules(db),
   };
 };
 
@@ -113,8 +127,11 @@ export type ProjectRoleInput = Pick<ProjectRow, 'id' | 'groupId' | 'groupDefault
 export const defaultRoleOf = (p: Pick<ProjectRow, 'projectDefaultRole' | 'groupDefaultRole'>): DefaultRole =>
   p.projectDefaultRole ?? p.groupDefaultRole;
 
-/** 纯函数：一个项目对一个用户的生效角色；null 表示不可见（所有地方都用这一份规则） */
-export const effectiveRole = (rc: RoleContext, p: ProjectRoleInput): Role | null => {
+/**
+ * 前四项（实例管理员、组管理员、组默认权限、授权）的最高角色，**不含**“能创建令牌”带来的只读可见性。
+ * 判断“能不能创建令牌”的角色条件用它（否则可见性和规则会互相引用）。
+ */
+export const baseRole = (rc: RoleContext, p: ProjectRoleInput): Role | null => {
   let best: Role | null = null;
   const raise = (role: Role | null) => {
     if (role && (best === null || RANK[role] > RANK[best])) best = role;
@@ -140,6 +157,26 @@ export const effectiveRole = (rc: RoleContext, p: ProjectRoleInput): Role | null
     if (applies) raise(g.role === 'executor' ? 'viewer' : g.role);
   }
   return best;
+};
+
+/**
+ * 能不能创建这个项目的 CI 令牌（P6 T2）：实例管理员总是可以；其余按三层规则逐层取与（@dowel/api 的 tokenCreatorAllows），
+ * 角色条件看 baseRole，组条件看组成员关系。
+ */
+export const canCreateToken = (rc: RoleContext, p: ProjectRoleInput): boolean => {
+  if (rc.instanceAdmin) return true;
+  if (!rc.tokenRules) return false;
+  return tokenCreatorAllows(tokenRulesFor(rc.tokenRules, p), { role: baseRole(rc, p), groups: rc.groups });
+};
+
+/** 纯函数：一个项目对一个用户的生效角色；null 表示不可见（所有地方都用这一份规则） */
+export const effectiveRole = (rc: RoleContext, p: ProjectRoleInput): Role | null => {
+  const base = baseRole(rc, p);
+  if (base) return base;
+  // 被允许创建令牌的人自动能只读查看范围内的项目（02-consensus.md 11.4）。基础角色为空时只有组条件可能满足，
+  // 规则里根本没有组条件就不用算
+  if (rc.tokenRules && hasGroupCondition(rc.tokenRules) && canCreateToken(rc, p)) return 'viewer';
+  return null;
 };
 
 /** 列表接口用的形状：带上组信息和调用者的项目角色 */

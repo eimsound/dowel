@@ -527,6 +527,52 @@ test('每个应审计的动作都能在 audit_events 里找到', async () => {
     { action: 'webhook.delete', run: () => directAudit('webhook.delete', 'webhook', 'w1') },
     { action: 'webhook.test', run: () => directAudit('webhook.test', 'webhook', 'w1') },
     { action: 'model.import', run: () => directAudit('model.import', 'project', 'p1') },
+    // P6：CI 令牌创建 / 吊销、谁能创建令牌规则
+    {
+      action: 'token_policy.update',
+      run: async () =>
+        expect(
+          (
+            await call(
+              'PUT',
+              '/api/admin/token-policy',
+              { rule: { roles: ['admin'], groups: [] } },
+              adminCookie,
+            )
+          ).status,
+        ).toBe(200),
+    },
+    {
+      action: 'ci_token.create',
+      run: async () => {
+        const p = (await call('GET', '/api/projects', undefined, adminCookie)).data as unknown as {
+          id: string;
+        }[];
+        expect(
+          (await call('POST', `/api/projects/${p[0]!.id}/tokens`, { name: 'ci' }, adminCookie)).status,
+        ).toBe(201);
+      },
+    },
+    {
+      action: 'ci_token.revoke',
+      run: async () => {
+        const p = (await call('GET', '/api/projects', undefined, adminCookie)).data as unknown as {
+          id: string;
+        }[];
+        const list = (await call('GET', `/api/projects/${p[0]!.id}/tokens`, undefined, adminCookie))
+          .data as unknown as { tokens: { id: string }[] };
+        expect(
+          (
+            await call(
+              'POST',
+              `/api/projects/${p[0]!.id}/tokens/${list.tokens[0]!.id}/revoke`,
+              {},
+              adminCookie,
+            )
+          ).status,
+        ).toBe(200);
+      },
+    },
     // OIDC 动作（路由级覆盖在 oidc.test.ts 里）
     { action: 'oidc.provider_create', run: () => directAudit('oidc.provider_create', 'oidc_provider', 'o1') },
     { action: 'oidc.provider_update', run: () => directAudit('oidc.provider_update', 'oidc_provider', 'o1') },

@@ -51,7 +51,12 @@ export const registerAudit = (app: Hono<Env>, ctx: AppContext) => {
     };
 
     if (q.action) add((n) => `substr(a.action, 1, length($${n})) = $${n}`, q.action);
-    if (q.actor) add((n) => `(a.actor_id = $${n} or lower(u.username) = lower($${n}))`, q.actor.trim());
+    if (q.actor)
+      add(
+        (n) =>
+          `(a.actor_id = $${n} or lower(u.username) = lower($${n}) or (a.actor_kind = 'token' and (lower(ct.name) = lower($${n}) or ct.prefix = $${n})))`,
+        q.actor.trim(),
+      );
     if (q.targetKind) add((n) => `a.target_kind = $${n}`, q.targetKind);
     if (q.targetId) add((n) => `a.target_id = $${n}`, q.targetId);
     const cast = db.dialect === 'pg' ? '::timestamptz' : '';
@@ -70,10 +75,12 @@ export const registerAudit = (app: Hono<Env>, ctx: AppContext) => {
     const rows = await db.query<Omit<AuditEvent, 'at'> & { at: unknown; atRaw: unknown }>(
       `select a.id, a.at, cast(a.at as text) as "atRaw",
               a.actor_kind as "actorKind", a.actor_id as "actorId",
-              u.username as "actorUsername", a.action, a.target_kind as "targetKind",
+              coalesce(u.username, case when a.actor_kind = 'token' and ct.id is not null then ct.name || ' (' || ct.prefix || '…)' end) as "actorUsername",
+              a.action, a.target_kind as "targetKind",
               a.target_id as "targetId", a.ip, a.data
          from audit_events a
-         left join users u on u.id = a.actor_id
+         left join users u on a.actor_kind = 'user' and u.id = a.actor_id
+         left join ci_tokens ct on a.actor_kind = 'token' and ct.id = a.actor_id
         ${conditions.length ? `where ${conditions.join(' and ')}` : ''}
         order by a.at desc, a.id desc
         limit ${limit + 1}`,

@@ -12,6 +12,7 @@ import {
 
 export * from './policy.ts';
 export * from './requests.ts';
+export * from './tokens.ts';
 export * from './webhooks.ts';
 
 // 项目角色：查看者 / 编辑者 / 项目管理员（GLOSSARY：项目角色）。旧的 owner 在迁移里映射成 admin。
@@ -357,6 +358,8 @@ export const projectInfoSchema = z.object({
   groupRole: groupRoleSchema.nullable(),
   /** schema 范围：null 表示全部（dowel 永远排除） */
   schemas: schemaScopeSchema.nullable(),
+  /** 当前用户能不能查看项目设置里的 CI 令牌列表（项目管理员或满足“谁能创建令牌”规则） */
+  canListTokens: z.boolean().optional(),
 });
 export type ProjectInfo = z.infer<typeof projectInfoSchema>;
 

@@ -57,6 +57,13 @@ import { CHECK_CONNECT_TIMEOUT, ConnectError, type ConnectionGuard, connectPg, s
 /** 同一个环境同一时间只做一件事（单进程内；跨进程由目标库上的项目锁保证）。默认等 30 秒 */
 export const LOCK_WAIT_MS = 30_000;
 
+/** 等环境锁超时（409）：CI 接口据此返回 lock_timeout，其余接口照旧是 409 + 文案 */
+export class EnvBusyError extends HTTPException {
+  constructor(message: string) {
+    super(409, { message });
+  }
+}
+
 export class EnvLocks {
   private held = new Map<string, Promise<void>>();
   /** 这个环境现在有没有正在执行的操作 */
@@ -68,11 +75,10 @@ export class EnvLocks {
     while (this.held.has(id)) {
       const left = deadline - Date.now();
       if (left <= 0)
-        throw new HTTPException(409, {
-          message:
-            busyMessage ??
+        throw new EnvBusyError(
+          busyMessage ??
             `这个环境正在执行另一个操作，等待 ${Math.round(timeoutMs / 1000)} 秒后超时。请稍后再试`,
-        });
+        );
       let timer: ReturnType<typeof setTimeout> | undefined;
       await Promise.race([
         this.held.get(id)!,
@@ -211,11 +217,28 @@ export interface RunInput {
   mode: 'migrate' | 'baseline';
   to?: string;
   direction?: 'up' | 'down';
+  /** 写进目标库历史的执行者：用户 ID；CI 令牌执行时是令牌 ID（via = ci） */
   userId: string;
+  /** 从哪里发起（写进目标库历史）：界面 / 执行申请是 web，CI 令牌是 ci（P6） */
+  via?: 'web' | 'ci';
+  /**
+   * 等执行锁的总时长（毫秒，P6 的 CI 接口可以在请求里调小）：先等本进程的环境锁，剩下的时间再等目标库的项目锁。
+   * 不给 = 两把锁各自默认 30 秒（原来的行为）。
+   */
+  lockWaitMs?: number;
   /** 执行策略的超时（生效策略里的语句超时 / 锁等待超时，P5a）；预演不用 */
   timeouts?: { statementMs: number; lockMs: number };
   /** 执行申请的绑定（P5b）：执行器在目标库锁里核对起点和迁移，不一致就 request_stale，什么都不写 */
   expect?: ExecuteExpect;
+  /**
+   * 拿到环境锁、重新读出环境行之后、连接目标库之前的复查钩子（P6：CI 执行等锁期间令牌可能被吊销、
+   * 策略或前置环境可能被改）。可以返回锁内最新的超时设置；抛错直接中止并释放锁。
+   */
+  beforeConnect?: (
+    env: EnvRow,
+  ) => Promise<{ timeouts?: { statementMs: number; lockMs: number } } | undefined>;
+  /** 每个迁移在目标库提交后触发（即使后续迁移遇到非 ExecutorError 也能准确回报 reached 和已执行列表） */
+  onCommitted?: (m: { number: number; direction: 'up' | 'down' | 'baseline'; toId: string }) => void;
   onEvent?: (e: ExecEvent) => void | Promise<void>;
 }
 
@@ -374,7 +397,7 @@ export const dryRunExecution = async (
       to: input.to,
       direction: input.direction,
       executedBy: input.userId,
-      via: 'web',
+      via: input.via ?? 'web',
       lockTimeoutMs: DRY_RUN_LOCK_WAIT_MS,
       dryRun: true,
     });
@@ -389,7 +412,8 @@ export const runExecution = async (
 ): Promise<{ result: ExecuteResult; current: ReturnType<typeof versionRef> | null }> => {
   const { db } = x;
   const { pid } = input;
-  const release = await x.locks.acquire(input.env.id);
+  const deadline = input.lockWaitMs === undefined ? null : Date.now() + input.lockWaitMs;
+  const release = await x.locks.acquire(input.env.id, input.lockWaitMs ?? LOCK_WAIT_MS);
   let conn: ReturnType<typeof open> | null = null;
   let env = input.env;
   /** 这次新插入的 claimed 登记：finally 里按 touched 确认或撤销 */
@@ -402,6 +426,8 @@ export const runExecution = async (
     // 拿到环境锁之后重新读环境行再解密：等锁期间 PATCH（持有同一把锁）可能已经换了连接串，或者环境已经被删除（404）；
     // 用新 URL，不用请求开始时读到的旧 URL。解密 / 建连接都在 try 里，失败也一定释放锁
     env = await loadEnv(db, pid, input.env.id);
+    const checked = await input.beforeConnect?.(env);
+    const timeouts = checked?.timeouts ?? input.timeouts;
     conn = open(decrypt(env.url_enc), x.guard);
     const chain = await loadChain(db, pid);
     if (!chain.length) throw new HTTPException(422, { message: '项目还没有发布任何版本' });
@@ -418,8 +444,10 @@ export const runExecution = async (
         to: input.to,
         direction: input.direction,
         executedBy: input.userId,
-        via: 'web',
-        timeouts: input.timeouts,
+        via: input.via ?? 'web',
+        // 给了总等待时长：目标库项目锁只等剩下的部分（环境锁已经用掉了一些）
+        ...(deadline !== null ? { lockTimeoutMs: Math.max(0, deadline - Date.now()) } : {}),
+        timeouts,
         expect: input.expect,
         onEvent: emit,
         beforeMigration: async (m) => {
@@ -429,6 +457,7 @@ export const runExecution = async (
         },
         onTouch: (m) => void touched.add(m.version.id),
         afterMigration: async (m) => {
+          input.onCommitted?.({ number: m.version.number, direction: m.direction, toId: m.to.id });
           // 执行成功：永久写下“执行过”（executed_at，只写一次），登记改成 confirmed
           await confirmVersion(db, env.id, m.version.id);
           claimed.delete(m.version.id);
@@ -517,7 +546,12 @@ export const settleClaims = async (tx: Db, envId: string) => {
 // ───── 读历史 ─────
 
 /** 读目标库的历史；sync 为真时顺便同步到平台库缓存（在项目锁里，拿不到锁就只读不同步） */
-export const readTargetState = async (x: ExecContext, env: EnvRow, sync = false): Promise<TargetState> => {
+export const readTargetState = async (
+  x: ExecContext,
+  env: EnvRow,
+  sync = false,
+  opts: { preserveHistoryError?: boolean } = {},
+): Promise<TargetState> => {
   const url = decrypt(env.url_enc);
   let conn: ReturnType<typeof open> | null = null;
   try {
@@ -528,6 +562,7 @@ export const readTargetState = async (x: ExecContext, env: EnvRow, sync = false)
     );
   } catch (e) {
     if (e instanceof HTTPException) throw e;
+    if (opts.preserveHistoryError && (e instanceof HistoryError || e instanceof ExecutorError)) throw e;
     throw new ConnectError(classifyError(e, url).message);
   } finally {
     await conn?.close().catch(() => {});
