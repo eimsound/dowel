@@ -30,6 +30,10 @@ export type { Role } from '@dowel/api';
 
 const SNAPSHOT_EVERY = 200;
 const HISTORY_SUMMARY_LIMIT = 5;
+/** join 复查权限时因并发刷新触发重查的最大尝试次数 */
+const MAX_JOIN_VERIFY_ATTEMPTS = 8;
+
+type RefreshTarget = 'all' | Set<string>;
 
 /** 将客户端上报的 client 标识绑定到当前认证用户，在 Room 幂等表与持久化层跨副本彻底隔离不同用户 */
 const scopeClient = (userId: string, client: string): string => `${userId}:${client}`;
@@ -167,6 +171,23 @@ export class Rooms {
   private resolveRole: ResolveRole;
   private bus?: EventBus;
   private unsubBus: (() => void)[] = [];
+  /** 全量权限刷新与全库踢人的代际计数 */
+  private globalRefreshGen = 0;
+  /** 按分支的定向权限刷新代际计数 */
+  private branchRefreshGen = new Map<string, number>();
+  /** 单调递增的刷新批次序号，避免旧批次刷新覆盖在更新批次之后完成 join 校验的 peer */
+  private refreshSeq = 0;
+  /** 记录每个 peer 最近一次完成 join 校验时对应的刷新批次序号 */
+  private peerVerifiedSeq = new WeakMap<Peer, number>();
+  /** 单飞权限刷新状态：串行执行 refreshLoadedLocal 并合并期间到来的新请求 */
+  private refreshActive = false;
+  private refreshInFlight: Promise<void> | null = null;
+  private pendingRefreshTarget: RefreshTarget | null = null;
+  private pendingRefreshWait: {
+    promise: Promise<void>;
+    resolve: () => void;
+    reject: (err: unknown) => void;
+  } | null = null;
 
   constructor(db: PlatformDb, resolveRole: ResolveRole, bus?: EventBus) {
     this.db = db;
@@ -579,10 +600,45 @@ export class Rooms {
     return [...r.peers].filter((p) => p.client).map((p) => ({ client: p.client!, user: p.user.name }));
   }
 
-  /** 账号是否还能用：停用之后不能继续实时协作 */
-  private async userActive(userId: string): Promise<boolean> {
-    const [row] = await this.db.query<{ status: string }>('select status from users where id = $1', [userId]);
-    return row?.status === 'active';
+  /** 推进权限刷新代际；不传 branchIds 表示全量影响所有已加载房间 */
+  private bumpRefreshGen(branchIds?: Iterable<string>) {
+    this.refreshSeq += 1;
+    if (!branchIds) {
+      this.globalRefreshGen += 1;
+      return;
+    }
+    for (const id of branchIds) {
+      if (this.rooms.has(id)) {
+        this.branchRefreshGen.set(id, (this.branchRefreshGen.get(id) ?? 0) + 1);
+      }
+    }
+  }
+
+  private refreshGenFor(branchId: string): number {
+    return this.globalRefreshGen + (this.branchRefreshGen.get(branchId) ?? 0);
+  }
+
+  private mergePendingRefresh(target: RefreshTarget) {
+    if (target === 'all' || this.pendingRefreshTarget === 'all') {
+      this.pendingRefreshTarget = 'all';
+      return;
+    }
+    if (!this.pendingRefreshTarget) {
+      this.pendingRefreshTarget = new Set(target);
+      return;
+    }
+    for (const id of target) this.pendingRefreshTarget.add(id);
+  }
+
+  /** 查询用户最新的实例角色与账号状态：停用或角色变更后不能沿用 WS 升级时的快照 */
+  private async fetchUserState(
+    userId: string,
+  ): Promise<{ role: User['role']; status: User['status'] } | null> {
+    const [row] = await this.db.query<{ role: User['role']; status: User['status'] }>(
+      'select role, status from users where id = $1',
+      [userId],
+    );
+    return row ?? null;
   }
 
   /** 分支属于哪个项目（join 复查角色、刷新已加载房间时用） */
@@ -595,32 +651,57 @@ export class Rooms {
   }
 
   /**
-   * 加入房间。**先**把 peer 放进集合，再做两次复查，避免“升级之后、join 之前”状态已经变了：
-   * 1. 账号是否还能用（停用后不能继续实时协作）；
+   * 加入房间。**先**把 peer 放进集合，再按刷新代际循环复查，避免“升级之后、join 之前/期间”状态已经变了：
+   * 1. 重查 users.role 与 users.status（停用后不能继续实时协作，实例角色变更同步更新到 peer.user）；
    * 2. 重新算一次生效角色——授权、组成员、默认权限可能正好在这之间被改，
-   *    算不到就让位（4403），和升级时不一样就更新并通知客户端。
+   *    算不到就让位（4403），和升级时不一样就更新并通知客户端；
+   * 3. 若 await 期间 peer 已被踢出或离开，直接中止；若并发刷新/踢人推进了代际，放弃旧结果重查直到稳定。
    * join 成功（含重连）后总会发一条 role，前端以它为准校正本地状态。
    */
   async join(branchId: string, peer: Peer) {
     const r = await this.get(branchId);
     r.peers.add(peer);
-    if (!(await this.userActive(peer.user.id))) {
-      r.peers.delete(peer);
-      peer.close?.(4403, '账号已被停用');
+
+    const abort = (reason: string) => {
+      if (!r.peers.delete(peer)) return;
+      peer.close?.(4403, reason);
       for (const p of r.peers) this.safeSend(p, { t: 'peers', peers: this.peerList(r) });
+    };
+
+    for (let attempt = 0; attempt < MAX_JOIN_VERIFY_ATTEMPTS; attempt++) {
+      if (!r.peers.has(peer)) return;
+      const gen = this.refreshGenFor(branchId);
+      const seq = this.refreshSeq;
+
+      const current = await this.fetchUserState(peer.user.id);
+      if (!r.peers.has(peer)) return;
+      if (this.refreshGenFor(branchId) !== gen) continue;
+      if (current?.status !== 'active') {
+        abort('账号已被停用');
+        return;
+      }
+      if (peer.user.role !== current.role) {
+        peer.user = { ...peer.user, role: current.role };
+      }
+
+      const projectId = await this.projectOfBranch(branchId);
+      if (!r.peers.has(peer)) return;
+      const role = projectId ? await this.resolveRole(peer.user, projectId) : null;
+      if (!r.peers.has(peer)) return;
+      if (this.refreshGenFor(branchId) !== gen) continue;
+
+      if (!role) {
+        abort('你在这个项目里已经没有权限');
+        return;
+      }
+      this.peerVerifiedSeq.set(peer, seq);
+      peer.role = role;
+      this.safeSend(peer, { t: 'role', role });
+      this.safeSend(peer, { t: 'layout', positions: r.layout });
       return;
     }
-    const projectId = await this.projectOfBranch(branchId);
-    const role = projectId ? await this.resolveRole(peer.user, projectId) : null;
-    if (!role) {
-      r.peers.delete(peer);
-      peer.close?.(4403, '你在这个项目里已经没有权限');
-      for (const p of r.peers) this.safeSend(p, { t: 'peers', peers: this.peerList(r) });
-      return;
-    }
-    peer.role = role;
-    this.safeSend(peer, { t: 'role', role });
-    this.safeSend(peer, { t: 'layout', positions: r.layout });
+
+    abort('权限状态正在变更，请重试');
   }
 
   async leave(branchId: string, peer: Peer) {
@@ -1116,14 +1197,15 @@ export class Rooms {
 
   /** 仅在当前副本踢出指定用户的所有在线连接 */
   async kickUserLocal(userId: string, reason = '账号已被停用') {
+    this.bumpRefreshGen();
     for (const pending of this.rooms.values()) {
       const r = await pending.catch(() => null);
       if (!r) continue;
       let removed = false;
       for (const peer of [...r.peers]) {
         if (peer.user.id !== userId) continue;
-        peer.close?.(4403, reason);
         r.peers.delete(peer);
+        peer.close?.(4403, reason);
         removed = true;
       }
       if (removed) for (const p of r.peers) this.safeSend(p, { t: 'peers', peers: this.peerList(r) });
@@ -1139,15 +1221,84 @@ export class Rooms {
   /**
    * 仅在当前副本重算已加载房间（或指定分支子集）里每个在线 peer 的生效角色（G6）。
    *
+   * 采用单飞串行 + 合并重跑保护：并发到达的多次刷新不会交错乱序写回，期间新来的请求会合并为下一轮重跑；
+   * 每次发起与切换轮次都会推进刷新代际，避免挂起中的 join 用旧角色覆写回去。
+   */
+  async refreshLoadedLocal(branchIds?: string[]): Promise<void> {
+    if (branchIds && branchIds.length === 0) return;
+    const target: RefreshTarget = branchIds ? new Set(branchIds) : 'all';
+    this.bumpRefreshGen(target === 'all' ? undefined : target);
+
+    if (this.refreshActive) {
+      this.mergePendingRefresh(target);
+      if (!this.pendingRefreshWait) {
+        let resolve!: () => void;
+        let reject!: (err: unknown) => void;
+        const promise = new Promise<void>((res, rej) => {
+          resolve = res;
+          reject = rej;
+        });
+        promise.catch(() => {});
+        this.pendingRefreshWait = { promise, resolve, reject };
+      }
+      return this.pendingRefreshWait.promise;
+    }
+
+    this.refreshActive = true;
+    let resolveFirst!: () => void;
+    let rejectFirst!: (err: unknown) => void;
+    const firstPromise = new Promise<void>((res, rej) => {
+      resolveFirst = res;
+      rejectFirst = rej;
+    });
+
+    const initialSeq = this.refreshSeq;
+    const loop = (async () => {
+      let nextTarget: RefreshTarget | null = target;
+      let nextSeq = initialSeq;
+      let nextWait: { resolve: () => void; reject: (err: unknown) => void } = {
+        resolve: resolveFirst,
+        reject: rejectFirst,
+      };
+      try {
+        while (nextTarget) {
+          try {
+            await this.runRefreshLoadedLocal(nextTarget, nextSeq);
+            nextWait.resolve();
+          } catch (err) {
+            nextWait.reject(err);
+          }
+          if (!this.pendingRefreshTarget || !this.pendingRefreshWait) {
+            nextTarget = null;
+            break;
+          }
+          nextTarget = this.pendingRefreshTarget;
+          nextWait = this.pendingRefreshWait;
+          this.pendingRefreshTarget = null;
+          this.pendingRefreshWait = null;
+          this.bumpRefreshGen(nextTarget === 'all' ? undefined : nextTarget);
+          nextSeq = this.refreshSeq;
+        }
+      } finally {
+        this.refreshActive = false;
+        this.refreshInFlight = null;
+      }
+    })();
+    this.refreshInFlight = loop;
+    return firstPromise;
+  }
+
+  /**
+   * 执行单轮本地权限刷新（由 refreshLoadedLocal 串行调度）：
    * - 只遍历 this.rooms：没人在线的分支不在里面，所以没有连接时整次刷新是零查询；
    * - 分支 → 项目用一条查询反查，角色上下文按用户缓存，整次刷新共享；
    * - 分支已不存在（项目被删除）→ 4403 断开并移除房间缓存；
-   * - 没有权限了 → 4403 断开（沿用停用账号的关闭码，客户端收到后不再重连）；
-   * - 账号被停用 → 同样断开；
-   * - 降级 / 升级 → 更新 peer.role 并发一条 role 消息，客户端切换只读。
+   * - 没有权限了 / 账号被停用 → 4403 断开（沿用停用账号的关闭码，客户端收到后不再重连）；
+   * - 降级 / 升级 → 同步更新 peer.user.role 与 peer.role 并发一条 role 消息，客户端切换只读。
    */
-  async refreshLoadedLocal(branchIds?: string[]) {
-    const targets = branchIds ? branchIds.filter((id) => this.rooms.has(id)) : [...this.rooms.keys()];
+  private async runRefreshLoadedLocal(target: RefreshTarget, roundSeq: number) {
+    const targets =
+      target === 'all' ? [...this.rooms.keys()] : [...target].filter((id) => this.rooms.has(id));
     if (targets.length === 0) return;
     // 分支 → 项目只反查一次（同一个项目可能有多个分支的房间）
     const projects = await this.db.query<{ branchId: string; projectId: string }>(
@@ -1156,11 +1307,11 @@ export class Rooms {
     );
     const projectByBranch = new Map(projects.map((p) => [p.branchId, p.projectId]));
     // 整次刷新共用：用户当前状态（可能刚被停用 / 改了实例角色）+ 角色上下文 / 项目缓存
-    const users = new Map<string, { role: User['role']; status: string } | null>();
+    const users = new Map<string, { role: User['role']; status: User['status'] } | null>();
     const lookup: RoleLookup = { contexts: new Map(), projects: new Map() };
     const kick = (r: Loaded, peer: Peer, reason: string) => {
-      peer.close?.(4403, reason);
       r.peers.delete(peer);
+      peer.close?.(4403, reason);
     };
 
     for (const branchId of targets) {
@@ -1176,25 +1327,31 @@ export class Rooms {
         }
         for (const peer of [...r.peers]) kick(r, peer, '项目已被删除');
         this.rooms.delete(branchId);
+        this.branchRefreshGen.delete(branchId);
         continue;
       }
       let removed = false;
       for (const peer of [...r.peers]) {
+        if (!r.peers.has(peer)) continue;
+        if ((this.peerVerifiedSeq.get(peer) ?? 0) > roundSeq) continue;
         let current = users.get(peer.user.id);
         if (current === undefined) {
-          const [row] = await this.db.query<{ role: User['role']; status: string }>(
-            'select role, status from users where id = $1',
-            [peer.user.id],
-          );
-          current = row ?? null;
+          current = await this.fetchUserState(peer.user.id);
           users.set(peer.user.id, current);
         }
+        if (!r.peers.has(peer)) continue;
+        if ((this.peerVerifiedSeq.get(peer) ?? 0) > roundSeq) continue;
         if (current?.status !== 'active') {
           kick(r, peer, '账号已被停用');
           removed = true;
           continue;
         }
-        const role = await this.resolveRole({ ...peer.user, role: current.role }, projectId, lookup);
+        if (peer.user.role !== current.role) {
+          peer.user = { ...peer.user, role: current.role };
+        }
+        const role = await this.resolveRole(peer.user, projectId, lookup);
+        if (!r.peers.has(peer)) continue;
+        if ((this.peerVerifiedSeq.get(peer) ?? 0) > roundSeq) continue;
         if (!role) {
           kick(r, peer, '你在这个项目里已经没有权限');
           removed = true;
@@ -1224,6 +1381,7 @@ export class Rooms {
    * 客户端收到后不会再重连。房间从缓存里移除，避免继续拿着已经不存在的分支，并通知其他副本清理。
    */
   async kickBranches(branchIds: string[], reason: string) {
+    if (branchIds.length > 0) this.bumpRefreshGen(branchIds);
     const gone = new Set(branchIds);
     for (const [branchId, pending] of this.rooms) {
       if (!gone.has(branchId)) continue;
@@ -1234,11 +1392,12 @@ export class Rooms {
           r.layoutTimer = undefined;
         }
         for (const peer of [...r.peers]) {
-          peer.close?.(4403, reason);
           r.peers.delete(peer);
+          peer.close?.(4403, reason);
         }
       }
       this.rooms.delete(branchId);
+      this.branchRefreshGen.delete(branchId);
     }
     if (branchIds.length > 0) {
       await this.publish({ t: 'room.refresh', branchIds });
@@ -1266,6 +1425,9 @@ export class Rooms {
 
   /** 立即写入所有挂起的布局，并等待进行中的房间操作完成（关闭服务和测试时用） */
   async flush() {
+    while (this.refreshInFlight) {
+      await this.refreshInFlight.catch(() => {});
+    }
     for (const [branchId, p] of this.rooms) {
       const r = await p.catch(() => null);
       if (!r) continue;

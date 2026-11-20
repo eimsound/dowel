@@ -5,7 +5,8 @@ import { type Commit, SyncClient, type ToClient } from '@dowel/sync';
 import { afterAll, beforeAll, expect, test } from 'vitest';
 import type { User } from '../src/auth.ts';
 import { createApp, openPlatformDb, type PlatformDb } from '../src/index.ts';
-import type { Peer, Rooms } from '../src/rooms.ts';
+import { effectiveProjectRole } from '../src/roles.ts';
+import { type Peer, Rooms } from '../src/rooms.ts';
 import { makeUser, PASSWORD } from './support.ts';
 
 let db: PlatformDb;
@@ -441,4 +442,273 @@ test('禁止保留标识 system 与非法 client，无法干扰 replace / patch'
   // 系统 replace 仍正常工作
   await rooms.replace(branchSys, '系统测试', model, 'replaceModel', 0);
   expect((await rooms.model(branchSys)).seq).toBe(1);
+});
+
+const deferred = <T = void>() => {
+  let resolve!: (value: T | PromiseLike<T>) => void;
+  let reject!: (err: unknown) => void;
+  const promise = new Promise<T>((res, rej) => {
+    resolve = res;
+    reject = rej;
+  });
+  return { promise, resolve, reject };
+};
+
+test('实例管理员在升级与 join 之间被降级为普通 member：join 按最新 users.role 拒绝或降级', async () => {
+  // 1. 无项目授权的实例管理员被降级为 member 后，join 必须按最新 users.role 拒绝（4403）
+  const demoted = await makeUser(db, 'demoted-admin', { name: '前管理员', role: 'admin' });
+  const stalePeer = peerOf(demoted);
+  stalePeer.peer.role = 'admin'; // 升级瞬间快照仍是 admin
+
+  await db.query("update users set role = 'member' where id = $1", [demoted.id]);
+  await rooms.join(branchId, stalePeer.peer);
+
+  expect(stalePeer.closed()).toBe(4403);
+  expect(stalePeer.sent).toHaveLength(0);
+  expect(stalePeer.peer.user.role).toBe('member');
+  // 拒绝后的连接继续发 op 必须被丢弃
+  const commitsBefore = (await commits()).length;
+  await rooms.message(branchId, stalePeer.peer, nextOp());
+  expect((await commits()).length).toBe(commitsBefore);
+
+  // 2. 若被降级的管理员仍拥有项目 viewer 授权，join 按最新 users.role 降级为 viewer（而非沿用 admin）
+  const demotedViewer = await makeUser(db, 'demoted-admin-viewer', { name: '降级只读', role: 'admin' });
+  await db.query(
+    "insert into grants (id, scope_kind, scope_id, subject_kind, subject_id, role) values ($1, 'project', $2, 'user', $3, 'viewer')",
+    ['g-demoted-viewer', pid, demotedViewer.id],
+  );
+  const viewerPeer = peerOf(demotedViewer);
+  viewerPeer.peer.role = 'admin';
+
+  await db.query("update users set role = 'member' where id = $1", [demotedViewer.id]);
+  await rooms.join(branchId, viewerPeer.peer);
+
+  expect(viewerPeer.closed()).toBeNull();
+  expect(viewerPeer.peer.user.role).toBe('member');
+  expect(viewerPeer.peer.role).toBe('viewer');
+  expect(viewerPeer.sent[0]).toEqual({ t: 'role', role: 'viewer' });
+});
+
+test('编辑者 join 在 resolveRole 挂起期间被降级并 refreshLoaded：最终收敛为 viewer 且不能发 op', async () => {
+  const raceUser = await makeUser(db, 'race-join-editor', { name: '竞态编辑者' });
+  await db.query(
+    "insert into grants (id, scope_kind, scope_id, subject_kind, subject_id, role) values ($1, 'project', $2, 'user', $3, 'editor')",
+    ['g-race-join', pid, raceUser.id],
+  );
+  const branchRace = `${branchId}-race-join`;
+  await db.query("insert into branches (id, project_id, name) values ($1, $2, 'race-join')", [
+    branchRace,
+    pid,
+  ]);
+  await rooms.init(branchRace, model);
+
+  const entered = deferred();
+  const release = deferred();
+  let calls = 0;
+  const raceRooms = new Rooms(db, async (user, projectId, lookup) => {
+    const idx = ++calls;
+    const role = await effectiveProjectRole(db, user, projectId, lookup);
+    if (idx === 1) {
+      // 第一次（join）已查出旧的 editor，随后挂起
+      entered.resolve();
+      await release.promise;
+    }
+    return role;
+  });
+
+  const p = peerOf(raceUser);
+  const joinPromise = raceRooms.join(branchRace, p.peer);
+  await entered.promise;
+
+  // join 挂起期间降级为 viewer 并触发刷新
+  await db.query("update grants set role = 'viewer' where id = 'g-race-join'");
+  await raceRooms.refreshLoaded();
+  expect(p.peer.role).toBe('viewer');
+
+  // 放行旧的 join resolveRole（其返回值为过期的 editor），绝不能覆盖回 editor
+  release.resolve();
+  await joinPromise;
+
+  expect(p.closed()).toBeNull();
+  expect(p.peer.role).toBe('viewer');
+  const roleMsgs = p.sent.filter((m): m is { t: 'role'; role: string } => (m as { t: string }).t === 'role');
+  expect(roleMsgs.length).toBeGreaterThan(0);
+  expect(roleMsgs.every((m) => m.role === 'viewer')).toBe(true);
+  expect(p.sent.some((m) => (m as { t: string }).t === 'layout')).toBe(true);
+
+  // 作为 viewer 发 op 必须被拒绝，不能修改模型
+  await raceRooms.message(branchRace, p.peer, { t: 'hello', client: 'c-race', lastSeq: 0 });
+  await raceRooms.message(branchRace, p.peer, {
+    t: 'op',
+    op: {
+      client: 'c-race',
+      n: 1,
+      name: 'createTable',
+      args: { id: 't_race_denied', schema: schemaId, name: 'race_denied' },
+      reads: [[schemaId, 0]],
+    },
+  });
+  expect(
+    p.sent.some((m) => {
+      const msg = m as { t: string; code?: string };
+      return msg.t === 'reject' && msg.code === 'invalid';
+    }),
+  ).toBe(true);
+  expect((await raceRooms.model(branchRace)).seq).toBe(0);
+  await raceRooms.flush();
+});
+
+test('join 挂起期间被 kickUserLocal 踢出：恢复后直接中止，不留连接也不发消息', async () => {
+  const kickUser = await makeUser(db, 'race-join-kick', { name: '入房被踢' });
+  await db.query(
+    "insert into grants (id, scope_kind, scope_id, subject_kind, subject_id, role) values ($1, 'project', $2, 'user', $3, 'editor')",
+    ['g-race-kick', pid, kickUser.id],
+  );
+  const branchKick = `${branchId}-race-kick`;
+  await db.query("insert into branches (id, project_id, name) values ($1, $2, 'race-kick')", [
+    branchKick,
+    pid,
+  ]);
+  await rooms.init(branchKick, model);
+
+  const entered = deferred();
+  const release = deferred();
+  const raceRooms = new Rooms(db, async (user, projectId, lookup) => {
+    const role = await effectiveProjectRole(db, user, projectId, lookup);
+    entered.resolve();
+    await release.promise;
+    return role;
+  });
+
+  const sent: unknown[] = [];
+  const closes: number[] = [];
+  const peer: Peer = {
+    user: kickUser,
+    role: 'editor',
+    send: (m) => sent.push(m),
+    close: (code) => closes.push(code),
+  };
+
+  const joinPromise = raceRooms.join(branchKick, peer);
+  await entered.promise;
+
+  // join 挂起期间停用并踢出该用户
+  await db.query("update users set status = 'disabled' where id = $1", [kickUser.id]);
+  await raceRooms.kickUserLocal(kickUser.id, '账号已被停用');
+  expect(closes).toEqual([4403]);
+
+  release.resolve();
+  await joinPromise;
+
+  // 绝不能再发 role / layout，也不能重复 close 或把连接留在房间里
+  expect(sent).toHaveLength(0);
+  expect(closes).toEqual([4403]);
+  await raceRooms.message(branchKick, peer, { t: 'hello', client: 'c-kicked', lastSeq: 0 });
+  await raceRooms.message(branchKick, peer, {
+    t: 'op',
+    op: {
+      client: 'c-kicked',
+      n: 1,
+      name: 'createTable',
+      args: { id: 't_kick_denied', schema: schemaId, name: 'kick_denied' },
+      reads: [[schemaId, 0]],
+    },
+  });
+  expect(sent).toHaveLength(0);
+  expect((await raceRooms.model(branchKick)).seq).toBe(0);
+  await raceRooms.flush();
+});
+
+test('连续并发 refreshLoaded（先升级后降级 & 先降级后升级合并重跑）：串行收敛到最新角色，不被慢查询倒挂覆盖', async () => {
+  const user = await makeUser(db, 'race-refresh-user', { name: '并发刷新用户' });
+  await db.query(
+    "insert into grants (id, scope_kind, scope_id, subject_kind, subject_id, role) values ($1, 'project', $2, 'user', $3, 'viewer')",
+    ['g-race-refresh', pid, user.id],
+  );
+  const branchRefresh = `${branchId}-race-refresh`;
+  await db.query("insert into branches (id, project_id, name) values ($1, $2, 'race-refresh')", [
+    branchRefresh,
+    pid,
+  ]);
+  await rooms.init(branchRefresh, model);
+
+  let blockNext = false;
+  let entered = deferred();
+  let release = deferred();
+  let resolveCalls = 0;
+
+  const raceRooms = new Rooms(db, async (u, projectId, lookup) => {
+    resolveCalls += 1;
+    const role = await effectiveProjectRole(db, u, projectId, lookup);
+    if (blockNext) {
+      blockNext = false;
+      entered.resolve();
+      await release.promise;
+    }
+    return role;
+  });
+
+  const p = peerOf(user);
+  await raceRooms.join(branchRefresh, p.peer);
+  expect(p.peer.role).toBe('viewer');
+
+  // 场景 1：先升级到 editor（慢查询挂起），期间降级回 viewer 并再次触发 refreshLoaded
+  resolveCalls = 0;
+  blockNext = true;
+  entered = deferred();
+  release = deferred();
+
+  await db.query("update grants set role = 'editor' where id = 'g-race-refresh'");
+  const firstRefresh = raceRooms.refreshLoaded();
+  await entered.promise;
+  expect(resolveCalls).toBe(1);
+
+  await db.query("update grants set role = 'viewer' where id = 'g-race-refresh'");
+  const secondRefresh = raceRooms.refreshLoaded();
+  // 单飞互斥：第一轮未结束前第二轮不会并发进入 resolveRole
+  await Promise.resolve();
+  expect(resolveCalls).toBe(1);
+
+  release.resolve();
+  await Promise.all([firstRefresh, secondRefresh]);
+
+  expect(resolveCalls).toBe(2);
+  expect(p.peer.role).toBe('viewer');
+  const lastRole1 = [...p.sent]
+    .reverse()
+    .find((m): m is { t: 'role'; role: string } => (m as { t: string }).t === 'role');
+  expect(lastRole1?.role).toBe('viewer');
+
+  // 场景 2：先降级/变更（慢查询挂起），期间连续到来定向与全量两次刷新（合并为下一轮单次重跑），最终收敛到 admin
+  await db.query("update grants set role = 'editor' where id = 'g-race-refresh'");
+  await raceRooms.refreshLoaded();
+  expect(p.peer.role).toBe('editor');
+
+  resolveCalls = 0;
+  blockNext = true;
+  entered = deferred();
+  release = deferred();
+
+  await db.query("update grants set role = 'viewer' where id = 'g-race-refresh'");
+  const r1 = raceRooms.refreshLoaded([branchRefresh]);
+  await entered.promise;
+
+  await db.query("update grants set role = 'admin' where id = 'g-race-refresh'");
+  const r2 = raceRooms.refreshLoaded([branchRefresh]);
+  const r3 = raceRooms.refreshLoaded();
+  await Promise.resolve();
+  expect(resolveCalls).toBe(1);
+
+  release.resolve();
+  await Promise.all([r1, r2, r3]);
+
+  // r2 与 r3 被合并成同一轮重跑，总计只执行 2 轮，最终收敛为 admin
+  expect(resolveCalls).toBe(2);
+  expect(p.peer.role).toBe('admin');
+  const lastRole2 = [...p.sent]
+    .reverse()
+    .find((m): m is { t: 'role'; role: string } => (m as { t: string }).t === 'role');
+  expect(lastRole2?.role).toBe('admin');
+
+  await raceRooms.flush();
 });

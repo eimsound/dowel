@@ -742,6 +742,190 @@ describe.skipIf(!PG_URL)('P7 HA2：无状态实时协作房间（真实 PG 双�
     ).toEqual(['alice_iso', 'bob_iso']);
     expect(sameModel(modelA.model, modelB.model)).toBe(true);
   });
+
+  test('8. 跨副本实例管理员降级后 join：副本 A 降级为 member，副本 B 携带旧升级快照 join 时按最新 users.role 拒绝（4403）', async () => {
+    const f = await boot('admin-demote-join');
+    // 新建一名无任何项目/组授权的实例管理员（仅凭 users.role='admin' 可访问私有项目）
+    const admin2 = await makeUser(f.dbA, 'admin2', { name: '副管理员', role: 'admin' });
+    // 模拟 WS 升级瞬间在副本 B 捕获到的旧快照（user.role='admin', role='admin'）
+    const peerAdmin2 = makePeer(admin2, 'admin');
+
+    // 副本 A 在升级与 join 之间将其降级为普通 member
+    const patch = await callJson(
+      f.appA.app,
+      'PATCH',
+      `/api/admin/users/${admin2.id}`,
+      { role: 'member' },
+      f.adminCookie,
+    );
+    expect(patch.status).toBe(200);
+
+    // 副本 B 执行 join 时必须重查 users.role，发现已降级为 member 且无项目权限 → 4403 拒绝
+    await f.appB.rooms.join(f.branchId, peerAdmin2.peer);
+    expect(peerAdmin2.closed()?.code).toBe(4403);
+    expect(peerAdmin2.sent).toHaveLength(0);
+    expect(peerAdmin2.peer.user.role).toBe('member');
+  });
+
+  test('9. 跨副本 join 挂起期间权限降级 + room.refresh 广播：副本 B 最终收敛为 viewer 且拒绝 op', async () => {
+    const f = await boot('join-refresh-race');
+    // 预加载副本 B 房间
+    const bobPeer = makePeer(f.bob);
+    await f.appB.rooms.join(f.branchId, bobPeer.peer);
+
+    let enteredResolve!: () => void;
+    const entered = new Promise<void>((r) => {
+      enteredResolve = r;
+    });
+    let releaseResolve!: () => void;
+    const release = new Promise<void>((r) => {
+      releaseResolve = r;
+    });
+
+    // 人为拉慢副本 B 上第一次对张三的 grants 查询（join 的 resolveRole），在读出旧 editor 结果后挂起
+    const origQuery = f.dbB.query.bind(f.dbB);
+    let intercepted = false;
+    f.dbB.query = (async <T = Record<string, unknown>>(sql: string, params?: unknown[]) => {
+      const rows = await origQuery<T>(sql, params);
+      if (!intercepted && sql.includes('from grants gr') && params?.[0] === f.alice.id) {
+        intercepted = true;
+        enteredResolve();
+        await release;
+      }
+      return rows;
+    }) as typeof f.dbB.query;
+
+    const alicePeer = makePeer(f.alice, 'editor');
+    try {
+      const joinPromise = f.appB.rooms.join(f.branchId, alicePeer.peer);
+      await entered;
+
+      // 在副本 A 上将张三降级为 viewer 并通过 PG NOTIFY 广播 room.refresh 到副本 B
+      await f.dbA.query(
+        "update grants set role = 'viewer' where subject_kind = 'user' and subject_id = $1 and scope_kind = 'project' and scope_id = $2",
+        [f.alice.id, f.projectId],
+      );
+      await f.appA.rooms.refreshLoaded();
+
+      // 等待副本 B 收到跨副本 room.refresh 并把挂起中的 alicePeer 降级为 viewer
+      await waitFor(() => alicePeer.peer.role === 'viewer');
+
+      // 放行旧 join 的 resolveRole（返回过期的 editor），恢复后绝不能覆盖回 editor
+      releaseResolve();
+      await joinPromise;
+    } finally {
+      f.dbB.query = origQuery;
+    }
+
+    expect(alicePeer.closed()).toBeNull();
+    expect(alicePeer.peer.role).toBe('viewer');
+    const roleMsgs = alicePeer.sent.filter((m): m is { t: 'role'; role: Peer['role'] } => m.t === 'role');
+    expect(roleMsgs.length).toBeGreaterThan(0);
+    expect(roleMsgs.every((m) => m.role === 'viewer')).toBe(true);
+
+    // 确认张三后续发 op 被只读拒绝，模型保持 seq=0
+    await f.appB.rooms.message(f.branchId, alicePeer.peer, {
+      t: 'hello',
+      client: 'c-alice-race',
+      lastSeq: 0,
+    });
+    await f.appB.rooms.message(f.branchId, alicePeer.peer, {
+      t: 'op',
+      op: {
+        client: 'c-alice-race',
+        n: 1,
+        name: 'createTable',
+        args: { id: 't_ha_race_denied', schema: f.schemaId, name: 'ha_race_denied' },
+        reads: [[f.schemaId, 0]],
+      },
+    });
+    expect(alicePeer.sent.some((m) => m.t === 'reject' && m.code === 'invalid')).toBe(true);
+    expect((await f.appB.rooms.model(f.branchId)).seq).toBe(0);
+  });
+
+  test('10. 跨副本连续两次 room.refresh 并发到达（先慢后快）：串行合并收敛到最新角色，不被慢查询倒挂覆盖', async () => {
+    const f = await boot('concurrent-refresh');
+    const alicePeer = makePeer(f.alice);
+    await f.appB.rooms.join(f.branchId, alicePeer.peer);
+    await f.appB.rooms.message(f.branchId, alicePeer.peer, { t: 'hello', client: 'c-alice-seq', lastSeq: 0 });
+
+    // 先将张三降为 viewer 作为基线
+    await f.dbA.query(
+      "update grants set role = 'viewer' where subject_kind = 'user' and subject_id = $1 and scope_kind = 'project' and scope_id = $2",
+      [f.alice.id, f.projectId],
+    );
+    await f.appA.rooms.refreshLoaded();
+    await waitFor(() => alicePeer.peer.role === 'viewer');
+
+    let enteredResolve!: () => void;
+    const entered = new Promise<void>((r) => {
+      enteredResolve = r;
+    });
+    let releaseResolve!: () => void;
+    const release = new Promise<void>((r) => {
+      releaseResolve = r;
+    });
+
+    const origQuery = f.dbB.query.bind(f.dbB);
+    let intercepted = false;
+    f.dbB.query = (async <T = Record<string, unknown>>(sql: string, params?: unknown[]) => {
+      const rows = await origQuery<T>(sql, params);
+      if (!intercepted && sql.includes('from grants gr') && params?.[0] === f.alice.id) {
+        intercepted = true;
+        enteredResolve();
+        await release;
+      }
+      return rows;
+    }) as typeof f.dbB.query;
+
+    let refreshEvents = 0;
+    const off = f.appB.bus.onEvent((event) => {
+      if (event.t === 'room.refresh' && event.origin !== f.appB.bus.replicaId) refreshEvents += 1;
+    });
+
+    try {
+      // 第一次：副本 A 升级张三为 editor 并广播（副本 B 读出 editor 后挂起）
+      await f.dbA.query(
+        "update grants set role = 'editor' where subject_kind = 'user' and subject_id = $1 and scope_kind = 'project' and scope_id = $2",
+        [f.alice.id, f.projectId],
+      );
+      await f.appA.rooms.refreshLoaded();
+      await entered;
+
+      // 第二次：第一次尚未返回时，副本 A 将张三降回 viewer 并再次广播
+      await f.dbA.query(
+        "update grants set role = 'viewer' where subject_kind = 'user' and subject_id = $1 and scope_kind = 'project' and scope_id = $2",
+        [f.alice.id, f.projectId],
+      );
+      await f.appA.rooms.refreshLoaded();
+      // 等第二次 room.refresh 确实已送达副本 B 并进入排队合并
+      await waitFor(() => refreshEvents >= 2);
+
+      // 放行第一次慢查询，验证串行重跑后最终收敛为 viewer（不被第一次的 editor 倒挂覆盖）
+      releaseResolve();
+      await f.appB.rooms.flush();
+    } finally {
+      off();
+      f.dbB.query = origQuery;
+    }
+
+    expect(alicePeer.peer.role).toBe('viewer');
+    const roleMsgs = alicePeer.sent.filter((m): m is { t: 'role'; role: Peer['role'] } => m.t === 'role');
+    expect(roleMsgs.at(-1)?.role).toBe('viewer');
+
+    await f.appB.rooms.message(f.branchId, alicePeer.peer, {
+      t: 'op',
+      op: {
+        client: 'c-alice-seq',
+        n: 1,
+        name: 'createTable',
+        args: { id: 't_ha_seq_denied', schema: f.schemaId, name: 'ha_seq_denied' },
+        reads: [[f.schemaId, 0]],
+      },
+    });
+    expect(alicePeer.sent.some((m) => m.t === 'reject' && m.code === 'invalid')).toBe(true);
+    expect((await f.appB.rooms.model(f.branchId)).seq).toBe(0);
+  });
 });
 
 describe('Room.applyExternalCommit / applyExternalRejection 单元测试', () => {
