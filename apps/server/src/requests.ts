@@ -38,9 +38,11 @@ import type { Context } from 'hono';
 import { HTTPException } from 'hono/http-exception';
 import { auditIn } from './audit.ts';
 import { can, userActor } from './authz.ts';
+import type { EventBus } from './bus.ts';
 import { inList, type PlatformDb } from './db.ts';
 import { type EnvRow, iso } from './envs.ts';
 import type { ExecContext } from './executions.ts';
+import type { HaCoordinator } from './ha.ts';
 import {
   isExecutor,
   loadPolicies,
@@ -125,6 +127,7 @@ export interface RequestRow {
   executed_at: unknown;
   emergency: boolean;
   result: ExecRequestDetail['result'];
+  worker_id?: string | null;
 }
 
 export const loadRequest = async (db: Db, pid: string, rid: string): Promise<RequestRow> => {
@@ -486,12 +489,24 @@ export interface RequestScope {
   resolved: ResolvedPolicy;
 }
 
+export interface RequestsOptions {
+  /** 跨副本事件总线（可选）：收件箱变更与 requests.kick 跨副本同步 */
+  bus?: EventBus;
+  /** 副本租约与分布式任务协调器（可选）：按副本租约恢复中断申请与巡检互斥 */
+  ha?: HaCoordinator;
+}
+
+const INBOX_CHANGED_BATCH = 100;
+
 export class Requests {
   readonly db: PlatformDb;
   readonly exec: ExecContext;
   readonly webhooks: Webhooks;
   readonly security: SecurityConfig;
+  readonly bus: EventBus | null;
+  readonly ha: HaCoordinator | null;
   private listeners = new Map<string, Set<Listener>>();
+  private busUnsubs: (() => void)[] = [];
   private timer: ReturnType<typeof setInterval> | null = null;
   private kickTimer: ReturnType<typeof setTimeout> | null = null;
   /** 排着的检查范围（合并）；queued / done 是代数：sweep() 等到包含自己那一次的一轮跑完 */
@@ -501,46 +516,129 @@ export class Requests {
   private done = 0;
   private draining: Promise<number> | null = null;
   /**
-   * 本进程开始的时间：启动时只把“这之前就已经是执行中”的申请记为中断（第一轮审查：不能把本进程刚开始的真实执行记成失败）。
+   * 本进程开始的时间：无 HA 租约或历史无 worker_id 的记录仍据此区分重启前遗留与本进程刚发起的执行。
    * 在 createApp 里构造，早于开始接受连接。
    */
   readonly bootAt = new Date();
 
-  constructor(db: PlatformDb, exec: ExecContext, webhooks: Webhooks, security: SecurityConfig) {
+  constructor(
+    db: PlatformDb,
+    exec: ExecContext,
+    webhooks: Webhooks,
+    security: SecurityConfig,
+    options: RequestsOptions = {},
+  ) {
     this.db = db;
     this.exec = exec;
     this.webhooks = webhooks;
     this.security = security;
+    this.bus = options.bus ?? null;
+    this.ha = options.ha ?? null;
+    this.attachBus();
+  }
+
+  /** 当前副本 ID（写入 exec_requests.worker_id；无 HA 时为 null） */
+  get workerId(): string | null {
+    return this.ha?.replicaId ?? null;
+  }
+
+  private attachBus(): void {
+    if (!this.bus || this.busUnsubs.length) return;
+    const replicaId = this.bus.replicaId;
+    this.busUnsubs.push(
+      this.bus.onEvent(async (event) => {
+        if (event.origin === replicaId) return;
+        if (event.t === 'inbox.changed') {
+          if (!event.userIds.length) {
+            this.broadcastLocal({ requests: true });
+            return;
+          }
+          for (const uid of event.userIds) {
+            if (this.listeners.has(uid)) await this.publishUnreadLocal(uid);
+          }
+          return;
+        }
+        if (event.t === 'requests.kick') {
+          this.kickLocal({
+            all: event.all,
+            envIds: event.envIds,
+            projectIds: event.projectIds,
+            groupIds: event.groupIds,
+          });
+        }
+      }),
+      this.bus.onReconnect(async () => {
+        const activeUsers = [...this.listeners.keys()];
+        for (const uid of activeUsers) await this.publishUnreadLocal(uid);
+        if (activeUsers.length) this.broadcastLocal({ requests: true });
+      }),
+    );
+  }
+
+  private detachBus(): void {
+    for (const off of this.busUnsubs) off();
+    this.busUnsubs = [];
   }
 
   // ───── 定时清理 ─────
 
   /**
-   * 启动定时清理（main.ts，**在开始接受连接之前**调用）。先把重启前就在“执行中”的申请记为执行中断（执行失败）：
-   * 单进程部署下它们一定已经中断了（执行进度在目标库历史里，界面提示去看执行历史）。
+   * 启动定时清理（main.ts，在 ha.start() / bus.start() 之后、开始接受连接之前调用）。
+   * 先恢复已离线节点遗留的“执行中”申请，再按间隔巡检过期、失效与中断的申请。
    */
   async start(intervalMs = REQUEST_SWEEP_MS) {
     this.stop();
+    this.attachBus();
     await this.recoverInterrupted();
     if (!(intervalMs > 0)) return;
     this.timer = setInterval(() => void this.sweep(), intervalMs);
     this.timer.unref?.();
   }
 
+  /** 判断一条 executing 申请是否已经因原执行副本离线/重启而中断 */
+  private async isInterruptedRow(row: RequestRow, aliveCache: Map<string, boolean>): Promise<boolean> {
+    const updatedMs = new Date(iso(row.updated_at)!).getTime();
+    const olderThanBoot = updatedMs < this.bootAt.getTime();
+    if (!this.ha) return olderThanBoot;
+    const wid = row.worker_id ?? null;
+    // 无 worker_id（升级前遗留或单测手工造数据）或属于本副本 ID：仅按早于本进程启动时间判断，避免误杀本进程正在执行的申请
+    if (!wid || wid === this.ha.replicaId) return olderThanBoot;
+    let alive = aliveCache.get(wid);
+    if (alive === undefined) {
+      alive = await this.ha.isNodeAlive(wid);
+      aliveCache.set(wid, alive);
+    }
+    return !alive;
+  }
+
   /**
-   * 重启前就在“执行中”的申请 → 执行失败（result.code = interrupted）。在执行策略锁里、条件更新：
-   * 只动 updated_at 早于本进程启动时间、而且现在仍是 executing 的行。之后真正的执行结果如果还能送到（不应该发生：
-   * 单进程），finish() 仍然接受这种状态，用真实结果覆盖。返回处理了几个。
+   * 恢复卡死的“执行中”申请 → 执行失败（result.code = interrupted）。
+   * - 有 HaCoordinator 时：按 worker_id 检查所属副本心跳租约是否仍存活，绝不误杀其他存活副本正在跑的迁移；
+   * - 无 HaCoordinator 或历史无 worker_id 记录时：退回 updated_at < bootAt 判断。
+   * 之后真正的执行结果如果还能送到，finish() 仍然接受这种状态，用真实结果覆盖。返回处理了几个。
    */
   async recoverInterrupted(): Promise<number> {
+    const candidates = await this.db.query<RequestRow>(
+      "select * from exec_requests where status = 'executing'",
+    );
+    if (!candidates.length) return 0;
+    const preCache = new Map<string, boolean>();
+    const staleIds: string[] = [];
+    for (const r of candidates) {
+      if (await this.isInterruptedRow(r, preCache)) staleIds.push(r.id);
+    }
+    if (!staleIds.length) return 0;
+
     const fx = await withPolicyLock(this.db, async (tx) => {
       const fx = Object.assign(new Effects(), { n: 0 });
       const rows = await tx.query<RequestRow>(
-        "select * from exec_requests where status = 'executing' and updated_at < $1",
-        [this.bootAt.toISOString()],
+        `select * from exec_requests where status = 'executing' and id in (${inList(staleIds)})`,
+        staleIds,
       );
+      const lockCache = new Map<string, boolean>();
       for (const r of rows) {
-        const reason = '服务重启时这个申请正在执行，结果未知：请到环境页查看执行历史';
+        if (!(await this.isInterruptedRow(r, lockCache))) continue;
+        const reason = '服务重启或执行节点离线时这个申请正在执行，结果未知：请到环境页查看执行历史';
         const ok = await this.setStatus(tx, null, r, 'failed', reason, null, fx, {
           result: { ok: false, code: INTERRUPTED, error: reason, current: null },
           onlyIf: 'executing',
@@ -558,6 +656,7 @@ export class Requests {
     this.timer = null;
     if (this.kickTimer) clearTimeout(this.kickTimer);
     this.kickTimer = null;
+    this.detachBus();
   }
 
   private enqueue(t: SweepTarget): number {
@@ -570,12 +669,7 @@ export class Requests {
     return ++this.queued;
   }
 
-  /**
-   * 环境状态或执行策略可能变了（执行结束、漂移检查、读历史同步、改脚本、改策略、改连接、转组……）：
-   * 由相应的路由**显式**调用，带上受影响的范围，尽快检查这个范围里还没结束的申请（合并成一轮；检查进行中又来的会再跑一轮）。
-   * 正确性不依赖它：审批、执行时都在锁内重新检查绑定，另有定时检查。
-   */
-  kick(t: SweepTarget) {
+  private kickLocal(t: SweepTarget) {
     this.enqueue(t);
     if (this.kickTimer) return;
     this.kickTimer = setTimeout(() => {
@@ -583,6 +677,28 @@ export class Requests {
       void this.drain();
     }, 0);
     this.kickTimer.unref?.();
+  }
+
+  /**
+   * 环境状态或执行策略可能变了（执行结束、漂移检查、读历史同步、改脚本、改策略、改连接、转组……）：
+   * 由相应的路由**显式**调用，带上受影响的范围，尽快检查这个范围里还没结束的申请（合并成一轮；检查进行中又来的会再跑一轮），
+   * 并广播给其他副本。正确性不依赖它：审批、执行时都在锁内重新检查绑定，另有定时检查。
+   */
+  kick(t: SweepTarget) {
+    this.kickLocal(t);
+    if (this.bus) {
+      void this.bus
+        .publish({
+          t: 'requests.kick',
+          ...(t.all ? { all: true } : {}),
+          ...(t.envIds?.length ? { envIds: t.envIds } : {}),
+          ...(t.projectIds?.length ? { projectIds: t.projectIds } : {}),
+          ...(t.groupIds?.length ? { groupIds: t.groupIds } : {}),
+        })
+        .catch((e) => {
+          console.error('广播 requests.kick 失败', e instanceof Error ? scrubSecrets(e.message) : e);
+        });
+    }
   }
 
   /** 检查一个范围（默认全部）里还没结束的申请，失效 / 过期的转成终态并通知申请人；等到包含这次请求的那一轮跑完，返回处理了几个 */
@@ -615,16 +731,32 @@ export class Requests {
     return this.draining;
   }
 
-  /**
-   * 一轮检查：先在锁外只读地找出绑定已经不成立的申请（大多数时候一个都没有，不拿全局锁），
-   * 再在执行策略锁里逐个重新读、重新判断、条件更新。
-   */
+  /** 分布式巡检入口：多副本下通过 advisory lock 互斥，同一时刻只有一个副本跑巡检 */
   private async sweepOnce(t: {
     all: boolean;
     envs: Set<string>;
     projects: Set<string>;
     groups: Set<string>;
-  }) {
+  }): Promise<number> {
+    const run = () => this.runSweep(t);
+    if (!this.ha) return run();
+    const res = await this.ha.tryWithJobLock('requests.sweep', run);
+    return res.acquired ? res.value : 0;
+  }
+
+  /**
+   * 一轮检查：全量巡检时先按副本租约恢复卡死的 executing 申请，
+   * 再在锁外只读地找出绑定已经不成立的申请（大多数时候一个都没有，不拿全局锁），
+   * 最后在执行策略锁里逐个重新读、重新判断、条件更新。
+   */
+  private async runSweep(t: {
+    all: boolean;
+    envs: Set<string>;
+    projects: Set<string>;
+    groups: Set<string>;
+  }): Promise<number> {
+    let n = 0;
+    if (t.all) n += await this.recoverInterrupted();
     const params: string[] = [];
     const conds: string[] = [];
     if (!t.all) {
@@ -636,7 +768,7 @@ export class Requests {
       add(t.envs, (l) => `environment_id in (${l})`);
       add(t.projects, (l) => `project_id in (${l})`);
       add(t.groups, (l) => `project_id in (select id from projects where group_id in (${l}))`);
-      if (!conds.length) return 0;
+      if (!conds.length) return n;
     }
     const rows = await this.db.query<RequestRow>(
       `select * from exec_requests where ${SWEEP_WHERE}${conds.length ? ` and (${conds.join(' or ')})` : ''}`,
@@ -646,8 +778,8 @@ export class Requests {
     const cache = newBindingCache();
     const now = new Date();
     for (const r of rows) if (await bindingProblem(this.db, r, now, cache)) stale.push(r.id);
-    if (!stale.length) return 0;
-    return this.closeStale(stale);
+    if (!stale.length) return n;
+    return n + (await this.closeStale(stale));
   }
 
   /** 锁内重新读、重新判断、条件更新：只读判断之后状态可能又变了（被执行、被撤回……） */
@@ -1050,11 +1182,16 @@ export class Requests {
     });
   }
 
-  /** 事务提交之后：实时推送未读数、广播“申请有变化”、投递 Webhook */
+  /** 事务提交之后：实时推送未读数、广播“申请有变化”、跨副本通知并投递 Webhook */
   async flushEffects(fx: Effects) {
     for (const h of fx.hooks) this.webhooks.emit(h.groupId, h.event);
-    for (const u of fx.users) await this.publishUnread(u);
-    if (fx.requestsChanged) this.broadcast({ requests: true });
+    const userIds = [...fx.users];
+    for (const u of userIds) await this.publishUnreadLocal(u);
+    if (userIds.length) await this.publishInboxChanged(userIds);
+    if (fx.requestsChanged) {
+      this.broadcastLocal({ requests: true });
+      await this.publishInboxChanged([]);
+    }
   }
 
   // ───── 执行结束 ─────
@@ -1326,8 +1463,8 @@ export class Requests {
     };
   }
 
-  /** 推送未读数给这个用户的实时连接；调用方已经算好的值直接用，不再查 */
-  async publishUnread(userId: string, known?: number) {
+  /** 仅推送未读数给本副本上这个用户的实时连接；调用方已经算好的值直接用，不再查 */
+  private async publishUnreadLocal(userId: string, known?: number) {
     const set = this.listeners.get(userId);
     if (!set?.size) return;
     const unread = known ?? (await this.unread(this.db, userId).catch(() => null));
@@ -1335,9 +1472,37 @@ export class Requests {
     for (const fn of set) fn({ unread });
   }
 
+  /** 向其他副本广播收件箱变更（分批防止超过 PG NOTIFY 8 KB 上限；空数组表示“申请列表有变化”） */
+  private async publishInboxChanged(userIds: string[]) {
+    if (!this.bus) return;
+    if (!userIds.length) {
+      await this.bus.publish({ t: 'inbox.changed', userIds: [] }).catch((e) => {
+        console.error('广播收件箱变更失败', e instanceof Error ? scrubSecrets(e.message) : e);
+      });
+      return;
+    }
+    for (let i = 0; i < userIds.length; i += INBOX_CHANGED_BATCH) {
+      const chunk = userIds.slice(i, i + INBOX_CHANGED_BATCH);
+      await this.bus.publish({ t: 'inbox.changed', userIds: chunk }).catch((e) => {
+        console.error('广播收件箱变更失败', e instanceof Error ? scrubSecrets(e.message) : e);
+      });
+    }
+  }
+
+  /** 推送未读数给这个用户的实时连接（本副本立即推送 + 跨副本广播）；调用方已经算好的值直接用，不再查 */
+  async publishUnread(userId: string, known?: number) {
+    await this.publishUnreadLocal(userId, known);
+    await this.publishInboxChanged([userId]);
+  }
+
+  /** 仅向本副本活跃 SSE 订阅者广播一个不带内容的“申请有变化” */
+  private broadcastLocal(e: InboxEvent) {
+    for (const set of this.listeners.values()) for (const fn of set) fn(e);
+  }
+
   /** 广播一个不带内容的“申请有变化”（界面据此重新拉自己能看到的列表；不泄露是哪个项目） */
   broadcast(e: InboxEvent) {
-    for (const set of this.listeners.values()) for (const fn of set) fn(e);
+    this.broadcastLocal(e);
   }
 
   // ───── 视图 ─────

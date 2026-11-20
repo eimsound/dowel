@@ -4,10 +4,11 @@
 //   检查在**真正连接时**做（给 http.request 传自定义 lookup，对解析出的每个地址判断），DNS 重绑定绕不过去；
 //   URL 主机是 IP 字面量时不会调用 lookup，发请求前单独检查；
 // - 不跟随重定向（3xx 算失败）；网络错误 / 超时 / 429 / 5xx 才重试，最多 3 次，指数退避（2s、8s、32s）；
-// - 进程内队列：单进程前提，重启丢失未完成的投递和排着的重试。
+// - 持久化队列（P7 HA3，ADR 0011）：投递与重试任务写入 webhook_jobs 表，PG 上通过 FOR UPDATE SKIP LOCKED
+//   多副本并发认领不重复，并由 EventBus（webhooks.wake）实时唤醒与定时轮询兜底，进程重启不丢失。
 // URL 和签名密钥在库里用 DOWEL_SECRET 加密，响应、审计、日志、投递记录里都不出现（错误文本去掉 URL 的路径和查询参数）。
 
-import { createHmac } from 'node:crypto';
+import { createHmac, randomUUID } from 'node:crypto';
 import { lookup as dnsLookup, type LookupAddress, type LookupAllOptions } from 'node:dns';
 import { lookup as dnsLookupAsync } from 'node:dns/promises';
 import { request as httpRequest, type IncomingMessage } from 'node:http';
@@ -15,8 +16,11 @@ import { request as httpsRequest } from 'node:https';
 import { isIP, type LookupFunction } from 'node:net';
 import type { WebhookDelivery, WebhookEventInput, WebhookEventType, WebhookFormat } from '@dowel/api';
 import { newId } from '@dowel/core';
+import type { Db } from '@dowel/engines';
 import { bytesOf, inCidr, isCidr, parseAllowlist, v6Bytes } from './allowlist.ts';
-import type { PlatformDb } from './db.ts';
+import type { EventBus } from './bus.ts';
+import { inList, type PlatformDb } from './db.ts';
+import type { HaCoordinator } from './ha.ts';
 import { decrypt, scrubSecrets } from './secrets.ts';
 import { readSettings } from './settings.ts';
 import { scrubDeep } from './sse.ts';
@@ -31,9 +35,21 @@ export interface WebhookOptions {
   timeoutMs?: number;
   /** 同时进行的投递数（默认 4） */
   concurrency?: number;
+  /** 跨副本事件总线（可选）：入队后广播 webhooks.wake，收到广播或重连时立即拉取 */
+  bus?: EventBus;
+  /** 副本协调器（可选）：用于标识认领任务的 workerId */
+  ha?: HaCoordinator;
+  /** 定时轮询 webhook_jobs 的间隔（毫秒，默认 1000；测试里随 retryBaseMs 自适应调短） */
+  pollIntervalMs?: number;
+  /** 任务认领租约时长（毫秒，默认 Math.max(30_000, timeoutMs * 3)） */
+  leaseMs?: number;
 }
 
-const DEFAULTS: Required<WebhookOptions> = {
+type CoreWebhookOptions = Required<
+  Pick<WebhookOptions, 'retryBaseMs' | 'maxRetries' | 'timeoutMs' | 'concurrency'>
+>;
+
+const DEFAULTS: CoreWebhookOptions = {
   retryBaseMs: 2000,
   maxRetries: 3,
   timeoutMs: 5000,
@@ -514,35 +530,115 @@ interface Job {
   attempt: number;
 }
 
+interface JobRow {
+  id: string;
+  webhookId: string;
+  deliveryId: string;
+  eventType: string;
+  payload: OutgoingEvent;
+  attempts: number;
+  maxRetries: number;
+}
+
+const isDbClosedError = (e: unknown): boolean => {
+  const msg = e instanceof Error ? e.message : String(e);
+  const code =
+    typeof e === 'object' && e !== null && 'code' in e ? String((e as { code: unknown }).code) : '';
+  return (
+    code === 'CONNECTION_ENDED' ||
+    code === 'CONNECTION_DESTROYED' ||
+    code === '3D000' ||
+    code === '57P01' ||
+    /database is not open|connection.*ended|connection.*closed|does not exist/i.test(msg)
+  );
+};
+
 export class Webhooks {
   readonly db: PlatformDb;
-  readonly options: Required<WebhookOptions>;
-  /** 进行中的工作（排队查询、投递、等待中的重试）：flush() 等它们全部结束 */
-  private readonly pending = new Set<Promise<unknown>>();
-  /** 等待中的重试定时器 → 让 flush 结束等待的 resolve */
-  private readonly timers = new Map<ReturnType<typeof setTimeout>, () => void>();
-  private readonly queue: (() => Promise<void>)[] = [];
+  readonly options: CoreWebhookOptions;
+  readonly workerId: string;
+  readonly pollIntervalMs: number;
+  readonly leaseMs: number;
+  private readonly bus: EventBus | null;
+  /** 正在写入 webhook_jobs 的异步入队操作 */
+  private readonly enqueuing = new Set<Promise<unknown>>();
+  /** 正在认领或执行中的投递任务 */
+  private readonly inFlight = new Set<Promise<unknown>>();
+  private pollTimer: ReturnType<typeof setInterval> | null = null;
+  private wakeTimer: ReturnType<typeof setTimeout> | null = null;
+  private wakeAt = Number.POSITIVE_INFINITY;
+  private busUnsubs: (() => void)[] = [];
+  private pumping = false;
+  private needPump = false;
   private running = 0;
   private closed = false;
 
   constructor(db: PlatformDb, options: WebhookOptions = {}) {
     this.db = db;
-    this.options = { ...DEFAULTS, ...options };
+    this.options = {
+      retryBaseMs: options.retryBaseMs ?? DEFAULTS.retryBaseMs,
+      maxRetries: options.maxRetries ?? DEFAULTS.maxRetries,
+      timeoutMs: options.timeoutMs ?? DEFAULTS.timeoutMs,
+      concurrency: options.concurrency ?? DEFAULTS.concurrency,
+    };
+    this.bus = options.bus ?? null;
+    this.workerId = options.ha?.replicaId ?? options.bus?.replicaId ?? randomUUID();
+    this.pollIntervalMs = options.pollIntervalMs ?? Math.min(1000, Math.max(20, this.options.retryBaseMs));
+    this.leaseMs = options.leaseMs ?? Math.max(30_000, this.options.timeoutMs * 3);
+    this.attachBus();
+    this.startPolling();
   }
 
-  /** 投递一个事件给这个组里订阅了它的所有启用的 Webhook（异步，不等结果、不抛错） */
+  /** 在业务事务（或普通连接）内将事件写入 webhook_jobs，返回入队条数；提交后由调用方调用 wake() 唤醒投递 */
+  async enqueueIn(tx: Db, groupId: string, event: WebhookEventInput): Promise<number> {
+    const hooks = await tx.query<{ id: string; events: string[]; enabled: boolean }>(
+      'select id, events, enabled from webhooks where group_id = $1',
+      [groupId],
+    );
+    const now = new Date();
+    let count = 0;
+    for (const h of hooks) {
+      if (!h.enabled || !Array.isArray(h.events) || !h.events.includes(event.type)) continue;
+      if (this.db.dialect === 'pg') {
+        await tx.query(
+          `insert into webhook_jobs (id, webhook_id, delivery_id, event_type, payload, attempts, max_retries, next_run_at, created_at)
+           values ($1, $2, $3, $4, $5::text::jsonb, 0, $6, now(), now())`,
+          [newId(), h.id, newId(), event.type, JSON.stringify(event), this.options.maxRetries],
+        );
+      } else {
+        await tx.query(
+          `insert into webhook_jobs (id, webhook_id, delivery_id, event_type, payload, attempts, max_retries, next_run_at, created_at)
+           values ($1, $2, $3, $4, $5::text::jsonb, 0, $6, $7, $7)`,
+          [newId(), h.id, newId(), event.type, JSON.stringify(event), this.options.maxRetries, now],
+        );
+      }
+      count++;
+    }
+    return count;
+  }
+
+  /** 触发本副本立即拉取并广播唤醒其他副本 */
+  wake(broadcast = true): void {
+    if (this.closed) return;
+    this.pump();
+    if (broadcast && this.bus) {
+      void this.bus.publish({ t: 'webhooks.wake' }).catch((e) => {
+        console.error('Webhook 唤醒广播失败：', scrubSecrets(String(e)));
+      });
+    }
+  }
+
+  /** 投递一个事件给这个组里订阅了它的所有启用的 Webhook（异步入队到 webhook_jobs，不等结果、不抛错） */
   emit(groupId: string, event: WebhookEventInput): void {
     if (this.closed) return;
-    this.track(
+    this.trackSet(
+      this.enqueuing,
       (async () => {
-        const hooks = await this.db.query<{ id: string; events: string[]; enabled: boolean }>(
-          'select id, events, enabled from webhooks where group_id = $1',
-          [groupId],
-        );
-        for (const h of hooks)
-          if (h.enabled && Array.isArray(h.events) && h.events.includes(event.type))
-            this.enqueue({ webhookId: h.id, deliveryId: newId(), event, attempt: 1 });
-      })().catch((e) => console.error('Webhook 排队失败：', scrubSecrets(String(e)))),
+        const inserted = await this.enqueueIn(this.db, groupId, event);
+        if (inserted > 0 && !this.closed) this.wake(true);
+      })().catch((e) => {
+        if (!isDbClosedError(e)) console.error('Webhook 排队失败：', scrubSecrets(String(e)));
+      }),
     );
   }
 
@@ -561,72 +657,229 @@ export class Webhooks {
     };
     const job: Job = { webhookId, deliveryId: newId(), event, attempt: 1 };
     const result = await this.attemptOnce(hook, job);
-    return this.record(hook.id, job, result, true);
+    return this.recordIn(this.db, hook.id, job, result, true);
   }
 
-  /** 等队列里的投递（含已排上的重试）全部结束（测试用） */
+  /** 等队列里的投递（含持久化在 webhook_jobs 里的待重试任务）全部结束（测试用） */
   async flush(): Promise<void> {
-    while (this.pending.size) await Promise.allSettled([...this.pending]);
-  }
-
-  /** 停止：清掉等待中的重试定时器，之后不再发送（进程退出时） */
-  close(): void {
-    this.closed = true;
-    for (const [t, release] of this.timers) {
-      clearTimeout(t);
-      release();
+    for (;;) {
+      while (this.enqueuing.size) await Promise.allSettled([...this.enqueuing]);
+      while (this.inFlight.size) await Promise.allSettled([...this.inFlight]);
+      if (this.closed) return;
+      let pending: { n: number | string; nextRunAt: unknown } | undefined;
+      try {
+        [pending] = await this.db.query<{ n: number | string; nextRunAt: unknown }>(
+          'select count(*) as n, min(next_run_at) as "nextRunAt" from webhook_jobs',
+        );
+      } catch (e) {
+        if (isDbClosedError(e)) return;
+        throw e;
+      }
+      if (!pending || Number(pending.n) === 0) {
+        if (!this.enqueuing.size && !this.inFlight.size) return;
+        continue;
+      }
+      const dueMs = pending.nextRunAt ? new Date(atOf(pending.nextRunAt)).getTime() - Date.now() : 0;
+      if (dueMs <= 0) {
+        this.pump();
+        if (this.inFlight.size) {
+          await Promise.allSettled([...this.inFlight]);
+          if (this.running > 0 || this.enqueuing.size) continue;
+        }
+        await new Promise<void>((resolve) => {
+          const t = setTimeout(resolve, Math.max(5, Math.min(20, this.pollIntervalMs)));
+          t.unref?.();
+        });
+      } else {
+        const waitMs = Math.min(dueMs, this.pollIntervalMs);
+        await new Promise<void>((resolve) => {
+          const t = setTimeout(resolve, Math.max(5, waitMs));
+          t.unref?.();
+        });
+        if (!this.closed) this.pump();
+      }
     }
-    this.timers.clear();
   }
 
-  private track(p: Promise<unknown>) {
-    this.pending.add(p);
-    const drop = () => this.pending.delete(p);
+  /** flush() 别名 */
+  drain(): Promise<void> {
+    return this.flush();
+  }
+
+  /** 停止：清掉轮询与唤醒定时器、取消总线订阅，等待在途任务结束并释放残留锁（进程退出时） */
+  close(): Promise<void> {
+    this.closed = true;
+    this.stopPolling();
+    for (const off of this.busUnsubs) off();
+    this.busUnsubs = [];
+    return (async () => {
+      while (this.enqueuing.size || this.inFlight.size) {
+        await Promise.allSettled([...this.enqueuing, ...this.inFlight]);
+      }
+      await this.db
+        .query('update webhook_jobs set locked_by = null, locked_until = null where locked_by = $1', [
+          this.workerId,
+        ])
+        .catch(() => {});
+    })();
+  }
+
+  private attachBus(): void {
+    if (!this.bus) return;
+    const replicaId = this.bus.replicaId;
+    this.busUnsubs.push(
+      this.bus.onEvent((event) => {
+        if (this.closed) return;
+        if (event.t === 'webhooks.wake' && event.origin !== replicaId) this.pump();
+      }),
+      this.bus.onReconnect(() => {
+        if (!this.closed) this.pump();
+      }),
+    );
+  }
+
+  private startPolling(): void {
+    if (this.closed || this.pollTimer) return;
+    this.pollTimer = setInterval(() => {
+      if (!this.closed) this.pump();
+    }, this.pollIntervalMs);
+    this.pollTimer.unref?.();
+    // 启动后立即尝试拾取可能因重启或崩溃遗留的到期任务
+    queueMicrotask(() => {
+      if (!this.closed) this.pump();
+    });
+  }
+
+  private stopPolling(): void {
+    if (this.pollTimer) {
+      clearInterval(this.pollTimer);
+      this.pollTimer = null;
+    }
+    if (this.wakeTimer) {
+      clearTimeout(this.wakeTimer);
+      this.wakeTimer = null;
+      this.wakeAt = Number.POSITIVE_INFINITY;
+    }
+  }
+
+  private scheduleWake(delayMs: number): void {
+    if (this.closed) return;
+    const wait = Math.max(1, Math.ceil(delayMs));
+    const target = Date.now() + wait;
+    if (this.wakeTimer && this.wakeAt <= target) return;
+    if (this.wakeTimer) clearTimeout(this.wakeTimer);
+    this.wakeAt = target;
+    this.wakeTimer = setTimeout(() => {
+      this.wakeTimer = null;
+      this.wakeAt = Number.POSITIVE_INFINITY;
+      if (!this.closed) this.pump();
+    }, wait);
+    this.wakeTimer.unref?.();
+  }
+
+  private trackSet(set: Set<Promise<unknown>>, p: Promise<unknown>): void {
+    set.add(p);
+    const drop = () => set.delete(p);
     p.then(drop, drop);
   }
 
-  private enqueue(job: Job) {
-    this.track(
-      new Promise<void>((resolve) => {
-        this.queue.push(async () => {
-          try {
-            await this.deliver(job);
-          } catch (e) {
-            console.error('Webhook 投递失败：', scrubSecrets(String(e)));
-          } finally {
-            resolve();
+  private pump(): void {
+    if (this.closed) return;
+    if (this.pumping) {
+      this.needPump = true;
+      return;
+    }
+    if (this.running >= this.options.concurrency) return;
+    this.pumping = true;
+    const p = (async () => {
+      try {
+        while (!this.closed) {
+          const free = this.options.concurrency - this.running;
+          if (free <= 0) break;
+          const jobs = await this.claimBatch(free);
+          if (!jobs.length) break;
+          for (const row of jobs) {
+            this.running++;
+            const task = this.executeJob(row)
+              .catch((e) => {
+                if (!isDbClosedError(e)) console.error('Webhook 投递失败：', scrubSecrets(String(e)));
+              })
+              .finally(() => {
+                this.running--;
+                if (!this.closed) this.pump();
+              });
+            this.trackSet(this.inFlight, task);
           }
-        });
-      }),
-    );
-    this.pump();
+          if (jobs.length < free) break;
+        }
+      } catch (e) {
+        if (isDbClosedError(e)) {
+          this.stopPolling();
+          return;
+        }
+        console.error('Webhook 任务认领失败：', scrubSecrets(String(e)));
+      } finally {
+        this.pumping = false;
+        if (this.needPump && !this.closed) {
+          this.needPump = false;
+          if (this.running < this.options.concurrency) this.pump();
+        }
+      }
+    })();
+    this.trackSet(this.inFlight, p);
   }
 
-  private pump() {
-    while (this.running < this.options.concurrency && this.queue.length) {
-      const task = this.queue.shift()!;
-      this.running++;
-      void task().finally(() => {
-        this.running--;
-        this.pump();
+  private async claimBatch(limit: number): Promise<JobRow[]> {
+    if (limit <= 0 || this.closed) return [];
+    if (this.db.dialect === 'pg') {
+      return this.db.transaction(async (tx) => {
+        const rows = await tx.query<JobRow>(
+          `select id, webhook_id as "webhookId", delivery_id as "deliveryId",
+                  event_type as "eventType", payload, attempts, max_retries as "maxRetries"
+             from webhook_jobs
+            where next_run_at <= now()
+              and (locked_until is null or locked_until <= now())
+            order by next_run_at, id
+            limit $1
+              for update skip locked`,
+          [limit],
+        );
+        if (!rows.length) return [];
+        const ids = rows.map((r) => r.id);
+        await tx.query(
+          `update webhook_jobs
+              set locked_by = $1,
+                  locked_until = now() + ($2::double precision * interval '1 millisecond')
+            where id in (${inList(ids, 3)})`,
+          [this.workerId, this.leaseMs, ...ids],
+        );
+        return rows;
       });
     }
-  }
-
-  /** 定时器 unref：等待中的重试不阻止进程退出（重启丢失，见 ADR 0008） */
-  private later(ms: number, fn: () => void) {
-    let release!: () => void;
-    const done = new Promise<void>((r) => {
-      release = r;
+    return this.db.transaction(async (tx) => {
+      const now = new Date();
+      const rows = await tx.query<JobRow>(
+        `select id, webhook_id as "webhookId", delivery_id as "deliveryId",
+                event_type as "eventType", payload, attempts, max_retries as "maxRetries"
+           from webhook_jobs
+          where next_run_at <= $1
+            and (locked_until is null or locked_until <= $1)
+          order by next_run_at, id
+          limit $2`,
+        [now, limit],
+      );
+      if (!rows.length) return [];
+      const ids = rows.map((r) => r.id);
+      const lockedUntil = new Date(now.getTime() + this.leaseMs);
+      await tx.query(
+        `update webhook_jobs
+            set locked_by = $1,
+                locked_until = $2
+          where id in (${inList(ids, 3)})`,
+        [this.workerId, lockedUntil, ...ids],
+      );
+      return rows;
     });
-    const t = setTimeout(() => {
-      this.timers.delete(t);
-      if (!this.closed) fn();
-      release();
-    }, ms);
-    t.unref();
-    this.timers.set(t, release);
-    this.track(done);
   }
 
   private async load(webhookId: string): Promise<HookRow | null> {
@@ -657,27 +910,76 @@ export class Webhooks {
     );
   }
 
-  private async deliver(job: Job) {
-    if (this.closed) return;
-    // 重试时 Webhook 可能已经被删除 / 停用：不再发
-    const hook = await this.load(job.webhookId);
-    if (!hook?.enabled) return;
+  private async executeJob(row: JobRow): Promise<void> {
+    if (this.closed) {
+      await this.db
+        .query(
+          'update webhook_jobs set locked_by = null, locked_until = null where id = $1 and locked_by = $2',
+          [row.id, this.workerId],
+        )
+        .catch(() => {});
+      return;
+    }
+    // 重试时 Webhook 可能已经被删除 / 停用：直接清理任务
+    const hook = await this.load(row.webhookId);
+    if (!hook?.enabled) {
+      await this.db.query('delete from webhook_jobs where id = $1', [row.id]).catch(() => {});
+      return;
+    }
+    const attempts = Number(row.attempts);
+    const maxRetries = Number(row.maxRetries);
+    const job: Job = {
+      webhookId: row.webhookId,
+      deliveryId: row.deliveryId,
+      event: row.payload,
+      attempt: attempts + 1,
+    };
     const result = await this.attemptOnce(hook, job);
+    const shouldRetry = !result.ok && result.retry && attempts < maxRetries;
+    const delayMs = shouldRetry ? this.options.retryBaseMs * 4 ** attempts : 0;
+
     try {
-      await this.record(hook.id, job, result, false);
+      await this.db.transaction(async (tx) => {
+        await this.recordIn(tx, hook.id, job, result, false);
+        if (!shouldRetry) {
+          await tx.query('delete from webhook_jobs where id = $1', [row.id]);
+          return;
+        }
+        const nextAttempts = attempts + 1;
+        if (this.db.dialect === 'pg') {
+          await tx.query(
+            `update webhook_jobs
+                set attempts = $2,
+                    next_run_at = now() + ($3::double precision * interval '1 millisecond'),
+                    locked_by = null,
+                    locked_until = null
+              where id = $1`,
+            [row.id, nextAttempts, delayMs],
+          );
+        } else {
+          await tx.query(
+            `update webhook_jobs
+                set attempts = $2,
+                    next_run_at = $3,
+                    locked_by = null,
+                    locked_until = null
+              where id = $1`,
+            [row.id, nextAttempts, new Date(Date.now() + delayMs)],
+          );
+        }
+      });
     } catch (e) {
-      // 发送期间 Webhook 被删除（外键）：没有地方记了，也不用再重试
-      if (!(await this.load(job.webhookId))) return;
+      // 发送期间 Webhook 被删除（外键）：webhook_jobs 会随外键级联删除，没有地方记了，也不用再重试
+      if (!(await this.load(row.webhookId).catch(() => null))) return;
       throw e;
     }
-    if (!result.ok && result.retry && job.attempt <= this.options.maxRetries && !this.closed)
-      this.later(this.options.retryBaseMs * 4 ** (job.attempt - 1), () =>
-        this.enqueue({ ...job, attempt: job.attempt + 1 }),
-      );
+
+    if (shouldRetry && !this.closed) this.scheduleWake(delayMs);
   }
 
   /** 写一行投递记录，然后只保留这个 Webhook 最近 KEEP_DELIVERIES 条 */
-  private async record(
+  private async recordIn(
+    db: Db,
     webhookId: string,
     job: Job,
     r: AttemptResult,
@@ -695,7 +997,7 @@ export class Webhooks {
       test,
       at: new Date().toISOString(),
     };
-    await this.db.query(
+    await db.query(
       `insert into webhook_deliveries (id, webhook_id, delivery_id, event, attempt, ok, status, error, duration_ms, test, at)
        values ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11)`,
       [
@@ -712,7 +1014,7 @@ export class Webhooks {
         row.at,
       ],
     );
-    await this.db.query(
+    await db.query(
       `delete from webhook_deliveries where webhook_id = $1 and id not in
          (select id from webhook_deliveries where webhook_id = $1 order by at desc, id desc limit ${KEEP_DELIVERIES})`,
       [webhookId],
