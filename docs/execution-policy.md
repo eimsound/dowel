@@ -88,7 +88,7 @@
 - 执行时，每个迁移会话在执行步骤前设置 PostgreSQL 的 `lock_timeout` 和 `statement_timeout`（生效策略里的值），**事务步骤和不在事务里的步骤都生效**；步骤做完用 `RESET` 恢复，Dowel 自己的读回校验和写历史跑在库端原来的设置上。
 - 策略里是“不限”（0）的项**不会去设置**：数据库或账号上已经配置的 `statement_timeout` / `lock_timeout`（`ALTER DATABASE … SET`、`ALTER ROLE … SET`）照常生效，Dowel 不会把它们改成不限。这种由库端配置取消的步骤按普通的失败报告（不是 `step_timeout`）。
 - **`CREATE INDEX CONCURRENTLY`、`DROP INDEX CONCURRENTLY`、`REINDEX … CONCURRENTLY`（包括 `REINDEX (CONCURRENTLY) …` 的括号写法）不设锁等待超时**（语句超时照常）：它们只拿不阻塞读写的锁，等的是库里已有的事务结束，排队时不会把业务语句堵在后面——而锁等待超时要防的正是这一点。所以库里有长事务时，这类步骤会一直等到长事务结束，不会因为 5 秒的默认值反复失败、留下无效索引。重试前清理遗留无效索引的那一步也一样。
-- **`ALTER TABLE … DETACH PARTITION … CONCURRENTLY` 照常受锁等待超时约束**：它的第二阶段要对分区拿 `ACCESS EXCLUSIVE`，排队时一样会挡住访问这个分区的业务。已知限制：它在第二阶段超时后，分区会停在“detach pending”状态，重跑同一条语句会失败；需要人工在目标库执行 `ALTER TABLE … DETACH PARTITION … FINALIZE` 完成分离，再按“半途失败后手工补完”的方式处理（手工完成这次迁移剩下的步骤后，用“标记为已执行”）。Dowel 不会自动生成这类语句，它只会出现在人工编辑过的脚本里。
+- **`ALTER TABLE … DETACH PARTITION … CONCURRENTLY` 照常受锁等待超时约束**：它的第二阶段要对分区拿 `ACCESS EXCLUSIVE`，排队时一样会挡住访问这个分区的业务。它的第一阶段提交后（分区已经标成“detach pending”），还要等库里已有的事务结束、再拿锁完成分离——这两段等待都可能超过锁等待超时（库里有长事务时前者更常见）。超时后分区停在 detach pending，**重试时 Dowel 会自动改为执行 `ALTER TABLE … DETACH PARTITION … FINALIZE`** 完成分离（同样受锁等待超时约束，可以反复重试，等长事务结束后就能完成），迁移照常从断点续跑。只有 Dowel 识别不了这条语句（例如表名没写 schema）时，才需要人工在目标库执行 `… FINALIZE`，再按“半途失败后手工补完”的方式处理（手工完成这次迁移剩下的步骤后，用“标记为已执行”）；失败信息里会提示。Dowel 不会自动生成这类语句，它只会出现在人工编辑过的脚本里。
 - 某一步因为超时被取消时，失败原因写明是“等锁超过 N 秒（执行策略的锁等待超时）”还是“执行超过 N 秒（执行策略的语句超时）”，错误代码 `step_timeout`，和普通的 SQL 错误区分开。
 - 失败后的处理和其他失败一样：事务型迁移整体回滚，稍后直接重试；含非事务步骤的迁移从断点续跑。
 - 等项目锁（同一个项目的另一个执行正在进行）是另一回事，仍然是最多等 30 秒，不受这两个超时影响。

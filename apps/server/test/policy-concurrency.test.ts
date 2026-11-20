@@ -386,4 +386,77 @@ describe.skipIf(!PG_URL)('执行策略写入串行化（平台库 PG）', () => 
     }
     expect((await db.query('select 1 from environments where id = $1', [eid])).length).toBe(1);
   });
+
+  test('转组：等锁期间被撤掉了目标组的组管理员身份 → 锁内按新的组成员关系判断，403，项目没动', async () => {
+    const g1 = await call(
+      'POST',
+      '/api/groups',
+      { slug: 'conc-a1', name: '源（pa 管）', defaultRole: 'none' },
+      'admin',
+    );
+    const g2 = await call(
+      'POST',
+      '/api/groups',
+      { slug: 'conc-a2', name: '目标（pa 管）', defaultRole: 'none' },
+      'admin',
+    );
+    for (const slug of ['conc-a1', 'conc-a2'])
+      expect(
+        (await call('POST', `/api/groups/${slug}/members`, { username: 'pa', role: 'admin' }, 'admin'))
+          .status,
+      ).toBe(200);
+    const { id } = await project('revoke-race', g1.data.id as string, false);
+    const holder = connect(platform.url);
+    try {
+      await holder.db.query('select pg_advisory_lock(hashtext($1))', [POLICY_LOCK_KEY]);
+      // pa 是两边的组管理员：锁外检查通过，排在执行策略锁上
+      const t = call('POST', `/api/projects/${id}/transfer`, { groupId: g2.data.id }, 'pa');
+      await waiters(holder, 1);
+      // 等锁期间实例管理员把 pa 降成目标组的普通成员（改成员不需要执行策略锁，立刻生效）
+      expect(
+        (await call('PATCH', `/api/groups/conc-a2/members/${ids.pa}`, { role: 'member' }, 'admin')).status,
+      ).toBe(200);
+      await holder.db.query('select pg_advisory_unlock(hashtext($1))', [POLICY_LOCK_KEY]);
+      const r = await t;
+      expect(r.status).toBe(403);
+      expect(r.data.error).toContain('组管理员');
+    } finally {
+      await holder.close();
+    }
+    const [row] = await db.query<{ groupId: string }>(
+      'select group_id as "groupId" from projects where id = $1',
+      [id],
+    );
+    expect(row!.groupId).toBe(g1.data.id);
+    expect((await db.query('select 1 from project_redirects where project_id = $1', [id])).length).toBe(0);
+  });
+
+  test('转组的审计记锁内读到的源组和 slug，和写下的跳转记录一致', async () => {
+    const g1 = await call(
+      'POST',
+      '/api/groups',
+      { slug: 'conc-au1', name: '审计源', defaultRole: 'none' },
+      'admin',
+    );
+    const g2 = await call(
+      'POST',
+      '/api/groups',
+      { slug: 'conc-au2', name: '审计目标', defaultRole: 'none' },
+      'admin',
+    );
+    const { id } = await project('audit-slug', g1.data.id as string, false);
+    expect(
+      (await call('POST', `/api/projects/${id}/transfer`, { groupId: g2.data.id }, 'admin')).status,
+    ).toBe(200);
+    const [redirect] = await db.query<{ owner: string; slug: string }>(
+      'select owner_slug as owner, project_slug as slug from project_redirects where project_id = $1',
+      [id],
+    );
+    const [audit] = await db.query<{ data: { from: string; slug: string } }>(
+      "select data from audit_events where action = 'project.transfer' and project_id = $1",
+      [id],
+    );
+    expect(redirect).toEqual({ owner: 'conc-au1', slug: audit!.data.slug });
+    expect(audit!.data.from).toBe(g1.data.id);
+  });
 });

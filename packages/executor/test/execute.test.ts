@@ -36,6 +36,7 @@ import {
   execute,
   isReadbackFailure,
   parseCreateIndexConcurrently,
+  parseDetachConcurrently,
   readState,
 } from '../src/index.ts';
 
@@ -1183,6 +1184,106 @@ test.skipIf(!PG_URL)(
       // 没有设超时时，同一个慢步骤照常执行（普通的 57014 不会被当成超时：只有设了语句超时才这么认）
       const r = await run(t.db, chain, 2, { timeouts: { statementMs: 0, lockMs: 5000 } });
       expect(r.ran.map((x) => x.number)).toEqual([2]);
+    });
+  },
+);
+
+test('parseDetachConcurrently：只认写明 schema 的 DETACH PARTITION … CONCURRENTLY', () => {
+  expect(
+    parseDetachConcurrently('ALTER TABLE "public"."p" DETACH PARTITION "public"."p1" CONCURRENTLY'),
+  ).toEqual({
+    parentSchema: 'public',
+    parent: 'p',
+    schema: 'public',
+    partition: 'p1',
+  });
+  expect(
+    parseDetachConcurrently('alter table if exists only app."P x" * detach partition app.p_2 concurrently;'),
+  ).toEqual({ parentSchema: 'app', parent: 'P x', schema: 'app', partition: 'p_2' });
+  expect(parseDetachConcurrently('ALTER TABLE p DETACH PARTITION p1 CONCURRENTLY')).toBe('unparsed'); // 没写 schema
+  expect(parseDetachConcurrently('ALTER TABLE public.p DETACH PARTITION public.p1')).toBeNull();
+  expect(parseDetachConcurrently('CREATE INDEX CONCURRENTLY ix ON public.t (x)')).toBeNull();
+});
+
+test.skipIf(!PG_URL)(
+  'DETACH PARTITION … CONCURRENTLY 在等旧事务时超过 lock_timeout：分区停在 detach pending；释放后续跑自动改为 FINALIZE，分区已分离',
+  async () => {
+    const DDL = `create table public.p (id int not null, k int not null) partition by range (k);
+      create table public.p1 partition of public.p for values from (0) to (10);
+      create table public.p2 partition of public.p for values from (10) to (20);`;
+    const DETACH = 'ALTER TABLE "public"."p" DETACH PARTITION "public"."p1" CONCURRENTLY';
+    // v1 / v2 的模型都从真实的库读出来（v2 = 分离之后的样子，含 PG 给分离出来的表加的约束），对象 ID 沿用 v1
+    const modelOf = async (sqls: string[]) => {
+      const t = await createTestDb('detach_model');
+      try {
+        for (const s of sqls) await t.db.exec(s);
+        return importSnapshot(await readSnapshot(t.db));
+      } finally {
+        await t.close();
+      }
+    };
+    const m1 = await modelOf([DDL]);
+    const m2 = reconcileIds(m1, await modelOf([DDL, DETACH]));
+    // 规划器不支持改分区设置：v2 的脚本手写（就像人工编辑的冻结脚本）
+    const [v1] = chainOf([m1]);
+    const up = [nontx(DETACH)];
+    const down = [
+      nontx('ALTER TABLE "public"."p" ATTACH PARTITION "public"."p1" FOR VALUES FROM (0) TO (10)'),
+    ];
+    const chain: ChainVersion[] = [
+      v1!,
+      {
+        ...v1!,
+        id: 'v-2',
+        number: 2,
+        parentId: v1!.id,
+        name: '版本 2',
+        model: m2,
+        upSteps: up,
+        downSteps: down,
+        checksum: stepsChecksum(up, down),
+      },
+    ];
+    const pending = async (db: Db) =>
+      (
+        await db.query<{ n: number }>(
+          `select count(*)::int as n from pg_inherits i join pg_class c on c.oid = i.inhrelid
+            where c.relname = 'p1' and i.inhdetachpending`,
+        )
+      )[0]!.n;
+    const attached = async (db: Db) =>
+      (
+        await db.query<{ n: number }>(
+          "select count(*)::int as n from pg_inherits i join pg_class c on c.oid = i.inhrelid where c.relname = 'p1'",
+        )
+      )[0]!.n;
+    await withTarget(async (t) => {
+      await run(t.db, chain, 1);
+      const timeouts = { statementMs: 0, lockMs: 300 };
+      // 另一个会话开着事务、碰过父表：DETACH … CONCURRENTLY 的第一个事务提交（分区标成 detach pending）之后，
+      // 要等这个旧事务结束——这段等待受 lock_timeout 约束，超时
+      const holder = connect(t.url);
+      const reserved = await holder.db.reserve!();
+      try {
+        await reserved.exec('BEGIN');
+        await reserved.query('select count(*) from public.p');
+        const e = await fails(run(t.db, chain, 2, { timeouts }));
+        expect(e.code).toBe('step_timeout');
+        expect(e.details).toMatchObject({ timeout: { kind: 'lock', ms: 300 }, partial: true, step: 1 });
+        expect(await pending(t.db)).toBe(1);
+        // 还没释放时续跑：FINALIZE 同样受锁等待超时约束，同样超时、可以再重试
+        expect((await fails(run(t.db, chain, 2, { timeouts }))).code).toBe('step_timeout');
+        expect(await pending(t.db)).toBe(1);
+      } finally {
+        await reserved.exec('ROLLBACK').catch(() => {});
+        reserved.release?.();
+        await holder.close();
+      }
+      // 释放后续跑：检测到 detach pending，改为 FINALIZE，迁移完成，结构等于 v2
+      const r = await run(t.db, chain, 2, { timeouts });
+      expect(r.ran.map((x) => x.number)).toEqual([2]);
+      expect(await attached(t.db)).toBe(0);
+      await structureIs(t.db, m2);
     });
   },
 );

@@ -189,6 +189,65 @@ export const parseCreateIndexConcurrently = (
 const CIC_HINT =
   '（如果这条语句失败后在库里留下了无效索引，而 Dowel 没能识别出它，请先手工 DROP INDEX CONCURRENTLY 再重试）';
 
+/** 在 s 的 i 位置读一个带 schema 的名字（schema.name）；没写 schema 返回 null */
+const qualifiedAt = (s: string, from: number): { schema: string; name: string; end: number } | null => {
+  const first = identAt(s, from);
+  if (!first || s[first.end] !== '.') return null;
+  const second = identAt(s, first.end + 1);
+  return second ? { schema: first.name, name: second.name, end: second.end } : null;
+};
+
+const DETACH_HEAD = /^\s*alter\s+table\s+(?:if\s+exists\s+)?(?:only\s+)?/i;
+
+/**
+ * 解析 ALTER TABLE [IF EXISTS] [ONLY] schema.父表 [*] DETACH PARTITION schema.分区 CONCURRENTLY；
+ * 不是这种语句返回 null，是但解析不了（没写 schema、带注释等）返回 'unparsed'。
+ */
+export const parseDetachConcurrently = (
+  sql: string,
+): { parentSchema: string; parent: string; schema: string; partition: string } | 'unparsed' | null => {
+  if (!/\bdetach\s+partition\b[\s\S]*\bconcurrently\b/i.test(sql)) return null;
+  const head = DETACH_HEAD.exec(sql);
+  if (!head) return 'unparsed';
+  const parent = qualifiedAt(sql, head[0].length);
+  if (!parent) return 'unparsed';
+  const mid = /^(?:\s*\*)?\s+detach\s+partition\s+/i.exec(sql.slice(parent.end));
+  if (!mid) return 'unparsed';
+  const part = qualifiedAt(sql, parent.end + mid[0].length);
+  if (!part) return 'unparsed';
+  if (!/^\s+concurrently\s*;?\s*$/i.test(sql.slice(part.end))) return 'unparsed';
+  return { parentSchema: parent.schema, parent: parent.name, schema: part.schema, partition: part.name };
+};
+
+const DETACH_HINT =
+  '（如果分区停在了 detach pending 状态，而 Dowel 没能识别这条语句，请先手工执行 ALTER TABLE … DETACH PARTITION … FINALIZE 再处理）';
+
+/**
+ * DETACH PARTITION … CONCURRENTLY 分两个事务：第一个事务把分区标成 detach pending 并提交，之后要等所有可能用到父表的旧事务结束，
+ * 第二个事务再对分区拿 ACCESS EXCLUSIVE 完成分离。等旧事务和拿锁都受 lock_timeout 约束（执行策略照常设锁等待超时：
+ * 第二阶段排队会挡业务）。第一个事务提交之后超时，分区就停在 detach pending，重跑原语句会报 “already pending detach”，
+ * 迁移会卡死。所以执行（续跑）这一步之前先看目标分区是不是已经 detach pending：是就改为执行
+ * `ALTER TABLE 父表 DETACH PARTITION 分区 FINALIZE`（同样受超时约束，可以反复重试），效果相同。
+ * 返回要执行的语句（null = 照原样执行）和识别不了时的提示。
+ */
+const detachFinalizeFor = async (conn: Db, sql: string): Promise<{ sql: string | null; hint: string }> => {
+  const p = parseDetachConcurrently(sql);
+  if (p === null) return { sql: null, hint: '' };
+  if (p === 'unparsed') return { sql: null, hint: DETACH_HINT };
+  const [row] = await conn.query<{ parent: string; partition: string }>(
+    `select format('%I.%I', pn.nspname, pc.relname) as parent, format('%I.%I', cn.nspname, cc.relname) as partition
+       from pg_inherits i
+       join pg_class cc on cc.oid = i.inhrelid join pg_namespace cn on cn.oid = cc.relnamespace
+       join pg_class pc on pc.oid = i.inhparent join pg_namespace pn on pn.oid = pc.relnamespace
+      where i.inhdetachpending and cc.relname = $1 and cn.nspname = $2 and pc.relname = $3 and pn.nspname = $4`,
+    [p.partition, p.schema, p.parent, p.parentSchema],
+  );
+  return {
+    sql: row ? `ALTER TABLE ${row.parent} DETACH PARTITION ${row.partition} FINALIZE` : null,
+    hint: '',
+  };
+};
+
 /** 返回这条 CIC 语句能不能被识别（识别不了时失败信息里要提示手工处理） */
 const dropLeftoverInvalidIndex = async (conn: Db, sql: string): Promise<boolean> => {
   const p = parseCreateIndexConcurrently(sql);
@@ -305,9 +364,11 @@ const execStep = async (
   i: number,
   hint = '',
   applied: AppliedTimeouts = NO_TIMEOUTS,
+  /** 实际执行的语句（续跑时把停在 detach pending 的 DETACH … CONCURRENTLY 换成 FINALIZE）；默认就是这一步的语句 */
+  sql = steps[i]!.sql,
 ) => {
   try {
-    await conn.exec(steps[i]!.sql);
+    await conn.exec(sql);
   } catch (e) {
     throw new StepFailure(i, e, hint, applied);
   }
@@ -476,7 +537,9 @@ const runMigration = async (
         try {
           // 没能识别 CIC 的索引名时，这一步失败的信息里提示手工处理（只属于这一步，不会带到别的步骤的错误里）
           const hint = (await dropLeftoverInvalidIndex(conn, steps[i]!.sql)) ? '' : CIC_HINT;
-          await execStep(conn, steps, i, hint, applied);
+          // 上一次停在 detach pending 的 DETACH PARTITION … CONCURRENTLY：续跑时改为 FINALIZE（见 detachFinalizeFor）
+          const detach = await detachFinalizeFor(conn, steps[i]!.sql);
+          await execStep(conn, steps, i, hint + detach.hint, applied, detach.sql ?? undefined);
         } finally {
           await restoreTimeouts(conn, applied).catch(() => {});
         }

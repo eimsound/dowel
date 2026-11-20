@@ -42,7 +42,7 @@ import {
 } from '../policy.ts';
 import { encrypt } from '../secrets.ts';
 import { CHECK_CONNECT_TIMEOUT, claimShadow, inspectTarget } from '../targets.ts';
-import { type AppContext, access, body, connectionLimit, type Env, envAccess } from './context.ts';
+import { type AppContext, access, body, connectionLimit, type Env } from './context.ts';
 
 export const registerEnvironments = (app: Hono<Env>, ctx: AppContext) => {
   const { db, rooms, shadows, refresher } = ctx;
@@ -273,9 +273,9 @@ export const registerEnvironments = (app: Hono<Env>, ctx: AppContext) => {
   });
 
   app.delete('/api/projects/:pid/environments/:eid', async (c) => {
-    // 锁外先挡一道（看不见 404、不满足执行策略 403），不碰任何东西；真正的判断在执行策略锁里再做一次
-    const a = await envAccess(c, ctx, 'environment.delete');
-    const eid = a.env.id;
+    // 锁外只做轻量检查（看不见项目 / 环境不存在 404），不读执行策略；删除受执行策略约束，权限只在执行策略锁里判断一次（和 PATCH 一致）
+    const a = await access(c, ctx, 'environment.read');
+    const eid = (await loadEnv(db, a.pid, c.req.param('eid')!)).id;
     const user = c.get('user');
     // 本进程正在执行时不能删（409，见 lockEnvIdle）；残留的 claimed 保守处理（settleClaims）：版本算执行过，然后照常删
     const release = await lockEnvIdle(ctx.exec, eid);
