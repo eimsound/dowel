@@ -1,8 +1,9 @@
 // M1a 验收：随机修改 IR，迁移在 PG 18 上必须 100% 闭环通过。
 // 本地默认跑少量用例；CI 的 heavy 任务用 RUNS=5000 跑大量用例（.github/workflows/ci.yml）。
 
-import { emptyBase, type Model, plan, validate } from '@dowel/core';
+import { emptyBase, LATEST_PG_MAJOR, type Model, pgMajorOf, plan, validate } from '@dowel/core';
 import {
+  type Db,
   importSnapshot,
   readHistory,
   readSnapshot,
@@ -25,13 +26,21 @@ const RUNS = Number(process.env.RUNS ?? 100);
 // 经由执行器的那条：默认最多 30 轮（每轮要建两个库），想深挖时用 EXEC_RUNS 单独调大
 const EXEC_RUNS = Number(process.env.EXEC_RUNS ?? Math.min(RUNS, 30));
 
+const queryPgMajor = async (db: Db): Promise<number> => {
+  const [{ v }] = (await db.query<{ v: number }>(
+    `select current_setting('server_version_num')::int as v`,
+  )) as [{ v: number }];
+  return pgMajorOf(v) ?? LATEST_PG_MAJOR;
+};
+
 test.skipIf(!PG_URL)(
   '随机编辑后迁移闭环通过（up 与 down）',
   async () => {
     const db = conn();
+    const pgMajor = await queryPgMajor(db);
     await fc.assert(
       fc.asyncProperty(versions, async (vs) => {
-        const { v1, v2 } = makeVersions(vs);
+        const { v1, v2 } = makeVersions(vs, { pgMajor });
         expect(validate(v1)).toEqual([]);
         expect(validate(v2)).toEqual([]);
         const t0 = performance.now();
@@ -60,9 +69,10 @@ test.skipIf(!PG_URL)(
   '随机编辑后，plan 产出的冻结脚本经 verifyScripts 闭环通过',
   async () => {
     const db = conn();
+    const pgMajor = await queryPgMajor(db);
     await fc.assert(
       fc.asyncProperty(versions, async (vs) => {
-        const { v1, v2 } = makeVersions(vs);
+        const { v1, v2 } = makeVersions(vs, { pgMajor });
         const up = toScriptSteps(plan(v1, v2));
         const down = toScriptSteps(plan(v2, v1));
         const r = await verifyScripts(db, v1, v2, up, down);
@@ -91,6 +101,7 @@ test.skipIf(!PG_URL)(
   async () => {
     const scratch = conn();
     const tdb = target();
+    const pgMajor = await queryPgMajor(scratch);
     const canon = async (m: Model): Promise<Model> => {
       await build(scratch, m);
       return reconcileIds(m, importSnapshot(await readSnapshot(scratch)));
@@ -117,7 +128,7 @@ test.skipIf(!PG_URL)(
     };
     await fc.assert(
       fc.asyncProperty(versions, async (vs) => {
-        const { v1, v2 } = makeVersions(vs);
+        const { v1, v2 } = makeVersions(vs, { pgMajor });
         const models = [await canon(v1), await canon(v2)];
         const chain = [version(models, 0), version(models, 1)];
         // 全新的目标库：清空（包括上一轮留下的 dowel schema），再建一个干净的 public

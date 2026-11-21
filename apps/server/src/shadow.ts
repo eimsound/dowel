@@ -263,6 +263,24 @@ export const shadowOps = (
       const e = engine.objects[o.id];
       if (!e || e.kind !== o.kind) continue;
       const c = structuredClone(o) as Obj;
+      if (c.kind === 'table' && e.kind === 'table') {
+        if (
+          c.partitionBy &&
+          typeof c.partitionBy !== 'string' &&
+          e.partitionBy &&
+          typeof e.partitionBy !== 'string' &&
+          c.partitionBy.keys.length === e.partitionBy.keys.length
+        ) {
+          const eKeys = e.partitionBy.keys;
+          c.partitionBy = {
+            ...c.partitionBy,
+            keys: c.partitionBy.keys.map((k, i) => (k.expr ? { ...k, expr: eKeys[i]!.expr } : k)),
+          };
+        }
+        if (c.partitionOf && e.partitionOf && c.partitionOf.parent === e.partitionOf.parent) {
+          c.partitionOf = { ...c.partitionOf, bound: e.partitionOf.bound };
+        }
+      }
       if (c.kind === 'check' && e.kind === 'check') c.expr = e.expr;
       if (c.kind === 'opaque' && e.kind === 'opaque') c.ddl = e.ddl;
       if (c.kind === 'index' && e.kind === 'index' && c.elements.length === e.elements.length) {

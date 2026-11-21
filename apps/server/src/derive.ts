@@ -372,6 +372,14 @@ export class OpaqueRefresher {
 const exprsOf = (o: Obj | undefined): unknown => {
   if (!o) return null;
   switch (o.kind) {
+    case 'table': {
+      const partExprs =
+        o.partitionBy && typeof o.partitionBy !== 'string' && o.partitionBy.keys.some((k) => k.expr)
+          ? o.partitionBy.keys.map((k) => k.expr)
+          : null;
+      const bound = o.partitionOf?.bound ?? null;
+      return partExprs || bound !== null ? [partExprs, bound] : null;
+    }
     case 'check':
       return o.expr;
     case 'index':

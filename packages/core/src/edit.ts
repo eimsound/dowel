@@ -14,6 +14,7 @@ import type {
   IndexElement,
   Model,
   Obj,
+  PartitionSpec,
   PrimaryKey,
   Schema,
   Sequence,
@@ -21,119 +22,52 @@ import type {
   Table,
   Unique,
 } from './ir.ts';
-import { all, childrenOf, colName, columnsOf, find, get, indexElementNames } from './model.ts';
+import { deepEqual } from './json.ts';
+import {
+  all,
+  childrenOf,
+  colName,
+  columnsOf,
+  effectiveColumnsOf,
+  find,
+  get,
+  indexElementNames,
+  partitionDescendants,
+  partitionsOf,
+  rootTableId,
+} from './model.ts';
+import {
+  columnRefs,
+  exprReferences,
+  renameInExpr,
+  renameQualifiedInExpr,
+  type Token,
+  tokenize,
+} from './pg/expr.ts';
 import { chooseName, joinNames } from './pg/naming.ts';
-import { ident, KEYWORDS } from './pg/quote.ts';
+import {
+  derivedUuid,
+  parsePartitionBound,
+  partitionKeyColumns,
+  resolvePartitionBy,
+  validatePartitionBound,
+} from './pg/partition.ts';
+import { KEYWORDS } from './pg/quote.ts';
 
-export { EditError };
+export { EditError, exprReferences, renameInExpr, renameQualifiedInExpr, type Token, tokenize };
 
 // ───── 表达式里的标识符 ─────
-
-type Token = { text: string; kind: 'ident' | 'qident' | 'other'; start: number; end: number };
-
-/** 简单的 PG 表达式词法分析：识别字符串、带引号标识符、普通标识符，其余字符原样保留 */
-export const tokenize = (s: string): Token[] => {
-  const out: Token[] = [];
-  let i = 0;
-  while (i < s.length) {
-    const ch = s[i]!;
-    const start = i;
-    if (ch === "'" || ((ch === 'E' || ch === 'e') && s[i + 1] === "'")) {
-      if (ch !== "'") i++;
-      i++;
-      while (i < s.length) {
-        if (s[i] === '\\' && ch !== "'") i += 2;
-        else if (s[i] === "'" && s[i + 1] === "'") i += 2;
-        else if (s[i] === "'") {
-          i++;
-          break;
-        } else i++;
-      }
-      out.push({ text: s.slice(start, i), kind: 'other', start, end: i });
-    } else if (ch === '$' && /^\$([A-Za-z_]\w*)?\$/.test(s.slice(i))) {
-      const tag = /^\$([A-Za-z_]\w*)?\$/.exec(s.slice(i))![0];
-      const close = s.indexOf(tag, i + tag.length);
-      i = close < 0 ? s.length : close + tag.length;
-      out.push({ text: s.slice(start, i), kind: 'other', start, end: i });
-    } else if (ch === '"') {
-      i++;
-      while (i < s.length) {
-        if (s[i] === '"' && s[i + 1] === '"') i += 2;
-        else if (s[i] === '"') {
-          i++;
-          break;
-        } else i++;
-      }
-      out.push({ text: s.slice(start + 1, i - 1).replaceAll('""', '"'), kind: 'qident', start, end: i });
-    } else if (/[A-Za-z_\u0080-￿]/.test(ch)) {
-      while (i < s.length && /[A-Za-z0-9_$\u0080-￿]/.test(s[i]!)) i++;
-      out.push({ text: s.slice(start, i).toLowerCase(), kind: 'ident', start, end: i });
-    } else {
-      i++;
-      out.push({ text: ch, kind: 'other', start, end: i });
-    }
-  }
-  return out;
-};
-
-/**
- * 表达式里作为列引用出现的名字。跳过：函数名（后面跟括号）、类型名（`::` 之后的整个限定名，如 `::public."user"`）、
- * 限定名中前面的部分（`t.col` 的 `t`）。
- */
-const columnRefs = (expr: string): Token[] => {
-  const sig = tokenize(expr).filter((x) => !/^\s$/.test(x.text));
-  const out: Token[] = [];
-  for (let i = 0; i < sig.length; i++) {
-    const x = sig[i]!;
-    if (x.text === ':' && sig[i + 1]?.text === ':') {
-      // 跳过类型名：ident ( . ident )*
-      i += 2;
-      while (sig[i + 1]?.text === '.' && sig[i + 2] && sig[i + 2]!.kind !== 'other') i += 2;
-      continue;
-    }
-    if (x.kind === 'other') continue;
-    const next = sig[i + 1]?.text;
-    if (next === '(' || next === '.') continue;
-    out.push(x);
-  }
-  return out;
-};
 
 /**
  * 校验表达式里的列引用都是本表存在的列（关键字除外）。
  * 只能发现明显的错误（如列已被改名、删除）；完整的语义校验由影子库完成。
  */
 export const checkExprColumns = (m: Model, table: string, expr: string) => {
-  const names = new Set(columnsOf(m, table).map((c) => c.name));
+  const names = new Set(effectiveColumnsOf(m, table).map((c) => c.name));
   const unknown = columnRefs(expr)
     .filter((t) => !names.has(t.text) && !(t.kind === 'ident' && KEYWORDS.has(t.text)))
     .map((t) => t.text);
   if (unknown.length) throw new EditError(`表达式引用了不存在的列：${[...new Set(unknown)].join('、')}`);
-};
-
-export const exprReferences = (expr: string, name: string): boolean =>
-  columnRefs(expr).some((x) => x.text === name);
-
-/** 改写表达式里的限定名 `schema.name`（类型改名、schema 改名时用） */
-export const renameQualifiedInExpr = (
-  expr: string,
-  schema: string,
-  name: string | null,
-  to: { schema: string; name: string | null },
-): string => {
-  const t = tokenize(expr);
-  let out = expr;
-  const match = (x: Token | undefined, n: string) =>
-    !!x && ((x.kind === 'ident' && x.text === n) || (x.kind === 'qident' && x.text === n));
-  for (let i = t.length - 1; i >= 0; i--) {
-    if (!match(t[i], schema) || t[i + 1]?.text !== '.') continue;
-    if (name === null) {
-      out = out.slice(0, t[i]!.start) + ident(to.schema) + out.slice(t[i]!.end);
-    } else if (match(t[i + 2], name)) {
-      out = `${out.slice(0, t[i]!.start)}${ident(to.schema)}.${ident(to.name!)}${out.slice(t[i + 2]!.end)}`;
-    }
-  }
-  return out;
 };
 
 /** 对模型里所有表达式应用同一个改写 */
@@ -152,13 +86,6 @@ export const rewriteExprs = (m: Model, f: (expr: string) => string) => {
       if (o.default && 'expr' in o.default) o.default.expr = f(o.default.expr);
     }
   }
-};
-
-export const renameInExpr = (expr: string, from: string, to: string): string => {
-  let out = expr;
-  for (const x of columnRefs(expr).reverse())
-    if (x.text === from) out = out.slice(0, x.start) + ident(to) + out.slice(x.end);
-  return out;
 };
 
 // ───── 命名 ─────
@@ -226,7 +153,7 @@ export const refreshDerivedNames = (m: Model, tableId: string) => {
         o.name = choose(o.id, t.name, joinCols(m, o.columns), 'fkey', false, true);
         break;
       case 'check': {
-        const refs = columnsOf(m, tableId).filter((c) => exprReferences(o.expr, c.name));
+        const refs = effectiveColumnsOf(m, tableId).filter((c) => exprReferences(o.expr, c.name));
         o.name = choose(o.id, t.name, refs.length === 1 ? refs[0]!.name : null, 'check', false, true);
         break;
       }
@@ -357,7 +284,13 @@ export const dropSequence = (m: Model, id: string) => {
 
 // ───── 表 ─────
 
-export const createTable = (m: Model, schema: string, name: string, id = newId()): string => {
+export const createTable = (
+  m: Model,
+  schema: string,
+  name: string,
+  id = newId(),
+  partitionBy: PartitionSpec | null = null,
+): string => {
   get(m, schema, 'schema');
   if (relTaken(m, schema, name, '') || typeTaken(m, schema, name, ''))
     throw new EditError(`名字 ${name} 已被占用`);
@@ -371,6 +304,14 @@ export const createTable = (m: Model, schema: string, name: string, id = newId()
     comment: null,
   };
   m.objects[o.id] = o;
+  if (partitionBy !== null) {
+    try {
+      setPartitionBy(m, o.id, partitionBy);
+    } catch (e) {
+      delete m.objects[o.id];
+      throw e;
+    }
+  }
   return o.id;
 };
 
@@ -398,6 +339,8 @@ const dropDependentOpaques = (m: Model, ids: Set<string>) => {
 
 export const dropTable = (m: Model, id: string) => {
   get(m, id, 'table');
+  // 级联删除其下所有子分区（支持多级），不留悬空 partitionOf
+  for (const child of partitionsOf(m, id)) dropTable(m, child.id);
   dropDependentOpaques(m, new Set([id, ...childrenOf(m, id, 'column').map((c) => c.id)]));
   for (const fk of all(m, 'foreignKey')) if (fk.refTable === id && fk.parent !== id) delete m.objects[fk.id];
   for (const c of childrenOf(m, id, 'column')) {
@@ -406,6 +349,446 @@ export const dropTable = (m: Model, id: string) => {
   }
   for (const o of Object.values(m.objects)) if ('parent' in o && o.parent === id) delete m.objects[o.id];
   delete m.objects[id];
+};
+
+// ───── 分区 ─────
+
+const assertNotPartitionChild = (m: Model, tableId: string) => {
+  const t = get(m, tableId, 'table');
+  if (t.partitionOf !== null)
+    throw new EditError(`分区子表 ${t.name} 继承父表的列定义，不能直接添加、修改或删除列`);
+};
+
+const assertNotPartitionKeyCol = (m: Model, colId: string, action: string) => {
+  const c = get(m, colId, 'column');
+  const tables = [get(m, c.parent, 'table'), ...partitionDescendants(m, c.parent)];
+  for (const t of tables) {
+    if (!t.partitionBy) continue;
+    const refs = partitionKeyColumns(m, t);
+    if (refs.all.includes(colId)) {
+      throw new EditError(`列 ${c.name} 被分区表 ${t.name} 的分区键引用，不能${action}`);
+    }
+  }
+};
+
+const assertSpecKeysValid = (m: Model, tableId: string, spec: PartitionSpec) => {
+  if (!spec.keys.length) throw new EditError('至少需要一个分区键');
+  if (spec.strategy === 'list' && spec.keys.length !== 1) throw new EditError('LIST 分区只能有 1 个分区键');
+  const root = rootTableId(m, tableId);
+  for (const k of spec.keys) {
+    if (!!k.column === !!k.expr) throw new EditError('分区键必须且只能指定列或表达式之一');
+    if (k.column) {
+      const col = get(m, k.column, 'column');
+      if (col.parent !== root && col.parent !== tableId) throw new EditError('分区键列不属于这张表');
+      if (col.generated) throw new EditError(`生成列 ${col.name} 不能作为分区键`);
+    } else if (k.expr) {
+      checkExprColumns(m, tableId, k.expr);
+    }
+  }
+};
+
+const assertPartitionConstraintCompat = (
+  spec: PartitionSpec,
+  kind: 'primaryKey' | 'unique' | 'index',
+  cols: string[],
+  elements?: IndexElement[],
+) => {
+  const hasExprKey = spec.keys.some((k) => k.expr !== null);
+  const directCols = spec.keys.flatMap((k) => (k.column ? [k.column] : []));
+  if (kind === 'primaryKey' || kind === 'unique') {
+    const label = kind === 'primaryKey' ? '主键' : '唯一约束';
+    if (hasExprKey) throw new EditError(`包含表达式分区键的分区表不能创建${label}`);
+    if (directCols.some((c) => !cols.includes(c)))
+      throw new EditError(`分区表的${label}必须包含全部分区键列`);
+    return;
+  }
+  if (hasExprKey) throw new EditError('包含表达式分区键的分区表不支持唯一索引');
+  const els = elements ?? [];
+  if (directCols.some((c) => !els.some((e) => e.column === c)))
+    throw new EditError('分区表的唯一索引必须包含全部分区键');
+};
+
+const nextDetId = (m: Model, seed: string): string => {
+  for (let i = 0; ; i++) {
+    const candidate = derivedUuid(i === 0 ? seed : `${seed}#${i}`);
+    if (!(candidate in m.objects)) return candidate;
+  }
+};
+
+export const setPartitionBy = (m: Model, tableId: string, spec: PartitionSpec | null) => {
+  const t = get(m, tableId, 'table');
+  const children = partitionsOf(m, tableId);
+  if (spec === null) {
+    if (children.length > 0) throw new EditError('表下仍有子分区，请先删除或脱离全部子分区再取消分区');
+    t.partitionBy = null;
+    return;
+  }
+  assertSpecKeysValid(m, tableId, spec);
+  for (const child of children) {
+    const err = validatePartitionBound(spec.strategy, child.partitionOf!.bound, spec.keys.length);
+    if (err) throw new EditError(`现有子分区 ${child.name} 与新分区策略不兼容：${err}`);
+  }
+  for (const pk of childrenOf(m, tableId, 'primaryKey'))
+    assertPartitionConstraintCompat(spec, 'primaryKey', pk.columns);
+  for (const u of childrenOf(m, tableId, 'unique'))
+    assertPartitionConstraintCompat(spec, 'unique', u.columns);
+  for (const x of childrenOf(m, tableId, 'index'))
+    if (x.unique) assertPartitionConstraintCompat(spec, 'index', [], x.elements);
+  for (const ck of childrenOf(m, tableId, 'check'))
+    if (ck.noInherit) throw new EditError(`检查约束 ${ck.name} 设为 NO INHERIT，分区父表不支持`);
+  t.partitionBy = structuredClone(spec);
+};
+
+export const createPartition = (
+  m: Model,
+  parentId: string,
+  name: string,
+  bound: string,
+  id = newId(),
+  schemaId?: string,
+): string => {
+  const parent = get(m, parentId, 'table');
+  if (!parent.partitionBy) throw new EditError(`表 ${parent.name} 不是分区父表`);
+  const spec = resolvePartitionBy(m, parent);
+  if (!spec) throw new EditError(`无法解析表 ${parent.name} 的分区定义`);
+  const trimmed = bound.trim();
+  const err = validatePartitionBound(spec.strategy, trimmed, spec.keys.length);
+  if (err) throw new EditError(err);
+  if (
+    parsePartitionBound(trimmed)?.kind === 'default' &&
+    partitionsOf(m, parentId).some((c) => parsePartitionBound(c.partitionOf!.bound)?.kind === 'default')
+  ) {
+    throw new EditError(`表 ${parent.name} 已有 DEFAULT 子分区`);
+  }
+  const schema = schemaId ?? parent.parent;
+  get(m, schema, 'schema');
+  if (relTaken(m, schema, name, '') || typeTaken(m, schema, name, ''))
+    throw new EditError(`名字 ${name} 已被占用`);
+  const o: Table = {
+    id,
+    kind: 'table',
+    parent: schema,
+    name,
+    partitionBy: null,
+    partitionOf: { parent: parentId, bound: trimmed },
+    comment: null,
+  };
+  m.objects[o.id] = o;
+  return o.id;
+};
+
+export const setPartitionBound = (m: Model, childId: string, bound: string) => {
+  const child = get(m, childId, 'table');
+  if (!child.partitionOf) throw new EditError(`表 ${child.name} 不是分区子表`);
+  const parent = get(m, child.partitionOf.parent, 'table');
+  const spec = resolvePartitionBy(m, parent);
+  if (!spec) throw new EditError(`无法解析表 ${parent.name} 的分区定义`);
+  const trimmed = bound.trim();
+  const err = validatePartitionBound(spec.strategy, trimmed, spec.keys.length);
+  if (err) throw new EditError(err);
+  if (
+    parsePartitionBound(trimmed)?.kind === 'default' &&
+    partitionsOf(m, parent.id).some(
+      (c) => c.id !== childId && parsePartitionBound(c.partitionOf!.bound)?.kind === 'default',
+    )
+  ) {
+    throw new EditError(`表 ${parent.name} 已有 DEFAULT 子分区`);
+  }
+  child.partitionOf = { parent: child.partitionOf.parent, bound: trimmed };
+};
+
+const ancestorsOf = (m: Model, tableId: string): Table[] => {
+  const out: Table[] = [];
+  const seen = new Set<string>();
+  let cur: string | null = tableId;
+  while (cur && !seen.has(cur)) {
+    seen.add(cur);
+    const t: Obj | undefined = m.objects[cur];
+    if (t?.kind !== 'table') break;
+    out.push(t);
+    cur = t.partitionOf?.parent ?? null;
+  }
+  return out;
+};
+
+const remapColRefsOnTable = (m: Model, tableId: string, colMap: Map<string, string>) => {
+  const mapCol = (c: string) => colMap.get(c) ?? c;
+  const targets = new Set([tableId, ...partitionDescendants(m, tableId).map((d) => d.id)]);
+  for (const o of Object.values(m.objects)) {
+    if (o.kind === 'table' && targets.has(o.id) && o.partitionBy && typeof o.partitionBy !== 'string') {
+      for (const k of o.partitionBy.keys) if (k.column) k.column = mapCol(k.column);
+    }
+    if (!('parent' in o) || !targets.has(o.parent)) continue;
+    if (o.kind === 'primaryKey' || o.kind === 'unique') o.columns = o.columns.map(mapCol);
+    else if (o.kind === 'foreignKey') {
+      o.columns = o.columns.map(mapCol);
+      if (targets.has(o.refTable)) o.refColumns = o.refColumns.map(mapCol);
+    } else if (o.kind === 'index') {
+      for (const el of o.elements) if (el.column) el.column = mapCol(el.column);
+      o.include = o.include.map(mapCol);
+    }
+  }
+};
+
+export const attachPartition = (m: Model, parentId: string, childId: string, bound: string) => {
+  const parent = get(m, parentId, 'table');
+  const child = get(m, childId, 'table');
+  if (parentId === childId) throw new EditError('不能将表挂载为自身的子分区');
+  if (!parent.partitionBy) throw new EditError(`表 ${parent.name} 不是分区父表`);
+  if (child.partitionOf !== null) throw new EditError(`表 ${child.name} 已经是子分区`);
+  const ancestors = ancestorsOf(m, parentId);
+  if (ancestors.some((a) => a.id === childId)) throw new EditError('不能形成循环分区引用');
+
+  const spec = resolvePartitionBy(m, parent);
+  if (!spec) throw new EditError(`无法解析表 ${parent.name} 的分区定义`);
+  const trimmed = bound.trim();
+  const err = validatePartitionBound(spec.strategy, trimmed, spec.keys.length);
+  if (err) throw new EditError(err);
+  if (
+    parsePartitionBound(trimmed)?.kind === 'default' &&
+    partitionsOf(m, parentId).some((c) => parsePartitionBound(c.partitionOf!.bound)?.kind === 'default')
+  ) {
+    throw new EditError(`表 ${parent.name} 已有 DEFAULT 子分区`);
+  }
+
+  // 校验外部外键与序列归属
+  if (all(m, 'foreignKey').some((fk) => fk.refTable === childId && fk.parent !== childId))
+    throw new EditError(`表 ${child.name} 被其他表的外键引用，不能挂载为子分区`);
+  const childCols = columnsOf(m, childId);
+  const childColIds = new Set(childCols.map((c) => c.id));
+  if (all(m, 'sequence').some((s) => s.ownedBy && childColIds.has(s.ownedBy)))
+    throw new EditError(`表 ${child.name} 存在归属列的序列，请先解除序列归属后再挂载`);
+
+  // 校验列与根父表一致
+  const rootId = rootTableId(m, parentId);
+  const rootCols = columnsOf(m, rootId);
+  if (childCols.length !== rootCols.length)
+    throw new EditError(
+      `表 ${child.name} 的列数（${childCols.length}）与分区父表（${rootCols.length}）不一致`,
+    );
+  const colMap = new Map<string, string>();
+  for (const rc of rootCols) {
+    const cc = childCols.find((x) => x.name === rc.name);
+    if (!cc) throw new EditError(`表 ${child.name} 缺少分区父表的列 ${rc.name}`);
+    if (cc.identity)
+      throw new EditError(`表 ${child.name} 的列 ${cc.name} 为 IDENTITY，不能直接挂载为子分区`);
+    if (
+      cc.type !== rc.type ||
+      cc.typeRef !== rc.typeRef ||
+      cc.collation !== rc.collation ||
+      !deepEqual(cc.generated, rc.generated)
+    ) {
+      throw new EditError(`表 ${child.name} 的列 ${cc.name} 类型定义与分区父表不一致`);
+    }
+    if (cc.notNull !== rc.notNull) {
+      throw new EditError(`表 ${child.name} 的列 ${cc.name} 非空属性与分区父表不一致`);
+    }
+    if (!deepEqual(cc.default, rc.default)) {
+      throw new EditError(`表 ${child.name} 的列 ${cc.name} 默认值与分区父表不一致`);
+    }
+    colMap.set(cc.id, rc.id);
+  }
+
+  // 校验子表主键与父表/祖先主键不冲突
+  const ancestorIds = new Set(ancestors.map((a) => a.id));
+  const ancPks = all(m, 'primaryKey').filter((k) => ancestorIds.has(k.parent));
+  const childPk = childrenOf(m, childId, 'primaryKey')[0];
+  if (childPk && ancPks.length > 0) {
+    const mapped = childPk.columns.map((c) => colMap.get(c) ?? c);
+    if (!ancPks.some((pk) => deepEqual(pk.columns, mapped))) {
+      throw new EditError(`表 ${child.name} 的主键与分区父表不一致`);
+    }
+  }
+
+  // 映射子表及其后代上的列引用
+  remapColRefsOnTable(m, childId, colMap);
+  for (const o of all(m, 'opaque')) {
+    if (o.deps.some((d) => colMap.has(d))) {
+      o.deps = [...new Set(o.deps.map((d) => colMap.get(d) ?? d))];
+    }
+  }
+
+  // 移除将被父表吸收的重复约束/索引
+  const ancUniques = all(m, 'unique').filter((u) => ancestorIds.has(u.parent));
+  const ancChecks = all(m, 'check').filter((k) => ancestorIds.has(k.parent));
+  const ancFks = all(m, 'foreignKey').filter((f) => ancestorIds.has(f.parent));
+  const ancIdxs = all(m, 'index').filter((x) => ancestorIds.has(x.parent));
+
+  if (childPk && ancPks.length > 0) delete m.objects[childPk.id];
+  for (const u of childrenOf(m, childId, 'unique')) {
+    if (
+      ancUniques.some((au) => au.nullsNotDistinct === u.nullsNotDistinct && deepEqual(au.columns, u.columns))
+    )
+      delete m.objects[u.id];
+  }
+  for (const ck of childrenOf(m, childId, 'check')) {
+    if (ancChecks.some((ak) => ak.name === ck.name && ak.expr === ck.expr)) delete m.objects[ck.id];
+  }
+  for (const fk of childrenOf(m, childId, 'foreignKey')) {
+    if (
+      ancFks.some(
+        (af) =>
+          deepEqual(af.columns, fk.columns) &&
+          af.refTable === fk.refTable &&
+          deepEqual(af.refColumns, fk.refColumns) &&
+          af.onDelete === fk.onDelete &&
+          af.onUpdate === fk.onUpdate &&
+          af.match === fk.match &&
+          af.deferrable === fk.deferrable &&
+          af.initiallyDeferred === fk.initiallyDeferred,
+      )
+    ) {
+      delete m.objects[fk.id];
+    }
+  }
+  for (const idx of childrenOf(m, childId, 'index')) {
+    if (
+      ancIdxs.some(
+        (ax) =>
+          ax.unique === idx.unique &&
+          ax.method === idx.method &&
+          deepEqual(ax.elements, idx.elements) &&
+          deepEqual(ax.include, idx.include) &&
+          ax.where === idx.where &&
+          ax.nullsNotDistinct === idx.nullsNotDistinct,
+      )
+    ) {
+      delete m.objects[idx.id];
+    }
+  }
+
+  // 删除子表自有列对象，改为继承父表列定义
+  for (const cc of childCols) delete m.objects[cc.id];
+  child.partitionOf = { parent: parentId, bound: trimmed };
+};
+
+export const detachPartition = (m: Model, childId: string) => {
+  const child = get(m, childId, 'table');
+  if (!child.partitionOf) throw new EditError(`表 ${child.name} 不是分区子表`);
+  const parentId = child.partitionOf.parent;
+  const ancestors = ancestorsOf(m, parentId);
+  const rootId = rootTableId(m, childId);
+  const rootCols = columnsOf(m, rootId);
+
+  child.partitionOf = null;
+
+  // 物化根父表的列到脱离后的独立表（使用确定性 ID 保证协作同步一致）
+  const colMap = new Map<string, string>();
+  for (const rc of rootCols) {
+    const cid = nextDetId(m, `${childId}:col:${rc.id}`);
+    colMap.set(rc.id, cid);
+    const col: Column = {
+      id: cid,
+      kind: 'column',
+      parent: childId,
+      name: rc.name,
+      pos: rc.pos,
+      type: rc.type,
+      typeRef: rc.typeRef,
+      notNull: rc.notNull,
+      notNullName: null,
+      notNullNameMode: 'derived',
+      default: rc.default ? structuredClone(rc.default) : null,
+      identity: null, // PG 子分区不继承 attidentity
+      generated: rc.generated ? structuredClone(rc.generated) : null,
+      collation: rc.collation,
+      comment: null,
+    };
+    m.objects[cid] = col;
+  }
+
+  // 先将子表已有本地约束/索引及后代分区键的列引用映射到新物化的列 ID
+  remapColRefsOnTable(m, childId, colMap);
+  const childTree = new Set([childId, ...partitionDescendants(m, childId).map((d) => d.id)]);
+  for (const o of all(m, 'opaque')) {
+    if (childTree.has(o.parent) && o.deps.some((d) => colMap.has(d))) {
+      o.deps = [...new Set(o.deps.map((d) => colMap.get(d) ?? d))];
+    }
+  }
+
+  // 物化父表/祖先表上由 PG DETACH 自动转正为独立对象的约束与索引
+  const mapCol = (c: string) => colMap.get(c) ?? c;
+  for (const anc of ancestors) {
+    for (const pk of childrenOf(m, anc.id, 'primaryKey')) {
+      if (childrenOf(m, childId, 'primaryKey').length > 0) continue;
+      const pid = nextDetId(m, `${childId}:con:${pk.id}`);
+      m.objects[pid] = {
+        id: pid,
+        kind: 'primaryKey',
+        parent: childId,
+        name: '',
+        nameMode: 'derived',
+        columns: pk.columns.map(mapCol),
+        comment: null,
+      };
+    }
+    for (const u of childrenOf(m, anc.id, 'unique')) {
+      const uid = nextDetId(m, `${childId}:con:${u.id}`);
+      m.objects[uid] = {
+        id: uid,
+        kind: 'unique',
+        parent: childId,
+        name: '',
+        nameMode: 'derived',
+        columns: u.columns.map(mapCol),
+        nullsNotDistinct: u.nullsNotDistinct,
+        comment: null,
+      };
+    }
+    for (const ck of childrenOf(m, anc.id, 'check')) {
+      if (childrenOf(m, childId, 'check').some((x) => x.name === ck.name)) continue;
+      const cid = nextDetId(m, `${childId}:con:${ck.id}`);
+      m.objects[cid] = {
+        id: cid,
+        kind: 'check',
+        parent: childId,
+        name: ck.name,
+        nameMode: 'explicit',
+        expr: ck.expr,
+        noInherit: false,
+        comment: null,
+      };
+    }
+    for (const fk of childrenOf(m, anc.id, 'foreignKey')) {
+      if (childrenOf(m, childId, 'foreignKey').some((x) => x.name === fk.name)) continue;
+      const fid = nextDetId(m, `${childId}:con:${fk.id}`);
+      m.objects[fid] = {
+        id: fid,
+        kind: 'foreignKey',
+        parent: childId,
+        name: fk.name,
+        nameMode: 'explicit',
+        columns: fk.columns.map(mapCol),
+        refTable: fk.refTable,
+        refColumns: [...fk.refColumns],
+        onDelete: fk.onDelete,
+        onUpdate: fk.onUpdate,
+        match: fk.match,
+        deferrable: fk.deferrable,
+        initiallyDeferred: fk.initiallyDeferred,
+        comment: null,
+      };
+    }
+    for (const idx of childrenOf(m, anc.id, 'index')) {
+      const iid = nextDetId(m, `${childId}:idx:${idx.id}`);
+      m.objects[iid] = {
+        id: iid,
+        kind: 'index',
+        parent: childId,
+        name: '',
+        nameMode: 'derived',
+        unique: idx.unique,
+        method: idx.method,
+        elements: idx.elements.map((e) => ({ ...e, column: e.column ? mapCol(e.column) : null })),
+        include: idx.include.map(mapCol),
+        where: idx.where,
+        nullsNotDistinct: idx.nullsNotDistinct,
+        comment: null,
+      };
+    }
+  }
+
+  refreshDerivedNames(m, childId);
 };
 
 // ───── 列 ─────
@@ -427,6 +810,7 @@ export interface ColumnSpec {
 
 export const addColumn = (m: Model, table: string, spec: ColumnSpec): string => {
   const t = get(m, table, 'table');
+  assertNotPartitionChild(m, table);
   const cols = columnsOf(m, table);
   if (cols.some((c) => c.name === spec.name)) throw new EditError(`列 ${spec.name} 已存在`);
   let pos: string;
@@ -477,17 +861,21 @@ const identityType = (type: string): SequenceOptions['type'] =>
 
 export const renameColumn = (m: Model, id: string, name: string) => {
   const c = get(m, id, 'column');
+  assertNotPartitionChild(m, c.parent);
   if (columnsOf(m, c.parent).some((x) => x.name === name && x.id !== id))
     throw new EditError(`列 ${name} 已存在`);
   const old = c.name;
   c.name = name;
-  // 同表表达式里对这一列的引用一起改写
-  const table = get(m, c.parent, 'table');
-  if (table.partitionBy && typeof table.partitionBy !== 'string') {
-    for (const k of table.partitionBy.keys) if (k.expr) k.expr = renameInExpr(k.expr, old, name);
+  // 同表及所有后代子分区表达式里对这一列的引用一起改写
+  const affected = new Set([c.parent, ...partitionDescendants(m, c.parent).map((d) => d.id)]);
+  for (const tid of affected) {
+    const table = get(m, tid, 'table');
+    if (table.partitionBy && typeof table.partitionBy !== 'string') {
+      for (const k of table.partitionBy.keys) if (k.expr) k.expr = renameInExpr(k.expr, old, name);
+    }
   }
   for (const o of Object.values(m.objects)) {
-    if (!('parent' in o) || o.parent !== c.parent) continue;
+    if (!('parent' in o) || !affected.has(o.parent)) continue;
     if (o.kind === 'check') o.expr = renameInExpr(o.expr, old, name);
     if (o.kind === 'index') {
       for (const e of o.elements) if (e.expr) e.expr = renameInExpr(e.expr, old, name);
@@ -498,20 +886,15 @@ export const renameColumn = (m: Model, id: string, name: string) => {
       if (o.default && 'expr' in o.default) o.default.expr = renameInExpr(o.default.expr, old, name);
     }
   }
-  refreshDerivedNames(m, c.parent);
+  for (const tid of affected) refreshDerivedNames(m, tid);
 };
 
 /** 删列：依赖它的约束、索引、外键、生成列、属于它的序列一并删除 */
 export const dropColumn = (m: Model, id: string) => {
   const c = get(m, id, 'column');
-  const table = get(m, c.parent, 'table');
-  if (
-    table.partitionBy &&
-    typeof table.partitionBy !== 'string' &&
-    table.partitionBy.keys.some((k) => k.column === id || (!!k.expr && exprReferences(k.expr, c.name)))
-  ) {
-    throw new EditError(`列 ${c.name} 被分区键引用，不能删除`);
-  }
+  assertNotPartitionChild(m, c.parent);
+  assertNotPartitionKeyCol(m, id, '删除');
+  const affected = new Set([c.parent, ...partitionDescendants(m, c.parent).map((d) => d.id)]);
   const uses = (o: Obj): boolean => {
     switch (o.kind) {
       case 'primaryKey':
@@ -520,10 +903,10 @@ export const dropColumn = (m: Model, id: string) => {
       case 'foreignKey':
         return o.columns.includes(id) || o.refColumns.includes(id);
       case 'check':
-        return o.parent === c.parent && exprReferences(o.expr, c.name);
+        return affected.has(o.parent) && exprReferences(o.expr, c.name);
       case 'index':
         return (
-          o.parent === c.parent &&
+          affected.has(o.parent) &&
           (o.elements.some((e) => e.column === id || (e.expr && exprReferences(e.expr, c.name))) ||
             o.include.includes(id) ||
             (!!o.where && exprReferences(o.where, c.name)))
@@ -549,6 +932,8 @@ export const dropColumn = (m: Model, id: string) => {
 
 export const setColumnType = (m: Model, id: string, type: string, typeRef: string | null = null) => {
   const c = get(m, id, 'column');
+  assertNotPartitionChild(m, c.parent);
+  assertNotPartitionKeyCol(m, id, '修改类型');
   if (typeRef) get(m, typeRef, 'enum');
   c.type = type;
   c.typeRef = typeRef;
@@ -557,6 +942,7 @@ export const setColumnType = (m: Model, id: string, type: string, typeRef: strin
 
 export const setNotNull = (m: Model, id: string, notNull: boolean) => {
   const c = get(m, id, 'column');
+  assertNotPartitionChild(m, c.parent);
   if (!notNull) {
     if (c.identity) throw new EditError('identity 列必须 NOT NULL');
     if (all(m, 'primaryKey').some((k) => k.columns.includes(id))) throw new EditError('主键列必须 NOT NULL');
@@ -569,6 +955,7 @@ export const setNotNull = (m: Model, id: string, notNull: boolean) => {
 
 export const setDefault = (m: Model, id: string, def: ColumnDefault | null) => {
   const c = get(m, id, 'column');
+  assertNotPartitionChild(m, c.parent);
   if (def && (c.identity || c.generated)) throw new EditError('identity 列和生成列不能有默认值');
   if (def && 'nextval' in def) get(m, def.nextval, 'sequence');
   c.default = def;
@@ -576,6 +963,7 @@ export const setDefault = (m: Model, id: string, def: ColumnDefault | null) => {
 
 export const setIdentity = (m: Model, id: string, identity: { always: boolean } | null) => {
   const c = get(m, id, 'column');
+  assertNotPartitionChild(m, c.parent);
   if (!identity) {
     c.identity = null;
     return;
@@ -606,6 +994,7 @@ export const setIdentity = (m: Model, id: string, identity: { always: boolean } 
 
 export const moveColumn = (m: Model, id: string, before: string | null) => {
   const c = get(m, id, 'column');
+  assertNotPartitionChild(m, c.parent);
   if (before === id) return;
   const cols = columnsOf(m, c.parent).filter((x) => x.id !== id);
   let i = before ? cols.findIndex((x) => x.id === before) : -1;
@@ -624,11 +1013,18 @@ const keyBase = (table: string, id = newId()) => ({
 });
 const checkCols = (m: Model, table: string, cols: string[]) => {
   if (!cols.length) throw new EditError('至少需要一列');
-  for (const c of cols) if (get(m, c, 'column').parent !== table) throw new EditError('列不属于这张表');
+  const root = rootTableId(m, table);
+  for (const c of cols) {
+    const col = get(m, c, 'column');
+    if (col.parent !== table && col.parent !== root) throw new EditError('列不属于这张表');
+  }
 };
 
 export const addPrimaryKey = (m: Model, table: string, columns: string[], id = newId()): string => {
   checkCols(m, table, columns);
+  const t = get(m, table, 'table');
+  if (t.partitionBy && typeof t.partitionBy !== 'string')
+    assertPartitionConstraintCompat(t.partitionBy, 'primaryKey', columns);
   if (childrenOf(m, table, 'primaryKey').length) throw new EditError('表已有主键');
   for (const c of columns) {
     const col = get(m, c, 'column');
@@ -640,6 +1036,7 @@ export const addPrimaryKey = (m: Model, table: string, columns: string[], id = n
   const o: PrimaryKey = { ...keyBase(table, id), kind: 'primaryKey', columns };
   m.objects[o.id] = o;
   refreshDerivedNames(m, table);
+  if (t.partitionOf) refreshDerivedNames(m, rootTableId(m, table));
   return o.id;
 };
 
@@ -651,16 +1048,20 @@ export const addUnique = (
   id = newId(),
 ): string => {
   checkCols(m, table, columns);
+  const t = get(m, table, 'table');
+  if (t.partitionBy && typeof t.partitionBy !== 'string')
+    assertPartitionConstraintCompat(t.partitionBy, 'unique', columns);
   const o: Unique = { ...keyBase(table, id), kind: 'unique', columns, nullsNotDistinct };
   m.objects[o.id] = o;
   refreshDerivedNames(m, table);
   return o.id;
 };
 
-export const addCheck = (m: Model, table: string, expr: string, id = newId()): string => {
-  get(m, table, 'table');
+export const addCheck = (m: Model, table: string, expr: string, id = newId(), noInherit = false): string => {
+  const t = get(m, table, 'table');
+  if (noInherit && t.partitionBy !== null) throw new EditError('分区父表的 CHECK 约束不能设为 NO INHERIT');
   checkExprColumns(m, table, expr);
-  const o: Check = { ...keyBase(table, id), kind: 'check', expr, noInherit: false };
+  const o: Check = { ...keyBase(table, id), kind: 'check', expr, noInherit };
   m.objects[o.id] = o;
   refreshDerivedNames(m, table);
   return o.id;
@@ -705,7 +1106,24 @@ export const addIndex = (
   opts: Partial<Pick<Index, 'unique' | 'method' | 'include' | 'where' | 'nullsNotDistinct'>> = {},
   id = newId(),
 ): string => {
-  get(m, table, 'table');
+  const t = get(m, table, 'table');
+  const fullElements: IndexElement[] = elements.map((e) => ({
+    column: null,
+    expr: null,
+    desc: false,
+    nullsFirst: null,
+    opclass: null,
+    collation: null,
+    ...e,
+  }));
+  const elCols = fullElements.flatMap((e) => (e.column ? [e.column] : []));
+  if (elCols.length) checkCols(m, table, elCols);
+  if (opts.include?.length) checkCols(m, table, opts.include);
+  for (const e of fullElements) if (e.expr) checkExprColumns(m, table, e.expr);
+  if (opts.where) checkExprColumns(m, table, opts.where);
+  if (opts.unique && t.partitionBy && typeof t.partitionBy !== 'string') {
+    assertPartitionConstraintCompat(t.partitionBy, 'index', [], fullElements);
+  }
   const o: Index = {
     ...keyBase(table, id),
     kind: 'index',
@@ -715,15 +1133,7 @@ export const addIndex = (
     where: null,
     nullsNotDistinct: false,
     ...opts,
-    elements: elements.map((e) => ({
-      column: null,
-      expr: null,
-      desc: false,
-      nullsFirst: null,
-      opclass: null,
-      collation: null,
-      ...e,
-    })),
+    elements: fullElements,
   };
   m.objects[o.id] = o;
   refreshDerivedNames(m, table);

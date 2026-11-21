@@ -32,7 +32,7 @@ const subscribe = (fn: () => void) => {
 export const setCurrentTables = (pid: string, model: Model) => {
   const tables: TableEntry[] = [];
   for (const o of Object.values(model.objects)) {
-    if (o.kind !== 'table') continue;
+    if (o.kind !== 'table' || o.partitionOf !== null) continue;
     const parent = model.objects[o.parent];
     tables.push({ id: o.id, name: o.name, schema: parent?.kind === 'schema' ? parent.name : '' });
   }

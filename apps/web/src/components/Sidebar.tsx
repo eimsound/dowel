@@ -1,11 +1,12 @@
-// 左侧对象树：搜索 + 表、枚举、序列、其他（不透明）对象，可折叠。分区子表不单独列出（DESIGN.md：Layout）。
-import { all, type Model } from '@dowel/core';
+// 左侧对象树：搜索 + 表（分区父表支持展开查看子分区）、枚举、序列、其他（不透明）对象，可折叠（DESIGN.md：Layout）。
+import { all, type Model, partitionsOf, resolvePartitionBy, type Table } from '@dowel/core';
 import {
   ChevronDown,
   ChevronRight,
   Eye,
   FileCode,
   Hash,
+  Layers,
   List,
   Search,
   SquareFunction,
@@ -81,21 +82,40 @@ export const Sidebar = ({
 }) => {
   const { t } = useTranslation();
   const [q, setQ] = useState('');
+  const [expanded, setExpanded] = useState<Record<string, boolean>>({});
   const schemaName = (id: string) => model.objects[id]?.name ?? '';
   const qname = (o: { parent: string; name: string }) =>
     schemaName(o.parent) === 'public' ? o.name : `${schemaName(o.parent)}.${o.name}`;
   const byName = <T extends { name: string }>(xs: T[]) =>
     [...xs].sort((a, b) => a.name.localeCompare(b.name));
   const match = (s: string) => !q || s.toLowerCase().includes(q.trim().toLowerCase());
-  const groups = [
-    {
-      title: t('ws.tables'),
-      items: byName(all(model, 'table').filter((x) => !x.partitionOf)).map((x) => ({
-        id: x.id,
-        label: qname(x),
-        icon: <Table2 size={16} aria-hidden="true" />,
-      })),
-    },
+  const strategyLabel = (tb: Table): string | null => {
+    if (!tb.partitionBy) return null;
+    const spec = resolvePartitionBy(model, tb);
+    if (spec) return spec.strategy.toUpperCase();
+    return typeof tb.partitionBy === 'string'
+      ? (tb.partitionBy.trim().split(/\s+/)[0]?.toUpperCase() ?? null)
+      : null;
+  };
+  const rootTables = byName(all(model, 'table').filter((x) => !x.partitionOf)).map((x) => {
+    const children = byName(partitionsOf(model, x.id));
+    const strat = strategyLabel(x);
+    return {
+      table: x,
+      label: qname(x),
+      strat,
+      children: children.map((ch) => ({ table: ch, label: qname(ch) })),
+    };
+  });
+  const filteredTables = rootTables
+    .map((entry) => {
+      const parentMatched = match(entry.label);
+      const matchedChildren = parentMatched ? entry.children : entry.children.filter((ch) => match(ch.label));
+      if (!parentMatched && matchedChildren.length === 0) return null;
+      return { ...entry, visibleChildren: matchedChildren, forceExpand: !parentMatched && !!q };
+    })
+    .filter((x): x is NonNullable<typeof x> => x !== null);
+  const otherGroups = [
     {
       title: t('ws.enums'),
       items: byName(all(model, 'enum')).map((x) => ({
@@ -135,7 +155,78 @@ export const Sidebar = ({
         />
       </label>
       <ul className="min-h-0 flex-1 list-none overflow-auto px-1.5 pb-3">
-        {groups.map(
+        {filteredTables.length > 0 && (
+          <Group title={t('ws.tables')} count={filteredTables.length}>
+            {filteredTables.map(({ table, label, strat, children, visibleChildren, forceExpand }) => {
+              if (!strat) {
+                return (
+                  <Item
+                    key={table.id}
+                    label={label}
+                    icon={<Table2 size={16} aria-hidden="true" />}
+                    active={table.id === selected}
+                    onClick={() => onSelect(table.id)}
+                  />
+                );
+              }
+              const isOpen = forceExpand || !!expanded[table.id];
+              const hasChildren = visibleChildren.length > 0;
+              return (
+                <li key={table.id}>
+                  <div className="flex h-[var(--row-h)] items-center">
+                    {hasChildren ? (
+                      <button
+                        type="button"
+                        aria-expanded={isOpen}
+                        aria-label={t('part.togglePartitions', { name: table.name })}
+                        onClick={() => setExpanded((prev) => ({ ...prev, [table.id]: !isOpen }))}
+                        className="flex size-[22px] shrink-0 items-center justify-center rounded-sm text-text-3 hover:bg-surface-hover hover:text-text-2"
+                      >
+                        {isOpen ? (
+                          <ChevronDown size={13} aria-hidden="true" />
+                        ) : (
+                          <ChevronRight size={13} aria-hidden="true" />
+                        )}
+                      </button>
+                    ) : (
+                      <span className="w-[22px] shrink-0" aria-hidden="true" />
+                    )}
+                    <button
+                      type="button"
+                      onClick={() => onSelect(table.id)}
+                      aria-current={table.id === selected ? 'true' : undefined}
+                      className="flex h-full min-w-0 flex-1 items-center gap-2 rounded-sm pr-2 pl-0.5 text-left font-mono text-sm text-text-2 transition-colors hover:bg-surface-hover aria-[current]:bg-primary-soft aria-[current]:font-medium aria-[current]:text-primary-text [&>svg]:text-text-3 aria-[current]:[&>svg]:text-primary-text"
+                    >
+                      <Table2 size={16} aria-hidden="true" />
+                      <span className="min-w-0 flex-1 truncate">{label}</span>
+                      <span className="shrink-0 font-mono text-[11px] text-text-3">
+                        {strat} · {children.length}
+                      </span>
+                    </button>
+                  </div>
+                  {hasChildren && isOpen && (
+                    <ul className="list-none p-0">
+                      {visibleChildren.map((ch) => (
+                        <li key={ch.table.id}>
+                          <button
+                            type="button"
+                            onClick={() => onSelect(ch.table.id)}
+                            aria-current={ch.table.id === selected ? 'true' : undefined}
+                            className="flex h-[26px] w-full items-center gap-1.5 rounded-sm pr-2 pl-[38px] text-left font-mono text-xs text-text-3 transition-colors hover:bg-surface-hover hover:text-text-2 aria-[current]:bg-primary-soft aria-[current]:text-primary-text"
+                          >
+                            <Layers size={12} aria-hidden="true" className="shrink-0" />
+                            <span className="min-w-0 flex-1 truncate">{ch.label}</span>
+                          </button>
+                        </li>
+                      ))}
+                    </ul>
+                  )}
+                </li>
+              );
+            })}
+          </Group>
+        )}
+        {otherGroups.map(
           (g) =>
             g.items.length > 0 && (
               <Group key={g.title} title={g.title} count={g.items.length}>
@@ -152,7 +243,7 @@ export const Sidebar = ({
               </Group>
             ),
         )}
-        {q && groups.every((g) => !g.items.length) && (
+        {q && filteredTables.length === 0 && otherGroups.every((g) => !g.items.length) && (
           <li className="px-2 py-4 text-center text-sm text-text-3">{t('ws.noMatch')}</li>
         )}
       </ul>

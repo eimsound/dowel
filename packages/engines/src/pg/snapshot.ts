@@ -3,7 +3,7 @@
 //
 // schema 范围（P3）：`readSnapshot(db, only)` 只读给定的 schema，在 SQL 层面就过滤掉，
 // 不读出来再丢弃；`dowel` 是 Dowel 自己的迁移历史 schema（ADR 0003），永远不读。（引擎层写死）
-import { literal } from '@dowel/core';
+import { literal, splitTopLevel } from '@dowel/core';
 
 import { type Db, pinSession } from './db.ts';
 import { type OpaqueSnap, readOpaques } from './opaque.ts';
@@ -65,6 +65,16 @@ export interface IdxSnap {
   nullsNotDistinct: boolean;
   comment: string | null;
 }
+export interface PartitionKeySnap {
+  column: string | null;
+  expr: string | null;
+  opclass: string | null;
+  collation: string | null;
+}
+export interface PartitionSpecSnap {
+  strategy: 'range' | 'list' | 'hash';
+  keys: PartitionKeySnap[];
+}
 export interface TableSnap {
   schema: string;
   name: string;
@@ -74,6 +84,7 @@ export interface TableSnap {
   constraints: Record<string, ConSnap>;
   indexes: Record<string, IdxSnap>;
   partitionBy: string | null;
+  partitionSpec: PartitionSpecSnap | null;
   partitionOf: { parent: string; bound: string } | null;
 }
 export interface Snapshot {
@@ -248,6 +259,7 @@ export const readSnapshot = async (db: Db, only?: string[] | null): Promise<Snap
       constraints: {},
       indexes: {},
       partitionBy: r.partBy,
+      partitionSpec: null,
       partitionOf: null,
     };
     snap.tables[key(r.schema, r.name)] = t;
@@ -283,7 +295,8 @@ export const readSnapshot = async (db: Db, only?: string[] | null): Promise<Snap
               where e.typtype = 'e' and (e.oid = t.oid or e.oid = t.typelem)) as "enumType",
             a.attnotnull as "notNull",
             (select k.conname from pg_constraint k
-              where k.conrelid = a.attrelid and k.contype = 'n' and k.conkey[1] = a.attnum) as "notNullName",
+              where k.conrelid = a.attrelid and k.contype = 'n' and k.conkey[1] = a.attnum
+                and k.conislocal and k.coninhcount = 0 and k.conparentid = 0) as "notNullName",
             pg_get_expr(d.adbin, d.adrelid) as default,
             a.attidentity::text as identity, a.attgenerated::text as generated,
             case when a.attcollation <> t.typcollation
@@ -318,6 +331,69 @@ export const readSnapshot = async (db: Db, only?: string[] | null): Promise<Snap
   const names = (rel: number, attnums: number[] | null) =>
     (attnums ?? []).map((n) => colName.get(`${rel}:${n}`)!);
 
+  const collCache = new Map<number, string | null>();
+  const collName = async (oid: number): Promise<string | null> => {
+    if (collCache.has(oid)) return collCache.get(oid)!;
+    const n =
+      (
+        await db.query<{ n: string }>(
+          `select quote_ident(n.nspname) || '.' || quote_ident(c.collname) as n
+             from pg_collation c join pg_namespace n on n.oid = c.collnamespace where c.oid = $1`,
+          [oid],
+        )
+      )[0]?.n ?? null;
+    collCache.set(oid, n);
+    return n;
+  };
+
+  // 分区表结构化分区键（pg_partitioned_table）
+  const PART_STRAT: Record<string, PartitionSpecSnap['strategy']> = { r: 'range', l: 'list', h: 'hash' };
+  for (const r of await db.query<{
+    rel: number;
+    strat: string;
+    natts: number;
+    attrs: number[];
+    opclasses: (string | null)[];
+    colls: number[];
+    colColls: number[];
+    exprs: string | null;
+  }>(
+    `select pt.partrelid::int as rel, pt.partstrat::text as strat, pt.partnatts::int as natts,
+            pt.partattrs::int2[]::int[] as attrs,
+            array(select case when opc.opcdefault then null
+                              else quote_ident(on_.nspname) || '.' || quote_ident(opc.opcname) end
+                    from unnest(pt.partclass::oid[]) with ordinality u(oid, ord)
+                    join pg_opclass opc on opc.oid = u.oid join pg_namespace on_ on on_.oid = opc.opcnamespace
+                   order by u.ord) as opclasses,
+            pt.partcollation::oid[]::int[] as colls,
+            array(select coalesce((select a.attcollation from pg_attribute a
+                                    where a.attrelid = pt.partrelid and a.attnum = u.k), 0)::int
+                    from unnest(pt.partattrs::int2[]) with ordinality u(k, ord) order by u.ord) as "colColls",
+            pg_get_expr(pt.partexprs, pt.partrelid) as exprs
+       from pg_partitioned_table pt
+       join pg_class c on c.oid = pt.partrelid join pg_namespace n on n.oid = c.relnamespace
+      where c.relkind = 'p' and ${ns} and ${NOT_EXT('pg_class', 'c.oid')}`,
+  )) {
+    const t = tableByOid.get(r.rel);
+    const strategy = PART_STRAT[r.strat];
+    if (!t || !strategy) continue;
+    const exprList = r.exprs ? splitTopLevel(r.exprs) : [];
+    let exprIdx = 0;
+    const keys: PartitionKeySnap[] = [];
+    for (let k = 0; k < r.natts; k++) {
+      const attnum = r.attrs[k]!;
+      const coll = r.colls[k]!;
+      const defaultColl = attnum ? r.colColls[k]! : 100; // 100 = default 排序规则
+      keys.push({
+        column: attnum ? colName.get(`${r.rel}:${attnum}`)! : null,
+        expr: attnum ? null : (exprList[exprIdx++] ?? ''),
+        opclass: r.opclasses[k] ?? null,
+        collation: coll && coll !== defaultColl ? await collName(coll) : null,
+      });
+    }
+    t.partitionSpec = { strategy, keys };
+  }
+
   // 约束（不含 NOT NULL，它已经并入列）
   for (const r of await db.query<{
     rel: number;
@@ -346,9 +422,9 @@ export const readSnapshot = async (db: Db, only?: string[] | null): Promise<Snap
             obj_description(k.oid, 'pg_constraint') as comment
        from pg_constraint k join pg_class c on c.oid = k.conrelid join pg_namespace n on n.oid = c.relnamespace
       where k.contype in ('p', 'u', 'f', 'c') and c.relkind in ('r', 'p') and ${ns}
-        and k.conislocal and k.conparentid = 0`,
+        and k.conislocal and k.coninhcount = 0 and k.conparentid = 0`,
   )) {
-    // 分区子表上从父表继承来的约束（conislocal 为假或 conparentid 非 0）建子表时自动产生，不读
+    // 分区子表上从父表继承来的约束（含 ATTACH 吸收后 conislocal 仍为真但 coninhcount > 0 的 CHECK）建子表/挂载时自动产生，不读
     const t = tableByOid.get(r.rel);
     if (!t) continue;
     const ref = r.type === 'f' ? tableByOid.get(r.refRel)! : null;
@@ -407,14 +483,6 @@ export const readSnapshot = async (db: Db, only?: string[] | null): Promise<Snap
   )) {
     const t = tableByOid.get(r.rel);
     if (!t) continue;
-    const collName = async (oid: number) =>
-      (
-        await db.query<{ n: string }>(
-          `select quote_ident(n.nspname) || '.' || quote_ident(c.collname) as n
-             from pg_collation c join pg_namespace n on n.oid = c.collnamespace where c.oid = $1`,
-          [oid],
-        )
-      )[0]?.n ?? null;
     const elements: IdxElemSnap[] = [];
     for (let k = 0; k < r.nkey; k++) {
       const attnum = r.keys[k]!;
@@ -454,7 +522,7 @@ export const normalize = (s: Snapshot): unknown => {
     if (x && typeof x === 'object')
       return Object.fromEntries(
         Object.keys(x)
-          .filter((k) => k !== 'attnum' && k !== 'version' && k !== 'order')
+          .filter((k) => k !== 'attnum' && k !== 'version' && k !== 'order' && k !== 'inherited')
           .sort()
           .map((k) => [k, sort((x as Record<string, unknown>)[k])]),
       );

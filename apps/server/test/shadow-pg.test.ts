@@ -1,7 +1,16 @@
 // 真实 PG 上的影子库行为：analyze 出错后连接要恢复干净、非事务步骤不挡住风险分析、
 // 影子库常驻连接出问题时要丢掉（锁随连接释放）、建 / 认领影子库时的错误分类。
 // 需要测试 PG（Testcontainers 或 DOWEL_TEST_PG），没有 Docker 时跳过。
-import { addColumn, createSchema, createTable, emptyModel, type Model } from '@dowel/core';
+import {
+  addColumn,
+  createPartition,
+  createSchema,
+  createTable,
+  emptyModel,
+  type Model,
+  setPartitionBy,
+  type Table,
+} from '@dowel/core';
 import { analyze, InstanceLevelStatementError, NON_TRANSACTIONAL_NOTE, StepError } from '@dowel/verifier';
 import { afterAll, beforeAll, describe, expect, test, vi } from 'vitest';
 
@@ -320,6 +329,54 @@ describe.skipIf(!PG_URL)('pgShadow（真实 PG）', () => {
       await shadow.close();
       await admin.db.exec(`DROP DATABASE IF EXISTS ${dbName}`);
       await admin.close();
+    }
+  });
+
+  test('canonicalize：规范化分区边界字面量与表达式分区键', async () => {
+    const shadow = pgShadow(shadowDb.url);
+    try {
+      const m = emptyModel();
+      const pub = createSchema(m, 'public', 's-pub');
+      const events = createTable(m, pub, 'events', 't-events');
+      const atCol = addColumn(m, events, {
+        name: 'created_at',
+        type: 'timestamp with time zone',
+        notNull: true,
+        id: 'c-at',
+      });
+      setPartitionBy(m, events, {
+        strategy: 'range',
+        keys: [{ column: atCol, expr: null, opclass: null, collation: null }],
+      });
+      const child = createPartition(
+        m,
+        events,
+        'events_2025',
+        "FOR VALUES FROM ('2025-01-01') TO ('2026-01-01')",
+        't-events-2025',
+      );
+      const tags = createTable(m, pub, 'tags', 't-tags');
+      addColumn(m, tags, { name: 'code', type: 'text', notNull: true, id: 'c-code' });
+      setPartitionBy(m, tags, {
+        strategy: 'list',
+        keys: [{ column: null, expr: 'LOWER(code)', opclass: null, collation: null }],
+      });
+      createPartition(m, tags, 'tags_a', "FOR VALUES IN ('a')", 't-tags-a');
+
+      const changed = await shadow.canonicalize(emptyModel(), m);
+      const canonChild = changed.find((o): o is Table => o.kind === 'table' && o.id === child);
+      expect(canonChild?.partitionOf?.bound).toBe(
+        "FOR VALUES FROM ('2025-01-01 00:00:00+00') TO ('2026-01-01 00:00:00+00')",
+      );
+      const canonTags = changed.find((o): o is Table => o.kind === 'table' && o.id === tags);
+      expect(
+        canonTags?.partitionBy && typeof canonTags.partitionBy !== 'string'
+          ? canonTags.partitionBy.keys[0]?.expr
+          : null,
+      ).toBe('lower(code)');
+      expect(await lockIsFree()).toBe(true);
+    } finally {
+      await shadow.close();
     }
   });
 });

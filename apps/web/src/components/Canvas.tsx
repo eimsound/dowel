@@ -1,5 +1,5 @@
 // 画布：每张表一个节点（DESIGN.md：画布），外键连线连到具体的列行；拖动后同步位置。
-import { all, columnsOf, type Model, type Table } from '@dowel/core';
+import { all, columnsOf, type Model, partitionKeyColumns, resolvePartitionBy, type Table } from '@dowel/core';
 import {
   Background,
   BackgroundVariant,
@@ -33,8 +33,16 @@ type Col = {
   isEnum: boolean;
   key: 'PK' | 'FK' | 'UQ' | '';
   notNull: boolean;
+  isPartKey: boolean;
 };
-type TableData = { table: Table; schema: string; columns: Col[]; partitions: number; selected: boolean };
+type TableData = {
+  table: Table;
+  schema: string;
+  columns: Col[];
+  partitions: number;
+  partitionStrategy: string | null;
+  selected: boolean;
+};
 type TableNode = Node<TableData, 'table'>;
 
 const NODE_W = 250;
@@ -54,40 +62,60 @@ const RowHandles = ({ id }: { id: string }) => (
 
 const KEY_CLASS = { PK: 'text-pk', FK: 'text-fk', UQ: 'text-text-3', '': '' };
 
-const TableNodeView = memo(({ data }: NodeProps<TableNode>) => (
-  <div
-    style={{ width: NODE_W }}
-    className={`rounded-md border bg-[var(--node-bg)] font-mono shadow-[var(--shadow-node)] ${
-      data.selected
-        ? 'border-primary shadow-[0_0_0_3px_var(--primary-ring),var(--shadow-node)]'
-        : 'border-[var(--node-border)]'
-    }`}
-  >
+const TableNodeView = memo(({ data }: NodeProps<TableNode>) => {
+  const { t } = useTranslation();
+  const partBadge = data.partitionStrategy
+    ? `${data.partitionStrategy} · ${data.partitions}`
+    : data.partitions > 0
+      ? t('canvas.partitions', { count: data.partitions })
+      : null;
+  return (
     <div
-      style={{ height: HEAD_H }}
-      className="flex items-center gap-[7px] rounded-t-md border-b border-[var(--node-border)] bg-[var(--node-head)] px-2.5 text-base font-semibold"
+      style={{ width: NODE_W }}
+      className={`rounded-md border bg-[var(--node-bg)] font-mono shadow-[var(--shadow-node)] ${
+        data.selected
+          ? 'border-primary shadow-[0_0_0_3px_var(--primary-ring),var(--shadow-node)]'
+          : 'border-[var(--node-border)]'
+      }`}
     >
-      <Table2 size={14} aria-hidden="true" className="text-text-3" />
-      <span className="min-w-0 flex-1 truncate">
-        {data.schema !== 'public' && <span className="font-normal text-text-3">{data.schema}.</span>}
-        {data.table.name}
-      </span>
-      {data.partitions > 0 && <span className="badge font-sans">{data.partitions} 个分区</span>}
-    </div>
-    {data.columns.map((c) => (
-      <div key={c.id} style={{ height: ROW_H }} className="relative flex items-center gap-1.5 px-2.5 text-sm">
-        <RowHandles id={c.id} />
-        <span className={`w-5 text-[10px] font-semibold ${KEY_CLASS[c.key]}`}>{c.key}</span>
+      <div
+        style={{ height: HEAD_H }}
+        className="flex items-center gap-[7px] rounded-t-md border-b border-[var(--node-border)] bg-[var(--node-head)] px-2.5 text-base font-semibold"
+      >
+        <Table2 size={14} aria-hidden="true" className="text-text-3" />
         <span className="min-w-0 flex-1 truncate">
-          {c.name}
-          {!c.notNull && <span className="text-text-3">?</span>}
+          {data.schema !== 'public' && <span className="font-normal text-text-3">{data.schema}.</span>}
+          {data.table.name}
         </span>
-        <span className={`truncate text-xs ${c.isEnum ? 'text-enum' : 'text-text-3'}`}>{c.type}</span>
+        {partBadge && (
+          <span
+            className="badge shrink-0 font-mono"
+            title={t('canvas.partitions', { count: data.partitions })}
+          >
+            {partBadge}
+          </span>
+        )}
       </div>
-    ))}
-    {data.columns.length === 0 && <div style={{ height: ROW_H }} />}
-  </div>
-));
+      {data.columns.map((c) => (
+        <div
+          key={c.id}
+          style={{ height: ROW_H }}
+          className="relative flex items-center gap-1.5 px-2.5 text-sm"
+        >
+          <RowHandles id={c.id} />
+          <span className={`w-5 text-[10px] font-semibold ${KEY_CLASS[c.key]}`}>{c.key}</span>
+          <span className="min-w-0 flex-1 truncate">
+            {c.name}
+            {!c.notNull && <span className="text-text-3">?</span>}
+          </span>
+          {c.isPartKey && <b className="flag shrink-0">PT</b>}
+          <span className={`truncate text-xs ${c.isEnum ? 'text-enum' : 'text-text-3'}`}>{c.type}</span>
+        </div>
+      ))}
+      {data.columns.length === 0 && <div style={{ height: ROW_H }} />}
+    </div>
+  );
+});
 
 const nodeTypes = { table: TableNodeView };
 
@@ -265,26 +293,37 @@ export const Canvas = ({
     // 还没算出位置的表先不画，避免叠在原点
     return tables
       .filter((t) => pos(t.id))
-      .map((t) => ({
-        id: t.id,
-        type: 'table',
-        position: pos(t.id)!,
-        selected: t.id === selected,
-        data: {
-          table: t,
-          schema: model.objects[t.parent]?.name ?? '',
-          columns: columnsOf(model, t.id).map((c) => ({
-            id: c.id,
-            name: c.name,
-            type: shortType(typeLabel(model, c)),
-            isEnum: !!c.typeRef,
-            key: pkCols.has(c.id) ? 'PK' : fkCols.has(c.id) ? 'FK' : uqCols.has(c.id) ? 'UQ' : '',
-            notNull: c.notNull || pkCols.has(c.id),
-          })),
-          partitions: parts.get(t.id) ?? 0,
+      .map((t) => {
+        const partSpec = t.partitionBy ? resolvePartitionBy(model, t) : null;
+        const partStrategy = partSpec
+          ? partSpec.strategy.toUpperCase()
+          : typeof t.partitionBy === 'string'
+            ? (t.partitionBy.trim().split(/\s+/)[0]?.toUpperCase() ?? null)
+            : null;
+        const partKeySet = new Set(t.partitionBy ? partitionKeyColumns(model, t).all : []);
+        return {
+          id: t.id,
+          type: 'table',
+          position: pos(t.id)!,
           selected: t.id === selected,
-        },
-      }));
+          data: {
+            table: t,
+            schema: model.objects[t.parent]?.name ?? '',
+            columns: columnsOf(model, t.id).map((c) => ({
+              id: c.id,
+              name: c.name,
+              type: shortType(typeLabel(model, c)),
+              isEnum: !!c.typeRef,
+              key: pkCols.has(c.id) ? 'PK' : fkCols.has(c.id) ? 'FK' : uqCols.has(c.id) ? 'UQ' : '',
+              notNull: c.notNull || pkCols.has(c.id),
+              isPartKey: partKeySet.has(c.id),
+            })),
+            partitions: parts.get(t.id) ?? 0,
+            partitionStrategy: partStrategy,
+            selected: t.id === selected,
+          },
+        };
+      });
   }, [model, tables, pos, selected]);
 
   const edges: Edge[] = useMemo(() => {

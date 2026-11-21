@@ -8,6 +8,7 @@ export * from './mutators.ts';
 export * from './pg/capabilities.ts';
 export * from './pg/naming.ts';
 export * from './pg/nontx.ts';
+export * from './pg/partition.ts';
 export { createAll, PlanError, plan, type Step } from './pg/plan.ts';
 export * from './pg/quote.ts';
 export * from './pg/types.ts';

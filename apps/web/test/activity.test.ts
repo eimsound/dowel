@@ -1,7 +1,8 @@
-// 审计动作文案与画布历史操作名 i18n 覆盖测试（#33）。
 import { readFileSync } from 'node:fs';
 import { resolve } from 'node:path';
 
+// 审计动作文案与画布历史操作名 i18n 覆盖测试（#33）。
+import { mutators } from '@dowel/core';
 import { afterEach, expect, test } from 'vitest';
 
 import { actionText } from '../src/activity.ts';
@@ -42,6 +43,15 @@ test('hist.op.edit 在中英文下均有对应文案', async () => {
   await i18n.changeLanguage('en');
   expect(i18n.exists('hist.op.edit')).toBe(true);
   expect(i18n.t('hist.op.edit')).toBe('Edit model');
+});
+
+test('所有 core mutators 在 zh / en 的 hist.op 词典中均有文案', async () => {
+  for (const lng of ['zh', 'en'] as const) {
+    await i18n.changeLanguage(lng);
+    for (const op of Object.keys(mutators)) {
+      expect(i18n.exists(`hist.op.${op}`, { lng }), `${lng}: 缺少 hist.op.${op}`).toBe(true);
+    }
+  }
 });
 
 test('服务端 audit-coverage 覆盖的全部审计动作在 zh / en 词典中均已登记', async () => {

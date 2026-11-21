@@ -84,18 +84,73 @@ export const importSnapshot = (snap: Snapshot): Model => {
 
   const tableId = new Map<string, string>();
   const columnId = new Map<string, string>(); // "schema.table" + "\0" + 列名
+  const rootKeyOf = (tableKey: string): string => {
+    const seen = new Set<string>();
+    let cur = tableKey;
+    while (!seen.has(cur)) {
+      seen.add(cur);
+      const t = snap.tables[cur];
+      if (!t?.partitionOf || !(t.partitionOf.parent in snap.tables)) return cur;
+      cur = t.partitionOf.parent;
+    }
+    return cur;
+  };
   for (const [k, t] of Object.entries(snap.tables)) {
     const tid = put({
       id: newId(),
       kind: 'table' as const,
       parent: schemaId.get(t.schema)!,
       name: t.name,
-      partitionBy: t.partitionBy,
+      partitionBy: null as
+        | string
+        | {
+            strategy: 'range' | 'list' | 'hash';
+            keys: {
+              column: string | null;
+              expr: string | null;
+              opclass: string | null;
+              collation: string | null;
+            }[];
+          }
+        | null,
       partitionOf: null as { parent: string; bound: string } | null,
       comment: t.comment,
     }).id;
     tableId.set(k, tid);
-    for (const name of Object.keys(t.columns)) columnId.set(`${k}\u0000${name}`, newId());
+    if (!t.partitionOf) {
+      for (const name of Object.keys(t.columns)) columnId.set(`${k}\u0000${name}`, newId());
+    }
+  }
+  // 分区子表不重复生成列对象：列引用沿 partitionOf 链统一映射到根父表的列 ID
+  for (const [k, t] of Object.entries(snap.tables)) {
+    if (!t.partitionOf) continue;
+    const rk = rootKeyOf(k);
+    for (const name of Object.keys(t.columns)) {
+      const rootCid = columnId.get(`${rk}\u0000${name}`);
+      if (rootCid) columnId.set(`${k}\u0000${name}`, rootCid);
+    }
+  }
+  // 设置分区父表的结构化 partitionBy（优先使用 partitionSpec）以及子分区的 partitionOf
+  for (const [k, t] of Object.entries(snap.tables)) {
+    const o = m.objects[tableId.get(k)!];
+    if (o?.kind !== 'table') continue;
+    if (t.partitionOf) {
+      o.partitionOf = { parent: tableId.get(t.partitionOf.parent)!, bound: t.partitionOf.bound };
+    }
+    if (t.partitionSpec) {
+      const rk = rootKeyOf(k);
+      o.partitionBy = {
+        strategy: t.partitionSpec.strategy,
+        keys: t.partitionSpec.keys.map((pk) => ({
+          column: pk.column ? columnId.get(`${rk}\u0000${pk.column}`)! : null,
+          expr: pk.expr,
+          opclass: pk.opclass,
+          collation: pk.collation,
+        })),
+      };
+    } else if (t.partitionBy) {
+      o.partitionBy = t.partitionBy;
+    }
   }
 
   const seqId = new Map<string, string>();
@@ -122,40 +177,42 @@ export const importSnapshot = (snap: Snapshot): Model => {
     const tid = tableId.get(k)!;
     let pos: string | null = null;
     const col = (name: string) => columnId.get(`${k}\u0000${name}`)!;
-    for (const [name, c] of Object.entries(t.columns).sort((a, b) => a[1].attnum - b[1].attnum)) {
-      pos = generateKeyBetween(pos, null);
-      let def: Column['default'] = null;
-      if (c.default) {
-        const nv = /^nextval\('((?:[^']|'')+)'::regclass\)$/.exec(c.default);
-        const q = nv ? parseQualified(nv[1]!.replaceAll("''", "'")) : null;
-        const sid = q ? seqId.get(`${q[0]}.${q[1]}`) : undefined;
-        def = sid ? { nextval: sid } : { expr: c.default };
+    if (!t.partitionOf) {
+      for (const [name, c] of Object.entries(t.columns).sort((a, b) => a[1].attnum - b[1].attnum)) {
+        pos = generateKeyBetween(pos, null);
+        let def: Column['default'] = null;
+        if (c.default) {
+          const nv = /^nextval\('((?:[^']|'')+)'::regclass\)$/.exec(c.default);
+          const q = nv ? parseQualified(nv[1]!.replaceAll("''", "'")) : null;
+          const sid = q ? seqId.get(`${q[0]}.${q[1]}`) : undefined;
+          def = sid ? { nextval: sid } : { expr: c.default };
+        }
+        put<Column>({
+          id: col(name),
+          kind: 'column',
+          parent: tid,
+          name,
+          pos,
+          type: c.type,
+          typeRef: c.enumType ? enumId.get(c.enumType)! : null,
+          notNull: c.notNull,
+          notNullName: c.notNullName,
+          notNullNameMode: c.notNullName === derivedNames.notNull(t.name, name) ? 'derived' : 'explicit',
+          default: def,
+          identity: c.identity
+            ? {
+                always: c.identity.always,
+                sequenceName: c.identity.sequence,
+                sequenceNameMode:
+                  c.identity.sequence === derivedNames.sequence(t.name, name) ? 'derived' : 'explicit',
+                options: seqOptionsFromSnap(c.identity.options),
+              }
+            : null,
+          generated: c.generated,
+          collation: c.collation,
+          comment: c.comment,
+        });
       }
-      put<Column>({
-        id: col(name),
-        kind: 'column',
-        parent: tid,
-        name,
-        pos,
-        type: c.type,
-        typeRef: c.enumType ? enumId.get(c.enumType)! : null,
-        notNull: c.notNull,
-        notNullName: c.notNullName,
-        notNullNameMode: c.notNullName === derivedNames.notNull(t.name, name) ? 'derived' : 'explicit',
-        default: def,
-        identity: c.identity
-          ? {
-              always: c.identity.always,
-              sequenceName: c.identity.sequence,
-              sequenceNameMode:
-                c.identity.sequence === derivedNames.sequence(t.name, name) ? 'derived' : 'explicit',
-              options: seqOptionsFromSnap(c.identity.options),
-            }
-          : null,
-        generated: c.generated,
-        collation: c.collation,
-        comment: c.comment,
-      });
     }
     for (const [name, k2] of Object.entries(t.constraints)) {
       const base = { id: newId(), parent: tid, name, comment: k2.comment };
@@ -233,14 +290,6 @@ export const importSnapshot = (snap: Snapshot): Model => {
       if (name === derivedNames.index(t.name, indexElementNames(m, idx))) idx.nameMode = 'derived';
     }
   }
-  // 分区子表指向父表
-  for (const [k, t] of Object.entries(snap.tables)) {
-    if (!t.partitionOf) continue;
-    const o = m.objects[tableId.get(k)!];
-    if (o?.kind === 'table')
-      o.partitionOf = { parent: tableId.get(t.partitionOf.parent)!, bound: t.partitionOf.bound };
-  }
-
   // 不透明对象：先分配 ID，再把依赖换算成 ID
   const opaqueId = new Map<string, string>();
   for (const k of Object.keys(snap.opaques)) opaqueId.set(k, newId());

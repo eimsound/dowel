@@ -1,18 +1,32 @@
 // 属性面板（DESIGN.md：属性面板）：编辑选中的表、枚举、序列；不透明对象只读显示 DDL。
 // 输入框是“草稿”：获得焦点时记下所依据对象的版本，保存时一并提交——期间别人改过这些对象，保存会被拒绝（04-ir-design.md 2.3）。
+import type { MigrationResult, VersionInfo } from '@dowel/api';
 import {
   all,
   COMMON_TYPES,
   type Column,
   childrenOf,
   columnsOf,
+  effectiveColumnsOf,
   type FkAction,
+  formatPartitionBound,
+  formatPartitionBy,
   type Model,
   newId,
   normalizeType,
+  parsePartitionBound,
+  partitionDescendants,
+  partitionKeyColumns,
+  type PartitionKey,
+  type PartitionSpec,
+  type PartitionStrategy,
+  partitionsOf,
+  resolvePartitionBy,
   type Table,
+  validatePartitionBound,
 } from '@dowel/core';
 import type { Versions } from '@dowel/sync';
+import { useQuery } from '@tanstack/react-query';
 import {
   ArrowDown,
   ArrowUp,
@@ -25,17 +39,22 @@ import {
   Fingerprint,
   Hash,
   KeyRound,
+  Layers,
   Link2,
   List,
   ListTree,
   MousePointerClick,
+  Pencil,
   Plus,
   Table2,
   Trash2,
+  Unlink,
 } from 'lucide-react';
-import { type ReactNode, useId, useRef, useState } from 'react';
+import { type ReactNode, useId, useMemo, useRef, useState } from 'react';
 import { useTranslation } from 'react-i18next';
 
+import { api } from '../api.ts';
+import { useProject } from '../project.tsx';
 import type { Workspace } from '../workspace.ts';
 import { shortType, typeLabel } from './Canvas.tsx';
 import { Modal } from './Modal.tsx';
@@ -55,6 +74,7 @@ const Field = ({
   mono,
   className,
   autoFocus,
+  disabled,
 }: {
   value: string;
   onCommit: (v: string, basis: Versions) => void;
@@ -66,6 +86,7 @@ const Field = ({
   mono?: boolean;
   className?: string;
   autoFocus?: boolean;
+  disabled?: boolean;
 }) => {
   const [draft, setDraft] = useState<string | null>(null);
   const basis = useRef<Versions>({});
@@ -77,6 +98,7 @@ const Field = ({
       list={list}
       placeholder={placeholder}
       autoFocus={autoFocus}
+      disabled={disabled}
       spellCheck={false}
       className={cx('input', mono && 'font-mono', className)}
       onFocus={() => {
@@ -127,7 +149,7 @@ const Section = ({
     <h3 className="section-title">
       {title}
       {count !== undefined && <span className="count">{count}</span>}
-      <span className="ml-auto">{action}</span>
+      <span className="ml-auto flex items-center gap-1">{action}</span>
     </h3>
     {children}
   </section>
@@ -234,9 +256,281 @@ const parseType = (m: Model, text: string): { type: string; typeRef: string | nu
 
 const FK_ACTIONS: FkAction[] = ['noAction', 'restrict', 'cascade', 'setNull', 'setDefault'];
 
-const TableInspector = ({ table, ws, model, readOnly }: Ctx & { table: Table }) => {
+// ───── 分区边界动态表单状态 ─────
+
+interface BoundDraft {
+  isDefault: boolean;
+  from: string[];
+  to: string[];
+  list: string;
+  modulus: string;
+  remainder: string;
+}
+
+const initBoundDraft = (spec: PartitionSpec, existing?: string): BoundDraft => {
+  const k = Math.max(1, spec.keys.length);
+  const base: BoundDraft = {
+    isDefault: false,
+    from: Array.from({ length: k }, () => ''),
+    to: Array.from({ length: k }, () => ''),
+    list: '',
+    modulus: '4',
+    remainder: '0',
+  };
+  if (!existing) return base;
+  const parsed = parsePartitionBound(existing);
+  if (!parsed) return base;
+  if (parsed.kind === 'default') return { ...base, isDefault: true };
+  if (parsed.kind === 'range') {
+    return {
+      ...base,
+      from: Array.from({ length: k }, (_, i) => parsed.from[i] ?? ''),
+      to: Array.from({ length: k }, (_, i) => parsed.to[i] ?? ''),
+    };
+  }
+  if (parsed.kind === 'list') return { ...base, list: parsed.values.join(', ') };
+  return { ...base, modulus: String(parsed.modulus), remainder: String(parsed.remainder) };
+};
+
+const buildBoundString = (spec: PartitionSpec, draft: BoundDraft): string => {
+  if (draft.isDefault && spec.strategy !== 'hash') return formatPartitionBound({ kind: 'default' });
+  if (spec.strategy === 'range') {
+    return formatPartitionBound({
+      kind: 'range',
+      from: draft.from.map((s) => s.trim()),
+      to: draft.to.map((s) => s.trim()),
+    });
+  }
+  if (spec.strategy === 'list') {
+    const raw = draft.list.trim();
+    return raw ? `FOR VALUES IN (${raw})` : '';
+  }
+  const modulus = Number.parseInt(draft.modulus, 10);
+  const remainder = Number.parseInt(draft.remainder, 10);
+  if (!Number.isInteger(modulus) || !Number.isInteger(remainder)) return '';
+  return formatPartitionBound({ kind: 'hash', modulus, remainder });
+};
+
+const BoundInputs = ({
+  spec,
+  draft,
+  onChange,
+  hasDefault,
+  isSelfDefault,
+}: {
+  spec: PartitionSpec;
+  draft: BoundDraft;
+  onChange: (next: BoundDraft) => void;
+  hasDefault: boolean;
+  isSelfDefault?: boolean;
+}) => {
   const { t } = useTranslation();
-  const cols = columnsOf(model, table.id);
+  const defaultBlocked = hasDefault && !isSelfDefault;
+  const keyCount = Math.max(1, spec.keys.length);
+
+  return (
+    <div className="space-y-2">
+      {spec.strategy !== 'hash' && (
+        <div className="space-y-1">
+          <label className="check text-sm">
+            <input
+              type="checkbox"
+              checked={draft.isDefault}
+              disabled={defaultBlocked}
+              onChange={(e) => onChange({ ...draft, isDefault: e.target.checked })}
+            />
+            {t('part.defaultPartition')}
+          </label>
+          {defaultBlocked && <p className="hint">{t('part.defaultExists')}</p>}
+        </div>
+      )}
+
+      {!draft.isDefault && spec.strategy === 'range' && (
+        <div className="space-y-2">
+          {Array.from({ length: keyCount }, (_, idx) => {
+            const suffix = keyCount > 1 ? ` #${idx + 1}` : '';
+            const fromVal = draft.from[idx] ?? '';
+            const toVal = draft.to[idx] ?? '';
+            const setFrom = (v: string) => {
+              const next = [...draft.from];
+              next[idx] = v;
+              onChange({ ...draft, from: next });
+            };
+            const setTo = (v: string) => {
+              const next = [...draft.to];
+              next[idx] = v;
+              onChange({ ...draft, to: next });
+            };
+            return (
+              <div key={idx} className="space-y-1.5">
+                <div className="field">
+                  <div className="flex items-center justify-between">
+                    <span className="label">{`${t('part.rangeFrom')}${suffix}`}</span>
+                    <button
+                      type="button"
+                      className="btn ghost sm font-mono text-[11px]"
+                      onClick={() => setFrom('MINVALUE')}
+                    >
+                      MINVALUE
+                    </button>
+                  </div>
+                  <input
+                    aria-label={`${t('part.rangeFrom')}${suffix}`}
+                    className="input font-mono"
+                    spellCheck={false}
+                    placeholder="'2025-01-01'"
+                    value={fromVal}
+                    onChange={(e) => setFrom(e.target.value)}
+                  />
+                </div>
+                <div className="field">
+                  <div className="flex items-center justify-between">
+                    <span className="label">{`${t('part.rangeTo')}${suffix}`}</span>
+                    <button
+                      type="button"
+                      className="btn ghost sm font-mono text-[11px]"
+                      onClick={() => setTo('MAXVALUE')}
+                    >
+                      MAXVALUE
+                    </button>
+                  </div>
+                  <input
+                    aria-label={`${t('part.rangeTo')}${suffix}`}
+                    className="input font-mono"
+                    spellCheck={false}
+                    placeholder="'2026-01-01'"
+                    value={toVal}
+                    onChange={(e) => setTo(e.target.value)}
+                  />
+                </div>
+              </div>
+            );
+          })}
+          <p className="hint">{t('part.rangeHint')}</p>
+        </div>
+      )}
+
+      {!draft.isDefault && spec.strategy === 'list' && (
+        <div className="space-y-1">
+          <label className="field">
+            <span className="label">{t('part.listValues')}</span>
+            <input
+              aria-label={t('part.listValues')}
+              className="input font-mono"
+              spellCheck={false}
+              placeholder={t('part.listPlaceholder')}
+              value={draft.list}
+              onChange={(e) => onChange({ ...draft, list: e.target.value })}
+            />
+          </label>
+          <p className="hint">{t('part.listHint')}</p>
+        </div>
+      )}
+
+      {spec.strategy === 'hash' && (
+        <div className="grid grid-cols-2 gap-2">
+          <label className="field">
+            <span className="label">{t('part.hashModulus')}</span>
+            <input
+              type="number"
+              min={1}
+              step={1}
+              aria-label={t('part.hashModulus')}
+              className="input font-mono"
+              value={draft.modulus}
+              onChange={(e) => onChange({ ...draft, modulus: e.target.value })}
+            />
+          </label>
+          <label className="field">
+            <span className="label">{t('part.hashRemainder')}</span>
+            <input
+              type="number"
+              min={0}
+              step={1}
+              aria-label={t('part.hashRemainder')}
+              className="input font-mono"
+              value={draft.remainder}
+              onChange={(e) => onChange({ ...draft, remainder: e.target.value })}
+            />
+          </label>
+        </div>
+      )}
+    </div>
+  );
+};
+
+/** 筛选列定义与分区父表一致、可挂载为子分区的普通表（与 edit.ts attachPartition 对齐） */
+const compatiblePlainTables = (model: Model, parent: Table): Table[] => {
+  const rootCols = effectiveColumnsOf(model, parent.id);
+  const referencedByExternalFk = new Set(
+    all(model, 'foreignKey')
+      .filter((fk) => fk.refTable !== fk.parent)
+      .map((fk) => fk.refTable),
+  );
+  const ownedColIds = new Set(
+    all(model, 'sequence')
+      .map((s) => s.ownedBy)
+      .filter((x): x is string => x !== null),
+  );
+  return all(model, 'table').filter((cand) => {
+    if (cand.id === parent.id || cand.partitionBy !== null || cand.partitionOf !== null) return false;
+    if (referencedByExternalFk.has(cand.id)) return false;
+    const cols = columnsOf(model, cand.id);
+    if (cols.length !== rootCols.length) return false;
+    if (cols.some((c) => c.identity !== null || ownedColIds.has(c.id))) return false;
+    return rootCols.every((rc) => {
+      const cc = cols.find((x) => x.name === rc.name);
+      if (!cc) return false;
+      return (
+        cc.type === rc.type &&
+        cc.typeRef === rc.typeRef &&
+        cc.collation === rc.collation &&
+        cc.notNull === rc.notNull &&
+        JSON.stringify(cc.generated) === JSON.stringify(rc.generated) &&
+        JSON.stringify(cc.default) === JSON.stringify(rc.default)
+      );
+    });
+  });
+};
+
+interface KeyDraft {
+  mode: 'column' | 'expr';
+  column: string;
+  expr: string;
+  collation: string;
+  opclass: string;
+}
+
+const TableInspector = ({
+  table,
+  ws,
+  model,
+  readOnly,
+  onSelect,
+}: Ctx & { table: Table; onSelect: (id: string | null) => void }) => {
+  const { t } = useTranslation();
+  const { pid } = useProject();
+  const versions = useQuery({
+    queryKey: ['versions', pid],
+    queryFn: () => api<VersionInfo[]>('GET', `/api/projects/${pid}/versions`),
+  });
+  const latestId = versions.data?.[0]?.id;
+  const latestTables = useQuery({
+    queryKey: ['version-tables', pid, latestId],
+    queryFn: async () => {
+      const { up } = await api<MigrationResult>(
+        'GET',
+        `/api/projects/${pid}/migration?from=empty&to=${encodeURIComponent(latestId!)}`,
+      );
+      return new Set(up.filter((s) => s.kind === 'createTable').map((s) => s.target));
+    },
+    enabled: !!latestId,
+    staleTime: Infinity,
+  });
+  const isPublished = !!latestTables.data?.has(table.id);
+
+  const isChild = table.partitionOf !== null;
+  const cols = isChild ? effectiveColumnsOf(model, table.id) : columnsOf(model, table.id);
   const pk = childrenOf(model, table.id, 'primaryKey')[0];
   const checks = childrenOf(model, table.id, 'check');
   const uniques = childrenOf(model, table.id, 'unique');
@@ -244,8 +538,36 @@ const TableInspector = ({ table, ws, model, readOnly }: Ctx & { table: Table }) 
   const indexes = childrenOf(model, table.id, 'index');
   const tableIds = [table.id, ...cols.map((c) => c.id)];
   const name = (id: string) => model.objects[id]?.name ?? '?';
-  const locked = readOnly || !!table.partitionBy || !!table.partitionOf;
+  const locked = readOnly;
   const fkCols = new Set(fks.flatMap((f) => f.columns));
+
+  const partKeyCols = useMemo(() => {
+    const ids = new Set<string>();
+    const tablesToScan = isChild ? [table] : [table, ...partitionDescendants(model, table.id)];
+    for (const tb of tablesToScan) {
+      if (tb.partitionBy) {
+        for (const id of partitionKeyColumns(model, tb).all) ids.add(id);
+      }
+    }
+    return ids;
+  }, [isChild, model, table]);
+
+  const spec = table.partitionBy ? resolvePartitionBy(model, table) : null;
+  const children = partitionsOf(model, table.id);
+  const parentTable = table.partitionOf
+    ? (model.objects[table.partitionOf.parent] as Table | undefined)
+    : undefined;
+  const parentSpec = parentTable?.partitionBy ? resolvePartitionBy(model, parentTable) : null;
+  const hasDefaultChild = children.some((c) => parsePartitionBound(c.partitionOf!.bound)?.kind === 'default');
+  const parentHasDefault = parentTable
+    ? partitionsOf(model, parentTable.id).some(
+        (c) => parsePartitionBound(c.partitionOf!.bound)?.kind === 'default',
+      )
+    : false;
+  const selfIsDefault = !!(
+    table.partitionOf && parsePartitionBound(table.partitionOf.bound)?.kind === 'default'
+  );
+
   const [openCol, setOpenCol] = useState<string | null>(null);
   const [focusNew, setFocusNew] = useState<string | null>(null);
   const [adding, setAdding] = useState<'check' | 'unique' | 'fk' | 'index' | null>(null);
@@ -254,6 +576,27 @@ const TableInspector = ({ table, ws, model, readOnly }: Ctx & { table: Table }) 
   const emptyFk = { col: '', ref: '', refCol: '', onDelete: 'noAction' as FkAction };
   const [fk, setFk] = useState(emptyFk);
   const typesId = useId();
+
+  // 分区配置与子分区操作状态
+  const [editingStrategy, setEditingStrategy] = useState(false);
+  const [draftStrategy, setDraftStrategy] = useState<PartitionStrategy>('range');
+  const [draftKeys, setDraftKeys] = useState<KeyDraft[]>([]);
+  const [partForm, setPartForm] = useState<'add' | 'attach' | null>(null);
+  const [childName, setChildName] = useState('');
+  const [attachTableId, setAttachTableId] = useState('');
+  const [boundDraft, setBoundDraft] = useState<BoundDraft>(() =>
+    initBoundDraft(spec ?? { strategy: 'range', keys: [] }),
+  );
+  const [editingBoundId, setEditingBoundId] = useState<string | null>(null);
+  const [editBoundDraft, setEditBoundDraft] = useState<BoundDraft>(() =>
+    initBoundDraft(spec ?? parentSpec ?? { strategy: 'range', keys: [] }),
+  );
+
+  // 实时降级为只读时直接派生为关闭，避免 effect 中 setState 级联渲染（pitfalls #30）
+  const activeAdding = locked ? null : adding;
+  const activeEditingStrategy = !locked && !isPublished && editingStrategy;
+  const activePartForm = locked ? null : partForm;
+  const activeEditingBoundId = locked ? null : editingBoundId;
 
   const startAdding = (k: typeof adding) => {
     setAdding(k);
@@ -284,9 +627,105 @@ const TableInspector = ({ table, ws, model, readOnly }: Ctx & { table: Table }) 
   const defaultText = (c: Column) =>
     c.default ? ('expr' in c.default ? c.default.expr : `nextval(${name(c.default.nextval)})`) : '';
 
+  const openStrategyEditor = () => {
+    const curSpec = spec;
+    setDraftStrategy(curSpec?.strategy ?? 'range');
+    if (curSpec?.keys.length) {
+      setDraftKeys(
+        curSpec.keys.map((k) => ({
+          mode: k.column ? 'column' : 'expr',
+          column: k.column ?? cols[0]?.id ?? '',
+          expr: k.expr ?? '',
+          collation: k.collation ?? '',
+          opclass: k.opclass ?? '',
+        })),
+      );
+    } else {
+      setDraftKeys([{ mode: 'column', column: cols[0]?.id ?? '', expr: '', collation: '', opclass: '' }]);
+    }
+    setEditingStrategy(true);
+  };
+
+  const commitStrategy = () => {
+    const keys: PartitionKey[] = draftKeys.map((k) =>
+      k.mode === 'column'
+        ? {
+            column: k.column,
+            expr: null,
+            collation: k.collation.trim() || null,
+            opclass: k.opclass.trim() || null,
+          }
+        : {
+            column: null,
+            expr: k.expr.trim(),
+            collation: k.collation.trim() || null,
+            opclass: k.opclass.trim() || null,
+          },
+    );
+    const nextSpec: PartitionSpec = { strategy: draftStrategy, keys };
+    if (ws.act('setPartitionBy', { id: table.id, partitionBy: nextSpec })) {
+      setEditingStrategy(false);
+    }
+  };
+
+  const strategyValid =
+    draftKeys.length > 0 &&
+    (draftStrategy !== 'list' || draftKeys.length === 1) &&
+    draftKeys.every((k) => (k.mode === 'column' ? !!k.column : !!k.expr.trim()));
+
+  const openAddPartition = () => {
+    if (!spec) return;
+    let n = children.length + 1;
+    while (all(model, 'table').some((x) => x.name === `${table.name}_p${n}`)) n++;
+    setChildName(`${table.name}_p${n}`);
+    setBoundDraft(initBoundDraft(spec));
+    setPartForm('add');
+  };
+
+  const openAttachPartition = () => {
+    if (!spec) return;
+    const cands = compatiblePlainTables(model, table);
+    setAttachTableId(cands[0]?.id ?? '');
+    setBoundDraft(initBoundDraft(spec));
+    setPartForm('attach');
+  };
+
+  const openEditBound = (target: Table, activeSpec: PartitionSpec) => {
+    setEditBoundDraft(initBoundDraft(activeSpec, target.partitionOf?.bound));
+    setEditingBoundId(target.id);
+  };
+
+  const attachCandidates = activePartForm === 'attach' ? compatiblePlainTables(model, table) : [];
+  const formBoundStr = spec ? buildBoundString(spec, boundDraft) : '';
+  const formBoundError =
+    spec && formBoundStr ? validatePartitionBound(spec.strategy, formBoundStr, spec.keys.length) : null;
+
+  const activeEditSpec = isChild ? parentSpec : spec;
+  const editBoundStr = activeEditSpec ? buildBoundString(activeEditSpec, editBoundDraft) : '';
+  const editBoundError =
+    activeEditSpec && editBoundStr
+      ? validatePartitionBound(activeEditSpec.strategy, editBoundStr, activeEditSpec.keys.length)
+      : null;
+
   return (
     <fieldset disabled={locked} className="min-w-0 space-y-3 border-0 p-0">
-      {(table.partitionBy || table.partitionOf) && <Banner kind="warn">{t('insp.partitioned')}</Banner>}
+      {isChild && parentTable && (
+        <div className="flex items-center gap-2 rounded-sm border border-border bg-surface-2 px-2.5 py-2 text-xs">
+          <Layers size={14} aria-hidden="true" className="shrink-0 text-text-3" />
+          <span className="min-w-0 flex-1 truncate text-text-2">
+            {t('part.childOf', { parent: parentTable.name })}
+          </span>
+          <button
+            type="button"
+            className="btn ghost sm shrink-0"
+            disabled={false}
+            onClick={() => onSelect(parentTable.id)}
+          >
+            {t('part.viewParent')}
+          </button>
+        </div>
+      )}
+
       <Labeled label={t('insp.tableName')}>
         <Field
           ws={ws}
@@ -308,26 +747,113 @@ const TableInspector = ({ table, ws, model, readOnly }: Ctx & { table: Table }) 
         />
       </Labeled>
 
+      {isChild && table.partitionOf && (
+        <Section
+          title={t('part.bound')}
+          action={
+            !locked && (
+              <>
+                {parentSpec && (
+                  <IconButton
+                    label={t('part.editBoundLabel', { name: table.name })}
+                    size="sm"
+                    onClick={() => openEditBound(table, parentSpec)}
+                  >
+                    <Pencil size={14} aria-hidden="true" />
+                  </IconButton>
+                )}
+                <IconButton
+                  label={t('part.detachLabel', { name: table.name })}
+                  size="sm"
+                  onClick={() => ws.act('detachPartition', { id: table.id })}
+                >
+                  <Unlink size={14} aria-hidden="true" />
+                </IconButton>
+              </>
+            )
+          }
+        >
+          <div className="rounded-sm border border-border bg-surface px-2.5 py-1.5 font-mono text-xs text-text-2">
+            {table.partitionOf.bound}
+          </div>
+          {table.partitionBy && (
+            <div className="flex flex-wrap items-center gap-1.5 pt-1">
+              <span className="badge">{t('part.subPartitionBadge')}</span>
+              <span className="font-mono text-xs text-text-3">{formatPartitionBy(model, table)}</span>
+            </div>
+          )}
+          {activeEditingBoundId === table.id && parentSpec && (
+            <AddForm
+              title={t('part.editBound')}
+              onCancel={() => setEditingBoundId(null)}
+              submit={
+                <button
+                  type="button"
+                  className="btn primary"
+                  disabled={!editBoundStr || !!editBoundError}
+                  onClick={() => {
+                    if (ws.act('setPartitionBound', { id: table.id, bound: editBoundStr })) {
+                      setEditingBoundId(null);
+                    }
+                  }}
+                >
+                  {t('part.saveBound')}
+                </button>
+              }
+            >
+              <BoundInputs
+                spec={parentSpec}
+                draft={editBoundDraft}
+                onChange={setEditBoundDraft}
+                hasDefault={parentHasDefault}
+                isSelfDefault={selfIsDefault}
+              />
+              {editBoundError && <p className="hint text-danger">{editBoundError}</p>}
+            </AddForm>
+          )}
+        </Section>
+      )}
+
       <Section
         title={t('insp.columns')}
         count={cols.length}
         action={
-          !locked && (
+          !locked &&
+          !isChild && (
             <IconButton label={t('insp.addColumn')} size="sm" onClick={addColumn}>
               <Plus size={14} aria-hidden="true" />
             </IconButton>
           )
         }
       >
-        <datalist id={typesId}>
-          {[...COMMON_TYPES, ...all(model, 'enum').map((e) => e.name)].map((x) => (
-            <option key={x} value={x} />
-          ))}
-        </datalist>
+        {!isChild && (
+          <datalist id={typesId}>
+            {[...COMMON_TYPES, ...all(model, 'enum').map((e) => e.name)].map((x) => (
+              <option key={x} value={x} />
+            ))}
+          </datalist>
+        )}
         <ul className="list-none overflow-hidden rounded-sm border border-border bg-surface p-0">
           {cols.map((c, i) => {
-            const open = openCol === c.id;
+            const open = !isChild && openCol === c.id;
             const isPk = !!pk?.columns.includes(c.id);
+            const isPartKey = partKeyCols.has(c.id);
+            if (isChild) {
+              return (
+                <li
+                  key={c.id}
+                  className="flex h-[var(--row-h)] items-center gap-1.5 border-border px-2.5 text-sm not-first:border-t"
+                >
+                  <span className="min-w-0 flex-1 truncate font-mono text-text-2">{c.name}</span>
+                  <span className={cx('truncate font-mono text-xs', c.typeRef ? 'text-enum' : 'text-text-3')}>
+                    {shortType(typeLabel(model, c))}
+                  </span>
+                  <span className="flex w-[52px] justify-end gap-[3px]">
+                    {c.notNull && <b className="flag">NN</b>}
+                  </span>
+                </li>
+              );
+            }
             return (
               <li key={c.id} className="border-border not-first:border-t">
                 <button
@@ -348,9 +874,10 @@ const TableInspector = ({ table, ws, model, readOnly }: Ctx & { table: Table }) 
                   <span className={cx('truncate font-mono text-xs', c.typeRef ? 'text-enum' : 'text-text-3')}>
                     {shortType(typeLabel(model, c))}
                   </span>
-                  <span className="flex w-[52px] justify-end gap-[3px]">
+                  <span className="flex min-w-[52px] shrink-0 justify-end gap-[3px]">
                     {isPk && <b className="flag pk">PK</b>}
                     {fkCols.has(c.id) && <b className="flag fk">FK</b>}
+                    {isPartKey && <b className="flag">PT</b>}
                     {c.notNull && !isPk && <b className="flag">NN</b>}
                   </span>
                 </button>
@@ -376,12 +903,14 @@ const TableInspector = ({ table, ws, model, readOnly }: Ctx & { table: Table }) 
                           list={typesId}
                           basisIds={[c.id]}
                           mono
+                          disabled={isPartKey}
                           onCommit={(v, b) =>
                             ws.act('setColumnType', { id: c.id, ...parseType(model, v) }, b)
                           }
                         />
                       </Labeled>
                     </div>
+                    {isPartKey && <p className="hint">{t('part.keyColLockedHint')}</p>}
                     <Labeled label={t('insp.default')}>
                       <Field
                         ws={ws}
@@ -431,8 +960,13 @@ const TableInspector = ({ table, ws, model, readOnly }: Ctx & { table: Table }) 
                         <ArrowDown size={14} aria-hidden="true" />
                       </IconButton>
                       <IconButton
-                        label={`${t('insp.delete')} ${c.name}`}
+                        label={
+                          isPartKey
+                            ? t('part.keyColDeleteLocked', { name: c.name })
+                            : `${t('insp.delete')} ${c.name}`
+                        }
                         size="sm"
+                        disabled={isPartKey}
                         className="hover:!text-danger"
                         onClick={() => ws.act('dropColumn', { id: c.id })}
                       >
@@ -445,6 +979,7 @@ const TableInspector = ({ table, ws, model, readOnly }: Ctx & { table: Table }) 
             );
           })}
         </ul>
+        {isChild && <p className="hint">{t('part.inheritedColumns')}</p>}
         {cols.length === 0 && <p className="hint">{t('insp.noColumns')}</p>}
       </Section>
 
@@ -520,10 +1055,10 @@ const TableInspector = ({ table, ws, model, readOnly }: Ctx & { table: Table }) 
             </Row>
           ))}
         </ul>
-        {!pk && !fks.length && !uniques.length && !checks.length && adding === null && (
+        {!pk && !fks.length && !uniques.length && !checks.length && activeAdding === null && (
           <p className="hint">{t('insp.noConstraints')}</p>
         )}
-        {adding === 'check' && (
+        {activeAdding === 'check' && (
           <AddForm title={t('insp.addCheck')} onCancel={() => setAdding(null)}>
             <Field
               ws={ws}
@@ -541,7 +1076,7 @@ const TableInspector = ({ table, ws, model, readOnly }: Ctx & { table: Table }) 
             <p className="hint">{t('insp.checkHint')}</p>
           </AddForm>
         )}
-        {adding === 'unique' && (
+        {activeAdding === 'unique' && (
           <AddForm
             title={t('insp.addUnique')}
             onCancel={() => setAdding(null)}
@@ -561,7 +1096,7 @@ const TableInspector = ({ table, ws, model, readOnly }: Ctx & { table: Table }) 
             <ColumnPicker label={t('insp.pickColumns')} columns={cols} value={picked} onChange={setPicked} />
           </AddForm>
         )}
-        {adding === 'fk' && (
+        {activeAdding === 'fk' && (
           <AddForm
             title={t('insp.addFk')}
             onCancel={() => setAdding(null)}
@@ -678,8 +1213,8 @@ const TableInspector = ({ table, ws, model, readOnly }: Ctx & { table: Table }) 
             </Row>
           ))}
         </ul>
-        {!indexes.length && adding !== 'index' && <p className="hint">{t('insp.noIndexes')}</p>}
-        {adding === 'index' && (
+        {!indexes.length && activeAdding !== 'index' && <p className="hint">{t('insp.noIndexes')}</p>}
+        {activeAdding === 'index' && (
           <AddForm
             title={t('insp.addIndex')}
             onCancel={() => setAdding(null)}
@@ -713,6 +1248,421 @@ const TableInspector = ({ table, ws, model, readOnly }: Ctx & { table: Table }) 
           </AddForm>
         )}
       </Section>
+
+      {!isChild && (
+        <Section
+          title={t('part.section')}
+          count={table.partitionBy ? children.length : undefined}
+          action={
+            !locked &&
+            !isPublished &&
+            !activeEditingStrategy &&
+            !table.partitionBy && (
+              <button type="button" className="btn ghost sm" onClick={openStrategyEditor}>
+                {t('part.configure')}
+              </button>
+            )
+          }
+        >
+          {!table.partitionBy && !activeEditingStrategy && (
+            <p className="hint">{isPublished ? t('part.publishedHint') : t('part.notPartitioned')}</p>
+          )}
+
+          {table.partitionBy && !activeEditingStrategy && (
+            <div className="space-y-2">
+              <div className="rounded-sm border border-border bg-surface px-2.5 py-2">
+                <div className="flex items-center gap-1.5">
+                  <span className="badge font-mono uppercase">{spec?.strategy ?? 'PARTITION'}</span>
+                  <span className="min-w-0 flex-1 truncate font-mono text-xs text-text-2">
+                    {formatPartitionBy(model, table)}
+                  </span>
+                </div>
+                {!locked && !isPublished && (
+                  <div className="mt-2 flex items-center gap-1.5">
+                    <button type="button" className="btn sm" onClick={openStrategyEditor}>
+                      {t('part.editStrategy')}
+                    </button>
+                    <button
+                      type="button"
+                      className="btn ghost sm"
+                      disabled={children.length > 0}
+                      title={children.length > 0 ? t('part.clearHasChildren') : undefined}
+                      onClick={() => ws.act('setPartitionBy', { id: table.id, partitionBy: null })}
+                    >
+                      {t('part.clearStrategy')}
+                    </button>
+                  </div>
+                )}
+              </div>
+              {isPublished && <p className="hint">{t('part.publishedHint')}</p>}
+            </div>
+          )}
+
+          {activeEditingStrategy && (
+            <AddForm
+              title={t('part.configure')}
+              onCancel={() => setEditingStrategy(false)}
+              submit={
+                <button
+                  type="button"
+                  className="btn primary"
+                  disabled={!strategyValid}
+                  onClick={commitStrategy}
+                >
+                  {t('part.applyStrategy')}
+                </button>
+              }
+            >
+              <label className="field">
+                <span className="label">{t('part.strategy')}</span>
+                <select
+                  aria-label={t('part.strategy')}
+                  className="select font-mono"
+                  value={draftStrategy}
+                  onChange={(e) => {
+                    const next = e.target.value as PartitionStrategy;
+                    setDraftStrategy(next);
+                    if (next === 'list' && draftKeys.length > 1) {
+                      setDraftKeys((ks) => ks.slice(0, 1));
+                    }
+                  }}
+                >
+                  <option value="range">RANGE</option>
+                  <option value="list">LIST</option>
+                  <option value="hash">HASH</option>
+                </select>
+              </label>
+
+              <div className="space-y-2">
+                <div className="flex items-center justify-between">
+                  <span className="label">{t('part.keys')}</span>
+                  {draftStrategy !== 'list' && (
+                    <button
+                      type="button"
+                      className="btn ghost sm"
+                      onClick={() =>
+                        setDraftKeys((ks) => [
+                          ...ks,
+                          { mode: 'column', column: cols[0]?.id ?? '', expr: '', collation: '', opclass: '' },
+                        ])
+                      }
+                    >
+                      <Plus size={12} aria-hidden="true" />
+                      {t('part.addKey')}
+                    </button>
+                  )}
+                </div>
+                {draftStrategy === 'list' && <p className="hint">{t('part.listSingleKey')}</p>}
+
+                {draftKeys.map((k, idx) => (
+                  <div key={idx} className="space-y-1.5 rounded-sm border border-border bg-surface p-2">
+                    <div className="flex items-center gap-1.5">
+                      <select
+                        aria-label={`${t('part.keyMode')} ${idx + 1}`}
+                        className="select w-24 shrink-0"
+                        value={k.mode}
+                        onChange={(e) => {
+                          const mode = e.target.value as 'column' | 'expr';
+                          setDraftKeys((ks) => ks.map((item, i) => (i === idx ? { ...item, mode } : item)));
+                        }}
+                      >
+                        <option value="column">{t('part.keyColumn')}</option>
+                        <option value="expr">{t('part.keyExpr')}</option>
+                      </select>
+
+                      {k.mode === 'column' ? (
+                        <select
+                          aria-label={`${t('part.pickColumn')} ${idx + 1}`}
+                          className="select min-w-0 flex-1 font-mono"
+                          value={k.column}
+                          onChange={(e) =>
+                            setDraftKeys((ks) =>
+                              ks.map((item, i) => (i === idx ? { ...item, column: e.target.value } : item)),
+                            )
+                          }
+                        >
+                          <option value="">—</option>
+                          {cols.map((c) => (
+                            <option key={c.id} value={c.id}>
+                              {c.name}
+                            </option>
+                          ))}
+                        </select>
+                      ) : (
+                        <input
+                          aria-label={`${t('part.keyExpr')} ${idx + 1}`}
+                          className="input min-w-0 flex-1 font-mono"
+                          spellCheck={false}
+                          placeholder={t('part.keyExprPlaceholder')}
+                          value={k.expr}
+                          onChange={(e) =>
+                            setDraftKeys((ks) =>
+                              ks.map((item, i) => (i === idx ? { ...item, expr: e.target.value } : item)),
+                            )
+                          }
+                        />
+                      )}
+
+                      {draftKeys.length > 1 && (
+                        <IconButton
+                          label={`${t('part.removeKey')} ${idx + 1}`}
+                          size="sm"
+                          onClick={() => setDraftKeys((ks) => ks.filter((_, i) => i !== idx))}
+                        >
+                          <Trash2 size={14} aria-hidden="true" />
+                        </IconButton>
+                      )}
+                    </div>
+
+                    <div className="grid grid-cols-2 gap-1.5">
+                      <input
+                        aria-label={`${t('part.collation')} ${idx + 1}`}
+                        className="input font-mono text-xs"
+                        spellCheck={false}
+                        placeholder={t('part.collation')}
+                        value={k.collation}
+                        onChange={(e) =>
+                          setDraftKeys((ks) =>
+                            ks.map((item, i) => (i === idx ? { ...item, collation: e.target.value } : item)),
+                          )
+                        }
+                      />
+                      <input
+                        aria-label={`${t('part.opclass')} ${idx + 1}`}
+                        className="input font-mono text-xs"
+                        spellCheck={false}
+                        placeholder={t('part.opclass')}
+                        value={k.opclass}
+                        onChange={(e) =>
+                          setDraftKeys((ks) =>
+                            ks.map((item, i) => (i === idx ? { ...item, opclass: e.target.value } : item)),
+                          )
+                        }
+                      />
+                    </div>
+                  </div>
+                ))}
+              </div>
+            </AddForm>
+          )}
+
+          {table.partitionBy && (
+            <div className="space-y-2 pt-1">
+              <div className="flex items-center gap-1.5">
+                <span className="label">{t('part.children')}</span>
+                <span className="count">{children.length}</span>
+                {!locked && spec && (
+                  <span className="ml-auto flex items-center gap-1">
+                    <button type="button" className="btn ghost sm" onClick={openAddPartition}>
+                      <Plus size={12} aria-hidden="true" />
+                      {t('part.addChild')}
+                    </button>
+                    <button type="button" className="btn ghost sm" onClick={openAttachPartition}>
+                      {t('part.attachTable')}
+                    </button>
+                  </span>
+                )}
+              </div>
+
+              {children.length > 0 && (
+                <ul className="list-none space-y-1 p-0">
+                  {children.map((ch) => {
+                    const isSubPart = ch.partitionBy !== null;
+                    const chIsDefault = parsePartitionBound(ch.partitionOf!.bound)?.kind === 'default';
+                    return (
+                      <li key={ch.id} className="rounded-sm border border-border bg-surface px-2 py-1.5">
+                        <div className="flex items-center gap-1.5">
+                          <Layers size={13} aria-hidden="true" className="shrink-0 text-text-3" />
+                          <button
+                            type="button"
+                            className="min-w-0 flex-1 truncate text-left font-mono text-sm hover:underline"
+                            disabled={false}
+                            onClick={() => onSelect(ch.id)}
+                          >
+                            {ch.name}
+                          </button>
+                          {isSubPart && <span className="badge shrink-0">{t('part.subPartitionBadge')}</span>}
+                          {!locked && (
+                            <span className="flex shrink-0 items-center gap-0.5">
+                              {spec && !isSubPart && (
+                                <IconButton
+                                  label={t('part.editBoundLabel', { name: ch.name })}
+                                  size="sm"
+                                  onClick={() => openEditBound(ch, spec)}
+                                >
+                                  <Pencil size={13} aria-hidden="true" />
+                                </IconButton>
+                              )}
+                              {!isSubPart && (
+                                <IconButton
+                                  label={t('part.detachLabel', { name: ch.name })}
+                                  size="sm"
+                                  onClick={() => ws.act('detachPartition', { id: ch.id })}
+                                >
+                                  <Unlink size={13} aria-hidden="true" />
+                                </IconButton>
+                              )}
+                              <IconButton
+                                label={t('part.deleteLabel', { name: ch.name })}
+                                size="sm"
+                                className="hover:!text-danger"
+                                onClick={() => ws.act('dropTable', { id: ch.id })}
+                              >
+                                <Trash2 size={13} aria-hidden="true" />
+                              </IconButton>
+                            </span>
+                          )}
+                        </div>
+                        <div className="mt-0.5 pl-5 font-mono text-xs text-text-3">
+                          {ch.partitionOf!.bound}
+                        </div>
+
+                        {activeEditingBoundId === ch.id && spec && (
+                          <div className="mt-2">
+                            <AddForm
+                              title={t('part.editBound')}
+                              onCancel={() => setEditingBoundId(null)}
+                              submit={
+                                <button
+                                  type="button"
+                                  className="btn primary"
+                                  disabled={!editBoundStr || !!editBoundError}
+                                  onClick={() => {
+                                    if (ws.act('setPartitionBound', { id: ch.id, bound: editBoundStr })) {
+                                      setEditingBoundId(null);
+                                    }
+                                  }}
+                                >
+                                  {t('part.saveBound')}
+                                </button>
+                              }
+                            >
+                              <BoundInputs
+                                spec={spec}
+                                draft={editBoundDraft}
+                                onChange={setEditBoundDraft}
+                                hasDefault={hasDefaultChild}
+                                isSelfDefault={chIsDefault}
+                              />
+                              {editBoundError && <p className="hint text-danger">{editBoundError}</p>}
+                            </AddForm>
+                          </div>
+                        )}
+                      </li>
+                    );
+                  })}
+                </ul>
+              )}
+              {children.length === 0 && activePartForm === null && (
+                <p className="hint">{t('part.noChildren')}</p>
+              )}
+
+              {activePartForm === 'add' && spec && (
+                <AddForm
+                  title={t('part.addChild')}
+                  onCancel={() => setPartForm(null)}
+                  submit={
+                    <button
+                      type="button"
+                      className="btn primary"
+                      disabled={!childName.trim() || !formBoundStr || !!formBoundError}
+                      onClick={() => {
+                        if (
+                          ws.act('createPartition', {
+                            id: newId(),
+                            parent: table.id,
+                            name: childName.trim(),
+                            bound: formBoundStr,
+                          })
+                        ) {
+                          setPartForm(null);
+                        }
+                      }}
+                    >
+                      {t('part.addChild')}
+                    </button>
+                  }
+                >
+                  <label className="field">
+                    <span className="label">{t('part.childName')}</span>
+                    <input
+                      aria-label={t('part.childName')}
+                      className="input font-mono"
+                      spellCheck={false}
+                      autoFocus
+                      value={childName}
+                      onChange={(e) => setChildName(e.target.value)}
+                    />
+                  </label>
+                  <BoundInputs
+                    spec={spec}
+                    draft={boundDraft}
+                    onChange={setBoundDraft}
+                    hasDefault={hasDefaultChild}
+                  />
+                  {formBoundError && <p className="hint text-danger">{formBoundError}</p>}
+                </AddForm>
+              )}
+
+              {activePartForm === 'attach' && spec && (
+                <AddForm
+                  title={t('part.attachTable')}
+                  onCancel={() => setPartForm(null)}
+                  submit={
+                    <button
+                      type="button"
+                      className="btn primary"
+                      disabled={!attachTableId || !formBoundStr || !!formBoundError}
+                      onClick={() => {
+                        if (
+                          ws.act('attachPartition', {
+                            parent: table.id,
+                            child: attachTableId,
+                            bound: formBoundStr,
+                          })
+                        ) {
+                          setPartForm(null);
+                        }
+                      }}
+                    >
+                      {t('part.attachSubmit')}
+                    </button>
+                  }
+                >
+                  {attachCandidates.length === 0 ? (
+                    <p className="hint">{t('part.attachNone')}</p>
+                  ) : (
+                    <>
+                      <label className="field">
+                        <span className="label">{t('part.attachPickTable')}</span>
+                        <select
+                          aria-label={t('part.attachPickTable')}
+                          className="select font-mono"
+                          value={attachTableId}
+                          onChange={(e) => setAttachTableId(e.target.value)}
+                        >
+                          {attachCandidates.map((cand) => (
+                            <option key={cand.id} value={cand.id}>
+                              {cand.name}
+                            </option>
+                          ))}
+                        </select>
+                      </label>
+                      <BoundInputs
+                        spec={spec}
+                        draft={boundDraft}
+                        onChange={setBoundDraft}
+                        hasDefault={hasDefaultChild}
+                      />
+                      {formBoundError && <p className="hint text-danger">{formBoundError}</p>}
+                    </>
+                  )}
+                </AddForm>
+              )}
+            </div>
+          )}
+        </Section>
+      )}
     </fieldset>
   );
 };
@@ -726,7 +1676,9 @@ export const Inspector = ({
 }: Ctx & { selected: string | null; onSelect: (id: string | null) => void }) => {
   const { t } = useTranslation();
   const [confirm, setConfirm] = useState(false);
-  const o = selected ? ctx.model.objects[selected] : undefined;
+  const { ws, readOnly, model } = ctx;
+
+  const o = selected ? model.objects[selected] : undefined;
   if (!o || !['table', 'enum', 'sequence', 'opaque'].includes(o.kind))
     return (
       <div className="p-4">
@@ -738,14 +1690,15 @@ export const Inspector = ({
         </Empty>
       </div>
     );
-  const { ws, readOnly, model } = ctx;
   const schema = 'parent' in o ? model.objects[o.parent]?.name : undefined;
   const Icon =
     o.kind === 'opaque'
       ? o.objType.includes('iew')
         ? Eye
         : FileCode
-      : KIND_ICON[o.kind as keyof typeof KIND_ICON];
+      : o.kind === 'table' && o.partitionOf
+        ? Layers
+        : KIND_ICON[o.kind as keyof typeof KIND_ICON];
   const canDelete = o.kind === 'table' && !readOnly;
 
   return (
@@ -773,7 +1726,7 @@ export const Inspector = ({
         )}
       </div>
       <div className="min-h-0 flex-1 overflow-auto px-3.5 pt-3 pb-5">
-        {o.kind === 'table' && <TableInspector key={o.id} table={o} {...ctx} />}
+        {o.kind === 'table' && <TableInspector key={o.id} table={o} onSelect={onSelect} {...ctx} />}
         {o.kind === 'enum' && (
           <fieldset disabled={readOnly} className="min-w-0 space-y-3 border-0 p-0">
             <Labeled label={t('insp.name')}>
@@ -831,7 +1784,7 @@ export const Inspector = ({
       </div>
       {o.kind === 'table' && (
         <Modal
-          open={confirm}
+          open={confirm && !readOnly}
           onClose={() => setConfirm(false)}
           size="sm"
           title={t('insp.deleteTableTitle', { name: o.name })}

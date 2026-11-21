@@ -3,8 +3,16 @@
 import { z } from 'zod';
 
 import * as E from './edit.ts';
-import { ColumnDefault, FkAction, IndexElement, type Model, SequenceOptions } from './ir.ts';
-import { columnsOf } from './model.ts';
+import {
+  ColumnDefault,
+  FkAction,
+  IndexElement,
+  type Model,
+  type Obj,
+  PartitionSpec,
+  SequenceOptions,
+} from './ir.ts';
+import { columnsOf, effectiveColumnsOf, rootTableId } from './model.ts';
 
 const id = z.string().min(1).max(64);
 const name = z.string().min(1).max(63);
@@ -42,9 +50,27 @@ export const mutators = {
   renameSequence: def(z.object({ id, name }), (m, a) => E.renameSequence(m, a.id, a.name)),
   dropSequence: def(z.object({ id }), (m, a) => E.dropSequence(m, a.id)),
 
-  createTable: def(z.object({ id, schema: id, name }), (m, a) => E.createTable(m, a.schema, a.name, a.id)),
+  createTable: def(
+    z.object({ id, schema: id, name, partitionBy: PartitionSpec.nullable().optional() }),
+    (m, a) => E.createTable(m, a.schema, a.name, a.id, a.partitionBy ?? null),
+  ),
   renameTable: def(z.object({ id, name }), (m, a) => E.renameTable(m, a.id, a.name)),
   dropTable: def(z.object({ id }), (m, a) => E.dropTable(m, a.id)),
+
+  setPartitionBy: def(z.object({ id, partitionBy: PartitionSpec.nullable() }), (m, a) =>
+    E.setPartitionBy(m, a.id, a.partitionBy),
+  ),
+  createPartition: def(
+    z.object({ id, parent: id, name, bound: z.string().min(1), schema: id.optional() }),
+    (m, a) => E.createPartition(m, a.parent, a.name, a.bound, a.id, a.schema),
+  ),
+  setPartitionBound: def(z.object({ id, bound: z.string().min(1) }), (m, a) =>
+    E.setPartitionBound(m, a.id, a.bound),
+  ),
+  attachPartition: def(z.object({ parent: id, child: id, bound: z.string().min(1) }), (m, a) =>
+    E.attachPartition(m, a.parent, a.child, a.bound),
+  ),
+  detachPartition: def(z.object({ id }), (m, a) => E.detachPartition(m, a.id)),
 
   addColumn: def(
     z.object({
@@ -173,6 +199,22 @@ export const readsOf = (m: Model, args: unknown): string[] => {
     else if (x && typeof x === 'object') for (const [kk, v] of Object.entries(x)) walk(v, kk);
   };
   walk(args);
+  // 分区表操作涉及祖先父表和有效列（用于并发冲突检测）
+  for (const i of [...out]) {
+    const o = m.objects[i];
+    if (o?.kind === 'table' && o.partitionOf) {
+      let cur: string | null = o.partitionOf.parent;
+      const seen = new Set<string>([o.id]);
+      while (cur && !seen.has(cur)) {
+        seen.add(cur);
+        const p: Obj | undefined = m.objects[cur];
+        if (p?.kind !== 'table') break;
+        out.add(p.id);
+        cur = p.partitionOf?.parent ?? null;
+      }
+      for (const c of columnsOf(m, rootTableId(m, o.id))) out.add(c.id);
+    }
+  }
   if (exprs.length) {
     // 表达式所在的表：参数里的表，或参数里对象所在的表
     const tables = new Set<string>();
@@ -182,7 +224,8 @@ export const readsOf = (m: Model, args: unknown): string[] => {
       else if ('parent' in o && m.objects[o.parent]?.kind === 'table') tables.add(o.parent);
     }
     for (const t of tables)
-      for (const c of columnsOf(m, t)) if (exprs.some((e) => E.exprReferences(e, c.name))) out.add(c.id);
+      for (const c of effectiveColumnsOf(m, t))
+        if (exprs.some((e) => E.exprReferences(e, c.name))) out.add(c.id);
   }
   return [...out];
 };

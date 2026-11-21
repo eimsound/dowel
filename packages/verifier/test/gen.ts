@@ -8,11 +8,21 @@ import {
   columnsOf,
   emptyModel,
   ident,
+  LATEST_PG_MAJOR,
   literal,
   type Model,
+  parsePartitionBound,
+  partitionDescendants,
+  partitionKeyColumns,
+  partitionsOf,
   qname,
+  resolvePartitionBy,
 } from '@dowel/core';
 import fc from 'fast-check';
+
+export interface GenOptions {
+  pgMajor?: number;
+}
 
 export type Action = { op: number; a: number; b: number; c: number; d: number };
 export const action = fc.record({ op: fc.nat(), a: fc.nat(), b: fc.nat(), c: fc.nat(), d: fc.nat() });
@@ -57,9 +67,9 @@ const pick = <T>(xs: T[], k: number): T | undefined => (xs.length ? xs[k % xs.le
  */
 // prettier-ignore
 const WEIGHTS = {
-  //       0  1  2  3  4  5   6  7  8  9 10 11 12 13 14 15 16 17 18 19 20 21 22 23 24 25 26 27 28 29 30
-  build: [1, 0, 5, 0, 0, 12, 0, 0, 0, 2, 3, 2, 2, 3, 3, 3, 4, 4, 0, 1, 0, 2, 0, 1, 0, 3, 2, 0, 0, 2, 1],
-  mutate: [1, 2, 1, 3, 2, 4, 4, 3, 6, 3, 3, 2, 1, 2, 2, 2, 2, 2, 3, 2, 1, 1, 2, 2, 1, 1, 1, 2, 1, 2, 1],
+  //       0  1  2  3  4  5   6  7  8  9 10 11 12 13 14 15 16 17 18 19 20 21 22 23 24 25 26 27 28 29 30 31 32 33 34 35
+  build: [1, 0, 5, 0, 0, 12, 0, 0, 0, 2, 3, 2, 2, 3, 3, 3, 4, 4, 0, 1, 0, 2, 0, 1, 0, 3, 2, 0, 0, 2, 1, 2, 4, 0, 0, 0],
+  mutate: [1, 2, 1, 3, 2, 4, 4, 3, 6, 3, 3, 2, 1, 2, 2, 2, 2, 2, 3, 2, 1, 1, 2, 2, 1, 1, 1, 2, 1, 2, 1, 1, 3, 2, 2, 2],
 };
 const opOf = (phase: keyof typeof WEIGHTS, op: number): number => {
   const w = WEIGHTS[phase];
@@ -71,9 +81,15 @@ const opOf = (phase: keyof typeof WEIGHTS, op: number): number => {
   return 0;
 };
 
-/** 列是否被表达式、外键、生成列、identity 牵连（这些列不随机改类型） */
+/** 列是否被表达式、外键、生成列、identity、分区键牵连（这些列不随机改类型） */
 const entangled = (m: Model, c: Column): boolean => {
   if (c.identity || c.generated) return true;
+  const parentTable = m.objects[c.parent];
+  if (parentTable?.kind === 'table') {
+    for (const tb of [parentTable, ...partitionDescendants(m, parentTable.id)]) {
+      if (tb.partitionBy && partitionKeyColumns(m, tb).all.includes(c.id)) return true;
+    }
+  }
   for (const o of Object.values(m.objects)) {
     if (o.kind === 'foreignKey' && (o.columns.includes(c.id) || o.refColumns.includes(c.id))) return true;
     if (!('parent' in o) || o.parent !== c.parent) continue;
@@ -91,11 +107,55 @@ const entangled = (m: Model, c: Column): boolean => {
 
 const plainCols = (m: Model, table: string) => columnsOf(m, table).filter((c) => !c.generated);
 
-export const interpret = (m: Model, actions: Action[], phase: keyof typeof WEIGHTS = 'mutate'): Model => {
+/** 为分区父表选择一个不与现有子分区冲突的新边界 */
+const nextPartitionBound = (m: Model, parent: E.Table, seed: number): string | null => {
+  const spec = resolvePartitionBy(m, parent);
+  if (!spec || spec.keys.length !== 1 || !spec.keys[0]?.column) return null;
+  const children = partitionsOf(m, parent.id);
+  const existingBounds = children.map((ch) => parsePartitionBound(ch.partitionOf!.bound));
+  const hasDefault = existingBounds.some((b) => b?.kind === 'default');
+  if (spec.strategy !== 'hash' && !hasDefault && seed % 5 === 0) return 'DEFAULT';
+  if (spec.strategy === 'range') {
+    const usedStarts = new Set(
+      existingBounds.filter((b) => b?.kind === 'range').map((b) => Number(b.from[0])),
+    );
+    for (let i = 0; i < 20; i++) {
+      const start = ((seed + i) % 20) * 100;
+      if (!usedStarts.has(start)) return `FOR VALUES FROM (${start}) TO (${start + 100})`;
+    }
+    return null;
+  }
+  if (spec.strategy === 'list') {
+    const usedVals = new Set(existingBounds.filter((b) => b?.kind === 'list').flatMap((b) => b.values));
+    for (let i = 0; i < 20; i++) {
+      const val = `'v_${(seed + i) % 20}'`;
+      if (!usedVals.has(val)) return `FOR VALUES IN (${val})`;
+    }
+    return null;
+  }
+  // hash: 固定 modulus 4
+  const usedRem = new Set(existingBounds.filter((b) => b?.kind === 'hash').map((b) => b.remainder));
+  for (let i = 0; i < 4; i++) {
+    const rem = (seed + i) % 4;
+    if (!usedRem.has(rem)) return `FOR VALUES WITH (modulus 4, remainder ${rem})`;
+  }
+  return null;
+};
+
+export const interpret = (
+  m: Model,
+  actions: Action[],
+  phase: keyof typeof WEIGHTS = 'mutate',
+  opts: GenOptions = {},
+): Model => {
+  const pgMajor = opts.pgMajor ?? LATEST_PG_MAJOR;
   for (const { op: raw, a, b, c, d } of actions) {
     const op = opOf(phase, raw);
     const schemas = all(m, 'schema');
     const tables = all(m, 'table');
+    const rootTables = tables.filter((x) => !x.partitionOf);
+    const partParents = tables.filter((x) => x.partitionBy !== null && !x.partitionOf);
+    const partChildren = tables.filter((x) => x.partitionOf !== null && x.partitionBy === null);
     const columns = all(m, 'column');
     const enums = all(m, 'enum');
     const seqs = all(m, 'sequence');
@@ -103,7 +163,7 @@ export const interpret = (m: Model, actions: Action[], phase: keyof typeof WEIGH
       ['primaryKey', 'unique', 'foreignKey', 'check', 'index'].includes(o.kind),
     );
     const name = NAMES[b % NAMES.length]!;
-    const t = pick(tables, a);
+    const t = pick(rootTables, a);
     const col = pick(columns, a);
     try {
       switch (op) {
@@ -165,14 +225,18 @@ export const interpret = (m: Model, actions: Action[], phase: keyof typeof WEIGH
           else E.setDefault(m, col.id, { expr: pick(ti.defaults, c)! });
           break;
         }
-        case 11:
-          if (col && (col.type === 'integer' || col.type === 'bigint') && !col.generated && !col.typeRef)
-            E.setIdentity(
-              m,
-              col.id,
-              col.identity ? (d % 2 ? null : { always: !col.identity.always }) : { always: d % 2 === 0 },
-            );
+        case 11: {
+          if (!col || (col.type !== 'integer' && col.type !== 'bigint') || col.generated || col.typeRef)
+            break;
+          const pt = m.objects[col.parent];
+          if (pgMajor < 17 && pt?.kind === 'table' && pt.partitionBy !== null) break;
+          E.setIdentity(
+            m,
+            col.id,
+            col.identity ? (d % 2 ? null : { always: !col.identity.always }) : { always: d % 2 === 0 },
+          );
           break;
+        }
         case 12: {
           if (!t) break;
           const src = pick(
@@ -183,7 +247,7 @@ export const interpret = (m: Model, actions: Action[], phase: keyof typeof WEIGH
             E.addColumn(m, t.id, {
               name,
               type: src.type,
-              generated: { expr: `(${ident(src.name)} * 2)`, stored: d % 2 === 0 },
+              generated: { expr: `(${ident(src.name)} * 2)`, stored: pgMajor < 18 ? true : d % 2 === 0 },
             });
           break;
         }
@@ -324,6 +388,65 @@ export const interpret = (m: Model, actions: Action[], phase: keyof typeof WEIGH
         case 30:
           if (col) E.moveColumn(m, col.id, pick(childrenOf(m, col.parent, 'column'), c)?.id ?? null);
           break;
+        case 31: {
+          // 新建分区父表（RANGE / LIST / HASH）
+          const s = pick(schemas, a) ?? { id: E.createSchema(m, 'public') };
+          const strategy = (['range', 'list', 'hash'] as const)[c % 3]!;
+          const tid = E.createTable(m, s.id, `pt_${name}`.slice(0, 63));
+          const keyType = strategy === 'list' ? 'text' : 'integer';
+          const keyCol = E.addColumn(m, tid, { name: 'pk_key', type: keyType, notNull: true });
+          E.addColumn(m, tid, { name: 'val', type: 'integer', default: { expr: '0' } });
+          E.setPartitionBy(m, tid, {
+            strategy,
+            keys: [{ column: keyCol, expr: null, opclass: null, collation: null }],
+          });
+          if (d % 2 === 0) E.addPrimaryKey(m, tid, [keyCol]);
+          break;
+        }
+        case 32: {
+          // 新增子分区（不重叠 RANGE / LIST / HASH / DEFAULT）
+          const parent = pick(partParents, a);
+          if (!parent) break;
+          const bound = nextPartitionBound(m, parent, c);
+          if (!bound) break;
+          E.createPartition(m, parent.id, `${parent.name}_p_${d % 97}`.slice(0, 63), bound);
+          break;
+        }
+        case 33: {
+          // 修改子分区边界或重命名/删除子分区
+          const child = pick(partChildren, a);
+          if (!child) break;
+          if (d % 4 === 0) {
+            E.dropTable(m, child.id);
+          } else if (d % 4 === 1) {
+            E.renameTable(m, child.id, `ch_${name}_${c % 31}`.slice(0, 63));
+          } else {
+            const parent = m.objects[child.partitionOf!.parent] as E.Table | undefined;
+            if (!parent) break;
+            const bound = nextPartitionBound(m, parent, c);
+            if (bound) E.setPartitionBound(m, child.id, bound);
+          }
+          break;
+        }
+        case 34: {
+          // 子分区脱离为普通表（Detach）
+          const child = pick(partChildren, a);
+          if (child) E.detachPartition(m, child.id);
+          break;
+        }
+        case 35: {
+          // 寻找结构兼容的普通表挂载为子分区（Attach）
+          const parent = pick(partParents, a);
+          if (!parent) break;
+          const bound = nextPartitionBound(m, parent, c);
+          if (!bound) break;
+          const plain = pick(
+            rootTables.filter((x) => x.id !== parent.id && x.partitionBy === null && x.partitionOf === null),
+            b,
+          );
+          if (plain) E.attachPartition(m, parent.id, plain.id, bound);
+          break;
+        }
       }
     } catch (e) {
       if (!(e instanceof E.EditError)) throw e;
@@ -343,8 +466,8 @@ export const versions = fc.tuple(
   fc.array(action, { minLength: 10, maxLength: 70, size: 'max' }),
   fc.array(action, { minLength: 1, maxLength: 30, size: 'max' }),
 );
-export const makeVersions = ([a1, a2]: [Action[], Action[]]) => {
-  const v1 = interpret(fresh(), a1, 'build');
-  const v2 = interpret(structuredClone(v1), a2, 'mutate');
+export const makeVersions = ([a1, a2]: [Action[], Action[]], opts: GenOptions = {}) => {
+  const v1 = interpret(fresh(), a1, 'build', opts);
+  const v2 = interpret(structuredClone(v1), a2, 'mutate', opts);
   return { v1, v2 };
 };

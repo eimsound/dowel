@@ -2,7 +2,7 @@
 // 规划时维护一份“当前状态” cur：每生成一步就把它更新到执行这一步之后的样子，
 // 所以每条语句引用的都是当时实际存在的名字；结束时断言 cur 等于目标版本。
 
-import { renameInExpr, renameQualifiedInExpr } from '../edit.ts';
+import { exprReferences, renameInExpr, renameQualifiedInExpr } from '../edit.ts';
 import type {
   Check,
   Column,
@@ -13,6 +13,7 @@ import type {
   Model,
   Obj,
   Opaque,
+  PartitionSpec,
   PrimaryKey,
   Schema,
   Sequence,
@@ -22,8 +23,22 @@ import type {
 } from '../ir.ts';
 import { EARLY_OPAQUE } from '../ir.ts';
 import { deepEqual } from '../json.ts';
-import { all, childrenOf, columnsOf, find, get, partitionBySql, qname } from '../model.ts';
+import {
+  all,
+  childrenOf,
+  columnsOf,
+  find,
+  get,
+  indexElementNames,
+  partitionBySql,
+  partitionDepth,
+  partitionDescendants,
+  qname,
+  rootTableId,
+} from '../model.ts';
 import { checkPgCompatibility, LATEST_PG_MAJOR, pgCapabilities, type PlanOptions } from './capabilities.ts';
+import { chooseName, joinNames } from './naming.ts';
+import { derivedUuid, partitionKeyColumns } from './partition.ts';
 import { ident, literal, qualified } from './quote.ts';
 
 export interface Step {
@@ -156,6 +171,79 @@ export const plan = (from: Model, to: Model, opts?: PlanOptions): Step[] => {
   const was = <T extends Obj>(o: T): T => from.objects[o.id] as T;
   const isRemoved = (id: string) => inFrom(id) && !inTo(id);
 
+  // ───── 分区挂载/脱离/改边界关系预分析 ─────
+  const detaching = new Set<string>();
+  const attaching = new Set<string>();
+  const rebinding = new Set<string>();
+  for (const o of common) {
+    if (o.kind !== 'table') continue;
+    const w = was(o);
+    if (w.partitionOf && !o.partitionOf) detaching.add(o.id);
+    else if (!w.partitionOf && o.partitionOf) attaching.add(o.id);
+    else if (w.partitionOf && o.partitionOf && !same(w.partitionOf, o.partitionOf)) rebinding.add(o.id);
+  }
+  const willDetach = new Set([...detaching, ...rebinding]);
+  const willAttach = new Set([...attaching, ...rebinding]);
+
+  // 脱离为独立表的子分区：把 to 中新物化的列匹配回 from 根父表的列
+  const detachToRootCol = new Map<string, Column>(); // toColId → fromRootCol
+  const detachRootToNewCol = new Map<string, Map<string, string>>(); // tableId → (fromRootColId → toColId)
+  for (const tId of detaching) {
+    const oldRootCols = columnsOf(from, rootTableId(from, tId));
+    const toCols = columnsOf(to, tId);
+    const used = new Set<string>();
+    const map = new Map<string, string>();
+    for (const rc of oldRootCols) {
+      const detCandidate = derivedUuid(`${tId}:col:${rc.id}`);
+      const byDet = toCols.find((x) => x.id === detCandidate && !used.has(x.id));
+      const matched = byDet ?? toCols.find((x) => x.name === rc.name && !used.has(x.id));
+      if (matched) {
+        used.add(matched.id);
+        detachToRootCol.set(matched.id, rc);
+        map.set(rc.id, matched.id);
+      }
+    }
+    detachRootToNewCol.set(tId, map);
+  }
+
+  // 挂载为子分区的普通表：其与目标根父表同名的列不在 P5 中删除，而在 P12h 中随 ATTACH 吸收
+  const attachKeptCols = new Set<string>();
+  const attachColMap = new Map<string, Map<string, string>>(); // tableId → (fromChildColId → toRootColId)
+  for (const tId of attaching) {
+    const targetRootCols = columnsOf(to, rootTableId(to, tId));
+    const map = new Map<string, string>();
+    for (const cc of columnsOf(from, tId)) {
+      const rc = targetRootCols.find((x) => x.name === cc.name);
+      if (rc) {
+        // 生成列（含普通列↔生成列互转）不在 attachKeptCols 保留：P5 统一先删生成列避免挡住普通列删除/改类型，P12h 再按目标根表重建
+        if (!cc.generated && !rc.generated) attachKeptCols.add(cc.id);
+        map.set(cc.id, rc.id);
+      }
+    }
+    attachColMap.set(tId, map);
+  }
+
+  // 存量旧格式子分区冗余列升级清理：from 和 to 均为子分区、但 to 已移除冗余列对象，不发 DROP COLUMN
+  const legacyChildCols = new Set<string>();
+  const legacyColMap = new Map<string, Map<string, string>>(); // tableId → (fromLegacyColId → toRootColId)
+  for (const o of removed) {
+    if (o.kind !== 'column') continue;
+    const ft = find(from, o.parent);
+    const tt = find(to, o.parent);
+    if (ft?.kind === 'table' && tt?.kind === 'table' && ft.partitionOf && tt.partitionOf) {
+      legacyChildCols.add(o.id);
+      const rc = columnsOf(to, rootTableId(to, tt.id)).find((x) => x.name === o.name);
+      if (rc) {
+        let map = legacyColMap.get(tt.id);
+        if (!map) {
+          map = new Map();
+          legacyColMap.set(tt.id, map);
+        }
+        map.set(o.id, rc.id);
+      }
+    }
+  }
+
   // ───── 改名带来的表达式变化：PG 按 OID 记录引用，改名时会自动更新表达式，不需要重建 ─────
   // 把旧版本表达式里的 schema、枚举、列名换成新名字后再比较；相同就说明只是改名带来的变化
   const schemaRenames = common
@@ -168,12 +256,17 @@ export const plan = (from: Model, to: Model, opts?: PlanOptions): Step[] => {
   for (const o of common)
     if (o.kind === 'column' && o.name !== was(o).name)
       colRenames.set(o.parent, [...(colRenames.get(o.parent) ?? []), [was(o).name, o.name]]);
+  for (const [toColId, rc] of detachToRootCol) {
+    const tc = get(to, toColId, 'column');
+    if (tc.name !== rc.name)
+      colRenames.set(tc.parent, [...(colRenames.get(tc.parent) ?? []), [rc.name, tc.name]]);
+  }
   const migrateExpr = (expr: string, table: string): string => {
     let e = expr;
     for (const [a, b] of schemaRenames) e = renameQualifiedInExpr(e, a, null, { schema: b, name: null });
     for (const [sch, a, b] of enumRenames) e = renameQualifiedInExpr(e, sch, a, { schema: sch, name: b });
     // 两阶段：先换成占位名，再换成目标名（处理互换）
-    const rs = colRenames.get(table) ?? [];
+    const rs = colRenames.get(table) ?? colRenames.get(rootTableId(from, table)) ?? [];
     rs.forEach(([a], i) => {
       e = renameInExpr(e, a, `__dowel_ph_${i}__`);
     });
@@ -182,14 +275,35 @@ export const plan = (from: Model, to: Model, opts?: PlanOptions): Step[] => {
     });
     return e;
   };
+  const remapIdsForTable = (tableId: string): Map<string, string> | undefined =>
+    attachColMap.get(tableId) ?? detachRootToNewCol.get(tableId) ?? legacyColMap.get(tableId);
   const migrated = <T extends Obj>(w: T): T => {
     const o = clone(w) as Obj;
     if (o.kind === 'table' && o.partitionBy && typeof o.partitionBy !== 'string') {
-      for (const k of o.partitionBy.keys) if (k.expr) k.expr = migrateExpr(k.expr, o.id);
+      const rm = remapIdsForTable(o.id);
+      for (const k of o.partitionBy.keys) {
+        if (k.column && rm?.has(k.column)) k.column = rm.get(k.column)!;
+        if (k.expr) k.expr = migrateExpr(k.expr, o.id);
+      }
     }
     if (o.kind === 'check') o.expr = migrateExpr(o.expr, o.parent);
+    if (o.kind === 'primaryKey' || o.kind === 'unique') {
+      const rm = remapIdsForTable(o.parent);
+      if (rm) o.columns = o.columns.map((c) => rm.get(c) ?? c);
+    }
+    if (o.kind === 'foreignKey') {
+      const rm = remapIdsForTable(o.parent);
+      if (rm) o.columns = o.columns.map((c) => rm.get(c) ?? c);
+      const rrm = remapIdsForTable(o.refTable);
+      if (rrm) o.refColumns = o.refColumns.map((c) => rrm.get(c) ?? c);
+    }
     if (o.kind === 'index') {
-      for (const el of o.elements) if (el.expr) el.expr = migrateExpr(el.expr, o.parent);
+      const rm = remapIdsForTable(o.parent);
+      for (const el of o.elements) {
+        if (el.column && rm?.has(el.column)) el.column = rm.get(el.column)!;
+        if (el.expr) el.expr = migrateExpr(el.expr, o.parent);
+      }
+      if (rm) o.include = o.include.map((c) => rm.get(c) ?? c);
       if (o.where) o.where = migrateExpr(o.where, o.parent);
     }
     if (o.kind === 'column') {
@@ -205,23 +319,37 @@ export const plan = (from: Model, to: Model, opts?: PlanOptions): Step[] => {
       throw new PlanError(`暂不支持把 ${o.kind} ${o.name} 移到其他 schema 或表`);
     if (o.kind === 'column' && o.parent !== was(o).parent)
       throw new PlanError(`不能把列 ${o.name} 移到其他表`);
-    if (o.kind === 'table' && !same(definition(o, to), definition(migrated(was(o)), to, from)))
-      throw new PlanError(`分区设置暂不支持修改：${o.name}`);
+    if (o.kind === 'table') {
+      const w = was(o);
+      if ((w.partitionBy === null) !== (o.partitionBy === null)) {
+        throw new PlanError(`暂不支持将普通表与分区表互转：${o.name}`);
+      }
+      if (w.partitionBy !== null && o.partitionBy !== null) {
+        const mw = migrated(w);
+        let samePartBy = partitionBySql(to, o) === partitionBySql(to, mw, from);
+        // Stage 0 复审要求：两侧同为结构化 PartitionSpec 时额外校验 column ID 一致且未被删/换绑
+        if (samePartBy && typeof w.partitionBy !== 'string' && typeof o.partitionBy !== 'string') {
+          const mwSpec = mw.partitionBy as PartitionSpec;
+          const oSpec = o.partitionBy;
+          samePartBy =
+            mwSpec.strategy === oSpec.strategy &&
+            mwSpec.keys.length === oSpec.keys.length &&
+            oSpec.keys.every((ok, i) => {
+              const wk = mwSpec.keys[i]!;
+              if (ok.column !== wk.column) return false;
+              if (ok.column !== null && isRemoved(ok.column)) return false;
+              if (ok.opclass !== wk.opclass || ok.collation !== wk.collation) return false;
+              if ((ok.expr === null) !== (wk.expr === null)) return false;
+              return ok.expr === wk.expr;
+            });
+        }
+        if (!samePartBy) {
+          throw new PlanError(`暂不支持修改已存在表的分区策略或分区键：${o.name}`);
+        }
+      }
+    }
     if (o.kind === 'extension' && !same(definition(o), definition(was(o))))
       throw new PlanError(`扩展暂不支持修改：${o.name}`);
-  }
-  // 分区表（父表和子表）在 M1 中只读：整张表的新增、删除可以，表内结构不能改
-  const partitioned = (tableId: string) => {
-    const t = (to.objects[tableId] ?? from.objects[tableId]) as Table | undefined;
-    return !!t && (!!t.partitionBy || !!t.partitionOf);
-  };
-  for (const o of [...added, ...removed, ...common]) {
-    if (o.kind === 'table' || o.kind === 'opaque' || !('parent' in o)) continue;
-    const table = o.parent;
-    if (!partitioned(table) || !inFrom(table) || !inTo(table)) continue;
-    const changed =
-      !inFrom(o.id) || !inTo(o.id) || o.name !== was(o).name || !same(definition(o), definition(was(o)));
-    if (changed) throw new PlanError(`分区表在 M1 中只读，不能修改其结构：${o.kind} ${o.name}`);
   }
 
   // ───── 渲染（都基于 cur） ─────
@@ -315,21 +443,31 @@ export const plan = (from: Model, to: Model, opts?: PlanOptions): Step[] => {
       )
       .map((c) => c.id),
   );
+  for (const [toColId, rc] of detachToRootCol) {
+    const tc = get(to, toColId, 'column');
+    if (!same(pick(tc, ['type', 'typeRef', 'collation']), pick(rc, ['type', 'typeRef', 'collation'])))
+      typeChanged.add(toColId);
+  }
   /** 表达式是否引用了某些列（按旧名或新名） */
   const exprTouches = (expr: string | null | undefined, colIds: Iterable<string>) => {
     if (!expr) return false;
     const ids = identsIn(expr);
     for (const c of colIds) {
-      const names = [find(from, c)?.name, find(to, c)?.name];
+      const names = [find(from, c)?.name, find(to, c)?.name, detachToRootCol.get(c)?.name];
       if (names.some((n) => n && ids.has(n))) return true;
     }
     return false;
   };
-  const colsOfTable = (table: string, set: Set<string>) =>
-    [...set].filter((c) => {
+  const colsOfTable = (table: string, set: Set<string>) => {
+    const rootTo = rootTableId(to, table);
+    const rootFrom = rootTableId(from, table);
+    return [...set].filter((c) => {
       const col = find(to, c) ?? find(from, c);
-      return col?.kind === 'column' && col.parent === table;
+      return (
+        col?.kind === 'column' && (col.parent === table || col.parent === rootTo || col.parent === rootFrom)
+      );
     });
+  };
 
   // 生成列：定义变了、或表达式引用的列类型变了 → 删掉重建（生成列的值可以重新算出，不丢数据）
   const regen = new Set<string>();
@@ -344,7 +482,31 @@ export const plan = (from: Model, to: Model, opts?: PlanOptions): Step[] => {
     )
       regen.add(c.id);
   }
+  for (const [toColId, rc] of detachToRootCol) {
+    const tc = get(to, toColId, 'column');
+    if (!tc.generated && !rc.generated) continue;
+    const mrc = { ...clone(rc), parent: tc.parent };
+    if (mrc.generated) mrc.generated.expr = migrateExpr(mrc.generated.expr, tc.parent);
+    if (
+      !same(tc.generated, mrc.generated) ||
+      typeChanged.has(toColId) ||
+      (tc.generated && exprTouches(tc.generated.expr, colsOfTable(tc.parent, typeChanged)))
+    )
+      regen.add(toColId);
+  }
   for (const id of regen) typeChanged.delete(id);
+
+  // 分区键引用的列不允许改类型（PG 报错 cannot alter type of column named in partition key）
+  for (const o of common) {
+    if (o.kind !== 'table' || !o.partitionBy) continue;
+    const refs = partitionKeyColumns(to, o);
+    for (const colId of refs.all) {
+      if (typeChanged.has(colId) || regen.has(colId)) {
+        const colName = find(to, colId)?.name ?? colId;
+        throw new PlanError(`列 ${colName} 被分区表 ${o.name} 的分区键引用，不能修改类型`);
+      }
+    }
+  }
 
   const usesCols = (o: Obj, set: Set<string>): boolean => {
     switch (o.kind) {
@@ -471,6 +633,9 @@ export const plan = (from: Model, to: Model, opts?: PlanOptions): Step[] => {
     ...regen,
     ...enumRebuild,
     ...opaqueChanged,
+    ...detaching,
+    ...attaching,
+    ...rebinding,
   ]);
   const lateRebuild = new Set([...opaqueChanged].filter((id) => isLate(from.objects[id] as Opaque)));
   for (let changed = true; changed;) {
@@ -508,27 +673,324 @@ export const plan = (from: Model, to: Model, opts?: PlanOptions): Step[] => {
   };
 
   let tmp = 0; // 临时名计数器
+  const ancestorsCur = (tableId: string): Table[] => {
+    const out: Table[] = [];
+    const seen = new Set<string>();
+    let curId: string | null = tableId;
+    while (curId && !seen.has(curId)) {
+      seen.add(curId);
+      const t: Obj | undefined = cur.objects[curId];
+      if (t?.kind !== 'table') break;
+      out.push(t);
+      curId = t.partitionOf?.parent ?? null;
+    }
+    return out;
+  };
+  const relTakenCur = (schema: string, name: string) =>
+    Object.values(cur.objects).some((o) => {
+      if ((o.kind === 'table' || o.kind === 'sequence') && o.parent === schema) return o.name === name;
+      if (
+        (o.kind === 'index' || o.kind === 'primaryKey' || o.kind === 'unique') &&
+        get(cur, o.parent, 'table').parent === schema
+      )
+        return o.name === name;
+      if (o.kind === 'column' && o.identity && get(cur, o.parent, 'table').parent === schema)
+        return o.identity.sequenceName === name;
+      return false;
+    });
+  const conTakenCur = (tableId: string, name: string) =>
+    Object.values(cur.objects).some((o) => {
+      if (
+        (o.kind === 'primaryKey' || o.kind === 'unique' || o.kind === 'check' || o.kind === 'foreignKey') &&
+        o.parent === tableId
+      )
+        return o.name === name;
+      if (o.kind === 'column' && o.parent === tableId && o.notNull && cap.namedNotNull)
+        return o.notNullName === name;
+      return false;
+    });
+  const chooseInCur = (
+    schema: string,
+    tableId: string,
+    n1: string,
+    n2: string | null,
+    label: string,
+    rel: boolean,
+    con: boolean,
+  ) => chooseName(n1, n2, label, (n) => (rel && relTakenCur(schema, n)) || (con && conTakenCur(tableId, n)));
+
+  const materialized = new Set<string>();
+  const syntheticDetached = new Set<string>();
+  const retainedForReattach = new Set<string>();
+  const keptForAttachCheck = new Set<string>();
+
   // ───── P0 删晚期不透明对象（被删除的、要重建的），依赖它的先删 ─────
   const lateDrops = all(from, 'opaque').filter(
     (o) => isLate(o) && (isRemoved(o.id) || lateRebuild.has(o.id)),
   );
   for (const o of topo(lateDrops).reverse()) dropOpaque(o);
+
+  // ───── P0b 脱离需要脱离或改边界的子分区（按深度降序，先脱离最深层子分区） ─────
+  let synSeq = 0;
+  for (const tId of [...willDetach].sort((a, b) => partitionDepth(from, b) - partitionDepth(from, a))) {
+    const t = get(cur, tId, 'table');
+    const oldParentId = t.partitionOf!.parent;
+    const oldAncestors = ancestorsCur(oldParentId);
+    const oldRootId = rootTableId(cur, tId);
+    const oldRootCols = columnsOf(cur, oldRootId);
+    const isFullDetach = detaching.has(tId);
+    const targetPartOf = (to.objects[tId] as Table).partitionOf;
+    const sameParentRebind = rebinding.has(tId) && targetPartOf?.parent === oldParentId;
+
+    emit('detachPartition', tId, `ALTER TABLE ${T(oldParentId)} DETACH PARTITION ${T(tId)}`);
+    t.partitionOf = null;
+
+    // 1. 物化列到 cur（与 PG DETACH 后的实际列状态一致）
+    const rootToCurCol = new Map<string, string>();
+    const detMap = detachRootToNewCol.get(tId);
+    for (const rc of oldRootCols) {
+      const matchedToId = isFullDetach ? detMap?.get(rc.id) : undefined;
+      const cid = matchedToId ?? `__dowel_det_col_${++synSeq}`;
+      rootToCurCol.set(rc.id, cid);
+      cur.objects[cid] = {
+        id: cid,
+        kind: 'column',
+        parent: tId,
+        name: rc.name,
+        pos: rc.pos,
+        type: rc.type,
+        typeRef: rc.typeRef,
+        notNull: rc.notNull,
+        notNullName: cap.namedNotNull && rc.notNull ? rc.notNullName : null,
+        notNullNameMode: 'explicit',
+        default: rc.default ? clone(rc.default) : null,
+        identity: null,
+        generated: rc.generated ? clone(rc.generated) : null,
+        collation: rc.collation,
+        comment: null,
+      };
+      if (matchedToId) materialized.add(matchedToId);
+      else syntheticDetached.add(cid);
+    }
+
+    // 2. 把该子分区（及其后代）原有本地约束/索引的列引用映射到新物化的列 ID
+    const subTree = new Set([tId, ...partitionDescendants(cur, tId).map((d) => d.id)]);
+    const mapCol = (c: string) => rootToCurCol.get(c) ?? c;
+    for (const o of Object.values(cur.objects)) {
+      if (o.kind === 'table' && subTree.has(o.id) && o.partitionBy && typeof o.partitionBy !== 'string') {
+        for (const k of o.partitionBy.keys) if (k.column) k.column = mapCol(k.column);
+      }
+      if (!('parent' in o) || !subTree.has(o.parent)) continue;
+      if (o.kind === 'primaryKey' || o.kind === 'unique') o.columns = o.columns.map(mapCol);
+      else if (o.kind === 'foreignKey') {
+        o.columns = o.columns.map(mapCol);
+        if (subTree.has(o.refTable)) o.refColumns = o.refColumns.map(mapCol);
+      } else if (o.kind === 'index') {
+        for (const el of o.elements) if (el.column) el.column = mapCol(el.column);
+        o.include = o.include.map(mapCol);
+      }
+    }
+
+    // 3. 物化祖先表被 PG DETACH 转为独立对象的约束与索引
+    const matchedToObjs = new Set<string>();
+    const toOnT = Object.values(to.objects).filter((o) => 'parent' in o && o.parent === tId);
+    const registerDetached = (
+      ancObj: PrimaryKey | Unique | Check | ForeignKey | Index,
+      detObj: PrimaryKey | Unique | Check | ForeignKey | Index,
+      seedPrefix: 'con' | 'idx',
+    ) => {
+      if (isFullDetach) {
+        const detId = derivedUuid(`${tId}:${seedPrefix}:${ancObj.id}`);
+        let toMatch = toOnT.find((x) => x.id === detId && x.kind === detObj.kind && !matchedToObjs.has(x.id));
+        if (!toMatch) {
+          toMatch = toOnT.find((x) => {
+            if (x.kind !== detObj.kind || matchedToObjs.has(x.id) || x.id in cur.objects) return false;
+            if (x.kind === 'primaryKey') return true;
+            if (x.kind === 'check' && detObj.kind === 'check')
+              return x.name === detObj.name || x.expr === migrateExpr(detObj.expr, tId);
+            if (x.kind === 'foreignKey' && detObj.kind === 'foreignKey') return x.name === detObj.name;
+            return same(definition(x), definition(migrated(detObj)));
+          });
+        }
+        if (toMatch) {
+          matchedToObjs.add(toMatch.id);
+          const placed = { ...detObj, id: toMatch.id };
+          cur.objects[toMatch.id] = placed;
+          materialized.add(toMatch.id);
+          if (
+            !same(definition(toMatch), definition(migrated(placed))) ||
+            usesCols(placed, regen) ||
+            usesCols(placed, typeChanged) ||
+            (placed.kind === 'foreignKey' && (usesCols(placed, enumCols) || refKeyGone(placed.refTable)))
+          ) {
+            rebuild.add(toMatch.id);
+          }
+          return;
+        }
+      }
+      const synId = `__dowel_det_obj_${++synSeq}`;
+      cur.objects[synId] = { ...detObj, id: synId };
+      syntheticDetached.add(synId);
+      if (
+        sameParentRebind &&
+        inTo(ancObj.id) &&
+        !rebuild.has(ancObj.id) &&
+        ((ancObj.kind !== 'check' && ancObj.kind !== 'foreignKey') ||
+          ancObj.name === to.objects[ancObj.id]!.name)
+      ) {
+        retainedForReattach.add(synId);
+      }
+    };
+
+    for (const anc of oldAncestors) {
+      for (const pk of childrenOf(cur, anc.id, 'primaryKey')) {
+        if (childrenOf(cur, tId, 'primaryKey').length > 0) continue;
+        const mappedCols = pk.columns.map(mapCol);
+        const detName = chooseInCur(t.parent, tId, t.name, null, 'pkey', true, true);
+        registerDetached(
+          pk,
+          {
+            id: '',
+            kind: 'primaryKey',
+            parent: tId,
+            name: detName,
+            nameMode: 'derived',
+            columns: mappedCols,
+            comment: null,
+          },
+          'con',
+        );
+      }
+      for (const u of childrenOf(cur, anc.id, 'unique')) {
+        const mappedCols = u.columns.map(mapCol);
+        const colNames = mappedCols.map((c) => get(cur, c, 'column').name);
+        const detName = chooseInCur(t.parent, tId, t.name, joinNames(colNames), 'key', true, true);
+        registerDetached(
+          u,
+          {
+            id: '',
+            kind: 'unique',
+            parent: tId,
+            name: detName,
+            nameMode: 'derived',
+            columns: mappedCols,
+            nullsNotDistinct: u.nullsNotDistinct,
+            comment: null,
+          },
+          'con',
+        );
+      }
+      for (const ck of childrenOf(cur, anc.id, 'check')) {
+        if (childrenOf(cur, tId, 'check').some((x) => x.name === ck.name)) continue;
+        registerDetached(
+          ck,
+          {
+            id: '',
+            kind: 'check',
+            parent: tId,
+            name: ck.name,
+            nameMode: 'explicit',
+            expr: ck.expr,
+            noInherit: false,
+            comment: null,
+          },
+          'con',
+        );
+      }
+      for (const fk of childrenOf(cur, anc.id, 'foreignKey')) {
+        if (childrenOf(cur, tId, 'foreignKey').some((x) => x.name === fk.name)) continue;
+        registerDetached(
+          fk,
+          {
+            id: '',
+            kind: 'foreignKey',
+            parent: tId,
+            name: fk.name,
+            nameMode: 'explicit',
+            columns: fk.columns.map(mapCol),
+            refTable: fk.refTable,
+            refColumns: [...fk.refColumns],
+            onDelete: fk.onDelete,
+            onUpdate: fk.onUpdate,
+            match: fk.match,
+            deferrable: fk.deferrable,
+            initiallyDeferred: fk.initiallyDeferred,
+            comment: null,
+          },
+          'con',
+        );
+      }
+      for (const idx of childrenOf(cur, anc.id, 'index')) {
+        const mappedIdx: Index = {
+          id: '',
+          kind: 'index',
+          parent: tId,
+          name: '',
+          nameMode: 'derived',
+          unique: idx.unique,
+          method: idx.method,
+          elements: idx.elements.map((e) => ({ ...e, column: e.column ? mapCol(e.column) : null })),
+          include: idx.include.map(mapCol),
+          where: idx.where,
+          nullsNotDistinct: idx.nullsNotDistinct,
+          comment: null,
+        };
+        mappedIdx.name = chooseInCur(
+          t.parent,
+          tId,
+          t.name,
+          joinNames(indexElementNames(cur, mappedIdx)),
+          'idx',
+          true,
+          false,
+        );
+        registerDetached(idx, mappedIdx, 'idx');
+      }
+    }
+  }
+
+  // 对 attaching 表上在 to 中已被吸收的 CHECK：若与目标父表/祖先表上未重建的 CHECK 同名同表达式，则保留至 P12h 由 ATTACH 吸收
+  for (const tId of attaching) {
+    const targetParentId = (to.objects[tId] as Table).partitionOf!.parent;
+    const ancIds = new Set(ancestorsCur(targetParentId).map((a) => a.id));
+    const ancChecks = Object.values(cur.objects).filter(
+      (o): o is Check =>
+        o.kind === 'check' &&
+        ancIds.has(o.parent) &&
+        inTo(o.id) &&
+        !rebuild.has(o.id) &&
+        o.name === to.objects[o.id]!.name,
+    );
+    for (const ck of childrenOf(cur, tId, 'check')) {
+      if (isRemoved(ck.id) && ancChecks.some((ak) => ak.name === ck.name && ak.expr === ck.expr)) {
+        keptForAttachCheck.add(ck.id);
+      }
+    }
+  }
+
   // ───── P1 删外键 ─────
-  for (const o of [...removed, ...common.map(was)]) {
-    if (o.kind !== 'foreignKey' || !(isRemoved(o.id) || rebuild.has(o.id))) continue;
-    emit('dropForeignKey', o.id, `ALTER TABLE ${T(o.parent)} DROP CONSTRAINT ${ident(get(cur, o.id).name)}`);
+  for (const o of Object.values(cur.objects)) {
+    if (o.kind !== 'foreignKey') continue;
+    const shouldDrop = syntheticDetached.has(o.id)
+      ? !retainedForReattach.has(o.id)
+      : isRemoved(o.id) || rebuild.has(o.id);
+    if (!shouldDrop) continue;
+    emit('dropForeignKey', o.id, `ALTER TABLE ${T(o.parent)} DROP CONSTRAINT ${ident(o.name)}`);
     delete cur.objects[o.id];
   }
   // ───── P2 删其他约束和索引（所在表要删的跳过，删表时一起删掉） ─────
-  for (const o of [...removed, ...common.map(was)]) {
-    if (!isKey(o) || !(isRemoved(o.id) || rebuild.has(o.id)) || tableRemoved(o)) continue;
-    const name = get(cur, o.id).name;
-    if (o.kind === 'index') emit('dropIndex', o.id, `DROP INDEX ${relIn(o.parent, name)}`);
+  for (const o of Object.values(cur.objects)) {
+    if (!isKey(o) || tableRemoved(o) || keptForAttachCheck.has(o.id)) continue;
+    const shouldDrop = syntheticDetached.has(o.id)
+      ? !retainedForReattach.has(o.id)
+      : isRemoved(o.id) || rebuild.has(o.id);
+    if (!shouldDrop) continue;
+    if (o.kind === 'index') emit('dropIndex', o.id, `DROP INDEX ${relIn(o.parent, o.name)}`);
     else
       emit(
         `drop${o.kind[0]!.toUpperCase()}${o.kind.slice(1)}`,
         o.id,
-        `ALTER TABLE ${T(o.parent)} DROP CONSTRAINT ${ident(name)}`,
+        `ALTER TABLE ${T(o.parent)} DROP CONSTRAINT ${ident(o.name)}`,
       );
     delete cur.objects[o.id];
   }
@@ -546,10 +1008,26 @@ export const plan = (from: Model, to: Model, opts?: PlanOptions): Step[] => {
     dropWithColumn(id);
     delete cur.objects[id];
   }
-  // ───── P4 删表（分区子表先于父表） ─────
-  const childFirst = (o: Obj) => (o.kind === 'table' && o.partitionOf ? 0 : 1);
-  for (const o of [...removed].sort((x, y) => childFirst(x) - childFirst(y))) {
-    if (o.kind !== 'table' || !(o.id in cur.objects)) continue;
+  // ───── P4 删表（按分区深度降序，深层子分区先于父表） ─────
+  const hasReferencingFkOnAncestor = (tableId: string) => {
+    const ancIds = new Set(
+      ancestorsCur(tableId)
+        .slice(1)
+        .map((a) => a.id),
+    );
+    return ancIds.size > 0 && all(cur, 'foreignKey').some((fk) => ancIds.has(fk.refTable));
+  };
+  const removedTables = removed
+    .filter((o): o is Table => o.kind === 'table')
+    .sort((x, y) => partitionDepth(from, y.id) - partitionDepth(from, x.id));
+  for (const o of removedTables) {
+    if (!(o.id in cur.objects)) continue;
+    const curT = get(cur, o.id, 'table');
+    // 若父表或祖先表仍被外键引用，PG 禁止直接 DROP 子分区，需先 DETACH 再 DROP
+    if (curT.partitionOf && hasReferencingFkOnAncestor(o.id)) {
+      emit('detachPartition', o.id, `ALTER TABLE ${T(curT.partitionOf.parent)} DETACH PARTITION ${T(o.id)}`);
+      curT.partitionOf = null;
+    }
     emit('dropTable', o.id, `DROP TABLE ${T(o.id)}`);
     for (const c of childrenOf(cur, o.id, 'column')) {
       dropWithColumn(c.id);
@@ -560,9 +1038,19 @@ export const plan = (from: Model, to: Model, opts?: PlanOptions): Step[] => {
     delete cur.objects[o.id];
   }
   // ───── P5 删列（生成列先删，它们依赖普通列） ─────
-  const generatedFirst = (o: Obj) => (o.kind === 'column' && o.generated ? 0 : 1);
-  for (const o of [...removed].sort((x, y) => generatedFirst(x) - generatedFirst(y))) {
-    if (o.kind !== 'column' || !(o.id in cur.objects)) continue;
+  const colsToDrop = [
+    ...removed.filter((o): o is Column => o.kind === 'column'),
+    ...Object.values(cur.objects).filter(
+      (o): o is Column => o.kind === 'column' && syntheticDetached.has(o.id) && detaching.has(o.parent),
+    ),
+  ].sort((x, y) => (x.generated ? 0 : 1) - (y.generated ? 0 : 1));
+  for (const o of colsToDrop) {
+    if (!(o.id in cur.objects)) continue;
+    if (attachKeptCols.has(o.id)) continue; // 将在 P12h 随 ATTACH 吸收
+    if (legacyChildCols.has(o.id)) {
+      delete cur.objects[o.id];
+      continue;
+    }
     emit('dropColumn', o.id, `ALTER TABLE ${T(o.parent)} DROP COLUMN ${C(o.id)}`);
     dropWithColumn(o.id);
     delete cur.objects[o.id];
@@ -570,7 +1058,8 @@ export const plan = (from: Model, to: Model, opts?: PlanOptions): Step[] => {
   for (const id of autoDropped) delete cur.objects[id];
 
   // ───── P5b 提前去掉 identity 和 NOT NULL：它们占用的序列名、约束名可能是后面改名的目标 ─────
-  for (const o of common) {
+  const liveTargets = Object.values(to.objects).filter((o) => inFrom(o.id) || materialized.has(o.id));
+  for (const o of liveTargets) {
     if (o.kind !== 'column' || regen.has(o.id)) continue;
     const c = cur.objects[o.id];
     if (c?.kind !== 'column') continue;
@@ -640,7 +1129,7 @@ export const plan = (from: Model, to: Model, opts?: PlanOptions): Step[] => {
         return `ALTER TABLE ${T(o.parent)} RENAME CONSTRAINT ${ident(o.name)} TO ${ident(name)}`;
     }
   };
-  for (const o of common) {
+  for (const o of liveTargets) {
     const c = cur.objects[o.id];
     if (!c) continue; // 已在前面被删掉重建
     if (c.name !== o.name && c.kind !== 'opaque' && c.kind !== 'extension') {
@@ -656,10 +1145,9 @@ export const plan = (from: Model, to: Model, opts?: PlanOptions): Step[] => {
     }
     // 列附带的两个名字：NOT NULL 约束、identity 序列
     if (o.kind === 'column' && c.kind === 'column') {
-      const w = was(o);
       if (
         cap.namedNotNull &&
-        w.notNull &&
+        c.notNull &&
         o.notNull &&
         c.notNullName &&
         o.notNullName &&
@@ -676,7 +1164,7 @@ export const plan = (from: Model, to: Model, opts?: PlanOptions): Step[] => {
           },
         });
       }
-      if (w.identity && o.identity && c.identity && c.identity.sequenceName !== o.identity.sequenceName) {
+      if (c.identity && o.identity && c.identity.sequenceName !== o.identity.sequenceName) {
         items.push({
           id: `${o.id}#seq`,
           spaces: [`rel:${schemaOfTable(o.parent)}`],
@@ -752,11 +1240,17 @@ export const plan = (from: Model, to: Model, opts?: PlanOptions): Step[] => {
   }
 
   // 改名完成后，PG 已自动更新了引用这些名字的表达式：把当前状态里的表达式同步成新文本
-  for (const o of common) {
+  for (const o of liveTargets) {
     const c = cur.objects[o.id];
     if (!c) continue;
-    const m = migrated(was(o));
-    if (c.kind === 'table' && o.kind === 'table' && same(definition(m, cur, from), definition(o, to))) {
+    const base = inFrom(o.id) ? was(o) : c;
+    const m = migrated(base);
+    if (
+      c.kind === 'table' &&
+      o.kind === 'table' &&
+      m.kind === 'table' &&
+      same(partitionBySql(cur, m, from), partitionBySql(to, o))
+    ) {
       c.partitionBy = clone(o.partitionBy);
     }
     if ((c.kind === 'check' || c.kind === 'index') && same(definition(m), definition(o)))
@@ -804,6 +1298,11 @@ export const plan = (from: Model, to: Model, opts?: PlanOptions): Step[] => {
         if (col.typeRef !== o.id) continue;
         if (col.default) {
           emit('dropDefault', col.id, `ALTER TABLE ${T(col.parent)} ALTER COLUMN ${C(col.id)} DROP DEFAULT`);
+          if (get(cur, col.parent, 'table').partitionBy !== null) {
+            for (const desc of partitionDescendants(cur, col.parent)) {
+              emit('dropDefault', col.id, `ALTER TABLE ${T(desc.id)} ALTER COLUMN ${C(col.id)} DROP DEFAULT`);
+            }
+          }
           col.default = null;
         }
         const arr = col.type;
@@ -850,24 +1349,63 @@ export const plan = (from: Model, to: Model, opts?: PlanOptions): Step[] => {
     emit('alterSequence', o.id, `ALTER SEQUENCE ${qname(cur, c)} ${seqOptions(o.options, true)}`);
     c.options = clone(o.options);
   }
-  // ───── P10 建表（列内联；约束和索引后面统一加；分区父表先于子表） ─────
-  const parentFirst = (o: Obj) => (o.kind === 'table' && o.partitionOf ? 1 : 0);
-  for (const o of [...added].sort((x, y) => parentFirst(x) - parentFirst(y))) {
-    if (o.kind !== 'table') continue;
+  // ───── P10 建表（列内联；约束和索引后面统一加；按分区深度升序，父表先于子表，天然支持多级分区） ─────
+  const addedTables = added
+    .filter((o): o is Table => o.kind === 'table')
+    .sort((x, y) => partitionDepth(to, x.id) - partitionDepth(to, y.id));
+  const emitConstraintOrIndex = (o: PrimaryKey | Unique | Check | Index) => {
+    cur.objects[o.id] = fresh(o);
+    if (o.kind === 'index') emit('createIndex', o.id, indexDef(o));
+    else
+      emit(
+        `add${o.kind[0]!.toUpperCase()}${o.kind.slice(1)}`,
+        o.id,
+        `ALTER TABLE ${T(o.parent)} ADD CONSTRAINT ${ident(o.name)} ${constraintDef(o)}`,
+      );
+  };
+  const allColRefsInCur = (o: PrimaryKey | Unique | Index): boolean => {
+    if (o.kind === 'primaryKey' || o.kind === 'unique') return o.columns.every((c) => c in cur.objects);
+    return (
+      o.elements.every((e) => !e.column || e.column in cur.objects) &&
+      o.include.every((c) => c in cur.objects)
+    );
+  };
+  for (const o of addedTables) {
     cur.objects[o.id] = fresh(o);
     const columns = columnsOf(to, o.id);
-    for (const c of columns) cur.objects[c.id] = fresh(c);
-    const body = columns.length ? `\n  ${columns.map((c) => columnDef(c, o)).join(',\n  ')}\n` : '';
-    const partSql = partitionBySql(cur, o);
-    const part = partSql ? ` PARTITION BY ${partSql}` : '';
-    emit('createTable', o.id, `CREATE TABLE ${T(o.id)} (${body})${part}`);
-    // 分区子表与 pg_dump 一样：先作为普通表建出来（保留自己的列定义和约束名），再挂到父表上
-    if (o.partitionOf)
+    if (o.partitionOf && columns.length === 0) {
+      const partSql = partitionBySql(cur, o);
+      const part = partSql ? ` PARTITION BY ${partSql}` : '';
+      // 标准分区子表：不冗余存列，直接使用 CREATE TABLE ... PARTITION OF 继承父表列与约束
       emit(
-        'attachPartition',
+        'createTable',
         o.id,
-        `ALTER TABLE ${T(o.partitionOf.parent)} ATTACH PARTITION ${T(o.id)} ${o.partitionOf.bound}`,
+        `CREATE TABLE ${T(o.id)} PARTITION OF ${T(o.partitionOf.parent)} ${o.partitionOf.bound}${part}`,
       );
+    } else {
+      for (const c of columns) cur.objects[c.id] = fresh(c);
+      const partSql = partitionBySql(cur, o);
+      const part = partSql ? ` PARTITION BY ${partSql}` : '';
+      const body = columns.length ? `\n  ${columns.map((c) => columnDef(c, o)).join(',\n  ')}\n` : '';
+      emit('createTable', o.id, `CREATE TABLE ${T(o.id)} (${body})${part}`);
+      // 兼容存量旧格式（子分区带冗余列）：先作为普通表建出来，再 ATTACH 到父表上
+      if (o.partitionOf)
+        emit(
+          'attachPartition',
+          o.id,
+          `ALTER TABLE ${T(o.partitionOf.parent)} ATTACH PARTITION ${T(o.id)} ${o.partitionOf.bound}`,
+        );
+    }
+    // 新建分区父表时，在创建其子分区之前先把父表自身的 PK / UNIQUE / INDEX 建好，
+    // 防止后续先建子分区再建索引时 PG 自动生成的子分区继承索引名抢占父表显式索引名（63 字节截断重名）
+    if (o.partitionBy !== null && !o.partitionOf) {
+      for (const kind of ['primaryKey', 'unique', 'index'] as const) {
+        for (const k of childrenOf(to, o.id, kind)) {
+          if (k.id in cur.objects || !allColRefsInCur(k)) continue;
+          emitConstraintOrIndex(k);
+        }
+      }
+    }
   }
   // ───── P11 加列（生成列在改完列之后再加，见 P12g） ─────
   const addColumn = (c: Column) => {
@@ -887,8 +1425,17 @@ export const plan = (from: Model, to: Model, opts?: PlanOptions): Step[] => {
   };
 
   // ───── P12 改列：分几轮，保证依赖顺序 ─────
-  const altered = common.filter((o): o is Column => o.kind === 'column' && !regen.has(o.id));
+  const altered = liveTargets.filter((o): o is Column => o.kind === 'column' && !regen.has(o.id));
   const A = (c: Column) => `ALTER TABLE ${T(c.parent)} ALTER COLUMN ${C(c.id)}`;
+  const emitDefaultCascade = (c: Column, kind: 'dropDefault' | 'setDefault', clause: string) => {
+    emit(kind, c.id, `${A(c)} ${clause}`);
+    // PG 修改分区父表列默认值不会自动级联已有子分区，必须对已附着的所有后代子分区补发以保证闭环一致
+    if (get(cur, c.parent, 'table').partitionBy !== null) {
+      for (const desc of partitionDescendants(cur, c.parent)) {
+        emit(kind, c.id, `ALTER TABLE ${T(desc.id)} ALTER COLUMN ${C(c.id)} ${clause}`);
+      }
+    }
+  };
   // a. 去掉 identity
   for (const o of altered) {
     const c = get(cur, o.id, 'column');
@@ -901,7 +1448,7 @@ export const plan = (from: Model, to: Model, opts?: PlanOptions): Step[] => {
   for (const o of altered) {
     const c = get(cur, o.id, 'column');
     if (c.default && (!same(c.default, o.default) || typeChanged.has(o.id))) {
-      emit('dropDefault', o.id, `${A(c)} DROP DEFAULT`);
+      emitDefaultCascade(c, 'dropDefault', 'DROP DEFAULT');
       c.default = null;
     }
   }
@@ -948,7 +1495,7 @@ export const plan = (from: Model, to: Model, opts?: PlanOptions): Step[] => {
     const c = get(cur, o.id, 'column');
     if (o.default && !same(c.default, o.default)) {
       c.default = clone(o.default);
-      emit('setDefault', o.id, `${A(c)} SET DEFAULT ${defaultOf(c)}`);
+      emitDefaultCascade(c, 'setDefault', `SET DEFAULT ${defaultOf(c)}`);
     }
   }
   // f. 加 identity、改 identity
@@ -986,6 +1533,190 @@ export const plan = (from: Model, to: Model, opts?: PlanOptions): Step[] => {
   }
   // g. 加生成列（新增的和重建的）：必须在它引用的列改完类型之后
   lateGenerated();
+
+  // ───── P12h 挂载子分区（普通表 → 子分区，或改边界/换父表后的重新挂载；按目标深度升序） ─────
+  for (const tId of [...willAttach].sort((a, b) => partitionDepth(to, a) - partitionDepth(to, b))) {
+    const targetTable = get(to, tId, 'table');
+    const targetParentId = targetTable.partitionOf!.parent;
+    const targetBound = targetTable.partitionOf!.bound;
+    const targetRootId = rootTableId(cur, targetParentId);
+    const rootCols = columnsOf(cur, targetRootId);
+    const childCols = columnsOf(cur, tId);
+    const childTable = get(cur, tId, 'table');
+
+    // 对齐列定义（处理挂载前差异或脱离期间父表列发生变更的情况）
+    // 1. 先删除多余列、生成表达式不一致的列、以及引用了将要改类型列的生成列；必须先删生成列再删普通列
+    const typeChangingNames = new Set(
+      childCols
+        .filter((cc) => {
+          const rc = rootCols.find((x) => x.name === cc.name);
+          return (
+            rc &&
+            !same(pick(cc, ['type', 'typeRef', 'collation']), pick(rc, ['type', 'typeRef', 'collation']))
+          );
+        })
+        .map((cc) => cc.name),
+    );
+    const colsToDropOnChild = childCols
+      .filter((cc) => {
+        const rc = rootCols.find((x) => x.name === cc.name);
+        if (!rc) return true;
+        if (!same(cc.generated, rc.generated)) return true;
+        if (cc.generated && [...typeChangingNames].some((n) => exprReferences(cc.generated!.expr, n)))
+          return true;
+        return false;
+      })
+      .sort((x, y) => (x.generated ? 0 : 1) - (y.generated ? 0 : 1));
+    for (const cc of colsToDropOnChild) {
+      emit('dropColumn', cc.id, `ALTER TABLE ${T(tId)} DROP COLUMN ${ident(cc.name)}`);
+      dropWithColumn(cc.id);
+      delete cur.objects[cc.id];
+    }
+    for (const id of autoDropped) delete cur.objects[id];
+    const curChildCols = columnsOf(cur, tId);
+    const childToRootCol = new Map<string, string>();
+    // 2. 补齐缺失的非生成列，并对齐已存在的非生成列
+    for (const rc of rootCols) {
+      const cc = curChildCols.find((x) => x.name === rc.name);
+      if (!cc) {
+        if (rc.generated) continue;
+        const addedCol: Column = {
+          ...clone(rc),
+          id: `__dowel_att_col_${++synSeq}`,
+          parent: tId,
+          identity: null,
+          notNullName: cap.namedNotNull ? rc.notNullName : null,
+          comment: null,
+        };
+        emit('addColumn', tId, `ALTER TABLE ${T(tId)} ADD COLUMN ${columnDef(addedCol, childTable)}`);
+        continue;
+      }
+      childToRootCol.set(cc.id, rc.id);
+      if (cc.generated) continue;
+      const Ac = `ALTER TABLE ${T(tId)} ALTER COLUMN ${ident(cc.name)}`;
+      if (cc.identity) {
+        emit('dropIdentity', cc.id, `${Ac} DROP IDENTITY`);
+        cc.identity = null;
+      }
+      if (cc.default && !same(cc.default, rc.default)) {
+        emit('dropDefault', cc.id, `${Ac} DROP DEFAULT`);
+        cc.default = null;
+      }
+      if (!same(pick(cc, ['type', 'typeRef', 'collation']), pick(rc, ['type', 'typeRef', 'collation']))) {
+        const viaText = !!(cc.typeRef || rc.typeRef) || !hasDirectCast(cc.type, rc.type);
+        const targetType = rc.typeRef ? qname(cur, get(cur, rc.typeRef, 'enum')) + rc.type : rc.type;
+        emit(
+          'alterType',
+          cc.id,
+          `${Ac} TYPE ${typeOf(rc)} USING ${ident(cc.name)}${viaText ? `::text${arrayDims(cc.type) === arrayDims(rc.type) ? arrayDims(cc.type) : ''}` : ''}::${targetType}`,
+        );
+        Object.assign(cc, { type: rc.type, typeRef: rc.typeRef, collation: rc.collation });
+      }
+      if (cc.notNull && !rc.notNull) {
+        emit('dropNotNull', cc.id, `${Ac} DROP NOT NULL`);
+        cc.notNull = false;
+        cc.notNullName = null;
+      }
+      if (!cc.notNull && rc.notNull) {
+        emit(
+          'setNotNull',
+          cc.id,
+          cap.namedNotNull && rc.notNullName
+            ? `ALTER TABLE ${T(tId)} ADD CONSTRAINT ${ident(rc.notNullName)} NOT NULL ${ident(cc.name)}`
+            : `${Ac} SET NOT NULL`,
+        );
+        cc.notNull = true;
+        cc.notNullName = cap.namedNotNull ? rc.notNullName : null;
+      } else if (
+        cap.namedNotNull &&
+        cc.notNull &&
+        rc.notNull &&
+        cc.notNullName &&
+        rc.notNullName &&
+        cc.notNullName !== rc.notNullName &&
+        !conTakenCur(tId, rc.notNullName)
+      ) {
+        emit(
+          'rename',
+          `${cc.id}#nn`,
+          `ALTER TABLE ${T(tId)} RENAME CONSTRAINT ${ident(cc.notNullName)} TO ${ident(rc.notNullName)}`,
+        );
+        cc.notNullName = rc.notNullName;
+      }
+      if (rc.default && !same(cc.default, rc.default)) {
+        cc.default = clone(rc.default);
+        emit('setDefault', cc.id, `${Ac} SET DEFAULT ${defaultOf(rc)}`);
+      }
+    }
+    // 3. 最后补齐缺失或刚删除重建的生成列（此时其引用的普通列均已到位且类型已对齐）
+    for (const rc of rootCols) {
+      if (!rc.generated) continue;
+      if (curChildCols.some((x) => x.name === rc.name)) continue;
+      const addedCol: Column = {
+        ...clone(rc),
+        id: `__dowel_att_col_${++synSeq}`,
+        parent: tId,
+        identity: null,
+        notNullName: cap.namedNotNull ? rc.notNullName : null,
+        comment: null,
+      };
+      emit('addColumn', tId, `ALTER TABLE ${T(tId)} ADD COLUMN ${columnDef(addedCol, childTable)}`);
+    }
+
+    // 补齐目标父表/祖先表上已存在的 CHECK 约束（PG ATTACH PARTITION 要求子表先具备父表 CHECK）
+    for (const anc of ancestorsCur(targetParentId)) {
+      for (const ancCk of childrenOf(cur, anc.id, 'check')) {
+        const existing = childrenOf(cur, tId, 'check').find((x) => x.name === ancCk.name);
+        if (existing) {
+          if (existing.expr === ancCk.expr || retainedForReattach.has(existing.id)) continue;
+          emit('dropCheck', existing.id, `ALTER TABLE ${T(tId)} DROP CONSTRAINT ${ident(existing.name)}`);
+          delete cur.objects[existing.id];
+        }
+        emit(
+          'addCheck',
+          tId,
+          `ALTER TABLE ${T(tId)} ADD CONSTRAINT ${ident(ancCk.name)} CHECK (${ancCk.expr})`,
+        );
+      }
+    }
+
+    emit(
+      'attachPartition',
+      tId,
+      `ALTER TABLE ${T(targetParentId)} ATTACH PARTITION ${T(tId)} ${targetBound}`,
+    );
+    childTable.partitionOf = clone(targetTable.partitionOf);
+
+    // 映射子表及其后代保留的本地约束/索引列引用至根父表列 ID
+    const subTree = new Set([tId, ...partitionDescendants(cur, tId).map((d) => d.id)]);
+    const mapCol = (c: string) => childToRootCol.get(c) ?? c;
+    for (const o of Object.values(cur.objects)) {
+      if (o.kind === 'table' && subTree.has(o.id) && o.partitionBy && typeof o.partitionBy !== 'string') {
+        for (const k of o.partitionBy.keys) if (k.column) k.column = mapCol(k.column);
+      }
+      if (!('parent' in o) || !subTree.has(o.parent)) continue;
+      if (o.kind === 'primaryKey' || o.kind === 'unique') o.columns = o.columns.map(mapCol);
+      else if (o.kind === 'foreignKey') {
+        o.columns = o.columns.map(mapCol);
+        if (subTree.has(o.refTable)) o.refColumns = o.refColumns.map(mapCol);
+      } else if (o.kind === 'index') {
+        for (const el of o.elements) if (el.column) el.column = mapCol(el.column);
+        o.include = o.include.map(mapCol);
+      }
+    }
+
+    // 清理被 ATTACH 吸收的列、保留重挂对象与同名 CHECK
+    for (const cc of columnsOf(cur, tId)) delete cur.objects[cc.id];
+    for (const o of Object.values(cur.objects)) {
+      if (
+        'parent' in o &&
+        o.parent === tId &&
+        (retainedForReattach.has(o.id) || keptForAttachCheck.has(o.id))
+      ) {
+        delete cur.objects[o.id];
+      }
+    }
+  }
   // ───── P13 序列属于哪一列 ─────
   for (const o of [...added, ...common]) {
     if (o.kind !== 'sequence') continue;
@@ -1018,18 +1749,76 @@ export const plan = (from: Model, to: Model, opts?: PlanOptions): Step[] => {
     }
   }
   // ───── P15 加主键、唯一、CHECK，建索引 ─────
-  // cur 里没有的就是新增的或前面删掉待重建的
+  // cur 里没有的就是新增的或前面删掉待重建的；子表本地对象先于父表创建，
+  // 且当在已有子分区的父表上建 PK / UNIQUE / INDEX 时，若 PG 自动生成的子分区继承索引名抢占了待建对象的名字，立即改名为非冲突派生名
+  const pendingRelNames = new Set<string>();
+  for (const o of Object.values(to.objects)) {
+    if ((o.kind === 'primaryKey' || o.kind === 'unique' || o.kind === 'index') && !(o.id in cur.objects)) {
+      pendingRelNames.add(`${get(to, o.parent, 'table').parent}:${o.name}`);
+    }
+  }
+  const implicitRels = new Set<string>();
+  const implicitNameOf = (o: PrimaryKey | Unique | Index, desc: Table, skipPending: boolean): string => {
+    const colPart =
+      o.kind === 'primaryKey'
+        ? null
+        : o.kind === 'unique'
+          ? joinNames(o.columns.map((c) => get(cur, c, 'column').name))
+          : joinNames(indexElementNames(cur, o));
+    const label = o.kind === 'primaryKey' ? 'pkey' : o.kind === 'unique' ? 'key' : 'idx';
+    return chooseName(
+      desc.name,
+      colPart,
+      label,
+      (n) =>
+        relTakenCur(desc.parent, n) ||
+        implicitRels.has(`${desc.parent}:${n}`) ||
+        (skipPending && pendingRelNames.has(`${desc.parent}:${n}`)),
+    );
+  };
+  // 先登记 cur 中已存在的分区父表 PK / UNIQUE / INDEX 在其后代上已占用的隐式继承索引名
+  for (const kind of ['primaryKey', 'unique', 'index'] as const) {
+    for (const o of Object.values(cur.objects)) {
+      if (o.kind !== kind) continue;
+      const tbl = get(cur, o.parent, 'table');
+      if (tbl.partitionBy === null) continue;
+      for (const desc of partitionDescendants(cur, tbl.id)) {
+        implicitRels.add(`${desc.parent}:${implicitNameOf(o, desc, false)}`);
+      }
+    }
+  }
   for (const kind of ['primaryKey', 'unique', 'check', 'index'] as const) {
-    for (const o of Object.values(to.objects)) {
-      if (o.kind !== kind || o.id in cur.objects) continue;
-      cur.objects[o.id] = fresh(o);
-      if (o.kind === 'index') emit('createIndex', o.id, indexDef(o));
-      else
-        emit(
-          `add${kind[0]!.toUpperCase()}${kind.slice(1)}`,
-          o.id,
-          `ALTER TABLE ${T(o.parent)} ADD CONSTRAINT ${ident(o.name)} ${constraintDef(o)}`,
-        );
+    const todo = Object.values(to.objects)
+      .filter((o): o is PrimaryKey | Unique | Check | Index => o.kind === kind && !(o.id in cur.objects))
+      .sort((a, b) => partitionDepth(to, b.parent) - partitionDepth(to, a.parent));
+    for (const o of todo) {
+      emitConstraintOrIndex(o);
+      if (o.kind === 'check') continue;
+      const tbl = get(cur, o.parent, 'table');
+      pendingRelNames.delete(`${tbl.parent}:${o.name}`);
+      if (tbl.partitionBy === null) continue;
+      for (const desc of partitionDescendants(cur, tbl.id)) {
+        const pgName = implicitNameOf(o, desc, false);
+        if (pendingRelNames.has(`${desc.parent}:${pgName}`)) {
+          const safeName = implicitNameOf(o, desc, true);
+          if (o.kind === 'index') {
+            emit(
+              'rename',
+              `${o.id}#ci`,
+              `ALTER INDEX ${relIn(desc.id, pgName)} RENAME TO ${ident(safeName)}`,
+            );
+          } else {
+            emit(
+              'rename',
+              `${o.id}#cc`,
+              `ALTER TABLE ${T(desc.id)} RENAME CONSTRAINT ${ident(pgName)} TO ${ident(safeName)}`,
+            );
+          }
+          implicitRels.add(`${desc.parent}:${safeName}`);
+        } else {
+          implicitRels.add(`${desc.parent}:${pgName}`);
+        }
+      }
     }
   }
   // ───── P16 加外键 ─────

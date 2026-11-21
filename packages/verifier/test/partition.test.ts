@@ -1,0 +1,292 @@
+// 分区表专项 PG 闭环与往返测试：RANGE / LIST / HASH、多列/表达式键、DEFAULT、
+// 父表列与默认值级联子分区、Attach/Detach、改边界、删除父表级联、多级分区往返、存量 string partitionBy 升级。
+import * as E from '@dowel/core';
+import { createAll, emptyModel, plan, validate } from '@dowel/core';
+import { diffSnapshots, importSnapshot, readSnapshot, reconcileIds } from '@dowel/engines';
+import { describe, expect, test } from 'vitest';
+
+import { PG_URL, useTestDb } from '../../../test/pg.ts';
+import { build, resetShadow, runSteps, verify } from '../src/index.ts';
+
+const conn = useTestDb('partition');
+
+const roundtrip = async (ddl: string) => {
+  const db = conn();
+  await resetShadow(db);
+  await db.exec('CREATE SCHEMA public');
+  await db.exec(`SET search_path = public; ${ddl}`);
+  const s1 = await readSnapshot(db);
+  const m = importSnapshot(s1);
+  expect(validate(m)).toEqual([]);
+  expect(plan(m, m)).toEqual([]);
+  const s2 = await build(db, m);
+  expect(diffSnapshots(s1, s2)).toEqual([]);
+  return { m, s1 };
+};
+
+describe.skipIf(!PG_URL)('PG 分区表闭环与往返验证', () => {
+  test('RANGE / LIST / HASH + 多列键 + 表达式键 + collation/opclass + DEFAULT 往返一致', async () => {
+    const { m } = await roundtrip(`
+      CREATE TABLE r_multi (
+        tenant_id integer NOT NULL,
+        created_at date NOT NULL,
+        note text DEFAULT 'init',
+        PRIMARY KEY (tenant_id, created_at)
+      ) PARTITION BY RANGE (tenant_id, created_at);
+      CREATE TABLE r_multi_1 PARTITION OF r_multi FOR VALUES FROM (1, MINVALUE) TO (100, '2025-01-01');
+      CREATE TABLE r_multi_2 PARTITION OF r_multi FOR VALUES FROM (100, '2025-01-01') TO (MAXVALUE, MAXVALUE);
+      CREATE TABLE r_multi_def PARTITION OF r_multi DEFAULT;
+
+      CREATE TABLE l_region (
+        code text NOT NULL,
+        payload text
+      ) PARTITION BY LIST (lower(code) COLLATE "C");
+      CREATE INDEX l_region_idx ON l_region ((lower(code)));
+      CREATE TABLE l_region_us PARTITION OF l_region FOR VALUES IN ('us', 'ca');
+      CREATE TABLE l_region_def PARTITION OF l_region DEFAULT;
+
+      CREATE TABLE h_items (
+        id bigint NOT NULL,
+        val integer NOT NULL DEFAULT 0,
+        PRIMARY KEY (id)
+      ) PARTITION BY HASH (id);
+      CREATE TABLE h_items_0 PARTITION OF h_items FOR VALUES WITH (modulus 2, remainder 0);
+      CREATE TABLE h_items_1 PARTITION OF h_items FOR VALUES WITH (modulus 2, remainder 1);
+    `);
+
+    // 子分区在 IR 中不再存储冗余列
+    const children = E.all(m, 'table').filter((t) => t.partitionOf !== null);
+    expect(children.length).toBe(7);
+    for (const ch of children) {
+      expect(E.columnsOf(m, ch.id)).toEqual([]);
+    }
+    // 父表均导入为结构化 PartitionSpec
+    const parents = E.all(m, 'table').filter((t) => t.partitionBy !== null);
+    expect(parents.length).toBe(3);
+    for (const p of parents) {
+      expect(typeof p.partitionBy).toBe('object');
+    }
+  });
+
+  test('父表增删改列与 SET/DROP DEFAULT 级联子分区闭环通过', async () => {
+    const db = conn();
+    const from = emptyModel();
+    const s = E.createSchema(from, 'public');
+    const p = E.createTable(from, s, 'events');
+    const cId = E.addColumn(from, p, { name: 'id', type: 'bigint', notNull: true });
+    const cDay = E.addColumn(from, p, { name: 'day', type: 'integer', notNull: true });
+    const cStatus = E.addColumn(from, p, {
+      name: 'status',
+      type: 'text',
+      notNull: true,
+      default: { expr: "'open'::text" },
+    });
+    const cScore = E.addColumn(from, p, { name: 'score', type: 'integer' });
+    E.setPartitionBy(from, p, {
+      strategy: 'range',
+      keys: [{ column: cDay, expr: null, opclass: null, collation: null }],
+    });
+    E.addPrimaryKey(from, p, [cId, cDay]);
+    E.addCheck(from, p, '(day >= 0)');
+    E.addIndex(from, p, [{ column: cStatus }]);
+    const ch1 = E.createPartition(from, p, 'events_1', 'FOR VALUES FROM (0) TO (100)');
+    const ch2 = E.createPartition(from, p, 'events_2', 'FOR VALUES FROM (100) TO (200)');
+
+    const to = structuredClone(from);
+    // 1. 改父表默认值（须级联子分区）
+    E.setDefault(to, cStatus, { expr: "'pending'::text" });
+    E.setDefault(to, cScore, { expr: '10' });
+    // 2. 改非分区键列类型、重命名、新增列
+    E.setColumnType(to, cScore, 'bigint');
+    E.renameColumn(to, cStatus, 'state');
+    E.addColumn(to, p, { name: 'tag', type: 'text', default: { expr: "'v1'::text" } });
+    // 3. 子分区重命名、加注释、新增 DEFAULT 子分区
+    E.renameTable(to, ch1, 'events_p1');
+    E.setComment(to, ch2, '第二分区');
+    E.createPartition(to, p, 'events_default', 'DEFAULT');
+
+    expect(validate(to)).toEqual([]);
+    const r = await verify(db, from, to);
+    expect(r.upDiff).toEqual([]);
+    expect(r.downDiff).toEqual([]);
+
+    // 反向测试 DROP DEFAULT 级联子分区
+    const to2 = structuredClone(to);
+    E.setDefault(to2, cStatus, null);
+    E.setDefault(to2, cScore, null);
+    const r2 = await verify(db, to, to2);
+    expect(r2.upDiff).toEqual([]);
+    expect(r2.downDiff).toEqual([]);
+  });
+
+  test('Attach / Detach / 改边界 / 互换边界 / 删父表级联全闭环通过', async () => {
+    const db = conn();
+    const v1 = emptyModel();
+    const s = E.createSchema(v1, 'public');
+    const ref = E.createTable(v1, s, 'accounts');
+    const rId = E.addColumn(v1, ref, { name: 'id', type: 'integer', notNull: true });
+    E.addPrimaryKey(v1, ref, [rId]);
+
+    const p = E.createTable(v1, s, 'ledger');
+    const cId = E.addColumn(v1, p, { name: 'id', type: 'integer', notNull: true });
+    const cAcct = E.addColumn(v1, p, { name: 'account_id', type: 'integer', notNull: true });
+    E.addColumn(v1, p, { name: 'amount', type: 'integer', default: { expr: '0' } });
+    E.setPartitionBy(v1, p, {
+      strategy: 'range',
+      keys: [{ column: cId, expr: null, opclass: null, collation: null }],
+    });
+    E.addPrimaryKey(v1, p, [cId]);
+    E.addCheck(v1, p, '(amount >= 0)');
+    E.addForeignKey(v1, p, [cAcct], ref, [rId]);
+    E.addIndex(v1, p, [{ column: cAcct }]);
+    const ch1 = E.createPartition(v1, p, 'ledger_1', 'FOR VALUES FROM (0) TO (100)');
+    const ch2 = E.createPartition(v1, p, 'ledger_2', 'FOR VALUES FROM (100) TO (200)');
+
+    // 独立普通表（结构兼容，待 Attach）
+    const plain = E.createTable(v1, s, 'ledger_archive');
+    E.addColumn(v1, plain, { name: 'id', type: 'integer', notNull: true });
+    E.addColumn(v1, plain, { name: 'account_id', type: 'integer', notNull: true });
+    E.addColumn(v1, plain, { name: 'amount', type: 'integer', default: { expr: '0' } });
+
+    // v1 → v2: Attach plain + Detach ch2 + 修改 ch1 边界
+    const v2 = structuredClone(v1);
+    E.attachPartition(v2, p, plain, 'FOR VALUES FROM (200) TO (300)');
+    E.detachPartition(v2, ch2);
+    E.setPartitionBound(v2, ch1, 'FOR VALUES FROM (0) TO (150)');
+    expect(validate(v2)).toEqual([]);
+    const r12 = await verify(db, v1, v2);
+    expect(r12.upDiff).toEqual([]);
+    expect(r12.downDiff).toEqual([]);
+
+    // v2 → v3: 互换 ch1 与 plain 边界
+    const v3 = structuredClone(v2);
+    E.setPartitionBound(v3, ch1, 'FOR VALUES FROM (200) TO (300)');
+    E.setPartitionBound(v3, plain, 'FOR VALUES FROM (0) TO (150)');
+    expect(validate(v3)).toEqual([]);
+    const r23 = await verify(db, v2, v3);
+    expect(r23.upDiff).toEqual([]);
+    expect(r23.downDiff).toEqual([]);
+
+    // v3 → v4: 删除父表（级联删除全部子分区）
+    const v4 = structuredClone(v3);
+    E.dropTable(v4, p);
+    expect(validate(v4)).toEqual([]);
+    const r34 = await verify(db, v3, v4);
+    expect(r34.upDiff).toEqual([]);
+    expect(r34.downDiff).toEqual([]);
+  });
+
+  test('多级子分区导入、往返与闭环验证通过', async () => {
+    const db = conn();
+    const { m } = await roundtrip(`
+      CREATE TABLE metrics (
+        yr integer NOT NULL,
+        region text NOT NULL,
+        val bigint NOT NULL DEFAULT 0,
+        PRIMARY KEY (yr, region)
+      ) PARTITION BY RANGE (yr);
+      CREATE TABLE metrics_2025 PARTITION OF metrics
+        FOR VALUES FROM (2025) TO (2026)
+        PARTITION BY LIST (region);
+      CREATE TABLE metrics_2025_us PARTITION OF metrics_2025 FOR VALUES IN ('us');
+      CREATE TABLE metrics_2025_eu PARTITION OF metrics_2025 FOR VALUES IN ('eu');
+      CREATE TABLE metrics_2026 PARTITION OF metrics
+        FOR VALUES FROM (2026) TO (2027)
+        PARTITION BY HASH (region);
+      CREATE TABLE metrics_2026_0 PARTITION OF metrics_2026 FOR VALUES WITH (modulus 2, remainder 0);
+      CREATE TABLE metrics_2026_1 PARTITION OF metrics_2026 FOR VALUES WITH (modulus 2, remainder 1);
+    `);
+
+    const pub = E.all(m, 'schema').find((s) => s.name === 'public')!;
+    const empty = { ...m, objects: { [pub.id]: { ...pub, comment: null } } };
+    const r = await verify(db, empty, m);
+    expect(r.upDiff).toEqual([]);
+    expect(r.downDiff).toEqual([]);
+  });
+
+  test('存量旧格式 string partitionBy + 子分区冗余列升级到结构化 PartitionSpec 零冗余 SQL', async () => {
+    const db = conn();
+    const legacy = emptyModel();
+    const s = E.createSchema(legacy, 'public', 's1');
+    legacy.objects.p = {
+      id: 'p',
+      kind: 'table',
+      parent: s,
+      name: 'sales',
+      partitionBy: 'RANGE (day)',
+      partitionOf: null,
+      comment: null,
+    };
+    legacy.objects.p_day = {
+      id: 'p_day',
+      kind: 'column',
+      parent: 'p',
+      name: 'day',
+      pos: 'a0',
+      type: 'integer',
+      typeRef: null,
+      notNull: true,
+      notNullName: 'sales_day_not_null',
+      notNullNameMode: 'derived',
+      default: null,
+      identity: null,
+      generated: null,
+      collation: null,
+      comment: null,
+    };
+    legacy.objects.c1 = {
+      id: 'c1',
+      kind: 'table',
+      parent: s,
+      name: 'sales_1',
+      partitionBy: null,
+      partitionOf: { parent: 'p', bound: 'FOR VALUES FROM (0) TO (10)' },
+      comment: null,
+    };
+    legacy.objects.c1_day = {
+      id: 'c1_day',
+      kind: 'column',
+      parent: 'c1',
+      name: 'day',
+      pos: 'a0',
+      type: 'integer',
+      typeRef: null,
+      notNull: true,
+      notNullName: 'sales_1_day_not_null',
+      notNullNameMode: 'derived',
+      default: null,
+      identity: null,
+      generated: null,
+      collation: null,
+      comment: null,
+    };
+    legacy.objects.c1_idx = {
+      id: 'c1_idx',
+      kind: 'index',
+      parent: 'c1',
+      name: 'sales_1_day_idx',
+      nameMode: 'derived',
+      unique: false,
+      method: 'btree',
+      elements: [
+        { column: 'c1_day', expr: null, desc: false, nullsFirst: null, opclass: null, collation: null },
+      ],
+      include: [],
+      where: null,
+      nullsNotDistinct: false,
+      comment: null,
+    };
+
+    // 建出旧格式库并重新导入得到新格式模型
+    await resetShadow(db);
+    await runSteps(db, createAll(legacy));
+    const upgraded = reconcileIds(legacy, importSnapshot(await readSnapshot(db)));
+    expect(validate(upgraded)).toEqual([]);
+    expect(E.columnsOf(upgraded, 'c1')).toEqual([]);
+    expect(typeof (upgraded.objects.p as E.Table).partitionBy).toBe('object');
+
+    // 从旧格式模型迁移到新格式模型：不产生多余 DROP COLUMN 或重建索引 SQL
+    const steps = plan(legacy, upgraded);
+    expect(steps).toEqual([]);
+  });
+});
