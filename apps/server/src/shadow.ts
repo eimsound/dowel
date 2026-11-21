@@ -14,7 +14,14 @@ import {
   plan,
   type Step,
 } from '@dowel/core';
-import { type Db, getEngine, reconcileIds, type ScriptStep } from '@dowel/engines';
+import {
+  type Db,
+  getEngine,
+  mssqlErrorCode,
+  mssqlErrorNumber,
+  reconcileIds,
+  type ScriptStep,
+} from '@dowel/engines';
 import {
   analyze,
   buildTarget,
@@ -103,17 +110,25 @@ const messageOf = (e: unknown): string => {
 export const SHADOW_STATEMENT_TIMEOUT_MS = 120_000;
 
 /**
- * 语句超时识别（PG 57014 query_canceled / MySQL 3024 ER_QUERY_TIMEOUT / 1969）：
+ * 语句超时识别（PG 57014 query_canceled / MySQL 3024 ER_QUERY_TIMEOUT / 1969 / MSSQL ETIMEOUT & ECANCEL）：
  * - PG：错误消息含 "statement timeout"，或耗时 ≥ 会话 statement_timeout 的 90%；
- * - MySQL：errno === 3024 或 1969。
+ * - MySQL：errno === 3024 或 1969；
+ * - MSSQL：code === 'ETIMEOUT' 或 'ECANCEL' 且消息含 timeout/超时或耗时 ≥ 90%。
  */
 const isStatementTimeout = (e: unknown, timeoutMs: number) => {
   const errno = errnoOf(e);
   if (errno === 3024 || errno === 1969) return true;
-  return (
-    codeOf(e) === '57014' &&
-    (/statement timeout/i.test(messageOf(e)) || (e instanceof StepError && e.elapsedMs >= timeoutMs * 0.9))
-  );
+  const cause = e instanceof StepError ? e.cause : e;
+  const code = codeOf(e) ?? mssqlErrorCode(cause);
+  if (code === '57014') {
+    return (
+      /statement timeout/i.test(messageOf(e)) || (e instanceof StepError && e.elapsedMs >= timeoutMs * 0.9)
+    );
+  }
+  if (code === 'ETIMEOUT' || code === 'ECANCEL') {
+    return e instanceof StepError && (/timeout|超时/i.test(messageOf(e)) || e.elapsedMs >= timeoutMs * 0.9);
+  }
+  return false;
 };
 
 const errorOf = (e: unknown, timeoutMs: number) =>
@@ -159,26 +174,37 @@ export const storedReport = (
  */
 const CONNECTION_SQLSTATE = /^(08|53|57P)|^(55P03|58030)$/;
 const CONNECTION_CODE =
-  /^(CONNECTION_|CONNECT_TIMEOUT|PROTOCOL_|HANDSHAKE_|ER_CON_COUNT_ERROR|ER_SERVER_SHUTDOWN|ECONN|ETIMEDOUT|EPIPE|ENOTFOUND|EAI_AGAIN|ENETUNREACH|EHOSTUNREACH)/;
+  /^(CONNECTION_|CONNECT_TIMEOUT|PROTOCOL_|HANDSHAKE_|ER_CON_COUNT_ERROR|ER_SERVER_SHUTDOWN|ECONN|ETIMEDOUT|EPIPE|ENOTFOUND|EAI_AGAIN|ENETUNREACH|EHOSTUNREACH|ESOCKET|ELOGIN|EINSTLOOKUP|ENOTOPEN)/;
 const MYSQL_CONNECTION_ERRNOS = new Set([1040, 1053, 1205, 2002, 2003, 2006, 2013]);
+const MSSQL_INFRA_NUMBERS = new Set([1222, 18456, 4060]);
 
-/** 连接类故障（任何地方出现都是影子库的问题；涵盖 PG / MySQL / Node 网络错误） */
+/** 连接类故障（任何地方出现都是影子库的问题；涵盖 PG / MySQL / MSSQL / Node 网络错误） */
 export const isConnectionFailure = (e: unknown): boolean => {
-  if ((e instanceof StepError ? e.cause : e) instanceof ShadowError) return true;
-  const code = codeOf(e);
+  const cause = e instanceof StepError ? e.cause : e;
+  if (cause instanceof ShadowError) return true;
+  const code = codeOf(e) ?? mssqlErrorCode(cause);
   if (code !== null && (CONNECTION_SQLSTATE.test(code) || CONNECTION_CODE.test(code))) return true;
   const errno = errnoOf(e);
-  return errno !== null && MYSQL_CONNECTION_ERRNOS.has(errno);
+  if (errno !== null && MYSQL_CONNECTION_ERRNOS.has(errno)) return true;
+  const num = mssqlErrorNumber(cause);
+  return num !== null && MSSQL_INFRA_NUMBERS.has(num);
 };
 
-/** 影子库的问题：连接类故障，或者不是“用户的步骤自己造成的”超时 / 58 类错误 */
+/** 影子库的问题：连接类故障，或者不是“用户的步骤自己造成的”超时 / 58 类 / MSSQL ETIMEOUT & ECANCEL */
 export const isInfraFailure = (e: unknown, timeoutMs = SHADOW_STATEMENT_TIMEOUT_MS): boolean => {
   if (isConnectionFailure(e)) return true;
   const errno = errnoOf(e);
   if (errno === 3024 || errno === 1969) return !(e instanceof StepError);
-  const code = codeOf(e);
-  if (code === null || !(code === '57014' || code.startsWith('58'))) return false;
-  return !(e instanceof StepError && (code.startsWith('58') || isStatementTimeout(e, timeoutMs)));
+  const cause = e instanceof StepError ? e.cause : e;
+  const code = codeOf(e) ?? mssqlErrorCode(cause);
+  if (code === null) return false;
+  if (code === '57014' || code.startsWith('58')) {
+    return !(e instanceof StepError && (code.startsWith('58') || isStatementTimeout(e, timeoutMs)));
+  }
+  if (code === 'ETIMEOUT' || code === 'ECANCEL') {
+    return !(e instanceof StepError && isStatementTimeout(e, timeoutMs));
+  }
+  return false;
 };
 
 /**
@@ -250,10 +276,11 @@ const risksOf = async (
  * 真正的边界是影子库的账号权限和“生产环境默认不在同一实例上建影子库”。
  */
 export const assertImportable = (sql: string, dialect: Dialect = 'pg'): ImportableSql => {
-  const hit = findInstanceLevelStatement(sql, dialect);
+  const checked = dialect === 'mssql' ? getEngine('mssql').stripImportNoise(sql) : sql;
+  const hit = findInstanceLevelStatement(checked, dialect);
   if (hit !== null)
     throw new ShadowError(`导入的 SQL 含实例级语句（${hit}）。${instanceLevelDescription(dialect)}`);
-  return sql as ImportableSql;
+  return checked as ImportableSql;
 };
 
 export const shadowOps = (
@@ -334,7 +361,11 @@ export const shadowOps = (
         c.where = e.where;
       }
       if (c.kind === 'column' && e.kind === 'column') {
-        if (c.generated && e.generated) c.generated = { ...c.generated, expr: e.generated.expr };
+        if (c.generated && e.generated) {
+          c.generated = { ...c.generated, expr: e.generated.expr };
+          c.type = e.type;
+          if (dDialect === 'mssql' && c.generated.stored) c.notNull = e.notNull;
+        }
         if (c.default && 'expr' in c.default && e.default && 'expr' in e.default)
           c.default = { expr: e.default.expr };
       }

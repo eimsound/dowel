@@ -7,6 +7,7 @@ import {
   findInstanceLevelStep,
   instanceLevelDescription,
   type Model,
+  mssqlMajorOf,
   pgMajorOf,
   type PlanOptions,
   plan,
@@ -71,6 +72,7 @@ const hasExplicitVersionOpt = (dialect: Dialect, opts?: PlanOptions): boolean =>
   if (!opts) return false;
   if (dialect === 'pg') return opts.pgMajor !== undefined;
   if (dialect === 'mysql') return opts.mysqlVersionNum !== undefined;
+  if (dialect === 'mssql') return opts.mssqlMajor !== undefined;
   return true;
 };
 
@@ -122,6 +124,11 @@ export const verify = async (db: Db, from: Model, to: Model, opts?: PlanOptions)
       const planMajor = opts?.pgMajor ?? shadowMajor;
       planOpts = planMajor !== null ? { pgMajor: planMajor } : undefined;
       buildOpts = shadowMajor !== null ? { pgMajor: shadowMajor } : undefined;
+    } else if (dialect === 'mssql') {
+      const mssqlMajor = mssqlMajorOf(vNum);
+      const planMajor = opts?.mssqlMajor ?? mssqlMajor;
+      planOpts = planMajor !== null ? { ...opts, mssqlMajor: planMajor } : opts;
+      buildOpts = mssqlMajor !== null ? { mssqlMajor } : undefined;
     } else {
       planOpts = hasExplicitVersionOpt(dialect, opts) ? opts : shadowOpts;
       buildOpts = shadowOpts ?? opts;
@@ -200,6 +207,11 @@ export const verifyScripts = async (
     checkMysqlVersionCompatibility(to, effectiveVersionNum);
     buildOpts =
       effectiveVersionNum !== null ? engine.planOptionsForVersion?.(effectiveVersionNum) : undefined;
+  } else if (dialect === 'mssql') {
+    const vNum = await engine.readVersionNum?.(db);
+    shadowVersionNum = vNum ?? null;
+    const mssqlMajor = mssqlMajorOf(vNum);
+    buildOpts = mssqlMajor !== null ? { mssqlMajor } : undefined;
   } else if (engine.readVersionNum && engine.planOptionsForVersion) {
     const vNum = await engine.readVersionNum(db);
     shadowVersionNum = vNum ?? null;

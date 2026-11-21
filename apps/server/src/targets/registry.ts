@@ -5,6 +5,7 @@ import type { Db } from '@dowel/engines';
 import { HTTPException } from 'hono/http-exception';
 
 import { detectUrlDialect } from '../allowlist.ts';
+import { mssqlTargetDriver } from './mssql.ts';
 import { mysqlTargetDriver } from './mysql.ts';
 import { pgTargetDriver } from './pg.ts';
 import { sqliteTargetDriver } from './sqlite.ts';
@@ -19,6 +20,7 @@ const drivers = new Map<Dialect, TargetDriver>([
   ['pg', pgTargetDriver],
   ['sqlite', sqliteTargetDriver],
   ['mysql', mysqlTargetDriver],
+  ['mssql', mssqlTargetDriver],
 ]);
 
 export const registerTargetDriver = (driver: TargetDriver): void => {

@@ -323,6 +323,9 @@ const parseHostPort = (entry: string, allowInstanceName = false): ConnectionTarg
     const end = decoded.indexOf(']');
     if (end < 0) throw new HTTPException(422, { message: '连接串里的 IPv6 地址不合法' });
     const rest = decoded.slice(end + 1);
+    if (rest && !rest.startsWith(':')) {
+      throw new HTTPException(422, { message: '连接串里的 IPv6 地址不合法' });
+    }
     const port = rest.startsWith(':') ? Number(rest.slice(1)) : null;
     return { host: decoded.slice(1, end).toLowerCase(), port: Number.isFinite(port) ? port : null };
   }

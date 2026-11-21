@@ -267,8 +267,11 @@ const runMigration = async (
           await engine.pinSession(conn);
           const id = await engine.history.startRun(conn, runBase(c, m));
           const applied = await engine.applyTimeouts(conn, c.o.timeouts);
-          for (let i = 0; i < steps.length; i++) await execStep(conn, c, steps, i, '', applied);
-          await engine.restoreTimeouts(conn, applied);
+          try {
+            for (let i = 0; i < steps.length; i++) await execStep(conn, c, steps, i, '', applied);
+          } finally {
+            await engine.restoreTimeouts(conn, applied).catch(() => {});
+          }
           await verifyAndRecord(conn, c, m);
           await engine.history.finishRun(conn, id, 'done');
           return id;
@@ -349,8 +352,11 @@ const runMigration = async (
           async () => {
             await engine.pinSession(conn);
             const applied = await engine.applyTimeouts(conn, c.o.timeouts);
-            for (let k = i; k < j; k++) await execStep(conn, c, steps, k, '', applied);
-            await engine.restoreTimeouts(conn, applied);
+            try {
+              for (let k = i; k < j; k++) await execStep(conn, c, steps, k, '', applied);
+            } finally {
+              await engine.restoreTimeouts(conn, applied).catch(() => {});
+            }
             if (last) {
               await verifyAndRecord(conn, c, m);
               await engine.history.markStep(conn, runId, j - 1);

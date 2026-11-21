@@ -687,6 +687,19 @@ export const runExecution = async (
               await updateEnvVersion(db, env.id, parsed.version, parsed.versionNum, env.url_enc);
             }
           }
+        } else if (dialect === 'mssql') {
+          const [v] = await conn.db.query<{ version: string; major: number; minor: number }>(
+            `SELECT CAST(SERVERPROPERTY('ProductVersion') AS nvarchar(64)) AS version,
+                    CAST(SERVERPROPERTY('ProductMajorVersion') AS int) AS major,
+                    CAST(SERVERPROPERTY('ProductMinorVersion') AS int) AS minor`,
+          );
+          if (v && Number.isInteger(Number(v.major))) {
+            const clean = String(v.version).trim();
+            const num = Number(v.major) * 10000 + Number(v.minor ?? 0);
+            if (env.engine_version !== clean || env.engine_version_num !== num) {
+              await updateEnvVersion(db, env.id, clean, num, env.url_enc);
+            }
+          }
         }
       } catch {
         // 忽略探测异常（如连接已断），不影响执行主流程

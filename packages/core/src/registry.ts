@@ -1,6 +1,7 @@
 // 方言静态注册表与跨方言派发入口（零动态 import，浏览器轻量安全）。
 import type { DialectSpec } from './dialect.ts';
 import type { Dialect, Model } from './ir.ts';
+import { mssqlDialect } from './mssql/dialect.ts';
 import { mysqlDialect } from './mysql/dialect.ts';
 import type { PlanOptions } from './pg/capabilities.ts';
 import { pgDialect } from './pg/dialect.ts';
@@ -13,6 +14,7 @@ const dialects = new Map<Dialect, DialectSpec>([
   ['pg', pgDialect],
   ['sqlite', sqliteDialect],
   ['mysql', mysqlDialect],
+  ['mssql', mssqlDialect],
 ]);
 
 export const registerDialect = (spec: DialectSpec): void => {

@@ -198,7 +198,7 @@ const verifyAcrossVersions = async (
       ranRisk = true;
     }
 
-    // PG / MySQL 各自以影子库实测版本为准；若独立 shadowUrl 实际版本与环境声称的不一致，不得记作覆盖了目标版本
+    // 仅 PG 与 MySQL 各自按对应影子库实测版本归档与校对；非 PG 方言（SQLite / MySQL / MSSQL）不按 PG 大版本归档或拼 PG 前缀
     const actualMajor = isPg ? (report.shadowMajor !== undefined ? report.shadowMajor : entry.major) : null;
     if (isPg && entry.major !== null && actualMajor !== null && actualMajor !== entry.major) {
       mismatchReasons.set(
