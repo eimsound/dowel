@@ -1,5 +1,5 @@
 ---
-name: dowel-pitfalls
+name: pitfalls
 description: >-
   Dowel 仓库高频踩坑与防坑指南（提炼自 P6 / P6.5 / P7 审查确认的 #8–#45 真实缺陷）。
   在 Dowel 项目中开发、重构或代码审查以下模块时触发：PostgreSQL 平台库连接池、advisory lock 与冷启动迁移、
