@@ -289,4 +289,81 @@ describe.skipIf(!PG_URL)('PG 分区表闭环与往返验证', () => {
     const steps = plan(legacy, upgraded);
     expect(steps).toEqual([]);
   });
+
+  test('High #3: 子分区改名与父表列改名同步重命名 PG 隐式继承约束/索引（同迁移占名新建 + 跨版本 Detach 闭环）', async () => {
+    const db = conn();
+    const v1 = emptyModel();
+    const s = E.createSchema(v1, 'public');
+    const p = E.createTable(v1, s, 'events');
+    const cId = E.addColumn(v1, p, { name: 'id', type: 'integer', notNull: true });
+    const cAcct = E.addColumn(v1, p, { name: 'acct', type: 'integer', notNull: true });
+    E.setPartitionBy(v1, p, {
+      strategy: 'range',
+      keys: [{ column: cId, expr: null, opclass: null, collation: null }],
+    });
+    E.addPrimaryKey(v1, p, [cId]);
+    E.addUnique(v1, p, [cId, cAcct]);
+    E.addIndex(v1, p, [{ column: cAcct }]);
+    const ch1 = E.createPartition(v1, p, 'events_1', 'FOR VALUES FROM (0) TO (100)');
+
+    // v1 → v2: 重命名子分区 events_1 → events_h1、重命名列 acct → account_id，且同迁移新建同名分区 events_1
+    const v2 = structuredClone(v1);
+    E.renameTable(v2, ch1, 'events_h1');
+    E.renameColumn(v2, cAcct, 'account_id');
+    E.createPartition(v2, p, 'events_1', 'FOR VALUES FROM (100) TO (200)');
+    expect(validate(v2)).toEqual([]);
+    const r12 = await verify(db, v1, v2);
+    expect(r12.upDiff).toEqual([]);
+    expect(r12.downDiff).toEqual([]);
+
+    // v2 → v3: 跨版本脱离已改名的 events_h1 并删除其脱离后的主键与索引（验证 PG 中隐式约束/索引名已与 v2 一致）
+    const v3 = structuredClone(v2);
+    E.detachPartition(v3, ch1);
+    const detPk = E.childrenOf(v3, ch1, 'primaryKey')[0]!;
+    E.dropKey(v3, detPk.id);
+    expect(validate(v3)).toEqual([]);
+    const r23 = await verify(db, v2, v3);
+    expect(r23.upDiff).toEqual([]);
+    expect(r23.downDiff).toEqual([]);
+
+    // 同迁移内子分区改名 + 改边界（sameParentRebind）+ 占旧名新建分区
+    const v2b = structuredClone(v1);
+    E.renameTable(v2b, ch1, 'events_old');
+    E.setPartitionBound(v2b, ch1, 'FOR VALUES FROM (0) TO (50)');
+    E.createPartition(v2b, p, 'events_1', 'FOR VALUES FROM (50) TO (100)');
+    expect(validate(v2b)).toEqual([]);
+    const rRebind = await verify(db, v1, v2b);
+    expect(rRebind.upDiff).toEqual([]);
+    expect(rRebind.downDiff).toEqual([]);
+  });
+
+  test('High #4: 分区父表 FOR EACH ROW 触发器不重复导入子分区克隆记录（tgparentid = 0）', async () => {
+    const db = conn();
+    const { m } = await roundtrip(`
+      CREATE FUNCTION public.touch_noop() RETURNS trigger LANGUAGE plpgsql AS $$
+      BEGIN
+        RETURN NEW;
+      END;
+      $$;
+      CREATE TABLE audit_events (
+        id integer NOT NULL,
+        day integer NOT NULL,
+        PRIMARY KEY (id, day)
+      ) PARTITION BY RANGE (day);
+      CREATE TABLE audit_events_1 PARTITION OF audit_events FOR VALUES FROM (0) TO (10);
+      CREATE TABLE audit_events_2 PARTITION OF audit_events FOR VALUES FROM (10) TO (20);
+      CREATE TRIGGER trg_audit_noop BEFORE INSERT ON public.audit_events
+        FOR EACH ROW EXECUTE FUNCTION public.touch_noop();
+    `);
+
+    const triggers = E.all(m, 'opaque').filter((o) => o.objType === 'trigger');
+    expect(triggers.length).toBe(1);
+    expect(triggers[0]!.name).toBe('trg_audit_noop');
+
+    const pub = E.all(m, 'schema').find((s) => s.name === 'public')!;
+    const empty = { ...m, objects: { [pub.id]: { ...pub, comment: null } } };
+    const r = await verify(db, empty, m);
+    expect(r.upDiff).toEqual([]);
+    expect(r.downDiff).toEqual([]);
+  });
 });

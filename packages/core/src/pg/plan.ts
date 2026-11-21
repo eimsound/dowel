@@ -343,6 +343,27 @@ export const plan = (from: Model, to: Model, opts?: PlanOptions): Step[] => {
               return ok.expr === wk.expr;
             });
         }
+        // 防绕过检查（覆盖表达式分区键与存量字符串 partitionBy）：核验 from 分区键引用的全部列 ID 在 to 中均存活且未换绑
+        if (samePartBy) {
+          const fromKeyCols = partitionKeyColumns(from, w).all;
+          const toKeyCols = new Set(partitionKeyColumns(to, o).all);
+          const toRoot = rootTableId(to, o.id);
+          const mapFromColToTo = (fromColId: string): string | null => {
+            if (!isRemoved(fromColId)) return fromColId;
+            for (const [toColId, rc] of detachToRootCol) {
+              const tc = find(to, toColId);
+              if (rc.id === fromColId && tc?.kind === 'column' && tc.parent === toRoot) return toColId;
+            }
+            return null;
+          };
+          const mappedFromCols = fromKeyCols.map(mapFromColToTo);
+          if (
+            mappedFromCols.some((cid) => cid === null || !toKeyCols.has(cid)) ||
+            mappedFromCols.length !== toKeyCols.size
+          ) {
+            samePartBy = false;
+          }
+        }
         if (!samePartBy) {
           throw new PlanError(`暂不支持修改已存在表的分区策略或分区键：${o.name}`);
         }
@@ -499,10 +520,10 @@ export const plan = (from: Model, to: Model, opts?: PlanOptions): Step[] => {
   // 分区键引用的列不允许改类型（PG 报错 cannot alter type of column named in partition key）
   for (const o of common) {
     if (o.kind !== 'table' || !o.partitionBy) continue;
-    const refs = partitionKeyColumns(to, o);
-    for (const colId of refs.all) {
+    const refIds = new Set([...partitionKeyColumns(to, o).all, ...partitionKeyColumns(from, was(o)).all]);
+    for (const colId of refIds) {
       if (typeChanged.has(colId) || regen.has(colId)) {
-        const colName = find(to, colId)?.name ?? colId;
+        const colName = find(to, colId)?.name ?? find(from, colId)?.name ?? colId;
         throw new PlanError(`列 ${colName} 被分区表 ${o.name} 的分区键引用，不能修改类型`);
       }
     }
@@ -831,13 +852,22 @@ export const plan = (from: Model, to: Model, opts?: PlanOptions): Step[] => {
       const synId = `__dowel_det_obj_${++synSeq}`;
       cur.objects[synId] = { ...detObj, id: synId };
       syntheticDetached.add(synId);
-      if (
-        sameParentRebind &&
-        inTo(ancObj.id) &&
-        !rebuild.has(ancObj.id) &&
-        ((ancObj.kind !== 'check' && ancObj.kind !== 'foreignKey') ||
-          ancObj.name === to.objects[ancObj.id]!.name)
-      ) {
+      const childRenamed = t.name !== (to.objects[tId] as Table | undefined)?.name;
+      const colRenamedInKey =
+        ancObj.kind === 'unique'
+          ? ancObj.columns.some((cid) => cur.objects[cid]?.name !== to.objects[cid]?.name)
+          : ancObj.kind === 'index'
+            ? ancObj.elements.some((e, i) =>
+                e.column
+                  ? cur.objects[e.column]?.name !== to.objects[e.column]?.name
+                  : e.expr !== (to.objects[ancObj.id] as Index | undefined)?.elements[i]?.expr,
+              ) || ancObj.include.some((cid) => cur.objects[cid]?.name !== to.objects[cid]?.name)
+            : false;
+      const keepImplicitName =
+        ancObj.kind === 'check' || ancObj.kind === 'foreignKey'
+          ? ancObj.name === to.objects[ancObj.id]?.name
+          : !childRenamed && !colRenamedInKey;
+      if (sameParentRebind && inTo(ancObj.id) && !rebuild.has(ancObj.id) && keepImplicitName) {
         retainedForReattach.add(synId);
       }
     };
@@ -1178,6 +1208,111 @@ export const plan = (from: Model, to: Model, opts?: PlanOptions): Step[] => {
       }
     }
   }
+  // 分区子表改名或父表约束/索引引用列改名时，同步重命名 PG 在后代子分区上自动生成的隐式继承 PK/UNIQUE/INDEX，
+  // 避免旧名继续占用关系命名空间导致同迁移占名冲突，或跨版本 DETACH 时与派生名失步。
+  const implicitState = new Map<string, { name: string; spaces: string[] }>();
+  const attachedChildrenInCur = all(cur, 'table')
+    .filter((t) => t.partitionOf !== null && inTo(t.id))
+    .sort((a, b) => partitionDepth(cur, a.id) - partitionDepth(cur, b.id) || a.id.localeCompare(b.id));
+  if (attachedChildrenInCur.length > 0) {
+    const takenOld = new Set<string>();
+    const takenNew = new Set<string>();
+    const toRelTaken = (schemaId: string, name: string): boolean =>
+      Object.values(to.objects).some((o) => {
+        if ((o.kind === 'table' || o.kind === 'sequence') && o.parent === schemaId) return o.name === name;
+        if (
+          (o.kind === 'index' || o.kind === 'primaryKey' || o.kind === 'unique') &&
+          find(to, o.parent)?.kind === 'table' &&
+          (to.objects[o.parent] as Table).parent === schemaId
+        )
+          return o.name === name;
+        if (
+          o.kind === 'column' &&
+          o.identity &&
+          find(to, o.parent)?.kind === 'table' &&
+          (to.objects[o.parent] as Table).parent === schemaId
+        )
+          return o.identity.sequenceName === name;
+        return false;
+      });
+    const toConTaken = (tableId: string, name: string): boolean =>
+      Object.values(to.objects).some((o) => {
+        if (
+          (o.kind === 'primaryKey' || o.kind === 'unique' || o.kind === 'check' || o.kind === 'foreignKey') &&
+          o.parent === tableId
+        )
+          return o.name === name;
+        if (cap.namedNotNull && o.kind === 'column' && o.parent === tableId && o.notNull)
+          return o.notNullName === name;
+        return false;
+      });
+    for (const desc of attachedChildrenInCur) {
+      const toDesc = get(to, desc.id, 'table');
+      const ancs = ancestorsCur(desc.partitionOf!.parent);
+      const ancIds = new Set(ancs.map((a) => a.id));
+      for (const kind of ['primaryKey', 'unique', 'index'] as const) {
+        const ancObjs = Object.values(cur.objects)
+          .filter(
+            (o): o is PrimaryKey | Unique | Index => o.kind === kind && ancIds.has(o.parent) && inTo(o.id),
+          )
+          .sort((a, b) => a.id.localeCompare(b.id));
+        for (const ancObj of ancObjs) {
+          const toAncObj = get(to, ancObj.id, ancObj.kind);
+          const label = kind === 'primaryKey' ? 'pkey' : kind === 'unique' ? 'key' : 'idx';
+          const isCon = kind !== 'index';
+          const oldColPart =
+            kind === 'primaryKey'
+              ? null
+              : kind === 'unique'
+                ? joinNames((ancObj as Unique).columns.map((c) => get(cur, c, 'column').name))
+                : joinNames(indexElementNames(cur, ancObj as Index));
+          const newColPart =
+            kind === 'primaryKey'
+              ? null
+              : kind === 'unique'
+                ? joinNames((toAncObj as Unique).columns.map((c) => get(to, c, 'column').name))
+                : joinNames(indexElementNames(to, toAncObj as Index));
+          const oldName = chooseName(
+            desc.name,
+            oldColPart,
+            label,
+            (n) =>
+              relTakenCur(desc.parent, n) ||
+              (isCon && conTakenCur(desc.id, n)) ||
+              takenOld.has(`${desc.parent}:${n}`),
+          );
+          takenOld.add(`${desc.parent}:${oldName}`);
+          const newName = chooseName(
+            toDesc.name,
+            newColPart,
+            label,
+            (n) =>
+              toRelTaken(toDesc.parent, n) ||
+              (isCon && toConTaken(toDesc.id, n)) ||
+              takenNew.has(`${toDesc.parent}:${n}`),
+          );
+          takenNew.add(`${toDesc.parent}:${newName}`);
+          const impId = `${desc.id}#imp#${ancObj.id}`;
+          const spaces = isCon ? [`rel:${desc.parent}`, `con:${desc.id}`] : [`rel:${desc.parent}`];
+          implicitState.set(impId, { name: oldName, spaces });
+          if (oldName !== newName) {
+            items.push({
+              id: impId,
+              spaces,
+              target: newName,
+              rename: (n) =>
+                kind === 'index'
+                  ? `ALTER INDEX ${relIn(desc.id, implicitState.get(impId)!.name)} RENAME TO ${ident(n)}`
+                  : `ALTER TABLE ${T(desc.id)} RENAME CONSTRAINT ${ident(implicitState.get(impId)!.name)} TO ${ident(n)}`,
+              apply: (n) => {
+                implicitState.get(impId)!.name = n;
+              },
+            });
+          }
+        }
+      }
+    }
+  }
   // 后面才删除的对象（枚举、序列、schema）如果占着新对象要用的名字，先改成临时名腾出来
   const toNames = new Set<string>();
   for (const o of Object.values(to.objects))
@@ -1206,6 +1341,9 @@ export const plan = (from: Model, to: Model, opts?: PlanOptions): Step[] => {
         if (o.identity?.sequenceName === name && space === `rel:${schemaOfTable(o.parent)}`)
           return `${o.id}#seq`;
       }
+    }
+    for (const [impId, st] of implicitState) {
+      if (st.name === name && st.spaces.includes(space)) return impId;
     }
     return undefined;
   };

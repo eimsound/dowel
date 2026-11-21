@@ -277,7 +277,7 @@ export const readOpaques = async (
     `select g.oid::int as oid, g.tgrelid::int as rel, g.tgname as name, pg_get_triggerdef(g.oid) as def,
             obj_description(g.oid, 'pg_trigger') as comment
        from pg_trigger g join pg_class c on c.oid = g.tgrelid join pg_namespace n on n.oid = c.relnamespace
-      where not g.tgisinternal and ${ns}`,
+      where not g.tgisinternal and g.tgparentid = 0 and ${ns}`,
   )) {
     const t = tableKey(r.rel);
     const rel = maps.tableByOid.get(r.rel);

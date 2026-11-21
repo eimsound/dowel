@@ -2,6 +2,7 @@
 // 影子库常驻连接出问题时要丢掉（锁随连接释放）、建 / 认领影子库时的错误分类。
 // 需要测试 PG（Testcontainers 或 DOWEL_TEST_PG），没有 Docker 时跳过。
 import {
+  addCheck,
   addColumn,
   createPartition,
   createSchema,
@@ -18,6 +19,8 @@ import { connect, createTestDb, dbUrl, PG_URL } from '../../../test/pg.ts';
 import { createApp } from '../src/app.ts';
 import { type ClusterEvent, EventBus } from '../src/bus.ts';
 import { openPlatformDb } from '../src/db.ts';
+import { OpaqueRefresher } from '../src/derive.ts';
+import { Rooms } from '../src/rooms.ts';
 import { encrypt, scrubSecrets } from '../src/secrets.ts';
 import { ShadowError, ShadowUnavailableError, toShadowError } from '../src/shadow.ts';
 import { Shadows } from '../src/shadows.ts';
@@ -376,6 +379,89 @@ describe.skipIf(!PG_URL)('pgShadow（真实 PG）', () => {
       ).toBe('lower(code)');
       expect(await lockIsFree()).toBe(true);
     } finally {
+      await shadow.close();
+    }
+  });
+
+  test('High #1: canonicalize 与 OpaqueRefresher 遇未发布表切换分区策略抛 PlanError 时自动回退重建并推进基线', async () => {
+    const shadow = pgShadow(shadowDb.url);
+    const platform = await createTestDb('derive_part_fallback');
+    const db = await openPlatformDb(platform.url);
+    const rooms = new Rooms(db, async () => 'editor');
+    const baselines = new Map<string, Model>();
+    const refresher = new OpaqueRefresher(rooms, async () => shadow, {
+      load: async (b) => baselines.get(b) ?? null,
+      save: async (b, m) => {
+        baselines.set(b, structuredClone(m));
+      },
+    });
+    try {
+      // 1. 直接验证 shadow.canonicalize(prev, next) 在普通表→表达式分区表转换时回退 build(next)
+      const prev = emptyModel();
+      const pub = createSchema(prev, 'public', 's-pub');
+      const tags = createTable(prev, pub, 'tags', 't-tags');
+      addColumn(prev, tags, { name: 'code', type: 'text', notNull: true, id: 'c-code' });
+
+      const next = structuredClone(prev);
+      setPartitionBy(next, tags, {
+        strategy: 'list',
+        keys: [{ column: null, expr: 'LOWER(code)', opclass: null, collation: null }],
+      });
+      createPartition(next, tags, 'tags_a', "FOR VALUES IN ('a')", 't-tags-a');
+
+      const changed = await shadow.canonicalize(prev, next);
+      const canonTags = changed.find((o): o is Table => o.kind === 'table' && o.id === tags);
+      expect(
+        canonTags?.partitionBy && typeof canonTags.partitionBy !== 'string'
+          ? canonTags.partitionBy.keys[0]?.expr
+          : null,
+      ).toBe('lower(code)');
+
+      // 2. 端到端验证 OpaqueRefresher：表先进入 good 基线，再配置表达式分区键与后续 CHECK 表达式
+      await db.query("insert into groups (id, slug, name) values ('g1', 'g1', 'g1')");
+      await db.query("insert into projects (id, name, group_id, slug) values ('p1', 'p1', 'g1', 'p1')");
+      await db.query("insert into branches (id, project_id, name) values ('b1', 'p1', 'main')");
+      await db.query(
+        'insert into room_snapshots (branch_id, seq, model, versions) values ($1, 0, $2::text::jsonb, $3::text::jsonb)',
+        ['b1', JSON.stringify(prev), '{}'],
+      );
+
+      // 首次 flush：plain table 无表达式，直接落入 good 基线
+      refresher.schedule('b1', 0);
+      await refresher.flush('b1');
+      expect((baselines.get('b1')?.objects[tags] as Table | undefined)?.partitionBy).toBeNull();
+
+      // 未发布态将普通表配置为表达式分区表并添加子分区
+      await rooms.replace('b1', 'tester', next, 'setPartitionBy');
+      refresher.schedule('b1', 0);
+      await refresher.flush('b1');
+
+      const afterPart = (await rooms.model('b1')).model;
+      const tAfter = afterPart.objects[tags] as Table;
+      expect(
+        tAfter.partitionBy && typeof tAfter.partitionBy !== 'string'
+          ? tAfter.partitionBy.keys[0]?.expr
+          : null,
+      ).toBe('lower(code)');
+      // good 基线已成功推进，不再卡在旧普通表
+      expect((baselines.get('b1')?.objects[tags] as Table | undefined)?.partitionBy).toEqual(
+        tAfter.partitionBy,
+      );
+
+      // 后续新增 CHECK 表达式也能正常规范化
+      const nextWithCheck = structuredClone(afterPart);
+      const ckId = addCheck(nextWithCheck, tags, "code <> ''", 'ck-code');
+      await rooms.replace('b1', 'tester', nextWithCheck, 'addCheck');
+      refresher.schedule('b1', 0);
+      await refresher.flush('b1');
+      const afterCheck = (await rooms.model('b1')).model;
+      expect((afterCheck.objects[ckId] as { expr: string }).expr).toContain('::text');
+      expect(await lockIsFree()).toBe(true);
+    } finally {
+      await refresher.drain();
+      rooms.close();
+      await db.close();
+      await platform.close();
       await shadow.close();
     }
   });

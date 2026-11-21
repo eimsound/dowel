@@ -1,12 +1,13 @@
 // 属性面板（DESIGN.md：属性面板）：编辑选中的表、枚举、序列；不透明对象只读显示 DDL。
 // 输入框是“草稿”：获得焦点时记下所依据对象的版本，保存时一并提交——期间别人改过这些对象，保存会被拒绝（04-ir-design.md 2.3）。
-import type { MigrationResult, VersionInfo } from '@dowel/api';
+import type { PublishedTables, VersionInfo } from '@dowel/api';
 import {
   all,
   COMMON_TYPES,
   type Column,
   childrenOf,
   columnsOf,
+  deepEqual,
   effectiveColumnsOf,
   type FkAction,
   formatPartitionBound,
@@ -23,7 +24,7 @@ import {
   partitionsOf,
   resolvePartitionBy,
   type Table,
-  validatePartitionBound,
+  validatePartitionBoundCode,
 } from '@dowel/core';
 import type { Versions } from '@dowel/sync';
 import { useQuery } from '@tanstack/react-query';
@@ -292,23 +293,41 @@ const initBoundDraft = (spec: PartitionSpec, existing?: string): BoundDraft => {
   return { ...base, modulus: String(parsed.modulus), remainder: String(parsed.remainder) };
 };
 
-const buildBoundString = (spec: PartitionSpec, draft: BoundDraft): string => {
-  if (draft.isDefault && spec.strategy !== 'hash') return formatPartitionBound({ kind: 'default' });
+const evaluateBoundDraft = (
+  spec: PartitionSpec,
+  draft: BoundDraft,
+): { bound: string; errorKey: string | null; errorParams?: Record<string, string | number> } => {
+  if (draft.isDefault && spec.strategy !== 'hash') {
+    return { bound: formatPartitionBound({ kind: 'default' }), errorKey: null };
+  }
+  let bound = '';
   if (spec.strategy === 'range') {
-    return formatPartitionBound({
-      kind: 'range',
-      from: draft.from.map((s) => s.trim()),
-      to: draft.to.map((s) => s.trim()),
-    });
-  }
-  if (spec.strategy === 'list') {
+    const from = draft.from.map((s) => s.trim());
+    const to = draft.to.map((s) => s.trim());
+    if (from.some((v) => !v) || to.some((v) => !v)) return { bound: '', errorKey: null };
+    bound = formatPartitionBound({ kind: 'range', from, to });
+  } else if (spec.strategy === 'list') {
     const raw = draft.list.trim();
-    return raw ? `FOR VALUES IN (${raw})` : '';
+    if (!raw) return { bound: '', errorKey: null };
+    bound = `FOR VALUES IN (${raw})`;
+  } else {
+    const modText = draft.modulus.trim();
+    const remText = draft.remainder.trim();
+    if (!modText || !remText) return { bound: '', errorKey: null };
+    if (!/^\d+$/.test(modText) || !/^\d+$/.test(remText)) {
+      return { bound: '', errorKey: 'part.boundErr.hash_integer' };
+    }
+    const modulus = Number(modText);
+    const remainder = Number(remText);
+    if (!Number.isSafeInteger(modulus) || !Number.isSafeInteger(remainder)) {
+      return { bound: '', errorKey: 'part.boundErr.hash_integer' };
+    }
+    bound = formatPartitionBound({ kind: 'hash', modulus, remainder });
   }
-  const modulus = Number.parseInt(draft.modulus, 10);
-  const remainder = Number.parseInt(draft.remainder, 10);
-  if (!Number.isInteger(modulus) || !Number.isInteger(remainder)) return '';
-  return formatPartitionBound({ kind: 'hash', modulus, remainder });
+  const err = validatePartitionBoundCode(spec.strategy, bound, spec.keys.length);
+  if (!err) return { bound, errorKey: null };
+  const { code, ...params } = err;
+  return { bound, errorKey: `part.boundErr.${code}`, errorParams: params };
 };
 
 const BoundInputs = ({
@@ -459,9 +478,16 @@ const BoundInputs = ({
   );
 };
 
-/** 筛选列定义与分区父表一致、可挂载为子分区的普通表（与 edit.ts attachPartition 对齐） */
+/** 筛选列定义、主键与 CHECK 约束均与分区父表兼容、可挂载为子分区的普通表（与 edit.ts attachPartition 对齐） */
 const compatiblePlainTables = (model: Model, parent: Table): Table[] => {
   const rootCols = effectiveColumnsOf(model, parent.id);
+  const ancestorIds = new Set<string>();
+  for (let cur: Table | undefined = parent; cur && !ancestorIds.has(cur.id);) {
+    ancestorIds.add(cur.id);
+    cur = cur.partitionOf ? (model.objects[cur.partitionOf.parent] as Table | undefined) : undefined;
+  }
+  const ancPks = all(model, 'primaryKey').filter((k) => ancestorIds.has(k.parent));
+  const ancChecks = all(model, 'check').filter((k) => ancestorIds.has(k.parent));
   const referencedByExternalFk = new Set(
     all(model, 'foreignKey')
       .filter((fk) => fk.refTable !== fk.parent)
@@ -478,18 +504,31 @@ const compatiblePlainTables = (model: Model, parent: Table): Table[] => {
     const cols = columnsOf(model, cand.id);
     if (cols.length !== rootCols.length) return false;
     if (cols.some((c) => c.identity !== null || ownedColIds.has(c.id))) return false;
-    return rootCols.every((rc) => {
+    const colMap = new Map<string, string>();
+    for (const rc of rootCols) {
       const cc = cols.find((x) => x.name === rc.name);
       if (!cc) return false;
-      return (
-        cc.type === rc.type &&
-        cc.typeRef === rc.typeRef &&
-        cc.collation === rc.collation &&
-        cc.notNull === rc.notNull &&
-        JSON.stringify(cc.generated) === JSON.stringify(rc.generated) &&
-        JSON.stringify(cc.default) === JSON.stringify(rc.default)
-      );
-    });
+      if (
+        cc.type !== rc.type ||
+        cc.typeRef !== rc.typeRef ||
+        cc.collation !== rc.collation ||
+        cc.notNull !== rc.notNull ||
+        !deepEqual(cc.generated, rc.generated) ||
+        !deepEqual(cc.default, rc.default)
+      ) {
+        return false;
+      }
+      colMap.set(cc.id, rc.id);
+    }
+    const candPk = childrenOf(model, cand.id, 'primaryKey')[0];
+    if (candPk && ancPks.length > 0) {
+      const mapped = candPk.columns.map((c) => colMap.get(c) ?? c);
+      if (!ancPks.some((pk) => deepEqual(pk.columns, mapped))) return false;
+    }
+    for (const ck of childrenOf(model, cand.id, 'check')) {
+      if (ancChecks.some((ak) => ak.name === ck.name && ak.expr !== ck.expr)) return false;
+    }
+    return true;
   });
 };
 
@@ -501,6 +540,9 @@ interface KeyDraft {
   opclass: string;
 }
 
+const isIntegerColumn = (c: Column) =>
+  !c.typeRef && (c.type === 'smallint' || c.type === 'integer' || c.type === 'bigint');
+
 const TableInspector = ({
   table,
   ws,
@@ -509,25 +551,29 @@ const TableInspector = ({
   onSelect,
 }: Ctx & { table: Table; onSelect: (id: string | null) => void }) => {
   const { t } = useTranslation();
-  const { pid } = useProject();
+  const { pid, project } = useProject();
   const versions = useQuery({
     queryKey: ['versions', pid],
     queryFn: () => api<VersionInfo[]>('GET', `/api/projects/${pid}/versions`),
   });
+  const versionCount = versions.data?.length ?? 0;
   const latestId = versions.data?.[0]?.id;
-  const latestTables = useQuery({
-    queryKey: ['version-tables', pid, latestId],
+  const publishedTables = useQuery({
+    queryKey: ['published-tables', pid, latestId, versionCount],
     queryFn: async () => {
-      const { up } = await api<MigrationResult>(
-        'GET',
-        `/api/projects/${pid}/migration?from=empty&to=${encodeURIComponent(latestId!)}`,
-      );
-      return new Set(up.filter((s) => s.kind === 'createTable').map((s) => s.target));
+      const res = await api<PublishedTables>('GET', `/api/projects/${pid}/published-tables`);
+      return new Set(res.tableIds);
     },
-    enabled: !!latestId,
+    enabled: versionCount > 0,
     staleTime: Infinity,
   });
-  const isPublished = !!latestTables.data?.has(table.id);
+  // Fail-closed：版本列表或已发布表集合仍在加载/出错时，默认锁定策略编辑，避免短暂暴露非法操作
+  const publishedUnknown =
+    versions.isPending ||
+    versions.isError ||
+    (versionCount > 0 && (publishedTables.isPending || publishedTables.isError));
+  const isPublished = !publishedUnknown && versionCount > 0 && !!publishedTables.data?.has(table.id);
+  const pgBlocksPartitionIdentity = project.targetPgMajor !== null && project.targetPgMajor < 17;
 
   const isChild = table.partitionOf !== null;
   const cols = isChild ? effectiveColumnsOf(model, table.id) : columnsOf(model, table.id);
@@ -592,11 +638,12 @@ const TableInspector = ({
     initBoundDraft(spec ?? parentSpec ?? { strategy: 'range', keys: [] }),
   );
 
-  // 实时降级为只读时直接派生为关闭，避免 effect 中 setState 级联渲染（pitfalls #30）
+  const strategyLocked = locked || publishedUnknown || isPublished;
   const activeAdding = locked ? null : adding;
-  const activeEditingStrategy = !locked && !isPublished && editingStrategy;
-  const activePartForm = locked ? null : partForm;
+  const activeEditingStrategy = !strategyLocked && !isChild && editingStrategy;
+  const activePartForm = locked || isChild ? null : partForm;
   const activeEditingBoundId = locked ? null : editingBoundId;
+  const identityCols = cols.filter((c) => c.identity !== null);
 
   const startAdding = (k: typeof adding) => {
     setAdding(k);
@@ -696,16 +743,20 @@ const TableInspector = ({
   };
 
   const attachCandidates = activePartForm === 'attach' ? compatiblePlainTables(model, table) : [];
-  const formBoundStr = spec ? buildBoundString(spec, boundDraft) : '';
-  const formBoundError =
-    spec && formBoundStr ? validatePartitionBound(spec.strategy, formBoundStr, spec.keys.length) : null;
+  const formBoundEval = spec ? evaluateBoundDraft(spec, boundDraft) : { bound: '', errorKey: null };
+  const formBoundStr = formBoundEval.bound;
+  const formBoundError = formBoundEval.errorKey
+    ? t(formBoundEval.errorKey, formBoundEval.errorParams ?? {})
+    : null;
 
   const activeEditSpec = isChild ? parentSpec : spec;
-  const editBoundStr = activeEditSpec ? buildBoundString(activeEditSpec, editBoundDraft) : '';
-  const editBoundError =
-    activeEditSpec && editBoundStr
-      ? validatePartitionBound(activeEditSpec.strategy, editBoundStr, activeEditSpec.keys.length)
-      : null;
+  const editBoundEval = activeEditSpec
+    ? evaluateBoundDraft(activeEditSpec, editBoundDraft)
+    : { bound: '', errorKey: null };
+  const editBoundStr = editBoundEval.bound;
+  const editBoundError = editBoundEval.errorKey
+    ? t(editBoundEval.errorKey, editBoundEval.errorParams ?? {})
+    : null;
 
   return (
     <fieldset disabled={locked} className="min-w-0 space-y-3 border-0 p-0">
@@ -751,7 +802,8 @@ const TableInspector = ({
         <Section
           title={t('part.bound')}
           action={
-            !locked && (
+            !locked &&
+            !table.partitionBy && (
               <>
                 {parentSpec && (
                   <IconButton
@@ -782,7 +834,7 @@ const TableInspector = ({
               <span className="font-mono text-xs text-text-3">{formatPartitionBy(model, table)}</span>
             </div>
           )}
-          {activeEditingBoundId === table.id && parentSpec && (
+          {activeEditingBoundId === table.id && !table.partitionBy && parentSpec && (
             <AddForm
               title={t('part.editBound')}
               onCancel={() => setEditingBoundId(null)}
@@ -942,6 +994,31 @@ const TableInspector = ({
                           />
                           {t('insp.pk')}
                         </label>
+                        {(isIntegerColumn(c) || c.identity !== null) && (
+                          <label
+                            title={
+                              table.partitionBy !== null && pgBlocksPartitionIdentity && !c.identity
+                                ? t('part.identityRequiresPg17', { target: project.targetPgMajor })
+                                : undefined
+                            }
+                          >
+                            <input
+                              type="checkbox"
+                              checked={c.identity !== null}
+                              disabled={
+                                c.generated !== null ||
+                                (table.partitionBy !== null && pgBlocksPartitionIdentity && !c.identity)
+                              }
+                              onChange={(e) =>
+                                ws.act('setIdentity', {
+                                  id: c.id,
+                                  identity: e.target.checked ? { always: false } : null,
+                                })
+                              }
+                            />
+                            {t('part.identity')}
+                          </label>
+                        )}
                       </div>
                       <IconButton
                         label={`${t('insp.moveUp')} ${c.name}`}
@@ -973,6 +1050,13 @@ const TableInspector = ({
                         <Trash2 size={14} aria-hidden="true" />
                       </IconButton>
                     </div>
+                    {table.partitionBy !== null &&
+                      pgBlocksPartitionIdentity &&
+                      (isIntegerColumn(c) || c.identity !== null) && (
+                        <p className={cx('hint', c.identity && 'text-warn')}>
+                          {t('part.identityRequiresPg17', { target: project.targetPgMajor })}
+                        </p>
+                      )}
                   </div>
                 )}
               </li>
@@ -1249,13 +1333,13 @@ const TableInspector = ({
         )}
       </Section>
 
-      {!isChild && (
+      {(!isChild || table.partitionBy !== null) && (
         <Section
           title={t('part.section')}
           count={table.partitionBy ? children.length : undefined}
           action={
-            !locked &&
-            !isPublished &&
+            !isChild &&
+            !strategyLocked &&
             !activeEditingStrategy &&
             !table.partitionBy && (
               <button type="button" className="btn ghost sm" onClick={openStrategyEditor}>
@@ -1264,8 +1348,14 @@ const TableInspector = ({
             )
           }
         >
-          {!table.partitionBy && !activeEditingStrategy && (
-            <p className="hint">{isPublished ? t('part.publishedHint') : t('part.notPartitioned')}</p>
+          {!isChild && !table.partitionBy && !activeEditingStrategy && (
+            <p className="hint">
+              {publishedUnknown && !locked
+                ? t('part.publishedChecking')
+                : isPublished
+                  ? t('part.publishedHint')
+                  : t('part.notPartitioned')}
+            </p>
           )}
 
           {table.partitionBy && !activeEditingStrategy && (
@@ -1277,7 +1367,7 @@ const TableInspector = ({
                     {formatPartitionBy(model, table)}
                   </span>
                 </div>
-                {!locked && !isPublished && (
+                {!isChild && !strategyLocked && (
                   <div className="mt-2 flex items-center gap-1.5">
                     <button type="button" className="btn sm" onClick={openStrategyEditor}>
                       {t('part.editStrategy')}
@@ -1294,7 +1384,18 @@ const TableInspector = ({
                   </div>
                 )}
               </div>
-              {isPublished && <p className="hint">{t('part.publishedHint')}</p>}
+              {!isChild && publishedUnknown && !locked && (
+                <p className="hint">{t('part.publishedChecking')}</p>
+              )}
+              {!isChild && isPublished && <p className="hint">{t('part.publishedHint')}</p>}
+              {!isChild && pgBlocksPartitionIdentity && identityCols.length > 0 && (
+                <Banner kind="warn">
+                  {t('part.identityRequiresPg17Banner', {
+                    target: project.targetPgMajor,
+                    columns: identityCols.map((c) => c.name).join(', '),
+                  })}
+                </Banner>
+              )}
             </div>
           )}
 
@@ -1313,9 +1414,18 @@ const TableInspector = ({
                 </button>
               }
             >
+              {pgBlocksPartitionIdentity && identityCols.length > 0 && (
+                <Banner kind="warn">
+                  {t('part.identityRequiresPg17Banner', {
+                    target: project.targetPgMajor,
+                    columns: identityCols.map((c) => c.name).join(', '),
+                  })}
+                </Banner>
+              )}
               <label className="field">
                 <span className="label">{t('part.strategy')}</span>
                 <select
+                  name="partitionStrategy"
                   aria-label={t('part.strategy')}
                   className="select font-mono"
                   value={draftStrategy}
@@ -1358,6 +1468,7 @@ const TableInspector = ({
                   <div key={idx} className="space-y-1.5 rounded-sm border border-border bg-surface p-2">
                     <div className="flex items-center gap-1.5">
                       <select
+                        name={`partitionKeyMode_${idx}`}
                         aria-label={`${t('part.keyMode')} ${idx + 1}`}
                         className="select w-24 shrink-0"
                         value={k.mode}
@@ -1372,6 +1483,7 @@ const TableInspector = ({
 
                       {k.mode === 'column' ? (
                         <select
+                          name={`partitionKeyCol_${idx}`}
                           aria-label={`${t('part.pickColumn')} ${idx + 1}`}
                           className="select min-w-0 flex-1 font-mono"
                           value={k.column}
@@ -1451,7 +1563,7 @@ const TableInspector = ({
               <div className="flex items-center gap-1.5">
                 <span className="label">{t('part.children')}</span>
                 <span className="count">{children.length}</span>
-                {!locked && spec && (
+                {!locked && !isChild && spec && (
                   <span className="ml-auto flex items-center gap-1">
                     <button type="button" className="btn ghost sm" onClick={openAddPartition}>
                       <Plus size={12} aria-hidden="true" />
@@ -1484,7 +1596,7 @@ const TableInspector = ({
                           {isSubPart && <span className="badge shrink-0">{t('part.subPartitionBadge')}</span>}
                           {!locked && (
                             <span className="flex shrink-0 items-center gap-0.5">
-                              {spec && !isSubPart && (
+                              {!isChild && spec && !isSubPart && (
                                 <IconButton
                                   label={t('part.editBoundLabel', { name: ch.name })}
                                   size="sm"
@@ -1493,7 +1605,7 @@ const TableInspector = ({
                                   <Pencil size={13} aria-hidden="true" />
                                 </IconButton>
                               )}
-                              {!isSubPart && (
+                              {!isChild && !isSubPart && (
                                 <IconButton
                                   label={t('part.detachLabel', { name: ch.name })}
                                   size="sm"
@@ -1517,7 +1629,7 @@ const TableInspector = ({
                           {ch.partitionOf!.bound}
                         </div>
 
-                        {activeEditingBoundId === ch.id && spec && (
+                        {!isChild && activeEditingBoundId === ch.id && spec && (
                           <div className="mt-2">
                             <AddForm
                               title={t('part.editBound')}
@@ -1636,6 +1748,7 @@ const TableInspector = ({
                       <label className="field">
                         <span className="label">{t('part.attachPickTable')}</span>
                         <select
+                          name="attachPartitionTable"
                           aria-label={t('part.attachPickTable')}
                           className="select font-mono"
                           value={attachTableId}
@@ -1669,27 +1782,14 @@ const TableInspector = ({
 
 const KIND_ICON = { table: Table2, enum: List, sequence: Hash } as const;
 
-export const Inspector = ({
-  selected,
+const InspectorContent = ({
+  o,
   onSelect,
   ...ctx
-}: Ctx & { selected: string | null; onSelect: (id: string | null) => void }) => {
+}: Ctx & { o: NonNullable<Model['objects'][string]>; onSelect: (id: string | null) => void }) => {
   const { t } = useTranslation();
   const [confirm, setConfirm] = useState(false);
   const { ws, readOnly, model } = ctx;
-
-  const o = selected ? model.objects[selected] : undefined;
-  if (!o || !['table', 'enum', 'sequence', 'opaque'].includes(o.kind))
-    return (
-      <div className="p-4">
-        <Empty
-          icon={<MousePointerClick size={28} strokeWidth={1.5} aria-hidden="true" />}
-          title={t('insp.nothingTitle')}
-        >
-          {t('insp.nothing')}
-        </Empty>
-      </div>
-    );
   const schema = 'parent' in o ? model.objects[o.parent]?.name : undefined;
   const Icon =
     o.kind === 'opaque'
@@ -1726,7 +1826,7 @@ export const Inspector = ({
         )}
       </div>
       <div className="min-h-0 flex-1 overflow-auto px-3.5 pt-3 pb-5">
-        {o.kind === 'table' && <TableInspector key={o.id} table={o} onSelect={onSelect} {...ctx} />}
+        {o.kind === 'table' && <TableInspector table={o} onSelect={onSelect} {...ctx} />}
         {o.kind === 'enum' && (
           <fieldset disabled={readOnly} className="min-w-0 space-y-3 border-0 p-0">
             <Labeled label={t('insp.name')}>
@@ -1813,4 +1913,29 @@ export const Inspector = ({
       )}
     </>
   );
+};
+
+export const Inspector = ({
+  selected,
+  onSelect,
+  ...ctx
+}: Ctx & { selected: string | null; onSelect: (id: string | null) => void }) => {
+  const { t } = useTranslation();
+  const { readOnly, model } = ctx;
+
+  const o = selected ? model.objects[selected] : undefined;
+  if (!o || !['table', 'enum', 'sequence', 'opaque'].includes(o.kind))
+    return (
+      <div className="p-4">
+        <Empty
+          icon={<MousePointerClick size={28} strokeWidth={1.5} aria-hidden="true" />}
+          title={t('insp.nothingTitle')}
+        >
+          {t('insp.nothing')}
+        </Empty>
+      </div>
+    );
+
+  // 通过对象 ID 与只读状态联合 key 挂载内容，实时降级只读时自动彻底重置全部内联表单与确认弹窗状态
+  return <InspectorContent key={`${o.id}:${readOnly ? 'ro' : 'rw'}`} o={o} onSelect={onSelect} {...ctx} />;
 };

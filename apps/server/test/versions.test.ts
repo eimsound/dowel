@@ -1,8 +1,14 @@
 // 发布 = 冻结迁移（P4a H1）：版本链（number / parent）、steps 与 checksum、空迁移、影子库验证、
 // 人工编辑冻结脚本、重新验证（执行的是冻结脚本而不是重新 plan）。
 // 平台库在 SQLite 和 PostgreSQL 上各跑一遍；影子库验证需要测试 PG（没有 Docker 时跳过）。
-import type { StoredVerifyReport, VersionCreated, VersionDetail, VersionInfo } from '@dowel/api';
-import { addColumn, all, createSchema, createTable, emptyModel, type Model } from '@dowel/core';
+import type {
+  PublishedTables,
+  StoredVerifyReport,
+  VersionCreated,
+  VersionDetail,
+  VersionInfo,
+} from '@dowel/api';
+import { addColumn, all, createSchema, createTable, dropTable, emptyModel, type Model } from '@dowel/core';
 import { type Db, type ScriptStep, stepsChecksum } from '@dowel/engines';
 import { HTTPException } from 'hono/http-exception';
 import { afterAll, beforeAll, describe, expect, test } from 'vitest';
@@ -1063,6 +1069,39 @@ describe.each([
       expect(published.status).toBe(409);
       expect(await detail(pid, v1.id)).toMatchObject({ edited: false, checksum: d1.checksum });
       expect((await list(pid)).map((v) => v.number)).toEqual([2, 1]);
+    },
+  );
+
+  test.skipIf(skip)(
+    'Medium #7: /published-tables 覆盖所有历史已发布版本中出现过的表 ID（含 v1 发布、v2 删除的表）',
+    async () => {
+      const pid = await newProject('pub-tables');
+      const r0 = await call('GET', `/api/projects/${pid}/published-tables`);
+      expect(r0.status).toBe(200);
+      expect((r0.data as unknown as PublishedTables).tableIds).toEqual([]);
+
+      let t1Id = '';
+      let t2Id = '';
+      await editModel(created.rooms, db, pid, (m) => {
+        const pub = all(m, 'schema').find((s) => s.name === 'public')!;
+        t1Id = createTable(m, pub.id, 't_one');
+        addColumn(m, t1Id, { name: 'id', type: 'integer', notNull: true });
+      });
+      expect((await publish(pid, 'v1')).status).toBe(201);
+
+      await editModel(created.rooms, db, pid, (m) => {
+        const pub = all(m, 'schema').find((s) => s.name === 'public')!;
+        dropTable(m, t1Id);
+        t2Id = createTable(m, pub.id, 't_two');
+        addColumn(m, t2Id, { name: 'id', type: 'integer', notNull: true });
+      });
+      expect((await publish(pid, 'v2')).status).toBe(201);
+
+      const r2 = await call('GET', `/api/projects/${pid}/published-tables`, undefined, viewer);
+      expect(r2.status).toBe(200);
+      const ids = (r2.data as unknown as PublishedTables).tableIds;
+      expect(ids).toContain(t1Id);
+      expect(ids).toContain(t2Id);
     },
   );
 });

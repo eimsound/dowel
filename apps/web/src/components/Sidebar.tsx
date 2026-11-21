@@ -97,24 +97,105 @@ export const Sidebar = ({
       ? (tb.partitionBy.trim().split(/\s+/)[0]?.toUpperCase() ?? null)
       : null;
   };
-  const rootTables = byName(all(model, 'table').filter((x) => !x.partitionOf)).map((x) => {
-    const children = byName(partitionsOf(model, x.id));
-    const strat = strategyLabel(x);
+  interface TableNode {
+    table: Table;
+    label: string;
+    strat: string | null;
+    totalChildren: number;
+    children: TableNode[];
+    forceExpand: boolean;
+  }
+  const buildTableNode = (tb: Table, ancestorMatched: boolean, seen: Set<string>): TableNode | null => {
+    if (seen.has(tb.id)) return null;
+    seen.add(tb.id);
+    const label = qname(tb);
+    const selfMatched = match(label);
+    const rawChildren = byName(partitionsOf(model, tb.id));
+    const visibleChildren = rawChildren
+      .map((ch) => buildTableNode(ch, ancestorMatched || selfMatched, seen))
+      .filter((x): x is TableNode => x !== null);
+    if (!ancestorMatched && !selfMatched && visibleChildren.length === 0) return null;
     return {
-      table: x,
-      label: qname(x),
-      strat,
-      children: children.map((ch) => ({ table: ch, label: qname(ch) })),
+      table: tb,
+      label,
+      strat: strategyLabel(tb),
+      totalChildren: rawChildren.length,
+      children: visibleChildren,
+      forceExpand: !!q && !selfMatched && visibleChildren.length > 0,
     };
-  });
-  const filteredTables = rootTables
-    .map((entry) => {
-      const parentMatched = match(entry.label);
-      const matchedChildren = parentMatched ? entry.children : entry.children.filter((ch) => match(ch.label));
-      if (!parentMatched && matchedChildren.length === 0) return null;
-      return { ...entry, visibleChildren: matchedChildren, forceExpand: !parentMatched && !!q };
-    })
-    .filter((x): x is NonNullable<typeof x> => x !== null);
+  };
+  const filteredTables = byName(all(model, 'table').filter((x) => !x.partitionOf))
+    .map((x) => buildTableNode(x, false, new Set()))
+    .filter((x): x is TableNode => x !== null);
+  const renderTableNode = (node: TableNode, depth: number): ReactNode => {
+    const { table, label, strat, totalChildren, children, forceExpand } = node;
+    if (depth === 0 && !strat && totalChildren === 0) {
+      return (
+        <Item
+          key={table.id}
+          label={label}
+          icon={<Table2 size={16} aria-hidden="true" />}
+          active={table.id === selected}
+          onClick={() => onSelect(table.id)}
+        />
+      );
+    }
+    const isOpen = forceExpand || !!expanded[table.id];
+    const hasChildren = children.length > 0;
+    const isChild = depth > 0;
+    const indentPx = depth * 14;
+    return (
+      <li key={table.id}>
+        <div
+          className={isChild ? 'flex h-[26px] items-center' : 'flex h-[var(--row-h)] items-center'}
+          style={indentPx ? { paddingLeft: `${indentPx}px` } : undefined}
+        >
+          {hasChildren ? (
+            <button
+              type="button"
+              aria-expanded={isOpen}
+              aria-label={t('part.togglePartitions', { name: table.name })}
+              onClick={() => setExpanded((prev) => ({ ...prev, [table.id]: !isOpen }))}
+              className="flex size-[22px] shrink-0 items-center justify-center rounded-sm text-text-3 hover:bg-surface-hover hover:text-text-2"
+            >
+              {isOpen ? (
+                <ChevronDown size={13} aria-hidden="true" />
+              ) : (
+                <ChevronRight size={13} aria-hidden="true" />
+              )}
+            </button>
+          ) : (
+            <span className="w-[22px] shrink-0" aria-hidden="true" />
+          )}
+          <button
+            type="button"
+            onClick={() => onSelect(table.id)}
+            aria-current={table.id === selected ? 'true' : undefined}
+            className={
+              isChild
+                ? 'flex h-full min-w-0 flex-1 items-center gap-1.5 rounded-sm pr-2 pl-0.5 text-left font-mono text-xs text-text-3 transition-colors hover:bg-surface-hover hover:text-text-2 aria-[current]:bg-primary-soft aria-[current]:text-primary-text'
+                : 'flex h-full min-w-0 flex-1 items-center gap-2 rounded-sm pr-2 pl-0.5 text-left font-mono text-sm text-text-2 transition-colors hover:bg-surface-hover aria-[current]:bg-primary-soft aria-[current]:font-medium aria-[current]:text-primary-text [&>svg]:text-text-3 aria-[current]:[&>svg]:text-primary-text'
+            }
+          >
+            {isChild ? (
+              <Layers size={12} aria-hidden="true" className="shrink-0" />
+            ) : (
+              <Table2 size={16} aria-hidden="true" />
+            )}
+            <span className="min-w-0 flex-1 truncate">{label}</span>
+            {strat && (
+              <span className="shrink-0 font-mono text-[11px] text-text-3">
+                {strat} · {totalChildren}
+              </span>
+            )}
+          </button>
+        </div>
+        {hasChildren && isOpen && (
+          <ul className="list-none p-0">{children.map((ch) => renderTableNode(ch, depth + 1))}</ul>
+        )}
+      </li>
+    );
+  };
   const otherGroups = [
     {
       title: t('ws.enums'),
@@ -157,73 +238,7 @@ export const Sidebar = ({
       <ul className="min-h-0 flex-1 list-none overflow-auto px-1.5 pb-3">
         {filteredTables.length > 0 && (
           <Group title={t('ws.tables')} count={filteredTables.length}>
-            {filteredTables.map(({ table, label, strat, children, visibleChildren, forceExpand }) => {
-              if (!strat) {
-                return (
-                  <Item
-                    key={table.id}
-                    label={label}
-                    icon={<Table2 size={16} aria-hidden="true" />}
-                    active={table.id === selected}
-                    onClick={() => onSelect(table.id)}
-                  />
-                );
-              }
-              const isOpen = forceExpand || !!expanded[table.id];
-              const hasChildren = visibleChildren.length > 0;
-              return (
-                <li key={table.id}>
-                  <div className="flex h-[var(--row-h)] items-center">
-                    {hasChildren ? (
-                      <button
-                        type="button"
-                        aria-expanded={isOpen}
-                        aria-label={t('part.togglePartitions', { name: table.name })}
-                        onClick={() => setExpanded((prev) => ({ ...prev, [table.id]: !isOpen }))}
-                        className="flex size-[22px] shrink-0 items-center justify-center rounded-sm text-text-3 hover:bg-surface-hover hover:text-text-2"
-                      >
-                        {isOpen ? (
-                          <ChevronDown size={13} aria-hidden="true" />
-                        ) : (
-                          <ChevronRight size={13} aria-hidden="true" />
-                        )}
-                      </button>
-                    ) : (
-                      <span className="w-[22px] shrink-0" aria-hidden="true" />
-                    )}
-                    <button
-                      type="button"
-                      onClick={() => onSelect(table.id)}
-                      aria-current={table.id === selected ? 'true' : undefined}
-                      className="flex h-full min-w-0 flex-1 items-center gap-2 rounded-sm pr-2 pl-0.5 text-left font-mono text-sm text-text-2 transition-colors hover:bg-surface-hover aria-[current]:bg-primary-soft aria-[current]:font-medium aria-[current]:text-primary-text [&>svg]:text-text-3 aria-[current]:[&>svg]:text-primary-text"
-                    >
-                      <Table2 size={16} aria-hidden="true" />
-                      <span className="min-w-0 flex-1 truncate">{label}</span>
-                      <span className="shrink-0 font-mono text-[11px] text-text-3">
-                        {strat} · {children.length}
-                      </span>
-                    </button>
-                  </div>
-                  {hasChildren && isOpen && (
-                    <ul className="list-none p-0">
-                      {visibleChildren.map((ch) => (
-                        <li key={ch.table.id}>
-                          <button
-                            type="button"
-                            onClick={() => onSelect(ch.table.id)}
-                            aria-current={ch.table.id === selected ? 'true' : undefined}
-                            className="flex h-[26px] w-full items-center gap-1.5 rounded-sm pr-2 pl-[38px] text-left font-mono text-xs text-text-3 transition-colors hover:bg-surface-hover hover:text-text-2 aria-[current]:bg-primary-soft aria-[current]:text-primary-text"
-                          >
-                            <Layers size={12} aria-hidden="true" className="shrink-0" />
-                            <span className="min-w-0 flex-1 truncate">{ch.label}</span>
-                          </button>
-                        </li>
-                      ))}
-                    </ul>
-                  )}
-                </li>
-              );
-            })}
+            {filteredTables.map((node) => renderTableNode(node, 0))}
           </Group>
         )}
         {otherGroups.map(

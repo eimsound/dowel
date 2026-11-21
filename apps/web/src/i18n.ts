@@ -1710,6 +1710,23 @@ const zh = {
     opclass: '运算符类（可选）',
     listSingleKey: 'LIST 分区只能有 1 个分区键。',
     publishedHint: '表已存在于已发布版本中；PostgreSQL 不支持原地修改分区策略或将普通表与分区表互转。',
+    publishedChecking: '正在校验已发布版本，暂不可修改分区策略。',
+    identity: '自增（IDENTITY）',
+    identityRequiresPg17: '目标环境为 PG {{target}}，分区表列 IDENTITY 需要 PostgreSQL 17+，请改用独立序列。',
+    identityRequiresPg17Banner:
+      '当前目标版本为 PG {{target}}，分区表不支持 IDENTITY 列（{{columns}}），请取消自增并改用独立序列。',
+    boundErr: {
+      syntax: '分区边界语法不合法',
+      hash_no_default: 'HASH 分区不支持 DEFAULT 子分区',
+      strategy_mismatch: '分区边界类型（{{actual}}）与父表分区策略（{{expected}}）不匹配',
+      range_count_mismatch: 'RANGE 分区边界的 FROM 与 TO 值数量必须一致',
+      range_key_count: 'RANGE 分区边界的值数量（{{actual}}）必须与分区键数量（{{expected}}）一致',
+      list_empty: 'LIST 分区边界至少需要一个值',
+      hash_modulus: 'HASH 分区的 modulus 必须为正整数（>= 1）',
+      hash_remainder:
+        'HASH 分区的 remainder 必须满足 0 <= remainder < modulus（当前 {{remainder}} / {{modulus}}）',
+      hash_integer: 'HASH 分区的 modulus 和 remainder 必须为非负整数',
+    },
     keyColLockedHint: '该列被分区键引用，不能修改类型或删除。',
     keyColDeleteLocked: '无法删除分区键列 {{name}}',
     children: '子分区',
@@ -3535,6 +3552,24 @@ const en: typeof zh = {
     listSingleKey: 'LIST partitioning allows only 1 partition key.',
     publishedHint:
       'This table exists in a published version; PostgreSQL does not support changing partitioning strategy in place.',
+    publishedChecking: 'Checking published versions; partitioning strategy editing is locked.',
+    identity: 'Identity',
+    identityRequiresPg17:
+      'Target environment is PG {{target}}; IDENTITY on partitioned tables requires PostgreSQL 17+. Use an independent sequence instead.',
+    identityRequiresPg17Banner:
+      'Target version is PG {{target}}, which does not support IDENTITY columns on partitioned tables ({{columns}}). Disable IDENTITY and use an independent sequence instead.',
+    boundErr: {
+      syntax: 'Invalid partition bound syntax',
+      hash_no_default: 'HASH partitioning does not support a DEFAULT partition',
+      strategy_mismatch: 'Bound type ({{actual}}) does not match parent strategy ({{expected}})',
+      range_count_mismatch: 'RANGE bound FROM and TO must have the same number of values',
+      range_key_count: 'RANGE bound value count ({{actual}}) must match partition key count ({{expected}})',
+      list_empty: 'LIST partition bound requires at least one value',
+      hash_modulus: 'HASH modulus must be a positive integer (>= 1)',
+      hash_remainder:
+        'HASH remainder must satisfy 0 <= remainder < modulus (got {{remainder}} / {{modulus}})',
+      hash_integer: 'HASH modulus and remainder must be non-negative integers',
+    },
     keyColLockedHint: 'Referenced by the partition key; type cannot be changed and column cannot be dropped.',
     keyColDeleteLocked: 'Cannot delete partition key column {{name}}',
     children: 'Partitions',

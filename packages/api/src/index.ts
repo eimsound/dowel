@@ -528,6 +528,12 @@ export const versionInfoSchema = z.object({
 });
 export type VersionInfo = z.infer<typeof versionInfoSchema>;
 
+/** 项目所有已发布版本中出现过的表 ID 集合（用于锁定已发布表的不可变分区策略） */
+export const publishedTablesSchema = z.object({
+  tableIds: z.array(z.string()),
+});
+export type PublishedTables = z.infer<typeof publishedTablesSchema>;
+
 export const versionCreatedSchema = z.object({
   id: z.string(),
   name: z.string(),

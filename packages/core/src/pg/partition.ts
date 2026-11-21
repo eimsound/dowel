@@ -190,48 +190,81 @@ export const formatPartitionBound = (parsed: PartitionBound): string => {
   }
 };
 
+export type PartitionBoundError =
+  | { code: 'syntax' }
+  | { code: 'hash_no_default' }
+  | { code: 'strategy_mismatch'; actual: string; expected: string }
+  | { code: 'range_count_mismatch' }
+  | { code: 'range_key_count'; actual: number; expected: number }
+  | { code: 'list_empty' }
+  | { code: 'hash_modulus' }
+  | { code: 'hash_remainder'; remainder: number; modulus: number };
+
+/** 结构化校验分区边界，返回错误码及参数或 null（合法），便于前端按语言环境展示 */
+export const validatePartitionBoundCode = (
+  strategy: PartitionStrategy,
+  bound: string,
+  keyCount?: number,
+): PartitionBoundError | null => {
+  const parsed = parsePartitionBound(bound);
+  if (!parsed) return { code: 'syntax' };
+  if (parsed.kind === 'default') {
+    if (strategy === 'hash') return { code: 'hash_no_default' };
+    return null;
+  }
+  if (parsed.kind !== strategy) {
+    return {
+      code: 'strategy_mismatch',
+      actual: parsed.kind.toUpperCase(),
+      expected: strategy.toUpperCase(),
+    };
+  }
+  if (parsed.kind === 'range') {
+    if (parsed.from.length !== parsed.to.length) {
+      return { code: 'range_count_mismatch' };
+    }
+    if (keyCount !== undefined && parsed.from.length !== keyCount) {
+      return { code: 'range_key_count', actual: parsed.from.length, expected: keyCount };
+    }
+    return null;
+  }
+  if (parsed.kind === 'list') {
+    if (!parsed.values.length) return { code: 'list_empty' };
+    return null;
+  }
+  if (parsed.modulus < 1) return { code: 'hash_modulus' };
+  if (parsed.remainder < 0 || parsed.remainder >= parsed.modulus) {
+    return { code: 'hash_remainder', remainder: parsed.remainder, modulus: parsed.modulus };
+  }
+  return null;
+};
+
 /** 校验分区边界是否匹配给定策略与分区键数量；返回错误信息或 null（合法） */
 export const validatePartitionBound = (
   strategy: PartitionStrategy,
   bound: string,
   keyCount?: number,
 ): string | null => {
-  const parsed = parsePartitionBound(bound);
-  if (!parsed) return '分区边界语法不合法';
-  if (parsed.kind === 'default') {
-    if (strategy === 'hash') return 'HASH 分区不支持 DEFAULT 子分区';
-    return null;
-  }
-  if (parsed.kind !== strategy) {
-    return `分区边界类型（${parsed.kind.toUpperCase()}）与父表分区策略（${strategy.toUpperCase()}）不匹配`;
-  }
-  if (parsed.kind === 'range') {
-    if (parsed.from.length !== parsed.to.length) {
+  const err = validatePartitionBoundCode(strategy, bound, keyCount);
+  if (!err) return null;
+  switch (err.code) {
+    case 'syntax':
+      return '分区边界语法不合法';
+    case 'hash_no_default':
+      return 'HASH 分区不支持 DEFAULT 子分区';
+    case 'strategy_mismatch':
+      return `分区边界类型（${err.actual}）与父表分区策略（${err.expected}）不匹配`;
+    case 'range_count_mismatch':
       return 'RANGE 分区边界的 FROM 与 TO 值数量必须一致';
-    }
-    if (keyCount !== undefined && parsed.from.length !== keyCount) {
-      return `RANGE 分区边界的值数量（${parsed.from.length}）必须与分区键数量（${keyCount}）一致`;
-    }
-    return null;
+    case 'range_key_count':
+      return `RANGE 分区边界的值数量（${err.actual}）必须与分区键数量（${err.expected}）一致`;
+    case 'list_empty':
+      return 'LIST 分区边界至少需要一个值';
+    case 'hash_modulus':
+      return 'HASH 分区的 modulus 必须为正整数（>= 1）';
+    case 'hash_remainder':
+      return `HASH 分区的 remainder 必须满足 0 <= remainder < modulus（当前 ${err.remainder} / ${err.modulus}）`;
   }
-  if (parsed.kind === 'list') {
-    if (!parsed.values.length) return 'LIST 分区边界至少需要一个值';
-    return null;
-  }
-  if (parsed.modulus < 1) return 'HASH 分区的 modulus 必须为正整数（>= 1）';
-  if (parsed.remainder < 0 || parsed.remainder >= parsed.modulus) {
-    return `HASH 分区的 remainder 必须满足 0 <= remainder < modulus（当前 ${parsed.remainder} / ${parsed.modulus}）`;
-  }
-  return null;
-};
-
-/** 归一化表达式文本（去掉多余的最外层成对括号和首尾空白），用于比对表达式分区键与唯一索引元素 */
-export const normPartitionExpr = (expr: string): string => {
-  let s = expr.trim();
-  while (s.startsWith('(') && findMatchingParen(s, 0) === s.length - 1) {
-    s = s.slice(1, -1).trim();
-  }
-  return s;
 };
 
 /** 沿 partitionOf 链找根表（带环保护），供内部与 model.ts 共享 */

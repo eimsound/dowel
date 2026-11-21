@@ -1,7 +1,7 @@
 // 在扁平模型上查询对象的工具函数，以及模型的一致性校验。
 import { EditError } from './errors.ts';
-import type { Column, Enum, Index, Kind, Model, Obj, ObjOf, Sequence, Table } from './ir.ts';
-import { parsePartitionBound, validatePartitionBound } from './pg/partition.ts';
+import type { Column, Enum, Index, Kind, Model, Obj, ObjOf, PartitionSpec, Sequence, Table } from './ir.ts';
+import { parsePartitionBound, resolvePartitionBy, validatePartitionBound } from './pg/partition.ts';
 import { ident, qualified } from './pg/quote.ts';
 
 export const get = <K extends Kind>(m: Model, id: string, kind?: K): ObjOf<K> => {
@@ -93,6 +93,34 @@ export const partitionDepth = (m: Model, tableId: string): number => {
 /** 表的有效列（子分区沿 partitionOf 链继承根父表的列） */
 export const effectiveColumnsOf = (m: Model, tableId: string): Column[] =>
   columnsOf(m, rootTableId(m, tableId));
+
+/**
+ * 汇总分区表及其全部后代分区表对主键/唯一约束/唯一索引的分区键要求（支持多级分区）：
+ * PG 要求父表的唯一约束或唯一索引必须包含本表及所有下级子分区的全部分区键列，
+ * 且任一层包含表达式分区键时，上级表不得创建主键/唯一约束/唯一索引。
+ */
+export const requiredUniquePartitionKeys = (
+  m: Model,
+  tableId: string,
+  override?: { tableId: string; spec: PartitionSpec | null },
+): { directCols: string[]; hasExprKey: boolean } => {
+  const t = find(m, tableId);
+  if (t?.kind !== 'table') return { directCols: [], hasExprKey: false };
+  const directCols: string[] = [];
+  let hasExprKey = false;
+  for (const tb of [t, ...partitionDescendants(m, tableId)]) {
+    const spec = override && tb.id === override.tableId ? override.spec : resolvePartitionBy(m, tb);
+    if (!spec) continue;
+    for (const k of spec.keys) {
+      if (k.expr !== null) {
+        hasExprKey = true;
+      } else if (k.column && !directCols.includes(k.column)) {
+        directCols.push(k.column);
+      }
+    }
+  }
+  return { directCols, hasExprKey };
+};
 
 /** 将表的 partitionBy 渲染为 PG `PARTITION BY` 之后的分句（兼容存量原始字符串与结构化 PartitionSpec） */
 export const partitionBySql = (
@@ -298,23 +326,19 @@ export const validate = (m: Model): string[] => {
           if (o.kind === 'check' && o.noInherit) {
             errs.push(`检查约束 ${o.name}：分区父表的 CHECK 约束不能设为 NO INHERIT`);
           }
-          if (typeof t.partitionBy !== 'string') {
-            const spec = t.partitionBy;
-            const hasExprKey = spec.keys.some((k) => k.expr !== null);
-            const directCols = spec.keys.flatMap((k) => (k.column ? [k.column] : []));
-            if (o.kind === 'primaryKey' || o.kind === 'unique') {
-              const label = o.kind === 'primaryKey' ? '主键' : '唯一约束';
-              if (hasExprKey) {
-                errs.push(`${label} ${o.name}：包含表达式分区键的分区表不能创建主键或唯一约束`);
-              } else if (directCols.some((c) => !o.columns.includes(c))) {
-                errs.push(`${label} ${o.name}：分区表的主键或唯一约束必须包含全部分区键列`);
-              }
-            } else if (o.kind === 'index' && o.unique) {
-              if (hasExprKey) {
-                errs.push(`唯一索引 ${o.name}：包含表达式分区键的分区表不支持唯一索引`);
-              } else if (directCols.some((c) => !o.elements.some((e) => e.column === c))) {
-                errs.push(`唯一索引 ${o.name}：分区表的唯一索引必须包含全部分区键`);
-              }
+          const req = requiredUniquePartitionKeys(m, t.id);
+          if (o.kind === 'primaryKey' || o.kind === 'unique') {
+            const label = o.kind === 'primaryKey' ? '主键' : '唯一约束';
+            if (req.hasExprKey) {
+              errs.push(`${label} ${o.name}：包含表达式分区键的分区表不能创建主键或唯一约束`);
+            } else if (req.directCols.some((c) => !o.columns.includes(c))) {
+              errs.push(`${label} ${o.name}：分区表的主键或唯一约束必须包含全部分区键列`);
+            }
+          } else if (o.kind === 'index' && o.unique) {
+            if (req.hasExprKey) {
+              errs.push(`唯一索引 ${o.name}：包含表达式分区键的分区表不支持唯一索引`);
+            } else if (req.directCols.some((c) => !o.elements.some((e) => e.column === c))) {
+              errs.push(`唯一索引 ${o.name}：分区表的唯一索引必须包含全部分区键`);
             }
           }
         }
@@ -334,8 +358,16 @@ export const validate = (m: Model): string[] => {
     }
   }
   for (const t of all(m, 'table')) {
-    if (childrenOf(m, t.id, 'primaryKey').length > 1) errs.push(`表 ${t.name}：主键不止一个`);
+    const pks = childrenOf(m, t.id, 'primaryKey');
+    if (pks.length > 1) errs.push(`表 ${t.name}：主键不止一个`);
     if (t.partitionBy !== null) {
+      if (pks.length > 0) {
+        for (const desc of partitionDescendants(m, t.id)) {
+          if (childrenOf(m, desc.id, 'primaryKey').length > 0) {
+            errs.push(`表 ${desc.name}：祖先分区表 ${t.name} 已有主键，子分区不能再定义主键`);
+          }
+        }
+      }
       const defaults = partitionsOf(m, t.id).filter(
         (c) => parsePartitionBound(c.partitionOf!.bound)?.kind === 'default',
       );

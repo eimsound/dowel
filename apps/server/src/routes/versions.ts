@@ -3,6 +3,7 @@
 // 之后只有“链上最新、还没在任何环境执行过”的版本可以人工改脚本，改完就回到未验证。
 import {
   type MigrationResult,
+  type PublishedTables,
   type PublishRejected,
   type StoredVerifyReport,
   stepsPatchSchema,
@@ -296,6 +297,20 @@ export const registerVersions = (app: Hono<Env>, ctx: AppContext) => {
       [a.pid],
     );
     return c.json<VersionInfo[]>(rows.map((v) => toInfo(v, rows[0]?.id ?? null)));
+  });
+
+  app.get('/api/projects/:pid/published-tables', async (c) => {
+    const a = await access(c, ctx, 'project.read');
+    const rows = await db.query<{ model: Model }>('select model from versions where project_id = $1', [
+      a.pid,
+    ]);
+    const ids = new Set<string>();
+    for (const row of rows) {
+      for (const o of Object.values(row.model.objects)) {
+        if (o.kind === 'table') ids.add(o.id);
+      }
+    }
+    return c.json<PublishedTables>({ tableIds: [...ids] });
   });
 
   app.get('/api/projects/:pid/versions/:vid', async (c) => {

@@ -34,6 +34,7 @@ import {
   indexElementNames,
   partitionDescendants,
   partitionsOf,
+  requiredUniquePartitionKeys,
   rootTableId,
 } from './model.ts';
 import {
@@ -72,6 +73,9 @@ export const checkExprColumns = (m: Model, table: string, expr: string) => {
 
 /** 对模型里所有表达式应用同一个改写 */
 export const rewriteExprs = (m: Model, f: (expr: string) => string) => {
+  for (const t of all(m, 'table')) {
+    if (typeof t.partitionBy === 'string') normalizePartitionFamily(m, t.id);
+  }
   for (const o of Object.values(m.objects)) {
     if (o.kind === 'table' && o.partitionBy && typeof o.partitionBy !== 'string') {
       for (const k of o.partitionBy.keys) if (k.expr) k.expr = f(k.expr);
@@ -317,6 +321,7 @@ export const createTable = (
 
 export const renameTable = (m: Model, id: string, name: string) => {
   const t = get(m, id, 'table');
+  normalizePartitionFamily(m, id);
   if (relTaken(m, t.parent, name, id) || typeTaken(m, t.parent, name, id))
     throw new EditError(`名字 ${name} 已被占用`);
   t.name = name;
@@ -387,14 +392,66 @@ const assertSpecKeysValid = (m: Model, tableId: string, spec: PartitionSpec) => 
   }
 };
 
+/**
+ * 幂等升级存量旧格式分区表家族：
+ * 1) 清理子分区上的冗余列对象，并把其本地约束/索引/外键/序列归属/不透明对象依赖映射到根父表列 ID；
+ * 2) 将 `typeof partitionBy === 'string'` 经 `resolvePartitionBy` 升级为结构化 `PartitionSpec`。
+ */
+const normalizePartitionFamily = (m: Model, tableId: string) => {
+  const rootId = rootTableId(m, tableId);
+  const root = find(m, rootId);
+  if (root?.kind !== 'table') return;
+  const descendants = partitionDescendants(m, rootId);
+  const family = [root, ...descendants];
+  const hasLegacyString = family.some((t) => typeof t.partitionBy === 'string');
+  const hasChildCols = descendants.some((d) => childrenOf(m, d.id, 'column').length > 0);
+  if (!hasLegacyString && !hasChildCols) return;
+
+  if (hasChildCols) {
+    const rootColByName = new Map(columnsOf(m, rootId).map((c) => [c.name, c.id]));
+    for (const ch of descendants) {
+      const redundant = columnsOf(m, ch.id);
+      if (!redundant.length) continue;
+      const colMap = new Map<string, string>();
+      for (const cc of redundant) {
+        const rcId = rootColByName.get(cc.name);
+        if (rcId) colMap.set(cc.id, rcId);
+      }
+      if (colMap.size > 0) {
+        remapColRefsOnTable(m, ch.id, colMap);
+        for (const fk of all(m, 'foreignKey')) {
+          if (fk.refTable === ch.id && fk.refColumns.some((c) => colMap.has(c))) {
+            fk.refColumns = fk.refColumns.map((c) => colMap.get(c) ?? c);
+          }
+        }
+        for (const s of all(m, 'sequence')) {
+          if (s.ownedBy && colMap.has(s.ownedBy)) s.ownedBy = colMap.get(s.ownedBy)!;
+        }
+        for (const o of all(m, 'opaque')) {
+          if (o.deps.some((d) => colMap.has(d))) {
+            o.deps = [...new Set(o.deps.map((d) => colMap.get(d) ?? d))];
+          }
+        }
+      }
+      for (const cc of redundant) delete m.objects[cc.id];
+    }
+  }
+
+  for (const t of family) {
+    if (typeof t.partitionBy === 'string') {
+      const spec = resolvePartitionBy(m, t);
+      if (spec) t.partitionBy = structuredClone(spec);
+    }
+  }
+};
+
 const assertPartitionConstraintCompat = (
-  spec: PartitionSpec,
+  req: { directCols: string[]; hasExprKey: boolean },
   kind: 'primaryKey' | 'unique' | 'index',
   cols: string[],
   elements?: IndexElement[],
 ) => {
-  const hasExprKey = spec.keys.some((k) => k.expr !== null);
-  const directCols = spec.keys.flatMap((k) => (k.column ? [k.column] : []));
+  const { hasExprKey, directCols } = req;
   if (kind === 'primaryKey' || kind === 'unique') {
     const label = kind === 'primaryKey' ? '主键' : '唯一约束';
     if (hasExprKey) throw new EditError(`包含表达式分区键的分区表不能创建${label}`);
@@ -417,6 +474,7 @@ const nextDetId = (m: Model, seed: string): string => {
 
 export const setPartitionBy = (m: Model, tableId: string, spec: PartitionSpec | null) => {
   const t = get(m, tableId, 'table');
+  normalizePartitionFamily(m, tableId);
   const children = partitionsOf(m, tableId);
   if (spec === null) {
     if (children.length > 0) throw new EditError('表下仍有子分区，请先删除或脱离全部子分区再取消分区');
@@ -428,12 +486,15 @@ export const setPartitionBy = (m: Model, tableId: string, spec: PartitionSpec | 
     const err = validatePartitionBound(spec.strategy, child.partitionOf!.bound, spec.keys.length);
     if (err) throw new EditError(`现有子分区 ${child.name} 与新分区策略不兼容：${err}`);
   }
-  for (const pk of childrenOf(m, tableId, 'primaryKey'))
-    assertPartitionConstraintCompat(spec, 'primaryKey', pk.columns);
-  for (const u of childrenOf(m, tableId, 'unique'))
-    assertPartitionConstraintCompat(spec, 'unique', u.columns);
-  for (const x of childrenOf(m, tableId, 'index'))
-    if (x.unique) assertPartitionConstraintCompat(spec, 'index', [], x.elements);
+  for (const anc of ancestorsOf(m, tableId)) {
+    const req = requiredUniquePartitionKeys(m, anc.id, { tableId, spec });
+    for (const pk of childrenOf(m, anc.id, 'primaryKey'))
+      assertPartitionConstraintCompat(req, 'primaryKey', pk.columns);
+    for (const u of childrenOf(m, anc.id, 'unique'))
+      assertPartitionConstraintCompat(req, 'unique', u.columns);
+    for (const x of childrenOf(m, anc.id, 'index'))
+      if (x.unique) assertPartitionConstraintCompat(req, 'index', [], x.elements);
+  }
   for (const ck of childrenOf(m, tableId, 'check'))
     if (ck.noInherit) throw new EditError(`检查约束 ${ck.name} 设为 NO INHERIT，分区父表不支持`);
   t.partitionBy = structuredClone(spec);
@@ -448,6 +509,7 @@ export const createPartition = (
   schemaId?: string,
 ): string => {
   const parent = get(m, parentId, 'table');
+  normalizePartitionFamily(m, parentId);
   if (!parent.partitionBy) throw new EditError(`表 ${parent.name} 不是分区父表`);
   const spec = resolvePartitionBy(m, parent);
   if (!spec) throw new EditError(`无法解析表 ${parent.name} 的分区定义`);
@@ -479,6 +541,7 @@ export const createPartition = (
 
 export const setPartitionBound = (m: Model, childId: string, bound: string) => {
   const child = get(m, childId, 'table');
+  normalizePartitionFamily(m, childId);
   if (!child.partitionOf) throw new EditError(`表 ${child.name} 不是分区子表`);
   const parent = get(m, child.partitionOf.parent, 'table');
   const spec = resolvePartitionBy(m, parent);
@@ -533,6 +596,8 @@ const remapColRefsOnTable = (m: Model, tableId: string, colMap: Map<string, stri
 export const attachPartition = (m: Model, parentId: string, childId: string, bound: string) => {
   const parent = get(m, parentId, 'table');
   const child = get(m, childId, 'table');
+  normalizePartitionFamily(m, parentId);
+  normalizePartitionFamily(m, childId);
   if (parentId === childId) throw new EditError('不能将表挂载为自身的子分区');
   if (!parent.partitionBy) throw new EditError(`表 ${parent.name} 不是分区父表`);
   if (child.partitionOf !== null) throw new EditError(`表 ${child.name} 已经是子分区`);
@@ -589,7 +654,7 @@ export const attachPartition = (m: Model, parentId: string, childId: string, bou
     colMap.set(cc.id, rc.id);
   }
 
-  // 校验子表主键与父表/祖先主键不冲突
+  // 校验子表及其后代主键与父表/祖先主键不冲突
   const ancestorIds = new Set(ancestors.map((a) => a.id));
   const ancPks = all(m, 'primaryKey').filter((k) => ancestorIds.has(k.parent));
   const childPk = childrenOf(m, childId, 'primaryKey')[0];
@@ -597,6 +662,40 @@ export const attachPartition = (m: Model, parentId: string, childId: string, bou
     const mapped = childPk.columns.map((c) => colMap.get(c) ?? c);
     if (!ancPks.some((pk) => deepEqual(pk.columns, mapped))) {
       throw new EditError(`表 ${child.name} 的主键与分区父表不一致`);
+    }
+  }
+  if (ancPks.length > 0) {
+    for (const desc of partitionDescendants(m, childId)) {
+      if (childrenOf(m, desc.id, 'primaryKey').length > 0) {
+        throw new EditError(`子表 ${desc.name} 已存在主键，与分区父表主键冲突`);
+      }
+    }
+  }
+
+  // 校验同名异义 CHECK 约束（PG 禁止子表携带与父表同名但表达式不同的 CHECK）
+  const ancChecks = all(m, 'check').filter((k) => ancestorIds.has(k.parent));
+  for (const ck of childrenOf(m, childId, 'check')) {
+    if (ancChecks.some((ak) => ak.name === ck.name && ak.expr !== ck.expr)) {
+      throw new EditError(`表 ${child.name} 的检查约束 ${ck.name} 与分区父表同名但表达式不同，不能挂载`);
+    }
+  }
+
+  // 多级分区：若待挂载表自身也是分区表，祖先的全部唯一约束/主键/唯一索引必须兼容下级分区键
+  if (child.partitionBy !== null) {
+    const childReq = requiredUniquePartitionKeys(m, childId);
+    const mappedChildCols = childReq.directCols.map((c) => colMap.get(c) ?? c);
+    for (const anc of ancestors) {
+      const ancReq = requiredUniquePartitionKeys(m, anc.id);
+      const combined = {
+        hasExprKey: ancReq.hasExprKey || childReq.hasExprKey,
+        directCols: [...new Set([...ancReq.directCols, ...mappedChildCols])],
+      };
+      for (const pk of childrenOf(m, anc.id, 'primaryKey'))
+        assertPartitionConstraintCompat(combined, 'primaryKey', pk.columns);
+      for (const u of childrenOf(m, anc.id, 'unique'))
+        assertPartitionConstraintCompat(combined, 'unique', u.columns);
+      for (const x of childrenOf(m, anc.id, 'index'))
+        if (x.unique) assertPartitionConstraintCompat(combined, 'index', [], x.elements);
     }
   }
 
@@ -610,7 +709,6 @@ export const attachPartition = (m: Model, parentId: string, childId: string, bou
 
   // 移除将被父表吸收的重复约束/索引
   const ancUniques = all(m, 'unique').filter((u) => ancestorIds.has(u.parent));
-  const ancChecks = all(m, 'check').filter((k) => ancestorIds.has(k.parent));
   const ancFks = all(m, 'foreignKey').filter((f) => ancestorIds.has(f.parent));
   const ancIdxs = all(m, 'index').filter((x) => ancestorIds.has(x.parent));
 
@@ -664,6 +762,7 @@ export const attachPartition = (m: Model, parentId: string, childId: string, bou
 
 export const detachPartition = (m: Model, childId: string) => {
   const child = get(m, childId, 'table');
+  normalizePartitionFamily(m, childId);
   if (!child.partitionOf) throw new EditError(`表 ${child.name} 不是分区子表`);
   const parentId = child.partitionOf.parent;
   const ancestors = ancestorsOf(m, parentId);
@@ -697,11 +796,18 @@ export const detachPartition = (m: Model, childId: string) => {
     m.objects[cid] = col;
   }
 
-  // 先将子表已有本地约束/索引及后代分区键的列引用映射到新物化的列 ID
+  // 先将子表已有本地约束/索引、后代分区键及直接依赖子分区的不透明对象（含 schema 级视图）列引用映射到新物化的列 ID
   remapColRefsOnTable(m, childId, colMap);
   const childTree = new Set([childId, ...partitionDescendants(m, childId).map((d) => d.id)]);
+  const ancTree = new Set(ancestors.map((a) => a.id));
   for (const o of all(m, 'opaque')) {
-    if (childTree.has(o.parent) && o.deps.some((d) => colMap.has(d))) {
+    const touchesChild = childTree.has(o.parent) || o.deps.some((d) => childTree.has(d));
+    if (!touchesChild || !o.deps.some((d) => colMap.has(d))) continue;
+    const touchesAnc = ancTree.has(o.parent) || o.deps.some((d) => ancTree.has(d));
+    if (touchesAnc) {
+      const extra = o.deps.filter((d) => colMap.has(d)).map((d) => colMap.get(d)!);
+      o.deps = [...new Set([...o.deps, ...extra])];
+    } else {
       o.deps = [...new Set(o.deps.map((d) => colMap.get(d) ?? d))];
     }
   }
@@ -810,6 +916,7 @@ export interface ColumnSpec {
 
 export const addColumn = (m: Model, table: string, spec: ColumnSpec): string => {
   const t = get(m, table, 'table');
+  normalizePartitionFamily(m, table);
   assertNotPartitionChild(m, table);
   const cols = columnsOf(m, table);
   if (cols.some((c) => c.name === spec.name)) throw new EditError(`列 ${spec.name} 已存在`);
@@ -862,6 +969,7 @@ const identityType = (type: string): SequenceOptions['type'] =>
 export const renameColumn = (m: Model, id: string, name: string) => {
   const c = get(m, id, 'column');
   assertNotPartitionChild(m, c.parent);
+  normalizePartitionFamily(m, c.parent);
   if (columnsOf(m, c.parent).some((x) => x.name === name && x.id !== id))
     throw new EditError(`列 ${name} 已存在`);
   const old = c.name;
@@ -893,6 +1001,7 @@ export const renameColumn = (m: Model, id: string, name: string) => {
 export const dropColumn = (m: Model, id: string) => {
   const c = get(m, id, 'column');
   assertNotPartitionChild(m, c.parent);
+  normalizePartitionFamily(m, c.parent);
   assertNotPartitionKeyCol(m, id, '删除');
   const affected = new Set([c.parent, ...partitionDescendants(m, c.parent).map((d) => d.id)]);
   const uses = (o: Obj): boolean => {
@@ -933,6 +1042,7 @@ export const dropColumn = (m: Model, id: string) => {
 export const setColumnType = (m: Model, id: string, type: string, typeRef: string | null = null) => {
   const c = get(m, id, 'column');
   assertNotPartitionChild(m, c.parent);
+  normalizePartitionFamily(m, c.parent);
   assertNotPartitionKeyCol(m, id, '修改类型');
   if (typeRef) get(m, typeRef, 'enum');
   c.type = type;
@@ -943,6 +1053,7 @@ export const setColumnType = (m: Model, id: string, type: string, typeRef: strin
 export const setNotNull = (m: Model, id: string, notNull: boolean) => {
   const c = get(m, id, 'column');
   assertNotPartitionChild(m, c.parent);
+  normalizePartitionFamily(m, c.parent);
   if (!notNull) {
     if (c.identity) throw new EditError('identity 列必须 NOT NULL');
     if (all(m, 'primaryKey').some((k) => k.columns.includes(id))) throw new EditError('主键列必须 NOT NULL');
@@ -956,6 +1067,7 @@ export const setNotNull = (m: Model, id: string, notNull: boolean) => {
 export const setDefault = (m: Model, id: string, def: ColumnDefault | null) => {
   const c = get(m, id, 'column');
   assertNotPartitionChild(m, c.parent);
+  normalizePartitionFamily(m, c.parent);
   if (def && (c.identity || c.generated)) throw new EditError('identity 列和生成列不能有默认值');
   if (def && 'nextval' in def) get(m, def.nextval, 'sequence');
   c.default = def;
@@ -964,6 +1076,7 @@ export const setDefault = (m: Model, id: string, def: ColumnDefault | null) => {
 export const setIdentity = (m: Model, id: string, identity: { always: boolean } | null) => {
   const c = get(m, id, 'column');
   assertNotPartitionChild(m, c.parent);
+  normalizePartitionFamily(m, c.parent);
   if (!identity) {
     c.identity = null;
     return;
@@ -995,6 +1108,7 @@ export const setIdentity = (m: Model, id: string, identity: { always: boolean } 
 export const moveColumn = (m: Model, id: string, before: string | null) => {
   const c = get(m, id, 'column');
   assertNotPartitionChild(m, c.parent);
+  normalizePartitionFamily(m, c.parent);
   if (before === id) return;
   const cols = columnsOf(m, c.parent).filter((x) => x.id !== id);
   let i = before ? cols.findIndex((x) => x.id === before) : -1;
@@ -1021,11 +1135,22 @@ const checkCols = (m: Model, table: string, cols: string[]) => {
 };
 
 export const addPrimaryKey = (m: Model, table: string, columns: string[], id = newId()): string => {
-  checkCols(m, table, columns);
   const t = get(m, table, 'table');
-  if (t.partitionBy && typeof t.partitionBy !== 'string')
-    assertPartitionConstraintCompat(t.partitionBy, 'primaryKey', columns);
+  normalizePartitionFamily(m, table);
+  checkCols(m, table, columns);
+  if (t.partitionBy !== null)
+    assertPartitionConstraintCompat(requiredUniquePartitionKeys(m, table), 'primaryKey', columns);
   if (childrenOf(m, table, 'primaryKey').length) throw new EditError('表已有主键');
+  for (const anc of ancestorsOf(m, table)) {
+    if (anc.id !== table && childrenOf(m, anc.id, 'primaryKey').length) {
+      throw new EditError(`分区父表 ${anc.name} 已有主键，子分区不能再添加主键`);
+    }
+  }
+  for (const desc of partitionDescendants(m, table)) {
+    if (childrenOf(m, desc.id, 'primaryKey').length) {
+      throw new EditError(`子分区 ${desc.name} 已有主键，分区父表不能再添加主键`);
+    }
+  }
   for (const c of columns) {
     const col = get(m, c, 'column');
     if (!col.notNull) {
@@ -1047,10 +1172,11 @@ export const addUnique = (
   nullsNotDistinct = false,
   id = newId(),
 ): string => {
-  checkCols(m, table, columns);
   const t = get(m, table, 'table');
-  if (t.partitionBy && typeof t.partitionBy !== 'string')
-    assertPartitionConstraintCompat(t.partitionBy, 'unique', columns);
+  normalizePartitionFamily(m, table);
+  checkCols(m, table, columns);
+  if (t.partitionBy !== null)
+    assertPartitionConstraintCompat(requiredUniquePartitionKeys(m, table), 'unique', columns);
   const o: Unique = { ...keyBase(table, id), kind: 'unique', columns, nullsNotDistinct };
   m.objects[o.id] = o;
   refreshDerivedNames(m, table);
@@ -1059,6 +1185,7 @@ export const addUnique = (
 
 export const addCheck = (m: Model, table: string, expr: string, id = newId(), noInherit = false): string => {
   const t = get(m, table, 'table');
+  normalizePartitionFamily(m, table);
   if (noInherit && t.partitionBy !== null) throw new EditError('分区父表的 CHECK 约束不能设为 NO INHERIT');
   checkExprColumns(m, table, expr);
   const o: Check = { ...keyBase(table, id), kind: 'check', expr, noInherit };
@@ -1078,6 +1205,8 @@ export const addForeignKey = (
   > = {},
   id = newId(),
 ): string => {
+  normalizePartitionFamily(m, table);
+  normalizePartitionFamily(m, refTable);
   checkCols(m, table, columns);
   checkCols(m, refTable, refColumns);
   if (columns.length !== refColumns.length) throw new EditError('两边列数必须相同');
@@ -1107,6 +1236,7 @@ export const addIndex = (
   id = newId(),
 ): string => {
   const t = get(m, table, 'table');
+  normalizePartitionFamily(m, table);
   const fullElements: IndexElement[] = elements.map((e) => ({
     column: null,
     expr: null,
@@ -1121,8 +1251,8 @@ export const addIndex = (
   if (opts.include?.length) checkCols(m, table, opts.include);
   for (const e of fullElements) if (e.expr) checkExprColumns(m, table, e.expr);
   if (opts.where) checkExprColumns(m, table, opts.where);
-  if (opts.unique && t.partitionBy && typeof t.partitionBy !== 'string') {
-    assertPartitionConstraintCompat(t.partitionBy, 'index', [], fullElements);
+  if (opts.unique && t.partitionBy !== null) {
+    assertPartitionConstraintCompat(requiredUniquePartitionKeys(m, table), 'index', [], fullElements);
   }
   const o: Index = {
     ...keyBase(table, id),

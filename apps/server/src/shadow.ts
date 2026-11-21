@@ -8,6 +8,7 @@ import {
   INSTANCE_LEVEL_DESCRIPTION,
   type Model,
   type Obj,
+  PlanError,
   type PlanOptions,
   plan,
   type Step,
@@ -269,8 +270,19 @@ export const shadowOps = (
     const d = await db();
     const pgMajor = await readShadowPgMajor(d);
     const planOpts = pgMajor !== null ? { pgMajor } : undefined;
-    await build(d, prev, planOpts);
-    await runSteps(d, plan(prev, next, planOpts));
+    let steps: Step[] | null = null;
+    try {
+      steps = plan(prev, next, planOpts);
+    } catch (e) {
+      if (!(e instanceof PlanError)) throw e;
+    }
+    if (steps !== null) {
+      await build(d, prev, planOpts);
+      await runSteps(d, steps);
+    } else {
+      // 未发布表发生普通表↔分区表互转或分区策略变更时无法增量规划：回退为从空库直接建出 next
+      await build(d, next, planOpts);
+    }
     // 读回引擎里的结构，按名字对回 next 的 ID，取出规范形式
     const engine = reconcileIds(next, importSnapshot(await readSnapshot(d, schemas)));
     const out: Obj[] = [];
