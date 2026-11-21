@@ -10,6 +10,87 @@ import { build, resetShadow, runSteps, verify } from '../src/index.ts';
 
 const conn = useTestDb('partition');
 
+test('importSnapshot：子分区在 snap.tables 中排在根父表之前时不崩溃且正确推导子分区索引名', () => {
+  const m = importSnapshot({
+    version: 180000,
+    schemas: { public: { comment: null } },
+    extensions: {},
+    opaques: {},
+    enums: {},
+    sequences: {},
+    tables: {
+      'public.a_child': {
+        schema: 'public',
+        name: 'a_child',
+        comment: null,
+        columns: {
+          day: {
+            attnum: 1,
+            type: 'integer',
+            enumType: null,
+            notNull: true,
+            notNullName: 'z_parent_day_not_null',
+            default: null,
+            identity: null,
+            generated: null,
+            collation: null,
+            comment: null,
+            inherited: true,
+          },
+        },
+        constraints: {},
+        indexes: {
+          a_child_day_idx: {
+            unique: false,
+            method: 'btree',
+            elements: [
+              { column: 'day', expr: null, desc: false, nullsFirst: false, opclass: null, collation: null },
+            ],
+            include: [],
+            where: null,
+            nullsNotDistinct: false,
+            comment: null,
+          },
+        },
+        partitionBy: null,
+        partitionSpec: null,
+        partitionOf: { parent: 'public.z_parent', bound: 'FOR VALUES FROM (0) TO (10)' },
+      },
+      'public.z_parent': {
+        schema: 'public',
+        name: 'z_parent',
+        comment: null,
+        columns: {
+          day: {
+            attnum: 1,
+            type: 'integer',
+            enumType: null,
+            notNull: true,
+            notNullName: 'z_parent_day_not_null',
+            default: null,
+            identity: null,
+            generated: null,
+            collation: null,
+            comment: null,
+            inherited: false,
+          },
+        },
+        constraints: {},
+        indexes: {},
+        partitionBy: 'RANGE (day)',
+        partitionSpec: {
+          strategy: 'range',
+          keys: [{ column: 'day', expr: null, opclass: null, collation: null }],
+        },
+        partitionOf: null,
+      },
+    },
+  });
+  expect(validate(m)).toEqual([]);
+  const idx = E.all(m, 'index').find((i) => i.name === 'a_child_day_idx');
+  expect(idx?.nameMode).toBe('derived');
+});
+
 const roundtrip = async (ddl: string) => {
   const db = conn();
   await resetShadow(db);

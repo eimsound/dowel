@@ -173,47 +173,52 @@ export const importSnapshot = (snap: Snapshot): Model => {
     );
   }
 
+  // 先写入所有非子分区表的列，确保后续任何表（含在快照中排在父表之前的子分区）的索引都能解析到根父表列对象
   for (const [k, t] of Object.entries(snap.tables)) {
+    if (t.partitionOf) continue;
     const tid = tableId.get(k)!;
     let pos: string | null = null;
     const col = (name: string) => columnId.get(`${k}\u0000${name}`)!;
-    if (!t.partitionOf) {
-      for (const [name, c] of Object.entries(t.columns).sort((a, b) => a[1].attnum - b[1].attnum)) {
-        pos = generateKeyBetween(pos, null);
-        let def: Column['default'] = null;
-        if (c.default) {
-          const nv = /^nextval\('((?:[^']|'')+)'::regclass\)$/.exec(c.default);
-          const q = nv ? parseQualified(nv[1]!.replaceAll("''", "'")) : null;
-          const sid = q ? seqId.get(`${q[0]}.${q[1]}`) : undefined;
-          def = sid ? { nextval: sid } : { expr: c.default };
-        }
-        put<Column>({
-          id: col(name),
-          kind: 'column',
-          parent: tid,
-          name,
-          pos,
-          type: c.type,
-          typeRef: c.enumType ? enumId.get(c.enumType)! : null,
-          notNull: c.notNull,
-          notNullName: c.notNullName,
-          notNullNameMode: c.notNullName === derivedNames.notNull(t.name, name) ? 'derived' : 'explicit',
-          default: def,
-          identity: c.identity
-            ? {
-                always: c.identity.always,
-                sequenceName: c.identity.sequence,
-                sequenceNameMode:
-                  c.identity.sequence === derivedNames.sequence(t.name, name) ? 'derived' : 'explicit',
-                options: seqOptionsFromSnap(c.identity.options),
-              }
-            : null,
-          generated: c.generated,
-          collation: c.collation,
-          comment: c.comment,
-        });
+    for (const [name, c] of Object.entries(t.columns).sort((a, b) => a[1].attnum - b[1].attnum)) {
+      pos = generateKeyBetween(pos, null);
+      let def: Column['default'] = null;
+      if (c.default) {
+        const nv = /^nextval\('((?:[^']|'')+)'::regclass\)$/.exec(c.default);
+        const q = nv ? parseQualified(nv[1]!.replaceAll("''", "'")) : null;
+        const sid = q ? seqId.get(`${q[0]}.${q[1]}`) : undefined;
+        def = sid ? { nextval: sid } : { expr: c.default };
       }
+      put<Column>({
+        id: col(name),
+        kind: 'column',
+        parent: tid,
+        name,
+        pos,
+        type: c.type,
+        typeRef: c.enumType ? enumId.get(c.enumType)! : null,
+        notNull: c.notNull,
+        notNullName: c.notNullName,
+        notNullNameMode: c.notNullName === derivedNames.notNull(t.name, name) ? 'derived' : 'explicit',
+        default: def,
+        identity: c.identity
+          ? {
+              always: c.identity.always,
+              sequenceName: c.identity.sequence,
+              sequenceNameMode:
+                c.identity.sequence === derivedNames.sequence(t.name, name) ? 'derived' : 'explicit',
+              options: seqOptionsFromSnap(c.identity.options),
+            }
+          : null,
+        generated: c.generated,
+        collation: c.collation,
+        comment: c.comment,
+      });
     }
+  }
+
+  for (const [k, t] of Object.entries(snap.tables)) {
+    const tid = tableId.get(k)!;
+    const col = (name: string) => columnId.get(`${k}\u0000${name}`)!;
     for (const [name, k2] of Object.entries(t.constraints)) {
       const base = { id: newId(), parent: tid, name, comment: k2.comment };
       const cols = k2.columns.map(col);

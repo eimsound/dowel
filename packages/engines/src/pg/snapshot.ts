@@ -248,7 +248,8 @@ export const readSnapshot = async (db: Db, only?: string[] | null): Promise<Snap
             case when c.relispartition then (select i.inhparent::int from pg_inherits i where i.inhrelid = c.oid) end as parent,
             case when c.relispartition then pg_get_expr(c.relpartbound, c.oid) end as bound
        from pg_class c join pg_namespace n on n.oid = c.relnamespace
-      where c.relkind in ('r', 'p') and ${ns} and ${NOT_EXT('pg_class', 'c.oid')}`,
+      where c.relkind in ('r', 'p') and ${ns} and ${NOT_EXT('pg_class', 'c.oid')}
+      order by n.nspname, c.relname`,
   );
   for (const r of tableRows) {
     const t: TableSnap = {
