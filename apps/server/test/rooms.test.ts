@@ -1447,6 +1447,8 @@ test('SQLite 模式下并发写入在 COMMIT 前挂起并最终回滚：并发 s
     let modelAt0Done = false;
     let modelAt1Done = false;
     let histDone = false;
+    let entry0Done = false;
+    let entry1Done = false;
 
     const pState = testRooms.state(branchDirty).then((r) => {
       stateDone = true;
@@ -1474,6 +1476,20 @@ test('SQLite 模式下并发写入在 COMMIT 前挂起并最终回滚：并发 s
       histDone = true;
       return r;
     });
+    const pEntry0 = testRooms.historyEntry(branchDirty, 0).then((r) => {
+      entry0Done = true;
+      return r;
+    });
+    const pEntry1 = testRooms.historyEntry(branchDirty, 1).then(
+      () => {
+        entry1Done = true;
+        return 'ok';
+      },
+      (err) => {
+        entry1Done = true;
+        return err;
+      },
+    );
 
     // 写事务挂起期间，所有并发只读查询均必须阻塞等待房间锁
     await new Promise((r) => setTimeout(r, 40));
@@ -1482,12 +1498,22 @@ test('SQLite 模式下并发写入在 COMMIT 前挂起并最终回滚：并发 s
     expect(modelAt0Done).toBe(false);
     expect(modelAt1Done).toBe(false);
     expect(histDone).toBe(false);
+    expect(entry0Done).toBe(false);
+    expect(entry1Done).toBe(false);
 
     // 放行并触发事务回滚
     txRelease.resolve();
     await expect(writePromise).rejects.toThrow('模拟提交前事务回滚');
 
-    const [st, md, at0, at1Err, hist] = await Promise.all([pState, pModel, pModelAt0, pModelAt1, pHist]);
+    const [st, md, at0, at1Err, hist, entry0, entry1Err] = await Promise.all([
+      pState,
+      pModel,
+      pModelAt0,
+      pModelAt1,
+      pHist,
+      pEntry0,
+      pEntry1,
+    ]);
     expect(st.seq).toBe(0);
     expect(all(st.model, 'table')).toEqual([]);
     expect(md.seq).toBe(0);
@@ -1495,6 +1521,9 @@ test('SQLite 模式下并发写入在 COMMIT 前挂起并最终回滚：并发 s
     expect(all(at0, 'table')).toEqual([]);
     expect((at1Err as { status?: number })?.status).toBe(404);
     expect(hist.currentSeq).toBe(0);
+    expect(entry0.seq).toBe(0);
+    expect(entry0.isCurrent).toBe(true);
+    expect((entry1Err as { status?: number })?.status).toBe(404);
 
     // 2. WS op 路径同样受锁保护，绝不读到未提交的 op 建表态
     const p = peerOf(u);
@@ -1544,6 +1573,181 @@ test('SQLite 模式下并发写入在 COMMIT 前挂起并最终回滚：并发 s
     expect(freshCheck.model.objects.mutated_by_caller).toBeUndefined();
     freshCheck.versions[schemaId] = 999;
     expect((await testRooms.state(branchDirty)).versions[schemaId]).toBeUndefined();
+  } finally {
+    testRooms.close();
+    await testRooms.flush();
+  }
+});
+
+test('防抖 flushLayout 首次 SQL 失败自动重试落盘；持续失败达上限清理 pendingLayout 恢复空闲卸载；close() 清理残余 layoutTimer（#45）', async () => {
+  const u = await makeUser(db, 'layout-retry-user', { name: '布局重试测试' });
+  await db.query(
+    "insert into grants (id, scope_kind, scope_id, subject_kind, subject_id, role) values ($1, 'project', $2, 'user', $3, 'editor')",
+    ['g-layout-retry', pid, u.id],
+  );
+  const branchRetry = `${branchId}-layout-retry`;
+  await db.query("insert into branches (id, project_id, name) values ($1, $2, 'layout-retry')", [
+    branchRetry,
+    pid,
+  ]);
+  await rooms.init(branchRetry, model);
+
+  let failRemaining = 0;
+  let updateCalls = 0;
+  const flakyDb: PlatformDb = {
+    ...db,
+    query: async <T>(sql: string, params?: unknown[]) => {
+      if (sql.includes('update branches set layout')) {
+        updateCalls += 1;
+        if (failRemaining > 0) {
+          failRemaining -= 1;
+          throw new Error('模拟布局写库瞬时失败');
+        }
+      }
+      return db.query<T>(sql, params);
+    },
+  };
+
+  const retryRooms = new Rooms(
+    flakyDb,
+    (user, projectId, lookup) => effectiveProjectRole(db, user, projectId, lookup),
+    undefined,
+    undefined,
+    {
+      idleEvictMs: 40,
+      layoutDebounceMs: 25,
+      layoutMaxRetries: 2,
+      layoutRetryBaseMs: 20,
+    },
+  );
+
+  try {
+    // 1. 首次防抖落盘抛错后自动退避重试并成功持久化，随后空闲房间正常卸载
+    const p1 = peerOf(u);
+    await retryRooms.join(branchRetry, p1.peer);
+    await retryRooms.message(branchRetry, p1.peer, { t: 'hello', client: 'c-retry-1', lastSeq: 0 });
+    failRemaining = 1;
+    updateCalls = 0;
+    await retryRooms.message(branchRetry, p1.peer, {
+      t: 'layout',
+      positions: { tbl_retry_ok: { x: 12, y: 34 } },
+    });
+    await retryRooms.leave(branchRetry, p1.peer);
+
+    await waitForCond(() => !retryRooms.has(branchRetry));
+    expect(updateCalls).toBe(2);
+    const [saved1] = await db.query<{ layout: Record<string, { x: number; y: number }> }>(
+      'select layout from branches where id = $1',
+      [branchRetry],
+    );
+    expect(saved1?.layout.tbl_retry_ok).toEqual({ x: 12, y: 34 });
+
+    // 2. 持续性写库失败达重试上限（1 次初始 + 2 次重试 = 3 次）后，清理失败快照并恢复空闲卸载
+    const p2 = peerOf(u);
+    await retryRooms.join(branchRetry, p2.peer);
+    await retryRooms.message(branchRetry, p2.peer, { t: 'hello', client: 'c-retry-2', lastSeq: 0 });
+    failRemaining = 99;
+    updateCalls = 0;
+    await retryRooms.message(branchRetry, p2.peer, {
+      t: 'layout',
+      positions: { tbl_retry_fail: { x: 56, y: 78 } },
+    });
+    await retryRooms.leave(branchRetry, p2.peer);
+
+    await waitForCond(() => !retryRooms.has(branchRetry));
+    expect(updateCalls).toBe(3);
+
+    // 3. close() 同步清理残余 layoutTimer，不再后台触发自动写库，但 flush() 仍可将待落盘布局刷库
+    failRemaining = 0;
+    const p3 = peerOf(u);
+    await retryRooms.join(branchRetry, p3.peer);
+    await retryRooms.message(branchRetry, p3.peer, { t: 'hello', client: 'c-retry-3', lastSeq: 0 });
+    updateCalls = 0;
+    await retryRooms.message(branchRetry, p3.peer, {
+      t: 'layout',
+      positions: { tbl_close_flush: { x: 90, y: 100 } },
+    });
+    retryRooms.close();
+    await new Promise((r) => setTimeout(r, 80));
+    expect(updateCalls).toBe(0);
+
+    await retryRooms.flush();
+    expect(updateCalls).toBe(1);
+    const [saved3] = await db.query<{ layout: Record<string, { x: number; y: number }> }>(
+      'select layout from branches where id = $1',
+      [branchRetry],
+    );
+    expect(saved3?.layout.tbl_close_flush).toEqual({ x: 90, y: 100 });
+  } finally {
+    retryRooms.close();
+    await retryRooms.flush();
+  }
+});
+
+test('远端 room.layout 不重置本地空闲倒计时；join 异步核验抛异常时回滚 peers 并恢复空闲卸载（#45）', async () => {
+  const u = await makeUser(db, 'idle-remote-layout-user', { name: '远端布局不续命' });
+  await db.query(
+    "insert into grants (id, scope_kind, scope_id, subject_kind, subject_id, role) values ($1, 'project', $2, 'user', $3, 'editor')",
+    ['g-idle-remote-layout', pid, u.id],
+  );
+  const branchRemote = `${branchId}-idle-remote-layout`;
+  await db.query("insert into branches (id, project_id, name) values ($1, $2, 'idle-remote-layout')", [
+    branchRemote,
+    pid,
+  ]);
+  await rooms.init(branchRemote, model);
+
+  let failResolveOnce = false;
+  const fake = makeFakeBus('replica-local-idle');
+  const testRooms = new Rooms(
+    db,
+    async (user, projectId, lookup) => {
+      if (failResolveOnce) {
+        failResolveOnce = false;
+        throw new Error('模拟 join 角色查询异常');
+      }
+      return effectiveProjectRole(db, user, projectId, lookup);
+    },
+    fake.bus,
+    undefined,
+    { idleEvictMs: 120 },
+  );
+
+  try {
+    // 1. 加载空闲房间后每 30ms 收到一次远端 room.layout（远短于 idleEvictMs=120ms），仍必须在原倒计时附近卸载
+    await testRooms.model(branchRemote);
+    expect(testRooms.has(branchRemote)).toBe(true);
+    const startedAt = Date.now();
+    let ticks = 0;
+    const emitter = setInterval(() => {
+      ticks += 1;
+      void fake.emit({
+        t: 'room.layout',
+        origin: 'replica-remote-idle',
+        branchId: branchRemote,
+        positions: { tbl_remote: { x: ticks, y: ticks } },
+        ver: ticks,
+      });
+    }, 30);
+    try {
+      await waitForCond(() => !testRooms.has(branchRemote), 600);
+    } finally {
+      clearInterval(emitter);
+    }
+    const elapsed = Date.now() - startedAt;
+    expect(ticks).toBeGreaterThanOrEqual(2);
+    expect(elapsed).toBeLessThan(350);
+    expect(testRooms.has(branchRemote)).toBe(false);
+
+    // 2. join 异步核验抛异常时，必须回滚 r.peers 且正常触发空闲卸载（后续幂等 leave 也安全）
+    failResolveOnce = true;
+    const p = peerOf(u);
+    await expect(testRooms.join(branchRemote, p.peer)).rejects.toThrow('模拟 join 角色查询异常');
+    expect(testRooms.has(branchRemote)).toBe(true);
+    await waitForCond(() => !testRooms.has(branchRemote), 600);
+    expect(testRooms.has(branchRemote)).toBe(false);
+    await testRooms.leave(branchRemote, p.peer);
+    expect(testRooms.has(branchRemote)).toBe(false);
   } finally {
     testRooms.close();
     await testRooms.flush();

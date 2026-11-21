@@ -47,10 +47,22 @@ const PEERS_EVENT_MAX_BYTES = 7000;
 const PEER_PRUNE_INTERVAL_MS = 10_000;
 /** 空闲房间（无在线成员且无待落盘布局）默认超时卸载时间（毫秒） */
 const DEFAULT_IDLE_EVICT_MS = 5 * 60_000;
+/** 画布布局防抖落盘默认延迟（毫秒） */
+const DEFAULT_LAYOUT_DEBOUNCE_MS = 500;
+/** 画布布局防抖落盘失败默认最大重试次数 */
+const DEFAULT_LAYOUT_FLUSH_MAX_RETRIES = 3;
+/** 画布布局防抖落盘重试默认基础退避间隔（毫秒） */
+const DEFAULT_LAYOUT_RETRY_BASE_MS = 500;
 
 export interface RoomsOptions {
   /** 空闲房间超时卸载时间（毫秒）；默认 5 分钟，传入 0 或 Infinity 禁用 */
   idleEvictMs?: number;
+  /** 画布布局防抖落盘延迟（毫秒）；默认 500ms */
+  layoutDebounceMs?: number;
+  /** 画布布局防抖落盘失败后的最大重试次数；默认 3 次 */
+  layoutMaxRetries?: number;
+  /** 画布布局防抖落盘失败后的初始指数退避间隔（毫秒）；默认 500ms */
+  layoutRetryBaseMs?: number;
 }
 
 type RefreshTarget = 'all' | Set<string>;
@@ -181,6 +193,8 @@ interface Loaded {
   layoutTimer?: ReturnType<typeof setTimeout>;
   /** 当前在途的布局落库任务（串行化落库并确保 flush() 等待 SQL 真正完成） */
   layoutFlushing: Promise<void> | null;
+  /** 连续防抖落盘失败的重试次数（收到新本地布局或落盘成功后清零） */
+  layoutRetries: number;
   /** 空闲卸载定时器（仅在无在线成员、无在途操作且无待落盘布局时存在） */
   idleTimer?: ReturnType<typeof setTimeout>;
   /** 当前在途/等待房间锁的活跃操作计数（避免等待锁期间被空闲卸载误删） */
@@ -223,8 +237,13 @@ export class Rooms {
   private unsubBus: (() => void)[] = [];
   private closed = false;
   private idleEvictMs: number;
+  private layoutDebounceMs: number;
+  private layoutMaxRetries: number;
+  private layoutRetryBaseMs: number;
   /** 追踪所有活跃的空闲卸载定时器，确保 close() 时同步彻底清理 */
   private idleTimers = new Map<Loaded, ReturnType<typeof setTimeout>>();
+  /** 追踪所有活跃的布局防抖/重试定时器，确保 close() 时同步彻底清理 */
+  private layoutTimers = new Map<Loaded, ReturnType<typeof setTimeout>>();
   private peerPruneTimer: ReturnType<typeof setInterval> | null = null;
   private pruneInFlight: Promise<void> | null = null;
   /** 追踪非阻塞路径（load / close）发起的在途事件发布，供 flush() 排空避免与 db.close() 竞态 */
@@ -261,6 +280,21 @@ export class Rooms {
     const rawIdle = options?.idleEvictMs;
     this.idleEvictMs =
       rawIdle === undefined ? DEFAULT_IDLE_EVICT_MS : rawIdle <= 0 || !Number.isFinite(rawIdle) ? 0 : rawIdle;
+    const rawLayoutDebounce = options?.layoutDebounceMs;
+    this.layoutDebounceMs =
+      rawLayoutDebounce !== undefined && Number.isFinite(rawLayoutDebounce) && rawLayoutDebounce >= 0
+        ? rawLayoutDebounce
+        : DEFAULT_LAYOUT_DEBOUNCE_MS;
+    const rawLayoutMaxRetries = options?.layoutMaxRetries;
+    this.layoutMaxRetries =
+      rawLayoutMaxRetries !== undefined && Number.isFinite(rawLayoutMaxRetries) && rawLayoutMaxRetries >= 0
+        ? Math.floor(rawLayoutMaxRetries)
+        : DEFAULT_LAYOUT_FLUSH_MAX_RETRIES;
+    const rawLayoutRetryBase = options?.layoutRetryBaseMs;
+    this.layoutRetryBaseMs =
+      rawLayoutRetryBase !== undefined && Number.isFinite(rawLayoutRetryBase) && rawLayoutRetryBase >= 0
+        ? rawLayoutRetryBase
+        : DEFAULT_LAYOUT_RETRY_BASE_MS;
     if (bus) {
       this.unsubBus.push(
         bus.onEvent((event) => this.handleClusterEvent(event)),
@@ -293,6 +327,11 @@ export class Rooms {
       if (r.idleTimer === timer) r.idleTimer = undefined;
     }
     this.idleTimers.clear();
+    for (const [r, timer] of this.layoutTimers) {
+      clearTimeout(timer);
+      if (r.layoutTimer === timer) r.layoutTimer = undefined;
+    }
+    this.layoutTimers.clear();
     if (this.bus) {
       for (const [branchId, pending] of this.rooms) {
         const p = pending
@@ -473,6 +512,7 @@ export class Rooms {
       layoutClock: 0,
       layoutVersions: new Map(),
       layoutFlushing: null,
+      layoutRetries: 0,
       activeOps: 0,
       evicted: false,
       lock: Promise.resolve(),
@@ -514,6 +554,14 @@ export class Rooms {
     this.idleTimers.delete(r);
   }
 
+  private clearLayoutTimer(r: Loaded) {
+    if (r.layoutTimer !== undefined) {
+      clearTimeout(r.layoutTimer);
+      r.layoutTimer = undefined;
+    }
+    this.layoutTimers.delete(r);
+  }
+
   private scheduleIdleEvictIfNeeded(branchId: string, r: Loaded) {
     if (this.closed || this.idleEvictMs <= 0) return;
     if (!this.isCurrentEntry(branchId, r)) return;
@@ -521,7 +569,9 @@ export class Rooms {
       this.clearIdleEvict(r);
       return;
     }
-    this.clearIdleEvict(r);
+    // 已有空闲卸载倒计时则保持原到期时间，避免外部事件/重复调度无限续命
+    // （真实打破空闲的本机访问已在入口显式 clearIdleEvict）
+    if (r.idleTimer !== undefined) return;
     const timer = setTimeout(() => {
       if (r.idleTimer === timer) r.idleTimer = undefined;
       this.idleTimers.delete(r);
@@ -796,25 +846,67 @@ export class Rooms {
     return p;
   }
 
-  private scheduleLayoutFlush(branchId: string, r: Loaded) {
+  private scheduleLayoutFlush(branchId: string, r: Loaded, delayMs?: number) {
+    if (this.closed || !this.isCurrentEntry(branchId, r)) return;
     this.clearIdleEvict(r);
-    if (r.layoutTimer) clearTimeout(r.layoutTimer);
-    r.layoutTimer = setTimeout(() => {
-      r.layoutTimer = undefined;
-      this.flushLayout(branchId, r).catch((e) => {
+    this.clearLayoutTimer(r);
+    const timer = setTimeout(() => {
+      if (r.layoutTimer === timer) r.layoutTimer = undefined;
+      this.layoutTimers.delete(r);
+      if (this.closed || !this.isCurrentEntry(branchId, r)) return;
+      let failedSnapshot: Layout = {};
+      this.flushLayout(branchId, r, (snap) => {
+        failedSnapshot = snap;
+      }).catch((e) => {
         console.error(`保存画布布局失败（branchId=${branchId}）`, e);
+        this.handleLayoutFlushFailure(branchId, r, failedSnapshot);
       });
-    }, 500);
-    r.layoutTimer.unref?.();
+    }, delayMs ?? this.layoutDebounceMs);
+    timer.unref?.();
+    r.layoutTimer = timer;
+    this.layoutTimers.set(r, timer);
+  }
+
+  private handleLayoutFlushFailure(branchId: string, r: Loaded, failedSnapshot: Layout) {
+    if (this.closed || !this.isCurrentEntry(branchId, r)) return;
+    if (Object.keys(r.pendingLayout).length === 0) {
+      r.layoutRetries = 0;
+      this.scheduleIdleEvictIfNeeded(branchId, r);
+      return;
+    }
+    if (r.layoutRetries < this.layoutMaxRetries) {
+      r.layoutRetries += 1;
+      const backoffMs = this.layoutRetryBaseMs * 2 ** (r.layoutRetries - 1);
+      this.scheduleLayoutFlush(branchId, r, backoffMs);
+      return;
+    }
+    // 连续失败达重试上限：清理本次失败快照中未被新拖动覆盖的键，防止空闲房间永久卡死无法卸载
+    for (const [key, point] of Object.entries(failedSnapshot)) {
+      if (r.pendingLayout[key] === point) {
+        delete r.pendingLayout[key];
+      }
+    }
+    r.layoutRetries = 0;
+    if (Object.keys(r.pendingLayout).length > 0) {
+      this.scheduleLayoutFlush(branchId, r);
+      return;
+    }
+    this.clearLayoutTimer(r);
+    this.scheduleIdleEvictIfNeeded(branchId, r);
   }
 
   private clearPendingLayoutKeys(branchId: string, r: Loaded, keys: Iterable<string>) {
+    let deletedAny = false;
     for (const key of keys) {
-      delete r.pendingLayout[key];
+      if (key in r.pendingLayout) {
+        delete r.pendingLayout[key];
+        deletedAny = true;
+      }
     }
-    if (r.layoutTimer && Object.keys(r.pendingLayout).length === 0) {
-      clearTimeout(r.layoutTimer);
-      r.layoutTimer = undefined;
+    if (!deletedAny) return;
+    if (Object.keys(r.pendingLayout).length === 0) {
+      this.clearLayoutTimer(r);
+      r.layoutRetries = 0;
     }
     this.scheduleIdleEvictIfNeeded(branchId, r);
   }
@@ -1156,10 +1248,10 @@ export class Rooms {
     this.clearIdleEvict(r);
     r.peers.add(peer);
 
-    const abort = (reason: string) => {
+    const removePeer = (closeReason?: string) => {
       const hadClient = Boolean(peer.client);
       if (!r.peers.delete(peer)) return;
-      peer.close?.(4403, reason);
+      if (closeReason !== undefined) peer.close?.(4403, closeReason);
       this.broadcastPeers(r);
       if (hadClient) {
         const p = this.publishRoomPeers(branchId, r).finally(() => {
@@ -1170,40 +1262,45 @@ export class Rooms {
       this.scheduleIdleEvictIfNeeded(branchId, r);
     };
 
-    for (let attempt = 0; attempt < MAX_JOIN_VERIFY_ATTEMPTS; attempt++) {
-      if (!r.peers.has(peer)) return;
-      const gen = this.refreshGenFor(branchId);
-      const seq = this.refreshSeq;
+    try {
+      for (let attempt = 0; attempt < MAX_JOIN_VERIFY_ATTEMPTS; attempt++) {
+        if (!r.peers.has(peer)) return;
+        const gen = this.refreshGenFor(branchId);
+        const seq = this.refreshSeq;
 
-      const current = await this.fetchUserState(peer.user.id);
-      if (!r.peers.has(peer)) return;
-      if (this.refreshGenFor(branchId) !== gen) continue;
-      if (current?.status !== 'active') {
-        abort('账号已被停用');
+        const current = await this.fetchUserState(peer.user.id);
+        if (!r.peers.has(peer)) return;
+        if (this.refreshGenFor(branchId) !== gen) continue;
+        if (current?.status !== 'active') {
+          removePeer('账号已被停用');
+          return;
+        }
+        if (peer.user.role !== current.role) {
+          peer.user = { ...peer.user, role: current.role };
+        }
+
+        const projectId = await this.projectOfBranch(branchId);
+        if (!r.peers.has(peer)) return;
+        const role = projectId ? await this.resolveRole(peer.user, projectId) : null;
+        if (!r.peers.has(peer)) return;
+        if (this.refreshGenFor(branchId) !== gen) continue;
+
+        if (!role) {
+          removePeer('你在这个项目里已经没有权限');
+          return;
+        }
+        this.peerVerifiedSeq.set(peer, seq);
+        peer.role = role;
+        this.safeSend(peer, { t: 'role', role });
+        this.safeSend(peer, { t: 'layout', positions: r.layout });
         return;
       }
-      if (peer.user.role !== current.role) {
-        peer.user = { ...peer.user, role: current.role };
-      }
-
-      const projectId = await this.projectOfBranch(branchId);
-      if (!r.peers.has(peer)) return;
-      const role = projectId ? await this.resolveRole(peer.user, projectId) : null;
-      if (!r.peers.has(peer)) return;
-      if (this.refreshGenFor(branchId) !== gen) continue;
-
-      if (!role) {
-        abort('你在这个项目里已经没有权限');
-        return;
-      }
-      this.peerVerifiedSeq.set(peer, seq);
-      peer.role = role;
-      this.safeSend(peer, { t: 'role', role });
-      this.safeSend(peer, { t: 'layout', positions: r.layout });
-      return;
+    } catch (err) {
+      removePeer();
+      throw err;
     }
 
-    abort('权限状态正在变更，请重试');
+    removePeer('权限状态正在变更，请重试');
   }
 
   async leave(branchId: string, peer: Peer) {
@@ -1223,17 +1320,24 @@ export class Rooms {
     }
   }
 
-  private async flushLayout(branchId: string, r: Loaded): Promise<void> {
+  private async flushLayout(
+    branchId: string,
+    r: Loaded,
+    onErrorSnapshot?: (snapshot: Layout) => void,
+  ): Promise<void> {
     while (r.layoutFlushing) {
       await r.layoutFlushing.catch(() => {});
     }
     if (Object.keys(r.pendingLayout).length === 0) {
+      r.layoutRetries = 0;
       this.scheduleIdleEvictIfNeeded(branchId, r);
       return;
     }
+    let currentSnapshot: Layout = {};
     const task = (async () => {
       while (Object.keys(r.pendingLayout).length > 0) {
         const snapshot: Layout = { ...r.pendingLayout };
+        currentSnapshot = snapshot;
         const keys = Object.keys(snapshot);
         if (keys.length === 0) break;
         if (this.db.dialect === 'pg') {
@@ -1253,11 +1357,15 @@ export class Rooms {
             delete r.pendingLayout[key];
           }
         }
+        r.layoutRetries = 0;
       }
     })();
     r.layoutFlushing = task;
     try {
       await task;
+    } catch (err) {
+      onErrorSnapshot?.(currentSnapshot);
+      throw err;
     } finally {
       if (r.layoutFlushing === task) r.layoutFlushing = null;
       this.scheduleIdleEvictIfNeeded(branchId, r);
@@ -1447,6 +1555,7 @@ export class Rooms {
       if (tableIds.length === 0) return;
 
       r.layoutClock += 1;
+      r.layoutRetries = 0;
       const ver = r.layoutClock;
       const versionStamp: LayoutVersion = { ver, origin: this.bus?.replicaId ?? '' };
       for (const tableId of tableIds) r.layoutVersions.set(tableId, versionStamp);
@@ -1463,10 +1572,7 @@ export class Rooms {
         ) > LAYOUT_INLINE_MAX_BYTES;
 
       if (needsReloadBroadcast) {
-        if (r.layoutTimer) {
-          clearTimeout(r.layoutTimer);
-          r.layoutTimer = undefined;
-        }
+        this.clearLayoutTimer(r);
         try {
           await this.flushLayout(branchId, r);
         } catch (e) {
@@ -1966,10 +2072,7 @@ export class Rooms {
       if (!projectId) {
         const hadClients = this.localPeerList(r).length > 0;
         this.clearIdleEvict(r);
-        if (r.layoutTimer) {
-          clearTimeout(r.layoutTimer);
-          r.layoutTimer = undefined;
-        }
+        this.clearLayoutTimer(r);
         r.evicted = true;
         for (const peer of [...r.peers]) kick(r, peer, '项目已被删除');
         if (this.rooms.get(branchId) === pending) this.rooms.delete(branchId);
@@ -2047,10 +2150,7 @@ export class Rooms {
       if (r) {
         hadClients = this.localPeerList(r).length > 0;
         this.clearIdleEvict(r);
-        if (r.layoutTimer) {
-          clearTimeout(r.layoutTimer);
-          r.layoutTimer = undefined;
-        }
+        this.clearLayoutTimer(r);
         r.evicted = true;
         for (const peer of [...r.peers]) {
           r.peers.delete(peer);
@@ -2106,10 +2206,7 @@ export class Rooms {
       const r = await p.catch(() => null);
       if (!r) continue;
       await r.lock.catch(() => {});
-      if (r.layoutTimer) {
-        clearTimeout(r.layoutTimer);
-        r.layoutTimer = undefined;
-      }
+      this.clearLayoutTimer(r);
       if (r.layoutFlushing || Object.keys(r.pendingLayout).length > 0) {
         await this.flushLayout(branchId, r);
       } else {
