@@ -1,4 +1,4 @@
-# 需要 PostgreSQL 的测试用 Testcontainers 启动 pgvector/pgvector:pg18（GitHub 的 ubuntu 运行器自带 Docker）。
+# 需要数据库的测试用 Testcontainers 启动对应镜像（默认 pgvector/pgvector:pg18，多版本矩阵按需拉起 PG / MySQL / SQL Server；GitHub 的 ubuntu 运行器自带 Docker）。
 # CI=true 时没有 Docker 会直接失败，不会悄悄跳过。
 name: CI
 
@@ -88,6 +88,54 @@ jobs:
       - run: pnpm vitest run packages/engines/test/roundtrip.test.ts packages/engines/test/pagila.test.ts packages/verifier/test/pg-matrix.test.ts
         env:
           DOWEL_PG_IMAGE: pgvector/pgvector:pg${{ matrix.pg }}
+
+  mysql-matrix:
+    name: MySQL 多版本矩阵（MySQL ${{ matrix.mysql }}）
+    runs-on: ubuntu-latest
+    timeout-minutes: 25
+    strategy:
+      fail-fast: false
+      matrix:
+        mysql: ['8.4', '9.7']
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: pnpm/action-setup@73e46992e05b19abd31f2f3c20e0e7370d762115 # v6.1.1
+      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
+        with:
+          node-version-file: .tool-versions
+          cache: pnpm
+      - run: pnpm install --frozen-lockfile
+      - run: pnpm vitest run packages/core/test/mysql.test.ts packages/executor/test/mysql-execute.test.ts apps/server/test/mysql-target.test.ts packages/verifier/test/mysql-random.test.ts
+        env:
+          MYSQL_VERSION: ${{ matrix.mysql }}
+          DOWEL_TEST_PG: skip
+          DOWEL_TEST_MSSQL: skip
+
+  mssql-matrix:
+    name: MSSQL 多版本矩阵（SQL Server ${{ matrix.mssql }}）
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    strategy:
+      fail-fast: false
+      matrix:
+        mssql: ['2019', '2022', '2025']
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: pnpm/action-setup@73e46992e05b19abd31f2f3c20e0e7370d762115 # v6.1.1
+      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
+        with:
+          node-version-file: .tool-versions
+          cache: pnpm
+      - run: pnpm install --frozen-lockfile
+      - run: pnpm vitest run packages/core/test/mssql.test.ts packages/executor/test/mssql-execute.test.ts apps/server/test/mssql-target.test.ts packages/verifier/test/mssql-random.test.ts
+        env:
+          MSSQL_VERSION: ${{ matrix.mssql }}
+          DOWEL_TEST_PG: skip
+          DOWEL_TEST_MYSQL: skip
 
   heavy:
     name: 随机闭环测试（5000 例）
