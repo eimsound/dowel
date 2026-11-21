@@ -1,6 +1,6 @@
 // 执行器的输入输出类型。执行器是纯库：只依赖 core 和 engines，不依赖服务端；
 // 平台库里的东西（版本链、环境缓存）由调用方整理成 ChainVersion 传进来，需要写平台库时用 hooks 回调。
-import type { Model } from '@dowel/core';
+import type { Dialect, Model } from '@dowel/core';
 import type { Db, RunDirection, ScriptStep } from '@dowel/engines';
 
 /** 执行器真正“执行”的方向（不含 mark：标记不执行任何 SQL，见 mark.ts） */
@@ -82,6 +82,8 @@ export type ExecutorEvent =
 export interface ExecuteOptions {
   /** 目标库（连接池）；执行器会独占其中一个连接来持有项目锁和执行迁移 */
   db: Db;
+  /** 目标库方言；缺省自动取 chain[0].model.dialect 或 'pg' */
+  dialect?: Dialect;
   projectId: string;
   projectName: string | null;
   /** 本 Dowel 实例的唯一标识，写进历史 */

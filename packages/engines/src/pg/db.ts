@@ -1,18 +1,7 @@
 // 访问 PG 的最小接口（服务端和测试都用 postgres.js 适配）。
-export interface Db {
-  query<T = Record<string, unknown>>(sql: string, params?: unknown[]): Promise<T[]>;
-  /** 执行一条或多条不返回结果的语句 */
-  exec(sql: string): Promise<void>;
-  /**
-   * 从连接池里独占一个连接（postgres.js 的 `sql.reserve()`），用完必须调 release()。
-   * 会话级的东西（advisory lock、SET、游标、临时表）必须固定在同一个连接上，
-   * 而普通 query / exec 是连接池的抽象，可能落到不同连接。
-   * 单连接的适配器（测试里的连接、SQLite）可以不实现，此时直接用 db 本身。
-   */
-  reserve?(): Promise<Db>;
-  /** 归还 reserve() 独占的连接 */
-  release?(): void;
-}
+import type { Db } from '../types.ts';
+
+export type { Db };
 
 /**
  * 影子库会话固定的参数（04-ir-design.md 1.6）。

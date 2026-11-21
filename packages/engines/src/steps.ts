@@ -2,25 +2,25 @@
 //
 // 步骤格式 { sql, transactional }：
 // - sql 是引擎输出的原始 SQL（不带结尾分号，由执行方决定怎么拼）；
-// - transactional = false 表示这一步不能放进事务里，例如 CREATE INDEX CONCURRENTLY。
-//   core 的 plan() 输出的步骤本身不带这个信息，由 core 的 isNontransactionalSql() 按语句文本判断
-//   （CONCURRENTLY、VACUUM、CREATE/DROP DATABASE / TABLESPACE、ALTER SYSTEM、ALTER TYPE … ADD VALUE 等）；
-//   规划器以后能直接给出明确的值时，优先用它。
+// - transactional = false 表示这一步不能放进外层事务里（例如 PG CONCURRENTLY、SQLite 12 步表重建、MySQL DDL）。
+//   若规划器已显式给出 Step.transactional，优先采用；否则按 isNontransactionalSql(s.sql, dialect) 推断。
 import { createHash } from 'node:crypto';
 
-import { isNontransactionalSql, type Step, stableJson } from '@dowel/core';
+import { type Dialect, isNontransactionalSql, type Step, stableJson } from '@dowel/core';
 
 export interface ScriptStep {
   sql: string;
   transactional: boolean;
 }
 
-// 判断规则在 core（前后端共用），这里重新导出，保持 engines 里原来的导入路径
 export { isNontransactionalSql };
 
 /** plan() 的输出 → 冻结步骤。保留顺序，其它字段（kind / target）只用于界面展示，不进冻结脚本 */
-export const toScriptSteps = (steps: Step[]): ScriptStep[] =>
-  steps.map((s) => ({ sql: s.sql, transactional: !isNontransactionalSql(s.sql) }));
+export const toScriptSteps = (steps: Step[], dialect: Dialect = 'pg'): ScriptStep[] =>
+  steps.map((s) => ({
+    sql: s.sql,
+    transactional: s.transactional !== undefined ? s.transactional : !isNontransactionalSql(s.sql, dialect),
+  }));
 
 /** 规范化：只保留两个字段、固定顺序；SQL 文本本身不做任何改写（冻结的就是原文） */
 export const canonicalSteps = (steps: ScriptStep[]): ScriptStep[] =>

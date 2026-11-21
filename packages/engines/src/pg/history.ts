@@ -7,118 +7,53 @@ import { createHash } from 'node:crypto';
 
 import { type Model, stableJson } from '@dowel/core';
 
-import { canonicalSteps, type ScriptStep, stepsChecksum } from '../steps.ts';
-import type { Db } from './db.ts';
+import {
+  type ChainProblem,
+  type ChainProblemCode,
+  HISTORY_FORMAT,
+  readSteps,
+  verifyChain,
+} from '../history-common.ts';
+import { canonicalSteps, stepsChecksum } from '../steps.ts';
+import {
+  type ClaimInput,
+  type ClaimRow,
+  type Db,
+  HistoryError,
+  type HistoryErrorCode,
+  type HistoryProjectSummary,
+  type HistoryState,
+  type HistoryVersionRow,
+  type ProjectRow,
+  type RunDirection,
+  type RunRow,
+  type RunStatus,
+  type RunVia,
+  type StartRunInput,
+} from '../types.ts';
 import { DOWEL_SCHEMA, normalize, type Snapshot } from './snapshot.ts';
 
-/**
- * 当前代码写的格式版本。**只有破坏性变更**（旧版 Dowel 照旧读写会出错）才 +1，加列之类的兼容变更不动它，
- * 靠建表语句的 `if not exists` / 幂等的 `add column if not exists` 处理。
- * 读的一方（readHistoryFormat / ensureHistory / historyWriteProblem）从第一个发布版起就检查：库里的值比这个新、
- * 或者不是整数，就拒绝执行和读历史（format_too_new）——这个检查事后补不上。目前还没有任何升级路径（发版之前不写）。
- */
-export const HISTORY_FORMAT = 1;
-
-export type HistoryErrorCode =
-  | 'no_schema_privilege'
-  | 'format_too_new'
-  | 'checksum_mismatch'
-  | 'number_conflict'
-  | 'lock_timeout'
-  | 'run_not_running'
-  | 'invalid_steps'
-  | 'claim_conflict';
-
-export class HistoryError extends Error {
-  code: HistoryErrorCode;
-  constructor(code: HistoryErrorCode, message: string) {
-    super(message);
-    this.name = 'HistoryError';
-    this.code = code;
-  }
-}
+export {
+  type ChainProblem,
+  type ChainProblemCode,
+  type ClaimInput,
+  type ClaimRow,
+  HISTORY_FORMAT,
+  HistoryError,
+  type HistoryErrorCode,
+  type HistoryProjectSummary,
+  type HistoryState,
+  type HistoryVersionRow,
+  type ProjectRow,
+  type RunDirection,
+  type RunRow,
+  type RunStatus,
+  type RunVia,
+  type StartRunInput,
+  verifyChain,
+};
 
 const ident = (s: string) => `"${s.replaceAll('"', '""')}"`;
-
-export interface HistoryVersionRow {
-  projectId: string;
-  versionId: string;
-  /** 链上的序号：第一个版本是 0（v0 基线），之后 1、2… */
-  number: number;
-  parentId: string | null;
-  name: string;
-  /**
-   * 冻结这个版本时项目的 schema 范围（null = 全部；dowel 永远排除）。接手时直接取它恢复范围：读结构、判断空库都要按范围。
-   */
-  scope: string[] | null;
-  upSteps: ScriptStep[];
-  downSteps: ScriptStep[];
-  /** stepsChecksum(upSteps, downSteps) */
-  checksum: string;
-  /** 发布时的完整模型（含对象 ID），接手时用它恢复改名识别和名字锁定 */
-  model: Model;
-  /** 结构指纹（fingerprint()），漂移检测用 */
-  fingerprint: string;
-  publishedAt: string;
-  publishedBy: string | null;
-}
-
-/**
- * 一次执行的方向：baseline 写入基线；up / down 执行升级 / 回滚脚本；
- * mark **标记为已执行**：不执行任何 SQL，只记“这个环境已经到达 to 版本”（线上结构经核对等于 to 的模型），from 是标记前的版本。
- */
-export type RunDirection = 'baseline' | 'up' | 'down' | 'mark';
-export type RunStatus = 'running' | 'done' | 'failed';
-export type RunVia = 'web' | 'ci';
-
-export interface RunRow {
-  id: number;
-  projectId: string;
-  fromVersion: string | null;
-  toVersion: string;
-  direction: RunDirection;
-  status: RunStatus;
-  /** 已完成的最后一步（断点续跑用） */
-  stepIndex: number | null;
-  error: string | null;
-  executedBy: string | null;
-  via: RunVia;
-  instanceId: string;
-  startedAt: string;
-  finishedAt: string | null;
-}
-
-export interface HistoryState {
-  /** 当前版本：最后一条 done 的 to_version（down 方向也一样看 to_version） */
-  currentVersion: string | null;
-  versions: HistoryVersionRow[];
-  history: RunRow[];
-}
-
-/**
- * 项目认领：这个项目现在由哪个 Dowel 实例拥有。instanceId 是**当前认领它的实例**（执行时据此拒绝别的实例，见执行器的
- * foreign_instance）；换手时 previousInstanceId 记下上一个实例，完整的换手事件在 dowel.claims（只追加）里。
- */
-export interface ProjectRow {
-  projectId: string;
-  name: string | null;
-  instanceId: string;
-  claimedAt: string | null;
-  claimedBy: string | null;
-  previousInstanceId: string | null;
-}
-
-/** 一次“认领”事件（dowel.claims，只追加）：哪个实例、什么时候、谁确认的、从哪个实例手里接过来的 */
-export interface ClaimRow {
-  id: number;
-  projectId: string;
-  instanceId: string;
-  previousInstanceId: string | null;
-  claimedBy: string | null;
-  claimedByName: string | null;
-  claimedAt: string;
-  note: string | null;
-}
 
 // ───── 建表 ─────
 
@@ -374,14 +309,6 @@ export const ensureHistory = async (db: Db): Promise<void> => {
 
 // ───── 读写 ─────
 
-const EMPTY_STEPS: ScriptStep[] = [];
-
-const readSteps = (value: unknown): ScriptStep[] => {
-  if (value === null || value === undefined) return EMPTY_STEPS;
-  if (!Array.isArray(value)) throw new HistoryError('invalid_steps', '冻结脚本不是数组');
-  return canonicalSteps(value as ScriptStep[]);
-};
-
 /** postgres.js 把 timestamptz 读成 Date；统一成 ISO 字符串 */
 const iso = (v: unknown): string => (v instanceof Date ? v.toISOString() : String(v));
 const isoOrNull = (v: unknown): string | null => (v === null || v === undefined ? null : iso(v));
@@ -515,16 +442,6 @@ export const recordVersion = async (db: Db, row: HistoryVersionRow): Promise<voi
     );
 };
 
-export interface StartRunInput {
-  projectId: string;
-  fromVersion: string | null;
-  toVersion: string;
-  direction: RunDirection;
-  executedBy: string | null;
-  via: RunVia;
-  instanceId: string;
-}
-
 /** 开始一次执行；返回记录 ID（断点续跑和 finishRun 用） */
 export const startRun = async (db: Db, run: StartRunInput): Promise<number> => {
   const [row] = await db.query<{ id: number }>(
@@ -644,54 +561,7 @@ export const fingerprint = (snapshot: Snapshot): string =>
     .update(stableJson(normalize(snapshot)))
     .digest('hex');
 
-// ───── 链完整性 ─────
-
-export type ChainProblemCode = 'number_gap' | 'parent_broken' | 'checksum_mismatch';
-
-export interface ChainProblem {
-  code: ChainProblemCode;
-  /** 出问题的版本 */
-  versionId: string;
-  message: string;
-}
-
-/**
- * 校验版本链：number 连续、parent 指向上一个版本（第一个版本为空）、
- * 每行重新算的 checksum 与存储值一致。返回问题列表（空数组表示链是完整的）。
- * 链的起点：导入出来的项目从 v0 基线开始（number 0），空白项目从 v1 开始（number 1，parent 为空，
- * 它的迁移是从空库建出来的），所以第一个版本的 number 只能是 0 或 1，之后逐个加 1。
- */
-export const verifyChain = (rows: HistoryVersionRow[]): ChainProblem[] => {
-  const sorted = [...rows].sort((a, b) => a.number - b.number);
-  const out: ChainProblem[] = [];
-  const start = sorted[0]?.number === 1 ? 1 : 0;
-  for (const [i, r] of sorted.entries()) {
-    if (r.number !== start + i)
-      out.push({
-        code: 'number_gap',
-        versionId: r.versionId,
-        message: `版本 ${r.name} 的 number 是 ${r.number}，链上这个位置应该是 ${start + i}`,
-      });
-    const expectedParent = i === 0 ? null : sorted[i - 1]!.versionId;
-    if (r.parentId !== expectedParent)
-      out.push({
-        code: 'parent_broken',
-        versionId: r.versionId,
-        message:
-          i === 0
-            ? `链上第一个版本 ${r.name} 不应该有 parent（现在是 ${r.parentId ?? '空'}）`
-            : `版本 ${r.name} 的 parent 是 ${r.parentId ?? '空'}，应该指向上一个版本 ${expectedParent}`,
-      });
-    const checksum = stepsChecksum(r.upSteps, r.downSteps);
-    if (checksum !== r.checksum)
-      out.push({
-        code: 'checksum_mismatch',
-        versionId: r.versionId,
-        message: `版本 ${r.name} 的冻结脚本和校验和不符（存储 ${r.checksum.slice(0, 12)}…，重算 ${checksum.slice(0, 12)}…）`,
-      });
-  }
-  return out;
-};
+// ───── 链完整性（已提升至 history-common.ts） ─────
 
 // ───── 项目认领 ─────
 
@@ -728,18 +598,6 @@ export const writeProject = async (
     [row.projectId, row.name, row.instanceId, row.claimedAt, row.claimedBy, row.previousInstanceId ?? null],
   );
 };
-
-export interface ClaimInput {
-  projectId: string;
-  /** 认领的实例（本实例） */
-  instanceId: string;
-  /** 在平台上确认认领的用户（ID 和显示名；显示名只为了在目标库里留下可读的痕迹） */
-  claimedBy: string | null;
-  claimedByName: string | null;
-  /** 项目名（平台上的名字，更新 projects.name） */
-  name: string | null;
-  note?: string | null;
-}
 
 /**
  * 认领：把这个库里项目的“当前认领实例”换成 `instanceId`。**必须在调用方的事务和项目锁里执行**（执行器的 claimInstance）。
@@ -808,20 +666,6 @@ export const readClaims = async (db: Db, projectId: string): Promise<ClaimRow[]>
     note: (r.note as string | null) ?? null,
   }));
 };
-
-/** 接手向导里“这个库登记过哪些项目”的一行 */
-export interface HistoryProjectSummary {
-  projectId: string;
-  name: string | null;
-  instanceId: string;
-  claimedAt: string | null;
-  /** 库里记着的版本数、最新版本的序号 */
-  versions: number;
-  headNumber: number | null;
-  /** 这个库当前的版本序号（最后一条 done 的记录的目标版本）；没有执行过为 null */
-  currentNumber: number | null;
-  lastRunAt: string | null;
-}
 
 /** 目标库里登记过的项目（接手向导用）。只读，兼容格式 1。没有历史表返回空数组 */
 export const listHistoryProjects = async (db: Db): Promise<HistoryProjectSummary[]> => {
