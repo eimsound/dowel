@@ -17,5 +17,5 @@
       }
     ]
   },
-  "ignorePatterns": [".agents/skills/**", "DESIGN.md", "**/dist/**"]
+  "ignorePatterns": [".agents/skills/**", "DESIGN.md", "**/dist/**", "site/**", ".cache/**"]
 }

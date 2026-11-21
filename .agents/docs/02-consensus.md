@@ -15,7 +15,7 @@
 | 锁和重写整表的风险分析 | ❌               | ❌          | 靠人工规则       | ✅ 引擎实测         |
 | 分支和评审流程         | ❌               | ❌          | 审批流           | ✅ 以模型为中心     |
 
-数据库支持优先级：**第一批 PostgreSQL、SQLite；第二批 MySQL、SQL Server。**
+数据库支持优先级：**第一批 PostgreSQL、SQLite；第二批 MySQL、SQL Server。**（**2026-11-22 更新**：上述四方言及 PG 15–19 多版本与分区表编辑均已合入 `main`）。
 
 ### 1.1 项目性质与开发方式（2026-11-17 确定）
 
@@ -90,49 +90,51 @@
 - **评审**：可视化 diff + 迁移 SQL + 验证结果 + 风险报告，评论、批准、合并。
 - **分支合并时检测语义冲突，交给人处理，不自动解决。**
 
-### 4.3 核心引擎 `@dowel/core`（纯 TS，浏览器 / 服务端 / CLI 共用）
+### 4.3 核心引擎 `@dowel/core`、`@dowel/engines` 与跨方言抽象（纯 TS，浏览器 / 服务端共用）
 
 ```
 IR(v1), IR(v2)
   → diff：按 ID 匹配 → 操作列表（AddColumn / RenameColumn / AlterType / AddFK …）
   → 编排：按依赖排序，拆成适合在线执行的步骤
-       （NOT VALID + VALIDATE；CONCURRENTLY 单独拆出事务；expand / contract 两阶段）
-  → 各方言翻译层：查版本能力表 → 生成 up / down SQL
+       （NOT VALID + VALIDATE；CONCURRENTLY 单独拆出事务；SQLite 12 步重建表；MSSQL 带名 DEFAULT 约束顺序）
+  → DialectSpec / 各方言翻译层：查版本能力表 → 生成 up / down SQL（via DialectRegistry）
   → 静态规则检查：不可逆操作、数据丢失风险、目标版本不支持的写法
 ```
 
+多方言三层抽象已落地：
+
+- **`@dowel/core`（`DialectSpec` + `DialectCapabilities`）**：纯函数、无 I/O，前后端共用，统一封装引用/词法/类型规范化、推导命名、模型校验、规划器、非事务与高危语句检测；
+- **`@dowel/engines`（`EngineAdapter` + `HistoryStore`）**：统一封装连接适配、固定会话参数、快照读取与指纹、风险实测、目标库迁移历史读写与项目互斥锁；
+- **`apps/server/src/targets/`（`TargetDriver`）**：按方言分派目标探测、拉取结构与影子库准备/清理生命周期。
+
 各方言要单独处理的坑：
 
-- **PG**：DDL 支持事务；`CONCURRENTLY` 不能在事务里；锁表操作尽量拆成更安全的多步。
-- **SQLite**：大部分 ALTER 不支持，按官方 12 步流程重建表，处理外键开关。
-- **MySQL**：DDL 会自动提交，迁移失败无法回滚，每一步要能断点续跑；`ALGORITHM=INSTANT/INPLACE` 提示。
-- **MSSQL**：删列前先删带名字的默认值约束；改名用 `sp_rename`；`GO` 分批；identity 列建后不可改。
-
-版本能力表示例（PG）：11+ 常量默认值不重写整表；12+ 生成列、`ADD VALUE` 可在事务里；15+ `NULLS NOT DISTINCT`；18 生成列默认 VIRTUAL（必须显式写 STORED / VIRTUAL）、NOT NULL 以约束形式存储并可 `NOT VALID`。
+- **PG（15–19）**：DDL 支持事务；`CONCURRENTLY` 不能在事务里（失败清理遗留 `INVALID` 索引、`DETACH PARTITION ... CONCURRENTLY` 超时转 `FINALIZE`）；多环境取最低大版本作目标版本（`NULLS NOT DISTINCT` 15+、分区表 `IDENTITY`/排他约束 17+、`VIRTUAL` 生成列与显式命名 `NOT NULL` 与 `uuidv7()` 18+、`REPACK` 19+）。
+- **SQLite（`node:sqlite`）**：大部分 ALTER 不支持，按官方 12 步流程重建表，在事务外切换 `PRAGMA foreign_keys = OFF/ON` 并在提交前跑 `PRAGMA foreign_key_check`；目标库经 `DOWEL_SQLITE_ROOTS` 白名单与逐段软链消解保护（禁指 `DOWEL_DB`），引擎开启 `enableDefensive` 与 authorizer。
+- **MySQL（8.4 / 9.7）**：DDL 会自动提交，每一步记断点并在崩溃重跑时结合 `information_schema` 与幂等 errno 探测跳过已提交单步；`ALGORITHM=INSTANT / INPLACE / COPY` 渐进试跑风险；多环境按主次版本分组验证（9.0+ `VECTOR` 检查）。
+- **MSSQL（2019 / 2022 / 2025）**：删列或改默认值前先删带名 `DEFAULT` 约束（`DF_<table>_<col>`）；改名用 `EXEC sp_rename`；独占行 `GO [count]` 切批；`CLUSTERED` 约束/索引互斥；2025（17+）原生 `json` 与 `vector(n)` 能力检查；TLS 默认严格校验。
 
 ### 4.4 影子库
 
 确定顺序：
 
 1. 环境里显式配置的影子库实例（用户可指定其他实例）。
-2. **默认：目标库所在实例上的 `{原库名}_dowel`。**
-3. ~~兜底：项目还没连接任何数据库时，PG 用 PGlite~~。**2026-11-18 用户决定：不用 PGlite 兜底**——浪费精力，而且 PGlite 与目标实例的版本、扩展不同，可能造成不一致。影子库只能是真实的 PostgreSQL 实例，**不可用就报错**（项目没有环境时，导入 SQL、验证迁移直接提示先配置环境）。
+2. **默认：目标库所在实例上的 `{原库名}_dowel`**（PG / MySQL / MSSQL 均采用 `{原库名}_dowel`，超长按各自标识符上限截断并拼接 8 位短哈希）。
+3. ~~兜底：项目还没连接任何数据库时，PG 用 PGlite~~。**2026-11-18 用户决定：不用 PGlite 兜底**——PG / MySQL / MSSQL 影子库只能是真实数据库实例，**不可用就报错**。
 
-**SQLite 例外：一律用内存库**（Node 内置 `node:sqlite`）。
+**SQLite 例外：一律用内存库**（Node 26 内置 `node:sqlite` `:memory:`，免环境配置即可导入 SQL 与闭环验证）。
 
-同实例影子库的好处：版本、扩展、排序规则、参数和目标完全一致，版本矩阵问题自然消失，SaaS 不需要维护验证集群，还能读目标库真实表大小来估算耗时。
+同实例影子库的好处：版本、扩展、排序规则、参数和目标完全一致，版本矩阵问题自然消失，不需要单独维护验证集群。
 
 配套保护措施：
 
-| 风险                             | 措施                                                                                                       |
-| -------------------------------- | ---------------------------------------------------------------------------------------------------------- |
-| 检查拖累生产实例                 | `production` 环境默认禁用同实例影子库，需明确同意或改配其他实例；同一实例同时只跑一个检查（advisory lock） |
-| 锁表空间耗尽                     | 限制单次检查的对象数量；`lock_timeout`、`statement_timeout`                                                |
-| 回滚后仍产生 WAL，进入从库和备份 | 文档说明；这类实例建议改配其他实例                                                                         |
-| 权限                             | 专用账号 `dowel` 拥有 `_dowel` 库；对目标库只读系统目录；没有 `CREATEDB` 时提示手动建库                    |
-| 残留对象                         | PG / MSSQL 每次检查用 `BEGIN…ROLLBACK`；非事务语句和 MySQL 每次检查前清空影子库                            |
-| 库名超长                         | PG 63 字节、MySQL 64、MSSQL 128；超出时截断 + 短哈希                                                       |
-| 云数据库限制                     | 按库计费（如 Azure SQL Database）或不允许建库时，引导配置其他实例                                          |
+| 风险             | 措施                                                                                                                                                                               |
+| ---------------- | ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| 检查拖累生产实例 | `production` 环境默认禁用同实例影子库，需明确同意或改配其他实例；同一影子库串行互斥                                                                                                |
+| 锁表空间耗尽     | 限制等待与语句超时（PG `lock_timeout` / `statement_timeout`、MySQL `lock_wait_timeout` / `max_execution_time`、MSSQL `SET LOCK_TIMEOUT` / 请求取消、SQLite `PRAGMA busy_timeout`） |
+| 误清空业务库     | 专用标记核对后才清空：PG 用库级 `COMMENT`、MySQL 用 `__dowel_shadow_mark` 哨兵表、MSSQL 用 `dowel_shadow` 数据库扩展属性（并拒绝 `master`/`tempdb`/`model`/`msdb`）                |
+| 权限与残留       | 专用账号拥有 `_dowel` 库；对目标库只读系统目录；无建库权限时提示手动建库语句；每次检查前清空影子库（PG 用 `DROP SCHEMA CASCADE`、MySQL / MSSQL 按依赖拓扑清理对象并保留标记）      |
+| 并发生命周期竞争 | PG 使用维护库 advisory lock、MySQL 使用 `GET_LOCK`、MSSQL 使用 `sys.sp_getapplock`，遇并发建库错误码自动回退复用                                                                   |
 
 ### 4.5 验证执行器
 
@@ -232,19 +234,19 @@ IR(v1), IR(v2)
 
 ```
 apps/
-  web/          前端
-  server/       Hono API + 协作同步 + 任务队列
-  cli/          ~~CLI / 代理~~（2026-11-19：不做，见 11.4）
+  web/          前端（React 19 + Vite 8 + @xyflow/react 画布）
+  server/       Hono API + WebSocket 协作同步 + 目标库驱动（targets/）+ HA 协调与后台任务
 packages/
-  core/         IR、diff、编排、翻译层、版本能力表、静态检查、修改操作（mutator）（依赖尽量只有 zod）
+  api/          共享 zod 请求/响应 schema 与类型（@dowel/api）
+  core/         IR、diff、编排、PG/SQLite/MySQL/MSSQL 方言规划器与能力表、mutators（纯 TS）
+  engines/      四方言数据库适配（db.ts）、快照导入、风险分析、目标库历史存储
+  executor/     冻结迁移执行器、预演、漂移检查、认领与标记为已执行
   sync/         同步层：客户端待确认队列与 rebase、服务端排序与校验、操作日志
-  verifier/     验证执行器（服务端和 CLI 共用）
-  engines/      各数据库的影子库适配和结构读取
-  sql-frontend/ 解析器适配和语句切分器
-  importers/    导入 DDL 文本、迁移目录、ORM schema
-  ui-canvas/    画布组件
-docs/           面向用户的项目文档
-.agents/docs/    AI 协作与规划文档（调研、决策、待解决问题）
+  verifier/     闭环验证执行器与各方言随机属性测试
+actions/
+  execute/      内置纯 bash + curl 复合 Action 与 CI 脚本
+docs/           面向最终用户的 Zensical 文档站点源码（zensical.toml 构建）
+.agents/docs/   AI 协作与架构/决策文档（调研、共识、设计、ADR、进展）
 ```
 
 ## 7. 协议
@@ -262,17 +264,18 @@ docs/           面向用户的项目文档
 
 ## 9. 路线图
 
-| 阶段                                                                              | 内容                                                                                                                                                            | 验收标准                                                                |
-| --------------------------------------------------------------------------------- | --------------------------------------------------------------------------------------------------------------------------------------------------------------- | ----------------------------------------------------------------------- |
-| M1 先把 PG 做透 ✅（2026-11-18，见 [05-implementation.md](05-implementation.md)） | IR、画布、实时协作（服务器按顺序处理修改）、同实例影子库（不用兜底）、导入 DDL 文本、版本快照、生成迁移并闭环验证、锁和重写分析；分区表只能导入和查看，不能编辑 | 随机修改 IR 的自动测试在 PG 18 上 100% 闭环通过；改名不会被当成先删后加 |
-| M2 SQLite + PG 多版本                                                             | 12 步重建表；PG 分区表的编辑；版本能力表；多环境、目标版本；保护措施                                                                                            | 随机测试在 PG 14～18 和 SQLite 上通过                                   |
-| M3 工程化流程                                                                     | 分支、评审、语义冲突检测；~~CLI 代理；漂移检测~~（2026-11-19：不做 CLI，漂移检测提前到产品化阶段）；导出 Flyway / Prisma / Git                                  | 走通“建分支 → 评审 → 合并 → 提交 PR → 在 CI 里 apply”                   |
-| M4 MySQL + MSSQL                                                                  | 翻译层、影子库适配、断点续跑执行                                                                                                                                | 随机测试在两种方言上通过                                                |
+| 阶段                                                                              | 内容                                                                                                                                                                 | 验收标准                                                                     |
+| --------------------------------------------------------------------------------- | -------------------------------------------------------------------------------------------------------------------------------------------------------------------- | ---------------------------------------------------------------------------- |
+| M1 先把 PG 做透 ✅（2026-11-18，见 [05-implementation.md](05-implementation.md)） | IR、画布、实时协作（服务器按顺序处理修改）、同实例影子库（不用兜底）、导入 DDL 文本、版本快照、生成迁移并闭环验证、锁和重写分析；分区表只能导入和查看，不能编辑      | 随机修改 IR 的自动测试在 PG 18 上 100% 闭环通过；改名不会被当成先删后加      |
+| M2 SQLite + PG 多版本 + 分区表编辑 ✅（2026-11-21）                               | 12 步重建表与 `DOWEL_SQLITE_ROOTS` 白名单；PG 15–19 分区表编辑、版本能力表与多版本环境分别验证；跨方言 `DialectSpec` / `EngineAdapter` / `TargetDriver` 抽象         | 随机测试在 PG 15–19 矩阵和 SQLite 上 100% 闭环通过                           |
+| M3 工程化流程（待做）                                                             | 分支、评审、语义冲突检测；导出 Flyway / Prisma / Atlas 格式；MCP 服务（注：不做 CLI，漂移检测已提前在产品化阶段完成）                                                | 走通“建分支 → 评审 → 合并 → 导出/交付”                                       |
+| M4 MySQL + MSSQL ✅（2026-11-22）                                                 | MySQL 8.4 / 9.7 与 SQL Server 2019 / 2022 / 2025 翻译层、影子库适配、风险实测、非事务/隐式提交断点续跑执行与多方言 UI/E2E 收口；Zensical 0.1.3 用户文档站点与 README | 四方言随机闭环测试、执行器测试与多方言 Playwright E2E 通过，文档严格构建通过 |
 
 项目公开开发，不单独定义“首个公开版本”；每个里程碑完成即可发布。
 
 **2026-11-19**：M1 与 M2 之间插入“产品化”阶段（账户与组、应用外壳、新建项目向导、目标库迁移历史与执行、执行策略与审批、CI 令牌），决策见第 11 节；原 M3 的迁移历史表和 apply 提前到这个阶段。
 **2026-11-21**：P6 完成后、进入 M2 之前，增加 **P6.5（收尾、清理与 Docker 冒烟）**、**P7（HA 纯平台 PG 多活）** 与 **P7.5（VoidZero 工具链迁移：Oxlint + Oxfmt + tsdown）**；同时清理当前不做的公域待办（移除 M3 的“GitHub 集成”）。
+**2026-11-22**：Stage 2（PG 15–19 多版本与分区表编辑、SQLite / MySQL 8.4 & 9.7 / SQL Server 2019 & 2022 & 2025 多方言、全方言 UI 与 Zensical 0.1.3 用户文档站点及架构文档同步）合入 `main`。
 
 **M1 的内部顺序**（按“先做能自动验证的部分”）：
 

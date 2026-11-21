@@ -93,17 +93,26 @@ interface TypeRef {
 }
 ```
 
-### 1.3 方言扩展字段
+### 1.3 方言扩展字段（实际落地，`packages/core/src/ir.ts`）
 
-项目只绑定一种方言，所以用泛型而不是可选字段堆叠：
+项目只绑定一种方言，对象在核心字段外挂载按方言分区的可选 `ext` 槽位（省略时不改变既有 PG IR 序列化），并在 `packages/core/src/dialect.ts` 中由各 `DialectSpec` 统一声明 `DialectCapabilities`：
 
-```ts
-type Obj<D extends Dialect> = CoreObj & { ext?: Ext[D][CoreObj['kind']] };
-```
+- **`Table.ext`**：
+  - `sqlite`：`{ withoutRowid?: boolean, strict?: boolean }`
+  - `mysql`：`{ engine?: string, charset?: string, collation?: string }`
+  - `mssql`：`{}`（预留）
+- **`Table.partitionBy` / `Table.partitionOf`**（PG 分区表编辑落地后结构化）：`partitionBy` 支持结构化 `PartitionSpec`（`{ strategy: 'range' | 'list' | 'hash', keys: PartitionKey[] }`）并向后兼容存量 `format: 1` 中的 `pg_get_partkeydef` 字符串。
+- **`Column.ext`**：
+  - `sqlite`：`{ autoincrement?: boolean }`
+  - `mysql`：`{ unsigned?: boolean, zerofill?: boolean, autoIncrement?: boolean, charset?: string, onUpdateCurrentTimestamp?: boolean, enumValues?: string[], setValues?: string[] }`
+  - `mssql`：`{ identity?: { seed: string, increment: string }, defaultName?: string, defaultNameMode?: 'derived' | 'explicit', sparse?: boolean, rowguidcol?: boolean }`
+- **`PrimaryKey.ext` / `Unique.ext`**：
+  - `mssql`：`{ clustered?: boolean }`
+- **`Index.ext`**：
+  - `mysql`：`{ indexType?: 'BTREE' | 'HASH' | 'FULLTEXT' | 'SPATIAL', lengths?: (number | null)[] }`
+  - `mssql`：`{ clustered?: boolean, fillFactor?: number }`（`1`–`100`）
 
-zod 层面：先按 `kind` 做判别联合，再按项目方言选 `ext` 的 schema。PG 的 `ext` 例子：索引的 `method`、`include`、`nullsNotDistinct`；表的 `unlogged`、`rls`；外键的 `deferrable`、`match`。
-
-**边界原则**：只有“至少两种方言都有、且语义一致”的才进核心字段；拿不准的先放 `ext`，以后再提升。提升是一次 IR 格式升级（1.8）。
+**边界原则**：只有“至少两种方言都有、且语义一致”的才进核心字段；方言专属属性放入对应 `ext.<dialect>`，升级或提升公共字段再走 `Model.format` 递增（1.8）。
 
 ### 1.4 名字：显式还是推导（D5）
 
@@ -143,19 +152,24 @@ interface Expr {
 - 界面上默认显示规范形式（去掉最外层多余括号）；用户编辑时显示原文。
 - `canon` 由服务器在影子库归一化后写入（第 2.6 节“派生数据”）。
 
-### 1.6 影子库会话参数（D8）
+### 1.6 影子库会话参数（D8，四方言现状）
 
-每个影子库会话、每个生成的迁移文件开头都固定：
+每个影子库会话与下载的迁移脚本开头按方言固定会话设置，保证在任意客户端或实例执行结果一致：
 
-```sql
-SET TimeZone = 'UTC';
-SET DateStyle = 'ISO, MDY';
-SET IntervalStyle = 'postgres';
-SET search_path = '';          -- 与 pg_dump 相同：所有非 pg_catalog 的名字带 schema 前缀
-SET extra_float_digits = 3;
-```
+- **PostgreSQL**（`packages/engines/src/pg/db.ts`）：
+  ```sql
+  SET TimeZone = 'UTC';
+  SET DateStyle = 'ISO, MDY';
+  SET IntervalStyle = 'postgres';
+  SET search_path = '';
+  SET extra_float_digits = 3;
+  SET check_function_bodies = false;
+  ```
+- **SQLite**（`packages/engines/src/sqlite/db.ts`）：`PRAGMA foreign_keys = ON`、`PRAGMA legacy_alter_table = OFF`（12 步表重建步骤内部在事务外临时关闭并在 `finally` 恢复）。
+- **MySQL**（`packages/engines/src/mysql/db.ts`）：`SET SESSION time_zone = '+00:00'`、`SET SESSION sql_mode = 'STRICT_TRANS_TABLES,NO_ZERO_IN_DATE,NO_ZERO_DATE,ERROR_FOR_DIVISION_BY_ZERO,NO_ENGINE_SUBSTITUTION'`、`SET SESSION information_schema_stats_expiry = 0`。
+- **SQL Server**（`packages/engines/src/mssql/db.ts`）：`SET ANSI_NULLS ON`、`SET QUOTED_IDENTIFIER ON`、`SET XACT_ABORT ON`（后接 `GO`）。
 
-用户在界面上看到的表达式和类型名去掉项目默认 schema 的前缀。
+用户在界面上看到的 PostgreSQL / SQL Server 表达式和类型名去掉项目默认 schema 前缀。
 
 ### 1.7 不透明对象
 
@@ -350,16 +364,14 @@ dowel/
 
 ---
 
-## 4. M1 覆盖的 PG 对象（Q4）
+## 4. 四方言覆盖范围现状（2026-11-22 更新）
 
-| 分类       | 内容                                                                                                                                                                     |
-| ---------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------ |
-| 可视化编辑 | schema（多个）、扩展、表、列、主键、唯一、外键、CHECK、NOT NULL、索引（部分索引、表达式索引、INCLUDE、NULLS NOT DISTINCT、索引方法）、枚举、序列、identity、生成列、注释 |
-| 不透明对象 | 视图、物化视图、函数、过程、触发器、RLS 策略、域、复合类型、EXCLUDE 约束                                                                                                 |
-| 只读导入   | 分区表及其分区：能导入、能显示，不能在 M1 编辑（D10）                                                                                                                    |
-| 不支持     | 继承表、外部表、事件触发器、publication / subscription                                                                                                                   |
-
-**已确定：分区表从 M1 移到 M2。**理由是 M1 的验收标准是“随机修改 IR 后 100% 闭环通过”，分区表（分区边界、attach / detach、分区上的索引和约束继承）会让随机生成器和翻译层的状态空间大幅增加，先把基础对象做透。
+| 方言                                 | 可视化建模对象                                                                                                                                                                                                                                                                                                          | 不透明对象 / 特殊支持                                                           | 明确不支持 / 只读边界                                                                                                                            |
+| ------------------------------------ | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | ------------------------------------------------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------ |
+| **PostgreSQL（15–19）**              | 多 schema、扩展、表、列、主键、唯一（`NULLS NOT DISTINCT` 15+）、外键、CHECK、NOT NULL（18+ 显式命名）、索引（部分/表达式/`INCLUDE`/方法）、枚举、序列、identity、生成列（`STORED`/`VIRTUAL`）、注释、**声明式分区表及子分区（RANGE/LIST/HASH、边界编辑、ATTACH/DETACH）**                                              | 视图、物化视图、函数、过程、触发器、RLS 策略、域、复合类型、排他约束            | 已发布分区表的分区策略只读；多级子分区在属性面板以只读徽标展示；不支持继承表、外部表、事件触发器、publication/subscription                       |
+| **SQLite**                           | 单一 `main` schema、表（`STRICT`、`WITHOUT ROWID`）、列（`INTEGER PRIMARY KEY AUTOINCREMENT`、生成列、列顺序调整）、主键、唯一、外键、CHECK、索引（部分/表达式/排序）                                                                                                                                                   | 视图、触发器（通过 SQL 导入与 12 步表重建自动迁移重建）                         | 不支持多 schema、独立枚举、独立序列、对象注释、`INCLUDE`、`NULLS NOT DISTINCT`、声明式分区表                                                     |
+| **MySQL（8.4 / 9.7）**               | 单一 `default` schema、表（`engine`/`charset`/`collation`）、列（`UNSIGNED`/`ZEROFILL`/`AUTO_INCREMENT`/`ON UPDATE CURRENT_TIMESTAMP`/列级 `enum`/`set`/列顺序 `FIRST`/`AFTER`）、主键（`PRIMARY`）、唯一、外键（含 InnoDB `KEY_GENERATED` 隐式索引管理）、CHECK、索引（`BTREE`/`HASH`/`FULLTEXT`/`SPATIAL`、前缀长度） | 视图、触发器、函数、存储过程                                                    | 不支持多 schema、独立枚举对象、独立序列、分区表编辑、部分索引 `WHERE` 与 `INCLUDE`；9.0+ `VECTOR(n)` 在 8.4 目标下静态拦截                       |
+| **SQL Server（2019 / 2022 / 2025）** | 多 schema（默认 `dbo`）、表、列（`IDENTITY(seed, increment)`、带名默认约束 `DF_*`、计算列 `PERSISTED`/`SPARSE`/`ROWGUIDCOL`）、序列、主键/唯一/索引（`CLUSTERED`/`NONCLUSTERED`、`FILLFACTOR`、`INCLUDE`）、外键、CHECK、扩展属性注释                                                                                   | 视图、触发器、存储过程、函数、用户自定义类型/同义词；独占行 `GO [count]` 批切分 | 不支持独立枚举、扩展、声明式分区表编辑、直接表达式索引（需用计算列）、`DEFERRABLE` 外键；2025 原生 `json` 与 `vector(n)` 在 2019/2022 下静态拦截 |
 
 ---
 
@@ -392,28 +404,15 @@ type Step =
 
 ---
 
-## 7. 目标库里的 `dowel` schema（P4a，开发者说明）
+## 7. 目标库里的 `dowel` 迁移历史（P4a / Stage 2 四方言开发者说明）
 
-决策见 [ADR 0003](adr/0003-version-content-in-target-db.md)，实现是 `packages/engines/src/pg/history.ts`（纯库代码，只依赖 `Db` 接口）。用户文档见 [docs/execution.md](../../docs/execution.md)，执行器（P4b）怎么读写它见 [05-implementation.md](05-implementation.md) 的“产品化 P4b”一节。
+决策见 [ADR 0003](adr/0003-version-content-in-target-db.md)，各引擎实现位于 `packages/engines/src/{pg,sqlite,mysql,mssql}/history.ts`（统一实现 `HistoryStore` 接口，只依赖 `Db` 接口）。用户文档见 [docs/execution.md](../../docs/execution.md)，执行器读写逻辑位于 `packages/executor/src/`。
 
-**位置与权限**：固定叫 `dowel`，不提供改名；没有建 schema 的权限时 `ensureHistory()` 抛 `HistoryError('no_schema_privilege')`，消息里写明账号缺什么、给出让 DBA 预先执行的语句（`CREATE SCHEMA dowel AUTHORIZATION "<账号>"`，或 schema 已存在时 `GRANT USAGE, CREATE ON SCHEMA dowel TO "<账号>"`），**不退回业务 schema**。`dowel` 永远不被导入（`userNs()` 写死排除，所以它不会让漂移检测的结构指纹变化）。同一个库里的多个项目共用这个 schema，表里都带 `project_id`。建表在一个隐式事务里执行并先拿 `pg_advisory_xact_lock`，两个实例同时初始化不会撞上目录唯一约束；schema 已存在时不再执行 `CREATE SCHEMA`（哪怕带 `IF NOT EXISTS`，PG 也会先检查库级 CREATE 权限，而 DBA 预建 schema 的账号恰恰没有这个权限）。
+**双存储模型（`DialectCapabilities.historyStorage`）**：
 
-| 表         | 列                                                                                                                                                                                                                                                                                                                                                                                        | 说明                                                                                                                                                                                                                                                                                                                                                                    |
-| ---------- | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| `meta`     | `key text pk`, `value jsonb`                                                                                                                                                                                                                                                                                                                                                              | 目前只有 `format_version`：**当前是 1**（`HISTORY_FORMAT`）。**只有破坏性变更**（旧版 Dowel 照旧读写会出错）才 +1，兼容的变更（加列、加表）不动它。库里的值比代码新或者不是整数时，`ensureHistory()` 抛 `format_too_new`，只读的 `readHistoryFormat()` 也一样（读也拒绝）——这个检查从第一个发布版起就有，事后补不上。建表时写入 1；目前没有任何升级路径（发版之前不写） |
-| `projects` | `project_id text pk`, `name`, `instance_id text not null`, `claimed_at timestamptz`, `claimed_by text`, `previous_instance_id text`                                                                                                                                                                                                                                                       | **`instance_id` = 当前认领这个项目的 Dowel 实例**（实例标识在平台库 `instance_settings.instance_id`）：第一次执行时登记，换手时由 `claimProject` 改写并把上一个实例记进 `previous_instance_id`；执行时不是本实例就拒绝（`foreign_instance`）。认领流程已在 P4c 实现，见 [05-implementation.md](05-implementation.md) 的“产品化 P4c”                                     |
-| `versions` | `project_id`, `version_id`, `number int`, `parent_id`, `name`, `scope jsonb`（冻结时项目的 schema 范围，null = 全部；接手时直接取这一列恢复范围）, `up_steps jsonb`, `down_steps jsonb`, `checksum`, `model jsonb`, `fingerprint`, `published_at`, `published_by`；`pk(project_id, version_id)`，`unique(project_id, number)`                                                             | 每个版本的完整内容：模型（含对象 ID 和名字锁定）、冻结的脚本、结构指纹。`recordVersion()` 幂等：同一个 `version_id` 再写必须 checksum 相同，否则 `checksum_mismatch`；传入的 checksum 必须等于由脚本重算的值；序号被占用抛 `number_conflict`                                                                                                                            |
-| `history`  | `id bigserial pk`, `project_id`, `from_version`, `to_version`, `direction ('baseline'｜'up'｜'down'｜'mark')`（mark = 标记为已执行：不执行 SQL，只记“环境已到达 to 版本”；from 是标记前的版本）, `status ('running'｜'done'｜'failed')`, `step_index int`, `error`, `executed_by`, `via ('web'｜'ci')`, `instance_id`, `started_at default now()`, `finished_at`；索引 `(project_id, id)` | 只追加的执行记录                                                                                                                                                                                                                                                                                                                                                        |
-| `claims`   | `id bigserial pk`, `project_id`, `instance_id`（认领者）, `previous_instance_id`, `claimed_by`, `claimed_by_name`, `claimed_at default now()`, `note`；索引 `(project_id, id)`                                                                                                                                                                                                            | 认领事件，只追加：触发器 `dowel.claims_guard` 禁止修改和删除。`claimProject()` 在调用方的事务和项目锁里同时写项目行和这条事件                                                                                                                                                                                                                                           |
+- **`schema` 模式（PostgreSQL / SQL Server）**：固定存放在 `dowel` schema（`dowel.meta`、`dowel.projects`、`dowel.versions`、`dowel.history`、`dowel.claims`），不提供改名；无建 schema 权限时抛 `HistoryError('no_schema_privilege')` 并提示 DBA 授权语句。PG 通过 `pg_advisory_xact_lock` + 事务建表；MSSQL 通过 `sp_getapplock` + 事务建表，`history` 与 `claims` 用 `AFTER UPDATE, DELETE` 触发器（`tr_history_guard` / `tr_claims_guard`）保护只追加语义。
+- **`prefix` 模式（SQLite / MySQL）**：同库存储 5 张表（`dowel_meta`、`dowel_projects`、`dowel_versions`、`dowel_history`、`dowel_claims`），在建模器保留字检查与快照读取中硬编码排除；SQLite 与 MySQL 均使用 `BEFORE UPDATE` / `BEFORE DELETE` 触发器强制 `dowel_history` 与 `dowel_claims` 的只追加语义。
 
-**scope、认领与 `mark`（P4c）**：`versions.scope`（接手要靠它恢复 schema 范围）、`projects.previous_instance_id`、`claims` 表和 `history.direction` 的 `mark` 都直接写在建表语句里（还没有发过版，没有升级路径；以后兼容地加列用 `add column if not exists`，只有破坏性变更才升格式版本）。读 `versions` / `projects` 用 `to_jsonb(行)` 整行读再按字段取，读历史、检查漂移、接手前的检查都是**只读**。`historyWriteProblem()` 是预演用的只读检查：账号能不能建 schema / 建表、格式是不是比当前代码新，有问题就返回说明、不建任何东西。
+**跨实例项目互斥锁（`withProjectLock`）**：PG 用会话级 advisory lock；MSSQL 用独占单连接 Session 级 `sp_getapplock`；MySQL 用独占连接 `GET_LOCK` / `RELEASE_LOCK`（释放失败时销毁连接防锁泄漏）；SQLite 用按规范路径隔离的进程内互斥锁。
 
-**`history` 只追加**：模块只提供 `startRun`（insert）、`markStep`（记录已完成的步骤序号，断点续跑用）和 `finishRun`（running → done / failed）。另外用触发器 `dowel.history_guard` 兜底：禁止 DELETE；只允许改 `status = 'running'` 的行，且项目、版本、方向、执行者、来源、实例、开始时间这些标识字段不能变；已结束的行不能再改。理由：历史是“谁在什么时候把库改成了什么样”的证据，平台库丢了以后要靠它接手，被改写比缺失更糟；触发器只拦应用层的误改（别的版本的 Dowel、手写 SQL、以后功能里的 bug），不是安全边界——表的所有者和超级用户仍然能 drop 触发器，这一点接受。触发器和函数只在不存在时创建，避免每次启动都对 `history` 拿 AccessExclusive 锁。
-
-**当前版本** = 最后一条 `status = 'done'` 的记录的 `to_version`（基线、up、down 一样，down 方向也取 `to_version`）；失败和进行中的记录不改变它。`readHistory(db, projectId)` 一次返回当前版本、全部版本行和全部记录。
-
-**`versions` 行的 `number`**：v0 基线是 0，空白项目的第一个版本是 1（它的 parent 为空、迁移从带 public 的空库建出来）。`verifyChain(rows)` 校验：number 从 0 或 1 起连续；第一个版本没有 parent、之后每个版本的 parent 是上一个；每行用 `stepsChecksum(upSteps, downSteps)` 重算的 checksum 等于存储值。返回问题列表（`number_gap` / `parent_broken` / `checksum_mismatch`），空数组表示链完整。
-
-**项目锁**：`withProjectLock(db, projectId, timeoutMs, fn)`，见 `05-implementation.md` 的 P4a 一节。
-
-**结构指纹**：`fingerprint(snapshot)`，剔除的字段见 `05-implementation.md` 的 P4a 一节。
+其余 `meta.format_version`（当前 `1`）、`projects`（认领 `instance_id`）、`versions`（含完整 `model` 与 `scope`）、`claims`、`history`（含 `step_index` 断点与 `direction` = `baseline | up | down | mark`）及 `verifyChain` 规则在四方言间保持 1:1 字段与语义对齐。
