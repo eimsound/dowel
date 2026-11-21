@@ -50,7 +50,7 @@ pnpm check        # 依次执行 pnpm lint（Oxlint --type-aware --deny-warnings
 | `DOWEL_ADMIN_PASSWORD`         | 无                | 无人值守初始化密码：须与 `DOWEL_ADMIN_USERNAME` 同时设置，不合法时服务直接启动失败                                                                                                             |
 | `DOWEL_ALLOW_PASSWORD_LOGIN`   | 无                | 设为 `1` 或 `true` 时强制开启密码登录。在实例设置中关闭密码登录后用作应急恢复入口                                                                                                              |
 | `DOWEL_DRIFT_INTERVAL_MINUTES` | `60`              | 定时漂移检查间隔（分钟）；设为 `0` 关闭定时检查                                                                                                                                                |
-| `DOWEL_LOGIN_LIMIT`            | `10`              | 登录失败限速：同一 IP + 账号在窗口内允许的失败次数                                                                                                                                             |
+| `DOWEL_LOGIN_LIMIT`            | `10`              | 登录失败限速：同一 IP + 用户名在窗口内允许的失败次数                                                                                                                                           |
 | `DOWEL_LOGIN_IP_LIMIT`         | `30`              | 登录失败限速：同一 IP 在窗口内允许的总失败次数（企业 NAT 或共享出口下可调大）                                                                                                                  |
 | `DOWEL_LOGIN_WINDOW_MS`        | `600000`          | 登录失败限速窗口时长（毫秒，默认 10 分钟）                                                                                                                                                     |
 | `DOWEL_CONNECTION_LIMIT`       | `10`              | 连库探测限速：单个用户在窗口内允许的连接检查、接手探测、漂移检查或拉取结构次数                                                                                                                 |
@@ -84,7 +84,7 @@ pnpm check        # 依次执行 pnpm lint（Oxlint --type-aware --deny-warnings
 当 Dowel 运行在 Nginx、Caddy、Traefik 或云负载均衡之后时，需满足以下两项配置：
 
 1. **环境变量**：同时设置 `DOWEL_TRUST_PROXY=1` 与 `DOWEL_PUBLIC_URL=https://你的对外域名`。启用后服务端从 `X-Forwarded-For`（取最后一个由可信代理追加的地址）获取客户端 IP，并使用 `DOWEL_PUBLIC_URL` 统一校验 CSRF `Origin` 和生成 OIDC 回调地址。
-2. **WebSocket 与 SSE 转发**：代理需正确传递 `Upgrade`、`Connection` 头并配置长连接超时，确保协作画布 WebSocket（`/api/projects/:pid/ws`）与收件箱实时 SSE（`/api/inbox/stream`）不被提前中断；若需要服务端感知真实请求来源，传递 `X-Forwarded-Proto`、`X-Forwarded-Host` 与 `X-Forwarded-For`。
+2. **WebSocket 与 SSE 转发**：代理需正确传递 `Upgrade`、`Connection` 头并配置长连接超时，同时关闭 SSE 响应缓冲以配合服务端返回的 `X-Accel-Buffering: no`，确保协作画布 WebSocket（`/api/projects/:pid/sync`）与收件箱实时 SSE（`/api/me/inbox/stream`）不被提前中断或缓冲延迟；若需要服务端感知真实请求来源，传递 `X-Forwarded-Proto`、`X-Forwarded-Host` 与 `X-Forwarded-For`。
 
 ## 数据库连接安全边界 {#connection-security}
 

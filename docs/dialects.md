@@ -87,6 +87,6 @@ Dowel 的每个项目在创建时绑定一种目标数据库方言，并在全�
 - **聚集与计算列**：主键、唯一约束与索引支持 `CLUSTERED` / `NONCLUSTERED`（每表至多 1 个聚集约束/索引，未显式指定时主键默认聚集），索引支持 `FILLFACTOR`（1–100）；支持 `PERSISTED` 计算列（非持久化计算列禁止设为 `NOT NULL`）、`SPARSE` 与 `ROWGUIDCOL`。
 - **批处理分隔符 `GO`**：导入解析、执行器与导出脚本均内置词法级 `GO [count]` 批分隔符切分（上限重复 `100` 次，不误切字符串与注释内文本）。
 - **2019 / 2022 / 2025 版本差异**：
-  - **SQL Server 2025（主版本 17）**：支持原生 `json` 与 `vector(n)` 类型；当项目目标版本为 2019（15）或 2022（16）时，使用原生 `json` 或 `vector(n)` 会被静态检查拦截并提示改用 `nvarchar(max)`。
+  - **SQL Server 2025（主版本 17）**：支持原生 `json` 与 `vector(n)` 类型；当项目目标版本低于 SQL Server 2025（2019 / 2022）时，两者均会被静态检查拦截：其中原生 `json` 会提示低版本改用 `nvarchar(max)`，而 `vector(n)` 直接提示需要 SQL Server 2025（主版本 17+）。
   - **SQL Server 2022（主版本 16）及以上**：支持 `IS DISTINCT FROM`。
 - **历史、事务与风险实测**：历史表固定写在目标库的 `[dowel]` schema（由 `AFTER UPDATE, DELETE` 触发器保护只追加语义）。普通 DDL 在 `SET XACT_ABORT ON` 事务内原子执行；影子库通过 `sys.dm_tran_locks`（`Sch-M` / `X` 对象锁）与 `sys.partitions.hobt_id` 变更检测页级重写风险。

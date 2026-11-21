@@ -19,14 +19,16 @@ Dowel 把“发布的版本”真正作用到目标数据库的步骤称为**执
 
 ### 账号所需权限 {#privilege-table}
 
-| 用途                 | PostgreSQL / SQL Server                                                                                                      | SQLite / MySQL                                                 |
-| -------------------- | ---------------------------------------------------------------------------------------------------------------------------- | -------------------------------------------------------------- |
-| 执行业务 DDL         | 脚本本身涉及的业务 schema 与对象权限                                                                                         | 目标库 / 文件读写与 DDL 权限                                   |
-| 首次建历史表         | 数据库级 `CREATE`（或 `CREATE SCHEMA`）权限；也可由 DBA 预建 `dowel` schema 并把所有权或 `CREATE`/`ALTER`/`USAGE` 授给该账号 | 建表与建触发器权限（SQLite 需允许读写且未设 `query_only = 1`） |
-| 读写迁移历史         | 对 `dowel` schema 的读写及触发器执行权限                                                                                     | 对 `dowel_*` 表的读写与触发器权限                              |
-| 漂移检测与只读查历史 | 连接权限 + 系统目录读权限 + `dowel` schema 只读（此类只读账号可检测漂移，不能执行）                                          | 连接 / 文件读权限 + `dowel_*` 表只读权限                       |
+执行业务迁移需要脚本本身涉及的业务 schema / 库与对象权限；管理迁移历史与只读检查所需权限按方言区分如下：
 
-若目标账号没有建 `dowel` schema 的权限，Dowel 会直接报错并给出让 DBA 预先执行的授权语句，绝不退回业务 schema 中建表。`dowel` schema 与 `dowel_*` 表名固定且不可更改，导入与漂移比对时永远自动跳过。
+| 方言       | 首次初始化历史表                                                                                                                                                                                                                                                | 读写迁移历史                                                                                                  | 漂移检测与只读查历史                                                                  |
+| ---------- | --------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | ------------------------------------------------------------------------------------------------------------- | ------------------------------------------------------------------------------------- |
+| PostgreSQL | 库级 `CREATE`（`GRANT CREATE ON DATABASE <db> TO <role>`）或由 DBA 预建 `CREATE SCHEMA dowel AUTHORIZATION <role>`；若 `dowel` schema 已存在，需 `GRANT USAGE, CREATE ON SCHEMA dowel`                                                                          | `GRANT USAGE, CREATE ON SCHEMA dowel` 及对应历史表读写权限                                                    | 连接权限 + 系统目录读权限 + `dowel` schema 只读（此类只读账号可检测漂移，不能执行）   |
+| SQL Server | 库级 `CREATE SCHEMA`（或由 DBA 预建 `CREATE SCHEMA [dowel] AUTHORIZATION [role]`）+ 库级 `CREATE TABLE`；若 `[dowel]` schema 已存在但尚未建表与触发器，还需 `GRANT ALTER, SELECT, INSERT, UPDATE ON SCHEMA::[dowel]`                                            | 若 DBA 已完整预建 5 张表与 2 个守卫触发器，最小权限账号仅需 `GRANT SELECT, INSERT, UPDATE ON SCHEMA::[dowel]` | 连接权限 + 系统目录读权限 + `[dowel]` schema 只读（此类只读账号可检测漂移，不能执行） |
+| MySQL      | 目标库 `CREATE`、`INSERT`、`UPDATE`、`TRIGGER` 权限（且实例未启用 `read_only` / `super_read_only`）；若开启 `log_bin=1` 且未启用 `log_bin_trust_function_creators=1`，首次创建守卫触发器还需全局 `SUPER` 权限（或提前设置 `log_bin_trust_function_creators=1`） | 同库 `dowel_*` 表的读写与触发器执行权限                                                                       | 连接权限 + `information_schema` 读权限 + `dowel_*` 表只读权限                         |
+| SQLite     | 目标库文件读写权限且未设 `query_only = 1`，允许建 `dowel_*` 表与触发器                                                                                                                                                                                          | 目标库文件读写权限（读写 `dowel_*` 表与触发器）                                                               | 目标库文件读权限 + `dowel_*` 表只读权限                                               |
+
+若目标账号缺少初始化迁移历史的权限，Dowel 会直接报错并给出让 DBA 预先执行的授权语句，绝不退回业务 schema 中建表。`dowel` schema 与 `dowel_*` 表名固定且不可更改，导入与漂移比对时永远自动跳过。
 
 ### 历史表结构 {#history-tables}
 
