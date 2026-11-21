@@ -1289,18 +1289,8 @@ export const mysqlPlan = (from: Model, to: Model, opts?: MysqlPlanOptions): Step
     );
   }
 
-  // ───── P13: 清理存活 FK 因新增显式覆盖索引而不再需要的旧隐式索引 ─────
-  for (const t of commonTables) {
-    const owners = fromImplicitOwnersByTable.get(t.id);
-    if (!owners || owners.size === 0) continue;
-    const toExplicit = explicitCoveringKeyPrefixes(to, t.id);
-    for (const fk of childrenOf(to, t.id, 'foreignKey').sort((a, b) => a.name.localeCompare(b.name))) {
-      if (!inFrom(fk.id) || fkRebuild.has(fk.id) || !owners.has(fk.id)) continue;
-      if (toExplicit.some((k) => prefixMatches(k, fk.columns))) {
-        emit('dropIndex', fk.name, `DROP INDEX ${mysqlIdent(fk.name)} ON ${mysqlIdent(t.name)}`);
-      }
-    }
-  }
+  // ───── P13: MySQL 8.0+/8.4/9.7 在 CREATE INDEX / ADD UNIQUE / ADD PRIMARY KEY 新增显式覆盖索引时，
+  // 会由 InnoDB 自动移除原有的 KEY_GENERATED 隐式外键索引，因此此处不再重复发射 DROP INDEX。 ─────
 
   // ───── P14: 新增或重建外键 ─────
   const fksToAdd = all(to, 'foreignKey')

@@ -258,6 +258,16 @@ const validateMysqlModel = (m: Model): string[] => {
         `表 ${t.name}：每张表最多只能有一列 AUTO_INCREMENT（当前有 ${aiCols.map((c) => c.name).join('、')}）`,
       );
     }
+    if (aiCols.length > 0) {
+      for (const gc of cols) {
+        if (!gc.generated) continue;
+        for (const ai of aiCols) {
+          if (mysqlExprReferences(gc.generated.expr, ai.name)) {
+            errs.push(`表 ${t.name}：生成列 ${gc.name} 不能引用 AUTO_INCREMENT 列 ${ai.name}`);
+          }
+        }
+      }
+    }
     for (const c of aiCols) {
       if (!isMysqlAutoIncrementType(c.type)) {
         errs.push(`表 ${t.name} 列 ${c.name}：AUTO_INCREMENT 只能用于整数或浮点类型（当前为 ${c.type}）`);

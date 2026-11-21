@@ -2,7 +2,7 @@
 import * as E from '@dowel/core';
 import { emptyBase, emptyModel, plan, validate } from '@dowel/core';
 import { getEngine, stepsChecksum, toScriptSteps } from '@dowel/engines';
-import { type ChainVersion, checkDrift, execute, markApplied } from '@dowel/executor';
+import { type ChainVersion, checkDrift, execute, expectOf, markApplied } from '@dowel/executor';
 import fc from 'fast-check';
 import { describe, expect, it } from 'vitest';
 
@@ -223,6 +223,17 @@ describe('MySQL verifier & random roundtrip (8.4 / 9.7)', () => {
     await handle.db.exec('DROP TABLE `rogue_tbl`');
 
     for (const st of up2) await handle.db.exec(st.sql);
+    const preview = await markApplied({
+      db: handle.db,
+      dialect: 'mysql',
+      projectId: 'proj-mysql',
+      projectName: 'MySQL App',
+      instanceId: 'inst-1',
+      chain,
+      to: 'ver-2',
+      dryRun: true,
+      executedBy: 'u1',
+    });
     const marked = await markApplied({
       db: handle.db,
       dialect: 'mysql',
@@ -232,6 +243,7 @@ describe('MySQL verifier & random roundtrip (8.4 / 9.7)', () => {
       chain,
       to: 'ver-2',
       acknowledge: true,
+      expect: expectOf(preview.plan),
       executedBy: 'u1',
     });
     expect(marked.plan.direction).toBe('forward');

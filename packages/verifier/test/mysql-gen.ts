@@ -132,7 +132,10 @@ export const mutateMysql = (m: Model, r: () => number): boolean => {
         const cols = E.columnsOf(m, t.id);
         if (cols.length >= 8) return false;
         if (r() < 0.2) {
-          const base = cols.find((c) => !c.generated && (c.type === 'int' || c.type === 'varchar(64)'));
+          const base = cols.find(
+            (c) =>
+              !c.generated && !c.ext?.mysql?.autoIncrement && (c.type === 'int' || c.type === 'varchar(64)'),
+          );
           if (!base) return false;
           const expr =
             base.type === 'varchar(64)'
