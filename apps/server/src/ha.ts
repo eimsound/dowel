@@ -2,6 +2,8 @@
 // - 每个副本在 ha_leases 表维护自己的心跳租约（key = 'node:<replicaId>'，默认 TTL 15 秒、每 5 秒续租）；
 // - 单次续租配备 PG 事务级 statement_timeout / lock_timeout 与 JS 侧有界超时保护，防止半开连接长期占住
 //   inFlightRenews 导致后续心跳全部跳过、存活副本租约过期；同时通过代际校验与停机补删防止滞后续租复活已删租约；
+// - 心跳续租周期内按节流间隔（默认每 10 分钟）清理过期超过保留宽限期（默认 1 小时）的崩溃节点租约行，
+//   防止被 SIGKILL / OOM 强杀的容器在 ha_leases 表永久堆积僵尸行，且不误删未过期、刚过期或非 node: 租约；
 // - 优雅停机时有界等待在途续租并主动删除自身租约行，既不卡死停机又便于其他副本立即感知接管；
 // - 提供 tryWithJobLock(jobName, fn)，通过平台库 advisory lock 防止多副本重复跑同一轮巡检。
 import { randomUUID } from 'node:crypto';
@@ -9,6 +11,8 @@ import type { AdvisoryLockResult, PlatformDb } from './db.ts';
 
 export const DEFAULT_LEASE_TTL_MS = 15_000;
 export const DEFAULT_HEARTBEAT_INTERVAL_MS = 5_000;
+export const DEFAULT_EXPIRED_LEASE_RETENTION_MS = 60 * 60 * 1000;
+export const DEFAULT_LEASE_CLEANUP_INTERVAL_MS = 10 * 60 * 1000;
 const MIN_DEFAULT_RENEW_TIMEOUT_MS = 1_000;
 
 const NODE_KEY_PREFIX = 'node:';
@@ -104,12 +108,18 @@ export interface HaCoordinatorOptions {
   renewTimeoutMs?: number;
   /** stop() 等待在途续租与删除租约的超时上限（毫秒，默认与 renewTimeoutMs 一致） */
   stopTimeoutMs?: number;
+  /** 清理过期节点租约行前的保留宽限期（毫秒，默认 3600000 = 1 小时） */
+  expiredLeaseRetentionMs?: number;
+  /** 定期清理过期节点租约行的节流间隔（毫秒，默认 600000 = 10 分钟；传 0 或负数禁用自动定期清理） */
+  leaseCleanupIntervalMs?: number;
 }
 
 export class HaCoordinator {
   readonly replicaId: string;
   readonly renewTimeoutMs: number;
   readonly stopTimeoutMs: number;
+  readonly expiredLeaseRetentionMs: number;
+  readonly leaseCleanupIntervalMs: number;
   private readonly db: PlatformDb;
   private readonly ttlMs: number;
   private readonly heartbeatIntervalMs: number;
@@ -118,6 +128,8 @@ export class HaCoordinator {
   private running = false;
   private generation = 0;
   private inFlightRenews = new Map<Promise<void>, AbortController>();
+  private lastCleanupAt = 0;
+  private inFlightCleanup: { task: Promise<void>; ac: AbortController } | null = null;
 
   constructor(db: PlatformDb, options: HaCoordinatorOptions = {}) {
     this.db = db;
@@ -140,6 +152,16 @@ export class HaCoordinator {
       options.stopTimeoutMs > 0
         ? Math.max(1, Math.floor(options.stopTimeoutMs))
         : this.renewTimeoutMs;
+    this.expiredLeaseRetentionMs =
+      options.expiredLeaseRetentionMs !== undefined &&
+      Number.isFinite(options.expiredLeaseRetentionMs) &&
+      options.expiredLeaseRetentionMs >= 0
+        ? Math.floor(options.expiredLeaseRetentionMs)
+        : DEFAULT_EXPIRED_LEASE_RETENTION_MS;
+    this.leaseCleanupIntervalMs =
+      options.leaseCleanupIntervalMs !== undefined && Number.isFinite(options.leaseCleanupIntervalMs)
+        ? Math.max(0, Math.floor(options.leaseCleanupIntervalMs))
+        : DEFAULT_LEASE_CLEANUP_INTERVAL_MS;
     this.nodeKey = `${NODE_KEY_PREFIX}${this.replicaId}`;
   }
 
@@ -159,12 +181,17 @@ export class HaCoordinator {
     }
     // 首次续租期间若已被 stop()，不再启动心跳定时器
     if (!this.running || this.generation !== startGen) return;
+    this.lastCleanupAt = Date.now();
     this.timer = setInterval(() => {
       if (!this.running || this.inFlightRenews.size > 0) return;
-      this.renew().catch((e) => {
-        if (e instanceof RenewAbortedError) return;
-        console.error(`HA 副本心跳续租失败（replica=${this.replicaId}）`, e);
-      });
+      this.renew()
+        .then(() => {
+          this.maybeCleanupExpiredLeases();
+        })
+        .catch((e) => {
+          if (e instanceof RenewAbortedError) return;
+          console.error(`HA 副本心跳续租失败（replica=${this.replicaId}）`, e);
+        });
     }, this.heartbeatIntervalMs);
     this.timer.unref?.();
   }
@@ -178,17 +205,21 @@ export class HaCoordinator {
       clearInterval(this.timer);
       this.timer = null;
     }
-    // 有界等待进行中的 renew 结束再删除，防止半开连接无限卡死停机
-    if (this.inFlightRenews.size > 0) {
-      const pending = [...this.inFlightRenews.entries()];
-      const raced = await raceWithTimeout(
-        Promise.allSettled(pending.map(([task]) => task)),
-        this.stopTimeoutMs,
-      );
+    // 有界等待进行中的 renew 与过期租约清理结束再删除，防止半开连接无限卡死停机
+    if (this.inFlightRenews.size > 0 || this.inFlightCleanup) {
+      const pendingRenews = [...this.inFlightRenews.entries()];
+      const pendingCleanup = this.inFlightCleanup;
+      const tasks: Promise<unknown>[] = pendingRenews.map(([task]) => task);
+      if (pendingCleanup) tasks.push(pendingCleanup.task);
+      const raced = await raceWithTimeout(Promise.allSettled(tasks), this.stopTimeoutMs);
       if (raced.outcome === 'timeout') {
-        for (const [task, ac] of pending) {
+        for (const [task, ac] of pendingRenews) {
           this.inFlightRenews.delete(task);
           ac.abort();
+        }
+        if (pendingCleanup) {
+          pendingCleanup.ac.abort();
+          if (this.inFlightCleanup === pendingCleanup) this.inFlightCleanup = null;
         }
         console.warn(
           `HA 副本停机等待在途续租超时（replica=${this.replicaId}, timeoutMs=${this.stopTimeoutMs}），将直接尝试删除租约`,
@@ -328,6 +359,73 @@ export class HaCoordinator {
         console.warn(`HA 副本${reason}失败（replica=${this.replicaId}）`, e);
       },
     );
+  }
+
+  private maybeCleanupExpiredLeases(): void {
+    if (!this.running || this.leaseCleanupIntervalMs <= 0 || this.inFlightCleanup) return;
+    const now = Date.now();
+    if (now - this.lastCleanupAt < this.leaseCleanupIntervalMs) return;
+    this.lastCleanupAt = now;
+    const ac = new AbortController();
+    const entry = { task: Promise.resolve(), ac };
+    entry.task = this.cleanupExpiredLeases(ac.signal)
+      .then(() => {})
+      .catch((e) => {
+        if (isDbClosedError(e)) return;
+        console.warn(`HA 副本清理过期节点租约失败（replica=${this.replicaId}）`, e);
+      })
+      .finally(() => {
+        if (this.inFlightCleanup === entry) this.inFlightCleanup = null;
+      });
+    this.inFlightCleanup = entry;
+  }
+
+  /**
+   * 清理过期超过保留宽限期（默认 1 小时）的崩溃节点租约行。
+   * 仅删除 `node:*` 前缀且排除当前副本自身，不误删未过期、刚过期或非 `node:` 租约（如 `job:*`）。
+   * 返回删除的行数；受单次续租超时上限约束。
+   */
+  async cleanupExpiredLeases(signal?: AbortSignal): Promise<number> {
+    const raced = await raceWithTimeout(this.executeCleanupExpiredLeases(), this.renewTimeoutMs, signal);
+    if (raced.outcome === 'aborted') return 0;
+    if (raced.outcome === 'timeout') {
+      throw new Error(
+        `HA 副本清理过期节点租约超时（replica=${this.replicaId}, timeoutMs=${this.renewTimeoutMs}）`,
+      );
+    }
+    return raced.value;
+  }
+
+  private async executeCleanupExpiredLeases(): Promise<number> {
+    if (this.db.dialect === 'pg') {
+      const pgTimeoutMs = Math.max(1, Math.floor(this.renewTimeoutMs * 0.9));
+      const timeoutParam = `${pgTimeoutMs}ms`;
+      const rows = await this.db.transaction(async (tx) => {
+        await tx.query(
+          "select set_config('statement_timeout', $1, true), set_config('lock_timeout', $1, true)",
+          [timeoutParam],
+        );
+        return tx.query<{ key: string }>(
+          `delete from ha_leases
+            where key like 'node:%'
+              and key <> $1
+              and expires_at < now() - ($2::double precision * interval '1 millisecond')
+          returning key`,
+          [this.nodeKey, this.expiredLeaseRetentionMs],
+        );
+      });
+      return rows.length;
+    }
+    const cutoff = new Date(Date.now() - this.expiredLeaseRetentionMs);
+    const rows = await this.db.query<{ key: string }>(
+      `delete from ha_leases
+        where key like 'node:%'
+          and key <> $1
+          and expires_at < $2
+      returning key`,
+      [this.nodeKey, cutoff],
+    );
+    return rows.length;
   }
 
   /** 判断指定副本当前租约是否仍有效 */

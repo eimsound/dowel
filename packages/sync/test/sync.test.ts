@@ -319,6 +319,421 @@ describe('同步：固定场景', () => {
     });
     expect(probe[0]?.msg).toMatchObject({ t: 'reject', n: 1, code: 'dependency' });
   });
+
+  test('outcome 有界裁剪：按最近插入/访问顺序淘汰旧记录，保护活跃依赖与去重窗口，且系统提交不挤占额度', async () => {
+    const room = new Room(emptyRoomState(emptyModel()), memoryStore(), { outcomeLimit: 4 });
+    await room.handle('c1', '张三', {
+      t: 'op',
+      op: { client: 'c1', n: 1, name: 'createSchema', args: { id: 's', name: 'public' }, reads: [] },
+    });
+    await room.handle('c1', '张三', {
+      t: 'op',
+      op: {
+        client: 'c1',
+        n: 2,
+        name: 'createTable',
+        args: { id: 't1', schema: 's', name: 't1' },
+        reads: [['s', 'p:c1:1']],
+      },
+    });
+
+    // 系统提交（replace / patch）不进入 outcome，不会挤掉活跃客户端的待确认结果
+    await room.replace('管理员', room.model, 'replaceModel');
+    await room.replace('管理员', room.model, 'replaceModel');
+    expect(room.stats.outcome).toBe(2);
+
+    // c2 提交 1 次，c1 再提交第 3 次并引用 p:c1:1（刷新 c1:1 到较新位置）
+    // 此时 outcome 满额 4 条，顺序为 [c1:2, c2:1, c1:1, c1:3]
+    await room.handle('c2', '李四', {
+      t: 'op',
+      op: {
+        client: 'c2',
+        n: 1,
+        name: 'createTable',
+        args: { id: 't2', schema: 's', name: 't2' },
+        reads: [['s', 1]],
+      },
+    });
+    const refreshC1 = await room.handle('c1', '张三', {
+      t: 'op',
+      op: {
+        client: 'c1',
+        n: 3,
+        name: 'createTable',
+        args: { id: 't3', schema: 's', name: 't3' },
+        reads: [['s', 'p:c1:1']],
+      },
+    });
+    expect(refreshC1[0]?.msg).toMatchObject({ t: 'commit', client: 'c1', n: 3 });
+    expect(room.stats.outcome).toBe(4);
+
+    // c2 再提交 1 次：最久未使用的 c1:2 被淘汰，但被引用刷新保活的 c1:1 仍保留
+    await room.handle('c2', '李四', {
+      t: 'op',
+      op: {
+        client: 'c2',
+        n: 2,
+        name: 'createTable',
+        args: { id: 't4', schema: 's', name: 't4' },
+        reads: [['s', 1]],
+      },
+    });
+    expect(room.stats.outcome).toBe(4);
+
+    // c1 仍可引用被刷新保活的 p:c1:1
+    const stillValid = await room.handle('c1', '张三', {
+      t: 'op',
+      op: {
+        client: 'c1',
+        n: 4,
+        name: 'createTable',
+        args: { id: 't5', schema: 's', name: 't5' },
+        reads: [['s', 'p:c1:1']],
+      },
+    });
+    expect(stillValid[0]?.msg).toMatchObject({ t: 'commit', client: 'c1', n: 4 });
+
+    // c1 引用已被淘汰的 p:c1:2 时返回 dependency 拒绝
+    const evictedRef = await room.handle('c1', '张三', {
+      t: 'op',
+      op: {
+        client: 'c1',
+        n: 5,
+        name: 'addColumn',
+        args: { table: 't1', column: { id: 'col1', name: 'id', type: 'integer' } },
+        reads: [['t1', 'p:c1:2']],
+      },
+    });
+    expect(evictedRef[0]?.msg).toEqual({
+      t: 'reject',
+      n: 5,
+      code: 'dependency',
+      message: '依赖的修改不存在',
+    });
+    expect(room.stats.outcome).toBe(4);
+
+    // outcome 淘汰后，lastProcessed 与重复发送去重语义仍完全保留
+    const dup = await room.handle('c1', '张三', {
+      t: 'op',
+      op: {
+        client: 'c1',
+        n: 2,
+        name: 'createTable',
+        args: { id: 't1_dup', schema: 's', name: 't1_dup' },
+        reads: [],
+      },
+    });
+    expect(dup).toEqual([]);
+    const welcome = await room.handle('c1', '张三', { t: 'hello', client: 'c1', lastSeq: room.seq });
+    expect(welcome[0]?.msg).toMatchObject({ t: 'welcome', lastProcessed: 5 });
+  });
+
+  test('rejections 单客户端与全局上限裁剪，兼容外部全量重放且不挤掉活跃客户端拒绝记录', async () => {
+    const room = new Room(emptyRoomState(emptyModel()), memoryStore(), {
+      rejectionsPerClientLimit: 3,
+      rejectionsLimit: 5,
+      outcomeLimit: 4,
+    });
+
+    // c1 连续触发 5 次拒绝（缺少 schema，renameSchema 直接报 EditError）
+    for (let n = 1; n <= 5; n++) {
+      const out = await room.handle('c1', '张三', {
+        t: 'op',
+        op: { client: 'c1', n, name: 'renameSchema', args: { id: 'missing', name: `s${n}` }, reads: [] },
+      });
+      expect(out[0]?.msg).toMatchObject({ t: 'reject', n, code: 'invalid' });
+    }
+    expect(room.stats.rejections).toBe(3);
+    expect(room.stats.rejectionClients).toBe(1);
+
+    // c1 重连握手：lastProcessed 为 5，仅保留最近的 [3, 4, 5]，重发旧 op n=1 仍按去重忽略
+    const helloC1 = await room.handle('c1', '张三', { t: 'hello', client: 'c1', lastSeq: 0 });
+    expect(helloC1[0]?.msg).toMatchObject({
+      t: 'welcome',
+      lastProcessed: 5,
+      rejected: [
+        expect.objectContaining({ n: 3 }),
+        expect.objectContaining({ n: 4 }),
+        expect.objectContaining({ n: 5 }),
+      ],
+    });
+    expect(
+      await room.handle('c1', '张三', {
+        t: 'op',
+        op: { client: 'c1', n: 1, name: 'renameSchema', args: { id: 'missing', name: 'dup' }, reads: [] },
+      }),
+    ).toEqual([]);
+
+    // c2 与 c3 产生 5 条新拒绝，达到全局上限 5 后淘汰最旧的 c1 拒绝记录并清理空键
+    for (let n = 1; n <= 3; n++) {
+      await room.handle('c2', '李四', {
+        t: 'op',
+        op: { client: 'c2', n, name: 'renameSchema', args: { id: 'missing', name: `b${n}` }, reads: [] },
+      });
+    }
+    for (let n = 1; n <= 2; n++) {
+      await room.handle('c3', '王五', {
+        t: 'op',
+        op: { client: 'c3', n, name: 'renameSchema', args: { id: 'missing', name: `w${n}` }, reads: [] },
+      });
+    }
+    expect(room.stats.rejections).toBe(5);
+    expect(room.stats.rejectionClients).toBe(2);
+
+    // 模拟 rooms.ts catchUpFrom 按 (client, n) 全量重放历史拒绝记录：已淘汰和已存在的记录一律幂等返回 false，绝不挤掉 c2/c3
+    for (let n = 1; n <= 5; n++) {
+      expect(room.applyExternalRejection('c1', { n, code: 'invalid', message: '旧拒绝' })).toBe(false);
+    }
+    for (let n = 1; n <= 3; n++) {
+      expect(room.applyExternalRejection('c2', { n, code: 'invalid', message: '已存在' })).toBe(false);
+    }
+    const helloC2 = await room.handle('c2', '李四', { t: 'hello', client: 'c2', lastSeq: 0 });
+    expect(helloC2[0]?.msg).toMatchObject({
+      t: 'welcome',
+      lastProcessed: 3,
+      rejected: [
+        expect.objectContaining({ n: 1 }),
+        expect.objectContaining({ n: 2 }),
+        expect.objectContaining({ n: 3 }),
+      ],
+    });
+    const helloC3 = await room.handle('c3', '王五', { t: 'hello', client: 'c3', lastSeq: 0 });
+    expect(helloC3[0]?.msg).toMatchObject({
+      t: 'welcome',
+      lastProcessed: 2,
+      rejected: [expect.objectContaining({ n: 1 }), expect.objectContaining({ n: 2 })],
+    });
+
+    // c1 真正新增的外部拒绝 n=6 仍可正常合入并推进 lastProcessed
+    expect(room.applyExternalRejection('c1', { n: 6, code: 'conflict', message: '新冲突' })).toBe(true);
+    expect(room.stats.rejections).toBe(5);
+    const helloC1After = await room.handle('c1', '张三', { t: 'hello', client: 'c1', lastSeq: 0 });
+    expect(helloC1After[0]?.msg).toEqual({
+      t: 'welcome',
+      lastProcessed: 6,
+      rejected: [{ n: 6, code: 'conflict', message: '新冲突' }],
+    });
+
+    // 乱序外部合入（先 n=10 后 n=9）触发全局裁剪时，同一客户端优先淘汰更旧的 n=9 而保留 n=10
+    const oooRoom = new Room(emptyRoomState(emptyModel()), memoryStore(), {
+      rejectionsPerClientLimit: 3,
+      rejectionsLimit: 1,
+    });
+    expect(oooRoom.applyExternalRejection('c_ooo', { n: 10, code: 'conflict', message: '较新' })).toBe(true);
+    expect(oooRoom.applyExternalRejection('c_ooo', { n: 9, code: 'conflict', message: '较旧' })).toBe(false);
+    const oooHello = await oooRoom.handle('c_ooo', '测试', { t: 'hello', client: 'c_ooo', lastSeq: 0 });
+    expect(oooHello[0]?.msg).toEqual({
+      t: 'welcome',
+      lastProcessed: 10,
+      rejected: [{ n: 10, code: 'conflict', message: '较新' }],
+    });
+
+    // 构造器快照重载时自动裁剪超量历史 rejections，且优先保留近期有提交的活跃客户端记录
+    const loadedState = emptyRoomState(emptyModel());
+    loadedState.log = [
+      {
+        t: 'commit',
+        seq: 1,
+        client: 'active',
+        n: 1,
+        user: '活跃用户',
+        changes: [{ id: 's1', obj: { kind: 'schema', id: 's1', name: 'public', comment: null } }],
+      },
+    ];
+    loadedState.model.objects.s1 = { kind: 'schema', id: 's1', name: 'public', comment: null };
+    loadedState.seq = 1;
+    loadedState.processed = { stale: 3, active: 3 };
+    loadedState.rejections = {
+      stale: [
+        { n: 1, code: 'conflict', message: 's1' },
+        { n: 2, code: 'conflict', message: 's2' },
+        { n: 3, code: 'conflict', message: 's3' },
+      ],
+      active: [
+        { n: 2, code: 'conflict', message: 'a2' },
+        { n: 3, code: 'conflict', message: 'a3' },
+      ],
+    };
+    const loadedRoom = new Room(loadedState, memoryStore(), {
+      rejectionsPerClientLimit: 2,
+      rejectionsLimit: 3,
+    });
+    expect(loadedRoom.stats.rejections).toBe(3);
+    const activeWelcome = await loadedRoom.handle('active', '活跃用户', {
+      t: 'hello',
+      client: 'active',
+      lastSeq: 1,
+    });
+    expect(activeWelcome[0]?.msg).toEqual({
+      t: 'welcome',
+      lastProcessed: 3,
+      rejected: [
+        { n: 2, code: 'conflict', message: 'a2' },
+        { n: 3, code: 'conflict', message: 'a3' },
+      ],
+    });
+    const staleWelcome = await loadedRoom.handle('stale', '历史用户', {
+      t: 'hello',
+      client: 'stale',
+      lastSeq: 1,
+    });
+    expect(staleWelcome[0]?.msg).toEqual({
+      t: 'welcome',
+      lastProcessed: 3,
+      rejected: [{ n: 3, code: 'conflict', message: 's3' }],
+    });
+  });
+
+  test('lastWriter 在对象删除、模型 replace、快照重载时清理，并在极端对象数下遵守上限', async () => {
+    const room = new Room(emptyRoomState(emptyModel()), memoryStore());
+    let n = 0;
+    const send = (name: string, args: unknown, reads: [string, number | string | null][] = []) =>
+      room.handle('c1', '张三', { t: 'op', op: { client: 'c1', n: ++n, name, args, reads } });
+
+    await send('createSchema', { id: 's', name: 'public' });
+    await send('createEnum', { id: 'e1', schema: 's', name: 'role_t', values: ['admin'] });
+    await send('createTable', { id: 't1', schema: 's', name: 'users' });
+    await send('addColumn', { table: 't1', column: { id: 'c1', name: 'id', type: 'integer' } });
+    await send('addColumn', { table: 't1', column: { id: 'c2', name: 'age', type: 'integer' } });
+    await send('addCheck', { id: 'chk1', table: 't1', expr: '(age > 0)' });
+    await send('addIndex', { id: 'idx1', table: 't1', elements: [{ column: 'c1' }] });
+    // 7 个存活对象：s, e1, t1, c1, c2, chk1, idx1
+    expect(room.stats.lastWriter).toBe(7);
+
+    // 逐类删除：约束、索引、列、枚举、表（含级联删列）都同步清理 lastWriter
+    await send('dropKey', { id: 'chk1' });
+    expect(room.stats.lastWriter).toBe(6);
+    await send('dropKey', { id: 'idx1' });
+    expect(room.stats.lastWriter).toBe(5);
+    await send('dropColumn', { id: 'c2' });
+    expect(room.stats.lastWriter).toBe(4);
+    await send('dropEnum', { id: 'e1' });
+    expect(room.stats.lastWriter).toBe(3);
+
+    // 对已删除列发起冲突操作：回退文案“其他人”，不再残留旧 lastWriter
+    const deletedConflict = await room.handle('c2', '李四', {
+      t: 'op',
+      op: {
+        client: 'c2',
+        n: 1,
+        name: 'renameColumn',
+        args: { id: 'c2', name: 'years' },
+        reads: [['c2', 5]],
+      },
+    });
+    expect(deletedConflict[0]?.msg).toEqual({
+      t: 'reject',
+      n: 1,
+      code: 'conflict',
+      message: '对象 已被 其他人 删除，请在最新数据上重新操作',
+    });
+
+    // dropTable 级联移除表与残留列 c1，仅剩 schema s
+    await send('dropTable', { id: 't1' });
+    expect(room.stats.lastWriter).toBe(1);
+
+    // replace 加入不透明对象再清空：opaque 对象的 lastWriter 随 replace 正确增删
+    const withOpaque = structuredClone(room.model);
+    withOpaque.objects.op1 = {
+      kind: 'opaque',
+      id: 'op1',
+      parent: 's',
+      name: 'v_users',
+      objType: 'view',
+      ddl: ['CREATE VIEW public.v_users AS SELECT 1'],
+      drop: 'DROP VIEW public.v_users',
+      deps: [],
+      order: 0,
+      comment: null,
+    };
+    await room.replace('导入者', withOpaque, 'import');
+    expect(room.stats.lastWriter).toBe(2);
+    await room.replace('管理员', emptyModel(), 'reset');
+    expect(room.stats.lastWriter).toBe(0);
+
+    // 快照重载：log 里包含已删除对象的历史提交时，构造后的 lastWriter 只保留当前模型中存活的对象
+    const reloadModel = emptyModel();
+    reloadModel.objects.s = { kind: 'schema', id: 's', name: 'public', comment: null };
+    const reloadState = emptyRoomState(reloadModel);
+    reloadState.seq = 2;
+    reloadState.versions = { s: 1 };
+    reloadState.log = [
+      {
+        t: 'commit',
+        seq: 1,
+        client: 'c1',
+        n: 1,
+        user: '张三',
+        changes: [
+          { id: 's', obj: { kind: 'schema', id: 's', name: 'public', comment: null } },
+          {
+            id: 'gone',
+            obj: {
+              kind: 'table',
+              id: 'gone',
+              parent: 's',
+              name: 'old',
+              partitionBy: null,
+              partitionOf: null,
+              comment: null,
+            },
+          },
+        ],
+      },
+      {
+        t: 'commit',
+        seq: 2,
+        client: 'c1',
+        n: 2,
+        user: '李四',
+        changes: [{ id: 'gone', obj: null }],
+      },
+    ];
+    const reloaded = new Room(reloadState, memoryStore());
+    expect(reloaded.stats.lastWriter).toBe(1);
+
+    // lastWriterLimit 上限保护：创建超过上限的对象时淘汰最旧条目，保留最新写入者
+    const capped = new Room(emptyRoomState(emptyModel()), memoryStore(), { lastWriterLimit: 3 });
+    await capped.handle('c1', '张三', {
+      t: 'op',
+      op: { client: 'c1', n: 1, name: 'createSchema', args: { id: 's', name: 'public' }, reads: [] },
+    });
+    for (let i = 1; i <= 5; i++) {
+      await capped.handle('c1', `用户${i}`, {
+        t: 'op',
+        op: {
+          client: 'c1',
+          n: i + 1,
+          name: 'createTable',
+          args: { id: `t${i}`, schema: 's', name: `t${i}` },
+          reads: [['s', 1]],
+        },
+      });
+    }
+    expect(capped.stats.lastWriter).toBe(3);
+
+    // 最旧的 t1 已被淘汰 → 冲突文案回退为“其他人”；最新的 t5 仍在缓存 → 保留“用户5”
+    const oldConflict = await capped.handle('c2', '观察者', {
+      t: 'op',
+      op: { client: 'c2', n: 1, name: 'renameTable', args: { id: 't1', name: 't1_x' }, reads: [['t1', 0]] },
+    });
+    expect(oldConflict[0]?.msg).toEqual({
+      t: 'reject',
+      n: 1,
+      code: 'conflict',
+      message: '表 t1 已被 其他人 修改，请在最新数据上重新操作',
+    });
+    const newConflict = await capped.handle('c2', '观察者', {
+      t: 'op',
+      op: { client: 'c2', n: 2, name: 'renameTable', args: { id: 't5', name: 't5_x' }, reads: [['t5', 0]] },
+    });
+    expect(newConflict[0]?.msg).toEqual({
+      t: 'reject',
+      n: 2,
+      code: 'conflict',
+      message: '表 t5 已被 用户5 修改，请在最新数据上重新操作',
+    });
+  });
 });
 
 // ───── 随机测试 ─────

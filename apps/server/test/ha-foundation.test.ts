@@ -20,7 +20,11 @@ import {
   type PlatformDb,
 } from '../src/db.ts';
 import { EnvBusyError, EnvLocks, lockEnvIdle } from '../src/executions.ts';
-import { HaCoordinator } from '../src/ha.ts';
+import {
+  DEFAULT_EXPIRED_LEASE_RETENTION_MS,
+  DEFAULT_LEASE_CLEANUP_INTERVAL_MS,
+  HaCoordinator,
+} from '../src/ha.ts';
 import { encrypt } from '../src/secrets.ts';
 import { autoSetup, ensureSetupToken, SETUP_TOKEN_KEY } from '../src/setup.ts';
 import { makeUser, PASSWORD } from './support.ts';
@@ -834,6 +838,111 @@ describe.each([
       if (dbB !== dbA) await dbB.close();
     }
   });
+
+  test.skipIf(skip)(
+    '定期与显式清理过期已久的 node:* 租约行，不误删存活、未满宽限期、自身及非 node: 租约（#45）',
+    async () => {
+      let db: PlatformDb;
+      if (platform === 'sqlite') {
+        db = await openPlatformDb(':memory:');
+      } else {
+        const t = await createTestDb('ha_lease_cleanup');
+        closers.push(t.close);
+        db = await openPlatformDb(t.url);
+      }
+
+      const defaultHa = new HaCoordinator(db, { replicaId: 'node-defaults' });
+      expect(defaultHa.expiredLeaseRetentionMs).toBe(DEFAULT_EXPIRED_LEASE_RETENTION_MS);
+      expect(defaultHa.leaseCleanupIntervalMs).toBe(DEFAULT_LEASE_CLEANUP_INTERVAL_MS);
+
+      const ha = new HaCoordinator(db, {
+        replicaId: 'node-cleaner',
+        ttlMs: 1_500,
+        heartbeatIntervalMs: 80,
+        expiredLeaseRetentionMs: 60_000, // 宽限期 60s
+        leaseCleanupIntervalMs: 180, // 180ms 节流后自动清理
+      });
+
+      const listKeys = async (): Promise<string[]> => {
+        const rows = await db.query<{ key: string }>('select key from ha_leases order by key');
+        return rows.map((r) => r.key);
+      };
+
+      try {
+        const now = Date.now();
+        // 1. 过期超过宽限期（2 分钟前过期）的崩溃节点租约 → 应被清理
+        await db.query(
+          "insert into ha_leases (key, owner, expires_at) values ('node:crashed-old-1', 'crashed-old-1', $1)",
+          [new Date(now - 120_000)],
+        );
+        await db.query(
+          "insert into ha_leases (key, owner, expires_at) values ('node:crashed-old-2', 'crashed-old-2', $1)",
+          [new Date(now - 90_000)],
+        );
+        // 2. 刚刚过期但未满 60s 宽限期（10 秒前过期）的节点租约 → 不应被误删
+        await db.query(
+          "insert into ha_leases (key, owner, expires_at) values ('node:crashed-recent', 'crashed-recent', $1)",
+          [new Date(now - 10_000)],
+        );
+        // 3. 仍然存活的另一节点租约 → 不应被误删
+        await db.query(
+          "insert into ha_leases (key, owner, expires_at) values ('node:other-alive', 'other-alive', $1)",
+          [new Date(now + 60_000)],
+        );
+        // 4. 非 node: 前缀的租约（即便已过期很久）→ 不应被误删
+        await db.query(
+          "insert into ha_leases (key, owner, expires_at) values ('job:drift-sweep', 'old-node', $1)",
+          [new Date(now - 300_000)],
+        );
+
+        // 先验证显式 cleanupExpiredLeases() 精准清理
+        const deleted = await ha.cleanupExpiredLeases();
+        expect(deleted).toBe(2);
+        expect(await listKeys()).toEqual(['job:drift-sweep', 'node:crashed-recent', 'node:other-alive']);
+
+        // 再插入一条过期很久的崩溃节点租约，验证 start() 心跳周期内按节流间隔自动清理
+        await db.query(
+          "insert into ha_leases (key, owner, expires_at) values ('node:crashed-periodic', 'crashed-periodic', $1)",
+          [new Date(now - 180_000)],
+        );
+        await ha.start();
+
+        // 刚 start() 完成时未满节流间隔，不应阻塞启动清理
+        expect(await listKeys()).toContain('node:crashed-periodic');
+        expect(await listKeys()).toContain('node:node-cleaner');
+
+        // 等待节流间隔后的心跳自动清理过期节点行
+        await waitFor(async () => !(await listKeys()).includes('node:crashed-periodic'), 3_000);
+        expect(await listKeys()).toEqual([
+          'job:drift-sweep',
+          'node:crashed-recent',
+          'node:node-cleaner',
+          'node:other-alive',
+        ]);
+
+        // 即使把保留阈值设为 0，也不会误删本副本自身租约行
+        const zeroRetentionHa = new HaCoordinator(db, {
+          replicaId: 'node-self-guard',
+          ttlMs: 100,
+          expiredLeaseRetentionMs: 0,
+        });
+        await db.query(
+          "insert into ha_leases (key, owner, expires_at) values ('node:node-self-guard', 'node-self-guard', $1)",
+          [new Date(Date.now() - 10_000)],
+        );
+        expect(await zeroRetentionHa.cleanupExpiredLeases()).toBe(1); // 仅清理 node:crashed-recent
+        expect(await listKeys()).toEqual([
+          'job:drift-sweep',
+          'node:node-cleaner',
+          'node:node-self-guard',
+          'node:other-alive',
+        ]);
+      } finally {
+        await ha.stop();
+        await db.close();
+      }
+    },
+  );
 });
 
 describe('HaCoordinator 续租超时、有界停机与防租约复活（#23）', () => {
