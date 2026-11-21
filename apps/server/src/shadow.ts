@@ -1,13 +1,14 @@
 // 影子库上的操作：导入 DDL、闭环验证、风险分析、派生数据的规范化。
 // 影子库只能是真实的 PostgreSQL 实例（targets.ts 的 pgShadow），没有兜底。
 
-import type { StepRisk, StoredVerifyReport, VerifyReport } from '@dowel/api';
+import type { StepRisk, StoredVerifyReport, VerifyReport, VerifyTargetReport } from '@dowel/api';
 import {
   deepEqual,
   findInstanceLevelStatement,
   INSTANCE_LEVEL_DESCRIPTION,
   type Model,
   type Obj,
+  type PlanOptions,
   plan,
   type Step,
 } from '@dowel/core';
@@ -16,6 +17,7 @@ import {
   analyze,
   build,
   InstanceLevelStatementError,
+  readShadowPgMajor,
   resetShadow,
   runSteps,
   StepError,
@@ -32,11 +34,16 @@ import { scrubSecrets } from './secrets.ts';
  */
 export type ImportableSql = string & { readonly __importable: unique symbol };
 
+export interface ShadowVerifyScriptsOptions extends VerifyScriptsOptions {
+  /** 跳过锁和重写风险分析（多版本影子库验证时，只在首个/最低版本影子库分析一次） */
+  skipRisk?: boolean;
+}
+
 export interface Shadow {
   /** 在空的影子库里执行一段已检查过的 DDL（assertImportable），读出结构并导入成 IR（只读 schema 范围内的） */
   importSql(sql: ImportableSql): Promise<Model>;
   /** 闭环验证 from → to，并分析每一步的锁和重写 */
-  verify(from: Model, to: Model): Promise<VerifyReport>;
+  verify(from: Model, to: Model, opts?: PlanOptions): Promise<VerifyReport>;
   /**
    * 闭环验证**给定的脚本**（冻结的 up / down，可能被人工改过），不重新 plan：建 from → 执行 up → 必须等于 to →
    * 执行 down → 必须等于 from，并分析 up 每一步的锁和重写。
@@ -46,7 +53,7 @@ export interface Shadow {
     to: Model,
     up: ScriptStep[],
     down: ScriptStep[],
-    options?: VerifyScriptsOptions,
+    options?: ShadowVerifyScriptsOptions,
   ): Promise<VerifyReport>;
   /**
    * 派生数据（04-ir-design.md 2.6）：建出 prev（已规范化的版本），执行到 next 的迁移，读回引擎输出，
@@ -118,7 +125,11 @@ const errorOf = (e: unknown, timeoutMs: number) =>
     : { step: null, message: scrubSecrets(e instanceof Error ? e.message : String(e)) };
 
 /** 影子库给的完整报告 → 存进版本里的报告（up / down 就是冻结的脚本本身，不重复存） */
-export const storedReport = (r: VerifyReport, shadow: string): StoredVerifyReport => ({
+export const storedReport = (
+  r: VerifyReport,
+  shadow: string,
+  extra?: { targets?: VerifyTargetReport[]; missingTargetMajor?: number | null },
+): StoredVerifyReport => ({
   ok: r.ok,
   upDiff: r.upDiff,
   downDiff: r.downDiff,
@@ -127,6 +138,8 @@ export const storedReport = (r: VerifyReport, shadow: string): StoredVerifyRepor
   error: r.error,
   shadow,
   at: new Date().toISOString(),
+  ...(extra?.targets?.length ? { targets: extra.targets } : {}),
+  ...(extra?.missingTargetMajor !== undefined ? { missingTargetMajor: extra.missingTargetMajor } : {}),
 });
 
 /**
@@ -254,8 +267,10 @@ export const shadowOps = (
   },
   canonicalize: async (prev: Model, next: Model): Promise<Obj[]> => {
     const d = await db();
-    await build(d, prev);
-    await runSteps(d, plan(prev, next));
+    const pgMajor = await readShadowPgMajor(d);
+    const planOpts = pgMajor !== null ? { pgMajor } : undefined;
+    await build(d, prev, planOpts);
+    await runSteps(d, plan(prev, next, planOpts));
     // 读回引擎里的结构，按名字对回 next 的 ID，取出规范形式
     const engine = reconcileIds(next, importSnapshot(await readSnapshot(d, schemas)));
     const out: Obj[] = [];
@@ -301,23 +316,35 @@ export const shadowOps = (
     to: Model,
     up: ScriptStep[],
     down: ScriptStep[],
-    options?: VerifyScriptsOptions,
+    options?: ShadowVerifyScriptsOptions,
   ): Promise<VerifyReport> => {
     const d = await db();
     try {
       const r = await verifyScripts(d, from, to, up, down, options);
-      const risk = await risksOf(d, from, r.up, statementTimeoutMs);
-      return { ok: !r.upDiff.length && !r.downDiff.length, ...r, ...risk, error: null };
+      const risk = options?.skipRisk ? { risks: [] } : await risksOf(d, from, r.up, statementTimeoutMs);
+      return {
+        ok: !r.upDiff.length && !r.downDiff.length,
+        ...r,
+        ...risk,
+        error: null,
+        shadowMajor: r.shadowMajor,
+      };
     } catch (e) {
       return failedReport(e, statementTimeoutMs);
     }
   },
-  verify: async (from: Model, to: Model): Promise<VerifyReport> => {
+  verify: async (from: Model, to: Model, opts?: PlanOptions): Promise<VerifyReport> => {
     const d = await db();
     try {
-      const r = await verify(d, from, to);
+      const r = await verify(d, from, to, opts);
       const risk = await risksOf(d, from, r.up, statementTimeoutMs);
-      return { ok: !r.upDiff.length && !r.downDiff.length, ...r, ...risk, error: null };
+      return {
+        ok: !r.upDiff.length && !r.downDiff.length,
+        ...r,
+        ...risk,
+        error: null,
+        shadowMajor: r.shadowMajor,
+      };
     } catch (e) {
       return failedReport(e, statementTimeoutMs);
     }

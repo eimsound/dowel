@@ -77,6 +77,20 @@ export const Overview = () => {
           </dd>
           <dt className="text-text-2">{t('ov.role')}</dt>
           <dd className="m-0">{t(`projects.role.${project.role}`)}</dd>
+          {(project.envPgMajors.length > 1 ||
+            (project.targetPgMajor !== null && project.targetPgMajor < 18)) && (
+            <>
+              <dt className="text-text-2">{t('ov.targetPg')}</dt>
+              <dd className="m-0 flex flex-wrap items-center gap-2">
+                <span className="font-mono">PostgreSQL {project.targetPgMajor}+</span>
+                {project.envPgMajors.length > 1 && (
+                  <span className="font-mono text-xs text-text-3">
+                    ({project.envPgMajors.map((v) => `PG ${v}`).join(' · ')})
+                  </span>
+                )}
+              </dd>
+            </>
+          )}
         </dl>
 
         <div className="grid grid-cols-2 gap-6 max-[1100px]:grid-cols-1">
@@ -136,6 +150,9 @@ export const Overview = () => {
                     >
                       {e.name}
                     </Link>
+                    {e.engineMajor !== null && (
+                      <span className="chip shrink-0 font-mono">PG {e.engineMajor}</span>
+                    )}
                     {e.production && <span className="badge danger">{t('ov.envProduction')}</span>}
                     {e.drift.status === 'drifted' || e.drift.status === 'error' ? (
                       <DriftBadge drift={e.drift} />

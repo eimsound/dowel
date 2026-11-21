@@ -152,15 +152,17 @@ export const scrubUrl = (message: string, url: string): string => {
   return out;
 };
 
-/** 连接检查：版本、当前用户和权限、schema 列表（带表数）、dowel schema 是否存在。只读，不建影子库。 */
-export const inspectTarget = async (
-  url: string,
-  connectTimeout = CHECK_CONNECT_TIMEOUT,
-  guard?: ConnectionGuard,
-): Promise<TargetInfo> => {
-  const c = connectPg(url, connectTimeout, guard);
+/** 从 PG server_version（如 "16.4 (Debian 16.4-1.pgdg120+1)" 或 "18.1"）提取简洁版本串 */
+export const normalizePgVersion = (raw: string): string => {
+  const trimmed = raw.trim();
+  const token = trimmed.split(/\s+/)[0];
+  return token || trimmed;
+};
+
+/** 在已有目标库连接上做基础探测（只读，不建影子库；inspectTarget 与 claims.ts 复用） */
+export const inspectTargetOn = async (tdb: Db, url: string): Promise<TargetInfo> => {
   try {
-    const [r] = await c.db.query<{
+    const [r] = await tdb.query<{
       version: string;
       num: number;
       database: string;
@@ -177,12 +179,12 @@ export const inspectTarget = async (
               has_database_privilege(current_database(), 'CREATE') as "canCreateSchema"`,
     );
     const shadow = shadowDbName(r!.database);
-    const [ex] = await c.db.query<{ n: number }>(
+    const [ex] = await tdb.query<{ n: number }>(
       'select count(*)::int as n from pg_database where datname = $1',
       [shadow],
     );
     // schema 列表：排除系统 schema（pg_*、information_schema）和 dowel，每个带上表数
-    const schemas = await c.db.query<SchemaInfo>(
+    const schemas = await tdb.query<SchemaInfo>(
       `select n.nspname as name, count(c.oid)::int as tables
          from pg_namespace n
          left join pg_class c on c.relnamespace = n.oid and c.relkind in ('r', 'p')
@@ -190,15 +192,15 @@ export const inspectTarget = async (
         group by n.nspname order by n.nspname`,
       [DOWEL_SCHEMA],
     );
-    const [dowel] = await c.db.query<{ schema: boolean; meta: boolean }>(
+    const [dowel] = await tdb.query<{ schema: boolean; meta: boolean }>(
       `select exists(select 1 from pg_namespace where nspname = $1) as schema,
               exists(select 1 from pg_class c join pg_namespace n on n.oid = c.relnamespace
                       where n.nspname = $1 and c.relname = 'meta' and c.relkind in ('r', 'p')) as meta`,
       [DOWEL_SCHEMA],
     );
     return {
-      version: r!.version,
-      versionNum: r!.num,
+      version: normalizePgVersion(r!.version),
+      versionNum: Number(r!.num),
       database: r!.database,
       canCreateDb: r!.createdb,
       shadow,
@@ -214,6 +216,18 @@ export const inspectTarget = async (
     // 白名单等前置检查的 422 不包装成“连接失败”（它本来就不是连接问题）
     if (e instanceof HTTPException) throw e;
     throw new ConnectError(`连接失败：${scrubUrl(rawError(e), url)}`);
+  }
+};
+
+/** 连接检查：版本、当前用户和权限、schema 列表（带表数）、dowel schema 是否存在。只读，不建影子库。 */
+export const inspectTarget = async (
+  url: string,
+  connectTimeout = CHECK_CONNECT_TIMEOUT,
+  guard?: ConnectionGuard,
+): Promise<TargetInfo> => {
+  const c = connectPg(url, connectTimeout, guard);
+  try {
+    return await inspectTargetOn(c.db, url);
   } finally {
     await c.close();
   }
@@ -428,7 +442,7 @@ export const pgShadow = (shadowUrl: string, schemas?: string[] | null, guard?: C
   };
   return {
     importSql: (sql) => run((ops) => ops.importSql(sql)),
-    verify: (from, to): Promise<VerifyReport> => run((ops) => ops.verify(from, to)),
+    verify: (from, to, opts): Promise<VerifyReport> => run((ops) => ops.verify(from, to, opts)),
     verifyScripts: (from, to, up, down, options): Promise<VerifyReport> =>
       run((ops) => ops.verifyScripts(from, to, up, down, options)),
     canonicalize: (prev, next) => run((ops) => ops.canonicalize(prev, next)),

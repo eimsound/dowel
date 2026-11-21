@@ -19,7 +19,7 @@ import {
   type WizardEvent,
   type WizardStage,
 } from '@dowel/api';
-import { createSchema, emptyModel, type Model, newId } from '@dowel/core';
+import { createSchema, deriveTargetPgMajor, emptyModel, type Model, newId, pgMajorOf } from '@dowel/core';
 import { ScopeError } from '@dowel/engines';
 import type { Hono } from 'hono';
 import { HTTPException } from 'hono/http-exception';
@@ -92,13 +92,24 @@ export const registerWizard = (app: Hono<Env>, ctx: AppContext) => {
     const importable = kind === 'sql' ? assertImportable(b.content.sql!) : null;
 
     // 和环境创建同样的检查：每个环境都要连得上（白名单在连接层检查）；配置了影子库的还要能认领
+    const inspected = new Map<string, { version: string; versionNum: number }>();
     for (const e of environments) {
-      await inspectTarget(e.url, CHECK_CONNECT_TIMEOUT, ctx.guard);
+      const info = await inspectTarget(e.url, CHECK_CONNECT_TIMEOUT, ctx.guard);
+      inspected.set(e.name, { version: info.version, versionNum: info.versionNum });
       if (e.shadowUrl) await claimShadow(e.shadowUrl, ctx.guard);
     }
 
     const slug = await pickProjectSlug(db, g.id, b.name, b.slug);
-    const envRows = environments.map((e) => ({ ...e, id: newId() }));
+    const envRows = environments.map((e) => {
+      const v = inspected.get(e.name);
+      return {
+        ...e,
+        id: newId(),
+        engineVersion: v?.version ?? null,
+        engineVersionNum: v?.versionNum ?? null,
+      };
+    });
+    const targetPgMajor = deriveTargetPgMajor(envRows.map((e) => pgMajorOf(e.engineVersionNum)));
     const project: ProjectCreated = {
       id: newId(),
       name: b.name,
@@ -175,7 +186,9 @@ export const registerWizard = (app: Hono<Env>, ctx: AppContext) => {
         // - 没有可用的影子库（ShadowError：生产环境不让用同实例、没有建库权限、连不上、被占用）：基线未验证；
         // - 脚本执行失败 / 结构对不上：基线未验证，带着失败报告；
         // - 其他任何意外错误：记日志，基线未验证，报告里写明原因。
-        const baseline = imported ? freezeBaseline(model, scope) : null;
+        const baseline = imported
+          ? freezeBaseline(model, scope, targetPgMajor !== null ? { pgMajor: targetPgMajor } : undefined)
+          : null;
         let baselineReport: StoredVerifyReport | null = null;
         if (baseline) {
           try {
@@ -237,8 +250,9 @@ export const registerWizard = (app: Hono<Env>, ctx: AppContext) => {
           );
           for (const e of envRows)
             await tx.query(
-              `insert into environments (id, project_id, name, url_enc, production, allow_same_instance, shadow_url_enc)
-               values ($1, $2, $3, $4, $5, $6, $7)`,
+              `insert into environments (id, project_id, name, url_enc, production, allow_same_instance, shadow_url_enc,
+                                         engine_version, engine_version_num)
+               values ($1, $2, $3, $4, $5, $6, $7, $8, $9)`,
               [
                 e.id,
                 project.id,
@@ -247,6 +261,8 @@ export const registerWizard = (app: Hono<Env>, ctx: AppContext) => {
                 e.production,
                 e.allowSameInstance,
                 e.shadowUrl ? encrypt(e.shadowUrl) : null,
+                e.engineVersion,
+                e.engineVersionNum,
               ],
             );
           // v0 基线：number 0、没有 parent；up 是在空库上建出这个模型，down 为空（基线没有回滚）。

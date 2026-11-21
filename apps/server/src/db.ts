@@ -1123,6 +1123,23 @@ export const MIGRATIONS: MigrationStep[] = [
       );
     },
   },
+  // PG 多版本支持：按环境持久化目标库 PostgreSQL 版本串（如 "16.4"）与 server_version_num（如 160004）
+  {
+    run: async (tx, d) => {
+      if (d === 'pg') {
+        await tx.exec(`alter table environments add column if not exists engine_version text;
+   alter table environments add column if not exists engine_version_num integer;`);
+        return;
+      }
+      const cols = await tx.query<{ name: string }>('pragma table_info(environments)');
+      if (!cols.some((c) => c.name === 'engine_version')) {
+        await tx.exec('alter table environments add column engine_version text;');
+      }
+      if (!cols.some((c) => c.name === 'engine_version_num')) {
+        await tx.exec('alter table environments add column engine_version_num integer;');
+      }
+    },
+  },
 ];
 
 /** PG 启动迁移使用的跨副本 advisory lock 键 */

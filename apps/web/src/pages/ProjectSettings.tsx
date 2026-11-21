@@ -327,6 +327,12 @@ const SchemaScope = ({
   const activeEnv = envs.data?.find((e) => e.id === envId) ?? first;
   const check = useMutation({
     mutationFn: (eid: string) => api<TargetInfo>('POST', `/api/projects/${pid}/environments/${eid}/test`),
+    onSuccess: () => {
+      void qc.invalidateQueries({ queryKey: ['envs', pid] });
+      void qc.invalidateQueries({ queryKey: ['project', pid] });
+      void qc.invalidateQueries({ queryKey: ['migration', pid] });
+      void qc.invalidateQueries({ queryKey: ['ddl', pid] });
+    },
   });
   // 打开这一节时先用第一个环境检查一次：schema 勾选列表直接出现，不用先点“检查连接”
   const started = useRef(false);

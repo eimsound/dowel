@@ -32,6 +32,8 @@ const zh = {
   ov: {
     group: '所属组',
     role: '我的角色',
+    targetPg: '目标兼容版本',
+    targetPgUnknown: 'PostgreSQL（尚未探测环境版本）',
     recentVersions: '最近版本',
     allVersions: '查看全部版本',
     environments: '环境',
@@ -95,6 +97,7 @@ const zh = {
     noRollback: '基线没有回滚脚本。',
     verifyPassed: '验证通过',
     verifyFailed: '验证没有通过，见下方报告',
+    verifyMissingTarget: '未完成最低目标版本验证，见下方详情',
   },
   envp: {
     title: '环境',
@@ -120,6 +123,8 @@ const zh = {
     sameInstance: '允许在同一实例上建影子库',
     status: '连接状态',
     statusUnknown: '未测试',
+    pgVersion: 'PostgreSQL 版本',
+    pgVersionUnknown: '尚未探测（点击「测试连接」以记录版本）',
     manageHint: '只有项目管理员能添加和删除环境。',
     delete: '删除环境',
     deleteTitle: '删除环境 {{name}}？',
@@ -824,6 +829,10 @@ const zh = {
     peopleOnline: '{{count}} 人在线',
     shadowOf: '影子库：{{env}} 环境',
     noEnv: '未配置环境',
+    pgTargetMultiTip:
+      '目标兼容版本由项目环境中最低的 PostgreSQL 版本推导：PG {{target}}+（当前环境：{{versions}}）',
+    pgTargetSingleTip: '目标兼容版本来自项目环境：PG {{target}}+',
+    pgTargetUnknownTip: '尚未记录环境 PostgreSQL 版本，默认按最新 PostgreSQL 语法规划',
   },
   canvas: { zoomIn: '放大', zoomOut: '缩小', fit: '适应画布', partitions: '{{count}} 个分区' },
   insp: {
@@ -930,6 +939,13 @@ const zh = {
     noSteps: '两个版本相同，没有需要执行的语句。',
     verifyOkTitle: '验证通过',
     verifyOk: '升级后与目标一致，回滚后回到起点。',
+    verifyTargetsAllPassed: '（{{versions}} 均通过）',
+    verifyTargetSinglePassed: '（{{version}} 通过）',
+    verifyTargetPassed: 'PG {{major}} 通过',
+    verifyTargetFailed: 'PG {{major}} 失败',
+    verifyMissingTargetTitle: '未完成最低目标版本验证',
+    verifyMissingTargetBody:
+      '缺少 PG {{major}} 影子库，无法将此版本标记为已验证。请为对应环境配置独立影子库或允许使用同实例影子库。',
     highRisks: '其中 {{count}} 步高风险，见下方说明。',
     verifyFail: '验证失败',
     risk: { high: '高', medium: '中', low: '低' },
@@ -1760,6 +1776,8 @@ const en: typeof zh = {
   ov: {
     group: 'Group',
     role: 'My role',
+    targetPg: 'Target PostgreSQL',
+    targetPgUnknown: 'PostgreSQL (environment version not yet detected)',
     recentVersions: 'Recent versions',
     allVersions: 'All versions',
     environments: 'Environments',
@@ -1828,6 +1846,7 @@ const en: typeof zh = {
     noRollback: 'The baseline has no rollback script.',
     verifyPassed: 'Verification passed',
     verifyFailed: 'Verification failed; see the report below',
+    verifyMissingTarget: 'Lowest target version not verified; see details below',
   },
   envp: {
     title: 'Environments',
@@ -1853,6 +1872,8 @@ const en: typeof zh = {
     sameInstance: 'Allow a shadow database on the same instance',
     status: 'Connection',
     statusUnknown: 'Not tested',
+    pgVersion: 'PostgreSQL version',
+    pgVersionUnknown: 'Not detected yet (click “Test connection” to record)',
     manageHint: 'Only project admins can add and delete environments.',
     delete: 'Delete environment',
     deleteTitle: 'Delete environment {{name}}?',
@@ -2597,6 +2618,11 @@ const en: typeof zh = {
     peopleOnline: '{{count}} online',
     shadowOf: 'Shadow database: {{env}}',
     noEnv: 'No environment',
+    pgTargetMultiTip:
+      'Target version derived from the lowest environment PostgreSQL version: PG {{target}}+ (environments: {{versions}})',
+    pgTargetSingleTip: 'Target version derived from project environment: PG {{target}}+',
+    pgTargetUnknownTip:
+      'No environment PostgreSQL version recorded yet; planning against the latest PostgreSQL',
   },
   canvas: {
     zoomIn: 'Zoom in',
@@ -2712,6 +2738,13 @@ const en: typeof zh = {
     noSteps: 'The two versions are identical; there is nothing to run.',
     verifyOkTitle: 'Verified',
     verifyOk: 'The upgrade matches the target and the rollback returns to the start.',
+    verifyTargetsAllPassed: '({{versions}} all passed)',
+    verifyTargetSinglePassed: '({{version}} passed)',
+    verifyTargetPassed: 'PG {{major}} passed',
+    verifyTargetFailed: 'PG {{major}} failed',
+    verifyMissingTargetTitle: 'Lowest target version not verified',
+    verifyMissingTargetBody:
+      'Missing a PG {{major}} shadow database; this version cannot be marked verified. Configure a dedicated shadow database or allow a same-instance shadow.',
     highRisks: '{{count}} high-risk steps, see below.',
     verifyFail: 'Verification failed',
     risk: { high: 'High', medium: 'Med', low: 'Low' },

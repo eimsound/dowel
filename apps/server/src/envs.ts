@@ -11,7 +11,7 @@ import type {
   EnvVersionRef,
 } from '@dowel/api';
 import { needsManualSchema } from '@dowel/api';
-import type { Model } from '@dowel/core';
+import { deriveTargetPgMajor, type Model, pgMajorOf } from '@dowel/core';
 import type { Db, ScriptStep } from '@dowel/engines';
 import { type ChainVersion, isNonTx, runTouched, runVersionId, type TargetState } from '@dowel/executor';
 import { HTTPException } from 'hono/http-exception';
@@ -44,7 +44,66 @@ export interface EnvRow {
   last_drift_check: unknown;
   drift_status: DriftStatus;
   drift_summary: DriftSummary | null;
+  engine_version?: string | null;
+  engine_version_num?: number | null;
 }
+
+/** 从 server_version_num（如 160004）回退格式化简洁版本串（"16.4"），仅在未读 server_version 时使用 */
+export const formatVersionNum = (versionNum: number): string => {
+  const major = Math.floor(versionNum / 10000);
+  const minor = versionNum % 10000;
+  return `${major}.${minor}`;
+};
+
+/**
+ * 更新环境记录的 PostgreSQL 版本。
+ * 传入 `expectedUrlEnc` 时在 WHERE 中校验 `url_enc = $4`，防止与并发 PATCH 改连接串发生倒挂。
+ */
+export const updateEnvVersion = async (
+  db: Db,
+  envId: string,
+  version: string | null,
+  versionNum: number | null,
+  expectedUrlEnc?: string,
+): Promise<boolean> => {
+  if (expectedUrlEnc !== undefined) {
+    const rows = await db.query<{ id: string }>(
+      'update environments set engine_version = $2, engine_version_num = $3 where id = $1 and url_enc = $4 returning id',
+      [envId, version, versionNum, expectedUrlEnc],
+    );
+    return rows.length > 0;
+  }
+  const rows = await db.query<{ id: string }>(
+    'update environments set engine_version = $2, engine_version_num = $3 where id = $1 returning id',
+    [envId, version, versionNum],
+  );
+  return rows.length > 0;
+};
+
+/** 汇总项目下全部环境的 PG 大版本（去重升序）并推导目标最低版本 */
+export const projectPgVersionSummary = async (
+  db: Db,
+  projectId: string,
+): Promise<{ targetPgMajor: number | null; envPgMajors: number[] }> => {
+  const rows = await db.query<{ engine_version_num: number | null }>(
+    'select engine_version_num from environments where project_id = $1',
+    [projectId],
+  );
+  const majors = new Set<number>();
+  for (const r of rows) {
+    const major = pgMajorOf(r.engine_version_num);
+    if (major !== null) majors.add(major);
+  }
+  const envPgMajors = [...majors].sort((a, b) => a - b);
+  return {
+    targetPgMajor: deriveTargetPgMajor(envPgMajors),
+    envPgMajors,
+  };
+};
+
+/** 推导项目目标兼容的最低 PG 大版本（无已探测环境时为 null） */
+export const projectTargetPgMajor = async (db: Db, projectId: string): Promise<number | null> =>
+  (await projectPgVersionSummary(db, projectId)).targetPgMajor;
 
 export const loadEnv = async (db: Db, pid: string, eid: string): Promise<EnvRow> => {
   const [r] = await db.query<EnvRow>('select * from environments where id = $1 and project_id = $2', [
@@ -301,6 +360,9 @@ export const toEnvInfo = (
   effectiveExecPolicy: auth.resolved.whoCanExecute.value,
   policy: auth.resolved,
   currentVersion: refs.currentVersion,
+  engineVersion: r.engine_version ?? null,
+  engineVersionNum: r.engine_version_num ?? null,
+  engineMajor: pgMajorOf(r.engine_version_num),
   drift: driftInfo(r),
   permissions: permissionsOf(actor, r, role, auth),
 });

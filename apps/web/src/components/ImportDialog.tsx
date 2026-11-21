@@ -43,6 +43,10 @@ export const ImportDialog = ({ pid, eid, onClose }: { pid: string; eid: string; 
         workingSeq: preview.workingSeq,
       });
       void qc.invalidateQueries({ queryKey: ['project', pid] });
+      void qc.invalidateQueries({ queryKey: ['envs', pid] });
+      void qc.invalidateQueries({ queryKey: ['migration', pid] });
+      void qc.invalidateQueries({ queryKey: ['ddl', pid] });
+      void qc.invalidateQueries({ queryKey: ['activity', pid] });
       toast(t('dr.importDone', { count: r.objects }));
       onClose();
     } catch (e) {

@@ -207,6 +207,8 @@ export interface RestoreEnv {
   production: boolean;
   allowSameInstance: boolean;
   shadow_url_enc: string | null;
+  engineVersion?: string | null;
+  engineVersionNum?: number | null;
   state: TargetState;
 }
 
@@ -248,9 +250,20 @@ export const restoreChain = async (
   for (const e of o.envs) {
     await tx.query(
       `insert into environments (id, project_id, name, url_enc, production, allow_same_instance, shadow_url_enc,
-                                 current_version_id)
-       values ($1, $2, $3, $4, $5, $6, $7, $8)`,
-      [e.id, o.pid, e.name, e.url_enc, e.production, e.allowSameInstance, e.shadow_url_enc, e.state.current],
+                                 current_version_id, engine_version, engine_version_num)
+       values ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)`,
+      [
+        e.id,
+        o.pid,
+        e.name,
+        e.url_enc,
+        e.production,
+        e.allowSameInstance,
+        e.shadow_url_enc,
+        e.state.current,
+        e.engineVersion ?? null,
+        e.engineVersionNum ?? null,
+      ],
     );
     await syncEnvCache(tx, e.id, e.state);
   }

@@ -3,7 +3,7 @@
 import { PostgreSqlContainer } from '@testcontainers/postgresql';
 import { getContainerRuntimeClient } from 'testcontainers';
 
-export const PG_IMAGE = 'pgvector/pgvector:pg18';
+export const PG_IMAGE = process.env.DOWEL_PG_IMAGE ?? 'pgvector/pgvector:pg18';
 
 export const startPg = async (): Promise<{ url: string; stop: () => Promise<void> } | null> => {
   const given = process.env.DOWEL_TEST_PG;

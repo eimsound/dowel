@@ -58,14 +58,27 @@ describe.skipIf(!PG_URL)('导入 → 重建 往返一致', () => {
       create table "My App".items (id int primary key, ord int references "My App"."Order" ("select") deferrable initially deferred);
     `);
   });
+
+  test('域与 NOT NULL（PG 15/16 typnotnull 与 PG 17+ pg_constraint 跨版本往返）', async () => {
+    await roundtrip(`
+      create domain pos_int as int not null check (value > 0);
+      create domain non_empty_email as text not null default 'a@b.c' check (length(value) > 0);
+      create table accounts (
+        id int primary key,
+        score pos_int,
+        email non_empty_email
+      );
+    `);
+  });
 });
 
 test.skipIf(!PG_URL)('从空模型建库再删光', async () => {
-  const { m } = await roundtrip(`create table t (a int primary key, b text unique)`);
+  const { m, s1 } = await roundtrip(`create table t (a int primary key, b text unique)`);
+  const pgMajor = Math.floor(s1.version / 10000);
   await resetShadow(db());
-  await runSteps(db(), createAll(m));
+  await runSteps(db(), createAll(m, { pgMajor }));
   const empty = { ...m, objects: {} };
-  await runSteps(db(), plan(m, empty));
+  await runSteps(db(), plan(m, empty, { pgMajor }));
   const s = await readSnapshot(db());
   expect(Object.keys(s.tables)).toEqual([]);
   expect(Object.keys(s.schemas)).toEqual([]);

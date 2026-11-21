@@ -2,7 +2,7 @@
 // 从 IR 重建后结构必须与原库完全一致。
 import { readFileSync } from 'node:fs';
 
-import { all, plan, validate } from '@dowel/core';
+import { all, pgMajorOf, plan, validate } from '@dowel/core';
 import { expect, test } from 'vitest';
 
 import { createTestDb, PG_URL, useTestDb } from '../../../test/pg.ts';
@@ -11,13 +11,26 @@ import { diffSnapshots, importSnapshot, readSnapshot } from '../src/index.ts';
 
 const conn = useTestDb('pagila');
 
+/** PG < 18 不支持 VIRTUAL 生成列与内置 uuidv7()，矩阵测试自动将其降级为 STORED 与 gen_random_uuid() */
+const adaptPagilaForPg = (sql: string, pgMajor: number | null): string => {
+  if (pgMajor !== null && pgMajor < 18) {
+    return sql.replaceAll(/\bVIRTUAL\b/g, 'STORED').replaceAll(/\buuidv7\(\)/g, 'gen_random_uuid()');
+  }
+  return sql;
+};
+
 test.skipIf(!PG_URL)('pagila：导入 → 从 IR 重建，结构完全一致', async () => {
   const db = conn();
-  await db.exec(readFileSync(new URL('./fixtures/pagila-schema.sql', import.meta.url), 'utf8'));
+  const [{ v }] = (await db.query<{ v: number }>(
+    `select current_setting('server_version_num')::int as v`,
+  )) as [{ v: number }];
+  const pgMajor = pgMajorOf(v);
+  const rawSql = readFileSync(new URL('./fixtures/pagila-schema.sql', import.meta.url), 'utf8');
+  await db.exec(adaptPagilaForPg(rawSql, pgMajor));
   const s1 = await readSnapshot(db);
   const m = importSnapshot(s1);
   expect(validate(m)).toEqual([]);
-  expect(plan(m, m)).toEqual([]);
+  expect(plan(m, m, { pgMajor })).toEqual([]);
 
   const count = (k: Parameters<typeof all>[1]) => all(m, k).length;
   console.log(

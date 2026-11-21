@@ -267,7 +267,15 @@ const VersionDetailView = ({ vid }: { vid: string }) => {
     onSuccess: (r) => {
       void qc.invalidateQueries({ queryKey: detailKey });
       void qc.invalidateQueries({ queryKey: ['versions', pid] });
-      toast(t(r.report.ok ? 'versions.verifyPassed' : 'versions.verifyFailed'));
+      toast(
+        t(
+          r.report.ok
+            ? 'versions.verifyPassed'
+            : r.report.missingTargetMajor != null
+              ? 'versions.verifyMissingTarget'
+              : 'versions.verifyFailed',
+        ),
+      );
     },
   });
 

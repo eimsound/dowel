@@ -359,6 +359,10 @@ export const projectInfoSchema = z.object({
   groupRole: groupRoleSchema.nullable(),
   /** schema 范围：null 表示全部（dowel 永远排除） */
   schemas: schemaScopeSchema.nullable(),
+  /** 项目目标兼容的最低 PostgreSQL 大版本（所有已探测版本环境的最小值；尚无环境或均未探测为 null） */
+  targetPgMajor: z.number().int().nullable(),
+  /** 项目下所有环境已记录的 PostgreSQL 大版本列表（去重升序） */
+  envPgMajors: z.array(z.number().int()),
   /** 当前用户能不能查看项目设置里的 CI 令牌列表（项目管理员或满足“谁能创建令牌”规则） */
   canListTokens: z.boolean().optional(),
 });
@@ -573,10 +577,26 @@ export const verifyReportSchema = z.object({
   /** 风险分析没有完成时的原因，只存原因本身（例如“执行超时…”），“风险分析没有完成”这个前缀由界面的标题 / i18n 模板提供；不影响 ok，但界面要如实显示，不能当成“没有风险” */
   riskError: z.string().optional(),
   error: z.object({ step: migrationStepSchema.nullable(), message: z.string() }).nullable(),
+  /** 实测影子库的 PostgreSQL 大版本（由 verifier 读取 server_version_num 推导） */
+  shadowMajor: z.number().int().nullable().optional(),
 });
 export type VerifyReport = z.infer<typeof verifyReportSchema>;
 
-export const verifyResponseSchema = verifyReportSchema.extend({ shadow: z.string() });
+export const verifyTargetReportSchema = z.object({
+  major: z.number().int(),
+  shadow: z.string(),
+  ok: z.boolean(),
+  error: z.string().nullable().optional(),
+  upDiffCount: z.number().int(),
+  downDiffCount: z.number().int(),
+});
+export type VerifyTargetReport = z.infer<typeof verifyTargetReportSchema>;
+
+export const verifyResponseSchema = verifyReportSchema.extend({
+  shadow: z.string(),
+  targets: z.array(verifyTargetReportSchema).optional(),
+  missingTargetMajor: z.number().int().nullable().optional(),
+});
 export type VerifyResponse = z.infer<typeof verifyResponseSchema>;
 
 export const verifyRequestSchema = z.object({
@@ -598,6 +618,10 @@ export const storedVerifyReportSchema = z.object({
   /** 实际用的影子库 */
   shadow: z.string(),
   at: z.string(),
+  /** 多版本影子库验证时，各大版本分别的验证结果（按大版本升序） */
+  targets: z.array(verifyTargetReportSchema).optional(),
+  /** 存在多个 PG 大版本但最低目标版本缺少可用影子库时记录缺失的大版本号 */
+  missingTargetMajor: z.number().int().nullable().optional(),
 });
 export type StoredVerifyReport = z.infer<typeof storedVerifyReportSchema>;
 
@@ -777,6 +801,12 @@ export const environmentInfoSchema = z.object({
   policy: z.custom<ResolvedPolicy>(),
   /** 环境当前版本（平台库缓存：最近一次读目标库历史 / 执行后的结果）；还没执行过为 null */
   currentVersion: envVersionRefSchema.nullable(),
+  /** 目标库 PostgreSQL 简洁版本串（如 "16.4"）；尚未探测过为 null */
+  engineVersion: z.string().nullable(),
+  /** 目标库 PostgreSQL server_version_num（如 160004）；尚未探测过为 null */
+  engineVersionNum: z.number().int().nullable(),
+  /** 目标库 PostgreSQL 大版本号（如 16）；尚未探测过为 null */
+  engineMajor: z.number().int().nullable(),
   drift: driftInfoSchema,
   permissions: envPermissionsSchema,
 });

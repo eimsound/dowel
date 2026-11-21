@@ -212,8 +212,10 @@ export const runTakeover = (c: Context<Env>, ctx: AppContext, b: ProjectWizard, 
       project.slug = await chooseSlug();
       await send({ stage });
       // 和环境创建同样的检查：连得上（白名单在连接层检查）、影子库能认领
+      const inspected = new Map<string, { version: string; versionNum: number }>();
       for (const e of environments) {
-        await inspectTarget(e.url, CHECK_CONNECT_TIMEOUT, ctx.guard);
+        const info = await inspectTarget(e.url, CHECK_CONNECT_TIMEOUT, ctx.guard);
+        inspected.set(e.name, { version: info.version, versionNum: info.versionNum });
         if (e.shadowUrl) await claimShadow(e.shadowUrl, ctx.guard);
       }
 
@@ -271,15 +273,20 @@ export const runTakeover = (c: Context<Env>, ctx: AppContext, b: ProjectWizard, 
       stage = 'write';
       await send({ stage });
       const branch = newId();
-      const envRows = environments.map((e) => ({
-        id: newId(),
-        name: e.name,
-        url_enc: encrypt(e.url),
-        production: e.production,
-        allowSameInstance: e.allowSameInstance,
-        shadow_url_enc: e.shadowUrl ? encrypt(e.shadowUrl) : null,
-        state: sources.find((s) => s.name === e.name)!.state,
-      }));
+      const envRows = environments.map((e) => {
+        const v = inspected.get(e.name);
+        return {
+          id: newId(),
+          name: e.name,
+          url_enc: encrypt(e.url),
+          production: e.production,
+          allowSameInstance: e.allowSameInstance,
+          shadow_url_enc: e.shadowUrl ? encrypt(e.shadowUrl) : null,
+          engineVersion: v?.version ?? null,
+          engineVersionNum: v?.versionNum ?? null,
+          state: sources.find((s) => s.name === e.name)!.state,
+        };
+      });
       for (let attempt = 0; ; attempt++) {
         let txResult: 'ok' | 'project' | 'slug';
         try {

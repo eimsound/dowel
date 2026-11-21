@@ -43,6 +43,7 @@ import {
   confirmVersion,
   driftInfo,
   type EnvRow,
+  formatVersionNum,
   iso,
   loadChain,
   loadEnv,
@@ -50,11 +51,19 @@ import {
   releaseClaim,
   setDrift,
   syncEnvCache,
+  updateEnvVersion,
   versionRef,
 } from './envs.ts';
 import { decrypt, SecretError, scrubSecrets } from './secrets.ts';
 import { readSettings } from './settings.ts';
-import { CHECK_CONNECT_TIMEOUT, ConnectError, type ConnectionGuard, connectPg, scrubUrl } from './targets.ts';
+import {
+  CHECK_CONNECT_TIMEOUT,
+  ConnectError,
+  type ConnectionGuard,
+  connectPg,
+  normalizePgVersion,
+  scrubUrl,
+} from './targets.ts';
 
 /** 同一个环境同一时间只做一件事（单进程内互斥 + PG 多副本下平台库 advisory lock 跨副本互斥）。默认等 30 秒 */
 export const LOCK_WAIT_MS = 30_000;
@@ -624,6 +633,21 @@ export const runExecution = async (
           e instanceof Error ? scrubSecrets(e.message) : e,
         );
       }
+      // 顺带感知目标库原地升级（复用现有连接，零额外建连；已在环境锁内，再叠加 url_enc 校验）
+      try {
+        const [v] = await conn.db.query<{ version: string; num: number }>(
+          `select current_setting('server_version') as version, current_setting('server_version_num')::int as num`,
+        );
+        if (v) {
+          const clean = normalizePgVersion(v.version);
+          const num = Number(v.num);
+          if (env.engine_version !== clean || env.engine_version_num !== num) {
+            await updateEnvVersion(db, env.id, clean, num, env.url_enc);
+          }
+        }
+      } catch {
+        // 忽略探测异常（如连接已断），不影响执行主流程
+      }
       await conn.close().catch(() => {});
     }
     await release();
@@ -766,6 +790,7 @@ const commitDrift = async (
   snapshot: EnvDriftSnapshot,
   status: EnvRow['drift_status'],
   summary: DriftSummary | null,
+  engineVersionNum?: number,
 ): Promise<CommitDriftResult> => {
   const { db } = x;
   const locked = await x.locks.withIdleLock<CommitDriftResult>(env.id, async () => {
@@ -779,6 +804,19 @@ const commitDrift = async (
     }
     const at = new Date().toISOString();
     await setDrift(db, env.id, status, summary, at);
+    if (
+      typeof engineVersionNum === 'number' &&
+      Number.isInteger(engineVersionNum) &&
+      latest.engine_version_num !== engineVersionNum
+    ) {
+      await updateEnvVersion(
+        db,
+        env.id,
+        formatVersionNum(engineVersionNum),
+        engineVersionNum,
+        latest.url_enc,
+      );
+    }
     return { written: true, result: { status, checkedAt: at, summary, skipped: null } };
   });
   if (!locked.acquired) {
@@ -804,11 +842,19 @@ export const checkEnvDriftDetailed = async (x: ExecContext, given: EnvRow): Prom
   let conn: ReturnType<typeof open> | null = null;
   let rep: DriftReport;
   let chain: ChainVersion[];
+  let detectedVersionNum: number | undefined;
   try {
     url = decrypt(env.url_enc);
     chain = await loadChain(db, env.project_id);
     conn = open(url, x.guard, CHECK_CONNECT_TIMEOUT);
-    rep = await checkDrift({ db: conn.db, projectId: env.project_id, chain });
+    rep = await checkDrift({
+      db: conn.db,
+      projectId: env.project_id,
+      chain,
+      onVersion: (v) => {
+        detectedVersionNum = v;
+      },
+    });
   } catch (e) {
     if (e instanceof HTTPException) throw e;
     const c = classifyError(e, url);
@@ -822,8 +868,8 @@ export const checkEnvDriftDetailed = async (x: ExecContext, given: EnvRow): Prom
   const currentVersionId = rep.firstRun ? null : rep.version;
   const committed =
     rep.status === 'ok'
-      ? await commitDrift(x, env, snapshot, 'ok', null)
-      : await commitDrift(x, env, snapshot, 'drifted', summaryOf(rep, chain));
+      ? await commitDrift(x, env, snapshot, 'ok', null, detectedVersionNum)
+      : await commitDrift(x, env, snapshot, 'drifted', summaryOf(rep, chain), detectedVersionNum);
   if (!committed.written) return { result: committed.result };
   return { result: committed.result, currentVersionId };
 };
@@ -1005,6 +1051,20 @@ export const readLive = async (
   const conn = open(url, x.guard, CHECK_CONNECT_TIMEOUT);
   try {
     const snapshot = await readSnapshot(conn.db, scope);
+    // 顺带同步目标库 PG 版本（仅在版本号变化时回写，url_enc 保护防并发 PATCH 倒挂）
+    if (Number.isInteger(snapshot.version) && env.engine_version_num !== snapshot.version) {
+      const ver = await conn.db
+        .query<{ version: string }>(`select current_setting('server_version') as version`)
+        .then((rows) => (rows[0]?.version ? normalizePgVersion(rows[0].version) : null))
+        .catch(() => null);
+      await updateEnvVersion(
+        x.db,
+        env.id,
+        ver ?? formatVersionNum(snapshot.version),
+        snapshot.version,
+        env.url_enc,
+      ).catch(logFailure('更新环境 PG 版本失败'));
+    }
     // 和漂移检查、标记的核对同一套规则（compare.ts 的 importLive：按名字沿用 base 里的对象 ID，忽略 public 的默认注释）
     const model = importLive(snapshot, base);
     const state = await readState(conn.db, env.project_id).catch(() => null);
