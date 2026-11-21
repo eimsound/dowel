@@ -9,9 +9,9 @@
     "format": "oxfmt",
     "check": "pnpm lint && pnpm typecheck && pnpm test",
     "dev": "node --run dev:server & pnpm --filter @dowel/web dev",
-    "dev:server": "node --watch apps/server/src/main.ts",
-    "build": "pnpm --filter @dowel/web build",
-    "start": "node apps/server/src/main.ts",
+    "dev:server": "node --conditions=@dowel/source --watch apps/server/src/main.ts",
+    "build": "tsdown && pnpm --filter @dowel/web build",
+    "start": "node apps/server/dist/main.js",
     "e2e": "playwright test"
   },
   "devDependencies": {
@@ -28,6 +28,7 @@
     "oxlint-tsgolint": "^7.0.2007",
     "postgres": "^4.1.1",
     "testcontainers": "^12.2.1",
+    "tsdown": "^0.23.7",
     "typescript": "^7.0.2",
     "vitest": "^5.1.0"
   },

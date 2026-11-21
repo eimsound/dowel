@@ -17,7 +17,7 @@ concurrency:
 
 jobs:
   check:
-    name: lint、类型检查、单元测试
+    name: lint、类型检查、单元测试、构建与冒烟
     runs-on: ubuntu-latest
     timeout-minutes: 20
     steps:
@@ -33,6 +33,36 @@ jobs:
       - run: pnpm lint
       - run: pnpm typecheck
       - run: pnpm test
+      - run: pnpm build
+      - name: 生产构建产物启动冒烟（无 @dowel/source 条件）
+        run: |
+          set -euo pipefail
+          SMOKE_DB="$(mktemp -u /tmp/dowel-smoke-XXXXXX.db)"
+          PORT=4699 DOWEL_DB="$SMOKE_DB" DOWEL_SECRET="ci-smoke-secret-0123456789" \
+            DOWEL_DRIFT_INTERVAL_MINUTES=0 node apps/server/dist/main.js &
+          SERVER_PID=$!
+          cleanup() {
+            if kill -0 "$SERVER_PID" 2>/dev/null; then
+              kill -TERM "$SERVER_PID" 2>/dev/null || true
+              wait "$SERVER_PID" || true
+            fi
+            rm -f "$SMOKE_DB" "${SMOKE_DB}-wal" "${SMOKE_DB}-shm"
+          }
+          trap cleanup EXIT
+          for _ in $(seq 1 30); do
+            if curl -fsS http://127.0.0.1:4699/api/instance >/dev/null 2>&1; then
+              break
+            fi
+            sleep 0.5
+          done
+          INSTANCE_JSON="$(curl -fsS http://127.0.0.1:4699/api/instance)"
+          echo "GET /api/instance -> $INSTANCE_JSON"
+          echo "$INSTANCE_JSON" | grep -q '"needsSetup":true'
+          INDEX_HTML="$(curl -fsS http://127.0.0.1:4699/)"
+          echo "$INDEX_HTML" | grep -qi '<!doctype html>'
+          echo "$INDEX_HTML" | grep -q 'id="root"'
+          kill -TERM "$SERVER_PID"
+          wait "$SERVER_PID"
 
   heavy:
     name: 随机闭环测试（5000 例）

@@ -13,7 +13,7 @@ let proc: ChildProcess;
 let setupToken = '';
 
 test.beforeAll(async () => {
-  proc = spawn(process.execPath, ['apps/server/src/main.ts'], {
+  proc = spawn(process.execPath, ['apps/server/dist/main.js'], {
     // 显式清掉 DOWEL_ADMIN_*，走“打印初始化令牌”这条路
     env: {
       ...process.env,

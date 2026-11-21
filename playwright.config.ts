@@ -1,6 +1,6 @@
 import { defineConfig } from '@playwright/test';
 
-// 端到端测试：先构建前端，再用内存中的 SQLite 平台库启动服务（前端由服务端直接提供）
+// 端到端测试：先构建服务端与前端，再用内存中的 SQLite 平台库启动服务（前端由服务端直接提供）
 export default defineConfig({
   testDir: 'e2e',
   globalSetup: './e2e/global-setup.ts',
@@ -12,7 +12,7 @@ export default defineConfig({
   expect: { toHaveScreenshot: { animations: 'disabled', caret: 'hide' } },
   webServer: [
     {
-      command: 'pnpm build && node apps/server/src/main.ts',
+      command: 'pnpm build && node apps/server/dist/main.js',
       url: 'http://localhost:4650/login',
       // DOWEL_ADMIN_* 无人值守初始化主实例的管理员；初始化页本身由 e2e/invites.spec.ts 用独立服务覆盖
       env: {

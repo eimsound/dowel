@@ -22,8 +22,8 @@ docker compose up -d
 
 ```sh
 pnpm install
-pnpm build        # 构建前端
-pnpm start        # 启动服务：http://localhost:4600
+pnpm build        # 构建内部包、服务端与前端
+pnpm start        # 启动编译后的服务：http://localhost:4600
 ```
 
 开发时用 `pnpm dev`：服务端（4600）和前端开发服务器（5173，自动转发接口）同时启动，打开 <http://localhost:5173>。

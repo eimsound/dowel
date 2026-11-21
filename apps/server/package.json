@@ -5,11 +5,15 @@
   "license": "MIT",
   "type": "module",
   "exports": {
-    ".": "./src/index.ts"
+    ".": {
+      "@dowel/source": "./src/index.ts",
+      "types": "./dist/index.d.ts",
+      "import": "./dist/index.js"
+    }
   },
   "scripts": {
-    "dev": "node --watch src/main.ts",
-    "start": "node src/main.ts"
+    "dev": "node --conditions=@dowel/source --watch src/main.ts",
+    "start": "node dist/main.js"
   },
   "dependencies": {
     "@dowel/api": "workspace:*",
