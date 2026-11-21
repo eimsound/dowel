@@ -3,23 +3,35 @@
 // withAdvisoryLock 跨连接互斥与超时、HaCoordinator 心跳续租与停机释放、
 // 跨副本 EnvLocks 互斥、多副本共享 setupToken 与并发 autoSetup 幂等。
 import { mkdtempSync, rmSync } from 'node:fs';
+import { createServer, type Socket } from 'node:net';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { DatabaseSync } from 'node:sqlite';
-import { afterAll, describe, expect, test } from 'vitest';
+import { afterAll, describe, expect, test, vi } from 'vitest';
 import { createTestDb, PG_URL } from '../../../test/pg.ts';
 import { createApp } from '../src/app.ts';
 import { type ClusterEvent, EventBus } from '../src/bus.ts';
-import { MIGRATE_LOCK_KEY, MIGRATIONS, openPlatformDb, type PlatformDb } from '../src/db.ts';
+import {
+  DEFAULT_PG_CONNECT_TIMEOUT_SEC,
+  DEFAULT_PG_KEEP_ALIVE_SEC,
+  MIGRATE_LOCK_KEY,
+  MIGRATIONS,
+  openPlatformDb,
+  type PlatformDb,
+} from '../src/db.ts';
 import { EnvBusyError, EnvLocks, lockEnvIdle } from '../src/executions.ts';
 import { HaCoordinator } from '../src/ha.ts';
 import { encrypt } from '../src/secrets.ts';
 import { autoSetup, ensureSetupToken, SETUP_TOKEN_KEY } from '../src/setup.ts';
 import { makeUser, PASSWORD } from './support.ts';
 
-const waitFor = async (predicate: () => boolean, timeoutMs = 8000, stepMs = 25): Promise<void> => {
+const waitFor = async (
+  predicate: () => boolean | Promise<boolean>,
+  timeoutMs = 8000,
+  stepMs = 25,
+): Promise<void> => {
   const deadline = Date.now() + timeoutMs;
-  while (!predicate()) {
+  while (!(await predicate())) {
     if (Date.now() >= deadline) throw new Error(`等待条件超时（${timeoutMs}ms）`);
     await new Promise((r) => setTimeout(r, stepMs));
   }
@@ -820,6 +832,393 @@ describe.each([
       await haB.stop();
       await dbA.close();
       if (dbB !== dbA) await dbB.close();
+    }
+  });
+});
+
+describe('HaCoordinator 续租超时、有界停机与防租约复活（#23）', () => {
+  test('默认超时计算符合预期，并支持显式覆盖 renewTimeoutMs / stopTimeoutMs', async () => {
+    const db = await openPlatformDb(':memory:');
+    try {
+      expect(DEFAULT_PG_CONNECT_TIMEOUT_SEC).toBe(10);
+      expect(DEFAULT_PG_KEEP_ALIVE_SEC).toBe(15);
+
+      const defaultHa = new HaCoordinator(db, { replicaId: 'node-default' });
+      expect(defaultHa.renewTimeoutMs).toBe(5_000);
+      expect(defaultHa.stopTimeoutMs).toBe(5_000);
+
+      const shortTtlHa = new HaCoordinator(db, {
+        replicaId: 'node-short-ttl',
+        ttlMs: 9_000,
+        heartbeatIntervalMs: 5_000,
+      });
+      expect(shortTtlHa.renewTimeoutMs).toBe(3_000);
+
+      const floorHa = new HaCoordinator(db, {
+        replicaId: 'node-floor',
+        ttlMs: 1_200,
+        heartbeatIntervalMs: 400,
+      });
+      expect(floorHa.renewTimeoutMs).toBe(1_000);
+
+      const customHa = new HaCoordinator(db, {
+        replicaId: 'node-custom',
+        renewTimeoutMs: 80,
+        stopTimeoutMs: 50,
+      });
+      expect(customHa.renewTimeoutMs).toBe(80);
+      expect(customHa.stopTimeoutMs).toBe(50);
+    } finally {
+      await db.close();
+    }
+  });
+
+  test('首次心跳 renew() 挂起超时后及时释放 inFlightRenew，下一心跳周期立即恢复续租且旧写入不倒退租约', async () => {
+    const baseDb = await openPlatformDb(':memory:');
+    const errSpy = vi.spyOn(console, 'error').mockImplementation(() => {});
+    const warnSpy = vi.spyOn(console, 'warn').mockImplementation(() => {});
+
+    let renewSqlCalls = 0;
+    let releaseHangingRenew!: () => void;
+    const hangingGate = new Promise<void>((r) => {
+      releaseHangingRenew = r;
+    });
+    let hangingStarted!: () => void;
+    const hangingEntered = new Promise<void>((r) => {
+      hangingStarted = r;
+    });
+
+    const wrappedDb: PlatformDb = {
+      ...baseDb,
+      query: async <T>(q: string, params?: unknown[]) => {
+        if (q.includes('insert into ha_leases')) {
+          renewSqlCalls++;
+          // 第 1 次是 start() 首次写入；第 2 次模拟首次定时心跳落在半开连接上挂起
+          if (renewSqlCalls === 2) {
+            hangingStarted();
+            await hangingGate;
+          }
+        }
+        return baseDb.query<T>(q, params);
+      },
+    };
+
+    const ha = new HaCoordinator(wrappedDb, {
+      replicaId: 'node-recover',
+      ttlMs: 450,
+      heartbeatIntervalMs: 120,
+      renewTimeoutMs: 80,
+    });
+
+    try {
+      await ha.start();
+      expect(renewSqlCalls).toBe(1);
+      expect(await ha.isNodeAlive('node-recover')).toBe(true);
+
+      // 等第 2 次（首次定时心跳）挂起并超时释放，随后第 3 次心跳在下一个周期自动发起并成功续租
+      await hangingEntered;
+      await waitFor(() => renewSqlCalls >= 3, 2_000);
+      expect(errSpy).toHaveBeenCalledWith(
+        expect.stringContaining('HA 副本心跳续租失败（replica=node-recover）'),
+        expect.objectContaining({ message: expect.stringContaining('心跳续租超时') }),
+      );
+
+      // 超过单个 TTL（450ms）后，副本仍因后续心跳成功续租而保持存活
+      await new Promise((r) => setTimeout(r, 380));
+      expect(await ha.isNodeAlive('node-recover')).toBe(true);
+
+      // 记录当前最新 expires_at，再放开之前挂起的第 2 次旧续租：验证不会倒退覆盖新租约
+      const [beforeLate] = await baseDb.query<{ expires_at: string }>(
+        "select expires_at from ha_leases where key = 'node:node-recover'",
+      );
+      releaseHangingRenew();
+      await new Promise((r) => setTimeout(r, 50));
+      const [afterLate] = await baseDb.query<{ expires_at: string }>(
+        "select expires_at from ha_leases where key = 'node:node-recover'",
+      );
+      expect(afterLate!.expires_at >= beforeLate!.expires_at).toBe(true);
+    } finally {
+      releaseHangingRenew();
+      await ha.stop();
+      await baseDb.close();
+      errSpy.mockRestore();
+      warnSpy.mockRestore();
+    }
+  });
+
+  test('直接调用首次 renew() 挂起超时后立即抛出并释放状态，后续 renew() 正常成功', async () => {
+    const baseDb = await openPlatformDb(':memory:');
+    const warnSpy = vi.spyOn(console, 'warn').mockImplementation(() => {});
+
+    let calls = 0;
+    let releaseFirst!: () => void;
+    const firstGate = new Promise<void>((r) => {
+      releaseFirst = r;
+    });
+
+    const wrappedDb: PlatformDb = {
+      ...baseDb,
+      query: async <T>(q: string, params?: unknown[]) => {
+        if (q.includes('insert into ha_leases')) {
+          calls++;
+          if (calls === 1) await firstGate;
+        }
+        return baseDb.query<T>(q, params);
+      },
+    };
+
+    const ha = new HaCoordinator(wrappedDb, {
+      replicaId: 'node-first-hang',
+      ttlMs: 1_000,
+      heartbeatIntervalMs: 200,
+      renewTimeoutMs: 70,
+    });
+
+    try {
+      const t0 = Date.now();
+      await expect(ha.renew()).rejects.toThrow(/心跳续租超时/);
+      const elapsed = Date.now() - t0;
+      expect(elapsed).toBeGreaterThanOrEqual(50);
+      expect(elapsed).toBeLessThan(800);
+
+      // 首次超时后不会阻塞下一次续租
+      await ha.renew();
+      expect(await ha.isNodeAlive('node-first-hang')).toBe(true);
+    } finally {
+      releaseFirst();
+      await ha.stop();
+      await baseDb.close();
+      warnSpy.mockRestore();
+    }
+  });
+
+  test('renew() 挂起期间调用 ha.stop() 在有界超时内退出并删除租约，且滞后旧 renew 不会复活租约', async () => {
+    const baseDb = await openPlatformDb(':memory:');
+    const warnSpy = vi.spyOn(console, 'warn').mockImplementation(() => {});
+    const errSpy = vi.spyOn(console, 'error').mockImplementation(() => {});
+
+    let renewCalls = 0;
+    let deleteCalls = 0;
+    let releaseHanging!: () => void;
+    const hangingGate = new Promise<void>((r) => {
+      releaseHanging = r;
+    });
+    let hangingStarted!: () => void;
+    const hangingEntered = new Promise<void>((r) => {
+      hangingStarted = r;
+    });
+
+    const wrappedDb: PlatformDb = {
+      ...baseDb,
+      query: async <T>(q: string, params?: unknown[]) => {
+        if (q.includes('insert into ha_leases')) {
+          renewCalls++;
+          if (renewCalls === 2) {
+            hangingStarted();
+            await hangingGate;
+          }
+        }
+        if (q.includes('delete from ha_leases')) {
+          deleteCalls++;
+        }
+        return baseDb.query<T>(q, params);
+      },
+    };
+
+    const ha = new HaCoordinator(wrappedDb, {
+      replicaId: 'node-stop-bounded',
+      ttlMs: 2_000,
+      heartbeatIntervalMs: 80,
+      renewTimeoutMs: 5_000, // 故意给较长 renewTimeoutMs，验证 stop() 受 stopTimeoutMs 有界约束
+      stopTimeoutMs: 90,
+    });
+
+    try {
+      await ha.start();
+      expect(await ha.isNodeAlive('node-stop-bounded')).toBe(true);
+
+      // 等第 2 次心跳进入挂起状态，此时立刻调用 ha.stop()
+      await hangingEntered;
+      const t0 = Date.now();
+      await ha.stop();
+      const elapsed = Date.now() - t0;
+      expect(elapsed).toBeGreaterThanOrEqual(60);
+      expect(elapsed).toBeLessThan(1_000);
+      expect(deleteCalls).toBeGreaterThanOrEqual(1);
+      expect(await ha.isNodeAlive('node-stop-bounded')).toBe(false);
+
+      // 放开之前挂起的旧 renew，模拟网络恢复后迟到落盘：补删机制确保租约不会复活
+      releaseHanging();
+      await waitFor(async () => {
+        const rows = await baseDb.query("select key from ha_leases where key = 'node:node-stop-bounded'");
+        return rows.length === 0 && deleteCalls >= 2;
+      }, 2_000).catch(async () => {
+        // 如果旧 renew 没来得及写入或已补删，最终也必须保证库里没有复活的租约
+        expect(await ha.isNodeAlive('node-stop-bounded')).toBe(false);
+      });
+      expect(await ha.isNodeAlive('node-stop-bounded')).toBe(false);
+    } finally {
+      releaseHanging();
+      await baseDb.close();
+      warnSpy.mockRestore();
+      errSpy.mockRestore();
+    }
+  });
+
+  test('renew() 与 delete 同时挂起时，ha.stop() 依然在有界超时内返回', async () => {
+    const baseDb = await openPlatformDb(':memory:');
+    const warnSpy = vi.spyOn(console, 'warn').mockImplementation(() => {});
+
+    let renewCalls = 0;
+    let deleteAttempted = false;
+    let hangingStarted!: () => void;
+    const hangingEntered = new Promise<void>((r) => {
+      hangingStarted = r;
+    });
+    const neverResolve = new Promise<never>(() => {});
+
+    const wrappedDb: PlatformDb = {
+      ...baseDb,
+      query: async <T>(q: string, params?: unknown[]) => {
+        if (q.includes('insert into ha_leases')) {
+          renewCalls++;
+          if (renewCalls === 2) {
+            hangingStarted();
+            return neverResolve;
+          }
+        }
+        if (q.includes('delete from ha_leases')) {
+          deleteAttempted = true;
+          return neverResolve;
+        }
+        return baseDb.query<T>(q, params);
+      },
+    };
+
+    const ha = new HaCoordinator(wrappedDb, {
+      replicaId: 'node-stop-all-hang',
+      ttlMs: 2_000,
+      heartbeatIntervalMs: 60,
+      renewTimeoutMs: 5_000,
+      stopTimeoutMs: 80,
+    });
+
+    try {
+      await ha.start();
+      await hangingEntered;
+      const t0 = Date.now();
+      await ha.stop();
+      const elapsed = Date.now() - t0;
+      expect(deleteAttempted).toBe(true);
+      // 等待在途续租（~80ms）+ 尝试删除租约（~80ms），总体应远小于 1s
+      expect(elapsed).toBeGreaterThanOrEqual(120);
+      expect(elapsed).toBeLessThan(1_200);
+    } finally {
+      await baseDb.close();
+      warnSpy.mockRestore();
+    }
+  });
+
+  test('openPlatformDb 对 PG 黑洞端口按 connectTimeoutSec 及时建连超时，不会挂起默认 30s', async () => {
+    const sockets = new Set<Socket>();
+    const server = createServer((socket) => {
+      sockets.add(socket);
+      socket.on('close', () => sockets.delete(socket));
+      // 模拟半开/黑洞 TCP 连接：接受连接但不返回任何 PostgreSQL 协议响应
+    });
+
+    await new Promise<void>((resolve) => server.listen(0, '127.0.0.1', resolve));
+    const address = server.address();
+    const port = typeof address === 'object' && address ? address.port : 0;
+
+    try {
+      const t0 = Date.now();
+      await expect(
+        openPlatformDb(`postgres://postgres:postgres@127.0.0.1:${port}/postgres`, {
+          connectTimeoutSec: 1,
+          migrateLockTimeoutMs: 5_000,
+        }),
+      ).rejects.toMatchObject({ code: 'CONNECT_TIMEOUT' });
+      const elapsed = Date.now() - t0;
+      expect(elapsed).toBeGreaterThanOrEqual(800);
+      expect(elapsed).toBeLessThan(4_500);
+    } finally {
+      for (const s of sockets) s.destroy();
+      await new Promise<void>((resolve) => server.close(() => resolve()));
+    }
+  });
+});
+
+describe.skipIf(!PG_URL)('HaCoordinator PG 事务级续租超时与恢复（真实 PG，#23）', () => {
+  const closers: (() => Promise<void>)[] = [];
+  afterAll(async () => {
+    for (const c of closers) await c();
+  });
+
+  test('ha_leases 行被锁阻塞时 PG 事务内 lock_timeout/statement_timeout 及时中止续租，解锁后下一次心跳恢复存活且不污染连接池超时设置', async () => {
+    const t = await createTestDb('ha_pg_renew_timeout');
+    closers.push(t.close);
+    const dbA = await openPlatformDb(t.url);
+    const dbBlocker = await openPlatformDb(t.url);
+    const errSpy = vi.spyOn(console, 'error').mockImplementation(() => {});
+
+    const ha = new HaCoordinator(dbA, {
+      replicaId: 'pg-node-timeout',
+      ttlMs: 1_500,
+      heartbeatIntervalMs: 120,
+      renewTimeoutMs: 100,
+    });
+
+    let releaseLock!: () => void;
+    const holdLock = new Promise<void>((r) => {
+      releaseLock = r;
+    });
+    let lockAcquired!: () => void;
+    const inLock = new Promise<void>((r) => {
+      lockAcquired = r;
+    });
+
+    try {
+      await ha.start();
+      expect(await ha.isNodeAlive('pg-node-timeout')).toBe(true);
+
+      // 另一连接在事务中对当前副本的 ha_leases 行加 FOR UPDATE 行锁，阻塞续租 UPDATE
+      const blockerTask = dbBlocker.transaction(async (tx) => {
+        await tx.query("select key from ha_leases where key = 'node:pg-node-timeout' for update");
+        lockAcquired();
+        await holdLock;
+      });
+      await inLock;
+
+      // 等待至少一次心跳因 lock_timeout / statement_timeout 失败并记录错误日志
+      await waitFor(() => errSpy.mock.calls.length >= 1, 3_000);
+      const [beforeUnlock] = await dbA.query<{ updated_at: Date }>(
+        "select updated_at from ha_leases where key = 'node:pg-node-timeout'",
+      );
+
+      // 释放行锁后，下一次心跳立即恢复并推进 updated_at
+      releaseLock();
+      await blockerTask;
+
+      await waitFor(async () => {
+        const [row] = await dbA.query<{ updated_at: Date }>(
+          "select updated_at from ha_leases where key = 'node:pg-node-timeout'",
+        );
+        return !!row && row.updated_at.getTime() > beforeUnlock!.updated_at.getTime();
+      }, 3_000);
+      expect(await ha.isNodeAlive('pg-node-timeout')).toBe(true);
+
+      // SET LOCAL 仅在续租事务内生效，主连接池上的 statement_timeout / lock_timeout 保持默认 '0'
+      const [timeouts] = await dbA.query<{ st: string; lt: string }>(
+        "select current_setting('statement_timeout') as st, current_setting('lock_timeout') as lt",
+      );
+      expect(timeouts).toEqual({ st: '0', lt: '0' });
+    } finally {
+      releaseLock();
+      await ha.stop();
+      await dbA.close();
+      await dbBlocker.close();
+      errSpy.mockRestore();
     }
   });
 });

@@ -47,6 +47,10 @@ export interface OpenPlatformDbOptions {
   advisoryLockPoolMax?: number;
   /** PG 模式下启动迁移等待 `platform:migrate` advisory lock 的超时时间（毫秒，默认 60_000） */
   migrateLockTimeoutMs?: number;
+  /** PG 连接池建连超时（秒，默认 10；作用于主池、锁池与 LISTEN 重连握手，不影响已建立的 LISTEN 长连接） */
+  connectTimeoutSec?: number;
+  /** PG 连接 TCP keep-alive 探测间隔（秒，默认 15；加速识别半开连接且不影响 LISTEN 长连接） */
+  keepAliveSec?: number;
   /** 仅用于测试：替换 PG advisory lock 解锁执行逻辑，用于模拟解锁抛错或返回非 true 时销毁连接防锁泄漏 */
   advisoryUnlock?: (conn: postgres.ReservedSql, k1: number, k2: number) => Promise<boolean>;
 }
@@ -1137,6 +1141,10 @@ const MAX_NOTIFY_BYTES = 7500;
 const ADVISORY_POLL_MS = 50;
 /** PG advisory lock 专用连接池默认上限（独立于主业务池，避免并发持锁占满业务连接引发自死锁） */
 export const DEFAULT_ADVISORY_LOCK_POOL_MAX = 16;
+/** PG 连接池默认建连超时（秒）；收紧 postgres.js 默认 30s，避免网络黑洞/半开握手长时间挂起 */
+export const DEFAULT_PG_CONNECT_TIMEOUT_SEC = 10;
+/** PG 连接默认 TCP keep-alive 间隔（秒）；收紧 postgres.js 默认 60s，加快探测半开连接且不断开 LISTEN 长连接 */
+export const DEFAULT_PG_KEEP_ALIVE_SEC = 15;
 /** PG advisory lock 专用连接空闲回收时间（秒） */
 const ADVISORY_LOCK_IDLE_TIMEOUT_SEC = 30;
 /** 解锁失败后强制销毁/终止连接时的上限等待时间（毫秒） */
@@ -1211,8 +1219,22 @@ const raceWithTimeout = <T>(
   });
 
 const openPg = (url: string, options?: OpenPlatformDbOptions): PlatformDb => {
-  // bigint（seq）读成 number，与 SQLite 一致；序号不会超过 2^53
+  const rawConnectTimeout = options?.connectTimeoutSec ?? DEFAULT_PG_CONNECT_TIMEOUT_SEC;
+  const connectTimeoutSec =
+    Number.isFinite(rawConnectTimeout) && rawConnectTimeout > 0
+      ? rawConnectTimeout
+      : DEFAULT_PG_CONNECT_TIMEOUT_SEC;
+  const rawKeepAlive = options?.keepAliveSec ?? DEFAULT_PG_KEEP_ALIVE_SEC;
+  const keepAliveSec =
+    Number.isFinite(rawKeepAlive) && rawKeepAlive > 0 ? rawKeepAlive : DEFAULT_PG_KEEP_ALIVE_SEC;
+
+  // bigint（seq）读成 number，与 SQLite 一致；序号不会超过 2^53。
+  // 配置 connect_timeout 与 keep_alive（单位均为秒）：收紧半开连接与建连黑洞探测；
+  // postgres@4.1.1 的 sql.listen 内部连接会覆盖 query_timeout=0、idle_timeout=null、max_lifetime=null，
+  // 仅继承建连超时与 TCP keep-alive，不会误断开 LISTEN 长连接。
   const sql = postgres(url, {
+    connect_timeout: connectTimeoutSec,
+    keep_alive: keepAliveSec,
     onnotice: () => {},
     types: {
       bigint: { to: 20, from: [20], serialize: (x: number) => String(x), parse: (x: string) => Number(x) },
@@ -1231,6 +1253,8 @@ const openPg = (url: string, options?: OpenPlatformDbOptions): PlatformDb => {
     if (!lockSql) {
       lockSql = postgres(url, {
         max: lockPoolMax,
+        connect_timeout: connectTimeoutSec,
+        keep_alive: keepAliveSec,
         idle_timeout: ADVISORY_LOCK_IDLE_TIMEOUT_SEC,
         onnotice: () => {},
         fetch_types: false,

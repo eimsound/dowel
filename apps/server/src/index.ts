@@ -12,6 +12,8 @@ export {
   type AdvisoryLockOptions,
   type AdvisoryLockResult,
   DEFAULT_ADVISORY_LOCK_POOL_MAX,
+  DEFAULT_PG_CONNECT_TIMEOUT_SEC,
+  DEFAULT_PG_KEEP_ALIVE_SEC,
   type OpenPlatformDbOptions,
   openPlatformDb,
   type PlatformDb,
