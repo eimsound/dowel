@@ -1495,4 +1495,323 @@ describe.skipIf(!PG_URL)('P7 HA Wave 2B：持久化队列、分布式巡检、�
       await dbB.close();
     }
   });
+
+  test('11. 分布式巡检锁（PG 双副本）：显式 sweep() 阻塞等待不早退、局部 kick 撞锁重试、定时巡检非阻塞跳过（#22）', async () => {
+    const t = await createTestDb('ha_sweep_lock');
+    closers.push(t.close);
+    const dbA = await openPlatformDb(t.url);
+    const dbB = await openPlatformDb(t.url);
+    const haA = new HaCoordinator(dbA, { replicaId: 'sw-lock-a' });
+    const haB = new HaCoordinator(dbB, { replicaId: 'sw-lock-b' });
+    const busA = new EventBus(dbA, { replicaId: 'sw-lock-a' });
+    const busB = new EventBus(dbB, { replicaId: 'sw-lock-b' });
+    const whA = new Webhooks(dbA, { bus: busA, ha: haA, pollIntervalMs: 60_000 });
+    const whB = new Webhooks(dbB, { bus: busB, ha: haB, pollIntervalMs: 60_000 });
+    const security = securityConfigFromEnv();
+    const guard = async () => {};
+    const requestsA = new Requests(dbA, { db: dbA, guard, locks: new EnvLocks(dbA) }, whA, security, {
+      bus: busA,
+      ha: haA,
+      kickRetryMs: 50,
+    });
+    const requestsB = new Requests(dbB, { db: dbB, guard, locks: new EnvLocks(dbB) }, whB, security, {
+      bus: busB,
+      ha: haB,
+      kickRetryMs: 50,
+    });
+
+    try {
+      await haA.start();
+      await haB.start();
+      await busA.start();
+      await busB.start();
+
+      const dev = await makeUser(dbA, 'sw_lock_dev', { name: '开发者' });
+      await dbA.query("insert into groups (id, slug, name) values ('g-swl', 'g-swl', '巡检锁组')");
+      await dbA.query("insert into group_members (group_id, user_id, role) values ('g-swl', $1, 'admin')", [
+        dev.id,
+      ]);
+      await dbA.query(
+        "insert into projects (id, name, group_id, slug) values ('p-swl', '巡检锁项目', 'g-swl', 'p-swl')",
+      );
+      await dbA.query("insert into branches (id, project_id, name) values ('b-swl', 'p-swl', 'main')");
+      const urlEnc1 = encrypt('postgres://u:p@127.0.0.1:5432/swl1');
+      const urlEnc2 = encrypt('postgres://u:p@127.0.0.1:5432/swl2');
+      await dbA.query(
+        `insert into environments (id, project_id, name, url_enc, production)
+         values ('e-swl-1', 'p-swl', 'env1', $1, true), ('e-swl-2', 'p-swl', 'env2', $2, true)`,
+        [urlEnc1, urlEnc2],
+      );
+      await dbA.query(
+        `insert into versions (id, project_id, branch_id, seq, name, model, number, up_steps, down_steps, checksum)
+         values ('v-swl-1', 'p-swl', 'b-swl', 0, 'v1', $1::text::jsonb, 1, '[]'::jsonb, '[]'::jsonb, 'sum-swl-1')`,
+        [JSON.stringify(emptyModel())],
+      );
+
+      const hashByEnv: Record<string, string> = {
+        'e-swl-1': connHash({ url_enc: urlEnc1 }),
+        'e-swl-2': connHash({ url_enc: urlEnc2 }),
+      };
+
+      const insertExpired = async (id: string, envId: 'e-swl-1' | 'e-swl-2') => {
+        await dbA.query(
+          `insert into exec_requests
+             (id, project_id, environment_id, requested_by, direction, to_version_id, migrations, flow, conn_hash, production, status, expires_at, updated_at)
+           values ($1, 'p-swl', $2, $3, 'up', 'v-swl-1', '[]'::jsonb, $4::text::jsonb, $5, true, 'pending', $6, $7)`,
+          [
+            id,
+            envId,
+            dev.id,
+            JSON.stringify({ implicit: true, stages: [] }),
+            hashByEnv[envId],
+            new Date('2000-01-01T00:00:00.000Z'),
+            new Date(),
+          ],
+        );
+      };
+
+      const statusOf = async (id: string) =>
+        (await dbB.query<{ status: string }>('select status from exec_requests where id = $1', [id]))[0]!
+          .status;
+
+      // (a) 副本 A 持有 job:requests.sweep 期间，副本 B 显式 await sweep({ envIds: ['e-swl-2'] }) 阻塞等待并真正落库
+      await insertExpired('req-swl-env1', 'e-swl-1');
+      await insertExpired('req-swl-env2', 'e-swl-2');
+
+      let enteredA1!: () => void;
+      const inLockA1 = new Promise<void>((r) => {
+        enteredA1 = r;
+      });
+      let releaseA1!: () => void;
+      const holdA1 = new Promise<void>((r) => {
+        releaseA1 = r;
+      });
+
+      const lockA1 = haA.withJobLock('requests.sweep', async () => {
+        enteredA1();
+        await holdA1;
+      });
+      await inLockA1;
+
+      let sweepBDone = false;
+      const sweepBP = requestsB.sweep({ envIds: ['e-swl-2'] }).then((n) => {
+        sweepBDone = true;
+        return n;
+      });
+
+      await new Promise((r) => setTimeout(r, 80));
+      expect(sweepBDone).toBe(false);
+      expect(await statusOf('req-swl-env2')).toBe('pending');
+
+      releaseA1();
+      await lockA1;
+      expect(await sweepBP).toBe(1);
+      expect(sweepBDone).toBe(true);
+      expect(await statusOf('req-swl-env2')).toBe('expired');
+      // 仅巡检 env2，env1 上的申请未受影响
+      expect(await statusOf('req-swl-env1')).toBe('pending');
+
+      // (b) 副本 A 持锁期间副本 B 收到局部 kick({ envIds: ['e-swl-2'] })：撞锁不丢弃，释放锁后经短延迟重试自动落库
+      await insertExpired('req-swl-kick2', 'e-swl-2');
+      // 停止副本 A 监听，确保不会由副本 A 替副本 B 扫掉 req-swl-kick2
+      requestsA.stop();
+      await requestsA.drain();
+
+      let enteredA2!: () => void;
+      const inLockA2 = new Promise<void>((r) => {
+        enteredA2 = r;
+      });
+      let releaseA2!: () => void;
+      const holdA2 = new Promise<void>((r) => {
+        releaseA2 = r;
+      });
+      const lockA2 = haA.withJobLock('requests.sweep', async () => {
+        enteredA2();
+        await holdA2;
+      });
+      await inLockA2;
+
+      requestsB.kick({ envIds: ['e-swl-2'] });
+      await new Promise((r) => setTimeout(r, 70));
+      expect(await statusOf('req-swl-kick2')).toBe('pending');
+
+      releaseA2();
+      await lockA2;
+      await waitFor(async () => (await statusOf('req-swl-kick2')) === 'expired');
+      expect(await statusOf('req-swl-env1')).toBe('pending');
+
+      // (c) 普通定时巡检在副本 A 持锁期间非阻塞跳过、不调用阻塞等锁且不排重试
+      let enteredA3!: () => void;
+      const inLockA3 = new Promise<void>((r) => {
+        enteredA3 = r;
+      });
+      let releaseA3!: () => void;
+      const holdA3 = new Promise<void>((r) => {
+        releaseA3 = r;
+      });
+      const lockA3 = haA.withJobLock('requests.sweep', async () => {
+        enteredA3();
+        await holdA3;
+      });
+      await inLockA3;
+
+      let tryLockCallsB = 0;
+      let blockingLockCallsB = 0;
+      const origTryB = haB.tryWithJobLock.bind(haB);
+      const origBlockingB = haB.withJobLock.bind(haB);
+      haB.tryWithJobLock = ((name, fn) => {
+        if (name === 'requests.sweep') tryLockCallsB++;
+        return origTryB(name, fn);
+      }) as typeof haB.tryWithJobLock;
+      haB.withJobLock = ((name, fn, opts) => {
+        if (name === 'requests.sweep') blockingLockCallsB++;
+        return origBlockingB(name, fn, opts);
+      }) as typeof haB.withJobLock;
+
+      try {
+        await requestsB.start(35);
+        await waitFor(() => tryLockCallsB >= 2);
+        expect(blockingLockCallsB).toBe(0);
+        expect(await statusOf('req-swl-env1')).toBe('pending');
+
+        // 停机排空在另一副本持锁时立即返回，不阻塞不死锁
+        requestsB.stop();
+        await requestsB.drain();
+      } finally {
+        haB.tryWithJobLock = origTryB;
+        haB.withJobLock = origBlockingB;
+        releaseA3();
+        await lockA3;
+      }
+
+      // 释放锁后再等待一段时间：被跳过的定时巡检不会重排补跑
+      await new Promise((r) => setTimeout(r, 120));
+      expect(await statusOf('req-swl-env1')).toBe('pending');
+    } finally {
+      requestsA.stop();
+      requestsB.stop();
+      await requestsA.drain();
+      await requestsB.drain();
+      await whA.close();
+      await whB.close();
+      await busA.close();
+      await busB.close();
+      await haA.stop();
+      await haB.stop();
+      await dbA.close();
+      await dbB.close();
+    }
+  });
+
+  test('12. 强杀 PG LISTEN 连接触发 bus.onReconnect 后自动补跑全量巡检处理断线期间失效申请（#22）', async () => {
+    const t = await createTestDb('ha_sweep_reconnect');
+    closers.push(t.close);
+    const dbA = await openPlatformDb(t.url);
+    const dbB = await openPlatformDb(t.url);
+    const haB = new HaCoordinator(dbB, { replicaId: 'sw-reconn-b' });
+    const busB = new EventBus(dbB, { replicaId: 'sw-reconn-b' });
+    const whB = new Webhooks(dbB, { bus: busB, ha: haB, pollIntervalMs: 60_000 });
+    const security = securityConfigFromEnv();
+    const guard = async () => {};
+    const requestsB = new Requests(dbB, { db: dbB, guard, locks: new EnvLocks(dbB) }, whB, security, {
+      bus: busB,
+      ha: haB,
+      kickRetryMs: 50,
+    });
+
+    try {
+      await haB.start();
+      await busB.start();
+      // 关闭周期定时器（intervalMs = 0），确保只能由 bus.onReconnect 触发补扫
+      await requestsB.start(0);
+
+      let reconnects = 0;
+      const offReconn = busB.onReconnect(() => {
+        reconnects++;
+      });
+
+      const dev = await makeUser(dbA, 'reconn_dev', { name: '开发者' });
+      await dbA.query("insert into groups (id, slug, name) values ('g-rcn', 'g-rcn', '重连组')");
+      await dbA.query("insert into group_members (group_id, user_id, role) values ('g-rcn', $1, 'admin')", [
+        dev.id,
+      ]);
+      await dbA.query(
+        "insert into projects (id, name, group_id, slug) values ('p-rcn', '重连项目', 'g-rcn', 'p-rcn')",
+      );
+      await dbA.query("insert into branches (id, project_id, name) values ('b-rcn', 'p-rcn', 'main')");
+      const envUrlEnc = encrypt('postgres://u:p@127.0.0.1:5432/rcn');
+      await dbA.query(
+        `insert into environments (id, project_id, name, url_enc, production)
+         values ('e-rcn', 'p-rcn', 'prod', $1, true)`,
+        [envUrlEnc],
+      );
+      for (const [vid, seq, num] of [
+        ['v-rcn-1', 0, 1],
+        ['v-rcn-2', 1, 2],
+      ] as const) {
+        await dbA.query(
+          `insert into versions (id, project_id, branch_id, seq, name, model, number, up_steps, down_steps, checksum)
+           values ($1, 'p-rcn', 'b-rcn', $2, $3, $4::text::jsonb, $5, '[]'::jsonb, '[]'::jsonb, $6)`,
+          [vid, seq, `v${num}`, JSON.stringify(emptyModel()), num, `sum-rcn-${num}`],
+        );
+      }
+
+      const envConnHash = connHash({ url_enc: envUrlEnc });
+      // 模拟环境版本推进期间总线瞬断、未送达 requests.kick：申请仍停留在 pending
+      await dbA.query(
+        `insert into exec_requests
+           (id, project_id, environment_id, requested_by, direction, from_version_id, to_version_id,
+            migrations, flow, conn_hash, production, status, expires_at, updated_at)
+         values ('req-rcn-missed', 'p-rcn', 'e-rcn', $1, 'up', null, 'v-rcn-2',
+                 '[]'::jsonb, $2::text::jsonb, $3, true, 'pending', $4, $5)`,
+        [
+          dev.id,
+          JSON.stringify({ implicit: true, stages: [] }),
+          envConnHash,
+          new Date(Date.now() + 3600_000),
+          new Date(),
+        ],
+      );
+      await dbA.query("update environments set current_version_id = 'v-rcn-1' where id = 'e-rcn'");
+
+      const [before] = await dbB.query<{ status: string }>(
+        "select status from exec_requests where id = 'req-rcn-missed'",
+      );
+      expect(before!.status).toBe('pending');
+
+      // 主动强杀 PG LISTEN 连接触发 busB 自动重连与 onReconnect
+      await dbA.query(
+        `select pg_terminate_backend(pid)
+         from pg_stat_activity
+         where datname = current_database()
+           and pid <> pg_backend_pid()
+           and query ilike 'listen%'`,
+      );
+      await waitFor(() => reconnects >= 1, 10_000);
+
+      // 重连后 Requests 自动 kickLocal({ all: true }) 将漏掉的失效申请转为 invalid
+      await waitFor(async () => {
+        const [row] = await dbB.query<{ status: string }>(
+          "select status from exec_requests where id = 'req-rcn-missed'",
+        );
+        return row?.status === 'invalid';
+      }, 10_000);
+
+      const [after] = await dbB.query<{ status: string; status_reason: string | null }>(
+        "select status, status_reason from exec_requests where id = 'req-rcn-missed'",
+      );
+      expect(after!.status).toBe('invalid');
+      expect(after!.status_reason).toContain('当前版本变了');
+
+      offReconn();
+    } finally {
+      requestsB.stop();
+      await requestsB.drain();
+      await whB.close();
+      await busB.close();
+      await haB.stop();
+      await dbA.close();
+      await dbB.close();
+    }
+  });
 });

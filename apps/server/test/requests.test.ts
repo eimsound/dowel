@@ -15,12 +15,17 @@ import type {
 import { addColumn, all, emptyModel, type Model } from '@dowel/core';
 import { afterAll, beforeAll, describe, expect, test, vi } from 'vitest';
 import { connect, createTestDb, PG_URL } from '../../../test/pg.ts';
+import { EventBus } from '../src/bus.ts';
 import type { EnvRow } from '../src/envs.ts';
+import { EnvLocks } from '../src/executions.ts';
+import { HaCoordinator } from '../src/ha.ts';
 import { createApp, openPlatformDb, type PlatformDb } from '../src/index.ts';
 import { withPolicyLock } from '../src/policy.ts';
 import { KeyedLimiter, LoginLimiter } from '../src/rate-limit.ts';
-import { connHash, Effects, type RequestRow } from '../src/requests.ts';
+import { connHash, Effects, type RequestRow, Requests } from '../src/requests.ts';
 import { encrypt } from '../src/secrets.ts';
+import { securityConfigFromEnv } from '../src/security.ts';
+import { Webhooks } from '../src/webhooks.ts';
 import { addTable, editModel, makeUser, PASSWORD } from './support.ts';
 
 process.env.DOWEL_SECRET ??= 'requests-test-secret-0123456789';
@@ -1698,6 +1703,294 @@ describe('Webhook 事务内持久化入队（#20）', () => {
     } finally {
       appObj.webhooks.wake = origWake;
       appObj.webhooks.emit = origEmit;
+      await cleanup();
+    }
+  });
+});
+
+describe('巡检锁等待、事件 kick 重试与总线重连补扫（#22）', () => {
+  const waitUntil = async (predicate: () => boolean | Promise<boolean>, timeoutMs = 4000, stepMs = 15) => {
+    const deadline = Date.now() + timeoutMs;
+    while (!(await predicate())) {
+      if (Date.now() >= deadline) throw new Error(`等待条件超时（${timeoutMs}ms）`);
+      await new Promise((r) => setTimeout(r, stepMs));
+    }
+  };
+
+  const setupSweepEnv = async (opts: { sweepLockTimeoutMs?: number; kickRetryMs?: number } = {}) => {
+    const memDb = await openPlatformDb(':memory:');
+    const ha = new HaCoordinator(memDb, { replicaId: 'req-sweep-unit' });
+    const bus = new EventBus(memDb, { replicaId: 'req-sweep-unit' });
+    const webhooks = new Webhooks(memDb, { bus, ha, pollIntervalMs: 60_000, retryBaseMs: 60_000 });
+    const security = securityConfigFromEnv();
+    const requests = new Requests(
+      memDb,
+      { db: memDb, guard: async () => {}, locks: new EnvLocks(memDb) },
+      webhooks,
+      security,
+      {
+        bus,
+        ha,
+        ...opts,
+      },
+    );
+
+    const dev = await makeUser(memDb, 'sw_dev', { name: '开发者' });
+    await memDb.query("insert into groups (id, slug, name) values ('g-sw', 'g-sw', '巡检组')");
+    await memDb.query("insert into group_members (group_id, user_id, role) values ('g-sw', $1, 'admin')", [
+      dev.id,
+    ]);
+    await memDb.query(
+      "insert into projects (id, name, group_id, slug) values ('p-sw', '巡检项目', 'g-sw', 'p-sw')",
+    );
+    await memDb.query("insert into branches (id, project_id, name) values ('b-sw', 'p-sw', 'main')");
+    const urlEnc1 = encrypt('postgres://u:p@127.0.0.1:5432/sw1');
+    const urlEnc2 = encrypt('postgres://u:p@127.0.0.1:5432/sw2');
+    await memDb.query(
+      `insert into environments (id, project_id, name, url_enc, production)
+       values ('e-sw-1', 'p-sw', 'env1', $1, true), ('e-sw-2', 'p-sw', 'env2', $2, true)`,
+      [urlEnc1, urlEnc2],
+    );
+    await memDb.query(
+      `insert into versions (id, project_id, branch_id, seq, name, model, number, up_steps, down_steps, checksum)
+       values ('v-sw-1', 'p-sw', 'b-sw', 1, 'v1', $1::text::jsonb, 1, '[]', '[]', 'chk-sw-1')`,
+      [JSON.stringify(emptyModel())],
+    );
+
+    const hashByEnv: Record<string, string> = {
+      'e-sw-1': connHash({ url_enc: urlEnc1 }),
+      'e-sw-2': connHash({ url_enc: urlEnc2 }),
+    };
+
+    const insertExpired = async (id: string, envId = 'e-sw-2') => {
+      await memDb.query(
+        `insert into exec_requests
+           (id, project_id, environment_id, requested_by, direction, from_version_id, to_version_id,
+            migrations, dry_run, reason, flow, conn_hash, production, status, stage, expires_at, created_at, updated_at)
+         values ($1, 'p-sw', $2, $3, 'up', null, 'v-sw-1', '[]', null, '测试', $4::text::jsonb, $5, true, 'pending', 0, $6, $7, $7)`,
+        [
+          id,
+          envId,
+          dev.id,
+          JSON.stringify({ implicit: true, stages: [] }),
+          hashByEnv[envId]!,
+          '2000-01-01T00:00:00.000Z',
+          new Date().toISOString(),
+        ],
+      );
+    };
+
+    const statusOf = async (id: string) =>
+      (await memDb.query<{ status: string }>('select status from exec_requests where id = $1', [id]))[0]!
+        .status;
+
+    const cleanup = async () => {
+      requests.stop();
+      await requests.drain();
+      await webhooks.close();
+      await bus.close();
+      await ha.stop();
+      await memDb.close();
+    };
+
+    return { memDb, ha, bus, requests, insertExpired, statusOf, cleanup };
+  };
+
+  test('显式 sweep() 撞锁时阻塞等待锁释放后真正执行，超时抛错且不误推进 done', async () => {
+    const { ha, requests, insertExpired, statusOf, cleanup } = await setupSweepEnv({
+      sweepLockTimeoutMs: 5000,
+    });
+    try {
+      await insertExpired('req-block-1', 'e-sw-2');
+
+      let releaseLock!: () => void;
+      const holdLock = new Promise<void>((r) => {
+        releaseLock = r;
+      });
+      let enteredLock!: () => void;
+      const inLock = new Promise<void>((r) => {
+        enteredLock = r;
+      });
+
+      const lockHolder = ha.withJobLock('requests.sweep', async () => {
+        enteredLock();
+        await holdLock;
+      });
+      await inLock;
+
+      let done = false;
+      const sweepPromise = requests.sweep({ envIds: ['e-sw-2'] }).then((n) => {
+        done = true;
+        return n;
+      });
+
+      await new Promise((r) => setTimeout(r, 60));
+      expect(done).toBe(false);
+      expect(await statusOf('req-block-1')).toBe('pending');
+
+      releaseLock();
+      await lockHolder;
+      expect(await sweepPromise).toBe(1);
+      expect(done).toBe(true);
+      expect(await statusOf('req-block-1')).toBe('expired');
+    } finally {
+      await cleanup();
+    }
+
+    // 显式 sweep() 等锁超时时抛出明确错误，绝不静默返回 0 或误推进 done
+    const t2 = await setupSweepEnv({ sweepLockTimeoutMs: 40 });
+    try {
+      await t2.insertExpired('req-timeout-1', 'e-sw-2');
+      let releaseLock!: () => void;
+      const holdLock = new Promise<void>((r) => {
+        releaseLock = r;
+      });
+      let enteredLock!: () => void;
+      const inLock = new Promise<void>((r) => {
+        enteredLock = r;
+      });
+      const holder = t2.ha.withJobLock('requests.sweep', async () => {
+        enteredLock();
+        await holdLock;
+      });
+      await inLock;
+
+      await expect(t2.requests.sweep({ envIds: ['e-sw-2'] })).rejects.toThrow('超时');
+      expect(await t2.statusOf('req-timeout-1')).toBe('pending');
+
+      releaseLock();
+      await holder;
+      expect(await t2.requests.sweep({ envIds: ['e-sw-2'] })).toBe(1);
+      expect(await t2.statusOf('req-timeout-1')).toBe('expired');
+    } finally {
+      await t2.cleanup();
+    }
+  });
+
+  test('事件驱动 kick() 撞锁时短延迟重试不丢弃；stop() 后取消重试且 drain() 不阻塞', async () => {
+    const { ha, requests, insertExpired, statusOf, cleanup } = await setupSweepEnv({
+      kickRetryMs: 35,
+    });
+    try {
+      await insertExpired('req-kick-retry', 'e-sw-2');
+
+      let release1!: () => void;
+      const hold1 = new Promise<void>((r) => {
+        release1 = r;
+      });
+      let entered1!: () => void;
+      const inLock1 = new Promise<void>((r) => {
+        entered1 = r;
+      });
+      const holder1 = ha.withJobLock('requests.sweep', async () => {
+        entered1();
+        await hold1;
+      });
+      await inLock1;
+
+      // 持锁期间触发局部 kick：不会静默丢弃，锁释放后由短延迟重试自动落库
+      requests.kick({ envIds: ['e-sw-2'] });
+      await new Promise((r) => setTimeout(r, 50));
+      expect(await statusOf('req-kick-retry')).toBe('pending');
+
+      release1();
+      await holder1;
+      await waitUntil(async () => (await statusOf('req-kick-retry')) === 'expired');
+
+      // 停机保护：撞锁排上重试后调用 stop() + drain()，立即排空且不再重排执行
+      await insertExpired('req-kick-stop', 'e-sw-2');
+      let release2!: () => void;
+      const hold2 = new Promise<void>((r) => {
+        release2 = r;
+      });
+      let entered2!: () => void;
+      const inLock2 = new Promise<void>((r) => {
+        entered2 = r;
+      });
+      const holder2 = ha.withJobLock('requests.sweep', async () => {
+        entered2();
+        await hold2;
+      });
+      await inLock2;
+
+      requests.kick({ envIds: ['e-sw-2'] });
+      await new Promise((r) => setTimeout(r, 20));
+      requests.stop();
+      await requests.drain();
+
+      release2();
+      await holder2;
+      await new Promise((r) => setTimeout(r, 80));
+      expect(await statusOf('req-kick-stop')).toBe('pending');
+    } finally {
+      await cleanup();
+    }
+  });
+
+  test('普通定时巡检撞锁非阻塞跳过不重排；bus.onReconnect 补跑全量巡检且停机后跳过', async () => {
+    const { ha, bus, requests, insertExpired, statusOf, cleanup } = await setupSweepEnv({
+      kickRetryMs: 30,
+    });
+    try {
+      await insertExpired('req-periodic-skip', 'e-sw-1');
+
+      let release!: () => void;
+      const hold = new Promise<void>((r) => {
+        release = r;
+      });
+      let entered!: () => void;
+      const inLock = new Promise<void>((r) => {
+        entered = r;
+      });
+      const holder = ha.withJobLock('requests.sweep', async () => {
+        entered();
+        await hold;
+      });
+      await inLock;
+
+      let tryCount = 0;
+      let blockingCount = 0;
+      const origTry = ha.tryWithJobLock.bind(ha);
+      const origBlocking = ha.withJobLock.bind(ha);
+      ha.tryWithJobLock = ((name, fn) => {
+        if (name === 'requests.sweep') tryCount++;
+        return origTry(name, fn);
+      }) as typeof ha.tryWithJobLock;
+      ha.withJobLock = ((name, fn, o) => {
+        if (name === 'requests.sweep') blockingCount++;
+        return origBlocking(name, fn, o);
+      }) as typeof ha.withJobLock;
+
+      try {
+        await requests.start(25);
+        await waitUntil(() => tryCount >= 2);
+        expect(blockingCount).toBe(0);
+        expect(await statusOf('req-periodic-skip')).toBe('pending');
+
+        // 停机在持锁期间立即返回，且不会在锁释放后补跑定时巡检
+        requests.stop();
+        await requests.drain();
+      } finally {
+        ha.tryWithJobLock = origTry;
+        ha.withJobLock = origBlocking;
+        release();
+        await holder;
+      }
+      await new Promise((r) => setTimeout(r, 70));
+      expect(await statusOf('req-periodic-skip')).toBe('pending');
+
+      // 重新启动（关闭周期定时器）后模拟 bus.onReconnect → 自动触发 kickLocal({ all: true }) 补扫
+      await requests.start(0);
+      (bus as unknown as { handleReconnect: () => void }).handleReconnect();
+      await waitUntil(async () => (await statusOf('req-periodic-skip')) === 'expired');
+
+      // 停机后再收到 onReconnect 回调（模拟停机竞态）：直接跳过不执行巡检
+      await insertExpired('req-reconnect-stopped', 'e-sw-1');
+      requests.stop();
+      (bus as unknown as { handleReconnect: () => void }).handleReconnect();
+      await new Promise((r) => setTimeout(r, 60));
+      expect(await statusOf('req-reconnect-stopped')).toBe('pending');
+    } finally {
       await cleanup();
     }
   });

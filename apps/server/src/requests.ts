@@ -490,6 +490,51 @@ export interface SweepTarget {
 
 /** 定时清理的默认间隔：30 秒（过期、失效的申请转成终态并通知申请人） */
 export const REQUEST_SWEEP_MS = 30_000;
+/** 显式 sweep() 等待分布式巡检锁的默认超时时间 */
+const SWEEP_LOCK_TIMEOUT_MS = 30_000;
+/** 事件驱动 kick 未拿到分布式锁时的默认重试间隔 */
+const SWEEP_KICK_RETRY_MS = 200;
+/** 事件驱动 kick 连续撞锁时的最大重试次数（避免锁长期被占时无限自旋；另有 30 秒周期巡检兜底） */
+const MAX_SWEEP_KICK_RETRIES = 25;
+
+interface SweepScope {
+  all: boolean;
+  envs: Set<string>;
+  projects: Set<string>;
+  groups: Set<string>;
+}
+
+interface PendingSweep extends SweepScope {
+  /** 是否有显式 await sweep() 调用者在等待：需要阻塞等锁直到跑完 */
+  blocking: boolean;
+  /** 是否包含事件驱动的 kick（非单纯定时心跳）：未获锁时需要短延迟重试而非静默丢弃 */
+  retryOnContention: boolean;
+}
+
+interface SweepOnceResult {
+  acquired: boolean;
+  count: number;
+}
+
+const emptyScope = (): SweepScope => ({
+  all: false,
+  envs: new Set(),
+  projects: new Set(),
+  groups: new Set(),
+});
+
+const mergeScope = (dst: SweepScope, src: SweepTarget | SweepScope): void => {
+  if (src.all) dst.all = true;
+  if ('envs' in src) {
+    for (const id of src.envs) dst.envs.add(id);
+    for (const id of src.projects) dst.projects.add(id);
+    for (const id of src.groups) dst.groups.add(id);
+  } else {
+    for (const id of src.envIds ?? []) dst.envs.add(id);
+    for (const id of src.projectIds ?? []) dst.projects.add(id);
+    for (const id of src.groupIds ?? []) dst.groups.add(id);
+  }
+};
 
 export interface RequestScope {
   project: ProjectRow;
@@ -504,6 +549,10 @@ export interface RequestsOptions {
   bus?: EventBus;
   /** 副本租约与分布式任务协调器（可选）：按副本租约恢复中断申请与巡检互斥 */
   ha?: HaCoordinator;
+  /** 显式 sweep() 等待分布式巡检锁的超时时间（毫秒，默认 30000） */
+  sweepLockTimeoutMs?: number;
+  /** 事件驱动 kick 未获锁时的短延迟重试间隔（毫秒，默认 200） */
+  kickRetryMs?: number;
 }
 
 const INBOX_CHANGED_BATCH = 100;
@@ -515,15 +564,19 @@ export class Requests {
   readonly security: SecurityConfig;
   readonly bus: EventBus | null;
   readonly ha: HaCoordinator | null;
+  private readonly sweepLockTimeoutMs: number;
+  private readonly kickRetryMs: number;
   private listeners = new Map<string, Set<Listener>>();
   private stopListeners = new Set<() => void>();
   private stopped = false;
   private busUnsubs: (() => void)[] = [];
   private timer: ReturnType<typeof setInterval> | null = null;
   private kickTimer: ReturnType<typeof setTimeout> | null = null;
+  private retryTimer: ReturnType<typeof setTimeout> | null = null;
+  private retryPending: SweepScope | null = null;
+  private retryAttempts = 0;
   /** 排着的检查范围（合并）；queued / done 是代数：sweep() 等到包含自己那一次的一轮跑完 */
-  private pending: { all: boolean; envs: Set<string>; projects: Set<string>; groups: Set<string> } | null =
-    null;
+  private pending: PendingSweep | null = null;
   private queued = 0;
   private done = 0;
   private draining: Promise<number> | null = null;
@@ -548,6 +601,8 @@ export class Requests {
     this.security = security;
     this.bus = options.bus ?? null;
     this.ha = options.ha ?? null;
+    this.sweepLockTimeoutMs = options.sweepLockTimeoutMs ?? SWEEP_LOCK_TIMEOUT_MS;
+    this.kickRetryMs = options.kickRetryMs ?? SWEEP_KICK_RETRY_MS;
     this.attachBus();
   }
 
@@ -566,13 +621,14 @@ export class Requests {
     const replicaId = this.bus.replicaId;
     this.busUnsubs.push(
       this.bus.onEvent(async (event) => {
-        if (event.origin === replicaId) return;
+        if (this.stopped || event.origin === replicaId) return;
         if (event.t === 'inbox.changed') {
           if (!event.userIds.length) {
             this.broadcastLocal({ requests: true });
             return;
           }
           for (const uid of event.userIds) {
+            if (this.stopped) return;
             if (this.listeners.has(uid)) await this.publishUnreadLocal(uid);
           }
           return;
@@ -587,9 +643,15 @@ export class Requests {
         }
       }),
       this.bus.onReconnect(async () => {
+        if (this.stopped) return;
+        // 断线期间可能错过了 requests.kick，重连后补跑一次全量巡检（非阻塞、撞锁自动短延迟重试）
+        this.kickLocal({ all: true });
         const activeUsers = [...this.listeners.keys()];
-        for (const uid of activeUsers) await this.publishUnreadLocal(uid);
-        if (activeUsers.length) this.broadcastLocal({ requests: true });
+        for (const uid of activeUsers) {
+          if (this.stopped) return;
+          await this.publishUnreadLocal(uid);
+        }
+        if (!this.stopped && activeUsers.length) this.broadcastLocal({ requests: true });
       }),
     );
   }
@@ -611,7 +673,7 @@ export class Requests {
     this.attachBus();
     await this.recoverInterrupted();
     if (this.stopped || !(intervalMs > 0)) return;
-    this.timer = setInterval(() => void this.sweep(), intervalMs);
+    this.timer = setInterval(() => this.triggerPeriodicSweep(), intervalMs);
     this.timer.unref?.();
   }
 
@@ -677,6 +739,9 @@ export class Requests {
     this.timer = null;
     if (this.kickTimer) clearTimeout(this.kickTimer);
     this.kickTimer = null;
+    this.clearRetry();
+    this.retryAttempts = 0;
+    if (this.pending && !this.pending.blocking) this.pending = null;
     this.detachBus();
     const closers = [...this.stopListeners];
     this.stopListeners.clear();
@@ -704,24 +769,67 @@ export class Requests {
     return p;
   }
 
-  private enqueue(t: SweepTarget): number {
-    this.pending ??= { all: false, envs: new Set(), projects: new Set(), groups: new Set() };
-    const p = this.pending;
-    if (t.all) p.all = true;
-    for (const id of t.envIds ?? []) p.envs.add(id);
-    for (const id of t.projectIds ?? []) p.projects.add(id);
-    for (const id of t.groupIds ?? []) p.groups.add(id);
+  private clearRetry(): void {
+    if (this.retryTimer) clearTimeout(this.retryTimer);
+    this.retryTimer = null;
+    this.retryPending = null;
+  }
+
+  private scheduleRetry(t: SweepScope): void {
+    if (this.stopped || this.retryAttempts >= MAX_SWEEP_KICK_RETRIES) {
+      this.clearRetry();
+      return;
+    }
+    this.retryAttempts++;
+    this.retryPending ??= emptyScope();
+    mergeScope(this.retryPending, t);
+    if (this.retryTimer) return;
+    this.retryTimer = setTimeout(() => {
+      this.retryTimer = null;
+      const retry = this.retryPending;
+      this.retryPending = null;
+      if (this.stopped || !retry) return;
+      this.enqueue(retry, 'kick');
+      void this.drainPending().catch((e) => {
+        console.error('重试检查执行申请失败', e instanceof Error ? scrubSecrets(e.message) : e);
+      });
+    }, this.kickRetryMs);
+    this.retryTimer.unref?.();
+  }
+
+  private enqueue(t: SweepTarget | SweepScope, mode: 'periodic' | 'kick' | 'blocking'): number {
+    this.pending ??= { ...emptyScope(), blocking: false, retryOnContention: false };
+    mergeScope(this.pending, t);
+    if (mode === 'blocking') this.pending.blocking = true;
+    if (mode === 'kick') this.pending.retryOnContention = true;
+    // 非单纯定时心跳触发时，若已有挂起的短延迟重试目标则顺手并入本轮
+    if (this.retryPending && mode !== 'periodic') {
+      mergeScope(this.pending, this.retryPending);
+      this.pending.retryOnContention = true;
+      this.clearRetry();
+    }
     return ++this.queued;
+  }
+
+  private triggerPeriodicSweep(): void {
+    if (this.stopped) return;
+    this.enqueue({ all: true }, 'periodic');
+    void this.drainPending().catch((e) => {
+      console.error('定时检查执行申请失败', e instanceof Error ? scrubSecrets(e.message) : e);
+    });
   }
 
   private kickLocal(t: SweepTarget) {
     if (this.stopped) return;
-    this.enqueue(t);
+    this.retryAttempts = 0;
+    this.enqueue(t, 'kick');
     if (this.kickTimer) return;
     this.kickTimer = setTimeout(() => {
       this.kickTimer = null;
       if (this.stopped) return;
-      void this.drainPending();
+      void this.drainPending().catch((e) => {
+        console.error('检查执行申请失败', e instanceof Error ? scrubSecrets(e.message) : e);
+      });
     }, 0);
     this.kickTimer.unref?.();
   }
@@ -750,46 +858,82 @@ export class Requests {
 
   /** 检查一个范围（默认全部）里还没结束的申请，失效 / 过期的转成终态并通知申请人；等到包含这次请求的那一轮跑完，返回处理了几个 */
   async sweep(t: SweepTarget = { all: true }): Promise<number> {
-    const mine = this.enqueue(t);
+    const mine = this.enqueue(t, 'blocking');
     let n = 0;
     while (this.done < mine) n += await this.drainPending();
     return n;
+  }
+
+  private pendingBlocking(): PendingSweep | null {
+    return this.pending?.blocking ? this.pending : null;
   }
 
   private drainPending(): Promise<number> {
     this.draining ??= (async () => {
       let n = 0;
       while (this.pending) {
+        if (this.kickTimer) {
+          clearTimeout(this.kickTimer);
+          this.kickTimer = null;
+        }
         const t = this.pending;
         const gen = this.queued;
         this.pending = null;
-        n += await this.sweepOnce(t).catch((e) => {
+        let res: SweepOnceResult;
+        try {
+          res = await this.sweepOnce(t);
+        } catch (e) {
           console.error('检查执行申请失败', e instanceof Error ? scrubSecrets(e.message) : e);
-          return 0;
-        });
-        this.done = gen;
+          this.done = gen;
+          if (this.stopped) break;
+          continue;
+        }
+        if (res.acquired) {
+          n += res.count;
+          this.done = gen;
+          this.retryAttempts = 0;
+          if (t.all) this.clearRetry();
+        } else if (t.blocking) {
+          // 显式 sweep() 阻塞等锁超时：绝不误推进 done，也不丢弃合并进来的 kick 重试
+          if (t.retryOnContention && !this.stopped) this.scheduleRetry(t);
+          throw new Error('等待执行申请巡检锁超时');
+        } else if (t.retryOnContention && !this.stopped) {
+          // 事件驱动 kick 未拿到锁：若已有后续显式 sweep() 排队则直接并入，否则短延迟重试，防止跨副本撞锁/总线瞬断丢弃
+          const queuedBlocking = this.pendingBlocking();
+          if (queuedBlocking) {
+            mergeScope(queuedBlocking, t);
+            queuedBlocking.retryOnContention = true;
+          } else {
+            this.scheduleRetry(t);
+          }
+        }
         if (this.stopped) break;
       }
       return n;
     })().finally(() => {
       this.draining = null;
       // 循环结束和这里之间又排进来的：再跑一轮，不能丢（停机后不再续跑）
-      if (!this.stopped && this.pending) void this.drainPending();
+      if (!this.stopped && this.pending) {
+        void this.drainPending().catch((e) => {
+          console.error('检查执行申请失败', e instanceof Error ? scrubSecrets(e.message) : e);
+        });
+      }
     });
     return this.draining;
   }
 
-  /** 分布式巡检入口：多副本下通过 advisory lock 互斥，同一时刻只有一个副本跑巡检 */
-  private async sweepOnce(t: {
-    all: boolean;
-    envs: Set<string>;
-    projects: Set<string>;
-    groups: Set<string>;
-  }): Promise<number> {
+  /**
+   * 分布式巡检入口：多副本下通过 advisory lock 互斥，同一时刻只有一个副本跑巡检。
+   * - 显式 sweep()（blocking = true）使用阻塞等锁，确保等待锁释放并跑完目标范围后再推进 done；
+   * - 后台定时 / kick 巡检使用非阻塞 tryWithJobLock，避免后台周期巡检互相阻塞。
+   */
+  private async sweepOnce(t: PendingSweep): Promise<SweepOnceResult> {
     const run = () => this.runSweep(t);
-    if (!this.ha) return run();
-    const res = await this.ha.tryWithJobLock('requests.sweep', run);
-    return res.acquired ? res.value : 0;
+    if (!this.ha) return { acquired: true, count: await run() };
+    const res = t.blocking
+      ? await this.ha.withJobLock('requests.sweep', run, { timeoutMs: this.sweepLockTimeoutMs })
+      : await this.ha.tryWithJobLock('requests.sweep', run);
+    return res.acquired ? { acquired: true, count: res.value } : { acquired: false, count: 0 };
   }
 
   /**
@@ -797,12 +941,7 @@ export class Requests {
    * 再在锁外只读地找出绑定已经不成立的申请（大多数时候一个都没有，不拿全局锁），
    * 最后在执行策略锁里逐个重新读、重新判断、条件更新。
    */
-  private async runSweep(t: {
-    all: boolean;
-    envs: Set<string>;
-    projects: Set<string>;
-    groups: Set<string>;
-  }): Promise<number> {
+  private async runSweep(t: SweepScope): Promise<number> {
     let n = 0;
     if (t.all) n += await this.recoverInterrupted();
     const params: string[] = [];
