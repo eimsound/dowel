@@ -1293,4 +1293,206 @@ describe.skipIf(!PG_URL)('P7 HA Wave 2B：持久化队列、分布式巡检、�
       await dbB.close();
     }
   });
+
+  test('10. Webhook 租约超时防踩踏（PG 双副本）：副本 A 迟到重试写回与成功删除均不破坏副本 B 锁与 attempts（#21）', async () => {
+    const t = await createTestDb('ha_wh_lease');
+    closers.push(t.close);
+    const dbA = await openPlatformDb(t.url);
+    const dbB = await openPlatformDb(t.url);
+    const haA = new HaCoordinator(dbA, { replicaId: 'lease-wh-a' });
+    const haB = new HaCoordinator(dbB, { replicaId: 'lease-wh-b' });
+    const rx = await startReceiver();
+
+    const waitInFlight = async (wh: Webhooks) => {
+      const internal = wh as unknown as {
+        enqueuing: Set<Promise<unknown>>;
+        inFlight: Set<Promise<unknown>>;
+      };
+      while (internal.enqueuing.size || internal.inFlight.size) {
+        await Promise.allSettled([...internal.enqueuing, ...internal.inFlight]);
+      }
+    };
+
+    let whA: Webhooks | null = null;
+    let whB: Webhooks | null = null;
+
+    try {
+      await dbA.query(
+        `insert into instance_settings (key, value) values ('webhook_allowlist', $1::text::jsonb)
+         on conflict (key) do update set value = excluded.value`,
+        [JSON.stringify(['127.0.0.0/8'])],
+      );
+      await dbA.query("insert into groups (id, slug, name) values ('g-wh-lease', 'g-wh-lease', '租约组')");
+      await dbA.query(
+        `insert into webhooks (id, group_id, name, format, url_enc, events, enabled)
+         values ('w-wh-lease', 'g-wh-lease', 'lease-hook', 'json', $1, $2::text::jsonb, true)`,
+        [encrypt(`${rx.base}/lease-hook`), JSON.stringify(['request.created'])],
+      );
+
+      // (a) 副本 A 持短租约卡在 HTTP 请求中；租约过期后副本 B 连续两次 500 推进 attempts = 2 并再次持锁；
+      // 随后副本 A 迟到的 500 失败重试写回，不得清空副本 B 的锁、不得回退 attempts，且跳过本地唤醒。
+      let enteredA1!: () => void;
+      const inReqA1 = new Promise<void>((r) => {
+        enteredA1 = r;
+      });
+      let releaseA1!: () => void;
+      const holdA1 = new Promise<void>((r) => {
+        releaseA1 = r;
+      });
+      let enteredBHold!: () => void;
+      const inReqBHold = new Promise<void>((r) => {
+        enteredBHold = r;
+      });
+      let releaseBHold!: () => void;
+      const holdB = new Promise<void>((r) => {
+        releaseBHold = r;
+      });
+
+      rx.replies.push(
+        (res) => {
+          enteredA1();
+          void holdA1.then(() => {
+            res.writeHead(500);
+            res.end('late-500-from-a');
+          });
+        },
+        (res) => {
+          res.writeHead(500);
+          res.end('b-attempt-1');
+        },
+        (res) => {
+          res.writeHead(500);
+          res.end('b-attempt-2');
+        },
+        (res) => {
+          enteredBHold();
+          void holdB.then(() => ok200(res));
+        },
+      );
+
+      whA = new Webhooks(dbA, {
+        ha: haA,
+        retryBaseMs: 50,
+        pollIntervalMs: 60_000,
+        timeoutMs: 3000,
+        leaseMs: 120,
+      });
+      let wakeCallsA = 0;
+      const origWakeA = (whA as unknown as { scheduleWake: (ms: number) => void }).scheduleWake.bind(whA);
+      (whA as unknown as { scheduleWake: (ms: number) => void }).scheduleWake = (ms: number) => {
+        wakeCallsA++;
+        origWakeA(ms);
+      };
+
+      whA.emit('g-wh-lease', sampleEvent());
+      await inReqA1;
+
+      whB = new Webhooks(dbB, {
+        ha: haB,
+        retryBaseMs: 15,
+        pollIntervalMs: 20,
+        timeoutMs: 3000,
+        leaseMs: 10_000,
+      });
+      await inReqBHold;
+
+      const [beforeLateRetry] = await dbB.query<{
+        id: string;
+        locked_by: string | null;
+        locked_until: Date | string | null;
+        attempts: number;
+      }>('select id, locked_by, locked_until, attempts from webhook_jobs');
+      expect(beforeLateRetry).toMatchObject({ locked_by: 'lease-wh-b', attempts: 2 });
+      expect(beforeLateRetry!.locked_until).not.toBeNull();
+
+      releaseA1();
+      await waitInFlight(whA);
+
+      const [afterLateRetry] = await dbB.query<{
+        id: string;
+        locked_by: string | null;
+        locked_until: Date | string | null;
+        attempts: number;
+      }>('select id, locked_by, locked_until, attempts from webhook_jobs where id = $1', [
+        beforeLateRetry!.id,
+      ]);
+      expect(afterLateRetry!.locked_by).toBe('lease-wh-b');
+      expect(afterLateRetry!.attempts).toBe(2);
+      expect(new Date(afterLateRetry!.locked_until as string).getTime()).toBe(
+        new Date(beforeLateRetry!.locked_until as string).getTime(),
+      );
+      expect(wakeCallsA).toBe(0);
+
+      releaseBHold();
+      await whB.flush();
+      expect(await dbB.query('select id from webhook_jobs')).toEqual([]);
+
+      // (b) 副本 A 迟到的 200 成功删除不得误删副本 B 正在持有的任务
+      await whB.close();
+      whB = null;
+
+      let enteredA2!: () => void;
+      const inReqA2 = new Promise<void>((r) => {
+        enteredA2 = r;
+      });
+      let releaseA2!: () => void;
+      const holdA2 = new Promise<void>((r) => {
+        releaseA2 = r;
+      });
+      let enteredB2!: () => void;
+      const inReqB2 = new Promise<void>((r) => {
+        enteredB2 = r;
+      });
+      let releaseB2!: () => void;
+      const holdB2 = new Promise<void>((r) => {
+        releaseB2 = r;
+      });
+
+      rx.replies.push(
+        (res) => {
+          enteredA2();
+          void holdA2.then(() => ok200(res));
+        },
+        (res) => {
+          enteredB2();
+          void holdB2.then(() => ok200(res));
+        },
+      );
+
+      whA.emit('g-wh-lease', sampleEvent());
+      await inReqA2;
+
+      whB = new Webhooks(dbB, {
+        ha: haB,
+        retryBaseMs: 15,
+        pollIntervalMs: 20,
+        timeoutMs: 3000,
+        leaseMs: 10_000,
+      });
+      await inReqB2;
+
+      const [beforeLateOk] = await dbB.query<{ id: string; locked_by: string | null }>(
+        'select id, locked_by from webhook_jobs',
+      );
+      expect(beforeLateOk!.locked_by).toBe('lease-wh-b');
+
+      releaseA2();
+      await waitInFlight(whA);
+
+      const [afterLateOk] = await dbB.query<{ id: string; locked_by: string | null }>(
+        'select id, locked_by from webhook_jobs where id = $1',
+        [beforeLateOk!.id],
+      );
+      expect(afterLateOk).toEqual({ id: beforeLateOk!.id, locked_by: 'lease-wh-b' });
+
+      releaseB2();
+      await whB.flush();
+      expect(await dbB.query('select id from webhook_jobs')).toEqual([]);
+    } finally {
+      if (whA) await whA.close();
+      if (whB) await whB.close();
+      await dbA.close();
+      await dbB.close();
+    }
+  });
 });

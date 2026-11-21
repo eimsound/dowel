@@ -921,10 +921,12 @@ export class Webhooks {
         .catch(() => {});
       return;
     }
-    // 重试时 Webhook 可能已经被删除 / 停用：直接清理任务
+    // 重试时 Webhook 可能已经被删除 / 停用：仅在仍持有该任务租约时清理
     const hook = await this.load(row.webhookId);
     if (!hook?.enabled) {
-      await this.db.query('delete from webhook_jobs where id = $1', [row.id]).catch(() => {});
+      await this.db
+        .query('delete from webhook_jobs where id = $1 and locked_by = $2', [row.id, this.workerId])
+        .catch(() => {});
       return;
     }
     const attempts = Number(row.attempts);
@@ -939,35 +941,43 @@ export class Webhooks {
     const shouldRetry = !result.ok && result.retry && attempts < maxRetries;
     const delayMs = shouldRetry ? this.options.retryBaseMs * 4 ** attempts : 0;
 
+    let rescheduled = false;
     try {
-      await this.db.transaction(async (tx) => {
+      rescheduled = await this.db.transaction(async (tx) => {
         await this.recordIn(tx, hook.id, job, result, false);
         if (!shouldRetry) {
-          await tx.query('delete from webhook_jobs where id = $1', [row.id]);
-          return;
+          await tx.query('delete from webhook_jobs where id = $1 and locked_by = $2', [
+            row.id,
+            this.workerId,
+          ]);
+          return false;
         }
         const nextAttempts = attempts + 1;
-        if (this.db.dialect === 'pg') {
-          await tx.query(
-            `update webhook_jobs
-                set attempts = $2,
-                    next_run_at = now() + ($3::double precision * interval '1 millisecond'),
-                    locked_by = null,
-                    locked_until = null
-              where id = $1`,
-            [row.id, nextAttempts, delayMs],
-          );
-        } else {
-          await tx.query(
-            `update webhook_jobs
-                set attempts = $2,
-                    next_run_at = $3,
-                    locked_by = null,
-                    locked_until = null
-              where id = $1`,
-            [row.id, nextAttempts, new Date(Date.now() + delayMs)],
-          );
-        }
+        const updated =
+          this.db.dialect === 'pg'
+            ? await tx.query<{ id: string }>(
+                `update webhook_jobs
+                    set attempts = $2,
+                        next_run_at = now() + ($3::double precision * interval '1 millisecond'),
+                        locked_by = null,
+                        locked_until = null
+                  where id = $1
+                    and locked_by = $4
+                  returning id`,
+                [row.id, nextAttempts, delayMs, this.workerId],
+              )
+            : await tx.query<{ id: string }>(
+                `update webhook_jobs
+                    set attempts = $2,
+                        next_run_at = $3,
+                        locked_by = null,
+                        locked_until = null
+                  where id = $1
+                    and locked_by = $4
+                  returning id`,
+                [row.id, nextAttempts, new Date(Date.now() + delayMs), this.workerId],
+              );
+        return updated.length > 0;
       });
     } catch (e) {
       // 发送期间 Webhook 被删除（外键）：webhook_jobs 会随外键级联删除，没有地方记了，也不用再重试
@@ -975,7 +985,7 @@ export class Webhooks {
       throw e;
     }
 
-    if (shouldRetry && !this.closed) this.scheduleWake(delayMs);
+    if (rescheduled && !this.closed) this.scheduleWake(delayMs);
   }
 
   /** 写一行投递记录，然后只保留这个 Webhook 最近 KEEP_DELIVERIES 条 */

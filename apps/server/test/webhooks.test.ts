@@ -19,6 +19,7 @@ import {
   guardedLookup,
   maskWebhookUrl,
   renderRequest,
+  Webhooks,
 } from '../src/webhooks.ts';
 import { makeUser, PASSWORD } from './support.ts';
 
@@ -930,6 +931,238 @@ describe('配置接口', () => {
     expect(maskWebhookUrl('https://user:pass@hooks.example.com:8443/x')).toBe(
       'https://hooks.example.com:8443/…',
     );
+  });
+});
+
+describe('租约超时与 locked_by 校验（#21）', () => {
+  const waitInFlight = async (wh: Webhooks) => {
+    const internal = wh as unknown as {
+      enqueuing: Set<Promise<unknown>>;
+      inFlight: Set<Promise<unknown>>;
+    };
+    while (internal.enqueuing.size || internal.inFlight.size) {
+      await Promise.allSettled([...internal.enqueuing, ...internal.inFlight]);
+    }
+  };
+
+  const setupIsolated = async (url: string) => {
+    const localDb = await openPlatformDb(':memory:');
+    await localDb.query(
+      `insert into instance_settings (key, value) values ('webhook_allowlist', $1::text::jsonb)
+       on conflict (key) do update set value = excluded.value`,
+      [JSON.stringify(['127.0.0.0/8'])],
+    );
+    await localDb.query("insert into groups (id, slug, name) values ('g-lease', 'g-lease', '租约组')");
+    await localDb.query(
+      `insert into webhooks (id, group_id, name, format, url_enc, events, enabled)
+       values ('w-lease', 'g-lease', 'lease-hook', 'json', $1, $2::text::jsonb, true)`,
+      [encrypt(url), JSON.stringify(['request.created'])],
+    );
+    return localDb;
+  };
+
+  test('副本 A 投递失败重试写回时，若租约已被副本 B 接管，不破坏 locked_by / locked_until / attempts 且跳过本地唤醒', async () => {
+    let enteredA!: () => void;
+    const inReqA = new Promise<void>((r) => {
+      enteredA = r;
+    });
+    let releaseA!: () => void;
+    const holdA = new Promise<void>((r) => {
+      releaseA = r;
+    });
+    const rx = await startReceiver((res) => {
+      enteredA();
+      void holdA.then(() => {
+        res.writeHead(500);
+        res.end('temporary failure');
+      });
+    });
+
+    const localDb = await setupIsolated(`${rx.base}/retry-takeover`);
+    const whA = new Webhooks(localDb, {
+      retryBaseMs: 50,
+      pollIntervalMs: 60_000,
+      timeoutMs: 2000,
+      leaseMs: 100,
+    });
+    let wakeCalls = 0;
+    const origScheduleWake = (whA as unknown as { scheduleWake: (ms: number) => void }).scheduleWake.bind(
+      whA,
+    );
+    (whA as unknown as { scheduleWake: (ms: number) => void }).scheduleWake = (ms: number) => {
+      wakeCalls++;
+      origScheduleWake(ms);
+    };
+
+    try {
+      whA.emit('g-lease', event());
+      await inReqA;
+
+      const [claimed] = await localDb.query<{ id: string; locked_by: string | null; attempts: number }>(
+        'select id, locked_by, attempts from webhook_jobs',
+      );
+      expect(claimed).toMatchObject({ locked_by: whA.workerId, attempts: 0 });
+
+      // 模拟租约超时后被副本 B 重领并推进 attempts = 2
+      const bLockedUntil = new Date(Date.now() + 60_000);
+      await localDb.query(
+        'update webhook_jobs set locked_by = $1, locked_until = $2, attempts = 2 where id = $3',
+        ['replica-b', bLockedUntil, claimed!.id],
+      );
+
+      // 副本 A 迟到的 500 失败尝试完成写回
+      releaseA();
+      await waitInFlight(whA);
+
+      const [after] = await localDb.query<{
+        id: string;
+        locked_by: string | null;
+        locked_until: string | null;
+        attempts: number;
+      }>('select id, locked_by, locked_until, attempts from webhook_jobs where id = $1', [claimed!.id]);
+      expect(after).toEqual({
+        id: claimed!.id,
+        locked_by: 'replica-b',
+        locked_until: bLockedUntil.toISOString(),
+        attempts: 2,
+      });
+      // 租约已被接管时跳过无谓的本地退避唤醒
+      expect(wakeCalls).toBe(0);
+
+      // 关闭副本 A 也不释放副本 B 的锁
+      await whA.close();
+      const [afterClose] = await localDb.query<{ locked_by: string | null; locked_until: string | null }>(
+        'select locked_by, locked_until from webhook_jobs where id = $1',
+        [claimed!.id],
+      );
+      expect(afterClose).toEqual({ locked_by: 'replica-b', locked_until: bLockedUntil.toISOString() });
+    } finally {
+      await whA.close();
+      await localDb.close();
+    }
+  });
+
+  test('副本 A 投递成功删除时，若租约已被副本 B 接管则不误删；仍由本副本持有时正常删除', async () => {
+    let enteredA!: () => void;
+    const inReqA = new Promise<void>((r) => {
+      enteredA = r;
+    });
+    let releaseA!: () => void;
+    const holdA = new Promise<void>((r) => {
+      releaseA = r;
+    });
+    const rx = await startReceiver();
+    rx.replies.push((res) => {
+      enteredA();
+      void holdA.then(() => ok200(res));
+    });
+
+    const localDb = await setupIsolated(`${rx.base}/ok-takeover`);
+    const whA = new Webhooks(localDb, {
+      retryBaseMs: 50,
+      pollIntervalMs: 60_000,
+      timeoutMs: 2000,
+      leaseMs: 100,
+    });
+
+    try {
+      whA.emit('g-lease', event());
+      await inReqA;
+
+      const [claimed] = await localDb.query<{ id: string }>('select id from webhook_jobs');
+      const bLockedUntil = new Date(Date.now() + 60_000);
+      await localDb.query(
+        'update webhook_jobs set locked_by = $1, locked_until = $2, attempts = 2 where id = $3',
+        ['replica-b', bLockedUntil, claimed!.id],
+      );
+
+      // 副本 A 迟到的 200 投递完成，不得删除副本 B 持有的任务行
+      releaseA();
+      await waitInFlight(whA);
+
+      const [after] = await localDb.query<{
+        id: string;
+        locked_by: string | null;
+        locked_until: string | null;
+        attempts: number;
+      }>('select id, locked_by, locked_until, attempts from webhook_jobs where id = $1', [claimed!.id]);
+      expect(after).toEqual({
+        id: claimed!.id,
+        locked_by: 'replica-b',
+        locked_until: bLockedUntil.toISOString(),
+        attempts: 2,
+      });
+
+      // 当任务重新归属本副本且投递成功时，应正常删除
+      await localDb.query('update webhook_jobs set locked_until = $1, next_run_at = $1 where id = $2', [
+        new Date(Date.now() - 1000),
+        claimed!.id,
+      ]);
+      whA.wake(false);
+      await waitInFlight(whA);
+      expect(await localDb.query('select id from webhook_jobs')).toEqual([]);
+    } finally {
+      await whA.close();
+      await localDb.close();
+    }
+  });
+
+  test('hook 停用清理路径校验 locked_by：租约已被接管时不误删，仍由本副本持有时正常删除', async () => {
+    const rx = await startReceiver();
+    const localDb = await setupIsolated(`${rx.base}/disabled-takeover`);
+    const whA = new Webhooks(localDb, {
+      retryBaseMs: 50,
+      pollIntervalMs: 60_000,
+      timeoutMs: 2000,
+      leaseMs: 100,
+    });
+
+    const origLoad = (whA as unknown as { load: (id: string) => Promise<unknown> }).load.bind(whA);
+    let takeoverOnce = true;
+    const bLockedUntil = new Date(Date.now() + 60_000);
+    (whA as unknown as { load: (id: string) => Promise<unknown> }).load = async (id: string) => {
+      if (takeoverOnce) {
+        takeoverOnce = false;
+        // 模拟认领后 hook 被停用，且租约超时已被副本 B 接管
+        await localDb.query('update webhooks set enabled = false where id = $1', [id]);
+        await localDb.query(
+          'update webhook_jobs set locked_by = $1, locked_until = $2, attempts = 1 where webhook_id = $3',
+          ['replica-b', bLockedUntil, id],
+        );
+      }
+      return origLoad(id);
+    };
+
+    try {
+      whA.emit('g-lease', event());
+      await waitInFlight(whA);
+
+      // 副本 A 命中 !hook?.enabled 清理路径，但因 locked_by 已变为 replica-b，不得误删
+      const [after] = await localDb.query<{
+        id: string;
+        locked_by: string | null;
+        locked_until: string | null;
+        attempts: number;
+      }>('select id, locked_by, locked_until, attempts from webhook_jobs');
+      expect(after).toMatchObject({
+        locked_by: 'replica-b',
+        locked_until: bLockedUntil.toISOString(),
+        attempts: 1,
+      });
+
+      // 当租约过期重新被本副本持有并读到停用 hook 时，正常删除
+      await localDb.query('update webhook_jobs set locked_until = $1, next_run_at = $1 where id = $2', [
+        new Date(Date.now() - 1000),
+        after!.id,
+      ]);
+      whA.wake(false);
+      await waitInFlight(whA);
+      expect(await localDb.query('select id from webhook_jobs')).toEqual([]);
+      expect(rx.received).toHaveLength(0);
+    } finally {
+      await whA.close();
+      await localDb.close();
+    }
   });
 });
 
