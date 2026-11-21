@@ -4,7 +4,7 @@
   "type": "module",
   "scripts": {
     "test": "vitest run",
-    "typecheck": "tsc --noEmit -p . && tsc --noEmit -p apps/web",
+    "typecheck": "tsc --noEmit -p . && tsc --noEmit -p apps/web && tsc --noEmit -p apps/web/tsconfig.test.json",
     "lint": "oxlint --type-aware --deny-warnings && oxfmt --check",
     "format": "oxfmt",
     "check": "pnpm lint && pnpm typecheck && pnpm test",

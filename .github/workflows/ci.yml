@@ -50,17 +50,20 @@ jobs:
           }
           trap cleanup EXIT
           for _ in $(seq 1 30); do
-            if curl -fsS http://127.0.0.1:4699/api/instance >/dev/null 2>&1; then
+            if ! kill -0 "$SERVER_PID" 2>/dev/null; then
+              wait "$SERVER_PID"
+            fi
+            if curl -fsS --max-time 5 http://127.0.0.1:4699/api/instance >/dev/null 2>&1; then
               break
             fi
             sleep 0.5
           done
-          INSTANCE_JSON="$(curl -fsS http://127.0.0.1:4699/api/instance)"
+          INSTANCE_JSON="$(curl -fsS --max-time 5 http://127.0.0.1:4699/api/instance)"
           echo "GET /api/instance -> $INSTANCE_JSON"
-          echo "$INSTANCE_JSON" | grep -q '"needsSetup":true'
-          INDEX_HTML="$(curl -fsS http://127.0.0.1:4699/)"
-          echo "$INDEX_HTML" | grep -qi '<!doctype html>'
-          echo "$INDEX_HTML" | grep -q 'id="root"'
+          grep -q '"needsSetup":true' <<<"$INSTANCE_JSON"
+          INDEX_HTML="$(curl -fsS --max-time 5 http://127.0.0.1:4699/)"
+          grep -qi '<!doctype html>' <<<"$INDEX_HTML"
+          grep -q 'id="root"' <<<"$INDEX_HTML"
           kill -TERM "$SERVER_PID"
           wait "$SERVER_PID"
 

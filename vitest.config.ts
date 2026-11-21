@@ -6,7 +6,7 @@ export default defineConfig({
   },
   ssr: {
     resolve: {
-      conditions: ['@dowel/source', 'node', 'development|production'],
+      conditions: ['@dowel/source', 'module', 'node', 'development|production'],
     },
   },
   test: {

@@ -159,17 +159,19 @@ export const TokenPolicyPanel = ({ path, queryKey }: { path: string; queryKey: u
   const toast = useToast();
   const id = useId();
   const q = useQuery({ queryKey, queryFn: () => api<TokenPolicyView>('GET', path) });
-  // 本地未保存草稿：undefined 表示直接跟随服务端值，后台 refetch（例如窗口重新聚焦）不会覆盖正在编辑的草稿
-  const [localDraft, setLocalDraft] = useState<TokenCreatorRule | null | undefined>(undefined);
+  // 本地未保存草稿（按 path 隔离）：undefined 表示直接跟随服务端值，后台 refetch 不会覆盖正在编辑的草稿
+  const [localDraft, setLocalDraft] = useState<{ path: string; rule: TokenCreatorRule | null } | undefined>(
+    undefined,
+  );
   const serverRule = q.data?.rule ?? null;
-  const draft = localDraft === undefined ? serverRule : localDraft;
+  const draft = localDraft?.path === path ? localDraft.rule : serverRule;
   const setDraft: Dispatch<SetStateAction<TokenCreatorRule | null>> = (next) => {
     setLocalDraft((prev) => {
-      const base = prev === undefined ? serverRule : prev;
+      const base = prev?.path === path ? prev.rule : serverRule;
       const value = typeof next === 'function' ? next(base) : next;
       return JSON.stringify(normalizeDraft(value)) === JSON.stringify(normalizeDraft(serverRule))
         ? undefined
-        : value;
+        : { path, rule: value };
     });
   };
 

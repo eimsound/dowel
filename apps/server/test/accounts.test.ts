@@ -1047,7 +1047,7 @@ describe.each([
 
 test('DOWEL_ADMIN_* 不合法时服务启动失败并打印原因', () => {
   const run = (env: Record<string, string>) =>
-    spawnSync(process.execPath, ['apps/server/src/main.ts'], {
+    spawnSync(process.execPath, ['--conditions=@dowel/source', 'apps/server/src/main.ts'], {
       cwd: process.cwd(),
       env: { ...process.env, DOWEL_DB: ':memory:', PORT: '0', ...env },
       encoding: 'utf8',

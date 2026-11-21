@@ -31,15 +31,16 @@ export const Projects = ({ me }: { me: Me }) => {
 
   // 命令面板里的“新建组”：打开对话框，然后把参数用 replace 清掉，
   // 免得刷新或前进后退时又弹一次（已经在 / 时也会因为 search 变化触发这个 effect）。
-  const [prevNewFromPalette, setPrevNewFromPalette] = useState<boolean | undefined>(undefined);
-  if (newFromPalette !== prevNewFromPalette) {
-    setPrevNewFromPalette(newFromPalette);
-    if (newFromPalette) setGroupDialog(true);
+  const openNewGroup = newFromPalette === 'group';
+  const [prevOpenNewGroup, setPrevOpenNewGroup] = useState(false);
+  if (openNewGroup !== prevOpenNewGroup) {
+    setPrevOpenNewGroup(openNewGroup);
+    if (openNewGroup) setGroupDialog(true);
   }
   useEffect(() => {
-    if (!newFromPalette) return;
+    if (!openNewGroup) return;
     void nav({ to: '/', search: {}, replace: true });
-  }, [newFromPalette, nav]);
+  }, [openNewGroup, nav]);
 
   // 能在这个组建项目：实例管理员、组管理员，或 project_creation=members 时的组成员
   const canCreateIn = (g: GroupInfo) =>
