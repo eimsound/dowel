@@ -37,6 +37,7 @@ import {
   loadPolicies,
   withPolicyLock,
 } from '../policy.ts';
+import { WorkingChangedError } from '../rooms.ts';
 import { encrypt } from '../secrets.ts';
 import { CHECK_CONNECT_TIMEOUT, claimShadow, inspectTarget } from '../targets.ts';
 import { type AppContext, access, body, connectionLimit, type Env } from './context.ts';
@@ -369,21 +370,22 @@ export const registerEnvironments = (app: Hono<Env>, ctx: AppContext) => {
       };
     };
     if (preview) return c.json<PullPreview>(await previewOf());
+    const expectedSeq = b.success ? b.data.workingSeq : undefined;
+    const workingChangedResponse = async (model: Model, seq: number) =>
+      c.json(
+        {
+          error: '工作副本在预览之后被改过，请重新确认差异',
+          code: 'working_changed',
+          preview: await previewOf(model, seq),
+        },
+        409,
+      );
     // 确认覆盖时带着预览时的工作副本 seq：工作副本在预览之后被改过（别人又编辑了模型）→ 409 working_changed，带新的预览，不覆盖
     const workingChanged = async () => {
-      if (!b.success || b.data.workingSeq === undefined) return null;
+      if (expectedSeq === undefined) return null;
       // 现在的工作副本（读线上结构要花时间，期间也可能被改）：和预览时的 seq 比
       const now = await rooms.model(a.branch);
-      return now.seq === b.data.workingSeq
-        ? null
-        : c.json(
-            {
-              error: '工作副本在预览之后被改过，请重新确认差异',
-              code: 'working_changed',
-              preview: await previewOf(now.model, now.seq),
-            },
-            409,
-          );
+      return now.seq === expectedSeq ? null : workingChangedResponse(now.model, now.seq);
     };
     const changedEarly = await workingChanged();
     if (changedEarly) return changedEarly;
@@ -397,10 +399,16 @@ export const registerEnvironments = (app: Hono<Env>, ctx: AppContext) => {
         },
         409,
       );
-    // 覆盖之前再比一次（上面等线上结构的这段时间里工作副本也可能被改）；之后到 replace 之间没有 await 以外的窗口
+    // 覆盖之前再比一次（上面等线上结构的这段时间里工作副本也可能被改）；
+    // 最终由 replace 在房间锁与 PG 行锁内原子校验 expectedSeq，消除跨副本与本地并发窗口
     const changedLate = await workingChanged();
     if (changedLate) return changedLate;
-    await ctx.replace(a.branch, c.get('user').name, live.model, 'pullSchema');
+    try {
+      await ctx.replace(a.branch, c.get('user').name, live.model, 'pullSchema', expectedSeq);
+    } catch (err) {
+      if (err instanceof WorkingChangedError) return workingChangedResponse(err.currentModel, err.currentSeq);
+      throw err;
+    }
     const { seq } = await rooms.model(a.branch);
     await audit(
       db,
