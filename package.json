@@ -18,7 +18,7 @@
     "@axe-core/playwright": "^4.14.0",
     "@dowel/engines": "workspace:*",
     "@dowel/executor": "workspace:*",
-    "@playwright/test": "^1.65.0",
+    "@playwright/test": "^1.65.1",
     "@testcontainers/mssqlserver": "12.2.1",
     "@testcontainers/mysql": "12.2.1",
     "@testcontainers/postgresql": "^12.2.1",
