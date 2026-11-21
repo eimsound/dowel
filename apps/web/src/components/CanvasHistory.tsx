@@ -22,7 +22,7 @@ import {
   Workflow,
   X,
 } from 'lucide-react';
-import { type KeyboardEvent, useCallback, useEffect, useId, useMemo, useRef, useState } from 'react';
+import { useCallback, useEffect, useId, useMemo, useRef, useState } from 'react';
 import { useTranslation } from 'react-i18next';
 import { ApiError, api } from '../api.ts';
 import { formatTime } from '../format.ts';
@@ -36,8 +36,6 @@ import { Banner, cx, Empty, IconButton } from './ui.tsx';
 
 type PreviewTab = 'opDiff' | 'state' | 'diffToCurrent';
 type StateView = 'canvas' | 'schema' | 'sql';
-
-const nativeFocusgroup = typeof HTMLElement !== 'undefined' && 'focusGroup' in HTMLElement.prototype;
 
 const outside = (e: PointerEvent, d: HTMLDialogElement) => {
   const r = d.getBoundingClientRect();
@@ -427,22 +425,6 @@ export const CanvasHistory = ({
     { key: 'diffToCurrent', title: t('hist.tab.diffToCurrent'), count: detail?.diffToCurrent.total ?? 0 },
   ];
 
-  // 不支持原生 focusgroup 时的方向键回退（selection by activation：方向键移动焦点，Enter / Space / 点击激活）
-  const onTabKeyDown = (e: KeyboardEvent<HTMLDivElement>) => {
-    if (nativeFocusgroup || !['ArrowLeft', 'ArrowRight', 'Home', 'End'].includes(e.key)) return;
-    const btns = [...e.currentTarget.querySelectorAll<HTMLButtonElement>('[role="tab"]')];
-    const i = btns.indexOf(document.activeElement as HTMLButtonElement);
-    if (i < 0) return;
-    e.preventDefault();
-    const next =
-      e.key === 'Home'
-        ? 0
-        : e.key === 'End'
-          ? btns.length - 1
-          : (i + (e.key === 'ArrowLeft' ? -1 : 1) + btns.length) % btns.length;
-    btns[next]!.focus();
-  };
-
   return (
     <>
       <dialog
@@ -613,7 +595,6 @@ export const CanvasHistory = ({
                 role="tablist"
                 {...({ focusgroup: 'tablist nomemory' } as object)}
                 aria-label={t('hist.views')}
-                onKeyDown={onTabKeyDown}
                 className="flex shrink-0 items-center gap-1 border-b border-border bg-panel px-4"
               >
                 {previewTabs.map((item) => {

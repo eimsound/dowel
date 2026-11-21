@@ -56,6 +56,21 @@ for (const scheme of ['light', 'dark'] as const) {
     );
     await scan(page, `画布修改历史-本次修改（${scheme}）`);
 
+    // 预览选项卡键盘方向键：由 focusgroup / polyfill 单步顺序移动焦点，不跳格
+    const opDiffTab = historyDlg.getByRole('tab', { name: /本次修改/ });
+    const stateTab = historyDlg.getByRole('tab', { name: /当时状态/ });
+    const diffTab = historyDlg.getByRole('tab', { name: /与当前画布的差异/ });
+    await opDiffTab.focus();
+    await expect(opDiffTab).toBeFocused();
+    await page.keyboard.press('ArrowRight');
+    await expect(stateTab).toBeFocused();
+    await page.keyboard.press('ArrowRight');
+    await expect(diffTab).toBeFocused();
+    await page.keyboard.press('ArrowLeft');
+    await expect(stateTab).toBeFocused();
+    await page.keyboard.press('ArrowLeft');
+    await expect(opDiffTab).toBeFocused();
+
     // 选中更早的一步：把 column_2 改名为 total 的历史点（恢复目标）
     const totalRenameBtn = timeline.getByRole('button', { name: /重命名列.*total/ });
     await totalRenameBtn.click();
