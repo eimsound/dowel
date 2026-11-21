@@ -139,6 +139,9 @@ export const renameQualifiedInExpr = (
 /** 对模型里所有表达式应用同一个改写 */
 export const rewriteExprs = (m: Model, f: (expr: string) => string) => {
   for (const o of Object.values(m.objects)) {
+    if (o.kind === 'table' && o.partitionBy && typeof o.partitionBy !== 'string') {
+      for (const k of o.partitionBy.keys) if (k.expr) k.expr = f(k.expr);
+    }
     if (o.kind === 'check') o.expr = f(o.expr);
     if (o.kind === 'index') {
       for (const e of o.elements) if (e.expr) e.expr = f(e.expr);
@@ -479,6 +482,10 @@ export const renameColumn = (m: Model, id: string, name: string) => {
   const old = c.name;
   c.name = name;
   // 同表表达式里对这一列的引用一起改写
+  const table = get(m, c.parent, 'table');
+  if (table.partitionBy && typeof table.partitionBy !== 'string') {
+    for (const k of table.partitionBy.keys) if (k.expr) k.expr = renameInExpr(k.expr, old, name);
+  }
   for (const o of Object.values(m.objects)) {
     if (!('parent' in o) || o.parent !== c.parent) continue;
     if (o.kind === 'check') o.expr = renameInExpr(o.expr, old, name);
@@ -497,6 +504,14 @@ export const renameColumn = (m: Model, id: string, name: string) => {
 /** 删列：依赖它的约束、索引、外键、生成列、属于它的序列一并删除 */
 export const dropColumn = (m: Model, id: string) => {
   const c = get(m, id, 'column');
+  const table = get(m, c.parent, 'table');
+  if (
+    table.partitionBy &&
+    typeof table.partitionBy !== 'string' &&
+    table.partitionBy.keys.some((k) => k.column === id || (!!k.expr && exprReferences(k.expr, c.name)))
+  ) {
+    throw new EditError(`列 ${c.name} 被分区键引用，不能删除`);
+  }
   const uses = (o: Obj): boolean => {
     switch (o.kind) {
       case 'primaryKey':

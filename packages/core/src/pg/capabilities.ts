@@ -1,15 +1,16 @@
 // PostgreSQL 15–19 版本能力表、目标版本推导与静态兼容性检查。
 import type { Model, Table } from '../ir.ts';
 import { all, find } from '../model.ts';
+import { stripPgSql } from './nontx.ts';
 
 export const MIN_PG_MAJOR = 15;
 export const LATEST_PG_MAJOR = 19;
 export const SUPPORTED_PG_MAJORS = [15, 16, 17, 18, 19] as const;
 export type SupportedPgMajor = (typeof SUPPORTED_PG_MAJORS)[number];
 
-/** 从 PG `server_version_num`（如 160004、180000）提取大版本号；非正数或非法值返回 null */
+/** 从 PG `server_version_num`（如 160004、180000）提取大版本号；非整数、非正数或非法值返回 null */
 export const pgMajorOf = (versionNum: number | null | undefined): number | null =>
-  typeof versionNum === 'number' && Number.isFinite(versionNum) && versionNum >= 100000
+  typeof versionNum === 'number' && Number.isInteger(versionNum) && versionNum >= 100000
     ? Math.floor(versionNum / 10000)
     : null;
 
@@ -52,6 +53,7 @@ export interface PlanOptions {
 }
 
 export type CompatibilityCode =
+  | 'nulls_not_distinct'
   | 'virtual_generated'
   | 'named_not_null'
   | 'partitioned_identity'
@@ -69,15 +71,11 @@ export interface CompatibilityIssue {
   message: string;
 }
 
-/** 去掉单引号字面量（含 E'...' 转义字符串），避免把字符串中的 uuidv7() 误判为函数调用 */
-const stripStringLiterals = (expr: string): string =>
-  expr.replace(/[eE]'(?:\\.|''|[^'\\])*'|'(?:''|[^'])*'/g, ' ');
-
 /** 词边界匹配内置 uuidv7(...) / pg_catalog.uuidv7(...) 调用，排除 my_uuidv7()、uuidv7_ext()、自定义 schema.uuidv7() */
 const UUIDV7_CALL = /(?:^|[^A-Za-z0-9_$.])(?:pg_catalog\.)?uuidv7\s*\(/i;
 
 const hasUuidv7Call = (expr: string | null | undefined): boolean =>
-  !!expr && UUIDV7_CALL.test(stripStringLiterals(expr));
+  !!expr && UUIDV7_CALL.test(stripPgSql(expr));
 
 const tableDisplayName = (m: Model, table: Table): string => {
   const schema = find(m, table.parent);
@@ -114,14 +112,14 @@ export const checkPgCompatibility = (m: Model, targetMajor: number): Compatibili
       });
     }
 
-    if (!cap.namedNotNull && c.notNull && c.notNullNameMode === 'explicit') {
+    if (!cap.namedNotNull && c.notNull && c.notNullName !== null && c.notNullNameMode === 'explicit') {
       issues.push({
         code: 'named_not_null',
         severity: 'error',
         objectId: c.id,
         objectName: name,
         minMajor: 18,
-        message: `列 ${name} 显式命名了 NOT NULL 约束${c.notNullName ? `（${c.notNullName}）` : ''}，需要 PostgreSQL 18+（当前目标 PG ${targetMajor}）`,
+        message: `列 ${name} 显式命名了 NOT NULL 约束（${c.notNullName}），需要 PostgreSQL 18+（当前目标 PG ${targetMajor}）`,
       });
     }
 
@@ -148,6 +146,33 @@ export const checkPgCompatibility = (m: Model, targetMajor: number): Compatibili
           message: `列 ${name} 的表达式调用了 uuidv7()，内置函数需要 PostgreSQL 18+（当前目标 PG ${targetMajor}）`,
         });
       }
+    }
+  }
+
+  if (!cap.nullsNotDistinct) {
+    for (const u of all(m, 'unique')) {
+      if (!u.nullsNotDistinct) continue;
+      const name = colDisplayName(m, u.parent, u.name);
+      issues.push({
+        code: 'nulls_not_distinct',
+        severity: 'error',
+        objectId: u.id,
+        objectName: name,
+        minMajor: 15,
+        message: `唯一约束 ${name} 使用了 NULLS NOT DISTINCT，需要 PostgreSQL 15+（当前目标 PG ${targetMajor}）`,
+      });
+    }
+    for (const x of all(m, 'index')) {
+      if (!x.nullsNotDistinct) continue;
+      const name = colDisplayName(m, x.parent, x.name);
+      issues.push({
+        code: 'nulls_not_distinct',
+        severity: 'error',
+        objectId: x.id,
+        objectName: name,
+        minMajor: 15,
+        message: `索引 ${name} 使用了 NULLS NOT DISTINCT，需要 PostgreSQL 15+（当前目标 PG ${targetMajor}）`,
+      });
     }
   }
 

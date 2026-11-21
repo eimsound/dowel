@@ -49,12 +49,18 @@ export const Sequence = z.object({
 
 export const PartitionStrategy = z.enum(['range', 'list', 'hash']);
 
-export const PartitionKey = z.object({
-  column: id.nullable().default(null),
-  expr: z.string().nullable().default(null),
-  opclass: z.string().nullable().default(null),
-  collation: z.string().nullable().default(null),
-});
+export const PartitionKey = z
+  .object({
+    column: id.nullable().default(null),
+    expr: z.string().min(1).nullable().default(null),
+    /** 已按 PG SQL 规则加引号（或 schema 限定）的运算符类片段，例如 `pg_catalog.text_pattern_ops` */
+    opclass: z.string().min(1).nullable().default(null),
+    /** 已按 PG SQL 规则加引号（或 schema 限定）的排序规则片段，例如 `"C"` 或 `pg_catalog."C"` */
+    collation: z.string().min(1).nullable().default(null),
+  })
+  .refine((k) => (k.column !== null) !== (k.expr !== null), {
+    message: '分区键必须且只能指定 column 或 expr 之一',
+  });
 
 export const PartitionSpec = z.object({
   strategy: PartitionStrategy,
@@ -67,7 +73,10 @@ export const Table = z.object({
   parent: id, // schema
   name,
   /** 分区表的分区键：结构化 PartitionSpec 或兼容存量 format 1 中的 pg_get_partkeydef 字符串 */
-  partitionBy: z.union([PartitionSpec, z.string()]).nullable().default(null),
+  partitionBy: z
+    .union([PartitionSpec, z.string().min(1)])
+    .nullable()
+    .default(null),
   /** 分区子表：所属的分区表和分区边界（如 `FOR VALUES FROM (...) TO (...)`） */
   partitionOf: z.object({ parent: id, bound: z.string() }).nullable().default(null),
   comment,

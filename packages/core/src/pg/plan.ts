@@ -48,12 +48,12 @@ const same = deepEqual;
 const pick = <T extends object>(o: T, keys: (keyof T)[]) => keys.map((k) => o[k]);
 
 /** 对象中决定“定义”的字段（不含名字、注释、展示顺序），这些字段变了需要重建或修改 */
-const definition = (o: Obj): unknown => {
+const definition = (o: Obj, m?: Model, fallback?: Model): unknown => {
   switch (o.kind) {
     case 'schema':
       return null;
     case 'table':
-      return [o.partitionBy, o.partitionOf];
+      return [m ? partitionBySql(m, o, fallback) : o.partitionBy, o.partitionOf];
     case 'extension':
       return [o.name, o.parent];
     case 'opaque':
@@ -132,6 +132,9 @@ const pickExprs = (o: Obj): Partial<Obj> =>
 
 export const plan = (from: Model, to: Model, opts?: PlanOptions): Step[] => {
   const targetMajor = opts?.pgMajor ?? null;
+  if (targetMajor !== null && (!Number.isInteger(targetMajor) || targetMajor <= 0)) {
+    throw new PlanError(`无效的目标 PostgreSQL 主版本号：${String(targetMajor)}`);
+  }
   const cap = pgCapabilities(targetMajor ?? LATEST_PG_MAJOR);
   if (targetMajor !== null) {
     const errors = checkPgCompatibility(to, targetMajor).filter((i) => i.severity === 'error');
@@ -153,14 +156,59 @@ export const plan = (from: Model, to: Model, opts?: PlanOptions): Step[] => {
   const was = <T extends Obj>(o: T): T => from.objects[o.id] as T;
   const isRemoved = (id: string) => inFrom(id) && !inTo(id);
 
+  // ───── 改名带来的表达式变化：PG 按 OID 记录引用，改名时会自动更新表达式，不需要重建 ─────
+  // 把旧版本表达式里的 schema、枚举、列名换成新名字后再比较；相同就说明只是改名带来的变化
+  const schemaRenames = common
+    .filter((o): o is Schema => o.kind === 'schema' && o.name !== was(o).name)
+    .map((o) => [was(o).name, o.name] as const);
+  const enumRenames = common
+    .filter((o): o is Enum => o.kind === 'enum' && o.name !== was(o).name)
+    .map((o) => [(to.objects[o.parent] as Schema).name, was(o).name, o.name] as const);
+  const colRenames = new Map<string, [string, string][]>();
+  for (const o of common)
+    if (o.kind === 'column' && o.name !== was(o).name)
+      colRenames.set(o.parent, [...(colRenames.get(o.parent) ?? []), [was(o).name, o.name]]);
+  const migrateExpr = (expr: string, table: string): string => {
+    let e = expr;
+    for (const [a, b] of schemaRenames) e = renameQualifiedInExpr(e, a, null, { schema: b, name: null });
+    for (const [sch, a, b] of enumRenames) e = renameQualifiedInExpr(e, sch, a, { schema: sch, name: b });
+    // 两阶段：先换成占位名，再换成目标名（处理互换）
+    const rs = colRenames.get(table) ?? [];
+    rs.forEach(([a], i) => {
+      e = renameInExpr(e, a, `__dowel_ph_${i}__`);
+    });
+    rs.forEach(([, b], i) => {
+      e = renameInExpr(e, `__dowel_ph_${i}__`, b);
+    });
+    return e;
+  };
+  const migrated = <T extends Obj>(w: T): T => {
+    const o = clone(w) as Obj;
+    if (o.kind === 'table' && o.partitionBy && typeof o.partitionBy !== 'string') {
+      for (const k of o.partitionBy.keys) if (k.expr) k.expr = migrateExpr(k.expr, o.id);
+    }
+    if (o.kind === 'check') o.expr = migrateExpr(o.expr, o.parent);
+    if (o.kind === 'index') {
+      for (const el of o.elements) if (el.expr) el.expr = migrateExpr(el.expr, o.parent);
+      if (o.where) o.where = migrateExpr(o.where, o.parent);
+    }
+    if (o.kind === 'column') {
+      if (o.generated) o.generated.expr = migrateExpr(o.generated.expr, o.parent);
+      if (o.default && 'expr' in o.default) o.default.expr = migrateExpr(o.default.expr, o.parent);
+    }
+    return o as T;
+  };
+
   for (const o of common) {
     if (o.kind !== was(o).kind) throw new PlanError(`对象 ${o.id} 的种类从 ${was(o).kind} 变成了 ${o.kind}`);
     if ('parent' in o && o.parent !== (was(o) as typeof o).parent && o.kind !== 'column')
       throw new PlanError(`暂不支持把 ${o.kind} ${o.name} 移到其他 schema 或表`);
     if (o.kind === 'column' && o.parent !== was(o).parent)
       throw new PlanError(`不能把列 ${o.name} 移到其他表`);
-    if ((o.kind === 'table' || o.kind === 'extension') && !same(definition(o), definition(was(o))))
-      throw new PlanError(`${o.kind === 'table' ? '分区设置' : '扩展'}暂不支持修改：${o.name}`);
+    if (o.kind === 'table' && !same(definition(o, to), definition(migrated(was(o)), to, from)))
+      throw new PlanError(`分区设置暂不支持修改：${o.name}`);
+    if (o.kind === 'extension' && !same(definition(o), definition(was(o))))
+      throw new PlanError(`扩展暂不支持修改：${o.name}`);
   }
   // 分区表（父表和子表）在 M1 中只读：整张表的新增、删除可以，表内结构不能改
   const partitioned = (tableId: string) => {
@@ -255,46 +303,6 @@ export const plan = (from: Model, to: Model, opts?: PlanOptions): Step[] => {
     if (x.nullsNotDistinct) s += ' NULLS NOT DISTINCT';
     if (x.where) s += ` WHERE ${x.where}`;
     return s;
-  };
-
-  // ───── 改名带来的表达式变化：PG 按 OID 记录引用，改名时会自动更新表达式，不需要重建 ─────
-  // 把旧版本表达式里的 schema、枚举、列名换成新名字后再比较；相同就说明只是改名带来的变化
-  const schemaRenames = common
-    .filter((o): o is Schema => o.kind === 'schema' && o.name !== was(o).name)
-    .map((o) => [was(o).name, o.name] as const);
-  const enumRenames = common
-    .filter((o): o is Enum => o.kind === 'enum' && o.name !== was(o).name)
-    .map((o) => [(to.objects[o.parent] as Schema).name, was(o).name, o.name] as const);
-  const colRenames = new Map<string, [string, string][]>();
-  for (const o of common)
-    if (o.kind === 'column' && o.name !== was(o).name)
-      colRenames.set(o.parent, [...(colRenames.get(o.parent) ?? []), [was(o).name, o.name]]);
-  const migrateExpr = (expr: string, table: string): string => {
-    let e = expr;
-    for (const [a, b] of schemaRenames) e = renameQualifiedInExpr(e, a, null, { schema: b, name: null });
-    for (const [sch, a, b] of enumRenames) e = renameQualifiedInExpr(e, sch, a, { schema: sch, name: b });
-    // 两阶段：先换成占位名，再换成目标名（处理互换）
-    const rs = colRenames.get(table) ?? [];
-    rs.forEach(([a], i) => {
-      e = renameInExpr(e, a, `__dowel_ph_${i}__`);
-    });
-    rs.forEach(([, b], i) => {
-      e = renameInExpr(e, `__dowel_ph_${i}__`, b);
-    });
-    return e;
-  };
-  const migrated = <T extends Obj>(w: T): T => {
-    const o = clone(w) as Obj;
-    if (o.kind === 'check') o.expr = migrateExpr(o.expr, o.parent);
-    if (o.kind === 'index') {
-      for (const el of o.elements) if (el.expr) el.expr = migrateExpr(el.expr, o.parent);
-      if (o.where) o.where = migrateExpr(o.where, o.parent);
-    }
-    if (o.kind === 'column') {
-      if (o.generated) o.generated.expr = migrateExpr(o.generated.expr, o.parent);
-      if (o.default && 'expr' in o.default) o.default.expr = migrateExpr(o.default.expr, o.parent);
-    }
-    return o as T;
   };
 
   // ───── 预先计算：需要重建的约束 / 索引、需要重建的生成列、类型变化的列 ─────
@@ -748,6 +756,9 @@ export const plan = (from: Model, to: Model, opts?: PlanOptions): Step[] => {
     const c = cur.objects[o.id];
     if (!c) continue;
     const m = migrated(was(o));
+    if (c.kind === 'table' && o.kind === 'table' && same(definition(m, cur, from), definition(o, to))) {
+      c.partitionBy = clone(o.partitionBy);
+    }
     if ((c.kind === 'check' || c.kind === 'index') && same(definition(m), definition(o)))
       cur.objects[o.id] = { ...c, ...pickExprs(o) } as Obj;
     if (c.kind === 'column' && o.kind === 'column' && m.kind === 'column') {
@@ -1060,7 +1071,7 @@ export const plan = (from: Model, to: Model, opts?: PlanOptions): Step[] => {
   for (const o of Object.values(to.objects)) {
     const c = cur.objects[o.id];
     if (!c) throw new PlanError(`内部错误：规划结束时缺少对象 ${o.kind} ${o.name}`);
-    if (c.name !== o.name || !same(definition(c), definition(o)))
+    if (c.name !== o.name || !same(definition(c, cur), definition(o, to)))
       throw new PlanError(`内部错误：规划结束时 ${o.kind} ${o.name} 与目标不一致`);
     if ((c.comment ?? null) !== (o.comment ?? null) && o.kind !== 'opaque') {
       const what = commentTarget(o);

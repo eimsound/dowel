@@ -22,7 +22,7 @@ const dollarTagAt = (sql: string, i: number): string | null => {
  * - `/* … *\/` 块注释，PG 允许嵌套。
  * 没有结束的字符串 / 注释 / 美元引号一直吃到末尾。去掉的内容换成占位符（空串 '' / "" / 空格），语句之间的分号保留。
  */
-const strip = (sql: string): string => {
+export const stripPgSql = (sql: string): string => {
   let out = '';
   const n = sql.length;
   let i = 0;
@@ -80,26 +80,44 @@ const strip = (sql: string): string => {
   return out;
 };
 
+/** REPACK 的括号选项里有没有打开 ANALYZE / ANALYSE：`ANALYZE`、`ANALYZE true / on / 1` 算，`false / off / 0` 不算 */
+const repackOptionAnalyze = (options: string): boolean =>
+  options.split(',').some((o) => {
+    const m = /^\s*analy[zs]e(?:\s+(\S+))?\s*$/i.exec(o);
+    if (!m) return false;
+    const v = m[1]?.toLowerCase();
+    return v === undefined || v === 'true' || v === 'on' || v === '1';
+  });
+
+const REPACK_WITH_OPTIONS = /^\s*repack\s*\(([^)]*)\)/i;
+
 /** 单条语句（已经去掉注释、字符串等）是不是不能进事务 */
-const statementIsNontransactional = (s: string): boolean =>
-  /\bconcurrently\b/i.test(s) ||
-  /^\s*vacuum\b/i.test(s) ||
-  /^\s*alter\s+system\b/i.test(s) ||
-  /^\s*(create|drop)\s+(database|tablespace)\b/i.test(s) ||
-  /^\s*alter\s+type\b[\s\S]*?\badd\s+value\b/i.test(s) ||
-  /^\s*discard\s+all\b/i.test(s) ||
-  // REINDEX DATABASE / SYSTEM（可带 (选项)）不能在事务块里执行；REINDEX INDEX / TABLE / SCHEMA 可以
-  /^\s*reindex\s*(?:\([^)]*\)\s*)?(?:database|system)\b/i.test(s) ||
-  // 不带表名的 CLUSTER（整库重排，可带 (选项) 或老写法的 VERBOSE）不能在事务块里；CLUSTER 表名 可以
-  /^\s*cluster\s*(?:\([^)]*\)|verbose)?\s*$/i.test(s) ||
-  // PG 19+ 不带表名的 REPACK（整库重排，可带 (选项)）不能在事务块里；带 CONCURRENTLY 已被上面规则覆盖，单表 REPACK 表名 可以
-  /^\s*repack\s*(?:\([^)]*\))?\s*$/i.test(s);
+const statementIsNontransactional = (s: string): boolean => {
+  const repackOpts = REPACK_WITH_OPTIONS.exec(s);
+  return (
+    /\bconcurrently\b/i.test(s) ||
+    /^\s*vacuum\b/i.test(s) ||
+    /^\s*alter\s+system\b/i.test(s) ||
+    /^\s*(create|drop)\s+(database|tablespace)\b/i.test(s) ||
+    /^\s*alter\s+type\b[\s\S]*?\badd\s+value\b/i.test(s) ||
+    /^\s*discard\s+all\b/i.test(s) ||
+    // REINDEX DATABASE / SYSTEM（可带 (选项)）不能在事务块里执行；REINDEX INDEX / TABLE / SCHEMA 可以
+    /^\s*reindex\s*(?:\([^)]*\)\s*)?(?:database|system)\b/i.test(s) ||
+    // 不带表名的 CLUSTER（整库重排，可带 (选项) 或老写法的 VERBOSE）不能在事务块里；CLUSTER 表名 可以
+    /^\s*cluster\s*(?:\([^)]*\)|verbose)?\s*$/i.test(s) ||
+    // PG 19+ 无表名 REPACK（含 REPACK USING INDEX 及带选项的整库重排）与启用 ANALYZE/ANALYSE 的 REPACK 均不能在事务块里；
+    // 带 CONCURRENTLY 已被上面规则覆盖；不带 ANALYZE/CONCURRENTLY 的单表 REPACK 表名 可以进事务
+    /^\s*repack\s*(?:\([^)]*\)\s*)?(?:using\s+index\s*)?$/i.test(s) ||
+    (repackOpts !== null && repackOptionAnalyze(repackOpts[1]!))
+  );
+};
 
 /**
  * 能不能放进事务。判断依据是 PG“不能在事务块里执行”的命令，外加一条保守的规则：
  * - 任何带 CONCURRENTLY 的语句：CREATE INDEX / DROP INDEX / REINDEX / REPACK (CONCURRENTLY) / ALTER TABLE … DETACH PARTITION …；
  * - VACUUM、ALTER SYSTEM、CREATE / DROP DATABASE、CREATE / DROP TABLESPACE、DISCARD ALL、
- *   REINDEX DATABASE / SYSTEM、不带表名的 CLUSTER 与 REPACK（带表名的 CLUSTER / REPACK 和 REINDEX TABLE / INDEX / SCHEMA 可以进事务）；
+ *   REINDEX DATABASE / SYSTEM、不带表名的 CLUSTER 与 REPACK（含 REPACK USING INDEX）及带 ANALYZE/ANALYSE 选项的 REPACK
+ *   （不带 ANALYZE/CONCURRENTLY 的单表 CLUSTER / REPACK 和 REINDEX TABLE / INDEX / SCHEMA 可以进事务）；
  * - ALTER TYPE … ADD VALUE：PG 12 起可以在事务里执行，但新值在同一事务里不能使用（后面的步骤可能立刻
  *   用到它：默认值、索引条件），所以单独作为非事务步骤最稳妥（规划器会生成这条语句）。
  * 一步里可以有多条语句（用户手写的脚本）：先去掉字符串、注释、带引号标识符和 $$ 函数体（分号出现在这些地方
@@ -107,7 +125,7 @@ const statementIsNontransactional = (s: string): boolean =>
  * 只是保守的文本判断：宁可把能进事务的标成非事务（执行器少一层保护），也不要把不能进事务的塞进事务。
  */
 export const isNontransactionalSql = (sql: string): boolean =>
-  strip(sql).split(';').some(statementIsNontransactional);
+  stripPgSql(sql).split(';').some(statementIsNontransactional);
 
 /**
  * 单条语句（已经去掉注释、字符串等）是不是“只拿不阻塞读写的锁、等旧事务结束”的 CONCURRENTLY 操作：
@@ -115,8 +133,9 @@ export const isNontransactionalSql = (sql: string): boolean =>
  * REINDEX {INDEX|TABLE|SCHEMA|DATABASE|SYSTEM} CONCURRENTLY，以及 PG 14 起的括号选项写法 REINDEX (CONCURRENTLY [true|on|1], …) …
  * （`(CONCURRENTLY false|off|0)` 不算）。它们拿的是 SHARE UPDATE EXCLUSIVE，不挡业务的读写，等的是已有事务结束。
  *
- * **ALTER TABLE … DETACH PARTITION … CONCURRENTLY 不在其中**：它的第二个事务要对分区拿 ACCESS EXCLUSIVE，
- * 排队时一样会把访问这个分区的业务语句堵在后面，所以照常受锁等待超时约束（它仍然是非事务步骤，见 isNontransactionalSql）。
+ * **ALTER TABLE … DETACH PARTITION … CONCURRENTLY 与 PG 19+ REPACK (CONCURRENTLY) 不在其中**：
+ * 它们在最终切换/完成阶段仍需短暂获取 ACCESS EXCLUSIVE 锁，排队时一样会把访问目标表的业务语句堵在后面，
+ * 所以照常受锁等待超时约束（它们仍然是非事务步骤，见 isNontransactionalSql）。
  */
 const REINDEX =
   /^\s*reindex\s*(?:\(([^)]*)\)\s*)?(?:index|table|schema|database|system)\b(\s+concurrently\b)?/i;
@@ -144,7 +163,7 @@ const statementIsConcurrentDdl = (s: string): boolean => {
  * 一步里还有别的语句时不算（别的语句仍然要受锁等待超时约束；实际上 CONCURRENTLY 本来也不能和别的语句放在一个多语句请求里）。
  */
 export const isConcurrentDdlSql = (sql: string): boolean => {
-  const statements = strip(sql)
+  const statements = stripPgSql(sql)
     .split(';')
     .filter((s) => s.trim() !== '');
   return statements.length > 0 && statements.every(statementIsConcurrentDdl);
@@ -176,7 +195,7 @@ export const INSTANCE_LEVEL_DESCRIPTION =
  * 真正的边界是“生产环境默认不在同一实例上建影子库”和“影子库用权限受限的账号（不带 SUPERUSER / CREATEROLE）或独立实例”。
  */
 export const findInstanceLevelStatement = (sql: string): string | null => {
-  const hit = strip(sql).split(';').find(statementIsInstanceLevel);
+  const hit = stripPgSql(sql).split(';').find(statementIsInstanceLevel);
   return hit === undefined ? null : hit.trim().replace(/\s+/g, ' ').slice(0, 80);
 };
 

@@ -3,10 +3,14 @@ import { describe, expect, test } from 'vitest';
 import {
   addCheck,
   addColumn,
+  addIndex,
+  addUnique,
   checkPgCompatibility,
   createAll,
   createTable,
   deriveTargetPgMajor,
+  dropColumn,
+  EditError,
   emptyModel,
   FORMAT,
   isNontransactionalSql,
@@ -23,10 +27,12 @@ import {
   plan,
   renameColumn,
   renameKey,
+  renameSchema,
   SUPPORTED_PG_MAJORS,
   setDefault,
   setNotNull,
   Table,
+  validate,
   type Column,
   type Opaque,
   type Schema,
@@ -78,6 +84,7 @@ describe('PG version constants & helpers', () => {
     expect(pgMajorOf(180000)).toBe(18);
     expect(pgMajorOf(190001)).toBe(19);
     expect(pgMajorOf(140012)).toBe(14);
+    expect(pgMajorOf(160004.5)).toBeNull();
     expect(pgMajorOf(null)).toBeNull();
     expect(pgMajorOf(undefined)).toBeNull();
     expect(pgMajorOf(0)).toBeNull();
@@ -553,6 +560,13 @@ describe('PG 19 REPACK nontransactional detection', () => {
     'repack',
     'REPACK (VERBOSE)',
     'REPACK (ANALYZE, VERBOSE)',
+    'REPACK USING INDEX',
+    'REPACK (VERBOSE) USING INDEX',
+    'REPACK (ANALYZE) public.t',
+    'REPACK (VERBOSE, ANALYZE) public.t',
+    'REPACK (ANALYSE true) public.t (col)',
+    'REPACK (ANALYZE on) public.t',
+    'REPACK (ANALYZE 1) public.t',
     'REPACK (CONCURRENTLY) public.t',
     'REPACK (CONCURRENTLY, VERBOSE) public.t USING INDEX t_pkey',
     'UPDATE t SET a = 1; REPACK',
@@ -564,9 +578,159 @@ describe('PG 19 REPACK nontransactional detection', () => {
     'REPACK public.t',
     'REPACK public.t USING INDEX t_pkey',
     'REPACK (VERBOSE) public.t',
+    'REPACK (ANALYZE false) public.t',
+    'REPACK (ANALYSE off) public.t',
+    'REPACK (ANALYZE 0) public.t',
     "COMMENT ON TABLE t IS 'REPACK'",
     'CREATE TABLE "repack" (id int)',
   ])('%s → 事务内可执行', (sql) => {
     expect(isNontransactionalSql(sql)).toBe(false);
+  });
+});
+
+describe('Stage 0 review regressions', () => {
+  test('notNullName === null with explicit mode (PG 15-17 import) does not false-positive named_not_null', () => {
+    const m = baseModel();
+    m.objects.t1 = makeTable({ id: 't1', parent: 's1', name: 'users' });
+    m.objects.c1 = makeCol({
+      id: 'c1',
+      parent: 't1',
+      name: 'id',
+      notNull: true,
+      notNullName: null,
+      notNullNameMode: 'explicit',
+    });
+    expect(checkPgCompatibility(m, 15)).toEqual([]);
+    expect(checkPgCompatibility(m, 16)).toEqual([]);
+    expect(() => createAll(m, { pgMajor: 16 })).not.toThrow();
+  });
+
+  test('dollar-quoted strings, quoted identifiers, and comments do not trigger uuidv7_expr warning', () => {
+    const m = baseModel();
+    m.objects.t1 = makeTable({ id: 't1', parent: 's1', name: 'notes' });
+    m.objects.c1 = makeCol({
+      id: 'c1',
+      parent: 't1',
+      name: 'a',
+      type: 'text',
+      default: { expr: '$$uuidv7()$$' },
+    });
+    m.objects.c2 = makeCol({
+      id: 'c2',
+      parent: 't1',
+      name: 'b',
+      type: 'text',
+      default: { expr: '$tag$uuidv7()$tag$' },
+    });
+    m.objects.c3 = makeCol({
+      id: 'c3',
+      parent: 't1',
+      name: 'c',
+      type: 'text',
+      default: { expr: '/* uuidv7() */ lower("col uuidv7()")' },
+    });
+    expect(checkPgCompatibility(m, 16)).toEqual([]);
+  });
+
+  test('pgMajor < 15 detects NULLS NOT DISTINCT and plan rejects invalid pgMajor', () => {
+    const m = baseModel();
+    const t = createTable(m, 's1', 't', 't1');
+    const c = addColumn(m, t, { id: 'c1', name: 'code', type: 'text' });
+    addUnique(m, t, [c], true, 'u1');
+    addIndex(m, t, [{ column: c }], { unique: true, nullsNotDistinct: true }, 'x1');
+
+    const issues14 = checkPgCompatibility(m, 14);
+    expect(issues14.filter((i) => i.code === 'nulls_not_distinct')).toHaveLength(2);
+    expect(() => createAll(m, { pgMajor: 14 })).toThrow(PlanError);
+    expect(() => createAll(m, { pgMajor: 15 })).not.toThrow();
+
+    for (const bad of [0, -1, 16.5, Number.NaN, Number.POSITIVE_INFINITY]) {
+      expect(() => createAll(m, { pgMajor: bad })).toThrow(PlanError);
+    }
+  });
+
+  test('PartitionKey enforces column xor expr and validate(m) checks column ownership', () => {
+    expect(() => PartitionKey.parse({})).toThrow();
+    expect(() => PartitionKey.parse({ column: null, expr: null })).toThrow();
+    expect(() => PartitionKey.parse({ column: null, expr: '' })).toThrow();
+    expect(() => PartitionKey.parse({ column: 'c1', expr: 'lower(x)' })).toThrow();
+    expect(() =>
+      Table.parse({ id: 't1', kind: 'table', parent: 's1', name: 't', partitionBy: '' }),
+    ).toThrow();
+
+    const m = baseModel();
+    m.objects.t1 = makeTable({
+      id: 't1',
+      parent: 's1',
+      name: 't1',
+      partitionBy: {
+        strategy: 'range',
+        keys: [{ column: 'cOther', expr: null, opclass: null, collation: null }],
+      },
+    });
+    m.objects.t2 = makeTable({ id: 't2', parent: 's1', name: 't2' });
+    m.objects.cOther = makeCol({ id: 'cOther', parent: 't2', name: 'x' });
+    expect(validate(m).some((e) => e.includes('partitionBy'))).toBe(true);
+  });
+
+  test('legacy string partitionBy equals equivalent PartitionSpec in plan(), and renames/dropColumn stay consistent', () => {
+    const from = baseModel();
+    from.objects.t1 = makeTable({
+      id: 't1',
+      parent: 's1',
+      name: 'payment',
+      partitionBy: 'RANGE (payment_date)',
+    });
+    from.objects.c1 = makeCol({ id: 'c1', parent: 't1', name: 'payment_date', type: 'date' });
+
+    const to = structuredClone(from);
+    (to.objects.t1 as TableType).partitionBy = {
+      strategy: 'range',
+      keys: [{ column: 'c1', expr: null, opclass: null, collation: null }],
+    };
+    expect(plan(from, to, { pgMajor: 16 })).toEqual([]);
+
+    // Schema rename + column rename rewrite PartitionSpec expr and converge in plan()
+    const mExpr = baseModel();
+    mExpr.objects.t1 = makeTable({
+      id: 't1',
+      parent: 's1',
+      name: 'logs',
+      partitionBy: {
+        strategy: 'range',
+        keys: [
+          { column: 'c1', expr: null, opclass: null, collation: null },
+          { column: null, expr: 'public.norm_key(code)', opclass: null, collation: null },
+        ],
+      },
+    });
+    mExpr.objects.c1 = makeCol({ id: 'c1', parent: 't1', name: 'k', type: 'integer' });
+    mExpr.objects.c2 = makeCol({ id: 'c2', parent: 't1', name: 'code', type: 'text' });
+
+    expect(() => dropColumn(structuredClone(mExpr), 'c1')).toThrow(EditError);
+    expect(() => dropColumn(structuredClone(mExpr), 'c2')).toThrow(EditError);
+
+    const mRenamedSchema = structuredClone(mExpr);
+    renameSchema(mRenamedSchema, 's1', 'app');
+    expect((mRenamedSchema.objects.t1 as TableType).partitionBy).toEqual({
+      strategy: 'range',
+      keys: [
+        { column: 'c1', expr: null, opclass: null, collation: null },
+        { column: null, expr: 'app.norm_key(code)', opclass: null, collation: null },
+      ],
+    });
+    expect(plan(mExpr, mRenamedSchema, { pgMajor: 18 }).map((s) => s.sql)).toEqual([
+      'ALTER SCHEMA public RENAME TO app',
+    ]);
+
+    const mRenamedCol = structuredClone(mExpr);
+    renameColumn(mRenamedCol, 'c2', 'tag');
+    expect((mRenamedCol.objects.t1 as TableType).partitionBy).toEqual({
+      strategy: 'range',
+      keys: [
+        { column: 'c1', expr: null, opclass: null, collation: null },
+        { column: null, expr: 'public.norm_key(tag)', opclass: null, collation: null },
+      ],
+    });
   });
 });

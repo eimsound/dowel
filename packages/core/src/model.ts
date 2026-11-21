@@ -35,14 +35,25 @@ export const qname = (m: Model, o: Table | Enum | Sequence): string => qualified
 export const tableOfColumn = (m: Model, col: string): Table => get(m, get(m, col, 'column').parent, 'table');
 
 /** 将表的 partitionBy 渲染为 PG `PARTITION BY` 之后的分句（兼容存量原始字符串与结构化 PartitionSpec） */
-export const partitionBySql = (m: Model, table: Pick<Table, 'partitionBy'>): string | null => {
+export const partitionBySql = (
+  m: Model,
+  table: Pick<Table, 'partitionBy'>,
+  fallbackModel?: Model,
+): string | null => {
   const p = table.partitionBy;
   if (!p) return null;
   if (typeof p === 'string') return p;
   const keys = p.keys
     .map((k) => {
-      if (!k.column && !k.expr) throw new EditError('分区键必须指定列或表达式');
-      let s = k.column ? ident(get(m, k.column, 'column').name) : `(${k.expr})`;
+      if (!!k.column === !!k.expr) throw new EditError('分区键必须且只能指定列或表达式之一');
+      let s: string;
+      if (k.column) {
+        const col = find(m, k.column) ?? (fallbackModel ? find(fallbackModel, k.column) : undefined);
+        if (col?.kind !== 'column') throw new EditError(`找不到对象：${k.column}`);
+        s = ident(col.name);
+      } else {
+        s = `(${k.expr})`;
+      }
       if (k.collation) s += ` COLLATE ${k.collation}`;
       if (k.opclass) s += ` ${k.opclass}`;
       return s;
@@ -126,6 +137,14 @@ export const validate = (m: Model): string[] => {
       case 'table':
         need(o, o.parent, 'schema', 'parent');
         need(o, o.partitionOf?.parent, 'table', 'partitionOf');
+        if (typeof o.partitionBy === 'string') {
+          if (o.partitionBy.trim() === '') errs.push(`table ${o.name}：partitionBy 不能为空字符串`);
+        } else if (o.partitionBy !== null) {
+          for (const k of o.partitionBy.keys) {
+            if (!!k.column === !!k.expr) errs.push(`table ${o.name}：分区键必须且只能指定列或表达式之一`);
+            if (k.column) colOfTable(o, o.id, [k.column], 'partitionBy');
+          }
+        }
         claim(`rel:${o.parent}`, o.name, o);
         claim(`type:${o.parent}`, o.name, o); // 表自带同名的行类型
         break;
