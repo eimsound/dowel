@@ -41,7 +41,7 @@ import { PageHeader, useShellPanel } from '../components/Shell.tsx';
 import { useToast } from '../components/Toasts.tsx';
 import { Banner, IconButton } from '../components/ui.tsx';
 import { useVersionName, VersionBadges, VersionNumber } from '../components/VersionStatus.tsx';
-import { useEnvHistory, useEnvStatus, useEnvs } from '../envs.ts';
+import { attachSuccessMessage, useEnvHistory, useEnvStatus, useEnvs } from '../envs.ts';
 import { formatTime } from '../format.ts';
 import { invalidatePolicyDependents } from '../policy-cache.ts';
 import { useProject } from '../project.tsx';
@@ -169,16 +169,7 @@ const EnvForm = ({ pid }: { pid: string }) => {
     onSuccess: (r) => {
       if (attach) {
         const a = r as AttachResult;
-        const baseMsg = !a.attached
-          ? t('tk.attachedNone', { name: form.name })
-          : a.aheadVersions?.length
-            ? t('tk.attachedAheadOk', {
-                name: form.name,
-                count: a.aheadVersions.length,
-                number: a.currentVersion?.number ?? '—',
-              })
-            : t('tk.attachedOk', { name: form.name, number: a.currentVersion?.number ?? '—' });
-        toast(baseMsg + (a.claimed ? t('tk.attachedClaimed') : ''));
+        toast(attachSuccessMessage(t, form.name, a));
         // 环境已经添加，但认领失败 / 同步失败：如实告诉用户（可以在环境页重试）
         for (const w of a.warnings ?? []) toast(t('tk.attachedWarn', { msg: w }), 'error');
       }

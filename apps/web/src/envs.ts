@@ -1,6 +1,15 @@
 // 环境的共用数据：列表 / 状态 / 历史的查询、漂移警告的判断、执行接口的 SSE 读取。
-import type { EnvHistory, EnvInfo, EnvStatus, ExecErrorDetails, ExecEvent, ExecPolicy } from '@dowel/api';
+import type {
+  AttachResult,
+  EnvHistory,
+  EnvInfo,
+  EnvStatus,
+  ExecErrorDetails,
+  ExecEvent,
+  ExecPolicy,
+} from '@dowel/api';
 import { useQuery } from '@tanstack/react-query';
+import type { TFunction } from 'i18next';
 import { ApiError, api } from './api.ts';
 import { readSse } from './sse.ts';
 
@@ -29,6 +38,34 @@ export const driftWarnings = (envs: EnvInfo[] | undefined) =>
   (envs ?? []).filter((e) => e.drift.status === 'drifted' || e.drift.status === 'error');
 
 export const EXEC_POLICIES: ExecPolicy[] = ['editor', 'admin', 'executor'];
+
+/** 接入已有历史成功后的提示文案：按是否接入、领先版本、当前版本与认领状态选择完整整句，避免句末拼接双标点或渲染 v— */
+export const attachSuccessMessage = (
+  t: TFunction,
+  name: string,
+  result: Pick<AttachResult, 'attached' | 'claimed' | 'currentVersion' | 'aheadVersions'>,
+): string => {
+  if (!result.attached) return t('tk.attachedNone', { name });
+  const aheadCount = result.aheadVersions?.length ?? 0;
+  const version = result.currentVersion?.number;
+  if (aheadCount > 0) {
+    if (version !== undefined) {
+      return t(result.claimed ? 'tk.attachedAheadOkClaimed' : 'tk.attachedAheadOk', {
+        name,
+        count: aheadCount,
+        number: version,
+      });
+    }
+    return t(result.claimed ? 'tk.attachedAheadNoVersionClaimed' : 'tk.attachedAheadNoVersion', {
+      name,
+      count: aheadCount,
+    });
+  }
+  if (version !== undefined) {
+    return t(result.claimed ? 'tk.attachedOkClaimed' : 'tk.attachedOk', { name, number: version });
+  }
+  return t(result.claimed ? 'tk.attachedNoVersionClaimed' : 'tk.attachedNoVersion', { name });
+};
 
 /**
  * 读执行 / 回滚 / 写基线的 SSE：每条消息 `data: {ExecEvent JSON}`（解析见 sse.ts）。

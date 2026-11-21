@@ -396,9 +396,14 @@ const zh = {
     attachHint:
       '接入需要项目管理员，并且历史必须与本项目的版本链一致或是无分叉领先延伸（领先版本会先在影子库验证，验证通过后补齐版本链并同步工作副本）；由另一个实例认领的库需要实例管理员确认认领。没有历史的库只是一个新环境。',
     attachedOk: '已接入 {{name}}：当前版本 v{{number}}。',
+    attachedOkClaimed: '已接入 {{name}}：当前版本 v{{number}}，并已认领。',
+    attachedNoVersion: '已接入 {{name}}：尚未执行任何版本。',
+    attachedNoVersionClaimed: '已接入 {{name}}：尚未执行任何版本，并已认领。',
     attachedAheadOk: '已接入 {{name}}：补齐 {{count}} 个领先版本，当前版本 v{{number}}。',
+    attachedAheadOkClaimed: '已接入 {{name}}：补齐 {{count}} 个领先版本，当前版本 v{{number}}，并已认领。',
+    attachedAheadNoVersion: '已接入 {{name}}：补齐 {{count}} 个领先版本。',
+    attachedAheadNoVersionClaimed: '已接入 {{name}}：补齐 {{count}} 个领先版本，并已认领。',
     attachedNone: '已添加 {{name}}（这个库里还没有这个项目的历史）。',
-    attachedClaimed: '，并已认领。',
     attachedWarn: '环境已添加，但有没做完的事：{{msg}}',
     attachAheadTitle: '确认覆盖工作副本并接入领先环境',
     attachAheadIntro:
@@ -2086,9 +2091,15 @@ const en: typeof zh = {
     attachHint:
       'Attaching needs a project admin, and the history must match this project’s version chain or extend it without forking (ahead versions are verified in a shadow database before extending the chain and updating the working copy); a database claimed by another instance needs an instance admin to confirm the claim. A database without history is just a new environment.',
     attachedOk: 'Attached {{name}}: current version v{{number}}.',
+    attachedOkClaimed: 'Attached and claimed {{name}}: current version v{{number}}.',
+    attachedNoVersion: 'Attached {{name}}: not yet executed.',
+    attachedNoVersionClaimed: 'Attached and claimed {{name}}: not yet executed.',
     attachedAheadOk: 'Attached {{name}}: added {{count}} ahead version(s), current version v{{number}}.',
+    attachedAheadOkClaimed:
+      'Attached and claimed {{name}}: added {{count}} ahead version(s), current version v{{number}}.',
+    attachedAheadNoVersion: 'Attached {{name}}: added {{count}} ahead version(s).',
+    attachedAheadNoVersionClaimed: 'Attached and claimed {{name}}: added {{count}} ahead version(s).',
     attachedNone: 'Added {{name}} (no history of this project in that database yet).',
-    attachedClaimed: ' and claimed it.',
     attachedWarn: 'The environment was added, but something is unfinished: {{msg}}',
     attachAheadTitle: 'Confirm overwriting working copy to attach ahead environment',
     attachAheadIntro:
