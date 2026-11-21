@@ -15,6 +15,7 @@ import { PageHeader } from '../components/Shell.tsx';
 import { useToast } from '../components/Toasts.tsx';
 import { Banner } from '../components/ui.tsx';
 import { VersionNumber } from '../components/VersionStatus.tsx';
+import { dialectUiSpec } from '../dialects.ts';
 import { streamExec } from '../envs.ts';
 import { formatTime } from '../format.ts';
 import { useProject } from '../project.tsx';
@@ -510,7 +511,9 @@ const RequestView = ({ rid }: { rid: string }) => {
                 {t('req.dryRun', {
                   checks: r.dryRun.checks.map((c) => t(`tk.dry.check.${c}`)).join('、'),
                 })}
-                {r.dryRun.createsHistory ? ` ${t('tk.dry.createsHistory')}` : ''}
+                {r.dryRun.createsHistory
+                  ? ` ${t(dialectUiSpec(project.dialect).historyStorage === 'prefix' ? 'tk.dry.createsHistoryPrefix' : 'tk.dry.createsHistory')}`
+                  : ''}
               </p>
             )}
             <p className="hint">{t('req.binding')}</p>

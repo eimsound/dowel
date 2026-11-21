@@ -12,7 +12,14 @@ import {
   formatPartitionBound,
   formatPartitionBy,
   getDialect,
+  isMssqlIdentityEligibleType,
+  isMssqlPkClustered,
+  isMysqlAutoIncrementType,
   type Model,
+  MYSQL_SAFE_IDENT_RE,
+  mssqlChooseName,
+  mssqlDefaultNameOf,
+  mssqlNormalizeType,
   newId,
   normalizeType,
   parsePartitionBound,
@@ -23,6 +30,7 @@ import {
   type PartitionStrategy,
   partitionsOf,
   resolvePartitionBy,
+  splitMysqlTypeModifiers,
   type Table,
   validatePartitionBoundCode,
 } from '@dowel/core';
@@ -64,7 +72,7 @@ import { Banner, cx, Empty, IconButton, Menu, Sql } from './ui.tsx';
 
 type Ctx = { ws: Workspace; model: Model; readOnly: boolean };
 
-/** 失焦或回车时提交，Esc 放弃 */
+/** 失焦或回车时提交，Esc 放弃；传入 validate 时仅在失焦/提交时校验并在输入时清除错误 */
 const Field = ({
   value,
   onCommit,
@@ -77,6 +85,8 @@ const Field = ({
   className,
   autoFocus,
   disabled,
+  describedBy,
+  validate,
 }: {
   value: string;
   onCommit: (v: string, basis: Versions) => void;
@@ -89,40 +99,83 @@ const Field = ({
   className?: string;
   autoFocus?: boolean;
   disabled?: boolean;
+  describedBy?: string;
+  validate?: (trimmed: string) => string | null;
 }) => {
+  const errId = useId();
   const [draft, setDraft] = useState<string | null>(null);
+  const [error, setError] = useState<string | null>(null);
   const basis = useRef<Versions>({});
+  const draftBaseValue = useRef<string | null>(null);
   const cancelled = useRef(false);
+  const ariaDescribedBy = [describedBy, error ? errId : null].filter(Boolean).join(' ') || undefined;
   return (
-    <input
-      aria-label={label}
-      value={draft ?? value}
-      list={list}
-      placeholder={placeholder}
-      autoFocus={autoFocus}
-      disabled={disabled}
-      spellCheck={false}
-      className={cx('input', mono && 'font-mono', className)}
-      onFocus={() => {
-        cancelled.current = false;
-        setDraft(value);
-        basis.current = ws.client.basisOf(basisIds);
-      }}
-      onChange={(e) => setDraft(e.target.value)}
-      onKeyDown={(e) => {
-        // 输入法组字中按回车是确认候选词，不是提交（Safari / 部分安卓只给 keyCode 229）
-        if (e.nativeEvent.isComposing || e.keyCode === 229) return;
-        if (e.key === 'Enter') e.currentTarget.blur();
-        if (e.key === 'Escape') {
-          cancelled.current = true;
-          e.currentTarget.blur();
-        }
-      }}
-      onBlur={() => {
-        if (!cancelled.current && draft !== null && draft !== value) onCommit(draft, basis.current);
-        setDraft(null);
-      }}
-    />
+    <>
+      <input
+        aria-label={label}
+        aria-invalid={error ? true : undefined}
+        aria-describedby={ariaDescribedBy}
+        value={draft ?? value}
+        list={list}
+        placeholder={placeholder}
+        autoFocus={autoFocus}
+        disabled={disabled}
+        autoCapitalize={mono ? 'none' : undefined}
+        autoCorrect={mono ? 'off' : undefined}
+        spellCheck={false}
+        className={cx('input', mono && 'font-mono', className)}
+        onFocus={() => {
+          cancelled.current = false;
+          if (draft === null) {
+            setDraft(value);
+            draftBaseValue.current = value;
+            basis.current = ws.client.basisOf(basisIds);
+          } else if (value === draftBaseValue.current) {
+            basis.current = ws.client.basisOf(basisIds);
+          }
+        }}
+        onChange={(e) => {
+          setDraft(e.target.value);
+          if (error) setError(null);
+        }}
+        onKeyDown={(e) => {
+          // 输入法组字中按回车是确认候选词，不是提交（Safari / 部分安卓只给 keyCode 229）
+          if (e.nativeEvent.isComposing || e.keyCode === 229) return;
+          if (e.key === 'Enter') e.currentTarget.blur();
+          if (e.key === 'Escape') {
+            cancelled.current = true;
+            setError(null);
+            e.currentTarget.blur();
+          }
+        }}
+        onBlur={() => {
+          if (cancelled.current || draft === null) {
+            setDraft(null);
+            draftBaseValue.current = null;
+            setError(null);
+            return;
+          }
+          if (draft !== value) {
+            const err = validate?.(draft.trim()) ?? null;
+            if (err) {
+              setError(err);
+              return;
+            }
+            setError(null);
+            onCommit(draft, basis.current);
+          } else {
+            setError(null);
+          }
+          setDraft(null);
+          draftBaseValue.current = null;
+        }}
+      />
+      {error && (
+        <p id={errId} className="hint error">
+          {error}
+        </p>
+      )}
+    </>
   );
 };
 
@@ -546,6 +599,40 @@ interface KeyDraft {
 const isIntegerColumn = (c: Column) =>
   !c.typeRef && (c.type === 'smallint' || c.type === 'integer' || c.type === 'bigint');
 
+const MYSQL_UNSIGNED_BASE_TYPES = new Set([
+  'tinyint',
+  'smallint',
+  'mediumint',
+  'int',
+  'bigint',
+  'decimal',
+  'float',
+  'double',
+]);
+
+const isMysqlUnsignedEligible = (type: string): boolean => {
+  const base = splitMysqlTypeModifiers(type)
+    .baseType.replace(/\([^)]*\)/, '')
+    .trim()
+    .toLowerCase();
+  return MYSQL_UNSIGNED_BASE_TYPES.has(base);
+};
+
+const isMysqlOnUpdateTemporalType = (type: string): boolean =>
+  /^(?:datetime|timestamp)(?:\(\d+\))?$/i.test(splitMysqlTypeModifiers(type).baseType.trim());
+
+type MysqlIndexType = 'BTREE' | 'HASH' | 'FULLTEXT' | 'SPATIAL';
+const MYSQL_INDEX_TYPES: readonly MysqlIndexType[] = ['BTREE', 'HASH', 'FULLTEXT', 'SPATIAL'];
+
+const parseFillFactorInput = (raw: string): number | null | 'invalid' => {
+  const s = raw.trim();
+  if (!s) return null;
+  if (!/^\d+$/.test(s)) return 'invalid';
+  const n = Number.parseInt(s, 10);
+  if (!Number.isInteger(n) || n < 1 || n > 100) return 'invalid';
+  return n;
+};
+
 const TableInspector = ({
   table,
   ws,
@@ -580,7 +667,8 @@ const TableInspector = ({
     (versionCount > 0 &&
       (publishedTables.isPending || publishedTables.isFetching || publishedTables.isError));
   const isPublished = !publishedUnknown && versionCount > 0 && !!publishedTables.data?.has(table.id);
-  const pgBlocksPartitionIdentity = project.targetPgMajor !== null && project.targetPgMajor < 17;
+  const pgBlocksPartitionIdentity =
+    model.dialect === 'pg' && project.targetPgMajor !== null && project.targetPgMajor < 17;
 
   const isChild = table.partitionOf !== null;
   const cols = isChild ? effectiveColumnsOf(model, table.id) : columnsOf(model, table.id);
@@ -626,9 +714,16 @@ const TableInspector = ({
   const [adding, setAdding] = useState<'check' | 'unique' | 'fk' | 'index' | null>(null);
   const [picked, setPicked] = useState<string[]>([]);
   const [indexUnique, setIndexUnique] = useState(false);
+  const [uniqueClustered, setUniqueClustered] = useState(false);
+  const [mysqlIndexType, setMysqlIndexType] = useState<MysqlIndexType>('BTREE');
+  const [mssqlIndexClustered, setMssqlIndexClustered] = useState(false);
+  const [mssqlFillFactor, setMssqlFillFactor] = useState('');
+  const [mssqlFillFactorErr, setMssqlFillFactorErr] = useState<string | null>(null);
   const emptyFk = { col: '', ref: '', refCol: '', onDelete: 'noAction' as FkAction };
   const [fk, setFk] = useState(emptyFk);
   const typesId = useId();
+  const mysqlTypeHintId = useId();
+  const fillFactorErrId = useId();
 
   // 分区配置与子分区操作状态
   const [editingStrategy, setEditingStrategy] = useState(false);
@@ -656,9 +751,79 @@ const TableInspector = ({
     setAdding(k);
     setPicked([]);
     setIndexUnique(false);
+    setUniqueClustered(false);
+    setMysqlIndexType('BTREE');
+    setMssqlIndexClustered(false);
+    setMssqlFillFactor('');
+    setMssqlFillFactorErr(null);
     setFk(emptyFk);
   };
+  const validateMysqlSafeIdent = (trimmed: string): string | null =>
+    trimmed && !MYSQL_SAFE_IDENT_RE.test(trimmed) ? t('insp.mysqlSafeIdentErr') : null;
+  const hasOtherClustered = (excludeId: string): boolean =>
+    (pk !== undefined && pk.id !== excludeId && isMssqlPkClustered(model, pk)) ||
+    uniques.some((u) => u.id !== excludeId && !!u.ext?.mssql?.clustered) ||
+    indexes.some((ix) => ix.id !== excludeId && !!ix.ext?.mssql?.clustered);
+  const isMysqlColIndexedFirst = (colId: string): boolean =>
+    pk?.columns[0] === colId ||
+    uniques.some((u) => u.columns[0] === colId) ||
+    indexes.some((ix) => {
+      const it = (ix.ext?.mysql?.indexType ?? ix.method).toUpperCase();
+      return it !== 'FULLTEXT' && it !== 'SPATIAL' && ix.elements[0]?.column === colId;
+    });
+  const updateMysqlTableExt = (
+    patch: Partial<{ engine: string; charset: string; collation: string }>,
+    basis?: Versions,
+  ) => {
+    const nextMysql = { ...table.ext?.mysql, ...patch };
+    const nextExt = { ...table.ext, mysql: nextMysql };
+    ws.act('setTableExt', { id: table.id, ext: nextExt }, basis);
+  };
+  const updateMysqlColumnExt = (
+    c: Column,
+    patch: Partial<{
+      unsigned: boolean;
+      zerofill: boolean;
+      autoIncrement: boolean;
+      onUpdateCurrentTimestamp: boolean;
+      charset: string;
+    }>,
+    basis?: Versions,
+  ) => {
+    const nextMysql = { ...c.ext?.mysql, ...patch };
+    ws.act('setColumnExt', { id: c.id, ext: { ...c.ext, mysql: nextMysql } }, basis);
+  };
+  const updateMssqlColumnExt = (
+    c: Column,
+    patch: Partial<{
+      identity: { seed: string; increment: string };
+      defaultName: string;
+      defaultNameMode: 'derived' | 'explicit';
+      sparse: boolean;
+      rowguidcol: boolean;
+    }>,
+    basis?: Versions,
+  ) => {
+    const nextMssql = { ...c.ext?.mssql, ...patch };
+    ws.act('setColumnExt', { id: c.id, ext: { ...c.ext, mssql: nextMssql } }, basis);
+  };
+  const resetMssqlDefaultName = (c: Column, b?: Versions) => {
+    const derived =
+      c.default !== null
+        ? mssqlChooseName('DF', table.name, c.name, (n) =>
+            getDialect('mssql').isNameTaken(model, 'rel', table.parent, n, `${c.id}#df`),
+          )
+        : undefined;
+    updateMssqlColumnExt(
+      c,
+      derived
+        ? { defaultName: derived, defaultNameMode: 'derived' }
+        : { defaultName: undefined, defaultNameMode: undefined },
+      b,
+    );
+  };
   const setPk = (colId: string, on: boolean) => {
+    if (on && model.dialect === 'mssql' && cols.find((c) => c.id === colId)?.ext?.mssql?.sparse) return;
     const next = on ? [...(pk?.columns ?? []), colId] : (pk?.columns ?? []).filter((c) => c !== colId);
     ws.act('setPrimaryKey', { id: newId(), table: table.id, columns: next });
   };
@@ -847,6 +1012,50 @@ const TableInspector = ({
         </div>
       )}
 
+      {model.dialect === 'mysql' && (
+        <div className="space-y-2">
+          <div className="label">{t('insp.mysqlTableOptions')}</div>
+          <div className="grid grid-cols-2 gap-2">
+            <Labeled label={t('insp.mysqlEngine')}>
+              <Field
+                ws={ws}
+                label={t('insp.mysqlEngine')}
+                placeholder="InnoDB"
+                value={table.ext?.mysql?.engine ?? ''}
+                basisIds={[table.id]}
+                mono
+                validate={validateMysqlSafeIdent}
+                onCommit={(v, b) => updateMysqlTableExt({ engine: v.trim() || undefined }, b)}
+              />
+            </Labeled>
+            <Labeled label={t('insp.mysqlCharset')}>
+              <Field
+                ws={ws}
+                label={t('insp.mysqlCharset')}
+                placeholder="utf8mb4"
+                value={table.ext?.mysql?.charset ?? ''}
+                basisIds={[table.id]}
+                mono
+                validate={validateMysqlSafeIdent}
+                onCommit={(v, b) => updateMysqlTableExt({ charset: v.trim() || undefined }, b)}
+              />
+            </Labeled>
+          </div>
+          <Labeled label={t('insp.mysqlCollation')}>
+            <Field
+              ws={ws}
+              label={t('insp.mysqlCollation')}
+              placeholder="utf8mb4_0900_ai_ci"
+              value={table.ext?.mysql?.collation ?? ''}
+              basisIds={[table.id]}
+              mono
+              validate={validateMysqlSafeIdent}
+              onCommit={(v, b) => updateMysqlTableExt({ collation: v.trim() || undefined }, b)}
+            />
+          </Labeled>
+        </div>
+      )}
+
       {isChild && table.partitionOf && (
         <Section
           title={t('part.bound')}
@@ -931,6 +1140,7 @@ const TableInspector = ({
           <datalist id={typesId}>
             {[
               ...dialectSpec.commonTypes,
+              ...(model.dialect === 'mysql' ? ["enum('a','b')", "set('x','y')"] : []),
               ...(dialectSpec.capabilities.enums ? all(model, 'enum').map((e) => e.name) : []),
             ].map((x) => (
               <option key={x} value={x} />
@@ -942,6 +1152,9 @@ const TableInspector = ({
             const open = !isChild && openCol === c.id;
             const isPk = !!pk?.columns.includes(c.id);
             const isPartKey = partKeyCols.has(c.id);
+            const mysqlSplit = open && model.dialect === 'mysql' ? splitMysqlTypeModifiers(c.type) : null;
+            const isMysqlUnsigned =
+              !!mysqlSplit && !!(c.ext?.mysql?.unsigned || mysqlSplit.unsigned || c.ext?.mysql?.zerofill);
             if (isChild) {
               return (
                 <li
@@ -1008,12 +1221,55 @@ const TableInspector = ({
                           basisIds={[c.id]}
                           mono
                           disabled={isPartKey}
-                          onCommit={(v, b) =>
-                            ws.act('setColumnType', { id: c.id, ...parseType(model, v) }, b)
-                          }
+                          describedBy={model.dialect === 'mysql' ? mysqlTypeHintId : undefined}
+                          onCommit={(v, b) => {
+                            const parsed = parseType(model, v);
+                            if (model.dialect === 'mysql') {
+                              const { baseType, unsigned, zerofill } = splitMysqlTypeModifiers(parsed.type);
+                              let usedTypeOp = false;
+                              if (baseType !== c.type || parsed.typeRef !== c.typeRef) {
+                                if (
+                                  !ws.act(
+                                    'setColumnType',
+                                    { id: c.id, type: baseType, typeRef: parsed.typeRef },
+                                    b,
+                                  )
+                                )
+                                  return;
+                                usedTypeOp = true;
+                              }
+                              if (
+                                (unsigned || zerofill) &&
+                                c.generated === null &&
+                                isMysqlUnsignedEligible(baseType)
+                              ) {
+                                updateMysqlColumnExt(
+                                  c,
+                                  { unsigned: true, ...(zerofill ? { zerofill: true } : {}) },
+                                  usedTypeOp ? undefined : b,
+                                );
+                              } else if (
+                                !isMysqlUnsignedEligible(baseType) &&
+                                (c.ext?.mysql?.unsigned || c.ext?.mysql?.zerofill)
+                              ) {
+                                updateMysqlColumnExt(
+                                  c,
+                                  { unsigned: undefined, zerofill: undefined },
+                                  usedTypeOp ? undefined : b,
+                                );
+                              }
+                              return;
+                            }
+                            ws.act('setColumnType', { id: c.id, ...parsed }, b);
+                          }}
                         />
                       </Labeled>
                     </div>
+                    {model.dialect === 'mysql' && (
+                      <p id={mysqlTypeHintId} className="hint m-0">
+                        {t('insp.mysqlTypeHint')}
+                      </p>
+                    )}
                     {isPartKey && <p className="hint">{t('part.keyColLockedHint')}</p>}
                     <Labeled label={t('insp.default')}>
                       <Field
@@ -1023,18 +1279,63 @@ const TableInspector = ({
                         value={defaultText(c)}
                         basisIds={[c.id]}
                         mono
-                        onCommit={(v, b) =>
-                          ws.act('setDefault', { id: c.id, default: v.trim() ? { expr: v.trim() } : null }, b)
+                        disabled={
+                          c.generated !== null ||
+                          !!c.ext?.mysql?.autoIncrement ||
+                          !!c.ext?.mssql?.identity ||
+                          (model.dialect === 'mssql' && !!c.ext?.mssql?.sparse)
                         }
+                        onCommit={(v, b) => {
+                          const trimmed = v.trim();
+                          if (trimmed && model.dialect === 'mssql' && !!c.ext?.mssql?.sparse) return;
+                          ws.act('setDefault', { id: c.id, default: trimmed ? { expr: trimmed } : null }, b);
+                        }}
                       />
                     </Labeled>
+                    {c.generated && (
+                      <div className="space-y-1 rounded-sm border border-border bg-surface px-2 py-1.5">
+                        <div className="flex items-center justify-between gap-1.5">
+                          <span className="label m-0">{t('insp.generated')}</span>
+                          <span className="badge font-mono">
+                            {model.dialect === 'mssql'
+                              ? c.generated.stored
+                                ? t('insp.generatedPersisted')
+                                : t('insp.generatedVirtual')
+                              : c.generated.stored
+                                ? t('insp.generatedStored')
+                                : t('insp.generatedVirtual')}
+                          </span>
+                        </div>
+                        <div className="truncate font-mono text-xs text-text-2">{c.generated.expr}</div>
+                      </div>
+                    )}
+                    {c.collation !== null && (
+                      <div className="space-y-0.5 rounded-sm border border-border bg-surface px-2 py-1.5">
+                        <div className="flex items-center justify-between gap-1.5">
+                          <span className="label m-0">{t('insp.collation')}</span>
+                          <span className="truncate font-mono text-xs text-text-2">{c.collation}</span>
+                        </div>
+                        <p className="hint m-0">{t('insp.collationReadonlyHint')}</p>
+                      </div>
+                    )}
                     <div className="flex items-center gap-1">
                       <div className="checks flex-1">
                         <label>
                           <input
                             type="checkbox"
                             checked={c.notNull}
-                            onChange={(e) => ws.act('setNotNull', { id: c.id, notNull: e.target.checked })}
+                            disabled={
+                              c.identity !== null ||
+                              !!c.ext?.mssql?.identity ||
+                              !!c.ext?.mysql?.autoIncrement ||
+                              (model.dialect === 'mssql' && c.generated !== null && !c.generated.stored) ||
+                              (model.dialect === 'mssql' && !c.notNull && !!c.ext?.mssql?.sparse)
+                            }
+                            onChange={(e) => {
+                              const on = e.target.checked;
+                              if (on && model.dialect === 'mssql' && !!c.ext?.mssql?.sparse) return;
+                              ws.act('setNotNull', { id: c.id, notNull: on });
+                            }}
                           />
                           {t('insp.notNull')}
                         </label>
@@ -1042,6 +1343,7 @@ const TableInspector = ({
                           <input
                             type="checkbox"
                             checked={isPk}
+                            disabled={model.dialect === 'mssql' && !isPk && !!c.ext?.mssql?.sparse}
                             onChange={(e) => setPk(c.id, e.target.checked)}
                           />
                           {t('insp.pk')}
@@ -1114,18 +1416,286 @@ const TableInspector = ({
                         label={
                           isPartKey
                             ? t('part.keyColDeleteLocked', { name: c.name })
-                            : model.dialect === 'sqlite' && cols.length <= 1
-                              ? t('insp.sqliteLastColumnLocked', { name: c.name })
+                            : (model.dialect === 'sqlite' || model.dialect === 'mysql') && cols.length <= 1
+                              ? model.dialect === 'sqlite'
+                                ? t('insp.sqliteLastColumnLocked', { name: c.name })
+                                : t('insp.lastColumnLocked', { name: c.name, dialect: uiSpec.name })
                               : `${t('insp.delete')} ${c.name}`
                         }
                         size="sm"
-                        disabled={isPartKey || (model.dialect === 'sqlite' && cols.length <= 1)}
+                        disabled={
+                          isPartKey ||
+                          ((model.dialect === 'sqlite' || model.dialect === 'mysql') && cols.length <= 1)
+                        }
                         className="hover:!text-danger"
                         onClick={() => ws.act('dropColumn', { id: c.id })}
                       >
                         <Trash2 size={14} aria-hidden="true" />
                       </IconButton>
                     </div>
+                    {model.dialect === 'mysql' && mysqlSplit && (
+                      <div className="space-y-2 border-t border-border pt-2">
+                        <div className="checks">
+                          <label>
+                            <input
+                              type="checkbox"
+                              checked={isMysqlUnsigned}
+                              disabled={
+                                !isMysqlUnsigned && (c.generated !== null || !isMysqlUnsignedEligible(c.type))
+                              }
+                              onChange={(e) => {
+                                const on = e.target.checked;
+                                if (on) {
+                                  updateMysqlColumnExt(c, { unsigned: true });
+                                } else {
+                                  if (mysqlSplit.unsigned || mysqlSplit.zerofill) {
+                                    if (
+                                      !ws.act('setColumnType', {
+                                        id: c.id,
+                                        type: mysqlSplit.baseType,
+                                        typeRef: c.typeRef,
+                                      })
+                                    ) {
+                                      return;
+                                    }
+                                  }
+                                  updateMysqlColumnExt(c, { unsigned: undefined, zerofill: undefined });
+                                }
+                              }}
+                            />
+                            {t('insp.mysqlUnsigned')}
+                          </label>
+                          <label>
+                            <input
+                              type="checkbox"
+                              checked={!!c.ext?.mysql?.autoIncrement}
+                              disabled={
+                                !c.ext?.mysql?.autoIncrement &&
+                                (c.generated !== null ||
+                                  c.default !== null ||
+                                  !isMysqlAutoIncrementType(c.type) ||
+                                  cols.some((x) => x.id !== c.id && !!x.ext?.mysql?.autoIncrement))
+                              }
+                              onChange={(e) => {
+                                const on = e.target.checked;
+                                if (on && !c.notNull) {
+                                  ws.act('setNotNull', { id: c.id, notNull: true });
+                                }
+                                updateMysqlColumnExt(c, { autoIncrement: on ? true : undefined });
+                              }}
+                            />
+                            {t('insp.mysqlAutoIncrement')}
+                          </label>
+                          <label>
+                            <input
+                              type="checkbox"
+                              checked={!!c.ext?.mysql?.onUpdateCurrentTimestamp}
+                              disabled={
+                                !c.ext?.mysql?.onUpdateCurrentTimestamp &&
+                                (c.generated !== null || !isMysqlOnUpdateTemporalType(c.type))
+                              }
+                              onChange={(e) =>
+                                updateMysqlColumnExt(c, {
+                                  onUpdateCurrentTimestamp: e.target.checked ? true : undefined,
+                                })
+                              }
+                            />
+                            {t('insp.mysqlOnUpdateCurrentTimestamp')}
+                          </label>
+                        </div>
+                        {c.ext?.mysql?.autoIncrement && !isMysqlColIndexedFirst(c.id) && (
+                          <p className="hint m-0 text-warn">{t('insp.mysqlAutoIncrementIndexHint')}</p>
+                        )}
+                        <Labeled label={t('insp.mysqlCharset')}>
+                          <Field
+                            ws={ws}
+                            label={`${t('insp.mysqlCharset')} ${c.name}`}
+                            placeholder="utf8mb4"
+                            value={c.ext?.mysql?.charset ?? ''}
+                            basisIds={[c.id]}
+                            mono
+                            validate={validateMysqlSafeIdent}
+                            onCommit={(v, b) =>
+                              updateMysqlColumnExt(c, { charset: v.trim() || undefined }, b)
+                            }
+                          />
+                        </Labeled>
+                      </div>
+                    )}
+                    {model.dialect === 'mssql' && (
+                      <div className="space-y-2 border-t border-border pt-2">
+                        <div className="checks">
+                          <label>
+                            <input
+                              type="checkbox"
+                              checked={!!c.ext?.mssql?.identity}
+                              disabled={
+                                !c.ext?.mssql?.identity &&
+                                (c.generated !== null ||
+                                  c.default !== null ||
+                                  !!c.ext?.mssql?.sparse ||
+                                  !isMssqlIdentityEligibleType(c.type) ||
+                                  cols.some((x) => x.id !== c.id && !!x.ext?.mssql?.identity))
+                              }
+                              onChange={(e) => {
+                                const on = e.target.checked;
+                                if (on && !c.notNull) {
+                                  ws.act('setNotNull', { id: c.id, notNull: true });
+                                }
+                                updateMssqlColumnExt(c, {
+                                  identity: on ? { seed: '1', increment: '1' } : undefined,
+                                });
+                              }}
+                            />
+                            {t('insp.mssqlIdentity')}
+                          </label>
+                          <label>
+                            <input
+                              type="checkbox"
+                              checked={!!c.ext?.mssql?.sparse}
+                              disabled={
+                                !c.ext?.mssql?.sparse &&
+                                (c.notNull ||
+                                  isPk ||
+                                  c.default !== null ||
+                                  !!c.ext?.mssql?.identity ||
+                                  c.generated !== null ||
+                                  !!c.ext?.mssql?.rowguidcol)
+                              }
+                              onChange={(e) => {
+                                const on = e.target.checked;
+                                if (
+                                  on &&
+                                  (c.notNull ||
+                                    isPk ||
+                                    c.default !== null ||
+                                    !!c.ext?.mssql?.identity ||
+                                    c.generated !== null ||
+                                    !!c.ext?.mssql?.rowguidcol)
+                                ) {
+                                  return;
+                                }
+                                updateMssqlColumnExt(c, { sparse: on ? true : undefined });
+                              }}
+                            />
+                            {t('insp.mssqlSparse')}
+                          </label>
+                          <label>
+                            <input
+                              type="checkbox"
+                              checked={!!c.ext?.mssql?.rowguidcol}
+                              disabled={
+                                !c.ext?.mssql?.rowguidcol &&
+                                (mssqlNormalizeType(c.type) !== 'uniqueidentifier' ||
+                                  !!c.ext?.mssql?.sparse ||
+                                  c.generated !== null)
+                              }
+                              onChange={(e) =>
+                                updateMssqlColumnExt(c, { rowguidcol: e.target.checked ? true : undefined })
+                              }
+                            />
+                            {t('insp.mssqlRowguidcol')}
+                          </label>
+                        </div>
+                        {c.ext?.mssql?.identity && (
+                          <div className="grid grid-cols-2 gap-2">
+                            <Labeled label={t('insp.mssqlIdentitySeed')}>
+                              <Field
+                                ws={ws}
+                                label={`${t('insp.mssqlIdentitySeed')} ${c.name}`}
+                                value={c.ext.mssql.identity.seed}
+                                basisIds={[c.id]}
+                                mono
+                                validate={(v) => (/^-?\d+$/.test(v) ? null : t('insp.mssqlIdentityIntErr'))}
+                                onCommit={(v, b) =>
+                                  updateMssqlColumnExt(
+                                    c,
+                                    {
+                                      identity: {
+                                        seed: v.trim(),
+                                        increment: c.ext?.mssql?.identity?.increment ?? '1',
+                                      },
+                                    },
+                                    b,
+                                  )
+                                }
+                              />
+                            </Labeled>
+                            <Labeled label={t('insp.mssqlIdentityIncrement')}>
+                              <Field
+                                ws={ws}
+                                label={`${t('insp.mssqlIdentityIncrement')} ${c.name}`}
+                                value={c.ext.mssql.identity.increment}
+                                basisIds={[c.id]}
+                                mono
+                                validate={(v) => {
+                                  if (!/^-?\d+$/.test(v)) return t('insp.mssqlIdentityIntErr');
+                                  if (Number.parseInt(v, 10) === 0) return t('insp.mssqlIdentityIncZeroErr');
+                                  return null;
+                                }}
+                                onCommit={(v, b) =>
+                                  updateMssqlColumnExt(
+                                    c,
+                                    {
+                                      identity: {
+                                        seed: c.ext?.mssql?.identity?.seed ?? '1',
+                                        increment: v.trim(),
+                                      },
+                                    },
+                                    b,
+                                  )
+                                }
+                              />
+                            </Labeled>
+                          </div>
+                        )}
+                        {(c.default !== null || !!c.ext?.mssql?.defaultName) && (
+                          <div className="field">
+                            <div className="flex items-center justify-between gap-1.5">
+                              <span className="label m-0" aria-hidden="true">
+                                {t('insp.mssqlDefaultName')}
+                              </span>
+                              <span className="flex items-center gap-1">
+                                <span className="badge font-mono">
+                                  {c.ext?.mssql?.defaultNameMode === 'explicit'
+                                    ? t('insp.mssqlDefaultNameExplicit')
+                                    : t('insp.mssqlDefaultNameDerived')}
+                                </span>
+                                {c.ext?.mssql?.defaultNameMode === 'explicit' && (
+                                  <button
+                                    type="button"
+                                    className="btn ghost sm"
+                                    onClick={() => resetMssqlDefaultName(c)}
+                                  >
+                                    {t('insp.mssqlDefaultNameReset')}
+                                  </button>
+                                )}
+                              </span>
+                            </div>
+                            <Field
+                              ws={ws}
+                              label={`${t('insp.mssqlDefaultName')} ${c.name}`}
+                              placeholder={mssqlDefaultNameOf(c, table.name)}
+                              value={c.ext?.mssql?.defaultName ?? ''}
+                              basisIds={[c.id, table.id]}
+                              mono
+                              onCommit={(v, b) => {
+                                const trimmed = v.trim();
+                                if (trimmed) {
+                                  updateMssqlColumnExt(
+                                    c,
+                                    { defaultName: trimmed, defaultNameMode: 'explicit' },
+                                    b,
+                                  );
+                                } else {
+                                  resetMssqlDefaultName(c, b);
+                                }
+                              }}
+                            />
+                          </div>
+                        )}
+                      </div>
+                    )}
                     {table.partitionBy !== null &&
                       pgBlocksPartitionIdentity &&
                       (isIntegerColumn(c) || c.identity !== null) && (
@@ -1169,7 +1739,34 @@ const TableInspector = ({
               deleteLabel={`${t('insp.delete')} ${pk.name}`}
               onDelete={locked ? undefined : () => ws.act('dropKey', { id: pk.id })}
             >
-              ({pk.columns.map(name).join(', ')})
+              <div>
+                {model.dialect === 'mssql' &&
+                  `${isMssqlPkClustered(model, pk) ? 'CLUSTERED' : 'NONCLUSTERED'} `}
+                ({pk.columns.map(name).join(', ')})
+              </div>
+              {model.dialect === 'mssql' && !locked && (
+                <label className="mt-1 inline-flex items-center gap-1.5 font-sans text-xs text-text-2">
+                  <input
+                    type="checkbox"
+                    checked={isMssqlPkClustered(model, pk)}
+                    disabled={!isMssqlPkClustered(model, pk) && hasOtherClustered(pk.id)}
+                    title={
+                      !isMssqlPkClustered(model, pk) && hasOtherClustered(pk.id)
+                        ? t('insp.mssqlClusteredConflict')
+                        : undefined
+                    }
+                    onChange={(e) =>
+                      ws.act('setPrimaryKey', {
+                        id: pk.id,
+                        table: table.id,
+                        columns: pk.columns,
+                        ext: { mssql: { clustered: e.target.checked } },
+                      })
+                    }
+                  />
+                  {t('insp.mssqlClustered')}
+                </label>
+              )}
             </Row>
           )}
           {fks.map((f) => (
@@ -1192,7 +1789,9 @@ const TableInspector = ({
               deleteLabel={`${t('insp.delete')} ${u.name}`}
               onDelete={locked ? undefined : () => ws.act('dropKey', { id: u.id })}
             >
-              UNIQUE ({u.columns.map(name).join(', ')})
+              UNIQUE{' '}
+              {model.dialect === 'mssql' ? `${u.ext?.mssql?.clustered ? 'CLUSTERED' : 'NONCLUSTERED'} ` : ''}(
+              {u.columns.map(name).join(', ')})
             </Row>
           ))}
           {checks.map((k) => (
@@ -1246,7 +1845,14 @@ const TableInspector = ({
                 className="btn primary"
                 disabled={!picked.length}
                 onClick={() =>
-                  ws.act('addUnique', { id: newId(), table: table.id, columns: picked }) && setAdding(null)
+                  ws.act('addUnique', {
+                    id: newId(),
+                    table: table.id,
+                    columns: picked,
+                    ...(model.dialect === 'mssql' && uniqueClustered
+                      ? { ext: { mssql: { clustered: true } } }
+                      : {}),
+                  }) && setAdding(null)
                 }
               >
                 {t('insp.addUnique')}
@@ -1254,6 +1860,20 @@ const TableInspector = ({
             }
           >
             <ColumnPicker label={t('insp.pickColumns')} columns={cols} value={picked} onChange={setPicked} />
+            {model.dialect === 'mssql' && (
+              <div className="space-y-1">
+                <label className="check text-sm">
+                  <input
+                    type="checkbox"
+                    checked={uniqueClustered}
+                    disabled={hasOtherClustered('')}
+                    onChange={(e) => setUniqueClustered(e.target.checked)}
+                  />
+                  {t('insp.mssqlClustered')}
+                </label>
+                {hasOtherClustered('') && <p className="hint m-0">{t('insp.mssqlClusteredConflict')}</p>}
+              </div>
+            )}
           </AddForm>
         )}
         {activeAdding === 'fk' && (
@@ -1360,18 +1980,31 @@ const TableInspector = ({
         }
       >
         <ul className="list-none space-y-0.5 p-0">
-          {indexes.map((x) => (
-            <Row
-              key={x.id}
-              icon={<ListTree size={14} aria-hidden="true" />}
-              name={x.name}
-              deleteLabel={`${t('insp.delete')} ${x.name}`}
-              onDelete={locked ? undefined : () => ws.act('dropKey', { id: x.id })}
-            >
-              {x.unique && 'UNIQUE '}
-              {x.method} ({x.elements.map((e) => (e.column ? name(e.column) : e.expr)).join(', ')})
-            </Row>
-          ))}
+          {indexes.map((x) => {
+            const colList = x.elements.map((e) => (e.column ? name(e.column) : e.expr)).join(', ');
+            const label =
+              model.dialect === 'mysql'
+                ? `${x.ext?.mysql?.indexType ?? x.method.toUpperCase()} (${colList})`
+                : model.dialect === 'mssql'
+                  ? `${x.ext?.mssql?.clustered ? 'CLUSTERED' : 'NONCLUSTERED'} (${colList})${
+                      x.ext?.mssql?.fillFactor !== undefined
+                        ? ` · FILLFACTOR = ${x.ext.mssql.fillFactor}`
+                        : ''
+                    }`
+                  : `${x.method} (${colList})`;
+            return (
+              <Row
+                key={x.id}
+                icon={<ListTree size={14} aria-hidden="true" />}
+                name={x.name}
+                deleteLabel={`${t('insp.delete')} ${x.name}`}
+                onDelete={locked ? undefined : () => ws.act('dropKey', { id: x.id })}
+              >
+                {x.unique && 'UNIQUE '}
+                {label}
+              </Row>
+            );
+          })}
         </ul>
         {!indexes.length && activeAdding !== 'index' && <p className="hint">{t('insp.noIndexes')}</p>}
         {activeAdding === 'index' && (
@@ -1383,28 +2016,139 @@ const TableInspector = ({
                 type="button"
                 className="btn primary"
                 disabled={!picked.length}
-                onClick={() =>
-                  ws.act('addIndex', {
-                    id: newId(),
-                    table: table.id,
-                    elements: picked.map((column) => ({ column })),
-                    unique: indexUnique,
-                  }) && setAdding(null)
-                }
+                onClick={() => {
+                  if (model.dialect === 'mysql') {
+                    const isUnique =
+                      mysqlIndexType !== 'FULLTEXT' && mysqlIndexType !== 'SPATIAL' && indexUnique;
+                    if (
+                      ws.act('addIndex', {
+                        id: newId(),
+                        table: table.id,
+                        elements: picked.map((column) => ({ column })),
+                        unique: isUnique,
+                        method: mysqlIndexType === 'HASH' ? 'hash' : 'btree',
+                        ext: { mysql: { indexType: mysqlIndexType } },
+                      })
+                    ) {
+                      setAdding(null);
+                    }
+                    return;
+                  }
+                  if (model.dialect === 'mssql') {
+                    const parsedFf = parseFillFactorInput(mssqlFillFactor);
+                    if (parsedFf === 'invalid') {
+                      setMssqlFillFactorErr(t('insp.mssqlFillFactorErr'));
+                      return;
+                    }
+                    const mssqlExt = {
+                      ...(mssqlIndexClustered ? { clustered: true } : {}),
+                      ...(parsedFf !== null ? { fillFactor: parsedFf } : {}),
+                    };
+                    if (
+                      ws.act('addIndex', {
+                        id: newId(),
+                        table: table.id,
+                        elements: picked.map((column) => ({ column })),
+                        unique: indexUnique,
+                        ...(Object.keys(mssqlExt).length > 0 ? { ext: { mssql: mssqlExt } } : {}),
+                      })
+                    ) {
+                      setAdding(null);
+                    }
+                    return;
+                  }
+                  if (
+                    ws.act('addIndex', {
+                      id: newId(),
+                      table: table.id,
+                      elements: picked.map((column) => ({ column })),
+                      unique: indexUnique,
+                    })
+                  ) {
+                    setAdding(null);
+                  }
+                }}
               >
                 {t('insp.addIndex')}
               </button>
             }
           >
             <ColumnPicker label={t('insp.pickColumns')} columns={cols} value={picked} onChange={setPicked} />
+            {model.dialect === 'mysql' && (
+              <label className="field">
+                <span className="label">{t('insp.mysqlIndexType')}</span>
+                <select
+                  aria-label={t('insp.mysqlIndexType')}
+                  className="select font-mono"
+                  value={mysqlIndexType}
+                  onChange={(e) => {
+                    const next = e.target.value as MysqlIndexType;
+                    setMysqlIndexType(next);
+                    if (next === 'FULLTEXT' || next === 'SPATIAL') setIndexUnique(false);
+                  }}
+                >
+                  {MYSQL_INDEX_TYPES.map((it) => (
+                    <option key={it} value={it}>
+                      {it}
+                    </option>
+                  ))}
+                </select>
+              </label>
+            )}
             <label className="check text-sm">
               <input
                 type="checkbox"
                 checked={indexUnique}
+                disabled={
+                  model.dialect === 'mysql' && (mysqlIndexType === 'FULLTEXT' || mysqlIndexType === 'SPATIAL')
+                }
                 onChange={(e) => setIndexUnique(e.target.checked)}
               />
               {t('insp.unique')}
             </label>
+            {model.dialect === 'mssql' && (
+              <div className="space-y-2">
+                <div className="space-y-1">
+                  <label className="check text-sm">
+                    <input
+                      type="checkbox"
+                      checked={mssqlIndexClustered}
+                      disabled={hasOtherClustered('')}
+                      onChange={(e) => setMssqlIndexClustered(e.target.checked)}
+                    />
+                    {t('insp.mssqlClustered')}
+                  </label>
+                  {hasOtherClustered('') && <p className="hint m-0">{t('insp.mssqlClusteredConflict')}</p>}
+                </div>
+                <label className="field">
+                  <span className="label">{t('insp.mssqlFillFactor')}</span>
+                  <input
+                    aria-label={t('insp.mssqlFillFactor')}
+                    aria-invalid={mssqlFillFactorErr ? true : undefined}
+                    aria-describedby={mssqlFillFactorErr ? fillFactorErrId : undefined}
+                    className="input font-mono"
+                    placeholder="80"
+                    autoCapitalize="none"
+                    autoCorrect="off"
+                    spellCheck={false}
+                    value={mssqlFillFactor}
+                    onChange={(e) => {
+                      setMssqlFillFactor(e.target.value);
+                      if (mssqlFillFactorErr) setMssqlFillFactorErr(null);
+                    }}
+                    onBlur={() => {
+                      const parsed = parseFillFactorInput(mssqlFillFactor);
+                      setMssqlFillFactorErr(parsed === 'invalid' ? t('insp.mssqlFillFactorErr') : null);
+                    }}
+                  />
+                  {mssqlFillFactorErr && (
+                    <p id={fillFactorErrId} className="hint error m-0">
+                      {mssqlFillFactorErr}
+                    </p>
+                  )}
+                </label>
+              </div>
+            )}
           </AddForm>
         )}
       </Section>
@@ -1876,6 +2620,7 @@ const InspectorContent = ({
         ? Layers
         : KIND_ICON[o.kind as keyof typeof KIND_ICON];
   const canDelete = o.kind === 'table' && !readOnly;
+  const canDeleteSequence = o.kind === 'sequence' && !readOnly && !o.ownedBy;
 
   return (
     <>
@@ -1890,17 +2635,26 @@ const InspectorContent = ({
           {o.name}
         </h2>
         {o.kind === 'opaque' && <span className="badge">{o.objType}</span>}
-        {canDelete && (
+        {(canDelete || canDeleteSequence) && (
           <Menu
             label={t('insp.more')}
             trigger={<Ellipsis size={16} aria-hidden="true" />}
             items={[
-              {
-                label: t('insp.deleteTable'),
-                icon: <Trash2 size={16} aria-hidden="true" />,
-                danger: true,
-                onSelect: () => setConfirm(true),
-              },
+              canDelete
+                ? {
+                    label: t('insp.deleteTable'),
+                    icon: <Trash2 size={16} aria-hidden="true" />,
+                    danger: true,
+                    onSelect: () => setConfirm(true),
+                  }
+                : {
+                    label: t('insp.deleteSequence'),
+                    icon: <Trash2 size={16} aria-hidden="true" />,
+                    danger: true,
+                    onSelect: () => {
+                      if (ws.act('dropSequence', { id: o.id })) onSelect(null);
+                    },
+                  },
             ]}
           />
         )}
@@ -1940,7 +2694,7 @@ const InspectorContent = ({
           </fieldset>
         )}
         {o.kind === 'sequence' && (
-          <fieldset disabled={readOnly} className="min-w-0 border-0 p-0">
+          <fieldset disabled={readOnly} className="min-w-0 space-y-3 border-0 p-0">
             <Labeled label={t('insp.name')}>
               <Field
                 ws={ws}
@@ -1951,6 +2705,30 @@ const InspectorContent = ({
                 onCommit={(v, b) => ws.act('renameSequence', { id: o.id, name: v.trim() }, b)}
               />
             </Labeled>
+            <Section title={t('insp.sequenceOptions')}>
+              <dl className="grid grid-cols-[auto_1fr] gap-x-4 gap-y-1.5 rounded-sm border border-border bg-surface px-2.5 py-2 text-xs">
+                <dt className="text-text-2">{t('insp.sequenceType')}</dt>
+                <dd className="m-0 font-mono">{o.options.type}</dd>
+                <dt className="text-text-2">{t('insp.sequenceIncrement')}</dt>
+                <dd className="m-0 font-mono">{o.options.increment}</dd>
+                {o.options.start !== null && (
+                  <>
+                    <dt className="text-text-2">{t('insp.sequenceStart')}</dt>
+                    <dd className="m-0 font-mono">{o.options.start}</dd>
+                  </>
+                )}
+                <dt className="text-text-2">{t('insp.sequenceCache')}</dt>
+                <dd className="m-0 font-mono">{o.options.cache}</dd>
+                <dt className="text-text-2">{t('insp.sequenceCycle')}</dt>
+                <dd className="m-0 font-mono">{String(o.options.cycle)}</dd>
+                {o.ownedBy && model.objects[o.ownedBy] && (
+                  <>
+                    <dt className="text-text-2">{t('insp.sequenceOwnedBy')}</dt>
+                    <dd className="m-0 font-mono">{model.objects[o.ownedBy]!.name}</dd>
+                  </>
+                )}
+              </dl>
+            </Section>
           </fieldset>
         )}
         {o.kind === 'opaque' && (

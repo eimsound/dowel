@@ -1,5 +1,5 @@
 // SQLite 目标库端到端测试（零外部依赖）：
-// - 新建项目向导选择 SQLite（验证 MySQL / SQL Server 暂不可选）→ 跳过环境 → 零环境从 SQL 导入；
+// - 新建项目向导选择 SQLite（同时验证 4 种方言均已开放可选）→ 跳过环境 → 零环境从 SQL 导入；
 // - 概览显示 SQLite 方言与已验证 v0 基线；
 // - 模型页：对象树隐藏 main. 前缀、状态栏显示 SQLite :memory: 影子库、属性面板支持 SQLite STRICT/WITHOUT ROWID/AUTOINCREMENT 且隐藏 PG 分区/注释；
 // - 新增列 + SQL 视图预览 + 零环境发布 v1（自动通过 :memory: 影子库验证）。
@@ -11,13 +11,13 @@ test('SQLite 零环境向导导入、建模编辑、SQL 预览与自动验证发
   const { page } = await newUser(browser, 'SQLite 用户');
   const group = await createGroup(page, `SQLite 组 ${Date.now().toString(36)}`);
 
-  // 1. 向导第 1 步：选择 SQLite 方言，确认 MySQL / SQL Server 处于禁用状态
+  // 1. 向导第 1 步：选择 SQLite 方言，确认 MySQL / SQL Server 也均已开放可选
   await page.goto('/new');
   await expect(page.getByRole('heading', { name: '新建项目', exact: true })).toBeVisible();
   await page.getByRole('combobox', { name: /^组/ }).selectOption({ label: group.name });
   await page.getByLabel('项目名').fill('SQLite 笔记');
-  await expect(page.getByRole('radio', { name: /MySQL/ })).toBeDisabled();
-  await expect(page.getByRole('radio', { name: /SQL Server/ })).toBeDisabled();
+  await expect(page.getByRole('radio', { name: /MySQL/ })).toBeEnabled();
+  await expect(page.getByRole('radio', { name: /SQL Server/ })).toBeEnabled();
   await page.getByRole('radio', { name: /SQLite/ }).check();
   await page.getByRole('button', { name: '下一步' }).click();
 

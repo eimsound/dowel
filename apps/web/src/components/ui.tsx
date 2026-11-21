@@ -1,6 +1,6 @@
 // 通用组件：样式见 styles.css 的 @layer components，规范见 DESIGN.md 的 Components 一节。
 // 都建立在原生能力上：悬停提示是 interestfor + popover="hint"（不支持时退回 title），菜单是 popover + focusgroup。
-import { COMMON_TYPES } from '@dowel/core';
+import { COMMON_TYPES, MSSQL_COMMON_TYPES, MYSQL_COMMON_TYPES } from '@dowel/core';
 import { CircleAlert, CircleCheck, Info, TriangleAlert } from 'lucide-react';
 import {
   type ButtonHTMLAttributes,
@@ -306,20 +306,53 @@ export const Avatar = ({ name, color, title }: { name: string; color: string; ti
 );
 
 const KEYWORDS = new Set(
-  `ADD ALTER AND AS ASC BY CASCADE CHECK COLUMN COMMENT CONSTRAINT CREATE DATA DEFAULT DELETE DESC DROP
-   ENUM EXISTS EXTENSION FOREIGN FROM GENERATED IDENTITY IF IN INDEX IS KEY NOT NULL ON OR PARTITION
-   PRIMARY REFERENCES RENAME RESTRICT SCHEMA SEQUENCE SET TABLE TO TYPE UNIQUE USING VALUE VALUES VIEW
-   WHERE WITH ALWAYS ATTACH OF FOR INCREMENT START MINVALUE MAXVALUE CACHE CYCLE OWNED NONE ACTION
-   INCLUDE NULLS DISTINCT CONCURRENTLY LIKE BEFORE AFTER RETURNS FUNCTION TRIGGER STORED`.split(/\s+/),
+  `ADD ALTER AND AS ASC AUTO_INCREMENT BEFORE AFTER BY CASCADE CHARSET CHARACTER CHECK COLLATE COLUMN COMMENT
+   CONSTRAINT CREATE DATA DEFAULT DELETE DESC DROP ENGINE ENUM EXISTS EXTENSION FOREIGN FROM FULLTEXT
+   GENERATED GO GROUP HASH IDENTITY IF IN INCLUDE INDEX IS KEY LIKE MINVALUE MAXVALUE CACHE CYCLE NONE
+   NONCLUSTERED CLUSTERED NOT NULL NULLS DISTINCT ON OR ORDER OWNED PARTITION PERSISTED PRIMARY REFERENCES
+   RENAME RESTRICT ROWGUIDCOL SCHEMA SEQUENCE SET SPARSE SPATIAL START STORED TABLE TO TRIGGER TYPE UNIQUE
+   UNSIGNED USING VALUE VALUES VIEW VIRTUAL WHERE WITH ALWAYS ATTACH OF FOR INCREMENT STRICT WITHOUT ROWID
+   AUTOINCREMENT RETURNING RETURNS FUNCTION ACTION CONCURRENTLY ON_UPDATE CURRENT_TIMESTAMP FILLFACTOR
+   PAD_INDEX STATISTIC NORECOVERY`.split(/\s+/),
 );
 const TYPES = new Set(
-  [...COMMON_TYPES, 'serial', 'bigserial', 'int', 'int4', 'int8', 'regclass'].map((t) => t.toLowerCase()),
+  [
+    ...COMMON_TYPES,
+    ...MYSQL_COMMON_TYPES,
+    ...MSSQL_COMMON_TYPES,
+    'serial',
+    'bigserial',
+    'int',
+    'int4',
+    'int8',
+    'regclass',
+    'tinyint',
+    'mediumint',
+    'varchar',
+    'nvarchar',
+    'varbinary',
+    'datetime2',
+    'datetimeoffset',
+    'uniqueidentifier',
+    'bit',
+    'decimal',
+    'numeric',
+    'double',
+    'float',
+    'blob',
+    'longtext',
+    'mediumtext',
+    'tinytext',
+    'enum',
+    'set',
+  ].map((t) => t.replace(/\(.*\)$/, '').toLowerCase()),
 );
 
 /** 轻量 SQL 高亮（迁移步骤、DDL 片段）：关键字、字符串、数字、类型、注释 */
 export const Sql = ({ text }: { text: string }) => {
   const out: ReactNode[] = [];
-  const re = /(--[^\n]*)|('(?:[^']|'')*')|(\b\d+(?:\.\d+)?\b)|("(?:[^"]|"")*"|[A-Za-z_][\w$]*)|(\s+|.)/g;
+  const re =
+    /(--[^\n]*)|('(?:[^']|'')*')|(\b\d+(?:\.\d+)?\b)|(`(?:[^`]|``)*`|\[(?:[^\]]|\]\])*\]|"(?:[^"]|"")*"|[A-Za-z_][\w$]*)|(\s+|.)/g;
   let i = 0;
   for (const m of text.matchAll(re)) {
     const [s, cmt, str, num, word] = m;
@@ -342,7 +375,7 @@ export const Sql = ({ text }: { text: string }) => {
           {num}
         </span>,
       );
-    else if (word && KEYWORDS.has(word))
+    else if (word && KEYWORDS.has(word.toUpperCase()))
       out.push(
         <span key={k} className="kw">
           {word}

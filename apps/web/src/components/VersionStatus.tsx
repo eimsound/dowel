@@ -2,9 +2,11 @@
 // 术语见 GLOSSARY：版本、迁移、发布、影子库。
 import type { StoredVerifyReport, VerifyResponse, VersionInfo } from '@dowel/api';
 import { BASELINE_VERSION_NAME } from '@dowel/api';
+import type { Dialect } from '@dowel/core';
 import { CircleCheck, CircleHelp, DatabaseBackup, Pencil } from 'lucide-react';
 import { useTranslation } from 'react-i18next';
 
+import { dialectUiSpec } from '../dialects.ts';
 import { Banner } from './ui.tsx';
 
 /** 版本在界面上的名字：v0 基线的名字本身已经带着 v0，这里换成“基线”，避免和 v0 标记重复 */
@@ -77,17 +79,28 @@ export const RiskNote = ({ report }: { report: Pick<Report, 'riskError'> | null 
 };
 
 /** 验证报告：通过（可能带高风险提示）、缺失低版本影子库警告、或失败（出错的步骤和原因、结构差异），role=status */
-export const VerifyBanner = ({ report }: { report: Report | VerifyResponse }) => {
+export const VerifyBanner = ({
+  report,
+  dialect = 'pg',
+}: {
+  report: Report | VerifyResponse;
+  dialect?: Dialect;
+}) => {
   const { t } = useTranslation();
+  const shortDialect = dialectUiSpec(dialect).shortName;
   const highs = report.risks.filter((x) => x.level === 'high').length;
   const diffs = [...report.upDiff, ...report.downDiff];
   const targets = report.targets ?? [];
-  const targetsOkSummary = targets.length > 0 ? targets.map((item) => `PG ${item.major}`).join(' · ') : null;
+  const targetsOkSummary =
+    targets.length > 0 ? targets.map((item) => `${shortDialect} ${item.major}`).join(' · ') : null;
   const targetsStatusSummary =
     targets.length > 0
       ? targets
           .map((item) =>
-            t(item.ok ? 'dlg.verifyTargetPassed' : 'dlg.verifyTargetFailed', { major: item.major }),
+            t(item.ok ? 'dlg.verifyTargetPassed' : 'dlg.verifyTargetFailed', {
+              dialect: shortDialect,
+              major: item.major,
+            }),
           )
           .join(' · ')
       : null;
@@ -112,7 +125,11 @@ export const VerifyBanner = ({ report }: { report: Report | VerifyResponse }) =>
   if (report.missingTargetMajor != null)
     return (
       <Banner kind="warn" title={t('dlg.verifyMissingTargetTitle')} role="status">
-        {report.error?.message ?? t('dlg.verifyMissingTargetBody', { major: report.missingTargetMajor })}
+        {report.error?.message ??
+          t('dlg.verifyMissingTargetBody', {
+            dialect: shortDialect,
+            major: report.missingTargetMajor,
+          })}
         {targetsStatusSummary && (
           <span className="mt-1 block font-mono text-xs text-text-2">{targetsStatusSummary}</span>
         )}

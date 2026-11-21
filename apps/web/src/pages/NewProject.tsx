@@ -14,7 +14,7 @@ import type {
 import { useQuery, useQueryClient } from '@tanstack/react-query';
 import { useNavigate, useSearch } from '@tanstack/react-router';
 import { Check, CircleCheck, Database, FileUp, Plus, Trash2, TriangleAlert } from 'lucide-react';
-import { useRef, useState } from 'react';
+import { useId, useRef, useState } from 'react';
 import { useTranslation } from 'react-i18next';
 
 import { api } from '../api.ts';
@@ -119,6 +119,7 @@ export const NewProject = () => {
   const [stage, setStage] = useState<WizardStage | null>(null);
   const [stageDetail, setStageDetail] = useState<string | null>(null);
   const [busy, setBusy] = useState(false);
+  const shadowHintId = useId();
   const envSeq = useRef(0);
   /** 接手读取的代次（切组递增）与每环境序号（失效或重读递增），防止在途旧请求晚返回污染状态 */
   const takeGroupGenRef = useRef(0);
@@ -561,8 +562,11 @@ export const NewProject = () => {
           {step === 1 && (
             <section className="mt-4 space-y-4">
               <p className="hint">
-                {uiSpec.requiresExternalShadow ? t('wiz.databaseHint') : t('wiz.databaseHintSqlite')}
+                {uiSpec.requiresExternalShadow
+                  ? t('wiz.databaseHint', { dialect: uiSpec.name })
+                  : t('wiz.databaseHintSqlite')}
               </p>
+              {dialect === 'mssql' && envs.length > 0 && <Banner kind="info">{t('wiz.mssqlTlsHint')}</Banner>}
               {envs.length === 0 && <p className="hint">{t('wiz.envEmpty')}</p>}
               <ul className="m-0 list-none space-y-3 p-0">
                 {envs.map((env) => (
@@ -575,6 +579,9 @@ export const NewProject = () => {
                           aria-label={t('wiz.envName')}
                           value={env.name}
                           placeholder="dev"
+                          autoCapitalize="none"
+                          autoCorrect="off"
+                          spellCheck={false}
                           onChange={(e) => patchEnv(env.key, { name: e.target.value })}
                         />
                       </label>
@@ -596,18 +603,25 @@ export const NewProject = () => {
                         />
                       </label>
                       {uiSpec.requiresExternalShadow && (
-                        <label className="field col-span-2">
-                          <span className="label">{t('wiz.envShadowUrl')}</span>
-                          <input
-                            className="input font-mono"
-                            aria-label={t('wiz.envShadowUrl')}
-                            value={env.shadowUrl}
-                            autoCapitalize="none"
-                            autoCorrect="off"
-                            spellCheck={false}
-                            onChange={(e) => patchEnv(env.key, { shadowUrl: e.target.value })}
-                          />
-                        </label>
+                        <div className="field col-span-2">
+                          <label className="field">
+                            <span className="label">{t('wiz.envShadowUrl')}</span>
+                            <input
+                              className="input font-mono"
+                              aria-label={t('wiz.envShadowUrl')}
+                              aria-describedby={`${shadowHintId}-${env.key}`}
+                              value={env.shadowUrl}
+                              placeholder={uiSpec.shadowPlaceholder}
+                              autoCapitalize="none"
+                              autoCorrect="off"
+                              spellCheck={false}
+                              onChange={(e) => patchEnv(env.key, { shadowUrl: e.target.value })}
+                            />
+                          </label>
+                          <span id={`${shadowHintId}-${env.key}`} className="hint">
+                            {t('wiz.envShadowHint')}
+                          </span>
+                        </div>
                       )}
                       <div className="checks col-span-2">
                         <label>
@@ -696,10 +710,26 @@ export const NewProject = () => {
                     <span className="space-y-0.5">
                       <span className="block text-sm font-medium">{t(`wiz.content${cap(k)}`)}</span>
                       <span className="block text-xs text-text-2">
-                        {k === 'blank' && dialect === 'sqlite'
-                          ? t('wiz.contentBlankHintSqlite')
-                          : k === 'sql' && !uiSpec.requiresExternalShadow
-                            ? t('wiz.contentSqlHintSqlite')
+                        {k === 'blank'
+                          ? t(
+                              dialect === 'sqlite'
+                                ? 'wiz.contentBlankHintSqlite'
+                                : dialect === 'mysql'
+                                  ? 'wiz.contentBlankHintMysql'
+                                  : dialect === 'mssql'
+                                    ? 'wiz.contentBlankHintMssql'
+                                    : 'wiz.contentBlankHint',
+                            )
+                          : k === 'sql'
+                            ? t(
+                                dialect === 'sqlite'
+                                  ? 'wiz.contentSqlHintSqlite'
+                                  : dialect === 'mysql'
+                                    ? 'wiz.contentSqlHintMysql'
+                                    : dialect === 'mssql'
+                                      ? 'wiz.contentSqlHintMssql'
+                                      : 'wiz.contentSqlHint',
+                              )
                             : t(`wiz.content${cap(k)}Hint`)}
                       </span>
                     </span>
@@ -710,7 +740,9 @@ export const NewProject = () => {
               {kind === 'takeover' && (
                 <div className="space-y-3 rounded-md border border-border bg-panel p-4">
                   <h3 className="section-title">{t('tk.wizTitle')}</h3>
-                  <p className="hint">{t('tk.wizHint')}</p>
+                  <p className="hint">
+                    {t(uiSpec.historyStorage === 'prefix' ? 'tk.wizHintPrefix' : 'tk.wizHint')}
+                  </p>
                   {filledEnvs.length === 0 ? (
                     <Banner kind="warn" role="alert">
                       {t('tk.needEnv')}
@@ -742,7 +774,11 @@ export const NewProject = () => {
                           <Banner kind="warn" role="status">
                             {filledEnvs.every((e) => takeReads[e.key]?.data?.hasHistory === false)
                               ? t('tk.noHistory')
-                              : t('tk.noProjects')}
+                              : t(
+                                  uiSpec.historyStorage === 'prefix'
+                                    ? 'tk.noProjectsPrefix'
+                                    : 'tk.noProjects',
+                                )}
                           </Banner>
                         )}
                       {candidates.length > 0 && (
@@ -934,7 +970,15 @@ export const NewProject = () => {
                     <textarea
                       className="textarea h-64 font-mono"
                       value={sql}
-                      placeholder={t('wiz.sqlPlaceholder')}
+                      placeholder={t(
+                        dialect === 'sqlite'
+                          ? 'wiz.sqlPlaceholderSqlite'
+                          : dialect === 'mysql'
+                            ? 'wiz.sqlPlaceholderMysql'
+                            : dialect === 'mssql'
+                              ? 'wiz.sqlPlaceholderMssql'
+                              : 'wiz.sqlPlaceholderPg',
+                      )}
                       spellCheck={false}
                       onChange={(e) => setSql(e.target.value)}
                     />
@@ -959,7 +1003,9 @@ export const NewProject = () => {
                     {kind === 'sql' && !sql.trim() && <span className="hint">{t('wiz.sqlNeeded')}</span>}
                     {kind === 'sql' && filledEnvs.length === 0 && (
                       <span className="hint">
-                        {uiSpec.requiresExternalShadow ? t('wiz.sqlNeedsEnv') : t('wiz.sqlMemoryShadowHint')}
+                        {uiSpec.requiresExternalShadow
+                          ? t('wiz.sqlNeedsEnv', { dialect: uiSpec.name })
+                          : t('wiz.sqlMemoryShadowHint')}
                       </span>
                     )}
                   </div>
@@ -1136,14 +1182,19 @@ const CheckResult = ({ info, dialect }: { info: TargetInfo; dialect: Dialect }) 
               {yesNo(info.superuser)}
               {!info.superuser && (
                 <span className="ml-3 text-text-2">
-                  {t('wiz.checkCreateDb')}：{yesNo(info.canCreateDb)} · {t('wiz.checkCreateSchema')}：
-                  {yesNo(info.canCreateSchema)}
+                  {t('wiz.checkCreateDb')}：{yesNo(info.canCreateDb)}
+                  {uiSpec.schemas && (
+                    <>
+                      {' · '}
+                      {t('wiz.checkCreateSchema')}：{yesNo(info.canCreateSchema)}
+                    </>
+                  )}
                 </span>
               )}
             </dd>
           </>
         )}
-        <dt className="text-text-2">{t('wiz.schemasTitle')}</dt>
+        <dt className="text-text-2">{uiSpec.schemas ? t('wiz.schemasTitle') : t('wiz.databaseTitle')}</dt>
         <dd className="m-0 flex flex-wrap items-center gap-1.5">
           {info.schemas.length === 0 && <span className="text-text-2">{t('wiz.noSchemas')}</span>}
           {info.schemas.map((s) => (

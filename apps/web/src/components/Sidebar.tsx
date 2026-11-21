@@ -8,6 +8,7 @@ import {
   Hash,
   Layers,
   List,
+  Plus,
   Search,
   SquareFunction,
   Table2,
@@ -17,6 +18,7 @@ import { type ReactNode, useState } from 'react';
 import { useTranslation } from 'react-i18next';
 
 import { defaultSchemaOf, dialectUiSpec } from '../dialects.ts';
+import { cx, IconButton } from './ui.tsx';
 
 const OPAQUE_ICON: Record<string, typeof Eye> = {
   view: Eye,
@@ -54,20 +56,37 @@ const Item = ({
   </li>
 );
 
-const Group = ({ title, count, children }: { title: string; count: number; children: ReactNode }) => {
+const Group = ({
+  title,
+  count,
+  action,
+  children,
+}: {
+  title: string;
+  count: number;
+  action?: ReactNode;
+  children: ReactNode;
+}) => {
   const [open, setOpen] = useState(true);
   return (
     <li className="mb-1.5">
-      <button
-        type="button"
-        aria-expanded={open}
-        onClick={() => setOpen(!open)}
-        className="flex h-[26px] w-full items-center gap-1 rounded-sm px-1.5 text-xs font-semibold text-text-3 hover:text-text-2"
-      >
-        {open ? <ChevronDown size={14} aria-hidden="true" /> : <ChevronRight size={14} aria-hidden="true" />}
-        {title}
-        <span className="count ml-auto">{count}</span>
-      </button>
+      <div className={cx('flex h-[26px] items-center gap-0.5', Boolean(action) && 'pr-1')}>
+        <button
+          type="button"
+          aria-expanded={open}
+          onClick={() => setOpen(!open)}
+          className="flex h-full min-w-0 flex-1 items-center gap-1 rounded-sm px-1.5 text-xs font-semibold text-text-3 hover:text-text-2"
+        >
+          {open ? (
+            <ChevronDown size={14} aria-hidden="true" />
+          ) : (
+            <ChevronRight size={14} aria-hidden="true" />
+          )}
+          {title}
+          <span className="count ml-auto">{count}</span>
+        </button>
+        {action}
+      </div>
       {open && <ul className="list-none p-0">{children}</ul>}
     </li>
   );
@@ -77,10 +96,12 @@ export const Sidebar = ({
   model,
   selected,
   onSelect,
+  onAddSequence,
 }: {
   model: Model;
   selected: string | null;
   onSelect: (id: string) => void;
+  onAddSequence?: () => void;
 }) => {
   const { t } = useTranslation();
   const [q, setQ] = useState('');
@@ -203,7 +224,12 @@ export const Sidebar = ({
       </li>
     );
   };
-  const otherGroups = [
+  const otherGroups: {
+    title: string;
+    showEmpty?: boolean;
+    action?: ReactNode;
+    items: { id: string; label: string; icon: ReactNode; hint?: string }[];
+  }[] = [
     ...(uiSpec.enums
       ? [
           {
@@ -220,6 +246,12 @@ export const Sidebar = ({
       ? [
           {
             title: t('ws.sequences'),
+            showEmpty: Boolean(onAddSequence),
+            action: onAddSequence ? (
+              <IconButton label={t('ws.addSequence')} size="sm" onClick={onAddSequence}>
+                <Plus size={13} aria-hidden="true" />
+              </IconButton>
+            ) : undefined,
             items: byName(all(model, 'sequence')).map((x) => ({
               id: x.id,
               label: qname(x),
@@ -258,14 +290,14 @@ export const Sidebar = ({
         )}
         {otherGroups.map(
           (g) =>
-            g.items.length > 0 && (
-              <Group key={g.title} title={g.title} count={g.items.length}>
+            (g.items.length > 0 || (g.showEmpty && !q)) && (
+              <Group key={g.title} title={g.title} count={g.items.length} action={g.action}>
                 {g.items.map((i) => (
                   <Item
                     key={i.id}
                     label={i.label}
                     icon={i.icon}
-                    hint={'hint' in i ? (i.hint as string) : undefined}
+                    hint={i.hint}
                     active={i.id === selected}
                     onClick={() => onSelect(i.id)}
                   />

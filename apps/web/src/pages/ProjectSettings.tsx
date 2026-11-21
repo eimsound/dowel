@@ -390,7 +390,7 @@ const SchemaScope = ({
             <input
               className="input font-mono"
               value={manualValue}
-              placeholder="public, app"
+              placeholder={`${dialectUiSpec(project.dialect).defaultSchema}, app`}
               spellCheck={false}
               onChange={(e) => setManual(e.target.value)}
             />

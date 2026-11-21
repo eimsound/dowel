@@ -3,7 +3,7 @@ import { initReactI18next } from 'react-i18next';
 
 // 文案规范见 DESIGN.md 的 Voice & Content Strategy：术语统一、按钮用“动词 + 对象”、中文与英文 / 数字之间加空格。
 const zh = {
-  app: { name: 'Dowel', tagline: '多人实时协作的 PostgreSQL schema 建模' },
+  app: { name: 'Dowel', tagline: '多人实时协作的数据库 schema 建模' },
   nav: {
     rail: '实例与项目',
     myProjects: '我的项目',
@@ -84,6 +84,10 @@ const zh = {
     stepsSaved: '脚本已保存，版本回到未验证，请重新验证',
     editHint:
       '发布时冻结的迁移可以人工修改，例如插入数据迁移步骤。改完后版本回到“未验证”，需要在影子库里重新验证。不能放进事务的语句（CONCURRENTLY、ALTER TYPE … ADD VALUE 等）会自动勾选“非事务”，保存时服务端也会强制；其他需要的请手动勾选。',
+    editHintMysql:
+      '发布时冻结的迁移可以人工修改，例如插入数据迁移步骤。改完后版本回到“未验证”，需要在影子库里重新验证。MySQL 大多数 DDL 会隐式提交，每步在独立语句中执行，请确保顺序清晰。',
+    editHintGeneric:
+      '发布时冻结的迁移可以人工修改，例如插入数据迁移步骤。改完后版本回到“未验证”，需要在影子库里重新验证。各步骤按顺序执行，拆分后可单独校验每一步。',
     stepN: '第 {{n}} 步',
     blankSteps: '有空的步骤，保存不了：{{list}}。请填上 SQL 或删除这一步。',
     stepLabel: '{{dir}}第 {{n}} 步',
@@ -148,6 +152,9 @@ const zh = {
     historyError: '读不到目标库的执行历史：{{msg}}',
     nonTx:
       '含非事务步骤（例如 CREATE INDEX CONCURRENTLY）：这个迁移不是原子的，失败后目标库会停在中途，需要从断点续跑。',
+    nonTxMysql:
+      'MySQL DDL 会隐式提交：这个迁移不是原子的，每步都会直接生效并记录检查点，失败后需要修复或从断点续跑。',
+    nonTxGeneric: '含非事务步骤：这个迁移不是原子的，失败后目标库会停在中途，需要从断点续跑。',
     nonTxShort: '含非事务步骤',
     state: { applied: '已执行', current: '当前', pending: '待执行' },
     dir: { baseline: '写入基线', up: '升级', down: '回滚', mark: '标记' },
@@ -231,6 +238,8 @@ const zh = {
       confirmRollback: '确认回滚',
       confirmBaseline: '确认写入基线',
       executeIntro: '将依次执行下面 {{count}} 个迁移，每个迁移在目标库里一个事务，执行完都会读回结构并校验。',
+      executeIntroNonTx:
+        '将依次执行下面 {{count}} 个迁移。{{dialect}} 的 DDL 会隐式提交：每条语句会按顺序在目标库直接生效并记录检查点；如果中途失败，之前已执行的步骤不会自动回滚，后续可在环境页从失败步修复或继续，执行完都会读回结构并校验。',
       rollbackIntro: '将依次回滚下面 {{count}} 个版本（执行它们的回滚脚本）。',
       rollbackNoRisk: '回滚脚本没有做过锁和重写分析，请自行评估对线上的影响。',
       baselineHint: '库的结构已经等于基线，只在目标库里写入 Dowel 的历史，不执行任何 SQL。',
@@ -342,6 +351,8 @@ const zh = {
     wizTitle: '选择要接手的项目',
     wizHint:
       '给出项目所在的数据库（可以在“关联数据库”里添加多个环境，例如 dev 和 prod）。Dowel 读取库里 dowel schema 登记过的项目，选一个，从中恢复完整的版本链和环境。',
+    wizHintPrefix:
+      '给出项目所在的数据库（可以在“关联数据库”里添加多个环境，例如 dev 和 prod）。Dowel 读取库里 dowel_* 历史表登记过的项目，选一个，从中恢复完整的版本链和环境。',
     shadowTitle: '影子库验证配置',
     shadowHint:
       '接手会在写入平台前用本实例影子库逐版本闭环验证整条历史链。生产环境默认不在同实例建影子库，请为至少一个环境填写独立影子库连接串，或勾选允许同实例影子库。',
@@ -354,6 +365,7 @@ const zh = {
     reread: '重新读取',
     noHistory: '这个库里没有 Dowel 的迁移历史。',
     noProjects: '这个库的 dowel schema 里没有登记过项目。',
+    noProjectsPrefix: '这个库的 dowel_* 历史表里没有登记过项目。',
     readError: '读取失败：{{msg}}',
     pick: '项目',
     versionsInfo: '{{count}} 个版本，最新 v{{head}}',
@@ -445,6 +457,7 @@ const zh = {
       firstRunEmpty: '目标库还没有历史，而且是空库：会先建出 dowel 历史，再执行第一个版本建库。',
       firstRunBaseline: '目标库还没有历史，但结构已经等于基线：只会写入基线，不执行 SQL。',
       createsHistory: '会在目标库里新建 dowel schema（存迁移历史）。',
+      createsHistoryPrefix: '会在目标库里新建 dowel_* 历史表（存迁移历史）。',
       resume: '上一次停在中途：会从 v{{number}} 的第 {{step}} 步接着跑。',
       steps: '{{count}} 步',
       nonTx: '{{count}} 步不在事务里',
@@ -818,6 +831,7 @@ const zh = {
     search: '搜索对象…',
     noMatch: '没有匹配的对象',
     newTable: '新建表',
+    addSequence: '新建序列',
     autoLayout: '自动布局',
     import: '导入 SQL',
     saveVersion: '发布',
@@ -904,6 +918,50 @@ const zh = {
     sqliteWithoutRowid: 'WITHOUT ROWID（需显式主键）',
     sqliteAutoincrement: 'AUTOINCREMENT',
     sqliteLastColumnLocked: '列 {{name}} 是 SQLite 表的最后一列，无法删除',
+    lastColumnLocked: '列 {{name}} 是 {{dialect}} 表的最后一列，无法删除',
+    deleteSequence: '删除序列',
+    sequenceOptions: '序列参数',
+    sequenceType: '类型',
+    sequenceIncrement: '步长',
+    sequenceStart: '起始值',
+    sequenceCache: '缓存',
+    sequenceCycle: '循环',
+    sequenceOwnedBy: '所属列',
+    collation: '排序规则',
+    collationReadonlyHint: '当前仅展示既有排序规则（暂不支持原地修改）',
+    generated: '计算 / 生成列',
+    generatedPersisted: 'PERSISTED',
+    generatedStored: 'STORED',
+    generatedVirtual: 'VIRTUAL',
+    mysqlTableOptions: 'MySQL 表选项',
+    mysqlEngine: '存储引擎',
+    mysqlCharset: '字符集',
+    mysqlCollation: '排序规则',
+    mysqlSafeIdentErr: '仅允许 1–64 位 ASCII 字母、数字与下划线',
+    mysqlTypeHint: "支持直接输入 enum('a','b')、set('x','y') 等内联类型",
+    mysqlColumnOptions: 'MySQL 列选项',
+    mysqlUnsigned: 'UNSIGNED',
+    mysqlAutoIncrement: 'AUTO_INCREMENT',
+    mysqlAutoIncrementIndexHint: '发布校验要求 AUTO_INCREMENT 列必须是主键、唯一约束或普通索引的首列',
+    mysqlOnUpdateCurrentTimestamp: 'ON UPDATE CURRENT_TIMESTAMP',
+    mysqlIndexType: '索引类型',
+    mssqlColumnOptions: 'SQL Server 列选项',
+    mssqlIdentity: 'IDENTITY',
+    mssqlIdentitySeed: '起始值 (seed)',
+    mssqlIdentityIncrement: '步长 (increment)',
+    mssqlIdentityIntErr: '必须为整数',
+    mssqlIdentityIncZeroErr: '步长不能为 0',
+    mssqlDefaultName: '默认约束名',
+    mssqlDefaultNameDerived: '自动推导',
+    mssqlDefaultNameExplicit: '显式',
+    mssqlDefaultNameReset: '恢复推导名',
+    mssqlSparse: 'SPARSE',
+    mssqlRowguidcol: 'ROWGUIDCOL',
+    mssqlClustered: 'CLUSTERED',
+    mssqlNonClustered: 'NONCLUSTERED',
+    mssqlClusteredConflict: '每张表最多只能有 1 个 CLUSTERED 主键、唯一约束或索引',
+    mssqlFillFactor: 'FILLFACTOR (1–100)',
+    mssqlFillFactorErr: '必须为 1 到 100 之间的整数',
   },
   dlg: {
     cancel: '取消',
@@ -911,6 +969,12 @@ const zh = {
     importTitle: '导入 SQL',
     importHint:
       '粘贴 schema 的 DDL（例如 pg_dump --schema-only 的输出），或选择文件。Dowel 会在影子库里执行它并读出结构，替换当前的模型。',
+    importHintSqlite:
+      '粘贴 SQLite DDL（例如 sqlite3 .schema 的输出），或选择文件。Dowel 会在内置 :memory: 影子库里执行并读出结构，替换当前的模型。',
+    importHintMysql:
+      '粘贴 MySQL DDL（例如 SHOW CREATE TABLE 或 mysqldump --no-data 的输出），或选择文件。Dowel 会在影子库里执行它并读出结构，替换当前的模型。',
+    importHintMssql:
+      '粘贴 T-SQL DDL（例如 SSMS 生成的脚本或手写建表语句，支持 GO 批处理），或选择文件。Dowel 会在影子库里执行它并读出结构，替换当前的模型。',
     importFile: '选择文件',
     importRun: '导入',
     importFailed: '导入失败',
@@ -952,11 +1016,11 @@ const zh = {
     verifyOk: '升级后与目标一致，回滚后回到起点。',
     verifyTargetsAllPassed: '（{{versions}} 均通过）',
     verifyTargetSinglePassed: '（{{version}} 通过）',
-    verifyTargetPassed: 'PG {{major}} 通过',
-    verifyTargetFailed: 'PG {{major}} 失败',
+    verifyTargetPassed: '{{dialect}} {{major}} 通过',
+    verifyTargetFailed: '{{dialect}} {{major}} 失败',
     verifyMissingTargetTitle: '未完成最低目标版本验证',
     verifyMissingTargetBody:
-      '缺少 PG {{major}} 影子库，无法将此版本标记为已验证。请为对应环境配置独立影子库或允许使用同实例影子库。',
+      '缺少 {{dialect}} {{major}} 影子库，无法将此版本标记为已验证。请为对应环境配置独立影子库或允许使用同实例影子库。',
     highRisks: '其中 {{count}} 步高风险，见下方说明。',
     verifyFail: '验证失败',
     risk: { high: '高', medium: '中', low: '低' },
@@ -999,7 +1063,7 @@ const zh = {
     envTest: '测试连接',
     envPull: '从此库导入结构',
     envPulled: '已从数据库导入 {{count}} 个对象',
-    envTested: '{{database}}：PostgreSQL {{version}}；影子库 {{shadow}}{{exists}}；{{createdb}}',
+    envTested: '{{database}}：{{dialect}} {{version}}；影子库 {{shadow}}{{exists}}；{{createdb}}',
     envTestedSqlite: '{{database}}：SQLite {{version}}；内置影子库 {{shadow}}',
     envShadowExists: '（已存在）',
     envCanCreate: '可以建库',
@@ -1008,7 +1072,7 @@ const zh = {
     verifyOn: '验证用的影子库',
     verifyOnShort: '在此环境的影子库验证',
     verifyInMemory: '使用内置 SQLite :memory: 影子库进行验证（无需外部环境）',
-    noEnv: '项目还没有配置环境。验证迁移需要一个真实的 PostgreSQL 实例作影子库，请先在“环境”里添加。',
+    noEnv: '项目还没有配置环境。验证迁移需要一个真实的 {{dialect}} 实例作影子库，请先在“环境”里添加。',
     usedShadow: '影子库：{{s}}',
   },
   wiz: {
@@ -1027,8 +1091,8 @@ const zh = {
     dialectDesc: {
       pg: '支持多 Schema、枚举、序列与声明式分区',
       sqlite: '内置 :memory: 影子库，零环境即可导入 SQL 与验证',
-      mysql: '即将支持（MySQL 8.0 / 8.4）',
-      mssql: '即将支持（SQL Server 2019+）',
+      mysql: '支持 MySQL 8.4 / 9.7：引擎、字符集、内联 enum/set 与非事务 DDL 检查点',
+      mssql: '支持 SQL Server 2019 / 2022 / 2025：多 Schema、序列、聚集索引与 GO 批处理',
     },
     name: '项目名',
     namePlaceholder: '例如：商城',
@@ -1040,7 +1104,7 @@ const zh = {
     needGroup: '你还没有可以在其中建项目的组。先创建一个组，或让组管理员把你加进去。',
     groupHint: '只有你可以在其中建项目的组才会出现在这里。',
     databaseHint:
-      '环境是项目要部署到的数据库。可以先跳过，建好项目后再添加；导入结构需要至少一个环境（影子库只能用真实的 PostgreSQL 实例）。',
+      '环境是项目要部署到的 {{dialect}} 数据库。留空影子库时，会在同实例自动创建 {原库名}_dowel（也可填写独立空库连接串）。现在没有库可以先跳过，导入数据库或外部 SQL 迁移前再添加。',
     databaseHintSqlite:
       '环境是项目要部署到的本地 SQLite 文件（需在服务端 DOWEL_SQLITE_ROOTS 白名单内）。可以直接跳过——SQLite 内置 :memory: 影子库，零环境即可从 SQL 导入并验证。',
     addEnv: '添加数据库',
@@ -1049,6 +1113,10 @@ const zh = {
     envProduction: '生产环境',
     envAllowSame: '允许在同一实例上建影子库',
     envShadowUrl: '单独的影子库连接串（可选，必须是空库）',
+    envShadowHint:
+      '留空时，会在目标实例自动创建 {原库名}_dowel 影子库（生产环境需勾选「允许在同一实例上建影子库」）；也可填写独立空库连接串。',
+    mssqlTlsHint:
+      'SQL Server 默认启用 TLS 加密。开发/测试环境使用自签名证书时，可在连接串追加 ?encrypt=true&trustServerCertificate=true；生产环境建议配置受信任的 CA 证书，不要关闭证书校验。',
     addEnvRun: '添加',
     removeEnv: '移除 {{name}}',
     envEmpty: '还没有添加数据库。',
@@ -1064,6 +1132,7 @@ const zh = {
     yes: '是',
     no: '否',
     schemasTitle: 'schema',
+    databaseTitle: '数据库对象',
     schemasHint: '导入时只看勾选的 schema；`dowel` 永远跳过。',
     tables: '{{count}} 张表',
     noSchemas: '这个库里没有用户 schema。',
@@ -1071,6 +1140,8 @@ const zh = {
     contentBlank: '空白',
     contentBlankHint: '从空模型开始：只有一个 public schema。',
     contentBlankHintSqlite: '从空模型开始：使用 SQLite 默认 main 数据库。',
+    contentBlankHintMysql: '从空模型开始：建立一个空的 MySQL 默认数据库。',
+    contentBlankHintMssql: '从空模型开始：只有一个 dbo schema。',
     contentDatabase: '从数据库导入',
     contentDatabaseHint: '从上面添加的数据库读结构，作为 v0 基线。只读，不会写目标库。',
     contentSql: '从 SQL 导入',
@@ -1078,15 +1149,26 @@ const zh = {
       '粘贴或选择 DDL（例如 pg_dump --schema-only 的输出）。Dowel 会在影子库里执行它并读回结构。',
     contentSqlHintSqlite:
       '粘贴或选择 SQLite DDL（例如 sqlite3 .schema 的输出）。Dowel 会在内置 :memory: 影子库里执行并读回结构，无需先配置环境。',
+    contentSqlHintMysql:
+      '粘贴或选择 MySQL DDL（例如 SHOW CREATE TABLE 或 mysqldump --no-data 的输出）。Dowel 会在影子库里执行它并读回结构。',
+    contentSqlHintMssql:
+      '粘贴或选择 T-SQL DDL（例如 SSMS 生成的脚本或手写建表语句，支持 GO 批处理）。Dowel 会在影子库里执行它并读回结构。',
     contentTakeover: '接手现有项目',
     contentTakeoverHint: '从目标库的 dowel 历史恢复整个项目：版本链、模型（对象 ID 不变）和环境。',
     pickEnv: '从哪个数据库导入',
     pickSchemas: '勾选要导入的 schema（默认全选）',
     sqlText: 'SQL',
     sqlPlaceholder: '粘贴 schema 的 DDL…',
+    sqlPlaceholderPg: 'CREATE TABLE orders (\n  id bigint GENERATED BY DEFAULT AS IDENTITY PRIMARY KEY\n);',
+    sqlPlaceholderSqlite:
+      'CREATE TABLE notes (\n  id INTEGER PRIMARY KEY AUTOINCREMENT,\n  title TEXT NOT NULL\n) STRICT;',
+    sqlPlaceholderMysql:
+      'CREATE TABLE orders (\n  id BIGINT AUTO_INCREMENT PRIMARY KEY,\n  status VARCHAR(32) NOT NULL\n) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;',
+    sqlPlaceholderMssql:
+      'CREATE TABLE [dbo].[orders] (\n  [id] bigint IDENTITY(1,1) NOT NULL CONSTRAINT [PK_orders] PRIMARY KEY\n);\nGO',
     sqlFile: '选择 .sql 文件',
     sqlNeeded: '请粘贴 SQL 或选择一个文件。',
-    sqlNeedsEnv: '从 SQL 导入需要一个环境：SQL 会在影子库里执行，影子库只能用真实的 PostgreSQL 实例。',
+    sqlNeedsEnv: '从 SQL 导入需要一个环境：SQL 会在 {{dialect}} 影子库里执行，请先添加环境。',
     sqlMemoryShadowHint: '将使用内置 SQLite :memory: 影子库导入并验证基线，无需关联外部环境。',
     envNeeded: '导入需要至少一个数据库：先回到上一步添加一个环境。',
     schemaNeeded: '至少选一个 schema。',
@@ -1881,6 +1963,10 @@ const en: typeof zh = {
     stepsSaved: 'Scripts saved. The version is unverified again; verify it again.',
     editHint:
       'The migration frozen at publish time can be edited by hand, for example to add a data-migration step. After saving the version is unverified and must be verified again in the shadow database. Statements that cannot run in a transaction (CONCURRENTLY, ALTER TYPE … ADD VALUE and so on) are marked non-transactional automatically, and the server enforces it on save; tick the box by hand for others.',
+    editHintMysql:
+      'The migration frozen at publish time can be edited by hand, for example to add a data-migration step. After saving the version is unverified and must be verified again in the shadow database. Most MySQL DDL auto-commits per statement; ensure step order is explicit and safe.',
+    editHintGeneric:
+      'The migration frozen at publish time can be edited by hand, for example to add a data-migration step. After saving the version is unverified and must be verified again in the shadow database. Statements execute sequentially.',
     stepN: 'Step {{n}}',
     blankSteps: 'Empty steps cannot be saved: {{list}}. Fill in the SQL or remove the step.',
     stepLabel: '{{dir}}, step {{n}}',
@@ -1947,6 +2033,10 @@ const en: typeof zh = {
     historyError: 'Cannot read the execution history from the target database: {{msg}}',
     nonTx:
       'Contains non-transactional steps (e.g. CREATE INDEX CONCURRENTLY): this migration is not atomic. If it fails the database stops midway and must be resumed from the checkpoint.',
+    nonTxMysql:
+      'MySQL DDL auto-commits implicitly: this migration is not atomic; each step commits individually with checkpoints and must be repaired or resumed on failure.',
+    nonTxGeneric:
+      'Contains non-transactional steps: this migration is not atomic. If it fails the database stops midway and must be resumed from the checkpoint.',
     nonTxShort: 'non-transactional',
     state: { applied: 'Applied', current: 'Current', pending: 'Pending' },
     dir: { baseline: 'Baseline', up: 'Upgrade', down: 'Rollback', mark: 'Mark' },
@@ -2033,6 +2123,8 @@ const en: typeof zh = {
       confirmBaseline: 'Confirm baseline',
       executeIntro:
         'These {{count}} migrations will run in order, each in one transaction in the target database; the structure is read back and verified after each.',
+      executeIntroNonTx:
+        'These {{count}} migrations will run in order. DDL in {{dialect}} auto-commits: each statement runs sequentially with checkpoints; if a step fails, earlier steps are not rolled back automatically and can be repaired or resumed from the Environments page. The structure is read back and verified after each migration.',
       rollbackIntro: 'These {{count}} versions will be rolled back in order (their rollback scripts run).',
       rollbackNoRisk:
         'Rollback scripts have no lock or rewrite analysis; assess the impact on production yourself.',
@@ -2161,6 +2253,8 @@ const en: typeof zh = {
     wizTitle: 'Choose the project to take over',
     wizHint:
       'Give the database(s) the project lives in (add several environments in "Databases", e.g. dev and prod). Dowel reads the projects registered in their dowel schema; pick one to restore its full version chain and environments.',
+    wizHintPrefix:
+      'Give the database(s) the project lives in (add several environments in "Databases", e.g. dev and prod). Dowel reads the projects registered in their dowel_* history tables; pick one to restore its full version chain and environments.',
     shadowTitle: 'Shadow database verification',
     shadowHint:
       'Takeover verifies every version in the chain in a shadow database before writing to the platform. Production environments do not use a same-instance shadow by default: provide a separate shadow connection string or allow a same-instance shadow for at least one environment.',
@@ -2174,6 +2268,7 @@ const en: typeof zh = {
     reread: 'Read again',
     noHistory: 'This database has no Dowel migration history.',
     noProjects: 'No project is registered in this database’s dowel schema.',
+    noProjectsPrefix: 'No project is registered in this database’s dowel_* history tables.',
     readError: 'Read failed: {{msg}}',
     pick: 'Project',
     versionsInfo: '{{count}} versions, latest v{{head}}',
@@ -2272,6 +2367,8 @@ const en: typeof zh = {
         'The target has no history but its structure already equals the baseline: only the baseline is written, no SQL runs.',
       createsHistory:
         'Will create the dowel schema in the target database (it stores the migration history).',
+      createsHistoryPrefix:
+        'Will create the dowel_* history tables in the target database (they store migration history).',
       resume: 'The last run stopped midway: it continues v{{number}} after step {{step}}.',
       steps: '{{count}} steps',
       nonTx: '{{count}} not in a transaction',
@@ -2549,7 +2646,7 @@ const en: typeof zh = {
     },
     unknown: 'performed an action',
   },
-  app: { name: 'Dowel', tagline: 'Collaborative PostgreSQL schema modeling' },
+  app: { name: 'Dowel', tagline: 'Collaborative database schema modeling' },
   auth: {
     login: 'Log in',
     logout: 'Log out',
@@ -2657,6 +2754,7 @@ const en: typeof zh = {
     search: 'Search objects…',
     noMatch: 'No matching objects',
     newTable: 'New table',
+    addSequence: 'New sequence',
     autoLayout: 'Auto layout',
     import: 'Import SQL',
     saveVersion: 'Publish',
@@ -2751,6 +2849,51 @@ const en: typeof zh = {
     sqliteWithoutRowid: 'WITHOUT ROWID (requires primary key)',
     sqliteAutoincrement: 'AUTOINCREMENT',
     sqliteLastColumnLocked: 'Column {{name}} is the last column of this SQLite table and cannot be deleted',
+    lastColumnLocked: 'Column {{name}} is the last column of this {{dialect}} table and cannot be deleted',
+    deleteSequence: 'Delete sequence',
+    sequenceOptions: 'Sequence options',
+    sequenceType: 'Type',
+    sequenceIncrement: 'Increment',
+    sequenceStart: 'Start value',
+    sequenceCache: 'Cache',
+    sequenceCycle: 'Cycle',
+    sequenceOwnedBy: 'Owned by',
+    collation: 'Collation',
+    collationReadonlyHint: 'Read-only display of existing collation (in-place edit not yet supported)',
+    generated: 'Generated / computed column',
+    generatedPersisted: 'PERSISTED',
+    generatedStored: 'STORED',
+    generatedVirtual: 'VIRTUAL',
+    mysqlTableOptions: 'MySQL table options',
+    mysqlEngine: 'Engine',
+    mysqlCharset: 'Charset',
+    mysqlCollation: 'Collation',
+    mysqlSafeIdentErr: 'Only 1–64 ASCII letters, digits, and underscores are allowed',
+    mysqlTypeHint: "Supports inline types such as enum('a','b') and set('x','y')",
+    mysqlColumnOptions: 'MySQL column options',
+    mysqlUnsigned: 'UNSIGNED',
+    mysqlAutoIncrement: 'AUTO_INCREMENT',
+    mysqlAutoIncrementIndexHint:
+      'Publish validation requires an AUTO_INCREMENT column to be first in a primary key, unique constraint, or index',
+    mysqlOnUpdateCurrentTimestamp: 'ON UPDATE CURRENT_TIMESTAMP',
+    mysqlIndexType: 'Index type',
+    mssqlColumnOptions: 'SQL Server column options',
+    mssqlIdentity: 'IDENTITY',
+    mssqlIdentitySeed: 'Seed',
+    mssqlIdentityIncrement: 'Increment',
+    mssqlIdentityIntErr: 'Must be an integer',
+    mssqlIdentityIncZeroErr: 'Increment cannot be 0',
+    mssqlDefaultName: 'Default constraint name',
+    mssqlDefaultNameDerived: 'Derived',
+    mssqlDefaultNameExplicit: 'Explicit',
+    mssqlDefaultNameReset: 'Reset to derived',
+    mssqlSparse: 'SPARSE',
+    mssqlRowguidcol: 'ROWGUIDCOL',
+    mssqlClustered: 'CLUSTERED',
+    mssqlNonClustered: 'NONCLUSTERED',
+    mssqlClusteredConflict: 'A table can have at most one CLUSTERED primary key, unique constraint, or index',
+    mssqlFillFactor: 'FILLFACTOR (1–100)',
+    mssqlFillFactorErr: 'Must be an integer between 1 and 100',
   },
   dlg: {
     cancel: 'Cancel',
@@ -2758,6 +2901,12 @@ const en: typeof zh = {
     importTitle: 'Import SQL',
     importHint:
       'Paste schema DDL (e.g. the output of pg_dump --schema-only), or choose a file. Dowel runs it in the shadow database, reads the structure back and replaces the current model.',
+    importHintSqlite:
+      'Paste SQLite DDL (e.g. sqlite3 .schema output), or choose a file. Dowel runs it in the built-in :memory: shadow database, reads the structure back and replaces the current model.',
+    importHintMysql:
+      'Paste MySQL DDL (e.g. SHOW CREATE TABLE or mysqldump --no-data output), or choose a file. Dowel runs it in the shadow database, reads the structure back and replaces the current model.',
+    importHintMssql:
+      'Paste T-SQL DDL (e.g. SSMS scripts or CREATE statements; GO batches supported), or choose a file. Dowel runs it in the shadow database, reads the structure back and replaces the current model.',
     importFile: 'Choose file',
     importRun: 'Import',
     importFailed: 'Import failed',
@@ -2801,11 +2950,11 @@ const en: typeof zh = {
     verifyOk: 'The upgrade matches the target and the rollback returns to the start.',
     verifyTargetsAllPassed: '({{versions}} all passed)',
     verifyTargetSinglePassed: '({{version}} passed)',
-    verifyTargetPassed: 'PG {{major}} passed',
-    verifyTargetFailed: 'PG {{major}} failed',
+    verifyTargetPassed: '{{dialect}} {{major}} passed',
+    verifyTargetFailed: '{{dialect}} {{major}} failed',
     verifyMissingTargetTitle: 'Lowest target version not verified',
     verifyMissingTargetBody:
-      'Missing a PG {{major}} shadow database; this version cannot be marked verified. Configure a dedicated shadow database or allow a same-instance shadow.',
+      'Missing a {{dialect}} {{major}} shadow database; this version cannot be marked verified. Configure a dedicated shadow database or allow a same-instance shadow.',
     highRisks: '{{count}} high-risk steps, see below.',
     verifyFail: 'Verification failed',
     risk: { high: 'High', medium: 'Med', low: 'Low' },
@@ -2851,7 +3000,7 @@ const en: typeof zh = {
     envTest: 'Test connection',
     envPull: 'Import structure from this database',
     envPulled: 'Imported {{count}} objects from the database',
-    envTested: '{{database}}: PostgreSQL {{version}}; shadow {{shadow}}{{exists}}; {{createdb}}',
+    envTested: '{{database}}: {{dialect}} {{version}}; shadow {{shadow}}{{exists}}; {{createdb}}',
     envTestedSqlite: '{{database}}: SQLite {{version}}; built-in shadow {{shadow}}',
     envShadowExists: ' (exists)',
     envCanCreate: 'can create databases',
@@ -2861,7 +3010,7 @@ const en: typeof zh = {
     verifyOnShort: 'Verify in the shadow database of',
     verifyInMemory: 'Verified using built-in SQLite :memory: shadow (no external environment needed)',
     noEnv:
-      'No environment yet. Verifying migrations needs a real PostgreSQL instance as the shadow database; add one under “Environments”.',
+      'No environment yet. Verifying migrations needs a real {{dialect}} instance as the shadow database; add one under “Environments”.',
     usedShadow: 'Shadow: {{s}}',
   },
   wiz: {
@@ -2880,8 +3029,8 @@ const en: typeof zh = {
     dialectDesc: {
       pg: 'Multi-schema, enums, sequences, and declarative partitioning',
       sqlite: 'Built-in :memory: shadow database for zero-environment SQL import & verification',
-      mysql: 'Coming soon (MySQL 8.0 / 8.4)',
-      mssql: 'Coming soon (SQL Server 2019+)',
+      mysql: 'MySQL 8.4 / 9.7: engine, charset, inline enum/set & auto-commit DDL checkpoints',
+      mssql: 'SQL Server 2019 / 2022 / 2025: multi-schema, sequences, clustered keys & GO batches',
     },
     name: 'Project name',
     namePlaceholder: 'e.g. Shop',
@@ -2894,7 +3043,7 @@ const en: typeof zh = {
       'You have no group you can create projects in. Create a group first, or ask a group admin to add you.',
     groupHint: 'Only groups where you can create projects are listed.',
     databaseHint:
-      'An environment is a database the project deploys to. You can skip this and add one later; importing needs at least one environment (the shadow database must be a real PostgreSQL instance).',
+      'An environment is a {{dialect}} database the project deploys to. Leaving the shadow database blank auto-creates {database}_dowel on the same instance (or you can provide a separate empty database URL). You can skip this and add one later.',
     databaseHintSqlite:
       'An environment is a local SQLite database file (inside server DOWEL_SQLITE_ROOTS). You can skip this—SQLite includes a built-in :memory: shadow database for SQL import and verification.',
     addEnv: 'Add database',
@@ -2903,6 +3052,10 @@ const en: typeof zh = {
     envProduction: 'Production',
     envAllowSame: 'Allow a shadow database on the same instance',
     envShadowUrl: 'Separate shadow database connection string (optional, must be empty)',
+    envShadowHint:
+      'Leave blank to auto-create {database}_dowel on the target instance (production requires allowing a same-instance shadow DB), or enter a separate empty database URL.',
+    mssqlTlsHint:
+      'SQL Server uses TLS encryption by default. For dev/test with self-signed certificates, append ?encrypt=true&trustServerCertificate=true; in production, configure a trusted CA certificate rather than disabling verification.',
     addEnvRun: 'Add',
     removeEnv: 'Remove {{name}}',
     envEmpty: 'No databases added yet.',
@@ -2918,6 +3071,7 @@ const en: typeof zh = {
     yes: 'Yes',
     no: 'No',
     schemasTitle: 'Schemas',
+    databaseTitle: 'Database objects',
     schemasHint: 'Imports only look at the checked schemas; `dowel` is always skipped.',
     tables: '{{count}} tables',
     noSchemas: 'This database has no user schemas.',
@@ -2925,6 +3079,8 @@ const en: typeof zh = {
     contentBlank: 'Empty',
     contentBlankHint: 'Start from an empty model: just a public schema.',
     contentBlankHintSqlite: 'Start from an empty SQLite model (default main database).',
+    contentBlankHintMysql: 'Start from an empty MySQL default database model.',
+    contentBlankHintMssql: 'Start from an empty model: just a dbo schema.',
     contentDatabase: 'Import from a database',
     contentDatabaseHint:
       'Read the structure from one of the databases above as the v0 baseline. Read-only, nothing is written to the target.',
@@ -2933,6 +3089,10 @@ const en: typeof zh = {
       'Paste or choose DDL (e.g. the output of pg_dump --schema-only). Dowel runs it in the shadow database and reads the structure back.',
     contentSqlHintSqlite:
       'Paste or choose SQLite DDL (e.g. sqlite3 .schema output). Dowel runs it in the built-in :memory: shadow database without needing an external environment.',
+    contentSqlHintMysql:
+      'Paste or choose MySQL DDL (e.g. SHOW CREATE TABLE or mysqldump --no-data output). Dowel runs it in the shadow database and reads the structure back.',
+    contentSqlHintMssql:
+      'Paste or choose T-SQL DDL (e.g. SSMS scripts or CREATE statements; GO batches supported). Dowel runs it in the shadow database and reads the structure back.',
     contentTakeover: 'Take over an existing project',
     contentTakeoverHint:
       "Restore a whole project from the target database's dowel history: version chain, model (object IDs unchanged) and environments.",
@@ -2940,10 +3100,17 @@ const en: typeof zh = {
     pickSchemas: 'Schemas to import (all selected by default)',
     sqlText: 'SQL',
     sqlPlaceholder: 'Paste the schema DDL…',
+    sqlPlaceholderPg: 'CREATE TABLE orders (\n  id bigint GENERATED BY DEFAULT AS IDENTITY PRIMARY KEY\n);',
+    sqlPlaceholderSqlite:
+      'CREATE TABLE notes (\n  id INTEGER PRIMARY KEY AUTOINCREMENT,\n  title TEXT NOT NULL\n) STRICT;',
+    sqlPlaceholderMysql:
+      'CREATE TABLE orders (\n  id BIGINT AUTO_INCREMENT PRIMARY KEY,\n  status VARCHAR(32) NOT NULL\n) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;',
+    sqlPlaceholderMssql:
+      'CREATE TABLE [dbo].[orders] (\n  [id] bigint IDENTITY(1,1) NOT NULL CONSTRAINT [PK_orders] PRIMARY KEY\n);\nGO',
     sqlFile: 'Choose a .sql file',
     sqlNeeded: 'Paste SQL or choose a file.',
     sqlNeedsEnv:
-      'Importing from SQL needs an environment: the SQL runs in the shadow database, which must be a real PostgreSQL instance.',
+      'Importing from SQL needs an environment: the SQL runs in a {{dialect}} shadow database; add one first.',
     sqlMemoryShadowHint:
       'Uses the built-in SQLite :memory: shadow database to import and verify the baseline without external environments.',
     envNeeded: 'Importing needs at least one database: go back and add an environment.',

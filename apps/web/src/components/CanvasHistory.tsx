@@ -8,7 +8,7 @@ import type {
   CanvasHistoryList,
   ModelUpdate,
 } from '@dowel/api';
-import { all, columnsOf, createAll, type Model } from '@dowel/core';
+import { all, columnsOf, createAll, formatScript, type Model } from '@dowel/core';
 import { useInfiniteQuery, useMutation, useQuery, useQueryClient } from '@tanstack/react-query';
 import {
   FileCode,
@@ -356,9 +356,7 @@ export const CanvasHistory = ({
 
   const ddl = useMemo(() => {
     if (!detail || tab !== 'state' || stateView !== 'sql') return '';
-    return createAll(detail.model)
-      .map((s) => `${s.sql};`)
-      .join('\n\n');
+    return formatScript(createAll(detail.model), detail.model.dialect);
   }, [detail, tab, stateView]);
 
   const tableCount = useMemo(

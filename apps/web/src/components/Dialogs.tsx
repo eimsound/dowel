@@ -44,9 +44,11 @@ type Base = { pid: string; open: boolean; onClose: () => void };
 
 export const ImportDialog = ({ pid, open, onClose }: Base) => {
   const { t } = useTranslation();
+  const { project } = useProject();
   const toast = useToast();
   const [text, setText] = useState('');
   const [error, setError] = useState('');
+  const dialect = project.dialect;
   const run = useMutation({
     mutationFn: () => api<ModelUpdate>('POST', `/api/projects/${pid}/import`, { sql: text }),
     onSuccess: (r) => {
@@ -57,6 +59,22 @@ export const ImportDialog = ({ pid, open, onClose }: Base) => {
     },
     onError: (e) => setError(e.message),
   });
+  const hintKey =
+    dialect === 'sqlite'
+      ? 'dlg.importHintSqlite'
+      : dialect === 'mysql'
+        ? 'dlg.importHintMysql'
+        : dialect === 'mssql'
+          ? 'dlg.importHintMssql'
+          : 'dlg.importHint';
+  const placeholderKey =
+    dialect === 'sqlite'
+      ? 'wiz.sqlPlaceholderSqlite'
+      : dialect === 'mysql'
+        ? 'wiz.sqlPlaceholderMysql'
+        : dialect === 'mssql'
+          ? 'wiz.sqlPlaceholderMssql'
+          : 'wiz.sqlPlaceholderPg';
   return (
     <Modal
       open={open}
@@ -100,12 +118,12 @@ export const ImportDialog = ({ pid, open, onClose }: Base) => {
           run.mutate();
         }}
       >
-        <p className="text-sm text-text-2">{t('dlg.importHint')}</p>
+        <p className="text-sm text-text-2">{t(hintKey)}</p>
         <textarea
           aria-label="SQL"
           className="textarea h-80 font-mono text-xs"
           spellCheck={false}
-          placeholder="create table orders (…);"
+          placeholder={t(placeholderKey)}
           value={text}
           onChange={(e) => setText(e.target.value)}
           autoFocus
@@ -122,6 +140,7 @@ export const ImportDialog = ({ pid, open, onClose }: Base) => {
 
 export const VersionDialog = ({ pid, open, onClose }: Base) => {
   const { t } = useTranslation();
+  const { project } = useProject();
   const toast = useToast();
   const qc = useQueryClient();
   const [name, setName] = useState('');
@@ -279,7 +298,7 @@ export const VersionDialog = ({ pid, open, onClose }: Base) => {
               {run.error.message}
             </Banner>
           )}
-          {rejected && <VerifyBanner report={rejected} />}
+          {rejected && <VerifyBanner report={rejected} dialect={project.dialect} />}
         </form>
       )}
     </Modal>
@@ -495,7 +514,7 @@ export const MigrationDialog = ({ pid, open, onClose }: Base) => {
             <span>{t('dlg.verifyInMemory')}</span>
           </p>
         ) : noEnv ? (
-          <Banner kind="info">{t('dlg.noEnv')}</Banner>
+          <Banner kind="info">{t('dlg.noEnv', { dialect: uiSpec.name })}</Banner>
         ) : (
           <label className="flex items-center gap-2 text-sm">
             <Database size={14} aria-hidden="true" className="text-text-3" />
@@ -518,7 +537,7 @@ export const MigrationDialog = ({ pid, open, onClose }: Base) => {
           </label>
         )}
 
-        {r && <VerifyBanner report={r} />}
+        {r && <VerifyBanner report={r} dialect={project.dialect} />}
         {verify.error && (
           <Banner kind="danger" title={t('dlg.verifyFail')} role="alert">
             {verify.error.message}

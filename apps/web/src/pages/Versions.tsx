@@ -181,7 +181,15 @@ const StepsEditor = ({ detail, onDone }: { detail: VersionDetailData; onDone: ()
           {t('versions.saveSteps')}
         </button>
       </div>
-      <p className="hint">{t('versions.editHint')}</p>
+      <p className="hint">
+        {t(
+          dialect === 'pg'
+            ? 'versions.editHint'
+            : dialect === 'mysql'
+              ? 'versions.editHintMysql'
+              : 'versions.editHintGeneric',
+        )}
+      </p>
       {/* 普通提示（不是 alert：刚点“添加一步”就会出现，不该打断读屏）；保存按钮用 aria-describedby 关联它 */}
       {blanks.length > 0 && (
         <p id={blankId} className="hint error">
@@ -399,7 +407,7 @@ const VersionDetailView = ({ vid }: { vid: string }) => {
             </Banner>
           )}
           {report ? (
-            <VerifyBanner report={report} />
+            <VerifyBanner report={report} dialect={project.dialect} />
           ) : (
             !version.verifiedAt && (
               <Banner kind="warn" title={t('versions.unverified')}>
