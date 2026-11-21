@@ -767,83 +767,114 @@ export const mssqlPlan = (from: Model, to: Model, opts?: MssqlPlanOptions): Step
     delete cur.objects[o.id];
   }
 
-  // ───── P6a 建新增 schema（含用于 schema 改名与跨 schema 迁移的目标 schema） ─────
-  const createdSchemas = new Set<string>();
-  const ensureSchemaCreated = (name: string, targetId: string) => {
-    const low = name.toLowerCase();
-    if (low === 'dbo' || createdSchemas.has(low)) return;
-    const existsInCur = all(cur, 'schema').some((s) => s.name.toLowerCase() === low);
-    if (!existsInCur) {
-      emit('createSchema', targetId, `CREATE SCHEMA ${mssqlIdent(name)}`);
-      createdSchemas.add(low);
-    }
-  };
-
-  for (const o of added) {
-    if (o.kind !== 'schema') continue;
-    ensureSchemaCreated(o.name, o.id);
-    cur.objects[o.id] = fresh(o);
-  }
-
-  // ───── P6b Schema 改名（MSSQL 无 ALTER SCHEMA RENAME → 建新 schema + TRANSFER 对象 + 删旧 schema） ─────
+  // ───── P6a & P6b Schema 疏散、改名腾空、新建与落位 ─────
   const isTransferableInSchema = (obj: Obj, schemaId: string): boolean =>
     ((obj.kind === 'table' || obj.kind === 'sequence') && obj.parent === schemaId) ||
     (obj.kind === 'opaque' && obj.objType !== 'trigger' && obj.parent === schemaId);
 
+  const schemaExistsInCur = (name: string): boolean => {
+    const low = name.toLowerCase();
+    return all(cur, 'schema').some((s) => s.name.toLowerCase() === low);
+  };
+
+  const createdSchemas = new Set<string>();
+  const ensureSchemaCreated = (name: string, targetId: string) => {
+    const low = name.toLowerCase();
+    if (low === 'dbo' || createdSchemas.has(low) || schemaExistsInCur(name)) return;
+    emit('createSchema', targetId, `CREATE SCHEMA ${mssqlIdent(name)}`);
+    createdSchemas.add(low);
+  };
+
+  const dropSchemaIfNonDbo = (name: string, targetId: string) => {
+    const low = name.toLowerCase();
+    if (low === 'dbo') return;
+    emit('dropSchema', targetId, `DROP SCHEMA ${mssqlIdent(name)}`);
+    createdSchemas.delete(low);
+  };
+
+  const nextTempSchema = (): string => {
+    const taken = new Set<string>([
+      ...all(cur, 'schema').map((s) => s.name.toLowerCase()),
+      ...all(to, 'schema').map((s) => s.name.toLowerCase()),
+      ...createdSchemas,
+    ]);
+    let name: string;
+    do {
+      name = `_dowel_tmp_sch_${++tmp}`;
+    } while (taken.has(name.toLowerCase()));
+    return name;
+  };
+
+  const transferAllInSchema = (schemaId: string, fromName: string, toName: string) => {
+    for (const obj of Object.values(cur.objects)) {
+      if (isTransferableInSchema(obj, schemaId)) {
+        emit(
+          'transferSchema',
+          obj.id,
+          `ALTER SCHEMA ${mssqlIdent(toName)} TRANSFER ${mssqlQualified(fromName, obj.name)}`,
+        );
+      }
+    }
+  };
+
+  const addedSchemas = added.filter((o): o is Schema => o.kind === 'schema');
   const renamedSchemas = common.filter((o): o is Schema => o.kind === 'schema' && o.name !== was(o).name);
-  if (renamedSchemas.length > 0) {
-    // 收集需要改名的旧 schema 名字集合，解决 A->B / B->A 互换或与待删 schema 重名
-    const oldSchemaById = new Map<string, string>();
-    for (const s of renamedSchemas) {
-      const c = get(cur, s.id, 'schema');
-      oldSchemaById.set(s.id, c.name);
-    }
-    // 对被其他旧 schema 占用的目标名，先经由临时 schema 中转
-    const pendingTransfers: { schemaId: string; fromName: string; toName: string }[] = [];
-    const curSchemaNamesLower = () => new Set(all(cur, 'schema').map((s) => s.name.toLowerCase()));
+  const neededTargets = new Set<string>([
+    ...addedSchemas.map((s) => s.name.toLowerCase()),
+    ...renamedSchemas.map((s) => s.name.toLowerCase()),
+  ]);
 
-    for (const s of renamedSchemas) {
-      const c = get(cur, s.id, 'schema');
-      if (curSchemaNamesLower().has(s.name.toLowerCase())) {
-        const tmpSch = `_dowel_tmp_sch_${++tmp}`;
-        ensureSchemaCreated(tmpSch, s.id);
-        for (const obj of Object.values(cur.objects)) {
-          if (isTransferableInSchema(obj, s.id)) {
-            emit(
-              'transferSchema',
-              obj.id,
-              `ALTER SCHEMA ${mssqlIdent(tmpSch)} TRANSFER ${mssqlQualified(c.name, obj.name)}`,
-            );
-          }
-        }
-        if (c.name.toLowerCase() !== 'dbo') {
-          emit('dropSchema', s.id, `DROP SCHEMA ${mssqlIdent(c.name)}`);
-        }
-        c.name = tmpSch;
-        c.comment = null;
-      }
-      pendingTransfers.push({ schemaId: s.id, fromName: c.name, toName: s.name });
-    }
-
-    for (const tr of pendingTransfers) {
-      const c = get(cur, tr.schemaId, 'schema');
-      if (c.name === tr.toName) continue;
-      ensureSchemaCreated(tr.toName, tr.schemaId);
-      for (const obj of Object.values(cur.objects)) {
-        if (isTransferableInSchema(obj, tr.schemaId)) {
-          emit(
-            'transferSchema',
-            obj.id,
-            `ALTER SCHEMA ${mssqlIdent(tr.toName)} TRANSFER ${mssqlQualified(c.name, obj.name)}`,
-          );
-        }
-      }
-      if (c.name.toLowerCase() !== 'dbo') {
-        emit('dropSchema', tr.schemaId, `DROP SCHEMA ${mssqlIdent(c.name)}`);
-      }
-      c.name = tr.toName;
+  // 阶段 1：疏散所有与待新建或待改名目标名冲突的待删非 dbo schema
+  for (const o of removed) {
+    if (o.kind !== 'schema' || !(o.id in cur.objects)) continue;
+    const c = get(cur, o.id, 'schema');
+    const low = c.name.toLowerCase();
+    if (low === 'dbo' || !neededTargets.has(low)) continue;
+    const hasResidual = Object.values(cur.objects).some((obj) => isTransferableInSchema(obj, o.id));
+    if (!hasResidual) {
+      dropSchemaIfNonDbo(c.name, o.id);
+      delete cur.objects[o.id];
+    } else {
+      const tmpSch = nextTempSchema();
+      ensureSchemaCreated(tmpSch, o.id);
+      transferAllInSchema(o.id, c.name, tmpSch);
+      dropSchemaIfNonDbo(c.name, o.id);
+      c.name = tmpSch;
       c.comment = null;
     }
+  }
+
+  // 阶段 2（P6b Phase 1）：统一腾空所有当前名落入 neededTargets 的待改名 schema（含链式改名、两两互换、纯大小写变更与撞名新增）
+  const tempById = new Map<string, string>();
+  for (const s of renamedSchemas) {
+    const c = get(cur, s.id, 'schema');
+    if (neededTargets.has(c.name.toLowerCase())) {
+      const tmpSch = nextTempSchema();
+      ensureSchemaCreated(tmpSch, s.id);
+      transferAllInSchema(s.id, c.name, tmpSch);
+      dropSchemaIfNonDbo(c.name, s.id);
+      c.name = tmpSch;
+      c.comment = null;
+      tempById.set(s.id, tmpSch);
+    }
+  }
+
+  // 阶段 3（P6a）：建新增 schema
+  for (const o of addedSchemas) {
+    ensureSchemaCreated(o.name, o.id);
+    cur.objects[o.id] = fresh(o);
+  }
+
+  // 阶段 4（P6b Phase 2）：将待改名 schema 从原名或临时 schema 落位到最终目标名
+  for (const s of renamedSchemas) {
+    const c = get(cur, s.id, 'schema');
+    const fromName = tempById.get(s.id) ?? c.name;
+    if (fromName === s.name) continue;
+    ensureSchemaCreated(s.name, s.id);
+    transferAllInSchema(s.id, fromName, s.name);
+    dropSchemaIfNonDbo(fromName, s.id);
+    c.name = s.name;
+    c.comment = null;
   }
 
   // ───── P6c 跨 schema 迁移表、序列或非触发器不透明对象（ALTER SCHEMA [new] TRANSFER [old].[obj]） ─────
@@ -1183,9 +1214,7 @@ export const mssqlPlan = (from: Model, to: Model, opts?: MssqlPlanOptions): Step
   for (const o of removed) {
     if (o.kind !== 'schema' || !(o.id in cur.objects)) continue;
     const c = get(cur, o.id, 'schema');
-    if (c.name.toLowerCase() !== 'dbo') {
-      emit('dropSchema', o.id, `DROP SCHEMA ${mssqlIdent(c.name)}`);
-    }
+    dropSchemaIfNonDbo(c.name, o.id);
     delete cur.objects[o.id];
   }
 

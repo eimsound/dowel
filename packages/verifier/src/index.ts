@@ -112,10 +112,10 @@ export const verify = async (db: Db, from: Model, to: Model, opts?: PlanOptions)
     buildOpts = shadowMajor !== null ? { pgMajor: shadowMajor } : undefined;
   } else if (dialect === 'mssql') {
     const vNum = await engine.readVersionNum?.(db);
-    shadowMajor = mssqlMajorOf(vNum);
-    const planMajor = opts?.mssqlMajor ?? shadowMajor;
+    const mssqlMajor = mssqlMajorOf(vNum);
+    const planMajor = opts?.mssqlMajor ?? mssqlMajor;
     planOpts = planMajor !== null ? { ...opts, mssqlMajor: planMajor } : opts;
-    buildOpts = shadowMajor !== null ? { mssqlMajor: shadowMajor } : undefined;
+    buildOpts = mssqlMajor !== null ? { mssqlMajor } : undefined;
   }
   const up = plan(from, to, planOpts);
   const down = plan(to, from, planOpts);
@@ -178,8 +178,8 @@ export const verifyScripts = async (
     buildOpts = pgMajor !== null ? { pgMajor } : undefined;
   } else if (dialect === 'mssql') {
     const vNum = await engine.readVersionNum?.(db);
-    shadowMajor = mssqlMajorOf(vNum);
-    buildOpts = shadowMajor !== null ? { mssqlMajor: shadowMajor } : undefined;
+    const mssqlMajor = mssqlMajorOf(vNum);
+    buildOpts = mssqlMajor !== null ? { mssqlMajor } : undefined;
   }
   const toSnap = await buildTarget(db, to, buildOpts);
   const fromSnap = await buildTarget(db, from, buildOpts);

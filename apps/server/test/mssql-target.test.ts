@@ -2,8 +2,27 @@
 // - URL 解析校验（mssql:// / sqlserver://、host\instance、默认 encrypt=true & trustServerCertificate=false）；
 // - inspectTarget / pullSchema / 同实例影子库 claimShadow 扩展属性防误删业务库与清理；
 // - 服务端项目创建、SQL 导入、验证、发布与执行端到端闭环。
-import type { ProjectCreated, ProjectInfo, TargetInfo, VersionCreated, WizardEvent } from '@dowel/api';
-import { addColumn, all, createSchema, createTable, emptyModel, mssqlIdent, mssqlLiteral } from '@dowel/core';
+import type {
+  ProjectCreated,
+  ProjectInfo,
+  PublishRejected,
+  TargetInfo,
+  VersionCreated,
+  VersionDetail,
+  WizardEvent,
+} from '@dowel/api';
+import {
+  addColumn,
+  all,
+  createSchema,
+  createTable,
+  emptyBase,
+  emptyModel,
+  type Model,
+  mssqlIdent,
+  mssqlLiteral,
+  PlanError,
+} from '@dowel/core';
 import {
   type Db,
   isMetadataOnlyMssqlSql,
@@ -11,16 +30,17 @@ import {
   resetMssqlShadow,
   stripMssqlImportNoise,
 } from '@dowel/engines';
-import { StepError } from '@dowel/verifier';
+import { StepError, verify, verifyScripts } from '@dowel/verifier';
 import { afterAll, beforeAll, describe, expect, test } from 'vitest';
 
 import { connectTestMssql, createTestMssqlDb, getMssqlAdminUrl, MSSQL_VERSION } from '../../../test/mssql.ts';
 import { createApp, openPlatformDb, type PlatformDb } from '../src/index.ts';
-import { KeyedLimiter } from '../src/rate-limit.ts';
+import { KeyedLimiter, LoginLimiter } from '../src/rate-limit.ts';
 import {
   assertImportable,
   isConnectionFailure,
   isInfraFailure,
+  type Shadow,
   ShadowError,
   shadowOps,
 } from '../src/shadow.ts';
@@ -377,6 +397,359 @@ describe('MSSQL URL parsing and shadow naming (pure unit)', () => {
       kind: 'column',
       notNull: true,
     });
+  });
+
+  test('verifier keeps shadowMajor=null for mssql while preserving 2019/2022/2025 capability checks', async () => {
+    const makeFakeMssqlVerifyDb = (major: number): Db => {
+      const tables = new Set<string>();
+      return {
+        query: async <T>(q: string): Promise<T[]> => {
+          if (q.includes('SELECT DB_NAME()')) return [{ dbName: 'app_dowel' }] as T[];
+          if (q.includes('ProductMajorVersion') && q.includes('dbCollation')) {
+            return [
+              {
+                version: `${major}.0.1000.6`,
+                major,
+                minor: 0,
+                dbCollation: 'SQL_Latin1_General_CP1_CI_AS',
+              },
+            ] as T[];
+          }
+          if (q.includes('ProductMajorVersion')) return [{ major, minor: 0 }] as T[];
+          if (q.includes('FROM sys.schemas s') && q.includes('MS_Description')) {
+            return [{ name: 'dbo', comment: null }] as T[];
+          }
+          if (q.includes('FROM sys.tables t') && q.includes('MS_Description')) {
+            return [...tables].map((name, i) => ({
+              objectId: 100 + i,
+              schema: 'dbo',
+              name,
+              comment: null,
+            })) as T[];
+          }
+          if (q.includes('FROM sys.tables t')) {
+            return [...tables].map((name) => ({ schema: 'dbo', name })) as T[];
+          }
+          if (q.includes('FROM sys.columns c') && q.includes('sys.computed_columns')) {
+            const rows: Record<string, unknown>[] = [];
+            let oid = 100;
+            for (const name of tables) {
+              if (name === 'items') {
+                rows.push({
+                  objectId: oid,
+                  columnId: 1,
+                  name: 'id',
+                  typeName: 'int',
+                  maxLength: 4,
+                  precision: 10,
+                  scale: 0,
+                  isNullable: false,
+                  collationName: null,
+                  isSparse: false,
+                  isRowguidcol: false,
+                  isIdentity: false,
+                  seedValue: null,
+                  incrementValue: null,
+                  defaultName: null,
+                  defaultDef: null,
+                  isComputed: false,
+                  computedDef: null,
+                  isPersisted: null,
+                  comment: null,
+                });
+              } else if (name === 'embeddings') {
+                rows.push(
+                  {
+                    objectId: oid,
+                    columnId: 1,
+                    name: 'id',
+                    typeName: 'int',
+                    maxLength: 4,
+                    precision: 10,
+                    scale: 0,
+                    isNullable: false,
+                    collationName: null,
+                    isSparse: false,
+                    isRowguidcol: false,
+                    isIdentity: false,
+                    seedValue: null,
+                    incrementValue: null,
+                    defaultName: null,
+                    defaultDef: null,
+                    isComputed: false,
+                    computedDef: null,
+                    isPersisted: null,
+                    comment: null,
+                  },
+                  {
+                    objectId: oid,
+                    columnId: 2,
+                    name: 'payload',
+                    typeName: 'json',
+                    maxLength: -1,
+                    precision: 0,
+                    scale: 0,
+                    isNullable: true,
+                    collationName: null,
+                    isSparse: false,
+                    isRowguidcol: false,
+                    isIdentity: false,
+                    seedValue: null,
+                    incrementValue: null,
+                    defaultName: null,
+                    defaultDef: null,
+                    isComputed: false,
+                    computedDef: null,
+                    isPersisted: null,
+                    comment: null,
+                  },
+                  {
+                    objectId: oid,
+                    columnId: 3,
+                    name: 'vec',
+                    typeName: 'vector',
+                    maxLength: 20, // 8 + 4 * 3 => vector(3)
+                    precision: 0,
+                    scale: 0,
+                    isNullable: true,
+                    collationName: null,
+                    isSparse: false,
+                    isRowguidcol: false,
+                    isIdentity: false,
+                    seedValue: null,
+                    incrementValue: null,
+                    defaultName: null,
+                    defaultDef: null,
+                    isComputed: false,
+                    computedDef: null,
+                    isPersisted: null,
+                    comment: null,
+                  },
+                );
+              }
+              oid++;
+            }
+            return rows as T[];
+          }
+          return [] as T[];
+        },
+        exec: async (q: string) => {
+          const createMatch = /CREATE TABLE \[dbo\]\.\[([^\]]+)\]/.exec(q);
+          if (createMatch) tables.add(createMatch[1]!);
+          const dropMatch = /DROP TABLE \[dbo\]\.\[([^\]]+)\]/.exec(q);
+          if (dropMatch) tables.delete(dropMatch[1]!);
+        },
+      };
+    };
+
+    const mBasicTo = emptyModel('mssql');
+    const dBasic = createSchema(mBasicTo, 'dbo', 's-dbo');
+    const tItems = createTable(mBasicTo, dBasic, 'items', 't-items');
+    addColumn(mBasicTo, tItems, { id: 'c-id', name: 'id', type: 'int', notNull: true });
+    const mBasicFrom = emptyBase(mBasicTo, null);
+
+    const basicUp = [{ sql: 'CREATE TABLE [dbo].[items] (\n  [id] int NOT NULL\n)', transactional: true }];
+    const basicDown = [{ sql: 'DROP TABLE [dbo].[items]', transactional: true }];
+
+    for (const major of [15, 16, 17]) {
+      const rVerify = await verify(makeFakeMssqlVerifyDb(major), mBasicFrom, mBasicTo);
+      expect(rVerify.shadowMajor, `verify major=${major}`).toBeNull();
+      expect(rVerify.upDiff).toEqual([]);
+      expect(rVerify.downDiff).toEqual([]);
+
+      const rScripts = await verifyScripts(
+        makeFakeMssqlVerifyDb(major),
+        mBasicFrom,
+        mBasicTo,
+        basicUp,
+        basicDown,
+      );
+      expect(rScripts.shadowMajor, `verifyScripts major=${major}`).toBeNull();
+      expect(rScripts.upDiff).toEqual([]);
+      expect(rScripts.downDiff).toEqual([]);
+    }
+
+    // 2025 (17) 原生 json / vector(3)：2019 (15) 与 2022 (16) 拒绝，2025 (17) 放行且 shadowMajor 仍为 null
+    const m2025To = emptyModel('mssql');
+    const d25 = createSchema(m2025To, 'dbo', 's-dbo');
+    const tEmb = createTable(m2025To, d25, 'embeddings', 't-emb');
+    addColumn(m2025To, tEmb, { id: 'c-e-id', name: 'id', type: 'int', notNull: true });
+    addColumn(m2025To, tEmb, { id: 'c-e-json', name: 'payload', type: 'json' });
+    addColumn(m2025To, tEmb, { id: 'c-e-vec', name: 'vec', type: 'vector(3)' });
+    const m2025From = emptyBase(m2025To, null);
+    const up2025 = [
+      {
+        sql: 'CREATE TABLE [dbo].[embeddings] (\n  [id] int NOT NULL,\n  [payload] json NULL,\n  [vec] vector(3) NULL\n)',
+        transactional: true,
+      },
+    ];
+    const down2025 = [{ sql: 'DROP TABLE [dbo].[embeddings]', transactional: true }];
+
+    for (const oldMajor of [15, 16]) {
+      await expect(verify(makeFakeMssqlVerifyDb(oldMajor), m2025From, m2025To)).rejects.toThrow(PlanError);
+      await expect(verify(makeFakeMssqlVerifyDb(oldMajor), m2025From, m2025To)).rejects.toThrow(/2025/);
+      await expect(
+        verifyScripts(makeFakeMssqlVerifyDb(oldMajor), m2025From, m2025To, up2025, down2025),
+      ).rejects.toThrow(PlanError);
+      await expect(
+        verifyScripts(makeFakeMssqlVerifyDb(oldMajor), m2025From, m2025To, up2025, down2025),
+      ).rejects.toThrow(/2025/);
+    }
+
+    const ok25Verify = await verify(makeFakeMssqlVerifyDb(17), m2025From, m2025To);
+    expect(ok25Verify.shadowMajor).toBeNull();
+    expect(ok25Verify.upDiff).toEqual([]);
+    expect(ok25Verify.downDiff).toEqual([]);
+
+    const ok25Scripts = await verifyScripts(makeFakeMssqlVerifyDb(17), m2025From, m2025To, up2025, down2025);
+    expect(ok25Scripts.shadowMajor).toBeNull();
+    expect(ok25Scripts.upDiff).toEqual([]);
+    expect(ok25Scripts.downDiff).toEqual([]);
+  });
+
+  test('versions.ts guards non-PG dialects from PG major targets, mismatch tracking, and PG error prefixes', async () => {
+    const pdb = await openPlatformDb(':memory:');
+    const created = createApp(pdb, { loginLimiter: new LoginLimiter({ limit: 1000, windowMs: 60_000 }) });
+    try {
+      await makeUser(pdb, 'mssql-guard-admin', { role: 'admin' });
+      const loginRes = await created.app.request('/api/auth/login', {
+        method: 'POST',
+        headers: { 'content-type': 'application/json' },
+        body: JSON.stringify({ username: 'mssql-guard-admin', password: PASSWORD }),
+      });
+      expect(loginRes.status).toBe(200);
+      const cookie = loginRes.headers.get('set-cookie')?.split(';')[0] ?? '';
+
+      const gRes = await created.app.request('/api/groups', {
+        method: 'POST',
+        headers: { cookie, 'content-type': 'application/json' },
+        body: JSON.stringify({ name: 'MSSQL Guard Team', slug: 'mssql-guard-team' }),
+      });
+      expect(gRes.status).toBe(201);
+      const { id: groupId } = (await gRes.json()) as { id: string };
+
+      const pRes = await created.app.request('/api/projects', {
+        method: 'POST',
+        headers: { cookie, 'content-type': 'application/json' },
+        body: JSON.stringify({ name: 'MSSQL Guard Proj', groupId, dialect: 'mssql' }),
+      });
+      expect(pRes.status).toBe(201);
+      const { id: pid } = (await pRes.json()) as ProjectCreated;
+
+      const addMssqlTable = async (name: string) => {
+        await editModel(created.rooms, pdb, pid, (m: Model) => {
+          const dbo = all(m, 'schema').find((s) => s.name === 'dbo')?.id ?? createSchema(m, 'dbo');
+          const t = createTable(m, dbo, name);
+          addColumn(m, t, { name: 'id', type: 'int', notNull: true });
+        });
+      };
+      await addMssqlTable('items');
+
+      const stubShadow = (verifyScriptsFn: Shadow['verifyScripts']): Shadow =>
+        ({
+          verifyScripts: verifyScriptsFn,
+          importSql: async () => {
+            throw new Error('unused');
+          },
+          verify: async () => {
+            throw new Error('unused');
+          },
+          canonicalize: async () => [],
+          close: async () => {},
+        }) as Shadow;
+
+      // 即使上游 mock 传入了 major / targetPgMajor / shadowMajor，非 PG 方言也不能记录 targets 或 PG 文案
+      created.shadows.forProjectVersions = async () => ({
+        targetPgMajor: 16,
+        envPgMajors: [16],
+        skippedMajors: [],
+        entries: [
+          {
+            major: 16,
+            envId: 'e-mssql-16',
+            label: 'dev：app_dowel',
+            shadow: stubShadow(async () => ({
+              ok: true,
+              up: [],
+              down: [],
+              upDiff: [],
+              downDiff: [],
+              risks: [],
+              error: null,
+              shadowMajor: 16,
+            })),
+          },
+        ],
+      });
+
+      const okRes = await created.app.request(`/api/projects/${pid}/versions`, {
+        method: 'POST',
+        headers: { cookie, 'content-type': 'application/json' },
+        body: JSON.stringify({ name: 'v1' }),
+      });
+      expect(okRes.status).toBe(201);
+      const okData = (await okRes.json()) as VersionCreated;
+      expect(okData.verified).toBe(true);
+
+      const detRes = await created.app.request(`/api/projects/${pid}/versions/${okData.id}`, {
+        headers: { cookie },
+      });
+      expect(detRes.status).toBe(200);
+      const det = (await detRes.json()) as VersionDetail;
+      expect(det.verifyReport?.targets).toBeUndefined();
+      expect(det.verifyReport?.missingTargetMajor).toBeUndefined();
+      expect(det.verifyReport?.shadow).toBe('dev：app_dowel');
+      expect(det.verifyReport?.shadow).not.toContain('PG');
+
+      // 失败场景：错误文案与 shadow 标签不能带 "PG ..." 前缀，且不返回 targets
+      await addMssqlTable('orders');
+      created.shadows.forProjectVersions = async () => ({
+        targetPgMajor: 16,
+        envPgMajors: [16],
+        skippedMajors: [],
+        entries: [
+          {
+            major: 16,
+            envId: 'e-mssql-16',
+            label: 'dev：app_dowel',
+            shadow: stubShadow(async () => ({
+              ok: false,
+              up: [],
+              down: [],
+              upDiff: [],
+              downDiff: [],
+              risks: [],
+              error: { step: null, message: 'ddl failed' },
+              shadowMajor: 16,
+            })),
+          },
+        ],
+      });
+
+      const failRes = await created.app.request(`/api/projects/${pid}/versions`, {
+        method: 'POST',
+        headers: { cookie, 'content-type': 'application/json' },
+        body: JSON.stringify({ name: 'v2' }),
+      });
+      expect(failRes.status).toBe(422);
+      const failBody = (await failRes.json()) as PublishRejected;
+      expect(failBody.error).toBe('闭环验证没有通过，版本没有发布。请先修正模型');
+      expect(failBody.error).not.toContain('PG');
+      expect(failBody.report).toBeDefined();
+      expect(failBody.report?.error?.message).toBe('ddl failed');
+      expect(failBody.report?.shadow).toBe('dev：app_dowel');
+      expect(failBody.report?.targets).toBeUndefined();
+    } finally {
+      created.drift.stop();
+      created.requests.stop();
+      await created.webhooks.close();
+      await created.refresher.drain();
+      await created.shadows.close();
+      created.rooms.close();
+      await created.bus.close();
+      await created.ha.stop();
+      await pdb.close();
+    }
   });
 });
 

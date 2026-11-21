@@ -156,6 +156,7 @@ const verifyAcrossVersions = async (
     throw new ShadowError(selection.skippedMajors[0]?.reason ?? '没有可用的影子库');
   }
 
+  const isPg = to.dialect === 'pg';
   const targets: VerifyTargetReport[] = [];
   const passedShadows: { major: number | null; label: string }[] = [];
   const runtimeSkipped = new Map<number | null, string>();
@@ -181,9 +182,9 @@ const verifyAcrossVersions = async (
       ranRisk = true;
     }
 
-    // 以影子库实测大版本为准；若独立 shadowUrl 的实际 PG 大版本与环境声称的不一致，不得记作覆盖了目标大版本
-    const actualMajor = report.shadowMajor !== undefined ? report.shadowMajor : entry.major;
-    if (entry.major !== null && actualMajor !== null && actualMajor !== entry.major) {
+    // 仅 PG 跟踪并校验影子库大版本；非 PG 方言（SQLite / MySQL / MSSQL）不按 PG 大版本归档或报错
+    const actualMajor = isPg ? (report.shadowMajor !== undefined ? report.shadowMajor : entry.major) : null;
+    if (isPg && entry.major !== null && actualMajor !== null && actualMajor !== entry.major) {
       mismatchReasons.set(
         entry.major,
         `影子库实际版本为 PG ${actualMajor}（${entry.label}），与目标环境 PG ${entry.major} 不一致，不能作为 PG ${entry.major} 的验证依据`,
@@ -243,7 +244,11 @@ const verifyAcrossVersions = async (
 
   // 严格安全规则：只要项目存在已记录版本的最低目标 targetPgMajor，且本次实测通过的影子库集合中未覆盖该大版本
   // （包括多版本缺低版本影子库、存在未探测版本环境、或独立 shadowUrl 与目标库大版本错配），均不得标记为已验证
-  if (selection.targetPgMajor !== null && !passedShadows.some((s) => s.major === selection.targetPgMajor)) {
+  if (
+    isPg &&
+    selection.targetPgMajor !== null &&
+    !passedShadows.some((s) => s.major === selection.targetPgMajor)
+  ) {
     const mismatch = mismatchReasons.get(selection.targetPgMajor);
     const skippedReason =
       runtimeSkipped.get(selection.targetPgMajor) ??

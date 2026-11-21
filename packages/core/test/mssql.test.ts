@@ -7,12 +7,14 @@ import {
   addIndex,
   addPrimaryKey,
   addUnique,
+  all,
   createAll,
   createEnum,
   createSchema,
   createSequence,
   createTable,
   dropColumn,
+  dropSchema,
   dropSequence,
   emptyBase,
   emptyModel,
@@ -21,6 +23,7 @@ import {
   getDialect,
   isNontransactionalSql,
   MAX_GO_REPEAT,
+  type Model,
   mssqlColumnRefs,
   mssqlDerivedNames,
   mssqlIdent,
@@ -44,6 +47,7 @@ import {
   setDefault,
   setNotNull,
   splitMssqlBatches,
+  type Step,
   validate,
 } from '../src/index.ts';
 
@@ -800,5 +804,275 @@ describe('MSSQL core dialect: quote, lexer, batch splitter, naming, types, nontx
     const mTrigOtherSchema = structuredClone(mTrig0);
     renameTable(mTrigOtherSchema, tUsers, 'tr_app_only');
     expect(() => plan(mTrig0, mTrigOtherSchema)).not.toThrow();
+  });
+
+  it('handles schema drop-and-recreate, drop+rename reuse, chain rename, swap, and case-only rename without collisions or spurious drops', () => {
+    // 轻量 SQL Server 大小写无关 schema / table 状态模拟器，断言任意一步都无重名碰撞、删非空 schema 或遗漏创建
+    const verifyPlanOnSimulator = (from: Model, to: Model, label: string): Step[] => {
+      const steps = plan(from, to);
+      const schemas = new Map<string, { rawName: string; tables: Map<string, string> }>();
+      for (const s of all(from, 'schema')) {
+        schemas.set(s.name.toLowerCase(), { rawName: s.name, tables: new Map() });
+      }
+      for (const t of all(from, 'table')) {
+        const sch = from.objects[t.parent]!;
+        schemas.get(sch.name.toLowerCase())!.tables.set(t.name.toLowerCase(), t.name);
+      }
+      const unbracket = (s: string) => s.slice(1, -1).replace(/\]\]/g, ']');
+
+      for (const step of steps) {
+        if (step.kind === 'createSchema') {
+          const m = /^CREATE SCHEMA (\[[^\]]+\])$/.exec(step.sql);
+          expect(m, `${label}: ${step.sql}`).not.toBeNull();
+          const raw = unbracket(m![1]!);
+          const low = raw.toLowerCase();
+          expect(schemas.has(low), `${label}: duplicate CREATE SCHEMA ${raw}`).toBe(false);
+          schemas.set(low, { rawName: raw, tables: new Map() });
+        } else if (step.kind === 'dropSchema') {
+          const m = /^DROP SCHEMA (\[[^\]]+\])$/.exec(step.sql);
+          expect(m, `${label}: ${step.sql}`).not.toBeNull();
+          const raw = unbracket(m![1]!);
+          const low = raw.toLowerCase();
+          expect(low, `${label}: cannot drop dbo`).not.toBe('dbo');
+          const curSch = schemas.get(low);
+          expect(curSch, `${label}: DROP missing schema ${raw}`).toBeDefined();
+          expect(curSch!.tables.size, `${label}: DROP non-empty schema ${raw}`).toBe(0);
+          schemas.delete(low);
+        } else if (step.kind === 'createTable') {
+          const m = /^CREATE TABLE (\[[^\]]+\])\.\[([^\]]+)\]/.exec(step.sql);
+          expect(m, `${label}: ${step.sql}`).not.toBeNull();
+          const schLow = unbracket(m![1]!).toLowerCase();
+          const tblRaw = m![2]!.replace(/\]\]/g, ']');
+          const curSch = schemas.get(schLow);
+          expect(curSch, `${label}: missing target schema for ${step.sql}`).toBeDefined();
+          expect(curSch!.tables.has(tblRaw.toLowerCase()), `${label}: duplicate table ${tblRaw}`).toBe(false);
+          curSch!.tables.set(tblRaw.toLowerCase(), tblRaw);
+        } else if (step.kind === 'dropTable') {
+          const m = /^DROP TABLE (\[[^\]]+\])\.\[([^\]]+)\]$/.exec(step.sql);
+          expect(m, `${label}: ${step.sql}`).not.toBeNull();
+          const schLow = unbracket(m![1]!).toLowerCase();
+          const tblLow = m![2]!.replace(/\]\]/g, ']').toLowerCase();
+          const curSch = schemas.get(schLow);
+          expect(curSch?.tables.has(tblLow), `${label}: DROP missing table ${step.sql}`).toBe(true);
+          curSch!.tables.delete(tblLow);
+        } else if (step.kind === 'transferSchema') {
+          const m = /^ALTER SCHEMA (\[[^\]]+\]) TRANSFER (\[[^\]]+\])\.\[([^\]]+)\]$/.exec(step.sql);
+          expect(m, `${label}: ${step.sql}`).not.toBeNull();
+          const dstLow = unbracket(m![1]!).toLowerCase();
+          const srcLow = unbracket(m![2]!).toLowerCase();
+          const tblRaw = m![3]!.replace(/\]\]/g, ']');
+          const tblLow = tblRaw.toLowerCase();
+          const srcSch = schemas.get(srcLow);
+          const dstSch = schemas.get(dstLow);
+          expect(srcSch, `${label}: missing src schema ${m![2]}`).toBeDefined();
+          expect(dstSch, `${label}: missing dst schema ${m![1]}`).toBeDefined();
+          expect(srcSch!.tables.has(tblLow), `${label}: missing src table ${tblRaw}`).toBe(true);
+          expect(dstSch!.tables.has(tblLow), `${label}: dst already has table ${tblRaw}`).toBe(false);
+          const oldRaw = srcSch!.tables.get(tblLow)!;
+          srcSch!.tables.delete(tblLow);
+          dstSch!.tables.set(tblLow, oldRaw);
+        }
+      }
+
+      const expectedSchemas = new Map<string, { rawName: string; tables: Map<string, string> }>();
+      for (const s of all(to, 'schema')) {
+        expectedSchemas.set(s.name.toLowerCase(), { rawName: s.name, tables: new Map() });
+      }
+      for (const t of all(to, 'table')) {
+        const sch = to.objects[t.parent]!;
+        expectedSchemas.get(sch.name.toLowerCase())!.tables.set(t.name.toLowerCase(), t.name);
+      }
+      expect(
+        [...schemas.values()].every((s) => !s.rawName.startsWith('_dowel_tmp_sch_')),
+        `${label}: temp schema leaked`,
+      ).toBe(true);
+      expect(schemas).toEqual(expectedSchemas);
+      return steps;
+    };
+
+    // 1. 删 s2(core) + 新建 s3(core) 含新表 [core].[t1]
+    {
+      const m0 = emptyModel('mssql');
+      createSchema(m0, 'dbo', 's-dbo');
+      const s2 = createSchema(m0, 'core', 's-2');
+      const tOld = createTable(m0, s2, 'legacy_t', 't-old');
+      addColumn(m0, tOld, { name: 'id', type: 'int', notNull: true });
+
+      const m1 = structuredClone(m0);
+      dropSchema(m1, s2);
+      const s3 = createSchema(m1, 'core', 's-3');
+      const t1 = createTable(m1, s3, 't1', 't-1');
+      addColumn(m1, t1, { name: 'id', type: 'int', notNull: true });
+
+      const steps = verifyPlanOnSimulator(m0, m1, 'case1-drop-recreate-with-table');
+      const dropOldIdx = steps.findIndex((s) => s.sql === 'DROP TABLE [core].[legacy_t]');
+      const dropCoreIdx = steps.findIndex((s) => s.sql === 'DROP SCHEMA [core]');
+      const createCoreIdx = steps.findIndex((s) => s.sql === 'CREATE SCHEMA [core]');
+      const createT1Idx = steps.findIndex((s) => s.kind === 'createTable' && s.sql.includes('[core].[t1]'));
+      expect(dropOldIdx).toBeGreaterThanOrEqual(0);
+      expect(dropCoreIdx).toBeGreaterThan(dropOldIdx);
+      expect(createCoreIdx).toBeGreaterThan(dropCoreIdx);
+      expect(createT1Idx).toBeGreaterThan(createCoreIdx);
+      expect(steps.filter((s) => s.sql === 'DROP SCHEMA [core]')).toHaveLength(1);
+      verifyPlanOnSimulator(m1, m0, 'case1-reverse');
+    }
+
+    // 2. 删 s2(core) + 新建空 s3(core)（必须先 DROP 再 CREATE，不能只剩 DROP）
+    {
+      const m0 = emptyModel('mssql');
+      createSchema(m0, 'dbo', 's-dbo');
+      const s2 = createSchema(m0, 'core', 's-2');
+
+      const m1 = structuredClone(m0);
+      dropSchema(m1, s2);
+      createSchema(m1, 'core', 's-3');
+
+      const steps = verifyPlanOnSimulator(m0, m1, 'case2-drop-recreate-empty');
+      expect(steps.map((s) => s.sql)).toEqual(['DROP SCHEMA [core]', 'CREATE SCHEMA [core]']);
+      const rev = verifyPlanOnSimulator(m1, m0, 'case2-reverse');
+      expect(rev.map((s) => s.sql)).toEqual(['DROP SCHEMA [core]', 'CREATE SCHEMA [core]']);
+    }
+
+    // 3. 删 s2(core) + s1: app -> core
+    {
+      const m0 = emptyModel('mssql');
+      createSchema(m0, 'dbo', 's-dbo');
+      const s1 = createSchema(m0, 'app', 's-1');
+      const t1 = createTable(m0, s1, 't1', 't-1');
+      addColumn(m0, t1, { name: 'id', type: 'int', notNull: true });
+      const s2 = createSchema(m0, 'core', 's-2');
+
+      const m1 = structuredClone(m0);
+      dropSchema(m1, s2);
+      renameSchema(m1, s1, 'core');
+
+      const steps = verifyPlanOnSimulator(m0, m1, 'case3-drop-core-rename-app-to-core');
+      expect(steps.map((s) => s.sql)).toEqual([
+        'DROP SCHEMA [core]',
+        'CREATE SCHEMA [core]',
+        'ALTER SCHEMA [core] TRANSFER [app].[t1]',
+        'DROP SCHEMA [app]',
+      ]);
+      verifyPlanOnSimulator(m1, m0, 'case3-reverse');
+    }
+
+    // 4. 删 s2(core) 且把 s2 的旧表 t2 迁往 dbo + 新建 s3(core) 含新表 t3
+    {
+      const m0 = emptyModel('mssql');
+      const sDbo = createSchema(m0, 'dbo', 's-dbo');
+      const s2 = createSchema(m0, 'core', 's-2');
+      const t2 = createTable(m0, s2, 't2', 't-2');
+      addColumn(m0, t2, { name: 'id', type: 'int', notNull: true });
+
+      const m1 = structuredClone(m0);
+      (m1.objects[t2] as { parent: string }).parent = sDbo;
+      dropSchema(m1, s2);
+      const s3 = createSchema(m1, 'core', 's-3');
+      const t3 = createTable(m1, s3, 't3', 't-3');
+      addColumn(m1, t3, { name: 'id', type: 'int', notNull: true });
+
+      const steps = verifyPlanOnSimulator(m0, m1, 'case4-evacuate-t2-to-dbo-recreate-core');
+      const createTmpIdx = steps.findIndex((s) => /^CREATE SCHEMA \[_dowel_tmp_sch_\d+\]$/.test(s.sql));
+      const xferTmpIdx = steps.findIndex((s) =>
+        /^ALTER SCHEMA \[_dowel_tmp_sch_\d+\] TRANSFER \[core\]\.\[t2\]$/.test(s.sql),
+      );
+      const dropCoreIdx = steps.findIndex((s) => s.sql === 'DROP SCHEMA [core]');
+      const createCoreIdx = steps.findIndex((s) => s.sql === 'CREATE SCHEMA [core]');
+      const xferDboIdx = steps.findIndex((s) =>
+        /^ALTER SCHEMA \[dbo\] TRANSFER \[_dowel_tmp_sch_\d+\]\.\[t2\]$/.test(s.sql),
+      );
+      const createT3Idx = steps.findIndex((s) => s.kind === 'createTable' && s.sql.includes('[core].[t3]'));
+      const dropTmpIdx = steps.findIndex((s) => /^DROP SCHEMA \[_dowel_tmp_sch_\d+\]$/.test(s.sql));
+      expect(createTmpIdx).toBe(0);
+      expect(xferTmpIdx).toBeGreaterThan(createTmpIdx);
+      expect(dropCoreIdx).toBeGreaterThan(xferTmpIdx);
+      expect(createCoreIdx).toBeGreaterThan(dropCoreIdx);
+      expect(xferDboIdx).toBeGreaterThan(createCoreIdx);
+      expect(createT3Idx).toBeGreaterThan(createCoreIdx);
+      expect(dropTmpIdx).toBeGreaterThan(xferDboIdx);
+      verifyPlanOnSimulator(m1, m0, 'case4-reverse');
+    }
+
+    // 5. 链式改名 s1: app -> core, s2: core -> other（含表 t1 / t2）
+    {
+      const m0 = emptyModel('mssql');
+      createSchema(m0, 'dbo', 's-dbo');
+      const s1 = createSchema(m0, 'app', 's-1');
+      const t1 = createTable(m0, s1, 't1', 't-1');
+      addColumn(m0, t1, { name: 'id', type: 'int', notNull: true });
+      const s2 = createSchema(m0, 'core', 's-2');
+      const t2 = createTable(m0, s2, 't2', 't-2');
+      addColumn(m0, t2, { name: 'id', type: 'int', notNull: true });
+
+      const m1 = structuredClone(m0);
+      renameSchema(m1, s2, 'other');
+      renameSchema(m1, s1, 'core');
+
+      const steps = verifyPlanOnSimulator(m0, m1, 'case5-chain-rename');
+      const dropCoreIdx = steps.findIndex((s) => s.sql === 'DROP SCHEMA [core]');
+      const createCoreIdx = steps.findIndex((s) => s.sql === 'CREATE SCHEMA [core]');
+      expect(dropCoreIdx).toBeGreaterThan(0);
+      expect(createCoreIdx).toBeGreaterThan(dropCoreIdx);
+      verifyPlanOnSimulator(m1, m0, 'case5-reverse');
+    }
+
+    // 6. 两两互换 s1: a -> b, s2: b -> a（含同名表 [a].[t] 与 [b].[t]）
+    {
+      const m0 = emptyModel('mssql');
+      createSchema(m0, 'dbo', 's-dbo');
+      const s1 = createSchema(m0, 'a', 's-1');
+      const tA = createTable(m0, s1, 't', 't-a');
+      addColumn(m0, tA, { name: 'id', type: 'int', notNull: true });
+      const s2 = createSchema(m0, 'b', 's-2');
+      const tB = createTable(m0, s2, 't', 't-b');
+      addColumn(m0, tB, { name: 'id', type: 'int', notNull: true });
+
+      const m1 = structuredClone(m0);
+      renameSchema(m1, s1, '__swap_tmp');
+      renameSchema(m1, s2, 'a');
+      renameSchema(m1, s1, 'b');
+
+      const steps = verifyPlanOnSimulator(m0, m1, 'case6-pairwise-swap-same-table-name');
+      const dropAIdx = steps.findIndex((s) => s.sql === 'DROP SCHEMA [a]');
+      const dropBIdx = steps.findIndex((s) => s.sql === 'DROP SCHEMA [b]');
+      const createAIdx = steps.findIndex((s) => s.sql === 'CREATE SCHEMA [a]');
+      const createBIdx = steps.findIndex((s) => s.sql === 'CREATE SCHEMA [b]');
+      expect(dropAIdx).toBeGreaterThan(0);
+      expect(dropBIdx).toBeGreaterThan(0);
+      expect(createAIdx).toBeGreaterThan(Math.max(dropAIdx, dropBIdx));
+      expect(createBIdx).toBeGreaterThan(Math.max(dropAIdx, dropBIdx));
+      verifyPlanOnSimulator(m1, m0, 'case6-reverse');
+    }
+
+    // 7. 纯大小写变更 s1: core -> Core（含表与空 schema）
+    {
+      const m0 = emptyModel('mssql');
+      createSchema(m0, 'dbo', 's-dbo');
+      const s1 = createSchema(m0, 'core', 's-1');
+      const t1 = createTable(m0, s1, 't1', 't-1');
+      addColumn(m0, t1, { name: 'id', type: 'int', notNull: true });
+
+      const m1 = structuredClone(m0);
+      renameSchema(m1, s1, 'Core');
+
+      const stepsWithTable = verifyPlanOnSimulator(m0, m1, 'case7-case-only-with-table');
+      expect(stepsWithTable.findIndex((s) => s.sql === 'DROP SCHEMA [core]')).toBeLessThan(
+        stepsWithTable.findIndex((s) => s.sql === 'CREATE SCHEMA [Core]'),
+      );
+      verifyPlanOnSimulator(m1, m0, 'case7-reverse');
+
+      const mEmpty0 = emptyModel('mssql');
+      createSchema(mEmpty0, 'dbo', 's-dbo');
+      const sEmpty = createSchema(mEmpty0, 'core', 's-1');
+      const mEmpty1 = structuredClone(mEmpty0);
+      renameSchema(mEmpty1, sEmpty, 'Core');
+      const stepsEmpty = verifyPlanOnSimulator(mEmpty0, mEmpty1, 'case7-case-only-empty');
+      expect(stepsEmpty.map((s) => s.sql)).toEqual([
+        'CREATE SCHEMA [_dowel_tmp_sch_1]',
+        'DROP SCHEMA [core]',
+        'CREATE SCHEMA [Core]',
+        'DROP SCHEMA [_dowel_tmp_sch_1]',
+      ]);
+    }
   });
 });
