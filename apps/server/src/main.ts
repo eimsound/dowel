@@ -45,6 +45,8 @@ await ha.start();
 await bus.start();
 // 执行申请：先按副本租约恢复已离线节点遗留的“执行中”申请，再开始接受连接；然后按间隔做分布式巡检
 await requests.start();
+// 组级 Webhook：显式启动后台定时轮询兜底，并立即拾取重启或崩溃遗留的持久化任务
+webhooks.start();
 
 const server = serve({ fetch: app.fetch, port }, (info) => {
   console.log(`Dowel 已启动：http://localhost:${info.port}`);

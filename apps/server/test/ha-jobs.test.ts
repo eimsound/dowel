@@ -137,6 +137,8 @@ describe.skipIf(!PG_URL)('P7 HA Wave 2B：持久化队列、分布式巡检、�
         pollIntervalMs: 30,
         timeoutMs: 2000,
       });
+      hooksA.start();
+      hooksB.start();
 
       hooksA.emit('g-wh', sampleEvent());
       await hooksA.flush();
@@ -185,7 +187,7 @@ describe.skipIf(!PG_URL)('P7 HA Wave 2B：持久化队列、分布式巡检、�
       await hooksA.close();
       hooksA = null;
 
-      // 启动全新的 Webhooks 实例（接收端 fallback 为 200）：无需重新 emit，自动拾取 webhook_jobs 完成重试
+      // 启动全新的 Webhooks 实例（接收端 fallback 为 200）：无需重新 emit，显式 start() 后自动拾取 webhook_jobs 完成重试
       hooksC = new Webhooks(dbB, {
         bus: busB,
         ha: haB,
@@ -193,6 +195,8 @@ describe.skipIf(!PG_URL)('P7 HA Wave 2B：持久化队列、分布式巡检、�
         pollIntervalMs: 30,
         timeoutMs: 2000,
       });
+      hooksC.start();
+      await waitFor(() => rx.received.length === 2);
       await hooksC.flush();
 
       expect(rx.received).toHaveLength(2);
@@ -1394,6 +1398,7 @@ describe.skipIf(!PG_URL)('P7 HA Wave 2B：持久化队列、分布式巡检、�
         timeoutMs: 3000,
         leaseMs: 10_000,
       });
+      whB.start();
       await inReqBHold;
 
       const [beforeLateRetry] = await dbB.query<{
@@ -1469,6 +1474,7 @@ describe.skipIf(!PG_URL)('P7 HA Wave 2B：持久化队列、分布式巡检、�
         timeoutMs: 3000,
         leaseMs: 10_000,
       });
+      whB.start();
       await inReqB2;
 
       const [beforeLateOk] = await dbB.query<{ id: string; locked_by: string | null }>(
@@ -1811,6 +1817,167 @@ describe.skipIf(!PG_URL)('P7 HA Wave 2B：持久化队列、分布式巡检、�
       await busB.close();
       await haB.stop();
       await dbA.close();
+      await dbB.close();
+    }
+  });
+
+  test('13. Webhook 持锁硬崩溃租约接管（PG 双副本）：locked_until 过期前副本 B 绝不重复投递，过期后自动接管并完成投递（#25）', async () => {
+    const t = await createTestDb('ha_wh_hard_crash');
+    closers.push(t.close);
+    const dbA = await openPlatformDb(t.url);
+    const dbB = await openPlatformDb(t.url);
+    const busA = new EventBus(dbA, { replicaId: 'crash-wh-a' });
+    const busB = new EventBus(dbB, { replicaId: 'crash-wh-b' });
+    const haA = new HaCoordinator(dbA, { replicaId: 'crash-wh-a' });
+    const haB = new HaCoordinator(dbB, { replicaId: 'crash-wh-b' });
+    const rx = await startReceiver();
+
+    const waitInFlight = async (wh: Webhooks) => {
+      const internal = wh as unknown as {
+        enqueuing: Set<Promise<unknown>>;
+        inFlight: Set<Promise<unknown>>;
+      };
+      while (internal.enqueuing.size || internal.inFlight.size) {
+        await Promise.allSettled([...internal.enqueuing, ...internal.inFlight]);
+      }
+    };
+
+    let whA: Webhooks | null = null;
+    let whB: Webhooks | null = null;
+    let dbAClosed = false;
+    let busAClosed = false;
+    let releaseCrashA: () => void = () => {};
+
+    try {
+      await busA.start();
+      await busB.start();
+      await dbA.query(
+        `insert into instance_settings (key, value) values ('webhook_allowlist', $1::text::jsonb)
+         on conflict (key) do update set value = excluded.value`,
+        [JSON.stringify(['127.0.0.0/8'])],
+      );
+      await dbA.query("insert into groups (id, slug, name) values ('g-wh-crash', 'g-wh-crash', '硬崩溃组')");
+      await dbA.query(
+        `insert into webhooks (id, group_id, name, format, url_enc, events, enabled)
+         values ('w-wh-crash', 'g-wh-crash', 'crash-hook', 'json', $1, $2::text::jsonb, true)`,
+        [encrypt(`${rx.base}/hard-crash`), JSON.stringify(['request.created'])],
+      );
+
+      let claimedByA!: () => void;
+      const onClaimedByA = new Promise<void>((r) => {
+        claimedByA = r;
+      });
+      const holdCrashA = new Promise<void>((r) => {
+        releaseCrashA = r;
+      });
+
+      const leaseMs = 800;
+      whA = new Webhooks(dbA, {
+        bus: busA,
+        ha: haA,
+        retryBaseMs: 50,
+        pollIntervalMs: 60_000,
+        timeoutMs: 3000,
+        leaseMs,
+      });
+      // 模拟副本 A 经 FOR UPDATE SKIP LOCKED 认领持锁后，在投递中途硬崩溃（不写回、不释放锁、不调用 close()）
+      (whA as unknown as { attemptOnce: () => Promise<never> }).attemptOnce = async () => {
+        claimedByA();
+        await holdCrashA;
+        throw Object.assign(new Error('replica A hard-crashed'), { code: 'CONNECTION_ENDED' });
+      };
+
+      whA.emit('g-wh-crash', sampleEvent());
+      await onClaimedByA;
+
+      // 立即断开副本 A 的总线与数据库连接（模拟进程 SIGKILL，绝不调用 whA.close()，保留 locked_by 与 locked_until）
+      await busA.close();
+      busAClosed = true;
+      await dbA.close();
+      dbAClosed = true;
+
+      // 核实 PG 中任务处于副本 A 持锁且租约未过期状态
+      const [held] = await dbB.query<{
+        id: string;
+        delivery_id: string;
+        locked_by: string | null;
+        locked_until: Date | string | null;
+        remaining_ms: number | string;
+      }>(
+        `select id, delivery_id, locked_by, locked_until,
+                extract(epoch from (locked_until - now())) * 1000 as remaining_ms
+           from webhook_jobs`,
+      );
+      expect(held).toBeDefined();
+      expect(held!.locked_by).toBe('crash-wh-a');
+      expect(held!.locked_until).not.toBeNull();
+      expect(Number(held!.remaining_ms)).toBeGreaterThan(200);
+
+      // 1. 启动副本 B（短间隔后台轮询）并主动触发多次唤醒：在 locked_until 过期前绝不能重复认领或投递
+      whB = new Webhooks(dbB, {
+        bus: busB,
+        ha: haB,
+        retryBaseMs: 30,
+        pollIntervalMs: 25,
+        timeoutMs: 3000,
+        leaseMs: 10_000,
+      });
+      whB.start();
+      whB.wake(true);
+      await waitInFlight(whB);
+
+      const preWaitMs = Math.min(180, Math.max(80, Number(held!.remaining_ms) - 250));
+      await new Promise((r) => setTimeout(r, preWaitMs));
+      whB.wake(false);
+      await waitInFlight(whB);
+
+      const [stillHeld] = await dbB.query<{
+        id: string;
+        locked_by: string | null;
+        remaining_ms: number | string;
+      }>(
+        `select id, locked_by,
+                extract(epoch from (locked_until - now())) * 1000 as remaining_ms
+           from webhook_jobs
+          where id = $1`,
+        [held!.id],
+      );
+      expect(stillHeld).toBeDefined();
+      expect(Number(stillHeld!.remaining_ms)).toBeGreaterThan(0);
+      expect(stillHeld!.locked_by).toBe('crash-wh-a');
+      expect(rx.received).toHaveLength(0);
+      expect(await dbB.query('select id from webhook_deliveries')).toEqual([]);
+
+      // 2. 不手动改库、不重新 emit：等待 locked_until 自然过期，副本 B 通过定时轮询 + FOR UPDATE SKIP LOCKED 自动接管并完成投递
+      await waitFor(async () => {
+        if (rx.received.length !== 1) return false;
+        const rows = await dbB.query('select id from webhook_jobs');
+        return rows.length === 0;
+      }, 5000);
+
+      // 多等数轮轮询确认不会产生二次投递
+      await new Promise((r) => setTimeout(r, 100));
+      await whB.flush();
+
+      expect(rx.received).toHaveLength(1);
+      expect(rx.received[0]!.headers['x-dowel-delivery']).toBe(held!.delivery_id);
+      expect(await dbB.query('select id from webhook_jobs')).toEqual([]);
+      const deliveries = await dbB.query<{
+        delivery_id: string;
+        attempt: number;
+        ok: boolean;
+        status: number;
+      }>('select delivery_id, attempt, ok, status from webhook_deliveries where webhook_id = $1', [
+        'w-wh-crash',
+      ]);
+      expect(deliveries).toEqual([{ delivery_id: held!.delivery_id, attempt: 1, ok: true, status: 200 }]);
+    } finally {
+      releaseCrashA();
+      if (whA) await whA.close();
+      if (whB) await whB.close();
+      if (!busAClosed) await busA.close();
+      await busB.close();
+      if (!dbAClosed) await dbA.close();
       await dbB.close();
     }
   });

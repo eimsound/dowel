@@ -157,8 +157,7 @@ beforeAll(async () => {
 });
 
 afterAll(async () => {
-  created.webhooks.close();
-  await created.webhooks.flush();
+  await created.webhooks.close();
   for (const r of receivers) await r.close();
   await created.rooms.flush();
   await created.shadows.close();
@@ -1301,6 +1300,79 @@ describe('close() 排空入队与释放残留锁后的唤醒广播（#27）', ()
   });
 });
 
+describe('显式 start() 与后台轮询生命周期（#25）', () => {
+  test('默认构造不自启后台轮询，显式 start() 后自动拾取遗留任务；未 start() 时 emit + 重试仍正常工作', async () => {
+    const rx = await startReceiver();
+    const localDb = await openPlatformDb(':memory:');
+    await localDb.query(
+      `insert into instance_settings (key, value) values ('webhook_allowlist', $1::text::jsonb)
+       on conflict (key) do update set value = excluded.value`,
+      [JSON.stringify(['127.0.0.0/8'])],
+    );
+    await localDb.query("insert into groups (id, slug, name) values ('g-start', 'g-start', '启动组')");
+    await localDb.query(
+      `insert into webhooks (id, group_id, name, format, url_enc, events, enabled)
+       values ('w-start', 'g-start', 'start-hook', 'json', $1, $2::text::jsonb, true)`,
+      [encrypt(`${rx.base}/start-hook`), JSON.stringify(['request.created'])],
+    );
+    // 预先写入一条已到期的持久化任务（模拟旧进程遗留）
+    const now = new Date();
+    await localDb.query(
+      `insert into webhook_jobs
+         (id, webhook_id, delivery_id, event_type, payload, attempts, max_retries, next_run_at, created_at)
+       values ('job-legacy', 'w-start', 'del-legacy', 'request.created', $1::text::jsonb, 0, 3, $2, $2)`,
+      [JSON.stringify(event()), now],
+    );
+
+    const wh = new Webhooks(localDb, {
+      retryBaseMs: 25,
+      pollIntervalMs: 20,
+      timeoutMs: 2000,
+    });
+    try {
+      // 未调用 start()：不应启动后台轮询去主动消费遗留任务
+      await new Promise((r) => setTimeout(r, 80));
+      expect(rx.received).toHaveLength(0);
+      expect(await localDb.query('select id from webhook_jobs')).toEqual([{ id: 'job-legacy' }]);
+
+      // 显式调用 start()（重复调用幂等）：立即拾取遗留任务并完成投递
+      wh.start();
+      wh.start();
+      await wh.flush();
+      expect(rx.received).toHaveLength(1);
+      expect(rx.received[0]!.headers['x-dowel-delivery']).toBe('del-legacy');
+      expect(await localDb.query('select id from webhook_jobs')).toEqual([]);
+    } finally {
+      await wh.close();
+    }
+
+    // 未调用 start() 的实例：通过 emit() + 500 退避重试也能独立完成投递
+    rx.received.length = 0;
+    rx.replies.push((res) => {
+      res.writeHead(500);
+      res.end('retry once');
+    });
+    const whNoPoll = new Webhooks(localDb, {
+      retryBaseMs: 25,
+      pollIntervalMs: 60_000,
+      timeoutMs: 2000,
+    });
+    try {
+      whNoPoll.emit('g-start', event());
+      const deadline = Date.now() + 2000;
+      while (rx.received.length < 2 && Date.now() < deadline) {
+        await new Promise((r) => setTimeout(r, 15));
+      }
+      expect(rx.received).toHaveLength(2);
+      await whNoPoll.flush();
+      expect(await localDb.query('select id from webhook_jobs')).toEqual([]);
+    } finally {
+      await whNoPoll.close();
+      await localDb.close();
+    }
+  });
+});
+
 // 平台库是 PG 时：同一套 SQL（布尔 / JSON / 时间列、清理最近 50 条）也能用（没有 Docker 时跳过）
 describe.skipIf(!PG_URL)('平台库 PG', () => {
   test('建 Webhook、投递、发送测试、列表与投递记录、清理', async () => {
@@ -1362,7 +1434,7 @@ describe.skipIf(!PG_URL)('平台库 PG', () => {
       expect(list[0]!.lastDelivery).toMatchObject({ ok: true });
       expect((await req('DELETE', `/api/groups/pg/webhooks/${id}`)).status).toBe(200);
     } finally {
-      app.webhooks.close();
+      await app.webhooks.close();
       await app.rooms.flush();
       await app.shadows.close();
       await pdb.close();

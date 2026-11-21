@@ -102,6 +102,7 @@ beforeAll(async () => {
 
 afterAll(async () => {
   created.requests.stop();
+  await created.webhooks.close();
   await created.rooms.flush();
   await created.shadows.close();
   await db.close();

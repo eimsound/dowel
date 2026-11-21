@@ -43,6 +43,8 @@ export interface WebhookOptions {
   pollIntervalMs?: number;
   /** 任务认领租约时长（毫秒，默认 Math.max(30_000, timeoutMs * 3)） */
   leaseMs?: number;
+  /** 是否在构造时自动启动后台定时轮询（默认 false；生产入口 main.ts 显式调用 start()，避免未使用的测试残留空闲轮询） */
+  autoStart?: boolean;
 }
 
 type CoreWebhookOptions = Required<
@@ -588,6 +590,11 @@ export class Webhooks {
     this.pollIntervalMs = options.pollIntervalMs ?? Math.min(1000, Math.max(20, this.options.retryBaseMs));
     this.leaseMs = options.leaseMs ?? Math.max(30_000, this.options.timeoutMs * 3);
     this.attachBus();
+    if (options.autoStart) this.start();
+  }
+
+  /** 启动后台定时轮询并立即尝试拾取重启或崩溃遗留的到期任务（幂等，生产入口 main.ts 显式调用） */
+  start(): void {
     this.startPolling();
   }
 

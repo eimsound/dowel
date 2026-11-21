@@ -116,7 +116,7 @@ export const createApp = (db: PlatformDb, options: AppOptions = {}) => {
   const exec: ExecContext = { db, guard, locks: new EnvLocks(db) };
   // 定时漂移检查：这里只创建，不启动（main.ts 按配置启动；测试里不启动或调短间隔）
   const drift = new DriftScheduler(db, exec, ha);
-  // 组级 Webhook（持久化队列 webhook_jobs + EventBus 唤醒）和执行申请（状态检查、跨副本通知、分布式巡检）
+  // 组级 Webhook（持久化队列 webhook_jobs + EventBus 唤醒；后台定时轮询由 main.ts 显式 start()）和执行申请（状态检查、跨副本通知、分布式巡检）
   const webhooks = new Webhooks(db, { bus, ha, ...options.webhooks });
   const requests = new Requests(db, exec, webhooks, security, { bus, ha });
   drift.afterSweep = () => requests.kick({ all: true });
