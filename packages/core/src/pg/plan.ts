@@ -41,25 +41,13 @@ import {
   qname,
   rootTableId,
 } from '../model.ts';
+import { PlanError, type Step } from '../plan-types.ts';
 import { checkPgCompatibility, LATEST_PG_MAJOR, pgCapabilities, type PlanOptions } from './capabilities.ts';
 import { chooseName, joinNames } from './naming.ts';
 import { derivedUuid, partitionKeyColumns } from './partition.ts';
 import { ident, literal, qualified } from './quote.ts';
 
-export interface Step {
-  /** 步骤种类，用于界面展示和测试 */
-  kind: string;
-  /** 主要涉及的对象 */
-  target: string;
-  sql: string;
-  /**
-   * 冻结脚本里这一步的 transactional 标记（规划器自己不填）：验证时带着它一路传到风险分析，
-   * 只用于“用户标了非事务、但文本看不出来”的兜底，不决定要不要放进事务。
-   */
-  transactional?: boolean;
-}
-
-export class PlanError extends Error {}
+export { PlanError, type Step };
 
 const clone = <T>(x: T): T => structuredClone(x);
 /** 新建的对象此时还没有注释，注释在最后一个阶段统一加 */

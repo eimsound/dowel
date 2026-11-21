@@ -5,17 +5,23 @@ import { z } from 'zod';
 import * as E from './edit.ts';
 import {
   ColumnDefault,
+  ColumnExt,
   FkAction,
   IndexElement,
+  IndexExt,
   type Model,
   type Obj,
   PartitionSpec,
+  PrimaryKeyExt,
   SequenceOptions,
+  TableExt,
+  UniqueExt,
 } from './ir.ts';
 import { columnsOf, effectiveColumnsOf, rootTableId } from './model.ts';
+import { getDialect } from './registry.ts';
 
 const id = z.string().min(1).max(64);
-const name = z.string().min(1).max(63);
+const name = z.string().min(1).max(128);
 
 /** 修改一个 CHECK 约束的表达式（推导名会随引用的列变化） */
 export const setCheckExpr = (m: Model, checkId: string, expr: string) => {
@@ -52,11 +58,18 @@ export const mutators = {
   dropSequence: def(z.object({ id }), (m, a) => E.dropSequence(m, a.id)),
 
   createTable: def(
-    z.object({ id, schema: id, name, partitionBy: PartitionSpec.nullable().optional() }),
-    (m, a) => E.createTable(m, a.schema, a.name, a.id, a.partitionBy ?? null),
+    z.object({
+      id,
+      schema: id,
+      name,
+      partitionBy: PartitionSpec.nullable().optional(),
+      ext: TableExt.optional(),
+    }),
+    (m, a) => E.createTable(m, a.schema, a.name, a.id, a.partitionBy ?? null, a.ext),
   ),
   renameTable: def(z.object({ id, name }), (m, a) => E.renameTable(m, a.id, a.name)),
   dropTable: def(z.object({ id }), (m, a) => E.dropTable(m, a.id)),
+  setTableExt: def(z.object({ id, ext: TableExt.nullable() }), (m, a) => E.setTableExt(m, a.id, a.ext)),
 
   setPartitionBy: def(z.object({ id, partitionBy: PartitionSpec.nullable() }), (m, a) =>
     E.setPartitionBy(m, a.id, a.partitionBy),
@@ -90,6 +103,7 @@ export const mutators = {
           .optional(),
         collation: z.string().nullable().optional(),
         before: id.optional(),
+        ext: ColumnExt.optional(),
       }),
     }),
     (m, a) => E.addColumn(m, a.table, a.column),
@@ -106,14 +120,22 @@ export const mutators = {
   setIdentity: def(z.object({ id, identity: z.object({ always: z.boolean() }).nullable() }), (m, a) =>
     E.setIdentity(m, a.id, a.identity),
   ),
+  setColumnExt: def(z.object({ id, ext: ColumnExt.nullable() }), (m, a) => E.setColumnExt(m, a.id, a.ext)),
   moveColumn: def(z.object({ id, before: id.nullable() }), (m, a) => E.moveColumn(m, a.id, a.before)),
 
-  addPrimaryKey: def(z.object({ id, table: id, columns: z.array(id).min(1) }), (m, a) =>
-    E.addPrimaryKey(m, a.table, a.columns, a.id),
+  addPrimaryKey: def(
+    z.object({ id, table: id, columns: z.array(id).min(1), ext: PrimaryKeyExt.optional() }),
+    (m, a) => E.addPrimaryKey(m, a.table, a.columns, a.id, a.ext),
   ),
   addUnique: def(
-    z.object({ id, table: id, columns: z.array(id).min(1), nullsNotDistinct: z.boolean().optional() }),
-    (m, a) => E.addUnique(m, a.table, a.columns, a.nullsNotDistinct ?? false, a.id),
+    z.object({
+      id,
+      table: id,
+      columns: z.array(id).min(1),
+      nullsNotDistinct: z.boolean().optional(),
+      ext: UniqueExt.optional(),
+    }),
+    (m, a) => E.addUnique(m, a.table, a.columns, a.nullsNotDistinct ?? false, a.id, a.ext),
   ),
   addCheck: def(z.object({ id, table: id, expr: z.string().min(1) }), (m, a) =>
     E.addCheck(m, a.table, a.expr, a.id),
@@ -153,6 +175,7 @@ export const mutators = {
       include: z.array(id).optional(),
       where: z.string().nullable().optional(),
       nullsNotDistinct: z.boolean().optional(),
+      ext: IndexExt.optional(),
     }),
     (m, { id, table, elements, ...opts }) =>
       E.addIndex(
@@ -217,6 +240,7 @@ export const readsOf = (m: Model, args: unknown): string[] => {
     }
   }
   if (exprs.length) {
+    const d = getDialect(m.dialect);
     // 表达式所在的表：参数里的表，或参数里对象所在的表
     const tables = new Set<string>();
     for (const i of out) {
@@ -226,7 +250,7 @@ export const readsOf = (m: Model, args: unknown): string[] => {
     }
     for (const t of tables)
       for (const c of effectiveColumnsOf(m, t))
-        if (exprs.some((e) => E.exprReferences(e, c.name))) out.add(c.id);
+        if (exprs.some((e) => d.exprReferences(e, c.name))) out.add(c.id);
   }
   return [...out];
 };

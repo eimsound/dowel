@@ -1,7 +1,8 @@
 // PG 表达式词法分析与列/限定名引用改写。
+import type { Token } from '../plan-types.ts';
 import { ident } from './quote.ts';
 
-export type Token = { text: string; kind: 'ident' | 'qident' | 'other'; start: number; end: number };
+export type { Token };
 
 /** 简单的 PG 表达式词法分析：识别字符串、带引号标识符、普通标识符，其余字符原样保留 */
 export const tokenize = (s: string): Token[] => {

@@ -1,8 +1,9 @@
 // 在扁平模型上查询对象的工具函数，以及模型的一致性校验。
 import { EditError } from './errors.ts';
 import type { Column, Enum, Index, Kind, Model, Obj, ObjOf, PartitionSpec, Sequence, Table } from './ir.ts';
-import { parsePartitionBound, resolvePartitionBy, validatePartitionBound } from './pg/partition.ts';
-import { ident, qualified } from './pg/quote.ts';
+import { resolvePartitionBy } from './pg/partition.ts';
+import { ident } from './pg/quote.ts';
+import { getDialect } from './registry.ts';
 
 export const get = <K extends Kind>(m: Model, id: string, kind?: K): ObjOf<K> => {
   const o = m.objects[id];
@@ -31,7 +32,8 @@ export const colName = (m: Model, id: string): string => get(m, id, 'column').na
 export const schemaName = (m: Model, o: Table | Enum | Sequence): string => get(m, o.parent, 'schema').name;
 
 /** 带 schema 的引用名：表、枚举、序列 */
-export const qname = (m: Model, o: Table | Enum | Sequence): string => qualified(schemaName(m, o), o.name);
+export const qname = (m: Model, o: Table | Enum | Sequence): string =>
+  getDialect(m.dialect).quoteQualified(schemaName(m, o), o.name);
 
 export const tableOfColumn = (m: Model, col: string): Table => get(m, get(m, col, 'column').parent, 'table');
 
@@ -171,7 +173,7 @@ export const indexElementNames = (m: Model, idx: Pick<Index, 'elements' | 'inclu
   return out;
 };
 
-/** 模型的一致性校验：引用都存在、同一命名空间内不重名。返回错误列表（空表示通过）。 */
+/** 模型的一致性校验：通用引用一致性 + 方言专属命名空间/长度/能力校验。返回错误列表（空表示通过）。 */
 export const validate = (m: Model): string[] => {
   const errs: string[] = [];
   const need = (o: Obj, ref: string | null | undefined, kind: Kind, what: string) => {
@@ -187,24 +189,14 @@ export const validate = (m: Model): string[] => {
         errs.push(`${o.kind} ${o.name}：${what} 引用的列 ${c} 不在表 ${table} 中`);
     }
   };
-  const ns = new Map<string, string>();
-  const claim = (space: string, name: string, o: Obj) => {
-    const k = `${space}\u0000${name}`;
-    const prev = ns.get(k);
-    if (prev && prev !== o.id) errs.push(`名字冲突：${name}（${space}）`);
-    ns.set(k, o.id);
-  };
 
-  for (const o of Object.values(m.objects)) {
-    if (o.id !== Object.keys(m.objects).find((k) => m.objects[k] === o))
-      errs.push(`对象 ${o.id} 的键与 id 不一致`);
+  for (const [k, o] of Object.entries(m.objects)) {
+    if (o.id !== k) errs.push(`对象 ${o.id} 的键与 id 不一致`);
     switch (o.kind) {
       case 'schema':
-        claim('schema', o.name, o);
         break;
       case 'extension':
         need(o, o.parent, 'schema', 'parent');
-        claim('extension', o.name, o);
         break;
       case 'opaque': {
         const p = m.objects[o.parent];
@@ -212,100 +204,37 @@ export const validate = (m: Model): string[] => {
           errs.push(`${o.objType} ${o.name}：parent 不存在`);
         for (const d of o.deps)
           if (!m.objects[d]) errs.push(`${o.objType} ${o.name}：依赖的对象 ${d} 不存在`);
-        claim(`opaque:${o.objType}:${o.parent}`, o.name, o);
         break;
       }
       case 'enum':
         need(o, o.parent, 'schema', 'parent');
-        claim(`type:${o.parent}`, o.name, o);
         if (new Set(o.values).size !== o.values.length) errs.push(`enum ${o.name}：值重复`);
         break;
       case 'sequence':
         need(o, o.parent, 'schema', 'parent');
         need(o, o.ownedBy, 'column', 'ownedBy');
-        claim(`rel:${o.parent}`, o.name, o);
         break;
-      case 'table': {
+      case 'table':
         need(o, o.parent, 'schema', 'parent');
         need(o, o.partitionOf?.parent, 'table', 'partitionOf');
-        if (o.partitionOf) {
-          const parentTable = m.objects[o.partitionOf.parent];
-          if (parentTable?.kind === 'table') {
-            if (parentTable.partitionBy === null)
-              errs.push(`table ${o.name}：partitionOf 指向的表 ${parentTable.name} 不是分区父表`);
-            // 环引用检测
-            const seen = new Set<string>([o.id]);
-            let cur: string | null = o.partitionOf.parent;
-            while (cur) {
-              if (seen.has(cur)) {
-                errs.push(`table ${o.name}：partitionOf 存在环引用`);
-                break;
-              }
-              seen.add(cur);
-              const next: Obj | undefined = m.objects[cur];
-              cur = next?.kind === 'table' && next.partitionOf ? next.partitionOf.parent : null;
-            }
-            if (parentTable.partitionBy && typeof parentTable.partitionBy !== 'string') {
-              const boundErr = validatePartitionBound(
-                parentTable.partitionBy.strategy,
-                o.partitionOf.bound,
-                parentTable.partitionBy.keys.length,
-              );
-              if (boundErr) errs.push(`table ${o.name}：${boundErr}`);
-            } else if (!o.partitionOf.bound.trim()) {
-              errs.push(`table ${o.name}：partitionOf.bound 不能为空`);
-            }
-          }
-        }
-        if (typeof o.partitionBy === 'string') {
-          if (o.partitionBy.trim() === '') errs.push(`table ${o.name}：partitionBy 不能为空字符串`);
-        } else if (o.partitionBy !== null) {
-          if (o.partitionBy.keys.length === 0) errs.push(`table ${o.name}：partitionBy 至少需要一个分区键`);
-          if (o.partitionBy.strategy === 'list' && o.partitionBy.keys.length !== 1)
-            errs.push(`table ${o.name}：LIST 分区策略只能有 1 个分区键`);
-          for (const k of o.partitionBy.keys) {
-            if (!!k.column === !!k.expr) errs.push(`table ${o.name}：分区键必须且只能指定列或表达式之一`);
-            if (k.column) {
-              colOfTable(o, o.id, [k.column], 'partitionBy');
-              const col = m.objects[k.column];
-              if (col?.kind === 'column' && col.generated)
-                errs.push(`table ${o.name}：生成列 ${col.name} 不能作为分区键`);
-            }
-          }
-        }
-        claim(`rel:${o.parent}`, o.name, o);
-        claim(`type:${o.parent}`, o.name, o); // 表自带同名的行类型
         break;
-      }
-      case 'column': {
+      case 'column':
         need(o, o.parent, 'table', 'parent');
         need(o, o.typeRef, 'enum', 'typeRef');
-        const parentTable = m.objects[o.parent];
-        if (parentTable?.kind === 'table' && parentTable.partitionOf !== null) {
-          const root = m.objects[rootTableId(m, parentTable.id)];
-          if (!(root?.kind === 'table' && typeof root.partitionBy === 'string')) {
-            errs.push(`列 ${o.name}：分区子表 ${parentTable.name} 不能直接拥有列，列应定义在根分区父表上`);
-          }
-        }
-        claim(`col:${o.parent}`, o.name, o);
         if (o.default && 'nextval' in o.default) need(o, o.default.nextval, 'sequence', 'default');
-        if (o.notNull && o.notNullName) claim(`con:${o.parent}`, o.notNullName, o);
         if (o.identity) {
           if (o.default) errs.push(`列 ${o.name}：identity 列不能有默认值`);
           if (!o.notNull) errs.push(`列 ${o.name}：identity 列必须 NOT NULL`);
-          if (parentTable?.kind === 'table') claim(`rel:${parentTable.parent}`, o.identity.sequenceName, o);
         }
         if (o.generated && (o.default || o.identity))
           errs.push(`列 ${o.name}：生成列不能有默认值或 identity`);
         break;
-      }
       case 'primaryKey':
       case 'unique':
       case 'foreignKey':
       case 'check':
       case 'index': {
         need(o, o.parent, 'table', 'parent');
-        const t = m.objects[o.parent];
         if (o.kind !== 'check') {
           const cols =
             o.kind === 'index'
@@ -322,30 +251,6 @@ export const validate = (m: Model): string[] => {
           for (const e of o.elements)
             if (!!e.column === !!e.expr) errs.push(`索引 ${o.name}：元素必须是列或表达式之一`);
         }
-        if (t?.kind === 'table' && t.partitionBy !== null) {
-          if (o.kind === 'check' && o.noInherit) {
-            errs.push(`检查约束 ${o.name}：分区父表的 CHECK 约束不能设为 NO INHERIT`);
-          }
-          const req = requiredUniquePartitionKeys(m, t.id);
-          if (o.kind === 'primaryKey' || o.kind === 'unique') {
-            const label = o.kind === 'primaryKey' ? '主键' : '唯一约束';
-            if (req.hasExprKey) {
-              errs.push(`${label} ${o.name}：包含表达式分区键的分区表不能创建主键或唯一约束`);
-            } else if (req.directCols.some((c) => !o.columns.includes(c))) {
-              errs.push(`${label} ${o.name}：分区表的主键或唯一约束必须包含全部分区键列`);
-            }
-          } else if (o.kind === 'index' && o.unique) {
-            if (req.hasExprKey) {
-              errs.push(`唯一索引 ${o.name}：包含表达式分区键的分区表不支持唯一索引`);
-            } else if (req.directCols.some((c) => !o.elements.some((e) => e.column === c))) {
-              errs.push(`唯一索引 ${o.name}：分区表的唯一索引必须包含全部分区键`);
-            }
-          }
-        }
-        // 主键、唯一约束和索引的名字同时占用关系命名空间（它们背后是索引）
-        if (o.kind !== 'index') claim(`con:${o.parent}`, o.name, o);
-        if ((o.kind === 'primaryKey' || o.kind === 'unique' || o.kind === 'index') && t?.kind === 'table')
-          claim(`rel:${t.parent}`, o.name, o);
         if (o.kind === 'primaryKey') {
           for (const c of o.columns) {
             const col = m.objects[c];
@@ -360,19 +265,7 @@ export const validate = (m: Model): string[] => {
   for (const t of all(m, 'table')) {
     const pks = childrenOf(m, t.id, 'primaryKey');
     if (pks.length > 1) errs.push(`表 ${t.name}：主键不止一个`);
-    if (t.partitionBy !== null) {
-      if (pks.length > 0) {
-        for (const desc of partitionDescendants(m, t.id)) {
-          if (childrenOf(m, desc.id, 'primaryKey').length > 0) {
-            errs.push(`表 ${desc.name}：祖先分区表 ${t.name} 已有主键，子分区不能再定义主键`);
-          }
-        }
-      }
-      const defaults = partitionsOf(m, t.id).filter(
-        (c) => parsePartitionBound(c.partitionOf!.bound)?.kind === 'default',
-      );
-      if (defaults.length > 1) errs.push(`表 ${t.name}：最多只能有 1 个 DEFAULT 子分区`);
-    }
   }
+  errs.push(...getDialect(m.dialect).validateModel(m));
   return errs;
 };

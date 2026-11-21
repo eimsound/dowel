@@ -4,11 +4,96 @@ import { z } from 'zod';
 
 export const FORMAT = 1;
 
+export const Dialect = z.enum(['pg', 'sqlite', 'mysql', 'mssql']);
+export type Dialect = z.infer<typeof Dialect>;
+
 const id = z.string().min(1);
-const name = z.string().min(1).max(63);
+/** 通用标识符上限 128 字符；具体方言上限由各 DialectSpec.validateModel 严格校验（PG 63B / MySQL 64C / MSSQL 128C / SQLite 128C） */
+const name = z.string().min(1).max(128);
 /** 推导名（按引擎规则由表名、列名算出，改名时跟着改）或显式名（用户指定或锁定，不跟着改） */
 const nameMode = z.enum(['derived', 'explicit']);
 const comment = z.string().nullable().default(null);
+
+// ───── 方言专属扩展槽位（可选，省略时不改变既有 PG IR 序列化） ─────
+
+export const SqliteTableExt = z.object({
+  withoutRowid: z.boolean().optional(),
+  strict: z.boolean().optional(),
+});
+
+export const MysqlTableExt = z.object({
+  engine: z.string().min(1).optional(),
+  charset: z.string().min(1).optional(),
+  collation: z.string().min(1).optional(),
+});
+
+export const MssqlTableExt = z.object({});
+
+export const TableExt = z.object({
+  sqlite: SqliteTableExt.optional(),
+  mysql: MysqlTableExt.optional(),
+  mssql: MssqlTableExt.optional(),
+});
+
+export const SqliteColumnExt = z.object({
+  autoincrement: z.boolean().optional(),
+});
+
+export const MysqlColumnExt = z.object({
+  unsigned: z.boolean().optional(),
+  zerofill: z.boolean().optional(),
+  autoIncrement: z.boolean().optional(),
+  charset: z.string().min(1).optional(),
+  onUpdateCurrentTimestamp: z.boolean().optional(),
+  enumValues: z.array(z.string()).optional(),
+  setValues: z.array(z.string()).optional(),
+});
+
+export const MssqlColumnExt = z.object({
+  identity: z
+    .object({
+      seed: z.string(),
+      increment: z.string(),
+    })
+    .optional(),
+  defaultName: name.optional(),
+  defaultNameMode: nameMode.optional(),
+  sparse: z.boolean().optional(),
+  rowguidcol: z.boolean().optional(),
+});
+
+export const ColumnExt = z.object({
+  sqlite: SqliteColumnExt.optional(),
+  mysql: MysqlColumnExt.optional(),
+  mssql: MssqlColumnExt.optional(),
+});
+
+export const MssqlKeyExt = z.object({
+  clustered: z.boolean().optional(),
+});
+
+export const PrimaryKeyExt = z.object({
+  mssql: MssqlKeyExt.optional(),
+});
+
+export const UniqueExt = z.object({
+  mssql: MssqlKeyExt.optional(),
+});
+
+export const MysqlIndexExt = z.object({
+  indexType: z.enum(['BTREE', 'HASH', 'FULLTEXT', 'SPATIAL']).optional(),
+  lengths: z.array(z.number().int().positive().nullable()).optional(),
+});
+
+export const MssqlIndexExt = z.object({
+  clustered: z.boolean().optional(),
+  fillFactor: z.number().int().min(1).max(100).optional(),
+});
+
+export const IndexExt = z.object({
+  mysql: MysqlIndexExt.optional(),
+  mssql: MssqlIndexExt.optional(),
+});
 
 export const Schema = z.object({
   id,
@@ -80,6 +165,7 @@ export const Table = z.object({
   /** 分区子表：所属的分区表和分区边界（如 `FOR VALUES FROM (...) TO (...)`） */
   partitionOf: z.object({ parent: id, bound: z.string() }).nullable().default(null),
   comment,
+  ext: TableExt.optional(),
 });
 
 export const ColumnDefault = z.union([
@@ -117,6 +203,7 @@ export const Column = z.object({
     .default(null),
   collation: z.string().nullable().default(null),
   comment,
+  ext: ColumnExt.optional(),
 });
 
 const constraintBase = {
@@ -131,6 +218,7 @@ export const PrimaryKey = z.object({
   ...constraintBase,
   kind: z.literal('primaryKey'),
   columns: z.array(id).min(1),
+  ext: PrimaryKeyExt.optional(),
 });
 
 export const Unique = z.object({
@@ -138,6 +226,7 @@ export const Unique = z.object({
   kind: z.literal('unique'),
   columns: z.array(id).min(1),
   nullsNotDistinct: z.boolean().default(false),
+  ext: UniqueExt.optional(),
 });
 
 export const FkAction = z.enum(['noAction', 'restrict', 'cascade', 'setNull', 'setDefault']);
@@ -180,6 +269,7 @@ export const Index = z.object({
   include: z.array(id).default([]),
   where: z.string().nullable().default(null),
   nullsNotDistinct: z.boolean().default(false),
+  ext: IndexExt.optional(),
 });
 
 export const Extension = z.object({
@@ -249,9 +339,23 @@ export const Obj = z.discriminatedUnion('kind', [
 
 export const Model = z.object({
   format: z.literal(FORMAT),
-  dialect: z.literal('pg'),
+  dialect: Dialect,
   objects: z.record(z.string(), Obj),
 });
+
+export type SqliteTableExt = z.infer<typeof SqliteTableExt>;
+export type MysqlTableExt = z.infer<typeof MysqlTableExt>;
+export type MssqlTableExt = z.infer<typeof MssqlTableExt>;
+export type TableExt = z.infer<typeof TableExt>;
+export type SqliteColumnExt = z.infer<typeof SqliteColumnExt>;
+export type MysqlColumnExt = z.infer<typeof MysqlColumnExt>;
+export type MssqlColumnExt = z.infer<typeof MssqlColumnExt>;
+export type ColumnExt = z.infer<typeof ColumnExt>;
+export type PrimaryKeyExt = z.infer<typeof PrimaryKeyExt>;
+export type UniqueExt = z.infer<typeof UniqueExt>;
+export type MysqlIndexExt = z.infer<typeof MysqlIndexExt>;
+export type MssqlIndexExt = z.infer<typeof MssqlIndexExt>;
+export type IndexExt = z.infer<typeof IndexExt>;
 
 export type Schema = z.infer<typeof Schema>;
 export type Extension = z.infer<typeof Extension>;
@@ -279,7 +383,7 @@ export type Model = z.infer<typeof Model>;
 export type Constraint = PrimaryKey | Unique | ForeignKey | Check;
 export type ObjOf<K extends Kind> = Extract<Obj, { kind: K }>;
 
-export const emptyModel = (): Model => ({ format: FORMAT, dialect: 'pg', objects: {} });
+export const emptyModel = (dialect: Dialect = 'pg'): Model => ({ format: FORMAT, dialect, objects: {} });
 
 export const isConstraint = (o: Obj): o is Constraint =>
   o.kind === 'primaryKey' || o.kind === 'unique' || o.kind === 'foreignKey' || o.kind === 'check';

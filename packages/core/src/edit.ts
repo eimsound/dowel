@@ -8,44 +8,39 @@ import type {
   Check,
   Column,
   ColumnDefault,
+  ColumnExt,
   Enum,
   ForeignKey,
   Index,
   IndexElement,
+  IndexExt,
   Model,
   Obj,
   PartitionSpec,
   PrimaryKey,
+  PrimaryKeyExt,
   Schema,
   Sequence,
   SequenceOptions,
   Table,
+  TableExt,
   Unique,
+  UniqueExt,
 } from './ir.ts';
 import { deepEqual } from './json.ts';
 import {
   all,
   childrenOf,
-  colName,
   columnsOf,
   effectiveColumnsOf,
   find,
   get,
-  indexElementNames,
   partitionDescendants,
   partitionsOf,
   requiredUniquePartitionKeys,
   rootTableId,
 } from './model.ts';
-import {
-  columnRefs,
-  exprReferences,
-  renameInExpr,
-  renameQualifiedInExpr,
-  type Token,
-  tokenize,
-} from './pg/expr.ts';
-import { chooseName, joinNames } from './pg/naming.ts';
+import { exprReferences, renameInExpr, renameQualifiedInExpr, type Token, tokenize } from './pg/expr.ts';
 import {
   derivedUuid,
   parsePartitionBound,
@@ -53,7 +48,8 @@ import {
   resolvePartitionBy,
   validatePartitionBound,
 } from './pg/partition.ts';
-import { KEYWORDS } from './pg/quote.ts';
+import { getDialect } from './registry.ts';
+import { SQLITE_STRICT_TYPES } from './sqlite/types.ts';
 
 export { EditError, exprReferences, renameInExpr, renameQualifiedInExpr, type Token, tokenize };
 
@@ -64,9 +60,17 @@ export { EditError, exprReferences, renameInExpr, renameQualifiedInExpr, type To
  * 只能发现明显的错误（如列已被改名、删除）；完整的语义校验由影子库完成。
  */
 export const checkExprColumns = (m: Model, table: string, expr: string) => {
-  const names = new Set(effectiveColumnsOf(m, table).map((c) => c.name));
-  const unknown = columnRefs(expr)
-    .filter((t) => !names.has(t.text) && !(t.kind === 'ident' && KEYWORDS.has(t.text)))
+  const d = getDialect(m.dialect);
+  const caseInsensitive = m.dialect === 'sqlite';
+  const names = new Set(
+    effectiveColumnsOf(m, table).map((c) => (caseInsensitive ? c.name.toLowerCase() : c.name)),
+  );
+  const unknown = d
+    .columnRefs(expr)
+    .filter((t) => {
+      const k = caseInsensitive ? t.text.toLowerCase() : t.text;
+      return !names.has(k) && !(t.kind === 'ident' && d.keywords.has(t.text.toLowerCase()));
+    })
     .map((t) => t.text);
   if (unknown.length) throw new EditError(`表达式引用了不存在的列：${[...new Set(unknown)].join('、')}`);
 };
@@ -96,83 +100,27 @@ export const rewriteExprs = (m: Model, f: (expr: string) => string) => {
 
 const schemaOf = (m: Model, tableId: string) => get(m, tableId, 'table').parent;
 
-/** 某个名字在关系命名空间（同 schema 的表、序列、索引）里是否被别的对象占用 */
 const relTaken = (m: Model, schema: string, name: string, self: string) =>
-  Object.values(m.objects).some((o) => {
-    if (o.id === self) return false;
-    if ((o.kind === 'table' || o.kind === 'sequence') && o.parent === schema) return o.name === name;
-    if (
-      (o.kind === 'index' || o.kind === 'primaryKey' || o.kind === 'unique') &&
-      schemaOf(m, o.parent) === schema
-    )
-      return o.name === name;
-    if (o.kind === 'column' && o.identity && self !== `${o.id}#seq` && schemaOf(m, o.parent) === schema)
-      return o.identity.sequenceName === name;
-    return false;
-  });
-/** 某个名字在表的约束命名空间里是否被别的对象占用 */
+  getDialect(m.dialect).isNameTaken(m, 'rel', schema, name, self);
+
 const conTaken = (m: Model, table: string, name: string, self: string) =>
-  Object.values(m.objects).some((o) => {
-    if (o.id === self) return false;
-    if (
-      (o.kind === 'primaryKey' || o.kind === 'unique' || o.kind === 'check' || o.kind === 'foreignKey') &&
-      o.parent === table
-    )
-      return o.name === name;
-    if (o.kind === 'column' && o.parent === table && o.notNull && self !== `${o.id}#nn`)
-      return o.notNullName === name;
-    return false;
-  });
+  getDialect(m.dialect).isNameTaken(m, 'con', table, name, self);
+
+const typeTaken = (m: Model, schema: string, name: string, self: string) =>
+  getDialect(m.dialect).isNameTaken(m, 'type', schema, name, self);
 
 /** 重新计算一张表上所有推导名（改表名、改列名、改约束列之后调用） */
 export const refreshDerivedNames = (m: Model, tableId: string) => {
-  const t = get(m, tableId, 'table');
-  const schema = t.parent;
-  const choose = (id: string, n1: string, n2: string | null, label: string, rel: boolean, con: boolean) =>
-    chooseName(
-      n1,
-      n2,
-      label,
-      (n) => (rel && relTaken(m, schema, n, id)) || (con && conTaken(m, tableId, n, id)),
-    );
-  for (const c of columnsOf(m, tableId)) {
-    if (c.notNull && c.notNullNameMode === 'derived')
-      c.notNullName = choose(`${c.id}#nn`, t.name, c.name, 'not_null', false, true);
-    if (c.identity?.sequenceNameMode === 'derived')
-      c.identity.sequenceName = choose(`${c.id}#seq`, t.name, c.name, 'seq', true, false);
-    for (const s of all(m, 'sequence'))
-      if (s.ownedBy === c.id && s.nameMode === 'derived')
-        s.name = choose(s.id, t.name, c.name, 'seq', true, false);
-  }
-  for (const o of Object.values(m.objects)) {
-    if (!('parent' in o) || o.parent !== tableId || !('nameMode' in o) || o.nameMode !== 'derived') continue;
-    switch (o.kind) {
-      case 'primaryKey':
-        o.name = choose(o.id, t.name, null, 'pkey', true, true);
-        break;
-      case 'unique':
-        o.name = choose(o.id, t.name, joinCols(m, o.columns), 'key', true, true);
-        break;
-      case 'foreignKey':
-        o.name = choose(o.id, t.name, joinCols(m, o.columns), 'fkey', false, true);
-        break;
-      case 'check': {
-        const refs = effectiveColumnsOf(m, tableId).filter((c) => exprReferences(o.expr, c.name));
-        o.name = choose(o.id, t.name, refs.length === 1 ? refs[0]!.name : null, 'check', false, true);
-        break;
-      }
-      case 'index':
-        o.name = choose(o.id, t.name, joinIdx(indexElementNames(m, o)), 'idx', true, false);
-        break;
-    }
-  }
+  getDialect(m.dialect).refreshDerivedNames(m, tableId);
 };
-const joinCols = (m: Model, ids: string[]) => joinNames(ids.map((c) => colName(m, c)));
-const joinIdx = (names: string[]) => joinNames(names);
 
 // ───── schema ─────
 
 export const createSchema = (m: Model, name: string, id = newId()): string => {
+  const cap = getDialect(m.dialect).capabilities;
+  if (!cap.schemas && name !== cap.defaultSchema) {
+    throw new EditError(`当前方言不支持多 schema（固定为 ${cap.defaultSchema}）`);
+  }
   if (all(m, 'schema').some((s) => s.name === name)) throw new EditError(`schema ${name} 已存在`);
   const o: Schema = { id, kind: 'schema', name, comment: null };
   m.objects[o.id] = o;
@@ -180,15 +128,22 @@ export const createSchema = (m: Model, name: string, id = newId()): string => {
 };
 
 export const renameSchema = (m: Model, id: string, name: string) => {
+  if (!getDialect(m.dialect).capabilities.schemas) {
+    throw new EditError('当前方言不支持重命名 schema');
+  }
   if (all(m, 'schema').some((s) => s.name === name && s.id !== id))
     throw new EditError(`schema ${name} 已存在`);
   const s = get(m, id, 'schema');
   const old = s.name;
   s.name = name;
-  rewriteExprs(m, (e) => renameQualifiedInExpr(e, old, null, { schema: name, name: null }));
+  const d = getDialect(m.dialect);
+  rewriteExprs(m, (e) => d.renameQualifiedInExpr(e, old, null, { schema: name, name: null }));
 };
 
 export const dropSchema = (m: Model, id: string) => {
+  if (!getDialect(m.dialect).capabilities.schemas) {
+    throw new EditError('当前方言不支持删除默认 schema');
+  }
   for (const t of childrenOf(m, id, 'table')) dropTable(m, t.id);
   for (const s of childrenOf(m, id, 'sequence')) dropSequence(m, s.id);
   for (const e of childrenOf(m, id, 'enum')) dropEnum(m, e.id);
@@ -197,12 +152,6 @@ export const dropSchema = (m: Model, id: string) => {
 
 // ───── 枚举、序列 ─────
 
-const typeTaken = (m: Model, schema: string, name: string, self: string) =>
-  Object.values(m.objects).some(
-    (o) =>
-      o.id !== self && (o.kind === 'enum' || o.kind === 'table') && o.parent === schema && o.name === name,
-  );
-
 export const createEnum = (
   m: Model,
   schema: string,
@@ -210,6 +159,7 @@ export const createEnum = (
   values: string[],
   id = newId(),
 ): string => {
+  if (!getDialect(m.dialect).capabilities.enums) throw new EditError('当前方言不支持独立枚举类型');
   get(m, schema, 'schema');
   if (typeTaken(m, schema, name, '')) throw new EditError(`类型名 ${name} 已被占用`);
   if (!values.length || new Set(values).size !== values.length) throw new EditError('枚举值不能为空或重复');
@@ -219,22 +169,26 @@ export const createEnum = (
 };
 
 export const renameEnum = (m: Model, id: string, name: string) => {
+  if (!getDialect(m.dialect).capabilities.enums) throw new EditError('当前方言不支持独立枚举类型');
   const e = get(m, id, 'enum');
   if (typeTaken(m, e.parent, name, id)) throw new EditError(`类型名 ${name} 已被占用`);
   const schema = get(m, e.parent, 'schema').name;
   const old = e.name;
   e.name = name;
-  rewriteExprs(m, (x) => renameQualifiedInExpr(x, schema, old, { schema, name }));
+  const d = getDialect(m.dialect);
+  rewriteExprs(m, (x) => d.renameQualifiedInExpr(x, schema, old, { schema, name }));
 };
 
 /** 在第 index 个位置插入新值（PG 只支持新增，不支持删除或重排） */
 export const addEnumValue = (m: Model, id: string, value: string, index?: number) => {
+  if (!getDialect(m.dialect).capabilities.enums) throw new EditError('当前方言不支持独立枚举类型');
   const e = get(m, id, 'enum');
   if (e.values.includes(value)) throw new EditError(`枚举值 ${value} 已存在`);
   e.values.splice(index ?? e.values.length, 0, value);
 };
 
 export const dropEnum = (m: Model, id: string) => {
+  if (!getDialect(m.dialect).capabilities.enums) throw new EditError('当前方言不支持独立枚举类型');
   get(m, id, 'enum');
   if (all(m, 'column').some((c) => c.typeRef === id)) throw new EditError('枚举仍被列使用');
   delete m.objects[id];
@@ -247,6 +201,7 @@ export const createSequence = (
   options: Partial<SequenceOptions> = {},
   id = newId(),
 ): string => {
+  if (!getDialect(m.dialect).capabilities.sequences) throw new EditError('当前方言不支持独立序列');
   get(m, schema, 'schema');
   if (relTaken(m, schema, name, '')) throw new EditError(`名字 ${name} 已被占用`);
   const o: Sequence = {
@@ -273,6 +228,7 @@ export const createSequence = (
 };
 
 export const renameSequence = (m: Model, id: string, name: string) => {
+  if (!getDialect(m.dialect).capabilities.sequences) throw new EditError('当前方言不支持独立序列');
   const s = get(m, id, 'sequence');
   if (relTaken(m, s.parent, name, id)) throw new EditError(`名字 ${name} 已被占用`);
   s.name = name;
@@ -280,6 +236,7 @@ export const renameSequence = (m: Model, id: string, name: string) => {
 };
 
 export const dropSequence = (m: Model, id: string) => {
+  if (!getDialect(m.dialect).capabilities.sequences) throw new EditError('当前方言不支持独立序列');
   get(m, id, 'sequence');
   for (const c of all(m, 'column'))
     if (c.default && 'nextval' in c.default && c.default.nextval === id) c.default = null;
@@ -294,6 +251,7 @@ export const createTable = (
   name: string,
   id = newId(),
   partitionBy: PartitionSpec | null = null,
+  ext?: TableExt,
 ): string => {
   get(m, schema, 'schema');
   if (id in m.objects) throw new EditError(`对象 ID ${id} 已存在`);
@@ -307,6 +265,7 @@ export const createTable = (
     partitionBy: null,
     partitionOf: null,
     comment: null,
+    ...(ext !== undefined ? { ext } : {}),
   };
   m.objects[o.id] = o;
   if (partitionBy !== null) {
@@ -318,6 +277,50 @@ export const createTable = (
     }
   }
   return o.id;
+};
+
+/** 更新表的方言专属扩展选项（如 SQLite STRICT / WITHOUT ROWID、MySQL ENGINE / CHARSET） */
+export const setTableExt = (m: Model, id: string, ext: TableExt | null) => {
+  const t = get(m, id, 'table');
+  if (m.dialect === 'sqlite' && ext?.sqlite) {
+    if (ext.sqlite.withoutRowid) {
+      const pks = childrenOf(m, id, 'primaryKey');
+      if (pks.length === 0) throw new EditError('WITHOUT ROWID 表必须先定义主键');
+      for (const c of columnsOf(m, id)) {
+        if (c.ext?.sqlite?.autoincrement) {
+          throw new EditError(`列 ${c.name} 启用了 AUTOINCREMENT，不能开启 WITHOUT ROWID`);
+        }
+      }
+    }
+    if (ext.sqlite.strict) {
+      for (const c of columnsOf(m, id)) {
+        if (!SQLITE_STRICT_TYPES.has(c.type.trim().toUpperCase())) {
+          throw new EditError(
+            `列 ${c.name} 的类型 ${c.type} 不符合 STRICT 表要求（仅允许 INT/INTEGER/REAL/TEXT/BLOB/ANY）`,
+          );
+        }
+      }
+    }
+  }
+  const cleaned = cleanExt(ext);
+  if (cleaned) t.ext = cleaned as TableExt;
+  else delete t.ext;
+};
+
+const cleanExt = <T extends Record<string, unknown>>(ext: T | null | undefined): T | undefined => {
+  if (!ext) return undefined;
+  const out: Record<string, unknown> = {};
+  for (const [k, v] of Object.entries(ext)) {
+    if (v && typeof v === 'object' && !Array.isArray(v)) {
+      const inner = Object.fromEntries(
+        Object.entries(v as Record<string, unknown>).filter(([, iv]) => iv !== undefined),
+      );
+      if (Object.keys(inner).length > 0) out[k] = inner;
+    } else if (v !== undefined) {
+      out[k] = v;
+    }
+  }
+  return Object.keys(out).length > 0 ? (out as T) : undefined;
 };
 
 export const renameTable = (m: Model, id: string, name: string) => {
@@ -501,6 +504,7 @@ const nextDetId = (m: Model, seed: string): string => {
 };
 
 export const setPartitionBy = (m: Model, tableId: string, spec: PartitionSpec | null) => {
+  if (!getDialect(m.dialect).capabilities.partitioning) throw new EditError('当前方言不支持分区表');
   const t = get(m, tableId, 'table');
   normalizePartitionFamily(m, tableId);
   const children = partitionsOf(m, tableId);
@@ -536,6 +540,7 @@ export const createPartition = (
   id = newId(),
   schemaId?: string,
 ): string => {
+  if (!getDialect(m.dialect).capabilities.partitioning) throw new EditError('当前方言不支持分区表');
   const parent = get(m, parentId, 'table');
   normalizePartitionFamily(m, parentId);
   if (id in m.objects) throw new EditError(`对象 ID ${id} 已存在`);
@@ -569,6 +574,7 @@ export const createPartition = (
 };
 
 export const setPartitionBound = (m: Model, childId: string, bound: string) => {
+  if (!getDialect(m.dialect).capabilities.partitioning) throw new EditError('当前方言不支持分区表');
   const child = get(m, childId, 'table');
   normalizePartitionFamily(m, childId);
   if (!child.partitionOf) throw new EditError(`表 ${child.name} 不是分区子表`);
@@ -623,6 +629,7 @@ const remapColRefsOnTable = (m: Model, tableId: string, colMap: Map<string, stri
 };
 
 export const attachPartition = (m: Model, parentId: string, childId: string, bound: string) => {
+  if (!getDialect(m.dialect).capabilities.partitioning) throw new EditError('当前方言不支持分区表');
   const parent = get(m, parentId, 'table');
   const child = get(m, childId, 'table');
   normalizePartitionFamily(m, parentId);
@@ -795,6 +802,7 @@ export const attachPartition = (m: Model, parentId: string, childId: string, bou
 };
 
 export const detachPartition = (m: Model, childId: string) => {
+  if (!getDialect(m.dialect).capabilities.partitioning) throw new EditError('当前方言不支持分区表');
   const child = get(m, childId, 'table');
   normalizePartitionFamily(m, childId);
   if (!child.partitionOf) throw new EditError(`表 ${child.name} 不是分区子表`);
@@ -947,19 +955,40 @@ export interface ColumnSpec {
   before?: string;
   /** 指定 ID（同步层要求客户端和服务器执行同一修改时生成相同的 ID） */
   id?: string;
+  /** 方言专属列扩展 */
+  ext?: ColumnExt;
 }
 
 export const addColumn = (m: Model, table: string, spec: ColumnSpec): string => {
   const t = get(m, table, 'table');
+  const d = getDialect(m.dialect);
   normalizePartitionFamily(m, table);
   assertNotPartitionChild(m, table);
+  if (spec.identity && !d.capabilities.sequences) {
+    throw new EditError('当前方言不支持 PG IDENTITY');
+  }
+  if (spec.typeRef && !d.capabilities.enums) {
+    throw new EditError('当前方言不支持独立枚举类型');
+  }
   const cols = columnsOf(m, table);
-  if (cols.some((c) => c.name === spec.name)) throw new EditError(`列 ${spec.name} 已存在`);
+  const dup =
+    m.dialect === 'sqlite'
+      ? cols.some((c) => c.name.toLowerCase() === spec.name.toLowerCase())
+      : cols.some((c) => c.name === spec.name);
+  if (dup) throw new EditError(`列 ${spec.name} 已存在`);
+  if (
+    m.dialect === 'sqlite' &&
+    t.ext?.sqlite?.strict &&
+    !SQLITE_STRICT_TYPES.has(spec.type.trim().toUpperCase())
+  ) {
+    throw new EditError(`STRICT 表不支持列类型 ${spec.type}（仅允许 INT/INTEGER/REAL/TEXT/BLOB/ANY）`);
+  }
   let pos: string;
   if (spec.before) {
     const i = cols.findIndex((c) => c.id === spec.before);
     pos = generateKeyBetween(cols[i - 1]?.pos ?? null, cols[i]!.pos);
   } else pos = generateKeyBetween(cols.at(-1)?.pos ?? null, null);
+  const cleanedExt = cleanExt(spec.ext);
   const c: Column = {
     id: spec.id ?? newId(),
     kind: 'column',
@@ -991,6 +1020,7 @@ export const addColumn = (m: Model, table: string, spec: ColumnSpec): string => 
     generated: spec.generated ?? null,
     collation: spec.collation ?? null,
     comment: null,
+    ...(cleanedExt ? { ext: cleanedExt as ColumnExt } : {}),
   };
   if (c.identity) c.identity.options.type = identityType(c.type);
   m.objects[c.id] = c;
@@ -998,15 +1028,41 @@ export const addColumn = (m: Model, table: string, spec: ColumnSpec): string => 
   return c.id;
 };
 
+/** 更新列的方言专属扩展选项（如 SQLite AUTOINCREMENT、MySQL UNSIGNED/AUTO_INCREMENT） */
+export const setColumnExt = (m: Model, id: string, ext: ColumnExt | null) => {
+  const c = get(m, id, 'column');
+  assertNotPartitionChild(m, c.parent);
+  if (m.dialect === 'sqlite' && ext?.sqlite?.autoincrement) {
+    const t = get(m, c.parent, 'table');
+    if (t.ext?.sqlite?.withoutRowid) {
+      throw new EditError('WITHOUT ROWID 表不能使用 AUTOINCREMENT');
+    }
+    if (c.type.trim().toUpperCase() !== 'INTEGER') {
+      throw new EditError('AUTOINCREMENT 只能用于 INTEGER 类型列');
+    }
+    const pk = childrenOf(m, c.parent, 'primaryKey')[0];
+    if (!pk || pk.columns.length !== 1 || pk.columns[0] !== c.id) {
+      throw new EditError('AUTOINCREMENT 只能用于单列主键');
+    }
+  }
+  const cleaned = cleanExt(ext);
+  if (cleaned) c.ext = cleaned as ColumnExt;
+  else delete c.ext;
+};
+
 const identityType = (type: string): SequenceOptions['type'] =>
   type === 'smallint' ? 'smallint' : type === 'integer' ? 'integer' : 'bigint';
 
 export const renameColumn = (m: Model, id: string, name: string) => {
   const c = get(m, id, 'column');
+  const d = getDialect(m.dialect);
   assertNotPartitionChild(m, c.parent);
   normalizePartitionFamily(m, c.parent);
-  if (columnsOf(m, c.parent).some((x) => x.name === name && x.id !== id))
-    throw new EditError(`列 ${name} 已存在`);
+  const dup =
+    m.dialect === 'sqlite'
+      ? columnsOf(m, c.parent).some((x) => x.id !== id && x.name.toLowerCase() === name.toLowerCase())
+      : columnsOf(m, c.parent).some((x) => x.name === name && x.id !== id);
+  if (dup) throw new EditError(`列 ${name} 已存在`);
   const old = c.name;
   c.name = name;
   // 同表及所有后代子分区表达式里对这一列的引用一起改写
@@ -1014,19 +1070,19 @@ export const renameColumn = (m: Model, id: string, name: string) => {
   for (const tid of affected) {
     const table = get(m, tid, 'table');
     if (table.partitionBy && typeof table.partitionBy !== 'string') {
-      for (const k of table.partitionBy.keys) if (k.expr) k.expr = renameInExpr(k.expr, old, name);
+      for (const k of table.partitionBy.keys) if (k.expr) k.expr = d.renameInExpr(k.expr, old, name);
     }
   }
   for (const o of Object.values(m.objects)) {
     if (!('parent' in o) || !affected.has(o.parent)) continue;
-    if (o.kind === 'check') o.expr = renameInExpr(o.expr, old, name);
+    if (o.kind === 'check') o.expr = d.renameInExpr(o.expr, old, name);
     if (o.kind === 'index') {
-      for (const e of o.elements) if (e.expr) e.expr = renameInExpr(e.expr, old, name);
-      if (o.where) o.where = renameInExpr(o.where, old, name);
+      for (const e of o.elements) if (e.expr) e.expr = d.renameInExpr(e.expr, old, name);
+      if (o.where) o.where = d.renameInExpr(o.where, old, name);
     }
     if (o.kind === 'column') {
-      if (o.generated) o.generated.expr = renameInExpr(o.generated.expr, old, name);
-      if (o.default && 'expr' in o.default) o.default.expr = renameInExpr(o.default.expr, old, name);
+      if (o.generated) o.generated.expr = d.renameInExpr(o.generated.expr, old, name);
+      if (o.default && 'expr' in o.default) o.default.expr = d.renameInExpr(o.default.expr, old, name);
     }
   }
   for (const tid of affected) refreshDerivedNames(m, tid);
@@ -1035,10 +1091,11 @@ export const renameColumn = (m: Model, id: string, name: string) => {
 /** 删列：依赖它的约束、索引、外键、生成列、属于它的序列一并删除 */
 export const dropColumn = (m: Model, id: string) => {
   const c = get(m, id, 'column');
+  const d = getDialect(m.dialect);
   assertNotPartitionChild(m, c.parent);
   normalizePartitionFamily(m, c.parent);
   assertNotPartitionKeyCol(m, id, '删除');
-  const affected = new Set([c.parent, ...partitionDescendants(m, c.parent).map((d) => d.id)]);
+  const affected = new Set([c.parent, ...partitionDescendants(m, c.parent).map((x) => x.id)]);
   const uses = (o: Obj): boolean => {
     switch (o.kind) {
       case 'primaryKey':
@@ -1047,17 +1104,17 @@ export const dropColumn = (m: Model, id: string) => {
       case 'foreignKey':
         return o.columns.includes(id) || o.refColumns.includes(id);
       case 'check':
-        return affected.has(o.parent) && exprReferences(o.expr, c.name);
+        return affected.has(o.parent) && d.exprReferences(o.expr, c.name);
       case 'index':
         return (
           affected.has(o.parent) &&
-          (o.elements.some((e) => e.column === id || (e.expr && exprReferences(e.expr, c.name))) ||
+          (o.elements.some((e) => e.column === id || (e.expr && d.exprReferences(e.expr, c.name))) ||
             o.include.includes(id) ||
-            (!!o.where && exprReferences(o.where, c.name)))
+            (!!o.where && d.exprReferences(o.where, c.name)))
         );
       case 'column':
         return (
-          o.id !== id && o.parent === c.parent && !!o.generated && exprReferences(o.generated.expr, c.name)
+          o.id !== id && o.parent === c.parent && !!o.generated && d.exprReferences(o.generated.expr, c.name)
         );
       case 'sequence':
         return o.ownedBy === id;
@@ -1079,7 +1136,22 @@ export const setColumnType = (m: Model, id: string, type: string, typeRef: strin
   assertNotPartitionChild(m, c.parent);
   normalizePartitionFamily(m, c.parent);
   assertNotPartitionKeyCol(m, id, '修改类型');
-  if (typeRef) get(m, typeRef, 'enum');
+  if (typeRef) {
+    if (!getDialect(m.dialect).capabilities.enums) throw new EditError('当前方言不支持独立枚举类型');
+    get(m, typeRef, 'enum');
+  }
+  if (m.dialect === 'sqlite') {
+    const t = get(m, c.parent, 'table');
+    if (t.ext?.sqlite?.strict && !SQLITE_STRICT_TYPES.has(type.trim().toUpperCase())) {
+      throw new EditError(`STRICT 表不支持列类型 ${type}（仅允许 INT/INTEGER/REAL/TEXT/BLOB/ANY）`);
+    }
+    if (c.ext?.sqlite?.autoincrement && type.trim().toUpperCase() !== 'INTEGER') {
+      const nextExt = { ...c.ext, sqlite: { ...c.ext.sqlite, autoincrement: undefined } };
+      const cleaned = cleanExt(nextExt);
+      if (cleaned) c.ext = cleaned as ColumnExt;
+      else delete c.ext;
+    }
+  }
   c.type = type;
   c.typeRef = typeRef;
   if (c.identity) c.identity.options.type = identityType(type);
@@ -1109,6 +1181,9 @@ export const setDefault = (m: Model, id: string, def: ColumnDefault | null) => {
 };
 
 export const setIdentity = (m: Model, id: string, identity: { always: boolean } | null) => {
+  if (identity && !getDialect(m.dialect).capabilities.sequences) {
+    throw new EditError('当前方言不支持 PG IDENTITY');
+  }
   const c = get(m, id, 'column');
   assertNotPartitionChild(m, c.parent);
   normalizePartitionFamily(m, c.parent);
@@ -1169,7 +1244,13 @@ const checkCols = (m: Model, table: string, cols: string[]) => {
   }
 };
 
-export const addPrimaryKey = (m: Model, table: string, columns: string[], id = newId()): string => {
+export const addPrimaryKey = (
+  m: Model,
+  table: string,
+  columns: string[],
+  id = newId(),
+  ext?: PrimaryKeyExt,
+): string => {
   const t = get(m, table, 'table');
   normalizePartitionFamily(m, table);
   checkCols(m, table, columns);
@@ -1193,7 +1274,13 @@ export const addPrimaryKey = (m: Model, table: string, columns: string[], id = n
       col.notNullNameMode = 'derived';
     }
   }
-  const o: PrimaryKey = { ...keyBase(table, id), kind: 'primaryKey', columns };
+  const cleanedExt = cleanExt(ext);
+  const o: PrimaryKey = {
+    ...keyBase(table, id),
+    kind: 'primaryKey',
+    columns,
+    ...(cleanedExt ? { ext: cleanedExt as PrimaryKeyExt } : {}),
+  };
   m.objects[o.id] = o;
   refreshDerivedNames(m, table);
   if (t.partitionOf) refreshDerivedNames(m, rootTableId(m, table));
@@ -1206,13 +1293,24 @@ export const addUnique = (
   columns: string[],
   nullsNotDistinct = false,
   id = newId(),
+  ext?: UniqueExt,
 ): string => {
+  if (nullsNotDistinct && !getDialect(m.dialect).capabilities.nullsNotDistinct) {
+    throw new EditError('当前方言不支持 NULLS NOT DISTINCT');
+  }
   const t = get(m, table, 'table');
   normalizePartitionFamily(m, table);
   checkCols(m, table, columns);
   if (t.partitionBy !== null)
     assertPartitionConstraintCompat(requiredUniquePartitionKeys(m, table), 'unique', columns);
-  const o: Unique = { ...keyBase(table, id), kind: 'unique', columns, nullsNotDistinct };
+  const cleanedExt = cleanExt(ext);
+  const o: Unique = {
+    ...keyBase(table, id),
+    kind: 'unique',
+    columns,
+    nullsNotDistinct,
+    ...(cleanedExt ? { ext: cleanedExt as UniqueExt } : {}),
+  };
   m.objects[o.id] = o;
   refreshDerivedNames(m, table);
   return o.id;
@@ -1267,9 +1365,12 @@ export const addIndex = (
   m: Model,
   table: string,
   elements: Partial<IndexElement>[],
-  opts: Partial<Pick<Index, 'unique' | 'method' | 'include' | 'where' | 'nullsNotDistinct'>> = {},
+  opts: Partial<Pick<Index, 'unique' | 'method' | 'include' | 'where' | 'nullsNotDistinct' | 'ext'>> = {},
   id = newId(),
 ): string => {
+  if (opts.nullsNotDistinct && !getDialect(m.dialect).capabilities.nullsNotDistinct) {
+    throw new EditError('当前方言不支持 NULLS NOT DISTINCT');
+  }
   const t = get(m, table, 'table');
   normalizePartitionFamily(m, table);
   const fullElements: IndexElement[] = elements.map((e) => ({
@@ -1289,6 +1390,8 @@ export const addIndex = (
   if (opts.unique && t.partitionBy !== null) {
     assertPartitionConstraintCompat(requiredUniquePartitionKeys(m, table), 'index', [], fullElements);
   }
+  const { ext, ...restOpts } = opts;
+  const cleanedExt = cleanExt(ext);
   const o: Index = {
     ...keyBase(table, id),
     kind: 'index',
@@ -1297,8 +1400,9 @@ export const addIndex = (
     include: [],
     where: null,
     nullsNotDistinct: false,
-    ...opts,
+    ...restOpts,
     elements: fullElements,
+    ...(cleanedExt ? { ext: cleanedExt as IndexExt } : {}),
   };
   m.objects[o.id] = o;
   refreshDerivedNames(m, table);
@@ -1319,6 +1423,21 @@ export const dropKey = (m: Model, id: string) => {
   )
     throw new EditError('不是约束或索引');
   normalizePartitionFamily(m, o.parent);
+  if (o.kind === 'primaryKey' && m.dialect === 'sqlite') {
+    const t = get(m, o.parent, 'table');
+    if (t.ext?.sqlite?.withoutRowid) {
+      throw new EditError('WITHOUT ROWID 表不能删除主键，请先关闭 WITHOUT ROWID');
+    }
+    for (const cid of o.columns) {
+      const col = find(m, cid);
+      if (col?.kind === 'column' && col.ext?.sqlite?.autoincrement) {
+        const nextExt = { ...col.ext, sqlite: { ...col.ext.sqlite, autoincrement: undefined } };
+        const cleaned = cleanExt(nextExt);
+        if (cleaned) col.ext = cleaned as ColumnExt;
+        else delete col.ext;
+      }
+    }
+  }
   const keyCols =
     o.kind === 'primaryKey' || o.kind === 'unique'
       ? o.columns
@@ -1347,7 +1466,7 @@ export const renameKey = (m: Model, id: string, name: string) => {
   )
     throw new EditError('不是约束或索引');
   normalizePartitionFamily(m, o.parent);
-  const rel = o.kind !== 'check' && o.kind !== 'foreignKey';
+  const rel = m.dialect === 'sqlite' ? o.kind === 'index' : o.kind !== 'check' && o.kind !== 'foreignKey';
   const con = o.kind !== 'index';
   if ((rel && relTaken(m, schemaOf(m, o.parent), name, id)) || (con && conTaken(m, o.parent, name, id)))
     throw new EditError(`名字 ${name} 已被占用`);
