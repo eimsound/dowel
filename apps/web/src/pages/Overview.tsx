@@ -84,20 +84,21 @@ export const Overview = () => {
               <dd className="m-0 font-mono">{dialectUiSpec(project.dialect).name}</dd>
             </>
           )}
-          {(project.envPgMajors.length > 1 ||
-            (project.targetPgMajor !== null && project.targetPgMajor < 18)) && (
-            <>
-              <dt className="text-text-2">{t('ov.targetPg')}</dt>
-              <dd className="m-0 flex flex-wrap items-center gap-2">
-                <span className="font-mono">PostgreSQL {project.targetPgMajor}+</span>
-                {project.envPgMajors.length > 1 && (
-                  <span className="font-mono text-xs text-text-3">
-                    ({project.envPgMajors.map((v) => `PG ${v}`).join(' · ')})
-                  </span>
-                )}
-              </dd>
-            </>
-          )}
+          {project.dialect === 'pg' &&
+            (project.envPgMajors.length > 1 ||
+              (project.targetPgMajor !== null && project.targetPgMajor < 18)) && (
+              <>
+                <dt className="text-text-2">{t('ov.targetPg')}</dt>
+                <dd className="m-0 flex flex-wrap items-center gap-2">
+                  <span className="font-mono">PostgreSQL {project.targetPgMajor}+</span>
+                  {project.envPgMajors.length > 1 && (
+                    <span className="font-mono text-xs text-text-3">
+                      ({project.envPgMajors.map((v) => `PG ${v}`).join(' · ')})
+                    </span>
+                  )}
+                </dd>
+              </>
+            )}
         </dl>
 
         <div className="grid grid-cols-2 gap-6 max-[1100px]:grid-cols-1">
@@ -147,33 +148,32 @@ export const Overview = () => {
               <EmptyHint>{t('ov.noEnv')}</EmptyHint>
             ) : (
               <Rows>
-                {(envs.data ?? []).map((e) => (
-                  <Row key={e.id}>
-                    <Database size={16} aria-hidden="true" className="shrink-0 text-text-3" />
-                    <Link
-                      to="/project/$owner/$project/environments/$eid"
-                      params={{ ...params, eid: e.id }}
-                      className="min-w-0 flex-1 truncate font-mono font-medium no-underline"
-                    >
-                      {e.name}
-                    </Link>
-                    {formatEngineVersion(project.dialect, e.engineVersion, e.engineMajor) && (
-                      <span className="chip shrink-0 font-mono">
-                        {formatEngineVersion(
-                          project.dialect,
-                          project.dialect === 'pg' ? null : e.engineVersion,
-                          e.engineMajor,
-                        )}
-                      </span>
-                    )}
-                    {e.production && <span className="badge danger">{t('ov.envProduction')}</span>}
-                    {e.drift.status === 'drifted' || e.drift.status === 'error' ? (
-                      <DriftBadge drift={e.drift} />
-                    ) : (
-                      <span className="chip">{t('ov.envConfigured')}</span>
-                    )}
-                  </Row>
-                ))}
+                {(envs.data ?? []).map((e) => {
+                  const verLabel = formatEngineVersion(
+                    project.dialect,
+                    project.dialect === 'pg' && e.engineMajor !== null ? null : e.engineVersion,
+                    e.engineMajor,
+                  );
+                  return (
+                    <Row key={e.id}>
+                      <Database size={16} aria-hidden="true" className="shrink-0 text-text-3" />
+                      <Link
+                        to="/project/$owner/$project/environments/$eid"
+                        params={{ ...params, eid: e.id }}
+                        className="min-w-0 flex-1 truncate font-mono font-medium no-underline"
+                      >
+                        {e.name}
+                      </Link>
+                      {verLabel && <span className="chip shrink-0 font-mono">{verLabel}</span>}
+                      {e.production && <span className="badge danger">{t('ov.envProduction')}</span>}
+                      {e.drift.status === 'drifted' || e.drift.status === 'error' ? (
+                        <DriftBadge drift={e.drift} />
+                      ) : (
+                        <span className="chip">{t('ov.envConfigured')}</span>
+                      )}
+                    </Row>
+                  );
+                })}
               </Rows>
             )}
             <p className="hint">{t('ov.configOnly')}</p>

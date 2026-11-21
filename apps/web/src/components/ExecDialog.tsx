@@ -11,12 +11,14 @@ import type {
   ExecEvent,
   ExecRequestDetail,
 } from '@dowel/api';
+import type { Dialect } from '@dowel/core';
 import { useQueryClient } from '@tanstack/react-query';
 import { CircleCheck, CircleDashed, LoaderCircle } from 'lucide-react';
 import { useEffect, useId, useRef, useState } from 'react';
 import { useTranslation } from 'react-i18next';
 
 import { ApiError, api } from '../api.ts';
+import { dialectUiSpec } from '../dialects.ts';
 import { streamExec } from '../envs.ts';
 import { Modal } from './Modal.tsx';
 import { PolicySummary } from './PolicyEditor.tsx';
@@ -89,9 +91,18 @@ type DryState =
  * 预演结果：确认对话框打开时先调用 dryRun（做完全部执行前检查，不写目标库也不写平台库的登记），
  * 把“现在执行会做什么 / 为什么会被拒绝”显示出来。
  */
-const DryRunPanel = ({ dry, onRetry }: { dry: DryState; onRetry: () => void }) => {
+const DryRunPanel = ({
+  dry,
+  onRetry,
+  dialect = 'pg',
+}: {
+  dry: DryState;
+  onRetry: () => void;
+  dialect?: Dialect;
+}) => {
   const { t } = useTranslation();
   const versionName = useVersionName();
+  const uiSpec = dialectUiSpec(dialect);
   if (dry.state === 'loading')
     return (
       <p role="status" className="m-0 inline-flex items-center gap-1.5 text-sm text-text-2">
@@ -139,7 +150,11 @@ const DryRunPanel = ({ dry, onRetry }: { dry: DryState; onRetry: () => void }) =
       </Banner>
       {plan.firstRun === 'empty' && <p className="hint m-0">{t('tk.dry.firstRunEmpty')}</p>}
       {plan.firstRun === 'baseline' && <p className="hint m-0">{t('tk.dry.firstRunBaseline')}</p>}
-      {plan.createsHistory && <p className="hint m-0">{t('tk.dry.createsHistory')}</p>}
+      {plan.createsHistory && (
+        <p className="hint m-0">
+          {t(uiSpec.historyStorage === 'prefix' ? 'tk.dry.createsHistoryPrefix' : 'tk.dry.createsHistory')}
+        </p>
+      )}
       {plan.resume && (
         <p className="hint m-0">
           {t('tk.dry.resume', {
@@ -200,6 +215,7 @@ export const ExecDialog = ({
   eid,
   envName,
   production,
+  dialect = 'pg',
   status,
   kind,
   to,
@@ -211,6 +227,7 @@ export const ExecDialog = ({
   eid: string;
   envName: string;
   production: boolean;
+  dialect?: Dialect;
   status: EnvStatus;
   kind: ExecKind;
   to?: EnvVersion;
@@ -220,6 +237,10 @@ export const ExecDialog = ({
   onRequested?: (r: ExecRequestDetail) => void;
 }) => {
   const { t } = useTranslation();
+  const uiSpec = dialectUiSpec(dialect);
+  const nonTxHint = t(
+    dialect === 'pg' ? 'envx.nonTx' : dialect === 'mysql' ? 'envx.nonTxMysql' : 'envx.nonTxGeneric',
+  );
   const qc = useQueryClient();
   const versionName = useVersionName();
   const inputId = useId();
@@ -413,7 +434,12 @@ export const ExecDialog = ({
           <>
             <p className="text-sm text-text-2">
               {kind === 'execute'
-                ? t('envx.exec.executeIntro', { count: migrations.length })
+                ? uiSpec.transactionalDdl
+                  ? t('envx.exec.executeIntro', { count: migrations.length })
+                  : t('envx.exec.executeIntroNonTx', {
+                      count: migrations.length,
+                      dialect: uiSpec.name,
+                    })
                 : t('envx.exec.rollbackIntro', { count: migrations.length })}
             </p>
             <ol
@@ -434,7 +460,7 @@ export const ExecDialog = ({
                       {t('envx.exec.steps', { count: kind === 'execute' ? v.upSteps : v.downSteps })}
                     </span>
                     {kind === 'execute' && v.nonTransactional && (
-                      <span className="risk medium" title={t('envx.nonTx')}>
+                      <span className="risk medium" title={nonTxHint}>
                         {t('envx.nonTxShort')}
                       </span>
                     )}
@@ -460,12 +486,14 @@ export const ExecDialog = ({
             </ol>
             {kind === 'rollback' && <p className="hint">{t('envx.exec.rollbackNoRisk')}</p>}
             {kind === 'execute' && migrations.some((v) => v.nonTransactional) && (
-              <p className="hint">{t('envx.nonTx')}</p>
+              <p className="hint">{nonTxHint}</p>
             )}
           </>
         )}
 
-        {phase === 'confirm' && <DryRunPanel dry={dry} onRetry={() => setDryTick((n) => n + 1)} />}
+        {phase === 'confirm' && (
+          <DryRunPanel dry={dry} onRetry={() => setDryTick((n) => n + 1)} dialect={dialect} />
+        )}
 
         {phase === 'confirm' && isRequest && (
           <div className="space-y-2">

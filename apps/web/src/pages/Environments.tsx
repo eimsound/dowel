@@ -11,6 +11,7 @@ import type {
   RunInfo,
   TargetInfo,
 } from '@dowel/api';
+import type { Dialect } from '@dowel/core';
 import { useMutation, useQueryClient } from '@tanstack/react-query';
 import { Link, useNavigate, useParams } from '@tanstack/react-router';
 import {
@@ -152,6 +153,7 @@ const EnvForm = ({ pid }: { pid: string }) => {
   } | null>(null);
   const attachCodeOf = (e: Error | null) =>
     e instanceof ApiError && e.status === 409 ? (e.body as { code?: string } | undefined)?.code : undefined;
+  const shadowHintId = useId();
   const add = useMutation<
     unknown,
     Error,
@@ -252,7 +254,8 @@ const EnvForm = ({ pid }: { pid: string }) => {
       }}
     >
       <h2 className="section-title">{t('envp.add')}</h2>
-      <p className="hint">{t('dlg.envHint')}</p>
+      <p className="hint">{uiSpec.requiresExternalShadow ? t('dlg.envHint') : t('envp.addHintSqlite')}</p>
+      {project.dialect === 'mssql' && <Banner kind="info">{t('wiz.mssqlTlsHint')}</Banner>}
       <div className="grid grid-cols-2 gap-x-3 gap-y-2.5 max-[800px]:grid-cols-1">
         <label className="field">
           <span className="label">{t('dlg.envName')}</span>
@@ -262,6 +265,9 @@ const EnvForm = ({ pid }: { pid: string }) => {
             value={form.name}
             onChange={set('name')}
             placeholder="dev"
+            autoCapitalize="none"
+            autoCorrect="off"
+            spellCheck={false}
             required
           />
         </label>
@@ -292,18 +298,25 @@ const EnvForm = ({ pid }: { pid: string }) => {
           )}
         </div>
         {uiSpec.requiresExternalShadow && (
-          <label className="field col-span-2">
-            <span className="label">{t('dlg.envShadowUrl')}</span>
-            <input
-              className="input font-mono"
-              aria-label={t('dlg.envShadowUrl')}
-              value={form.shadowUrl}
-              onChange={set('shadowUrl')}
-              autoCapitalize="none"
-              autoCorrect="off"
-              spellCheck={false}
-            />
-          </label>
+          <div className="field col-span-2">
+            <label className="field">
+              <span className="label">{t('dlg.envShadowUrl')}</span>
+              <input
+                className="input font-mono"
+                aria-label={t('dlg.envShadowUrl')}
+                aria-describedby={shadowHintId}
+                value={form.shadowUrl}
+                onChange={set('shadowUrl')}
+                placeholder={uiSpec.shadowPlaceholder}
+                autoCapitalize="none"
+                autoCorrect="off"
+                spellCheck={false}
+              />
+            </label>
+            <span id={shadowHintId} className="hint">
+              {t('wiz.envShadowHint')}
+            </span>
+          </div>
         )}
         <div className="checks col-span-2">
           <label>
@@ -469,12 +482,17 @@ const VERSION_STATE_KEY = {
 const VersionChain = ({
   status,
   params,
+  dialect,
 }: {
   status: EnvStatus;
   params: { owner: string; project: string };
+  dialect: Dialect;
 }) => {
   const { t } = useTranslation();
   const versionName = useVersionName();
+  const nonTxHint = t(
+    dialect === 'pg' ? 'envx.nonTx' : dialect === 'mysql' ? 'envx.nonTxMysql' : 'envx.nonTxGeneric',
+  );
   return (
     <Rows>
       {[...status.versions].reverse().map((v) => (
@@ -489,7 +507,7 @@ const VersionChain = ({
           </Link>
           <VersionBadges v={{ verifiedAt: v.verified ? 'x' : null, edited: v.edited }} />
           {v.nonTransactional && (
-            <span className="risk medium" title={t('envx.nonTx')}>
+            <span className="risk medium" title={nonTxHint}>
               {t('envx.nonTxShort')}
             </span>
           )}
@@ -665,6 +683,7 @@ const EnvironmentDetailView = ({ eid }: { eid: string }) => {
         text: uiSpec.requiresExternalShadow
           ? t('dlg.envTested', {
               ...r,
+              dialect: uiSpec.name,
               exists: r.shadowExists ? t('dlg.envShadowExists') : '',
               createdb: r.canCreateDb ? t('dlg.envCanCreate') : t('dlg.envCannotCreate'),
             })
@@ -1149,7 +1168,7 @@ const EnvironmentDetailView = ({ eid }: { eid: string }) => {
             {status && status.versions.length === 0 ? (
               <EmptyHint>{t('envx.noVersions')}</EmptyHint>
             ) : status ? (
-              <VersionChain status={status} params={params} />
+              <VersionChain status={status} params={params} dialect={project.dialect} />
             ) : statusQ.error ? (
               <Banner kind="danger" role="alert">
                 {statusQ.error.message}
@@ -1280,6 +1299,7 @@ const EnvironmentDetailView = ({ eid }: { eid: string }) => {
           eid={eid}
           envName={env.name}
           production={env.production}
+          dialect={project.dialect}
           status={status}
           kind={dlg.kind}
           to={dlg.to}

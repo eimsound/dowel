@@ -82,12 +82,37 @@ export const Model = () => {
     prevRole.current = liveRole;
   }, [liveRole, project.role, qc, pid, toast, t]);
 
+  const uiSpec = dialectUiSpec(model.dialect);
+  const newSequence = useCallback(() => {
+    if (readOnly || !uiSpec.sequences) return;
+    const schema =
+      Object.values(model.objects).find((o) => o.kind === 'schema' && o.name === uiSpec.defaultSchema) ??
+      Object.values(model.objects).find((o) => o.kind === 'schema');
+    if (!schema) return;
+    const taken = new Set(
+      Object.values(model.objects)
+        .filter((o) => o.kind === 'table' || o.kind === 'sequence')
+        .map((o) => o.name.toLowerCase()),
+    );
+    let n = 1;
+    while (taken.has(`seq_${n}`)) n++;
+    const id = newId();
+    if (ws.act('createSequence', { id, schema: schema.id, name: `seq_${n}` })) {
+      setSelected(id);
+    }
+  }, [model.objects, readOnly, uiSpec.defaultSchema, uiSpec.sequences, ws]);
+
   // 对象树放在应用外壳的侧面板里；选中项变化时更新
-  useShellPanel(t('ws.objects'), <Sidebar model={model} selected={selected} onSelect={setSelected} />, [
-    model,
-    selected,
-    t,
-  ]);
+  useShellPanel(
+    t('ws.objects'),
+    <Sidebar
+      model={model}
+      selected={selected}
+      onSelect={setSelected}
+      onAddSequence={!readOnly && uiSpec.sequences ? newSequence : undefined}
+    />,
+    [model, selected, t, readOnly, uiSpec.sequences, newSequence],
+  );
 
   // 命令面板要能搜到当前模型里的表：把表清单登记到一个模块级的小注册表（离开模型页时清空）
   useEffect(() => {
@@ -118,7 +143,12 @@ export const Model = () => {
     if (tab !== 'sql') return '';
     try {
       return formatScript(
-        createAll(model, project.targetPgMajor !== null ? { pgMajor: project.targetPgMajor } : undefined),
+        createAll(
+          model,
+          model.dialect === 'pg' && project.targetPgMajor !== null
+            ? { pgMajor: project.targetPgMajor }
+            : undefined,
+        ),
         model.dialect,
       );
     } catch (e) {
@@ -143,7 +173,6 @@ export const Model = () => {
     });
   };
 
-  const uiSpec = dialectUiSpec(model.dialect);
   const newTable = () => {
     const schema =
       Object.values(model.objects).find((o) => o.kind === 'schema' && o.name === uiSpec.defaultSchema) ??

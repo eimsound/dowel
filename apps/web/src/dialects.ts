@@ -11,7 +11,9 @@ export interface DialectUiSpec {
   enums: boolean;
   sequences: boolean;
   partitioning: boolean;
+  transactionalDdl: boolean;
   requiresExternalShadow: boolean;
+  historyStorage: 'schema' | 'prefix';
   comments: boolean;
   urlPlaceholder: string;
   shadowPlaceholder: string;
@@ -34,7 +36,9 @@ export const DIALECT_UI_SPECS: Record<Dialect, DialectUiSpec> = {
     enums: capsOf('pg')?.enums ?? true,
     sequences: capsOf('pg')?.sequences ?? true,
     partitioning: capsOf('pg')?.partitioning ?? true,
+    transactionalDdl: capsOf('pg')?.transactionalDdl ?? true,
     requiresExternalShadow: capsOf('pg')?.requiresExternalShadow ?? true,
+    historyStorage: capsOf('pg')?.historyStorage ?? 'schema',
     comments: capsOf('pg')?.comments ?? true,
     urlPlaceholder: 'postgres://user:password@host:5432/db',
     shadowPlaceholder: 'postgres://user:password@shadow-host:5432/empty_db',
@@ -52,7 +56,9 @@ export const DIALECT_UI_SPECS: Record<Dialect, DialectUiSpec> = {
     enums: capsOf('sqlite')?.enums ?? false,
     sequences: capsOf('sqlite')?.sequences ?? false,
     partitioning: capsOf('sqlite')?.partitioning ?? false,
+    transactionalDdl: capsOf('sqlite')?.transactionalDdl ?? true,
     requiresExternalShadow: capsOf('sqlite')?.requiresExternalShadow ?? false,
+    historyStorage: capsOf('sqlite')?.historyStorage ?? 'prefix',
     comments: capsOf('sqlite')?.comments ?? false,
     urlPlaceholder: 'sqlite:///data/app.db',
     shadowPlaceholder: '',
@@ -76,12 +82,20 @@ export const DIALECT_UI_SPECS: Record<Dialect, DialectUiSpec> = {
     enums: capsOf('mysql')?.enums ?? false,
     sequences: capsOf('mysql')?.sequences ?? false,
     partitioning: capsOf('mysql')?.partitioning ?? false,
+    transactionalDdl: capsOf('mysql')?.transactionalDdl ?? false,
     requiresExternalShadow: capsOf('mysql')?.requiresExternalShadow ?? true,
+    historyStorage: capsOf('mysql')?.historyStorage ?? 'prefix',
     comments: capsOf('mysql')?.comments ?? true,
     urlPlaceholder: 'mysql://user:password@host:3306/db',
     shadowPlaceholder: 'mysql://user:password@shadow-host:3306/empty_db',
     defaultColumnType: 'varchar(255)',
-    defaultPkColumn: (id) => ({ id, name: 'id', type: 'bigint', notNull: true }),
+    defaultPkColumn: (id) => ({
+      id,
+      name: 'id',
+      type: 'bigint',
+      notNull: true,
+      ext: { mysql: { autoIncrement: true } },
+    }),
     autoPrimaryKey: true,
   },
   mssql: {
@@ -94,12 +108,20 @@ export const DIALECT_UI_SPECS: Record<Dialect, DialectUiSpec> = {
     enums: capsOf('mssql')?.enums ?? false,
     sequences: capsOf('mssql')?.sequences ?? true,
     partitioning: capsOf('mssql')?.partitioning ?? false,
+    transactionalDdl: capsOf('mssql')?.transactionalDdl ?? true,
     requiresExternalShadow: capsOf('mssql')?.requiresExternalShadow ?? true,
+    historyStorage: capsOf('mssql')?.historyStorage ?? 'schema',
     comments: capsOf('mssql')?.comments ?? true,
-    urlPlaceholder: 'mssql://user:password@host:1433/db',
-    shadowPlaceholder: 'mssql://user:password@shadow-host:1433/empty_db',
+    urlPlaceholder: 'mssql://user:password@host:1433/db?encrypt=true',
+    shadowPlaceholder: 'mssql://user:password@shadow-host:1433/empty_db?encrypt=true',
     defaultColumnType: 'nvarchar(255)',
-    defaultPkColumn: (id) => ({ id, name: 'id', type: 'bigint', notNull: true }),
+    defaultPkColumn: (id) => ({
+      id,
+      name: 'id',
+      type: 'bigint',
+      notNull: true,
+      ext: { mssql: { identity: { seed: '1', increment: '1' } } },
+    }),
     autoPrimaryKey: true,
   },
 };
@@ -123,7 +145,8 @@ export const formatEngineVersion = (
   engineMajor: number | null,
   full = false,
 ): string | null => {
-  const ver = engineVersion ?? (engineMajor !== null ? String(engineMajor) : null);
+  const trimmed = engineVersion?.trim() || null;
+  const ver = trimmed ?? (engineMajor !== null ? String(engineMajor) : null);
   if (!ver) return null;
   const spec = dialectUiSpec(dialect);
   return `${full ? spec.name : spec.shortName} ${ver}`;
