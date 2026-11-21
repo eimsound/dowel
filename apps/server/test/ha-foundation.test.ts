@@ -1228,6 +1228,54 @@ describe('HaCoordinator 续租超时、有界停机与防租约复活（#23）',
     }
   });
 
+  test('定期清理过期租约挂起期间调用 ha.stop() 按 stopTimeoutMs 有界退出并删除自身租约（#45）', async () => {
+    const baseDb = await openPlatformDb(':memory:');
+    const warnSpy = vi.spyOn(console, 'warn').mockImplementation(() => {});
+
+    let cleanupStarted!: () => void;
+    const cleanupEntered = new Promise<void>((r) => {
+      cleanupStarted = r;
+    });
+    const neverResolve = new Promise<never>(() => {});
+
+    const wrappedDb: PlatformDb = {
+      ...baseDb,
+      query: async <T>(q: string, params?: unknown[]) => {
+        if (q.includes('delete from ha_leases') && q.includes("key like 'node:%'")) {
+          cleanupStarted();
+          return neverResolve;
+        }
+        return baseDb.query<T>(q, params);
+      },
+    };
+
+    const ha = new HaCoordinator(wrappedDb, {
+      replicaId: 'node-cleanup-hang',
+      ttlMs: 2_000,
+      heartbeatIntervalMs: 40,
+      renewTimeoutMs: 5_000,
+      stopTimeoutMs: 90,
+      expiredLeaseRetentionMs: 60_000,
+      leaseCleanupIntervalMs: 50,
+    });
+
+    try {
+      await ha.start();
+      expect(await ha.isNodeAlive('node-cleanup-hang')).toBe(true);
+
+      await cleanupEntered;
+      const t0 = Date.now();
+      await ha.stop();
+      const elapsed = Date.now() - t0;
+      expect(elapsed).toBeGreaterThanOrEqual(60);
+      expect(elapsed).toBeLessThan(1_000);
+      expect(await ha.isNodeAlive('node-cleanup-hang')).toBe(false);
+    } finally {
+      await baseDb.close();
+      warnSpy.mockRestore();
+    }
+  });
+
   test('openPlatformDb 对 PG 黑洞端口按 connectTimeoutSec 及时建连超时，不会挂起默认 30s', async () => {
     const sockets = new Set<Socket>();
     const server = createServer((socket) => {

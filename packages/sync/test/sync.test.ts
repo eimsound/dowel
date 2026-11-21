@@ -734,6 +734,224 @@ describe('同步：固定场景', () => {
       message: '表 t5 已被 用户5 修改，请在最新数据上重新操作',
     });
   });
+
+  test('SyncClient 在 lastSeq > 0（处于 log 窗口内）且拒绝记录被淘汰后重连：服务端下发 snapshot，pending 清空且视图收敛', async () => {
+    const room = new Room(emptyRoomState(emptyModel()), memoryStore(), {
+      logLimit: 2000,
+      rejectionsPerClientLimit: 1,
+      rejectionsLimit: 1,
+    });
+    const zhang = new SyncClient('zhang', emptyModel());
+    const li = new SyncClient('li', emptyModel());
+
+    const deliver = async (sender: SyncClient, user: string, msg: ToServer, dropToSender = false) => {
+      const outs = await room.handle(sender.id, user, structuredClone(msg));
+      for (const o of outs) {
+        if (o.to === '*') {
+          if (!dropToSender || sender !== zhang) zhang.receive(structuredClone(o.msg));
+          if (!dropToSender || sender !== li) li.receive(structuredClone(o.msg));
+        } else if (o.to === zhang.id && (!dropToSender || sender !== zhang)) {
+          zhang.receive(structuredClone(o.msg));
+        } else if (o.to === li.id && (!dropToSender || sender !== li)) {
+          li.receive(structuredClone(o.msg));
+        }
+      }
+      return outs;
+    };
+
+    // 同步辅助：顺序发送客户端发出的消息
+    const wire = (c: SyncClient, user: string, opts: { dropReply?: boolean } = {}) => {
+      const sent: ToServer[] = [];
+      c.send = (m) => {
+        sent.push(structuredClone(m));
+      };
+      return async () => {
+        const allOuts: Awaited<ReturnType<typeof room.handle>> = [];
+        while (sent.length) {
+          const m = sent.shift()!;
+          allOuts.push(...(await deliver(c, user, m, opts.dropReply)));
+        }
+        return allOuts;
+      };
+    };
+
+    const flushZhang = wire(zhang, '张三');
+    const flushLi = wire(li, '李四');
+
+    // 建立初始模型并同步到两端（seq = 4，远小于 logLimit=2000）
+    zhang.connect();
+    li.connect();
+    await flushZhang();
+    await flushLi();
+
+    zhang.mutate('createSchema', { id: 's', name: 'public' });
+    zhang.mutate('createTable', { id: 't', schema: 's', name: 'users' });
+    zhang.mutate('addColumn', { table: 't', column: { id: 'c1', name: 'email', type: 'text' } });
+    zhang.mutate('addColumn', { table: 't', column: { id: 'c2', name: 'age', type: 'integer' } });
+    await flushZhang();
+    expect(li.seq).toBe(4);
+    expect(same(li.view, room.model)).toBe(true);
+
+    // 张三先将 email 改名为 mail（seq = 5），但先不推给李四（模拟网络延迟/断线窗口）
+    const zhangMsg: ToServer[] = [];
+    zhang.send = (m) => zhangMsg.push(structuredClone(m));
+    zhang.mutate('renameColumn', { id: 'c1', name: 'mail' });
+    for (const m of zhangMsg) {
+      const outs = await room.handle('zhang', '张三', m);
+      for (const o of outs) {
+        if (o.to === '*' || o.to === 'zhang') zhang.receive(structuredClone(o.msg));
+      }
+    }
+    expect(room.seq).toBe(5);
+    expect(li.seq).toBe(4);
+
+    // 李四基于旧视图修改 c1，op(n=1) 到达服务端被拒绝，但李四在收到 reject 之前就断线了
+    const liOpMsgs: ToServer[] = [];
+    li.send = (m) => liOpMsgs.push(structuredClone(m));
+    li.mutate('renameColumn', { id: 'c1', name: 'e2' });
+    expect(li.pending).toHaveLength(1);
+    expect(li.viewVersions.c1).toBe('p:li:1');
+    const rejOuts = await room.handle('li', '李四', liOpMsgs[0]!);
+    expect(rejOuts[0]?.msg).toMatchObject({ t: 'reject', n: 1, code: 'conflict' });
+    li.disconnect();
+
+    // 另一客户端产生拒绝，把李四在 s.rejections 中的唯一拒绝记录淘汰（此时 seq=5 仍在 s.log 窗口内）
+    const otherRej = await room.handle('other', '王五', {
+      t: 'op',
+      op: { client: 'other', n: 1, name: 'renameSchema', args: { id: 'missing', name: 'x' }, reads: [] },
+    });
+    expect(otherRej[0]?.msg).toMatchObject({ t: 'reject', n: 1, code: 'invalid' });
+    expect(room.stats.rejections).toBe(1);
+    expect(room.stats.evictedRejectionWatermarks).toBe(1);
+
+    // 李四带 lastSeq=4 重连：服务端必须走 snapshot 分支兜底，不能仅发增量 log
+    const flushLiReconnect = wire(li, '李四');
+    li.connect();
+    const reconnectOuts = await flushLiReconnect();
+    expect(reconnectOuts.map((o) => o.msg.t)).toEqual(['welcome', 'snapshot']);
+    expect(reconnectOuts[0]?.msg).toEqual({ t: 'welcome', lastProcessed: 1, rejected: [] });
+    expect(li.pending).toEqual([]);
+    expect(li.seq).toBe(5);
+    expect(same(li.view, room.model)).toBe(true);
+    expect(li.viewVersions.c1).toBe(5);
+
+    // 李四继续编辑同一列 c1：不再携带残留的 p:li:1，能够正常提交生效
+    li.mutate('renameColumn', { id: 'c1', name: 'contact_email' });
+    const nextOuts = await flushLiReconnect();
+    expect(nextOuts[0]?.msg).toMatchObject({ t: 'commit', client: 'li', n: 2 });
+    expect(li.pending).toEqual([]);
+    expect(same(li.view, room.model)).toBe(true);
+    expect(all(room.model, 'column').find((c) => c.id === 'c1')?.name).toBe('contact_email');
+  });
+
+  test('evictedRejectionWatermark 有界淘汰防泄漏，溢出后兼容全量重放、缺口外部拒绝与 hello 快照兜底', async () => {
+    const room = new Room(emptyRoomState(emptyModel()), memoryStore(), {
+      logLimit: 2000,
+      rejectionsPerClientLimit: 1,
+      rejectionsLimit: 2,
+      evictedRejectionWatermarkLimit: 3,
+    });
+
+    // 先写入一个 schema 提交，使 s.log 非空（seq = 1）
+    await room.handle('seed', '初始化', {
+      t: 'op',
+      op: { client: 'seed', n: 1, name: 'createSchema', args: { id: 's', name: 'public' }, reads: [] },
+    });
+
+    // 8 个不同客户端各触发 1 次拒绝：仅留最新 2 个在 rejections，evictedRejectionWatermark 严格封顶为 3
+    for (let i = 1; i <= 8; i++) {
+      const cid = `tab-${i}`;
+      const out = await room.handle(cid, `用户${i}`, {
+        t: 'op',
+        op: { client: cid, n: 1, name: 'renameSchema', args: { id: 'missing', name: `x${i}` }, reads: [] },
+      });
+      expect(out[0]?.msg).toMatchObject({ t: 'reject', n: 1, code: 'invalid' });
+    }
+    expect(room.stats.rejections).toBe(2);
+    expect(room.stats.evictedRejectionWatermarks).toBe(3);
+
+    // 溢出后全量重放被挤出 watermark 的老客户端 tab-1..tab-6：均幂等返回 false，绝不挤掉活跃的 tab-7 / tab-8
+    for (let i = 1; i <= 6; i++) {
+      expect(room.applyExternalRejection(`tab-${i}`, { n: 1, code: 'invalid', message: '旧拒绝' })).toBe(
+        false,
+      );
+    }
+    expect(room.stats.rejections).toBe(2);
+    const tab7Hello = await room.handle('tab-7', '用户7', { t: 'hello', client: 'tab-7', lastSeq: 1 });
+    expect(tab7Hello[0]?.msg).toMatchObject({
+      t: 'welcome',
+      lastProcessed: 1,
+      rejected: [expect.objectContaining({ n: 1 })],
+    });
+    const tab8Hello = await room.handle('tab-8', '用户8', { t: 'hello', client: 'tab-8', lastSeq: 1 });
+    expect(tab8Hello[0]?.msg).toMatchObject({
+      t: 'welcome',
+      lastProcessed: 1,
+      rejected: [expect.objectContaining({ n: 1 })],
+    });
+
+    // watermark 溢出后，被挤出 watermark 的老客户端 tab-1 带 lastSeq=1（在 log 窗口内）重连必须安全走 snapshot
+    const tab1Hello = await room.handle('tab-1', '用户1', { t: 'hello', client: 'tab-1', lastSeq: 1 });
+    expect(tab1Hello.map((o) => o.msg.t)).toEqual(['welcome', 'snapshot']);
+    expect(tab1Hello[0]?.msg).toEqual({ t: 'welcome', lastProcessed: 1, rejected: [] });
+
+    // 无历史处理的只读客户端（lastProcessed=0）带 lastSeq=1 重连仍可走增量 log，不被误伤
+    const viewerHello = await room.handle('viewer-1', '只读', {
+      t: 'hello',
+      client: 'viewer-1',
+      lastSeq: 1,
+    });
+    expect(viewerHello.map((o) => o.msg.t)).toEqual(['welcome']);
+
+    // watermark 溢出后，外部提交出现跳号（prevProcessed=0, commit.n=2）产生的合法缺口 n=1 仍可被 applyExternalRejection 合入
+    expect(
+      room.applyExternalCommit({
+        t: 'commit',
+        seq: room.seq + 1,
+        client: 'gap-client',
+        n: 2,
+        user: '远端用户',
+        changes: [
+          {
+            id: 't_gap',
+            obj: {
+              kind: 'table',
+              id: 't_gap',
+              parent: 's',
+              name: 'gap_tbl',
+              partitionBy: null,
+              partitionOf: null,
+              comment: null,
+            },
+          },
+        ],
+      }),
+    ).toBe(true);
+    expect(room.applyExternalRejection('gap-client', { n: 1, code: 'conflict', message: '缺口拒绝' })).toBe(
+      true,
+    );
+    // 缺口消费后再次重放同一拒绝返回 false
+    expect(room.applyExternalRejection('gap-client', { n: 1, code: 'conflict', message: '缺口拒绝' })).toBe(
+      false,
+    );
+    // 老客户端 tab-1 产生真正更新的外部拒绝 n=2 仍可正常合入
+    expect(room.applyExternalRejection('tab-1', { n: 2, code: 'conflict', message: '新拒绝' })).toBe(true);
+    expect(room.stats.evictedRejectionWatermarks).toBeLessThanOrEqual(3);
+
+    // 构造器重载包含大量不同客户端拒绝记录时，evictedRejectionWatermark 同样受上限约束
+    const hugeState = emptyRoomState(emptyModel());
+    for (let i = 1; i <= 10; i++) {
+      hugeState.processed[`old-${i}`] = 1;
+      hugeState.rejections[`old-${i}`] = [{ n: 1, code: 'conflict', message: `r${i}` }];
+    }
+    const reloaded = new Room(hugeState, memoryStore(), {
+      rejectionsPerClientLimit: 1,
+      rejectionsLimit: 2,
+      evictedRejectionWatermarkLimit: 3,
+    });
+    expect(reloaded.stats.rejections).toBe(2);
+    expect(reloaded.stats.evictedRejectionWatermarks).toBe(3);
+  });
 });
 
 // ───── 随机测试 ─────

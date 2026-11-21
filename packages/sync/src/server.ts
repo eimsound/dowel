@@ -42,6 +42,7 @@ export const DEFAULT_OUTCOME_LIMIT = 4000;
 export const DEFAULT_REJECTIONS_PER_CLIENT_LIMIT = 200;
 export const DEFAULT_REJECTIONS_LIMIT = 2000;
 export const DEFAULT_LAST_WRITER_LIMIT = 10_000;
+export const DEFAULT_EVICTED_REJECTION_WATERMARK_LIMIT = 10_000;
 
 export interface RoomOptions {
   /** 内存中保留的最近提交条数上限（默认 2000） */
@@ -54,6 +55,8 @@ export interface RoomOptions {
   rejectionsLimit?: number;
   /** lastWriter 映射表最大条目数上限（默认 10000；对象删除时会同步移除对应条目） */
   lastWriterLimit?: number;
+  /** evictedRejectionWatermark 映射表最大客户端数上限（默认 Math.max(rejectionsLimit * 4, 10000)） */
+  evictedRejectionWatermarkLimit?: number;
 }
 
 export interface RoomMemoryStats {
@@ -62,6 +65,7 @@ export interface RoomMemoryStats {
   lastWriter: number;
   rejections: number;
   rejectionClients: number;
+  evictedRejectionWatermarks: number;
 }
 
 const normalizeLimit = (value: number | undefined, fallback: number): number =>
@@ -77,13 +81,18 @@ export class Room {
   private lastWriter = new Map<string, string>();
   /** 内存中保留的拒绝记录全局 FIFO 顺序（key = `${client}:${n}`），用于跨客户端总量裁剪 */
   private rejectionOrder = new Map<string, { client: string; n: number }>();
-  /** 每个客户端已因容量上限淘汰的最大拒绝序号，防止外部追赶全量重放旧拒绝时挤掉活跃记录 */
+  /** 每个客户端已因容量上限淘汰的最大拒绝序号（有界），防止外部追赶重放旧拒绝挤掉活跃记录并触发 hello 快照兜底 */
   private evictedRejectionWatermark = new Map<string, number>();
+  /** evictedRejectionWatermark 是否曾发生容量溢出（溢出后对老客户端保守走 snapshot 兜底并拦截无缺口旧重放） */
+  private watermarkOverflowed = false;
+  /** 外部提交跳号产生的待合入拒绝序号区间（用于 watermark 溢出后仍放行合法乱序的外部拒绝） */
+  private externalRejectionGaps = new Map<string, { from: number; to: number }[]>();
   logLimit: number;
   readonly outcomeLimit: number;
   readonly rejectionsPerClientLimit: number;
   readonly rejectionsLimit: number;
   readonly lastWriterLimit: number;
+  readonly evictedRejectionWatermarkLimit: number;
 
   constructor(state: RoomState, store: RoomStore, options: RoomOptions = {}) {
     this.s = state;
@@ -96,6 +105,10 @@ export class Room {
     );
     this.rejectionsLimit = normalizeLimit(options.rejectionsLimit, DEFAULT_REJECTIONS_LIMIT);
     this.lastWriterLimit = normalizeLimit(options.lastWriterLimit, DEFAULT_LAST_WRITER_LIMIT);
+    this.evictedRejectionWatermarkLimit = normalizeLimit(
+      options.evictedRejectionWatermarkLimit,
+      Math.max(this.rejectionsLimit * 4, DEFAULT_EVICTED_REJECTION_WATERMARK_LIMIT),
+    );
 
     const lastSeenSeqByClient = new Map<string, number>();
     for (const c of state.log) {
@@ -157,6 +170,7 @@ export class Room {
       lastWriter: this.lastWriter.size,
       rejections: this.rejectionOrder.size,
       rejectionClients: Object.keys(this.s.rejections).length,
+      evictedRejectionWatermarks: this.evictedRejectionWatermark.size,
     };
   }
 
@@ -234,7 +248,11 @@ export class Room {
       if (c.obj) next.objects[c.id] = structuredClone(c.obj);
       else delete next.objects[c.id];
     }
-    if ((s.processed[commit.client] ?? 0) < commit.n) {
+    const prevProcessed = s.processed[commit.client] ?? 0;
+    if (commit.client !== SYSTEM_CLIENT && commit.n > prevProcessed + 1) {
+      this.recordExternalRejectionGap(commit.client, prevProcessed + 1, commit.n - 1);
+    }
+    if (prevProcessed < commit.n) {
       s.processed[commit.client] = commit.n;
     }
     this.commit(commit, next, commit.user);
@@ -247,8 +265,15 @@ export class Room {
     const s = this.s;
     const key = `${client}:${r.n}`;
     if (this.outcome.get(key) === 'rejected') return false;
+    const done = s.processed[client] ?? 0;
+    if (r.n <= done) {
+      const inGap = this.consumeExternalRejectionGap(client, r.n);
+      if (this.watermarkOverflowed && !inGap) {
+        return false;
+      }
+    }
     if (!this.recordRejection(client, r)) return false;
-    if ((s.processed[client] ?? 0) < r.n) {
+    if (done < r.n) {
       s.processed[client] = r.n;
     }
     this.recordOutcome(key, 'rejected');
@@ -282,8 +307,62 @@ export class Room {
   }
 
   private markEvictedRejection(client: string, n: number) {
-    const prev = this.evictedRejectionWatermark.get(client) ?? 0;
-    if (n > prev) this.evictedRejectionWatermark.set(client, n);
+    const prev = this.evictedRejectionWatermark.get(client);
+    const next = prev !== undefined ? Math.max(prev, n) : n;
+    if (prev !== undefined) this.evictedRejectionWatermark.delete(client);
+    this.evictedRejectionWatermark.set(client, next);
+    while (this.evictedRejectionWatermark.size > this.evictedRejectionWatermarkLimit) {
+      const oldest = this.evictedRejectionWatermark.keys().next().value;
+      if (oldest === undefined) break;
+      this.evictedRejectionWatermark.delete(oldest);
+      this.watermarkOverflowed = true;
+    }
+  }
+
+  private recordExternalRejectionGap(client: string, from: number, to: number) {
+    if (from > to) return;
+    const prev = this.externalRejectionGaps.get(client);
+    const ranges = prev ? [...prev] : [];
+    const last = ranges[ranges.length - 1];
+    if (last && from <= last.to + 1) {
+      if (to > last.to) last.to = to;
+    } else {
+      ranges.push({ from, to });
+    }
+    const perClientCap = Math.min(this.rejectionsPerClientLimit, this.rejectionsLimit);
+    if (ranges.length > perClientCap) {
+      ranges.splice(0, ranges.length - perClientCap);
+    }
+    if (prev !== undefined) this.externalRejectionGaps.delete(client);
+    this.externalRejectionGaps.set(client, ranges);
+    while (this.externalRejectionGaps.size > this.rejectionsLimit) {
+      const oldest = this.externalRejectionGaps.keys().next().value;
+      if (oldest === undefined) break;
+      this.externalRejectionGaps.delete(oldest);
+    }
+  }
+
+  private consumeExternalRejectionGap(client: string, n: number): boolean {
+    const ranges = this.externalRejectionGaps.get(client);
+    if (!ranges) return false;
+    const idx = ranges.findIndex((r) => n >= r.from && n <= r.to);
+    if (idx === -1) return false;
+    const target = ranges[idx]!;
+    if (target.from === target.to) {
+      ranges.splice(idx, 1);
+    } else if (n === target.from) {
+      target.from++;
+    } else if (n === target.to) {
+      target.to--;
+    } else {
+      ranges.splice(idx, 1, { from: target.from, to: n - 1 }, { from: n + 1, to: target.to });
+      const perClientCap = Math.min(this.rejectionsPerClientLimit, this.rejectionsLimit);
+      if (ranges.length > perClientCap) {
+        ranges.splice(0, ranges.length - perClientCap);
+      }
+    }
+    if (ranges.length === 0) this.externalRejectionGaps.delete(client);
+    return true;
   }
 
   private trimGlobalRejections() {
@@ -373,18 +452,24 @@ export class Room {
     const s = this.s;
     if (msg.t === 'hello') {
       if (msg.client !== client) return [];
+      const lastProcessed = s.processed[client] ?? 0;
       const out: Out[] = [
         {
           to: client,
           msg: {
             t: 'welcome',
-            lastProcessed: s.processed[client] ?? 0,
+            lastProcessed,
             rejected: [...(s.rejections[client] ?? [])],
           },
         },
       ];
       const oldest = s.log[0]?.seq ?? s.seq + 1;
-      if (msg.lastSeq === 0 || msg.lastSeq + 1 < oldest) {
+      // 该客户端曾有拒绝记录被淘汰（或 watermark 曾溢出且客户端有已处理记录）时，强制下发 snapshot，
+      // 防止 SyncClient 走增量 log 分支导致缺失拒绝记录的 pending 项永久卡死并引起视图分叉。
+      const rejectionEvicted =
+        (this.evictedRejectionWatermark.get(client) ?? 0) > 0 ||
+        (this.watermarkOverflowed && lastProcessed > 0);
+      if (msg.lastSeq === 0 || msg.lastSeq + 1 < oldest || rejectionEvicted) {
         out.push({
           to: client,
           msg: {
@@ -392,7 +477,7 @@ export class Room {
             seq: s.seq,
             model: structuredClone(s.model),
             versions: { ...s.versions },
-            lastProcessed: s.processed[client] ?? 0,
+            lastProcessed,
           },
         });
       } else for (const c of s.log) if (c.seq > msg.lastSeq) out.push({ to: client, msg: c });
