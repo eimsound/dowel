@@ -1160,7 +1160,12 @@ test('WebSocket：未登录 / 停用 / 无关用户被拒，查看者只读', as
   const client = new SyncClient('matrix-viewer', { format: 1, dialect: 'pg', objects: {} });
   client.send = (m) => ws.send(JSON.stringify(m));
   ws.on('message', (d) => {
-    const m = JSON.parse(String(d)) as ToClient | { t: string };
+    const text = Buffer.isBuffer(d)
+      ? d.toString('utf8')
+      : Array.isArray(d)
+        ? Buffer.concat(d).toString('utf8')
+        : new TextDecoder().decode(d);
+    const m = JSON.parse(text) as ToClient | { t: string };
     if (['welcome', 'snapshot', 'commit', 'reject'].includes(m.t)) client.receive(m as ToClient);
   });
   await new Promise((r) => ws.once('open', r));

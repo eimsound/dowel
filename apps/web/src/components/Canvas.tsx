@@ -19,7 +19,7 @@ import {
 import '@xyflow/react/dist/style.css';
 import ELK from 'elkjs/lib/elk.bundled.js';
 import { Maximize, Table2, ZoomIn, ZoomOut } from 'lucide-react';
-import { memo, useCallback, useEffect, useMemo, useRef, useState } from 'react';
+import { memo, useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState } from 'react';
 import { useTranslation } from 'react-i18next';
 import type { Layout } from '../workspace.ts';
 import { IconButton } from './ui.tsx';
@@ -228,7 +228,9 @@ export const Canvas = ({
 
   // 点击“自动布局”时对所有表重新布局；用 ref 取最新的模型，effect 只随点击次数触发
   const latest = useRef({ model, tables, onMove });
-  latest.current = { model, tables, onMove };
+  useLayoutEffect(() => {
+    latest.current = { model, tables, onMove };
+  });
   useEffect(() => {
     if (!relayout) return;
     const { model: m, tables: ts, onMove: move } = latest.current;

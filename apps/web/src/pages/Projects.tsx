@@ -30,9 +30,13 @@ export const Projects = ({ me }: { me: Me }) => {
 
   // 命令面板里的“新建组”：打开对话框，然后把参数用 replace 清掉，
   // 免得刷新或前进后退时又弹一次（已经在 / 时也会因为 search 变化触发这个 effect）。
+  const [prevNewFromPalette, setPrevNewFromPalette] = useState<boolean | undefined>(undefined);
+  if (newFromPalette !== prevNewFromPalette) {
+    setPrevNewFromPalette(newFromPalette);
+    if (newFromPalette) setGroupDialog(true);
+  }
   useEffect(() => {
     if (!newFromPalette) return;
-    setGroupDialog(true);
     void nav({ to: '/', search: {}, replace: true });
   }, [newFromPalette, nav]);
 

@@ -417,9 +417,11 @@ export const AppShell = ({
   const page = pageFromPath(path, project);
 
   // 变宽屏时丢掉抽屉状态，避免从窄拖宽后遗留一个“已打开”的抽屉
-  useEffect(() => {
+  const [prevNarrow, setPrevNarrow] = useState(narrow);
+  if (narrow !== prevNarrow) {
+    setPrevNarrow(narrow);
     if (!narrow) setDrawer(false);
-  }, [narrow]);
+  }
 
   // 抽屉打开：焦点移进去（第一个可聚焦元素）；Esc 关闭。
   // 关闭后把焦点还给“打开侧面板”：那个按钮在抽屉打开时不渲染，所以只能在关闭后的 effect 里聚焦。
@@ -634,9 +636,9 @@ export const AppShell = ({
 /** 页面把侧面板内容交给外壳；离开页面时清空 */
 export const useShellPanel = (label: string, node: ReactNode, deps: unknown[]) => {
   const { setSlot } = useShell();
-  // biome-ignore lint/correctness/useExhaustiveDependencies: 调用方通过 deps 明确列出内容依赖
   useLayoutEffect(() => {
     setSlot({ label, node });
     return () => setSlot(null);
+    // oxlint-disable-next-line react-hooks/exhaustive-deps -- 调用方通过 deps 明确列出内容依赖
   }, [setSlot, label, ...deps]);
 };

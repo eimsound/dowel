@@ -25,7 +25,7 @@ import {
 } from '@dowel/api';
 import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query';
 import { Lock, Plus, Trash2 } from 'lucide-react';
-import { useEffect, useId, useMemo, useState } from 'react';
+import { useId, useMemo, useState } from 'react';
 import { useTranslation } from 'react-i18next';
 import { api } from '../api.ts';
 import { invalidatePolicyDependents } from '../policy-cache.ts';
@@ -501,7 +501,6 @@ export const PolicySetEditor = ({
         <ol className="list-none space-y-1.5 p-0">
           {locked.map((s, i) => (
             <li
-              // biome-ignore lint/suspicious/noArrayIndexKey: 环节没有 ID，顺序就是身份
               key={`l${i}`}
               className="flex flex-wrap items-center gap-2 rounded-md border border-border bg-surface-2 px-3 py-2 text-sm text-text-2"
             >
@@ -516,7 +515,6 @@ export const PolicySetEditor = ({
         <ol className="list-none space-y-1.5 p-0">
           {own.map((s, i) => (
             <StageEditor
-              // biome-ignore lint/suspicious/noArrayIndexKey: 环节没有 ID，顺序就是身份
               key={i}
               stage={s}
               index={locked.length + i}
@@ -578,10 +576,11 @@ export const PolicyLayerPanel = ({ path, queryKey }: { path: string; queryKey: u
   const qc = useQueryClient();
   const toast = useToast();
   const q = useQuery({ queryKey, queryFn: () => api<PolicyLayerView>('GET', path) });
-  const [draft, setDraft] = useState<LayerPolicy | null>(null);
-  useEffect(() => {
-    if (q.data) setDraft(q.data.settings);
-  }, [q.data]);
+  const [edited, setEdited] = useState<{ base: PolicyLayerView; draft: LayerPolicy } | null>(null);
+  const draft = edited && edited.base === q.data ? edited.draft : (q.data?.settings ?? null);
+  const setDraft = (next: LayerPolicy) => {
+    if (q.data) setEdited({ base: q.data, draft: next });
+  };
   const save = useMutation({
     mutationFn: (body: LayerPolicy) => api<PolicyLayerView>('PUT', path, body),
     onSuccess: (v) => {
@@ -656,10 +655,12 @@ export const EnvPolicyPanel = ({ pid, eid }: { pid: string; eid: string }) => {
   const path = `/api/projects/${pid}/environments/${eid}/exec-policy`;
   const queryKey = ['env-policy', pid, eid];
   const q = useQuery({ queryKey, queryFn: () => api<EnvPolicyView>('GET', path) });
-  const [draft, setDraft] = useState<EnvPolicyPut | null>(null);
-  useEffect(() => {
-    if (q.data) setDraft({ settings: q.data.settings });
-  }, [q.data]);
+  const [edited, setEdited] = useState<{ base: EnvPolicyView; draft: EnvPolicyPut } | null>(null);
+  const draft =
+    edited && edited.base === q.data ? edited.draft : q.data ? { settings: q.data.settings } : null;
+  const setDraft = (next: EnvPolicyPut) => {
+    if (q.data) setEdited({ base: q.data, draft: next });
+  };
   const save = useMutation({
     mutationFn: (body: EnvPolicyPut) => api<EnvPolicyView>('PUT', path, body),
     onSuccess: (v) => {

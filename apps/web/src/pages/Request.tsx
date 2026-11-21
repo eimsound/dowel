@@ -517,7 +517,6 @@ const RequestView = ({ rid }: { rid: string }) => {
           <Section title={t('req.timeline.title')}>
             <ol className="list-none space-y-1 p-0 text-sm" data-testid="timeline">
               {r.timeline.map((e, i) => (
-                // biome-ignore lint/suspicious/noArrayIndexKey: 时间线只读、顺序固定
                 <li key={i} className="flex flex-wrap gap-x-2">
                   <span className="text-text-3 tabular-nums">{formatTime(e.at)}</span>
                   <span>

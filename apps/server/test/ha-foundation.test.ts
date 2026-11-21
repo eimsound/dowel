@@ -1553,7 +1553,7 @@ describe.each([
           password: PASSWORD,
         }),
       ]);
-      expect([r1.status, r2.status].sort()).toEqual([200, 409]);
+      expect([r1.status, r2.status].sort((a, b) => a - b)).toEqual([200, 409]);
       expect(await dbA.query('select id from users')).toHaveLength(1);
 
       // 创建管理员的同一事务里已删除 instance_settings 中的 setup_token

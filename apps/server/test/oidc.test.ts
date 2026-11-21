@@ -260,7 +260,7 @@ describe('OIDC 登录', () => {
     const first = await loginWithOidc(await invite());
     const session = cookieFrom(first.result, 'dowel_session');
     const me = await call('GET', '/api/auth/me', undefined, session);
-    await call('PATCH', `/api/admin/users/${me.data.id}`, { status: 'disabled' }, admin.cookie);
+    await call('PATCH', `/api/admin/users/${me.data.id as string}`, { status: 'disabled' }, admin.cookie);
     const again = await loginWithOidc();
     expect(again.result.status).toBe(302);
     expect(again.result.location).toBe('/login?oidc_error=disabled');
@@ -375,14 +375,19 @@ describe('OIDC 登录', () => {
       200,
     );
     expect(
-      (await call('PATCH', `/api/admin/oidc/${created.id}`, { enabled: false }, admin.cookie)).status,
+      (await call('PATCH', `/api/admin/oidc/${created.id as string}`, { enabled: false }, admin.cookie))
+        .status,
     ).toBe(422);
-    expect((await call('DELETE', `/api/admin/oidc/${created.id}`, undefined, admin.cookie)).status).toBe(422);
+    expect(
+      (await call('DELETE', `/api/admin/oidc/${created.id as string}`, undefined, admin.cookie)).status,
+    ).toBe(422);
     // 再启用密码登录后可以删除
     expect((await call('PATCH', '/api/admin/settings', { passwordLogin: true }, admin.cookie)).status).toBe(
       200,
     );
-    expect((await call('DELETE', `/api/admin/oidc/${created.id}`, undefined, admin.cookie)).status).toBe(200);
+    expect(
+      (await call('DELETE', `/api/admin/oidc/${created.id as string}`, undefined, admin.cookie)).status,
+    ).toBe(200);
   });
 
   test('client_secret 加密存储；列表只返回是否已设置；discovery 失败返回 422', async () => {
@@ -483,7 +488,12 @@ describe('OIDC 登录', () => {
     const created = await createProvider();
     // 模拟提供方已经不可达（直接改库，避免触发 PATCH 的 discovery）
     await db.query('update oidc_providers set issuer = $2 where id = $1', [created.id, 'http://127.0.0.1:1']);
-    const r = await call('PATCH', `/api/admin/oidc/${created.id}`, { enabled: false }, admin.cookie);
+    const r = await call(
+      'PATCH',
+      `/api/admin/oidc/${created.id as string}`,
+      { enabled: false },
+      admin.cookie,
+    );
     expect(r.status).toBe(200);
     expect(r.data).toMatchObject({ enabled: false });
   });
@@ -514,7 +524,8 @@ describe('OIDC 登录', () => {
 
     // 改名不触发 discovery，但 updated_at 变化会让下一次登录重新 discovery
     expect(
-      (await call('PATCH', `/api/admin/oidc/${created.id}`, { name: 'Mock 2' }, admin.cookie)).status,
+      (await call('PATCH', `/api/admin/oidc/${created.id as string}`, { name: 'Mock 2' }, admin.cookie))
+        .status,
     ).toBe(200);
     discoveryCount = 0;
     expect((await loginWithOidc()).result.status).toBe(302);
@@ -528,7 +539,8 @@ describe('OIDC 登录', () => {
     expect(await hasOidcProvider(db)).toBe(true);
     expect((await call('GET', '/api/instance')).data.providers).toEqual([{ slug: 'mock', name: 'Mock' }]);
     expect(
-      (await call('PATCH', `/api/admin/oidc/${created.id}`, { enabled: false }, admin.cookie)).status,
+      (await call('PATCH', `/api/admin/oidc/${created.id as string}`, { enabled: false }, admin.cookie))
+        .status,
     ).toBe(200);
     expect(await countEnabledProviders(db)).toBe(0);
     expect(await hasOidcProvider(db)).toBe(false);
@@ -544,7 +556,7 @@ describe('OIDC 登录', () => {
       user.id,
     ]);
     expect(await hasOtherLoginMethod(db, user.id, 'none', false)).toBe(true);
-    await call('PATCH', `/api/admin/oidc/${created.id}`, { enabled: false }, admin.cookie);
+    await call('PATCH', `/api/admin/oidc/${created.id as string}`, { enabled: false }, admin.cookie);
     expect(await hasOtherLoginMethod(db, user.id, 'none', false)).toBe(false);
   });
 });

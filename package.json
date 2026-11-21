@@ -9,8 +9,8 @@
   "scripts": {
     "test": "vitest run",
     "typecheck": "tsc --noEmit -p . && tsc --noEmit -p apps/web",
-    "lint": "biome check .",
-    "format": "biome check --write .",
+    "lint": "oxlint --type-aware --deny-warnings && oxfmt --check",
+    "format": "oxfmt",
     "check": "pnpm lint && pnpm typecheck && pnpm test",
     "dev": "node --run dev:server & pnpm --filter @dowel/web dev",
     "dev:server": "node --watch apps/server/src/main.ts",
@@ -20,7 +20,6 @@
   },
   "devDependencies": {
     "@axe-core/playwright": "^4.14.0",
-    "@biomejs/biome": "^2.6.7",
     "@dowel/engines": "workspace:*",
     "@dowel/executor": "workspace:*",
     "@playwright/test": "^1.65.0",
@@ -28,6 +27,9 @@
     "@types/node": "^26.6.6",
     "fast-check": "^4.10.2",
     "oauth2-mock-server": "^9.3.0",
+    "oxfmt": "^0.78.0",
+    "oxlint": "^1.93.0",
+    "oxlint-tsgolint": "^7.0.2007",
     "postgres": "^4.1.1",
     "testcontainers": "^12.2.1",
     "typescript": "^7.0.2",

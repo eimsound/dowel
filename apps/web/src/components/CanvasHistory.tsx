@@ -22,7 +22,7 @@ import {
   Workflow,
   X,
 } from 'lucide-react';
-import { useCallback, useEffect, useId, useMemo, useRef, useState } from 'react';
+import { useCallback, useEffect, useId, useLayoutEffect, useMemo, useRef, useState } from 'react';
 import { useTranslation } from 'react-i18next';
 import { ApiError, api } from '../api.ts';
 import { formatTime } from '../format.ts';
@@ -270,7 +270,9 @@ export const CanvasHistory = ({
   const [restoreError, setRestoreError] = useState<string | null>(null);
 
   const confirmOpenRef = useRef(confirmOpen);
-  confirmOpenRef.current = confirmOpen;
+  useLayoutEffect(() => {
+    confirmOpenRef.current = confirmOpen;
+  });
 
   // 打开 / 关闭原生 <dialog>（遵循 modern-web-guidance: dialog）
   useEffect(() => {
@@ -300,14 +302,16 @@ export const CanvasHistory = ({
   }, []);
 
   // 每次重新打开时回到默认选中最新条目
-  useEffect(() => {
+  const [prevOpen, setPrevOpen] = useState(open);
+  if (open !== prevOpen) {
+    setPrevOpen(open);
     if (open) {
       setSelectedSeq(null);
       setConfirmOpen(false);
       setConflict(null);
       setRestoreError(null);
     }
-  }, [open]);
+  }
 
   const listQuery = useInfiniteQuery({
     queryKey: ['canvas-history', pid],
@@ -408,11 +412,18 @@ export const CanvasHistory = ({
   }, [resetRestore]);
 
   // 确认框打开期间若权限被实时降级为只读，自动关闭确认框并清空恢复错误与冲突态
-  useEffect(() => {
+  const [prevReadOnly, setPrevReadOnly] = useState(readOnly);
+  if (readOnly !== prevReadOnly) {
+    setPrevReadOnly(readOnly);
     if (readOnly && confirmOpen) {
-      closeConfirm();
+      setConfirmOpen(false);
+      setConflict(null);
+      setRestoreError(null);
     }
-  }, [readOnly, confirmOpen, closeConfirm]);
+  }
+  useEffect(() => {
+    if (readOnly) resetRestore();
+  }, [readOnly, resetRestore]);
 
   const canRestore = !readOnly && !!detail && !detail.entry.isCurrent && detail.diffToCurrent.total > 0;
 

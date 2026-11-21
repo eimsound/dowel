@@ -374,7 +374,7 @@ describe.each([
     const [a, b] = await Promise.all([exec(pid, eid, 'execute', v3!.id), exec(pid, eid, 'execute', v3!.id)]);
     const results = [last(a.events), last(b.events)];
     expect(results.every((e) => e.stage === 'done')).toBe(true);
-    expect(results.map((e) => e.ran).sort()).toEqual([0, 3]); // 一个执行了 3 个迁移，另一个等到之后什么都没做
+    expect(results.map((e) => e.ran).sort((x, y) => (x ?? 0) - (y ?? 0))).toEqual([0, 3]); // 一个执行了 3 个迁移，另一个等到之后什么都没做
     const h = await history(pid, eid);
     expect(h.runs.filter((r) => r.status === 'done').length).toBe(3);
     expect(h.runs.length).toBe(3);
@@ -1017,7 +1017,7 @@ describe.each([
           (await call('PATCH', `/api/projects/${pid}/environments/${eid}`, { execPolicy: 'admin' })).status,
         ).toBe(200);
       } finally {
-        release();
+        await release();
       }
     },
   );
@@ -1066,7 +1066,7 @@ describe.each([
       const running = exec(pid, eid, 'execute', v1!.id);
       await new Promise((r) => setTimeout(r, 200));
       await db.query('update environments set url_enc = $2 where id = $1', [eid, encrypt(other.url)]);
-      release();
+      await release();
       expect(last((await running).events).stage).toBe('done');
       const has = async (d: { db: typeof target.db }) =>
         (await d.db.query<{ n: string | null }>("select to_regnamespace('dowel')::text as n"))[0]!.n !== null;
@@ -1080,7 +1080,7 @@ describe.each([
       const running2 = exec(pid2, eid2, 'execute', w1!.id);
       await new Promise((r) => setTimeout(r, 200));
       await db.query('delete from environments where id = $1', [eid2]);
-      release2();
+      await release2();
       const r2 = await running2;
       expect(last(r2.events)).toMatchObject({ code: 'rejected' });
       expect(last(r2.events).error).toContain('环境不存在');
@@ -1280,7 +1280,7 @@ describe.each([
         expect(busy.summary).toMatchObject({ total: 1, message: '旧文案' });
         expect(busy.summary).not.toHaveProperty('needsManual');
       } finally {
-        release();
+        await release();
       }
     },
   );

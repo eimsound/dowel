@@ -62,7 +62,6 @@ export const MarkDialog = ({
   const versionName = useVersionName();
   const ackId = useId();
   const typeId = useId();
-  const [check, setCheck] = useState<Check>({ state: 'loading' });
   const [tick, setTick] = useState(0);
   const [ack, setAck] = useState(false);
   const [typed, setTyped] = useState('');
@@ -71,23 +70,32 @@ export const MarkDialog = ({
   const [notice, setNotice] = useState('');
   const [error, setError] = useState<{ message: string; diff?: MarkDryRunResponse['details'] } | null>(null);
   const base = `/api/projects/${pid}/environments/${eid}/mark`;
-
-  // 打开（或点“重新核对”）时先核对线上结构：只读，不写任何东西
-  // biome-ignore lint/correctness/useExhaustiveDependencies: tick 只用来触发重新核对
-  useEffect(() => {
-    let live = true;
+  const reqKey = `${base}\0${to.id}\0${tick}`;
+  const [checkState, setCheckState] = useState<{ key: string; val: Check } | null>(null);
+  const check: Check = checkState?.key === reqKey ? checkState.val : { state: 'loading' };
+  const [prevReqKey, setPrevReqKey] = useState(reqKey);
+  if (reqKey !== prevReqKey) {
+    setPrevReqKey(reqKey);
     // 每次重新预演都把已勾选的确认清掉：确认只对应它看到的那一份计划
     setAck(false);
-    setCheck({ state: 'loading' });
+  }
+
+  // 打开（或点“重新核对”）时先核对线上结构：只读，不写任何东西
+  useEffect(() => {
+    let live = true;
     api<MarkDryRunResponse>('POST', base, { to: to.id, dryRun: true }).then(
-      (res) => live && setCheck({ state: 'done', res }),
+      (res) => live && setCheckState({ key: reqKey, val: { state: 'done', res } }),
       (e: unknown) =>
-        live && setCheck({ state: 'error', message: e instanceof Error ? e.message : String(e) }),
+        live &&
+        setCheckState({
+          key: reqKey,
+          val: { state: 'error', message: e instanceof Error ? e.message : String(e) },
+        }),
     );
     return () => {
       live = false;
     };
-  }, [base, to.id, tick]);
+  }, [base, to.id, reqKey]);
 
   const refresh = () =>
     Promise.all([
@@ -128,7 +136,7 @@ export const MarkDialog = ({
           : null;
       if (body?.code === 'plan_changed' && body.details?.plan) {
         // 目标库在核对之后变了：刷新预演结果（新的计划），清掉勾选，提示重新确认
-        setCheck({ state: 'done', res: { ok: true, plan: body.details.plan } });
+        setCheckState({ key: reqKey, val: { state: 'done', res: { ok: true, plan: body.details.plan } } });
         setAck(false);
         setNotice(t('dr.mark.planChanged'));
         setPhase('confirm');
@@ -235,7 +243,6 @@ export const MarkDialog = ({
                           <summary className="cursor-pointer text-text-2">{t('tk.dry.showSteps')}</summary>
                           <ol className="m-0 mt-1 list-none space-y-1 p-0">
                             {v.upSteps.map((st, i) => (
-                              // biome-ignore lint/suspicious/noArrayIndexKey: 步骤只读、顺序固定
                               <li key={i}>
                                 <code className="block font-mono break-all whitespace-pre-wrap">
                                   <Sql text={st.sql} />

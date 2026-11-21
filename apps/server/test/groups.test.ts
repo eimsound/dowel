@@ -171,7 +171,6 @@ describe('生效角色（四种来源取最高）', () => {
 // ───── HTTP 集成测试 ─────
 
 interface Agent {
-  // biome-ignore lint/suspicious/noExplicitAny: 测试里的 HTTP 响应形状随用例变化，直接取字段更省事
   call: (method: string, path: string, json?: unknown) => Promise<{ status: number; data: any }>;
   cookie: () => string;
 }
@@ -239,7 +238,12 @@ describe.each([
     client.send = (m) => ws.send(JSON.stringify(m));
     const extras: unknown[] = [];
     ws.on('message', (d) => {
-      const m = JSON.parse(String(d)) as ToClient | { t: string };
+      const text = Buffer.isBuffer(d)
+        ? d.toString('utf8')
+        : Array.isArray(d)
+          ? Buffer.concat(d).toString('utf8')
+          : new TextDecoder().decode(d);
+      const m = JSON.parse(text) as ToClient | { t: string };
       if (['welcome', 'snapshot', 'commit', 'reject'].includes(m.t)) client.receive(m as ToClient);
       else extras.push(m);
     });
@@ -766,6 +770,6 @@ describe.each([
       zhangAgent.call('POST', `/api/projects/${pa.data.id}/transfer`, { groupId: rt.data.id }),
       zhangAgent.call('POST', `/api/projects/${pb.data.id}/transfer`, { groupId: rt.data.id }),
     ]);
-    expect(results.map((r) => r.status).sort()).toEqual([200, 409]);
+    expect(results.map((r) => r.status).sort((a, b) => a - b)).toEqual([200, 409]);
   });
 });

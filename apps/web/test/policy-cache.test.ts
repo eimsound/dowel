@@ -17,7 +17,7 @@ test('保存项目层后：环境列表、环境状态、环境层配置页、�
     versions: ['versions', 'p1'],
   };
   for (const k of Object.values(keys)) qc.setQueryData(k, { x: 1 });
-  invalidatePolicyDependents(qc, keys.saved);
+  await invalidatePolicyDependents(qc, keys.saved);
   const invalid = (k: unknown[]) => qc.getQueryState(k)!.isInvalidated;
   for (const k of [keys.group, keys.envs, keys.otherEnvs, keys.status, keys.envPolicy])
     expect(invalid(k), String(k)).toBe(true);

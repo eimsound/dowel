@@ -23,7 +23,13 @@ import { decrypt, maskUrl } from './secrets.ts';
 
 /** postgres.js 把 timestamptz 读成 Date，SQLite 是文本：统一成 ISO 字符串 */
 export const iso = (v: unknown): string | null =>
-  v === null || v === undefined ? null : v instanceof Date ? v.toISOString() : String(v);
+  v === null || v === undefined
+    ? null
+    : v instanceof Date
+      ? v.toISOString()
+      : typeof v === 'string' || typeof v === 'number'
+        ? String(v)
+        : null;
 
 export interface EnvRow {
   id: string;

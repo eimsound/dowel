@@ -27,7 +27,7 @@ export interface RoomState {
   rejections: Record<string, Rejection[]>;
 }
 
-export type Out = { to: string | '*'; msg: ToClient };
+export type Out = { to: '*' | (string & {}); msg: ToClient };
 
 class Reject extends Error {
   code: Rejection['code'];

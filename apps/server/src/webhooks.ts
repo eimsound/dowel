@@ -385,7 +385,11 @@ const businessError = (format: WebhookFormat, text: string): string | null => {
   const code = format === 'feishu' ? (j.code ?? j.StatusCode) : j.errcode;
   if (code === undefined || code === null || code === 0 || code === '0') return null;
   const msg = format === 'feishu' ? (j.msg ?? j.StatusMessage) : j.errmsg;
-  return `${FORMAT_LABEL[format]}返回错误码 ${String(code)}${typeof msg === 'string' && msg ? `：${msg}` : ''}`;
+  const codeText =
+    typeof code === 'string' || typeof code === 'number' || typeof code === 'boolean'
+      ? String(code)
+      : JSON.stringify(code);
+  return `${FORMAT_LABEL[format]}返回错误码 ${codeText}${typeof msg === 'string' && msg ? `：${msg}` : ''}`;
 };
 
 /**

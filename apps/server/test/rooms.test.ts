@@ -308,7 +308,7 @@ test('同项目另一名 editor 冒用受害者 client：不窃取 lastProcessed
   const victimPeer = peerOf(victimUser);
   const attackerPeer = peerOf(attackerUser);
 
-  const origVictimSend = victimPeer.peer.send;
+  const origVictimSend = victimPeer.peer.send.bind(victimPeer.peer);
   victimPeer.peer.send = (m) => {
     origVictimSend(m);
     if (m.t === 'welcome' || m.t === 'snapshot' || m.t === 'commit' || m.t === 'reject') {
@@ -1118,7 +1118,7 @@ test('catchUp 按游标增量拉取 room_rejections（不反复全表扫描历�
 
     // 4. 事务回滚触发 reloadLocked 后游标重新对齐：模拟一次本地 op 写入后事务回滚，同时数据库写入新外部拒绝 n=6
     let failWriteOnce = true;
-    const prevWrapTx = wrappedDb.transaction;
+    const prevWrapTx = wrappedDb.transaction.bind(wrappedDb);
     wrappedDb.transaction = (async (fn, opts) =>
       prevWrapTx(async (tx) => {
         const res = await fn(tx);

@@ -233,7 +233,7 @@ describe('同步：固定场景', () => {
     const rejectedCalls: { client: string; r: Rejection }[] = [];
     const baseStore = memoryStore();
     const store = {
-      append: baseStore.append,
+      append: (...args: Parameters<typeof baseStore.append>) => baseStore.append(...args),
       reject: async (client: string, r: Rejection) => {
         rejectedCalls.push({ client, r });
       },

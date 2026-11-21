@@ -63,7 +63,12 @@ const connect = async (a: ReturnType<typeof agent>, pid: string, id: string) => 
   client.send = (m) => ws.send(JSON.stringify(m));
   const extras: unknown[] = [];
   ws.on('message', (d) => {
-    const m = JSON.parse(String(d)) as ToClient | { t: string };
+    const text = Buffer.isBuffer(d)
+      ? d.toString('utf8')
+      : Array.isArray(d)
+        ? Buffer.concat(d).toString('utf8')
+        : new TextDecoder().decode(d);
+    const m = JSON.parse(text) as ToClient | { t: string };
     if (['welcome', 'snapshot', 'commit', 'reject'].includes(m.t)) client.receive(m as ToClient);
     else extras.push(m);
   });

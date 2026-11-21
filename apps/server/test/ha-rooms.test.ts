@@ -579,7 +579,7 @@ describe.skipIf(!PG_URL)('P7 HA2：无状态实时协作房间（真实 PG 双�
     const attach = (replica: typeof f.appA.rooms, mp: MockPeer) => {
       activeReplica = replica;
       activePeer = mp;
-      const origSend = mp.peer.send;
+      const origSend = mp.peer.send.bind(mp.peer);
       mp.peer.send = (msg) => {
         origSend(msg);
         if (msg.t === 'welcome' || msg.t === 'snapshot' || msg.t === 'commit' || msg.t === 'reject') {
@@ -1235,7 +1235,7 @@ describe.skipIf(!PG_URL)('P7 HA2：无状态实时协作房间（真实 PG 双�
     const peerB = makePeer(f.alice);
     await f.appB.rooms.join(f.branchId, peerB.peer);
     let sendChain = Promise.resolve();
-    const origSend = peerB.peer.send;
+    const origSend = peerB.peer.send.bind(peerB.peer);
     peerB.peer.send = (msg) => {
       origSend(msg);
       if (msg.t === 'welcome' || msg.t === 'snapshot' || msg.t === 'commit' || msg.t === 'reject') {

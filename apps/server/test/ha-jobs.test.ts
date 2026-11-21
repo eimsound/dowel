@@ -1264,7 +1264,7 @@ describe.skipIf(!PG_URL)('P7 HA Wave 2B：持久化队列、分布式巡检、�
       // (b) 副本 A finish() 提交：即使关闭副本 A 的本地拉取（仅广播唤醒），副本 B 仍通过 webhooks.wake 立即拾取并投递 1 次
       const origWakeA = whA.wake.bind(whA);
       let wakeBroadcasts = 0;
-      whA.wake = (broadcast = true) => {
+      whA.wake = (broadcast) => {
         if (broadcast) {
           wakeBroadcasts++;
           void busA.publish({ t: 'webhooks.wake' });

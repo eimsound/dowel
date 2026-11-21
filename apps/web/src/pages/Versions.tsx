@@ -108,20 +108,23 @@ const StepsEditor = ({ detail, onDone }: { detail: VersionDetailData; onDone: ()
   const { pid } = useProject();
   const qc = useQueryClient();
   const toast = useToast();
-  const counter = useRef(0);
   const blankId = useId();
-  const init = (steps: ScriptStepInfo[]): EditStep[] =>
-    steps.map((s) => ({
-      key: counter.current++,
-      sql: s.sql,
-      // 原来标为非事务、但语句本身判断不出来的（人工标的），保留为手动勾选
-      manualNonTx: !s.transactional && !isNontransactionalSql(s.sql),
-    }));
   const [dir, setDir] = useState<'up' | 'down'>('up');
-  const [steps, setSteps] = useState<Record<'up' | 'down', EditStep[]>>(() => ({
-    up: init(detail.upSteps),
-    down: init(detail.downSteps),
-  }));
+  const [steps, setSteps] = useState<Record<'up' | 'down', EditStep[]>>(() => {
+    let nextKey = 0;
+    const init = (list: ScriptStepInfo[]): EditStep[] =>
+      list.map((s) => ({
+        key: nextKey++,
+        sql: s.sql,
+        // 原来标为非事务、但语句本身判断不出来的（人工标的），保留为手动勾选
+        manualNonTx: !s.transactional && !isNontransactionalSql(s.sql),
+      }));
+    return {
+      up: init(detail.upSteps),
+      down: init(detail.downSteps),
+    };
+  });
+  const counter = useRef(detail.upSteps.length + detail.downSteps.length);
   const save = useMutation({
     mutationFn: () =>
       api<VersionDetailData>('PATCH', `/api/projects/${pid}/versions/${detail.id}/steps`, {

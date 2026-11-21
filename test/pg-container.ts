@@ -13,7 +13,7 @@ export const startPg = async (): Promise<{ url: string; stop: () => Promise<void
   } catch (e) {
     if (process.env.CI) throw e;
     console.warn(
-      `\n⚠ 没有可用的 Docker（${e instanceof Error ? e.message.split('\n')[0] : e}）：跳过所有需要 PostgreSQL 的测试。` +
+      `\n⚠ 没有可用的 Docker（${e instanceof Error ? e.message.split('\n')[0] : String(e)}）：跳过所有需要 PostgreSQL 的测试。` +
         '\n  安装并启动 Docker，或设置 DOWEL_TEST_PG=postgres://user:pass@host:port/postgres（需要建库权限）。\n',
     );
     return null;

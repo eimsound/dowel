@@ -28,7 +28,7 @@ import {
   TriangleAlert,
   Users,
 } from 'lucide-react';
-import { Fragment, useEffect, useRef, useState } from 'react';
+import { Fragment, useEffect, useLayoutEffect, useRef, useState } from 'react';
 import { useTranslation } from 'react-i18next';
 import { ApiError, api } from '../api.ts';
 import { Modal } from './Modal.tsx';
@@ -130,7 +130,6 @@ export const VersionDialog = ({ pid, open, onClose }: Base) => {
   };
   // 请求还在进行时对话框可能已经被关掉、甚至重新打开：回调要知道“现在”是不是开着
   const openRef = useRef(open);
-  openRef.current = open;
   const pendingRef = useRef(false);
   // 发布 = 冻结迁移：服务端先在影子库里闭环验证，通过才写入版本；验证可能要几秒到几十秒
   const run = useMutation({
@@ -179,7 +178,10 @@ export const VersionDialog = ({ pid, open, onClose }: Base) => {
   });
   // 每次打开都从干净的状态开始：清掉上次留下的“未验证”结果和错误报告（reset 的引用是稳定的）。
   // 请求还没完成时重新打开：不重置，继续显示“正在发布”，按钮保持禁用，避免重复提交
-  pendingRef.current = run.isPending;
+  useLayoutEffect(() => {
+    openRef.current = open;
+    pendingRef.current = run.isPending;
+  });
   const { reset } = run;
   useEffect(() => {
     if (open && !pendingRef.current) {
@@ -314,7 +316,6 @@ export const StepList = ({
             : [];
         return (
           <li
-            // biome-ignore lint/suspicious/noArrayIndexKey: 同一份迁移里的步骤顺序固定，第 i 步与第 i 个风险一一对应
             key={i}
             className="grid grid-cols-[22px_auto_minmax(0,1fr)] items-baseline gap-x-2 px-3 py-2 not-first:border-t not-first:border-border"
           >

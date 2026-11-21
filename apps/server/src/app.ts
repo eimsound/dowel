@@ -117,7 +117,9 @@ export const createApp = (db: PlatformDb, options: AppOptions = {}) => {
   const replace = async (branch: string, user: string, model: Model, op: string, expectedSeq?: number) => {
     await refresher.runWithReset(branch, model, () => rooms.replace(branch, user, model, op, expectedSeq));
   };
-  const { injectWebSocket, upgradeWebSocket, wss } = createNodeWebSocket({ app });
+  const nodeWs = createNodeWebSocket({ app });
+  const { upgradeWebSocket, wss } = nodeWs;
+  const injectWebSocket: typeof nodeWs.injectWebSocket = (server) => nodeWs.injectWebSocket(server);
   const security: SecurityConfig = { ...securityConfigFromEnv(), ...options.security };
 
   // 执行 / 漂移检查：环境锁在单进程互斥之上叠加 PG 平台库 advisory lock 跨副本互斥

@@ -297,7 +297,12 @@ describe.each([
     // 撤销
     const second = await call('POST', '/api/admin/invites', {}, admin.cookie);
     const secondToken = second.data.token as string;
-    const revoked = await call('DELETE', `/api/admin/invites/${second.data.id}`, undefined, admin.cookie);
+    const revoked = await call(
+      'DELETE',
+      `/api/admin/invites/${second.data.id as string}`,
+      undefined,
+      admin.cookie,
+    );
     expect(revoked.status).toBe(200);
     expect((await call('GET', `/api/invites/${secondToken}`)).data).toMatchObject({ state: 'revoked' });
     expect(
@@ -316,10 +321,12 @@ describe.each([
       third.data.id,
       new Date(Date.now() - 1000).toISOString(),
     ]);
-    expect((await call('GET', `/api/invites/${third.data.token}`)).data).toMatchObject({ state: 'expired' });
+    expect((await call('GET', `/api/invites/${third.data.token as string}`)).data).toMatchObject({
+      state: 'expired',
+    });
     expect(
       (
-        await call('POST', `/api/invites/${third.data.token}/accept`, {
+        await call('POST', `/api/invites/${third.data.token as string}/accept`, {
           username: 'expired-one',
           name: '过期',
           password: PASSWORD,
@@ -458,7 +465,8 @@ describe.each([
     // 现在唯一的管理员是 admin2：不能再降级它
     const admin2 = await login('admin2');
     expect(
-      (await call('PATCH', `/api/admin/users/${second.data.id}`, { role: 'member' }, admin2)).status,
+      (await call('PATCH', `/api/admin/users/${second.data.id as string}`, { role: 'member' }, admin2))
+        .status,
     ).toBe(422);
   });
 
@@ -476,9 +484,13 @@ describe.each([
     expect(hours).toBeLessThan(24.1);
 
     // 重置链接不能当邀请用
-    expect((await call('GET', `/api/invites/${link.data.token}`)).data).toMatchObject({ state: 'missing' });
+    expect((await call('GET', `/api/invites/${link.data.token as string}`)).data).toMatchObject({
+      state: 'missing',
+    });
 
-    const reset = await call('POST', `/api/reset/${link.data.token}`, { password: 'new-password' });
+    const reset = await call('POST', `/api/reset/${link.data.token as string}`, {
+      password: 'new-password',
+    });
     expect(reset.status).toBe(200);
     expect((await call('POST', '/api/auth/login', { username: 'member', password: PASSWORD })).status).toBe(
       401,
@@ -496,9 +508,9 @@ describe.each([
     ).toHaveLength(1);
 
     // 一次性
-    expect((await call('POST', `/api/reset/${link.data.token}`, { password: 'third-password' })).status).toBe(
-      410,
-    );
+    expect(
+      (await call('POST', `/api/reset/${link.data.token as string}`, { password: 'third-password' })).status,
+    ).toBe(410);
     // 过期的重置链接
     const expired = await call('POST', `/api/admin/users/${memberId}/reset-link`, undefined, admin.cookie);
     await db.query('update invites set expires_at = $2 where id = $1', [
@@ -507,7 +519,8 @@ describe.each([
       new Date(Date.now() - 1000).toISOString(),
     ]);
     expect(
-      (await call('POST', `/api/reset/${expired.data.token}`, { password: 'third-password' })).status,
+      (await call('POST', `/api/reset/${expired.data.token as string}`, { password: 'third-password' }))
+        .status,
     ).toBe(410);
 
     // 不存在的用户
@@ -724,10 +737,10 @@ describe.each([
     const admin2 = await login('admin2');
 
     const [a, b] = await Promise.all([
-      call('PATCH', `/api/admin/users/${second.data.id}`, { role: 'member' }, admin.cookie),
+      call('PATCH', `/api/admin/users/${second.data.id as string}`, { role: 'member' }, admin.cookie),
       call('PATCH', `/api/admin/users/${admin.id}`, { role: 'member' }, admin2),
     ]);
-    expect([a.status, b.status].sort()).toEqual([200, 422]);
+    expect([a.status, b.status].sort((x, y) => x - y)).toEqual([200, 422]);
     // 计数和更新在同一个事务里，结果一定还剩一个 active 管理员
     expect(
       await db.query<{ id: string }>("select id from users where role = 'admin' and status = 'active'"),
@@ -876,7 +889,7 @@ describe.each([
 
     // 接受邀请时同样转小写
     const invite = await call('POST', '/api/admin/invites', {}, admin.cookie);
-    const accepted = await call('POST', `/api/invites/${invite.data.token}/accept`, {
+    const accepted = await call('POST', `/api/invites/${invite.data.token as string}/accept`, {
       username: 'InvitedUser',
       name: '被邀请',
       password: 'password2',
@@ -907,24 +920,33 @@ describe.each([
     const used = await call('POST', '/api/admin/invites', {}, admin.cookie);
     expect(
       (
-        await call('POST', `/api/invites/${used.data.token}/accept`, {
+        await call('POST', `/api/invites/${used.data.token as string}/accept`, {
           username: 'used-invite',
           name: '用过',
           password: 'password2',
         })
       ).status,
     ).toBe(200);
-    const revokeUsed = await call('DELETE', `/api/admin/invites/${used.data.id}`, undefined, admin.cookie);
+    const revokeUsed = await call(
+      'DELETE',
+      `/api/admin/invites/${used.data.id as string}`,
+      undefined,
+      admin.cookie,
+    );
     expect(revokeUsed.status).toBe(409);
     // 已使用的邀请状态优先显示“已使用”
-    expect((await call('GET', `/api/invites/${used.data.token}`)).data).toMatchObject({ state: 'used' });
+    expect((await call('GET', `/api/invites/${used.data.token as string}`)).data).toMatchObject({
+      state: 'used',
+    });
 
     const revoked = await call('POST', '/api/admin/invites', {}, admin.cookie);
     expect(
-      (await call('DELETE', `/api/admin/invites/${revoked.data.id}`, undefined, admin.cookie)).status,
+      (await call('DELETE', `/api/admin/invites/${revoked.data.id as string}`, undefined, admin.cookie))
+        .status,
     ).toBe(200);
     expect(
-      (await call('DELETE', `/api/admin/invites/${revoked.data.id}`, undefined, admin.cookie)).status,
+      (await call('DELETE', `/api/admin/invites/${revoked.data.id as string}`, undefined, admin.cookie))
+        .status,
     ).toBe(404);
   });
 
@@ -1012,7 +1034,7 @@ describe.each([
       call('POST', '/api/me/password', { newPassword: 'race-password-1' }, cookie),
       call('POST', '/api/me/password', { newPassword: 'race-password-2' }, cookie),
     ]);
-    expect([a.status, b.status].sort()).toEqual([200, 409]);
+    expect([a.status, b.status].sort((x, y) => x - y)).toEqual([200, 409]);
     // 首次设置不吊销其他会话（否则只是帮攻击者把主人踢下线）
     expect((await call('GET', '/api/auth/me', undefined, `dowel_session=${otherSession}`)).status).toBe(200);
     // 设好的密码能用

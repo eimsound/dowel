@@ -1,0 +1,14 @@
+{
+  "$schema": "./node_modules/oxfmt/configuration_schema.json",
+  "tabWidth": 2,
+  "useTabs": false,
+  "printWidth": 110,
+  "singleQuote": true,
+  "semi": true,
+  "sortImports": true,
+  "sortTailwindcss": {
+    "stylesheet": "./apps/web/src/styles.css",
+    "functions": ["cx"]
+  },
+  "ignorePatterns": [".agents/skills/**", "DESIGN.md", "**/dist/**", "pnpm-lock.yaml"]
+}

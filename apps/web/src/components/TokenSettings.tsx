@@ -18,7 +18,7 @@ import {
 } from '@dowel/api';
 import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query';
 import { Check, Copy, KeyRound, Lock, Plus, Trash2 } from 'lucide-react';
-import { useEffect, useId, useRef, useState } from 'react';
+import { type Dispatch, type SetStateAction, useEffect, useId, useRef, useState } from 'react';
 import { useTranslation } from 'react-i18next';
 import { api } from '../api.ts';
 import { formatTime } from '../format.ts';
@@ -158,17 +158,19 @@ export const TokenPolicyPanel = ({ path, queryKey }: { path: string; queryKey: u
   const toast = useToast();
   const id = useId();
   const q = useQuery({ queryKey, queryFn: () => api<TokenPolicyView>('GET', path) });
-  const [draft, setDraft] = useState<TokenCreatorRule | null>(null);
-  const [initialized, setInitialized] = useState(false);
-  const dirtyRef = useRef(false);
-
-  // 后台 refetch（例如窗口重新聚焦）不覆盖用户尚未保存的本地草稿
-  useEffect(() => {
-    if (q.data && (!initialized || !dirtyRef.current)) {
-      setDraft(q.data.rule);
-      setInitialized(true);
-    }
-  }, [q.data, initialized]);
+  // 本地未保存草稿：undefined 表示直接跟随服务端值，后台 refetch（例如窗口重新聚焦）不会覆盖正在编辑的草稿
+  const [localDraft, setLocalDraft] = useState<TokenCreatorRule | null | undefined>(undefined);
+  const serverRule = q.data?.rule ?? null;
+  const draft = localDraft === undefined ? serverRule : localDraft;
+  const setDraft: Dispatch<SetStateAction<TokenCreatorRule | null>> = (next) => {
+    setLocalDraft((prev) => {
+      const base = prev === undefined ? serverRule : prev;
+      const value = typeof next === 'function' ? next(base) : next;
+      return JSON.stringify(normalizeDraft(value)) === JSON.stringify(normalizeDraft(serverRule))
+        ? undefined
+        : value;
+    });
+  };
 
   const canEdit = q.data?.canEdit ?? false;
   // 读取全部组列表（/api/groups 不受 /api/directory 的 20 条上限截断）
@@ -182,8 +184,7 @@ export const TokenPolicyPanel = ({ path, queryKey }: { path: string; queryKey: u
     mutationFn: (rule: TokenCreatorRule | null) => api<TokenPolicyView>('PUT', path, { rule }),
     onSuccess: (v) => {
       qc.setQueryData(queryKey, v);
-      dirtyRef.current = false;
-      setDraft(v.rule);
+      setLocalDraft(undefined);
       void qc.invalidateQueries({ queryKey: ['token-policy'] });
       void qc.invalidateQueries({ queryKey: ['ci-tokens'] });
       void qc.invalidateQueries({ queryKey: ['project'] });
@@ -199,7 +200,7 @@ export const TokenPolicyPanel = ({ path, queryKey }: { path: string; queryKey: u
         {q.error.message}
       </Banner>
     );
-  if (!q.data || !initialized) return null;
+  if (!q.data) return null;
 
   const v = q.data;
   const allGroups = groupsQuery.data?.groups ?? [];
@@ -213,7 +214,6 @@ export const TokenPolicyPanel = ({ path, queryKey }: { path: string; queryKey: u
   const liveEffective = effectiveTokenRules(liveLayers);
 
   const dirty = JSON.stringify(normalizeDraft(draft)) !== JSON.stringify(normalizeDraft(v.rule));
-  dirtyRef.current = dirty;
   const disabled = !v.canEdit || save.isPending;
   const pickedGroupIds = new Set(draft?.groups.map((g) => g.groupId) ?? []);
   const remainingGroups = allGroups.filter((g) => !pickedGroupIds.has(g.id));
@@ -343,11 +343,7 @@ export const TokenPolicyPanel = ({ path, queryKey }: { path: string; queryKey: u
             {draft.groups.length > 0 ? (
               <ul className="m-0 list-none space-y-1.5 p-0">
                 {draft.groups.map((g, i) => (
-                  <li
-                    // biome-ignore lint/suspicious/noArrayIndexKey: 组条件列表按顺序编辑
-                    key={i}
-                    className="flex flex-wrap items-end gap-2"
-                  >
+                  <li key={i} className="flex flex-wrap items-end gap-2">
                     <div className="field w-48">
                       <label className="label" htmlFor={`${id}-g-${i}`}>
                         {t('tok.policy.groupCol')}

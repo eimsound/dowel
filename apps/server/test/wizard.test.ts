@@ -568,7 +568,7 @@ describe.runIf(ADMIN)('新建项目向导', () => {
     const v1 = await call('POST', `/api/projects/${project.id}/versions`, { name: '加列' });
     expect(v1.status).toBe(201);
     expect(v1.data).toMatchObject({ number: 1, verified: true });
-    const d1 = (await call('GET', `/api/projects/${project.id}/versions/${v1.data.id}`))
+    const d1 = (await call('GET', `/api/projects/${project.id}/versions/${v1.data.id as string}`))
       .data as unknown as VersionDetail;
     expect(d1.parentId).toBe(v0!.id);
     expect(d1.upSteps.map((x) => x.sql)).toEqual(['ALTER TABLE s.t ADD COLUMN extra text']);

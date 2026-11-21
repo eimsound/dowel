@@ -13,7 +13,7 @@ import type {
 import { useQuery, useQueryClient } from '@tanstack/react-query';
 import { useNavigate, useSearch } from '@tanstack/react-router';
 import { Check, CircleCheck, Database, FileUp, Plus, Trash2, TriangleAlert } from 'lucide-react';
-import { useEffect, useRef, useState } from 'react';
+import { useRef, useState } from 'react';
 import { useTranslation } from 'react-i18next';
 import { api } from '../api.ts';
 import { ClaimDialog } from '../components/ClaimDialog.tsx';
@@ -268,10 +268,7 @@ export const NewProject = () => {
     return [...map.values()];
   })();
   const takeCand = candidates.find((c) => c.id === takeProject);
-  const hasTakeCand = !!takeCand;
-  useEffect(() => {
-    if (takeProject && !hasTakeCand) setTakeProject('');
-  }, [takeProject, hasTakeCand]);
+  const selectedTakeProject = takeCand ? takeProject : '';
   const readsDone =
     filledEnvs.length > 0 && filledEnvs.every((e) => takeReads[e.key] && !takeReads[e.key]!.loading);
   const takeReading = filledEnvs.some((e) => takeReads[e.key]?.loading);
@@ -339,7 +336,7 @@ export const NewProject = () => {
         kind,
         env: kind === 'database' ? sourceEnv?.name : undefined,
         sql: kind === 'sql' ? sql : undefined,
-        projectId: kind === 'takeover' ? takeProject : undefined,
+        projectId: kind === 'takeover' ? selectedTakeProject : undefined,
         claim: kind === 'takeover' && (claimConfirmed || !!takeClaim) ? true : undefined,
       },
     };
@@ -691,7 +688,7 @@ export const NewProject = () => {
                                 key={c.id}
                                 className={cx(
                                   'flex cursor-pointer items-start gap-2.5 rounded-md border p-3',
-                                  takeProject === c.id
+                                  selectedTakeProject === c.id
                                     ? 'border-primary bg-primary-soft'
                                     : 'border-border bg-bg',
                                 )}
@@ -700,7 +697,7 @@ export const NewProject = () => {
                                   type="radio"
                                   name="takeover-project"
                                   className="mt-0.5"
-                                  checked={takeProject === c.id}
+                                  checked={selectedTakeProject === c.id}
                                   onChange={() => setTakeProject(c.id)}
                                 />
                                 <span className="space-y-0.5">

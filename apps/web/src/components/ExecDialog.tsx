@@ -62,7 +62,6 @@ export const DiffList = ({ items, total }: { items: DriftItem[]; total?: number 
     <div className="space-y-1.5">
       <ul className="m-0 list-none space-y-1.5 p-0">
         {items.map((d, i) => (
-          // biome-ignore lint/suspicious/noArrayIndexKey: 差异列表只读、顺序固定
           <li key={i} className="rounded-sm border border-border bg-bg px-2 py-1.5 text-xs">
             <div className="mb-0.5 text-text-3">
               {d.kind} · <span className="font-mono">{d.target}</span>
@@ -175,7 +174,6 @@ const DryRunPanel = ({ dry, onRetry }: { dry: DryState; onRetry: () => void }) =
               <summary className="cursor-pointer text-text-2">{t('tk.dry.showSteps')}</summary>
               <ol className="m-0 mt-1 list-none space-y-1 p-0">
                 {m.steps.map((st, i) => (
-                  // biome-ignore lint/suspicious/noArrayIndexKey: 步骤只读、顺序固定
                   <li key={i}>
                     <code className="block font-mono break-all whitespace-pre-wrap">
                       <Sql text={st.sql} />
@@ -234,7 +232,6 @@ export const ExecDialog = ({
   const [result, setResult] = useState<ExecEvent | null>(null);
   const [error, setError] = useState<{ message: string; code?: string; event?: ExecEvent } | null>(null);
   const running = useRef(false);
-  const [dry, setDry] = useState<DryState>({ state: 'loading' });
   const [dryTick, setDryTick] = useState(0);
   const reasonId = useId();
   const ackId = useId();
@@ -243,6 +240,9 @@ export const ExecDialog = ({
   const [submitError, setSubmitError] = useState<string | null>(null);
   const isRequest = mode === 'request';
   const isEmergency = mode === 'emergency';
+  const dryKey = `${pid}\0${eid}\0${kind}\0${to?.id ?? ''}\0${dryTick}\0${isRequest ? '1' : '0'}`;
+  const [dryState, setDryState] = useState<{ key: string; val: DryState } | null>(null);
+  const dry: DryState = dryState?.key === dryKey ? dryState.val : { state: 'loading' };
   // 申请不执行任何东西，不用输入环境名（执行时再输入）；直接执行和紧急执行在生产环境要输入
   const mustType = production && !isRequest;
   const dryOk = dry.state === 'done' && dry.res.ok;
@@ -255,10 +255,8 @@ export const ExecDialog = ({
 
   // 对话框打开（或点“重新预演”）时先预演：只读，不写目标库，也不写平台库的登记；
   // 预演没通过不挡着确认按钮——真正的执行会被同样的原因拒绝，原因照样显示
-  // biome-ignore lint/correctness/useExhaustiveDependencies: dryTick 只用来触发重新预演
   useEffect(() => {
     let live = true;
-    setDry({ state: 'loading' });
     const body = kind === 'baseline' ? { dryRun: true } : { to: to?.id, dryRun: true };
     // 申请：没有直接执行权限的人也能预演（提交申请的接口带 dryRun）
     const req = isRequest
@@ -269,13 +267,18 @@ export const ExecDialog = ({
         })
       : api<DryRunResponse>('POST', `/api/projects/${pid}/environments/${eid}/${kind}`, body);
     req.then(
-      (res) => live && setDry({ state: 'done', res }),
-      (e: unknown) => live && setDry({ state: 'error', message: e instanceof Error ? e.message : String(e) }),
+      (res) => live && setDryState({ key: dryKey, val: { state: 'done', res } }),
+      (e: unknown) =>
+        live &&
+        setDryState({
+          key: dryKey,
+          val: { state: 'error', message: e instanceof Error ? e.message : String(e) },
+        }),
     );
     return () => {
       live = false;
     };
-  }, [pid, eid, kind, to?.id, dryTick, isRequest]);
+  }, [pid, eid, kind, to?.id, dryKey, isRequest]);
 
   const refresh = () =>
     Promise.all([

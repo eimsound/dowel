@@ -325,7 +325,6 @@ export const CommandPalette = ({
         className="max-h-[min(420px,60vh)] overflow-auto p-1"
       >
         {filtered.map((g) => (
-          // biome-ignore lint/a11y/useSemanticElements: listbox 的分组只能是 role=group（fieldset 不能放进 listbox）
           <div key={g.key} role="group" aria-label={g.label} className="p-0">
             <div className="section-title px-2 pt-2 pb-1" aria-hidden="true">
               {g.label}

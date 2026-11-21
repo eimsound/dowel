@@ -19,7 +19,7 @@ let created = null;
 try {
   created = await autoSetup(db);
 } catch (e) {
-  console.error(`Dowel 启动失败：${e instanceof Error ? e.message : e}`);
+  console.error(`Dowel 启动失败：${e instanceof Error ? e.message : String(e)}`);
   await db.close();
   process.exit(1);
 }

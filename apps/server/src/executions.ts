@@ -544,7 +544,9 @@ export const runExecution = async (
     const chain = await loadChain(db, pid);
     if (!chain.length) throw new HTTPException(422, { message: '项目还没有发布任何版本' });
     const settings = await readSettings(db);
-    const emit = async (e: ExecutorEvent) => void (await input.onEvent?.(toExecEvent(e)));
+    const emit = async (e: ExecutorEvent) => {
+      await input.onEvent?.(toExecEvent(e));
+    };
     try {
       const result = await execute({
         db: conn.db,

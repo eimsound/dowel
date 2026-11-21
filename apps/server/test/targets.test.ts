@@ -141,7 +141,12 @@ describe.runIf(ADMIN)('真实 PG 实例', () => {
     const client = new SyncClient('t', { format: 1, dialect: 'pg', objects: {} });
     client.send = (m) => ws.send(JSON.stringify(m));
     ws.on('message', (d) => {
-      const m = JSON.parse(String(d)) as ToClient;
+      const text = Buffer.isBuffer(d)
+        ? d.toString('utf8')
+        : Array.isArray(d)
+          ? Buffer.concat(d).toString('utf8')
+          : new TextDecoder().decode(d);
+      const m = JSON.parse(text) as ToClient;
       if (['welcome', 'snapshot', 'commit', 'reject'].includes(m.t)) client.receive(m);
     });
     await new Promise((r) => ws.once('open', r));

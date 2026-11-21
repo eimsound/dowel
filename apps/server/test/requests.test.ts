@@ -724,7 +724,10 @@ describe.skipIf(!PG_URL)('第一轮审查的修复（目标库 PG）', () => {
     expect((await statusOf(em.id)).status).toBe('failed');
     // 审批人（组管理员）收到开始和失败两条
     const failed = (await inbox('ga')).items.filter((i) => i.requestId === em.id);
-    expect(failed.map((i) => i.data.event).sort()).toEqual(['emergency', 'emergency_failed']);
+    expect(failed.map((i) => i.data.event).sort((a, b) => (a ?? '').localeCompare(b ?? ''))).toEqual([
+      'emergency',
+      'emergency_failed',
+    ]);
     // 重新发起紧急执行（新记录）成功，审批人收到“紧急执行完成”
     const ok = await call('POST', path, { kind: 'execute', to: v1!.id, reason: '再来一次', confirm: 'prod' });
     expect(last(ok.events)).toMatchObject({ stage: 'done', current: { number: 1 } });
@@ -894,7 +897,10 @@ describe.skipIf(!PG_URL)('第一轮审查的修复（目标库 PG）', () => {
       expect((await statusOf(a.id)).status).toBe('failed');
       // 审批人对 A 只收到开始和失败两条
       const forA = (await inbox('ga')).items.filter((i) => i.requestId === a.id).map((i) => i.data.event);
-      expect(forA.sort()).toEqual(['emergency', 'emergency_failed']);
+      expect(forA.sort((x, y) => (x ?? '').localeCompare(y ?? ''))).toEqual([
+        'emergency',
+        'emergency_failed',
+      ]);
       // A 的 Webhook 只有失败那一次
       expect(hooks.filter((h) => h.requestId === a.id).map((h) => h.type)).toEqual(['emergency.executed']);
     } finally {
@@ -1129,8 +1135,8 @@ describe.skipIf(!PG_URL)('中断申请巡检保护与重试限制（#18）', () 
     const origWake = created.webhooks.wake.bind(created.webhooks);
     const origEmit = created.webhooks.emit.bind(created.webhooks);
     // 拦截 wake 阻止立即拉取消费，同时拦截 emit 断言全路径零调用
-    created.webhooks.wake = (broadcast = true) => {
-      wakeCalls.push(broadcast);
+    created.webhooks.wake = (broadcast) => {
+      wakeCalls.push(broadcast ?? true);
     };
     created.webhooks.emit = (gid, ev) => {
       emitCalls.push({ gid, ev });
@@ -1493,8 +1499,8 @@ describe('Webhook 事务内持久化入队（#20）', () => {
     const { memDb, appObj, admin, adminCookie, insertReq, jobsOf, cleanup } = await setupTxEnv();
     const wakeCalls: boolean[] = [];
     const origWake = appObj.webhooks.wake.bind(appObj.webhooks);
-    appObj.webhooks.wake = (broadcast = true) => {
-      wakeCalls.push(broadcast);
+    appObj.webhooks.wake = (broadcast) => {
+      wakeCalls.push(broadcast ?? true);
     };
     try {
       // 1. 审批接口事务中：queueHook(tx) 写完 webhook_jobs 后，随后的 inbox_items 写库抛错 → 整个事务回滚
@@ -1599,8 +1605,8 @@ describe('Webhook 事务内持久化入队（#20）', () => {
     const emitCalls: unknown[] = [];
     const origWake = appObj.webhooks.wake.bind(appObj.webhooks);
     const origEmit = appObj.webhooks.emit.bind(appObj.webhooks);
-    appObj.webhooks.wake = (broadcast = true) => {
-      wakeCalls.push(broadcast);
+    appObj.webhooks.wake = (broadcast) => {
+      wakeCalls.push(broadcast ?? true);
     };
     appObj.webhooks.emit = (gid, ev) => {
       emitCalls.push({ gid, ev });

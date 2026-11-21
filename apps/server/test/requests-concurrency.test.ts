@@ -188,7 +188,7 @@ describe.skipIf(!PG_URL)('执行申请的并发（平台库 PG）', () => {
       await holder.db.query('select pg_advisory_unlock(hashtext($1))', [POLICY_LOCK_KEY]);
       return Promise.all([a, b]);
     });
-    expect([a.status, b.status].sort()).toEqual([200, 409]);
+    expect([a.status, b.status].sort((x, y) => x - y)).toEqual([200, 409]);
     const ok = a.status === 200 ? a : b;
     expect(ok.events.at(-1)).toMatchObject({ stage: 'done', current: { number: 1 } });
     expect(await upRuns(target, pid)).toBe(1);

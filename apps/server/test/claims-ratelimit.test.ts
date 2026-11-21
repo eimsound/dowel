@@ -99,7 +99,7 @@ const newInstance = async (connectionLimit = 10_000): Promise<Inst> => {
 const drain = async () => {
   for (let i = instances.pop(); i; i = instances.pop()) {
     await i.created.refresher.drain();
-    await i.created.requests.stop();
+    i.created.requests.stop();
     await i.created.webhooks.close();
     await i.created.rooms.flush();
     await i.created.shadows.close();

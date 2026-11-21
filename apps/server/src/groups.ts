@@ -82,7 +82,7 @@ export const slugTaken = async (db: Db, slug: string, exceptId?: string) => {
 
 /** 项目 slug 在组内唯一 */
 export const projectSlugTaken = async (db: Db, groupId: string, slug: string, exceptId?: string) => {
-  const [row] = (await exceptId)
+  const [row] = exceptId
     ? await db.query('select 1 from projects where group_id = $1 and slug = $2 and id <> $3', [
         groupId,
         slug,

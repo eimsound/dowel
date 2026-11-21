@@ -2,8 +2,10 @@
 // 背景色用 peer 色和 surface 混合：亮 / 暗两种配色下都保持与 text-2 足够对比，同时不同组能区分开。
 const CJK = /[\u2e80-\u9fff\uf900-\ufaff\u3040-\u30ff\uac00-\ud7af]/;
 
+const segmenter = new Intl.Segmenter(undefined, { granularity: 'grapheme' });
+
 export const groupInitial = (name: string): string => {
-  const first = [...name.trim()][0] ?? '?';
+  const first = segmenter.segment(name.trim())[Symbol.iterator]().next().value?.segment ?? '?';
   return CJK.test(first) ? first : first.toUpperCase();
 };
 

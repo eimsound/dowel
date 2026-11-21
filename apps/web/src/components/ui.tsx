@@ -184,7 +184,7 @@ export const Menu = ({
       >
         {trigger}
       </button>
-      {/* biome-ignore lint/a11y/noStaticElementInteractions: 键盘事件从菜单项冒泡上来，菜单本身不可聚焦 */}
+      {/* oxlint-disable-next-line jsx-a11y/no-static-element-interactions -- 键盘事件从菜单项冒泡上来，菜单本身不可聚焦 */}
       <div
         ref={pop}
         popover="auto"
@@ -192,7 +192,6 @@ export const Menu = ({
         style={{ positionAnchor: anchor } as CSSProperties}
         onKeyDown={onKeyDown}
       >
-        {/* biome-ignore lint/a11y/useAriaPropsSupportedByRole: focusgroup="menu" 让浏览器推断出 menu 角色；不支持时显式加上 */}
         <div
           {...({ focusgroup: 'menu nomemory' } as object)}
           aria-label={label}

@@ -370,7 +370,7 @@ describe.skipIf(!PG_URL)('接手与认领（P4c）', () => {
     expect(detail.upSteps.map((s) => s.sql)).toEqual([
       expect.stringMatching(/RENAME COLUMN "?c2"? TO "?memo"?/i),
     ]);
-    expect(detail.upSteps.join(' ')).not.toMatch(/DROP COLUMN|ADD COLUMN/i);
+    expect(detail.upSteps.map((s) => s.sql).join(' ')).not.toMatch(/DROP COLUMN|ADD COLUMN/i);
     // B 执行成功（v1~v3 已经在这个库里，只跑 v4）
     const run = await exec(B, pid, eidB, 'execute', v4.data.id as string);
     expect(run.last, JSON.stringify(run.events)).toMatchObject({ stage: 'done', ran: 1 });
@@ -505,7 +505,7 @@ describe.skipIf(!PG_URL)('接手与认领（P4c）', () => {
     );
     expect(done.last, JSON.stringify(done.events)).toMatchObject({ stage: 'done' });
     const vs = (await inst.call('GET', `/api/projects/${pid}/versions`)).data as unknown as VersionInfo[];
-    expect(vs.map((v) => v.number).sort()).toEqual([1, 2, 3]);
+    expect(vs.map((v) => v.number).sort((a, b) => a - b)).toEqual([1, 2, 3]);
     const list = await envs(inst, pid);
     const by = Object.fromEntries(list.map((e) => [e.name, e.currentVersion?.number]));
     expect(by).toEqual({ dev: 3, prod: 2 });

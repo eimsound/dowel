@@ -2,7 +2,7 @@
 import type { Role } from '@dowel/api';
 import { EditError, emptyModel, type Model, newId } from '@dowel/core';
 import { SyncClient, type ToClient, type Versions } from '@dowel/sync';
-import { useEffect, useState, useSyncExternalStore } from 'react';
+import { useEffect, useLayoutEffect, useState, useSyncExternalStore } from 'react';
 
 export type Layout = Record<string, { x: number; y: number }>;
 export type Status = 'connecting' | 'online' | 'offline';
@@ -138,11 +138,17 @@ export class Workspace {
     this.update({ layout: { ...this.snap.layout, ...positions } });
     if (this.ws?.readyState === WebSocket.OPEN) this.ws.send(JSON.stringify({ t: 'layout', positions }));
   }
+
+  setOnNotice(fn: Workspace['onNotice']) {
+    this.onNotice = fn;
+  }
 }
 
 export const useWorkspace = (pid: string, onNotice: Workspace['onNotice']) => {
   const [ws] = useState(() => new Workspace(pid));
-  ws.onNotice = onNotice;
+  useLayoutEffect(() => {
+    ws.setOnNotice(onNotice);
+  }, [ws, onNotice]);
   useEffect(() => {
     ws.start();
     return () => ws.stop();

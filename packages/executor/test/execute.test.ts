@@ -232,7 +232,7 @@ test.skipIf(!PG_URL)('并发：同一个库两次执行只有一次真正执行�
     try {
       const [a, b] = await Promise.all([run(t.db, chain, 3), run(other.db, chain, 3)]);
       // 一个执行了 3 个迁移，另一个等到锁之后发现已经到位，什么都没做
-      expect([a.ran.length, b.ran.length].sort()).toEqual([0, 3]);
+      expect([a.ran.length, b.ran.length].sort((x, y) => x - y)).toEqual([0, 3]);
       const h = await readHistory(t.db, 'p1');
       expect(h.history.filter((x) => x.status === 'done').length).toBe(3);
       expect(h.history.length).toBe(3);

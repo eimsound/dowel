@@ -816,7 +816,7 @@ export const MIGRATIONS: MigrationStep[] = [
   // 产品化 P4b 第二轮审查：重新划分两张表的职责。`versions.executed_at` 是唯一的永久事实；
   // environment_versions 是“目标库历史的镜像 + 进行中的登记”：state = claimed（执行开始前登记，还没确认）/ confirmed（目标库历史里有）。
   // 旧行都是已回填进 executed_at 的，按 confirmed 处理；之后在目标库项目锁里的同步会把它对齐到目标库历史。
-  (d) => `alter table environment_versions add column state text not null default 'confirmed';`,
+  () => `alter table environment_versions add column state text not null default 'confirmed';`,
   // 产品化 P4c：接手时从目标库历史恢复出来的版本记下恢复时间（null = 在本实例发布的）。恢复的版本一律未验证
   (d) => `alter table versions add column restored_at ${types(d).ts};`,
   // 产品化 P5a：执行策略四层（实例 → 组 → 项目 → 环境）、执行者授权、前置环境（ADR 0005）。

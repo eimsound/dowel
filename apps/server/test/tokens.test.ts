@@ -1122,12 +1122,12 @@ describe.skipIf(!PG_URL)('CI 执行接口、错误码、审计通知与 GitHub A
           )
         ).status,
       ).toBe(200);
-      release();
+      await release();
       const rechecked = await waiting;
       expect(rechecked.status).toBe(403);
       expect(rechecked.data).toMatchObject({ ok: false, code: 'token_execution_disabled' });
     } finally {
-      release();
+      await release();
     }
     // 重新打开 allowTokens
     expect(
@@ -1399,7 +1399,7 @@ describe.skipIf(!PG_URL)('CI 执行接口、错误码、审计通知与 GitHub A
       expect(busyDrift.status).toBe(423);
       expect(busyDrift.data).toMatchObject({ ok: false, code: 'lock_timeout' });
     } finally {
-      release();
+      await release();
     }
 
     //    - 历史格式过新：GET .../environments/:env 和 POST .../drift 均返回 409 version_mismatch

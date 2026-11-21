@@ -6,7 +6,7 @@ import { EditorState } from '@codemirror/state';
 import { EditorView } from '@codemirror/view';
 import { tags } from '@lezer/highlight';
 import { basicSetup } from 'codemirror';
-import { useEffect, useRef } from 'react';
+import { useEffect, useLayoutEffect, useRef } from 'react';
 
 const highlight = HighlightStyle.define([
   { tag: tags.keyword, color: 'var(--syn-kw)' },
@@ -33,10 +33,12 @@ export const SqlView = ({
   const view = useRef<EditorView | null>(null);
   const editable = onChange !== undefined;
   const change = useRef(onChange);
-  change.current = onChange;
   // 编辑器因 label / 可编辑状态变化重建时，用当时最新的文本作初始内容
   const latest = useRef(text);
-  latest.current = text;
+  useLayoutEffect(() => {
+    change.current = onChange;
+    latest.current = text;
+  });
   useEffect(() => {
     view.current = new EditorView({
       parent: host.current!,
