@@ -44,7 +44,7 @@ const buildUsersV2 = (v1: Model): Model => {
     name: 'role',
     type: 'nvarchar(32)',
     notNull: true,
-    default: { expr: "N'member'" },
+    default: { expr: "(N'member')" },
   });
   addUnique(m, 't-users', ['c-email'], false, 'uq-email');
   return m;

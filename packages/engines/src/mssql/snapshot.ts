@@ -565,7 +565,7 @@ export const readMssqlSnapshot = async (db: Db, only?: string[] | null): Promise
     comment: string | null;
   }>(
     `SELECT ix.object_id AS objectId, ix.index_id AS indexId, ix.name,
-            ix.type AS indexType, ix.is_unique AS isUnique, ix.fill_factor AS fillFactor,
+            ix.type AS indexType, ix.is_unique AS isUnique, ix.fill_factor AS [fillFactor],
             ix.filter_definition AS filterDef,
             ixc.column_id AS columnId, ixc.key_ordinal AS keyOrdinal,
             ixc.index_column_id AS indexColumnId, ixc.is_included_column AS isIncluded,

@@ -318,7 +318,7 @@ export class Shadows {
     const groups = new Map<number | null, typeof rows>();
     const knownMajors = new Set<number>();
     for (const r of rows) {
-      const major = pgMajorOf(r.engine_version_num);
+      const major = dialect === 'pg' ? pgMajorOf(r.engine_version_num) : null;
       if (major !== null) knownMajors.add(major);
       const list = groups.get(major);
       if (list) list.push(r);
