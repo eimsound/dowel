@@ -400,7 +400,7 @@ export const readMssqlSnapshot = async (db: Db, only?: string[] | null): Promise
     tbl.columns[r.name] = {
       columnId: Number(r.columnId),
       type: formatMssqlColType(r.typeName, Number(r.maxLength), Number(r.precision), Number(r.scale)),
-      notNull: !r.isNullable,
+      notNull: r.isComputed && !r.isPersisted ? false : !r.isNullable,
       default: r.isComputed ? null : (r.defaultDef ?? null),
       defaultName: r.isComputed ? null : (r.defaultName ?? null),
       identity: r.isIdentity

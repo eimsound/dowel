@@ -1,9 +1,75 @@
 // MSSQL 步骤风险分析：利用事务内 DDL 能力在影子库实测 sys.dm_tran_locks 对象锁（Sch-M / Sch-S / X）
 // 与 sys.partitions.hobt_id 数据页重写检测。
-import { createAll, isNontransactionalSql, type Model, type Step } from '@dowel/core';
+import {
+  createAll,
+  isNontransactionalSql,
+  type Model,
+  mssqlTokenize,
+  splitMssqlBatches,
+  type Step,
+} from '@dowel/core';
 
 import { type Db, EngineStepError, NON_TRANSACTIONAL_NOTE, type StepRisk } from '../types.ts';
 import { mssqlErrorNumber, pinMssqlSession, runMssqlTransaction } from './db.ts';
+
+const METADATA_PROCS = new Set([
+  'sp_addextendedproperty',
+  'sp_updateextendedproperty',
+  'sp_dropextendedproperty',
+]);
+
+/**
+ * 词法级判断一步 MSSQL SQL 是否仅包含纯元数据操作（扩展属性注释或删除默认约束），
+ * 不依赖 Step.kind（兼容冻结脚本 kind === 'frozen'）。
+ */
+export const isMetadataOnlyMssqlSql = (sql: string): boolean => {
+  const batches = splitMssqlBatches(sql, { expandRepeat: false });
+  if (batches.length === 0) return true;
+  for (const batch of batches) {
+    const toks = mssqlTokenize(batch).filter(
+      (t) => !/^\s+$/.test(t.text) && !t.text.startsWith('--') && !t.text.startsWith('/*') && t.text !== ';',
+    );
+    if (toks.length === 0) continue;
+    // 1. EXEC [sys.]sp_{add,update,drop}extendedproperty ...
+    if (toks[0]?.kind === 'ident' && (toks[0].text === 'exec' || toks[0].text === 'execute')) {
+      let idx = 1;
+      if (toks[idx + 1]?.text === '.') idx += 2;
+      const proc = toks[idx]?.text.toLowerCase();
+      if (proc && METADATA_PROCS.has(proc)) continue;
+      return false;
+    }
+    // 2. ALTER TABLE <tbl> DROP CONSTRAINT [DF_...]
+    if (
+      toks[0]?.kind === 'ident' &&
+      toks[0].text === 'alter' &&
+      toks[1]?.kind === 'ident' &&
+      toks[1].text === 'table'
+    ) {
+      const dropIdx = toks.findIndex(
+        (t, k) =>
+          k >= 3 &&
+          t.kind === 'ident' &&
+          t.text === 'drop' &&
+          toks[k + 1]?.kind === 'ident' &&
+          toks[k + 1]!.text === 'constraint',
+      );
+      if (dropIdx >= 3) {
+        const nameTok = toks[dropIdx + 2];
+        const afterName = toks[dropIdx + 3];
+        if (
+          nameTok &&
+          (nameTok.kind === 'ident' || nameTok.kind === 'qident') &&
+          /^df_/i.test(nameTok.text) &&
+          !afterName
+        ) {
+          continue;
+        }
+      }
+    }
+    return false;
+  }
+  return true;
+};
 
 /** SQL Server 错误号：当前语句不允许在用户事务内执行（226 / 574 / 15002） */
 const NON_TX_ERROR_NUMBERS = new Set([226, 574, 15002]);
@@ -122,9 +188,8 @@ export const analyzeMssqlStepRisk = async (
     if (rewrites.length > 0) {
       level = 'high';
     } else if (hasSchM || hasX) {
-      // 对已有表的 ALTER COLUMN / 建聚集索引等强模式锁标 medium
-      level =
-        s.kind === 'alterColumn' || s.kind === 'createIndex' || s.kind === 'addPrimaryKey' ? 'medium' : 'low';
+      // 基于 SQL 词法分类而非 Step.kind（兼容冻结脚本 kind === 'frozen'）：纯元数据操作保持 low，其余已有表强锁标 medium
+      level = isMetadataOnlyMssqlSql(s.sql) ? 'low' : 'medium';
     }
 
     return {

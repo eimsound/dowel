@@ -6,14 +6,9 @@ import { emptyBase, emptyModel, plan, validate } from '@dowel/core';
 import { stepsChecksum, toScriptSteps } from '@dowel/engines';
 import { type ChainVersion, checkDrift, execute, markApplied } from '@dowel/executor';
 import fc from 'fast-check';
-import { afterAll, beforeAll, describe, expect, it } from 'vitest';
+import { beforeAll, describe, expect, it } from 'vitest';
 
-import {
-  createTestMssqlDb,
-  getMssqlAdminUrl,
-  MSSQL_VERSION,
-  stopMssqlContainer,
-} from '../../../test/mssql.ts';
+import { createTestMssqlDb, getMssqlAdminUrl, MSSQL_VERSION } from '../../../test/mssql.ts';
 import { analyze, verify, verifyScripts } from '../src/index.ts';
 import { buildMssqlPair } from './mssql-gen.ts';
 
@@ -23,10 +18,6 @@ describe(`MSSQL (${MSSQL_VERSION}) fast-check random roundtrip`, () => {
   beforeAll(async () => {
     adminUrl = await getMssqlAdminUrl();
   }, 120_000);
-
-  afterAll(async () => {
-    await stopMssqlContainer();
-  }, 60_000);
 
   it('verifies up/down closure and frozen verifyScripts over random MSSQL schema transitions', async () => {
     if (!adminUrl) return;

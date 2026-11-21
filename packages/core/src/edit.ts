@@ -62,7 +62,7 @@ export { EditError, exprReferences, renameInExpr, renameQualifiedInExpr, type To
  */
 export const checkExprColumns = (m: Model, table: string, expr: string) => {
   const d = getDialect(m.dialect);
-  const caseInsensitive = m.dialect === 'sqlite';
+  const caseInsensitive = m.dialect === 'sqlite' || m.dialect === 'mssql';
   const names = new Set(
     effectiveColumnsOf(m, table).map((c) => (caseInsensitive ? c.name.toLowerCase() : c.name)),
   );
@@ -137,7 +137,9 @@ export const createSchema = (m: Model, name: string, id = newId()): string => {
     throw new EditError(`当前方言不支持多 schema（固定为 ${cap.defaultSchema}）`);
   }
   assertIdent(m, name, 'schema');
-  if (all(m, 'schema').some((s) => s.name === name)) throw new EditError(`schema ${name} 已存在`);
+  const ci = m.dialect === 'sqlite' || m.dialect === 'mssql';
+  if (all(m, 'schema').some((s) => (ci ? s.name.toLowerCase() === name.toLowerCase() : s.name === name)))
+    throw new EditError(`schema ${name} 已存在`);
   const o: Schema = { id, kind: 'schema', name, comment: null };
   m.objects[o.id] = o;
   return o.id;
@@ -148,7 +150,12 @@ export const renameSchema = (m: Model, id: string, name: string) => {
     throw new EditError('当前方言不支持重命名 schema');
   }
   assertIdent(m, name, 'schema');
-  if (all(m, 'schema').some((s) => s.name === name && s.id !== id))
+  const ci = m.dialect === 'sqlite' || m.dialect === 'mssql';
+  if (
+    all(m, 'schema').some(
+      (s) => (ci ? s.name.toLowerCase() === name.toLowerCase() : s.name === name) && s.id !== id,
+    )
+  )
     throw new EditError(`schema ${name} 已存在`);
   const s = get(m, id, 'schema');
   const old = s.name;
@@ -259,9 +266,15 @@ export const renameSequence = (m: Model, id: string, name: string) => {
 export const dropSequence = (m: Model, id: string) => {
   if (!getDialect(m.dialect).capabilities.sequences) throw new EditError('当前方言不支持独立序列');
   get(m, id, 'sequence');
-  for (const c of all(m, 'column'))
-    if (c.default && 'nextval' in c.default && c.default.nextval === id) c.default = null;
+  const affectedTables = new Set<string>();
+  for (const c of all(m, 'column')) {
+    if (c.default && 'nextval' in c.default && c.default.nextval === id) {
+      c.default = null;
+      affectedTables.add(c.parent);
+    }
+  }
   delete m.objects[id];
+  for (const tid of affectedTables) refreshDerivedNames(m, tid);
 };
 
 // ───── 表 ─────
@@ -997,7 +1010,7 @@ export const addColumn = (m: Model, table: string, spec: ColumnSpec): string => 
   }
   const cols = columnsOf(m, table);
   const dup =
-    m.dialect === 'sqlite'
+    m.dialect === 'sqlite' || m.dialect === 'mssql'
       ? cols.some((c) => c.name.toLowerCase() === spec.name.toLowerCase())
       : cols.some((c) => c.name === spec.name);
   if (dup) throw new EditError(`列 ${spec.name} 已存在`);
@@ -1085,7 +1098,7 @@ export const renameColumn = (m: Model, id: string, name: string) => {
   assertNotPartitionChild(m, c.parent);
   normalizePartitionFamily(m, c.parent);
   const dup =
-    m.dialect === 'sqlite'
+    m.dialect === 'sqlite' || m.dialect === 'mssql'
       ? columnsOf(m, c.parent).some((x) => x.id !== id && x.name.toLowerCase() === name.toLowerCase())
       : columnsOf(m, c.parent).some((x) => x.name === name && x.id !== id);
   if (dup) throw new EditError(`列 ${name} 已存在`);
@@ -1219,6 +1232,7 @@ export const setDefault = (m: Model, id: string, def: ColumnDefault | null) => {
   if (def && (c.identity || c.generated)) throw new EditError('identity 列和生成列不能有默认值');
   if (def && 'nextval' in def) get(m, def.nextval, 'sequence');
   c.default = def;
+  refreshDerivedNames(m, c.parent);
 };
 
 export const setIdentity = (m: Model, id: string, identity: { always: boolean } | null) => {

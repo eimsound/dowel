@@ -14,12 +14,18 @@ import {
   plan,
   type Step,
 } from '@dowel/core';
-import { type Db, getEngine, reconcileIds, type ScriptStep } from '@dowel/engines';
+import {
+  type Db,
+  getEngine,
+  mssqlErrorCode,
+  mssqlErrorNumber,
+  reconcileIds,
+  type ScriptStep,
+} from '@dowel/engines';
 import {
   analyze,
   buildTarget,
   InstanceLevelStatementError,
-  readShadowPgMajor,
   runSteps,
   StepError,
   type VerifyScriptsOptions,
@@ -110,9 +116,19 @@ export const SHADOW_STATEMENT_TIMEOUT_MS = 120_000;
  * 误判的最坏结果只是把基础设施问题记成“验证失败”，或者把用户的超时当成“影子库不可用 → 未验证”，
  * 都不会把版本误判成“已验证”。
  */
-const isStatementTimeout = (e: unknown, timeoutMs: number) =>
-  codeOf(e) === '57014' &&
-  (/statement timeout/i.test(messageOf(e)) || (e instanceof StepError && e.elapsedMs >= timeoutMs * 0.9));
+const isStatementTimeout = (e: unknown, timeoutMs: number) => {
+  const cause = e instanceof StepError ? e.cause : e;
+  const code = codeOf(e) ?? mssqlErrorCode(cause);
+  if (code === '57014') {
+    return (
+      /statement timeout/i.test(messageOf(e)) || (e instanceof StepError && e.elapsedMs >= timeoutMs * 0.9)
+    );
+  }
+  if (code === 'ETIMEOUT' || code === 'ECANCEL') {
+    return e instanceof StepError && (/timeout|超时/i.test(messageOf(e)) || e.elapsedMs >= timeoutMs * 0.9);
+  }
+  return false;
+};
 
 const errorOf = (e: unknown, timeoutMs: number) =>
   e instanceof StepError
@@ -157,21 +173,32 @@ export const storedReport = (
  */
 const CONNECTION_SQLSTATE = /^(08|53|57P)|^(55P03|58030)$/;
 const CONNECTION_CODE =
-  /^(CONNECTION_|CONNECT_TIMEOUT|ECONN|ETIMEDOUT|EPIPE|ENOTFOUND|EAI_AGAIN|ENETUNREACH|EHOSTUNREACH)/;
+  /^(CONNECTION_|CONNECT_TIMEOUT|ECONN|ETIMEDOUT|EPIPE|ENOTFOUND|EAI_AGAIN|ENETUNREACH|EHOSTUNREACH|ESOCKET|ELOGIN|EINSTLOOKUP|ENOTOPEN)/;
+const MSSQL_INFRA_NUMBERS = new Set([1222, 18456, 4060]);
 
 /** 连接类故障（任何地方出现都是影子库的问题） */
 export const isConnectionFailure = (e: unknown): boolean => {
-  if ((e instanceof StepError ? e.cause : e) instanceof ShadowError) return true;
-  const code = codeOf(e);
-  return code !== null && (CONNECTION_SQLSTATE.test(code) || CONNECTION_CODE.test(code));
+  const cause = e instanceof StepError ? e.cause : e;
+  if (cause instanceof ShadowError) return true;
+  const code = codeOf(e) ?? mssqlErrorCode(cause);
+  if (code !== null && (CONNECTION_SQLSTATE.test(code) || CONNECTION_CODE.test(code))) return true;
+  const num = mssqlErrorNumber(cause);
+  return num !== null && MSSQL_INFRA_NUMBERS.has(num);
 };
 
-/** 影子库的问题：连接类故障，或者不是“用户的步骤自己造成的” 57014 / 58 类 */
+/** 影子库的问题：连接类故障，或者不是“用户的步骤自己造成的” 57014 / 58 类 / MSSQL ETIMEOUT & ECANCEL */
 export const isInfraFailure = (e: unknown, timeoutMs = SHADOW_STATEMENT_TIMEOUT_MS): boolean => {
   if (isConnectionFailure(e)) return true;
-  const code = codeOf(e);
-  if (code === null || !(code === '57014' || code.startsWith('58'))) return false;
-  return !(e instanceof StepError && (code.startsWith('58') || isStatementTimeout(e, timeoutMs)));
+  const cause = e instanceof StepError ? e.cause : e;
+  const code = codeOf(e) ?? mssqlErrorCode(cause);
+  if (code === null) return false;
+  if (code === '57014' || code.startsWith('58')) {
+    return !(e instanceof StepError && (code.startsWith('58') || isStatementTimeout(e, timeoutMs)));
+  }
+  if (code === 'ETIMEOUT' || code === 'ECANCEL') {
+    return !(e instanceof StepError && isStatementTimeout(e, timeoutMs));
+  }
+  return false;
 };
 
 /**
@@ -280,8 +307,8 @@ export const shadowOps = (
     const d = await db();
     const dDialect = next.dialect;
     const engine = getEngine(dDialect);
-    const pgMajor = dDialect === 'pg' ? await readShadowPgMajor(d) : null;
-    const planOpts = pgMajor !== null ? { pgMajor } : undefined;
+    const vNum = await engine.readVersionNum?.(d);
+    const planOpts = vNum !== null && vNum !== undefined ? engine.planOptionsForVersion?.(vNum) : undefined;
     let steps: Step[] | null = null;
     try {
       steps = plan(prev, next, planOpts);
@@ -327,7 +354,10 @@ export const shadowOps = (
         c.where = e.where;
       }
       if (c.kind === 'column' && e.kind === 'column') {
-        if (c.generated && e.generated) c.generated = { ...c.generated, expr: e.generated.expr };
+        if (c.generated && e.generated) {
+          c.generated = { ...c.generated, expr: e.generated.expr };
+          c.type = e.type;
+        }
         if (c.default && 'expr' in c.default && e.default && 'expr' in e.default)
           c.default = { expr: e.default.expr };
       }

@@ -4,18 +4,15 @@
 // - 服务端项目创建、SQL 导入、验证、发布与执行端到端闭环。
 import type { ProjectCreated, ProjectInfo, TargetInfo, VersionCreated, WizardEvent } from '@dowel/api';
 import { addColumn, all, mssqlIdent, mssqlLiteral } from '@dowel/core';
+import { isMetadataOnlyMssqlSql, stripMssqlImportNoise } from '@dowel/engines';
+import { StepError } from '@dowel/verifier';
 import { afterAll, beforeAll, describe, expect, test } from 'vitest';
 
-import {
-  connectTestMssql,
-  createTestMssqlDb,
-  getMssqlAdminUrl,
-  MSSQL_VERSION,
-  stopMssqlContainer,
-} from '../../../test/mssql.ts';
+import { connectTestMssql, createTestMssqlDb, getMssqlAdminUrl, MSSQL_VERSION } from '../../../test/mssql.ts';
 import { createApp, openPlatformDb, type PlatformDb } from '../src/index.ts';
 import { KeyedLimiter } from '../src/rate-limit.ts';
-import { ShadowError } from '../src/shadow.ts';
+import { isConnectionFailure, isInfraFailure, ShadowError } from '../src/shadow.ts';
+import { scrubUrl } from '../src/targets.ts';
 import {
   claimMssqlShadow,
   dropMssqlSameInstanceShadow,
@@ -72,6 +69,54 @@ describe('MSSQL URL parsing and shadow naming (pure unit)', () => {
     const sh = mssqlShadowDbName(longDb);
     expect(sh.length).toBeLessThanOrEqual(128);
     expect(sh.endsWith('_dowel')).toBe(true);
+
+    // 严格校验端口、超时参数与 IPv6 尾随垃圾字符
+    expect(() => parseMssqlUrl('mssql://sa:pw@db.internal:1433abc/app')).toThrow();
+    expect(() => parseMssqlUrl('mssql://sa:pw@db.internal:1433/app?connectTimeout=5000ms')).toThrow();
+    expect(() => parseMssqlUrl('mssql://sa:pw@db.internal:1433/app?requestTimeout=10s')).toThrow();
+    expect(() => parseMssqlUrl('mssql://sa:pw@[::1]garbage/app')).toThrow();
+    expect(() => parseMssqlUrl('mssql://sa:pw@[::1]:1433x/app')).toThrow();
+    expect(parseMssqlUrl('mssql://sa:pw@[::1]:1434/app')).toMatchObject({ server: '::1', port: 1434 });
+
+    // 跨方言 scrubUrl 脱敏 host\instance 连接串与编码/明文密码
+    const instUrl = 'mssql://sa:P%40ssWord!@10.0.0.5\\SQLEXPRESS/appdb';
+    const scrubbed = scrubUrl(`connect ${instUrl} failed for P@ssWord! and P%40ssWord!`, instUrl);
+    expect(scrubbed).not.toContain('P@ssWord!');
+    expect(scrubbed).not.toContain('P%40ssWord!');
+
+    // shadow.ts 识别 tedious/mssql 连接与基础设施故障
+    expect(isConnectionFailure(Object.assign(new Error('socket'), { code: 'ESOCKET' }))).toBe(true);
+    expect(isConnectionFailure(Object.assign(new Error('login'), { code: 'ELOGIN' }))).toBe(true);
+    expect(isConnectionFailure(Object.assign(new Error('lock'), { number: 1222 }))).toBe(true);
+    expect(isConnectionFailure(Object.assign(new Error('auth'), { number: 18456 }))).toBe(true);
+    expect(isInfraFailure(Object.assign(new Error('timeout'), { code: 'ETIMEOUT' }))).toBe(true);
+    // 步骤内因语句超时取消按用户 DDL 超时（非基础设施故障）归类
+    const userTimeoutStep = new StepError(
+      { kind: 'frozen', target: 'up#1', sql: 'CREATE INDEX ...' },
+      Object.assign(new Error('MSSQL 语句执行超过 1000ms（已取消）'), { code: 'ETIMEOUT' }),
+      1050,
+    );
+    expect(isInfraFailure(userTimeoutStep, 1000)).toBe(false);
+
+    // 词法级 stripMssqlImportNoise 支持同行 USE 与普通语句共存
+    expect(stripMssqlImportNoise('USE [app]; CREATE TABLE [dbo].[t] ([id] int);').trim()).toBe(
+      'CREATE TABLE [dbo].[t] ([id] int);',
+    );
+    expect(stripMssqlImportNoise("CREATE TABLE [dbo].[t] ([note] nvarchar(50) DEFAULT N'USE master')")).toBe(
+      "CREATE TABLE [dbo].[t] ([note] nvarchar(50) DEFAULT N'USE master')",
+    );
+
+    // 词法级风险分类不依赖 Step.kind（兼容 frozen）
+    expect(
+      isMetadataOnlyMssqlSql(
+        "EXEC sys.sp_addextendedproperty @name = N'MS_Description', @value = N'x', @level0type = N'SCHEMA', @level0name = N'dbo'",
+      ),
+    ).toBe(true);
+    expect(isMetadataOnlyMssqlSql('ALTER TABLE [dbo].[users] DROP CONSTRAINT [DF_users_code]')).toBe(true);
+    expect(
+      isMetadataOnlyMssqlSql('ALTER TABLE [dbo].[users] ALTER COLUMN [code] nvarchar(64) NOT NULL'),
+    ).toBe(false);
+    expect(isMetadataOnlyMssqlSql('CREATE INDEX [IX_u] ON [dbo].[users] ([code])')).toBe(false);
   });
 });
 
@@ -128,7 +173,6 @@ describe(`MSSQL (${MSSQL_VERSION}) target driver & server E2E`, () => {
   afterAll(async () => {
     await shadows?.close();
     await pdb?.close();
-    await stopMssqlContainer();
   }, 60_000);
 
   test('inspectTarget, pullSchema, claimShadow safety guard, and same-instance shadow lifecycle', async () => {

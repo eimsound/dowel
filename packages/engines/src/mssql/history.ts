@@ -85,9 +85,13 @@ interface MssqlPriv {
   role: string;
   database: string;
   schemaExists: boolean;
+  initialized: boolean;
   canCreateSchema: boolean;
   canCreateTable: boolean;
   canAlterSchema: boolean;
+  canSelectSchema: boolean;
+  canInsertSchema: boolean;
+  canUpdateSchema: boolean;
 }
 
 const readPriv = async (db: Db): Promise<MssqlPriv> => {
@@ -95,31 +99,67 @@ const readPriv = async (db: Db): Promise<MssqlPriv> => {
     role: string;
     database: string;
     schemaExists: number;
+    initialized: number;
     canCreateSchema: number;
     canCreateTable: number;
     canAlterSchema: number;
+    canSelectSchema: number;
+    canInsertSchema: number;
+    canUpdateSchema: number;
   }>(
     `SELECT USER_NAME() AS role,
             DB_NAME() AS [database],
             CASE WHEN SCHEMA_ID(@p1) IS NOT NULL THEN 1 ELSE 0 END AS schemaExists,
+            CASE WHEN SCHEMA_ID(@p1) IS NOT NULL
+                  AND OBJECT_ID(N'${S}.[meta]', N'U') IS NOT NULL
+                  AND OBJECT_ID(N'${S}.[projects]', N'U') IS NOT NULL
+                  AND OBJECT_ID(N'${S}.[versions]', N'U') IS NOT NULL
+                  AND OBJECT_ID(N'${S}.[history]', N'U') IS NOT NULL
+                  AND OBJECT_ID(N'${S}.[claims]', N'U') IS NOT NULL
+                  AND OBJECT_ID(N'${S}.[tr_history_guard]', N'TR') IS NOT NULL
+                  AND OBJECT_ID(N'${S}.[tr_claims_guard]', N'TR') IS NOT NULL
+                 THEN 1 ELSE 0 END AS initialized,
             ISNULL(HAS_PERMS_BY_NAME(DB_NAME(), 'DATABASE', 'CREATE SCHEMA'), 0) AS canCreateSchema,
             ISNULL(HAS_PERMS_BY_NAME(DB_NAME(), 'DATABASE', 'CREATE TABLE'), 0) AS canCreateTable,
             CASE WHEN SCHEMA_ID(@p1) IS NOT NULL
                  THEN ISNULL(HAS_PERMS_BY_NAME(@p1, 'SCHEMA', 'ALTER'), 0)
-                 ELSE 0 END AS canAlterSchema`,
+                 ELSE 0 END AS canAlterSchema,
+            CASE WHEN SCHEMA_ID(@p1) IS NOT NULL
+                 THEN ISNULL(HAS_PERMS_BY_NAME(@p1, 'SCHEMA', 'SELECT'), 0)
+                 ELSE 0 END AS canSelectSchema,
+            CASE WHEN SCHEMA_ID(@p1) IS NOT NULL
+                 THEN ISNULL(HAS_PERMS_BY_NAME(@p1, 'SCHEMA', 'INSERT'), 0)
+                 ELSE 0 END AS canInsertSchema,
+            CASE WHEN SCHEMA_ID(@p1) IS NOT NULL
+                 THEN ISNULL(HAS_PERMS_BY_NAME(@p1, 'SCHEMA', 'UPDATE'), 0)
+                 ELSE 0 END AS canUpdateSchema`,
     [MSSQL_DOWEL_SCHEMA],
   );
   return {
     role: r?.role ?? 'unknown',
     database: r?.database ?? '',
     schemaExists: Number(r?.schemaExists ?? 0) === 1,
+    initialized: Number(r?.initialized ?? 0) === 1,
     canCreateSchema: Number(r?.canCreateSchema ?? 0) === 1,
     canCreateTable: Number(r?.canCreateTable ?? 0) === 1,
     canAlterSchema: Number(r?.canAlterSchema ?? 0) === 1,
+    canSelectSchema: Number(r?.canSelectSchema ?? 0) === 1,
+    canInsertSchema: Number(r?.canInsertSchema ?? 0) === 1,
+    canUpdateSchema: Number(r?.canUpdateSchema ?? 0) === 1,
   };
 };
 
 const privProblem = (p: MssqlPriv): HistoryError | null => {
+  // 当历史表与守卫触发器已全部由 DBA 预初始化时，最小权限账号只需 SELECT / INSERT / UPDATE 权限
+  if (p.initialized) {
+    if (!p.canSelectSchema || !p.canInsertSchema || !p.canUpdateSchema) {
+      return new HistoryError(
+        'no_schema_privilege',
+        `\`${MSSQL_DOWEL_SCHEMA}\` 迁移历史已存在，但账号 ${p.role} 缺少该 schema 的 SELECT / INSERT / UPDATE 权限。请让 DBA 执行 \`GRANT SELECT, INSERT, UPDATE ON SCHEMA::${S} TO ${mssqlIdent(p.role)};\``,
+      );
+    }
+    return null;
+  }
   if (!p.schemaExists && !p.canCreateSchema) {
     return new HistoryError(
       'no_schema_privilege',
@@ -133,10 +173,13 @@ const privProblem = (p: MssqlPriv): HistoryError | null => {
       `账号 ${p.role} 缺少在库 ${p.database} 中建表的权限（CREATE TABLE），无法初始化 \`${MSSQL_DOWEL_SCHEMA}\` 迁移历史表。`,
     );
   }
-  if (p.schemaExists && !p.canAlterSchema) {
+  if (
+    p.schemaExists &&
+    (!p.canAlterSchema || !p.canSelectSchema || !p.canInsertSchema || !p.canUpdateSchema)
+  ) {
     return new HistoryError(
       'no_schema_privilege',
-      `\`${MSSQL_DOWEL_SCHEMA}\` schema 已存在，但账号 ${p.role} 缺少该 schema 的 ALTER 权限。请让 DBA 执行 \`GRANT ALTER, SELECT, INSERT, UPDATE ON SCHEMA::${S} TO ${mssqlIdent(p.role)};\``,
+      `\`${MSSQL_DOWEL_SCHEMA}\` schema 已存在，但账号 ${p.role} 缺少初始化所需的 ALTER / SELECT / INSERT / UPDATE 权限。请让 DBA 执行 \`GRANT ALTER, SELECT, INSERT, UPDATE ON SCHEMA::${S} TO ${mssqlIdent(p.role)};\``,
     );
   }
   return null;
@@ -192,6 +235,7 @@ AFTER UPDATE, DELETE
 AS
 BEGIN
   SET NOCOUNT ON;
+  IF NOT EXISTS (SELECT 1 FROM deleted) AND NOT EXISTS (SELECT 1 FROM inserted) RETURN;
   IF NOT EXISTS (SELECT 1 FROM inserted)
   BEGIN
     THROW 50001, N'dowel.history 只追加，不允许修改已完成记录或删除', 1;
@@ -227,6 +271,7 @@ AFTER UPDATE, DELETE
 AS
 BEGIN
   SET NOCOUNT ON;
+  IF NOT EXISTS (SELECT 1 FROM deleted) AND NOT EXISTS (SELECT 1 FROM inserted) RETURN;
   THROW 50002, N'dowel.claims 只追加，不允许修改或删除', 1;
 END`;
 
@@ -235,11 +280,12 @@ const ensureHistory = async (db: Db): Promise<void> => {
   const prob = privProblem(p);
   if (prob) throw prob;
 
-  try {
-    if (!p.schemaExists) {
-      await db.exec(`IF SCHEMA_ID(N'${MSSQL_DOWEL_SCHEMA}') IS NULL EXEC(N'CREATE SCHEMA ${S}');`);
-    }
-    await db.exec(`
+  if (!p.initialized) {
+    try {
+      if (!p.schemaExists) {
+        await db.exec(`IF SCHEMA_ID(N'${MSSQL_DOWEL_SCHEMA}') IS NULL EXEC(N'CREATE SCHEMA ${S}');`);
+      }
+      await db.exec(`
       IF OBJECT_ID(N'${S}.[meta]', N'U') IS NULL
       BEGIN
         CREATE TABLE ${S}.[meta] (
@@ -325,24 +371,25 @@ const ensureHistory = async (db: Db): Promise<void> => {
       END
     `);
 
-    const [hasHistTrig] = await db.query<{ ok: number }>(
-      `SELECT CASE WHEN OBJECT_ID(N'${S}.[tr_history_guard]', N'TR') IS NOT NULL THEN 1 ELSE 0 END AS ok`,
-    );
-    if (!hasHistTrig?.ok) await db.exec(HISTORY_GUARD_TRIGGER_DDL);
-
-    const [hasClaimsTrig] = await db.query<{ ok: number }>(
-      `SELECT CASE WHEN OBJECT_ID(N'${S}.[tr_claims_guard]', N'TR') IS NOT NULL THEN 1 ELSE 0 END AS ok`,
-    );
-    if (!hasClaimsTrig?.ok) await db.exec(CLAIMS_GUARD_TRIGGER_DDL);
-  } catch (e) {
-    const num = mssqlErrorNumber(e);
-    if (num === 229 || num === 262 || num === 2760) {
-      throw new HistoryError(
-        'no_schema_privilege',
-        `在 \`${MSSQL_DOWEL_SCHEMA}\` schema 里建表被拒绝（账号 ${p.role}）：${e instanceof Error ? e.message : String(e)}`,
+      const [hasHistTrig] = await db.query<{ ok: number }>(
+        `SELECT CASE WHEN OBJECT_ID(N'${S}.[tr_history_guard]', N'TR') IS NOT NULL THEN 1 ELSE 0 END AS ok`,
       );
+      if (!hasHistTrig?.ok) await db.exec(HISTORY_GUARD_TRIGGER_DDL);
+
+      const [hasClaimsTrig] = await db.query<{ ok: number }>(
+        `SELECT CASE WHEN OBJECT_ID(N'${S}.[tr_claims_guard]', N'TR') IS NOT NULL THEN 1 ELSE 0 END AS ok`,
+      );
+      if (!hasClaimsTrig?.ok) await db.exec(CLAIMS_GUARD_TRIGGER_DDL);
+    } catch (e) {
+      const num = mssqlErrorNumber(e);
+      if (num === 229 || num === 262 || num === 2760) {
+        throw new HistoryError(
+          'no_schema_privilege',
+          `在 \`${MSSQL_DOWEL_SCHEMA}\` schema 里建表被拒绝（账号 ${p.role}）：${e instanceof Error ? e.message : String(e)}`,
+        );
+      }
+      throw e;
     }
-    throw e;
   }
 
   const [meta] = await db.query<{ value: string }>(

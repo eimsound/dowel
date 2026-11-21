@@ -37,14 +37,28 @@ const pgCode = (e: unknown): string | null => {
 const rawError = (e: unknown) => (e instanceof Error ? e.message : String(e));
 const pgError = (e: unknown) => scrubSecrets(rawError(e));
 
+const extractRawPassword = (url: string): string => {
+  try {
+    const pw = new URL(url).password;
+    if (pw) return pw;
+  } catch {
+    // MSSQL host\instance 等不被 WHATWG URL 接受的连接串回退到权威段解析
+  }
+  const schemeEnd = url.indexOf('://');
+  if (schemeEnd < 0) return '';
+  const rest = url.slice(schemeEnd + 3);
+  const boundary = rest.search(/[/?#]/);
+  const authority = boundary >= 0 ? rest.slice(0, boundary) : rest;
+  const at = authority.lastIndexOf('@');
+  if (at < 0) return '';
+  const userinfo = authority.slice(0, at);
+  const colon = userinfo.indexOf(':');
+  return colon >= 0 ? userinfo.slice(colon + 1) : '';
+};
+
 export const scrubUrl = (message: string, url: string): string => {
   let out = scrubSecrets(message.split(url).join(maskUrl(url)));
-  let pw = '';
-  try {
-    pw = new URL(url).password;
-  } catch {
-    // 连接串不能用 URL 解析时只做上面的整串替换
-  }
+  const pw = extractRawPassword(url);
   if (!pw) return out;
   out = out.split(pw).join('***');
   try {

@@ -6,6 +6,7 @@ import {
   findInstanceLevelStep,
   instanceLevelDescription,
   type Model,
+  mssqlMajorOf,
   pgMajorOf,
   type PlanOptions,
   plan,
@@ -74,6 +75,9 @@ export const buildTarget = async (db: Db, m: Model, opts?: PlanOptions): Promise
   if (m.dialect === 'pg' && opts?.pgMajor === undefined) {
     const vNum = await engine.readVersionNum?.(db);
     buildOpts = vNum !== null && vNum !== undefined ? engine.planOptionsForVersion?.(vNum) : undefined;
+  } else if (m.dialect === 'mssql' && opts?.mssqlMajor === undefined) {
+    const vNum = await engine.readVersionNum?.(db);
+    buildOpts = vNum !== null && vNum !== undefined ? engine.planOptionsForVersion?.(vNum) : undefined;
   }
   await runSteps(db, createAll(m, buildOpts), m.dialect);
   return engine.readSnapshot(db);
@@ -106,6 +110,12 @@ export const verify = async (db: Db, from: Model, to: Model, opts?: PlanOptions)
     const planMajor = opts?.pgMajor ?? shadowMajor;
     planOpts = planMajor !== null ? { pgMajor: planMajor } : undefined;
     buildOpts = shadowMajor !== null ? { pgMajor: shadowMajor } : undefined;
+  } else if (dialect === 'mssql') {
+    const vNum = await engine.readVersionNum?.(db);
+    shadowMajor = mssqlMajorOf(vNum);
+    const planMajor = opts?.mssqlMajor ?? shadowMajor;
+    planOpts = planMajor !== null ? { ...opts, mssqlMajor: planMajor } : opts;
+    buildOpts = shadowMajor !== null ? { mssqlMajor: shadowMajor } : undefined;
   }
   const up = plan(from, to, planOpts);
   const down = plan(to, from, planOpts);
@@ -166,6 +176,10 @@ export const verifyScripts = async (
     shadowMajor = await readShadowPgMajor(db);
     const pgMajor = options.pgMajor !== undefined ? options.pgMajor : shadowMajor;
     buildOpts = pgMajor !== null ? { pgMajor } : undefined;
+  } else if (dialect === 'mssql') {
+    const vNum = await engine.readVersionNum?.(db);
+    shadowMajor = mssqlMajorOf(vNum);
+    buildOpts = shadowMajor !== null ? { mssqlMajor: shadowMajor } : undefined;
   }
   const toSnap = await buildTarget(db, to, buildOpts);
   const fromSnap = await buildTarget(db, from, buildOpts);

@@ -16,10 +16,11 @@ export const MAX_GO_REPEAT = 100;
  * - 尾部只允许空白、可选分号或 `--` 单行注释（不允许跟随其他 SQL 语句）。
  * 返回重复次数（0 表示跳过该批），非 GO 行返回 null。
  */
-const parseGoLine = (line: string): number | null => {
+const parseGoLine = (line: string, expandRepeat: boolean): number | null => {
   const m = /^[ \t]*GO(?:[ \t]+(\d+))?[ \t]*(?:--.*)?$/i.exec(line);
   if (!m) return null;
   if (m[1] === undefined) return 1;
+  if (!expandRepeat) return 1;
   const count = Number.parseInt(m[1], 10);
   if (!Number.isSafeInteger(count) || count < 0 || count > MAX_GO_REPEAT) {
     throw new PlanError(`GO 批重复次数超出允许范围（0–${MAX_GO_REPEAT}）：${m[1]}`);
@@ -32,9 +33,11 @@ const parseGoLine = (line: string): number | null => {
  * - 绝不误切字符串（`'...'` / `N'...'`）、方括号标识符（`[...]`）、双引号标识符（`"..."`）、
  *   单行注释（`--`）以及支持嵌套的块注释（`/* ... *\/`）内部的 `GO`；
  * - 支持 `GO 2` 重复输出前一批次（上限 MAX_GO_REPEAT）；
+ * - `expandRepeat: false` 供静态扫描（nontx / 高危检测）使用：不展开重复次数、不因超大 count 抛异常；
  * - 忽略空批次。
  */
-export const splitMssqlBatches = (sql: string): string[] => {
+export const splitMssqlBatches = (sql: string, opts: { expandRepeat?: boolean } = {}): string[] => {
+  const expandRepeat = opts.expandRepeat ?? true;
   const batches: string[] = [];
   const n = sql.length;
   let batchStart = 0;
@@ -61,7 +64,7 @@ export const splitMssqlBatches = (sql: string): string[] => {
     const line = rawLine.endsWith('\r') ? rawLine.slice(0, -1) : rawLine;
 
     if (isTopLevel()) {
-      const goCount = parseGoLine(line);
+      const goCount = parseGoLine(line, expandRepeat);
       if (goCount !== null) {
         pushBatch(lineStart, goCount);
         batchStart = hasNewline ? lineEnd + 1 : n;
@@ -157,26 +160,40 @@ export const needsOwnMssqlBatch = (sql: string): boolean => {
   return !!target && target.kind === 'ident' && OWN_BATCH_TARGETS.has(target.text);
 };
 
+const endsWithGoLine = (raw: string): boolean => {
+  const lastLine = raw.slice(raw.lastIndexOf('\n') + 1);
+  return /^[ \t]*GO(?:[ \t]+\d+)?[ \t]*(?:--.*)?$/i.test(lastLine);
+};
+
+const needsTrailingSemicolon = (raw: string): boolean => {
+  if (!raw || endsWithGoLine(raw)) return false;
+  const toks = mssqlTokenize(raw);
+  const last = toks.at(-1);
+  if (last && last.text.startsWith('--')) return false;
+  for (let i = toks.length - 1; i >= 0; i--) {
+    const t = toks[i]!;
+    if (/^\s+$/.test(t.text) || t.text.startsWith('--') || t.text.startsWith('/*')) continue;
+    return t.text !== ';';
+  }
+  return false;
+};
+
 /**
  * 将 MSSQL 迁移步骤格式化为可直接交给 SSMS / sqlcmd 执行的完整脚本：
- * 在需要独占批次的步骤（CREATE/ALTER SCHEMA、VIEW、TRIGGER、PROCEDURE、FUNCTION）前后自动插入 `GO`。
+ * 每个步骤之间统一使用 `GO` 隔离批边界（与执行器逐步 `request.batch()` 行为一致），
+ * 并避免在行注释或已有 `GO`/`;` 结尾后误拼 `;`。
  */
 export const formatMssqlScript = (steps: readonly { sql: string }[]): string => {
   if (steps.length === 0) return '';
   const parts: string[] = [];
   for (let i = 0; i < steps.length; i++) {
     const raw = steps[i]!.sql.trim();
-    const withSemi = raw.endsWith(';') ? raw : `${raw};`;
-    const currNeeds = needsOwnMssqlBatch(raw);
+    const formatted = needsTrailingSemicolon(raw) ? `${raw};` : raw;
     if (i > 0) {
-      const prevNeeds = needsOwnMssqlBatch(steps[i - 1]!.sql.trim());
-      if (prevNeeds || currNeeds) {
-        parts.push('\nGO\n\n');
-      } else {
-        parts.push('\n\n');
-      }
+      const prevRaw = steps[i - 1]!.sql.trim();
+      parts.push(endsWithGoLine(prevRaw) ? '\n\n' : '\nGO\n\n');
     }
-    parts.push(withSemi);
+    parts.push(formatted);
   }
   return parts.join('');
 };

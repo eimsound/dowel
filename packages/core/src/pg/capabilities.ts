@@ -50,6 +50,7 @@ export const pgCapabilities = (major: number): PgCapabilities => ({
 
 export interface PlanOptions {
   pgMajor?: number | null;
+  mssqlMajor?: number | null;
 }
 
 export type CompatibilityCode =

@@ -1,5 +1,5 @@
 // MSSQL EngineAdapter 实现（SQL Server 2019 / 2022 / 2025）。
-import { mssqlIdent, mssqlQualified } from '@dowel/core';
+import { mssqlIdent, mssqlMajorOf, mssqlQualified, mssqlTokenize } from '@dowel/core';
 
 import {
   type AppliedTimeouts,
@@ -9,6 +9,7 @@ import {
   type TxHooks,
 } from '../types.ts';
 import {
+  getMssqlShadowGuard,
   MSSQL_SESSION_SETTINGS,
   mssqlErrorCode,
   mssqlErrorNumber,
@@ -27,12 +28,86 @@ import {
   readMssqlSnapshot,
 } from './snapshot.ts';
 
+const SYSTEM_DATABASES = new Set(['master', 'tempdb', 'model', 'msdb']);
+
+/**
+ * 词法级剥离导入 SQL 中顶层的 `USE <ident>[;]` 语句（支持与下一条语句位于同一行、带注释/方括号/双引号）。
+ * 绝不误删字符串字面量、注释或标识符内部的 `USE`。
+ */
+export const stripMssqlImportNoise = (sql: string): string => {
+  const toks = mssqlTokenize(sql);
+  const sigIdx: number[] = [];
+  for (let i = 0; i < toks.length; i++) {
+    const t = toks[i]!;
+    if (!/^\s+$/.test(t.text) && !t.text.startsWith('--') && !t.text.startsWith('/*')) {
+      sigIdx.push(i);
+    }
+  }
+  const removals: [number, number][] = [];
+  for (let s = 0; s < sigIdx.length; s++) {
+    const t = toks[sigIdx[s]!]!;
+    if (t.kind !== 'ident' || t.text !== 'use') continue;
+    const prev = s > 0 ? toks[sigIdx[s - 1]!] : undefined;
+    const atStmtStart = !prev || prev.text === ';' || (prev.kind === 'ident' && prev.text === 'go');
+    if (!atStmtStart) continue;
+    const next = s + 1 < sigIdx.length ? toks[sigIdx[s + 1]!] : undefined;
+    if (!next || (next.kind !== 'ident' && next.kind !== 'qident')) continue;
+    let end = next.end;
+    const after = s + 2 < sigIdx.length ? toks[sigIdx[s + 2]!] : undefined;
+    if (after?.text === ';') {
+      end = after.end;
+      s += 2;
+    } else {
+      s += 1;
+    }
+    removals.push([t.start, end]);
+  }
+  if (removals.length === 0) return sql;
+  let out = sql;
+  for (let i = removals.length - 1; i >= 0; i--) {
+    const [start, end] = removals[i]!;
+    out = out.slice(0, start) + ' ' + out.slice(end);
+  }
+  return out;
+};
+
 /**
  * 清空 MSSQL 影子库中全部非系统对象（保留 dbo 与系统 schema）：
- * 依赖顺序：外键 → 触发器 → 视图/存储过程/函数 → 表 → 序列 → 用户类型 → 非 dbo 用户 schema（含 dowel）。
+ * - 安全护栏：拒绝清空任何系统库（master/tempdb/model/msdb）；若连接挂载了 shadowGuard，严格校验当前 DB_NAME() 与 dowel_shadow 扩展属性；
+ * - 依赖顺序：数据库级触发器 → 外键 → 表级触发器 → 视图/存储过程/函数 → 表 → 序列 → 同义词 → 用户类型 → 非 dbo 用户 schema（含 dowel）。
  */
 export const resetMssqlShadow = async (db: Db): Promise<void> => {
+  const [ctx] = await db.query<{ dbName: string | null }>(`SELECT DB_NAME() AS dbName`);
+  const currentDb = ctx?.dbName ?? '';
+  if (!currentDb || SYSTEM_DATABASES.has(currentDb.toLowerCase())) {
+    throw new Error(`拒绝清空 SQL Server 系统库或未指定数据库：${currentDb || '(empty)'}`);
+  }
+  const guard = getMssqlShadowGuard(db);
+  if (guard) {
+    if (guard.expectedDb && currentDb.toLowerCase() !== guard.expectedDb.toLowerCase()) {
+      throw new Error(
+        `拒绝清空 MSSQL 影子库：当前会话数据库（${currentDb}）与预期影子库（${guard.expectedDb}）不一致`,
+      );
+    }
+    const [markRow] = await db.query<{ v: string | null }>(
+      `SELECT CAST(value AS nvarchar(max)) AS v
+         FROM sys.extended_properties
+        WHERE class = 0 AND major_id = 0 AND minor_id = 0 AND name = N'dowel_shadow'`,
+    );
+    if (markRow?.v !== guard.mark) {
+      throw new Error(`拒绝清空 MSSQL 影子库（${currentDb}）：缺少有效的 Dowel 影子库标记`);
+    }
+  }
+
   await pinMssqlSession(db);
+
+  // 0. 删除所有数据库级触发器
+  const dbTrigs = await db.query<{ name: string }>(
+    `SELECT name FROM sys.triggers WHERE parent_class = 0 AND is_ms_shipped = 0`,
+  );
+  for (const tr of dbTrigs) {
+    await db.exec(`DROP TRIGGER ${mssqlIdent(tr.name)} ON DATABASE`);
+  }
 
   // 1. 删除所有非系统外键
   const fks = await db.query<{ schema: string; table: string; name: string }>(
@@ -117,6 +192,19 @@ export const resetMssqlShadow = async (db: Db): Promise<void> => {
     await db.exec(`DROP SEQUENCE ${mssqlQualified(q.schema, q.name)}`);
   }
 
+  // 5b. 删除所有同义词
+  const syns = await db.query<{ schema: string; name: string }>(
+    `SELECT s.name AS [schema], sy.name
+       FROM sys.synonyms sy
+       JOIN sys.schemas s ON s.schema_id = sy.schema_id
+      WHERE sy.is_ms_shipped = 0 AND s.schema_id < 16384
+        AND s.name NOT IN (N'sys', N'INFORMATION_SCHEMA', N'guest', N'cdc')
+        AND s.name NOT LIKE N'db[_]%'`,
+  );
+  for (const sy of syns) {
+    await db.exec(`DROP SYNONYM ${mssqlQualified(sy.schema, sy.name)}`);
+  }
+
   // 6. 删除所有用户自定义类型
   const types = await db.query<{ schema: string; name: string }>(
     `SELECT s.name AS [schema], ty.name
@@ -196,17 +284,18 @@ export const mssqlEngine: EngineAdapter = {
 
   readVersionNum: readMssqlVersionNum,
 
+  planOptionsForVersion: (versionNum) => {
+    const m = mssqlMajorOf(versionNum);
+    return m !== null ? { mssqlMajor: m } : undefined;
+  },
+
   resetShadow: resetMssqlShadow,
 
   prepareImportShadow: async (db) => {
     await pinMssqlSession(db);
   },
 
-  stripImportNoise: (sql) =>
-    sql
-      .split('\n')
-      .filter((l) => !/^\s*USE\s+(?:\[[^\]]+\]|"[^"]+"|[A-Za-z_][A-Za-z0-9_$#]*)\s*;?\s*$/i.test(l))
-      .join('\n'),
+  stripImportNoise: stripMssqlImportNoise,
 
   analyzeStepRisk: (db, from, steps) => analyzeMssqlStepRisk(db, from, steps, resetMssqlShadow),
 
@@ -220,8 +309,8 @@ export const mssqlEngine: EngineAdapter = {
   },
 
   restoreTimeouts: async (conn, applied) => {
-    if (applied.lockMs > 0) await conn.exec('SET LOCK_TIMEOUT -1');
     if (applied.statementMs > 0) setMssqlRequestTimeout(conn, null);
+    if (applied.lockMs > 0) await conn.exec('SET LOCK_TIMEOUT -1');
   },
 
   classifyTimeout: (err, applied): TimeoutInfo | undefined => {

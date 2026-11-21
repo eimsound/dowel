@@ -11,11 +11,12 @@ import {
   mssqlErrorCode,
   mssqlErrorNumber,
   readMssqlSnapshot,
+  setMssqlShadowGuard,
 } from '@dowel/engines';
 import { HTTPException } from 'hono/http-exception';
 import sql from 'mssql';
 
-import { maskUrl, scrubSecrets } from '../secrets.ts';
+import { scrubSecrets } from '../secrets.ts';
 import {
   SHADOW_STATEMENT_TIMEOUT_MS,
   type Shadow,
@@ -23,6 +24,7 @@ import {
   ShadowUnavailableError,
   shadowOps,
 } from '../shadow.ts';
+import { scrubUrl } from './pg.ts';
 import {
   CHECK_CONNECT_TIMEOUT,
   ConnectError,
@@ -51,11 +53,26 @@ const parseBoolParam = (raw: string | null, fallback: boolean): boolean => {
 
 const parseIntParam = (raw: string | null, fallback: number, name: string): number => {
   if (raw === null) return fallback;
-  const n = Number.parseInt(raw.trim(), 10);
-  if (!Number.isFinite(n) || n <= 0) {
+  const trimmed = raw.trim();
+  if (!/^\d+$/.test(trimmed)) {
+    throw new HTTPException(422, { message: `MSSQL 连接串参数 ${name} 必须为正整数` });
+  }
+  const n = Number.parseInt(trimmed, 10);
+  if (!Number.isSafeInteger(n) || n <= 0) {
     throw new HTTPException(422, { message: `MSSQL 连接串参数 ${name} 必须为正整数` });
   }
   return n;
+};
+
+const parsePort = (raw: string): number => {
+  if (!/^\d+$/.test(raw)) {
+    throw new HTTPException(422, { message: 'MSSQL 连接串端口号不合法' });
+  }
+  const p = Number.parseInt(raw, 10);
+  if (!Number.isInteger(p) || p <= 0 || p > 65535) {
+    throw new HTTPException(422, { message: 'MSSQL 连接串端口号不合法' });
+  }
+  return p;
 };
 
 export interface ParsedMssqlUrl {
@@ -126,22 +143,17 @@ export const parseMssqlUrl = (
     if (end < 0) throw new HTTPException(422, { message: 'MSSQL 连接串中的 IPv6 地址不合法' });
     server = trimmedHostPort.slice(1, end);
     const tail = trimmedHostPort.slice(end + 1);
-    if (tail.startsWith(':')) {
-      const p = Number.parseInt(tail.slice(1), 10);
-      if (!Number.isInteger(p) || p <= 0 || p > 65535) {
-        throw new HTTPException(422, { message: 'MSSQL 连接串端口号不合法' });
+    if (tail) {
+      if (!tail.startsWith(':')) {
+        throw new HTTPException(422, { message: 'MSSQL 连接串中的 IPv6 地址不合法' });
       }
-      port = p;
+      port = parsePort(tail.slice(1));
     }
   } else {
     const colon = trimmedHostPort.lastIndexOf(':');
     const hostPart = colon >= 0 ? trimmedHostPort.slice(0, colon) : trimmedHostPort;
     if (colon >= 0) {
-      const p = Number.parseInt(trimmedHostPort.slice(colon + 1), 10);
-      if (!Number.isInteger(p) || p <= 0 || p > 65535) {
-        throw new HTTPException(422, { message: 'MSSQL 连接串端口号不合法' });
-      }
-      port = p;
+      port = parsePort(trimmedHostPort.slice(colon + 1));
     }
     const bs = hostPart.indexOf('\\');
     if (bs >= 0) {
@@ -246,17 +258,6 @@ export const withMssqlDb = (url: string, dbName: string): string => {
   return `${scheme}${authority}/${encodeURIComponent(dbName)}${tail}`;
 };
 
-const scrubMssqlUrl = (message: string, url: string): string => {
-  let out = scrubSecrets(message.split(url).join(maskUrl(url)));
-  try {
-    const parsed = parseMssqlUrl(url);
-    if (parsed.password) out = out.split(parsed.password).join('***');
-  } catch {
-    // 忽略解析失败
-  }
-  return out;
-};
-
 /** MSSQL 同实例影子库名：`{db}_dowel`，上限 128 字符（超出截断 + `_<8hex>_dowel`） */
 export const mssqlShadowDbName = (db: string): string => {
   const full = `${db}_dowel`;
@@ -326,6 +327,7 @@ export const connectMssql = (
       if (closed) throw new ConnectError('MSSQL 连接已关闭');
       const config = toMssqlConfig(url, { connectTimeoutSec, requestTimeoutMs, maxPool: 1 });
       const p = new sql.ConnectionPool(config);
+      p.on('error', () => {});
       try {
         await p.connect();
       } catch (e) {
@@ -436,7 +438,7 @@ export const inspectMssqlTargetOn = async (tdb: Db, url: string): Promise<Target
     };
   } catch (e) {
     if (e instanceof HTTPException || e instanceof ConnectError) throw e;
-    throw new ConnectError(`连接失败：${scrubMssqlUrl(rawError(e), url)}`);
+    throw new ConnectError(`连接失败：${scrubUrl(rawError(e), url)}`);
   }
 };
 
@@ -495,20 +497,37 @@ export const claimMssqlShadow = async (url: string, guard?: ConnectionGuard): Pr
   let phase: 'claim-read' | 'claim' = 'claim-read';
   try {
     if (await isMarkedMssql(c.db)) return;
-    const [counts] = await c.db.query<{ objs: number; schemas: number }>(
+    const [counts] = await c.db.query<{
+      objs: number;
+      schemas: number;
+      types: number;
+      dbTriggers: number;
+    }>(
       `SELECT
          (SELECT COUNT(*) FROM sys.objects o
            JOIN sys.schemas s ON s.schema_id = o.schema_id
           WHERE o.is_ms_shipped = 0 AND s.schema_id < 16384
             AND s.name NOT IN (N'sys', N'INFORMATION_SCHEMA', N'guest', N'cdc')
             AND s.name NOT LIKE N'db[_]%'
-            AND o.type IN ('U', 'V', 'P', 'FN', 'IF', 'TF', 'TR', 'SO')) AS objs,
+            AND o.type IN ('U', 'V', 'P', 'FN', 'IF', 'TF', 'TR', 'SO', 'SN')) AS objs,
          (SELECT COUNT(*) FROM sys.schemas s
           WHERE s.schema_id < 16384
             AND s.name NOT IN (N'dbo', N'sys', N'INFORMATION_SCHEMA', N'guest', N'cdc')
-            AND s.name NOT LIKE N'db[_]%') AS schemas`,
+            AND s.name NOT LIKE N'db[_]%') AS schemas,
+         (SELECT COUNT(*) FROM sys.types ty
+           JOIN sys.schemas s ON s.schema_id = ty.schema_id
+          WHERE ty.is_user_defined = 1 AND s.schema_id < 16384
+            AND s.name NOT IN (N'sys', N'INFORMATION_SCHEMA', N'guest', N'cdc')
+            AND s.name NOT LIKE N'db[_]%') AS [types],
+         (SELECT COUNT(*) FROM sys.triggers tr
+          WHERE tr.parent_class = 0 AND tr.is_ms_shipped = 0) AS dbTriggers`,
     );
-    if (Number(counts?.objs ?? 0) > 0 || Number(counts?.schemas ?? 0) > 0) {
+    if (
+      Number(counts?.objs ?? 0) > 0 ||
+      Number(counts?.schemas ?? 0) > 0 ||
+      Number(counts?.types ?? 0) > 0 ||
+      Number(counts?.dbTriggers ?? 0) > 0
+    ) {
       throw new ShadowError(
         '拒绝使用这个库作影子库：它不是空库，也没有 Dowel 影子库标记。影子库每次检查前都会被清空',
       );
@@ -613,14 +632,10 @@ export const dropMssqlSameInstanceShadow = async (
     }
 
     const q = mssqlIdent(name);
-    await c.db.exec(
-      `IF DB_ID(${mssqlLiteral(name)}) IS NOT NULL
-       BEGIN
-         ALTER DATABASE ${q} SET SINGLE_USER WITH ROLLBACK IMMEDIATE;
-         DROP DATABASE ${q};
-       END`,
-    );
+    await c.db.exec(`IF DB_ID(${mssqlLiteral(name)}) IS NOT NULL DROP DATABASE ${q};`);
   } catch (e) {
+    // 3702 = Cannot drop database because it is currently in use（有其他并发会话在使用，安全跳过）
+    if (mssqlErrorNumber(e) === 3702) return;
     console.error('清理 MSSQL 影子库失败', name, mssqlErrText(e));
   } finally {
     if (locked) await releaseAppLock(c.db, lockRes);
@@ -633,6 +648,7 @@ export const mssqlShadow = (
   schemas?: string[] | null,
   guard?: ConnectionGuard,
 ): Shadow => {
+  const expectedDb = parseMssqlUrl(shadowUrl).database;
   let conn: TargetConnection | null = null;
   let queue: Promise<unknown> = Promise.resolve();
   const discard = async () => {
@@ -640,12 +656,19 @@ export const mssqlShadow = (
     conn = null;
     await old?.close().catch(() => {});
   };
+  const checkDbMatches = async (db: Db): Promise<boolean> => {
+    const [r] = await db.query<{ dbName: string | null }>(`SELECT DB_NAME() AS dbName`);
+    const cur = r?.dbName ?? '';
+    if (!cur) return false;
+    return !expectedDb || cur.toLowerCase() === expectedDb.toLowerCase();
+  };
   const run = <T>(fn: (ops: ReturnType<typeof shadowOps>) => Promise<T>): Promise<T> => {
     const p = queue.then(async () => {
       conn ??= connectMssql(shadowUrl, 10, guard, SHADOW_STATEMENT_TIMEOUT_MS);
       const db = conn.db;
       try {
         await db.exec('SET LOCK_TIMEOUT 10000');
+        setMssqlShadowGuard(db, { expectedDb, mark: SHADOW_MARK });
         if (!(await tryAppLock(db, 'dowel_shadow', 60_000))) {
           throw new ShadowUnavailableError('正被其他检查占用，请稍后再试');
         }
@@ -655,11 +678,17 @@ export const mssqlShadow = (
       }
       let clean = false;
       try {
+        if (!(await checkDbMatches(db).catch((e) => Promise.reject(shadowSetupError(e, 'check'))))) {
+          throw new ShadowError(`拒绝执行：影子库会话当前数据库与预期（${expectedDb}）不一致`);
+        }
         if (!(await isMarkedMssql(db).catch((e) => Promise.reject(shadowSetupError(e, 'check'))))) {
           throw new ShadowError('拒绝执行：影子库的 Dowel 标记不见了');
         }
         const result = await fn(shadowOps(async () => db, schemas, { dialect: 'mssql' }));
-        clean = true;
+        // 执行后复核会话上下文与影子库标记，防止动态 SQL 切换库后污染后续复用连接
+        const stillSafe =
+          (await checkDbMatches(db).catch(() => false)) && (await isMarkedMssql(db).catch(() => false));
+        clean = stillSafe;
         return result;
       } finally {
         const unlocked = await releaseAppLock(db, 'dowel_shadow');
@@ -692,7 +721,7 @@ export const pullMssqlSchema = async (
     return importMssqlSnapshot(await readMssqlSnapshot(c.db, schemas));
   } catch (e) {
     if (e instanceof HTTPException || e instanceof ConnectError) throw e;
-    throw new ConnectError(`读取结构失败：${scrubMssqlUrl(rawError(e), url)}`);
+    throw new ConnectError(`读取结构失败：${scrubUrl(rawError(e), url)}`);
   } finally {
     await c.close();
   }

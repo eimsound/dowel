@@ -17,15 +17,9 @@ import {
 } from '@dowel/core';
 import { getEngine, type ScriptStep, stepsChecksum, toScriptSteps } from '@dowel/engines';
 import { type ChainVersion, checkDrift, execute, ExecutorError } from '@dowel/executor';
-import { afterAll, beforeAll, describe, expect, it } from 'vitest';
+import { beforeAll, describe, expect, it } from 'vitest';
 
-import {
-  connectTestMssql,
-  createTestMssqlDb,
-  getMssqlAdminUrl,
-  MSSQL_VERSION,
-  stopMssqlContainer,
-} from '../../../test/mssql.ts';
+import { connectTestMssql, createTestMssqlDb, getMssqlAdminUrl, MSSQL_VERSION } from '../../../test/mssql.ts';
 
 const buildUsersV1 = (): Model => {
   const m = emptyModel('mssql');
@@ -88,10 +82,6 @@ describe(`MSSQL (${MSSQL_VERSION}) executor integration`, () => {
     adminUrl = await getMssqlAdminUrl();
   }, 120_000);
 
-  afterAll(async () => {
-    await stopMssqlContainer();
-  }, 60_000);
-
   it('enforces append-only triggers on [dowel].[history] and [dowel].[claims]', async () => {
     if (!adminUrl) return;
     const t = await createTestMssqlDb('mssql_hist_guard');
@@ -108,6 +98,15 @@ describe(`MSSQL (${MSSQL_VERSION}) executor integration`, () => {
       });
       await engine.history.markStep(t.db, runId, 0);
       await engine.history.finishRun(t.db, runId, 'done');
+
+      // 0-row UPDATE 必须正常返回 run_not_running，而不是被触发器误报 50001
+      await expect(engine.history.markStep(t.db, runId, 1)).rejects.toThrow(/不存在或已经结束/);
+      await expect(engine.history.finishRun(t.db, runId, 'failed', 'dup')).rejects.toThrow(
+        /不存在或已经结束/,
+      );
+      await expect(
+        t.db.exec(`UPDATE [dowel].[claims] SET [note] = N'x' WHERE [id] = -1`),
+      ).resolves.toBeUndefined();
 
       // 禁止删除 history 行
       await expect(t.db.exec(`DELETE FROM [dowel].[history] WHERE [id] = ${runId}`)).rejects.toThrow(

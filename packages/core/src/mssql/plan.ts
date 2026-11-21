@@ -31,9 +31,7 @@ import {
 } from './quote.ts';
 import { checkMssqlVersionCompatibility, mssqlNormalizeType } from './types.ts';
 
-export interface MssqlPlanOptions extends PlanOptions {
-  mssqlMajor?: number | null;
-}
+export type MssqlPlanOptions = PlanOptions;
 
 const clone = <T>(x: T): T => structuredClone(x);
 const fresh = <T extends Obj>(o: T): T => ({ ...structuredClone(o), comment: null });
@@ -128,9 +126,9 @@ const definition = (o: Obj, m: Model): unknown => {
       return [o.options];
     case 'column':
       return [
-        mssqlNormalizeType(o.type),
+        o.generated ? null : mssqlNormalizeType(o.type),
         o.collation,
-        o.notNull,
+        o.generated && !o.generated.stored ? false : o.notNull,
         o.default,
         o.generated,
         identitySpecOf(o),
@@ -203,6 +201,18 @@ export const mssqlPlan = (from: Model, to: Model, opts?: MssqlPlanOptions): Step
   }
 
   const cur = clone(from);
+  // 固化 cur 中既有列的带名 DEFAULT 约束实际名，避免 P6d 改表名/改列名后回退推导名漂移导致漏改名或报错 15248
+  for (const c of all(cur, 'column')) {
+    if (!c.default) continue;
+    const tbl = get(cur, c.parent, 'table');
+    c.ext = {
+      ...c.ext,
+      mssql: {
+        ...c.ext?.mssql,
+        defaultName: mssqlDefaultNameOf(c, tbl.name),
+      },
+    };
+  }
   const steps: Step[] = [];
   const emit = (kind: string, target: string, sql: string) => steps.push({ kind, target, sql });
 
@@ -444,9 +454,11 @@ export const mssqlPlan = (from: Model, to: Model, opts?: MssqlPlanOptions): Step
     const refsAltered =
       (o.generated && exprTouches(o.generated.expr, colsOfTableIn(o.parent, colAltered))) ||
       (w.generated && exprTouches(w.generated.expr, colsOfTableIn(o.parent, colAltered)));
+    const persistedNotNullChanged =
+      (Boolean(o.generated?.stored) || Boolean(w.generated?.stored)) && o.notNull !== w.notNull;
     if (
       !same(o.generated, oldGen) ||
-      o.notNull !== w.notNull ||
+      persistedNotNullChanged ||
       refsRenamed ||
       refsAltered ||
       Boolean(o.generated) !== Boolean(w.generated)
@@ -680,11 +692,21 @@ export const mssqlPlan = (from: Model, to: Model, opts?: MssqlPlanOptions): Step
     }
   };
 
+  const seqMovedOrRenamed = (seqId: string): boolean => {
+    if (seqRebuild.has(seqId) || isRemoved(seqId)) return true;
+    const fs = find(from, seqId);
+    const ts = find(to, seqId);
+    if (fs?.kind !== 'sequence' || ts?.kind !== 'sequence') return true;
+    if (fs.name !== ts.name || fs.parent !== ts.parent) return true;
+    const fSch = find(from, fs.parent);
+    const tSch = find(to, ts.parent);
+    return fSch?.name !== tSch?.name;
+  };
+
   for (const c of all(cur, 'column')) {
     if (!c.default || tableRemoved(c)) continue;
     const target = inTo(c.id) ? (to.objects[c.id] as Column) : null;
-    const refsSeqRebuild =
-      'nextval' in c.default && (seqRebuild.has(c.default.nextval) || isRemoved(c.default.nextval));
+    const refsSeqRebuild = 'nextval' in c.default && seqMovedOrRenamed(c.default.nextval);
     const defaultValueChanged =
       !target ||
       !target.default ||
@@ -727,11 +749,22 @@ export const mssqlPlan = (from: Model, to: Model, opts?: MssqlPlanOptions): Step
     delete cur.objects[o.id];
   }
 
-  // ───── P5c 删除需要改类型重建的序列（新序列在 P9 重建） ─────
+  // ───── P5c 删除早期不透明对象（已移除或变更的）、需重建的序列及已移除序列（必须在 P6b schema 改名与 P10 建表前完成） ─────
+  const earlyDrops = all(from, 'opaque').filter(
+    (o) => !isLate(o) && (isRemoved(o.id) || opaqueChanged.has(o.id)) && o.id in cur.objects,
+  );
+  for (const o of topo(earlyDrops).reverse()) dropOpaque(get(cur, o.id, 'opaque'));
+
   for (const id of seqRebuild) {
+    if (!(id in cur.objects)) continue;
     get(cur, id, 'sequence');
     emit('dropSequence', id, `DROP SEQUENCE ${S(id)}`);
     delete cur.objects[id];
+  }
+  for (const o of removed) {
+    if (o.kind !== 'sequence' || !(o.id in cur.objects)) continue;
+    emit('dropSequence', o.id, `DROP SEQUENCE ${S(o.id)}`);
+    delete cur.objects[o.id];
   }
 
   // ───── P6a 建新增 schema（含用于 schema 改名与跨 schema 迁移的目标 schema） ─────
@@ -753,6 +786,10 @@ export const mssqlPlan = (from: Model, to: Model, opts?: MssqlPlanOptions): Step
   }
 
   // ───── P6b Schema 改名（MSSQL 无 ALTER SCHEMA RENAME → 建新 schema + TRANSFER 对象 + 删旧 schema） ─────
+  const isTransferableInSchema = (obj: Obj, schemaId: string): boolean =>
+    ((obj.kind === 'table' || obj.kind === 'sequence') && obj.parent === schemaId) ||
+    (obj.kind === 'opaque' && obj.objType !== 'trigger' && obj.parent === schemaId);
+
   const renamedSchemas = common.filter((o): o is Schema => o.kind === 'schema' && o.name !== was(o).name);
   if (renamedSchemas.length > 0) {
     // 收集需要改名的旧 schema 名字集合，解决 A->B / B->A 互换或与待删 schema 重名
@@ -771,7 +808,7 @@ export const mssqlPlan = (from: Model, to: Model, opts?: MssqlPlanOptions): Step
         const tmpSch = `_dowel_tmp_sch_${++tmp}`;
         ensureSchemaCreated(tmpSch, s.id);
         for (const obj of Object.values(cur.objects)) {
-          if ((obj.kind === 'table' || obj.kind === 'sequence') && obj.parent === s.id) {
+          if (isTransferableInSchema(obj, s.id)) {
             emit(
               'transferSchema',
               obj.id,
@@ -793,7 +830,7 @@ export const mssqlPlan = (from: Model, to: Model, opts?: MssqlPlanOptions): Step
       if (c.name === tr.toName) continue;
       ensureSchemaCreated(tr.toName, tr.schemaId);
       for (const obj of Object.values(cur.objects)) {
-        if ((obj.kind === 'table' || obj.kind === 'sequence') && obj.parent === tr.schemaId) {
+        if (isTransferableInSchema(obj, tr.schemaId)) {
           emit(
             'transferSchema',
             obj.id,
@@ -809,12 +846,13 @@ export const mssqlPlan = (from: Model, to: Model, opts?: MssqlPlanOptions): Step
     }
   }
 
-  // ───── P6c 跨 schema 迁移表或序列（ALTER SCHEMA [new] TRANSFER [old].[obj]） ─────
+  // ───── P6c 跨 schema 迁移表、序列或非触发器不透明对象（ALTER SCHEMA [new] TRANSFER [old].[obj]） ─────
   for (const o of common) {
-    if (o.kind !== 'table' && o.kind !== 'sequence') continue;
+    const canTransfer =
+      o.kind === 'table' || o.kind === 'sequence' || (o.kind === 'opaque' && o.objType !== 'trigger');
+    if (!canTransfer) continue;
     const c = cur.objects[o.id];
-    if (!c || (c.kind !== 'table' && c.kind !== 'sequence')) continue;
-    if (c.parent === o.parent) continue;
+    if (!c || !('parent' in c) || c.parent === o.parent) continue;
     const oldSch = schemaOf(c.parent);
     const newSch = schemaOf(o.parent);
     emit(
@@ -1139,16 +1177,7 @@ export const mssqlPlan = (from: Model, to: Model, opts?: MssqlPlanOptions): Step
     emitAddColumn(c);
   }
 
-  // ───── P14 删早期不透明对象、序列、用户 schema ─────
-  const earlyDrops = all(from, 'opaque').filter((o) => !isLate(o) && isRemoved(o.id) && o.id in cur.objects);
-  for (const o of topo(earlyDrops).reverse()) dropOpaque(get(cur, o.id, 'opaque'));
-
-  for (const o of removed) {
-    if (o.kind !== 'sequence' || !(o.id in cur.objects)) continue;
-    emit('dropSequence', o.id, `DROP SEQUENCE ${S(o.id)}`);
-    delete cur.objects[o.id];
-  }
-
+  // ───── P14 删已移除用户 schema（其内部表/序列/早期不透明对象已在 P4/P5c 清理或 P6c 迁出） ─────
   for (const o of removed) {
     if (o.kind !== 'schema' || !(o.id in cur.objects)) continue;
     const c = get(cur, o.id, 'schema');

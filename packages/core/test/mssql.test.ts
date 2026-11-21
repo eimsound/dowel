@@ -13,6 +13,7 @@ import {
   createSequence,
   createTable,
   dropColumn,
+  dropSequence,
   emptyBase,
   emptyModel,
   findInstanceLevelStatement,
@@ -35,6 +36,7 @@ import {
   renameColumn,
   renameKey,
   renameSchema,
+  renameSequence,
   renameTable,
   setColumnExt,
   setColumnType,
@@ -465,5 +467,239 @@ describe('MSSQL core dialect: quote, lexer, batch splitter, naming, types, nontx
     expect(fkSteps.findIndex((s) => s.kind === 'alterColumn')).toBeLessThan(
       fkSteps.findIndex((s) => s.kind === 'addForeignKey'),
     );
+  });
+
+  it('hardens instance/cross-db/dowel bypasses, GO 101 scanning, formatScript batching, datepart refs, virtual computed columns, schema rename, and named DEFAULTs', () => {
+    // 1. Instance-level / cross-DB / [dowel] bypasses must all be blocked
+    for (const bad of [
+      'USE master',
+      'USE [other_db]',
+      'KILL 55',
+      'SELECT * FROM otherdb.dbo.users',
+      'DROP TABLE [otherdb]..[users]',
+      "EXEC [master]..[xp_cmdshell] 'whoami'",
+      'SELECT * FROM linked_srv.db.dbo.t',
+      "[xp_cmdshell] 'id'",
+      "EXEC [sys].[sp_configure] N'xp_cmdshell', 1",
+      "sys.[sp_configure] N'xp_cmdshell', 1",
+      "sp_renamedb 'a', 'b'",
+      "sp_rename 'dowel.history', 'h2'",
+      `EXEC sys.sp_rename @newname = N'h2', @objname = N' "dowel" . "history" '`,
+      "EXEC sys.sp_rename N'mydb', N'mydb2', N'DATABASE'",
+      "EXEC [sys].[sp_rename] @objtype = N'DATABASE', @objname = N'mydb', @newname = N'mydb2'",
+      'DELETE TOP (1) FROM [dowel].[history]',
+      "UPDATE h SET [status] = N'failed' FROM [dowel].[history] AS h",
+      'WITH c AS (SELECT * FROM [dowel].[history]) DELETE FROM c',
+      'SELECT 1 AS x INTO [dowel].[evil]',
+      'ALTER AUTHORIZATION ON SCHEMA::[dowel] TO [dbo]',
+      'GRANT CONTROL ON SCHEMA::[dowel] TO [app_user]',
+      'DENY SELECT ON OBJECT::[dowel].[history] TO [app_user]',
+      'REVOKE INSERT ON [dowel].[history] FROM [app_user]',
+      'DISABLE TRIGGER ALL ON DATABASE',
+      'DISABLE TRIGGER [tr_audit] ON ALL SERVER',
+      'CREATE SYNONYM [dbo].[s] FOR [dowel].[history]',
+    ]) {
+      expect(findInstanceLevelStatement(bad, 'mssql'), `expected block: ${bad}`).not.toBeNull();
+    }
+    // Legitimate sp_rename on dbo column / object remains allowed
+    expect(
+      findInstanceLevelStatement(
+        "EXEC sys.sp_rename N'[dbo].[users].[old_col]', N'new_col', N'COLUMN'",
+        'mssql',
+      ),
+    ).toBeNull();
+    expect(
+      findInstanceLevelStatement("EXEC sys.sp_rename N'[dbo].[users]', N'members', N'OBJECT'", 'mssql'),
+    ).toBeNull();
+
+    // 2. GO 101 must NOT crash isNontransactionalSql / findInstanceLevelStatement, while splitMssqlBatches still rejects
+    const go101 = `SELECT 1\nGO ${MAX_GO_REPEAT + 1}`;
+    expect(isNontransactionalSql(go101, 'mssql')).toBe(false);
+    expect(findInstanceLevelStatement(go101, 'mssql')).toBeNull();
+    expect(findInstanceLevelStatement(`DROP DATABASE [x]\nGO ${MAX_GO_REPEAT + 1}`, 'mssql')).not.toBeNull();
+    expect(() => splitMssqlBatches(go101)).toThrow(PlanError);
+
+    // 3. formatMssqlScript always isolates steps with GO and avoids appending ';' after '--' comment or trailing GO
+    const formatted = formatScript(
+      [
+        { sql: 'CREATE TABLE [dbo].[a] ([id] int NOT NULL) -- comment' },
+        { sql: 'CREATE INDEX [IX_a_id] ON [dbo].[a] ([id])' },
+        { sql: 'SELECT 1\nGO' },
+        { sql: 'SELECT 2;' },
+      ],
+      'mssql',
+    );
+    expect(formatted).toBe(
+      [
+        'CREATE TABLE [dbo].[a] ([id] int NOT NULL) -- comment',
+        'GO',
+        '',
+        'CREATE INDEX [IX_a_id] ON [dbo].[a] ([id]);',
+        'GO',
+        '',
+        'SELECT 1',
+        'GO',
+        '',
+        'SELECT 2;',
+      ].join('\n'),
+    );
+
+    // 4. mssqlColumnRefs skips datepart units in DATEDIFF/DATEPART/DATEADD/DATETRUNC
+    expect(
+      mssqlColumnRefs(
+        'DATEDIFF(day, [created_at], GETDATE()) + DATEPART(year, [updated_at]) + DATETRUNC(month, ts)',
+      ).map((t) => t.text),
+    ).toEqual(['created_at', 'updated_at', 'ts']);
+
+    // 5. Case-insensitive checks in edit.ts for MSSQL + addCheck with DATEDIFF
+    const mCi = emptyModel('mssql');
+    const sDbo = createSchema(mCi, 'dbo', 's-dbo');
+    expect(() => createSchema(mCi, 'DBO')).toThrow(/已存在/);
+    const tCi = createTable(mCi, sDbo, 'events', 't-events');
+    addColumn(mCi, tCi, { id: 'c-at', name: 'created_at', type: 'datetime2(7)', notNull: true });
+    expect(() => addColumn(mCi, tCi, { name: 'CREATED_AT', type: 'int' })).toThrow(/已存在/);
+    const cOther = addColumn(mCi, tCi, { id: 'c-other', name: 'other', type: 'int' });
+    expect(() => renameColumn(mCi, cOther, 'Created_At')).toThrow(/已存在/);
+    expect(() => addCheck(mCi, tCi, 'DATEDIFF(day, [CREATED_AT], GETDATE()) >= 0')).not.toThrow();
+
+    // 6. Virtual (non-PERSISTED) computed column ignores type & notNull diff (no spurious regen)
+    const mVirt0 = emptyModel('mssql');
+    const sV = createSchema(mVirt0, 'dbo', 's-dbo');
+    const tV = createTable(mVirt0, sV, 'calc', 't-calc');
+    addColumn(mVirt0, tV, { id: 'c-a', name: 'a', type: 'int', notNull: true });
+    addColumn(mVirt0, tV, {
+      id: 'c-v',
+      name: 'v',
+      type: 'int',
+      notNull: false,
+      generated: { expr: '[a] + 1', stored: false },
+    });
+    const mVirt1 = structuredClone(mVirt0);
+    (mVirt1.objects['c-v'] as { type: string; notNull: boolean }).type = 'bigint';
+    (mVirt1.objects['c-v'] as { type: string; notNull: boolean }).notNull = true;
+    expect(plan(mVirt0, mVirt1)).toEqual([]);
+
+    // 7. Schema rename with removed sequence, removed early function, kept unchanged early function, and changed early function
+    const mSch0 = emptyModel('mssql');
+    const sApp = createSchema(mSch0, 'app', 's-app');
+    const seqDrop = createSequence(mSch0, sApp, 'old_seq', {}, 'seq-drop');
+    mSch0.objects['op-drop'] = {
+      id: 'op-drop',
+      kind: 'opaque',
+      objType: 'function',
+      parent: sApp,
+      name: 'fn_old',
+      ddl: ['CREATE FUNCTION [app].[fn_old]() RETURNS int AS BEGIN RETURN 1 END'],
+      drop: 'DROP FUNCTION [app].[fn_old]',
+      deps: [],
+      order: 1,
+      comment: null,
+    };
+    mSch0.objects['op-keep'] = {
+      id: 'op-keep',
+      kind: 'opaque',
+      objType: 'function',
+      parent: sApp,
+      name: 'fn_keep',
+      ddl: ['CREATE FUNCTION [app].[fn_keep]() RETURNS int AS BEGIN RETURN 2 END'],
+      drop: 'DROP FUNCTION [app].[fn_keep]',
+      deps: [],
+      order: 2,
+      comment: null,
+    };
+    mSch0.objects['op-chg'] = {
+      id: 'op-chg',
+      kind: 'opaque',
+      objType: 'function',
+      parent: sApp,
+      name: 'fn_chg',
+      ddl: ['CREATE FUNCTION [app].[fn_chg]() RETURNS int AS BEGIN RETURN 3 END'],
+      drop: 'DROP FUNCTION [app].[fn_chg]',
+      deps: [],
+      order: 3,
+      comment: null,
+    };
+
+    const mSch1 = structuredClone(mSch0);
+    dropSequence(mSch1, seqDrop);
+    delete mSch1.objects['op-drop'];
+    renameSchema(mSch1, sApp, 'core');
+    (mSch1.objects['op-chg'] as { ddl: string[]; drop: string }).ddl = [
+      'CREATE FUNCTION [core].[fn_chg]() RETURNS int AS BEGIN RETURN 30 END',
+    ];
+    (mSch1.objects['op-chg'] as { ddl: string[]; drop: string }).drop = 'DROP FUNCTION [core].[fn_chg]';
+
+    const schRenameSteps = plan(mSch0, mSch1);
+    const dropSchemaIdx = schRenameSteps.findIndex((s) => s.kind === 'dropSchema' && s.sql.includes('[app]'));
+    expect(dropSchemaIdx).toBeGreaterThan(0);
+    expect(schRenameSteps.findIndex((s) => s.kind === 'dropSequence')).toBeLessThan(dropSchemaIdx);
+    expect(
+      schRenameSteps.findIndex((s) => s.kind === 'dropOpaque' && s.sql.includes('[fn_old]')),
+    ).toBeLessThan(dropSchemaIdx);
+    expect(
+      schRenameSteps.findIndex((s) => s.kind === 'dropOpaque' && s.sql.includes('[fn_chg]')),
+    ).toBeLessThan(dropSchemaIdx);
+    expect(
+      schRenameSteps.findIndex(
+        (s) => s.kind === 'transferSchema' && s.sql === 'ALTER SCHEMA [core] TRANSFER [app].[fn_keep]',
+      ),
+    ).toBeLessThan(dropSchemaIdx);
+    expect(
+      schRenameSteps.findIndex((s) => s.kind === 'createOpaque' && s.sql.includes('[core].[fn_chg]')),
+    ).toBeGreaterThan(dropSchemaIdx);
+
+    // 8. Named DEFAULT solidification (missing ext.mssql.defaultName) + setDefault/dropSequence refresh + sequence rename rebuild
+    const mDef0 = emptyModel('mssql');
+    const sDef = createSchema(mDef0, 'dbo', 's-dbo');
+    const qDef = createSequence(mDef0, sDef, 'seq_a', {}, 'seq-a');
+    const tDef = createTable(mDef0, sDef, 'orders', 't-orders');
+    const cCode = addColumn(mDef0, tDef, { id: 'c-code', name: 'code', type: 'nvarchar(16)' });
+    setDefault(mDef0, cCode, { expr: "N'init'" });
+    expect(
+      (mDef0.objects[cCode] as { ext?: { mssql?: { defaultName?: string } } }).ext?.mssql?.defaultName,
+    ).toBe('DF_orders_code');
+    const cSeq = addColumn(mDef0, tDef, {
+      id: 'c-seq',
+      name: 'seq_no',
+      type: 'bigint',
+      default: { nextval: qDef },
+    });
+    expect(
+      (mDef0.objects[cSeq] as { ext?: { mssql?: { defaultName?: string } } }).ext?.mssql?.defaultName,
+    ).toBe('DF_orders_seq_no');
+
+    // Clear explicit defaultName on from to simulate legacy/raw IR without ext.mssql.defaultName
+    const mDefFromRaw = structuredClone(mDef0);
+    delete (mDefFromRaw.objects[cCode] as { ext?: unknown }).ext;
+    const mDefToRenamed = structuredClone(mDef0);
+    renameTable(mDefToRenamed, tDef, 'invoices');
+    renameSequence(mDefToRenamed, qDef, 'seq_b');
+
+    const defSteps = plan(mDefFromRaw, mDefToRenamed);
+    // Solidified DF_orders_code must be sp_renamed to DF_invoices_code (not skipped!)
+    expect(
+      defSteps.some(
+        (s) =>
+          s.kind === 'rename' &&
+          s.sql === "EXEC sys.sp_rename N'[dbo].[DF_orders_code]', N'DF_invoices_code', N'OBJECT'",
+      ),
+    ).toBe(true);
+    // Sequence rename must drop old DEFAULT referencing seq_a and recreate referencing seq_b
+    expect(defSteps.some((s) => s.kind === 'dropDefault' && s.sql.includes('[DF_orders_seq_no]'))).toBe(true);
+    expect(
+      defSteps.some(
+        (s) =>
+          s.kind === 'setDefault' &&
+          s.sql.includes('[DF_invoices_seq_no]') &&
+          s.sql.includes('[dbo].[seq_b]'),
+      ),
+    ).toBe(true);
+
+    // dropSequence clears derived defaultName on referencing column
+    const mDropSeq = structuredClone(mDef0);
+    dropSequence(mDropSeq, qDef);
+    expect(
+      (mDropSeq.objects[cSeq] as { ext?: { mssql?: { defaultName?: string } } }).ext?.mssql?.defaultName,
+    ).toBeUndefined();
   });
 });

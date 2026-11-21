@@ -203,7 +203,16 @@ export const mssqlTokenize = (s: string): Token[] => {
   return out;
 };
 
-/** 表达式中出现的列引用（跳过函数名、限定名前缀、CAST/TRY_CAST(... AS <type>)、CONVERT/TRY_CONVERT(<type>, ...)、COLLATE <name>） */
+const DATEPART_FIRST_ARG_FNS = new Set([
+  'datepart',
+  'datediff',
+  'datediff_big',
+  'dateadd',
+  'datename',
+  'datetrunc',
+]);
+
+/** 表达式中出现的列引用（跳过函数名、限定名前缀、CAST/TRY_CAST(... AS <type>)、CONVERT/TRY_CONVERT(<type>, ...)、DATEPART/DATEDIFF 等首个单位参数、COLLATE <name>） */
 export const mssqlColumnRefs = (expr: string): Token[] => {
   const sig = mssqlTokenize(expr).filter(
     (x) => !/^\s+$/.test(x.text) && !x.text.startsWith('--') && !x.text.startsWith('/*'),
@@ -214,6 +223,13 @@ export const mssqlColumnRefs = (expr: string): Token[] => {
     const x = sig[i]!;
     if (x.kind === 'ident' && x.text === 'collate') {
       i++;
+      continue;
+    }
+    if (x.kind === 'ident' && DATEPART_FIRST_ARG_FNS.has(x.text) && sig[i + 1]?.text === '(') {
+      i += 2; // 跳过函数名与 '('
+      if (sig[i]?.kind === 'ident' && sig[i + 1]?.text === ',') {
+        i += 1; // 跳过 datepart 单位标识符，下一轮指向逗号之后
+      }
       continue;
     }
     if (x.kind === 'ident' && (x.text === 'cast' || x.text === 'try_cast') && sig[i + 1]?.text === '(') {

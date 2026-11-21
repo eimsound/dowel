@@ -16,6 +16,20 @@ export const MSSQL_SESSION_SETTINGS = [
 
 const MSSQL_STATE = Symbol('mssqlConnState');
 
+export interface MssqlShadowGuard {
+  expectedDb: string;
+  mark: string;
+}
+
+const SHADOW_GUARDS = new WeakMap<Db, MssqlShadowGuard>();
+
+export const setMssqlShadowGuard = (db: Db, guard: MssqlShadowGuard | null): void => {
+  if (guard) SHADOW_GUARDS.set(db, guard);
+  else SHADOW_GUARDS.delete(db);
+};
+
+export const getMssqlShadowGuard = (db: Db): MssqlShadowGuard | null => SHADOW_GUARDS.get(db) ?? null;
+
 export interface MssqlConnState {
   pool: sql.ConnectionPool;
   config?: sql.config;
@@ -170,7 +184,13 @@ export const fromMssql = (pool: sql.ConnectionPool, config?: sql.config): Db => 
         },
       };
       const dedicatedPool = new sql.ConnectionPool(dedicatedConfig);
-      await dedicatedPool.connect();
+      dedicatedPool.on('error', () => {});
+      try {
+        await dedicatedPool.connect();
+      } catch (e) {
+        await dedicatedPool.close().catch(() => {});
+        throw e;
+      }
       const one = fromMssql(dedicatedPool, dedicatedConfig);
       let released = false;
       one.release = () => {
@@ -194,33 +214,35 @@ export const runMssqlTransaction = async <T>(
   const st = getMssqlState(conn);
   if (!st) {
     await conn.exec('BEGIN TRANSACTION');
+    let r: T;
     try {
-      const r = await fn();
+      r = await fn();
       hooks.beforeCommit?.();
       await conn.exec('COMMIT TRANSACTION');
-      hooks.afterCommit?.();
-      return r;
     } catch (e) {
       await conn.exec('IF @@TRANCOUNT > 0 ROLLBACK TRANSACTION').catch(() => {});
       throw e;
     }
+    hooks.afterCommit?.();
+    return r;
   }
   const tx = new sql.Transaction(st.pool);
   await tx.begin();
   const prev = st.activeTx;
   st.activeTx = tx;
+  let r: T;
   try {
-    const r = await fn();
+    r = await fn();
     hooks.beforeCommit?.();
     await tx.commit();
     st.activeTx = prev;
-    hooks.afterCommit?.();
-    return r;
   } catch (e) {
     st.activeTx = prev;
     await tx.rollback().catch(() => {});
     throw e;
   }
+  hooks.afterCommit?.();
+  return r;
 };
 
 export const pinMssqlSession = async (db: Db): Promise<void> => {
