@@ -29,6 +29,8 @@ env_name="${DOWEL_ENVIRONMENT:-}"
 target_to="${DOWEL_TO:-}"
 dry_run="${DOWEL_DRY_RUN:-false}"
 lock_timeout="${DOWEL_LOCK_TIMEOUT:-30}"
+connect_timeout="${DOWEL_CONNECT_TIMEOUT:-15}"
+timeout="${DOWEL_TIMEOUT:-1800}"
 
 [[ -n "$url" ]] || fail_input "缺少输入 url（DOWEL_URL）"
 [[ -n "$token" ]] || fail_input "缺少输入 token（DOWEL_TOKEN）"
@@ -62,6 +64,15 @@ esac
 # 禁止前导零（避免 bash (( )) 按八进制解析 08/09 或拼出非法 JSON 010）
 if ! [[ "$lock_timeout" =~ ^(0|[1-9][0-9]*)$ ]] || (( lock_timeout < 0 || lock_timeout > 30 )); then
   fail_input "lock-timeout 必须是 0～30 的十进制整数（不含前导零），收到：$lock_timeout"
+fi
+
+# 禁止前导零并限制位数，避免 bash (( )) 按八进制解析或大整数溢出
+if ! [[ "$connect_timeout" =~ ^[1-9][0-9]{0,3}$ ]] || (( connect_timeout < 1 || connect_timeout > 3600 )); then
+  fail_input "connect-timeout 必须是 1～3600 的十进制正整数（不含前导零），收到：$connect_timeout"
+fi
+
+if ! [[ "$timeout" =~ ^(0|[1-9][0-9]{0,4})$ ]] || (( timeout < 0 || timeout > 86400 )); then
+  fail_input "timeout 必须是 0～86400 的十进制整数（不含前导零，0 表示不限总时长），收到：$timeout"
 fi
 
 if ! [[ "$target_to" =~ ^([Ll][Aa][Tt][Ee][Ss][Tt]|[Vv]?[0-9]{1,9})$ ]]; then
@@ -154,17 +165,29 @@ cleanup() {
 }
 trap cleanup EXIT
 
-# 经标准输入传 header，避免令牌出现在进程列表里；仅允许 http/https 协议并用 -- 终止选项解析
+# 经标准输入传 header，避免令牌出现在进程列表里；仅允许 http/https 协议并用 -- 终止选项解析；
+# 仅设置连接与请求总超时，绝不对非幂等写接口默认启用 --retry
+curl_args=(
+  -sS
+  -X POST
+  --proto '=http,https'
+  --connect-timeout "$connect_timeout"
+)
+if (( timeout > 0 )); then
+  curl_args+=(--max-time "$timeout")
+fi
+curl_args+=(
+  --config -
+  --data "$payload"
+  --output "$resp_file"
+  --write-out '%{http_code}'
+  -- "$endpoint"
+)
+
 http_code=""
 if ! http_code="$(
   printf 'header = "Authorization: Bearer %s"\nheader = "Content-Type: application/json"\nheader = "Accept: application/json"\n' "$token" \
-  | curl -sS -X POST \
-      --proto '=http,https' \
-      --config - \
-      --data "$payload" \
-      --output "$resp_file" \
-      --write-out '%{http_code}' \
-      -- "$endpoint" 2>"$err_file"
+  | curl "${curl_args[@]}" 2>"$err_file"
 )"; then
   curl_err="$(cat "$err_file")"
   write_output "ok" "false"

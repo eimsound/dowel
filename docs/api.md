@@ -267,12 +267,34 @@ curl -fsS \
 
 ```bash
 curl -fsS \
+  --connect-timeout 15 \
+  --max-time 1800 \
   -X POST \
   -H "Authorization: Bearer ${DOWEL_TOKEN}" \
   -H "Content-Type: application/json" \
   -d '{"to":"v5","lockTimeoutSeconds":30}' \
   "${DOWEL_URL}/api/ci/projects/acme/shop/environments/staging/execute"
 ```
+
+> **超时与重试建议**：调用执行接口时建议始终设置连接超时（`--connect-timeout`）与整次请求上限（`--max-time`），防止网络黑洞或服务端挂起导致流水线无限阻塞；同时**不要**对该写接口启用自动重试（如 `curl --retry`）——接口支持 `to: "latest"`、可能包含非事务 DDL 步骤并会产生审计与 Webhook 通知，超时后应先查询环境实时状态再决定是否重试。
+
+### 内置 CI 脚本 / Action 参数（`actions/execute`）
+
+使用仓库内置的 [actions/execute](../actions/execute/README.md)（支持 GitHub / Gitea / Forgejo / GHES 复合 Action 或直接运行 `bash actions/execute/run.sh`）时，支持以下输入参数与对应环境变量：
+
+| Action 输入       | 环境变量                | 必填 | 默认值  | 说明                                                                                   |
+| ----------------- | ----------------------- | ---- | ------- | -------------------------------------------------------------------------------------- |
+| `url`             | `DOWEL_URL`             | 是   | —       | Dowel 服务地址（仅允许 `http://` / `https://`）                                        |
+| `token`           | `DOWEL_TOKEN`           | 是   | —       | 项目 CI 令牌（`dwl_…`，通过 `curl --config -` 经标准输入传递，不出现在命令行参数中）   |
+| `project`         | `DOWEL_PROJECT`         | 是   | —       | 项目路径 `owner/slug`                                                                  |
+| `environment`     | `DOWEL_ENVIRONMENT`     | 是   | —       | 目标环境名，例如 `staging`                                                             |
+| `to`              | `DOWEL_TO`              | 是   | —       | 目标版本：`latest`、`v5` 或 `5`                                                        |
+| `dry-run`         | `DOWEL_DRY_RUN`         | 否   | `false` | `true` 时只预演不写入目标库                                                            |
+| `lock-timeout`    | `DOWEL_LOCK_TIMEOUT`    | 否   | `30`    | 等待执行锁的最长秒数（`0`～`30`）                                                      |
+| `connect-timeout` | `DOWEL_CONNECT_TIMEOUT` | 否   | `15`    | 建立 HTTP 连接的超时秒数（`1`～`3600`，对应 `curl --connect-timeout`）                 |
+| `timeout`         | `DOWEL_TIMEOUT`         | 否   | `1800`  | 整次 HTTP 请求的最长耗时秒数（`0`～`86400`，对应 `curl --max-time`；`0` 表示不限时长） |
+
+脚本输入校验失败返回 `invalid_input`（发起请求前直接退出码 `1`）；建连或请求超时、网络不可达返回 `network_error`（不自动重试）。
 
 ### 成功响应（`200 OK`）
 

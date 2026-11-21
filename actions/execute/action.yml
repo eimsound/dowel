@@ -24,6 +24,14 @@ inputs:
     description: 等待执行锁的秒数（0～30，默认 30）
     required: false
     default: "30"
+  connect-timeout:
+    description: 建立 HTTP 连接的超时秒数（1～3600，默认 15）
+    required: false
+    default: "15"
+  timeout:
+    description: 整次 HTTP 请求的最长耗时秒数（0～86400，默认 1800；0 表示不限制总时长）
+    required: false
+    default: "1800"
 outputs:
   ok:
     description: 执行或预演是否成功（true / false）
@@ -53,4 +61,6 @@ runs:
         DOWEL_TO: ${{ inputs.to }}
         DOWEL_DRY_RUN: ${{ inputs.dry-run }}
         DOWEL_LOCK_TIMEOUT: ${{ inputs.lock-timeout }}
+        DOWEL_CONNECT_TIMEOUT: ${{ inputs.connect-timeout }}
+        DOWEL_TIMEOUT: ${{ inputs.timeout }}
       run: bash "${{ github.action_path }}/run.sh"

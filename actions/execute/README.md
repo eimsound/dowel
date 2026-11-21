@@ -19,10 +19,12 @@ DOWEL_ENVIRONMENT="staging" \
 DOWEL_TO="latest" \
 DOWEL_DRY_RUN="false" \
 DOWEL_LOCK_TIMEOUT="30" \
+DOWEL_CONNECT_TIMEOUT="15" \
+DOWEL_TIMEOUT="1800" \
 bash actions/execute/run.sh
 ```
 
-环境变量与下方输入表一一对应：`DOWEL_URL`、`DOWEL_TOKEN`、`DOWEL_PROJECT`、`DOWEL_ENVIRONMENT`、`DOWEL_TO`、`DOWEL_DRY_RUN`（默认 `false`）、`DOWEL_LOCK_TIMEOUT`（默认 `30`）。
+环境变量与下方输入表一一对应：`DOWEL_URL`、`DOWEL_TOKEN`、`DOWEL_PROJECT`、`DOWEL_ENVIRONMENT`、`DOWEL_TO`、`DOWEL_DRY_RUN`（默认 `false`）、`DOWEL_LOCK_TIMEOUT`（默认 `30`）、`DOWEL_CONNECT_TIMEOUT`（默认 `15`）、`DOWEL_TIMEOUT`（默认 `1800`）。
 
 ## Actions 用法示例（GitHub / Gitea / Forgejo / GHES）
 
@@ -71,15 +73,17 @@ jobs:
 
 ## 输入
 
-| 名称           | 必填 | 默认值  | 说明                                                 |
-| -------------- | ---- | ------- | ---------------------------------------------------- |
-| `url`          | 是   | —       | Dowel 服务地址，例如 `https://dowel.example.com`     |
-| `token`        | 是   | —       | 项目 CI 令牌（`dwl_…`），放到 GitHub Secrets 中传入  |
-| `project`      | 是   | —       | 项目路径 `owner/slug`                                |
-| `environment`  | 是   | —       | 目标环境名，例如 `staging`                           |
-| `to`           | 是   | —       | 目标版本，必须显式指定：`latest`、`v5` 或 `5`        |
-| `dry-run`      | 否   | `false` | 设为 `true` 时只做执行前检查并返回计划，不写入目标库 |
-| `lock-timeout` | 否   | `30`    | 等待执行锁的最长秒数（`0`～`30`）                    |
+| 名称              | 必填 | 默认值  | 说明                                                                                       |
+| ----------------- | ---- | ------- | ------------------------------------------------------------------------------------------ |
+| `url`             | 是   | —       | Dowel 服务地址，例如 `https://dowel.example.com`                                           |
+| `token`           | 是   | —       | 项目 CI 令牌（`dwl_…`），放到 GitHub Secrets 中传入                                        |
+| `project`         | 是   | —       | 项目路径 `owner/slug`                                                                      |
+| `environment`     | 是   | —       | 目标环境名，例如 `staging`                                                                 |
+| `to`              | 是   | —       | 目标版本，必须显式指定：`latest`、`v5` 或 `5`                                              |
+| `dry-run`         | 否   | `false` | 设为 `true` 时只做执行前检查并返回计划，不写入目标库                                       |
+| `lock-timeout`    | 否   | `30`    | 等待执行锁的最长秒数（`0`～`30`）                                                          |
+| `connect-timeout` | 否   | `15`    | 建立 HTTP 连接的超时秒数（`1`～`3600`，对应 `curl --connect-timeout`）                     |
+| `timeout`         | 否   | `1800`  | 整次 HTTP 请求的最长耗时秒数（`0`～`86400`，对应 `curl --max-time`；`0` 表示不限制总时长） |
 
 ## 输出
 
@@ -94,4 +98,5 @@ jobs:
 ## 失败行为
 
 - 任意检查未通过或执行失败时，脚本输出错误码与原因（在 GitHub Actions 里用 `::error::[code] …` 标出），并以退出码 `1` 失败。
+- 建连或整次请求超时、网络不可达时返回 `code=network_error` 并以退出码 `1` 失败；由于 `POST /api/ci/.../execute` 并非严格幂等接口（如 `to: "latest"`、含非事务 DDL 步骤、写审计与发 Webhook），脚本**不会**自动重试，超时后请先确认目标环境当前状态再决定是否重新执行。
 - 完整的接口契约与错误码表见 [docs/api.md](../../docs/api.md)。
