@@ -991,3 +991,178 @@ test('超大 layout（200 张表）立即落库并改发 room.layout.reload，�
     await roomsB.flush();
   }
 });
+
+test('catchUp 按游标增量拉取 room_rejections（不反复全表扫描历史拒绝），本地拒绝与脏重载后游标保持同步', async () => {
+  const u = await makeUser(db, 'rej-cursor-user', { name: '游标测试' });
+  await db.query(
+    "insert into grants (id, scope_kind, scope_id, subject_kind, subject_id, role) values ($1, 'project', $2, 'user', $3, 'editor')",
+    ['g-rej-cursor', pid, u.id],
+  );
+  const branchRej = `${branchId}-rej-cursor`;
+  await db.query("insert into branches (id, project_id, name) values ($1, $2, 'rej-cursor')", [
+    branchRej,
+    pid,
+  ]);
+  await rooms.init(branchRej, model);
+
+  // 预置 3 条历史拒绝记录，模拟加载前已有历史拒绝
+  const scopedClient = `${u.id}:c-cursor`;
+  for (let n = 1; n <= 3; n++) {
+    await db.query(
+      'insert into room_rejections (branch_id, client, n, code, message) values ($1, $2, $3, $4, $5)',
+      [branchRej, scopedClient, n, 'conflict', `历史拒绝-${n}`],
+    );
+  }
+  const existingRows = await db.query<{ id: number }>(
+    'select id from room_rejections where branch_id = $1 order by id asc',
+    [branchRej],
+  );
+  expect(existingRows).toHaveLength(3);
+  const maxExistingId = Number(existingRows.at(-1)!.id);
+
+  // 包装 db.transaction，记录每一次针对 room_rejections 的查询参数与返回行数
+  const rejectionQueries: { sql: string; params: unknown[]; returned: number; readOnly?: boolean }[] = [];
+  const wrappedDb: PlatformDb = {
+    ...db,
+    transaction: (fn, opts) =>
+      db.transaction(async (tx) => {
+        const tracedTx: typeof tx = {
+          exec: (q) => tx.exec(q),
+          query: async <T>(q: string, params?: unknown[]) => {
+            const rows = await tx.query<T>(q, params);
+            if (q.includes('from room_rejections')) {
+              rejectionQueries.push({
+                sql: q,
+                params: params ? [...params] : [],
+                returned: rows.length,
+                readOnly: opts?.readOnly,
+              });
+            }
+            return rows;
+          },
+        };
+        return fn(tracedTx);
+      }, opts),
+  };
+
+  const testRooms = new Rooms(wrappedDb, (user, projectId, lookup) =>
+    effectiveProjectRole(db, user, projectId, lookup),
+  );
+  try {
+    const p = peerOf(u);
+    await testRooms.join(branchRej, p.peer);
+    await testRooms.message(branchRej, p.peer, { t: 'hello', client: 'c-cursor', lastSeq: 0 });
+    const welcome1 = p.sent.find((m) => (m as { t: string }).t === 'welcome') as {
+      t: 'welcome';
+      lastProcessed: number;
+      rejected: { n: number }[];
+    };
+    expect(welcome1.lastProcessed).toBe(3);
+    expect(welcome1.rejected.map((r) => r.n)).toEqual([1, 2, 3]);
+    // 首次 loadRoom 在只读快照事务中读取了 3 条历史拒绝
+    expect(rejectionQueries).toHaveLength(1);
+    expect(rejectionQueries[0]!.readOnly).toBe(true);
+    expect(rejectionQueries[0]!.returned).toBe(3);
+
+    // 1. 无新增拒绝时调用 catchUp：仅按 id > maxExistingId 增量查询，返回 0 行
+    rejectionQueries.length = 0;
+    await testRooms.catchUp(branchRej);
+    expect(rejectionQueries).toHaveLength(1);
+    expect(rejectionQueries[0]!.sql).toContain('id > $2');
+    expect(rejectionQueries[0]!.params).toEqual([branchRej, maxExistingId]);
+    expect(rejectionQueries[0]!.returned).toBe(0);
+    expect(rejectionQueries[0]!.readOnly).toBe(true);
+
+    // 2. 外部新增 1 条拒绝记录（n=4）：catchUp 仅查回这 1 条并推进游标
+    const [ins4] = await db.query<{ id: number }>(
+      'insert into room_rejections (branch_id, client, n, code, message) values ($1, $2, 4, $3, $4) returning id',
+      [branchRej, scopedClient, 'conflict', '外部拒绝-4'],
+    );
+    const id4 = Number(ins4!.id);
+    rejectionQueries.length = 0;
+    await testRooms.catchUp(branchRej);
+    expect(rejectionQueries).toHaveLength(1);
+    expect(rejectionQueries[0]!.params).toEqual([branchRej, maxExistingId]);
+    expect(rejectionQueries[0]!.returned).toBe(1);
+
+    // 再次 catchUp：游标已推进到 id4，返回 0 行
+    rejectionQueries.length = 0;
+    await testRooms.catchUp(branchRej);
+    expect(rejectionQueries).toHaveLength(1);
+    expect(rejectionQueries[0]!.params).toEqual([branchRej, id4]);
+    expect(rejectionQueries[0]!.returned).toBe(0);
+
+    // 3. 本地触发一次 op 拒绝（n=5，引用不存在的表触发 invalid）：通过 RETURNING id 同步推进游标，后续 catchUp 不重复回扫
+    await testRooms.message(branchRej, p.peer, {
+      t: 'op',
+      op: {
+        client: 'c-cursor',
+        n: 5,
+        name: 'renameTable',
+        args: { id: 'nonexistent_table', name: 'x' },
+        reads: [],
+      },
+    });
+    const [row5] = await db.query<{ id: number }>(
+      'select id from room_rejections where branch_id = $1 and client = $2 and n = 5',
+      [branchRej, scopedClient],
+    );
+    const id5 = Number(row5!.id);
+    expect(id5).toBeGreaterThan(id4);
+
+    rejectionQueries.length = 0;
+    await testRooms.catchUp(branchRej);
+    expect(rejectionQueries).toHaveLength(1);
+    expect(rejectionQueries[0]!.params).toEqual([branchRej, id5]);
+    expect(rejectionQueries[0]!.returned).toBe(0);
+
+    // 4. 事务回滚触发 reloadLocked 后游标重新对齐：模拟一次本地 op 写入后事务回滚，同时数据库写入新外部拒绝 n=6
+    let failWriteOnce = true;
+    const prevWrapTx = wrappedDb.transaction;
+    wrappedDb.transaction = (async (fn, opts) =>
+      prevWrapTx(async (tx) => {
+        const res = await fn(tx);
+        if (!opts?.readOnly && failWriteOnce) {
+          failWriteOnce = false;
+          throw new Error('模拟提交阶段回滚');
+        }
+        return res;
+      }, opts)) as PlatformDb['transaction'];
+
+    await expect(
+      testRooms.message(branchRej, p.peer, {
+        t: 'op',
+        op: {
+          client: 'c-cursor',
+          n: 6,
+          name: 'renameTable',
+          args: { id: 'nonexistent_table', name: 'rollback_rej' },
+          reads: [],
+        },
+      }),
+    ).rejects.toThrow('模拟提交阶段回滚');
+    wrappedDb.transaction = prevWrapTx;
+
+    // 事务回滚后 reloadLocked 已重新对齐游标到 id5（n=6 未落库），随后 catchUp 仅查 id > id5 且返回 0 行
+    rejectionQueries.length = 0;
+    await testRooms.catchUp(branchRej);
+    expect(rejectionQueries).toHaveLength(1);
+    expect(rejectionQueries[0]!.params).toEqual([branchRej, id5]);
+    expect(rejectionQueries[0]!.returned).toBe(0);
+
+    // 验证重连后 welcome 中 lastProcessed=5 且全部 5 条拒绝记录状态完整一致
+    const pReconn = peerOf(u);
+    await testRooms.join(branchRej, pReconn.peer);
+    await testRooms.message(branchRej, pReconn.peer, { t: 'hello', client: 'c-cursor', lastSeq: 0 });
+    const welcome2 = pReconn.sent.find((m) => (m as { t: string }).t === 'welcome') as {
+      t: 'welcome';
+      lastProcessed: number;
+      rejected: { n: number }[];
+    };
+    expect(welcome2.lastProcessed).toBe(5);
+    expect(welcome2.rejected.map((r) => r.n)).toEqual([1, 2, 3, 4, 5]);
+  } finally {
+    testRooms.close();
+    await testRooms.flush();
+  }
+});

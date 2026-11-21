@@ -159,6 +159,8 @@ const isNewerLayoutVersion = (incoming: LayoutVersion, existing: LayoutVersion |
 
 interface Loaded {
   room: Room;
+  /** 已同步到内存的 room_rejections 最大游标 id（同分支写事务由 branches FOR UPDATE 串行提交，可安全按 id > 游标增量拉取） */
+  lastRejectionId: number;
   peers: Set<Peer>;
   /** 其他副本上已握手的在线成员快照（按远端 replicaId 隔离） */
   remotePeers: Map<string, RoomPeerInfo[]>;
@@ -300,7 +302,7 @@ export class Rooms {
     return r;
   }
 
-  private makeStore(db: Db, branchId: string): RoomStore {
+  private makeStore(db: Db, branchId: string, onRejectionId?: (id: number) => void): RoomStore {
     return {
       append: async (commit, op) => {
         await db.query(
@@ -319,93 +321,115 @@ export class Rooms {
         );
       },
       reject: async (client, r) => {
-        await db.query(
-          'insert into room_rejections (branch_id, client, n, code, message) values ($1, $2, $3, $4, $5)',
+        const rows = await db.query<{ id: string | number }>(
+          'insert into room_rejections (branch_id, client, n, code, message) values ($1, $2, $3, $4, $5) returning id',
           [branchId, client, r.n, r.code, r.message],
         );
+        if (rows[0]) onRejectionId?.(Number(rows[0].id));
       },
     };
   }
 
-  private async loadRoom(branchId: string): Promise<Room> {
-    const db = this.db;
-    const [snap] = await db.query<{ seq: string; model: Model; versions: Versions }>(
-      'select seq, model, versions from room_snapshots where branch_id = $1 order by seq desc limit 1',
-      [branchId],
-    );
-    if (!snap) throw new Error(`分支 ${branchId} 没有初始快照`);
-    const state: RoomState = emptyRoomState(snap.model);
-    state.versions = snap.versions;
-    state.seq = Number(snap.seq);
-    const after = await db.query<{
-      seq: string;
-      client: string;
-      n: number;
-      user_name: string;
-      changes: Commit['changes'];
-    }>(
-      'select seq, client, n, user_name, changes from room_commits where branch_id = $1 and seq > $2 order by seq',
-      [branchId, state.seq],
-    );
-    for (const c of after) {
-      const seq = Number(c.seq);
-      for (const ch of c.changes) {
-        if (ch.obj) {
-          state.model.objects[ch.id] = ch.obj;
-          state.versions[ch.id] = seq;
-        } else {
-          delete state.model.objects[ch.id];
-          delete state.versions[ch.id];
+  private async loadRoom(branchId: string): Promise<{ room: Room; lastRejectionId: number }> {
+    // PG 下用单次 REPEATABLE READ READ ONLY 事务读取 room_snapshots / room_commits / room_rejections，
+    // 保证来自同一 MVCC 快照，避免先读 commits 后读 rejections 产生“旧 seq + 新 lastProcessed”读撕裂；
+    // SQLite 下用只读事务包在单连接 exclusive 队列内，同样保证整次加载不被并发写入穿插。
+    return this.db.transaction(
+      async (tx) => {
+        const [snap] = await tx.query<{ seq: string; model: Model; versions: Versions }>(
+          'select seq, model, versions from room_snapshots where branch_id = $1 order by seq desc limit 1',
+          [branchId],
+        );
+        if (!snap) throw new Error(`分支 ${branchId} 没有初始快照`);
+        const state: RoomState = emptyRoomState(snap.model);
+        state.versions = snap.versions;
+        state.seq = Number(snap.seq);
+        const after = await tx.query<{
+          seq: string;
+          client: string;
+          n: number;
+          user_name: string;
+          changes: Commit['changes'];
+        }>(
+          'select seq, client, n, user_name, changes from room_commits where branch_id = $1 and seq > $2 order by seq',
+          [branchId, state.seq],
+        );
+        for (const c of after) {
+          const seq = Number(c.seq);
+          for (const ch of c.changes) {
+            if (ch.obj) {
+              state.model.objects[ch.id] = ch.obj;
+              state.versions[ch.id] = seq;
+            } else {
+              delete state.model.objects[ch.id];
+              delete state.versions[ch.id];
+            }
+          }
+          state.seq = seq;
         }
-      }
-      state.seq = seq;
-    }
-    // 最近的提交用于给重连的客户端补发（限定 seq <= state.seq，防止并发写入导致 log 领先于 model）
-    const recent = await db.query<{
-      seq: string;
-      client: string;
-      n: number;
-      user_name: string;
-      changes: Commit['changes'];
-    }>(
-      `select seq, client, n, user_name, changes from
-         (select * from room_commits where branch_id = $1 and seq <= $2 order by seq desc limit 2000) x order by seq`,
-      [branchId, state.seq],
-    );
-    state.log = recent.map((c) => ({
-      t: 'commit',
-      seq: Number(c.seq),
-      client: c.client,
-      n: Number(c.n),
-      user: c.user_name,
-      changes: c.changes,
-    }));
-    for (const r of await db.query<{ client: string; n: number }>(
-      `select client, max(n) as n from (
-         select client, n from room_commits where branch_id = $1 and seq <= $2
-         union all select client, n from room_rejections where branch_id = $1) x group by client`,
-      [branchId, state.seq],
-    ))
-      state.processed[r.client] = Number(r.n);
-    for (const r of await db.query<{ client: string; n: number; code: Rejection['code']; message: string }>(
-      'select client, n, code, message from room_rejections where branch_id = $1 order by n',
-      [branchId],
-    ))
-      state.rejections[r.client] = [
-        ...(state.rejections[r.client] ?? []),
-        { n: Number(r.n), code: r.code, message: r.message },
-      ];
+        // 最近的提交用于给重连的客户端补发（限定 seq <= state.seq，防止并发写入导致 log 领先于 model）
+        const recent = await tx.query<{
+          seq: string;
+          client: string;
+          n: number;
+          user_name: string;
+          changes: Commit['changes'];
+        }>(
+          `select seq, client, n, user_name, changes from
+             (select * from room_commits where branch_id = $1 and seq <= $2 order by seq desc limit 2000) x order by seq`,
+          [branchId, state.seq],
+        );
+        state.log = recent.map((c) => ({
+          t: 'commit',
+          seq: Number(c.seq),
+          client: c.client,
+          n: Number(c.n),
+          user: c.user_name,
+          changes: c.changes,
+        }));
+        for (const r of await tx.query<{ client: string; n: number }>(
+          'select client, max(n) as n from room_commits where branch_id = $1 and seq <= $2 group by client',
+          [branchId, state.seq],
+        ))
+          state.processed[r.client] = Number(r.n);
+        let lastRejectionId = 0;
+        for (const r of await tx.query<{
+          id: string | number;
+          client: string;
+          n: number;
+          code: Rejection['code'];
+          message: string;
+        }>('select id, client, n, code, message from room_rejections where branch_id = $1 order by id asc', [
+          branchId,
+        ])) {
+          const id = Number(r.id);
+          const n = Number(r.n);
+          if (id > lastRejectionId) lastRejectionId = id;
+          if ((state.processed[r.client] ?? 0) < n) state.processed[r.client] = n;
+          state.rejections[r.client] = [
+            ...(state.rejections[r.client] ?? []),
+            { n, code: r.code, message: r.message },
+          ];
+        }
+        for (const list of Object.values(state.rejections)) {
+          list.sort((a, b) => a.n - b.n);
+        }
 
-    return new Room(state, this.makeStore(db, branchId));
+        // Room 的默认 store 绑定顶层 this.db（不可绑定短生命周期只读快照 tx）
+        return { room: new Room(state, this.makeStore(this.db, branchId)), lastRejectionId };
+      },
+      { isolationLevel: 'repeatable_read', readOnly: true },
+    );
   }
 
   private async load(branchId: string): Promise<Loaded> {
-    const room = await this.loadRoom(branchId);
+    const { room, lastRejectionId } = await this.loadRoom(branchId);
     const [b] = await this.db.query<{ layout: Layout }>('select layout from branches where id = $1', [
       branchId,
     ]);
     const loaded: Loaded = {
       room,
+      lastRejectionId,
       peers: new Set(),
       remotePeers: new Map(),
       layout: b?.layout ?? {},
@@ -424,7 +448,9 @@ export class Rooms {
   }
 
   private async reloadLocked(branchId: string, r: Loaded) {
-    r.room = await this.loadRoom(branchId);
+    const { room, lastRejectionId } = await this.loadRoom(branchId);
+    r.room = room;
+    r.lastRejectionId = lastRejectionId;
     r.dirty = false;
   }
 
@@ -444,8 +470,23 @@ export class Rooms {
     }
   }
 
-  /** 从给定连接（主库或事务 tx）读取比内存更新的提交与拒绝记录并合入内存态 */
+  /** 无写锁场景的追赶：在单次 REPEATABLE READ READ ONLY 快照事务中增量拉取 commits 与 rejections，避免读撕裂 */
+  private catchUpReadOnly(branchId: string, r: Loaded): Promise<Commit[]> {
+    return this.db.transaction((tx) => this.catchUpFrom(tx, branchId, r), {
+      isolationLevel: 'repeatable_read',
+      readOnly: true,
+    });
+  }
+
+  /**
+   * 从给定连接（已有写事务 tx 或顶层 this.db）按游标增量读取更新的提交与拒绝记录并合入内存态：
+   * - 若传入顶层 this.db（无写锁路径），自动包裹进 REPEATABLE READ READ ONLY 快照事务；
+   * - 若已在写事务 tx（如 branches FOR UPDATE）内调用，直接复用 tx，绝不嵌套新事务。
+   */
   private async catchUpFrom(db: Db, branchId: string, r: Loaded): Promise<Commit[]> {
+    if (db === this.db) {
+      return this.catchUpReadOnly(branchId, r);
+    }
     const rows = await db.query<{
       seq: string | number;
       client: string;
@@ -456,6 +497,17 @@ export class Rooms {
       'select seq, client, n, user_name, changes from room_commits where branch_id = $1 and seq > $2 order by seq',
       [branchId, r.room.seq],
     );
+    const rejections = await db.query<{
+      id: string | number;
+      client: string;
+      n: number;
+      code: Rejection['code'];
+      message: string;
+    }>(
+      'select id, client, n, code, message from room_rejections where branch_id = $1 and id > $2 order by id asc',
+      [branchId, r.lastRejectionId],
+    );
+    // 两条查询均完成后再合入内存，避免中途查询失败造成半截内存态
     const applied: Commit[] = [];
     for (const row of rows) {
       const commit: Commit = {
@@ -468,20 +520,14 @@ export class Rooms {
       };
       if (r.room.applyExternalCommit(commit)) applied.push(commit);
     }
-    const rejections = await db.query<{
-      client: string;
-      n: number;
-      code: Rejection['code'];
-      message: string;
-    }>('select client, n, code, message from room_rejections where branch_id = $1 order by client, n', [
-      branchId,
-    ]);
     for (const rej of rejections) {
       r.room.applyExternalRejection(rej.client, {
         n: Number(rej.n),
         code: rej.code,
         message: rej.message,
       });
+      const id = Number(rej.id);
+      if (id > r.lastRejectionId) r.lastRejectionId = id;
     }
     return applied;
   }
@@ -520,7 +566,7 @@ export class Rooms {
           }
         }
       }
-      const fresh = await this.catchUpFrom(this.db, branchId, r);
+      const fresh = await this.catchUpReadOnly(branchId, r);
       return [...missed, ...fresh];
     });
     if (caughtUp.length) this.broadcastCommits(r, caughtUp, opts?.excludePeer);
@@ -1106,7 +1152,7 @@ export class Rooms {
       const { caughtUp, outs } = await this.withRoomLock(r, async () => {
         if (!r.peers.has(peer)) return { caughtUp: [] as Commit[], outs: [] as Out[] };
         if (r.dirty) await this.reloadLocked(branchId, r);
-        const caughtUp = this.db.dialect === 'pg' ? await this.catchUpFrom(this.db, branchId, r) : [];
+        const caughtUp = this.db.dialect === 'pg' ? await this.catchUpReadOnly(branchId, r) : [];
         const outs = await r.room.handle(syncClient, peer.user.name, scopedHello, {
           readOnly: peer.role === 'viewer',
         });
@@ -1151,7 +1197,8 @@ export class Rooms {
           if (r.dirty) await this.reloadLocked(branchId, r);
           let mutated = false;
           try {
-            return await this.db.transaction(async (tx) => {
+            let committedRejectionId = r.lastRejectionId;
+            const out = await this.db.transaction(async (tx) => {
               if (this.db.dialect === 'pg') {
                 const [locked] = await tx.query<{ id: string }>(
                   'select id from branches where id = $1 for update',
@@ -1159,8 +1206,11 @@ export class Rooms {
                 );
                 if (!locked) throw new Error(`分支 ${branchId} 不存在`);
                 caughtUp = await this.catchUpFrom(tx, branchId, r);
+                committedRejectionId = r.lastRejectionId;
               }
-              const store = this.makeStore(tx, branchId);
+              const store = this.makeStore(tx, branchId, (rejId) => {
+                if (rejId > committedRejectionId) committedRejectionId = rejId;
+              });
               mutated = true;
               const outs = await r.room.handle(syncClient, peer.user.name, scopedMsg, {
                 readOnly: peer.role === 'viewer',
@@ -1170,6 +1220,10 @@ export class Rooms {
               if (committed) await this.maybeSnapshot(tx, branchId, r.room);
               return { outs, committed, seq: r.room.seq };
             });
+            if (committedRejectionId > r.lastRejectionId) {
+              r.lastRejectionId = committedRejectionId;
+            }
+            return out;
           } catch (err) {
             if (mutated) {
               r.dirty = true;

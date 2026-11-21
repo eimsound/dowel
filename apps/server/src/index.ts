@@ -17,6 +17,7 @@ export {
   type OpenPlatformDbOptions,
   openPlatformDb,
   type PlatformDb,
+  type TransactionOptions,
 } from './db.ts';
 export { HaCoordinator, type HaCoordinatorOptions } from './ha.ts';
 export { readSettings, writeSettings } from './settings.ts';

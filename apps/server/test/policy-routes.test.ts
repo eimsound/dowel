@@ -16,7 +16,6 @@ import type {
 import { addColumn, all, type Model } from '@dowel/core';
 import { afterAll, beforeAll, describe, expect, test } from 'vitest';
 import { connect, createTestDb, PG_URL } from '../../../test/pg.ts';
-import { MIGRATIONS } from '../src/db.ts';
 import { createApp, openPlatformDb, type PlatformDb } from '../src/index.ts';
 import { KeyedLimiter, LoginLimiter } from '../src/rate-limit.ts';
 import { encrypt } from '../src/secrets.ts';
@@ -744,8 +743,8 @@ describe('平台库迁移：H6 的档位搬进执行策略的环境层，且迁�
         await fresh.exec(`drop table ${t}`);
       await fresh.exec('drop table exec_policies');
       await fresh.exec('alter table environments add column exec_policy text');
-      // P5a 的两条迁移、P5b 的一条、P6 的一条、P6.5 的一条和 P7 HA 的一条都退回去
-      await fresh.query('delete from dowel_migrations where version > $1', [MIGRATIONS.length - 6]);
+      // P5a 的两条迁移（18、19）及之后所有迁移都退回去（24 为幂等迁移）
+      await fresh.query('delete from dowel_migrations where version > $1', [17]);
       await fresh.query("insert into groups (id, slug, name) values ('g1', 'g1', 'g')");
       await fresh.query("insert into projects (id, name, group_id, slug) values ('p1', 'p', 'g1', 'p')");
       for (const [id, pol] of [

@@ -97,7 +97,7 @@ describe.each([
         await base.exec('drop table ha_leases');
         await base.exec('drop table webhook_jobs');
         await base.exec('alter table exec_requests drop column worker_id');
-        await base.query('delete from dowel_migrations where version >= $1', [MIGRATIONS.length]);
+        await base.query('delete from dowel_migrations where version >= $1', [23]);
       } finally {
         await base.close();
       }

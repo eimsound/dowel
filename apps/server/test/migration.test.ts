@@ -586,7 +586,7 @@ describe.each([
             and not exists (select 1 from environments e where e.id = new.prerequisite_id)
            begin select raise(abort, 'FOREIGN KEY constraint failed: environments.prerequisite_id'); end;`);
         }
-        await base.query('delete from dowel_migrations where version >= $1', [MIGRATIONS.length - 1]);
+        await base.query('delete from dowel_migrations where version >= $1', [22]);
         await base.query("insert into groups (id, slug, name) values ('g1', 'g1', '组')");
         await base.query("insert into projects (id, name, group_id, slug) values ('p1', 'p1', 'g1', 'p1')");
         await base.query(
@@ -625,6 +625,150 @@ describe.each([
         await upgraded.query("delete from environments where id = 'e-dev'");
       } finally {
         await upgraded.close();
+      }
+    },
+  );
+});
+
+describe.each([
+  { platform: 'sqlite', skip: false },
+  { platform: 'pg', skip: !PG_URL },
+])('平台库升级：迁移 24 为 room_rejections 增加单调游标列与索引（$platform）', ({ platform, skip }) => {
+  const dirs: string[] = [];
+  const closers: (() => Promise<void>)[] = [];
+  afterAll(async () => {
+    for (const c of closers) await c();
+    for (const d of dirs) rmSync(d, { recursive: true, force: true });
+  });
+
+  test.skipIf(skip)(
+    '从 v23（含存量 room_rejections）升到最新：自动回填递增 id、保留唯一约束与 ON CONFLICT、索引生效且重跑幂等',
+    async () => {
+      let url: string;
+      if (platform === 'sqlite') {
+        const dir = mkdtempSync(join(tmpdir(), 'dowel-m24-'));
+        dirs.push(dir);
+        url = join(dir, 'm24.db');
+      } else {
+        const t = await createTestDb('m24');
+        closers.push(t.close);
+        url = t.url;
+      }
+
+      const base = await openPlatformDb(url);
+      try {
+        // 退回迁移 24，还原为 v23 的 room_rejections 表结构（无 id 列、无 room_rejections_branch_id_idx）
+        await base.exec('drop index if exists room_rejections_branch_id_idx');
+        if (platform === 'pg') {
+          await base.exec('alter table room_rejections drop column if exists id');
+        } else {
+          await base.exec(`drop table room_rejections;
+            create table room_rejections (
+              branch_id text not null references branches on delete cascade,
+              client text not null,
+              n int not null,
+              code text not null,
+              message text not null,
+              primary key (branch_id, client, n)
+            );`);
+        }
+        await base.query('delete from dowel_migrations where version >= $1', [24]);
+
+        await base.query("insert into groups (id, slug, name) values ('g1', 'g1', '组')");
+        await base.query("insert into projects (id, name, group_id, slug) values ('p1', 'p1', 'g1', 'p1')");
+        await base.query("insert into branches (id, project_id, name) values ('b1', 'p1', 'main')");
+        await base.query("insert into branches (id, project_id, name) values ('b2', 'p1', 'dev')");
+
+        // 写入存量拒绝记录（跨多分支与多客户端）
+        await base.query(
+          "insert into room_rejections (branch_id, client, n, code, message) values ('b1', 'u1:c1', 1, 'conflict', '旧拒绝1')",
+        );
+        await base.query(
+          "insert into room_rejections (branch_id, client, n, code, message) values ('b2', 'u2:c1', 1, 'invalid', '旧拒绝2')",
+        );
+        await base.query(
+          "insert into room_rejections (branch_id, client, n, code, message) values ('b1', 'u1:c1', 2, 'dependency', '旧拒绝3')",
+        );
+      } finally {
+        await base.close();
+      }
+
+      const upgraded = await openPlatformDb(url);
+      try {
+        const [ver] = await upgraded.query<{ v: number }>('select max(version) as v from dowel_migrations');
+        expect(ver!.v).toBe(MIGRATIONS.length);
+
+        // 存量行已回填严格单调递增的正整数 id
+        const existing = await upgraded.query<{
+          id: number;
+          branch_id: string;
+          client: string;
+          n: number;
+          message: string;
+        }>('select id, branch_id, client, n, message from room_rejections order by id asc');
+        expect(existing).toHaveLength(3);
+        expect(existing.every((r) => typeof r.id === 'number' && Number.isInteger(r.id) && r.id > 0)).toBe(
+          true,
+        );
+        expect(existing[0]!.id).toBeLessThan(existing[1]!.id);
+        expect(existing[1]!.id).toBeLessThan(existing[2]!.id);
+        const maxExistingId = existing[2]!.id;
+
+        // 索引已创建
+        if (platform === 'pg') {
+          const idx = await upgraded.query<{ indexname: string }>(
+            "select indexname from pg_indexes where tablename = 'room_rejections' and indexname = 'room_rejections_branch_id_idx'",
+          );
+          expect(idx).toHaveLength(1);
+        } else {
+          const idx = await upgraded.query<{ name: string }>(
+            "select name from sqlite_master where type = 'index' and name = 'room_rejections_branch_id_idx'",
+          );
+          expect(idx).toHaveLength(1);
+          expect(await upgraded.query('pragma foreign_key_check')).toEqual([]);
+        }
+
+        // 新插入记录自动分配大于存量最大值的单调递增 id（支持 RETURNING id）
+        const [ins1] = await upgraded.query<{ id: number }>(
+          "insert into room_rejections (branch_id, client, n, code, message) values ('b1', 'u1:c1', 3, 'conflict', '新拒绝4') returning id",
+        );
+        const [ins2] = await upgraded.query<{ id: number }>(
+          "insert into room_rejections (branch_id, client, n, code, message) values ('b1', 'u1:c2', 1, 'invalid', '新拒绝5') returning id",
+        );
+        expect(Number(ins1!.id)).toBeGreaterThan(maxExistingId);
+        expect(Number(ins2!.id)).toBeGreaterThan(Number(ins1!.id));
+
+        // 唯一约束 (branch_id, client, n) 与 ON CONFLICT DO NOTHING 仍完整生效
+        const dupErr = await upgraded
+          .query(
+            "insert into room_rejections (branch_id, client, n, code, message) values ('b1', 'u1:c1', 3, 'conflict', '重复')",
+          )
+          .catch((e: unknown) => e);
+        expect(isUniqueViolation(dupErr)).toBe(true);
+
+        const skipped = await upgraded.query<{ id: number }>(
+          "insert into room_rejections (branch_id, client, n, code, message) values ('b1', 'u1:c1', 3, 'conflict', '覆盖尝试') on conflict do nothing returning id",
+        );
+        expect(skipped).toEqual([]);
+        const [kept] = await upgraded.query<{ message: string }>(
+          "select message from room_rejections where branch_id = 'b1' and client = 'u1:c1' and n = 3",
+        );
+        expect(kept!.message).toBe('新拒绝4');
+
+        // 幂等重跑迁移 24：保留既有 id 与数据
+        await upgraded.query('delete from dowel_migrations where version >= $1', [24]);
+        await upgraded.close();
+        const rerun = await openPlatformDb(url);
+        try {
+          const afterRerun = await rerun.query<{ id: number; n: number }>(
+            "select id, n from room_rejections where branch_id = 'b1' and client = 'u1:c1' and n = 3",
+          );
+          expect(afterRerun).toEqual([{ id: Number(ins1!.id), n: 3 }]);
+        } finally {
+          await rerun.close();
+        }
+      } finally {
+        await upgraded.close().catch(() => {});
       }
     },
   );

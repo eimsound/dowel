@@ -1152,6 +1152,429 @@ describe.skipIf(!PG_URL)('P7 HA2：无状态实时协作房间（真实 PG 双�
     );
     expect(rowFinal?.layout.tbl_inflight).toEqual({ x: 42, y: 84 });
   });
+
+  test('14. PG REPEATABLE READ READ ONLY 快照读消除 loadRoom 与无锁 catchUpFrom 读撕裂（#40）', async () => {
+    // 禁用 EventBus，完全由本测试精确编排跨副本并发提交与读暂停窗口
+    const f = await boot('rr-snapshot', false);
+
+    // 14a. 先验证无锁 catchUpFrom（hello 路径）在 REPEATABLE READ READ ONLY 事务中执行，且不会发生“旧 seq + 新 lastProcessed”读撕裂
+    // 预加载副本 B 房间到 seq=0
+    expect((await f.appB.rooms.model(f.branchId)).seq).toBe(0);
+
+    const peerA = makePeer(f.alice);
+    await f.appA.rooms.join(f.branchId, peerA.peer);
+    await f.appA.rooms.message(f.branchId, peerA.peer, { t: 'hello', client: 'c-tear', lastSeq: 0 });
+
+    const origTxB = f.dbB.transaction.bind(f.dbB);
+    let catchUpPausedResolve!: () => void;
+    const catchUpPaused = new Promise<void>((r) => {
+      catchUpPausedResolve = r;
+    });
+    let releaseCatchUp!: () => void;
+    const catchUpGate = new Promise<void>((r) => {
+      releaseCatchUp = r;
+    });
+
+    const observedTxModes: { isolation: string; readOnly: string }[] = [];
+    let pauseNextCatchUp = true;
+
+    f.dbB.transaction = (async (fn, opts) =>
+      origTxB(async (tx) => {
+        if (opts?.readOnly) {
+          const [meta] = await tx.query<{ iso: string; ro: string }>(
+            "select current_setting('transaction_isolation') as iso, current_setting('transaction_read_only') as ro",
+          );
+          if (meta) observedTxModes.push({ isolation: meta.iso, readOnly: meta.ro });
+        }
+        const wrappedTx: typeof tx = {
+          exec: (q) => tx.exec(q),
+          query: async <T>(q: string, params?: unknown[]) => {
+            const rows = await tx.query<T>(q, params);
+            if (
+              pauseNextCatchUp &&
+              opts?.readOnly &&
+              q.includes('from room_commits where branch_id = $1 and seq > $2')
+            ) {
+              pauseNextCatchUp = false;
+              catchUpPausedResolve();
+              await catchUpGate;
+            }
+            return rows;
+          },
+        };
+        return fn(wrappedTx);
+      }, opts)) as typeof f.dbB.transaction;
+
+    // 模拟断线重连到副本 B 的 SyncClient：待确认队列里已有 n=1（将由副本 A 提交）与 n=2（将由副本 A 拒绝）
+    const client = new SyncClient('c-tear', (await f.appA.rooms.model(f.branchId)).model);
+    const createArgs = { id: 'tbl_tear_1', schema: f.schemaId, name: 'tear_ok' };
+    client.mutate('createTable', createArgs); // n = 1
+    // 手工压入 n = 2（过期版本冲突，将会被副本 A 拒绝）
+    client.pending.push({
+      client: 'c-tear',
+      n: 2,
+      name: 'renameTable',
+      args: { id: 'tbl_tear_1', name: 'stale_rename' },
+      reads: [['tbl_tear_1', 0]],
+    });
+
+    const peerB = makePeer(f.alice);
+    await f.appB.rooms.join(f.branchId, peerB.peer);
+    let sendChain = Promise.resolve();
+    const origSend = peerB.peer.send;
+    peerB.peer.send = (msg) => {
+      origSend(msg);
+      if (msg.t === 'welcome' || msg.t === 'snapshot' || msg.t === 'commit' || msg.t === 'reject') {
+        client.receive(msg);
+      }
+    };
+    client.send = (msg) => {
+      sendChain = sendChain.then(() => f.appB.rooms.message(f.branchId, peerB.peer, msg));
+    };
+
+    try {
+      // 触发 hello → 副本 B 进入无锁 catchUpReadOnly 并在读完 room_commits（seq=0）后暂停
+      client.connect();
+      await catchUpPaused;
+
+      // 在两次查询之间：副本 A 提交 c-tear 的 n=1（seq=1），并拒绝 c-tear 的 n=2（写 room_rejections）
+      await f.appA.rooms.message(f.branchId, peerA.peer, {
+        t: 'op',
+        op: {
+          client: 'c-tear',
+          n: 1,
+          name: 'createTable',
+          args: createArgs,
+          reads: [[f.schemaId, 0]],
+        },
+      });
+      await f.appA.rooms.message(f.branchId, peerA.peer, {
+        t: 'op',
+        op: {
+          client: 'c-tear',
+          n: 2,
+          name: 'renameTable',
+          args: { id: 'tbl_tear_1', name: 'stale_rename' },
+          reads: [['tbl_tear_1', 0]],
+        },
+      });
+      expect((await f.appA.rooms.model(f.branchId)).seq).toBe(1);
+
+      // 放行副本 B 的 room_rejections 查询
+      releaseCatchUp();
+      await sendChain;
+    } finally {
+      f.dbB.transaction = origTxB;
+    }
+
+    // 确认副本 B 确实在 REPEATABLE READ + READ ONLY 快照事务中执行
+    expect(observedTxModes.length).toBeGreaterThanOrEqual(1);
+    expect(observedTxModes[0]).toEqual({ isolation: 'repeatable read', readOnly: 'on' });
+
+    // hello 返回的 welcome 与 snapshot 必须来自同一快照：绝不能出现 seq=0 却配 lastProcessed=2 的读撕裂
+    const welcome = peerB.sent.find((m) => m.t === 'welcome') as {
+      t: 'welcome';
+      lastProcessed: number;
+      rejected: { n: number }[];
+    };
+    const snapshot = peerB.sent.find((m) => m.t === 'snapshot') as {
+      t: 'snapshot';
+      seq: number;
+      lastProcessed: number;
+    };
+    expect(welcome).toBeDefined();
+    expect(snapshot).toBeDefined();
+    expect(snapshot.seq).toBe(0);
+    expect(snapshot.lastProcessed).toBe(0);
+    expect(welcome.lastProcessed).toBe(0);
+    expect(welcome.rejected).toEqual([]);
+
+    // 因为没有读撕裂，客户端在收到 snapshot(seq=0, lastProcessed=0) 时不会误丢待确认的 n=1，
+    // 并正常触发副本 B 追赶回 commit(seq=1)；confirmed 已包含 n=1 建的表
+    await f.appB.rooms.catchUp(f.branchId);
+    expect(client.seq).toBe(1);
+    expect(all(client.confirmed, 'table').map((t) => t.name)).toEqual(['tear_ok']);
+    // 再次握手对齐最新拒绝记录后，n=2 收到拒绝通知，pending 清空，view 与 confirmed 完全一致
+    client.connect();
+    await sendChain;
+    expect(client.pending).toHaveLength(0);
+    expect(client.notices.some((x) => x.n === 2)).toBe(true);
+    expect(all(client.view, 'table').map((t) => t.name)).toEqual(['tear_ok']);
+
+    // 14b. 再验证 loadRoom 首次冷加载也在 REPEATABLE READ READ ONLY 事务中执行，并发提交 commit + rejection 不撕裂
+    const branch2 = `${f.branchId}-cold-rr`;
+    await f.dbA.query("insert into branches (id, project_id, name) values ($1, $2, 'cold-rr')", [
+      branch2,
+      f.projectId,
+    ]);
+    await f.appA.rooms.init(branch2, (await f.appA.rooms.model(f.branchId)).model);
+    const peerA2 = makePeer(f.alice);
+    await f.appA.rooms.join(branch2, peerA2.peer);
+    await f.appA.rooms.message(f.branchId, peerA.peer, { t: 'hello', client: 'c-tear', lastSeq: 1 });
+    await f.appA.rooms.message(branch2, peerA2.peer, { t: 'hello', client: 'c-cold', lastSeq: 0 });
+
+    let loadPausedResolve!: () => void;
+    const loadPaused = new Promise<void>((r) => {
+      loadPausedResolve = r;
+    });
+    let releaseLoad!: () => void;
+    const loadGate = new Promise<void>((r) => {
+      releaseLoad = r;
+    });
+    const loadTxModes: { isolation: string; readOnly: string }[] = [];
+    let pauseNextLoad = true;
+
+    f.dbB.transaction = (async (fn, opts) =>
+      origTxB(async (tx) => {
+        if (opts?.readOnly) {
+          const [meta] = await tx.query<{ iso: string; ro: string }>(
+            "select current_setting('transaction_isolation') as iso, current_setting('transaction_read_only') as ro",
+          );
+          if (meta) loadTxModes.push({ isolation: meta.iso, readOnly: meta.ro });
+        }
+        const wrappedTx: typeof tx = {
+          exec: (q) => tx.exec(q),
+          query: async <T>(q: string, params?: unknown[]) => {
+            const rows = await tx.query<T>(q, params);
+            if (
+              pauseNextLoad &&
+              opts?.readOnly &&
+              q.includes('from room_commits where branch_id = $1 and seq > $2')
+            ) {
+              pauseNextLoad = false;
+              loadPausedResolve();
+              await loadGate;
+            }
+            return rows;
+          },
+        };
+        return fn(wrappedTx);
+      }, opts)) as typeof f.dbB.transaction;
+
+    try {
+      // 副本 B 首次冷加载 branch2（在读完 room_commits 后暂停）
+      const loadPromise = f.appB.rooms.get(branch2);
+      await loadPaused;
+
+      // 并发期间副本 A 提交 c-cold 的 n=1 并拒绝 n=2
+      await f.appA.rooms.message(branch2, peerA2.peer, {
+        t: 'op',
+        op: {
+          client: 'c-cold',
+          n: 1,
+          name: 'createTable',
+          args: { id: 'tbl_cold_1', schema: f.schemaId, name: 'cold_ok' },
+          reads: [[f.schemaId, 0]],
+        },
+      });
+      await f.appA.rooms.message(branch2, peerA2.peer, {
+        t: 'op',
+        op: {
+          client: 'c-cold',
+          n: 2,
+          name: 'renameTable',
+          args: { id: 'tbl_cold_1', name: 'cold_stale' },
+          reads: [['tbl_cold_1', 0]],
+        },
+      });
+
+      releaseLoad();
+      const loadedB = await loadPromise;
+      // 首次冷加载在同一 MVCC 快照内完成：seq 与 processed 严格一致（均为 0），绝无撕裂
+      expect(loadedB.room.seq).toBe(0);
+      expect(loadedB.lastRejectionId).toBe(0);
+    } finally {
+      f.dbB.transaction = origTxB;
+    }
+
+    expect(loadTxModes[0]).toEqual({ isolation: 'repeatable read', readOnly: 'on' });
+
+    // 追赶后立即对齐到 seq=1, lastProcessed=2
+    const peerB2 = makePeer(f.alice);
+    await f.appB.rooms.join(branch2, peerB2.peer);
+    await f.appB.rooms.message(branch2, peerB2.peer, { t: 'hello', client: 'c-cold', lastSeq: 0 });
+    const welcomeB2 = peerB2.sent.find((m) => m.t === 'welcome') as {
+      t: 'welcome';
+      lastProcessed: number;
+      rejected: { n: number }[];
+    };
+    const snapB2 = peerB2.sent.find((m) => m.t === 'snapshot') as {
+      t: 'snapshot';
+      seq: number;
+      lastProcessed: number;
+    };
+    expect(snapB2.seq).toBe(1);
+    expect(snapB2.lastProcessed).toBe(2);
+    expect(welcomeB2.lastProcessed).toBe(2);
+    expect(welcomeB2.rejected.map((r) => r.n)).toEqual([2]);
+  });
+
+  test('15. PG 双副本 catchUpFrom 仅按游标增量拉取 room_rejections，且写事务内复用 tx 不嵌套新事务（#40）', async () => {
+    const f = await boot('rej-cursor-pg', false);
+    const peerA = makePeer(f.alice);
+    const peerB = makePeer(f.bob);
+    await f.appA.rooms.join(f.branchId, peerA.peer);
+    await f.appB.rooms.join(f.branchId, peerB.peer);
+    await f.appA.rooms.message(f.branchId, peerA.peer, { t: 'hello', client: 'c-a', lastSeq: 0 });
+    await f.appB.rooms.message(f.branchId, peerB.peer, { t: 'hello', client: 'c-b', lastSeq: 0 });
+
+    // 副本 A 先建一张表（seq=1），再连续制造 5 条历史冲突拒绝（n=2..6）
+    await f.appA.rooms.message(f.branchId, peerA.peer, {
+      t: 'op',
+      op: {
+        client: 'c-a',
+        n: 1,
+        name: 'createTable',
+        args: { id: 'tbl_cur', schema: f.schemaId, name: 'cur_base' },
+        reads: [[f.schemaId, 0]],
+      },
+    });
+    for (let n = 2; n <= 6; n++) {
+      await f.appA.rooms.message(f.branchId, peerA.peer, {
+        t: 'op',
+        op: {
+          client: 'c-a',
+          n,
+          name: 'renameTable',
+          args: { id: 'tbl_cur', name: `stale_${n}` },
+          reads: [['tbl_cur', 0]],
+        },
+      });
+    }
+
+    const dbRejIds = (
+      await f.dbA.query<{ id: number }>(
+        'select id from room_rejections where branch_id = $1 order by id asc',
+        [f.branchId],
+      )
+    ).map((r) => Number(r.id));
+    expect(dbRejIds).toHaveLength(5);
+    const fifthId = dbRejIds[4]!;
+
+    // 追踪副本 B 上所有事务调用与 room_rejections 查询
+    const origTxB = f.dbB.transaction.bind(f.dbB);
+    let txDepth = 0;
+    let maxTxDepth = 0;
+    const rejQueries: { sql: string; params: unknown[]; returned: number; readOnly: boolean }[] = [];
+
+    f.dbB.transaction = (async (fn, opts) => {
+      txDepth += 1;
+      if (txDepth > maxTxDepth) maxTxDepth = txDepth;
+      try {
+        return await origTxB(async (tx) => {
+          const tracedTx: typeof tx = {
+            exec: (q) => tx.exec(q),
+            query: async <T>(q: string, params?: unknown[]) => {
+              const rows = await tx.query<T>(q, params);
+              if (q.includes('from room_rejections')) {
+                rejQueries.push({
+                  sql: q,
+                  params: params ? [...params] : [],
+                  returned: rows.length,
+                  readOnly: opts?.readOnly === true,
+                });
+              }
+              return rows;
+            },
+          };
+          return fn(tracedTx);
+        }, opts);
+      } finally {
+        txDepth -= 1;
+      }
+    }) as typeof f.dbB.transaction;
+
+    try {
+      // 1. 副本 B 首次追赶（getFresh）：仅拉取 5 条，游标推进到 fifthId
+      await f.appB.rooms.model(f.branchId);
+      expect(rejQueries).toHaveLength(1);
+      expect(rejQueries[0]!.sql).toContain('id > $2');
+      expect(rejQueries[0]!.params).toEqual([f.branchId, 0]);
+      expect(rejQueries[0]!.returned).toBe(5);
+      expect(rejQueries[0]!.readOnly).toBe(true);
+
+      // 2. 副本 B 上在行锁写事务内连续提交 op：catchUpFrom 复用写事务 tx（不嵌套）、带 id > fifthId、返回 0 行
+      rejQueries.length = 0;
+      await f.appB.rooms.message(f.branchId, peerB.peer, {
+        t: 'op',
+        op: {
+          client: 'c-b',
+          n: 1,
+          name: 'createTable',
+          args: { id: 'tbl_b_1', schema: f.schemaId, name: 'from_b_1' },
+          reads: [[f.schemaId, 0]],
+        },
+      });
+      expect(maxTxDepth).toBe(1);
+      expect(rejQueries).toHaveLength(1);
+      expect(rejQueries[0]!.readOnly).toBe(false);
+      expect(rejQueries[0]!.params).toEqual([f.branchId, fifthId]);
+      expect(rejQueries[0]!.returned).toBe(0);
+
+      // 3. 副本 A 再新增 1 条拒绝（n=7）：副本 B 追赶时仅拉取新增的 1 行
+      await f.appA.rooms.message(f.branchId, peerA.peer, {
+        t: 'op',
+        op: {
+          client: 'c-a',
+          n: 7,
+          name: 'renameTable',
+          args: { id: 'tbl_cur', name: 'stale_7' },
+          reads: [['tbl_cur', 0]],
+        },
+      });
+      const [row7] = await f.dbA.query<{ id: number }>(
+        'select id from room_rejections where branch_id = $1 and n = 7',
+        [f.branchId],
+      );
+      const seventhId = Number(row7!.id);
+      expect(seventhId).toBeGreaterThan(fifthId);
+
+      rejQueries.length = 0;
+      await f.appB.rooms.catchUp(f.branchId);
+      expect(rejQueries).toHaveLength(1);
+      expect(rejQueries[0]!.readOnly).toBe(true);
+      expect(rejQueries[0]!.params).toEqual([f.branchId, fifthId]);
+      expect(rejQueries[0]!.returned).toBe(1);
+
+      // 4. 张三无粘性迁移到副本 B，hello 验证 lastProcessed=7 与全部 6 条拒绝完整保留，且依赖 n=7 的 op(n=8) 被拒绝（outcome 完整）
+      const peerAMigrated = makePeer(f.alice);
+      await f.appB.rooms.join(f.branchId, peerAMigrated.peer);
+      rejQueries.length = 0;
+      await f.appB.rooms.message(f.branchId, peerAMigrated.peer, {
+        t: 'hello',
+        client: 'c-a',
+        lastSeq: 0,
+      });
+      expect(rejQueries).toHaveLength(1);
+      expect(rejQueries[0]!.params).toEqual([f.branchId, seventhId]);
+      expect(rejQueries[0]!.returned).toBe(0);
+
+      const welcome = peerAMigrated.sent.find((m) => m.t === 'welcome') as {
+        t: 'welcome';
+        lastProcessed: number;
+        rejected: { n: number }[];
+      };
+      expect(welcome.lastProcessed).toBe(7);
+      expect(welcome.rejected.map((r) => r.n)).toEqual([2, 3, 4, 5, 6, 7]);
+
+      // 发送依赖已被拒绝的 n=7 的 n=8，验证 outcome 已完整同步并按 dependency 拒绝
+      await f.appB.rooms.message(f.branchId, peerAMigrated.peer, {
+        t: 'op',
+        op: {
+          client: 'c-a',
+          n: 8,
+          name: 'renameTable',
+          args: { id: 'tbl_cur', name: 'dep_on_7' },
+          reads: [['tbl_cur', 'p:c-a:7']],
+        },
+      });
+      expect(peerAMigrated.sent.some((m) => m.t === 'reject' && m.n === 8 && m.code === 'dependency')).toBe(
+        true,
+      );
+    } finally {
+      f.dbB.transaction = origTxB;
+    }
+  });
 });
 
 describe('Room.applyExternalCommit / applyExternalRejection 单元测试', () => {
