@@ -215,6 +215,8 @@ export const TokenPolicyPanel = ({ path, queryKey }: { path: string; queryKey: u
   const dirty = JSON.stringify(normalizeDraft(draft)) !== JSON.stringify(normalizeDraft(v.rule));
   dirtyRef.current = dirty;
   const disabled = !v.canEdit || save.isPending;
+  const pickedGroupIds = new Set(draft?.groups.map((g) => g.groupId) ?? []);
+  const remainingGroups = allGroups.filter((g) => !pickedGroupIds.has(g.id));
 
   const toggleRole = (role: TokenCreatorRole) => {
     if (!draft) return;
@@ -223,18 +225,28 @@ export const TokenPolicyPanel = ({ path, queryKey }: { path: string; queryKey: u
   };
 
   const addGroup = () => {
-    if (!draft) return;
-    const picked = new Set(draft.groups.map((g) => g.groupId));
-    const next = allGroups.find((g) => !picked.has(g.id)) ?? allGroups[0];
-    if (!next) return;
-    setDraft({ ...draft, groups: [...draft.groups, { groupId: next.id, role: 'member' }] });
+    setDraft((prev) => {
+      if (!prev) return prev;
+      const picked = new Set(prev.groups.map((g) => g.groupId));
+      const next = allGroups.find((g) => !picked.has(g.id));
+      if (!next) return prev;
+      return { ...prev, groups: [...prev.groups, { groupId: next.id, role: 'member' }] };
+    });
   };
 
   const updateGroup = (idx: number, patch: Partial<TokenCreatorGroup>) => {
-    if (!draft) return;
-    setDraft({
-      ...draft,
-      groups: draft.groups.map((g, i) => (i === idx ? { ...g, ...patch } : g)),
+    setDraft((prev) => {
+      if (!prev) return prev;
+      if (
+        patch.groupId !== undefined &&
+        prev.groups.some((g, i) => i !== idx && g.groupId === patch.groupId)
+      ) {
+        return prev;
+      }
+      return {
+        ...prev,
+        groups: prev.groups.map((g, i) => (i === idx ? { ...g, ...patch } : g)),
+      };
     });
   };
 
@@ -317,7 +329,12 @@ export const TokenPolicyPanel = ({ path, queryKey }: { path: string; queryKey: u
             <div className="flex items-center justify-between gap-2">
               <span className="label">{t('tok.policy.groupsLabel')}</span>
               {!disabled && (
-                <button type="button" className="btn sm" disabled={!allGroups.length} onClick={addGroup}>
+                <button
+                  type="button"
+                  className="btn sm"
+                  disabled={remainingGroups.length === 0}
+                  onClick={addGroup}
+                >
                   <Plus size={14} aria-hidden="true" />
                   {t('tok.policy.addGroup')}
                 </button>
@@ -344,7 +361,11 @@ export const TokenPolicyPanel = ({ path, queryKey }: { path: string; queryKey: u
                         onChange={(e) => updateGroup(i, { groupId: e.target.value })}
                       >
                         {allGroups.map((x) => (
-                          <option key={x.id} value={x.id}>
+                          <option
+                            key={x.id}
+                            value={x.id}
+                            disabled={x.id !== g.groupId && pickedGroupIds.has(x.id)}
+                          >
                             {x.name}
                           </option>
                         ))}
