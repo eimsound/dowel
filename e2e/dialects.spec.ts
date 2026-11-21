@@ -61,6 +61,9 @@ test('MySQL 向导、默认主键、属性面板专属编辑、校验与 SQL 视
   await engineInput.click();
   await engineInput.fill('Inno DB');
   await engineInput.press('Enter');
+  await expect(engineInput).toHaveValue('Inno DB');
+  await engineInput.click();
+  await expect(engineInput).toHaveValue('Inno DB');
   await expect(engineInput).toHaveAttribute('aria-invalid', 'true');
   await expect(inspector.getByText(/仅允许 1–64 位/)).toBeVisible();
 
@@ -99,13 +102,22 @@ test('MySQL 向导、默认主键、属性面板专属编辑、校验与 SQL 视
   await col2Charset.fill('utf8mb4');
   await col2Charset.press('Enter');
 
-  // 8. 新增整数列勾选 UNSIGNED
+  // 8. 新增整数列测试 int unsigned 双向同步与 UNSIGNED 复选框
   await inspector.getByRole('button', { name: '添加列' }).click();
   const col3Type = inspector.getByLabel('类型 column_3', { exact: true });
   await col3Type.click();
-  await col3Type.fill('int');
+  await col3Type.fill('int unsigned');
   await col3Type.press('Enter');
-  await inspector.getByRole('checkbox', { name: 'UNSIGNED' }).check();
+  await expect(col3Type).toHaveValue('int');
+  const unsignedCheckbox = inspector.getByRole('checkbox', { name: 'UNSIGNED' });
+  await expect(unsignedCheckbox).toBeChecked();
+  await unsignedCheckbox.uncheck();
+  await expect(unsignedCheckbox).not.toBeChecked();
+  await col3Type.click();
+  await col3Type.fill('int unsigned');
+  await col3Type.press('Enter');
+  await expect(col3Type).toHaveValue('int');
+  await expect(unsignedCheckbox).toBeChecked();
 
   // 9. 新增 datetime 列勾选 ON UPDATE CURRENT_TIMESTAMP
   await inspector.getByRole('button', { name: '添加列' }).click();
@@ -212,8 +224,16 @@ test('SQL Server 向导（TLS 提示）、Schema 与序列、属性面板专属�
   await defInput.click();
   await defInput.fill("'active'");
   await defInput.press('Enter');
+  await expect(inspector.getByRole('checkbox', { name: 'SPARSE' })).toBeDisabled();
   const dfNameInput = inspector.getByLabel('默认约束名 column_2', { exact: true });
   await expect(inspector.getByText('自动推导')).toBeVisible();
+  await dfNameInput.click();
+  await dfNameInput.fill('DF_custom_status');
+  await dfNameInput.press('Enter');
+  await expect(inspector.getByText('显式')).toBeVisible();
+  await inspector.getByRole('button', { name: '恢复推导名' }).click();
+  await expect(inspector.getByText('自动推导')).toBeVisible();
+  await expect(dfNameInput).toHaveValue('DF_table_1_column_2');
   await dfNameInput.click();
   await dfNameInput.fill('DF_custom_status');
   await dfNameInput.press('Enter');
@@ -227,9 +247,21 @@ test('SQL Server 向导（TLS 提示）、Schema 与序列、属性面板专属�
   await col3Type.press('Enter');
   await inspector.getByRole('checkbox', { name: 'ROWGUIDCOL' }).check();
 
-  // 9. 新增可空列勾选 SPARSE
+  // 9. 新增可空列勾选 SPARSE 并验证与非空 / 主键 / 默认值的双向互斥
   await inspector.getByRole('button', { name: '添加列' }).click();
-  await inspector.getByRole('checkbox', { name: 'SPARSE' }).check();
+  const sparseCheckbox = inspector.getByRole('checkbox', { name: 'SPARSE' });
+  const notNullCheckbox = inspector.getByRole('checkbox', { name: '非空' });
+  const pkCheckbox = inspector.getByRole('checkbox', { name: '主键' });
+  const col4DefInput = inspector.getByLabel('默认值 column_4', { exact: true });
+  await sparseCheckbox.check();
+  await expect(notNullCheckbox).toBeDisabled();
+  await expect(pkCheckbox).toBeDisabled();
+  await expect(col4DefInput).toBeDisabled();
+  await sparseCheckbox.uncheck();
+  await expect(notNullCheckbox).toBeEnabled();
+  await expect(pkCheckbox).toBeEnabled();
+  await expect(col4DefInput).toBeEnabled();
+  await sparseCheckbox.check();
 
   // 10. 主键改为 NONCLUSTERED，然后创建带 FILLFACTOR=80 的 CLUSTERED 索引与唯一约束
   await expect(inspector.getByText(/^CLUSTERED \(id\)$/)).toBeVisible();

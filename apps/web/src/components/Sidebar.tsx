@@ -18,7 +18,7 @@ import { type ReactNode, useState } from 'react';
 import { useTranslation } from 'react-i18next';
 
 import { defaultSchemaOf, dialectUiSpec } from '../dialects.ts';
-import { IconButton } from './ui.tsx';
+import { cx, IconButton } from './ui.tsx';
 
 const OPAQUE_ICON: Record<string, typeof Eye> = {
   view: Eye,
@@ -70,7 +70,7 @@ const Group = ({
   const [open, setOpen] = useState(true);
   return (
     <li className="mb-1.5">
-      <div className="flex h-[26px] items-center gap-0.5 pr-1">
+      <div className={cx('flex h-[26px] items-center gap-0.5', Boolean(action) && 'pr-1')}>
         <button
           type="button"
           aria-expanded={open}
@@ -246,7 +246,7 @@ export const Sidebar = ({
       ? [
           {
             title: t('ws.sequences'),
-            showEmpty: true,
+            showEmpty: Boolean(onAddSequence),
             action: onAddSequence ? (
               <IconButton label={t('ws.addSequence')} size="sm" onClick={onAddSequence}>
                 <Plus size={13} aria-hidden="true" />

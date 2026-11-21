@@ -17,6 +17,7 @@ import {
   isMysqlAutoIncrementType,
   type Model,
   MYSQL_SAFE_IDENT_RE,
+  mssqlChooseName,
   mssqlDefaultNameOf,
   mssqlNormalizeType,
   newId,
@@ -105,6 +106,7 @@ const Field = ({
   const [draft, setDraft] = useState<string | null>(null);
   const [error, setError] = useState<string | null>(null);
   const basis = useRef<Versions>({});
+  const draftBaseValue = useRef<string | null>(null);
   const cancelled = useRef(false);
   const ariaDescribedBy = [describedBy, error ? errId : null].filter(Boolean).join(' ') || undefined;
   return (
@@ -124,9 +126,13 @@ const Field = ({
         className={cx('input', mono && 'font-mono', className)}
         onFocus={() => {
           cancelled.current = false;
-          setError(null);
-          setDraft(value);
-          basis.current = ws.client.basisOf(basisIds);
+          if (draft === null) {
+            setDraft(value);
+            draftBaseValue.current = value;
+            basis.current = ws.client.basisOf(basisIds);
+          } else if (value === draftBaseValue.current) {
+            basis.current = ws.client.basisOf(basisIds);
+          }
         }}
         onChange={(e) => {
           setDraft(e.target.value);
@@ -145,6 +151,7 @@ const Field = ({
         onBlur={() => {
           if (cancelled.current || draft === null) {
             setDraft(null);
+            draftBaseValue.current = null;
             setError(null);
             return;
           }
@@ -160,6 +167,7 @@ const Field = ({
             setError(null);
           }
           setDraft(null);
+          draftBaseValue.current = null;
         }}
       />
       {error && (
@@ -775,6 +783,7 @@ const TableInspector = ({
     c: Column,
     patch: Partial<{
       unsigned: boolean;
+      zerofill: boolean;
       autoIncrement: boolean;
       onUpdateCurrentTimestamp: boolean;
       charset: string;
@@ -798,7 +807,23 @@ const TableInspector = ({
     const nextMssql = { ...c.ext?.mssql, ...patch };
     ws.act('setColumnExt', { id: c.id, ext: { ...c.ext, mssql: nextMssql } }, basis);
   };
+  const resetMssqlDefaultName = (c: Column, b?: Versions) => {
+    const derived =
+      c.default !== null
+        ? mssqlChooseName('DF', table.name, c.name, (n) =>
+            getDialect('mssql').isNameTaken(model, 'rel', table.parent, n, `${c.id}#df`),
+          )
+        : undefined;
+    updateMssqlColumnExt(
+      c,
+      derived
+        ? { defaultName: derived, defaultNameMode: 'derived' }
+        : { defaultName: undefined, defaultNameMode: undefined },
+      b,
+    );
+  };
   const setPk = (colId: string, on: boolean) => {
+    if (on && model.dialect === 'mssql' && cols.find((c) => c.id === colId)?.ext?.mssql?.sparse) return;
     const next = on ? [...(pk?.columns ?? []), colId] : (pk?.columns ?? []).filter((c) => c !== colId);
     ws.act('setPrimaryKey', { id: newId(), table: table.id, columns: next });
   };
@@ -1127,6 +1152,9 @@ const TableInspector = ({
             const open = !isChild && openCol === c.id;
             const isPk = !!pk?.columns.includes(c.id);
             const isPartKey = partKeyCols.has(c.id);
+            const mysqlSplit = open && model.dialect === 'mysql' ? splitMysqlTypeModifiers(c.type) : null;
+            const isMysqlUnsigned =
+              !!mysqlSplit && !!(c.ext?.mysql?.unsigned || mysqlSplit.unsigned || c.ext?.mysql?.zerofill);
             if (isChild) {
               return (
                 <li
@@ -1194,9 +1222,46 @@ const TableInspector = ({
                           mono
                           disabled={isPartKey}
                           describedBy={model.dialect === 'mysql' ? mysqlTypeHintId : undefined}
-                          onCommit={(v, b) =>
-                            ws.act('setColumnType', { id: c.id, ...parseType(model, v) }, b)
-                          }
+                          onCommit={(v, b) => {
+                            const parsed = parseType(model, v);
+                            if (model.dialect === 'mysql') {
+                              const { baseType, unsigned, zerofill } = splitMysqlTypeModifiers(parsed.type);
+                              let usedTypeOp = false;
+                              if (baseType !== c.type || parsed.typeRef !== c.typeRef) {
+                                if (
+                                  !ws.act(
+                                    'setColumnType',
+                                    { id: c.id, type: baseType, typeRef: parsed.typeRef },
+                                    b,
+                                  )
+                                )
+                                  return;
+                                usedTypeOp = true;
+                              }
+                              if (
+                                (unsigned || zerofill) &&
+                                c.generated === null &&
+                                isMysqlUnsignedEligible(baseType)
+                              ) {
+                                updateMysqlColumnExt(
+                                  c,
+                                  { unsigned: true, ...(zerofill ? { zerofill: true } : {}) },
+                                  usedTypeOp ? undefined : b,
+                                );
+                              } else if (
+                                !isMysqlUnsignedEligible(baseType) &&
+                                (c.ext?.mysql?.unsigned || c.ext?.mysql?.zerofill)
+                              ) {
+                                updateMysqlColumnExt(
+                                  c,
+                                  { unsigned: undefined, zerofill: undefined },
+                                  usedTypeOp ? undefined : b,
+                                );
+                              }
+                              return;
+                            }
+                            ws.act('setColumnType', { id: c.id, ...parsed }, b);
+                          }}
                         />
                       </Labeled>
                     </div>
@@ -1215,11 +1280,16 @@ const TableInspector = ({
                         basisIds={[c.id]}
                         mono
                         disabled={
-                          c.generated !== null || !!c.ext?.mysql?.autoIncrement || !!c.ext?.mssql?.identity
+                          c.generated !== null ||
+                          !!c.ext?.mysql?.autoIncrement ||
+                          !!c.ext?.mssql?.identity ||
+                          (model.dialect === 'mssql' && !!c.ext?.mssql?.sparse)
                         }
-                        onCommit={(v, b) =>
-                          ws.act('setDefault', { id: c.id, default: v.trim() ? { expr: v.trim() } : null }, b)
-                        }
+                        onCommit={(v, b) => {
+                          const trimmed = v.trim();
+                          if (trimmed && model.dialect === 'mssql' && !!c.ext?.mssql?.sparse) return;
+                          ws.act('setDefault', { id: c.id, default: trimmed ? { expr: trimmed } : null }, b);
+                        }}
                       />
                     </Labeled>
                     {c.generated && (
@@ -1258,9 +1328,14 @@ const TableInspector = ({
                               c.identity !== null ||
                               !!c.ext?.mssql?.identity ||
                               !!c.ext?.mysql?.autoIncrement ||
-                              (model.dialect === 'mssql' && c.generated !== null && !c.generated.stored)
+                              (model.dialect === 'mssql' && c.generated !== null && !c.generated.stored) ||
+                              (model.dialect === 'mssql' && !c.notNull && !!c.ext?.mssql?.sparse)
                             }
-                            onChange={(e) => ws.act('setNotNull', { id: c.id, notNull: e.target.checked })}
+                            onChange={(e) => {
+                              const on = e.target.checked;
+                              if (on && model.dialect === 'mssql' && !!c.ext?.mssql?.sparse) return;
+                              ws.act('setNotNull', { id: c.id, notNull: on });
+                            }}
                           />
                           {t('insp.notNull')}
                         </label>
@@ -1268,6 +1343,7 @@ const TableInspector = ({
                           <input
                             type="checkbox"
                             checked={isPk}
+                            disabled={model.dialect === 'mssql' && !isPk && !!c.ext?.mssql?.sparse}
                             onChange={(e) => setPk(c.id, e.target.checked)}
                           />
                           {t('insp.pk')}
@@ -1357,20 +1433,35 @@ const TableInspector = ({
                         <Trash2 size={14} aria-hidden="true" />
                       </IconButton>
                     </div>
-                    {model.dialect === 'mysql' && (
+                    {model.dialect === 'mysql' && mysqlSplit && (
                       <div className="space-y-2 border-t border-border pt-2">
                         <div className="checks">
                           <label>
                             <input
                               type="checkbox"
-                              checked={!!c.ext?.mysql?.unsigned}
+                              checked={isMysqlUnsigned}
                               disabled={
-                                !c.ext?.mysql?.unsigned &&
-                                (c.generated !== null || !isMysqlUnsignedEligible(c.type))
+                                !isMysqlUnsigned && (c.generated !== null || !isMysqlUnsignedEligible(c.type))
                               }
-                              onChange={(e) =>
-                                updateMysqlColumnExt(c, { unsigned: e.target.checked ? true : undefined })
-                              }
+                              onChange={(e) => {
+                                const on = e.target.checked;
+                                if (on) {
+                                  updateMysqlColumnExt(c, { unsigned: true });
+                                } else {
+                                  if (mysqlSplit.unsigned || mysqlSplit.zerofill) {
+                                    if (
+                                      !ws.act('setColumnType', {
+                                        id: c.id,
+                                        type: mysqlSplit.baseType,
+                                        typeRef: c.typeRef,
+                                      })
+                                    ) {
+                                      return;
+                                    }
+                                  }
+                                  updateMysqlColumnExt(c, { unsigned: undefined, zerofill: undefined });
+                                }
+                              }}
                             />
                             {t('insp.mysqlUnsigned')}
                           </label>
@@ -1466,13 +1557,26 @@ const TableInspector = ({
                                 !c.ext?.mssql?.sparse &&
                                 (c.notNull ||
                                   isPk ||
+                                  c.default !== null ||
                                   !!c.ext?.mssql?.identity ||
                                   c.generated !== null ||
                                   !!c.ext?.mssql?.rowguidcol)
                               }
-                              onChange={(e) =>
-                                updateMssqlColumnExt(c, { sparse: e.target.checked ? true : undefined })
-                              }
+                              onChange={(e) => {
+                                const on = e.target.checked;
+                                if (
+                                  on &&
+                                  (c.notNull ||
+                                    isPk ||
+                                    c.default !== null ||
+                                    !!c.ext?.mssql?.identity ||
+                                    c.generated !== null ||
+                                    !!c.ext?.mssql?.rowguidcol)
+                                ) {
+                                  return;
+                                }
+                                updateMssqlColumnExt(c, { sparse: on ? true : undefined });
+                              }}
                             />
                             {t('insp.mssqlSparse')}
                           </label>
@@ -1561,12 +1665,7 @@ const TableInspector = ({
                                   <button
                                     type="button"
                                     className="btn ghost sm"
-                                    onClick={() =>
-                                      updateMssqlColumnExt(c, {
-                                        defaultName: undefined,
-                                        defaultNameMode: undefined,
-                                      })
-                                    }
+                                    onClick={() => resetMssqlDefaultName(c)}
                                   >
                                     {t('insp.mssqlDefaultNameReset')}
                                   </button>
@@ -1582,13 +1681,15 @@ const TableInspector = ({
                               mono
                               onCommit={(v, b) => {
                                 const trimmed = v.trim();
-                                updateMssqlColumnExt(
-                                  c,
-                                  trimmed
-                                    ? { defaultName: trimmed, defaultNameMode: 'explicit' }
-                                    : { defaultName: undefined, defaultNameMode: undefined },
-                                  b,
-                                );
+                                if (trimmed) {
+                                  updateMssqlColumnExt(
+                                    c,
+                                    { defaultName: trimmed, defaultNameMode: 'explicit' },
+                                    b,
+                                  );
+                                } else {
+                                  resetMssqlDefaultName(c, b);
+                                }
                               }}
                             />
                           </div>
