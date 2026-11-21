@@ -45,7 +45,7 @@ import { useEnvHistory, useEnvStatus, useEnvs } from '../envs.ts';
 import { formatTime } from '../format.ts';
 import { invalidatePolicyDependents } from '../policy-cache.ts';
 import { useProject } from '../project.tsx';
-import { useEnvRequests } from '../requests.ts';
+import { invalidateRequests, useEnvRequests } from '../requests.ts';
 import { useMe } from '../session.ts';
 import { StatusBadge } from './Request.tsx';
 
@@ -189,6 +189,8 @@ const EnvForm = ({ pid }: { pid: string }) => {
       void qc.invalidateQueries({ queryKey: ['envs', pid] });
       void qc.invalidateQueries({ queryKey: ['versions', pid] });
       void qc.invalidateQueries({ queryKey: ['project', pid] });
+      void qc.invalidateQueries({ queryKey: ['activity', pid] });
+      void qc.invalidateQueries({ queryKey: ['migration', pid] });
     },
     onError: (e) => {
       // 这个库里的项目由另一个实例认领：弹出认领确认（说明后果），确认后带 claim: true 重新提交
@@ -687,6 +689,8 @@ const EnvironmentDetailView = ({ eid }: { eid: string }) => {
         }),
       );
       void invalidatePolicyDependents(qc);
+      void qc.invalidateQueries({ queryKey: ['activity', pid] });
+      void invalidateRequests(qc);
     },
     onError: (e, production) => {
       if (production) toast(e.message, 'error');
