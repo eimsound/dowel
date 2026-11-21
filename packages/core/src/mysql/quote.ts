@@ -324,6 +324,19 @@ export const mysqlRenameQualifiedInExpr = (
 };
 
 const END_COMPOUND_TAIL = new Set(['if', 'loop', 'while', 'repeat', 'case']);
+const NON_ROUTINE_CREATE_OBJECTS = new Set([
+  'table',
+  'view',
+  'index',
+  'database',
+  'schema',
+  'user',
+  'role',
+  'tablespace',
+  'server',
+  'logfile',
+  'resource',
+]);
 
 /**
  * 将 MySQL 多语句脚本文本拆分为单条顶层语句（禁止依赖 `multipleStatements: true`）：
@@ -341,14 +354,18 @@ export const splitMysqlStatements = (sql: string): string[] => {
   let inRoutineHeader = false;
   let blockDepth = 0;
   let caseDepth = 0;
-  let stmtWords: string[] = [];
+  let parenDepth = 0;
+  let stmtFirstWord: string | null = null;
+  let stmtObjectSeen = false;
   let inConditional = false;
 
   const resetStmt = () => {
     inRoutineHeader = false;
     blockDepth = 0;
     caseDepth = 0;
-    stmtWords = [];
+    parenDepth = 0;
+    stmtFirstWord = null;
+    stmtObjectSeen = false;
   };
 
   const flush = (end: number, delimLen: number) => {
@@ -356,6 +373,98 @@ export const splitMysqlStatements = (sql: string): string[] => {
     if (piece) out.push(piece);
     start = end + delimLen;
     resetStmt();
+  };
+
+  const skipTriviaInSplit = (from: number): number => {
+    let j = from;
+    while (j < n) {
+      const ch = sql[j]!;
+      if (/\s/.test(ch)) {
+        j++;
+      } else if (inConditional && ch === '*' && sql[j + 1] === '/') {
+        inConditional = false;
+        j += 2;
+      } else if (isMysqlLineCommentAt(sql, j)) {
+        while (j < n && sql[j] !== '\n') j++;
+      } else if (ch === '/' && sql[j + 1] === '*') {
+        const condLen = conditionalCommentPrefixLen(sql, j);
+        if (condLen > 0) {
+          inConditional = true;
+          j += condLen;
+        } else {
+          j += 2;
+          while (j < n && !(sql[j] === '*' && sql[j + 1] === '/')) j++;
+          j = Math.min(n, j + 2);
+        }
+      } else {
+        break;
+      }
+    }
+    return j;
+  };
+
+  const skipQuotedOrIdentAtom = (from: number, stopAtAtSign: boolean): number => {
+    let j = from;
+    if (j >= n) return j;
+    const ch = sql[j]!;
+    if (ch === "'" || ch === '"') {
+      const q = ch;
+      j++;
+      while (j < n) {
+        if (sql[j] === '\\') j = Math.min(n, j + 2);
+        else if (sql[j] === q) {
+          if (sql[j + 1] === q) j += 2;
+          else {
+            j++;
+            break;
+          }
+        } else j++;
+      }
+      return j;
+    }
+    if (ch === '`') {
+      j++;
+      while (j < n) {
+        if (sql[j] === '`') {
+          if (sql[j + 1] === '`') j += 2;
+          else {
+            j++;
+            break;
+          }
+        } else j++;
+      }
+      return j;
+    }
+    while (j < n) {
+      const c = sql[j]!;
+      if (/\s/.test(c) || c === ';' || c === '(' || c === '#') break;
+      if (stopAtAtSign && c === '@') break;
+      if (isMysqlLineCommentAt(sql, j)) break;
+      if (c === '/' && sql[j + 1] === '*') break;
+      if (inConditional && c === '*' && sql[j + 1] === '/') break;
+      j++;
+    }
+    return j;
+  };
+
+  const skipDefinerClause = (from: number): number => {
+    let j = skipTriviaInSplit(from);
+    if (sql[j] === '=') j = skipTriviaInSplit(j + 1);
+    if (/^current_user(?![A-Za-z0-9_$])/i.test(sql.slice(j))) {
+      j += 'current_user'.length;
+      const after = skipTriviaInSplit(j);
+      if (sql[after] === '(' && sql[skipTriviaInSplit(after + 1)] === ')') {
+        return skipTriviaInSplit(after + 1) + 1;
+      }
+      return after;
+    }
+    j = skipQuotedOrIdentAtom(j, true);
+    const afterUser = skipTriviaInSplit(j);
+    if (sql[afterUser] === '@') {
+      j = skipTriviaInSplit(afterUser + 1);
+      return skipQuotedOrIdentAtom(j, false);
+    }
+    return afterUser;
   };
 
   const peekNextWord = (from: number): { word: string; end: number } | null => {
@@ -382,7 +491,7 @@ export const splitMysqlStatements = (sql: string): string[] => {
 
   while (i < n) {
     // 顶层行首支持客户端 DELIMITER 指令
-    if (blockDepth === 0 && stmtWords.length === 0 && (i === 0 || sql[i - 1] === '\n')) {
+    if (blockDepth === 0 && stmtFirstWord === null && (i === 0 || sql[i - 1] === '\n')) {
       const m = /^[ \t]*DELIMITER[ \t]+(\S+)[ \t]*(?:\r?\n|$)/i.exec(sql.slice(i));
       if (m) {
         const piece = sql.slice(start, i).trim();
@@ -438,17 +547,33 @@ export const splitMysqlStatements = (sql: string): string[] => {
     } else if (blockDepth === 0 && sql.startsWith(delimiter, i)) {
       flush(i, delimiter.length);
       i = start;
+    } else if (blockDepth === 0 && c === '(') {
+      parenDepth++;
+      i++;
+    } else if (blockDepth === 0 && c === ')') {
+      parenDepth = Math.max(0, parenDepth - 1);
+      i++;
     } else if (/[A-Za-z_]/.test(c)) {
       const s0 = i;
       while (i < n && /[A-Za-z0-9_$]/.test(sql[i]!)) i++;
       const word = sql.slice(s0, i).toLowerCase();
-      if (stmtWords.length < 10) {
-        stmtWords.push(word);
-        if (
-          stmtWords[0] === 'create' &&
-          (word === 'trigger' || word === 'function' || word === 'procedure' || word === 'event')
-        ) {
+      if (stmtFirstWord === null) {
+        stmtFirstWord = word;
+      }
+      if (blockDepth === 0 && stmtFirstWord === 'create' && !stmtObjectSeen && parenDepth === 0) {
+        if (word === 'definer') {
+          const afterKw = skipTriviaInSplit(i);
+          if (sql[afterKw] === '=') {
+            i = skipDefinerClause(afterKw);
+            continue;
+          }
+          i = afterKw;
+          continue;
+        } else if (word === 'trigger' || word === 'function' || word === 'procedure' || word === 'event') {
           inRoutineHeader = true;
+          stmtObjectSeen = true;
+        } else if (NON_ROUTINE_CREATE_OBJECTS.has(word)) {
+          stmtObjectSeen = true;
         }
       }
       if (inRoutineHeader && word === 'begin') {

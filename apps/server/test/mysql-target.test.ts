@@ -12,6 +12,7 @@ import type {
   ProjectInfo,
   TargetInfo,
   VersionCreated,
+  VersionDetail,
   WizardEvent,
 } from '@dowel/api';
 import {
@@ -21,24 +22,32 @@ import {
   all,
   createSchema,
   createTable,
+  emptyBase,
   emptyModel,
   MYSQL_SHADOW_MARK_TABLE,
+  newId,
+  PlanError,
 } from '@dowel/core';
 import {
   alignMysqlImportedLive,
   type Db,
   detectMysqlStepAlreadyApplied,
+  fromMysql2,
   mysqlExprCanonEqual,
   mysqlGrantMatchesDb,
+  mysqlHistory,
+  updateExistingTablesAfterStep,
 } from '@dowel/engines';
-import { StepError } from '@dowel/verifier';
+import { StepError, verifyScripts } from '@dowel/verifier';
 import { afterAll, beforeAll, describe, expect, test } from 'vitest';
 
 import { createMysqlTestDb, mysqlDbUrl, useMysqlTestDb } from '../../../test/mysql.ts';
 import { formatVersionNum } from '../src/envs.ts';
 import { createApp, openPlatformDb, type PlatformDb } from '../src/index.ts';
 import { KeyedLimiter } from '../src/rate-limit.ts';
-import { isConnectionFailure, isInfraFailure } from '../src/shadow.ts';
+import { encrypt } from '../src/secrets.ts';
+import { isConnectionFailure, isInfraFailure, type Shadow, shadowOps } from '../src/shadow.ts';
+import { Shadows } from '../src/shadows.ts';
 import {
   claimMysqlShadow,
   dropMysqlSameInstanceShadow,
@@ -262,6 +271,251 @@ describe('MySQL 目标库服务端驱动与全栈', () => {
         { errno: 1068 },
       ),
     ).toBe(true);
+
+    // R2-2: 9.7 dev + 8.4 prod 混部下 verifyScripts 与 shadowOps.verifyScripts 阻断 VECTOR(3)
+    const mVec = emptyModel('mysql');
+    const sv = createSchema(mVec, 'default');
+    const emb = createTable(mVec, sv, 'embeddings');
+    const eid = addColumn(mVec, emb, { name: 'id', type: 'int', notNull: true });
+    addColumn(mVec, emb, { name: 'vec', type: 'vector(3)', notNull: true });
+    addPrimaryKey(mVec, emb, [eid]);
+    const vecFrom = emptyBase(mVec, null);
+    const mockMysql97Db: Db = {
+      query: async <T>(sql: string) => {
+        if (/SELECT\s+VERSION\(\)/i.test(sql)) return [{ v: '9.7.0' }] as T[];
+        return [] as T[];
+      },
+      exec: async () => {},
+    };
+    await expect(
+      verifyScripts(
+        mockMysql97Db,
+        vecFrom,
+        mVec,
+        [
+          {
+            sql: 'CREATE TABLE `embeddings` (`id` int PRIMARY KEY, `vec` vector(3) NOT NULL)',
+            transactional: false,
+          },
+        ],
+        [{ sql: 'DROP TABLE `embeddings`', transactional: false }],
+        { mysqlVersionNum: 80400 },
+      ),
+    ).rejects.toThrow(PlanError);
+    const ops97 = shadowOps(async () => mockMysql97Db, null, { dialect: 'mysql' });
+    const vecReport = await ops97.verifyScripts(
+      vecFrom,
+      mVec,
+      [
+        {
+          sql: 'CREATE TABLE `embeddings` (`id` int PRIMARY KEY, `vec` vector(3) NOT NULL)',
+          transactional: false,
+        },
+      ],
+      [{ sql: 'DROP TABLE `embeddings`', transactional: false }],
+      { mysqlVersionNum: 80400 },
+    );
+    expect(vecReport.ok).toBe(false);
+    expect(vecReport.error?.message).toMatch(/VECTOR.*8\.4/);
+
+    // R2-2: Shadows.forProjectVersions 对 MySQL 8.4 + 9.7 混部按主次版本分组（804 / 907），同时保持 PG 字段为空
+    const mixPid = newId();
+    await pdb.query(
+      `insert into projects (id, group_id, name, slug, dialect) values ($1, $2, 'MySQL Mix', $3, 'mysql')`,
+      [mixPid, groupId, `mysql-mix-${mixPid.slice(0, 6)}`],
+    );
+    await pdb.query(
+      `insert into environments (id, project_id, name, url_enc, production, allow_same_instance, shadow_url_enc, engine_version, engine_version_num)
+       values ($1, $2, 'dev97', $3, false, true, $4, '9.7.0', 90700),
+              ($5, $2, 'prod84', $6, true, false, $7, '8.4.13', 80413)`,
+      [
+        newId(),
+        mixPid,
+        encrypt('mysql://root:pw@127.0.0.1:3307/app97'),
+        encrypt('mysql://root:pw@127.0.0.1:3307/shadow97'),
+        newId(),
+        encrypt('mysql://root:pw@127.0.0.1:3306/app84'),
+        encrypt('mysql://root:pw@127.0.0.1:3306/shadow84'),
+      ],
+    );
+    const mixShadows = new Shadows(pdb, async () => {});
+    try {
+      const sel = await mixShadows.forProjectVersions(mixPid);
+      expect(sel.targetPgMajor).toBeNull();
+      expect(sel.envPgMajors).toEqual([]);
+      expect(sel.targetMysqlGroup).toBe(804);
+      expect(sel.entries.map((e) => e.mysqlGroup)).toEqual([804, 907]);
+      expect(sel.entries.every((e) => e.major === null)).toBe(true);
+    } finally {
+      await mixShadows.close();
+    }
+
+    // R2-2: MySQL 9.7 dev + 8.4 prod 混部缺失 8.4 影子库与版本错配门禁（不误标 verified，也不误拼 PG 804）
+    const mixVerProjRes = await req('POST', '/api/projects', {
+      name: 'MySQL Mix Gate',
+      groupId,
+      dialect: 'mysql',
+    });
+    expect(mixVerProjRes.status).toBe(201);
+    const mixVerPid = ((await mixVerProjRes.json()) as ProjectCreated).id;
+    await editModel(rooms, pdb, mixVerPid, (m) => {
+      const s = all(m, 'schema')[0]!.id;
+      const t = createTable(m, s, 'items');
+      const cid = addColumn(m, t, { name: 'id', type: 'int', notNull: true });
+      addPrimaryKey(m, t, [cid]);
+    });
+
+    const stubShadow = (verifyScriptsFn: Shadow['verifyScripts']): Shadow =>
+      ({
+        verifyScripts: verifyScriptsFn,
+        importSql: async () => {
+          throw new Error('unused');
+        },
+        verify: async () => {
+          throw new Error('unused');
+        },
+        canonicalize: async () => [],
+        close: async () => {},
+      }) as Shadow;
+
+    const origForProjectVersions = shadows.forProjectVersions.bind(shadows);
+    try {
+      // 场景 A：缺失 8.4 影子库（仅有 9.7 影子库通过）
+      shadows.forProjectVersions = async () => ({
+        entries: [
+          {
+            major: null,
+            mysqlGroup: 907,
+            envId: 'e-dev-97',
+            label: 'dev97：shadow97',
+            shadow: stubShadow(async () => ({
+              ok: true,
+              up: [],
+              down: [],
+              upDiff: [],
+              downDiff: [],
+              risks: [],
+              error: null,
+              shadowMajor: null,
+              shadowVersionNum: 90700,
+            })),
+          },
+        ],
+        skippedMajors: [
+          {
+            major: null,
+            mysqlGroup: 804,
+            reason: '环境“prod84”是生产环境，默认不在同一实例上建影子库',
+          },
+        ],
+        targetPgMajor: null,
+        envPgMajors: [],
+        targetMysqlGroup: 804,
+      });
+
+      const missingRes = await req('POST', `/api/projects/${mixVerPid}/versions`, { name: 'v1-missing-84' });
+      expect(missingRes.status).toBe(201);
+      const vMissing = (await missingRes.json()) as VersionCreated;
+      expect(vMissing.verified).toBe(false);
+      expect(vMissing.unverifiedReason).toContain('MySQL 8.4');
+      expect(vMissing.unverifiedReason).not.toMatch(/PG\s*804/);
+
+      const missingDetailRes = await req('GET', `/api/projects/${mixVerPid}/versions/${vMissing.id}`);
+      expect(missingDetailRes.status).toBe(200);
+      const missingDetail = (await missingDetailRes.json()) as VersionDetail;
+      expect(missingDetail.verifiedAt).toBeNull();
+      expect(missingDetail.verifyReport?.ok).toBe(false);
+      expect(missingDetail.verifyReport?.missingTargetMajor ?? null).toBeNull();
+      expect(missingDetail.verifyReport?.error?.message).toContain('MySQL 8.4');
+      expect(missingDetail.verifyReport?.error?.message).not.toMatch(/PG\s*804/);
+
+      // 场景 B：声明 8.4 影子库但实测返回 shadowVersionNum: 90700（版本错配）
+      await editModel(rooms, pdb, mixVerPid, (m) => {
+        const items = all(m, 'table').find((t) => t.name === 'items')!;
+        addColumn(m, items.id, { name: 'label', type: 'varchar(64)', notNull: true });
+      });
+      shadows.forProjectVersions = async () => ({
+        entries: [
+          {
+            major: null,
+            mysqlGroup: 804,
+            envId: 'e-prod-84',
+            label: 'prod84：shadow84',
+            shadow: stubShadow(async () => ({
+              ok: true,
+              up: [],
+              down: [],
+              upDiff: [],
+              downDiff: [],
+              risks: [],
+              error: null,
+              shadowMajor: null,
+              shadowVersionNum: 90700,
+            })),
+          },
+        ],
+        skippedMajors: [],
+        targetPgMajor: null,
+        envPgMajors: [],
+        targetMysqlGroup: 804,
+      });
+
+      const mismatchRes = await req('POST', `/api/projects/${mixVerPid}/versions`, {
+        name: 'v2-mismatch-84',
+      });
+      expect(mismatchRes.status).toBe(201);
+      const vMismatch = (await mismatchRes.json()) as VersionCreated;
+      expect(vMismatch.verified).toBe(false);
+      expect(vMismatch.unverifiedReason).toContain('MySQL 8.4');
+      expect(vMismatch.unverifiedReason).toContain('MySQL 9.7');
+      expect(vMismatch.unverifiedReason).not.toMatch(/PG\s*804/);
+
+      const mismatchDetailRes = await req('GET', `/api/projects/${mixVerPid}/versions/${vMismatch.id}`);
+      expect(mismatchDetailRes.status).toBe(200);
+      const mismatchDetail = (await mismatchDetailRes.json()) as VersionDetail;
+      expect(mismatchDetail.verifiedAt).toBeNull();
+      expect(mismatchDetail.verifyReport?.ok).toBe(false);
+      expect(mismatchDetail.verifyReport?.missingTargetMajor ?? null).toBeNull();
+    } finally {
+      shadows.forProjectVersions = origForProjectVersions;
+    }
+
+    // R2-4: ensureHistory 在 SELECT DATABASE() 抛错时必须销毁预留连接而非泄漏
+    let releasedCount = 0;
+    let destroyedCount = 0;
+    const leakTestDb = fromMysql2({
+      query: async () => [[], []],
+      getConnection: async () =>
+        ({
+          query: async () => {
+            throw new Error('connection lost before lock');
+          },
+          release: () => {
+            releasedCount++;
+          },
+          destroy: () => {
+            destroyedCount++;
+          },
+        }) as never,
+    });
+    await expect(mysqlHistory.ensureHistory(leakTestDb)).rejects.toThrow(/connection lost/);
+    expect(destroyedCount).toBe(1);
+    expect(releasedCount).toBe(0);
+
+    // R2-4: risk.ts 链式 RENAME TABLE 与省略 TO/AS 的 ALTER TABLE RENAME
+    const swapSet = new Set(['a', 'b']);
+    updateExistingTablesAfterStep('RENAME TABLE `a` TO `tmp`, `b` TO `a`, `tmp` TO `b`', swapSet);
+    expect([...swapSet].sort()).toEqual(['a', 'b']);
+
+    const chainSet = new Set(['a']);
+    updateExistingTablesAfterStep('RENAME TABLE `a` TO `tmp`, `tmp` TO `c`', chainSet);
+    expect([...chainSet]).toEqual(['c']);
+
+    updateExistingTablesAfterStep('ALTER TABLE `c` RENAME `d`', chainSet);
+    expect([...chainSet]).toEqual(['d']);
+
+    updateExistingTablesAfterStep('ALTER TABLE `d` RENAME COLUMN `x` TO `y`', chainSet);
+    expect([...chainSet]).toEqual(['d']);
   });
 
   test('真实 MySQL：inspectTarget、pullSchema、claimShadow 防误删非空业务库与同实例影子库生命周期', async () => {

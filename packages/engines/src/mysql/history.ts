@@ -270,13 +270,14 @@ const releaseMysqlAdvisoryLock = async (conn: Db, lockName: string): Promise<boo
 const ensureHistory = async (db: Db): Promise<void> => {
   const reserved = db.reserve ? await db.reserve() : null;
   const conn = reserved ?? db;
-  const [dbRow] = await conn.query<{ dbName: string | null }>('SELECT DATABASE() AS dbName');
-  const lockName = mysqlLockKey('dowel:init:', dbRow?.dbName ?? 'default');
+  let lockName = '';
   let locked = false;
   let broken = false;
 
   try {
     try {
+      const [dbRow] = await conn.query<{ dbName: string | null }>('SELECT DATABASE() AS dbName');
+      lockName = mysqlLockKey('dowel:init:', dbRow?.dbName ?? 'default');
       await acquireMysqlAdvisoryLock(conn, lockName, 15_000);
     } catch (e) {
       if (!(e instanceof HistoryError && e.code === 'lock_timeout')) broken = true;

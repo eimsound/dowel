@@ -39,8 +39,10 @@ export interface Env {
 }
 
 export interface VersionShadowEntry {
-  /** 该代表影子库对应的 PG 大版本号；未探测版本时为 null */
+  /** 该代表影子库对应的 PG 大版本号；非 PG 或未探测版本时为 null */
   major: number | null;
+  /** MySQL 主次版本分组键（如 804 = 8.4、907 = 9.7）；仅 MySQL 且已知版本时填充 */
+  mysqlGroup?: number | null;
   envId: string;
   shadow: Shadow;
   label: string;
@@ -48,19 +50,29 @@ export interface VersionShadowEntry {
 
 export interface SkippedMajorEntry {
   major: number | null;
+  /** MySQL 主次版本分组键（如 804 / 907）；仅 MySQL 且已知版本时填充 */
+  mysqlGroup?: number | null;
   reason: string;
 }
 
 export interface ProjectVersionShadows {
-  /** 按大版本升序排列（已知大版本在前，null 在后），每个大版本至多 1 个代表影子库 */
+  /** 按版本升序排列（已知版本在前，null 在后），每个版本组至多 1 个代表影子库 */
   entries: VersionShadowEntry[];
-  /** 无法获取可用影子库的大版本及其首个失败原因 */
+  /** 无法获取可用影子库的版本组及其首个失败原因 */
   skippedMajors: SkippedMajorEntry[];
-  /** 项目所有环境推导出的最低目标 PG 大版本（仅已知版本） */
+  /** 项目所有环境推导出的最低目标 PG 大版本（仅 PG 已知版本；非 PG 为 null） */
   targetPgMajor: number | null;
-  /** 项目所有环境去重升序的已知 PG 大版本 */
+  /** 项目所有环境去重升序的已知 PG 大版本（非 PG 为空数组） */
   envPgMajors: number[];
+  /** MySQL 项目所有环境推导出的最低主次版本分组（如 804；非 MySQL 或无已探测环境为 null） */
+  targetMysqlGroup?: number | null;
 }
+
+/** MySQL 主次版本分组键（如 80413 → 804、90700 → 907）；非法或未知返回 null */
+export const mysqlMinorGroupOf = (versionNum: number | null | undefined): number | null =>
+  typeof versionNum === 'number' && Number.isInteger(versionNum) && versionNum >= 10000
+    ? Math.floor(versionNum / 100)
+    : null;
 
 /**
  * 为一个环境准备影子库（共识 4.4）：按方言分派到对应目标库驱动。
@@ -283,6 +295,7 @@ export class Shadows {
         skippedMajors: [],
         targetPgMajor: null,
         envPgMajors: [],
+        targetMysqlGroup: null,
       };
     }
 
@@ -293,6 +306,7 @@ export class Shadows {
         skippedMajors: [],
         targetPgMajor: null,
         envPgMajors: [],
+        targetMysqlGroup: null,
       };
     }
 
@@ -316,22 +330,31 @@ export class Shadows {
     }
 
     const groups = new Map<number | null, typeof rows>();
-    const knownMajors = new Set<number>();
+    const knownKeys = new Set<number>();
     for (const r of rows) {
-      const major = dialect === 'pg' ? pgMajorOf(r.engine_version_num) : null;
-      if (major !== null) knownMajors.add(major);
-      const list = groups.get(major);
+      const key =
+        dialect === 'pg'
+          ? pgMajorOf(r.engine_version_num)
+          : dialect === 'mysql'
+            ? mysqlMinorGroupOf(r.engine_version_num)
+            : null;
+      if (key !== null) knownKeys.add(key);
+      const list = groups.get(key);
       if (list) list.push(r);
-      else groups.set(major, [r]);
+      else groups.set(key, [r]);
     }
-    const envPgMajors = [...knownMajors].sort((a, b) => a - b);
-    const targetPgMajor = deriveTargetPgMajor(envPgMajors);
-    const orderedKeys: (number | null)[] = [...envPgMajors, ...(groups.has(null) ? [null] : [])];
+    const sortedKnownKeys = [...knownKeys].sort((a, b) => a - b);
+    const envPgMajors = dialect === 'pg' ? sortedKnownKeys : [];
+    const targetPgMajor = dialect === 'pg' ? deriveTargetPgMajor(envPgMajors) : null;
+    const targetMysqlGroup = dialect === 'mysql' ? (sortedKnownKeys[0] ?? null) : null;
+    const orderedKeys: (number | null)[] = [...sortedKnownKeys, ...(groups.has(null) ? [null] : [])];
 
     const entries: VersionShadowEntry[] = [];
     const skippedMajors: SkippedMajorEntry[] = [];
-    for (const major of orderedKeys) {
-      const candidates = [...(groups.get(major) ?? [])].sort(
+    for (const key of orderedKeys) {
+      const major = dialect === 'pg' ? key : null;
+      const mysqlGroup = dialect === 'mysql' ? key : undefined;
+      const candidates = [...(groups.get(key) ?? [])].sort(
         (a, b) => candidatePriority(a) - candidatePriority(b),
       );
       let picked = false;
@@ -339,7 +362,13 @@ export class Shadows {
       for (const cand of candidates) {
         try {
           const s = await this.forProject(pid, cand.id);
-          entries.push({ major, envId: cand.id, shadow: s.shadow, label: s.label });
+          entries.push({
+            major,
+            ...(mysqlGroup !== undefined ? { mysqlGroup } : {}),
+            envId: cand.id,
+            shadow: s.shadow,
+            label: s.label,
+          });
           picked = true;
           break;
         } catch (e) {
@@ -348,21 +377,29 @@ export class Shadows {
         }
       }
       if (!picked) {
-        skippedMajors.push({ major, reason: firstReason });
+        skippedMajors.push({
+          major,
+          ...(mysqlGroup !== undefined ? { mysqlGroup } : {}),
+          reason: firstReason,
+        });
       }
     }
 
-    return { entries, skippedMajors, targetPgMajor, envPgMajors };
+    return { entries, skippedMajors, targetPgMajor, envPgMajors, targetMysqlGroup };
   }
 
   /**
-   * 为 OpaqueRefresher 等单影子库派生场景选影：优先选择 `engineMajor === targetPgMajor` 的可用环境影子库，
+   * 为 OpaqueRefresher 等单影子库派生场景选影：优先选择 `engineMajor === targetPgMajor`（或 MySQL `mysqlGroup === targetMysqlGroup`）的可用环境影子库，
    * 若无可用则回退到首个可用环境影子库。
    */
   async forProjectTarget(pid: string): Promise<{ shadow: Shadow; label: string }> {
     const res = await this.forProjectVersions(pid);
     if (res.targetPgMajor !== null) {
       const exact = res.entries.find((e) => e.major === res.targetPgMajor);
+      if (exact) return { shadow: exact.shadow, label: exact.label };
+    }
+    if (res.targetMysqlGroup != null) {
+      const exact = res.entries.find((e) => e.mysqlGroup === res.targetMysqlGroup);
       if (exact) return { shadow: exact.shadow, label: exact.label };
     }
     const first = res.entries[0];

@@ -227,7 +227,10 @@ export const registerWizard = (app: Hono<Env>, ctx: AppContext) => {
               createdShadow = prepared.created;
             }
             baselineReport = storedReport(
-              await shadow.verifyScripts(baseline.from, model, baseline.up, [], { checkDown: false }),
+              await shadow.verifyScripts(baseline.from, model, baseline.up, [], {
+                checkDown: false,
+                ...(targetMysqlVersionNum !== null ? { mysqlVersionNum: targetMysqlVersionNum } : {}),
+              }),
               shadowLabel,
             );
           } catch (e) {

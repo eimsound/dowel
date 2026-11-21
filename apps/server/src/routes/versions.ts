@@ -17,7 +17,7 @@ import {
   verifyRequestSchema,
   versionCreateSchema,
 } from '@dowel/api';
-import { createAll, formatScript, type Model, newId, plan, validate } from '@dowel/core';
+import { createAll, formatScript, type Model, newId, type PlanOptions, plan, validate } from '@dowel/core';
 import {
   canonicalSteps,
   type Db,
@@ -41,7 +41,7 @@ import { isUniqueViolation } from '../db.ts';
 import { projectPlanOptions } from '../envs.ts';
 import { scrubSecrets } from '../secrets.ts';
 import { ShadowError, storedReport } from '../shadow.ts';
-import type { Shadows } from '../shadows.ts';
+import { mysqlMinorGroupOf, type Shadows } from '../shadows.ts';
 import { type AppContext, access, body, type Env } from './context.ts';
 
 /** 概要字段：版本列表用 */
@@ -132,14 +132,21 @@ const CHAIN_CHANGED = '版本链刚刚发生了变化（有人先发布了），
 
 type MultiVersionVerifyOutcome =
   | { kind: 'ok'; stored: StoredVerifyReport }
-  | { kind: 'failed'; report: VerifyResponse; stored: StoredVerifyReport; failedMajor: number | null }
-  | { kind: 'missing_target'; missingMajor: number; reason: string; stored: StoredVerifyReport };
+  | {
+      kind: 'failed';
+      report: VerifyResponse;
+      stored: StoredVerifyReport;
+      failedMajor: number | null;
+      failedVersionLabel: string | null;
+    }
+  | { kind: 'missing_target'; missingMajor: number | null; reason: string; stored: StoredVerifyReport };
+
+const formatMysqlGroup = (group: number): string => `${Math.floor(group / 100)}.${group % 100}`;
 
 /**
- * 跨大版本影子库闭环验证冻结脚本（按大版本升序逐一执行，风险分析仅在首个可用影子库执行一次）：
- * - 任一大版本闭环验证失败 → 整体失败并指出具体 PG 版本；
- * - 存在多个 PG 大版本且最低目标版本 targetPgMajor 缺少可用影子库 → 不得标为已验证（missing_target），
- *   在报告与原因中明确写明缺少 PG <targetPgMajor> 影子库；
+ * 跨版本影子库闭环验证冻结脚本（按版本升序逐一执行，风险分析仅在首个可用影子库执行一次）：
+ * - PG：任一大版本闭环验证失败 → 整体失败并指出具体 PG 版本；存在多个 PG 大版本且最低目标 targetPgMajor 缺少可用影子库 → missing_target；
+ * - MySQL：按主次版本（如 8.4 / 9.7）分组逐一实测，并透传项目最低目标 mysqlVersionNum 阻断高版本特有类型（如 9.7 dev + 8.4 prod 混部下的 VECTOR）；
  * - 全部可用影子库均遇到 ShadowError 或项目无任何可用影子库 → 抛出 ShadowError（按基础设施/配置不可用处理）。
  */
 const verifyAcrossVersions = async (
@@ -150,29 +157,39 @@ const verifyAcrossVersions = async (
   up: ScriptStep[],
   down: ScriptStep[],
   checkDown = true,
+  planOpts?: PlanOptions,
 ): Promise<MultiVersionVerifyOutcome> => {
   const selection = await shadows.forProjectVersions(pid);
   if (!selection.entries.length) {
     throw new ShadowError(selection.skippedMajors[0]?.reason ?? '没有可用的影子库');
   }
 
+  const isPg = to.dialect === 'pg';
+  const isMysql = to.dialect === 'mysql';
   const targets: VerifyTargetReport[] = [];
-  const passedShadows: { major: number | null; label: string }[] = [];
+  const passedShadows: {
+    major: number | null;
+    mysqlGroup: number | null;
+    versionLabel: string | null;
+    label: string;
+  }[] = [];
   const runtimeSkipped = new Map<number | null, string>();
   const mismatchReasons = new Map<number, string>();
   let primaryReport: VerifyReport | null = null;
   let ranRisk = false;
 
   for (const entry of selection.entries) {
+    const groupKey = isPg ? entry.major : isMysql ? (entry.mysqlGroup ?? null) : null;
     let report: VerifyReport;
     try {
       report = await entry.shadow.verifyScripts(from, to, up, down, {
         checkDown,
         skipRisk: ranRisk,
+        ...(planOpts?.mysqlVersionNum !== undefined ? { mysqlVersionNum: planOpts.mysqlVersionNum } : {}),
       });
     } catch (e) {
       if (!(e instanceof ShadowError)) throw e;
-      runtimeSkipped.set(entry.major, scrubSecrets(e.message));
+      runtimeSkipped.set(groupKey, scrubSecrets(e.message));
       continue;
     }
 
@@ -181,16 +198,40 @@ const verifyAcrossVersions = async (
       ranRisk = true;
     }
 
-    // 以影子库实测大版本为准；若独立 shadowUrl 的实际 PG 大版本与环境声称的不一致，不得记作覆盖了目标大版本
-    const actualMajor = report.shadowMajor !== undefined ? report.shadowMajor : entry.major;
-    if (entry.major !== null && actualMajor !== null && actualMajor !== entry.major) {
+    // PG / MySQL 各自以影子库实测版本为准；若独立 shadowUrl 实际版本与环境声称的不一致，不得记作覆盖了目标版本
+    const actualMajor = isPg ? (report.shadowMajor !== undefined ? report.shadowMajor : entry.major) : null;
+    if (isPg && entry.major !== null && actualMajor !== null && actualMajor !== entry.major) {
       mismatchReasons.set(
         entry.major,
         `影子库实际版本为 PG ${actualMajor}（${entry.label}），与目标环境 PG ${entry.major} 不一致，不能作为 PG ${entry.major} 的验证依据`,
       );
     }
+    const actualMysqlGroup = isMysql
+      ? report.shadowVersionNum !== undefined
+        ? mysqlMinorGroupOf(report.shadowVersionNum)
+        : (entry.mysqlGroup ?? null)
+      : null;
+    if (
+      isMysql &&
+      entry.mysqlGroup != null &&
+      actualMysqlGroup !== null &&
+      actualMysqlGroup !== entry.mysqlGroup
+    ) {
+      mismatchReasons.set(
+        entry.mysqlGroup,
+        `影子库实际版本为 MySQL ${formatMysqlGroup(actualMysqlGroup)}（${entry.label}），与目标环境 MySQL ${formatMysqlGroup(entry.mysqlGroup)} 不一致，不能作为 MySQL ${formatMysqlGroup(entry.mysqlGroup)} 的验证依据`,
+      );
+    }
 
-    if (actualMajor !== null) {
+    const displayMysqlGroup = actualMysqlGroup ?? entry.mysqlGroup ?? null;
+    const versionLabel =
+      isPg && actualMajor !== null
+        ? `PG ${actualMajor}`
+        : isMysql && displayMysqlGroup !== null
+          ? `MySQL ${formatMysqlGroup(displayMysqlGroup)}`
+          : null;
+
+    if (isPg && actualMajor !== null) {
       targets.push({
         major: actualMajor,
         shadow: entry.label,
@@ -202,14 +243,14 @@ const verifyAcrossVersions = async (
     }
 
     if (!report.ok) {
-      const shadowLabel = actualMajor !== null ? `PG ${actualMajor}（${entry.label}）` : entry.label;
+      const shadowLabel = versionLabel !== null ? `${versionLabel}（${entry.label}）` : entry.label;
       const withPrefix =
-        actualMajor !== null && report.error
+        versionLabel !== null && report.error
           ? {
               ...report,
               error: {
                 ...report.error,
-                message: `PG ${actualMajor} 验证失败：${report.error.message}`,
+                message: `${versionLabel} 验证失败：${report.error.message}`,
               },
             }
           : report;
@@ -217,6 +258,7 @@ const verifyAcrossVersions = async (
       return {
         kind: 'failed',
         failedMajor: actualMajor,
+        failedVersionLabel: versionLabel,
         report: {
           ...withPrefix,
           shadow: shadowLabel,
@@ -226,7 +268,12 @@ const verifyAcrossVersions = async (
       };
     }
 
-    passedShadows.push({ major: actualMajor, label: entry.label });
+    passedShadows.push({
+      major: actualMajor,
+      mysqlGroup: actualMysqlGroup,
+      versionLabel,
+      label: entry.label,
+    });
   }
 
   // 所有候选影子库在运行期都遇到 ShadowError：回退为基础设施不可用
@@ -239,11 +286,17 @@ const verifyAcrossVersions = async (
   const shadowSummary =
     passedShadows.length === 1
       ? passedShadows[0]!.label
-      : passedShadows.map((s) => (s.major !== null ? `PG ${s.major}（${s.label}）` : s.label)).join(' · ');
+      : passedShadows
+          .map((s) => (s.versionLabel !== null ? `${s.versionLabel}（${s.label}）` : s.label))
+          .join(' · ');
 
-  // 严格安全规则：只要项目存在已记录版本的最低目标 targetPgMajor，且本次实测通过的影子库集合中未覆盖该大版本
+  // 严格安全规则：只要 PG 项目存在已记录版本的最低目标 targetPgMajor，且本次实测通过的影子库集合中未覆盖该大版本
   // （包括多版本缺低版本影子库、存在未探测版本环境、或独立 shadowUrl 与目标库大版本错配），均不得标记为已验证
-  if (selection.targetPgMajor !== null && !passedShadows.some((s) => s.major === selection.targetPgMajor)) {
+  if (
+    isPg &&
+    selection.targetPgMajor !== null &&
+    !passedShadows.some((s) => s.major === selection.targetPgMajor)
+  ) {
     const mismatch = mismatchReasons.get(selection.targetPgMajor);
     const skippedReason =
       runtimeSkipped.get(selection.targetPgMajor) ??
@@ -266,6 +319,35 @@ const verifyAcrossVersions = async (
         targets: targets.length ? targets : undefined,
         missingTargetMajor: selection.targetPgMajor,
       }),
+    };
+  }
+
+  // MySQL 混部（如 9.7 dev + 8.4 prod）缺失最低目标版本影子库或实际版本错配时，不得仅凭高版本通过标为已验证
+  if (
+    isMysql &&
+    selection.targetMysqlGroup != null &&
+    !passedShadows.some((s) => s.mysqlGroup === selection.targetMysqlGroup)
+  ) {
+    const targetLabel = `MySQL ${formatMysqlGroup(selection.targetMysqlGroup)}`;
+    const mismatch = mismatchReasons.get(selection.targetMysqlGroup);
+    const skippedReason =
+      runtimeSkipped.get(selection.targetMysqlGroup) ??
+      selection.skippedMajors.find((s) => s.mysqlGroup === selection.targetMysqlGroup)?.reason;
+    const reason = mismatch
+      ? `${mismatch}。请为 ${targetLabel} 环境配置同版本的独立影子库或允许使用同实例影子库`
+      : skippedReason
+        ? `缺少 ${targetLabel} 影子库，无法验证最低目标版本兼容性（${skippedReason}）。请为 ${targetLabel} 环境配置独立影子库或允许使用同实例影子库`
+        : `缺少 ${targetLabel} 影子库，无法验证最低目标版本兼容性。请为 ${targetLabel} 环境配置独立影子库或允许使用同实例影子库`;
+    const incompleteReport: VerifyReport = {
+      ...primaryReport,
+      ok: false,
+      error: { step: null, message: reason },
+    };
+    return {
+      kind: 'missing_target',
+      missingMajor: null,
+      reason,
+      stored: storedReport(incompleteReport, shadowSummary),
     };
   }
 
@@ -362,11 +444,20 @@ export const registerVersions = (app: Hono<Env>, ctx: AppContext) => {
     // 只放过预期的“没有影子库 / 影子库不可用”（ShadowError：没有环境、生产环境不让用同实例、连不上、被占用）；
     // 密钥解密失败（SecretError）、白名单拒绝（HTTPException）、平台库错误都继续抛出
     try {
-      const outcome = await verifyAcrossVersions(shadows, a.pid, from, model, frozen.up, frozen.down, true);
+      const outcome = await verifyAcrossVersions(
+        shadows,
+        a.pid,
+        from,
+        model,
+        frozen.up,
+        frozen.down,
+        true,
+        planOpts,
+      );
       if (outcome.kind === 'failed') {
         const msg =
-          outcome.failedMajor !== null
-            ? `PG ${outcome.failedMajor} 影子库闭环验证没有通过，版本没有发布。请先修正模型`
+          outcome.failedVersionLabel !== null
+            ? `${outcome.failedVersionLabel} 影子库闭环验证没有通过，版本没有发布。请先修正模型`
             : '闭环验证没有通过，版本没有发布。请先修正模型';
         return c.json<PublishRejected>({ error: msg, report: outcome.report }, 422);
       }
@@ -543,6 +634,7 @@ export const registerVersions = (app: Hono<Env>, ctx: AppContext) => {
     // 第一个版本的 from 用冻结时记下的范围，不用项目当前的（范围之后可能改过）
     const from = chainFrom(parent, v.model, v.scope);
     const checkDown = !(v.number === 0 && v.downSteps.length === 0);
+    const planOpts = await projectPlanOptions(db, a.pid, a.dialect);
     // 影子库的故障（拿不到、连接断开、超时……）是 ShadowError，直接抛出（422），不写回任何验证状态
     const outcome = await verifyAcrossVersions(
       shadows,
@@ -552,6 +644,7 @@ export const registerVersions = (app: Hono<Env>, ctx: AppContext) => {
       v.upSteps,
       v.downSteps,
       checkDown,
+      planOpts,
     );
     const report = outcome.stored;
     const verifiedAt = outcome.kind === 'ok' ? report.at : null;

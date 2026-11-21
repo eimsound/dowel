@@ -591,6 +591,8 @@ export const verifyReportSchema = z.object({
   error: z.object({ step: migrationStepSchema.nullable(), message: z.string() }).nullable(),
   /** 实测影子库的 PostgreSQL 大版本（由 verifier 读取 server_version_num 推导） */
   shadowMajor: z.number().int().nullable().optional(),
+  /** 实测影子库的数据库数值版本号（PG / MySQL，由 verifier 读取） */
+  shadowVersionNum: z.number().int().nullable().optional(),
 });
 export type VerifyReport = z.infer<typeof verifyReportSchema>;
 

@@ -114,7 +114,7 @@ const readTableIdent = (
 };
 
 /** 跟随已执行的 DROP TABLE / RENAME TABLE / ALTER TABLE ... RENAME 动态同步既有表集合 */
-const updateExistingTablesAfterStep = (sql: string, existingTables: Set<string>): void => {
+export const updateExistingTablesAfterStep = (sql: string, existingTables: Set<string>): void => {
   for (const stmt of splitMysqlStatements(sql)) {
     const toks = sigTokens(stmt);
     if (toks.length < 3) continue;
@@ -141,45 +141,35 @@ const updateExistingTablesAfterStep = (sql: string, existingTables: Set<string>)
       continue;
     }
 
-    // RENAME TABLE old1 TO new1, old2 TO new2, ...
+    // RENAME TABLE old1 TO new1, old2 TO new2, ...（按 MySQL 语义严格从左到右逐对应用）
     if (isWord(0, 'rename') && isWord(1, 'table')) {
-      const pairs: [string, string][] = [];
       let pos = 2;
       while (pos < toks.length) {
         const src = readTableIdent(toks, pos);
         if (!src || !isWord(src.next, 'to')) break;
         const dst = readTableIdent(toks, src.next + 1);
         if (!dst) break;
-        pairs.push([src.name, dst.name]);
+        if (existingTables.delete(src.name)) existingTables.add(dst.name);
         pos = dst.next;
         if (toks[pos]?.text === ',') pos++;
         else break;
       }
-      const had = pairs.map(([src]) => existingTables.has(src));
-      for (const [src] of pairs) existingTables.delete(src);
-      pairs.forEach(([, dst], idx) => {
-        if (had[idx]) existingTables.add(dst);
-      });
       continue;
     }
 
-    // ALTER TABLE old RENAME [TO|AS] new
+    // ALTER TABLE old RENAME [TO|AS] new（兼容省略 TO/AS，排除 RENAME COLUMN|INDEX|KEY）
     if (isWord(0, 'alter') && isWord(1, 'table')) {
       const src = readTableIdent(toks, 2);
       if (!src) continue;
+      let curName = src.name;
       for (let k = src.next; k < toks.length; k++) {
-        if (
-          isWord(k, 'rename') &&
-          (isWord(k + 1, 'to') || isWord(k + 1, 'as')) &&
-          !isWord(k - 1, 'column') &&
-          !isWord(k - 1, 'index')
-        ) {
-          const dst = readTableIdent(toks, k + 2);
-          if (dst && existingTables.has(src.name)) {
-            existingTables.delete(src.name);
-            existingTables.add(dst.name);
-          }
-          break;
+        if (!isWord(k, 'rename')) continue;
+        if (isWord(k + 1, 'column') || isWord(k + 1, 'index') || isWord(k + 1, 'key')) continue;
+        const dstPos = isWord(k + 1, 'to') || isWord(k + 1, 'as') ? k + 2 : k + 1;
+        const dst = readTableIdent(toks, dstPos);
+        if (dst) {
+          if (existingTables.delete(curName)) existingTables.add(dst.name);
+          curName = dst.name;
         }
       }
     }

@@ -359,8 +359,20 @@ export const shadowOps = (
         ...risk,
         error: null,
         shadowMajor: r.shadowMajor,
+        shadowVersionNum: r.shadowVersionNum,
       };
     } catch (e) {
+      if (e instanceof PlanError) {
+        return {
+          ok: false,
+          up: [],
+          down: [],
+          upDiff: [],
+          downDiff: [],
+          risks: [],
+          error: { step: null, message: scrubSecrets(e.message) },
+        };
+      }
       return failedReport(e, statementTimeoutMs);
     }
   },
@@ -375,6 +387,7 @@ export const shadowOps = (
         ...risk,
         error: null,
         shadowMajor: r.shadowMajor,
+        shadowVersionNum: r.shadowVersionNum,
       };
     } catch (e) {
       return failedReport(e, statementTimeoutMs);

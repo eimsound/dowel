@@ -1,6 +1,7 @@
 // 闭环验证：迁移后的结构必须等于直接按目标版本建出来的结构；反向迁移后必须回到原来的结构。
 // 全面通过 @dowel/engines 的 getEngine(dialect) 驱动，支持 PG / SQLite / MySQL / MSSQL。
 import {
+  checkMysqlVersionCompatibility,
   createAll,
   type Dialect,
   findInstanceLevelStep,
@@ -100,6 +101,8 @@ export interface VerifyResult {
   downDiff: string[];
   /** 实际执行本次验证的影子库 PG 大版本（仅 PG，其他方言为 null） */
   shadowMajor?: number | null;
+  /** 实际执行本次验证的影子库数值版本号（如 80413 / 90700 / 160004） */
+  shadowVersionNum?: number | null;
 }
 
 /** 闭环验证（只用一个影子库，依次建目标版本、建原版本、执行迁移、执行反向迁移）。任一步执行失败抛出 StepError。 */
@@ -107,10 +110,12 @@ export const verify = async (db: Db, from: Model, to: Model, opts?: PlanOptions)
   const dialect = to.dialect;
   const engine = getEngine(dialect);
   let shadowMajor: number | null = null;
+  let shadowVersionNum: number | null = null;
   let planOpts: PlanOptions | undefined = opts;
   let buildOpts: PlanOptions | undefined = opts;
   if (engine.readVersionNum && engine.planOptionsForVersion) {
     const vNum = await engine.readVersionNum(db);
+    shadowVersionNum = vNum ?? null;
     const shadowOpts = vNum !== null && vNum !== undefined ? engine.planOptionsForVersion(vNum) : undefined;
     if (dialect === 'pg') {
       shadowMajor = vNum !== null && vNum !== undefined ? pgMajorOf(vNum) : null;
@@ -139,6 +144,7 @@ export const verify = async (db: Db, from: Model, to: Model, opts?: PlanOptions)
     upDiff: engine.diffSnapshots(norm(afterUp, to), norm(toSnap, to)),
     downDiff: engine.diffSnapshots(norm(afterDown, from), norm(fromSnap, from)),
     shadowMajor,
+    shadowVersionNum,
   };
 };
 
@@ -156,6 +162,8 @@ export interface VerifyScriptsOptions {
   checkDown?: boolean;
   /** 构建 from / to 基准结构时使用的 PG 大版本；缺省自动从影子库读取 server_version_num */
   pgMajor?: number | null;
+  /** 目标 MySQL 最低数值版本号（如 80400）；与影子库实测版本取较小者执行版本兼容性检查 */
+  mysqlVersionNum?: number | null;
 }
 
 /**
@@ -176,13 +184,25 @@ export const verifyScripts = async (
   const downSteps = frozenSteps('down', down);
   assertNoInstanceLevel([...upSteps, ...downSteps], dialect);
   let shadowMajor: number | null = null;
+  let shadowVersionNum: number | null = null;
   let buildOpts: PlanOptions | undefined;
   if (dialect === 'pg') {
-    shadowMajor = await readShadowPgMajor(db);
+    shadowVersionNum = (await engine.readVersionNum?.(db)) ?? null;
+    shadowMajor = shadowVersionNum !== null ? pgMajorOf(shadowVersionNum) : null;
     const pgMajor = options.pgMajor !== undefined ? options.pgMajor : shadowMajor;
     buildOpts = pgMajor !== null ? { pgMajor } : undefined;
+  } else if (dialect === 'mysql') {
+    shadowVersionNum = (await engine.readVersionNum?.(db)) ?? null;
+    const candidates = [shadowVersionNum, options.mysqlVersionNum].filter(
+      (v): v is number => typeof v === 'number' && Number.isInteger(v) && v > 0,
+    );
+    const effectiveVersionNum = candidates.length ? Math.min(...candidates) : null;
+    checkMysqlVersionCompatibility(to, effectiveVersionNum);
+    buildOpts =
+      effectiveVersionNum !== null ? engine.planOptionsForVersion?.(effectiveVersionNum) : undefined;
   } else if (engine.readVersionNum && engine.planOptionsForVersion) {
     const vNum = await engine.readVersionNum(db);
+    shadowVersionNum = vNum ?? null;
     buildOpts = vNum !== null && vNum !== undefined ? engine.planOptionsForVersion(vNum) : undefined;
   }
   const toSnap = await buildTarget(db, to, buildOpts);
@@ -193,7 +213,7 @@ export const verifyScripts = async (
     engine.normalizeForVerify ? engine.normalizeForVerify(snap, model) : snap;
   const upDiff = engine.diffSnapshots(norm(afterUp, to), norm(toSnap, to));
   if (options.checkDown === false || upDiff.length)
-    return { up: upSteps, down: downSteps, upDiff, downDiff: [], shadowMajor };
+    return { up: upSteps, down: downSteps, upDiff, downDiff: [], shadowMajor, shadowVersionNum };
   await runSteps(db, downSteps, dialect);
   const afterDown = await engine.readSnapshot(db);
   return {
@@ -202,6 +222,7 @@ export const verifyScripts = async (
     upDiff,
     downDiff: engine.diffSnapshots(norm(afterDown, from), norm(fromSnap, from)),
     shadowMajor,
+    shadowVersionNum,
   };
 };
 

@@ -632,4 +632,134 @@ describe('MySQL dialect core (MySQL 8.4 & 9.7)', () => {
     expect(title).toBeTruthy();
     expect(rawCode).toBeTruthy();
   });
+
+  it('R2-1 & R2-3: closes sql_mode/SET_VAR, skipDefiner, splitMysqlStatements >10, single-stmt routines/XA, cross-DB DML/TABLE/fn, and collation-only table alter', () => {
+    // 1.1: SET RESOURCE GROUP、危险 sql_mode 与 /*+ SET_VAR(sql_mode=...) */ 优化器提示
+    for (const bad of [
+      'SET RESOURCE GROUP usr_default;',
+      "SET sql_mode = 'ANSI';",
+      "SET sql_mode = '4';",
+      "SET SESSION sql_mode = 'STRICT_TRANS_TABLES,ANSI_QUOTES';",
+      "SET LOCAL sql_mode = 'NO_BACKSLASH_ESCAPES';",
+      'SET sql_mode = ANSI_QUOTES;',
+      'SET sql_mode = 4;',
+      'SET sql_mode = @m;',
+      "CREATE PROCEDURE p() BEGIN DECLARE m VARCHAR(64) DEFAULT 'ANSI_QUOTES'; SET sql_mode = m; END;",
+      "SET @@sql_mode = CONCAT('ANSI', '_QUOTES');",
+      "SET @@session.sql_mode = (SELECT 'ANSI_QUOTES');",
+      "SET @a = 1, @@local.sql_mode = 'NO_BACKSLASH_ESCAPES';",
+      "SELECT /*+ SET_VAR(sql_mode='ANSI_QUOTES') */ 1;",
+      'SELECT /*+ SET_VAR(`sql_mode` = ANSI) */ 1;',
+      // 1.2: skipDefiner 引号/反引号 host 紧邻关键字
+      "CREATE DEFINER='root'@'%'EVENT ev1 ON SCHEDULE EVERY 1 HOUR DO SELECT 1;",
+      "CREATE DEFINER='root'@'%'VIEW dowel_v AS SELECT 1;",
+      'CREATE DEFINER=`root`@`localhost`TRIGGER tr AFTER INSERT ON dowel_history FOR EACH ROW SET @x = 1;',
+      // 1.3: 无 BEGIN 单语句例程、FOLLOWS/PRECEDES、DECLARE ... HANDLER 与 XA
+      'CREATE PROCEDURE p() EXECUTE s;',
+      'CREATE PROCEDURE p() FLUSH TABLE;',
+      'CREATE PROCEDURE p() FLUSH PRIVILEGES;',
+      'CREATE PROCEDURE p() RESET MASTER;',
+      'CREATE PROCEDURE p() SHUTDOWN;',
+      'CREATE PROCEDURE p() RESTART;',
+      "CREATE PROCEDURE p() BINLOG 'abc';",
+      "CREATE PROCEDURE p() GRANT ALL ON *.* TO 'u'@'%';",
+      "CREATE PROCEDURE p() XA START 'tx1';",
+      "XA START 'tx1';",
+      'CREATE TRIGGER tr AFTER INSERT ON users FOR EACH ROW FOLLOWS tr0 FLUSH TABLES;',
+      'CREATE TRIGGER tr AFTER INSERT ON users FOR EACH ROW PRECEDES tr0 RESET PERSIST;',
+      'CREATE PROCEDURE p() BEGIN DECLARE CONTINUE HANDLER FOR SQLEXCEPTION EXECUTE s; END;',
+      // 1.4: STRAIGHT_JOIN、穿过 JOIN...ON/USING 与派生表别名的多表、括号表因子、LOCK TABLES、HANDLER、tbl.*、TABLE 语句、跨库函数、ALTER RENAME/EXCHANGE、维护命令
+      'SELECT * FROM users STRAIGHT_JOIN prod.orders;',
+      'SELECT * FROM users u JOIN orders o ON u.id = o.user_id, dowel_versions v;',
+      'SELECT * FROM users u JOIN orders o USING (id), prod.accounts a;',
+      'SELECT * FROM (SELECT 1) AS sub, prod.users;',
+      'LOCK TABLES t1 AS a1 READ, prod.t2 WRITE;',
+      'LOCK TABLES t1 READ LOCAL, dowel_history WRITE;',
+      'LOCK TABLES t1 LOW_PRIORITY WRITE, prod.t2 READ;',
+      'HANDLER prod.users OPEN;',
+      'HANDLER dowel_history OPEN;',
+      "UPDATE (dowel_claims) SET note = 'x';",
+      'SELECT * FROM (prod.users);',
+      'SELECT dowel_versions.* FROM users;',
+      'DELETE prod.users.* FROM users;',
+      'TABLE prod.users;',
+      'TABLE dowel_history;',
+      'SELECT 1 UNION TABLE prod.users;',
+      'SELECT prod.secret_fn(1);',
+      'ALTER TABLE users RENAME prod.users;',
+      'ALTER TABLE users RENAME dowel_evil;',
+      'ALTER TABLE t EXCHANGE PARTITION p0 WITH TABLE prod.users;',
+      'ANALYZE TABLE prod.users;',
+      'OPTIMIZE TABLE dowel_history;',
+      'REPAIR TABLE prod.users;',
+      'CHECK TABLE prod.users;',
+      'CHECKSUM TABLE dowel_versions;',
+    ]) {
+      expect(findInstanceLevelStatement(bad, 'mysql'), `should block: ${bad}`).not.toBeNull();
+    }
+
+    expect(isNontransactionalSql("XA START 'tx1'", 'mysql')).toBe(true);
+
+    // 正常单库写法绝不误报
+    for (const ok of [
+      "SET SESSION sql_mode = 'STRICT_TRANS_TABLES,NO_ENGINE_SUBSTITUTION';",
+      'SET sql_mode = DEFAULT;',
+      'SET sql_mode = STRICT_TRANS_TABLES;',
+      'SELECT /*+ MAX_EXECUTION_TIME(1000) */ id FROM users;',
+      'SELECT STRAIGHT_JOIN u.id FROM users u;',
+      'SELECT EXTRACT(YEAR FROM u.created_at), SUBSTRING(u.name FROM 1 FOR 3), SUBSTR(u.name FROM 2), WEIGHT_STRING(u.name) FROM users u;',
+      'CREATE TABLE `t` (`shutdown` int, `restart` int, `execute` int, `flush` int, `reset` int, `xa` int);',
+      'CREATE TABLE t (shutdown INT, restart INT, execute INT, flush INT, reset INT, xa INT);',
+      'ALTER TABLE `users` RENAME COLUMN `a` TO `b`;',
+      "UPDATE users SET role = 'admin', password = 'secret', sql_mode = 'custom' WHERE id = 1;",
+      'SELECT shutdown;',
+    ]) {
+      expect(findInstanceLevelStatement(ok, 'mysql'), `should allow: ${ok}`).toBeNull();
+    }
+
+    // splitMysqlStatements 对无引号 DEFINER=user@localhost 不会将 user 误判为非例程对象
+    const definerUserSplit = splitMysqlStatements(
+      'CREATE DEFINER=user@localhost PROCEDURE p() BEGIN SET @a = 1; SET @b = 2; END; SELECT 1;',
+    );
+    expect(definerUserSplit).toHaveLength(2);
+    expect(definerUserSplit[0]).toContain('SET @b = 2;');
+    expect(definerUserSplit[1]).toBe('SELECT 1');
+
+    // 1.2: splitMysqlStatements 超过 10 个词的 CREATE DEFINER ... PROCEDURE 仍正确保留 BEGIN...END 复合块
+    const longHeaderProc = `
+      CREATE /* c1 */ DEFINER = 'admin'@'127.0.0.1'
+      SQL SECURITY DEFINER
+      PROCEDURE long_proc(IN a INT, IN b INT)
+      COMMENT 'long header'
+      DETERMINISTIC
+      MODIFIES SQL DATA
+      BEGIN
+        SET @x = 1;
+        SET @y = 2;
+      END;
+      CREATE TABLE t_after (event INT, begin INT);
+      CREATE TABLE t_next (id INT);
+    `;
+    const splitLong = splitMysqlStatements(longHeaderProc);
+    expect(splitLong).toHaveLength(3);
+    expect(splitLong[0]).toContain('PROCEDURE long_proc');
+    expect(splitLong[0]).toContain('SET @y = 2;');
+    expect(splitLong[1]).toContain('CREATE TABLE t_after');
+    expect(splitLong[2]).toBe('CREATE TABLE t_next (id INT)');
+
+    // R2-3: 表级仅设非 utf8mb4 的 collation（省略 charset）不硬编码 utf8mb4
+    const mc0 = emptyModel('mysql');
+    const sc = createSchema(mc0, 'default');
+    const tc = createTable(mc0, sc, 'legacy');
+    const lId = addColumn(mc0, tc, { name: 'id', type: 'int', notNull: true });
+    addColumn(mc0, tc, { name: 'code', type: 'varchar(32)', notNull: true });
+    addPrimaryKey(mc0, tc, [lId]);
+
+    const mc1 = structuredClone(mc0);
+    setTableExt(mc1, tc, { mysql: { collation: 'latin1_bin' } });
+    const latinSteps = plan(mc0, mc1);
+    expect(latinSteps[0]!.sql).toBe('ALTER TABLE `legacy` DEFAULT COLLATE latin1_bin');
+    expect(latinSteps[0]!.sql).not.toContain('utf8mb4');
+    expect(latinSteps.some((st) => st.sql.includes('MODIFY COLUMN `code`'))).toBe(true);
+  });
 });

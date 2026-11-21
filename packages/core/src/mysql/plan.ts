@@ -1040,17 +1040,30 @@ export const mysqlPlan = (from: Model, to: Model, opts?: MysqlPlanOptions): Step
 
     // 9.0 若表级默认字符集或排序规则变更，先更新表默认字符集，使后续 MODIFY COLUMN / ADD COLUMN 自动继承新默认值
     if (tableCharsetChangedTables.has(t.id)) {
-      const cs = assertSafeMysqlOption(t.ext?.mysql?.charset ?? 'utf8mb4', '字符集名');
-      const coll = t.ext?.mysql?.collation
-        ? assertSafeMysqlOption(t.ext.mysql.collation, '排序规则名')
-        : cs.toLowerCase() === 'utf8mb4'
-          ? 'utf8mb4_0900_ai_ci'
-          : null;
-      emit(
-        'alterTable',
-        t.name,
-        `ALTER TABLE ${mysqlIdent(t.name)} DEFAULT CHARACTER SET ${cs}${coll ? ` COLLATE ${coll}` : ''}`,
-      );
+      const rawCs = t.ext?.mysql?.charset;
+      const rawColl = t.ext?.mysql?.collation;
+      if (rawCs) {
+        const cs = assertSafeMysqlOption(rawCs, '字符集名');
+        const coll = rawColl
+          ? assertSafeMysqlOption(rawColl, '排序规则名')
+          : cs.toLowerCase() === 'utf8mb4'
+            ? 'utf8mb4_0900_ai_ci'
+            : null;
+        emit(
+          'alterTable',
+          t.name,
+          `ALTER TABLE ${mysqlIdent(t.name)} DEFAULT CHARACTER SET ${cs}${coll ? ` COLLATE ${coll}` : ''}`,
+        );
+      } else if (rawColl) {
+        const coll = assertSafeMysqlOption(rawColl, '排序规则名');
+        emit('alterTable', t.name, `ALTER TABLE ${mysqlIdent(t.name)} DEFAULT COLLATE ${coll}`);
+      } else {
+        emit(
+          'alterTable',
+          t.name,
+          `ALTER TABLE ${mysqlIdent(t.name)} DEFAULT CHARACTER SET utf8mb4 COLLATE utf8mb4_0900_ai_ci`,
+        );
+      }
     }
 
     // 计算当前仍在表上且未删的列
