@@ -8,6 +8,7 @@ import {
   INSTANCE_LEVEL_DESCRIPTION,
   type Model,
   type Obj,
+  type PlanOptions,
   plan,
   type Step,
 } from '@dowel/core';
@@ -42,7 +43,7 @@ export interface Shadow {
   /** 在空的影子库里执行一段已检查过的 DDL（assertImportable），读出结构并导入成 IR（只读 schema 范围内的） */
   importSql(sql: ImportableSql): Promise<Model>;
   /** 闭环验证 from → to，并分析每一步的锁和重写 */
-  verify(from: Model, to: Model): Promise<VerifyReport>;
+  verify(from: Model, to: Model, opts?: PlanOptions): Promise<VerifyReport>;
   /**
    * 闭环验证**给定的脚本**（冻结的 up / down，可能被人工改过），不重新 plan：建 from → 执行 up → 必须等于 to →
    * 执行 down → 必须等于 from，并分析 up 每一步的锁和重写。
@@ -303,17 +304,29 @@ export const shadowOps = (
     try {
       const r = await verifyScripts(d, from, to, up, down, options);
       const risk = options?.skipRisk ? { risks: [] } : await risksOf(d, from, r.up, statementTimeoutMs);
-      return { ok: !r.upDiff.length && !r.downDiff.length, ...r, ...risk, error: null };
+      return {
+        ok: !r.upDiff.length && !r.downDiff.length,
+        ...r,
+        ...risk,
+        error: null,
+        shadowMajor: r.shadowMajor,
+      };
     } catch (e) {
       return failedReport(e, statementTimeoutMs);
     }
   },
-  verify: async (from: Model, to: Model): Promise<VerifyReport> => {
+  verify: async (from: Model, to: Model, opts?: PlanOptions): Promise<VerifyReport> => {
     const d = await db();
     try {
-      const r = await verify(d, from, to);
+      const r = await verify(d, from, to, opts);
       const risk = await risksOf(d, from, r.up, statementTimeoutMs);
-      return { ok: !r.upDiff.length && !r.downDiff.length, ...r, ...risk, error: null };
+      return {
+        ok: !r.upDiff.length && !r.downDiff.length,
+        ...r,
+        ...risk,
+        error: null,
+        shadowMajor: r.shadowMajor,
+      };
     } catch (e) {
       return failedReport(e, statementTimeoutMs);
     }

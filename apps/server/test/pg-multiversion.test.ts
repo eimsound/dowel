@@ -441,6 +441,127 @@ describe('PG 多版本（15–19）服务端全链路', () => {
     }
   });
 
+  test('严格安全规则：prod=PG 15（无影子库）+ dev=null 未探测环境，不得借未探测环境绕过最低版本门禁', async () => {
+    const pid = await newProject('missing-lowest-with-null-env');
+    await addTable(created.rooms, db, pid, 'orders');
+
+    const orig = created.shadows.forProjectVersions.bind(created.shadows);
+    created.shadows.forProjectVersions = async () => ({
+      targetPgMajor: 15,
+      envPgMajors: [15], // 只有一个已知版本 15，另一环境 engine_version_num = null
+      skippedMajors: [{ major: 15, reason: '环境“prod15”是生产环境，默认不在同一实例上建影子库' }],
+      entries: [
+        {
+          major: null,
+          envId: 'e-dev-null',
+          label: 'dev：app_dowel',
+          shadow: stubShadow(async () => ({ ...okVerifyReport(true), shadowMajor: 18 })),
+        },
+      ],
+    });
+    try {
+      const pub = await call<VersionCreated>('POST', `/api/projects/${pid}/versions`, { name: 'v1' });
+      expect(pub.status).toBe(201);
+      expect(pub.data.verified).toBe(false);
+      expect(pub.data.unverifiedReason).toContain('PG 15');
+
+      const d = await call<VersionDetail>('GET', `/api/projects/${pid}/versions/${pub.data.id}`);
+      expect(d.data.verifiedAt).toBeNull();
+      expect(d.data.verifyReport?.missingTargetMajor).toBe(15);
+
+      const rev = await call<VersionVerifyResponse>(
+        'POST',
+        `/api/projects/${pid}/versions/${pub.data.id}/verify`,
+      );
+      expect(rev.status).toBe(200);
+      expect(rev.data.verifiedAt).toBeNull();
+      expect(rev.data.report.missingTargetMajor).toBe(15);
+    } finally {
+      created.shadows.forProjectVersions = orig;
+    }
+  });
+
+  test('严格安全规则：prod=PG 15 配置了 PG 18 独立 shadowUrl（版本错配）时，不得误记为 PG 15 通过', async () => {
+    const pid = await newProject('shadow-version-mismatch');
+    await addTable(created.rooms, db, pid, 'orders');
+
+    const orig = created.shadows.forProjectVersions.bind(created.shadows);
+    created.shadows.forProjectVersions = async () => ({
+      targetPgMajor: 15,
+      envPgMajors: [15],
+      skippedMajors: [],
+      entries: [
+        {
+          major: 15,
+          envId: 'e-prod-15',
+          label: 'prod15：wrong_pg18_shadow',
+          // 实测 shadowMajor 为 18，与环境记录的 PG 15 不一致
+          shadow: stubShadow(async () => ({ ...okVerifyReport(true), shadowMajor: 18 })),
+        },
+      ],
+    });
+    try {
+      const pub = await call<VersionCreated>('POST', `/api/projects/${pid}/versions`, { name: 'v1' });
+      expect(pub.status).toBe(201);
+      expect(pub.data.verified).toBe(false);
+      expect(pub.data.unverifiedReason).toContain('PG 18');
+      expect(pub.data.unverifiedReason).toContain('PG 15');
+
+      const d = await call<VersionDetail>('GET', `/api/projects/${pid}/versions/${pub.data.id}`);
+      expect(d.data.verifiedAt).toBeNull();
+      expect(d.data.verifyReport?.missingTargetMajor).toBe(15);
+      expect(d.data.verifyReport?.targets).toEqual([
+        {
+          major: 18,
+          shadow: 'prod15：wrong_pg18_shadow',
+          ok: true,
+          error: null,
+          upDiffCount: 0,
+          downDiffCount: 0,
+        },
+      ]);
+    } finally {
+      created.shadows.forProjectVersions = orig;
+    }
+  });
+
+  test('POST /api/projects/:pid/verify 透传项目 targetPgMajor，拦截不兼容特性', async () => {
+    const pid = await newProject('verify-endpoint-target-major');
+    await insertEnvRow({
+      id: 'e-verify-16',
+      pid,
+      name: 'prod16',
+      engineVersion: '16.4',
+      engineVersionNum: 160004,
+    });
+    await addTable(created.rooms, db, pid, 'orders');
+
+    let seenMajor: number | null | undefined;
+    const origForProject = created.shadows.forProject.bind(created.shadows);
+    created.shadows.forProject = async () => ({
+      label: 'prod16：shadow',
+      shadow: {
+        importSql: async () => {
+          throw new Error('unused');
+        },
+        verify: async (_from, _to, opts) => {
+          seenMajor = opts?.pgMajor;
+          return okVerifyReport(true);
+        },
+        verifyScripts: async () => okVerifyReport(true),
+        canonicalize: async () => [],
+        close: async () => {},
+      } as Shadow,
+    });
+    try {
+      const res = await call('POST', `/api/projects/${pid}/verify`, { from: 'empty', to: 'head' });
+      expect(res.status).toBe(200);
+      expect(seenMajor).toBe(16);
+    } finally {
+      created.shadows.forProject = origForProject;
+    }
+  });
+
   test('Shadows.forProjectVersions 按显式 shadowUrl > 非生产 > 允许同实例生产优先级分组选影', async () => {
     const pid = await newProject('shadow-priority');
     await insertEnvRow({

@@ -1,6 +1,8 @@
 // 闭环验证：迁移后的结构必须等于直接按目标版本建出来的结构；反向迁移后必须回到原来的结构。
 import {
+  all,
   createAll,
+  find,
   findInstanceLevelStep,
   INSTANCE_LEVEL_DESCRIPTION,
   isNontransactionalSql,
@@ -90,6 +92,35 @@ export const build = async (db: Db, m: Model, opts?: PlanOptions): Promise<Snaps
   return readSnapshot(db);
 };
 
+/**
+ * 对模型中非显式命名的 NOT NULL 列（notNullNameMode !== 'explicit'），将快照里该列的 notNullName 归一为 null：
+ * PG 15–17 冻结的 renameTable/renameColumn 脚本不含 PG 18+ 的 RENAME CONSTRAINT ... NOT NULL，
+ * 在 PG 18/19 影子库重放后仅推导约束名会残留旧名；归一化后仍严格比对 notNull 布尔值与 explicit 显式约束名。
+ */
+const normalizeDerivedNotNullNames = (snap: Snapshot, model: Model): Snapshot => {
+  const explicitCols = new Set<string>();
+  for (const col of all(model, 'column')) {
+    if (!col.notNull || col.notNullNameMode !== 'explicit') continue;
+    const table = find(model, col.parent);
+    if (table?.kind !== 'table') continue;
+    const schema = find(model, table.parent);
+    if (schema?.kind !== 'schema') continue;
+    explicitCols.add(`${schema.name}.${table.name}\0${col.name}`);
+  }
+  const tables: Snapshot['tables'] = {};
+  for (const [tableKey, table] of Object.entries(snap.tables)) {
+    const columns: Snapshot['tables'][string]['columns'] = {};
+    for (const [colName, col] of Object.entries(table.columns)) {
+      columns[colName] =
+        col.notNullName !== null && !explicitCols.has(`${tableKey}\0${colName}`)
+          ? { ...col, notNullName: null }
+          : col;
+    }
+    tables[tableKey] = { ...table, columns };
+  }
+  return { ...snap, tables };
+};
+
 export interface VerifyResult {
   up: Step[];
   down: Step[];
@@ -97,6 +128,8 @@ export interface VerifyResult {
   upDiff: string[];
   /** 反向迁移后与原版本的差异 */
   downDiff: string[];
+  /** 实际执行本次验证的影子库 PG 大版本（由 SHOW server_version_num 实测推导） */
+  shadowMajor?: number | null;
 }
 
 /** 闭环验证（只用一个影子库，依次建目标版本、建原版本、执行迁移、执行反向迁移）。任一步执行失败抛出 StepError。 */
@@ -104,8 +137,7 @@ export const verify = async (db: Db, from: Model, to: Model, opts?: PlanOptions)
   const shadowMajor = await readShadowPgMajor(db);
   const planMajor = opts?.pgMajor ?? shadowMajor;
   const planOpts: PlanOptions | undefined = planMajor !== null ? { pgMajor: planMajor } : undefined;
-  const buildOpts: PlanOptions | undefined =
-    (opts?.pgMajor ?? shadowMajor) !== null ? { pgMajor: opts?.pgMajor ?? shadowMajor } : undefined;
+  const buildOpts: PlanOptions | undefined = shadowMajor !== null ? { pgMajor: shadowMajor } : undefined;
   const up = plan(from, to, planOpts);
   const down = plan(to, from, planOpts);
   assertNoInstanceLevel([...up, ...down]); // 规划器正常不会生成，兜底
@@ -115,7 +147,19 @@ export const verify = async (db: Db, from: Model, to: Model, opts?: PlanOptions)
   const afterUp = await readSnapshot(db);
   await runSteps(db, down);
   const afterDown = await readSnapshot(db);
-  return { up, down, upDiff: diffSnapshots(afterUp, toSnap), downDiff: diffSnapshots(afterDown, fromSnap) };
+  return {
+    up,
+    down,
+    upDiff: diffSnapshots(
+      normalizeDerivedNotNullNames(afterUp, to),
+      normalizeDerivedNotNullNames(toSnap, to),
+    ),
+    downDiff: diffSnapshots(
+      normalizeDerivedNotNullNames(afterDown, from),
+      normalizeDerivedNotNullNames(fromSnap, from),
+    ),
+    shadowMajor,
+  };
 };
 
 /** 冻结脚本里的一步 → 带序号的 Step（kind 固定为 frozen，target 是“up#3”这样的位置，用于报错定位） */
@@ -152,19 +196,32 @@ export const verifyScripts = async (
   const downSteps = frozenSteps('down', down);
   // 任何一步（包括建 from / to）执行之前先检查整份脚本：有实例级语句就一条都不执行
   assertNoInstanceLevel([...upSteps, ...downSteps]);
-  const pgMajor = options.pgMajor !== undefined ? options.pgMajor : await readShadowPgMajor(db);
+  const shadowMajor = await readShadowPgMajor(db);
+  const pgMajor = options.pgMajor !== undefined ? options.pgMajor : shadowMajor;
   const buildOpts: PlanOptions | undefined = pgMajor !== null ? { pgMajor } : undefined;
   const toSnap = await build(db, to, buildOpts);
   const fromSnap = await build(db, from, buildOpts);
   await runSteps(db, upSteps);
   const afterUp = await readSnapshot(db);
-  const upDiff = diffSnapshots(afterUp, toSnap);
+  const upDiff = diffSnapshots(
+    normalizeDerivedNotNullNames(afterUp, to),
+    normalizeDerivedNotNullNames(toSnap, to),
+  );
   // 升级没有到达目标结构时，回滚的检查没有意义（起点就不对，回滚脚本还可能因此报错、盖住升级的差异），先把升级的差异报出来
   if (options.checkDown === false || upDiff.length)
-    return { up: upSteps, down: downSteps, upDiff, downDiff: [] };
+    return { up: upSteps, down: downSteps, upDiff, downDiff: [], shadowMajor };
   await runSteps(db, downSteps);
   const afterDown = await readSnapshot(db);
-  return { up: upSteps, down: downSteps, upDiff, downDiff: diffSnapshots(afterDown, fromSnap) };
+  return {
+    up: upSteps,
+    down: downSteps,
+    upDiff,
+    downDiff: diffSnapshots(
+      normalizeDerivedNotNullNames(afterDown, from),
+      normalizeDerivedNotNullNames(fromSnap, from),
+    ),
+    shadowMajor,
+  };
 };
 
 // ───── 锁和重写分析（01-research.md 2.4 的方法） ─────

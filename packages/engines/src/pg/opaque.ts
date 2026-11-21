@@ -1,5 +1,7 @@
 // 读取不透明对象（域、复合类型、函数、聚合、视图、物化视图、触发器、策略、排他约束）。
 // DDL 一律取引擎输出的规范形式；依赖从 pg_depend 读出，换算成快照里的名字，导入时再换成 IR 的 ID。
+import { makeObjectName } from '@dowel/core';
+
 import type { Db } from './db.ts';
 import { key, NOT_EXT, type TableSnap, USER_NS, userNs } from './snapshot.ts';
 
@@ -63,7 +65,10 @@ export const readOpaques = async (
     return t ? key(t.schema, t.name) : null;
   };
 
-  // 域（PG 15/16 不把域 NOT NULL 存入 pg_constraint，只记在 pg_type.typnotnull；PG 17+ 存入 pg_constraint contype='n'）
+  // 域：PG 15/16 仅把域 NOT NULL 记在 pg_type.typnotnull，PG 17+ 同时写入 pg_constraint(contype='n')。
+  // 按 k.contype 精确区分（避免正则误伤 CHECK (VALUE IS NOT NULL)）：
+  // 默认命名的域 NOT NULL 约束（makeObjectName(name, null, 'not_null')）统一排除并由 r.notnull 渲染为 NOT NULL，
+  // 确保 PG 15–19 产出的 opaque.ddl 跨版本完全一致；仅用户显式自定义命名的 contype='n' 约束保留在 cons 中。
   for (const r of await db.query<{
     oid: number;
     schema: string;
@@ -72,7 +77,7 @@ export const readOpaques = async (
     collation: string | null;
     def: string | null;
     notnull: boolean;
-    cons: string[];
+    cons: { name: string; type: string; def: string }[];
     comment: string | null;
   }>(
     `select t.oid::int as oid, n.nspname as schema, t.typname as name, format_type(t.typbasetype, t.typtypmod) as base,
@@ -82,8 +87,12 @@ export const readOpaques = async (
             end as collation,
             t.typdefault as def,
             t.typnotnull as notnull,
-            array(select 'CONSTRAINT ' || quote_ident(k.conname) || ' ' || pg_get_constraintdef(k.oid)
-                    from pg_constraint k where k.contypid = t.oid order by k.conname) as cons,
+            coalesce(
+              (select json_agg(json_build_object('name', k.conname, 'type', k.contype::text, 'def', pg_get_constraintdef(k.oid))
+                               order by k.conname)
+                 from pg_constraint k where k.contypid = t.oid),
+              '[]'::json
+            ) as cons,
             obj_description(t.oid, 'pg_type') as comment
        from pg_type t join pg_namespace n on n.oid = t.typnamespace join pg_type b on b.oid = t.typbasetype
       where t.typtype = 'd' and ${ns} and ${NOT_EXT('pg_type', 't.oid')}`,
@@ -92,9 +101,18 @@ export const readOpaques = async (
     let ddl = `CREATE DOMAIN ${q} AS ${r.base}`;
     if (r.collation) ddl += ` COLLATE ${r.collation}`;
     if (r.def) ddl += ` DEFAULT ${r.def}`;
-    const hasNotNull = r.cons.some((c) => /\bNOT\s+NULL\b/i.test(c));
-    if (r.notnull && !hasNotNull) ddl += ' NOT NULL';
-    for (const c of r.cons) ddl += ` ${c}`;
+    const defaultNnName = makeObjectName(r.name, null, 'not_null');
+    let hasExplicitNotNull = false;
+    const keptCons: string[] = [];
+    for (const c of r.cons) {
+      if (c.type === 'n') {
+        if (c.name === defaultNnName) continue;
+        hasExplicitNotNull = true;
+      }
+      keptCons.push(`CONSTRAINT ${qi(c.name)} ${c.def}`);
+    }
+    if (r.notnull && !hasExplicitNotNull) ddl += ' NOT NULL';
+    for (const c of keptCons) ddl += ` ${c}`;
     add(
       {
         objType: 'domain',

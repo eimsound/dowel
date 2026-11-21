@@ -121,7 +121,10 @@ export const Model = () => {
         .join('\n\n');
     } catch (e) {
       const msg = e instanceof Error ? e.message : String(e);
-      return `-- ${msg}`;
+      return msg
+        .split('\n')
+        .map((line) => `-- ${line}`)
+        .join('\n');
     }
   }, [model, tab, project.targetPgMajor]);
   const onMove = useCallback((l: Parameters<typeof ws.move>[0]) => !readOnly && ws.move(l), [ws, readOnly]);

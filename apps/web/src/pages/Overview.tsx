@@ -77,21 +77,20 @@ export const Overview = () => {
           </dd>
           <dt className="text-text-2">{t('ov.role')}</dt>
           <dd className="m-0">{t(`projects.role.${project.role}`)}</dd>
-          <dt className="text-text-2">{t('ov.targetPg')}</dt>
-          <dd className="m-0 flex flex-wrap items-center gap-2">
-            {project.targetPgMajor !== null ? (
-              <>
+          {(project.envPgMajors.length > 1 ||
+            (project.targetPgMajor !== null && project.targetPgMajor < 18)) && (
+            <>
+              <dt className="text-text-2">{t('ov.targetPg')}</dt>
+              <dd className="m-0 flex flex-wrap items-center gap-2">
                 <span className="font-mono">PostgreSQL {project.targetPgMajor}+</span>
                 {project.envPgMajors.length > 1 && (
                   <span className="font-mono text-xs text-text-3">
                     ({project.envPgMajors.map((v) => `PG ${v}`).join(' · ')})
                   </span>
                 )}
-              </>
-            ) : (
-              <span className="text-text-2">{t('ov.targetPgUnknown')}</span>
-            )}
-          </dd>
+              </dd>
+            </>
+          )}
         </dl>
 
         <div className="grid grid-cols-2 gap-6 max-[1100px]:grid-cols-1">

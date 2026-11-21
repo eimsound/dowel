@@ -183,6 +183,7 @@ const EnvForm = ({ pid }: { pid: string }) => {
       void qc.invalidateQueries({ queryKey: ['project', pid] });
       void qc.invalidateQueries({ queryKey: ['activity', pid] });
       void qc.invalidateQueries({ queryKey: ['migration', pid] });
+      void qc.invalidateQueries({ queryKey: ['ddl', pid] });
     },
     onError: (e) => {
       // 这个库里的项目由另一个实例认领：弹出认领确认（说明后果），确认后带 claim: true 重新提交
@@ -636,6 +637,9 @@ const EnvironmentDetailView = ({ eid }: { eid: string }) => {
 
   const refreshState = () => {
     void qc.invalidateQueries({ queryKey: ['envs', pid] });
+    void qc.invalidateQueries({ queryKey: ['project', pid] });
+    void qc.invalidateQueries({ queryKey: ['migration', pid] });
+    void qc.invalidateQueries({ queryKey: ['ddl', pid] });
     void qc.invalidateQueries({ queryKey: ['env-status', pid, eid] });
     void qc.invalidateQueries({ queryKey: ['env-history', pid, eid] });
   };
@@ -654,6 +658,7 @@ const EnvironmentDetailView = ({ eid }: { eid: string }) => {
       void qc.invalidateQueries({ queryKey: ['envs', pid] });
       void qc.invalidateQueries({ queryKey: ['project', pid] });
       void qc.invalidateQueries({ queryKey: ['migration', pid] });
+      void qc.invalidateQueries({ queryKey: ['ddl', pid] });
     },
     onError: (e) => setResult({ ok: false, text: e.message }),
   });
@@ -701,6 +706,9 @@ const EnvironmentDetailView = ({ eid }: { eid: string }) => {
       void qc.invalidateQueries({ queryKey: ['envs', pid] });
       void qc.invalidateQueries({ queryKey: ['project', pid] });
       void qc.invalidateQueries({ queryKey: ['migration', pid] });
+      void qc.invalidateQueries({ queryKey: ['ddl', pid] });
+      void qc.invalidateQueries({ queryKey: ['activity', pid] });
+      void invalidateRequests(qc);
       toast(t('envp.deleted', { name: env?.name ?? '' }));
       setConfirm(false);
       void nav({ to: '/project/$owner/$project/environments', params });

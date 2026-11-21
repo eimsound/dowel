@@ -64,11 +64,30 @@ const unresolvable = (e: unknown): DiffResult => ({
   items: [{ kind: 'unresolvable', target: '', sql: e instanceof Error ? e.message : String(e) }],
 });
 
+/**
+ * 当目标模型某列为推导 NOT NULL 约束名（notNullNameMode === 'derived'）且线上快照对应列同样为 NOT NULL 时，
+ * 将线上导入列的 notNullName 对齐到目标模型：消除 PG 15–17 冻结的 renameTable/renameColumn 脚本
+ * 在 PG 18/19 目标库执行后因旧默认约束名残留触发的假漂移与 readback_mismatch；显式约束名（explicit）仍严格比对。
+ */
+const alignDerivedNotNullNames = (live: Model, target: Model): Model => {
+  let objects: Model['objects'] | null = null;
+  for (const tObj of Object.values(target.objects)) {
+    if (tObj.kind !== 'column' || !tObj.notNull || tObj.notNullNameMode !== 'derived') continue;
+    const lObj = live.objects[tObj.id];
+    if (lObj?.kind !== 'column' || !lObj.notNull) continue;
+    if (lObj.notNullName === tObj.notNullName && lObj.notNullNameMode === 'derived') continue;
+    objects ??= { ...live.objects };
+    objects[tObj.id] = { ...lObj, notNullName: tObj.notNullName, notNullNameMode: 'derived' };
+  }
+  return objects ? { ...live, objects } : live;
+};
+
 /** 线上结构 → 版本模型的差异；total = 0 表示相等 */
 export const diffAgainst = (snapshot: Snapshot, model: Model): DiffResult => {
   try {
     const pgMajor = pgMajorOf(snapshot.version);
-    return planDiff(importLive(snapshot, model), model, pgMajor !== null ? { pgMajor } : undefined);
+    const live = alignDerivedNotNullNames(importLive(snapshot, model), model);
+    return planDiff(live, model, pgMajor !== null ? { pgMajor } : undefined);
   } catch (e) {
     // 线上结构怪到连导入都做不了：也算不一致，把原因当作一项差异
     return unresolvable(e);

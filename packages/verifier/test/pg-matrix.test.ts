@@ -11,6 +11,8 @@ import {
   MIN_PG_MAJOR,
   PlanError,
   plan,
+  renameColumn,
+  renameTable,
   setNotNull,
 } from '@dowel/core';
 import { diffSnapshots, importSnapshot, readSnapshot, toScriptSteps } from '@dowel/engines';
@@ -18,7 +20,15 @@ import { diffAgainst } from '@dowel/executor';
 import { describe, expect, test } from 'vitest';
 
 import { PG_URL, useTestDb } from '../../../test/pg.ts';
-import { analyze, build, readShadowPgMajor, resetShadow, verify, verifyScripts } from '../src/index.ts';
+import {
+  analyze,
+  build,
+  readShadowPgMajor,
+  resetShadow,
+  runSteps,
+  verify,
+  verifyScripts,
+} from '../src/index.ts';
 
 const conn = useTestDb('pg_matrix');
 
@@ -89,22 +99,74 @@ describe.skipIf(!PG_URL)('PG 15–19 多版本矩阵验证', () => {
     expect(r.downDiff).toEqual([]);
   });
 
-  test('CREATE DOMAIN ... NOT NULL 在 PG 15/16 与 PG 17+ 均往返一致', async () => {
+  test('按 PG 15 冻结含 renameTable / renameColumn（含 NOT NULL 列）的迁移脚本在 PG 15–19 验证通过且零漂移', async () => {
+    const db = conn();
+    const major = (await readShadowPgMajor(db))!;
+    const { m: m1, pub } = baseModel();
+    const t = createTable(m1, pub, 'legacy_orders');
+    const id = addColumn(m1, t, { name: 'id', type: 'integer', notNull: true });
+    addPrimaryKey(m1, t, [id]);
+    const oldCol = addColumn(m1, t, { name: 'buyer_email', type: 'text', notNull: true });
+
+    const m2 = structuredClone(m1);
+    renameTable(m2, t, 'orders');
+    renameColumn(m2, oldCol, 'customer_email');
+
+    // 按 PG 15 冻结：不含 PG 18+ 的 RENAME CONSTRAINT ... NOT NULL
+    const upSteps = plan(m1, m2, { pgMajor: 15 });
+    const downSteps = plan(m2, m1, { pgMajor: 15 });
+    expect(upSteps.some((s) => /RENAME CONSTRAINT .*not_null/i.test(s.sql))).toBe(false);
+
+    // 1) verifyScripts 在 PG 15–19（尤其 PG 18/19）不得报 derived notNullName 假阴，且返回实测 shadowMajor
+    const r = await verifyScripts(db, m1, m2, toScriptSteps(upSteps), toScriptSteps(downSteps));
+    expect(r.shadowMajor).toBe(major);
+    expect(r.upDiff).toEqual([]);
+    expect(r.downDiff).toEqual([]);
+
+    // 2) verify(db, m1, m2, { pgMajor: 15 }) 跨版本预览验证也必须通过
+    const vr = await verify(db, m1, m2, { pgMajor: 15 });
+    expect(vr.shadowMajor).toBe(major);
+    expect(vr.upDiff).toEqual([]);
+    expect(vr.downDiff).toEqual([]);
+
+    // 3) 模拟线上执行按 PG 15 冻结的 up 脚本，执行器 diffAgainst 读回比对必须零漂移（无 readback_mismatch）
+    await build(db, m1);
+    await runSteps(db, upSteps);
+    const afterUpSnap = await readSnapshot(db);
+    expect(diffAgainst(afterUpSnap, m2)).toEqual({ total: 0, items: [] });
+  });
+
+  test('CREATE DOMAIN ... NOT NULL 与 CHECK (VALUE IS NOT NULL) 在 PG 15–19 产出一致 DDL 且往返通过', async () => {
     const db = conn();
     await resetShadow(db);
     await db.exec('CREATE SCHEMA public');
     await db.exec(`
       SET search_path = public;
+      CREATE DOMAIN pos_int AS integer NOT NULL;
+      CREATE DOMAIN non_null_text AS text NOT NULL CHECK (VALUE IS NOT NULL);
       CREATE DOMAIN pos_amount AS numeric(12, 2) NOT NULL DEFAULT 0 CHECK (VALUE >= 0);
       CREATE TABLE invoices (
         id int PRIMARY KEY,
+        qty pos_int,
+        note non_null_text,
         amount pos_amount
       );
     `);
     const s1 = await readSnapshot(db);
-    const domain = Object.values(s1.opaques).find((o) => o.objType === 'domain' && o.name === 'pos_amount');
-    expect(domain).toBeDefined();
-    expect(domain!.ddl[0]).toMatch(/\bNOT\s+NULL\b/i);
+    const posInt = Object.values(s1.opaques).find((o) => o.objType === 'domain' && o.name === 'pos_int');
+    const nonNullText = Object.values(s1.opaques).find(
+      (o) => o.objType === 'domain' && o.name === 'non_null_text',
+    );
+    const posAmount = Object.values(s1.opaques).find(
+      (o) => o.objType === 'domain' && o.name === 'pos_amount',
+    );
+    expect(posInt?.ddl[0]).toBe('CREATE DOMAIN public.pos_int AS integer NOT NULL');
+    expect(nonNullText?.ddl[0]).toBe(
+      'CREATE DOMAIN public.non_null_text AS text NOT NULL CONSTRAINT non_null_text_check CHECK ((VALUE IS NOT NULL))',
+    );
+    expect(posAmount?.ddl[0]).toBe(
+      'CREATE DOMAIN public.pos_amount AS numeric(12,2) DEFAULT 0 NOT NULL CONSTRAINT pos_amount_check CHECK ((VALUE >= (0)::numeric))',
+    );
 
     const m = importSnapshot(s1);
     const s2 = await build(db, m);
@@ -144,7 +206,7 @@ describe.skipIf(!PG_URL)('PG 15–19 多版本矩阵验证', () => {
 
     const { m: target, pub } = baseModel();
     const t = createTable(target, pub, 'items');
-    const id = addColumn(target, t, { name: 'id', type: 'int', notNull: true });
+    const id = addColumn(target, t, { name: 'id', type: 'integer', notNull: true });
     addPrimaryKey(target, t, [id]);
     addColumn(target, t, { name: 'title', type: 'text', notNull: true });
 

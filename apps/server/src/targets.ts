@@ -442,7 +442,7 @@ export const pgShadow = (shadowUrl: string, schemas?: string[] | null, guard?: C
   };
   return {
     importSql: (sql) => run((ops) => ops.importSql(sql)),
-    verify: (from, to): Promise<VerifyReport> => run((ops) => ops.verify(from, to)),
+    verify: (from, to, opts): Promise<VerifyReport> => run((ops) => ops.verify(from, to, opts)),
     verifyScripts: (from, to, up, down, options): Promise<VerifyReport> =>
       run((ops) => ops.verifyScripts(from, to, up, down, options)),
     canonicalize: (prev, next) => run((ops) => ops.canonicalize(prev, next)),

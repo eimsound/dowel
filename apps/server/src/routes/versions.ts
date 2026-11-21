@@ -158,6 +158,7 @@ const verifyAcrossVersions = async (
   const targets: VerifyTargetReport[] = [];
   const passedShadows: { major: number | null; label: string }[] = [];
   const runtimeSkipped = new Map<number | null, string>();
+  const mismatchReasons = new Map<number, string>();
   let primaryReport: VerifyReport | null = null;
   let ranRisk = false;
 
@@ -179,9 +180,18 @@ const verifyAcrossVersions = async (
       ranRisk = true;
     }
 
-    if (entry.major !== null) {
+    // 以影子库实测大版本为准；若独立 shadowUrl 的实际 PG 大版本与环境声称的不一致，不得记作覆盖了目标大版本
+    const actualMajor = report.shadowMajor !== undefined ? report.shadowMajor : entry.major;
+    if (entry.major !== null && actualMajor !== null && actualMajor !== entry.major) {
+      mismatchReasons.set(
+        entry.major,
+        `影子库实际版本为 PG ${actualMajor}（${entry.label}），与目标环境 PG ${entry.major} 不一致，不能作为 PG ${entry.major} 的验证依据`,
+      );
+    }
+
+    if (actualMajor !== null) {
       targets.push({
-        major: entry.major,
+        major: actualMajor,
         shadow: entry.label,
         ok: report.ok,
         error: report.error?.message ?? null,
@@ -191,21 +201,21 @@ const verifyAcrossVersions = async (
     }
 
     if (!report.ok) {
-      const shadowLabel = entry.major !== null ? `PG ${entry.major}（${entry.label}）` : entry.label;
+      const shadowLabel = actualMajor !== null ? `PG ${actualMajor}（${entry.label}）` : entry.label;
       const withPrefix =
-        entry.major !== null && report.error
+        actualMajor !== null && report.error
           ? {
               ...report,
               error: {
                 ...report.error,
-                message: `PG ${entry.major} 验证失败：${report.error.message}`,
+                message: `PG ${actualMajor} 验证失败：${report.error.message}`,
               },
             }
           : report;
       const extra = targets.length ? { targets } : undefined;
       return {
         kind: 'failed',
-        failedMajor: entry.major,
+        failedMajor: actualMajor,
         report: {
           ...withPrefix,
           shadow: shadowLabel,
@@ -215,7 +225,7 @@ const verifyAcrossVersions = async (
       };
     }
 
-    passedShadows.push({ major: entry.major, label: entry.label });
+    passedShadows.push({ major: actualMajor, label: entry.label });
   }
 
   // 所有候选影子库在运行期都遇到 ShadowError：回退为基础设施不可用
@@ -230,31 +240,32 @@ const verifyAcrossVersions = async (
       ? passedShadows[0]!.label
       : passedShadows.map((s) => (s.major !== null ? `PG ${s.major}（${s.label}）` : s.label)).join(' · ');
 
-  // 严格安全规则：项目存在多个 PG 大版本时，若最低目标版本 targetPgMajor 缺少可用影子库，不得仅凭高版本通过就标为已验证
-  if (selection.envPgMajors.length > 1 && selection.targetPgMajor !== null) {
-    const targetCovered = passedShadows.some((s) => s.major === selection.targetPgMajor);
-    if (!targetCovered) {
-      const skippedReason =
-        runtimeSkipped.get(selection.targetPgMajor) ??
-        selection.skippedMajors.find((s) => s.major === selection.targetPgMajor)?.reason;
-      const reason = skippedReason
+  // 严格安全规则：只要项目存在已记录版本的最低目标 targetPgMajor，且本次实测通过的影子库集合中未覆盖该大版本
+  // （包括多版本缺低版本影子库、存在未探测版本环境、或独立 shadowUrl 与目标库大版本错配），均不得标记为已验证
+  if (selection.targetPgMajor !== null && !passedShadows.some((s) => s.major === selection.targetPgMajor)) {
+    const mismatch = mismatchReasons.get(selection.targetPgMajor);
+    const skippedReason =
+      runtimeSkipped.get(selection.targetPgMajor) ??
+      selection.skippedMajors.find((s) => s.major === selection.targetPgMajor)?.reason;
+    const reason = mismatch
+      ? `${mismatch}。请为 PG ${selection.targetPgMajor} 环境配置同大版本的独立影子库或允许使用同实例影子库`
+      : skippedReason
         ? `缺少 PG ${selection.targetPgMajor} 影子库，无法验证最低目标版本兼容性（${skippedReason}）。请为 PG ${selection.targetPgMajor} 环境配置独立影子库或允许使用同实例影子库`
         : `缺少 PG ${selection.targetPgMajor} 影子库，无法验证最低目标版本兼容性。请为 PG ${selection.targetPgMajor} 环境配置独立影子库或允许使用同实例影子库`;
-      const incompleteReport: VerifyReport = {
-        ...primaryReport,
-        ok: false,
-        error: { step: null, message: reason },
-      };
-      return {
-        kind: 'missing_target',
-        missingMajor: selection.targetPgMajor,
-        reason,
-        stored: storedReport(incompleteReport, shadowSummary, {
-          targets: targets.length ? targets : undefined,
-          missingTargetMajor: selection.targetPgMajor,
-        }),
-      };
-    }
+    const incompleteReport: VerifyReport = {
+      ...primaryReport,
+      ok: false,
+      error: { step: null, message: reason },
+    };
+    return {
+      kind: 'missing_target',
+      missingMajor: selection.targetPgMajor,
+      reason,
+      stored: storedReport(incompleteReport, shadowSummary, {
+        targets: targets.length ? targets : undefined,
+        missingTargetMajor: selection.targetPgMajor,
+      }),
+    };
   }
 
   return {
@@ -602,7 +613,11 @@ export const registerVersions = (app: Hono<Env>, ctx: AppContext) => {
     const b = await body(c, verifyRequestSchema);
     const to = await resolve(a.pid, a.branch, b.to);
     const from = await resolve(a.pid, a.branch, b.from, to, a.schemas);
+    const targetPgMajor = await projectTargetPgMajor(db, a.pid);
     const s = await shadows.forProject(a.pid, b.env);
-    return c.json<VerifyResponse>({ ...(await s.shadow.verify(from, to)), shadow: s.label });
+    return c.json<VerifyResponse>({
+      ...(await s.shadow.verify(from, to, targetPgMajor !== null ? { pgMajor: targetPgMajor } : undefined)),
+      shadow: s.label,
+    });
   });
 };

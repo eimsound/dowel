@@ -577,6 +577,8 @@ export const verifyReportSchema = z.object({
   /** 风险分析没有完成时的原因，只存原因本身（例如“执行超时…”），“风险分析没有完成”这个前缀由界面的标题 / i18n 模板提供；不影响 ok，但界面要如实显示，不能当成“没有风险” */
   riskError: z.string().optional(),
   error: z.object({ step: migrationStepSchema.nullable(), message: z.string() }).nullable(),
+  /** 实测影子库的 PostgreSQL 大版本（由 verifier 读取 server_version_num 推导） */
+  shadowMajor: z.number().int().nullable().optional(),
 });
 export type VerifyReport = z.infer<typeof verifyReportSchema>;
 
