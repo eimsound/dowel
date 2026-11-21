@@ -7,7 +7,38 @@ import type { PlatformDb } from './db.ts';
 export const CLUSTER_EVENTS_CHANNEL = 'dowel_events';
 
 /** 留出协议余量，避免触发 PG NOTIFY 8000 字节硬上限 */
-const MAX_EVENT_BYTES = 7500;
+export const MAX_EVENT_BYTES = 7500;
+
+/** 跨副本在线成员快照的单条结构（与前端 peers 协议一致） */
+export interface RoomPeerInfo {
+  client: string;
+  user: string;
+}
+
+/** 按字节上限截断单条 room.peers 集群事件的成员列表，避免超过 PG NOTIFY 上限被整包丢弃 */
+export const truncateRoomPeersForEvent = (
+  origin: string,
+  branchId: string,
+  peers: RoomPeerInfo[],
+  maxBytes = MAX_EVENT_BYTES,
+): { peers: RoomPeerInfo[]; truncated: boolean } => {
+  const baseBytes = Buffer.byteLength(
+    JSON.stringify({ t: 'room.peers', origin, branchId, peers: [] }),
+    'utf8',
+  );
+  if (baseBytes >= maxBytes) return { peers: [], truncated: peers.length > 0 };
+  const fitted: RoomPeerInfo[] = [];
+  let used = baseBytes;
+  for (const peer of peers) {
+    const itemBytes = Buffer.byteLength(JSON.stringify(peer), 'utf8') + (fitted.length > 0 ? 1 : 0);
+    if (used + itemBytes > maxBytes) {
+      return { peers: fitted, truncated: true };
+    }
+    fitted.push(peer);
+    used += itemBytes;
+  }
+  return { peers: fitted, truncated: false };
+};
 
 export type ClusterEvent =
   | { t: 'room.commit'; origin: string; branchId: string; seq: number }
@@ -16,6 +47,20 @@ export type ClusterEvent =
       origin: string;
       branchId: string;
       positions: Record<string, { x: number; y: number }>;
+      /** 房间级 Lamport 逻辑时钟，用于跨副本并发拖动同一张表时的确定性 LWW 裁决 */
+      ver?: number;
+    }
+  | { t: 'room.layout.reload'; origin: string; branchId: string; ver?: number }
+  | {
+      t: 'room.peers';
+      origin: string;
+      branchId: string;
+      peers: RoomPeerInfo[];
+    }
+  | {
+      t: 'room.peers.sync';
+      origin: string;
+      branchId?: string;
     }
   | {
       t: 'room.presence';
@@ -153,6 +198,18 @@ export class EventBus {
           full = full.projectId
             ? { t: 'shadows.forget', origin: this.replicaId, projectId: full.projectId }
             : { t: 'shadows.forget', origin: this.replicaId, all: true };
+          json = JSON.stringify(full);
+        } else if (full.t === 'room.peers') {
+          const { peers } = truncateRoomPeersForEvent(
+            this.replicaId,
+            full.branchId,
+            full.peers,
+            MAX_EVENT_BYTES,
+          );
+          console.warn(
+            `跨副本在线成员快照超出字节上限，已截断（branchId=${full.branchId}, total=${full.peers.length}, kept=${peers.length}）`,
+          );
+          full = { t: 'room.peers', origin: this.replicaId, branchId: full.branchId, peers };
           json = JSON.stringify(full);
         } else {
           console.warn(

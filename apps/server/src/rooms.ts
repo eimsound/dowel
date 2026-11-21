@@ -21,8 +21,15 @@ import {
 } from '@dowel/sync';
 import { HTTPException } from 'hono/http-exception';
 import type { User } from './auth.ts';
-import type { ClusterEvent, ClusterEventPayload, EventBus } from './bus.ts';
+import {
+  type ClusterEvent,
+  type ClusterEventPayload,
+  type EventBus,
+  type RoomPeerInfo,
+  truncateRoomPeersForEvent,
+} from './bus.ts';
 import { inList, type PlatformDb } from './db.ts';
+import type { HaCoordinator } from './ha.ts';
 import type { RoleLookup } from './roles.ts';
 import { atOf } from './time.ts';
 
@@ -32,6 +39,12 @@ const SNAPSHOT_EVERY = 200;
 const HISTORY_SUMMARY_LIMIT = 5;
 /** join 复查权限时因并发刷新触发重查的最大尝试次数 */
 const MAX_JOIN_VERIFY_ATTEMPTS = 8;
+/** 单条 room.layout 集群事件内联发送的安全字节上限（留足余量，低于 PG NOTIFY 7500B 上限） */
+const LAYOUT_INLINE_MAX_BYTES = 7000;
+/** 单条 room.peers 集群事件的安全字节上限 */
+const PEERS_EVENT_MAX_BYTES = 7000;
+/** 定期结合 HA 租约清理已离线副本残留 remotePeers 的间隔（毫秒） */
+const PEER_PRUNE_INTERVAL_MS = 10_000;
 
 type RefreshTarget = 'all' | Set<string>;
 
@@ -133,13 +146,32 @@ export interface Peer {
 /** 注入的生效角色计算；批量刷新时带上共享缓存 */
 export type ResolveRole = (user: User, projectId: string, lookup?: RoleLookup) => Promise<Role | null>;
 
+interface LayoutVersion {
+  ver: number;
+  origin: string;
+}
+
+const isNewerLayoutVersion = (incoming: LayoutVersion, existing: LayoutVersion | undefined): boolean => {
+  if (!existing) return true;
+  if (incoming.ver !== existing.ver) return incoming.ver > existing.ver;
+  return incoming.origin >= existing.origin;
+};
+
 interface Loaded {
   room: Room;
   peers: Set<Peer>;
+  /** 其他副本上已握手的在线成员快照（按远端 replicaId 隔离） */
+  remotePeers: Map<string, RoomPeerInfo[]>;
   layout: Layout;
   /** 尚未落库的本地布局改动（PG 下用 jsonb || 增量合并，避免多副本互盖） */
   pendingLayout: Layout;
+  /** 房间级布局逻辑时钟（Lamport clock），配合 origin 做确定性 LWW 裁决，避免并发拖动双方互删 pendingLayout */
+  layoutClock: number;
+  /** 每张表最近一次生效的布局版本（用于忽略乱序/败诉的远端旧坐标） */
+  layoutVersions: Map<string, LayoutVersion>;
   layoutTimer?: ReturnType<typeof setTimeout>;
+  /** 当前在途的布局落库任务（串行化落库并确保 flush() 等待 SQL 真正完成） */
+  layoutFlushing: Promise<void> | null;
   /** 进程内按分支串行化的互斥队列（保护 catchUp / 事务写 / 失败重建不交错） */
   lock: Promise<void>;
   /** 上次事务回滚后重建失败时置为 true，下次操作前强制重载 */
@@ -170,7 +202,13 @@ export class Rooms {
    */
   private resolveRole: ResolveRole;
   private bus?: EventBus;
+  private ha?: Pick<HaCoordinator, 'replicaId' | 'aliveNodes'>;
   private unsubBus: (() => void)[] = [];
+  private closed = false;
+  private peerPruneTimer: ReturnType<typeof setInterval> | null = null;
+  private pruneInFlight: Promise<void> | null = null;
+  /** 追踪非阻塞路径（load / close）发起的在途事件发布，供 flush() 排空避免与 db.close() 竞态 */
+  private pendingBackgroundPublishes = new Set<Promise<void>>();
   /** 全量权限刷新与全库踢人的代际计数 */
   private globalRefreshGen = 0;
   /** 按分支的定向权限刷新代际计数 */
@@ -189,22 +227,59 @@ export class Rooms {
     reject: (err: unknown) => void;
   } | null = null;
 
-  constructor(db: PlatformDb, resolveRole: ResolveRole, bus?: EventBus) {
+  constructor(
+    db: PlatformDb,
+    resolveRole: ResolveRole,
+    bus?: EventBus,
+    ha?: Pick<HaCoordinator, 'replicaId' | 'aliveNodes'>,
+  ) {
     this.db = db;
     this.resolveRole = resolveRole;
     this.bus = bus;
+    this.ha = ha;
     if (bus) {
       this.unsubBus.push(
         bus.onEvent((event) => this.handleClusterEvent(event)),
         bus.onReconnect(() => this.handleBusReconnect()),
       );
+      if (ha) {
+        this.peerPruneTimer = setInterval(() => {
+          if (this.closed) return;
+          void this.pruneDeadRemotePeers().catch((e) => {
+            console.error('定期清理离线副本在线成员失败', e);
+          });
+        }, PEER_PRUNE_INTERVAL_MS);
+        this.peerPruneTimer.unref?.();
+      }
     }
   }
 
-  /** 取消集群事件总线订阅（关闭实例或测试清理时调用） */
+  /** 取消集群事件总线订阅与后台清理定时器，并在仍有未清空本地成员时广播离线快照（关闭实例或测试清理时调用） */
   close() {
+    if (this.closed) return;
+    this.closed = true;
     for (const off of this.unsubBus) off();
     this.unsubBus = [];
+    if (this.peerPruneTimer) {
+      clearInterval(this.peerPruneTimer);
+      this.peerPruneTimer = null;
+    }
+    if (this.bus) {
+      for (const [branchId, pending] of this.rooms) {
+        const p = pending
+          .then(async (r) => {
+            const hadClients = this.localPeerList(r).length > 0;
+            if (!hadClients) return;
+            for (const peer of [...r.peers]) r.peers.delete(peer);
+            await this.publish({ t: 'room.peers', branchId, peers: [] });
+          })
+          .catch(() => {})
+          .finally(() => {
+            this.pendingBackgroundPublishes.delete(p);
+          });
+        this.pendingBackgroundPublishes.add(p);
+      }
+    }
   }
 
   /** 新建分支时写入初始模型（序号 0 的快照） */
@@ -329,14 +404,23 @@ export class Rooms {
     const [b] = await this.db.query<{ layout: Layout }>('select layout from branches where id = $1', [
       branchId,
     ]);
-    return {
+    const loaded: Loaded = {
       room,
       peers: new Set(),
+      remotePeers: new Map(),
       layout: b?.layout ?? {},
       pendingLayout: {},
+      layoutClock: 0,
+      layoutVersions: new Map(),
+      layoutFlushing: null,
       lock: Promise.resolve(),
       dirty: false,
     };
+    if (this.bus && !this.closed) {
+      // 房间首次加载时向其他副本请求一次该分支的在线成员快照
+      void this.trackPublish({ t: 'room.peers.sync', branchId });
+    }
+    return loaded;
   }
 
   private async reloadLocked(branchId: string, r: Loaded) {
@@ -521,8 +605,58 @@ export class Rooms {
     try {
       await this.bus.publish(event);
     } catch (e) {
-      console.error(`发布集群房间事件失败（t=${event.t}）`, e);
+      if (!this.closed) console.error(`发布集群房间事件失败（t=${event.t}）`, e);
     }
+  }
+
+  private trackPublish(event: ClusterEventPayload): Promise<void> {
+    const p = this.publish(event).finally(() => {
+      this.pendingBackgroundPublishes.delete(p);
+    });
+    this.pendingBackgroundPublishes.add(p);
+    return p;
+  }
+
+  private scheduleLayoutFlush(branchId: string, r: Loaded) {
+    if (r.layoutTimer) clearTimeout(r.layoutTimer);
+    r.layoutTimer = setTimeout(() => {
+      r.layoutTimer = undefined;
+      this.flushLayout(branchId, r).catch((e) => {
+        console.error(`保存画布布局失败（branchId=${branchId}）`, e);
+      });
+    }, 500);
+    r.layoutTimer.unref?.();
+  }
+
+  private clearPendingLayoutKeys(r: Loaded, keys: Iterable<string>) {
+    for (const key of keys) {
+      delete r.pendingLayout[key];
+    }
+    if (r.layoutTimer && Object.keys(r.pendingLayout).length === 0) {
+      clearTimeout(r.layoutTimer);
+      r.layoutTimer = undefined;
+    }
+  }
+
+  private async reloadLayoutFromDb(branchId: string, r: Loaded, incoming?: LayoutVersion) {
+    const pendingBefore: Layout = { ...r.pendingLayout };
+    const [b] = await this.db.query<{ layout: Layout }>('select layout from branches where id = $1', [
+      branchId,
+    ]);
+    if (!b?.layout) return;
+    const clearedKeys: string[] = [];
+    for (const [key, pos] of Object.entries(b.layout)) {
+      if (!pos || typeof pos.x !== 'number' || typeof pos.y !== 'number') continue;
+      const cur = r.pendingLayout[key];
+      // 查询期间新产生的本地拖动保留，不被此次重载覆盖
+      if (cur !== undefined && cur !== pendingBefore[key]) continue;
+      if (incoming && !isNewerLayoutVersion(incoming, r.layoutVersions.get(key))) continue;
+      if (cur !== undefined) clearedKeys.push(key);
+      if (incoming) r.layoutVersions.set(key, incoming);
+      r.layout[key] = { x: pos.x, y: pos.y };
+    }
+    if (clearedKeys.length > 0) this.clearPendingLayoutKeys(r, clearedKeys);
+    for (const p of r.peers) this.safeSend(p, { t: 'layout', positions: r.layout });
   }
 
   private async handleClusterEvent(event: ClusterEvent) {
@@ -538,8 +672,76 @@ export class Rooms {
         if (!pending) return;
         const r = await pending.catch(() => null);
         if (!r) return;
-        Object.assign(r.layout, event.positions);
-        for (const p of r.peers) this.safeSend(p, { t: 'layout', positions: event.positions });
+        const incomingVer = typeof event.ver === 'number' ? event.ver : r.layoutClock + 1;
+        if (incomingVer > r.layoutClock) r.layoutClock = incomingVer;
+        const incoming: LayoutVersion = { ver: incomingVer, origin: event.origin };
+        const accepted: Layout = {};
+        for (const [tableId, pos] of Object.entries(event.positions)) {
+          if (!pos || typeof pos.x !== 'number' || typeof pos.y !== 'number') continue;
+          if (!isNewerLayoutVersion(incoming, r.layoutVersions.get(tableId))) continue;
+          const point = { x: pos.x, y: pos.y };
+          accepted[tableId] = point;
+          r.layout[tableId] = point;
+          r.layoutVersions.set(tableId, incoming);
+        }
+        const acceptedKeys = Object.keys(accepted);
+        if (acceptedKeys.length === 0) return;
+        this.clearPendingLayoutKeys(r, acceptedKeys);
+        for (const p of r.peers) this.safeSend(p, { t: 'layout', positions: accepted });
+        break;
+      }
+      case 'room.layout.reload': {
+        const pending = this.rooms.get(event.branchId);
+        if (!pending) return;
+        const r = await pending.catch(() => null);
+        if (!r) return;
+        const incomingVer = typeof event.ver === 'number' ? event.ver : r.layoutClock + 1;
+        if (incomingVer > r.layoutClock) r.layoutClock = incomingVer;
+        await this.reloadLayoutFromDb(event.branchId, r, { ver: incomingVer, origin: event.origin });
+        break;
+      }
+      case 'room.peers': {
+        const pending = this.rooms.get(event.branchId);
+        if (!pending) return;
+        const r = await pending.catch(() => null);
+        if (!r) return;
+        const normalized: RoomPeerInfo[] = Array.isArray(event.peers)
+          ? event.peers
+              .filter(
+                (item): item is RoomPeerInfo =>
+                  Boolean(item) &&
+                  typeof item.client === 'string' &&
+                  item.client.length > 0 &&
+                  typeof item.user === 'string',
+              )
+              .map((item) => ({ client: item.client, user: item.user }))
+          : [];
+        const prev = r.remotePeers.get(event.origin);
+        if (this.samePeerList(prev, normalized)) return;
+        if (normalized.length === 0) {
+          r.remotePeers.delete(event.origin);
+        } else {
+          r.remotePeers.set(event.origin, normalized);
+        }
+        this.broadcastPeers(r);
+        break;
+      }
+      case 'room.peers.sync': {
+        if (event.branchId) {
+          const pending = this.rooms.get(event.branchId);
+          if (!pending) return;
+          const r = await pending.catch(() => null);
+          if (!r) return;
+          if (this.localPeerList(r).length > 0) {
+            await this.publishRoomPeers(event.branchId, r);
+          }
+          return;
+        }
+        for (const [branchId, pending] of this.rooms) {
+          const r = await pending.catch(() => null);
+          if (!r) continue;
+          await this.publishRoomPeers(branchId, r);
+        }
         break;
       }
       case 'room.presence': {
@@ -568,7 +770,7 @@ export class Rooms {
     }
   }
 
-  /** PG LISTEN 断线重连后：追赶所有已加载房间的提交与布局，并刷新权限（补齐断线期间错过的通知） */
+  /** PG LISTEN 断线重连后：追赶所有已加载房间的提交与布局、同步跨副本在线成员，并刷新权限（补齐断线期间错过的通知） */
   private async handleBusReconnect() {
     const branchIds = [...this.rooms.keys()];
     for (const branchId of branchIds) {
@@ -584,10 +786,19 @@ export class Rooms {
             r.layout = { ...b.layout, ...r.pendingLayout };
             for (const p of r.peers) this.safeSend(p, { t: 'layout', positions: r.layout });
           }
+          await this.publishRoomPeers(branchId, r);
         }
       } catch (e) {
         console.error(`事件总线重连后追赶房间失败（branchId=${branchId}）`, e);
       }
+    }
+    try {
+      await this.pruneDeadRemotePeers();
+    } catch (e) {
+      console.error('事件总线重连后清理离线副本在线成员失败', e);
+    }
+    if (branchIds.length > 0) {
+      await this.publish({ t: 'room.peers.sync' });
     }
     try {
       await this.refreshLoadedLocal();
@@ -596,8 +807,105 @@ export class Rooms {
     }
   }
 
-  private peerList(r: Loaded) {
-    return [...r.peers].filter((p) => p.client).map((p) => ({ client: p.client!, user: p.user.name }));
+  private localPeerList(r: Loaded): RoomPeerInfo[] {
+    return [...r.peers]
+      .filter((p): p is Peer & { client: string } => typeof p.client === 'string' && p.client.length > 0)
+      .map((p) => ({ client: p.client, user: p.user.name }));
+  }
+
+  private peerList(r: Loaded): RoomPeerInfo[] {
+    const local = this.localPeerList(r);
+    if (r.remotePeers.size === 0) return local;
+    const seen = new Set<string>();
+    const merged: RoomPeerInfo[] = [];
+    const append = (item: RoomPeerInfo) => {
+      if (typeof item.client !== 'string' || item.client.length === 0 || typeof item.user !== 'string')
+        return;
+      const key = `${item.client}\0${item.user}`;
+      if (seen.has(key)) return;
+      seen.add(key);
+      merged.push({ client: item.client, user: item.user });
+    };
+    for (const item of local) append(item);
+    for (const list of r.remotePeers.values()) {
+      for (const item of list) append(item);
+    }
+    return merged;
+  }
+
+  private samePeerList(a: RoomPeerInfo[] | undefined, b: RoomPeerInfo[]): boolean {
+    if (!a) return b.length === 0;
+    if (a.length !== b.length) return false;
+    for (let i = 0; i < a.length; i++) {
+      if (a[i]!.client !== b[i]!.client || a[i]!.user !== b[i]!.user) return false;
+    }
+    return true;
+  }
+
+  private broadcastPeers(r: Loaded) {
+    const peers = this.peerList(r);
+    for (const p of r.peers) {
+      if (!this.peerVerifiedSeq.has(p)) continue;
+      this.safeSend(p, { t: 'peers', peers });
+    }
+  }
+
+  private async publishRoomPeers(branchId: string, r: Loaded) {
+    if (!this.bus) return;
+    const raw = this.localPeerList(r);
+    const { peers, truncated } = truncateRoomPeersForEvent(
+      this.bus.replicaId,
+      branchId,
+      raw,
+      PEERS_EVENT_MAX_BYTES,
+    );
+    if (truncated) {
+      console.warn(
+        `分支 ${branchId} 在线成员快照超出单条集群事件字节上限，已截断（total=${raw.length}, kept=${peers.length}）`,
+      );
+    }
+    await this.publish({ t: 'room.peers', branchId, peers });
+  }
+
+  /** 结合 HA 租约清理已离线副本残留的 remotePeers，并在列表变动时广播给本地在线成员 */
+  async pruneDeadRemotePeers(): Promise<void> {
+    if (!this.ha || this.closed) return;
+    let hasRemote = false;
+    for (const pending of this.rooms.values()) {
+      const r = await pending.catch(() => null);
+      if (r && r.remotePeers.size > 0) {
+        hasRemote = true;
+        break;
+      }
+    }
+    if (!hasRemote) return;
+    if (this.pruneInFlight) {
+      await this.pruneInFlight;
+      return;
+    }
+    const task = (async () => {
+      const alive = await this.ha!.aliveNodes();
+      // 仅当本副本自身租约存活（HA 心跳已启用）时才剔除离线副本，避免未启动 HA 的测试环境误删
+      if (!alive.has(this.ha!.replicaId)) return;
+      for (const pending of this.rooms.values()) {
+        const r = await pending.catch(() => null);
+        if (!r || r.remotePeers.size === 0) continue;
+        let changed = false;
+        for (const origin of [...r.remotePeers.keys()]) {
+          if (!alive.has(origin)) {
+            r.remotePeers.delete(origin);
+            changed = true;
+          }
+        }
+        if (changed) this.broadcastPeers(r);
+      }
+    })();
+    this.pruneInFlight = task;
+    try {
+      await task;
+    } finally {
+      if (this.pruneInFlight === task) this.pruneInFlight = null;
+    }
   }
 
   /** 推进权限刷新代际；不传 branchIds 表示全量影响所有已加载房间 */
@@ -663,9 +971,16 @@ export class Rooms {
     r.peers.add(peer);
 
     const abort = (reason: string) => {
+      const hadClient = Boolean(peer.client);
       if (!r.peers.delete(peer)) return;
       peer.close?.(4403, reason);
-      for (const p of r.peers) this.safeSend(p, { t: 'peers', peers: this.peerList(r) });
+      this.broadcastPeers(r);
+      if (hadClient) {
+        const p = this.publishRoomPeers(branchId, r).finally(() => {
+          this.pendingBackgroundPublishes.delete(p);
+        });
+        this.pendingBackgroundPublishes.add(p);
+      }
     };
 
     for (let attempt = 0; attempt < MAX_JOIN_VERIFY_ATTEMPTS; attempt++) {
@@ -708,27 +1023,48 @@ export class Rooms {
     // 分支可能已经被删掉（项目删除）：加载失败就当没进过房间，不能抛出去
     const r = await this.get(branchId).catch(() => null);
     if (!r) return;
+    const hadClient = Boolean(peer.client);
     // 已经被踢掉的连接走 onClose 时不用再广播一次
     if (!r.peers.delete(peer)) return;
-    for (const p of r.peers) this.safeSend(p, { t: 'peers', peers: this.peerList(r) });
+    this.broadcastPeers(r);
+    if (hadClient) await this.publishRoomPeers(branchId, r);
   }
 
-  private async flushLayout(branchId: string, r: Loaded) {
-    if (this.db.dialect === 'pg') {
-      const pending = r.pendingLayout;
-      if (Object.keys(pending).length === 0) return;
-      r.pendingLayout = {};
-      await this.db.query(
-        "update branches set layout = coalesce(layout, '{}'::jsonb) || $2::text::jsonb where id = $1",
-        [branchId, JSON.stringify(pending)],
-      );
-      return;
+  private async flushLayout(branchId: string, r: Loaded): Promise<void> {
+    while (r.layoutFlushing) {
+      await r.layoutFlushing.catch(() => {});
     }
-    r.pendingLayout = {};
-    await this.db.query('update branches set layout = $2::text::jsonb where id = $1', [
-      branchId,
-      JSON.stringify(r.layout),
-    ]);
+    if (Object.keys(r.pendingLayout).length === 0) return;
+    const task = (async () => {
+      while (Object.keys(r.pendingLayout).length > 0) {
+        const snapshot: Layout = { ...r.pendingLayout };
+        const keys = Object.keys(snapshot);
+        if (keys.length === 0) break;
+        if (this.db.dialect === 'pg') {
+          await this.db.query(
+            "update branches set layout = coalesce(layout, '{}'::jsonb) || $2::text::jsonb where id = $1",
+            [branchId, JSON.stringify(snapshot)],
+          );
+        } else {
+          await this.db.query('update branches set layout = $2::text::jsonb where id = $1', [
+            branchId,
+            JSON.stringify(r.layout),
+          ]);
+        }
+        // SQL 落库成功后再清理快照中未被新坐标替换的键（按对象引用精确判定）
+        for (const key of keys) {
+          if (r.pendingLayout[key] === snapshot[key]) {
+            delete r.pendingLayout[key];
+          }
+        }
+      }
+    })();
+    r.layoutFlushing = task;
+    try {
+      await task;
+    } finally {
+      if (r.layoutFlushing === task) r.layoutFlushing = null;
+    }
   }
 
   async message(branchId: string, peer: Peer, msg: ToServer | ExtraIn) {
@@ -743,13 +1079,17 @@ export class Rooms {
         const hadClient = Boolean(peer.client);
         r.peers.delete(peer);
         peer.close?.(4400, '无效的客户端标识');
-        if (hadClient) for (const p of r.peers) this.safeSend(p, { t: 'peers', peers: this.peerList(r) });
+        if (hadClient) {
+          this.broadcastPeers(r);
+          await this.publishRoomPeers(branchId, r);
+        }
         return;
       }
       if (peer.client !== undefined && peer.client !== msg.client) {
         r.peers.delete(peer);
         peer.close?.(4400, '客户端标识不可变更');
-        for (const p of r.peers) this.safeSend(p, { t: 'peers', peers: this.peerList(r) });
+        this.broadcastPeers(r);
+        await this.publishRoomPeers(branchId, r);
         return;
       }
       // 同一用户带着相同 client 重连时，踢掉尚未触发 close 的旧连接，避免同键并发乱序
@@ -762,7 +1102,7 @@ export class Rooms {
       peer.client = msg.client;
       const syncClient = scopeClient(peer.user.id, msg.client);
       const scopedHello: ToServer = { t: 'hello', client: syncClient, lastSeq: msg.lastSeq };
-      for (const p of r.peers) this.safeSend(p, { t: 'peers', peers: this.peerList(r) });
+      this.broadcastPeers(r);
       const { caughtUp, outs } = await this.withRoomLock(r, async () => {
         if (!r.peers.has(peer)) return { caughtUp: [] as Commit[], outs: [] as Out[] };
         if (r.dirty) await this.reloadLocked(branchId, r);
@@ -774,6 +1114,7 @@ export class Rooms {
       });
       if (caughtUp.length) this.broadcastCommits(r, caughtUp, peer);
       this.deliver(r, peer, outs);
+      await this.publishRoomPeers(branchId, r);
       return;
     }
     if (msg.t === 'op') {
@@ -854,17 +1195,59 @@ export class Rooms {
       if (peer.role === 'viewer') return;
       // 处理过程中可能已经被踢出房间（以后这里加了 await 也不会漏）
       if (!r.peers.has(peer)) return;
-      Object.assign(r.layout, msg.positions);
-      Object.assign(r.pendingLayout, msg.positions);
-      for (const p of r.peers) if (p !== peer) this.safeSend(p, { t: 'layout', positions: msg.positions });
-      await this.publish({ t: 'room.layout', branchId, positions: msg.positions });
-      clearTimeout(r.layoutTimer);
-      r.layoutTimer = setTimeout(() => {
-        r.layoutTimer = undefined;
-        this.flushLayout(branchId, r).catch((e) => {
-          console.error(`保存画布布局失败（branchId=${branchId}）`, e);
-        });
-      }, 500);
+      if (!msg.positions || typeof msg.positions !== 'object') return;
+      const positions: Layout = {};
+      for (const [tableId, pos] of Object.entries(msg.positions)) {
+        if (
+          !pos ||
+          typeof pos !== 'object' ||
+          typeof pos.x !== 'number' ||
+          typeof pos.y !== 'number' ||
+          !Number.isFinite(pos.x) ||
+          !Number.isFinite(pos.y)
+        ) {
+          continue;
+        }
+        const point = { x: pos.x, y: pos.y };
+        positions[tableId] = point;
+        r.layout[tableId] = point;
+        r.pendingLayout[tableId] = point;
+      }
+      const tableIds = Object.keys(positions);
+      if (tableIds.length === 0) return;
+
+      r.layoutClock += 1;
+      const ver = r.layoutClock;
+      const versionStamp: LayoutVersion = { ver, origin: this.bus?.replicaId ?? '' };
+      for (const tableId of tableIds) r.layoutVersions.set(tableId, versionStamp);
+
+      // 写入 pendingLayout 后立即调度防抖定时器，避免在 await publish 挂起窗口内漏刷
+      this.scheduleLayoutFlush(branchId, r);
+      for (const p of r.peers) if (p !== peer) this.safeSend(p, { t: 'layout', positions });
+
+      const needsReloadBroadcast =
+        this.bus !== undefined &&
+        Buffer.byteLength(
+          JSON.stringify({ t: 'room.layout', origin: this.bus.replicaId, branchId, positions, ver }),
+          'utf8',
+        ) > LAYOUT_INLINE_MAX_BYTES;
+
+      if (needsReloadBroadcast) {
+        if (r.layoutTimer) {
+          clearTimeout(r.layoutTimer);
+          r.layoutTimer = undefined;
+        }
+        try {
+          await this.flushLayout(branchId, r);
+        } catch (e) {
+          if (Object.keys(r.pendingLayout).length > 0) this.scheduleLayoutFlush(branchId, r);
+          throw e;
+        }
+        await this.publish({ t: 'room.layout.reload', branchId, ver });
+        return;
+      }
+
+      await this.publish({ t: 'room.layout', branchId, positions, ver });
       return;
     }
     if (msg.t === 'presence' && peer.client) {
@@ -1199,17 +1582,22 @@ export class Rooms {
   /** 仅在当前副本踢出指定用户的所有在线连接 */
   async kickUserLocal(userId: string, reason = '账号已被停用') {
     this.bumpRefreshGen();
-    for (const pending of this.rooms.values()) {
+    for (const [branchId, pending] of this.rooms) {
       const r = await pending.catch(() => null);
       if (!r) continue;
       let removed = false;
+      let removedClient = false;
       for (const peer of [...r.peers]) {
         if (peer.user.id !== userId) continue;
+        if (peer.client) removedClient = true;
         r.peers.delete(peer);
         peer.close?.(4403, reason);
         removed = true;
       }
-      if (removed) for (const p of r.peers) this.safeSend(p, { t: 'peers', peers: this.peerList(r) });
+      if (removed) {
+        this.broadcastPeers(r);
+        if (removedClient) await this.publishRoomPeers(branchId, r);
+      }
     }
   }
 
@@ -1322,6 +1710,7 @@ export class Rooms {
       if (!r) continue;
       const projectId = projectByBranch.get(branchId);
       if (!projectId) {
+        const hadClients = this.localPeerList(r).length > 0;
         if (r.layoutTimer) {
           clearTimeout(r.layoutTimer);
           r.layoutTimer = undefined;
@@ -1329,9 +1718,11 @@ export class Rooms {
         for (const peer of [...r.peers]) kick(r, peer, '项目已被删除');
         this.rooms.delete(branchId);
         this.branchRefreshGen.delete(branchId);
+        if (hadClients) await this.publish({ t: 'room.peers', branchId, peers: [] });
         continue;
       }
       let removed = false;
+      let removedClient = false;
       for (const peer of [...r.peers]) {
         if (!r.peers.has(peer)) continue;
         if ((this.peerVerifiedSeq.get(peer) ?? 0) > roundSeq) continue;
@@ -1343,6 +1734,7 @@ export class Rooms {
         if (!r.peers.has(peer)) continue;
         if ((this.peerVerifiedSeq.get(peer) ?? 0) > roundSeq) continue;
         if (current?.status !== 'active') {
+          if (peer.client) removedClient = true;
           kick(r, peer, '账号已被停用');
           removed = true;
           continue;
@@ -1354,6 +1746,7 @@ export class Rooms {
         if (!r.peers.has(peer)) continue;
         if ((this.peerVerifiedSeq.get(peer) ?? 0) > roundSeq) continue;
         if (!role) {
+          if (peer.client) removedClient = true;
           kick(r, peer, '你在这个项目里已经没有权限');
           removed = true;
           continue;
@@ -1364,7 +1757,10 @@ export class Rooms {
         }
       }
       // 只给真正踢掉了人的房间广播在线列表
-      if (removed) for (const p of r.peers) this.safeSend(p, { t: 'peers', peers: this.peerList(r) });
+      if (removed) {
+        this.broadcastPeers(r);
+        if (removedClient) await this.publishRoomPeers(branchId, r);
+      }
     }
   }
 
@@ -1387,7 +1783,9 @@ export class Rooms {
     for (const [branchId, pending] of this.rooms) {
       if (!gone.has(branchId)) continue;
       const r = await pending.catch(() => null);
+      let hadClients = false;
       if (r) {
+        hadClients = this.localPeerList(r).length > 0;
         if (r.layoutTimer) {
           clearTimeout(r.layoutTimer);
           r.layoutTimer = undefined;
@@ -1399,6 +1797,7 @@ export class Rooms {
       }
       this.rooms.delete(branchId);
       this.branchRefreshGen.delete(branchId);
+      if (hadClients) await this.publish({ t: 'room.peers', branchId, peers: [] });
     }
     if (branchIds.length > 0) {
       await this.publish({ t: 'room.refresh', branchIds });
@@ -1410,33 +1809,44 @@ export class Rooms {
     return this.rooms.has(branchId);
   }
 
-  /** 优雅断开本副本所有在线房间连接（停机时通知客户端重连，避免持久连接阻塞 HTTP 服务关闭） */
+  /** 优雅断开本副本所有在线房间连接（停机时通知客户端重连并向集群广播离线快照，避免持久连接阻塞 HTTP 服务关闭） */
   async disconnectAll(code = 1001, reason = '服务正在关闭') {
-    for (const pending of this.rooms.values()) {
+    for (const [branchId, pending] of this.rooms) {
       const r = await pending.catch(() => null);
       if (!r) continue;
+      const hadClients = this.localPeerList(r).length > 0;
       for (const peer of [...r.peers]) {
         r.peers.delete(peer);
         try {
           peer.close?.(code, reason);
         } catch {}
       }
+      if (hadClients) await this.publish({ t: 'room.peers', branchId, peers: [] });
     }
   }
 
-  /** 立即写入所有挂起的布局，并等待进行中的房间操作完成（关闭服务和测试时用） */
+  /** 立即写入所有挂起的布局，并等待进行中的房间操作与在途布局落库完成（关闭服务和测试时用） */
   async flush() {
     while (this.refreshInFlight) {
       await this.refreshInFlight.catch(() => {});
+    }
+    if (this.pruneInFlight) {
+      await this.pruneInFlight.catch(() => {});
+    }
+    if (this.pendingBackgroundPublishes.size > 0) {
+      await Promise.allSettled([...this.pendingBackgroundPublishes]);
     }
     for (const [branchId, p] of this.rooms) {
       const r = await p.catch(() => null);
       if (!r) continue;
       await r.lock.catch(() => {});
-      if (!r.layoutTimer) continue;
-      clearTimeout(r.layoutTimer);
-      r.layoutTimer = undefined;
-      await this.flushLayout(branchId, r);
+      if (r.layoutTimer) {
+        clearTimeout(r.layoutTimer);
+        r.layoutTimer = undefined;
+      }
+      if (r.layoutFlushing || Object.keys(r.pendingLayout).length > 0) {
+        await this.flushLayout(branchId, r);
+      }
     }
   }
 }

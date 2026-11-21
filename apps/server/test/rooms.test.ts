@@ -4,6 +4,15 @@ import { all, emptyModel, type Model, readsOf } from '@dowel/core';
 import { type Commit, SyncClient, type ToClient } from '@dowel/sync';
 import { afterAll, beforeAll, expect, test } from 'vitest';
 import type { User } from '../src/auth.ts';
+import {
+  type ClusterEvent,
+  type ClusterEventHandler,
+  type ClusterEventPayload,
+  type EventBus,
+  MAX_EVENT_BYTES,
+  type ReconnectHandler,
+  truncateRoomPeersForEvent,
+} from '../src/bus.ts';
 import { createApp, openPlatformDb, type PlatformDb } from '../src/index.ts';
 import { effectiveProjectRole } from '../src/roles.ts';
 import { type Peer, Rooms } from '../src/rooms.ts';
@@ -711,4 +720,274 @@ test('连续并发 refreshLoaded（先升级后降级 & 先降级后升级合并
   expect(lastRole2?.role).toBe('admin');
 
   await raceRooms.flush();
+});
+
+const makeFakeBus = (replicaId: string) => {
+  const eventHandlers = new Set<ClusterEventHandler>();
+  const reconnectHandlers = new Set<ReconnectHandler>();
+  const published: ClusterEventPayload[] = [];
+  let publishHook: ((event: ClusterEventPayload) => Promise<void> | void) | null = null;
+
+  const bus = {
+    replicaId,
+    channel: 'test_events',
+    onEvent: (handler: ClusterEventHandler) => {
+      eventHandlers.add(handler);
+      return () => eventHandlers.delete(handler);
+    },
+    onReconnect: (handler: ReconnectHandler) => {
+      reconnectHandlers.add(handler);
+      return () => reconnectHandlers.delete(handler);
+    },
+    publish: async (event: ClusterEventPayload) => {
+      published.push(event);
+      if (publishHook) await publishHook(event);
+    },
+  } as unknown as EventBus;
+
+  const emit = async (event: ClusterEvent) => {
+    for (const h of [...eventHandlers]) {
+      await h(event);
+    }
+  };
+
+  const triggerReconnect = async () => {
+    for (const h of [...reconnectHandlers]) {
+      await h();
+    }
+  };
+
+  const setPublishHook = (fn: ((event: ClusterEventPayload) => Promise<void> | void) | null) => {
+    publishHook = fn;
+  };
+
+  return { bus, published, emit, triggerReconnect, setPublishHook };
+};
+
+test('远端 room.layout 清理本地 pendingLayout 冲突键；flush() 既覆盖 publish 挂起窗口也等待在途 flushLayout 完成', async () => {
+  const u = await makeUser(db, 'layout-unit-user', { name: '布局单测' });
+  await db.query(
+    "insert into grants (id, scope_kind, scope_id, subject_kind, subject_id, role) values ($1, 'project', $2, 'user', $3, 'editor')",
+    ['g-layout-unit', pid, u.id],
+  );
+  const branchLayout = `${branchId}-layout-unit`;
+  await db.query("insert into branches (id, project_id, name) values ($1, $2, 'layout-unit')", [
+    branchLayout,
+    pid,
+  ]);
+  await rooms.init(branchLayout, model);
+
+  const fake = makeFakeBus('replica-local');
+  const testRooms = new Rooms(
+    db,
+    (user, projectId, lookup) => effectiveProjectRole(db, user, projectId, lookup),
+    fake.bus,
+  );
+  try {
+    const p = peerOf(u);
+    await testRooms.join(branchLayout, p.peer);
+    await testRooms.message(branchLayout, p.peer, { t: 'hello', client: 'c-layout', lastSeq: 0 });
+
+    // 1. publish 挂起窗口内调用 flush()，不能漏刷 pendingLayout
+    const pubEntered = deferred();
+    const pubRelease = deferred();
+    fake.setPublishHook(async (ev) => {
+      if (ev.t === 'room.layout') {
+        pubEntered.resolve();
+        await pubRelease.promise;
+      }
+    });
+    const msgPromise = testRooms.message(branchLayout, p.peer, {
+      t: 'layout',
+      positions: { tbl_win: { x: 11, y: 22 } },
+    });
+    await pubEntered.promise;
+    await testRooms.flush();
+    const [rowWin] = await db.query<{ layout: Record<string, { x: number; y: number }> }>(
+      'select layout from branches where id = $1',
+      [branchLayout],
+    );
+    expect(rowWin?.layout.tbl_win).toEqual({ x: 11, y: 22 });
+    pubRelease.resolve();
+    await msgPromise;
+    fake.setPublishHook(null);
+
+    // 2. 本地拖动 tbl_1=(10,10)、tbl_2=(20,20) 处于防抖期，远端广播 tbl_1=(99,99) 必须清掉本地 tbl_1 的 pendingLayout
+    await testRooms.message(branchLayout, p.peer, {
+      t: 'layout',
+      positions: { tbl_1: { x: 10, y: 10 }, tbl_2: { x: 20, y: 20 } },
+    });
+    await fake.emit({
+      t: 'room.layout',
+      origin: 'replica-remote',
+      branchId: branchLayout,
+      positions: { tbl_1: { x: 99, y: 99 } },
+    });
+    await testRooms.flush();
+    const [rowConflict] = await db.query<{ layout: Record<string, { x: number; y: number }> }>(
+      'select layout from branches where id = $1',
+      [branchLayout],
+    );
+    expect(rowConflict?.layout.tbl_1).toEqual({ x: 99, y: 99 });
+    expect(rowConflict?.layout.tbl_2).toEqual({ x: 20, y: 20 });
+
+    // 3. 在途 flushLayout 进行期间，flush() 必须等待 SQL 完成，且期间新写入的坐标不会被旧快照误删
+    const sqlEntered = deferred();
+    const sqlRelease = deferred();
+    let intercepted = false;
+    const origQuery = db.query.bind(db);
+    db.query = (async <T = Record<string, unknown>>(sql: string, params?: unknown[]) => {
+      if (!intercepted && sql.includes('update branches set layout')) {
+        intercepted = true;
+        sqlEntered.resolve();
+        await sqlRelease.promise;
+      }
+      return origQuery<T>(sql, params);
+    }) as typeof db.query;
+
+    try {
+      await testRooms.message(branchLayout, p.peer, {
+        t: 'layout',
+        positions: { tbl_fly: { x: 1, y: 2 } },
+      });
+      // 先手动触发一次 flush 进入在途 SQL，并在 SQL 挂起期间再写入新坐标、同时发起第二次 flush()
+      const firstFlush = testRooms.flush();
+      await sqlEntered.promise;
+
+      await testRooms.message(branchLayout, p.peer, {
+        t: 'layout',
+        positions: { tbl_fly: { x: 33, y: 44 } },
+      });
+      let secondDone = false;
+      const secondFlush = testRooms.flush().then(() => {
+        secondDone = true;
+      });
+      await Promise.resolve();
+      await new Promise((r) => setTimeout(r, 20));
+      expect(secondDone).toBe(false);
+
+      sqlRelease.resolve();
+      await Promise.all([firstFlush, secondFlush]);
+      expect(secondDone).toBe(true);
+    } finally {
+      db.query = origQuery;
+    }
+
+    const [rowFinal] = await db.query<{ layout: Record<string, { x: number; y: number }> }>(
+      'select layout from branches where id = $1',
+      [branchLayout],
+    );
+    expect(rowFinal?.layout.tbl_fly).toEqual({ x: 33, y: 44 });
+  } finally {
+    testRooms.close();
+    await testRooms.flush();
+  }
+});
+
+test('超大 layout（200 张表）立即落库并改发 room.layout.reload，超大 room.peers 自动截断且 HA 离线副本清理生效', async () => {
+  const u = await makeUser(db, 'layout-big-user', { name: '大画布用户' });
+  await db.query(
+    "insert into grants (id, scope_kind, scope_id, subject_kind, subject_id, role) values ($1, 'project', $2, 'user', $3, 'editor')",
+    ['g-layout-big', pid, u.id],
+  );
+  const branchBig = `${branchId}-layout-big`;
+  await db.query("insert into branches (id, project_id, name) values ($1, $2, 'layout-big')", [
+    branchBig,
+    pid,
+  ]);
+  await rooms.init(branchBig, model);
+
+  const aliveSet = new Set(['replica-a', 'replica-b']);
+  const fakeA = makeFakeBus('replica-a');
+  const fakeB = makeFakeBus('replica-b');
+  const roomsA = new Rooms(
+    db,
+    (user, projectId, lookup) => effectiveProjectRole(db, user, projectId, lookup),
+    fakeA.bus,
+    { replicaId: 'replica-a', aliveNodes: async () => new Set(aliveSet) },
+  );
+  const roomsB = new Rooms(
+    db,
+    (user, projectId, lookup) => effectiveProjectRole(db, user, projectId, lookup),
+    fakeB.bus,
+    { replicaId: 'replica-b', aliveNodes: async () => new Set(aliveSet) },
+  );
+
+  try {
+    const peerA = peerOf(u);
+    const peerB = peerOf(u);
+    await roomsA.join(branchBig, peerA.peer);
+    await roomsB.join(branchBig, peerB.peer);
+    await roomsA.message(branchBig, peerA.peer, { t: 'hello', client: 'c-a', lastSeq: 0 });
+    await roomsB.message(branchBig, peerB.peer, { t: 'hello', client: 'c-b', lastSeq: 0 });
+
+    // 1. 200 张表自动布局（> 7500B）在副本 A 上立即落库并广播 room.layout.reload（而不是 room.layout）
+    const bigPositions: Record<string, { x: number; y: number }> = {};
+    for (let i = 0; i < 200; i++) {
+      bigPositions[`table_long_identifier_${String(i).padStart(4, '0')}`] = { x: i * 10, y: i * 20 };
+    }
+    expect(Buffer.byteLength(JSON.stringify(bigPositions), 'utf8')).toBeGreaterThan(MAX_EVENT_BYTES);
+
+    fakeA.published.length = 0;
+    await roomsA.message(branchBig, peerA.peer, { t: 'layout', positions: bigPositions });
+    expect(fakeA.published.some((e) => e.t === 'room.layout.reload' && e.branchId === branchBig)).toBe(true);
+    expect(fakeA.published.some((e) => e.t === 'room.layout')).toBe(false);
+
+    // 副本 B 收到 room.layout.reload 后从数据库读取并向本地 peerB 推送全部 200 张表
+    await fakeB.emit({ t: 'room.layout.reload', origin: 'replica-a', branchId: branchBig });
+    const lastLayoutB = [...peerB.sent]
+      .reverse()
+      .find(
+        (m): m is { t: 'layout'; positions: Record<string, { x: number; y: number }> } =>
+          (m as { t: string }).t === 'layout',
+      );
+    expect(Object.keys(lastLayoutB?.positions ?? {})).toHaveLength(200);
+    expect(lastLayoutB?.positions.table_long_identifier_0199).toEqual({ x: 1990, y: 3980 });
+
+    // 2. 跨副本 peers 同步与 HA 离线节点清理
+    await fakeA.emit({
+      t: 'room.peers',
+      origin: 'replica-b',
+      branchId: branchBig,
+      peers: [{ client: 'c-b', user: '大画布用户' }],
+    });
+    const peersBeforeCrash = [...peerA.sent]
+      .reverse()
+      .find(
+        (m): m is { t: 'peers'; peers: { client: string; user: string }[] } =>
+          (m as { t: string }).t === 'peers',
+      );
+    expect(peersBeforeCrash?.peers.map((item) => item.client).sort()).toEqual(['c-a', 'c-b']);
+
+    // 模拟 replica-b 租约过期离线
+    aliveSet.delete('replica-b');
+    await roomsA.pruneDeadRemotePeers();
+    const peersAfterCrash = [...peerA.sent]
+      .reverse()
+      .find(
+        (m): m is { t: 'peers'; peers: { client: string; user: string }[] } =>
+          (m as { t: string }).t === 'peers',
+      );
+    expect(peersAfterCrash?.peers).toEqual([{ client: 'c-a', user: '大画布用户' }]);
+
+    // 3. 超大 room.peers 截断保护（保证 JSON 字节严格 <= MAX_EVENT_BYTES）
+    const manyPeers = Array.from({ length: 400 }, (_, i) => ({
+      client: `tab-very-long-client-id-${String(i).padStart(4, '0')}`,
+      user: `协作成员_${i}`,
+    }));
+    const { peers: kept, truncated } = truncateRoomPeersForEvent('replica-a', branchBig, manyPeers);
+    expect(truncated).toBe(true);
+    expect(kept.length).toBeGreaterThan(0);
+    expect(kept.length).toBeLessThan(manyPeers.length);
+    const bytes = Buffer.byteLength(
+      JSON.stringify({ t: 'room.peers', origin: 'replica-a', branchId: branchBig, peers: kept }),
+      'utf8',
+    );
+    expect(bytes).toBeLessThanOrEqual(MAX_EVENT_BYTES);
+  } finally {
+    roomsA.close();
+    roomsB.close();
+    await roomsA.flush();
+    await roomsB.flush();
+  }
 });

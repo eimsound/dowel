@@ -4,7 +4,7 @@
 // 跨副本 layout / presence 转发、断线重连追赶、无粘性客户端跨副本迁移以及事务回滚内存隔离。
 import { all, emptyModel, type Model, newId, readsOf } from '@dowel/core';
 import { type Commit, type RoomState, SyncClient, type ToClient } from '@dowel/sync';
-import { afterAll, describe, expect, test } from 'vitest';
+import { afterEach, describe, expect, test } from 'vitest';
 import { createTestDb, PG_URL } from '../../../test/pg.ts';
 import { createApp } from '../src/app.ts';
 import type { User } from '../src/auth.ts';
@@ -180,6 +180,10 @@ const createDualReplicas = async (tag: string, startBus = true): Promise<DualRep
       schemaId,
       adminCookie,
       close: async () => {
+        appA.refresher.stop();
+        appB.refresher.stop();
+        await appA.refresher.drain();
+        await appB.refresher.drain();
         appA.rooms.close();
         appB.rooms.close();
         await appA.rooms.flush();
@@ -207,8 +211,10 @@ const createDualReplicas = async (tag: string, startBus = true): Promise<DualRep
 
 describe.skipIf(!PG_URL)('P7 HA2：无状态实时协作房间（真实 PG 双副本）', () => {
   const fixtures: DualReplicaFixture[] = [];
-  afterAll(async () => {
-    for (const f of fixtures) await f.close();
+  afterEach(async () => {
+    while (fixtures.length) {
+      await fixtures.pop()!.close();
+    }
   });
 
   const boot = async (tag: string, startBus = true) => {
@@ -925,6 +931,226 @@ describe.skipIf(!PG_URL)('P7 HA2：无状态实时协作房间（真实 PG 双�
     });
     expect(alicePeer.sent.some((m) => m.t === 'reject' && m.code === 'invalid')).toBe(true);
     expect((await f.appB.rooms.model(f.branchId)).seq).toBe(0);
+  });
+
+  test('11. 跨副本在线成员列表（peers）实时同步、离房/断开更新与 HA 离线副本残留清理', async () => {
+    const f = await boot('cross-replica-peers');
+    const peerA = makePeer(f.alice);
+    const peerB = makePeer(f.bob);
+
+    // 11a. 协作者 A 先在副本 A 入房并完成 hello，随后协作者 B 才在副本 B 加载房间并完成 hello
+    await f.appA.rooms.join(f.branchId, peerA.peer);
+    await f.appA.rooms.message(f.branchId, peerA.peer, { t: 'hello', client: 'c-alice', lastSeq: 0 });
+
+    await f.appB.rooms.join(f.branchId, peerB.peer);
+    await f.appB.rooms.message(f.branchId, peerB.peer, { t: 'hello', client: 'c-bob', lastSeq: 0 });
+
+    const lastPeersOf = (mp: MockPeer) => {
+      const msg = [...mp.sent]
+        .reverse()
+        .find((m): m is { t: 'peers'; peers: { client: string; user: string }[] } => m.t === 'peers');
+      return msg?.peers ?? [];
+    };
+    const sortedClients = (mp: MockPeer) =>
+      lastPeersOf(mp)
+        .map((p) => `${p.client}:${p.user}`)
+        .sort();
+
+    // 双方均在 peers 消息中看到彼此（协议格式与单机完全一致）
+    await waitFor(
+      () =>
+        JSON.stringify(sortedClients(peerA)) === JSON.stringify(['c-alice:张三', 'c-bob:李四']) &&
+        JSON.stringify(sortedClients(peerB)) === JSON.stringify(['c-alice:张三', 'c-bob:李四']),
+    );
+
+    // 11b. 协作者 B 在副本 B 离房后，副本 A 上的协作者 A 实时收到更新后的 peers
+    await f.appB.rooms.leave(f.branchId, peerB.peer);
+    await waitFor(() => JSON.stringify(sortedClients(peerA)) === JSON.stringify(['c-alice:张三']));
+
+    // 11c. 协作者 B 重新连接副本 B 后，副本 B 执行 disconnectAll()（停机断连），副本 A 立即收到移除通知
+    const peerB2 = makePeer(f.bob);
+    await f.appB.rooms.join(f.branchId, peerB2.peer);
+    await f.appB.rooms.message(f.branchId, peerB2.peer, { t: 'hello', client: 'c-bob-2', lastSeq: 0 });
+    await waitFor(
+      () => JSON.stringify(sortedClients(peerA)) === JSON.stringify(['c-alice:张三', 'c-bob-2:李四']),
+    );
+    await f.appB.rooms.disconnectAll();
+    await waitFor(() => JSON.stringify(sortedClients(peerA)) === JSON.stringify(['c-alice:张三']));
+
+    // 11d. 启用 HA 租约后模拟副本 B 异常崩溃（未发离房事件仅租约消失），副本 A 结合 aliveNodes 清理残留 remotePeers
+    await f.appA.ha.start();
+    await f.appB.ha.start();
+    try {
+      const peerB3 = makePeer(f.bob);
+      await f.appB.rooms.join(f.branchId, peerB3.peer);
+      await f.appB.rooms.message(f.branchId, peerB3.peer, { t: 'hello', client: 'c-bob-3', lastSeq: 0 });
+      await waitFor(
+        () => JSON.stringify(sortedClients(peerA)) === JSON.stringify(['c-alice:张三', 'c-bob-3:李四']),
+      );
+
+      // 直接停掉副本 B 的 HA 租约而不调 leave/disconnectAll，模拟节点崩溃后租约失效
+      await f.appB.ha.stop();
+      await f.appA.rooms.pruneDeadRemotePeers();
+      await waitFor(() => JSON.stringify(sortedClients(peerA)) === JSON.stringify(['c-alice:张三']));
+    } finally {
+      await f.appA.ha.stop().catch(() => {});
+      await f.appB.ha.stop().catch(() => {});
+    }
+  });
+
+  test('12. 大画布自动布局（200 张表 > 7500B）立即落库并通过 room.layout.reload 同步到副本 B 在线客户端', async () => {
+    const f = await boot('large-layout-reload');
+    const peerA = makePeer(f.alice);
+    const peerB = makePeer(f.bob);
+
+    await f.appA.rooms.join(f.branchId, peerA.peer);
+    await f.appB.rooms.join(f.branchId, peerB.peer);
+    await f.appA.rooms.message(f.branchId, peerA.peer, { t: 'hello', client: 'c-a', lastSeq: 0 });
+    await f.appB.rooms.message(f.branchId, peerB.peer, { t: 'hello', client: 'c-b', lastSeq: 0 });
+
+    let reloadEvents = 0;
+    const off = f.appB.bus.onEvent((event) => {
+      if (event.t === 'room.layout.reload' && event.branchId === f.branchId) reloadEvents += 1;
+    });
+
+    try {
+      const positions: Record<string, { x: number; y: number }> = {};
+      for (let i = 0; i < 200; i++) {
+        positions[`tbl_auto_layout_${String(i).padStart(4, '0')}`] = { x: i * 16, y: i * 24 };
+      }
+      expect(Buffer.byteLength(JSON.stringify(positions), 'utf8')).toBeGreaterThan(7500);
+
+      // 副本 B 先留一个旧的 tbl_auto_layout_0000 待落库坐标，验证重载时会清掉被远端覆盖的旧 pendingLayout
+      await f.appB.rooms.message(f.branchId, peerB.peer, {
+        t: 'layout',
+        positions: { tbl_auto_layout_0000: { x: 9999, y: 9999 } },
+      });
+      await waitFor(() =>
+        peerA.sent.some((m) => m.t === 'layout' && m.positions.tbl_auto_layout_0000?.x === 9999),
+      );
+
+      await f.appA.rooms.message(f.branchId, peerA.peer, { t: 'layout', positions });
+
+      // 发出超大布局后已立即落库
+      const [dbRow] = await f.dbA.query<{ layout: Record<string, { x: number; y: number }> }>(
+        'select layout from branches where id = $1',
+        [f.branchId],
+      );
+      expect(Object.keys(dbRow?.layout ?? {})).toHaveLength(200);
+      expect(dbRow?.layout.tbl_auto_layout_0199).toEqual({ x: 199 * 16, y: 199 * 24 });
+
+      // 副本 B 收到 room.layout.reload 并向在线 peerB 推送全部 200 张表
+      await waitFor(() =>
+        peerB.sent.some(
+          (m) =>
+            m.t === 'layout' &&
+            Object.keys(m.positions).length === 200 &&
+            m.positions.tbl_auto_layout_0000?.x === 0 &&
+            m.positions.tbl_auto_layout_0199?.x === 199 * 16,
+        ),
+      );
+      expect(reloadEvents).toBeGreaterThanOrEqual(1);
+
+      // 副本 B 随后 flush() 绝不把旧的 (9999, 9999) 写回数据库覆盖远端自动布局
+      await f.appB.rooms.flush();
+      const [afterFlushB] = await f.dbA.query<{ layout: Record<string, { x: number; y: number }> }>(
+        'select layout from branches where id = $1',
+        [f.branchId],
+      );
+      expect(afterFlushB?.layout.tbl_auto_layout_0000).toEqual({ x: 0, y: 0 });
+    } finally {
+      off();
+    }
+  });
+
+  test('13. pendingLayout 防抖期内收到远端 room.layout 不被旧坐标回写覆盖，且 flush() 等待在途 flushLayout 完成', async () => {
+    const f = await boot('pending-layout-flush');
+    const peerA = makePeer(f.alice);
+    const peerB = makePeer(f.bob);
+
+    await f.appA.rooms.join(f.branchId, peerA.peer);
+    await f.appB.rooms.join(f.branchId, peerB.peer);
+    await f.appA.rooms.message(f.branchId, peerA.peer, { t: 'hello', client: 'c-a', lastSeq: 0 });
+    await f.appB.rooms.message(f.branchId, peerB.peer, { t: 'hello', client: 'c-b', lastSeq: 0 });
+
+    // 13a. 副本 A 拖动 tbl_1=(10,10) 与 tbl_keep=(5,6) 处于防抖期，副本 B 拖动 tbl_1=(99,99) 并广播 + 落库
+    await f.appA.rooms.message(f.branchId, peerA.peer, {
+      t: 'layout',
+      positions: { tbl_1: { x: 10, y: 10 }, tbl_keep: { x: 5, y: 6 } },
+    });
+    await waitFor(() =>
+      peerB.sent.some((m) => m.t === 'layout' && m.positions.tbl_1?.x === 10 && m.positions.tbl_1?.y === 10),
+    );
+    await f.appB.rooms.message(f.branchId, peerB.peer, {
+      t: 'layout',
+      positions: { tbl_1: { x: 99, y: 99 } },
+    });
+    await f.appB.rooms.flush();
+
+    // 等待副本 A 收到远端 room.layout（同时应清掉本地 pendingLayout.tbl_1）
+    await waitFor(() =>
+      peerA.sent.some((m) => m.t === 'layout' && m.positions.tbl_1?.x === 99 && m.positions.tbl_1?.y === 99),
+    );
+
+    // 副本 A flush()：不得覆盖 tbl_1=(99,99)，且仍正确落库未冲突的 tbl_keep=(5,6)
+    await f.appA.rooms.flush();
+    const [rowAfterA] = await f.dbA.query<{ layout: Record<string, { x: number; y: number }> }>(
+      'select layout from branches where id = $1',
+      [f.branchId],
+    );
+    expect(rowAfterA?.layout).toEqual({
+      tbl_1: { x: 99, y: 99 },
+      tbl_keep: { x: 5, y: 6 },
+    });
+
+    // 13b. 验证 flush() 正确等待已在途执行的异步 flushLayout 完成
+    let enteredResolve!: () => void;
+    const entered = new Promise<void>((r) => {
+      enteredResolve = r;
+    });
+    let releaseResolve!: () => void;
+    const release = new Promise<void>((r) => {
+      releaseResolve = r;
+    });
+
+    const origQuery = f.dbA.query.bind(f.dbA);
+    let intercepted = false;
+    f.dbA.query = (async <T = Record<string, unknown>>(sql: string, params?: unknown[]) => {
+      if (!intercepted && sql.includes('update branches set layout')) {
+        intercepted = true;
+        enteredResolve();
+        await release;
+      }
+      return origQuery<T>(sql, params);
+    }) as typeof f.dbA.query;
+
+    try {
+      await f.appA.rooms.message(f.branchId, peerA.peer, {
+        t: 'layout',
+        positions: { tbl_inflight: { x: 42, y: 84 } },
+      });
+      // 等防抖定时器触发进入在途 flushLayout
+      await entered;
+
+      let flushFinished = false;
+      const flushPromise = f.appA.rooms.flush().then(() => {
+        flushFinished = true;
+      });
+      await new Promise((r) => setTimeout(r, 30));
+      expect(flushFinished).toBe(false);
+
+      releaseResolve();
+      await flushPromise;
+      expect(flushFinished).toBe(true);
+    } finally {
+      f.dbA.query = origQuery;
+    }
+
+    const [rowFinal] = await f.dbA.query<{ layout: Record<string, { x: number; y: number }> }>(
+      'select layout from branches where id = $1',
+      [f.branchId],
+    );
+    expect(rowFinal?.layout.tbl_inflight).toEqual({ x: 42, y: 84 });
   });
 });
 
