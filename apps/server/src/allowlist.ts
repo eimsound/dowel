@@ -4,7 +4,7 @@
 // （列表里的主机名也先解析，避免两边的 DNS 结果写法不同）。
 // PG 协议没有重定向，所以不需要考虑跟随重定向。
 import { lookup } from 'node:dns/promises';
-import { realpath } from 'node:fs/promises';
+import { lstat, readlink } from 'node:fs/promises';
 import { isIP } from 'node:net';
 import path from 'node:path';
 
@@ -184,27 +184,49 @@ export const assertUrlMatchesDialect = (url: string, dialect: Dialect): void => 
   });
 };
 
-/** 沿路径向上找到存在的最深祖先目录，消解符号链接后拼回剩余段 */
-const resolveRealWithMissingTail = async (absPath: string): Promise<string> => {
-  const missing: string[] = [];
-  let cur = path.resolve(absPath);
-  for (;;) {
-    try {
-      const real = await realpath(cur);
-      return missing.length ? path.join(real, ...missing.reverse()) : real;
-    } catch {
-      const parent = path.dirname(cur);
-      if (parent === cur) return path.resolve(absPath);
-      missing.push(path.basename(cur));
-      cur = parent;
-    }
+/** 服务端默认 SQLite 平台库路径（与 main.ts 共享，防止未显式设置 DOWEL_DB 时漏掉平台库自保护） */
+export const DEFAULT_SQLITE_PLATFORM_DB = './data/dowel.db';
+
+const MAX_SYMLINK_DEPTH = 40;
+
+/**
+ * 逐段消解路径中的符号链接（包括悬空符号链接与中间目录符号链接），防止通过悬空软链越出白名单目录。
+ * 遇到符号链接循环时抛出 422。
+ */
+const resolveRealWithMissingTail = async (absPath: string, depth = 0): Promise<string> => {
+  if (depth > MAX_SYMLINK_DEPTH) {
+    throw new HTTPException(422, { message: 'SQLite 目标库路径存在符号链接循环' });
   }
+  const resolved = path.resolve(absPath);
+  const { root } = path.parse(resolved);
+  const parts = resolved.slice(root.length).split(path.sep).filter(Boolean);
+  let cur = root;
+  for (let i = 0; i < parts.length; i++) {
+    const next = path.join(cur, parts[i]!);
+    let st;
+    try {
+      st = await lstat(next);
+    } catch (e) {
+      const code = (e as NodeJS.ErrnoException | null)?.code;
+      if (code === 'ENOENT') {
+        return path.join(cur, ...parts.slice(i));
+      }
+      throw new HTTPException(422, { message: 'SQLite 目标库路径无法访问或包含非法路径段' });
+    }
+    if (st.isSymbolicLink()) {
+      const linkTarget = await readlink(next);
+      const targetAbs = path.resolve(cur, linkTarget);
+      return resolveRealWithMissingTail(path.join(targetAbs, ...parts.slice(i + 1)), depth + 1);
+    }
+    cur = next;
+  }
+  return cur;
 };
 
 /** 解析并校验本地 SQLite 目标库路径（DOWEL_SQLITE_ROOTS 白名单 + 防符号链接越权 + 禁止指向 DOWEL_DB 平台库） */
 export const resolveSqlitePath = async (
   url: string,
-  opts: { rootsEnv?: string; platformDbEnv?: string } = {},
+  opts: { rootsEnv?: string; platformDbEnv?: string; platformDbPath?: string } = {},
 ): Promise<string> => {
   if (!SQLITE_SCHEME.test(url)) {
     throw new HTTPException(422, { message: 'SQLite 连接串必须以 sqlite:///绝对路径 开头' });
@@ -257,9 +279,16 @@ export const resolveSqlitePath = async (
     });
   }
 
-  // 严禁指向平台库自身路径（含 WAL/SHM/Journal 附属文件）
-  const platformDb = opts.platformDbEnv ?? process.env.DOWEL_DB;
-  if (platformDb && platformDb !== ':memory:' && !/^postgres(?:ql)?:\/\//i.test(platformDb)) {
+  // 严禁指向平台库自身路径（含 WAL/SHM/Journal 附属文件），涵盖实际打开的平台库路径及默认 ./data/dowel.db
+  const protectedDbs = new Set<string>();
+  if (opts.platformDbPath) protectedDbs.add(opts.platformDbPath);
+  if (opts.platformDbEnv !== undefined) {
+    if (opts.platformDbEnv) protectedDbs.add(opts.platformDbEnv);
+  } else {
+    protectedDbs.add(process.env.DOWEL_DB || DEFAULT_SQLITE_PLATFORM_DB);
+  }
+  for (const platformDb of protectedDbs) {
+    if (!platformDb || platformDb === ':memory:' || /^postgres(?:ql)?:\/\//i.test(platformDb)) continue;
     const realPlatform = await resolveRealWithMissingTail(platformDb);
     if (
       resolvedTarget === realPlatform ||
@@ -363,9 +392,13 @@ export const connectionTargets = (url: string): ConnectionTarget[] => {
  * - sqlite:// → 校验 DOWEL_SQLITE_ROOTS 目录白名单与防 DOWEL_DB 碰撞；
  * - postgres(ql)?:// / mysql:// / mssql:// / sqlserver:// → 校验主机白名单。
  */
-export const assertUrlAllowed = async (url: string, allowlist: string[]): Promise<void> => {
+export const assertUrlAllowed = async (
+  url: string,
+  allowlist: string[],
+  opts?: { platformDbPath?: string },
+): Promise<void> => {
   if (SQLITE_SCHEME.test(url)) {
-    await resolveSqlitePath(url);
+    await resolveSqlitePath(url, { platformDbPath: opts?.platformDbPath });
     return;
   }
   for (const target of connectionTargets(url)) {

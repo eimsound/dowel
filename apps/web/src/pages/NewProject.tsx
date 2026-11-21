@@ -539,6 +539,7 @@ export const NewProject = () => {
                             setSchemaSel(null);
                             resetTakeover();
                             setError('');
+                            setWarnings([]);
                           }}
                         />
                         <span className="min-w-0 flex-1 space-y-0.5">

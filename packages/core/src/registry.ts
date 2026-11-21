@@ -60,3 +60,6 @@ export const normalizeType = (input: string, dialect: Dialect = 'pg'): string =>
   getDialect(dialect).normalizeType(input);
 
 export const commonTypes = (dialect: Dialect = 'pg'): readonly string[] => getDialect(dialect).commonTypes;
+
+export const formatScript = (steps: readonly { sql: string }[], dialect: Dialect = 'pg'): string =>
+  getDialect(dialect).formatScript(steps);

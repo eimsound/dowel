@@ -65,7 +65,7 @@ export const registerProjects = (app: Hono<Env>, ctx: AppContext) => {
 
     // slug：显式给出时要求组内唯一（409）；由名字生成时冲突自动加后缀
     const slug = await pickProjectSlug(db, g.id, b.name, b.slug);
-    const scope = b.schemas?.length ? b.schemas : null;
+    const scope = spec.capabilities.schemas && b.schemas?.length ? b.schemas : null;
 
     const pid = newId();
     const branch = newId();
@@ -165,8 +165,17 @@ export const registerProjects = (app: Hono<Env>, ctx: AppContext) => {
     const slugChanged = b.slug !== undefined && b.slug !== a.slug;
     if (slugChanged && (await projectSlugTaken(db, a.groupId, b.slug!, a.id)))
       throw new HTTPException(409, { message: '这个组里已经有相同的标识' });
-    // schema 范围：空数组视为全部（和建项目时一致）；变了要重建影子库的读过滤
-    const scope = b.schemas === undefined ? undefined : b.schemas?.length ? b.schemas : null;
+    // schema 范围：单 schema 方言（如 SQLite）固定置空；多 schema 方言空数组视为全部；变了要重建影子库的读过滤
+    const spec = getDialect(a.dialect);
+    const scope = !spec.capabilities.schemas
+      ? a.schemas !== null
+        ? null
+        : undefined
+      : b.schemas === undefined
+        ? undefined
+        : b.schemas?.length
+          ? b.schemas
+          : null;
     const scopeChanged = scope !== undefined && JSON.stringify(scope) !== JSON.stringify(a.schemas ?? null);
 
     try {

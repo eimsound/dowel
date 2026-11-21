@@ -130,7 +130,7 @@ const DESTRUCTIVE_SQL =
   /^\s*(?:DROP\s+(?:TABLE|SCHEMA|VIEW|MATERIALIZED\s+VIEW|SEQUENCE|TYPE|FUNCTION|PROCEDURE|AGGREGATE|DOMAIN|TRIGGER|POLICY|INDEX|EXTENSION)\b|ALTER\s+TABLE\b[^;]*?\bDROP\s+COLUMN\b)/i;
 const CONSTRAINT_SQL = /^\s*ALTER\s+TABLE\b[^;]*?\bDROP\s+CONSTRAINT\b/i;
 const REWRITE_SQL =
-  /^\s*ALTER\s+TABLE\b[^;]*?\b(?:ALTER\s+COLUMN\b[^;]*?\bTYPE\b|(?:MODIFY|CHANGE)\s+COLUMN\b|ALTER\s+COLUMN\b)/i;
+  /^\s*ALTER\s+TABLE\b[^;]*?\b(?:ALTER\s+COLUMN\b[^;]*?\bTYPE\b|(?:MODIFY|CHANGE)\s+COLUMN\b)/i;
 
 export interface RepairRisks {
   drops: number;

@@ -17,7 +17,7 @@ import {
   verifyRequestSchema,
   versionCreateSchema,
 } from '@dowel/api';
-import { createAll, type Model, newId, plan } from '@dowel/core';
+import { createAll, formatScript, type Model, newId, plan, validate } from '@dowel/core';
 import {
   canonicalSteps,
   type Db,
@@ -338,6 +338,10 @@ export const registerVersions = (app: Hono<Env>, ctx: AppContext) => {
     const b = await body(c, versionCreateSchema);
     await refresher.flush(a.branch);
     const { model, seq } = await rooms.model(a.branch);
+    const modelErrs = validate(model);
+    if (modelErrs.length > 0) {
+      throw new HTTPException(422, { message: `模型校验未通过，无法发布：${modelErrs[0]}` });
+    }
     const parent = await chainHeadWithModel(db, a.pid);
     const from = chainFrom(parent, model, a.schemas);
     const targetPgMajor = await projectTargetPgMajor(db, a.pid);
@@ -611,7 +615,7 @@ export const registerVersions = (app: Hono<Env>, ctx: AppContext) => {
     if (c.req.query('format') === 'sql') {
       // 迁移脚本开头带上固定的会话设置（04-ir-design.md 1.6），保证在任何会话下执行结果相同
       const header = getEngine(a.dialect).sessionHeader();
-      const body = up.map((s) => `${s.sql};`).join('\n\n');
+      const body = formatScript(up, a.dialect);
       return c.text(`${header ? `${header}\n\n` : ''}${body}\n`, 200, {
         'content-type': 'application/sql; charset=utf-8',
       });
@@ -624,9 +628,10 @@ export const registerVersions = (app: Hono<Env>, ctx: AppContext) => {
     const m = await resolve(a.pid, a.branch, c.req.query('version'));
     const targetPgMajor = await projectTargetPgMajor(db, a.pid);
     return c.text(
-      `${createAll(m, targetPgMajor !== null ? { pgMajor: targetPgMajor } : undefined)
-        .map((s) => `${s.sql};`)
-        .join('\n\n')}\n`,
+      `${formatScript(
+        createAll(m, targetPgMajor !== null ? { pgMajor: targetPgMajor } : undefined),
+        a.dialect,
+      )}\n`,
       200,
       {
         'content-type': 'application/sql; charset=utf-8',

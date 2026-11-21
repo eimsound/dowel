@@ -6,13 +6,14 @@ import { fileURLToPath } from 'node:url';
 import { serve } from '@hono/node-server';
 import { serveStatic } from '@hono/node-server/serve-static';
 
+import { DEFAULT_SQLITE_PLATFORM_DB } from './allowlist.ts';
 import { createApp } from './app.ts';
 import { openPlatformDb } from './db.ts';
 import { DEFAULT_DRIFT_INTERVAL_MS } from './drift-scheduler.ts';
 import { autoSetup, ensureSetupToken, needsSetup } from './setup.ts';
 import { createShutdown } from './shutdown.ts';
 
-const db = await openPlatformDb(process.env.DOWEL_DB || './data/dowel.db');
+const db = await openPlatformDb(process.env.DOWEL_DB || DEFAULT_SQLITE_PLATFORM_DB);
 const port = Number(process.env.PORT ?? 4600);
 
 // 无人值守初始化：设置了 DOWEL_ADMIN_USERNAME / DOWEL_ADMIN_PASSWORD 并且还没有用户时直接建管理员。

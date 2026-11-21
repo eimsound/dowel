@@ -66,13 +66,21 @@ export const connectSqlite = (
     if (handle) return Promise.resolve(handle);
     opening ??= (async () => {
       await guard?.(url);
+      if (closed) throw new ConnectError('SQLite 连接已关闭');
       const filePath = await resolveSqlitePath(url);
+      if (closed) throw new ConnectError('SQLite 连接已关闭');
+      let h: SqliteDbHandle;
       try {
-        handle = openSqliteDb(filePath, { busyTimeoutMs: Math.max(1000, connectTimeoutSec * 1000) });
-        return handle;
+        h = openSqliteDb(filePath, { busyTimeoutMs: Math.max(1000, connectTimeoutSec * 1000) });
       } catch (e) {
         throw new ConnectError(`打开 SQLite 数据库失败：${rawError(e)}`);
       }
+      if (closed) {
+        h.close();
+        throw new ConnectError('SQLite 连接已关闭');
+      }
+      handle = h;
+      return h;
     })();
     return opening;
   };
@@ -92,6 +100,12 @@ export const connectSqlite = (
     db,
     close: async () => {
       closed = true;
+      const inFlight = opening;
+      opening = null;
+      if (inFlight) {
+        const opened = await inFlight.catch(() => null);
+        opened?.close();
+      }
       const h = handle;
       handle = null;
       h?.close();

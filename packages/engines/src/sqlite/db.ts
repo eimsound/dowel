@@ -1,8 +1,10 @@
 // SQLite 数据库适配器：基于 Node 26 内置 node:sqlite（DatabaseSync），零原生编译依赖。
 // 支持 :memory: 内存影子库与本地文件路径目标库；提供按规范路径隔离的进程内互斥锁。
-import { DatabaseSync, type SQLInputValue } from 'node:sqlite';
+import { constants, DatabaseSync, type SQLInputValue } from 'node:sqlite';
 
 import type { Db } from '../types.ts';
+
+const BLOCKED_PRAGMAS = new Set(['writable_schema', 'temp_store_directory', 'data_store_directory']);
 
 export const SQLITE_SESSION_SETTINGS = [
   'PRAGMA foreign_keys = ON',
@@ -75,10 +77,32 @@ export const openSqliteDb = (
   opts: { busyTimeoutMs?: number; readOnly?: boolean } = {},
 ): SqliteDbHandle => {
   const raw = opts.readOnly ? new DatabaseSync(filename, { readOnly: true }) : new DatabaseSync(filename);
-  const busyMs = Math.max(0, Math.trunc(opts.busyTimeoutMs ?? DEFAULT_SQLITE_BUSY_TIMEOUT_MS));
-  raw.exec(`PRAGMA busy_timeout = ${busyMs}`);
-  raw.exec('PRAGMA foreign_keys = ON');
-  raw.exec('PRAGMA legacy_alter_table = OFF');
+  try {
+    // 引擎级纵深防御：开启 defensive 模式并安装 authorizer，彻底禁止 ATTACH / DETACH 及高危 PRAGMA
+    raw.enableDefensive(true);
+    raw.setAuthorizer((actionCode, arg1) => {
+      if (actionCode === constants.SQLITE_ATTACH || actionCode === constants.SQLITE_DETACH) {
+        return constants.SQLITE_DENY;
+      }
+      if (
+        actionCode === constants.SQLITE_PRAGMA &&
+        typeof arg1 === 'string' &&
+        BLOCKED_PRAGMAS.has(arg1.toLowerCase())
+      ) {
+        return constants.SQLITE_DENY;
+      }
+      return constants.SQLITE_OK;
+    });
+    const busyMs = Math.max(0, Math.trunc(opts.busyTimeoutMs ?? DEFAULT_SQLITE_BUSY_TIMEOUT_MS));
+    raw.exec(`PRAGMA busy_timeout = ${busyMs}`);
+    raw.exec('PRAGMA foreign_keys = ON');
+    raw.exec('PRAGMA legacy_alter_table = OFF');
+  } catch (e) {
+    try {
+      raw.close();
+    } catch {}
+    throw e;
+  }
   const lockKey = filename === ':memory:' ? `memory:${++memorySeq}` : `file:${filename}`;
   const db = fromSqlite(raw, lockKey);
   let closed = false;

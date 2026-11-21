@@ -13,7 +13,7 @@
 
 import { createHash, randomUUID } from 'node:crypto';
 import { mkdirSync } from 'node:fs';
-import { dirname } from 'node:path';
+import { dirname, resolve as resolvePath } from 'node:path';
 import { DatabaseSync, type SQLInputValue, type StatementColumnMetadata } from 'node:sqlite';
 
 import { BASELINE_VERSION_NAME } from '@dowel/api';
@@ -66,6 +66,8 @@ export interface TransactionOptions {
 
 export interface PlatformDb extends Db {
   dialect: Dialect;
+  /** SQLite 平台库的物理文件路径（内存库或 PG 为 undefined），用于防止被配置为 SQLite 目标库 */
+  readonly filePath?: string;
   transaction<T>(fn: (tx: Db) => Promise<T>, options?: TransactionOptions): Promise<T>;
   /** 订阅跨副本通知通道（PG 用 LISTEN，重连时触发 onReconnect；SQLite 为空操作） */
   listen(
@@ -1686,6 +1688,7 @@ const openSqlite = (path: string): PlatformDb => {
   const advisoryLocks = new Map<string, Promise<void>>();
   return {
     dialect: 'sqlite',
+    ...(path !== ':memory:' ? { filePath: resolvePath(path) } : {}),
     query: (q, params) => exclusive(() => raw.query(q, params)),
     exec: (q) => exclusive(() => raw.exec(q)),
     transaction: (fn, txOptions) =>

@@ -1,7 +1,7 @@
 // 模型页：顶栏 + 画布 / SQL + 属性面板 + 状态栏（DESIGN.md：Layout）。
 // 对象树在应用外壳的侧面板里（由这里通过 useShellPanel 提供），属性面板默认按需出现、可固定。
 import type { EnvInfo, VersionInfo } from '@dowel/api';
-import { createAll, newId } from '@dowel/core';
+import { createAll, formatScript, newId } from '@dowel/core';
 import { useQuery, useQueryClient } from '@tanstack/react-query';
 import { Link } from '@tanstack/react-router';
 import {
@@ -117,9 +117,10 @@ export const Model = () => {
   const ddl = useMemo(() => {
     if (tab !== 'sql') return '';
     try {
-      return createAll(model, project.targetPgMajor !== null ? { pgMajor: project.targetPgMajor } : undefined)
-        .map((s) => `${s.sql};`)
-        .join('\n\n');
+      return formatScript(
+        createAll(model, project.targetPgMajor !== null ? { pgMajor: project.targetPgMajor } : undefined),
+        model.dialect,
+      );
     } catch (e) {
       const msg = e instanceof Error ? e.message : String(e);
       return msg

@@ -1,5 +1,5 @@
 // SQLite 方言规格实现（注册到 @dowel/core registry）。
-import type { DialectCapabilities, DialectSpec } from '../dialect.ts';
+import type { DialectCapabilities, DialectSpec, IdentKind } from '../dialect.ts';
 import { emptyModel, type Model, type Obj } from '../ir.ts';
 import { all, childrenOf, columnsOf, get, indexElementNames } from '../model.ts';
 import { sqliteChooseName, sqliteJoinNames } from './naming.ts';
@@ -206,6 +206,22 @@ const validateSqliteModel = (m: Model): string[] => {
   return errs;
 };
 
+const validateSqliteIdent = (name: string, kind: IdentKind): string | null => {
+  if (!name.trim()) return '标识符不能为空';
+  if (Array.from(name).length > MAX_IDENT_CHARS) {
+    return `标识符 ${name} 超出 SQLite 长度上限（${MAX_IDENT_CHARS} 字符）`;
+  }
+  if (kind === 'table' || kind === 'index') {
+    const low = name.toLowerCase();
+    if (low.startsWith('sqlite_')) return `名称 ${name} 不能使用 SQLite 保留前缀 sqlite_`;
+    if (low.startsWith('dowel_')) return `名称 ${name} 不能使用 Dowel 迁移历史保留前缀 dowel_`;
+  }
+  return null;
+};
+
+const formatSqliteScript = (steps: readonly { sql: string }[]): string =>
+  steps.map((s) => `${s.sql};`).join('\n\n');
+
 export const sqliteDialect: DialectSpec = {
   id: 'sqlite',
   capabilities: SQLITE_CAPABILITIES,
@@ -227,6 +243,8 @@ export const sqliteDialect: DialectSpec = {
     m.objects[id] = { id, kind: 'schema', name: 'main', comment: null };
     return m;
   },
+  validateIdent: validateSqliteIdent,
+  formatScript: formatSqliteScript,
   validateModel: validateSqliteModel,
   refreshDerivedNames: refreshSqliteDerivedNames,
   isNameTaken: (m, space, containerId, name, selfId) => {

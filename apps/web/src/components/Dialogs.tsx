@@ -12,6 +12,7 @@ import type {
   VersionCreated,
   VersionInfo,
 } from '@dowel/api';
+import { formatScript } from '@dowel/core';
 import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query';
 import {
   ArrowRight,
@@ -32,6 +33,8 @@ import { Fragment, useEffect, useLayoutEffect, useRef, useState } from 'react';
 import { useTranslation } from 'react-i18next';
 
 import { ApiError, api } from '../api.ts';
+import { dialectUiSpec } from '../dialects.ts';
+import { useProject } from '../project.tsx';
 import { Modal } from './Modal.tsx';
 import { useToast } from './Toasts.tsx';
 import { Banner, cx, Sql } from './ui.tsx';
@@ -352,6 +355,8 @@ export const StepList = ({
 
 export const MigrationDialog = ({ pid, open, onClose }: Base) => {
   const { t } = useTranslation();
+  const { project } = useProject();
+  const uiSpec = dialectUiSpec(project.dialect);
   const versions = useQuery({
     queryKey: ['versions', pid],
     queryFn: () => api<VersionInfo[]>('GET', `/api/projects/${pid}/versions`),
@@ -363,7 +368,7 @@ export const MigrationDialog = ({ pid, open, onClose }: Base) => {
   const envs = useQuery({
     queryKey: ['envs', pid],
     queryFn: () => api<EnvInfo[]>('GET', `/api/projects/${pid}/environments`),
-    enabled: open,
+    enabled: open && uiSpec.requiresExternalShadow,
   });
   const [env, setEnv] = useState('');
   const [copied, setCopied] = useState(false);
@@ -378,11 +383,11 @@ export const MigrationDialog = ({ pid, open, onClose }: Base) => {
       api<VerifyResponse>('POST', `/api/projects/${pid}/verify`, {
         from: effFrom,
         to,
-        env: env || undefined,
+        env: uiSpec.requiresExternalShadow ? env || undefined : undefined,
       }),
   });
   const steps = mig.data?.[dir] ?? [];
-  const text = steps.map((s) => `${s.sql};`).join('\n\n');
+  const text = formatScript(steps, project.dialect);
   const versionName = useVersionName();
   const versionOptions = (withEmpty: boolean, withHead: boolean) => (
     <>
@@ -396,7 +401,7 @@ export const MigrationDialog = ({ pid, open, onClose }: Base) => {
     </>
   );
   const r = verify.data;
-  const noEnv = envs.data?.length === 0;
+  const noEnv = uiSpec.requiresExternalShadow && envs.data?.length === 0;
   return (
     <Modal
       open={open}
@@ -484,7 +489,12 @@ export const MigrationDialog = ({ pid, open, onClose }: Base) => {
           </div>
         </div>
 
-        {noEnv ? (
+        {!uiSpec.requiresExternalShadow ? (
+          <p className="flex items-center gap-2 text-sm text-text-2">
+            <Database size={14} aria-hidden="true" className="text-text-3" />
+            <span>{t('dlg.verifyInMemory')}</span>
+          </p>
+        ) : noEnv ? (
           <Banner kind="info">{t('dlg.noEnv')}</Banner>
         ) : (
           <label className="flex items-center gap-2 text-sm">

@@ -287,11 +287,18 @@ export const readSqliteSnapshot = async (db: Db): Promise<SqliteSnapshot> => {
       const refCols = group.map((g) => g.to ?? '');
       const refTable = first.table;
       const lowKey = `${refTable.toLowerCase()}:${cols.map((c) => c.toLowerCase()).join(',')}`;
-      const matchIdx = parsed.foreignKeys.findIndex(
-        (pf, i) =>
-          !usedParsedFk.has(i) &&
-          `${pf.refTable.toLowerCase()}:${pf.columns.map((c) => c.toLowerCase()).join(',')}` === lowKey,
-      );
+      const hasExplicitRefCols = refCols.every(Boolean);
+      const refColsKey = refCols.map((c) => c.toLowerCase()).join(',');
+      const matchIdx = parsed.foreignKeys.findIndex((pf, i) => {
+        if (usedParsedFk.has(i)) return false;
+        if (`${pf.refTable.toLowerCase()}:${pf.columns.map((c) => c.toLowerCase()).join(',')}` !== lowKey) {
+          return false;
+        }
+        if (hasExplicitRefCols && pf.refColumns.length > 0) {
+          return pf.refColumns.map((c) => c.toLowerCase()).join(',') === refColsKey;
+        }
+        return true;
+      });
       const meta = matchIdx >= 0 ? parsed.foreignKeys[matchIdx]! : null;
       if (matchIdx >= 0) usedParsedFk.add(matchIdx);
       foreignKeys.push({

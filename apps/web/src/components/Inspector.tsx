@@ -660,8 +660,7 @@ const TableInspector = ({
   };
   const setPk = (colId: string, on: boolean) => {
     const next = on ? [...(pk?.columns ?? []), colId] : (pk?.columns ?? []).filter((c) => c !== colId);
-    if (pk) ws.act('dropKey', { id: pk.id });
-    if (next.length) ws.act('addPrimaryKey', { id: newId(), table: table.id, columns: next });
+    ws.act('setPrimaryKey', { id: newId(), table: table.id, columns: next });
   };
   // 外键可引用的列：被引用表上单列主键或唯一约束的列
   const refCols = fk.ref
@@ -1115,10 +1114,12 @@ const TableInspector = ({
                         label={
                           isPartKey
                             ? t('part.keyColDeleteLocked', { name: c.name })
-                            : `${t('insp.delete')} ${c.name}`
+                            : model.dialect === 'sqlite' && cols.length <= 1
+                              ? t('insp.sqliteLastColumnLocked', { name: c.name })
+                              : `${t('insp.delete')} ${c.name}`
                         }
                         size="sm"
-                        disabled={isPartKey}
+                        disabled={isPartKey || (model.dialect === 'sqlite' && cols.length <= 1)}
                         className="hover:!text-danger"
                         onClick={() => ws.act('dropColumn', { id: c.id })}
                       >
@@ -1232,7 +1233,7 @@ const TableInspector = ({
                   setAdding(null);
               }}
             />
-            <p className="hint">{t('insp.checkHint')}</p>
+            <p className="hint">{t('insp.checkHint', { dialect: uiSpec.name })}</p>
           </AddForm>
         )}
         {activeAdding === 'unique' && (

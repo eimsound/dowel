@@ -34,21 +34,16 @@ const isForeignKeyCheck = (stmt: string): boolean =>
 const isBeginStmt = (stmt: string): boolean => /^\s*begin\b/i.test(stripSqliteSql(stmt));
 const isCommitStmt = (stmt: string): boolean => /^\s*(?:commit|end)\b/i.test(stripSqliteSql(stmt));
 const isRollbackStmt = (stmt: string): boolean => /^\s*rollback\b/i.test(stripSqliteSql(stmt));
-const disablesForeignKeys = (sql: string): boolean =>
-  /\bpragma\s+(?:[a-z_][a-z0-9_]*\s*\.\s*)?foreign_keys\s*=\s*(?:off|0|false|no)\b/i.test(
-    stripSqliteSql(sql),
-  );
 
 /**
  * 执行一条 SQLite 迁移步骤（可含 12 步表重建的 `PRAGMA foreign_keys = OFF; BEGIN IMMEDIATE; ... PRAGMA foreign_key_check; COMMIT; PRAGMA foreign_keys = ON`）：
  * - 按顶层语句顺序执行；
  * - 遇到 `PRAGMA foreign_key_check` 时通过 `query()` 校验返回行，非空即抛错并回滚事务；
  * - 若步骤自行开启了 `BEGIN` 且中途失败，自动 `ROLLBACK`；
- * - 若步骤关闭了 `foreign_keys`，`finally` 必然兜底恢复 `PRAGMA foreign_keys = ON`。
+ * - `finally` 无条件兜底恢复 `PRAGMA foreign_keys = ON`，防止任何自定义脚本静默遗留关闭态。
  */
 export const execSqliteStepSql = async (conn: Db, sql: string): Promise<void> => {
   const stmts = splitSqliteStatements(sql);
-  const touchedFk = disablesForeignKeys(sql);
   let openedTx = false;
   try {
     for (const stmt of stmts) {
@@ -86,9 +81,7 @@ export const execSqliteStepSql = async (conn: Db, sql: string): Promise<void> =>
     if (openedTx) await conn.exec('ROLLBACK').catch(() => {});
     throw e;
   } finally {
-    if (touchedFk) {
-      await conn.exec('PRAGMA foreign_keys = ON').catch(() => {});
-    }
+    await conn.exec('PRAGMA foreign_keys = ON').catch(() => {});
   }
 };
 

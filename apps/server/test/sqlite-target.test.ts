@@ -4,7 +4,7 @@
 // - 零环境模型编辑（含 12 步表重建）+ 自动验证发布 + SQL 导出；
 // - DOWEL_SQLITE_ROOTS 安全边界（未配置、越界、符号链接逃逸、:memory:、query、..、指向平台库 DOWEL_DB、方言不匹配）；
 // - 本地 SQLite 文件目标库：连接检查、从现有库导入、执行升级/回滚/重跑、漂移检测、CI 令牌执行与接手恢复。
-import { mkdtempSync, rmSync, symlinkSync, writeFileSync } from 'node:fs';
+import { existsSync, mkdtempSync, rmSync, symlinkSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import path from 'node:path';
 
@@ -20,12 +20,14 @@ import type {
   VersionDetail,
   WizardEvent,
 } from '@dowel/api';
-import { addColumn, all, setColumnType, setDefault } from '@dowel/core';
+import { addColumn, all, createTable, setColumnType, setDefault } from '@dowel/core';
 import { openSqliteDb } from '@dowel/engines';
 import { afterAll, beforeAll, describe, expect, test } from 'vitest';
 
 import { createApp, openPlatformDb, type PlatformDb } from '../src/index.ts';
 import { KeyedLimiter } from '../src/rate-limit.ts';
+import { maskUrl } from '../src/secrets.ts';
+import { connectSqlite } from '../src/targets/sqlite.ts';
 import { editModel, makeUser, PASSWORD } from './support.ts';
 
 process.env.DOWEL_SECRET ??= 'test-secret-0123456789';
@@ -440,5 +442,101 @@ describe('SQLite 目标库全栈', () => {
     const takeoverDone = takeoverEvents.find((e) => e.stage === 'done');
     expect(takeoverDone?.project?.id).toBe(pid);
     expect(takeoverDone?.project?.dialect).toBe('sqlite');
+  });
+
+  test('R1 审查回归：悬空符号链接逃逸、默认 DOWEL_DB 保护、无空白 ATTACH、发布前 validate()、connectSqlite 竞态、单 schema 清理与 MSSQL maskUrl', async () => {
+    // C1: 无空白 ATTACH 变体在零环境 :memory: 向导导入中被 422 拦截
+    const bypassRes = await req('POST', '/api/projects/wizard', {
+      groupId,
+      name: 'Compact Attach',
+      dialect: 'sqlite',
+      environments: [],
+      content: { kind: 'sql', sql: "ATTACH'/etc/passwd'AS pwn; CREATE TABLE t (id INTEGER PRIMARY KEY);" },
+    });
+    expect(bypassRes.status).toBe(422);
+
+    // C2: 悬空符号链接与中间目录悬空符号链接不可越界创建文件
+    const escapedTarget = path.join(outsideDir, 'dangling-escaped.sqlite');
+    const danglingLink = path.join(allowedDir, 'innocent-dangling.sqlite');
+    symlinkSync(escapedTarget, danglingLink);
+    const danglingRes = await req('POST', '/api/connection-check', {
+      groupId,
+      dialect: 'sqlite',
+      url: `sqlite://${danglingLink}`,
+    });
+    expect(danglingRes.status).toBe(422);
+    expect(existsSync(escapedTarget)).toBe(false);
+
+    const escapedDir = path.join(outsideDir, 'dangling-dir');
+    const dirLink = path.join(allowedDir, 'dir-link');
+    symlinkSync(escapedDir, dirLink);
+    const dirLinkRes = await req('POST', '/api/connection-check', {
+      groupId,
+      dialect: 'sqlite',
+      url: `sqlite://${path.join(dirLink, 'app.sqlite')}`,
+    });
+    expect(dirLinkRes.status).toBe(422);
+
+    // C2: 即使未设置 DOWEL_DB 环境变量，平台库实际路径（db.filePath）依然受保护
+    const savedDowelDb = process.env.DOWEL_DB;
+    delete process.env.DOWEL_DB;
+    try {
+      const selfRes = await req('POST', '/api/connection-check', {
+        groupId,
+        dialect: 'sqlite',
+        url: `sqlite://${platformDbPath}`,
+      });
+      expect(selfRes.status).toBe(422);
+    } finally {
+      if (savedDowelDb !== undefined) process.env.DOWEL_DB = savedDowelDb;
+    }
+
+    // M5 + H1: SQLite 项目创建/PATCH 忽略 schemas 字段；空列表模型发布前被 validate(model) 以 422 拒绝
+    const pRes = await req('POST', '/api/projects', {
+      name: 'SQLite Single Schema',
+      groupId,
+      dialect: 'sqlite',
+      schemas: ['custom_ignored'],
+    });
+    expect(pRes.status).toBe(201);
+    const pCreated = (await pRes.json()) as ProjectCreated;
+    const pInfo1 = (await (await req('GET', `/api/projects/${pCreated.id}`)).json()) as ProjectInfo;
+    expect(pInfo1.schemas).toBeNull();
+
+    const patchRes = await req('PATCH', `/api/projects/${pCreated.id}`, { schemas: ['still_ignored'] });
+    expect(patchRes.status).toBe(200);
+    expect(((await patchRes.json()) as ProjectInfo).schemas).toBeNull();
+
+    // 建一张 0 列空表（非法 SQLite 模型）-> 发布被 validate(model) 422 拦截
+    await editModel(rooms, pdb, pCreated.id, (m) => {
+      const main = all(m, 'schema')[0]!;
+      createTable(m, main.id, 'empty_table');
+    });
+    const invalidPub = await req('POST', `/api/projects/${pCreated.id}/versions`, { name: 'invalid' });
+    expect(invalidPub.status).toBe(422);
+    expect(((await invalidPub.json()) as { error: string }).error).toContain('至少需要一列');
+
+    // M3: connectSqlite 异步 guard 进行中调用 close() 不会泄漏句柄
+    const raceDb = path.join(allowedDir, 'race-close.sqlite');
+    let releaseGuard!: () => void;
+    const guardGate = new Promise<void>((r) => {
+      releaseGuard = r;
+    });
+    const conn = connectSqlite(`sqlite://${raceDb}`, 5, async () => {
+      await guardGate;
+    });
+    const pendingQuery = conn.db.query('SELECT 1');
+    const closing = conn.close();
+    releaseGuard();
+    await expect(pendingQuery).rejects.toThrow(/已关闭/);
+    await closing;
+
+    // L1: maskUrl 支持 MSSQL 命名实例 host\instance
+    expect(maskUrl('mssql://sa:Secr3t!@dbhost\\SQLEXPRESS/mydb')).toBe(
+      'mssql://sa:***@dbhost\\SQLEXPRESS/mydb',
+    );
+    expect(maskUrl('sqlserver://sa:p@ss@10.0.0.1\\INST1:1433/app')).toBe(
+      'sqlserver://sa:***@10.0.0.1\\INST1:1433/app',
+    );
   });
 });

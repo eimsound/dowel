@@ -40,16 +40,29 @@ const flaky = vi.hoisted(() => ({
 }));
 vi.mock('@dowel/engines', async (orig) => {
   const m = await orig<typeof import('@dowel/engines')>();
+  const runFlaky = async () => {
+    if (flaky.onReadSnapshot) {
+      const hook = flaky.onReadSnapshot;
+      flaky.onReadSnapshot = undefined;
+      await hook();
+    }
+    if (flaky.readSnapshot) throw new Error('boom: connection reset by peer');
+  };
   return {
     ...m,
     readSnapshot: async (...a: Parameters<typeof m.readSnapshot>) => {
-      if (flaky.onReadSnapshot) {
-        const hook = flaky.onReadSnapshot;
-        flaky.onReadSnapshot = undefined;
-        await hook();
-      }
-      if (flaky.readSnapshot) throw new Error('boom: connection reset by peer');
+      await runFlaky();
       return m.readSnapshot(...a);
+    },
+    getEngine: (d: Parameters<typeof m.getEngine>[0]) => {
+      const e = m.getEngine(d);
+      return {
+        ...e,
+        readSnapshot: async (...a: Parameters<typeof e.readSnapshot>) => {
+          await runFlaky();
+          return e.readSnapshot(...a);
+        },
+      };
     },
   };
 });

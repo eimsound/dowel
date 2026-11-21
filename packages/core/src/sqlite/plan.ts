@@ -4,7 +4,13 @@ import type { Check, Column, ForeignKey, Index, Model, Opaque, PrimaryKey, Table
 import { deepEqual } from '../json.ts';
 import { all, childrenOf, columnsOf, get } from '../model.ts';
 import { PlanError, type Step } from '../plan-types.ts';
-import { sqliteExprReferences, sqliteIdent, sqliteRenameInExpr } from './quote.ts';
+import {
+  sqliteExprReferences,
+  sqliteIdent,
+  sqliteLiteral,
+  sqliteRenameInExpr,
+  sqliteTokenize,
+} from './quote.ts';
 
 const same = deepEqual;
 
@@ -485,12 +491,61 @@ export const sqlitePlan = (from: Model, to: Model): Step[] => {
     if (needsRebuild()) rebuilding.add(t.id);
   }
 
+  // H3 不动点闭包：若被引用表走 12 步重建且其被引用列同时改名，由于被引用表跳过 S5a 的 RENAME COLUMN，
+  // SQLite 不会自动改写子表外键中的被引用列名，必须将引用表一并纳入重建集合并在同一原子事务中重建。
+  for (let changed = true; changed;) {
+    changed = false;
+    for (const fk of all(to, 'foreignKey')) {
+      if (!inFrom(fk.parent) || rebuilding.has(fk.parent)) continue;
+      if (!rebuilding.has(fk.refTable)) continue;
+      const refColRenamed = fk.refColumns.some((rcId) => {
+        const fc = from.objects[rcId];
+        const tc = to.objects[rcId];
+        return fc?.kind === 'column' && tc?.kind === 'column' && fc.name !== tc.name;
+      });
+      if (refColRenamed) {
+        rebuilding.add(fk.parent);
+        changed = true;
+      }
+    }
+  }
+
   // ───── S1: 删除被移除 / 变更 / 依赖变更表的不透明对象（视图、触发器） ─────
   const touchedTableIds = new Set<string>([
     ...removedTables.map((t) => t.id),
     ...rebuilding,
     ...tableRenameIds,
   ]);
+  const touchedColIds = new Set<string>();
+  for (const c of all(from, 'column')) {
+    if (touchedTableIds.has(c.parent) || !inTo(c.id)) {
+      touchedColIds.add(c.id);
+      continue;
+    }
+    const next = to.objects[c.id];
+    if (next?.kind === 'column' && next.name !== c.name) touchedColIds.add(c.id);
+  }
+  const touchedTableNamesLower = new Set<string>();
+  for (const tid of touchedTableIds) {
+    const ft = from.objects[tid];
+    const tt = to.objects[tid];
+    if (ft?.kind === 'table') touchedTableNamesLower.add(ft.name.toLowerCase());
+    if (tt?.kind === 'table') touchedTableNamesLower.add(tt.name.toLowerCase());
+  }
+  const ddlMentionsTouchedTable = (ddl: string[]): boolean => {
+    if (touchedTableNamesLower.size === 0) return false;
+    for (const sql of ddl) {
+      for (const tok of sqliteTokenize(sql)) {
+        if (
+          (tok.kind === 'ident' || tok.kind === 'qident') &&
+          touchedTableNamesLower.has(tok.text.toLowerCase())
+        ) {
+          return true;
+        }
+      }
+    }
+    return false;
+  };
   const opaquesToDrop = new Set<string>();
   const opaqueChanged = (op: Opaque): boolean => {
     const next = to.objects[op.id];
@@ -498,7 +553,12 @@ export const sqlitePlan = (from: Model, to: Model): Step[] => {
     return !same([op.objType, op.name, op.ddl, op.drop], [next.objType, next.name, next.ddl, next.drop]);
   };
   for (const op of all(from, 'opaque')) {
-    if (opaqueChanged(op) || touchedTableIds.has(op.parent) || op.deps.some((d) => touchedTableIds.has(d))) {
+    if (
+      opaqueChanged(op) ||
+      touchedTableIds.has(op.parent) ||
+      op.deps.some((d) => touchedTableIds.has(d) || touchedColIds.has(d)) ||
+      (touchedTableIds.size > 0 && (op.objType === 'view' || ddlMentionsTouchedTable(op.ddl)))
+    ) {
       opaquesToDrop.add(op.id);
     }
   }
@@ -730,6 +790,15 @@ export const sqlitePlan = (from: Model, to: Model): Step[] => {
         `INSERT INTO ${sqliteIdent(tmpName)} (${dstCols}) SELECT ${srcCols} FROM ${sqliteIdent(t.name)}`,
       );
     }
+    // 保留 AUTOINCREMENT 高水位（sqlite_sequence）：防止清空或删除末尾行后重建导致主键 ID 回退复用
+    if (columnsOf(to, tid).some((c) => c.ext?.sqlite?.autoincrement)) {
+      const oldLit = sqliteLiteral(t.name);
+      const tmpLit = sqliteLiteral(tmpName);
+      stmts.push(
+        `UPDATE sqlite_sequence SET seq = MAX(seq, COALESCE((SELECT seq FROM sqlite_sequence WHERE name = ${oldLit}), 0)) WHERE name = ${tmpLit}`,
+        `INSERT INTO sqlite_sequence (name, seq) SELECT ${tmpLit}, seq FROM sqlite_sequence WHERE name = ${oldLit} AND NOT EXISTS (SELECT 1 FROM sqlite_sequence WHERE name = ${tmpLit})`,
+      );
+    }
     stmts.push(`DROP TABLE ${sqliteIdent(t.name)}`);
     stmts.push(`ALTER TABLE ${sqliteIdent(tmpName)} RENAME TO ${sqliteIdent(t.name)}`);
 
@@ -763,7 +832,15 @@ export const sqlitePlan = (from: Model, to: Model): Step[] => {
         stmts.push(renderSqliteCreateTable(to, tid));
       }
     }
-    stmts.push('PRAGMA foreign_key_check', 'COMMIT', 'PRAGMA foreign_keys = ON');
+    // PRAGMA foreign_key_check 供执行器产出明细错误；紧随的 _dowel_fk_guard 保证离线 sqlite3 CLI 遇违例也能强制中止并回滚事务
+    stmts.push(
+      'PRAGMA foreign_key_check',
+      'CREATE TEMP TABLE _dowel_fk_guard (x INT NOT NULL)',
+      'INSERT INTO temp._dowel_fk_guard SELECT NULL FROM pragma_foreign_key_check LIMIT 1',
+      'DROP TABLE temp._dowel_fk_guard',
+      'COMMIT',
+      'PRAGMA foreign_keys = ON',
+    );
     const targetLabel = orderedComp.map((id) => get(to, id, 'table').name).join(', ');
     emit('rebuildTable', targetLabel, stmts.join(';\n'), false);
   }

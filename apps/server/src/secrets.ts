@@ -54,6 +54,24 @@ export { scrubSecrets };
  */
 export const maskUrl = (url: string): string => {
   if (/^sqlite:\/\//i.test(url)) return url;
+  // MSSQL 命名实例支持 host\instance（反斜杠在 WHATWG URL 主机中不合法），先剥离命名实例脱敏后再还原
+  const mssqlScheme = /^(?:mssql|sqlserver):\/\//i.exec(url);
+  if (mssqlScheme) {
+    const rest = url.slice(mssqlScheme[0].length);
+    const boundary = rest.search(/[/?#]/);
+    const authority = boundary >= 0 ? rest.slice(0, boundary) : rest;
+    const tail = boundary >= 0 ? rest.slice(boundary) : '';
+    const at = authority.lastIndexOf('@');
+    const hostPort = at >= 0 ? authority.slice(at + 1) : authority;
+    if (hostPort.includes('\\')) {
+      if (!hostPort.split('\\')[0]?.trim()) return '（无效的连接串）';
+      if (at < 0) return url;
+      const userinfo = authority.slice(0, at);
+      const colon = userinfo.indexOf(':');
+      const maskedAuth = colon >= 0 ? `${userinfo.slice(0, colon)}:***` : userinfo;
+      return `${mssqlScheme[0]}${maskedAuth}@${hostPort}${tail}`;
+    }
+  }
   try {
     const u = new URL(url);
     if (u.password) u.password = '***';

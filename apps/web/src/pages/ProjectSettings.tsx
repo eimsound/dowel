@@ -12,6 +12,7 @@ import { ProjectPage, Section } from '../components/ProjectPage.tsx';
 import { useToast } from '../components/Toasts.tsx';
 import { ProjectTokensPanel, TokenPolicyPanel } from '../components/TokenSettings.tsx';
 import { Banner } from '../components/ui.tsx';
+import { dialectUiSpec } from '../dialects.ts';
 import { invalidatePolicyDependents } from '../policy-cache.ts';
 import { useProject } from '../project.tsx';
 
@@ -190,9 +191,11 @@ export const ProjectSettings = () => {
           )}
         </Section>
 
-        <Section title={t('pset.schemaSection')}>
-          <SchemaScope pid={pid} project={project} canManage={canManage} />
-        </Section>
+        {dialectUiSpec(project.dialect).schemas && (
+          <Section title={t('pset.schemaSection')}>
+            <SchemaScope pid={pid} project={project} canManage={canManage} />
+          </Section>
+        )}
 
         {/* 项目层的执行策略（P5a）：项目成员都能看，项目管理员可改；环境自己的那一层在环境页 */}
         <Section title={t('pol.title')}>

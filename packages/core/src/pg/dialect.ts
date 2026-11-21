@@ -1,5 +1,5 @@
 // PostgreSQL 方言规格实现（包装既有 PG 模块，保证 100% 向后兼容）。
-import type { DialectCapabilities, DialectSpec } from '../dialect.ts';
+import type { DialectCapabilities, DialectSpec, IdentKind } from '../dialect.ts';
 import { emptyModel, type Model, type Obj } from '../ir.ts';
 import {
   all,
@@ -154,6 +154,7 @@ const validatePgModel = (m: Model): string[] => {
     checkBytes(o, o.name);
     switch (o.kind) {
       case 'schema':
+        if (o.name === 'dowel') errs.push('schema dowel：dowel 保留给 Dowel 迁移历史');
         claim('schema', o.name, o);
         break;
       case 'extension':
@@ -289,6 +290,20 @@ const validatePgModel = (m: Model): string[] => {
   return errs;
 };
 
+const validatePgIdent = (name: string, kind: IdentKind): string | null => {
+  if (!name.trim()) return '标识符不能为空';
+  if (textEncoder.encode(name).length > PG_MAX_BYTES) {
+    return `标识符 ${name} 超出 PostgreSQL 长度上限（${PG_MAX_BYTES} 字节）`;
+  }
+  if (kind === 'schema' && name === 'dowel') {
+    return 'schema 名称 dowel 保留给 Dowel 迁移历史，不能使用';
+  }
+  return null;
+};
+
+const formatPgScript = (steps: readonly { sql: string }[]): string =>
+  steps.map((s) => `${s.sql};`).join('\n\n');
+
 export const pgDialect: DialectSpec = {
   id: 'pg',
   capabilities: PG_CAPABILITIES,
@@ -311,6 +326,8 @@ export const pgDialect: DialectSpec = {
     m.objects[id] = { id, kind: 'schema', name: 'public', comment: null };
     return m;
   },
+  validateIdent: validatePgIdent,
+  formatScript: formatPgScript,
   validateModel: validatePgModel,
   refreshDerivedNames: refreshPgDerivedNames,
   isNameTaken: (m, space, containerId, name, selfId) => {

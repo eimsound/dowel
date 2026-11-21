@@ -59,15 +59,23 @@ test('SQLite 零环境向导导入、建模编辑、SQL 预览与自动验证发
 
   // 6. 添加一列并检查 SQL 视图
   await inspector.getByRole('button', { name: '添加列' }).click();
-  await expect(inspector.getByRole('button', { name: /column_3/ })).toBeVisible();
+  await expect(inspector.getByRole('button', { name: /^column_3\b/ })).toBeVisible();
 
   await page.getByRole('tab', { name: 'SQL' }).click();
-  await expect(page.getByText(/CREATE TABLE notes/)).toBeVisible();
-  await expect(page.getByText(/STRICT/)).toBeVisible();
+  await expect(page.getByText(/CREATE TABLE notes[\s\S]*STRICT/)).toBeVisible();
+
+  // 6.5. 零环境在迁移弹窗直接通过 :memory: 影子库闭环验证
+  await page.getByRole('button', { name: '迁移' }).click();
+  const migDlg = page.getByRole('dialog', { name: '迁移' });
+  const verifyBtn = migDlg.getByRole('button', { name: '验证' });
+  await expect(verifyBtn).toBeEnabled();
+  await verifyBtn.click();
+  await expect(migDlg.getByText('验证通过')).toBeVisible();
+  await migDlg.getByRole('button', { name: '关闭' }).first().click();
 
   // 7. 零环境直接发布 v1，经内置 :memory: 影子库自动验证通过
   await page.getByRole('button', { name: '发布' }).click();
-  const dlg = page.getByRole('dialog', { name: '发布版本' });
+  const dlg = page.getByRole('dialog', { name: '发布' });
   await dlg.getByLabel('版本名').fill('add-column');
   await dlg.getByRole('button', { name: '发布' }).click();
   await expect(dlg).not.toBeVisible();

@@ -16,10 +16,12 @@ import {
   emptyBase,
   emptyModel,
   findInstanceLevelStatement,
+  formatScript,
   getDialect,
   isNontransactionalSql,
   plan,
   renameColumn,
+  renameKey,
   renameTable,
   runMutator,
   scrubSecrets,
@@ -28,6 +30,7 @@ import {
   setDefault,
   setNotNull,
   setPartitionBy,
+  setPrimaryKey,
   setTableExt,
   splitSqliteStatements,
   validate,
@@ -177,5 +180,101 @@ describe('multi-dialect core foundation & SQLite planner', () => {
     expect(steps23.some((st) => st.kind === 'rebuildTable')).toBe(true);
     expect(steps23.some((st) => st.kind === 'createTable' && st.target === 'orders')).toBe(true);
     expect(steps23.some((st) => st.kind === 'createIndex')).toBe(true);
+  });
+
+  it('C1 & H1: blocks whitespace-less ATTACH/DETACH, EXPLAIN ATTACH, dangerous PRAGMAs, and dowel_* tampering', () => {
+    for (const bad of [
+      "ATTACH'/etc/passwd'AS pwn;",
+      "ATTACH('x')AS pwn;",
+      'DETACH"pwn";',
+      'DETACH(pwn);',
+      "EXPLAIN ATTACH '/tmp/x' AS pwn;",
+      "EXPLAIN QUERY PLAN ATTACH '/tmp/x' AS pwn;",
+      'PRAGMA writable_schema = ON;',
+      'PRAGMA main.writable_schema = 1;',
+      "PRAGMA temp_store_directory = '/tmp';",
+      "PRAGMA data_store_directory = '/tmp';",
+      'DROP TABLE dowel_history;',
+      'DROP TRIGGER IF EXISTS dowel_history_no_delete;',
+      'DELETE FROM dowel_history;',
+      "UPDATE dowel_claims SET note = 'x';",
+      "INSERT INTO dowel_meta VALUES ('k', 'v');",
+      'CREATE TRIGGER tr_evil AFTER INSERT ON dowel_history BEGIN SELECT 1; END;',
+      'CREATE TRIGGER tr_evil2 AFTER INSERT ON users BEGIN DELETE FROM dowel_history; END;',
+    ]) {
+      expect(findInstanceLevelStatement(bad, 'sqlite'), `expected block: ${bad}`).not.toBeNull();
+    }
+    expect(findInstanceLevelStatement('CREATE TABLE users (id INTEGER PRIMARY KEY)', 'sqlite')).toBeNull();
+  });
+
+  it('H1: enforces real-time identifier length and reserved prefix checks in edit.ts', () => {
+    const pg = emptyModel('pg');
+    const pub = createSchema(pg, 'public');
+    expect(() => createSchema(pg, 'dowel')).toThrow(/dowel/);
+    expect(() => createTable(pg, pub, 'a'.repeat(64))).toThrow(/63/);
+    expect(() => createTable(pg, pub, '中'.repeat(22))).toThrow(/63/); // 66 UTF-8 bytes
+
+    const sq = emptyModel('sqlite');
+    const main = createSchema(sq, 'main');
+    expect(() => createTable(sq, main, 'sqlite_secret')).toThrow(/sqlite_/);
+    expect(() => createTable(sq, main, 'dowel_custom')).toThrow(/dowel_/);
+    expect(() => createTable(sq, main, 'x'.repeat(129))).toThrow(/128/);
+    const t = createTable(sq, main, 'notes');
+    const id = addColumn(sq, t, { name: 'id', type: 'INTEGER', notNull: true });
+    const ix = addIndex(sq, t, [{ column: id }]);
+    expect(() => renameKey(sq, ix, 'sqlite_idx')).toThrow(/sqlite_/);
+    expect(() => renameKey(sq, ix, 'dowel_idx')).toThrow(/dowel_/);
+  });
+
+  it('H3 & M1: pulls child FK table into atomic rebuild when parent rebuilds + renames referenced column, preserves sqlite_sequence & emits FK abort guard', () => {
+    const m0 = emptyModel('sqlite');
+    const main = createSchema(m0, 'main');
+    const orgs = createTable(m0, main, 'orgs');
+    const oid = addColumn(m0, orgs, { name: 'id', type: 'INTEGER', notNull: true });
+    addPrimaryKey(m0, orgs, [oid]);
+    setColumnExt(m0, oid, { sqlite: { autoincrement: true } });
+
+    const members = createTable(m0, main, 'members');
+    const mid = addColumn(m0, members, { name: 'id', type: 'INTEGER', notNull: true });
+    const mOrg = addColumn(m0, members, { name: 'org_id', type: 'INTEGER', notNull: true });
+    addPrimaryKey(m0, members, [mid]);
+    addForeignKey(m0, members, [mOrg], orgs, [oid]);
+
+    const m1 = structuredClone(m0);
+    // Parent table both rebuilds (STRICT) AND renames referenced column id -> org_pk
+    setTableExt(m1, orgs, { sqlite: { strict: true } });
+    renameColumn(m1, oid, 'org_pk');
+
+    const steps = plan(m0, m1);
+    const rebuild = steps.find((s) => s.kind === 'rebuildTable');
+    expect(rebuild).toBeDefined();
+    expect(rebuild!.target).toContain('orgs');
+    expect(rebuild!.target).toContain('members');
+    expect(rebuild!.sql).toContain('sqlite_sequence');
+    expect(rebuild!.sql).toContain('_dowel_fk_guard');
+    expect(formatScript(steps, 'sqlite')).toContain('PRAGMA foreign_key_check');
+  });
+
+  it('M5: setPrimaryKey atomically updates PK on WITHOUT ROWID & clears autoincrement; dropColumn blocks last column on SQLite', () => {
+    const m = emptyModel('sqlite');
+    const main = createSchema(m, 'main');
+    const t = createTable(m, main, 'items');
+    const id = addColumn(m, t, { name: 'id', type: 'INTEGER', notNull: true });
+    expect(() => dropColumn(m, id)).toThrow(/最后一列/);
+
+    const code = addColumn(m, t, { name: 'code', type: 'TEXT', notNull: true });
+    addPrimaryKey(m, t, [id]);
+    setColumnExt(m, id, { sqlite: { autoincrement: true } });
+    // Expanding to composite PK via setPrimaryKey clears autoincrement automatically
+    setPrimaryKey(m, t, [id, code]);
+    expect(validate(m)).toEqual([]);
+    expect((m.objects[id] as { ext?: { sqlite?: { autoincrement?: boolean } } }).ext).toBeUndefined();
+
+    // Turning on WITHOUT ROWID and atomically swapping PK to [code] succeeds without intermediate PK-less state
+    setTableExt(m, t, { sqlite: { withoutRowid: true } });
+    runMutator(m, 'setPrimaryKey', { table: t, columns: [code] });
+    expect(validate(m)).toEqual([]);
+    // Clearing PK completely on WITHOUT ROWID still fails
+    expect(() => setPrimaryKey(m, t, [])).toThrow(/WITHOUT ROWID/);
   });
 });

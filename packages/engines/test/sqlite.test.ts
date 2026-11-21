@@ -5,11 +5,13 @@ import {
   addIndex,
   addPrimaryKey,
   addUnique,
+  all,
   createAll,
   createSchema,
   createTable,
   emptyModel,
   plan,
+  renameColumn,
   setColumnExt,
   setNotNull,
   setTableExt,
@@ -278,6 +280,116 @@ describe('@dowel/engines SQLite adapter', () => {
       addPrimaryKey(m, t2, [tid]);
       addForeignKey(m, t2, [nid], t, [id]);
       expect(validate(m)).toEqual([]);
+    } finally {
+      h.close();
+    }
+  });
+
+  it('C1: engine-level authorizer blocks ATTACH/DETACH and dangerous PRAGMAs', async () => {
+    const h = openSqliteDb(':memory:');
+    try {
+      await expect(h.db.exec("ATTACH':memory:'AS pwn")).rejects.toThrow(/not authorized/);
+      await expect(h.db.exec('PRAGMA writable_schema = ON')).rejects.toThrow(/not authorized/);
+    } finally {
+      h.close();
+    }
+  });
+
+  it('H2, H3, M1, M2, L2: view/trigger deps, parent rebuild+rename FK sync, sqlite_sequence HWM, offline FK abort, multi-FK refColumns, unconditional FK restore', async () => {
+    const h = openSqliteDb(':memory:');
+    try {
+      await h.db.exec(`
+        CREATE TABLE orgs (
+          id INTEGER NOT NULL PRIMARY KEY AUTOINCREMENT,
+          code TEXT NOT NULL UNIQUE,
+          alt_code TEXT NOT NULL UNIQUE
+        );
+        CREATE TABLE members (
+          id INTEGER NOT NULL PRIMARY KEY,
+          org_id INTEGER NOT NULL,
+          ref_code TEXT NOT NULL,
+          FOREIGN KEY (org_id) REFERENCES orgs(id),
+          CONSTRAINT fk_code FOREIGN KEY (ref_code) REFERENCES orgs(code),
+          CONSTRAINT fk_alt FOREIGN KEY (ref_code) REFERENCES orgs(alt_code)
+        );
+        CREATE TABLE audit_log (id INTEGER PRIMARY KEY, note TEXT);
+        CREATE VIEW v_org_codes AS SELECT o.id, o.code FROM orgs o;
+        CREATE VIEW v_org_summary AS SELECT id FROM v_org_codes;
+        CREATE TRIGGER tr_orgs_audit AFTER INSERT ON orgs BEGIN
+          INSERT INTO audit_log(note) VALUES (NEW.code);
+        END;
+        INSERT INTO orgs (code, alt_code) VALUES ('a', 'a'), ('b', 'b'), ('c', 'c');
+        DELETE FROM orgs;
+      `);
+
+      const snap0 = await readSqliteSnapshot(h.db);
+      // M2: two FKs on same column ref_code pointing to different refColumns match their distinct names
+      const fkByName = new Map(snap0.tables.members!.foreignKeys.map((f) => [f.name, f.refColumns]));
+      expect(fkByName.get('fk_code')).toEqual(['code']);
+      expect(fkByName.get('fk_alt')).toEqual(['alt_code']);
+
+      // H2: view & cross-table trigger deps are populated
+      const m0 = importSqliteSnapshot(snap0);
+      const orgsTbl = all(m0, 'table').find((t) => t.name === 'orgs')!;
+      const auditTbl = all(m0, 'table').find((t) => t.name === 'audit_log')!;
+      const orgCodeCol = all(m0, 'column').find((c) => c.parent === orgsTbl.id && c.name === 'code')!;
+      const vCodes = all(m0, 'opaque').find((o) => o.name === 'v_org_codes')!;
+      const vSummary = all(m0, 'opaque').find((o) => o.name === 'v_org_summary')!;
+      const trAudit = all(m0, 'opaque').find((o) => o.name === 'tr_orgs_audit')!;
+      expect(vCodes.deps).toContain(orgsTbl.id);
+      expect(vCodes.deps).toContain(orgCodeCol.id);
+      expect(vSummary.deps).toContain(vCodes.id);
+      expect(trAudit.deps).toContain(orgsTbl.id);
+      expect(trAudit.deps).toContain(auditTbl.id);
+      expect(trAudit.deps).toContain(orgCodeCol.id);
+
+      // H2 + H3 + M1: rebuild orgs (STRICT) + rename referenced column id -> org_pk, update view DDL accordingly
+      const m1 = structuredClone(m0);
+      const oid = all(m1, 'column').find((c) => c.parent === orgsTbl.id && c.name === 'id')!.id;
+      setTableExt(m1, orgsTbl.id, { sqlite: { strict: true } });
+      renameColumn(m1, oid, 'org_pk');
+      // Update view DDLs to match renamed column
+      for (const o of all(m1, 'opaque')) {
+        if (o.name === 'v_org_codes')
+          o.ddl = ['CREATE VIEW v_org_codes AS SELECT o.org_pk, o.code FROM orgs o'];
+        if (o.name === 'v_org_summary')
+          o.ddl = ['CREATE VIEW v_org_summary AS SELECT org_pk FROM v_org_codes'];
+      }
+
+      const steps = plan(m0, m1);
+      for (const s of steps) {
+        await sqliteEngine.execStepSql(h.db, s.sql);
+      }
+
+      // M1: AUTOINCREMENT high-water mark (3) preserved even though table was empty during rebuild -> next id is 4
+      await h.db.exec("INSERT INTO orgs (code, alt_code) VALUES ('d', 'd')");
+      const [inserted] = await h.db.query<{ org_pk: number }>('SELECT org_pk FROM orgs');
+      expect(inserted?.org_pk).toBe(4);
+
+      // Verify snapshot matches fresh build of m1
+      const snapAfter = await readSqliteSnapshot(h.db);
+      const fresh = openSqliteDb(':memory:');
+      try {
+        for (const s of createAll(m1)) await sqliteEngine.execStepSql(fresh.db, s.sql);
+        expect(diffSqliteSnapshots(snapAfter, await readSqliteSnapshot(fresh.db))).toEqual([]);
+      } finally {
+        fresh.close();
+      }
+
+      // M1 offline abort: running raw SQL with _dowel_fk_guard fails even without Dowel's execSqliteStepSql wrapper
+      await h.db.exec('PRAGMA foreign_keys = OFF; BEGIN IMMEDIATE;');
+      await h.db.exec("INSERT INTO members (id, org_id, ref_code) VALUES (1, 9999, 'missing')");
+      expect(() =>
+        h.raw.exec(
+          'CREATE TEMP TABLE _dowel_fk_guard (x INT NOT NULL); INSERT INTO temp._dowel_fk_guard SELECT NULL FROM pragma_foreign_key_check LIMIT 1; DROP TABLE temp._dowel_fk_guard;',
+        ),
+      ).toThrow(/NOT NULL constraint failed/);
+      await h.db.exec('ROLLBACK; PRAGMA foreign_keys = ON;');
+
+      // L2: unconditional foreign_keys restore even on custom script without standard OFF token
+      await sqliteEngine.execStepSql(h.db, 'PRAGMA main.foreign_keys = 0');
+      const [fkState] = await h.db.query<{ foreign_keys: number }>('PRAGMA foreign_keys');
+      expect(fkState?.foreign_keys).toBe(1);
     } finally {
       h.close();
     }

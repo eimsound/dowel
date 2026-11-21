@@ -34,6 +34,8 @@ export interface DialectCapabilities {
   comments: boolean;
 }
 
+export type IdentKind = 'schema' | 'table' | 'column' | 'enum' | 'sequence' | 'constraint' | 'index';
+
 export interface DialectSpec {
   readonly id: Dialect;
   readonly capabilities: DialectCapabilities;
@@ -54,6 +56,10 @@ export interface DialectSpec {
   normalizeType(input: string): string;
   commonTypes: readonly string[];
   emptyBase(like: Model, scope: string[] | null | undefined): Model;
+  /** 校验单个标识符是否符合方言长度上限与保留前缀规则（合法返回 null，否则返回错误说明） */
+  validateIdent(name: string, kind: IdentKind): string | null;
+  /** 将步骤列表格式化为可导出/复制的完整 SQL 脚本文本（为 MSSQL GO 批次等方言预留扩展点） */
+  formatScript(steps: readonly { sql: string }[]): string;
   /** 方言专属的一致性校验（标识符上限、命名空间规则、能力限制等） */
   validateModel(m: Model): string[];
   /** 重新计算一张表上所有推导名（改表名、改列名、改约束列后调用） */

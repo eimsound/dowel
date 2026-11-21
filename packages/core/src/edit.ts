@@ -2,6 +2,7 @@
 // 这些操作就是同步层的 mutator（04-ir-design.md 第 2 节）：客户端乐观执行，服务器在最新状态上重新执行并校验。
 import { generateKeyBetween } from 'fractional-indexing';
 
+import type { IdentKind } from './dialect.ts';
 import { EditError } from './errors.ts';
 import { newId } from './ids.ts';
 import type {
@@ -109,6 +110,20 @@ const conTaken = (m: Model, table: string, name: string, self: string) =>
 const typeTaken = (m: Model, schema: string, name: string, self: string) =>
   getDialect(m.dialect).isNameTaken(m, 'type', schema, name, self);
 
+const assertIdent = (m: Model, name: string, kind: IdentKind) => {
+  const err = getDialect(m.dialect).validateIdent(name, kind);
+  if (err) throw new EditError(err);
+};
+
+/** 清除列上的 SQLite AUTOINCREMENT 标记（表变为 WITHOUT ROWID、主键改为多列或换列、或列类型不再为 INTEGER 时调用） */
+const clearSqliteAutoincrement = (c: Column) => {
+  if (!c.ext?.sqlite?.autoincrement) return;
+  const nextExt = { ...c.ext, sqlite: { ...c.ext.sqlite, autoincrement: undefined } };
+  const cleaned = cleanExt(nextExt);
+  if (cleaned) c.ext = cleaned as ColumnExt;
+  else delete c.ext;
+};
+
 /** 重新计算一张表上所有推导名（改表名、改列名、改约束列之后调用） */
 export const refreshDerivedNames = (m: Model, tableId: string) => {
   getDialect(m.dialect).refreshDerivedNames(m, tableId);
@@ -121,6 +136,7 @@ export const createSchema = (m: Model, name: string, id = newId()): string => {
   if (!cap.schemas && name !== cap.defaultSchema) {
     throw new EditError(`当前方言不支持多 schema（固定为 ${cap.defaultSchema}）`);
   }
+  assertIdent(m, name, 'schema');
   if (all(m, 'schema').some((s) => s.name === name)) throw new EditError(`schema ${name} 已存在`);
   const o: Schema = { id, kind: 'schema', name, comment: null };
   m.objects[o.id] = o;
@@ -131,6 +147,7 @@ export const renameSchema = (m: Model, id: string, name: string) => {
   if (!getDialect(m.dialect).capabilities.schemas) {
     throw new EditError('当前方言不支持重命名 schema');
   }
+  assertIdent(m, name, 'schema');
   if (all(m, 'schema').some((s) => s.name === name && s.id !== id))
     throw new EditError(`schema ${name} 已存在`);
   const s = get(m, id, 'schema');
@@ -161,6 +178,7 @@ export const createEnum = (
 ): string => {
   if (!getDialect(m.dialect).capabilities.enums) throw new EditError('当前方言不支持独立枚举类型');
   get(m, schema, 'schema');
+  assertIdent(m, name, 'enum');
   if (typeTaken(m, schema, name, '')) throw new EditError(`类型名 ${name} 已被占用`);
   if (!values.length || new Set(values).size !== values.length) throw new EditError('枚举值不能为空或重复');
   const o: Enum = { id, kind: 'enum', parent: schema, name, values, comment: null };
@@ -170,6 +188,7 @@ export const createEnum = (
 
 export const renameEnum = (m: Model, id: string, name: string) => {
   if (!getDialect(m.dialect).capabilities.enums) throw new EditError('当前方言不支持独立枚举类型');
+  assertIdent(m, name, 'enum');
   const e = get(m, id, 'enum');
   if (typeTaken(m, e.parent, name, id)) throw new EditError(`类型名 ${name} 已被占用`);
   const schema = get(m, e.parent, 'schema').name;
@@ -203,6 +222,7 @@ export const createSequence = (
 ): string => {
   if (!getDialect(m.dialect).capabilities.sequences) throw new EditError('当前方言不支持独立序列');
   get(m, schema, 'schema');
+  assertIdent(m, name, 'sequence');
   if (relTaken(m, schema, name, '')) throw new EditError(`名字 ${name} 已被占用`);
   const o: Sequence = {
     id,
@@ -229,6 +249,7 @@ export const createSequence = (
 
 export const renameSequence = (m: Model, id: string, name: string) => {
   if (!getDialect(m.dialect).capabilities.sequences) throw new EditError('当前方言不支持独立序列');
+  assertIdent(m, name, 'sequence');
   const s = get(m, id, 'sequence');
   if (relTaken(m, s.parent, name, id)) throw new EditError(`名字 ${name} 已被占用`);
   s.name = name;
@@ -254,6 +275,7 @@ export const createTable = (
   ext?: TableExt,
 ): string => {
   get(m, schema, 'schema');
+  assertIdent(m, name, 'table');
   if (id in m.objects) throw new EditError(`对象 ID ${id} 已存在`);
   if (relTaken(m, schema, name, '') || typeTaken(m, schema, name, ''))
     throw new EditError(`名字 ${name} 已被占用`);
@@ -325,6 +347,7 @@ const cleanExt = <T extends Record<string, unknown>>(ext: T | null | undefined):
 
 export const renameTable = (m: Model, id: string, name: string) => {
   const t = get(m, id, 'table');
+  assertIdent(m, name, 'table');
   normalizePartitionFamily(m, id);
   if (relTaken(m, t.parent, name, id) || typeTaken(m, t.parent, name, id))
     throw new EditError(`名字 ${name} 已被占用`);
@@ -558,6 +581,7 @@ export const createPartition = (
   }
   const schema = schemaId ?? parent.parent;
   get(m, schema, 'schema');
+  assertIdent(m, name, 'table');
   if (relTaken(m, schema, name, '') || typeTaken(m, schema, name, ''))
     throw new EditError(`名字 ${name} 已被占用`);
   const o: Table = {
@@ -962,6 +986,7 @@ export interface ColumnSpec {
 export const addColumn = (m: Model, table: string, spec: ColumnSpec): string => {
   const t = get(m, table, 'table');
   const d = getDialect(m.dialect);
+  assertIdent(m, spec.name, 'column');
   normalizePartitionFamily(m, table);
   assertNotPartitionChild(m, table);
   if (spec.identity && !d.capabilities.sequences) {
@@ -1056,6 +1081,7 @@ const identityType = (type: string): SequenceOptions['type'] =>
 export const renameColumn = (m: Model, id: string, name: string) => {
   const c = get(m, id, 'column');
   const d = getDialect(m.dialect);
+  assertIdent(m, name, 'column');
   assertNotPartitionChild(m, c.parent);
   normalizePartitionFamily(m, c.parent);
   const dup =
@@ -1095,6 +1121,24 @@ export const dropColumn = (m: Model, id: string) => {
   assertNotPartitionChild(m, c.parent);
   normalizePartitionFamily(m, c.parent);
   assertNotPartitionKeyCol(m, id, '删除');
+  if (m.dialect === 'sqlite') {
+    const tableCols = columnsOf(m, c.parent);
+    const willDrop = new Set<string>([id]);
+    for (let changed = true; changed;) {
+      changed = false;
+      for (const col of tableCols) {
+        if (willDrop.has(col.id) || !col.generated) continue;
+        const droppedNames = [...willDrop].map((cid) => get(m, cid, 'column').name);
+        if (droppedNames.some((n) => d.exprReferences(col.generated!.expr, n))) {
+          willDrop.add(col.id);
+          changed = true;
+        }
+      }
+    }
+    if (tableCols.length - willDrop.size <= 0) {
+      throw new EditError('SQLite 表至少需要保留一列，无法删除最后一列');
+    }
+  }
   const affected = new Set([c.parent, ...partitionDescendants(m, c.parent).map((x) => x.id)]);
   const uses = (o: Obj): boolean => {
     switch (o.kind) {
@@ -1146,10 +1190,7 @@ export const setColumnType = (m: Model, id: string, type: string, typeRef: strin
       throw new EditError(`STRICT 表不支持列类型 ${type}（仅允许 INT/INTEGER/REAL/TEXT/BLOB/ANY）`);
     }
     if (c.ext?.sqlite?.autoincrement && type.trim().toUpperCase() !== 'INTEGER') {
-      const nextExt = { ...c.ext, sqlite: { ...c.ext.sqlite, autoincrement: undefined } };
-      const cleaned = cleanExt(nextExt);
-      if (cleaned) c.ext = cleaned as ColumnExt;
-      else delete c.ext;
+      clearSqliteAutoincrement(c);
     }
   }
   c.type = type;
@@ -1274,6 +1315,19 @@ export const addPrimaryKey = (
       col.notNullNameMode = 'derived';
     }
   }
+  if (m.dialect === 'sqlite') {
+    for (const col of columnsOf(m, table)) {
+      if (
+        col.ext?.sqlite?.autoincrement &&
+        (columns.length !== 1 ||
+          columns[0] !== col.id ||
+          col.type.trim().toUpperCase() !== 'INTEGER' ||
+          t.ext?.sqlite?.withoutRowid)
+      ) {
+        clearSqliteAutoincrement(col);
+      }
+    }
+  }
   const cleanedExt = cleanExt(ext);
   const o: PrimaryKey = {
     ...keyBase(table, id),
@@ -1285,6 +1339,83 @@ export const addPrimaryKey = (
   refreshDerivedNames(m, table);
   if (t.partitionOf) refreshDerivedNames(m, rootTableId(m, table));
   return o.id;
+};
+
+/**
+ * 原子替换或清空表的主键：
+ * - `columns` 为空时等价于删除主键（保留 WITHOUT ROWID 保护）；
+ * - `columns` 非空且表已有主键时原地更新主键列（不经过无主键中间态，兼容 WITHOUT ROWID 表），
+ *   并按需清理不再满足条件的 SQLite AUTOINCREMENT 标记及指向旧主键列的外部外键。
+ */
+export const setPrimaryKey = (
+  m: Model,
+  table: string,
+  columns: string[],
+  id = newId(),
+  ext?: PrimaryKeyExt,
+): string | null => {
+  const existing = childrenOf(m, table, 'primaryKey')[0];
+  if (columns.length === 0) {
+    if (existing) dropKey(m, existing.id);
+    return null;
+  }
+  if (!existing) return addPrimaryKey(m, table, columns, id, ext);
+
+  const t = get(m, table, 'table');
+  normalizePartitionFamily(m, table);
+  checkCols(m, table, columns);
+  if (t.partitionBy !== null)
+    assertPartitionConstraintCompat(requiredUniquePartitionKeys(m, table), 'primaryKey', columns);
+  for (const c of columns) {
+    const col = get(m, c, 'column');
+    if (!col.notNull) {
+      col.notNull = true;
+      col.notNullNameMode = 'derived';
+    }
+  }
+  if (m.dialect === 'sqlite') {
+    for (const col of columnsOf(m, table)) {
+      if (
+        col.ext?.sqlite?.autoincrement &&
+        (columns.length !== 1 ||
+          columns[0] !== col.id ||
+          col.type.trim().toUpperCase() !== 'INTEGER' ||
+          t.ext?.sqlite?.withoutRowid)
+      ) {
+        clearSqliteAutoincrement(col);
+      }
+    }
+  }
+  const oldSet = [...existing.columns].sort().join();
+  const newSet = [...columns].sort().join();
+  if (oldSet !== newSet) {
+    const stillUnique =
+      childrenOf(m, table, 'unique').some((u) => [...u.columns].sort().join() === oldSet) ||
+      childrenOf(m, table, 'index').some(
+        (ix) =>
+          ix.unique &&
+          !ix.where &&
+          ix.elements.every((e) => e.column) &&
+          ix.elements
+            .map((e) => e.column!)
+            .sort()
+            .join() === oldSet,
+      );
+    if (!stillUnique) {
+      for (const fk of all(m, 'foreignKey')) {
+        if (fk.refTable === table && [...fk.refColumns].sort().join() === oldSet) delete m.objects[fk.id];
+      }
+    }
+  }
+  existing.columns = [...columns];
+  if (ext !== undefined) {
+    const cleanedExt = cleanExt(ext);
+    if (cleanedExt) existing.ext = cleanedExt as PrimaryKeyExt;
+    else delete existing.ext;
+  }
+  refreshDerivedNames(m, table);
+  if (t.partitionOf) refreshDerivedNames(m, rootTableId(m, table));
+  return existing.id;
 };
 
 export const addUnique = (
@@ -1430,12 +1561,7 @@ export const dropKey = (m: Model, id: string) => {
     }
     for (const cid of o.columns) {
       const col = find(m, cid);
-      if (col?.kind === 'column' && col.ext?.sqlite?.autoincrement) {
-        const nextExt = { ...col.ext, sqlite: { ...col.ext.sqlite, autoincrement: undefined } };
-        const cleaned = cleanExt(nextExt);
-        if (cleaned) col.ext = cleaned as ColumnExt;
-        else delete col.ext;
-      }
+      if (col?.kind === 'column' && col.ext?.sqlite?.autoincrement) clearSqliteAutoincrement(col);
     }
   }
   const keyCols =
@@ -1466,6 +1592,7 @@ export const renameKey = (m: Model, id: string, name: string) => {
   )
     throw new EditError('不是约束或索引');
   normalizePartitionFamily(m, o.parent);
+  assertIdent(m, name, o.kind === 'index' ? 'index' : 'constraint');
   const rel = m.dialect === 'sqlite' ? o.kind === 'index' : o.kind !== 'check' && o.kind !== 'foreignKey';
   const con = o.kind !== 'index';
   if ((rel && relTaken(m, schemaOf(m, o.parent), name, id)) || (con && conTaken(m, o.parent, name, id)))

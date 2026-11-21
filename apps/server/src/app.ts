@@ -85,7 +85,7 @@ export const createApp = (db: PlatformDb, options: AppOptions = {}) => {
   // 所有目标库 / 影子库连接都要过的检查：实例的白名单（服务端替用户连地址 = SSRF 面）
   const guard: ConnectionGuard = async (url) => {
     const { connectionAllowlist } = await readSettings(db);
-    await assertUrlAllowed(url, connectionAllowlist);
+    await assertUrlAllowed(url, connectionAllowlist, { platformDbPath: db.filePath });
   };
   const shadows = new Shadows(db, guard, bus);
   const refresher = new OpaqueRefresher(

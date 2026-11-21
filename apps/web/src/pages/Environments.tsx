@@ -615,6 +615,7 @@ const HistoryTable = ({ runs }: { runs: RunInfo[] }) => {
 const EnvironmentDetailView = ({ eid }: { eid: string }) => {
   const { t } = useTranslation();
   const { pid, project } = useProject();
+  const uiSpec = dialectUiSpec(project.dialect);
   const params = { owner: project.group.slug, project: project.slug };
   const nav = useNavigate();
   const qc = useQueryClient();
@@ -661,11 +662,17 @@ const EnvironmentDetailView = ({ eid }: { eid: string }) => {
     onSuccess: (r) => {
       setResult({
         ok: true,
-        text: t('dlg.envTested', {
-          ...r,
-          exists: r.shadowExists ? t('dlg.envShadowExists') : '',
-          createdb: r.canCreateDb ? t('dlg.envCanCreate') : t('dlg.envCannotCreate'),
-        }),
+        text: uiSpec.requiresExternalShadow
+          ? t('dlg.envTested', {
+              ...r,
+              exists: r.shadowExists ? t('dlg.envShadowExists') : '',
+              createdb: r.canCreateDb ? t('dlg.envCanCreate') : t('dlg.envCannotCreate'),
+            })
+          : t('dlg.envTestedSqlite', {
+              database: r.database,
+              version: r.version,
+              shadow: r.shadow,
+            }),
       });
       void qc.invalidateQueries({ queryKey: ['envs', pid] });
       void qc.invalidateQueries({ queryKey: ['project', pid] });

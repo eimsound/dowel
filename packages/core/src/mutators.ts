@@ -127,6 +127,10 @@ export const mutators = {
     z.object({ id, table: id, columns: z.array(id).min(1), ext: PrimaryKeyExt.optional() }),
     (m, a) => E.addPrimaryKey(m, a.table, a.columns, a.id, a.ext),
   ),
+  setPrimaryKey: def(
+    z.object({ id: id.optional(), table: id, columns: z.array(id), ext: PrimaryKeyExt.optional() }),
+    (m, a) => E.setPrimaryKey(m, a.table, a.columns, a.id, a.ext),
+  ),
   addUnique: def(
     z.object({
       id,
