@@ -572,6 +572,8 @@ export class Webhooks {
   private needPump = false;
   private running = 0;
   private closed = false;
+  private needWakeOnClose = false;
+  private closing: Promise<void> | null = null;
 
   constructor(db: PlatformDb, options: WebhookOptions = {}) {
     this.db = db;
@@ -636,7 +638,10 @@ export class Webhooks {
       this.enqueuing,
       (async () => {
         const inserted = await this.enqueueIn(this.db, groupId, event);
-        if (inserted > 0 && !this.closed) this.wake(true);
+        if (inserted > 0) {
+          if (this.closed) this.needWakeOnClose = true;
+          else this.wake(true);
+        }
       })().catch((e) => {
         if (!isDbClosedError(e)) console.error('Webhook 排队失败：', scrubSecrets(String(e)));
       }),
@@ -707,22 +712,30 @@ export class Webhooks {
     return this.flush();
   }
 
-  /** 停止：清掉轮询与唤醒定时器、取消总线订阅，等待在途任务结束并释放残留锁（进程退出时） */
+  /** 停止：清掉轮询与唤醒定时器、取消总线订阅，等待在途任务结束、释放残留锁并按需广播唤醒其他副本（进程退出时） */
   close(): Promise<void> {
+    if (this.closing) return this.closing;
     this.closed = true;
     this.stopPolling();
     for (const off of this.busUnsubs) off();
     this.busUnsubs = [];
-    return (async () => {
+    this.closing = (async () => {
       while (this.enqueuing.size || this.inFlight.size) {
         await Promise.allSettled([...this.enqueuing, ...this.inFlight]);
       }
-      await this.db
-        .query('update webhook_jobs set locked_by = null, locked_until = null where locked_by = $1', [
-          this.workerId,
-        ])
-        .catch(() => {});
+      const released = await this.db
+        .query<{ id: string }>(
+          'update webhook_jobs set locked_by = null, locked_until = null where locked_by = $1 returning id',
+          [this.workerId],
+        )
+        .catch(() => [] as { id: string }[]);
+      const shouldWake = this.needWakeOnClose || released.length > 0;
+      this.needWakeOnClose = false;
+      if (shouldWake && this.bus) {
+        await this.bus.publish({ t: 'webhooks.wake' }).catch(() => {});
+      }
     })();
+    return this.closing;
   }
 
   private attachBus(): void {
@@ -913,12 +926,13 @@ export class Webhooks {
 
   private async executeJob(row: JobRow): Promise<void> {
     if (this.closed) {
-      await this.db
-        .query(
-          'update webhook_jobs set locked_by = null, locked_until = null where id = $1 and locked_by = $2',
+      const released = await this.db
+        .query<{ id: string }>(
+          'update webhook_jobs set locked_by = null, locked_until = null where id = $1 and locked_by = $2 returning id',
           [row.id, this.workerId],
         )
-        .catch(() => {});
+        .catch(() => [] as { id: string }[]);
+      if (released.length > 0) this.needWakeOnClose = true;
       return;
     }
     // 重试时 Webhook 可能已经被删除 / 停用：仅在仍持有该任务租约时清理

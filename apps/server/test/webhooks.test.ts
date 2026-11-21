@@ -9,6 +9,7 @@ import type { AddressInfo } from 'node:net';
 import type { WebhookDelivery, WebhookEventInput, WebhookInfo } from '@dowel/api';
 import { afterAll, beforeAll, beforeEach, describe, expect, test } from 'vitest';
 import { createTestDb, PG_URL } from '../../../test/pg.ts';
+import { type ClusterEvent, EventBus } from '../src/bus.ts';
 import { createApp, openPlatformDb, type PlatformDb } from '../src/index.ts';
 import { KeyedLimiter, LoginLimiter } from '../src/rate-limit.ts';
 import { decrypt, encrypt } from '../src/secrets.ts';
@@ -1161,6 +1162,140 @@ describe('租约超时与 locked_by 校验（#21）', () => {
       expect(rx.received).toHaveLength(0);
     } finally {
       await whA.close();
+      await localDb.close();
+    }
+  });
+});
+
+describe('close() 排空入队与释放残留锁后的唤醒广播（#27）', () => {
+  const waitStartupPump = async (wh: Webhooks) => {
+    await new Promise<void>((r) => setTimeout(r, 0));
+    const internal = wh as unknown as {
+      enqueuing: Set<Promise<unknown>>;
+      inFlight: Set<Promise<unknown>>;
+    };
+    while (internal.enqueuing.size || internal.inFlight.size) {
+      await Promise.allSettled([...internal.enqueuing, ...internal.inFlight]);
+    }
+  };
+
+  const setupCloseEnv = async (url = 'http://127.0.0.1:1/close-hook') => {
+    const localDb = await openPlatformDb(':memory:');
+    await localDb.query(
+      `insert into instance_settings (key, value) values ('webhook_allowlist', $1::text::jsonb)
+       on conflict (key) do update set value = excluded.value`,
+      [JSON.stringify(['127.0.0.0/8'])],
+    );
+    await localDb.query("insert into groups (id, slug, name) values ('g-close', 'g-close', '关闭组')");
+    await localDb.query(
+      `insert into webhooks (id, group_id, name, format, url_enc, events, enabled)
+       values ('w-close', 'g-close', 'close-hook', 'json', $1, $2::text::jsonb, true)`,
+      [encrypt(url), JSON.stringify(['request.created'])],
+    );
+    const bus = new EventBus(localDb, { replicaId: 'replica-close' });
+    await bus.start();
+    const published: ClusterEvent[] = [];
+    bus.onEvent((ev) => {
+      published.push(ev);
+    });
+    return { localDb, bus, published };
+  };
+
+  test('存在由本副本持有的 locked_by 任务时调用 close()，释放锁后会经 bus 广播 webhooks.wake', async () => {
+    const { localDb, bus, published } = await setupCloseEnv();
+    const wh = new Webhooks(localDb, {
+      bus,
+      pollIntervalMs: 60_000,
+      timeoutMs: 2000,
+    });
+    try {
+      await waitStartupPump(wh);
+      const now = new Date();
+      await localDb.query(
+        `insert into webhook_jobs
+           (id, webhook_id, delivery_id, event_type, payload, attempts, max_retries, next_run_at, locked_by, locked_until, created_at)
+         values ('job-held', 'w-close', 'del-held', 'request.created', $1::text::jsonb, 0, 3, $2, $3, $4, $2)`,
+        [JSON.stringify(event()), now, wh.workerId, new Date(now.getTime() + 60_000)],
+      );
+      expect(published).toEqual([]);
+
+      await wh.close();
+
+      const [job] = await localDb.query<{ locked_by: string | null; locked_until: string | null }>(
+        'select locked_by, locked_until from webhook_jobs where id = $1',
+        ['job-held'],
+      );
+      expect(job).toEqual({ locked_by: null, locked_until: null });
+      expect(published).toEqual([{ t: 'webhooks.wake', origin: bus.replicaId }]);
+
+      // 重复调用 close() 幂等，不重复广播
+      await wh.close();
+      expect(published).toHaveLength(1);
+    } finally {
+      await wh.close();
+      await bus.close();
+      await localDb.close();
+    }
+  });
+
+  test('emit() 入队进行中立即调用 close()，排空入队后会经 bus 广播 webhooks.wake', async () => {
+    const { localDb, bus, published } = await setupCloseEnv();
+    const wh = new Webhooks(localDb, {
+      bus,
+      pollIntervalMs: 60_000,
+      timeoutMs: 2000,
+    });
+    try {
+      await waitStartupPump(wh);
+      expect(published).toEqual([]);
+
+      wh.emit('g-close', event('request.created'));
+      await wh.close();
+
+      const jobs = await localDb.query<{
+        webhook_id: string;
+        locked_by: string | null;
+        locked_until: string | null;
+      }>('select webhook_id, locked_by, locked_until from webhook_jobs');
+      expect(jobs).toEqual([{ webhook_id: 'w-close', locked_by: null, locked_until: null }]);
+      expect(published).toEqual([{ t: 'webhooks.wake', origin: bus.replicaId }]);
+    } finally {
+      await wh.close();
+      await bus.close();
+      await localDb.close();
+    }
+  });
+
+  test('无残留锁且无在途入队时调用 close()，不发送多余的 webhooks.wake', async () => {
+    const { localDb, bus, published } = await setupCloseEnv();
+    const wh = new Webhooks(localDb, {
+      bus,
+      pollIntervalMs: 60_000,
+      timeoutMs: 2000,
+    });
+    try {
+      await waitStartupPump(wh);
+      // 即便存在其他副本持有的任务，本副本也未释放锁，不应广播唤醒
+      const now = new Date();
+      await localDb.query(
+        `insert into webhook_jobs
+           (id, webhook_id, delivery_id, event_type, payload, attempts, max_retries, next_run_at, locked_by, locked_until, created_at)
+         values ('job-other', 'w-close', 'del-other', 'request.created', $1::text::jsonb, 0, 3, $2, 'other-replica', $3, $2)`,
+        [JSON.stringify(event()), now, new Date(now.getTime() + 60_000)],
+      );
+      // 触发一条无匹配 Webhook 的 emit（inserted = 0），也不应产生多余广播
+      wh.emit('g-close', event('request.approved'));
+      await wh.close();
+
+      const [otherJob] = await localDb.query<{ locked_by: string | null }>(
+        'select locked_by from webhook_jobs where id = $1',
+        ['job-other'],
+      );
+      expect(otherJob).toEqual({ locked_by: 'other-replica' });
+      expect(published).toEqual([]);
+    } finally {
+      await wh.close();
+      await bus.close();
       await localDb.close();
     }
   });
