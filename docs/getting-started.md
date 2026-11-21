@@ -222,7 +222,7 @@ Dowel 支持通用的 OpenID Connect（授权码 + PKCE）。实例管理员配�
 1. 在 Google Cloud Console 创建 OAuth 2.0 Client（类型 Web application）。
 2. Authorized redirect URI 填 `https://你的域名/api/auth/oidc/google/callback`。
 3. 记下 Client ID 和 Client secret。
-4. 在 Dowel 里用接口创建提供方（管理界面在 P2）：
+4. 在“管理后台 → 实例设置”里添加提供方，也可以直接调用接口创建：
 
 ```sh
 curl -X POST https://你的域名/api/admin/oidc \
@@ -262,7 +262,7 @@ curl -X POST https://你的域名/api/admin/oidc \
 ## 当前的限制
 
 - 只支持 PostgreSQL。导入 SQL、验证迁移需要先配置环境（真实的 PostgreSQL 实例）。
-- 可以在环境详情页把版本**执行 / 回滚**到你的数据库，并检查漂移，见 [执行迁移、回滚与漂移](execution.md)。审批和执行申请、CI 令牌还没有；仍然可以下载 `.sql` 自行执行。
+- 可以在环境详情页把版本**执行 / 回滚**到你的数据库并检查漂移（见 [执行迁移、回滚与漂移](execution.md)），并已支持四层执行策略与审批流程（见 [执行策略与执行者](execution-policy.md)、[执行申请与审批](approvals.md)、[组级 Webhook](webhooks.md)）以及 CI 令牌接口（见 [CI HTTP API](api.md)）；不使用托管执行时，仍然可以下载 `.sql` 自行执行。
 - 分区表可以导入和查看，不能修改结构。
 - 视图、函数、触发器等对象只能通过导入修改；给它们引用的列、表改名时，Dowel 会自动更新它们的定义。
 - SQL 视图是只读的。

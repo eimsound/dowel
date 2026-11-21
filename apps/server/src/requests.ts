@@ -477,7 +477,7 @@ const STATUS_LABEL: Record<RequestStatus, string> = {
 };
 export const statusLabel = (s: RequestStatus) => STATUS_LABEL[s];
 
-/** 收件箱实时推送的订阅者（单进程：内存里） */
+/** 收件箱实时推送的本副本订阅回调（内存维护本节点 SSE 连接；跨副本变更经 EventBus 的 inbox.changed 广播并在各副本本地扇出） */
 type Listener = (e: InboxEvent) => void;
 
 /** 重检的范围：全部，或者受影响的环境 / 项目 / 组（组层策略变了：组里所有项目） */
@@ -1391,8 +1391,8 @@ export class Requests {
 
   /**
    * 申请的执行结束：转成已执行 / 执行失败（执行器报 request_stale 时转成失效），通知申请人（紧急执行通知审批人），发 Webhook。
-   * 在锁里条件更新：只接受仍是 executing 的申请，以及被启动恢复误记为“中断”的申请（result.code = interrupted，
-   * 单进程下不应该发生；发生了就用真实结果覆盖）。
+   * 在锁里条件更新：只接受仍是 executing 的申请，以及被恢复逻辑记为“中断”的申请（result.code = interrupted，
+   * 例如执行节点租约抖动短暂失联后真实结果才送达时，用真实结果覆盖）。
    */
   finish(
     c: Context | null,

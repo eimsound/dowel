@@ -72,7 +72,7 @@ export interface AppContext {
   drift: DriftScheduler;
   /** 执行申请、审批与收件箱（P5b）：申请的状态检查、通知、定时清理过期 / 失效的申请 */
   requests: Requests;
-  /** 组级 Webhook 的投递队列（P5b，进程内，重启丢失） */
+  /** 组级 Webhook 的持久化投递队列（P5b / P7 HA：写入 webhook_jobs 表，重启不丢失，PG 多副本下通过 FOR UPDATE SKIP LOCKED 认领并经 EventBus 唤醒） */
   webhooks: Webhooks;
   security: SecurityConfig;
   /** 一次性初始化令牌：多副本冷启动时由 ensureSetupToken 持久化到 instance_settings 并同步至此，初始化成功后置空 */
