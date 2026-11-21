@@ -4,8 +4,11 @@
 // （列表里的主机名也先解析，避免两边的 DNS 结果写法不同）。
 // PG 协议没有重定向，所以不需要考虑跟随重定向。
 import { lookup } from 'node:dns/promises';
+import { realpath } from 'node:fs/promises';
 import { isIP } from 'node:net';
+import path from 'node:path';
 
+import type { Dialect } from '@dowel/core';
 import { HTTPException } from 'hono/http-exception';
 
 const IPV4 = /^(\d{1,3})\.(\d{1,3})\.(\d{1,3})\.(\d{1,3})$/;
@@ -153,9 +156,128 @@ export interface ConnectionTarget {
 }
 
 const POSTGRES_SCHEME = /^postgres(?:ql)?:\/\//i;
+const MYSQL_SCHEME = /^mysql:\/\//i;
+const MSSQL_SCHEME = /^(?:mssql|sqlserver):\/\//i;
+const SQLITE_SCHEME = /^sqlite:\/\//i;
 
-/** 解析 authority 里的一个 host[:port]（也支持 [IPv6]:port）；unix socket 直接拒绝 */
-const parseHostPort = (entry: string): ConnectionTarget => {
+/** 从连接串协议推断方言 */
+export const detectUrlDialect = (url: string): Dialect | null => {
+  if (POSTGRES_SCHEME.test(url)) return 'pg';
+  if (SQLITE_SCHEME.test(url)) return 'sqlite';
+  if (MYSQL_SCHEME.test(url)) return 'mysql';
+  if (MSSQL_SCHEME.test(url)) return 'mssql';
+  return null;
+};
+
+/** 校验连接串协议与项目方言一致（不一致返回 422） */
+export const assertUrlMatchesDialect = (url: string, dialect: Dialect): void => {
+  const actual = detectUrlDialect(url);
+  if (actual === dialect) return;
+  const expected: Record<Dialect, string> = {
+    pg: 'postgres:// 或 postgresql://',
+    sqlite: 'sqlite:///',
+    mysql: 'mysql://',
+    mssql: 'mssql:// 或 sqlserver://',
+  };
+  throw new HTTPException(422, {
+    message: `连接串协议与项目方言（${dialect}）不匹配：必须以 ${expected[dialect]} 开头`,
+  });
+};
+
+/** 沿路径向上找到存在的最深祖先目录，消解符号链接后拼回剩余段 */
+const resolveRealWithMissingTail = async (absPath: string): Promise<string> => {
+  const missing: string[] = [];
+  let cur = path.resolve(absPath);
+  for (;;) {
+    try {
+      const real = await realpath(cur);
+      return missing.length ? path.join(real, ...missing.reverse()) : real;
+    } catch {
+      const parent = path.dirname(cur);
+      if (parent === cur) return path.resolve(absPath);
+      missing.push(path.basename(cur));
+      cur = parent;
+    }
+  }
+};
+
+/** 解析并校验本地 SQLite 目标库路径（DOWEL_SQLITE_ROOTS 白名单 + 防符号链接越权 + 禁止指向 DOWEL_DB 平台库） */
+export const resolveSqlitePath = async (
+  url: string,
+  opts: { rootsEnv?: string; platformDbEnv?: string } = {},
+): Promise<string> => {
+  if (!SQLITE_SCHEME.test(url)) {
+    throw new HTTPException(422, { message: 'SQLite 连接串必须以 sqlite:///绝对路径 开头' });
+  }
+  const rest = url.slice('sqlite://'.length);
+  if (!rest || rest.startsWith(':memory:') || rest.includes('?') || rest.includes('#')) {
+    throw new HTTPException(422, {
+      message: 'SQLite 目标库连接串必须为 sqlite:///绝对路径，不支持 :memory: 或查询参数',
+    });
+  }
+  if (!rest.startsWith('/')) {
+    throw new HTTPException(422, {
+      message: 'SQLite 目标库连接串必须使用绝对路径（sqlite:///path/to/app.db）',
+    });
+  }
+  let decoded: string;
+  try {
+    decoded = decodeURIComponent(rest);
+  } catch {
+    throw new HTTPException(422, { message: 'SQLite 连接串路径包含非法百分号编码' });
+  }
+  if (decoded.includes('\0') || decoded.split('/').includes('..')) {
+    throw new HTTPException(422, { message: 'SQLite 连接串路径不合法（禁止包含空字节或 ..）' });
+  }
+
+  const rawRoots = (opts.rootsEnv ?? process.env.DOWEL_SQLITE_ROOTS ?? '')
+    .split(':')
+    .map((s) => s.trim())
+    .filter(Boolean);
+  if (!rawRoots.length) {
+    throw new HTTPException(422, {
+      message:
+        '服务端默认禁用直连本地 SQLite 文件：请在服务端配置环境变量 DOWEL_SQLITE_ROOTS（冒号分隔的绝对目录白名单）后再连接本地 SQLite 目标库',
+    });
+  }
+
+  const resolvedTarget = await resolveRealWithMissingTail(decoded);
+  const resolvedRoots: string[] = [];
+  for (const r of rawRoots) {
+    if (!path.isAbsolute(r)) continue;
+    resolvedRoots.push(await resolveRealWithMissingTail(r));
+  }
+  const allowed = resolvedRoots.some((root) => {
+    const prefix = root.endsWith(path.sep) ? root : root + path.sep;
+    return resolvedTarget !== root && resolvedTarget.startsWith(prefix);
+  });
+  if (!allowed) {
+    throw new HTTPException(422, {
+      message: 'SQLite 目标库路径不在服务端允许的目录范围（DOWEL_SQLITE_ROOTS）内',
+    });
+  }
+
+  // 严禁指向平台库自身路径（含 WAL/SHM/Journal 附属文件）
+  const platformDb = opts.platformDbEnv ?? process.env.DOWEL_DB;
+  if (platformDb && platformDb !== ':memory:' && !/^postgres(?:ql)?:\/\//i.test(platformDb)) {
+    const realPlatform = await resolveRealWithMissingTail(platformDb);
+    if (
+      resolvedTarget === realPlatform ||
+      resolvedTarget === `${realPlatform}-wal` ||
+      resolvedTarget === `${realPlatform}-shm` ||
+      resolvedTarget === `${realPlatform}-journal`
+    ) {
+      throw new HTTPException(422, {
+        message: '禁止将 Dowel 平台库自身（DOWEL_DB）配置为 SQLite 目标库',
+      });
+    }
+  }
+
+  return resolvedTarget;
+};
+
+/** 解析 authority 里的一个 host[:port]（支持 [IPv6]:port 与 MSSQL host\instance）；unix socket 直接拒绝 */
+const parseHostPort = (entry: string, allowInstanceName = false): ConnectionTarget => {
   const decoded = (() => {
     try {
       return decodeURIComponent(entry);
@@ -163,7 +285,6 @@ const parseHostPort = (entry: string): ConnectionTarget => {
       throw new HTTPException(422, { message: '连接串里的主机名不合法' });
     }
   })();
-  // unix socket（postgres://%2Fvar%2Frun/postgresql 或主机以 / 开头）：白名单对它没有意义，直接拒绝
   if (decoded.startsWith('/'))
     throw new HTTPException(422, {
       message:
@@ -177,28 +298,31 @@ const parseHostPort = (entry: string): ConnectionTarget => {
     return { host: decoded.slice(1, end).toLowerCase(), port: Number.isFinite(port) ? port : null };
   }
   const colon = decoded.lastIndexOf(':');
-  if (colon >= 0) {
-    const port = Number(decoded.slice(colon + 1));
-    return {
-      host: decoded.slice(0, colon).toLowerCase(),
-      port: Number.isFinite(port) ? port : null,
-    };
-  }
-  return { host: decoded.toLowerCase(), port: null };
+  const rawHost = colon >= 0 ? decoded.slice(0, colon) : decoded;
+  const host = allowInstanceName ? rawHost.split('\\')[0]! : rawHost;
+  const port = colon >= 0 ? Number(decoded.slice(colon + 1)) : null;
+  return {
+    host: host.toLowerCase(),
+    port: port !== null && Number.isFinite(port) ? port : null,
+  };
 };
 
 /**
- * 连接串里实际要连的目标（可能多个）：
- * - authority 可以是逗号分隔的多个 host:port（postgres.js 支持故障转移），**每一个都要检查**；
- * - `?host=` / `?hostaddr=` 会覆盖 authority 里的主机 —— 这等于绕过白名单，直接拒绝；
- * - unix socket（主机以 `/` 开头）也拒绝；
- * - `?port=` 只改端口、不改主机，不影响白名单判断（但一并解析出来，避免漏掉“实际要连到哪里”）。
- *
- * 不用 `new URL()` 解析 authority：Node 的 URL 不接受逗号分隔的多主机，会把合法的连接串当成非法。
+ * 连接串里实际要连的 TCP 目标（按协议分派）：
+ * - postgres(ql)?://：支持逗号分隔多主机；禁 ?host= / ?hostaddr= 与 unix socket；
+ * - mysql://：禁 ?socketPath= 与 unix socket；
+ * - mssql:// / sqlserver://：支持 host[:port] 与 host\instance；
+ * - sqlite://：非 TCP 目标（走 resolveSqlitePath 目录白名单守卫），返回空数组。
  */
 export const connectionTargets = (url: string): ConnectionTarget[] => {
-  const scheme = POSTGRES_SCHEME.exec(url);
-  if (!scheme) throw new HTTPException(422, { message: '连接串必须以 postgres:// 或 postgresql:// 开头' });
+  if (SQLITE_SCHEME.test(url)) return [];
+  const scheme = POSTGRES_SCHEME.exec(url) ?? MYSQL_SCHEME.exec(url) ?? MSSQL_SCHEME.exec(url);
+  if (!scheme) {
+    throw new HTTPException(422, {
+      message: '连接串必须以 postgres://、sqlite://、mysql:// 或 mssql:// 开头',
+    });
+  }
+  const dialect = detectUrlDialect(url)!;
   const rest = url.slice(scheme[0].length);
   const hash = rest.indexOf('#');
   const withoutHash = hash >= 0 ? rest.slice(0, hash) : rest;
@@ -209,23 +333,41 @@ export const connectionTargets = (url: string): ConnectionTarget[] => {
   const authority = slash >= 0 ? beforeQuery.slice(0, slash) : beforeQuery;
 
   const params = new URLSearchParams(query);
-  for (const key of ['host', 'hostaddr'] as const)
-    if (params.has(key))
-      throw new HTTPException(422, {
-        message: `不支持在连接串里用 ?${key}= 指定主机（它可以绕过实例的允许列表），请把主机写进 postgres://主机:端口/库`,
-      });
+  if (dialect === 'pg') {
+    for (const key of ['host', 'hostaddr'] as const)
+      if (params.has(key))
+        throw new HTTPException(422, {
+          message: `不支持在连接串里用 ?${key}= 指定主机（它可以绕过实例的允许列表），请把主机写进 postgres://主机:端口/库`,
+        });
+  } else if (dialect === 'mysql') {
+    for (const k of params.keys()) {
+      if (k.toLowerCase() === 'socketpath') {
+        throw new HTTPException(422, {
+          message: '不支持在 MySQL 连接串里使用 socketPath（无法通过主机白名单校验），请使用 TCP 地址',
+        });
+      }
+    }
+  }
 
   const at = authority.lastIndexOf('@');
   const hostPort = at >= 0 ? authority.slice(at + 1) : authority;
   if (!hostPort.trim()) throw new HTTPException(422, { message: '连接串里没有主机' });
-  return hostPort.split(',').map((entry) => parseHostPort(entry.trim()));
+  if (dialect === 'pg') {
+    return hostPort.split(',').map((entry) => parseHostPort(entry.trim()));
+  }
+  return [parseHostPort(hostPort.trim(), dialect === 'mssql')];
 };
 
 /**
- * 连接地址的 SSRF 检查：只允许 postgres:// / postgresql://，并且**每个**主机都要在白名单里。
- * 不通过时抛 422（和“连不上”一样是用户可修正的错误，不是服务器错误）。
+ * 连接地址的 SSRF / 本地目录边界检查：
+ * - sqlite:// → 校验 DOWEL_SQLITE_ROOTS 目录白名单与防 DOWEL_DB 碰撞；
+ * - postgres(ql)?:// / mysql:// / mssql:// / sqlserver:// → 校验主机白名单。
  */
 export const assertUrlAllowed = async (url: string, allowlist: string[]): Promise<void> => {
+  if (SQLITE_SCHEME.test(url)) {
+    await resolveSqlitePath(url);
+    return;
+  }
   for (const target of connectionTargets(url)) {
     if (await isAllowedHost(target.host, allowlist)) continue;
     throw new HTTPException(422, {

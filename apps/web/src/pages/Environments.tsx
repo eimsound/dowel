@@ -42,6 +42,7 @@ import { PageHeader, useShellPanel } from '../components/Shell.tsx';
 import { useToast } from '../components/Toasts.tsx';
 import { Banner, IconButton } from '../components/ui.tsx';
 import { useVersionName, VersionBadges, VersionNumber } from '../components/VersionStatus.tsx';
+import { dialectUiSpec, formatEngineVersion } from '../dialects.ts';
 import { attachSuccessMessage, useEnvHistory, useEnvStatus, useEnvs } from '../envs.ts';
 import { formatTime } from '../format.ts';
 import { invalidatePolicyDependents } from '../policy-cache.ts';
@@ -134,6 +135,8 @@ const EnvPanel = ({ pid, activeId }: { pid: string; activeId?: string }) => {
 
 const EnvForm = ({ pid }: { pid: string }) => {
   const { t } = useTranslation();
+  const { project } = useProject();
+  const uiSpec = dialectUiSpec(project.dialect);
   const qc = useQueryClient();
   const toast = useToast();
   const me = useMe().data;
@@ -269,7 +272,7 @@ const EnvForm = ({ pid }: { pid: string }) => {
             aria-label={t('dlg.envUrl')}
             value={form.url}
             onChange={set('url')}
-            placeholder="postgres://user:password@host:5432/db"
+            placeholder={uiSpec.urlPlaceholder}
             autoCapitalize="none"
             autoCorrect="off"
             spellCheck={false}
@@ -281,23 +284,27 @@ const EnvForm = ({ pid }: { pid: string }) => {
             <input type="checkbox" checked={form.production} onChange={set('production')} />
             {t('dlg.envProduction')}
           </label>
-          <label>
-            <input type="checkbox" checked={form.allowSameInstance} onChange={set('allowSameInstance')} />
-            {t('dlg.envAllowSame')}
-          </label>
+          {uiSpec.requiresExternalShadow && (
+            <label>
+              <input type="checkbox" checked={form.allowSameInstance} onChange={set('allowSameInstance')} />
+              {t('dlg.envAllowSame')}
+            </label>
+          )}
         </div>
-        <label className="field col-span-2">
-          <span className="label">{t('dlg.envShadowUrl')}</span>
-          <input
-            className="input font-mono"
-            aria-label={t('dlg.envShadowUrl')}
-            value={form.shadowUrl}
-            onChange={set('shadowUrl')}
-            autoCapitalize="none"
-            autoCorrect="off"
-            spellCheck={false}
-          />
-        </label>
+        {uiSpec.requiresExternalShadow && (
+          <label className="field col-span-2">
+            <span className="label">{t('dlg.envShadowUrl')}</span>
+            <input
+              className="input font-mono"
+              aria-label={t('dlg.envShadowUrl')}
+              value={form.shadowUrl}
+              onChange={set('shadowUrl')}
+              autoCapitalize="none"
+              autoCorrect="off"
+              spellCheck={false}
+            />
+          </label>
+        )}
         <div className="checks col-span-2">
           <label>
             <input type="checkbox" checked={attach} onChange={(e) => setAttach(e.target.checked)} />
@@ -402,6 +409,7 @@ const EnvForm = ({ pid }: { pid: string }) => {
 export const Environments = () => {
   const { t } = useTranslation();
   const { pid, project } = useProject();
+  const uiSpec = dialectUiSpec(project.dialect);
   const params = { owner: project.group.slug, project: project.slug };
   const envs = useEnvs(pid);
   const canManage = project.role === 'admin';
@@ -410,35 +418,38 @@ export const Environments = () => {
       <EnvPanel pid={pid} />
       <ProjectPage title={t('envp.title')}>
         <div className="space-y-6">
-          <p className="text-sm text-text-2">{t('envp.addHint')}</p>
+          <p className="text-sm text-text-2">
+            {uiSpec.requiresExternalShadow ? t('envp.addHint') : t('envp.addHintSqlite')}
+          </p>
           {envs.data && envs.data.length === 0 ? (
             <EmptyHint>{t('envp.empty')}</EmptyHint>
           ) : (
             <Rows>
-              {(envs.data ?? []).map((e) => (
-                <Row key={e.id}>
-                  <Database size={16} aria-hidden="true" className="shrink-0 text-text-3" />
-                  <Link
-                    to="/project/$owner/$project/environments/$eid"
-                    params={{ ...params, eid: e.id }}
-                    className="min-w-0 flex-1 truncate font-mono font-medium no-underline"
-                  >
-                    {e.name}
-                  </Link>
-                  {(e.engineVersion || e.engineMajor !== null) && (
-                    <span className="chip shrink-0 font-mono">PG {e.engineVersion ?? e.engineMajor}</span>
-                  )}
-                  {e.production ? (
-                    <span className="badge danger">{t('envp.production')}</span>
-                  ) : (
-                    <span className="badge">{t('envp.notProduction')}</span>
-                  )}
-                  {(e.drift.status === 'drifted' || e.drift.status === 'error') && (
-                    <DriftBadge drift={e.drift} />
-                  )}
-                  <code className="w-72 truncate text-xs text-text-3 max-[900px]:hidden">{e.url}</code>
-                </Row>
-              ))}
+              {(envs.data ?? []).map((e) => {
+                const verLabel = formatEngineVersion(project.dialect, e.engineVersion, e.engineMajor);
+                return (
+                  <Row key={e.id}>
+                    <Database size={16} aria-hidden="true" className="shrink-0 text-text-3" />
+                    <Link
+                      to="/project/$owner/$project/environments/$eid"
+                      params={{ ...params, eid: e.id }}
+                      className="min-w-0 flex-1 truncate font-mono font-medium no-underline"
+                    >
+                      {e.name}
+                    </Link>
+                    {verLabel && <span className="chip shrink-0 font-mono">{verLabel}</span>}
+                    {e.production ? (
+                      <span className="badge danger">{t('envp.production')}</span>
+                    ) : (
+                      <span className="badge">{t('envp.notProduction')}</span>
+                    )}
+                    {(e.drift.status === 'drifted' || e.drift.status === 'error') && (
+                      <DriftBadge drift={e.drift} />
+                    )}
+                    <code className="w-72 truncate text-xs text-text-3 max-[900px]:hidden">{e.url}</code>
+                  </Row>
+                );
+              })}
             </Rows>
           )}
           {canManage ? <EnvForm pid={pid} /> : <Banner kind="info">{t('envp.manageHint')}</Banner>}
@@ -822,8 +833,10 @@ const EnvironmentDetailView = ({ eid }: { eid: string }) => {
           <div className="flex flex-wrap items-baseline gap-x-3 gap-y-1">
             <Database size={20} aria-hidden="true" className="text-text-3" />
             <span className="font-mono text-[length:var(--fs-headline)] font-semibold">{env.name}</span>
-            {(env.engineVersion || env.engineMajor !== null) && (
-              <span className="chip font-mono">PG {env.engineVersion ?? env.engineMajor}</span>
+            {formatEngineVersion(project.dialect, env.engineVersion, env.engineMajor) && (
+              <span className="chip font-mono">
+                {formatEngineVersion(project.dialect, env.engineVersion, env.engineMajor)}
+              </span>
             )}
             {env.production ? (
               <span className="badge danger">{t('envp.production')}</span>
@@ -1158,12 +1171,18 @@ const EnvironmentDetailView = ({ eid }: { eid: string }) => {
             <dl className="grid grid-cols-[auto_1fr] gap-x-6 gap-y-2 rounded-md border border-border bg-panel px-4 py-3 text-sm">
               <dt className="text-text-2">{t('dlg.envUrl')}</dt>
               <dd className="m-0 truncate font-mono text-xs">{env.url}</dd>
-              <dt className="text-text-2">{t('envp.pgVersion')}</dt>
+              <dt className="text-text-2">
+                {project.dialect === 'pg' ? t('envp.pgVersion') : t('envp.engineVersion')}
+              </dt>
               <dd className="m-0">
-                {env.engineVersion || env.engineMajor !== null ? (
-                  <span className="font-mono text-xs">PostgreSQL {env.engineVersion ?? env.engineMajor}</span>
+                {formatEngineVersion(project.dialect, env.engineVersion, env.engineMajor, true) ? (
+                  <span className="font-mono text-xs">
+                    {formatEngineVersion(project.dialect, env.engineVersion, env.engineMajor, true)}
+                  </span>
                 ) : (
-                  <span className="text-text-2">{t('envp.pgVersionUnknown')}</span>
+                  <span className="text-text-2">
+                    {project.dialect === 'pg' ? t('envp.pgVersionUnknown') : t('envp.engineVersionUnknown')}
+                  </span>
                 )}
               </dd>
               <dt className="text-text-2">{t('dlg.envProduction')}</dt>
@@ -1196,10 +1215,19 @@ const EnvironmentDetailView = ({ eid }: { eid: string }) => {
                     </button>
                   ))}
               </dd>
-              <dt className="text-text-2">{t('dlg.envAllowSame')}</dt>
-              <dd className="m-0">{env.allowSameInstance ? '✓' : '—'}</dd>
-              <dt className="text-text-2">{t('envp.shadow')}</dt>
-              <dd className="m-0 font-mono text-xs">{env.shadowUrl ?? t('envp.shadowNone')}</dd>
+              {dialectUiSpec(project.dialect).requiresExternalShadow ? (
+                <>
+                  <dt className="text-text-2">{t('dlg.envAllowSame')}</dt>
+                  <dd className="m-0">{env.allowSameInstance ? '✓' : '—'}</dd>
+                  <dt className="text-text-2">{t('envp.shadow')}</dt>
+                  <dd className="m-0 font-mono text-xs">{env.shadowUrl ?? t('envp.shadowNone')}</dd>
+                </>
+              ) : (
+                <>
+                  <dt className="text-text-2">{t('envp.shadow')}</dt>
+                  <dd className="m-0 text-xs text-text-2">{t('envp.shadowMemory')}</dd>
+                </>
+              )}
               <dt className="text-text-2">{t('envp.status')}</dt>
               <dd className="m-0 text-text-2">{t('envp.statusUnknown')}</dd>
               {history && (

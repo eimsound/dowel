@@ -21,9 +21,9 @@ import { createAll, type Model, newId, plan } from '@dowel/core';
 import {
   canonicalSteps,
   type Db,
+  getEngine,
   isNontransactionalSql,
   type ScriptStep,
-  SESSION_SETTINGS,
   stepsChecksum,
 } from '@dowel/engines';
 import type { Hono } from 'hono';
@@ -346,8 +346,8 @@ export const registerVersions = (app: Hono<Env>, ctx: AppContext) => {
       model,
       targetPgMajor !== null ? { pgMajor: targetPgMajor } : undefined,
     );
-    // 兜底：规划器正常不会生成实例级语句，真出现了就不发布（验证会真的执行它们）
-    const instanceLevel = instanceLevelProblem(frozen.up, frozen.down);
+    // 兜底：规划器正常不会生成实例/文件级语句，真出现了就不发布（验证会真的执行它们）
+    const instanceLevel = instanceLevelProblem(frozen.up, frozen.down, a.dialect);
     if (instanceLevel) throw new HTTPException(422, { message: instanceLevel });
     if (!frozen.up.length)
       throw new HTTPException(422, {
@@ -478,11 +478,11 @@ export const registerVersions = (app: Hono<Env>, ctx: AppContext) => {
     const forceTx = (steps: ScriptStep[]) =>
       canonicalSteps(steps).map((x) => ({
         ...x,
-        transactional: x.transactional && !isNontransactionalSql(x.sql),
+        transactional: x.transactional && !isNontransactionalSql(x.sql, a.dialect),
       }));
     const up = forceTx(b.up);
     const down = forceTx(b.down);
-    const instanceLevel = instanceLevelProblem(up, down);
+    const instanceLevel = instanceLevelProblem(up, down, a.dialect);
     if (instanceLevel) throw new HTTPException(422, { message: instanceLevel });
     const checksum = stepsChecksum(up, down);
 
@@ -610,9 +610,11 @@ export const registerVersions = (app: Hono<Env>, ctx: AppContext) => {
     const down = plan(to, from, planOpts);
     if (c.req.query('format') === 'sql') {
       // 迁移脚本开头带上固定的会话设置（04-ir-design.md 1.6），保证在任何会话下执行结果相同
-      const header = SESSION_SETTINGS.map((x) => `${x};`).join('\n');
+      const header = getEngine(a.dialect).sessionHeader();
       const body = up.map((s) => `${s.sql};`).join('\n\n');
-      return c.text(`${header}\n\n${body}\n`, 200, { 'content-type': 'application/sql; charset=utf-8' });
+      return c.text(`${header ? `${header}\n\n` : ''}${body}\n`, 200, {
+        'content-type': 'application/sql; charset=utf-8',
+      });
     }
     return c.json<MigrationResult>({ up, down });
   });

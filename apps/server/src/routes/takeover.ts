@@ -13,8 +13,8 @@ import {
   type WizardEvent,
   type WizardStage,
 } from '@dowel/api';
-import { newId } from '@dowel/core';
-import { HistoryError, listHistoryProjects, readHistoryFormat, ScopeError } from '@dowel/engines';
+import { hasDialect, newId } from '@dowel/core';
+import { getEngine, HistoryError, ScopeError } from '@dowel/engines';
 import {
   type ChainVersion,
   claimInstance,
@@ -26,6 +26,7 @@ import type { Context, Hono } from 'hono';
 import { HTTPException } from 'hono/http-exception';
 import { streamSSE } from 'hono/streaming';
 
+import { assertUrlMatchesDialect } from '../allowlist.ts';
 import { audit } from '../audit.ts';
 import { can, userActor } from '../authz.ts';
 import { inList, isUniqueViolation, type PlatformDb } from '../db.ts';
@@ -49,9 +50,11 @@ import {
 import {
   CHECK_CONNECT_TIMEOUT,
   claimShadow,
-  connectPg,
+  connectTarget,
   dropSameInstanceShadow,
+  hasTargetDriver,
   inspectTarget,
+  inspectTargetOn,
   scrubUrl,
 } from '../targets.ts';
 import { type AppContext, body, connectionLimit, createProjectGroup, type Env } from './context.ts';
@@ -62,15 +65,19 @@ export const registerTakeover = (app: Hono<Env>, ctx: AppContext) => {
   /** 接手向导第一步：连上一个库，列出它登记过的项目（只读，兼容旧格式，不建任何东西） */
   app.post('/api/takeover/inspect', async (c) => {
     const b = await body(c, takeoverInspectSchema);
+    if (!hasDialect(b.dialect) || !hasTargetDriver(b.dialect))
+      throw new HTTPException(422, { message: `暂不支持方言 ${b.dialect}` });
+    assertUrlMatchesDialect(b.url, b.dialect);
     // 接手相当于新建项目：和向导、连接检查同一个判断；服务端替用户连地址，共用限速
     await createProjectGroup(c, ctx, b.groupId);
     connectionLimit(c, ctx);
     const settings = await readSettings(db);
-    const conn = connectPg(b.url, CHECK_CONNECT_TIMEOUT, ctx.guard);
+    const conn = connectTarget(b.dialect, b.url, CHECK_CONNECT_TIMEOUT, ctx.guard);
     try {
-      const [dbName] = await conn.db.query<{ name: string }>('select current_database() as name');
-      const format = await readHistoryFormat(conn.db);
-      const rows = format === null ? [] : await listHistoryProjects(conn.db);
+      const targetInfo = await inspectTargetOn(conn.db, b.url, b.dialect);
+      const engine = getEngine(b.dialect);
+      const format = await engine.history.readHistoryFormat(conn.db);
+      const rows = format === null ? [] : await engine.history.listHistoryProjects(conn.db);
       // 本实例里有没有同一个项目 ID：**只查目标库列出的这几个 ID**（不扫全表）。
       // 看不到的项目（调用者没有权限）只说“已存在”并标 hidden，不给名字、归属：不能借接手检查探测别人看不到的项目，
       // 但也不能让接手悄悄覆盖已有的项目（UI 据此挡住并提示联系管理员）
@@ -85,7 +92,7 @@ export const registerTakeover = (app: Hono<Env>, ctx: AppContext) => {
       for (const e of existing)
         here.set(e.id, { hidden: (await effectiveProjectRole(db, me, e.id, lookup)) === null });
       return c.json<TakeoverInspectResult>({
-        database: dbName?.name ?? '',
+        database: targetInfo.database,
         hasHistory: format !== null,
         instanceId: settings.instanceId,
         projects: rows.map((r) => ({
@@ -155,6 +162,9 @@ const assertTakeoverNotExists = async (
 export const runTakeover = (c: Context<Env>, ctx: AppContext, b: ProjectWizard, g: GroupRow) => {
   const { db } = ctx;
   const u = c.get('user');
+  const dialect = b.dialect;
+  if (!hasDialect(dialect) || !hasTargetDriver(dialect))
+    throw new HTTPException(422, { message: `暂不支持方言 ${dialect}` });
   const projectId = b.content.projectId;
   if (!projectId) throw new HTTPException(400, { message: '请选择要接手的项目' });
   const environments = b.environments.map((e) => ({ ...e, name: e.name.trim() }));
@@ -168,6 +178,8 @@ export const runTakeover = (c: Context<Env>, ctx: AppContext, b: ProjectWizard, 
     if (!e.name) throw new HTTPException(400, { message: '环境名不能为空' });
     if (names.has(e.name)) throw new HTTPException(422, { message: `环境名“${e.name}”重复` });
     names.add(e.name);
+    assertUrlMatchesDialect(e.url, dialect);
+    if (e.shadowUrl) assertUrlMatchesDialect(e.shadowUrl, dialect);
   }
   connectionLimit(c, ctx, environments.length);
 
@@ -189,13 +201,14 @@ export const runTakeover = (c: Context<Env>, ctx: AppContext, b: ProjectWizard, 
       if (!committed && createdShadow) {
         const s = createdShadow;
         createdShadow = null;
-        await dropSameInstanceShadow(s.targetUrl, s.name, ctx.guard);
+        await dropSameInstanceShadow(s.targetUrl, s.name, ctx.guard, dialect);
       }
     };
     const project: ProjectCreated = {
       id: projectId,
       name: b.name,
       slug: '',
+      dialect,
       role: 'admin',
       group: { id: g.id, slug: g.slug, name: g.name },
     };
@@ -214,9 +227,9 @@ export const runTakeover = (c: Context<Env>, ctx: AppContext, b: ProjectWizard, 
       // 和环境创建同样的检查：连得上（白名单在连接层检查）、影子库能认领
       const inspected = new Map<string, { version: string; versionNum: number }>();
       for (const e of environments) {
-        const info = await inspectTarget(e.url, CHECK_CONNECT_TIMEOUT, ctx.guard);
+        const info = await inspectTarget(e.url, CHECK_CONNECT_TIMEOUT, ctx.guard, dialect);
         inspected.set(e.name, { version: info.version, versionNum: info.versionNum });
-        if (e.shadowUrl) await claimShadow(e.shadowUrl, ctx.guard);
+        if (e.shadowUrl) await claimShadow(e.shadowUrl, ctx.guard, dialect);
       }
 
       stage = 'read';
@@ -226,7 +239,7 @@ export const runTakeover = (c: Context<Env>, ctx: AppContext, b: ProjectWizard, 
       for (const e of environments)
         sources.push({
           name: e.name,
-          state: await readSource(e.name, e.url, projectId, ctx.guard),
+          state: await readSource(e.name, e.url, projectId, ctx.guard, dialect),
         });
       const merged = mergeHistories(sources);
 
@@ -257,7 +270,7 @@ export const runTakeover = (c: Context<Env>, ctx: AppContext, b: ProjectWizard, 
       const head = merged.versions.at(-1)!;
       stage = 'verify';
       await send({ stage });
-      const prepared = await pickShadow(environments, unionScopes(merged.versions), ctx.guard);
+      const prepared = await pickShadow(environments, unionScopes(merged.versions), ctx.guard, dialect);
       shadow = prepared.shadow;
       createdShadow = prepared.created;
       const verifiedReports = await verifyVersionChain({
@@ -310,10 +323,11 @@ export const runTakeover = (c: Context<Env>, ctx: AppContext, b: ProjectWizard, 
             }
             if (await projectSlugTaken(tx, g.id, project.slug)) return 'slug';
             await tx.query(
-              'insert into projects (id, name, created_by, group_id, slug, schemas) values ($1, $2, $3, $4, $5, $6::text::jsonb)',
+              'insert into projects (id, name, dialect, created_by, group_id, slug, schemas) values ($1, $2, $3, $4, $5, $6, $7::text::jsonb)',
               [
                 projectId,
                 b.name,
+                dialect,
                 u.id,
                 g.id,
                 project.slug,
@@ -420,12 +434,13 @@ export const runTakeover = (c: Context<Env>, ctx: AppContext, b: ProjectWizard, 
           continue;
         }
         const url = environments.find((e) => e.name === s.name)!.url;
-        const conn = connectPg(url, CHECK_CONNECT_TIMEOUT, ctx.guard);
+        const conn = connectTarget(dialect, url, CHECK_CONNECT_TIMEOUT, ctx.guard);
         let claim: Awaited<ReturnType<typeof claimInstance>> | null = null;
         try {
           // 在目标库的项目锁里和平台刚恢复的链重新比对：读取之后原实例又执行了新版本，就拒绝认领
           claim = await claimInstance({
             db: conn.db,
+            dialect,
             projectId,
             projectName: b.name,
             instanceId: settings.instanceId,
@@ -435,7 +450,7 @@ export const runTakeover = (c: Context<Env>, ctx: AppContext, b: ProjectWizard, 
           });
         } catch (e) {
           console.error('接手：认领失败（项目已经建好）', e instanceof Error ? scrubSecrets(e.message) : e);
-          const why = claimFailure(e, url);
+          const why = claimFailure(e, url, dialect);
           const ahead =
             e instanceof ExecutorError && (e.code === 'history_mismatch' || e.code === 'history_conflict');
           warnings.push(

@@ -1,11 +1,12 @@
 // 影子库上的操作：导入 DDL、闭环验证、风险分析、派生数据的规范化。
-// 影子库只能是真实的 PostgreSQL 实例（targets.ts 的 pgShadow），没有兜底。
+// PG 使用真实 PostgreSQL 影子库实例；SQLite 使用进程内 `:memory:` 影子库。
 
 import type { StepRisk, StoredVerifyReport, VerifyReport, VerifyTargetReport } from '@dowel/api';
 import {
   deepEqual,
+  type Dialect,
   findInstanceLevelStatement,
-  INSTANCE_LEVEL_DESCRIPTION,
+  instanceLevelDescription,
   type Model,
   type Obj,
   PlanError,
@@ -13,13 +14,12 @@ import {
   plan,
   type Step,
 } from '@dowel/core';
-import { type Db, importSnapshot, readSnapshot, reconcileIds, type ScriptStep } from '@dowel/engines';
+import { type Db, getEngine, reconcileIds, type ScriptStep } from '@dowel/engines';
 import {
   analyze,
-  build,
+  buildTarget,
   InstanceLevelStatementError,
   readShadowPgMajor,
-  resetShadow,
   runSteps,
   StepError,
   type VerifyScriptsOptions,
@@ -242,9 +242,10 @@ const risksOf = async (
  * 这只是防误操作，不是安全边界（挡不住 DO 块里 EXECUTE 的动态 SQL）；
  * 真正的边界是影子库的账号权限和“生产环境默认不在同一实例上建影子库”。
  */
-export const assertImportable = (sql: string): ImportableSql => {
-  const hit = findInstanceLevelStatement(sql);
-  if (hit !== null) throw new ShadowError(`导入的 SQL 含实例级语句（${hit}）。${INSTANCE_LEVEL_DESCRIPTION}`);
+export const assertImportable = (sql: string, dialect: Dialect = 'pg'): ImportableSql => {
+  const hit = findInstanceLevelStatement(sql, dialect);
+  if (hit !== null)
+    throw new ShadowError(`导入的 SQL 含实例级语句（${hit}）。${instanceLevelDescription(dialect)}`);
   return sql as ImportableSql;
 };
 
@@ -252,23 +253,34 @@ export const shadowOps = (
   db: () => Promise<Db>,
   schemas?: string[] | null,
   /** 影子库会话的 statement_timeout（毫秒），判断 57014 是不是语句超时时用；测试里可以调小 */
-  { statementTimeoutMs = SHADOW_STATEMENT_TIMEOUT_MS }: { statementTimeoutMs?: number } = {},
+  {
+    statementTimeoutMs = SHADOW_STATEMENT_TIMEOUT_MS,
+    dialect = 'pg',
+  }: { statementTimeoutMs?: number; dialect?: Dialect } = {},
 ) => ({
   importSql: async (sql: ImportableSql): Promise<Model> => {
     const d = await db();
-    await resetShadow(d);
-    await d.exec('CREATE SCHEMA public');
+    const engine = getEngine(dialect);
+    await engine.resetShadow(d);
+    await engine.prepareImportShadow(d);
     try {
-      await d.exec(`SET search_path = public; ${stripOwnership(sql)}`);
+      const cleaned = engine.stripImportNoise(sql);
+      if (dialect === 'pg') {
+        await d.exec(`SET search_path = public; ${cleaned}`);
+      } else {
+        await engine.execStepSql(d, cleaned);
+      }
     } catch (e) {
       // 不在这里脱敏：错误只会走全局 onError（422）或 SSE 的 send，出口统一过 scrubSecrets
       throw new ShadowError(e instanceof Error ? e.message : String(e));
     }
-    return importSnapshot(await readSnapshot(d, schemas));
+    return engine.importSnapshot(await engine.readSnapshot(d, schemas));
   },
   canonicalize: async (prev: Model, next: Model): Promise<Obj[]> => {
     const d = await db();
-    const pgMajor = await readShadowPgMajor(d);
+    const dDialect = next.dialect;
+    const engine = getEngine(dDialect);
+    const pgMajor = dDialect === 'pg' ? await readShadowPgMajor(d) : null;
     const planOpts = pgMajor !== null ? { pgMajor } : undefined;
     let steps: Step[] | null = null;
     try {
@@ -277,17 +289,17 @@ export const shadowOps = (
       if (!(e instanceof PlanError)) throw e;
     }
     if (steps !== null) {
-      await build(d, prev, planOpts);
-      await runSteps(d, steps);
+      await buildTarget(d, prev, planOpts);
+      await runSteps(d, steps, dDialect);
     } else {
       // 未发布表发生普通表↔分区表互转或分区策略变更时无法增量规划：回退为从空库直接建出 next
-      await build(d, next, planOpts);
+      await buildTarget(d, next, planOpts);
     }
     // 读回引擎里的结构，按名字对回 next 的 ID，取出规范形式
-    const engine = reconcileIds(next, importSnapshot(await readSnapshot(d, schemas)));
+    const imported = reconcileIds(next, engine.importSnapshot(await engine.readSnapshot(d, schemas)));
     const out: Obj[] = [];
     for (const o of Object.values(next.objects)) {
-      const e = engine.objects[o.id];
+      const e = imported.objects[o.id];
       if (!e || e.kind !== o.kind) continue;
       const c = structuredClone(o) as Obj;
       if (c.kind === 'table' && e.kind === 'table') {

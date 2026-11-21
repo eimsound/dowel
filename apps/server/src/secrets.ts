@@ -53,6 +53,7 @@ export { scrubSecrets };
  * 解析不了的（密码里带没编码的 `/` 之类）不原样显示，给提示。
  */
 export const maskUrl = (url: string): string => {
+  if (/^sqlite:\/\//i.test(url)) return url;
   try {
     const u = new URL(url);
     if (u.password) u.password = '***';

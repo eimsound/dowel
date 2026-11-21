@@ -1,12 +1,20 @@
 // SQL 视图（CodeMirror）：默认只读；给了 onChange 就是可编辑的（版本详情里逐步编辑冻结的迁移）。
 // 语法颜色用 DESIGN.md 的 syn-* token，与迁移步骤里的高亮一致。
-import { PostgreSQL, sql } from '@codemirror/lang-sql';
+import { MSSQL, MySQL, PostgreSQL, SQLite, sql } from '@codemirror/lang-sql';
 import { HighlightStyle, syntaxHighlighting } from '@codemirror/language';
 import { EditorState } from '@codemirror/state';
 import { EditorView } from '@codemirror/view';
+import type { Dialect } from '@dowel/core';
 import { tags } from '@lezer/highlight';
 import { basicSetup } from 'codemirror';
 import { useEffect, useLayoutEffect, useRef } from 'react';
+
+const CM_DIALECT = {
+  pg: PostgreSQL,
+  sqlite: SQLite,
+  mysql: MySQL,
+  mssql: MSSQL,
+} as const;
 
 const highlight = HighlightStyle.define([
   { tag: tags.keyword, color: 'var(--syn-kw)' },
@@ -20,11 +28,13 @@ const highlight = HighlightStyle.define([
 export const SqlView = ({
   text,
   label,
+  dialect = 'pg',
   onChange,
   className,
 }: {
   text: string;
   label: string;
+  dialect?: Dialect;
   /** 给了就可编辑：每次内容变化时回调完整文本 */
   onChange?: (text: string) => void;
   className?: string;
@@ -33,7 +43,7 @@ export const SqlView = ({
   const view = useRef<EditorView | null>(null);
   const editable = onChange !== undefined;
   const change = useRef(onChange);
-  // 编辑器因 label / 可编辑状态变化重建时，用当时最新的文本作初始内容
+  // 编辑器因 label / 可编辑状态 / 方言变化重建时，用当时最新的文本作初始内容
   const latest = useRef(text);
   useLayoutEffect(() => {
     change.current = onChange;
@@ -46,7 +56,7 @@ export const SqlView = ({
         doc: latest.current,
         extensions: [
           basicSetup,
-          sql({ dialect: PostgreSQL }),
+          sql({ dialect: CM_DIALECT[dialect] ?? PostgreSQL }),
           syntaxHighlighting(highlight),
           EditorState.readOnly.of(!editable),
           EditorView.contentAttributes.of({ 'aria-label': label }),
@@ -60,7 +70,7 @@ export const SqlView = ({
       }),
     });
     return () => view.current?.destroy();
-  }, [label, editable]);
+  }, [label, editable, dialect]);
   useEffect(() => {
     const v = view.current!;
     if (v.state.doc.toString() !== text)

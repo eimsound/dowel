@@ -35,6 +35,7 @@ import { Tabs } from '../components/Tabs.tsx';
 import { useToast } from '../components/Toasts.tsx';
 import { Avatar, IconButton, peerColor } from '../components/ui.tsx';
 import { clearTables, SELECT_TABLE_EVENT, setCurrentTables } from '../current-tables.ts';
+import { dialectUiSpec } from '../dialects.ts';
 import { useProject } from '../project.tsx';
 import { useWorkspace } from '../workspace.ts';
 
@@ -141,9 +142,10 @@ export const Model = () => {
     });
   };
 
+  const uiSpec = dialectUiSpec(model.dialect);
   const newTable = () => {
     const schema =
-      Object.values(model.objects).find((o) => o.kind === 'schema' && o.name === 'public') ??
+      Object.values(model.objects).find((o) => o.kind === 'schema' && o.name === uiSpec.defaultSchema) ??
       Object.values(model.objects).find((o) => o.kind === 'schema');
     if (!schema) return;
     const names = new Set(
@@ -154,11 +156,12 @@ export const Model = () => {
     let n = 1;
     while (names.has(`table_${n}`)) n++;
     const id = newId();
+    const colId = newId();
     if (ws.act('createTable', { id, schema: schema.id, name: `table_${n}` })) {
-      ws.act('addColumn', {
-        table: id,
-        column: { id: newId(), name: 'id', type: 'bigint', notNull: true, identity: { always: false } },
-      });
+      const col = uiSpec.defaultPkColumn(colId);
+      if (ws.act('addColumn', { table: id, column: col }) && uiSpec.autoPrimaryKey) {
+        ws.act('addPrimaryKey', { id: newId(), table: id, columns: [colId] });
+      }
       setSelected(id);
     }
   };
@@ -166,17 +169,23 @@ export const Model = () => {
   const env = envs.data?.[0];
   const latest = versions.data?.[0];
   const showInspector = pinned || selected !== null;
-  const pgTargetLabel =
-    project.targetPgMajor !== null ? `PostgreSQL ${project.targetPgMajor}+` : 'PostgreSQL';
-  const pgTargetTip =
-    project.targetPgMajor !== null
-      ? project.envPgMajors.length > 1
-        ? t('ws.pgTargetMultiTip', {
-            target: project.targetPgMajor,
-            versions: project.envPgMajors.map((v) => `PG ${v}`).join(' · '),
-          })
-        : t('ws.pgTargetSingleTip', { target: project.targetPgMajor })
-      : t('ws.pgTargetUnknownTip');
+  const dialectLabel =
+    model.dialect === 'pg'
+      ? project.targetPgMajor !== null
+        ? `PostgreSQL ${project.targetPgMajor}+`
+        : 'PostgreSQL'
+      : uiSpec.name;
+  const dialectTip =
+    model.dialect !== 'pg'
+      ? undefined
+      : project.targetPgMajor !== null
+        ? project.envPgMajors.length > 1
+          ? t('ws.pgTargetMultiTip', {
+              target: project.targetPgMajor,
+              versions: project.envPgMajors.map((v) => `PG ${v}`).join(' · '),
+            })
+          : t('ws.pgTargetSingleTip', { target: project.targetPgMajor })
+        : t('ws.pgTargetUnknownTip');
 
   return (
     <>
@@ -320,7 +329,7 @@ export const Model = () => {
                 </div>
               ) : (
                 <div className="h-full pt-12">
-                  <SqlView text={ddl} label="DDL" />
+                  <SqlView text={ddl} label="DDL" dialect={model.dialect} />
                 </div>
               )
             }
@@ -351,11 +360,17 @@ export const Model = () => {
           {t(`ws.status.${status}`)}
           {status === 'online' && ` · ${t('ws.peopleOnline', { count: people.length })}`}
         </span>
-        <span>{env ? t('ws.shadowOf', { env: env.name }) : t('ws.noEnv')}</span>
+        <span>
+          {!uiSpec.requiresExternalShadow
+            ? t('ws.shadowMemory')
+            : env
+              ? t('ws.shadowOf', { env: env.name })
+              : t('ws.noEnv')}
+        </span>
         <span className="flex-1" />
         {latest && <span className="font-mono">{latest.name}</span>}
-        <span className="font-mono" title={pgTargetTip}>
-          {pgTargetLabel}
+        <span className="font-mono" title={dialectTip}>
+          {dialectLabel}
         </span>
       </footer>
 

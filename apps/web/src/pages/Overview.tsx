@@ -12,6 +12,7 @@ import { DriftBadge } from '../components/EnvBits.tsx';
 import { EmptyHint, MoreLink, ProjectPage, Row, Rows, Section } from '../components/ProjectPage.tsx';
 import { Banner } from '../components/ui.tsx';
 import { useVersionName, VersionBadges, VersionNumber } from '../components/VersionStatus.tsx';
+import { dialectUiSpec, formatEngineVersion } from '../dialects.ts';
 import { driftWarnings, useEnvs } from '../envs.ts';
 import { formatTime } from '../format.ts';
 import { useProject } from '../project.tsx';
@@ -77,6 +78,12 @@ export const Overview = () => {
           </dd>
           <dt className="text-text-2">{t('ov.role')}</dt>
           <dd className="m-0">{t(`projects.role.${project.role}`)}</dd>
+          {project.dialect !== 'pg' && (
+            <>
+              <dt className="text-text-2">{t('wiz.sumDialect')}</dt>
+              <dd className="m-0 font-mono">{dialectUiSpec(project.dialect).name}</dd>
+            </>
+          )}
           {(project.envPgMajors.length > 1 ||
             (project.targetPgMajor !== null && project.targetPgMajor < 18)) && (
             <>
@@ -150,8 +157,14 @@ export const Overview = () => {
                     >
                       {e.name}
                     </Link>
-                    {e.engineMajor !== null && (
-                      <span className="chip shrink-0 font-mono">PG {e.engineMajor}</span>
+                    {formatEngineVersion(project.dialect, e.engineVersion, e.engineMajor) && (
+                      <span className="chip shrink-0 font-mono">
+                        {formatEngineVersion(
+                          project.dialect,
+                          project.dialect === 'pg' ? null : e.engineVersion,
+                          e.engineMajor,
+                        )}
+                      </span>
                     )}
                     {e.production && <span className="badge danger">{t('ov.envProduction')}</span>}
                     {e.drift.status === 'drifted' || e.drift.status === 'error' ? (

@@ -11,6 +11,7 @@ import { api } from '../api.ts';
 import { GroupDialog } from '../components/Dialogs.tsx';
 import { AppShell, PageHeader } from '../components/Shell.tsx';
 import { Banner, Empty } from '../components/ui.tsx';
+import { dialectUiSpec } from '../dialects.ts';
 import { formatTime } from '../format.ts';
 
 export const Projects = ({ me }: { me: Me }) => {
@@ -131,6 +132,9 @@ export const Projects = ({ me }: { me: Me }) => {
                           >
                             <Workflow size={16} aria-hidden="true" className="text-text-3" />
                             <span className="min-w-0 flex-1 truncate font-medium">{p.name}</span>
+                            {p.dialect !== 'pg' && (
+                              <span className="chip font-mono">{dialectUiSpec(p.dialect).name}</span>
+                            )}
                             <span className="text-xs text-text-3">{formatTime(p.createdAt)}</span>
                             <span className="chip">{t(`projects.role.${p.role}`)}</span>
                           </Link>

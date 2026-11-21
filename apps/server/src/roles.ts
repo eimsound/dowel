@@ -14,6 +14,7 @@ import {
   type Role,
   tokenCreatorAllows,
 } from '@dowel/api';
+import type { Dialect } from '@dowel/core';
 import type { Db } from '@dowel/engines';
 
 import type { PlatformDb } from './db.ts';
@@ -24,7 +25,7 @@ export interface ProjectRow {
   id: string;
   name: string;
   slug: string;
-  dialect: string;
+  dialect: Dialect;
   groupId: string;
   groupSlug: string;
   groupName: string;

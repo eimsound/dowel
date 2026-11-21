@@ -16,6 +16,7 @@ import { planDiff } from '@dowel/executor';
 import type { Hono } from 'hono';
 import { HTTPException } from 'hono/http-exception';
 
+import { assertUrlMatchesDialect } from '../allowlist.ts';
 import { audit, auditIn } from '../audit.ts';
 import { can, type EnvAction, isEnvAction, userActor } from '../authz.ts';
 import { applyEnvPolicy, type EnvPolicyResult } from '../env-policy.ts';
@@ -61,9 +62,16 @@ export const registerEnvironments = (app: Hono<Env>, ctx: AppContext) => {
     return c.json<EnvInfo[]>(
       rows.map((r) => {
         const cur = r.current_version_id ? versions.get(r.current_version_id) : undefined;
-        return toEnvInfo(r, actor, a.role, envAuthOf(store, a.rc, a, r), {
-          currentVersion: cur ? versionRef(cur) : null,
-        });
+        return toEnvInfo(
+          r,
+          actor,
+          a.role,
+          envAuthOf(store, a.rc, a, r),
+          {
+            currentVersion: cur ? versionRef(cur) : null,
+          },
+          a.dialect,
+        );
       }),
     );
   });
@@ -71,9 +79,11 @@ export const registerEnvironments = (app: Hono<Env>, ctx: AppContext) => {
   app.post('/api/projects/:pid/environments', async (c) => {
     const a = await access(c, ctx, 'environment.manage');
     const b = await body(c, environmentCreateSchema);
+    assertUrlMatchesDialect(b.url, a.dialect);
+    if (b.shadowUrl) assertUrlMatchesDialect(b.shadowUrl, a.dialect);
     // 白名单在连接层检查（ctx.guard）：目标库和影子库都要过一遍
-    const info = await inspectTarget(b.url, CHECK_CONNECT_TIMEOUT, ctx.guard); // 先确认能连上
-    if (b.shadowUrl) await claimShadow(b.shadowUrl, ctx.guard);
+    const info = await inspectTarget(b.url, CHECK_CONNECT_TIMEOUT, ctx.guard, a.dialect); // 先确认能连上
+    if (b.shadowUrl) await claimShadow(b.shadowUrl, ctx.guard, a.dialect);
     const id = newId();
     await db.query(
       `insert into environments (id, project_id, name, url_enc, production, allow_same_instance, shadow_url_enc,
@@ -187,10 +197,12 @@ export const registerEnvironments = (app: Hono<Env>, ctx: AppContext) => {
     const release = connection ? await lockEnvIdle(ctx.exec, eid) : null;
     let done: { r: EnvPolicyResult; row: EnvRow };
     try {
+      if (b.url !== undefined) assertUrlMatchesDialect(b.url, a.dialect);
+      if (b.shadowUrl) assertUrlMatchesDialect(b.shadowUrl, a.dialect);
       // 外部检查在写库之前：新连接串要连得上（白名单在连接层检查），影子库要能认领
       const inspected =
-        b.url !== undefined ? await inspectTarget(b.url, CHECK_CONNECT_TIMEOUT, ctx.guard) : null;
-      if (b.shadowUrl) await claimShadow(b.shadowUrl, ctx.guard);
+        b.url !== undefined ? await inspectTarget(b.url, CHECK_CONNECT_TIMEOUT, ctx.guard, a.dialect) : null;
+      if (b.shadowUrl) await claimShadow(b.shadowUrl, ctx.guard, a.dialect);
       done = await withPolicyLock(db, async (tx) => {
         // 锁内重新读环境行、四层配置、项目当前的组和调用者的角色，按它们重新决定改什么、重新检查权限
         const r = await applyEnvPolicy(tx, policyInput(true));
@@ -275,9 +287,16 @@ export const registerEnvironments = (app: Hono<Env>, ctx: AppContext) => {
     // P5b：连接串 / 生产标记 / 档位变了，这个环境上还没结束的执行申请重新检查
     ctx.requests.kick({ envIds: [row.id] });
     return c.json<EnvInfo>(
-      toEnvInfo(row, actor, r.role, auth, {
-        currentVersion: cur ? versionRef(cur) : null,
-      }),
+      toEnvInfo(
+        row,
+        actor,
+        r.role,
+        auth,
+        {
+          currentVersion: cur ? versionRef(cur) : null,
+        },
+        a.dialect,
+      ),
     );
   });
 
@@ -335,7 +354,7 @@ export const registerEnvironments = (app: Hono<Env>, ctx: AppContext) => {
     const row = await loadEnv(db, a.pid, c.req.param('eid')!);
     const url = decrypt(row.url_enc);
     // 白名单在连接层检查，所以实例设置之后改严也会在这里生效
-    const info = await inspectTarget(url, CHECK_CONNECT_TIMEOUT, ctx.guard);
+    const info = await inspectTarget(url, CHECK_CONNECT_TIMEOUT, ctx.guard, a.dialect);
     // 探测成功后按 url_enc 条件原子回写最新版本（防与并发 PATCH 改连接串发生倒挂）
     if (row.engine_version !== info.version || row.engine_version_num !== info.versionNum) {
       const updated = await updateEnvVersion(db, row.id, info.version, info.versionNum, row.url_enc);

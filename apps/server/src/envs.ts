@@ -11,7 +11,7 @@ import type {
   EnvVersionRef,
 } from '@dowel/api';
 import { needsManualSchema } from '@dowel/api';
-import { deriveTargetPgMajor, type Model, pgMajorOf } from '@dowel/core';
+import { deriveTargetPgMajor, type Dialect, type Model, pgMajorOf } from '@dowel/core';
 import type { Db, ScriptStep } from '@dowel/engines';
 import { type ChainVersion, isNonTx, runTouched, runVersionId, type TargetState } from '@dowel/executor';
 import { HTTPException } from 'hono/http-exception';
@@ -48,15 +48,21 @@ export interface EnvRow {
   engine_version_num?: number | null;
 }
 
-/** 从 server_version_num（如 160004）回退格式化简洁版本串（"16.4"），仅在未读 server_version 时使用 */
-export const formatVersionNum = (versionNum: number): string => {
+/** 从版本号数值回退格式化简洁版本串（PG: 160004 → "16.4"；SQLite: 3054001 → "3.54.1"） */
+export const formatVersionNum = (versionNum: number, dialect: Dialect = 'pg'): string => {
+  if (dialect === 'sqlite') {
+    const major = Math.floor(versionNum / 1_000_000);
+    const minor = Math.floor((versionNum % 1_000_000) / 1000);
+    const patch = versionNum % 1000;
+    return `${major}.${minor}.${patch}`;
+  }
   const major = Math.floor(versionNum / 10000);
   const minor = versionNum % 10000;
   return `${major}.${minor}`;
 };
 
 /**
- * 更新环境记录的 PostgreSQL 版本。
+ * 更新环境记录的引擎版本。
  * 传入 `expectedUrlEnc` 时在 WHERE 中校验 `url_enc = $4`，防止与并发 PATCH 改连接串发生倒挂。
  */
 export const updateEnvVersion = async (
@@ -80,11 +86,15 @@ export const updateEnvVersion = async (
   return rows.length > 0;
 };
 
-/** 汇总项目下全部环境的 PG 大版本（去重升序）并推导目标最低版本 */
+/** 汇总项目下全部环境的 PG 大版本（去重升序）并推导目标最低版本（非 PG 项目返回空） */
 export const projectPgVersionSummary = async (
   db: Db,
   projectId: string,
 ): Promise<{ targetPgMajor: number | null; envPgMajors: number[] }> => {
+  const [proj] = await db.query<{ dialect: Dialect }>('select dialect from projects where id = $1', [
+    projectId,
+  ]);
+  if (proj && proj.dialect !== 'pg') return { targetPgMajor: null, envPgMajors: [] };
   const rows = await db.query<{ engine_version_num: number | null }>(
     'select engine_version_num from environments where project_id = $1',
     [projectId],
@@ -349,6 +359,7 @@ export const toEnvInfo = (
   role: Role,
   auth: EnvAuth,
   refs: { currentVersion: EnvVersionRef | null },
+  dialect: Dialect = 'pg',
 ): EnvInfo => ({
   id: r.id,
   name: r.name,
@@ -362,7 +373,7 @@ export const toEnvInfo = (
   currentVersion: refs.currentVersion,
   engineVersion: r.engine_version ?? null,
   engineVersionNum: r.engine_version_num ?? null,
-  engineMajor: pgMajorOf(r.engine_version_num),
+  engineMajor: dialect === 'pg' ? pgMajorOf(r.engine_version_num) : null,
   drift: driftInfo(r),
   permissions: permissionsOf(actor, r, role, auth),
 });
@@ -374,6 +385,7 @@ export const toEnvVersion = (
   m: VersionMeta,
   current: VersionMeta | undefined,
   executed: Set<string>,
+  dialect: Dialect = 'pg',
 ): EnvVersion => {
   const state =
     !current || m.number > current.number ? 'pending' : m.id === current.id ? 'current' : 'applied';
@@ -389,7 +401,7 @@ export const toEnvVersion = (
     upSteps: m.upSteps.length,
     downSteps: m.downSteps.length,
     // 和执行器用同一条规则（冻结标记 + 语句文本）
-    nonTransactional: m.upSteps.some(isNonTx),
+    nonTransactional: m.upSteps.some((s) => isNonTx(s, dialect)),
     risk: analysed.length
       ? analysed.reduce(
           (a, r) => (LEVELS[r.level] > LEVELS[a] ? r.level : a),

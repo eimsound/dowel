@@ -107,10 +107,15 @@ const zh = {
     add: '添加环境',
     addHint:
       '环境是项目要部署到的数据库。导入 SQL、验证迁移都在它所在实例上的影子库（{原库名}_dowel）里进行，版本、扩展与目标一致。',
+    addHintSqlite:
+      '环境是项目要部署到的本地 SQLite 数据库文件（需位于服务端 DOWEL_SQLITE_ROOTS 目录白名单内）。SQL 导入和迁移验证默认使用内置 :memory: 影子库，无需额外配置影子库。',
     list: '环境列表',
     config: '连接配置',
     shadow: '影子库',
     shadowNone: '没有单独设置，使用同实例上的 {原库名}_dowel',
+    shadowMemory: '内置 SQLite :memory: 影子库',
+    engineVersion: '数据库版本',
+    engineVersionUnknown: '尚未探测',
     production: '生产环境',
     notProduction: '非生产',
     markProduction: '标记为生产环境',
@@ -828,6 +833,7 @@ const zh = {
     inspector: '属性',
     peopleOnline: '{{count}} 人在线',
     shadowOf: '影子库：{{env}} 环境',
+    shadowMemory: '影子库：SQLite :memory:',
     noEnv: '未配置环境',
     pgTargetMultiTip:
       '目标兼容版本由项目环境中最低的 PostgreSQL 版本推导：PG {{target}}+（当前环境：{{versions}}）',
@@ -893,6 +899,10 @@ const zh = {
     expr: '表达式',
     pin: '固定属性面板',
     unpin: '取消固定属性面板',
+    sqliteOptions: 'SQLite 表选项',
+    sqliteStrict: 'STRICT（严格类型检查）',
+    sqliteWithoutRowid: 'WITHOUT ROWID（需显式主键）',
+    sqliteAutoincrement: 'AUTOINCREMENT',
   },
   dlg: {
     cancel: '取消',
@@ -1008,6 +1018,15 @@ const zh = {
     create: '创建项目',
     skip: '跳过',
     basicsHint: '项目属于一个组。建好之后可以在设置里改名字和标识。',
+    dialect: '数据库方言',
+    dialectHint: '创建后不可更改。',
+    dialectComingSoon: '开发中',
+    dialectDesc: {
+      pg: '支持多 Schema、枚举、序列与声明式分区',
+      sqlite: '内置 :memory: 影子库，零环境即可导入 SQL 与验证',
+      mysql: '即将支持（MySQL 8.0 / 8.4）',
+      mssql: '即将支持（SQL Server 2019+）',
+    },
     name: '项目名',
     namePlaceholder: '例如：商城',
     slug: '标识',
@@ -1019,6 +1038,8 @@ const zh = {
     groupHint: '只有你可以在其中建项目的组才会出现在这里。',
     databaseHint:
       '环境是项目要部署到的数据库。可以先跳过，建好项目后再添加；导入结构需要至少一个环境（影子库只能用真实的 PostgreSQL 实例）。',
+    databaseHintSqlite:
+      '环境是项目要部署到的本地 SQLite 文件（需在服务端 DOWEL_SQLITE_ROOTS 白名单内）。可以直接跳过——SQLite 内置 :memory: 影子库，零环境即可从 SQL 导入并验证。',
     addEnv: '添加数据库',
     envName: '名字',
     envUrl: '连接串',
@@ -1032,6 +1053,7 @@ const zh = {
     checking: '检查中…',
     checkOk: '连接正常',
     checkVersion: 'PostgreSQL {{version}}',
+    checkVersionGeneric: '{{dialect}} {{version}}',
     checkUser: '当前用户',
     checkSuper: '超级用户',
     checkCreateDb: '可以建库',
@@ -1045,11 +1067,14 @@ const zh = {
     contentTitle: '初始内容',
     contentBlank: '空白',
     contentBlankHint: '从空模型开始：只有一个 public schema。',
+    contentBlankHintSqlite: '从空模型开始：使用 SQLite 默认 main 数据库。',
     contentDatabase: '从数据库导入',
     contentDatabaseHint: '从上面添加的数据库读结构，作为 v0 基线。只读，不会写目标库。',
     contentSql: '从 SQL 导入',
     contentSqlHint:
       '粘贴或选择 DDL（例如 pg_dump --schema-only 的输出）。Dowel 会在影子库里执行它并读回结构。',
+    contentSqlHintSqlite:
+      '粘贴或选择 SQLite DDL（例如 sqlite3 .schema 的输出）。Dowel 会在内置 :memory: 影子库里执行并读回结构，无需先配置环境。',
     contentTakeover: '接手现有项目',
     contentTakeoverHint: '从目标库的 dowel 历史恢复整个项目：版本链、模型（对象 ID 不变）和环境。',
     pickEnv: '从哪个数据库导入',
@@ -1059,11 +1084,13 @@ const zh = {
     sqlFile: '选择 .sql 文件',
     sqlNeeded: '请粘贴 SQL 或选择一个文件。',
     sqlNeedsEnv: '从 SQL 导入需要一个环境：SQL 会在影子库里执行，影子库只能用真实的 PostgreSQL 实例。',
+    sqlMemoryShadowHint: '将使用内置 SQLite :memory: 影子库导入并验证基线，无需关联外部环境。',
     envNeeded: '导入需要至少一个数据库：先回到上一步添加一个环境。',
     schemaNeeded: '至少选一个 schema。',
     confirmHint:
       '确认后创建项目。导入的模型会成为 v0 基线版本；这一步只写 Dowel 的数据，不会修改你的数据库。',
     sumBasics: '基本信息',
+    sumDialect: '数据库方言',
     sumEnvs: '数据库',
     sumContent: '初始内容',
     sumSchemas: 'schema 范围',
@@ -1656,6 +1683,7 @@ const zh = {
       createTable: '新建表',
       renameTable: '重命名表',
       dropTable: '删除表',
+      setTableExt: '修改表扩展选项',
       // 分区表操作
       setPartitionBy: '配置分区策略',
       createPartition: '新建子分区',
@@ -1669,6 +1697,7 @@ const zh = {
       setNotNull: '修改非空约束',
       setDefault: '修改默认值',
       setIdentity: '修改自增属性',
+      setColumnExt: '修改列扩展选项',
       moveColumn: '调整列顺序',
       addPrimaryKey: '添加主键',
       addUnique: '添加唯一约束',
@@ -1873,10 +1902,15 @@ const en: typeof zh = {
     add: 'Add environment',
     addHint:
       'Environments are the databases this project deploys to. Importing SQL and verifying migrations run in a shadow database ({database}_dowel) on the same instance, so version and extensions match.',
+    addHintSqlite:
+      'Environments are local SQLite database files (within the server DOWEL_SQLITE_ROOTS allowlist). SQL imports and verification use a built-in :memory: shadow database automatically.',
     list: 'Environments',
     config: 'Connection',
     shadow: 'Shadow database',
     shadowNone: 'Not set separately; uses {database}_dowel on the same instance',
+    shadowMemory: 'Built-in SQLite :memory: shadow database',
+    engineVersion: 'Engine version',
+    engineVersionUnknown: 'Not detected yet',
     production: 'Production',
     notProduction: 'Not production',
     markProduction: 'Mark as production',
@@ -2634,6 +2668,7 @@ const en: typeof zh = {
     inspector: 'Properties',
     peopleOnline: '{{count}} online',
     shadowOf: 'Shadow database: {{env}}',
+    shadowMemory: 'Shadow database: SQLite :memory:',
     noEnv: 'No environment',
     pgTargetMultiTip:
       'Target version derived from the lowest environment PostgreSQL version: PG {{target}}+ (environments: {{versions}})',
@@ -2707,6 +2742,10 @@ const en: typeof zh = {
     expr: 'Expression',
     pin: 'Pin the properties panel',
     unpin: 'Unpin the properties panel',
+    sqliteOptions: 'SQLite table options',
+    sqliteStrict: 'STRICT (strict type checking)',
+    sqliteWithoutRowid: 'WITHOUT ROWID (requires primary key)',
+    sqliteAutoincrement: 'AUTOINCREMENT',
   },
   dlg: {
     cancel: 'Cancel',
@@ -2828,6 +2867,15 @@ const en: typeof zh = {
     create: 'Create project',
     skip: 'Skip',
     basicsHint: 'A project belongs to a group. You can rename it later in settings.',
+    dialect: 'Database dialect',
+    dialectHint: 'Cannot be changed after creation.',
+    dialectComingSoon: 'Coming soon',
+    dialectDesc: {
+      pg: 'Multi-schema, enums, sequences, and declarative partitioning',
+      sqlite: 'Built-in :memory: shadow database for zero-environment SQL import & verification',
+      mysql: 'Coming soon (MySQL 8.0 / 8.4)',
+      mssql: 'Coming soon (SQL Server 2019+)',
+    },
     name: 'Project name',
     namePlaceholder: 'e.g. Shop',
     slug: 'Identifier',
@@ -2840,6 +2888,8 @@ const en: typeof zh = {
     groupHint: 'Only groups where you can create projects are listed.',
     databaseHint:
       'An environment is a database the project deploys to. You can skip this and add one later; importing needs at least one environment (the shadow database must be a real PostgreSQL instance).',
+    databaseHintSqlite:
+      'An environment is a local SQLite database file (inside server DOWEL_SQLITE_ROOTS). You can skip this—SQLite includes a built-in :memory: shadow database for SQL import and verification.',
     addEnv: 'Add database',
     envName: 'Name',
     envUrl: 'Connection string',
@@ -2853,6 +2903,7 @@ const en: typeof zh = {
     checking: 'Checking…',
     checkOk: 'Connection OK',
     checkVersion: 'PostgreSQL {{version}}',
+    checkVersionGeneric: '{{dialect}} {{version}}',
     checkUser: 'Current user',
     checkSuper: 'Superuser',
     checkCreateDb: 'Can create databases',
@@ -2866,12 +2917,15 @@ const en: typeof zh = {
     contentTitle: 'Initial content',
     contentBlank: 'Empty',
     contentBlankHint: 'Start from an empty model: just a public schema.',
+    contentBlankHintSqlite: 'Start from an empty SQLite model (default main database).',
     contentDatabase: 'Import from a database',
     contentDatabaseHint:
       'Read the structure from one of the databases above as the v0 baseline. Read-only, nothing is written to the target.',
     contentSql: 'Import from SQL',
     contentSqlHint:
       'Paste or choose DDL (e.g. the output of pg_dump --schema-only). Dowel runs it in the shadow database and reads the structure back.',
+    contentSqlHintSqlite:
+      'Paste or choose SQLite DDL (e.g. sqlite3 .schema output). Dowel runs it in the built-in :memory: shadow database without needing an external environment.',
     contentTakeover: 'Take over an existing project',
     contentTakeoverHint:
       "Restore a whole project from the target database's dowel history: version chain, model (object IDs unchanged) and environments.",
@@ -2883,11 +2937,14 @@ const en: typeof zh = {
     sqlNeeded: 'Paste SQL or choose a file.',
     sqlNeedsEnv:
       'Importing from SQL needs an environment: the SQL runs in the shadow database, which must be a real PostgreSQL instance.',
+    sqlMemoryShadowHint:
+      'Uses the built-in SQLite :memory: shadow database to import and verify the baseline without external environments.',
     envNeeded: 'Importing needs at least one database: go back and add an environment.',
     schemaNeeded: 'Select at least one schema.',
     confirmHint:
       'Creating the project also publishes the imported model as the v0 baseline. This only writes Dowel data, never your database.',
     sumBasics: 'Basics',
+    sumDialect: 'Dialect',
     sumEnvs: 'Databases',
     sumContent: 'Initial content',
     sumSchemas: 'Schema scope',
@@ -3497,6 +3554,7 @@ const en: typeof zh = {
       createTable: 'Create table',
       renameTable: 'Rename table',
       dropTable: 'Drop table',
+      setTableExt: 'Edit table options',
       // Partition operations
       setPartitionBy: 'Configure partitioning',
       createPartition: 'Create partition',
@@ -3510,6 +3568,7 @@ const en: typeof zh = {
       setNotNull: 'Change NOT NULL',
       setDefault: 'Change default',
       setIdentity: 'Change identity',
+      setColumnExt: 'Edit column options',
       moveColumn: 'Reorder column',
       addPrimaryKey: 'Add primary key',
       addUnique: 'Add unique constraint',

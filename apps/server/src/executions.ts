@@ -8,15 +8,8 @@ import type {
   NeedsManual,
   RunInfo,
 } from '@dowel/api';
-import type { Model } from '@dowel/core';
-import {
-  type Db,
-  fingerprint,
-  HistoryError,
-  readSnapshot,
-  ScopeError,
-  withProjectLock,
-} from '@dowel/engines';
+import type { Dialect, Model } from '@dowel/core';
+import { type Db, getEngine, HistoryError, parseSqliteVersionNum, ScopeError } from '@dowel/engines';
 import {
   type ChainVersion,
   checkDrift,
@@ -58,9 +51,10 @@ import { decrypt, SecretError, scrubSecrets } from './secrets.ts';
 import { readSettings } from './settings.ts';
 import {
   CHECK_CONNECT_TIMEOUT,
+  classifyTargetDriverError,
   ConnectError,
   type ConnectionGuard,
-  connectPg,
+  connectTarget,
   normalizePgVersion,
   scrubUrl,
 } from './targets.ts';
@@ -229,13 +223,21 @@ export interface ExecContext {
   guard: ConnectionGuard;
   locks: EnvLocks;
   /** 在目标库项目锁里读历史并同步缓存（默认 syncTarget）；测试里可以替换，验证关键状态不依赖结尾的同步 */
-  syncTarget?: (db: PlatformDb, env: EnvRow, tdb: Db) => Promise<TargetState | null>;
+  syncTarget?: (db: PlatformDb, env: EnvRow, tdb: Db, dialect?: Dialect) => Promise<TargetState | null>;
   /** 标记等目标库项目锁的毫秒数（默认 30 秒）；测试里调短，验证“锁被占用”的错误路径 */
   lockTimeoutMs?: number;
 }
 
-/** 连目标库的连接（白名单在连接层检查）。postgres.js 是懒连接，URL 写错这里也可能同步抛错 */
-const open = (url: string, guard: ConnectionGuard, timeout = 10) => connectPg(url, timeout, guard);
+const projectDialect = async (db: Db, projectId: string): Promise<Dialect> => {
+  const [row] = await db.query<{ dialect: Dialect }>('select dialect from projects where id = $1', [
+    projectId,
+  ]);
+  return row?.dialect ?? 'pg';
+};
+
+/** 连目标库的连接（白名单在连接层检查）。懒连接，URL 写错这里也可能同步抛错 */
+const open = (dialect: Dialect, url: string, guard: ConnectionGuard, timeout = 10) =>
+  connectTarget(dialect, url, timeout, guard);
 
 /** 连接 / 通信层面的故障（SQLSTATE 08 / 53 / 57 / 28 / 3D 和驱动的网络错误） */
 const isConnectionFailure = (e: unknown): boolean => {
@@ -249,9 +251,11 @@ const isConnectionFailure = (e: unknown): boolean => {
 export type ErrorKind = NonNullable<DriftSummary['errorKind']>;
 
 /** 认领失败时给用户看的原因（已脱敏）：接入、接手共用 */
-export const claimFailure = (e: unknown, url: string): string =>
+export const claimFailure = (e: unknown, url: string, dialect?: Dialect): string =>
   scrubSecrets(
-    e instanceof ExecutorError && e.code !== 'unexpected' ? e.message : classifyError(e, url).message,
+    e instanceof ExecutorError && e.code !== 'unexpected'
+      ? e.message
+      : classifyError(e, url, dialect).message,
   );
 
 /**
@@ -259,10 +263,10 @@ export const claimFailure = (e: unknown, url: string): string =>
  * ExecutorError 非 unexpected）原样返回；连接故障、权限不足（目标库返回的错误）转成带原因的 ConnectError（422，文案已脱敏）；
  * 真正意外的原样返回（500，只记日志）。接入、认领、接手共用。
  */
-export const toTargetError = (e: unknown, url: string): unknown => {
+export const toTargetError = (e: unknown, url: string, dialect?: Dialect): unknown => {
   if (e instanceof HTTPException || e instanceof HistoryError) return e;
   if (e instanceof ExecutorError && e.code !== 'unexpected') return e;
-  const k = classifyError(e, url);
+  const k = classifyError(e, url, dialect);
   return k.kind === 'unexpected' ? e : new ConnectError(k.message);
 };
 
@@ -273,11 +277,15 @@ export const toTargetError = (e: unknown, url: string): unknown => {
  *   dowel 历史读不了（HistoryError）→ history；其他 → unexpected（只记日志，文案不给细节）。
  * ExecutorError('unexpected') 是执行器包起来的意外错误：按它的 cause 再分类。
  */
-export const classifyError = (e: unknown, url = ''): { kind: ErrorKind; message: string } => {
+export const classifyError = (
+  e: unknown,
+  url = '',
+  dialect?: Dialect,
+): { kind: ErrorKind; message: string } => {
   const raw = e instanceof Error ? e.message : String(e);
   const clean = url ? scrubUrl(raw, url) : scrubSecrets(raw);
   if (e instanceof ExecutorError) {
-    if (e.code === 'unexpected' && e.cause !== undefined) return classifyError(e.cause, url);
+    if (e.code === 'unexpected' && e.cause !== undefined) return classifyError(e.cause, url, dialect);
     return { kind: 'integrity', message: `完整性检查失败：${clean}` };
   }
   if (e instanceof ScopeError) return { kind: 'scope', message: `schema 范围检查失败：${clean}` };
@@ -285,8 +293,9 @@ export const classifyError = (e: unknown, url = ''): { kind: ErrorKind; message:
   if (e instanceof SecretError) return { kind: 'connect', message: clean };
   if (e instanceof ConnectError || isConnectionFailure(e))
     return { kind: 'connect', message: `连接目标库失败：${clean}` };
-  if (e instanceof Error && e.name === 'PostgresError')
-    return { kind: 'database', message: `目标库返回错误：${clean}` };
+  const driverKind = classifyTargetDriverError(e, dialect);
+  if (driverKind === 'connect') return { kind: 'connect', message: `连接目标库失败：${clean}` };
+  if (driverKind === 'database') return { kind: 'database', message: `目标库返回错误：${clean}` };
   console.error('目标库操作出错（意外）', e);
   return { kind: 'unexpected', message: '意外错误（详情见服务器日志）' };
 };
@@ -466,12 +475,17 @@ const summaryOfError = (e: ExecutorError, chain: { id: string; number: number }[
  * 同步写入必须在锁里：读到的状态和写进缓存的状态之间不能插进一个执行，否则会用旧状态覆盖执行刚留下的结果。
  * 跨进程以目标库的 advisory lock 为准，不依赖本进程的 EnvLocks.busy()。
  */
-const syncTarget = async (db: PlatformDb, env: EnvRow, tdb: Db): Promise<TargetState | null> => {
+const syncTarget = async (
+  db: PlatformDb,
+  env: EnvRow,
+  tdb: Db,
+  dialect: Dialect = 'pg',
+): Promise<TargetState | null> => {
   try {
-    return await withProjectLock(tdb, env.project_id, 0, async (c) => {
+    return await getEngine(dialect).history.withProjectLock(tdb, env.project_id, 0, async (c) => {
       // 读目标库和写平台库分开：平台库写入失败是服务端自己的问题，不能被当成目标库的错误；
       // 只记日志、跳过这次同步（状态照常返回，下次读取历史或执行结束时会重新对齐）
-      const state = await readState(c, env.project_id);
+      const state = await readState(c, env.project_id, dialect);
       try {
         await syncEnvCache(db, env.id, state);
       } catch (e) {
@@ -499,18 +513,20 @@ export const dryRunExecution = async (
 ): Promise<ExecuteResult> => {
   const { db } = x;
   const env = await loadEnv(db, input.pid, input.env.id);
+  const dialect = await projectDialect(db, input.pid);
   if (await x.locks.isBusyCluster(env.id))
     throw new ExecutorError(
       'lock_timeout',
       '这个环境正在执行另一个操作，现在不能执行（预演检查的就是这一点）',
     );
-  const conn = open(decrypt(env.url_enc), x.guard);
+  const conn = open(dialect, decrypt(env.url_enc), x.guard);
   try {
     const chain = await loadChain(db, input.pid);
     if (!chain.length) throw new HTTPException(422, { message: '项目还没有发布任何版本' });
     const settings = await readSettings(db);
     return await execute({
       db: conn.db,
+      dialect,
       projectId: input.pid,
       projectName: input.projectName,
       instanceId: settings.instanceId,
@@ -534,6 +550,7 @@ export const runExecution = async (
 ): Promise<{ result: ExecuteResult; current: ReturnType<typeof versionRef> | null }> => {
   const { db } = x;
   const { pid } = input;
+  const dialect = await projectDialect(db, pid);
   const deadline = input.lockWaitMs === undefined ? null : Date.now() + input.lockWaitMs;
   const release = await x.locks.acquire(input.env.id, input.lockWaitMs ?? LOCK_WAIT_MS);
   let conn: ReturnType<typeof open> | null = null;
@@ -550,7 +567,7 @@ export const runExecution = async (
     env = await loadEnv(db, pid, input.env.id);
     const checked = await input.beforeConnect?.(env);
     const timeouts = checked?.timeouts ?? input.timeouts;
-    conn = open(decrypt(env.url_enc), x.guard);
+    conn = open(dialect, decrypt(env.url_enc), x.guard);
     const chain = await loadChain(db, pid);
     if (!chain.length) throw new HTTPException(422, { message: '项目还没有发布任何版本' });
     const settings = await readSettings(db);
@@ -560,6 +577,7 @@ export const runExecution = async (
     try {
       const result = await execute({
         db: conn.db,
+        dialect,
         projectId: pid,
         projectName: input.projectName,
         instanceId: settings.instanceId,
@@ -626,7 +644,7 @@ export const runExecution = async (
     if (conn) {
       // 以目标库的历史为准把缓存完全对齐（在项目锁里做，拿不到锁就跳过；平台库写失败只记日志）
       try {
-        await (x.syncTarget ?? syncTarget)(db, env, conn.db);
+        await (x.syncTarget ?? syncTarget)(db, env, conn.db, dialect);
       } catch (e) {
         console.error(
           '读取目标库历史失败（下次读取历史时会重新同步）',
@@ -635,14 +653,24 @@ export const runExecution = async (
       }
       // 顺带感知目标库原地升级（复用现有连接，零额外建连；已在环境锁内，再叠加 url_enc 校验）
       try {
-        const [v] = await conn.db.query<{ version: string; num: number }>(
-          `select current_setting('server_version') as version, current_setting('server_version_num')::int as num`,
-        );
-        if (v) {
-          const clean = normalizePgVersion(v.version);
-          const num = Number(v.num);
-          if (env.engine_version !== clean || env.engine_version_num !== num) {
-            await updateEnvVersion(db, env.id, clean, num, env.url_enc);
+        if (dialect === 'pg') {
+          const [v] = await conn.db.query<{ version: string; num: number }>(
+            `select current_setting('server_version') as version, current_setting('server_version_num')::int as num`,
+          );
+          if (v) {
+            const clean = normalizePgVersion(v.version);
+            const num = Number(v.num);
+            if (env.engine_version !== clean || env.engine_version_num !== num) {
+              await updateEnvVersion(db, env.id, clean, num, env.url_enc);
+            }
+          }
+        } else if (dialect === 'sqlite') {
+          const [v] = await conn.db.query<{ version: string }>('SELECT sqlite_version() AS version');
+          if (v) {
+            const num = parseSqliteVersionNum(v.version);
+            if (env.engine_version !== v.version || env.engine_version_num !== num) {
+              await updateEnvVersion(db, env.id, v.version, num, env.url_enc);
+            }
           }
         }
       } catch {
@@ -690,17 +718,18 @@ export const readTargetState = async (
   opts: { preserveHistoryError?: boolean } = {},
 ): Promise<TargetState> => {
   const url = decrypt(env.url_enc);
+  const dialect = await projectDialect(x.db, env.project_id);
   let conn: ReturnType<typeof open> | null = null;
   try {
-    conn = open(url, x.guard, CHECK_CONNECT_TIMEOUT);
+    conn = open(dialect, url, x.guard, CHECK_CONNECT_TIMEOUT);
     return (
-      (sync ? await (x.syncTarget ?? syncTarget)(x.db, env, conn.db) : null) ??
-      (await readState(conn.db, env.project_id))
+      (sync ? await (x.syncTarget ?? syncTarget)(x.db, env, conn.db, dialect) : null) ??
+      (await readState(conn.db, env.project_id, dialect))
     );
   } catch (e) {
     if (e instanceof HTTPException) throw e;
     if (opts.preserveHistoryError && (e instanceof HistoryError || e instanceof ExecutorError)) throw e;
-    throw new ConnectError(classifyError(e, url).message);
+    throw new ConnectError(classifyError(e, url, dialect).message);
   } finally {
     await conn?.close().catch(() => {});
   }
@@ -791,6 +820,7 @@ const commitDrift = async (
   status: EnvRow['drift_status'],
   summary: DriftSummary | null,
   engineVersionNum?: number,
+  dialect: Dialect = 'pg',
 ): Promise<CommitDriftResult> => {
   const { db } = x;
   const locked = await x.locks.withIdleLock<CommitDriftResult>(env.id, async () => {
@@ -812,7 +842,7 @@ const commitDrift = async (
       await updateEnvVersion(
         db,
         env.id,
-        formatVersionNum(engineVersionNum),
+        formatVersionNum(engineVersionNum, dialect),
         engineVersionNum,
         latest.url_enc,
       );
@@ -834,6 +864,7 @@ export const checkEnvDriftDetailed = async (x: ExecContext, given: EnvRow): Prom
   const { db } = x;
   // 重新读一遍环境行：调用方（定时检查一轮里的后面几个环境）手里的可能已经过期（换了连接串、被删了：404）
   const env = await loadEnv(db, given.project_id, given.id);
+  const dialect = await projectDialect(db, env.project_id);
   const snapshot = takeDriftSnapshot(env);
   // 所有返回的漂移信息都经过 driftInfo（清洗旧格式）
   const current = (): DriftInfo => driftInfo(env);
@@ -846,9 +877,10 @@ export const checkEnvDriftDetailed = async (x: ExecContext, given: EnvRow): Prom
   try {
     url = decrypt(env.url_enc);
     chain = await loadChain(db, env.project_id);
-    conn = open(url, x.guard, CHECK_CONNECT_TIMEOUT);
+    conn = open(dialect, url, x.guard, CHECK_CONNECT_TIMEOUT);
     rep = await checkDrift({
       db: conn.db,
+      dialect,
       projectId: env.project_id,
       chain,
       onVersion: (v) => {
@@ -857,7 +889,7 @@ export const checkEnvDriftDetailed = async (x: ExecContext, given: EnvRow): Prom
     });
   } catch (e) {
     if (e instanceof HTTPException) throw e;
-    const c = classifyError(e, url);
+    const c = classifyError(e, url, dialect);
     const committed = await recordError(x, env, snapshot, c.kind, c.message);
     if (!committed.written) return { result: committed.result };
     return { result: committed.result, error: e };
@@ -868,8 +900,8 @@ export const checkEnvDriftDetailed = async (x: ExecContext, given: EnvRow): Prom
   const currentVersionId = rep.firstRun ? null : rep.version;
   const committed =
     rep.status === 'ok'
-      ? await commitDrift(x, env, snapshot, 'ok', null, detectedVersionNum)
-      : await commitDrift(x, env, snapshot, 'drifted', summaryOf(rep, chain), detectedVersionNum);
+      ? await commitDrift(x, env, snapshot, 'ok', null, detectedVersionNum, dialect)
+      : await commitDrift(x, env, snapshot, 'drifted', summaryOf(rep, chain), detectedVersionNum, dialect);
   if (!committed.written) return { result: committed.result };
   return { result: committed.result, currentVersionId };
 };
@@ -922,6 +954,7 @@ export interface MarkInput {
 export const runMark = async (x: ExecContext, input: MarkInput): Promise<MarkResult> => {
   const { db } = x;
   const { pid } = input;
+  const dialect = await projectDialect(db, pid);
   const release = await x.locks.acquire(input.env.id);
   let conn: ReturnType<typeof open> | null = null;
   let env = input.env;
@@ -930,12 +963,13 @@ export const runMark = async (x: ExecContext, input: MarkInput): Promise<MarkRes
   const touched = new Set<string>();
   try {
     env = await loadEnv(db, pid, input.env.id);
-    conn = open(decrypt(env.url_enc), x.guard);
+    conn = open(dialect, decrypt(env.url_enc), x.guard);
     const chain = await loadChain(db, pid);
     if (!chain.length) throw new HTTPException(422, { message: '项目还没有发布任何版本' });
     const settings = await readSettings(db);
     return await markApplied({
       db: conn.db,
+      dialect,
       projectId: pid,
       projectName: input.projectName,
       instanceId: settings.instanceId,
@@ -981,7 +1015,7 @@ export const runMark = async (x: ExecContext, input: MarkInput): Promise<MarkRes
         await confirmVersion(db, env.id, vid).catch(logFailure('处理标记登记失败（下次同步会清理）'));
     if (conn) {
       try {
-        await (x.syncTarget ?? syncTarget)(db, env, conn.db);
+        await (x.syncTarget ?? syncTarget)(db, env, conn.db, dialect);
       } catch (e) {
         console.error(
           '读取目标库历史失败（下次读取历史时会重新同步）',
@@ -1001,17 +1035,19 @@ export const dryRunMark = async (
 ): Promise<MarkResult> => {
   const { db } = x;
   const env = await loadEnv(db, input.pid, input.env.id);
+  const dialect = await projectDialect(db, input.pid);
   if (await x.locks.isBusyCluster(env.id))
     throw new ExecutorError(
       'lock_timeout',
       '这个环境正在执行另一个操作，现在不能标记（预演检查的就是这一点）',
     );
-  const conn = open(decrypt(env.url_enc), x.guard);
+  const conn = open(dialect, decrypt(env.url_enc), x.guard);
   try {
     const chain = await loadChain(db, input.pid);
     if (!chain.length) throw new HTTPException(422, { message: '项目还没有发布任何版本' });
     return await markApplied({
       db: conn.db,
+      dialect,
       projectId: input.pid,
       projectName: input.projectName,
       instanceId: (await readSettings(db)).instanceId,
@@ -1038,7 +1074,7 @@ export interface LiveRead {
 }
 
 /**
- * 读出环境的线上结构（只读：SET + SELECT，只读 scope 范围内的），用 reconcileIds 按名字沿用 `base`（工作副本）里的对象 ID；
+ * 读出环境的线上结构（只读：只读 scope 范围内的），用 reconcileIds 按名字沿用 `base`（工作副本）里的对象 ID；
  * 顺带读目标库历史，判断有没有半途失败的迁移（警告用）。
  */
 export const readLive = async (
@@ -1048,30 +1084,39 @@ export const readLive = async (
   base: Model,
 ): Promise<LiveRead> => {
   const url = decrypt(env.url_enc);
-  const conn = open(url, x.guard, CHECK_CONNECT_TIMEOUT);
+  const dialect = await projectDialect(x.db, env.project_id);
+  const engine = getEngine(dialect);
+  const conn = open(dialect, url, x.guard, CHECK_CONNECT_TIMEOUT);
   try {
-    const snapshot = await readSnapshot(conn.db, scope);
-    // 顺带同步目标库 PG 版本（仅在版本号变化时回写，url_enc 保护防并发 PATCH 倒挂）
-    if (Number.isInteger(snapshot.version) && env.engine_version_num !== snapshot.version) {
-      const ver = await conn.db
-        .query<{ version: string }>(`select current_setting('server_version') as version`)
-        .then((rows) => (rows[0]?.version ? normalizePgVersion(rows[0].version) : null))
-        .catch(() => null);
+    const snapshot = await engine.readSnapshot(conn.db, scope);
+    // 顺带同步目标库引擎版本（仅在版本号变化时回写，url_enc 保护防并发 PATCH 倒挂）
+    if (
+      typeof snapshot.versionNum === 'number' &&
+      Number.isInteger(snapshot.versionNum) &&
+      env.engine_version_num !== snapshot.versionNum
+    ) {
+      let ver: string | null = snapshot.version ?? null;
+      if (dialect === 'pg') {
+        ver = await conn.db
+          .query<{ version: string }>(`select current_setting('server_version') as version`)
+          .then((rows) => (rows[0]?.version ? normalizePgVersion(rows[0].version) : null))
+          .catch(() => ver);
+      }
       await updateEnvVersion(
         x.db,
         env.id,
-        ver ?? formatVersionNum(snapshot.version),
-        snapshot.version,
+        ver ?? formatVersionNum(snapshot.versionNum, dialect),
+        snapshot.versionNum,
         env.url_enc,
-      ).catch(logFailure('更新环境 PG 版本失败'));
+      ).catch(logFailure('更新环境引擎版本失败'));
     }
     // 和漂移检查、标记的核对同一套规则（compare.ts 的 importLive：按名字沿用 base 里的对象 ID，忽略 public 的默认注释）
     const model = importLive(snapshot, base);
-    const state = await readState(conn.db, env.project_id).catch(() => null);
-    return { model, fingerprint: fingerprint(snapshot), state };
+    const state = await readState(conn.db, env.project_id, dialect).catch(() => null);
+    return { model, fingerprint: engine.fingerprint(snapshot), state };
   } catch (e) {
     if (e instanceof HTTPException) throw e;
-    throw new ConnectError(classifyError(e, url).message);
+    throw new ConnectError(classifyError(e, url, dialect).message);
   } finally {
     await conn.close().catch(() => {});
   }

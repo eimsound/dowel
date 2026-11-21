@@ -5,7 +5,7 @@
 //
 // 这个文件只放“读目标库 + 影子库验证 + 写平台库”的函数，路由（routes/takeover.ts / routes/claims.ts）负责权限、进度和审计。
 import type { StoredVerifyReport, VerifyReport } from '@dowel/api';
-import type { Model } from '@dowel/core';
+import { type Dialect, getDialect, type Model } from '@dowel/core';
 import { type Db, HistoryError, type HistoryVersionRow, ScopeError } from '@dowel/engines';
 import { ExecutorError, type MergedHistory, readState, type TargetState } from '@dowel/executor';
 import { HTTPException } from 'hono/http-exception';
@@ -16,7 +16,15 @@ import { classifyError } from './executions.ts';
 import { SecretError, scrubSecrets } from './secrets.ts';
 import { type Shadow, ShadowError, storedReport } from './shadow.ts';
 import { prepareShadow, type ShadowSource } from './shadows.ts';
-import { CHECK_CONNECT_TIMEOUT, ConnectError, type ConnectionGuard, connectPg } from './targets.ts';
+import {
+  CHECK_CONNECT_TIMEOUT,
+  ConnectError,
+  type ConnectionGuard,
+  connectTarget,
+  type PreparedShadow,
+} from './targets.ts';
+
+export type { PreparedShadow };
 
 /** 接手 / 接入领先验证被拒绝：code 给界面分支（claim_required、claim_forbidden、shadow_unavailable、verify_failed、project_exists 等） */
 export class TakeoverRejected extends Error {
@@ -34,29 +42,23 @@ export const readSource = async (
   url: string,
   projectId: string,
   guard: ConnectionGuard,
+  dialect: Dialect = 'pg',
 ): Promise<TargetState> => {
-  const c = connectPg(url, CHECK_CONNECT_TIMEOUT, guard);
+  const c = connectTarget(dialect, url, CHECK_CONNECT_TIMEOUT, guard);
   try {
-    return await readState(c.db, projectId);
+    return await readState(c.db, projectId, dialect);
   } catch (e) {
     if (e instanceof HTTPException) throw e;
     if (e instanceof ExecutorError && e.code !== 'unexpected') throw e;
     if (e instanceof HistoryError) throw new ExecutorError(e.code, `环境“${name}”：${e.message}`, {}, e);
     if (e instanceof ScopeError || e instanceof SecretError) throw e;
-    const k = classifyError(e, url);
+    const k = classifyError(e, url, dialect);
     if (k.kind === 'unexpected') throw e;
     throw new ConnectError(`环境“${name}”：${k.message}`);
   } finally {
     await c.close().catch(() => {});
   }
 };
-
-export interface PreparedShadow {
-  shadow: Shadow;
-  label: string;
-  url: string;
-  created: { targetUrl: string; name: string } | null;
-}
 
 /**
  * 计算整条待验证版本链上全部版本 scope 的并集：任一版本为全量（null / 空）则返回 null（全部 schema），
@@ -83,7 +85,11 @@ export const pickShadow = async (
   sources: ShadowSource[],
   schemas: string[] | null,
   guard?: ConnectionGuard,
+  dialect: Dialect = 'pg',
 ): Promise<PreparedShadow> => {
+  if (!getDialect(dialect).capabilities.requiresExternalShadow) {
+    return prepareShadow(null, schemas, guard, dialect);
+  }
   if (!sources.length)
     throw new TakeoverRejected(
       'shadow_unavailable',
@@ -93,7 +99,7 @@ export const pickShadow = async (
   const reasons: string[] = [];
   for (const env of ordered) {
     try {
-      return await prepareShadow(env, schemas, guard);
+      return await prepareShadow(env, schemas, guard, dialect);
     } catch (e) {
       if (!(e instanceof ShadowError)) throw e;
       reasons.push(scrubSecrets(e.message));

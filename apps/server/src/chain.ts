@@ -1,9 +1,10 @@
 // 版本链：发布时把相邻两个版本之间的迁移冻结成脚本（ADR 0002）。
 // 冻结逻辑是纯函数，发布、编辑、平台库迁移（db.ts）都用同一份。
 import {
+  type Dialect,
   emptyBase,
   findInstanceLevelStep,
-  INSTANCE_LEVEL_DESCRIPTION,
+  instanceLevelDescription,
   type Model,
   type PlanOptions,
   plan,
@@ -22,8 +23,8 @@ export interface FrozenScripts {
 
 /** 冻结 from → to 的迁移：up = plan(from, to, opts)，down = plan(to, from, opts) */
 export const freezeScripts = (from: Model, to: Model, opts?: PlanOptions): FrozenScripts => {
-  const up = toScriptSteps(plan(from, to, opts));
-  const down = toScriptSteps(plan(to, from, opts));
+  const up = toScriptSteps(plan(from, to, opts), to.dialect);
+  const down = toScriptSteps(plan(to, from, opts), from.dialect);
   return { up, down, checksum: stepsChecksum(up, down) };
 };
 
@@ -37,7 +38,7 @@ export const freezeBaseline = (
   opts?: PlanOptions,
 ): FrozenScripts & { /** 基线的 from（空库模型）：验证时直接用，不用再构建一遍 */ from: Model } => {
   const from = emptyBase(model, scope);
-  const up = toScriptSteps(plan(from, model, opts));
+  const up = toScriptSteps(plan(from, model, opts), model.dialect);
   return { up, down: [], checksum: stepsChecksum(up, []), from };
 };
 
@@ -49,18 +50,22 @@ export const chainFrom = (
 ): Model => (parent ? parent.model : emptyBase(to, scope));
 
 /**
- * 迁移脚本里不允许出现实例级语句（CREATE / DROP / ALTER DATABASE、TABLESPACE、ROLE | USER | GROUP，ALTER SYSTEM）：
- * 它们作用于整个数据库实例，而影子库常常和线上库在同一个实例上，验证会真的执行它们。
+ * 迁移脚本里不允许出现实例/文件级语句（PG：DATABASE/TABLESPACE/ROLE/ALTER SYSTEM；SQLite：ATTACH/DETACH/VACUUM INTO）：
+ * 它们作用于整个数据库实例或本地文件系统，验证会真的执行它们。
  * 有就返回说明（哪一边、第几步），没有返回 null。发布（兜底，规划器正常不会生成）和编辑脚本都用它。
  */
-export const instanceLevelProblem = (up: ScriptStep[], down: ScriptStep[]): string | null => {
+export const instanceLevelProblem = (
+  up: ScriptStep[],
+  down: ScriptStep[],
+  dialect: Dialect = 'pg',
+): string | null => {
   for (const [dir, steps] of [
     ['升级', up],
     ['回滚', down],
   ] as const) {
     // 和验证前的拒绝检查是同一个函数、同一份说明
-    const i = findInstanceLevelStep(steps);
-    if (i >= 0) return `${dir}脚本第 ${i + 1} 步含实例级语句。${INSTANCE_LEVEL_DESCRIPTION}`;
+    const i = findInstanceLevelStep(steps, dialect);
+    if (i >= 0) return `${dir}脚本第 ${i + 1} 步含实例级语句。${instanceLevelDescription(dialect)}`;
   }
   return null;
 };

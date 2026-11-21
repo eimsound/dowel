@@ -3,7 +3,6 @@
 import type { PublishedTables, VersionInfo } from '@dowel/api';
 import {
   all,
-  COMMON_TYPES,
   type Column,
   childrenOf,
   columnsOf,
@@ -12,6 +11,7 @@ import {
   type FkAction,
   formatPartitionBound,
   formatPartitionBy,
+  getDialect,
   type Model,
   newId,
   normalizeType,
@@ -55,6 +55,7 @@ import { type ReactNode, useId, useMemo, useRef, useState } from 'react';
 import { useTranslation } from 'react-i18next';
 
 import { api } from '../api.ts';
+import { dialectUiSpec } from '../dialects.ts';
 import { useProject } from '../project.tsx';
 import type { Workspace } from '../workspace.ts';
 import { shortType, typeLabel } from './Canvas.tsx';
@@ -247,12 +248,14 @@ const AddForm = ({
   );
 };
 
-/** 解析类型输入：枚举名（可带 schema、可带 []）→ typeRef；否则规范化成 PG 的写法 */
+/** 解析类型输入：枚举名（可带 schema、可带 []）→ typeRef；否则规范化成当前方言的写法 */
 const parseType = (m: Model, text: string): { type: string; typeRef: string | null } => {
   const arr = /(\[\])*$/.exec(text.trim())![0];
   const base = text.trim().slice(0, text.trim().length - arr.length);
-  const e = all(m, 'enum').find((x) => x.name === base || `${m.objects[x.parent]?.name}.${x.name}` === base);
-  return e ? { type: arr, typeRef: e.id } : { type: normalizeType(text), typeRef: null };
+  const e = getDialect(m.dialect).capabilities.enums
+    ? all(m, 'enum').find((x) => x.name === base || `${m.objects[x.parent]?.name}.${x.name}` === base)
+    : undefined;
+  return e ? { type: arr, typeRef: e.id } : { type: normalizeType(text, m.dialect), typeRef: null };
 };
 
 const FK_ACTIONS: FkAction[] = ['noAction', 'restrict', 'cascade', 'setNull', 'setDefault'];
@@ -552,6 +555,8 @@ const TableInspector = ({
 }: Ctx & { table: Table; onSelect: (id: string | null) => void }) => {
   const { t } = useTranslation();
   const { pid, project } = useProject();
+  const dialectSpec = getDialect(model.dialect);
+  const uiSpec = dialectUiSpec(model.dialect);
   const versions = useQuery({
     queryKey: ['versions', pid],
     queryFn: () => api<VersionInfo[]>('GET', `/api/projects/${pid}/versions`),
@@ -668,7 +673,12 @@ const TableInspector = ({
     let n = cols.length + 1;
     while (cols.some((c) => c.name === `column_${n}`)) n++;
     const id = newId();
-    if (ws.act('addColumn', { table: table.id, column: { id, name: `column_${n}`, type: 'text' } })) {
+    if (
+      ws.act('addColumn', {
+        table: table.id,
+        column: { id, name: `column_${n}`, type: uiSpec.defaultColumnType },
+      })
+    ) {
       setOpenCol(id);
       setFocusNew(id);
     }
@@ -789,16 +799,54 @@ const TableInspector = ({
           onCommit={(v, b) => ws.act('renameTable', { id: table.id, name: v.trim() }, b)}
         />
       </Labeled>
-      <Labeled label={t('insp.comment')}>
-        <Field
-          ws={ws}
-          label={t('insp.comment')}
-          placeholder={t('insp.commentPlaceholder')}
-          value={table.comment ?? ''}
-          basisIds={[table.id]}
-          onCommit={(v, b) => ws.act('setComment', { id: table.id, comment: v.trim() || null }, b)}
-        />
-      </Labeled>
+      {dialectSpec.capabilities.comments && (
+        <Labeled label={t('insp.comment')}>
+          <Field
+            ws={ws}
+            label={t('insp.comment')}
+            placeholder={t('insp.commentPlaceholder')}
+            value={table.comment ?? ''}
+            basisIds={[table.id]}
+            onCommit={(v, b) => ws.act('setComment', { id: table.id, comment: v.trim() || null }, b)}
+          />
+        </Labeled>
+      )}
+      {model.dialect === 'sqlite' && (
+        <div className="field">
+          <span className="label">{t('insp.sqliteOptions')}</span>
+          <div className="checks">
+            <label>
+              <input
+                type="checkbox"
+                checked={!!table.ext?.sqlite?.strict}
+                onChange={(e) => {
+                  const next = { ...table.ext?.sqlite, strict: e.target.checked };
+                  ws.act('setTableExt', {
+                    id: table.id,
+                    ext: next.strict || next.withoutRowid ? { ...table.ext, sqlite: next } : null,
+                  });
+                }}
+              />
+              {t('insp.sqliteStrict')}
+            </label>
+            <label>
+              <input
+                type="checkbox"
+                checked={!!table.ext?.sqlite?.withoutRowid}
+                disabled={!pk}
+                onChange={(e) => {
+                  const next = { ...table.ext?.sqlite, withoutRowid: e.target.checked };
+                  ws.act('setTableExt', {
+                    id: table.id,
+                    ext: next.strict || next.withoutRowid ? { ...table.ext, sqlite: next } : null,
+                  });
+                }}
+              />
+              {t('insp.sqliteWithoutRowid')}
+            </label>
+          </div>
+        </div>
+      )}
 
       {isChild && table.partitionOf && (
         <Section
@@ -882,7 +930,10 @@ const TableInspector = ({
       >
         {!isChild && (
           <datalist id={typesId}>
-            {[...COMMON_TYPES, ...all(model, 'enum').map((e) => e.name)].map((x) => (
+            {[
+              ...dialectSpec.commonTypes,
+              ...(dialectSpec.capabilities.enums ? all(model, 'enum').map((e) => e.name) : []),
+            ].map((x) => (
               <option key={x} value={x} />
             ))}
           </datalist>
@@ -996,7 +1047,7 @@ const TableInspector = ({
                           />
                           {t('insp.pk')}
                         </label>
-                        {(isIntegerColumn(c) || c.identity !== null) && (
+                        {model.dialect === 'pg' && (isIntegerColumn(c) || c.identity !== null) && (
                           <label
                             title={
                               table.partitionBy !== null && pgBlocksPartitionIdentity && !c.identity
@@ -1021,6 +1072,28 @@ const TableInspector = ({
                             {t('part.identity')}
                           </label>
                         )}
+                        {model.dialect === 'sqlite' &&
+                          isPk &&
+                          pk?.columns.length === 1 &&
+                          c.type.toUpperCase() === 'INTEGER' &&
+                          !table.ext?.sqlite?.withoutRowid && (
+                            <label>
+                              <input
+                                type="checkbox"
+                                checked={!!c.ext?.sqlite?.autoincrement}
+                                disabled={c.generated !== null}
+                                onChange={(e) =>
+                                  ws.act('setColumnExt', {
+                                    id: c.id,
+                                    ext: e.target.checked
+                                      ? { ...c.ext, sqlite: { autoincrement: true } }
+                                      : null,
+                                  })
+                                }
+                              />
+                              {t('insp.sqliteAutoincrement')}
+                            </label>
+                          )}
                       </div>
                       <IconButton
                         label={`${t('insp.moveUp')} ${c.name}`}
@@ -1335,7 +1408,7 @@ const TableInspector = ({
         )}
       </Section>
 
-      {(!isChild || table.partitionBy !== null) && (
+      {dialectSpec.capabilities.partitioning && (!isChild || table.partitionBy !== null) && (
         <Section
           title={t('part.section')}
           count={table.partitionBy ? children.length : undefined}
@@ -1808,7 +1881,11 @@ const InspectorContent = ({
       <div className="flex h-[46px] shrink-0 items-center gap-2 border-b border-border pr-2.5 pl-3.5">
         <Icon size={16} aria-hidden="true" className="text-text-3" />
         <h2 className="min-w-0 flex-1 truncate font-mono text-[length:var(--fs-lg)] font-semibold">
-          {schema && <span className="font-normal text-text-3">{schema}.</span>}
+          {schema &&
+            (getDialect(model.dialect).capabilities.schemas ||
+              schema !== getDialect(model.dialect).capabilities.defaultSchema) && (
+              <span className="font-normal text-text-3">{schema}.</span>
+            )}
           {o.name}
         </h2>
         {o.kind === 'opaque' && <span className="badge">{o.objType}</span>}

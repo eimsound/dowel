@@ -16,7 +16,8 @@ import {
   markRequestSchema,
   type RepairScript,
 } from '@dowel/api';
-import { type Db, SESSION_SETTINGS } from '@dowel/engines';
+import type { Dialect } from '@dowel/core';
+import { type Db, getEngine } from '@dowel/engines';
 import { claimOf, type ExecuteExpect, ExecutorError, type MarkPlan, repairRisks } from '@dowel/executor';
 import type { Context, Hono } from 'hono';
 import { HTTPException } from 'hono/http-exception';
@@ -180,7 +181,7 @@ export const execStream = (
  */
 export const dryRunFor = async (
   ctx: AppContext,
-  a: Pick<EnvAccess, 'pid' | 'name' | 'env'>,
+  a: Pick<EnvAccess, 'pid' | 'name' | 'env'> & { dialect?: Dialect },
   userId: string,
   run: { mode: 'migrate' | 'baseline'; to?: string; direction?: 'up' | 'down' },
 ): Promise<DryRunResponse> => {
@@ -198,6 +199,7 @@ export const dryRunFor = async (
     const metas = new Map((await loadVersionMetas(db, a.pid)).map((m) => [m.id, m]));
     const plan = result.dryRun!;
     const ref = (v: { id: string; number: number; name: string } | null) => (v ? versionRef(v) : null);
+    const dialect = a.dialect ?? 'pg';
     return {
       ok: true,
       plan: {
@@ -209,7 +211,7 @@ export const dryRunFor = async (
         to: ref(plan.to),
         migrations: plan.migrations.map((m) => {
           const meta = metas.get(m.versionId);
-          const ev = meta ? toEnvVersion(meta, undefined, new Set()) : null;
+          const ev = meta ? toEnvVersion(meta, undefined, new Set(), dialect) : null;
           return {
             versionId: m.versionId,
             number: m.number,
@@ -271,7 +273,7 @@ export const registerExecutions = (app: Hono<Env>, ctx: AppContext) => {
    * executedHere 只算 confirmed（目标库历史的镜像）；claimed 是进行中的登记，还不算执行过。
    */
   app.get('/api/projects/:pid/environments/:eid/status', async (c) => {
-    const { env, role, auth } = await envAccess(c, ctx, 'environment.read');
+    const { env, role, auth, dialect } = await envAccess(c, ctx, 'environment.read');
     const metas = await loadVersionMetas(db, env.project_id);
     const executed = new Set(
       (
@@ -282,7 +284,7 @@ export const registerExecutions = (app: Hono<Env>, ctx: AppContext) => {
       ).map((r) => r.version_id),
     );
     const cur = metas.find((m) => m.id === env.current_version_id);
-    const versions = metas.map((m) => toEnvVersion(m, cur, executed));
+    const versions = metas.map((m) => toEnvVersion(m, cur, executed, dialect));
     return c.json<EnvStatus>({
       id: env.id,
       name: env.name,
@@ -507,16 +509,17 @@ export const registerExecutions = (app: Hono<Env>, ctx: AppContext) => {
    * 模型表达不了的差异（unresolvable）单独列为“需要手工处理”。用户自己执行完后点“重新检查漂移”。
    */
   app.get('/api/projects/:pid/environments/:eid/repair-script', async (c) => {
-    const { env } = await envAccess(c, ctx, 'environment.read');
+    const { env, dialect } = await envAccess(c, ctx, 'environment.read');
     const d = driftInfo(env);
     const sum = d.status === 'drifted' ? d.summary : null;
     const items = sum?.items ?? [];
     const steps = items.filter((i) => i.kind !== 'unresolvable');
     const manual = items.filter((i) => i.kind === 'unresolvable');
+    const header = getEngine(dialect).sessionHeader();
     return c.json<RepairScript>({
       versionNumber: sum?.versionNumber ?? null,
       script: steps.length
-        ? `${[...SESSION_SETTINGS, ...steps.map((s) => s.sql)].map((q) => `${q};`).join('\n')}\n`
+        ? `${header ? `${header}\n` : ''}${steps.map((s) => `${s.sql};`).join('\n')}\n`
         : null,
       steps,
       manual,

@@ -7,7 +7,7 @@ import type {
   VersionInfo,
   VersionVerifyResponse,
 } from '@dowel/api';
-import { isNontransactionalSql } from '@dowel/core';
+import { type Dialect, isNontransactionalSql } from '@dowel/core';
 import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query';
 import { Link, useParams } from '@tanstack/react-router';
 import { ArrowRight, BookmarkPlus, Download, Pencil, Plus, ShieldCheck, Trash2 } from 'lucide-react';
@@ -98,7 +98,7 @@ interface EditStep {
   manualNonTx: boolean;
 }
 
-const nonTx = (s: EditStep) => s.manualNonTx || isNontransactionalSql(s.sql);
+const nonTx = (s: EditStep, dialect: Dialect) => s.manualNonTx || isNontransactionalSql(s.sql, dialect);
 
 /**
  * 逐步编辑冻结的迁移：每一步一个 SQL 编辑器，可以切换“非事务”（例如 CREATE INDEX CONCURRENTLY 不能放进事务）、
@@ -106,7 +106,8 @@ const nonTx = (s: EditStep) => s.manualNonTx || isNontransactionalSql(s.sql);
  */
 const StepsEditor = ({ detail, onDone }: { detail: VersionDetailData; onDone: () => void }) => {
   const { t } = useTranslation();
-  const { pid } = useProject();
+  const { pid, project } = useProject();
+  const dialect = project.dialect as Dialect;
   const qc = useQueryClient();
   const toast = useToast();
   const blankId = useId();
@@ -118,7 +119,7 @@ const StepsEditor = ({ detail, onDone }: { detail: VersionDetailData; onDone: ()
         key: nextKey++,
         sql: s.sql,
         // 原来标为非事务、但语句本身判断不出来的（人工标的），保留为手动勾选
-        manualNonTx: !s.transactional && !isNontransactionalSql(s.sql),
+        manualNonTx: !s.transactional && !isNontransactionalSql(s.sql, dialect),
       }));
     return {
       up: init(detail.upSteps),
@@ -129,8 +130,8 @@ const StepsEditor = ({ detail, onDone }: { detail: VersionDetailData; onDone: ()
   const save = useMutation({
     mutationFn: () =>
       api<VersionDetailData>('PATCH', `/api/projects/${pid}/versions/${detail.id}/steps`, {
-        up: steps.up.map((x) => ({ sql: x.sql, transactional: !nonTx(x) })),
-        down: steps.down.map((x) => ({ sql: x.sql, transactional: !nonTx(x) })),
+        up: steps.up.map((x) => ({ sql: x.sql, transactional: !nonTx(x, dialect) })),
+        down: steps.down.map((x) => ({ sql: x.sql, transactional: !nonTx(x, dialect) })),
       }),
     onSuccess: (d) => {
       qc.setQueryData(['version', pid, detail.id], d);
@@ -200,8 +201,8 @@ const StepsEditor = ({ detail, onDone }: { detail: VersionDetailData; onDone: ()
               <label className="check text-xs">
                 <input
                   type="checkbox"
-                  checked={nonTx(s)}
-                  disabled={isNontransactionalSql(s.sql)}
+                  checked={nonTx(s, dialect)}
+                  disabled={isNontransactionalSql(s.sql, dialect)}
                   onChange={(e) =>
                     set(list.map((x) => (x.key === s.key ? { ...x, manualNonTx: e.target.checked } : x)))
                   }
@@ -220,6 +221,7 @@ const StepsEditor = ({ detail, onDone }: { detail: VersionDetailData; onDone: ()
             <div className="overflow-hidden rounded-sm border border-border bg-[var(--code-bg)]">
               <SqlView
                 text={s.sql}
+                dialect={dialect}
                 label={t('versions.stepLabel', { dir: label, n: i + 1 })}
                 className="min-h-0 overflow-hidden"
                 onChange={(sql) => set(list.map((x) => (x.key === s.key ? { ...x, sql } : x)))}

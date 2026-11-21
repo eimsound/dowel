@@ -3,6 +3,7 @@
 // 创建是一个请求（POST /api/projects/wizard，SSE 推进度），完成后跳到项目概览。
 // 布局按 DESIGN.md 的“向导”：用外壳的内容区（没有侧面板），步骤指示在顶部，上一步 / 下一步在底部右侧。
 import type {
+  Dialect,
   GroupList,
   ProjectCreated,
   TakeoverInspectResult,
@@ -20,6 +21,7 @@ import { api } from '../api.ts';
 import { ClaimDialog } from '../components/ClaimDialog.tsx';
 import { AppShell, PageHeader } from '../components/Shell.tsx';
 import { Banner, cx, IconButton } from '../components/ui.tsx';
+import { DIALECT_UI_LIST, dialectUiSpec } from '../dialects.ts';
 import { useMe } from '../session.ts';
 import { readSse } from '../sse.ts';
 
@@ -90,6 +92,7 @@ export const NewProject = () => {
 
   const [step, setStep] = useState(0);
   const [groupId, setGroupId] = useState('');
+  const [dialect, setDialect] = useState<Dialect>('pg');
   const [name, setName] = useState('');
   const [slug, setSlug] = useState('');
   /** 用户改过 slug 之后就不再跟着名字变 */
@@ -97,6 +100,7 @@ export const NewProject = () => {
   const [envs, setEnvs] = useState<EnvDraft[]>([]);
   const [kind, setKind] = useState<Kind>('blank');
   const [importEnv, setImportEnv] = useState('');
+  const uiSpec = dialectUiSpec(dialect);
   /** schema 勾选：记下是哪个环境的选择，换了环境就按新环境的 schema 重新全选 */
   const [schemaSel, setSchemaSel] = useState<{ key: string; names: string[] } | null>(null);
   const [sql, setSql] = useState('');
@@ -162,6 +166,7 @@ export const NewProject = () => {
       const r = await api<TargetInfo>('POST', '/api/connection-check', {
         url: env.url.trim(),
         groupId: effectiveGroupId,
+        dialect,
       });
       patchEnv(env.key, { pending: false, result: r });
     } catch (e) {
@@ -219,6 +224,7 @@ export const NewProject = () => {
           const data = await api<TakeoverInspectResult>('POST', '/api/takeover/inspect', {
             url: e.url,
             groupId: effectiveGroupId,
+            dialect,
           });
           if (takeGroupGenRef.current !== groupGen || takeKeySeqRef.current[e.key] !== seq) return;
           setTakeReads((m) => ({ ...m, [e.key]: { loading: false, error: '', data } }));
@@ -280,19 +286,21 @@ export const NewProject = () => {
   const takeClaim = takeCand?.envs.find((x) => !x.p.mine) ?? null;
   const isInstanceAdmin = me?.role === 'admin';
 
-  /** 接手时是否至少有一个环境可以提供影子库（非生产、允许同实例，或配置了独立影子库） */
-  const hasTakeoverShadow = filledEnvs.some(
-    (e) => !e.production || e.allowSameInstance || e.shadowUrl.trim().length > 0,
-  );
+  /** 接手时是否至少有一个环境可以提供影子库（SQLite 内置 :memory: 始终可用；外部库需非生产、允许同实例或独立 shadowUrl） */
+  const hasTakeoverShadow =
+    !uiSpec.requiresExternalShadow ||
+    filledEnvs.some((e) => !e.production || e.allowSameInstance || e.shadowUrl.trim().length > 0);
   const validBasics = name.trim().length > 0 && !!effectiveGroupId;
-  const envMissing = (kind === 'database' || kind === 'sql') && filledEnvs.length === 0;
-  // schema 勾选不能为空（不知道 schema 列表时不拦，交给服务端报错）
-  const schemaMissing = kind === 'database' && allSchemaNames.length > 0 && selectedNames.length === 0;
+  const envMissing =
+    (kind === 'database' || (kind === 'sql' && uiSpec.requiresExternalShadow)) && filledEnvs.length === 0;
+  // schema 勾选不能为空（仅多 schema 方言检查；不知道 schema 列表时不拦，交给服务端报错）
+  const schemaMissing =
+    uiSpec.schemas && kind === 'database' && allSchemaNames.length > 0 && selectedNames.length === 0;
   const validContent =
     kind === 'blank'
       ? true
       : kind === 'sql'
-        ? filledEnvs.length > 0 && sql.trim().length > 0
+        ? (!uiSpec.requiresExternalShadow || filledEnvs.length > 0) && sql.trim().length > 0
         : kind === 'takeover'
           ? readsDone &&
             !!takeCand &&
@@ -323,16 +331,17 @@ export const NewProject = () => {
       name: name.trim(),
       groupId: effectiveGroupId,
       slug: slug.trim() || undefined,
+      dialect,
       // 名字在 filledEnvs 里已经 trim 过（界面上到处用的都是它）
       environments: filledEnvs.map((e) => ({
         name: e.name,
         url: e.url,
         production: e.production,
-        allowSameInstance: e.allowSameInstance,
-        shadowUrl: e.shadowUrl.trim() || null,
+        allowSameInstance: uiSpec.requiresExternalShadow ? e.allowSameInstance : false,
+        shadowUrl: uiSpec.requiresExternalShadow ? e.shadowUrl.trim() || null : null,
       })),
-      // 勾选的正好是全部时存 null（“全部 schema”）；一个都不选时不能点创建，不会走到这里
-      schemas: kind === 'database' ? scopeOf(selectedNames, allSchemaNames) : null,
+      // 勾选的正好是全部时存 null（“全部 schema”）；单 schema 方言始终传 null
+      schemas: uiSpec.schemas && kind === 'database' ? scopeOf(selectedNames, allSchemaNames) : null,
       content: {
         kind,
         env: kind === 'database' ? sourceEnv?.name : undefined,
@@ -501,12 +510,58 @@ export const NewProject = () => {
                   <span className="hint">{t('wiz.slugHint')}</span>
                 </label>
               </div>
+              <fieldset className="m-0 space-y-2 border-0 p-0">
+                <legend className="label">{t('wiz.dialect')}</legend>
+                <div className="grid grid-cols-2 gap-2.5 max-[640px]:grid-cols-1">
+                  {DIALECT_UI_LIST.map((d) => {
+                    const active = dialect === d.id;
+                    return (
+                      <label
+                        key={d.id}
+                        className={cx(
+                          'flex items-start gap-2.5 rounded-md border p-3',
+                          d.implemented ? 'cursor-pointer' : 'cursor-not-allowed opacity-60',
+                          active ? 'border-primary bg-primary-soft' : 'border-border bg-panel',
+                        )}
+                      >
+                        <input
+                          type="radio"
+                          name="dialect"
+                          value={d.id}
+                          className="mt-0.5"
+                          checked={active}
+                          disabled={!d.implemented}
+                          onChange={() => {
+                            if (!d.implemented || dialect === d.id) return;
+                            setDialect(d.id);
+                            setEnvs([]);
+                            setImportEnv('');
+                            setSchemaSel(null);
+                            resetTakeover();
+                            setError('');
+                          }}
+                        />
+                        <span className="min-w-0 flex-1 space-y-0.5">
+                          <span className="flex items-center gap-2 text-sm font-medium">
+                            <span>{d.name}</span>
+                            {!d.implemented && <span className="chip">{t('wiz.dialectComingSoon')}</span>}
+                          </span>
+                          <span className="block text-xs text-text-2">{t(`wiz.dialectDesc.${d.id}`)}</span>
+                        </span>
+                      </label>
+                    );
+                  })}
+                </div>
+                <p className="hint m-0">{t('wiz.dialectHint')}</p>
+              </fieldset>
             </section>
           )}
 
           {step === 1 && (
             <section className="mt-4 space-y-4">
-              <p className="hint">{t('wiz.databaseHint')}</p>
+              <p className="hint">
+                {uiSpec.requiresExternalShadow ? t('wiz.databaseHint') : t('wiz.databaseHintSqlite')}
+              </p>
               {envs.length === 0 && <p className="hint">{t('wiz.envEmpty')}</p>}
               <ul className="m-0 list-none space-y-3 p-0">
                 {envs.map((env) => (
@@ -528,7 +583,7 @@ export const NewProject = () => {
                           className="input font-mono"
                           aria-label={t('wiz.envUrl')}
                           value={env.url}
-                          placeholder="postgres://user:password@host:5432/db"
+                          placeholder={uiSpec.urlPlaceholder}
                           autoCapitalize="none"
                           autoCorrect="off"
                           spellCheck={false}
@@ -539,18 +594,20 @@ export const NewProject = () => {
                           }}
                         />
                       </label>
-                      <label className="field col-span-2">
-                        <span className="label">{t('wiz.envShadowUrl')}</span>
-                        <input
-                          className="input font-mono"
-                          aria-label={t('wiz.envShadowUrl')}
-                          value={env.shadowUrl}
-                          autoCapitalize="none"
-                          autoCorrect="off"
-                          spellCheck={false}
-                          onChange={(e) => patchEnv(env.key, { shadowUrl: e.target.value })}
-                        />
-                      </label>
+                      {uiSpec.requiresExternalShadow && (
+                        <label className="field col-span-2">
+                          <span className="label">{t('wiz.envShadowUrl')}</span>
+                          <input
+                            className="input font-mono"
+                            aria-label={t('wiz.envShadowUrl')}
+                            value={env.shadowUrl}
+                            autoCapitalize="none"
+                            autoCorrect="off"
+                            spellCheck={false}
+                            onChange={(e) => patchEnv(env.key, { shadowUrl: e.target.value })}
+                          />
+                        </label>
+                      )}
                       <div className="checks col-span-2">
                         <label>
                           <input
@@ -560,14 +617,16 @@ export const NewProject = () => {
                           />
                           {t('wiz.envProduction')}
                         </label>
-                        <label>
-                          <input
-                            type="checkbox"
-                            checked={env.allowSameInstance}
-                            onChange={(e) => patchEnv(env.key, { allowSameInstance: e.target.checked })}
-                          />
-                          {t('wiz.envAllowSame')}
-                        </label>
+                        {uiSpec.requiresExternalShadow && (
+                          <label>
+                            <input
+                              type="checkbox"
+                              checked={env.allowSameInstance}
+                              onChange={(e) => patchEnv(env.key, { allowSameInstance: e.target.checked })}
+                            />
+                            {t('wiz.envAllowSame')}
+                          </label>
+                        )}
                       </div>
                     </div>
                     <div className="flex flex-wrap items-center gap-2">
@@ -595,7 +654,7 @@ export const NewProject = () => {
                         {env.error}
                       </Banner>
                     )}
-                    {env.result && <CheckResult info={env.result} />}
+                    {env.result && <CheckResult info={env.result} dialect={dialect} />}
                   </li>
                 ))}
               </ul>
@@ -635,7 +694,13 @@ export const NewProject = () => {
                     />
                     <span className="space-y-0.5">
                       <span className="block text-sm font-medium">{t(`wiz.content${cap(k)}`)}</span>
-                      <span className="block text-xs text-text-2">{t(`wiz.content${cap(k)}Hint`)}</span>
+                      <span className="block text-xs text-text-2">
+                        {k === 'blank' && dialect === 'sqlite'
+                          ? t('wiz.contentBlankHintSqlite')
+                          : k === 'sql' && !uiSpec.requiresExternalShadow
+                            ? t('wiz.contentSqlHintSqlite')
+                            : t(`wiz.content${cap(k)}Hint`)}
+                      </span>
                     </span>
                   </label>
                 ))}
@@ -744,52 +809,54 @@ export const NewProject = () => {
                           {isInstanceAdmin ? t('tk.needsClaim') : t('tk.claimNeedsAdmin')}
                         </Banner>
                       )}
-                      <div className="space-y-2.5 border-t border-border pt-3">
-                        <h4 className="section-title">{t('tk.shadowTitle')}</h4>
-                        <p className="hint m-0">{t('tk.shadowHint')}</p>
-                        {!hasTakeoverShadow && (
-                          <Banner kind="warn" role="alert">
-                            {t('tk.shadowMissingWarn')}
-                          </Banner>
-                        )}
-                        <div className="space-y-2">
-                          {filledEnvs.map((env) => (
-                            <fieldset
-                              key={env.key}
-                              className="m-0 space-y-2 rounded-sm border border-border bg-bg p-3"
-                            >
-                              <legend className="px-1 font-mono text-xs font-medium">
-                                {env.name}
-                                {env.production ? ` · ${t('wiz.envProduction')}` : ''}
-                              </legend>
-                              <label className="field">
-                                <span className="label">{t('wiz.envShadowUrl')}</span>
-                                <input
-                                  className="input font-mono"
-                                  value={env.shadowUrl}
-                                  placeholder="postgres://user:password@shadow-host:5432/empty_db"
-                                  autoCapitalize="none"
-                                  autoCorrect="off"
-                                  spellCheck={false}
-                                  onChange={(e) => patchEnv(env.key, { shadowUrl: e.target.value })}
-                                />
-                              </label>
-                              <div className="checks">
-                                <label>
+                      {uiSpec.requiresExternalShadow && (
+                        <div className="space-y-2.5 border-t border-border pt-3">
+                          <h4 className="section-title">{t('tk.shadowTitle')}</h4>
+                          <p className="hint m-0">{t('tk.shadowHint')}</p>
+                          {!hasTakeoverShadow && (
+                            <Banner kind="warn" role="alert">
+                              {t('tk.shadowMissingWarn')}
+                            </Banner>
+                          )}
+                          <div className="space-y-2">
+                            {filledEnvs.map((env) => (
+                              <fieldset
+                                key={env.key}
+                                className="m-0 space-y-2 rounded-sm border border-border bg-bg p-3"
+                              >
+                                <legend className="px-1 font-mono text-xs font-medium">
+                                  {env.name}
+                                  {env.production ? ` · ${t('wiz.envProduction')}` : ''}
+                                </legend>
+                                <label className="field">
+                                  <span className="label">{t('wiz.envShadowUrl')}</span>
                                   <input
-                                    type="checkbox"
-                                    checked={env.allowSameInstance}
-                                    onChange={(e) =>
-                                      patchEnv(env.key, { allowSameInstance: e.target.checked })
-                                    }
+                                    className="input font-mono"
+                                    value={env.shadowUrl}
+                                    placeholder={uiSpec.shadowPlaceholder}
+                                    autoCapitalize="none"
+                                    autoCorrect="off"
+                                    spellCheck={false}
+                                    onChange={(e) => patchEnv(env.key, { shadowUrl: e.target.value })}
                                   />
-                                  {t('wiz.envAllowSame')}
                                 </label>
-                              </div>
-                            </fieldset>
-                          ))}
+                                <div className="checks">
+                                  <label>
+                                    <input
+                                      type="checkbox"
+                                      checked={env.allowSameInstance}
+                                      onChange={(e) =>
+                                        patchEnv(env.key, { allowSameInstance: e.target.checked })
+                                      }
+                                    />
+                                    {t('wiz.envAllowSame')}
+                                  </label>
+                                </div>
+                              </fieldset>
+                            ))}
+                          </div>
                         </div>
-                      </div>
+                      )}
                       <p className="hint m-0">{t('tk.mergeHint')}</p>
                     </>
                   )}
@@ -818,40 +885,44 @@ export const NewProject = () => {
                       ))}
                     </select>
                   </label>
-                  <div className="rounded-md border border-border bg-panel p-4">
-                    <div className="flex items-center gap-2">
-                      <span className="label mb-0">{t('wiz.pickSchemas')}</span>
-                      {sourceEnv?.pending && <span className="text-xs text-text-3">{t('wiz.checking')}</span>}
-                    </div>
-                    <p className="hint">{t('wiz.schemasHint')}</p>
-                    {schemaList.length === 0 ? (
-                      <p className="hint">{t('wiz.noSchemas')}</p>
-                    ) : (
-                      <div className="checks mt-1 flex-col items-start gap-1">
-                        {schemaList.map((s) => (
-                          <label key={s.name}>
-                            <input
-                              type="checkbox"
-                              checked={selectedNames.includes(s.name)}
-                              onChange={() => toggleSchema(s.name)}
-                            />
-                            <span className="font-mono text-xs">{s.name}</span>
-                            <span className="chip">{t('wiz.tables', { count: s.tables })}</span>
-                          </label>
-                        ))}
+                  {uiSpec.schemas && (
+                    <div className="rounded-md border border-border bg-panel p-4">
+                      <div className="flex items-center gap-2">
+                        <span className="label mb-0">{t('wiz.pickSchemas')}</span>
+                        {sourceEnv?.pending && (
+                          <span className="text-xs text-text-3">{t('wiz.checking')}</span>
+                        )}
                       </div>
-                    )}
-                    {schemaMissing && (
-                      <p className="hint error" role="alert">
-                        {t('wiz.schemaNeeded')}
-                      </p>
-                    )}
-                    {sourceEnv?.error && (
-                      <Banner kind="danger" role="alert">
-                        {sourceEnv.error}
-                      </Banner>
-                    )}
-                  </div>
+                      <p className="hint">{t('wiz.schemasHint')}</p>
+                      {schemaList.length === 0 ? (
+                        <p className="hint">{t('wiz.noSchemas')}</p>
+                      ) : (
+                        <div className="checks mt-1 flex-col items-start gap-1">
+                          {schemaList.map((s) => (
+                            <label key={s.name}>
+                              <input
+                                type="checkbox"
+                                checked={selectedNames.includes(s.name)}
+                                onChange={() => toggleSchema(s.name)}
+                              />
+                              <span className="font-mono text-xs">{s.name}</span>
+                              <span className="chip">{t('wiz.tables', { count: s.tables })}</span>
+                            </label>
+                          ))}
+                        </div>
+                      )}
+                      {schemaMissing && (
+                        <p className="hint error" role="alert">
+                          {t('wiz.schemaNeeded')}
+                        </p>
+                      )}
+                      {sourceEnv?.error && (
+                        <Banner kind="danger" role="alert">
+                          {sourceEnv.error}
+                        </Banner>
+                      )}
+                    </div>
+                  )}
                 </div>
               )}
 
@@ -886,7 +957,9 @@ export const NewProject = () => {
                     />
                     {kind === 'sql' && !sql.trim() && <span className="hint">{t('wiz.sqlNeeded')}</span>}
                     {kind === 'sql' && filledEnvs.length === 0 && (
-                      <span className="hint">{t('wiz.sqlNeedsEnv')}</span>
+                      <span className="hint">
+                        {uiSpec.requiresExternalShadow ? t('wiz.sqlNeedsEnv') : t('wiz.sqlMemoryShadowHint')}
+                      </span>
                     )}
                   </div>
                 </div>
@@ -903,6 +976,8 @@ export const NewProject = () => {
                   {name} · <span className="font-mono text-xs text-text-3">{slug || t('wiz.slugAuto')}</span>
                   {group && <span className="ml-2 text-text-2">{group.name}</span>}
                 </dd>
+                <dt className="text-text-2">{t('wiz.sumDialect')}</dt>
+                <dd className="m-0 font-mono text-xs">{uiSpec.name}</dd>
                 <dt className="text-text-2">{t('wiz.sumEnvs')}</dt>
                 <dd className="m-0">
                   {filledEnvs.length === 0 ? (
@@ -927,12 +1002,16 @@ export const NewProject = () => {
                     </div>
                   )}
                 </dd>
-                <dt className="text-text-2">{t('wiz.sumSchemas')}</dt>
-                <dd className="m-0 font-mono text-xs">
-                  {kind === 'database' && allSchemaNames.length > 0
-                    ? (scopeOf(selectedNames, allSchemaNames) ?? [t('wiz.sumAll')]).join('、')
-                    : t('wiz.sumAll')}
-                </dd>
+                {uiSpec.schemas && (
+                  <>
+                    <dt className="text-text-2">{t('wiz.sumSchemas')}</dt>
+                    <dd className="m-0 font-mono text-xs">
+                      {kind === 'database' && allSchemaNames.length > 0
+                        ? (scopeOf(selectedNames, allSchemaNames) ?? [t('wiz.sumAll')]).join('、')
+                        : t('wiz.sumAll')}
+                    </dd>
+                  </>
+                )}
               </dl>
               {busy && (
                 <Progress
@@ -1033,29 +1112,36 @@ export const NewProject = () => {
 const cap = (s: string) => s.charAt(0).toUpperCase() + s.slice(1);
 
 /** 连接检查的结果：版本、账号、权限、schema（每个带表数） */
-const CheckResult = ({ info }: { info: TargetInfo }) => {
+const CheckResult = ({ info, dialect }: { info: TargetInfo; dialect: Dialect }) => {
   const { t } = useTranslation();
+  const uiSpec = dialectUiSpec(dialect);
   const yesNo = (v: boolean) => (v ? t('wiz.yes') : t('wiz.no'));
   return (
     <div className="space-y-2 rounded-sm border border-border bg-surface-2 p-3 text-xs">
       <p className="flex items-center gap-1.5 font-medium">
         <CircleCheck size={14} aria-hidden="true" className="text-ok" />
         {t('wiz.checkOk')}
-        <span className="text-text-2">{t('wiz.checkVersion', { version: info.version })}</span>
+        <span className="text-text-2">
+          {t('wiz.checkVersionGeneric', { dialect: uiSpec.name, version: info.version })}
+        </span>
       </p>
       <dl className="grid grid-cols-[auto_1fr] gap-x-4 gap-y-1">
-        <dt className="text-text-2">{t('wiz.checkUser')}</dt>
-        <dd className="m-0 font-mono">{info.currentUser}</dd>
-        <dt className="text-text-2">{t('wiz.checkSuper')}</dt>
-        <dd className="m-0">
-          {yesNo(info.superuser)}
-          {!info.superuser && (
-            <span className="ml-3 text-text-2">
-              {t('wiz.checkCreateDb')}：{yesNo(info.canCreateDb)} · {t('wiz.checkCreateSchema')}：
-              {yesNo(info.canCreateSchema)}
-            </span>
-          )}
-        </dd>
+        {uiSpec.requiresExternalShadow && (
+          <>
+            <dt className="text-text-2">{t('wiz.checkUser')}</dt>
+            <dd className="m-0 font-mono">{info.currentUser}</dd>
+            <dt className="text-text-2">{t('wiz.checkSuper')}</dt>
+            <dd className="m-0">
+              {yesNo(info.superuser)}
+              {!info.superuser && (
+                <span className="ml-3 text-text-2">
+                  {t('wiz.checkCreateDb')}：{yesNo(info.canCreateDb)} · {t('wiz.checkCreateSchema')}：
+                  {yesNo(info.canCreateSchema)}
+                </span>
+              )}
+            </dd>
+          </>
+        )}
         <dt className="text-text-2">{t('wiz.schemasTitle')}</dt>
         <dd className="m-0 flex flex-wrap items-center gap-1.5">
           {info.schemas.length === 0 && <span className="text-text-2">{t('wiz.noSchemas')}</span>}

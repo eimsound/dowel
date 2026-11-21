@@ -1,30 +1,40 @@
-// 为一次检查选影子库（共识 4.4）：影子库必须是真实的 PostgreSQL 实例，没有兜底。
-//   1. 环境里显式配置的影子库实例；
-//   2. 默认：目标实例上的 {原库名}_dowel（生产环境需要明确同意才用同一实例）；
-//   项目没有环境、或影子库不可用时直接报错。
+// 为一次检查选影子库（共识 4.4）：
+//   - 不需要外部影子库的方言（SQLite）：直接使用进程内 `:memory:` 影子库，免环境配置；
+//   - 需要外部影子库的方言（PG / MySQL / MSSQL）：
+//     1. 环境里显式配置的影子库实例；
+//     2. 默认：目标实例上的 {原库名}_dowel（生产环境需要明确同意才用同一实例）。
 import { createHash } from 'node:crypto';
 
-import { deriveTargetPgMajor, pgMajorOf } from '@dowel/core';
+import { type Dialect, deriveTargetPgMajor, getDialect, pgMajorOf } from '@dowel/core';
 import { HTTPException } from 'hono/http-exception';
 
 import type { ClusterEvent, ClusterEventPayload, EventBus } from './bus.ts';
 import type { PlatformDb } from './db.ts';
 import { decrypt, scrubSecrets } from './secrets.ts';
 import { type Shadow, ShadowError, ShadowUnavailableError } from './shadow.ts';
-import { ConnectError, type ConnectionGuard, ensureSameInstanceShadow, pgShadow } from './targets.ts';
+import {
+  type ConnectionGuard,
+  getTargetDriver,
+  type PreparedShadow,
+  type ShadowSource,
+  sqliteMemoryShadow,
+} from './targets.ts';
+
+export type { ShadowSource };
 
 export interface Env {
   id: string;
   name: string;
+  dialect: Dialect;
   url: string;
   production: boolean;
   allowSameInstance: boolean;
   shadowUrl: string | null;
   /** 项目的 schema 范围（null 表示全部，dowel 永远排除） */
   schemas: string[] | null;
-  /** 目标库 server_version_num（尚未探测为 null） */
+  /** 目标库版本号数值（尚未探测为 null） */
   engineVersionNum: number | null;
-  /** 目标库 PG 大版本（尚未探测为 null） */
+  /** 目标库 PG 大版本（仅 PG；尚未探测或非 PG 为 null） */
   engineMajor: number | null;
 }
 
@@ -52,53 +62,16 @@ export interface ProjectVersionShadows {
   envPgMajors: number[];
 }
 
-/** 选影子库需要的环境信息（Env 和向导里还没入库的环境都满足） */
-export interface ShadowSource {
-  name: string;
-  url: string;
-  production: boolean;
-  allowSameInstance?: boolean;
-  shadowUrl?: string | null;
-}
-
 /**
- * 为一个环境准备影子库（共识 4.4）：显式配置的影子库实例用它（调用方已经 claimShadow 过）；
- * 否则用目标实例上的 {原库名}_dowel（没有就建）。生产环境默认不用同一实例（检查会占用生产实例的资源）。
- * 不可用时抛 ShadowError。Shadows.forProject、向导的 SQL 导入、向导的基线验证三处共用这一份，文案只有这一处。
- * `created`：这个影子库是本次调用新建的（向导在平台库写入失败时可以把它删掉）。
+ * 为一个环境准备影子库（共识 4.4）：按方言分派到对应目标库驱动。
+ * SQLite 直接返回 `:memory:` 影子库（env 可为 null）；PG 等外部库优先用显式 shadowUrl，否则建同实例 `{原库名}_dowel`。
  */
 export const prepareShadow = async (
-  env: ShadowSource,
+  env: ShadowSource | null,
   schemas: string[] | null,
   guard?: ConnectionGuard,
-): Promise<{
-  shadow: Shadow;
-  label: string;
-  url: string;
-  created: { targetUrl: string; name: string } | null;
-}> => {
-  let url = env.shadowUrl ?? null;
-  let created: { targetUrl: string; name: string } | null = null;
-  if (!url) {
-    if (env.production && !env.allowSameInstance)
-      throw new ShadowError(
-        `环境“${env.name}”是生产环境，默认不在同一实例上建影子库（检查会占用生产实例的资源）。请为它配置单独的影子库实例，或明确允许使用同一实例`,
-      );
-    // 连不上目标实例 / 建影子库失败是影子库的基础设施故障：在这个边界统一加一次“影子库不可用：”前缀
-    // （没有建库权限、拒绝使用这个库之类的配置性文案保持原样）
-    const prepared = await ensureSameInstanceShadow(env.url, guard).catch((e: unknown) => {
-      throw e instanceof ConnectError ? new ShadowUnavailableError(e.message) : e;
-    });
-    url = prepared.url;
-    if (prepared.created) created = { targetUrl: env.url, name: prepared.shadow };
-  }
-  return {
-    shadow: pgShadow(url, schemas, guard),
-    label: `${env.name}：${new URL(url).pathname.slice(1)}`,
-    url,
-    created,
-  };
-};
+  dialect: Dialect = 'pg',
+): Promise<PreparedShadow> => getTargetDriver(dialect).prepareShadow(env, schemas, guard);
 
 interface CacheEntry {
   shadow: Shadow;
@@ -166,6 +139,7 @@ export class Shadows {
     const [r] = await this.db.query<{
       id: string;
       name: string;
+      dialect: Dialect;
       url_enc: string;
       production: boolean;
       allow_same_instance: boolean;
@@ -173,7 +147,7 @@ export class Shadows {
       schemas: string[] | null;
       engine_version_num: number | null;
     }>(
-      `select e.id, e.name, e.url_enc, e.production, e.allow_same_instance, e.shadow_url_enc, p.schemas,
+      `select e.id, e.name, p.dialect, e.url_enc, e.production, e.allow_same_instance, e.shadow_url_enc, p.schemas,
               e.engine_version_num
          from environments e join projects p on p.id = e.project_id
         where e.id = $1 and e.project_id = $2`,
@@ -184,18 +158,30 @@ export class Shadows {
     return {
       id: r.id,
       name: r.name,
+      dialect: r.dialect,
       url: decrypt(r.url_enc),
       production: r.production,
       allowSameInstance: r.allow_same_instance,
       shadowUrl: r.shadow_url_enc ? decrypt(r.shadow_url_enc) : null,
       schemas: r.schemas ?? null,
       engineVersionNum,
-      engineMajor: pgMajorOf(engineVersionNum),
+      engineMajor: r.dialect === 'pg' ? pgMajorOf(engineVersionNum) : null,
     };
   }
 
-  /** 选影子库：指定了环境用它；没指定用项目的第一个环境；项目没有环境时报错 */
+  private async projectDialect(pid: string): Promise<Dialect> {
+    const [p] = await this.db.query<{ dialect: Dialect }>('select dialect from projects where id = $1', [
+      pid,
+    ]);
+    return p?.dialect ?? 'pg';
+  }
+
+  /** 选影子库：SQLite 直接用内存影子库（无需环境）；PG 等指定了环境用它，没指定用项目的第一个环境 */
   async forProject(pid: string, eid?: string): Promise<{ shadow: Shadow; label: string }> {
+    const dialect = await this.projectDialect(pid);
+    if (!getDialect(dialect).capabilities.requiresExternalShadow) {
+      return { shadow: sqliteMemoryShadow(), label: 'SQLite :memory:' };
+    }
     for (let attempt = 0; attempt < MAX_PREPARE_ATTEMPTS; attempt++) {
       let id = eid;
       if (!id) {
@@ -208,7 +194,7 @@ export class Shadows {
         const first = rows[0];
         if (!first)
           throw new ShadowError(
-            '项目还没有配置环境。导入 SQL、验证迁移都需要一个真实的 PostgreSQL 实例作影子库，请先在“环境”里添加项目要部署到的数据库',
+            '项目还没有配置环境。导入 SQL、验证迁移都需要一个真实的数据库实例作影子库，请先在“环境”里添加项目要部署到的数据库',
           );
         id = first.id;
       }
@@ -240,7 +226,7 @@ export class Shadows {
       if (hit && hit.projectId === pid && hit.fingerprint === fingerprint) return hit;
       if (hit) await this.forgetLocal(id, false);
 
-      const { shadow, label } = await prepareShadow(env, env.schemas, this.guard);
+      const { shadow, label } = await prepareShadow(env, env.schemas, this.guard, env.dialect);
 
       if (this.closed) {
         await shadow.close().catch(() => {});
@@ -300,6 +286,16 @@ export class Shadows {
       };
     }
 
+    const dialect = await this.projectDialect(pid);
+    if (!getDialect(dialect).capabilities.requiresExternalShadow) {
+      return {
+        entries: [{ major: null, envId: '', shadow: sqliteMemoryShadow(), label: 'SQLite :memory:' }],
+        skippedMajors: [],
+        targetPgMajor: null,
+        envPgMajors: [],
+      };
+    }
+
     const rows = await this.db.query<{
       id: string;
       production: boolean;
@@ -315,7 +311,7 @@ export class Shadows {
     await this.pruneRemovedForProject(pid, liveIds);
     if (!rows.length) {
       throw new ShadowError(
-        '项目还没有配置环境。导入 SQL、验证迁移都需要一个真实的 PostgreSQL 实例作影子库，请先在“环境”里添加项目要部署到的数据库',
+        '项目还没有配置环境。导入 SQL、验证迁移都需要一个真实的数据库实例作影子库，请先在“环境”里添加项目要部署到的数据库',
       );
     }
 

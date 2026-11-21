@@ -16,6 +16,8 @@ import {
 import { type ReactNode, useState } from 'react';
 import { useTranslation } from 'react-i18next';
 
+import { defaultSchemaOf, dialectUiSpec } from '../dialects.ts';
+
 const OPAQUE_ICON: Record<string, typeof Eye> = {
   view: Eye,
   materializedView: Eye,
@@ -83,9 +85,11 @@ export const Sidebar = ({
   const { t } = useTranslation();
   const [q, setQ] = useState('');
   const [expanded, setExpanded] = useState<Record<string, boolean>>({});
+  const defSchema = defaultSchemaOf(model);
+  const uiSpec = dialectUiSpec(model.dialect);
   const schemaName = (id: string) => model.objects[id]?.name ?? '';
   const qname = (o: { parent: string; name: string }) =>
-    schemaName(o.parent) === 'public' ? o.name : `${schemaName(o.parent)}.${o.name}`;
+    schemaName(o.parent) === defSchema ? o.name : `${schemaName(o.parent)}.${o.name}`;
   const byName = <T extends { name: string }>(xs: T[]) =>
     [...xs].sort((a, b) => a.name.localeCompare(b.name));
   const match = (s: string) => !q || s.toLowerCase().includes(q.trim().toLowerCase());
@@ -200,22 +204,30 @@ export const Sidebar = ({
     );
   };
   const otherGroups = [
-    {
-      title: t('ws.enums'),
-      items: byName(all(model, 'enum')).map((x) => ({
-        id: x.id,
-        label: qname(x),
-        icon: <List size={16} aria-hidden="true" />,
-      })),
-    },
-    {
-      title: t('ws.sequences'),
-      items: byName(all(model, 'sequence')).map((x) => ({
-        id: x.id,
-        label: qname(x),
-        icon: <Hash size={16} aria-hidden="true" />,
-      })),
-    },
+    ...(uiSpec.enums
+      ? [
+          {
+            title: t('ws.enums'),
+            items: byName(all(model, 'enum')).map((x) => ({
+              id: x.id,
+              label: qname(x),
+              icon: <List size={16} aria-hidden="true" />,
+            })),
+          },
+        ]
+      : []),
+    ...(uiSpec.sequences
+      ? [
+          {
+            title: t('ws.sequences'),
+            items: byName(all(model, 'sequence')).map((x) => ({
+              id: x.id,
+              label: qname(x),
+              icon: <Hash size={16} aria-hidden="true" />,
+            })),
+          },
+        ]
+      : []),
     {
       title: t('ws.others'),
       items: byName(all(model, 'opaque')).map((x) => {

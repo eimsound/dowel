@@ -23,6 +23,7 @@ import { Maximize, Table2, ZoomIn, ZoomOut } from 'lucide-react';
 import { memo, useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState } from 'react';
 import { useTranslation } from 'react-i18next';
 
+import { defaultSchemaOf } from '../dialects.ts';
 import type { Layout } from '../workspace.ts';
 import { IconButton } from './ui.tsx';
 
@@ -38,6 +39,7 @@ type Col = {
 type TableData = {
   table: Table;
   schema: string;
+  defaultSchema: string;
   columns: Col[];
   partitions: number;
   partitionStrategy: string | null;
@@ -84,7 +86,9 @@ const TableNodeView = memo(({ data }: NodeProps<TableNode>) => {
       >
         <Table2 size={14} aria-hidden="true" className="text-text-3" />
         <span className="min-w-0 flex-1 truncate">
-          {data.schema !== 'public' && <span className="font-normal text-text-3">{data.schema}.</span>}
+          {data.schema !== data.defaultSchema && (
+            <span className="font-normal text-text-3">{data.schema}.</span>
+          )}
           {data.table.name}
         </span>
         {partBadge && (
@@ -309,6 +313,7 @@ export const Canvas = ({
           data: {
             table: t,
             schema: model.objects[t.parent]?.name ?? '',
+            defaultSchema: defaultSchemaOf(model),
             columns: columnsOf(model, t.id).map((c) => ({
               id: c.id,
               name: c.name,

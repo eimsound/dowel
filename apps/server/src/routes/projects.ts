@@ -12,7 +12,7 @@ import {
   projectTransferSchema,
   type ResolvedProject,
 } from '@dowel/api';
-import { createSchema, emptyModel, FORMAT, newId } from '@dowel/core';
+import { createSchema, emptyModel, FORMAT, getDialect, hasDialect, newId } from '@dowel/core';
 import { reconcileIds } from '@dowel/engines';
 import type { Hono } from 'hono';
 import { HTTPException } from 'hono/http-exception';
@@ -60,19 +60,22 @@ export const registerProjects = (app: Hono<Env>, ctx: AppContext) => {
     )
       throw new HTTPException(403, { message: '没有在这个组建项目的权限' });
 
+    if (!hasDialect(b.dialect)) throw new HTTPException(422, { message: `暂不支持方言 ${b.dialect}` });
+    const spec = getDialect(b.dialect);
+
     // slug：显式给出时要求组内唯一（409）；由名字生成时冲突自动加后缀
     const slug = await pickProjectSlug(db, g.id, b.name, b.slug);
     const scope = b.schemas?.length ? b.schemas : null;
 
     const pid = newId();
     const branch = newId();
-    const model = emptyModel();
-    createSchema(model, 'public');
+    const model = emptyModel(b.dialect);
+    createSchema(model, spec.capabilities.defaultSchema);
     try {
       await db.transaction(async (tx) => {
         await tx.query(
-          'insert into projects (id, name, created_by, group_id, slug, schemas) values ($1, $2, $3, $4, $5, $6::text::jsonb)',
-          [pid, b.name, u.id, g.id, slug, scope ? JSON.stringify(scope) : null],
+          'insert into projects (id, name, dialect, created_by, group_id, slug, schemas) values ($1, $2, $3, $4, $5, $6, $7::text::jsonb)',
+          [pid, b.name, b.dialect, u.id, g.id, slug, scope ? JSON.stringify(scope) : null],
         );
         // 建项目的人自动获得这个项目的 admin 授权
         await insertGrant(tx, {
@@ -103,7 +106,7 @@ export const registerProjects = (app: Hono<Env>, ctx: AppContext) => {
         targetKind: 'project',
         targetId: pid,
         projectId: pid,
-        data: { name: b.name, slug, groupId: g.id, content: 'blank', schemas: scope },
+        data: { name: b.name, dialect: b.dialect, slug, groupId: g.id, content: 'blank', schemas: scope },
       },
       ctx.security,
     );
@@ -112,6 +115,7 @@ export const registerProjects = (app: Hono<Env>, ctx: AppContext) => {
         id: pid,
         name: b.name,
         slug,
+        dialect: b.dialect,
         role: 'admin',
         group: { id: g.id, slug: g.slug, name: g.name },
       },
@@ -125,6 +129,7 @@ export const registerProjects = (app: Hono<Env>, ctx: AppContext) => {
       id: a.id,
       name: a.name,
       slug: a.slug,
+      dialect: a.dialect,
       role: a.role,
       branch: a.branch,
       group: { id: a.groupId, slug: a.groupSlug, name: a.groupName },
@@ -417,7 +422,7 @@ export const registerProjects = (app: Hono<Env>, ctx: AppContext) => {
     const a = await access(c, ctx, 'model.import');
     const b = await body(c, importSchema);
     // 实例级语句在准备影子库之前就拒绝：不建库、不拿锁、不执行；只在这里扫一遍（见 assertImportable）
-    const sql = assertImportable(b.sql);
+    const sql = assertImportable(b.sql, a.dialect);
     const s = await shadows.forProject(a.pid, b.env);
     // 按名字沿用已有对象的 ID：重新导入不会把一切当成先删后加，画布布局也能保留
     const imported = reconcileIds((await rooms.model(a.branch)).model, await s.shadow.importSql(sql));

@@ -16,12 +16,13 @@ import {
   type StoredVerifyReport,
   type TargetInfo,
 } from '@dowel/api';
-import { type Model, newId } from '@dowel/core';
-import { type Db, HistoryError, withProjectLock } from '@dowel/engines';
+import { type Dialect, getDialect, type Model, newId } from '@dowel/core';
+import { type Db, getEngine, HistoryError } from '@dowel/engines';
 import { claimInstance, inspectAttach, planDiff, readState, type TargetState } from '@dowel/executor';
 import type { Context, Hono } from 'hono';
 import { HTTPException } from 'hono/http-exception';
 
+import { assertUrlMatchesDialect } from '../allowlist.ts';
 import { audit, auditIn } from '../audit.ts';
 import { can, userActor } from '../authz.ts';
 import { emptyBase } from '../chain.ts';
@@ -44,20 +45,25 @@ import {
 import {
   CHECK_CONNECT_TIMEOUT,
   claimShadow,
-  connectPg,
+  connectTarget,
   dropSameInstanceShadow,
   inspectTargetOn,
 } from '../targets.ts';
 import { type AppContext, access, body, connectionLimit, type Env } from './context.ts';
 
 /** 在已有目标库连接上读取历史并同步到平台库缓存（在目标库项目锁里做，拿不到锁就只读不同步） */
-const syncTargetOn = async (x: AppContext['exec'], env: EnvRow, tdb: Db): Promise<TargetState> => {
+const syncTargetOn = async (
+  x: AppContext['exec'],
+  env: EnvRow,
+  tdb: Db,
+  dialect: Dialect = 'pg',
+): Promise<TargetState> => {
   const sync =
     x.syncTarget ??
-    (async (db, e, c) => {
+    (async (db, e, c, d = dialect) => {
       try {
-        return await withProjectLock(c, e.project_id, 0, async (locked) => {
-          const state = await readState(locked, e.project_id);
+        return await getEngine(d).history.withProjectLock(c, e.project_id, 0, async (locked) => {
+          const state = await readState(locked, e.project_id, d);
           try {
             await syncEnvCache(db, e.id, state);
           } catch (err) {
@@ -70,13 +76,14 @@ const syncTargetOn = async (x: AppContext['exec'], env: EnvRow, tdb: Db): Promis
         throw err;
       }
     });
-  return (await sync(x.db, env, tdb)) ?? (await readState(tdb, env.project_id));
+  return (await sync(x.db, env, tdb, dialect)) ?? (await readState(tdb, env.project_id, dialect));
 };
 
 /**
  * 挑选可用影子库并按本次候选实际将建立的外部连接数扣减连库限速：
- * - 显式 shadowUrl：prepareShadow 不建连，verifyVersionChain 内 pgShadow 建 1 个连接 → 扣 1；
- * - 同实例影子库（!production || allowSameInstance）：ensureSameInstanceShadow 建 3 个连接 + pgShadow 建 1 个 → 扣 4；
+ * - SQLite（不需要外部影子库）：直接用内存影子库（0 个连接）；
+ * - 显式 shadowUrl：prepareShadow 不建连，verifyVersionChain 内建 1 个连接 → 扣 1；
+ * - 同实例影子库（!production || allowSameInstance）：ensureSameInstanceShadow 建 3 个连接 + shadow 建 1 个 → 扣 4；
  * - 生产且不允许同实例：纯内存拒绝（0 个连接），不扣减配额。
  */
 const pickShadowWithLimit = async (
@@ -84,7 +91,11 @@ const pickShadowWithLimit = async (
   ctx: AppContext,
   sources: ShadowSource[],
   schemas: string[] | null,
+  dialect: Dialect = 'pg',
 ): Promise<PreparedShadow> => {
+  if (!getDialect(dialect).capabilities.requiresExternalShadow) {
+    return prepareShadow(null, schemas, ctx.guard, dialect);
+  }
   if (!sources.length)
     throw new TakeoverRejected(
       'shadow_unavailable',
@@ -96,7 +107,7 @@ const pickShadowWithLimit = async (
     const cost = env.shadowUrl ? 1 : env.production && !env.allowSameInstance ? 0 : 4;
     if (cost > 0) connectionLimit(c, ctx, cost);
     try {
-      return await prepareShadow(env, schemas, ctx.guard);
+      return await prepareShadow(env, schemas, ctx.guard, dialect);
     } catch (e) {
       if (!(e instanceof ShadowError)) throw e;
       reasons.push(scrubSecrets(e.message));
@@ -141,27 +152,30 @@ export const registerClaims = (app: Hono<Env>, ctx: AppContext) => {
     if (b.confirmOverwrite && b.workingSeq === undefined)
       throw new HTTPException(400, { message: '确认覆盖工作副本时必须提供预览时的 workingSeq' });
 
+    assertUrlMatchesDialect(b.url, a.dialect);
+    if (b.shadowUrl) assertUrlMatchesDialect(b.shadowUrl, a.dialect);
+
     // 入口按本阶段实际要建立的外部连接数扣减：目标库探测+历史检查复用 1 条连接，可选独立影子库认领另占 1 条
     connectionLimit(c, ctx, b.shadowUrl ? 2 : 1);
 
     const settings = await readSettings(db);
     const chain = await loadChain(db, a.pid);
     // ① 只读：复用同一条目标库短连接依次完成基础检查（inspectTargetOn）与历史接入检查（inspectAttach），用完即关，不跨影子库或平台事务持连接
-    const probe = connectPg(b.url, CHECK_CONNECT_TIMEOUT, ctx.guard);
+    const probe = connectTarget(a.dialect, b.url, CHECK_CONNECT_TIMEOUT, ctx.guard);
     let info: TargetInfo;
     let ins: Awaited<ReturnType<typeof inspectAttach>>;
     try {
-      info = await inspectTargetOn(probe.db, b.url);
+      info = await inspectTargetOn(probe.db, b.url, a.dialect);
       try {
-        ins = await inspectAttach(probe.db, a.pid, chain, settings.instanceId);
+        ins = await inspectAttach(probe.db, a.pid, chain, settings.instanceId, a.dialect);
       } catch (e) {
-        throw toTargetError(e, b.url);
+        throw toTargetError(e, b.url, a.dialect);
       }
     } finally {
       await probe.close().catch(() => {});
     }
     // 和添加环境同样的检查：配置了独立影子库时确认其可认领（白名单在连接层检查）
-    if (b.shadowUrl) await claimShadow(b.shadowUrl, ctx.guard);
+    if (b.shadowUrl) await claimShadow(b.shadowUrl, ctx.guard, a.dialect);
     const hasHistory = ins.hasHistory;
     const aheadVersions = ins.hasHistory ? ins.aheadVersions : [];
     const needClaim = ins.hasHistory && !ins.claim.mine;
@@ -203,7 +217,7 @@ export const registerClaims = (app: Hono<Env>, ctx: AppContext) => {
       if (!committed && createdShadow) {
         const s = createdShadow;
         createdShadow = null;
-        await dropSameInstanceShadow(s.targetUrl, s.name, ctx.guard);
+        await dropSameInstanceShadow(s.targetUrl, s.name, ctx.guard, a.dialect);
       }
     };
 
@@ -233,7 +247,7 @@ export const registerClaims = (app: Hono<Env>, ctx: AppContext) => {
         ];
         try {
           const scope = unionScopes(aheadVersions, a.schemas);
-          const prepared = await pickShadowWithLimit(c, ctx, candidates, scope);
+          const prepared = await pickShadowWithLimit(c, ctx, candidates, scope, a.dialect);
           shadow = prepared.shadow;
           createdShadow = prepared.created;
           verifiedReports = await verifyVersionChain({
@@ -418,12 +432,13 @@ export const registerClaims = (app: Hono<Env>, ctx: AppContext) => {
       let current: ReturnType<typeof versionRef> | null = null;
       if (hasHistory) {
         let synced = false;
-        const conn = connectPg(b.url, CHECK_CONNECT_TIMEOUT, ctx.guard);
+        const conn = connectTarget(a.dialect, b.url, CHECK_CONNECT_TIMEOUT, ctx.guard);
         try {
           if (needClaim) {
             try {
               await claimInstance({
                 db: conn.db,
+                dialect: a.dialect,
                 projectId: a.pid,
                 projectName: a.name,
                 instanceId: settings.instanceId,
@@ -438,13 +453,13 @@ export const registerClaims = (app: Hono<Env>, ctx: AppContext) => {
                 e instanceof Error ? scrubSecrets(e.message) : e,
               );
               warnings.push(
-                `环境“${b.name}”已经添加，但认领失败：${claimFailure(e, b.url)}。可以在环境页重试认领`,
+                `环境“${b.name}”已经添加，但认领失败：${claimFailure(e, b.url, a.dialect)}。可以在环境页重试认领`,
               );
             }
           }
           try {
             const savedEnv = await loadEnv(db, a.pid, id);
-            const state = await syncTargetOn(ctx.exec, savedEnv, conn.db);
+            const state = await syncTargetOn(ctx.exec, savedEnv, conn.db, a.dialect);
             const cur = state.current ? mergedChain.find((v) => v.id === state.current) : undefined;
             current = cur ? versionRef(cur) : null;
             synced = true;
@@ -454,7 +469,7 @@ export const registerClaims = (app: Hono<Env>, ctx: AppContext) => {
               e instanceof Error ? scrubSecrets(e.message) : e,
             );
             warnings.push(
-              `环境“${b.name}”已经添加，但同步目标库状态失败：${claimFailure(e, b.url)}。再读一次执行历史就会对齐`,
+              `环境“${b.name}”已经添加，但同步目标库状态失败：${claimFailure(e, b.url, a.dialect)}。再读一次执行历史就会对齐`,
             );
           }
         } finally {
@@ -516,14 +531,15 @@ export const registerClaims = (app: Hono<Env>, ctx: AppContext) => {
     try {
       const chain = await loadChain(db, a.pid);
       const url = decrypt(env.url_enc);
-      const conn = connectPg(url, CHECK_CONNECT_TIMEOUT, ctx.guard);
+      const conn = connectTarget(a.dialect, url, CHECK_CONNECT_TIMEOUT, ctx.guard);
       try {
         try {
-          const ins = await inspectAttach(conn.db, a.pid, chain, settings.instanceId);
+          const ins = await inspectAttach(conn.db, a.pid, chain, settings.instanceId, a.dialect);
           if (!ins.hasHistory)
             throw new HTTPException(422, { message: '目标库里没有这个项目的历史，没有什么可认领的' });
           result = await claimInstance({
             db: conn.db,
+            dialect: a.dialect,
             projectId: a.pid,
             projectName: a.name,
             instanceId: settings.instanceId,
@@ -532,10 +548,10 @@ export const registerClaims = (app: Hono<Env>, ctx: AppContext) => {
             chain,
           });
         } catch (e) {
-          throw toTargetError(e, url);
+          throw toTargetError(e, url, a.dialect);
         }
         // 认领之后复用同一连接同步一次（当前版本、执行过哪些版本）：失败只记日志，不影响认领结果
-        await syncTargetOn(ctx.exec, env, conn.db).catch((e) =>
+        await syncTargetOn(ctx.exec, env, conn.db, a.dialect).catch((e) =>
           console.error('认领后同步环境状态失败（忽略）', e instanceof Error ? scrubSecrets(e.message) : e),
         );
       } finally {

@@ -19,12 +19,22 @@ import {
   type WizardEvent,
   type WizardStage,
 } from '@dowel/api';
-import { createSchema, deriveTargetPgMajor, emptyModel, type Model, newId, pgMajorOf } from '@dowel/core';
+import {
+  createSchema,
+  deriveTargetPgMajor,
+  emptyModel,
+  getDialect,
+  hasDialect,
+  type Model,
+  newId,
+  pgMajorOf,
+} from '@dowel/core';
 import { ScopeError } from '@dowel/engines';
 import type { Hono } from 'hono';
 import { HTTPException } from 'hono/http-exception';
 import { streamSSE } from 'hono/streaming';
 
+import { assertUrlMatchesDialect } from '../allowlist.ts';
 import { audit } from '../audit.ts';
 import { freezeBaseline } from '../chain.ts';
 import { insertGrant } from '../grants.ts';
@@ -37,6 +47,7 @@ import {
   CHECK_CONNECT_TIMEOUT,
   claimShadow,
   dropSameInstanceShadow,
+  hasTargetDriver,
   inspectTarget,
   pullSchema,
 } from '../targets.ts';
@@ -52,13 +63,22 @@ export const registerWizard = (app: Hono<Env>, ctx: AppContext) => {
 
     const g = await createProjectGroup(c, ctx, b.groupId);
 
+    if (!hasDialect(b.dialect) || !hasTargetDriver(b.dialect))
+      throw new HTTPException(422, { message: `暂不支持方言 ${b.dialect}` });
+    const spec = getDialect(b.dialect);
+    const needsExternalShadow = spec.capabilities.requiresExternalShadow;
+
     const kind = b.content.kind;
     // 接手：从目标库的 dowel 历史恢复整个项目（routes/takeover.ts）
     if (kind === 'takeover') return runTakeover(c, ctx, b, g);
 
     // 环境名统一去首尾空白（界面上也 trim；这里兜底），去完不能为空、不能重复
     const environments = b.environments.map((e) => ({ ...e, name: e.name.trim() }));
-    for (const e of environments) if (!e.name) throw new HTTPException(400, { message: '环境名不能为空' });
+    for (const e of environments) {
+      if (!e.name) throw new HTTPException(400, { message: '环境名不能为空' });
+      assertUrlMatchesDialect(e.url, b.dialect);
+      if (e.shadowUrl) assertUrlMatchesDialect(e.shadowUrl, b.dialect);
+    }
     const names = new Set<string>();
     for (const e of environments) {
       if (names.has(e.name)) throw new HTTPException(422, { message: `环境名“${e.name}”重复` });
@@ -66,9 +86,9 @@ export const registerWizard = (app: Hono<Env>, ctx: AppContext) => {
     }
 
     // schema 范围：空数组视为全部（dowel 永远排除，引擎层写死）
-    const scope = b.schemas?.length ? b.schemas : null;
+    const scope = spec.capabilities.schemas && b.schemas?.length ? b.schemas : null;
 
-    // 初始内容引用的环境：database 显式指定；sql 用第一个环境（影子库只能来自真实实例）
+    // 初始内容引用的环境：database 显式指定；sql 在需要外部影子库的方言下用第一个环境（SQLite 用 :memory: 免环境）
     const wantEnv = b.content.env?.trim();
     let source = kind === 'database' || kind === 'sql' ? environments[0] : undefined;
     if (kind === 'database') {
@@ -77,26 +97,26 @@ export const registerWizard = (app: Hono<Env>, ctx: AppContext) => {
     }
     if (kind === 'sql' && !b.content.sql)
       throw new HTTPException(400, { message: '请粘贴或选择要导入的 SQL' });
-    if ((kind === 'database' || kind === 'sql') && !source)
+    if ((kind === 'database' || (kind === 'sql' && needsExternalShadow)) && !source)
       throw new HTTPException(422, {
-        message:
-          '导入结构需要至少一个环境：Dowel 只用真实的 PostgreSQL 实例作影子库，请先在向导第 2 步添加环境',
+        message: '导入结构需要至少一个环境：请先在向导第 2 步添加环境作为影子库',
       });
 
-    // 限速（服务端替用户去连地址）：每个环境算一次，导入再算一次；超限时还没有开始任何写入
-    const needed = environments.length + (kind === 'database' || kind === 'sql' ? 1 : 0);
-    connectionLimit(c, ctx, needed);
+    // 限速（服务端替用户去连地址）：每个环境算一次，外部导入再算一次；超限时还没有开始任何写入
+    const needed =
+      environments.length + (kind === 'database' || (kind === 'sql' && needsExternalShadow) ? 1 : 0);
+    if (needed > 0) connectionLimit(c, ctx, needed);
 
-    // 导入的 SQL 里有实例级语句就拒绝：在限速之后（扫描 SQL 也要花 CPU）、连接任何数据库和准备影子库之前，
+    // 导入的 SQL 里有实例/文件级语句就拒绝：在限速之后（扫描 SQL 也要花 CPU）、连接任何数据库和准备影子库之前，
     // 不建 {库名}_dowel、不拿锁、不执行；只在这里扫一遍，下游的 importSql 只接受检查过的类型（见 assertImportable）
-    const importable = kind === 'sql' ? assertImportable(b.content.sql!) : null;
+    const importable = kind === 'sql' ? assertImportable(b.content.sql!, b.dialect) : null;
 
     // 和环境创建同样的检查：每个环境都要连得上（白名单在连接层检查）；配置了影子库的还要能认领
     const inspected = new Map<string, { version: string; versionNum: number }>();
     for (const e of environments) {
-      const info = await inspectTarget(e.url, CHECK_CONNECT_TIMEOUT, ctx.guard);
+      const info = await inspectTarget(e.url, CHECK_CONNECT_TIMEOUT, ctx.guard, b.dialect);
       inspected.set(e.name, { version: info.version, versionNum: info.versionNum });
-      if (e.shadowUrl) await claimShadow(e.shadowUrl, ctx.guard);
+      if (e.shadowUrl) await claimShadow(e.shadowUrl, ctx.guard, b.dialect);
     }
 
     const slug = await pickProjectSlug(db, g.id, b.name, b.slug);
@@ -109,11 +129,13 @@ export const registerWizard = (app: Hono<Env>, ctx: AppContext) => {
         engineVersionNum: v?.versionNum ?? null,
       };
     });
-    const targetPgMajor = deriveTargetPgMajor(envRows.map((e) => pgMajorOf(e.engineVersionNum)));
+    const targetPgMajor =
+      b.dialect === 'pg' ? deriveTargetPgMajor(envRows.map((e) => pgMajorOf(e.engineVersionNum))) : null;
     const project: ProjectCreated = {
       id: newId(),
       name: b.name,
       slug,
+      dialect: b.dialect,
       role: 'admin',
       group: { id: g.id, slug: g.slug, name: g.name },
     };
@@ -140,31 +162,31 @@ export const registerWizard = (app: Hono<Env>, ctx: AppContext) => {
         if (!committed && createdShadow) {
           const s = createdShadow;
           createdShadow = null;
-          await dropSameInstanceShadow(s.targetUrl, s.name, ctx.guard);
+          await dropSameInstanceShadow(s.targetUrl, s.name, ctx.guard, b.dialect);
         }
       };
-      /** 验证报告里显示的影子库（与环境页的写法一致：环境名：库名） */
+      /** 验证报告里显示的影子库（与环境页的写法一致：环境名：库名 或 SQLite :memory:） */
       let shadowLabel = '';
       let committed = false;
       try {
         // ── 外部操作：读目标库 / 在影子库里执行 SQL，都在平台库事务之前 ──
         let model: Model;
         if (kind === 'blank') {
-          model = emptyModel();
-          createSchema(model, 'public');
+          model = emptyModel(b.dialect);
+          createSchema(model, spec.capabilities.defaultSchema);
         } else if (kind === 'database') {
           // 环境在上面已经连过了（inspectTarget），这里只读结构
           stage = 'connect';
           await send({ stage });
           stage = 'read';
           await send({ stage });
-          // 从线上库读结构：只执行 SET 和 SELECT，按 schema 范围过滤；跨范围引用会抛 ScopeError
-          model = await pullSchema(source!.url, scope, ctx.guard);
+          // 从线上库读结构：只读，按 schema 范围过滤；跨范围引用会抛 ScopeError
+          model = await pullSchema(source!.url, scope, ctx.guard, b.dialect);
         } else {
           stage = 'connect';
           await send({ stage });
-          // 影子库：环境显式配置的用它（环境阶段已经 claimShadow 过）；否则用目标实例上的 {原库名}_dowel
-          const prepared = await prepareShadow(source!, scope, ctx.guard);
+          // 影子库：SQLite 用 :memory:；PG 等外部库优先显式 shadowUrl，否则用目标实例上的 {原库名}_dowel
+          const prepared = await prepareShadow(source ?? null, scope, ctx.guard, b.dialect);
           shadow = prepared.shadow;
           shadowLabel = prepared.label;
           createdShadow = prepared.created;
@@ -180,12 +202,6 @@ export const registerWizard = (app: Hono<Env>, ctx: AppContext) => {
         await send({ stage });
         const imported = kind !== 'blank';
 
-        // v0 基线的冻结脚本，以及它是否“已验证”（同样在平台库事务之前，是外部操作）。
-        // 已验证的含义是：**执行了这份冻结的 up 脚本**，在影子库里从空库建出来，读回的结构与模型一致。
-        // 验证是可选的，不能挡住项目创建：
-        // - 没有可用的影子库（ShadowError：生产环境不让用同实例、没有建库权限、连不上、被占用）：基线未验证；
-        // - 脚本执行失败 / 结构对不上：基线未验证，带着失败报告；
-        // - 其他任何意外错误：记日志，基线未验证，报告里写明原因。
         const baseline = imported
           ? freezeBaseline(model, scope, targetPgMajor !== null ? { pgMajor: targetPgMajor } : undefined)
           : null;
@@ -194,7 +210,7 @@ export const registerWizard = (app: Hono<Env>, ctx: AppContext) => {
           try {
             if (!shadow) {
               // database 路径本来没有用到影子库：和 sql 路径、forProject 用同一份选择逻辑
-              const prepared = await prepareShadow(source!, scope, ctx.guard);
+              const prepared = await prepareShadow(source ?? null, scope, ctx.guard, b.dialect);
               shadow = prepared.shadow;
               shadowLabel = prepared.label;
               createdShadow = prepared.created;
@@ -227,8 +243,8 @@ export const registerWizard = (app: Hono<Env>, ctx: AppContext) => {
         }
         await db.transaction(async (tx) => {
           await tx.query(
-            'insert into projects (id, name, created_by, group_id, slug, schemas) values ($1, $2, $3, $4, $5, $6::text::jsonb)',
-            [project.id, project.name, u.id, g.id, slug, scope ? JSON.stringify(scope) : null],
+            'insert into projects (id, name, dialect, created_by, group_id, slug, schemas) values ($1, $2, $3, $4, $5, $6, $7::text::jsonb)',
+            [project.id, project.name, b.dialect, u.id, g.id, slug, scope ? JSON.stringify(scope) : null],
           );
           // 建项目的人自动获得这个项目的 admin 授权
           await insertGrant(tx, {

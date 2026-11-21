@@ -313,14 +313,18 @@ export type GroupMemberPatch = z.infer<typeof groupMemberPatchSchema>;
 
 // ───── 项目 ─────
 
+export const dialectSchema = z.enum(['pg', 'sqlite', 'mysql', 'mssql']);
+export type Dialect = z.infer<typeof dialectSchema>;
+
 /** schema 范围：导入、拉取、规范化只看这些 schema；空表示全部（dowel 永远排除） */
-export const schemaScopeSchema = z.array(z.string().trim().min(1).max(63)).max(200);
+export const schemaScopeSchema = z.array(z.string().trim().min(1).max(128)).max(200);
 
 /** 建项目必须指定组；slug 不给时由名字生成 */
 export const projectCreateSchema = z.object({
   name: z.string().trim().min(1, '项目名不能为空').max(100),
   groupId: z.string().min(1, '请选择组'),
   slug: slugSchema.optional(),
+  dialect: dialectSchema.default('pg'),
   /** 初始的 schema 范围（可空，空表示全部） */
   schemas: schemaScopeSchema.nullable().optional(),
 });
@@ -338,7 +342,7 @@ export const projectListItemSchema = z.object({
   id: z.string(),
   name: z.string(),
   slug: z.string(),
-  dialect: z.string(),
+  dialect: dialectSchema,
   role: roleSchema,
   createdAt: z.string(),
   group: projectGroupSchema,
@@ -349,6 +353,7 @@ export const projectInfoSchema = z.object({
   id: z.string(),
   name: z.string(),
   slug: z.string(),
+  dialect: dialectSchema,
   role: roleSchema,
   branch: z.string(),
   group: projectGroupSchema,
@@ -372,6 +377,7 @@ export const projectCreatedSchema = z.object({
   id: z.string(),
   name: z.string(),
   slug: z.string(),
+  dialect: dialectSchema,
   role: roleSchema,
   group: projectGroupSchema,
 });
@@ -672,14 +678,19 @@ export type ModelUpdate = z.infer<typeof modelUpdateSchema>;
 
 // ───── 环境 ─────
 
-const postgresUrl = z.string().regex(/^postgres(ql)?:\/\//, '连接串必须以 postgres:// 开头');
+export const targetUrlSchema = z
+  .string()
+  .regex(
+    /^(?:postgres(?:ql)?|sqlite|mysql|mssql|sqlserver):\/\//i,
+    '连接串必须以 postgres://、sqlite://、mysql:// 或 mssql:// 开头',
+  );
 
 export const environmentCreateSchema = z.object({
   name: z.string().trim().min(1).max(100),
-  url: postgresUrl,
+  url: targetUrlSchema,
   production: z.boolean().default(true),
   allowSameInstance: z.boolean().default(false),
-  shadowUrl: postgresUrl.nullable().default(null),
+  shadowUrl: targetUrlSchema.nullable().default(null),
 });
 export type EnvironmentCreate = z.infer<typeof environmentCreateSchema>;
 
@@ -820,8 +831,8 @@ export type EnvInfo = z.infer<typeof environmentInfoSchema>;
 
 /** 修改环境：连接串 / 影子库 / 生产标记 / 执行档位都是特权操作，按环境的执行档位检查 */
 export const environmentPatchSchema = z.object({
-  url: postgresUrl.optional(),
-  shadowUrl: postgresUrl.nullable().optional(),
+  url: targetUrlSchema.optional(),
+  shadowUrl: targetUrlSchema.nullable().optional(),
   allowSameInstance: z.boolean().optional(),
   production: z.boolean().optional(),
   execPolicy: execPolicySchema.nullable().optional(),
@@ -1273,7 +1284,8 @@ export type ClaimResult = z.infer<typeof claimResultSchema>;
 
 /** 接手向导第一步：连上一个库，看它登记过哪些项目 */
 export const takeoverInspectSchema = z.object({
-  url: postgresUrl,
+  url: targetUrlSchema,
+  dialect: dialectSchema.default('pg'),
   /** 用这个组判断调用者有没有建项目的权限（接手相当于新建项目） */
   groupId: z.string().min(1, '请选择组'),
 });
@@ -1309,7 +1321,8 @@ export type TakeoverInspectResult = z.infer<typeof takeoverInspectResultSchema>;
 
 /** 连接检查（向导第 2 步）：建项目之前检查一个连接串 */
 export const connectionCheckSchema = z.object({
-  url: postgresUrl,
+  url: targetUrlSchema,
+  dialect: dialectSchema.default('pg'),
   /** 用这个组判断调用者有没有建项目的权限（复用 group.create_project） */
   groupId: z.string().min(1, '请选择组'),
 });
@@ -1328,6 +1341,7 @@ export const projectWizardSchema = z.object({
   name: z.string().trim().min(1, '项目名不能为空').max(100),
   groupId: z.string().min(1, '请选择组'),
   slug: slugSchema.optional(),
+  dialect: dialectSchema.default('pg'),
   /** 关联的数据库（可空）；和现有环境接口的字段一致 */
   environments: z.array(environmentCreateSchema).max(20).default([]),
   /** schema 范围（null / 空表示全部，dowel 永远排除） */

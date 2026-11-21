@@ -26,6 +26,7 @@ import { useCallback, useEffect, useId, useLayoutEffect, useMemo, useRef, useSta
 import { useTranslation } from 'react-i18next';
 
 import { ApiError, api } from '../api.ts';
+import { defaultSchemaOf } from '../dialects.ts';
 import { formatTime } from '../format.ts';
 import type { Layout } from '../workspace.ts';
 import { Canvas, shortType, typeLabel } from './Canvas.tsx';
@@ -129,9 +130,10 @@ const HistorySchemaSummary = ({ model }: { model: Model }) => {
     );
   }
 
+  const defSchema = defaultSchemaOf(model);
   const schemaPrefix = (parentId: string) => {
     const s = model.objects[parentId]?.name;
-    return s && s !== 'public' ? `${s}.` : '';
+    return s && s !== defSchema ? `${s}.` : '';
   };
 
   return (
@@ -738,7 +740,7 @@ export const CanvasHistory = ({
                             <HistorySchemaSummary model={detail.model} />
                           ) : (
                             <div className="h-full">
-                              <SqlView text={ddl} label="DDL" />
+                              <SqlView text={ddl} label="DDL" dialect={detail.model.dialect} />
                             </div>
                           )}
                         </div>
