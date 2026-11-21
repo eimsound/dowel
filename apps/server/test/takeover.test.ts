@@ -187,14 +187,15 @@ const takeover = (
     allowSameInstance?: boolean;
     shadowUrl?: string | null;
   }[],
-  extra: { claim?: boolean; name?: string } = {},
+  extra: { claim?: boolean; name?: string; slug?: string; groupId?: string } = {},
   cookie = inst.admin,
 ) =>
   wizard(
     inst,
     {
       name: extra.name ?? '接手的项目',
-      groupId: inst.groupId,
+      groupId: extra.groupId ?? inst.groupId,
+      ...(extra.slug ? { slug: extra.slug } : {}),
       environments: envs.map((e) => ({
         name: e.name,
         url: e.url,
@@ -1295,6 +1296,399 @@ describe.skipIf(!PG_URL)('接手与认领（P4c）', () => {
     expect(r.last).toMatchObject({ stage: 'read', code: 'history_missing' });
     // 检查没有在目标库里建任何东西
     expect(await empty.db.query("select 1 from pg_namespace where nspname = 'dowel'")).toEqual([]);
+  });
+
+  const shadowNameOf = (url: string) => `${new URL(url).pathname.slice(1)}_dowel`;
+  const shadowExists = async (name: string) => {
+    const admin = connect(PG_URL);
+    try {
+      const [row] = await admin.db.query<{ n: number }>(
+        'select count(*)::int as n from pg_database where datname = $1',
+        [name],
+      );
+      return (row?.n ?? 0) > 0;
+    } finally {
+      await admin.close();
+    }
+  };
+  const dropDb = async (name: string) => {
+    const admin = connect(PG_URL);
+    try {
+      await admin.db.exec(`DROP DATABASE IF EXISTS "${name}" WITH (FORCE)`);
+    } finally {
+      await admin.close();
+    }
+  };
+
+  /** 仅匹配 routes/takeover.ts 的写事务，避免误拦截后台 webhooks / requests 巡检事务 */
+  const isTakeoverTx = (fn: unknown) => typeof fn === 'function' && fn.toString().includes('restoreChain');
+
+  /** 构造一个多请求屏障：指定数量的 takeover 请求都进入 db.transaction 后才放行，保证并发撞在 write 阶段 */
+  const withTxBarrier = (db: PlatformDb, count: number) => {
+    const orig = db.transaction.bind(db);
+    let arrived = 0;
+    const waiters: (() => void)[] = [];
+    db.transaction = (async (fn) => {
+      if (!isTakeoverTx(fn)) return orig(fn);
+      arrived++;
+      if (arrived <= count) {
+        if (arrived === count) for (const w of waiters.splice(0)) w();
+        else
+          await new Promise<void>((resolve) => {
+            waiters.push(resolve);
+          });
+      }
+      return orig(fn);
+    }) as PlatformDb['transaction'];
+    return () => {
+      for (const w of waiters.splice(0)) w();
+      db.transaction = orig;
+    };
+  };
+
+  test('并发接手同一项目：后提交一方返回结构化 project_exists（不可见项目不泄露名称与所属组），覆盖 isUniqueViolation 并清理新建同实例影子库', async () => {
+    const inst = await newInstance('CC_SAME');
+    // 新增第二个实例管理员，用于真实双管理员并发接手
+    await makeUser(inst.db, 'admin2', { name: '管理员二', role: 'admin' });
+    const loginRes = await inst.created.app.request('/api/auth/login', {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ username: 'admin2', password: PASSWORD }),
+    });
+    expect(loginRes.status).toBe(200);
+    const admin2 = (loginRes.headers.get('set-cookie') ?? '').split(';')[0]!;
+
+    // 1) 双管理员真实并发接手同一项目：一个 done，另一个在 write 阶段收到结构化 project_exists（非“服务器内部错误”）
+    const dev1 = await newTarget();
+    const pid1 = await project(A, '并发同一项目');
+    const eid1 = await addEnv(A, pid1, 'dev', dev1.url);
+    const chain1 = await publishN(A, pid1, 1);
+    expect((await exec(A, pid1, eid1, 'execute', chain1[0]!.id)).last.stage).toBe('done');
+
+    const restoreBarrier1 = withTxBarrier(inst.db, 2);
+    let pair1: [Awaited<ReturnType<typeof takeover>>, Awaited<ReturnType<typeof takeover>>];
+    try {
+      pair1 = await Promise.all([
+        takeover(inst, pid1, [{ name: 'dev', url: dev1.url }], { claim: true, name: '并发项目' }, inst.admin),
+        takeover(inst, pid1, [{ name: 'dev', url: dev1.url }], { claim: true, name: '并发项目' }, admin2),
+      ]);
+    } finally {
+      restoreBarrier1();
+    }
+    const ok1 = pair1.filter((r) => r.last.stage === 'done');
+    const fail1 = pair1.filter((r) => r.last.stage !== 'done');
+    expect(ok1).toHaveLength(1);
+    expect(fail1).toHaveLength(1);
+    expect(fail1[0]!.last).toMatchObject({ stage: 'write', code: 'project_exists' });
+    expect(fail1[0]!.last.error).not.toContain('服务器内部错误');
+    expect(fail1[0]!.last.error).toContain('g/');
+    expect(await inst.db.query('select id from projects where id = $1', [pid1])).toHaveLength(1);
+
+    // 2) 隐藏组权限可见性：管理员在隐藏组 h、pa 在公开组 g 并发接手同一个本实例历史项目；
+    //    让 admin 先提交、pa 后提交 → pa 收到 project_exists 且不泄露隐藏组 h 与项目名/slug
+    const dev2 = await newTarget();
+    const pid2 = await project(inst, '本实例历史');
+    const eid2 = await addEnv(inst, pid2, 'dev', dev2.url);
+    const chain2 = await publishN(inst, pid2, 1);
+    expect((await exec(inst, pid2, eid2, 'execute', chain2[0]!.id)).last.stage).toBe('done');
+    const origSlug2 = (await inst.call('GET', `/api/projects/${pid2}`)).data.slug as string;
+    expect((await inst.call('DELETE', `/api/projects/${pid2}`, { confirm: origSlug2 })).status).toBe(200);
+
+    const hiddenGroup = await inst.call('POST', '/api/groups', { slug: 'secret-grp', name: '机密组' });
+    expect(hiddenGroup.status).toBe(201);
+    const hiddenGroupId = hiddenGroup.data.id as string;
+
+    // 确定性顺序：等两个请求都通过 read+verify 到达 db.transaction 后，先让 admin 在隐藏组提交，再放行 pa
+    const origTx2 = inst.db.transaction.bind(inst.db);
+    let paArrived!: () => void;
+    const waitPa = new Promise<void>((r) => {
+      paArrived = r;
+    });
+    let allowPa!: () => void;
+    const waitAdminDone = new Promise<void>((r) => {
+      allowPa = r;
+    });
+    let txCalls2 = 0;
+    inst.db.transaction = (async (fn) => {
+      if (!isTakeoverTx(fn)) return origTx2(fn);
+      txCalls2++;
+      if (txCalls2 === 1) {
+        // 第一个到达的是 pa（先启动），先通知 admin 启动并等待 admin 提交完成
+        paArrived();
+        await waitAdminDone;
+        return origTx2(fn);
+      }
+      const res = await origTx2(fn);
+      allowPa();
+      return res;
+    }) as PlatformDb['transaction'];
+    let rPa: Awaited<ReturnType<typeof takeover>>;
+    let rAdmin: Awaited<ReturnType<typeof takeover>>;
+    try {
+      const pPa = takeover(inst, pid2, [{ name: 'dev', url: dev2.url }], { name: '公开名称' }, inst.pa);
+      await waitPa;
+      rAdmin = await takeover(
+        inst,
+        pid2,
+        [{ name: 'dev', url: dev2.url }],
+        { name: '机密项目名', slug: 'top-secret', groupId: hiddenGroupId },
+        inst.admin,
+      );
+      rPa = await pPa;
+    } finally {
+      allowPa();
+      inst.db.transaction = origTx2;
+    }
+    expect(rAdmin.last, JSON.stringify(rAdmin.events)).toMatchObject({ stage: 'done' });
+    expect(rPa.last, JSON.stringify(rPa.events)).toMatchObject({ stage: 'write', code: 'project_exists' });
+    expect(rPa.last.error).toContain('联系管理员');
+    expect(rPa.last.error).not.toContain('服务器内部错误');
+    expect(rPa.last.error).not.toContain('secret-grp');
+    expect(rPa.last.error).not.toContain('top-secret');
+    expect(rPa.last.error).not.toContain('机密项目名');
+
+    // 3) 模拟 PG 并发穿透事务内复查直接触发 isUniqueViolation(23505)：
+    //    (a) projects.id 唯一冲突（落入隐藏组，对 pa 不可见）→ project_exists（不泄露名称/组）且清理本次新建同实例影子库
+    const dev3 = await newTarget();
+    const pid3 = await project(inst, '影子清理项目');
+    const eid3 = await addEnv(inst, pid3, 'dev', dev3.url);
+    const chain3 = await publishN(inst, pid3, 1);
+    expect((await exec(inst, pid3, eid3, 'execute', chain3[0]!.id)).last.stage).toBe('done');
+    const origSlug3 = (await inst.call('GET', `/api/projects/${pid3}`)).data.slug as string;
+    expect((await inst.call('DELETE', `/api/projects/${pid3}`, { confirm: origSlug3 })).status).toBe(200);
+    // 确保目标实例上不存在旧同实例影子库，让本次接手在 verify 阶段新建它
+    const shadow3 = shadowNameOf(dev3.url);
+    await dropDb(shadow3);
+    expect(await shadowExists(shadow3)).toBe(false);
+
+    const origTx3 = inst.db.transaction.bind(inst.db);
+    let sawShadowCreated = false;
+    inst.db.transaction = (async (fn) => {
+      if (!isTakeoverTx(fn)) return origTx3(fn);
+      sawShadowCreated = await shadowExists(shadow3);
+      // 模拟并发一方在 PG 上刚好提交了同一 projectId 到隐藏组，并让当前事务抛 23505
+      await origTx3(async (tx) => {
+        await tx.query(
+          'insert into projects (id, name, created_by, group_id, slug) values ($1, $2, null, $3, $4)',
+          [pid3, '不可见冲突项目', hiddenGroupId, 'hidden-clash'],
+        );
+        await tx.query("insert into branches (id, project_id, name) values ($1, $2, 'main')", [
+          `b-${pid3}`,
+          pid3,
+        ]);
+      });
+      throw Object.assign(new Error('duplicate key value violates unique constraint "projects_pkey"'), {
+        code: '23505',
+      });
+    }) as PlatformDb['transaction'];
+    let rPgProject: Awaited<ReturnType<typeof takeover>>;
+    try {
+      rPgProject = await takeover(
+        inst,
+        pid3,
+        [{ name: 'dev', url: dev3.url }],
+        { name: '冲突测试' },
+        inst.pa,
+      );
+    } finally {
+      inst.db.transaction = origTx3;
+    }
+    expect(sawShadowCreated).toBe(true);
+    expect(rPgProject.last, JSON.stringify(rPgProject.events)).toMatchObject({
+      stage: 'write',
+      code: 'project_exists',
+    });
+    expect(rPgProject.last.error).toContain('联系管理员');
+    expect(rPgProject.last.error).not.toContain('服务器内部错误');
+    expect(rPgProject.last.error).not.toContain('secret-grp');
+    expect(rPgProject.last.error).not.toContain('hidden-clash');
+    expect(rPgProject.last.error).not.toContain('不可见冲突项目');
+    // 提交前失败：本次新建的同实例影子库必须被 cleanupShadow 清理
+    expect(await shadowExists(shadow3)).toBe(false);
+
+    //    (b) versions.id 唯一冲突（不同 projectId 但同 versionId）通过 isUniqueViolation 转为 project_exists
+    const dev4 = await newTarget();
+    const pid4 = await project(A, '版本冲突项目');
+    const eid4 = await addEnv(A, pid4, 'dev', dev4.url);
+    const chain4 = await publishN(A, pid4, 1);
+    expect((await exec(A, pid4, eid4, 'execute', chain4[0]!.id)).last.stage).toBe('done');
+    const origTx4 = inst.db.transaction.bind(inst.db);
+    inst.db.transaction = (async (fn) => {
+      if (!isTakeoverTx(fn)) return origTx4(fn);
+      // 在一个已存在项目中插入同 ID 的版本行，然后模拟 PG 23505
+      await origTx4(async (tx) => {
+        await tx.query(
+          `insert into versions (id, project_id, branch_id, seq, name, model, number)
+           values ($1, $2, $3, 99, 'dup', '{}'::text::jsonb, 99)`,
+          [chain4[0]!.id, pid3, `b-${pid3}`],
+        );
+      });
+      throw Object.assign(new Error('duplicate key value violates unique constraint "versions_pkey"'), {
+        code: '23505',
+      });
+    }) as PlatformDb['transaction'];
+    let rPgVersion: Awaited<ReturnType<typeof takeover>>;
+    try {
+      rPgVersion = await takeover(inst, pid4, [{ name: 'dev', url: dev4.url }], { claim: true });
+    } finally {
+      inst.db.transaction = origTx4;
+    }
+    expect(rPgVersion.last, JSON.stringify(rPgVersion.events)).toMatchObject({
+      stage: 'write',
+      code: 'project_exists',
+    });
+    expect(rPgVersion.last.error).toContain(chain4[0]!.id);
+    expect(rPgVersion.last.error).not.toContain('服务器内部错误');
+  });
+
+  test('并发接手同组同 slug 的不同项目：自动 slug 自动重选重试成功；显式 slug 或重试耗尽返回结构化 slug_conflict 且清理影子库', async () => {
+    const inst = await newInstance('CC_SLUG');
+
+    // 准备 2 个不同项目，在同组用相同项目名（未显式指定 slug）真实并发接手
+    const dev1 = await newTarget();
+    const dev2 = await newTarget();
+    const pid1 = await project(A, '同组项目一');
+    const pid2 = await project(A, '同组项目二');
+    const eid1 = await addEnv(A, pid1, 'dev', dev1.url);
+    const eid2 = await addEnv(A, pid2, 'dev', dev2.url);
+    const c1 = await publishN(A, pid1, 1);
+    const c2 = await publishN(A, pid2, 1);
+    expect((await exec(A, pid1, eid1, 'execute', c1[0]!.id)).last.stage).toBe('done');
+    expect((await exec(A, pid2, eid2, 'execute', c2[0]!.id)).last.stage).toBe('done');
+
+    const restoreBarrier1 = withTxBarrier(inst.db, 2);
+    let pairAuto: [Awaited<ReturnType<typeof takeover>>, Awaited<ReturnType<typeof takeover>>];
+    try {
+      pairAuto = await Promise.all([
+        takeover(inst, pid1, [{ name: 'dev', url: dev1.url }], { claim: true, name: 'dup-shop' }),
+        takeover(inst, pid2, [{ name: 'dev', url: dev2.url }], { claim: true, name: 'dup-shop' }),
+      ]);
+    } finally {
+      restoreBarrier1();
+    }
+    expect(pairAuto[0].last, JSON.stringify(pairAuto[0].events)).toMatchObject({ stage: 'done' });
+    expect(pairAuto[1].last, JSON.stringify(pairAuto[1].events)).toMatchObject({ stage: 'done' });
+    expect([pairAuto[0].last.project!.slug, pairAuto[1].last.project!.slug].sort()).toEqual([
+      'dup-shop',
+      'dup-shop-2',
+    ]);
+
+    // 2) 模拟 PG 并发触发 (group_id, slug) 唯一约束 23505：自动重选 slug 重试一次并成功
+    const dev3 = await newTarget();
+    const pid3 = await project(A, 'PG重选项目');
+    const eid3 = await addEnv(A, pid3, 'dev', dev3.url);
+    const c3 = await publishN(A, pid3, 1);
+    expect((await exec(A, pid3, eid3, 'execute', c3[0]!.id)).last.stage).toBe('done');
+
+    const origTx3 = inst.db.transaction.bind(inst.db);
+    let firstSlugRace = true;
+    inst.db.transaction = (async (fn) => {
+      if (!isTakeoverTx(fn)) return origTx3(fn);
+      if (firstSlugRace) {
+        firstSlugRace = false;
+        await origTx3(async (tx) => {
+          await tx.query(
+            'insert into projects (id, name, created_by, group_id, slug) values ($1, $2, null, $3, $4)',
+            ['other-slug-holder', '占坑项目', inst.groupId, 'pg-race'],
+          );
+        });
+        throw Object.assign(
+          new Error('duplicate key value violates unique constraint "projects_group_slug_key"'),
+          { code: '23505' },
+        );
+      }
+      return origTx3(fn);
+    }) as PlatformDb['transaction'];
+    let rRetryOk: Awaited<ReturnType<typeof takeover>>;
+    try {
+      rRetryOk = await takeover(inst, pid3, [{ name: 'dev', url: dev3.url }], {
+        claim: true,
+        name: 'pg-race',
+      });
+    } finally {
+      inst.db.transaction = origTx3;
+    }
+    expect(rRetryOk.last, JSON.stringify(rRetryOk.events)).toMatchObject({ stage: 'done' });
+    expect(rRetryOk.last.project!.slug).toBe('pg-race-2');
+
+    // 3) 显式指定同一 slug 并发接手不同项目：一个 done，另一个返回结构化 slug_conflict（不返回“服务器内部错误”）
+    const dev4 = await newTarget();
+    const dev5 = await newTarget();
+    const pid4 = await project(A, '显式标识一');
+    const pid5 = await project(A, '显式标识二');
+    const eid4 = await addEnv(A, pid4, 'dev', dev4.url);
+    const eid5 = await addEnv(A, pid5, 'dev', dev5.url);
+    const c4 = await publishN(A, pid4, 1);
+    const c5 = await publishN(A, pid5, 1);
+    expect((await exec(A, pid4, eid4, 'execute', c4[0]!.id)).last.stage).toBe('done');
+    expect((await exec(A, pid5, eid5, 'execute', c5[0]!.id)).last.stage).toBe('done');
+
+    const restoreBarrier2 = withTxBarrier(inst.db, 2);
+    let pairExplicit: [Awaited<ReturnType<typeof takeover>>, Awaited<ReturnType<typeof takeover>>];
+    try {
+      pairExplicit = await Promise.all([
+        takeover(inst, pid4, [{ name: 'dev', url: dev4.url }], {
+          claim: true,
+          name: '显式一',
+          slug: 'fixed-slug',
+        }),
+        takeover(inst, pid5, [{ name: 'dev', url: dev5.url }], {
+          claim: true,
+          name: '显式二',
+          slug: 'fixed-slug',
+        }),
+      ]);
+    } finally {
+      restoreBarrier2();
+    }
+    const okExp = pairExplicit.filter((r) => r.last.stage === 'done');
+    const failExp = pairExplicit.filter((r) => r.last.stage !== 'done');
+    expect(okExp).toHaveLength(1);
+    expect(okExp[0]!.last.project!.slug).toBe('fixed-slug');
+    expect(failExp).toHaveLength(1);
+    expect(failExp[0]!.last).toMatchObject({ stage: 'write', code: 'slug_conflict' });
+    expect(failExp[0]!.last.error).toContain('相同的标识');
+    expect(failExp[0]!.last.error).not.toContain('服务器内部错误');
+
+    // 4) 自动 slug 连续冲突达到重试上限 → 返回结构化 slug_conflict，且清理本次新建同实例影子库
+    const dev6 = await newTarget();
+    const pid6 = await project(A, '重试耗尽');
+    const eid6 = await addEnv(A, pid6, 'dev', dev6.url);
+    const c6 = await publishN(A, pid6, 1);
+    expect((await exec(A, pid6, eid6, 'execute', c6[0]!.id)).last.stage).toBe('done');
+    const shadow6 = shadowNameOf(dev6.url);
+    await dropDb(shadow6);
+    expect(await shadowExists(shadow6)).toBe(false);
+
+    const origTx6 = inst.db.transaction.bind(inst.db);
+    let attempts = 0;
+    let sawShadow6 = false;
+    inst.db.transaction = (async (fn) => {
+      if (!isTakeoverTx(fn)) return origTx6(fn);
+      attempts++;
+      if (attempts === 1) sawShadow6 = await shadowExists(shadow6);
+      throw Object.assign(
+        new Error('duplicate key value violates unique constraint "projects_group_slug_key"'),
+        { code: '23505' },
+      );
+    }) as PlatformDb['transaction'];
+    let rExhausted: Awaited<ReturnType<typeof takeover>>;
+    try {
+      rExhausted = await takeover(inst, pid6, [{ name: 'dev', url: dev6.url }], {
+        claim: true,
+        name: 'always-clash',
+      });
+    } finally {
+      inst.db.transaction = origTx6;
+    }
+    expect(sawShadow6).toBe(true);
+    expect(attempts).toBe(4); // 首次 + 最多 3 次重试
+    expect(rExhausted.last, JSON.stringify(rExhausted.events)).toMatchObject({
+      stage: 'write',
+      code: 'slug_conflict',
+    });
+    expect(rExhausted.last.error).not.toContain('服务器内部错误');
+    expect(await shadowExists(shadow6)).toBe(false);
   });
 });
 

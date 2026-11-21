@@ -27,11 +27,11 @@ import { HTTPException } from 'hono/http-exception';
 import { streamSSE } from 'hono/streaming';
 import { audit } from '../audit.ts';
 import { can, userActor } from '../authz.ts';
-import { inList } from '../db.ts';
+import { inList, isUniqueViolation, type PlatformDb } from '../db.ts';
 import { loadChain, loadEnv } from '../envs.ts';
 import { checkEnvDrift, claimFailure } from '../executions.ts';
 import { insertGrant } from '../grants.ts';
-import { type GroupRow, pickProjectSlug } from '../groups.ts';
+import { type GroupRow, pickProjectSlug, projectSlugTaken } from '../groups.ts';
 import { effectiveProjectRole, type RoleLookup } from '../roles.ts';
 import { encrypt, SecretError, scrubSecrets } from '../secrets.ts';
 import { readSettings } from '../settings.ts';
@@ -110,6 +110,46 @@ export const registerTakeover = (app: Hono<Env>, ctx: AppContext) => {
   });
 };
 
+/** 同组自动生成 slug 并发撞名时的最大重试次数 */
+const MAX_SLUG_RETRIES = 3;
+
+/**
+ * 检查目标项目 ID 或任一版本 ID 是否已存在于平台库；已存在时按现有可见性策略抛出结构化
+ * TakeoverRejected('project_exists', …)，对调用者不可见的项目不透露项目名、slug 或所属组。
+ */
+const assertTakeoverNotExists = async (
+  db: PlatformDb,
+  u: { id: string; role: string },
+  projectId: string,
+  versionIds: string[],
+) => {
+  const [exists] = await db.query<{ slug: string; group_slug: string }>(
+    'select p.slug, g.slug as group_slug from projects p join groups g on g.id = p.group_id where p.id = $1',
+    [projectId],
+  );
+  if (exists) {
+    // 调用者看不到的项目不透露名字 / 归属
+    const visible = (await effectiveProjectRole(db, u, projectId)) !== null;
+    throw new TakeoverRejected(
+      'project_exists',
+      visible
+        ? `本实例里已经有这个项目（${exists.group_slug}/${exists.slug}）。要给它添加环境并接入已有历史，请用项目的“添加环境”`
+        : '这个项目已在本实例上存在，请联系管理员',
+    );
+  }
+  if (versionIds.length) {
+    const clash = await db.query<{ id: string }>(
+      `select id from versions where id in (${inList(versionIds)})`,
+      versionIds,
+    );
+    if (clash.length)
+      throw new TakeoverRejected(
+        'project_exists',
+        `本实例里已经有同一个版本（${clash[0]!.id}），不能重复接手`,
+      );
+  }
+};
+
 /** 向导里 kind = takeover：由 wizard.ts 在检查完组权限之后调用 */
 export const runTakeover = (c: Context<Env>, ctx: AppContext, b: ProjectWizard, g: GroupRow) => {
   const { db } = ctx;
@@ -158,8 +198,17 @@ export const runTakeover = (c: Context<Env>, ctx: AppContext, b: ProjectWizard, 
       role: 'admin',
       group: { id: g.id, slug: g.slug, name: g.name },
     };
+    const chooseSlug = async () => {
+      try {
+        return await pickProjectSlug(db, g.id, b.name, b.slug);
+      } catch (e) {
+        if (e instanceof HTTPException && e.status === 409)
+          throw new TakeoverRejected('slug_conflict', e.message);
+        throw e;
+      }
+    };
     try {
-      project.slug = await pickProjectSlug(db, g.id, b.name, b.slug);
+      project.slug = await chooseSlug();
       await send({ stage });
       // 和环境创建同样的检查：连得上（白名单在连接层检查）、影子库能认领
       for (const e of environments) {
@@ -178,30 +227,8 @@ export const runTakeover = (c: Context<Env>, ctx: AppContext, b: ProjectWizard, 
         });
       const merged = mergeHistories(sources);
 
-      const [exists] = await db.query<{ slug: string; group_slug: string }>(
-        'select p.slug, g.slug as group_slug from projects p join groups g on g.id = p.group_id where p.id = $1',
-        [projectId],
-      );
-      if (exists) {
-        // 调用者看不到的项目不透露名字 / 归属
-        const visible = (await effectiveProjectRole(db, u, projectId)) !== null;
-        throw new TakeoverRejected(
-          'project_exists',
-          visible
-            ? `本实例里已经有这个项目（${exists.group_slug}/${exists.slug}）。要给它添加环境并接入已有历史，请用项目的“添加环境”`
-            : '这个项目已在本实例上存在，请联系管理员',
-        );
-      }
-      const ids = merged.versions.map((v) => v.versionId);
-      const clash = await db.query<{ id: string }>(
-        `select id from versions where id in (${ids.map((_, i) => `$${i + 1}`).join(',')})`,
-        ids,
-      );
-      if (clash.length)
-        throw new TakeoverRejected(
-          'project_exists',
-          `本实例里已经有同一个版本（${clash[0]!.id}），不能重复接手`,
-        );
+      const versionIds = merged.versions.map((v) => v.versionId);
+      await assertTakeoverNotExists(db, u, projectId, versionIds);
 
       // 认领：目标库里这个项目的当前认领实例不是本实例，必须由实例管理员明确确认
       const settings = await readSettings(db);
@@ -252,28 +279,69 @@ export const runTakeover = (c: Context<Env>, ctx: AppContext, b: ProjectWizard, 
         shadow_url_enc: e.shadowUrl ? encrypt(e.shadowUrl) : null,
         state: sources.find((s) => s.name === e.name)!.state,
       }));
-      await db.transaction(async (tx) => {
-        await tx.query(
-          'insert into projects (id, name, created_by, group_id, slug, schemas) values ($1, $2, $3, $4, $5, $6::text::jsonb)',
-          [
-            projectId,
-            b.name,
-            u.id,
-            g.id,
-            project.slug,
-            head.scope?.length ? JSON.stringify(head.scope) : null,
-          ],
-        );
-        await insertGrant(tx, {
-          subjectKind: 'user',
-          subjectId: u.id,
-          role: 'admin',
-          scopeKind: 'project',
-          scopeId: projectId,
-          createdBy: u.id,
-        });
-        await restoreChain(tx, { pid: projectId, branch, merged, envs: envRows, verifiedReports });
-      });
+      for (let attempt = 0; ; attempt++) {
+        let txResult: 'ok' | 'project' | 'slug';
+        try {
+          txResult = await db.transaction<'ok' | 'project' | 'slug'>(async (tx) => {
+            // 事务内复查：SQLite 串行事务可直接命中；PG 并发事务若同时通过复查，则由下方 isUniqueViolation 兜底
+            const [existingProject] = await tx.query<{ id: string }>(
+              'select id from projects where id = $1',
+              [projectId],
+            );
+            if (existingProject) return 'project';
+            if (versionIds.length) {
+              const existingVersions = await tx.query<{ id: string }>(
+                `select id from versions where id in (${inList(versionIds)})`,
+                versionIds,
+              );
+              if (existingVersions.length)
+                throw new TakeoverRejected(
+                  'project_exists',
+                  `本实例里已经有同一个版本（${existingVersions[0]!.id}），不能重复接手`,
+                );
+            }
+            if (await projectSlugTaken(tx, g.id, project.slug)) return 'slug';
+            await tx.query(
+              'insert into projects (id, name, created_by, group_id, slug, schemas) values ($1, $2, $3, $4, $5, $6::text::jsonb)',
+              [
+                projectId,
+                b.name,
+                u.id,
+                g.id,
+                project.slug,
+                head.scope?.length ? JSON.stringify(head.scope) : null,
+              ],
+            );
+            await insertGrant(tx, {
+              subjectKind: 'user',
+              subjectId: u.id,
+              role: 'admin',
+              scopeKind: 'project',
+              scopeId: projectId,
+              createdBy: u.id,
+            });
+            await restoreChain(tx, { pid: projectId, branch, merged, envs: envRows, verifiedReports });
+            return 'ok';
+          });
+        } catch (e) {
+          if (!isUniqueViolation(e)) throw e;
+          // 事务回滚后用 db 区分冲突类型：优先判断 projects.id / versions.id（严格沿用权限可见性策略）
+          await assertTakeoverNotExists(db, u, projectId, versionIds);
+          txResult = 'slug';
+        }
+        if (txResult === 'ok') break;
+        if (txResult === 'project') {
+          // 事务外调用 effectiveProjectRole，避免 SQLite 在串行事务内重入 db.query 死锁
+          await assertTakeoverNotExists(db, u, projectId, versionIds);
+          if (attempt < MAX_SLUG_RETRIES) continue;
+          throw new TakeoverRejected('project_exists', '这个项目已在本实例上存在，请联系管理员');
+        }
+        // 仅 (group_id, slug) 撞名：显式 slug 直接返回结构化错误，自动生成 slug 重选并重试（最多 MAX_SLUG_RETRIES 次）
+        if (b.slug) throw new TakeoverRejected('slug_conflict', '这个组里已经有相同的标识');
+        if (attempt >= MAX_SLUG_RETRIES)
+          throw new TakeoverRejected('slug_conflict', '这个组里已经有相同的标识，请重试或手动指定项目标识');
+        project.slug = await chooseSlug();
+      }
       committed = true;
 
       try {
