@@ -42,6 +42,7 @@ import {
   confirmVersion,
   driftInfo,
   type EnvRow,
+  iso,
   loadChain,
   loadEnv,
   markExecuted,
@@ -73,6 +74,47 @@ export class EnvLocks {
   /** 本副本上这个环境现在有没有正在执行的操作 */
   busy(id: string): boolean {
     return this.held.has(id);
+  }
+  /** 集群内任一副本上这个环境现在有没有正在执行的操作（先查本进程，PG 下再非阻塞探测 advisory lock） */
+  async isBusyCluster(id: string): Promise<boolean> {
+    if (this.held.has(id)) return true;
+    if (this.db?.dialect !== 'pg') return false;
+    const res = await this.db.withAdvisoryLock(`env:${id}`, async () => {}, { tryOnly: true });
+    return !res.acquired || this.held.has(id);
+  }
+  /**
+   * 仅在环境空闲时短暂占住环境锁执行 fn（本进程 + PG 下叠加 `env:<id>` advisory lock，不等待）。
+   * 若本进程或其他副本正持有该环境锁，立即返回 `{ acquired: false }`。
+   */
+  async withIdleLock<T>(
+    id: string,
+    fn: () => Promise<T>,
+  ): Promise<{ acquired: true; value: T } | { acquired: false }> {
+    if (this.held.has(id)) return { acquired: false };
+    let releaseLocal!: () => void;
+    this.held.set(
+      id,
+      new Promise<void>((r) => {
+        releaseLocal = r;
+      }),
+    );
+    const freeLocal = () => {
+      this.held.delete(id);
+      releaseLocal();
+    };
+    if (this.db?.dialect !== 'pg') {
+      try {
+        const value = await fn();
+        return { acquired: true, value };
+      } finally {
+        freeLocal();
+      }
+    }
+    try {
+      return await this.db.withAdvisoryLock(`env:${id}`, fn, { tryOnly: true });
+    } finally {
+      freeLocal();
+    }
   }
   /** 本副本当前持有中的环境锁数量 */
   get activeCount(): number {
@@ -447,7 +489,7 @@ export const dryRunExecution = async (
 ): Promise<ExecuteResult> => {
   const { db } = x;
   const env = await loadEnv(db, input.pid, input.env.id);
-  if (x.locks.busy(env.id))
+  if (await x.locks.isBusyCluster(env.id))
     throw new ExecutorError(
       'lock_timeout',
       '这个环境正在执行另一个操作，现在不能执行（预演检查的就是这一点）',
@@ -674,6 +716,74 @@ export interface DriftCheckDetailed {
   error?: unknown;
 }
 
+interface EnvDriftSnapshot {
+  urlEnc: string;
+  currentVersionId: string | null;
+  lastDriftCheck: string | null;
+  driftStatus: EnvRow['drift_status'];
+  driftSummaryJson: string;
+}
+
+const takeDriftSnapshot = (env: EnvRow): EnvDriftSnapshot => ({
+  urlEnc: env.url_enc,
+  currentVersionId: env.current_version_id,
+  lastDriftCheck: iso(env.last_drift_check),
+  driftStatus: env.drift_status,
+  driftSummaryJson: JSON.stringify(env.drift_summary ?? null),
+});
+
+const matchesDriftSnapshot = (row: EnvRow, snap: EnvDriftSnapshot): boolean =>
+  row.url_enc === snap.urlEnc &&
+  row.current_version_id === snap.currentVersionId &&
+  iso(row.last_drift_check) === snap.lastDriftCheck &&
+  row.drift_status === snap.driftStatus &&
+  JSON.stringify(row.drift_summary ?? null) === snap.driftSummaryJson;
+
+type CommitDriftResult =
+  | { written: true; result: DriftCheckResponse }
+  | { written: false; result: DriftCheckResponse };
+
+const readLatestDrift = async (db: PlatformDb, env: EnvRow): Promise<DriftInfo> => {
+  const [latest] = await db.query<EnvRow>('select * from environments where id = $1 and project_id = $2', [
+    env.id,
+    env.project_id,
+  ]);
+  return driftInfo(latest ?? env);
+};
+
+/**
+ * 在跨副本非阻塞 `env:<id>` 锁内复核环境快照并写回漂移结果：
+ * - 拿不到锁（本副本或其他副本正持有该环境锁）→ 按 busy 跳过写回；
+ * - 锁内重读环境行：若环境已删除，或 url_enc / current_version_id / last_drift_check / drift_status / drift_summary
+ *   任一已被并发执行、换连接串或更新的检查推进 → 放弃写回，返回最新缓存并标 skipped = 'busy'，避免旧探测覆盖新状态。
+ */
+const commitDrift = async (
+  x: ExecContext,
+  env: EnvRow,
+  snapshot: EnvDriftSnapshot,
+  status: EnvRow['drift_status'],
+  summary: DriftSummary | null,
+): Promise<CommitDriftResult> => {
+  const { db } = x;
+  const locked = await x.locks.withIdleLock<CommitDriftResult>(env.id, async () => {
+    const [latest] = await db.query<EnvRow>('select * from environments where id = $1 and project_id = $2', [
+      env.id,
+      env.project_id,
+    ]);
+    if (!latest) return { written: false, result: { ...driftInfo(env), skipped: 'busy' } };
+    if (!matchesDriftSnapshot(latest, snapshot)) {
+      return { written: false, result: { ...driftInfo(latest), skipped: 'busy' } };
+    }
+    const at = new Date().toISOString();
+    await setDrift(db, env.id, status, summary, at);
+    return { written: true, result: { status, checkedAt: at, summary, skipped: null } };
+  });
+  if (!locked.acquired) {
+    return { written: false, result: { ...(await readLatestDrift(db, env)), skipped: 'busy' } };
+  }
+  return locked.value;
+};
+
 /**
  * 检查一个环境的漂移并写进缓存，附带实时读到的当前版本 ID 与原始错误（供 CI 漂移接口精确映射）。
  * 正在执行 / 上次停在中途 / 项目没有版本时跳过（不改缓存）；检查失败记为 error，并按真实原因分类
@@ -683,35 +793,36 @@ export const checkEnvDriftDetailed = async (x: ExecContext, given: EnvRow): Prom
   const { db } = x;
   // 重新读一遍环境行：调用方（定时检查一轮里的后面几个环境）手里的可能已经过期（换了连接串、被删了：404）
   const env = await loadEnv(db, given.project_id, given.id);
+  const snapshot = takeDriftSnapshot(env);
   // 所有返回的漂移信息都经过 driftInfo（清洗旧格式）
   const current = (): DriftInfo => driftInfo(env);
-  if (x.locks.busy(env.id)) return { result: { ...current(), skipped: 'busy' } };
+  if (await x.locks.isBusyCluster(env.id)) return { result: { ...current(), skipped: 'busy' } };
   let url = '';
   let conn: ReturnType<typeof open> | null = null;
+  let rep: DriftReport;
+  let chain: ChainVersion[];
   try {
     url = decrypt(env.url_enc);
-    const chain = await loadChain(db, env.project_id);
+    chain = await loadChain(db, env.project_id);
     conn = open(url, x.guard, CHECK_CONNECT_TIMEOUT);
-    const rep = await checkDrift({ db: conn.db, projectId: env.project_id, chain });
-    if (rep.status === 'skipped') return { result: { ...current(), skipped: rep.reason } };
-    // 检查期间如果开始了执行，结果作废（结构可能是半途状态）
-    if (x.locks.busy(env.id)) return { result: { ...current(), skipped: 'busy' } };
-    const at = new Date().toISOString();
-    const currentVersionId = rep.firstRun ? null : rep.version;
-    if (rep.status === 'ok') {
-      await setDrift(db, env.id, 'ok', null, at);
-      return { result: { status: 'ok', checkedAt: at, summary: null, skipped: null }, currentVersionId };
-    }
-    const summary = summaryOf(rep, chain);
-    await setDrift(db, env.id, 'drifted', summary, at);
-    return { result: { status: 'drifted', checkedAt: at, summary, skipped: null }, currentVersionId };
+    rep = await checkDrift({ db: conn.db, projectId: env.project_id, chain });
   } catch (e) {
     if (e instanceof HTTPException) throw e;
     const c = classifyError(e, url);
-    return { result: await recordError(db, env, c.kind, c.message), error: e };
+    const committed = await recordError(x, env, snapshot, c.kind, c.message);
+    if (!committed.written) return { result: committed.result };
+    return { result: committed.result, error: e };
   } finally {
     await conn?.close().catch(() => {});
   }
+  if (rep.status === 'skipped') return { result: { ...current(), skipped: rep.reason } };
+  const currentVersionId = rep.firstRun ? null : rep.version;
+  const committed =
+    rep.status === 'ok'
+      ? await commitDrift(x, env, snapshot, 'ok', null)
+      : await commitDrift(x, env, snapshot, 'drifted', summaryOf(rep, chain));
+  if (!committed.written) return { result: committed.result };
+  return { result: committed.result, currentVersionId };
 };
 
 /** 检查一个环境的漂移并写进缓存。手动检查和定时检查共用。 */
@@ -719,12 +830,12 @@ export const checkEnvDrift = async (x: ExecContext, given: EnvRow): Promise<Drif
   (await checkEnvDriftDetailed(x, given)).result;
 
 const recordError = async (
-  db: PlatformDb,
+  x: ExecContext,
   env: EnvRow,
+  snapshot: EnvDriftSnapshot,
   errorKind: ErrorKind,
   message: string,
-): Promise<DriftCheckResponse> => {
-  const at = new Date().toISOString();
+): Promise<CommitDriftResult> => {
   const summary: DriftSummary = {
     versionId: null,
     versionNumber: null,
@@ -733,8 +844,7 @@ const recordError = async (
     message: scrubSecrets(message),
     errorKind,
   };
-  await setDrift(db, env.id, 'error', summary, at);
-  return { status: 'error', checkedAt: at, summary, skipped: null };
+  return commitDrift(x, env, snapshot, 'error', summary);
 };
 
 // ───── 标记为已执行（ADR 0004） ─────
@@ -842,7 +952,7 @@ export const dryRunMark = async (
 ): Promise<MarkResult> => {
   const { db } = x;
   const env = await loadEnv(db, input.pid, input.env.id);
-  if (x.locks.busy(env.id))
+  if (await x.locks.isBusyCluster(env.id))
     throw new ExecutorError(
       'lock_timeout',
       '这个环境正在执行另一个操作，现在不能标记（预演检查的就是这一点）',

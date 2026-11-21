@@ -14,20 +14,39 @@ import type {
   RepairScript,
 } from '@dowel/api';
 import { addColumn, all, dropColumn, type Model, renameColumn } from '@dowel/core';
+import { ExecutorError } from '@dowel/executor';
 import { afterAll, beforeAll, describe, expect, test, vi } from 'vitest';
 import { connect, createTestDb, PG_URL } from '../../../test/pg.ts';
 import { versionExecutedAnywhere } from '../src/chain.ts';
+import { type EnvRow, iso, loadEnv, setDrift } from '../src/envs.ts';
+import {
+  checkEnvDriftDetailed,
+  DRY_RUN_LOCK_WAIT_MS,
+  dryRunExecution,
+  dryRunMark,
+  EnvLocks,
+} from '../src/executions.ts';
 import { createApp, openPlatformDb, type PlatformDb } from '../src/index.ts';
 import { KeyedLimiter, LoginLimiter } from '../src/rate-limit.ts';
 import { addTable, editModel, makeUser, PASSWORD } from './support.ts';
 
-// 读目标库结构（readSnapshot）可以按需失败：测“读到当前版本之后才出错”时审计 from 仍然是实际读到的版本
-const flaky = vi.hoisted(() => ({ readSnapshot: false }));
+// 读目标库结构（readSnapshot）可以按需失败或注入并发动作：
+// 1. 测“读到当前版本之后才出错”时审计 from 仍然是实际读到的版本；
+// 2. 测漂移检查探测期间另一副本持锁 / 推进状态 / 换连接串时，旧探测放弃写回。
+const flaky = vi.hoisted(() => ({
+  readSnapshot: false,
+  onReadSnapshot: undefined as (() => Promise<void> | void) | undefined,
+}));
 vi.mock('@dowel/engines', async (orig) => {
   const m = await orig<typeof import('@dowel/engines')>();
   return {
     ...m,
-    readSnapshot: (...a: Parameters<typeof m.readSnapshot>) => {
+    readSnapshot: async (...a: Parameters<typeof m.readSnapshot>) => {
+      if (flaky.onReadSnapshot) {
+        const hook = flaky.onReadSnapshot;
+        flaky.onReadSnapshot = undefined;
+        await hook();
+      }
       if (flaky.readSnapshot) throw new Error('boom: connection reset by peer');
       return m.readSnapshot(...a);
     },
@@ -805,6 +824,447 @@ describe.skipIf(!PG_URL)('漂移的两个出口与标记为已执行', () => {
     ).map((a) => a.data);
     expect(audits.at(-1)).toMatchObject({ ok: false, from: chain[0]!.id });
     expect(audits.at(-1)!.code).not.toBe('lock_timeout');
+  });
+});
+
+describe('EnvLocks.isBusyCluster 与 withIdleLock（单进程单测）', () => {
+  test('空闲时非阻塞获取并执行；持锁期间立即返回忙态；异常退出后自动释放', async () => {
+    const db = await openPlatformDb(':memory:');
+    try {
+      const locks = new EnvLocks(db);
+      expect(await locks.isBusyCluster('e1')).toBe(false);
+
+      const release = await locks.acquire('e1');
+      try {
+        expect(await locks.isBusyCluster('e1')).toBe(true);
+        let ran = false;
+        const skipped = await locks.withIdleLock('e1', async () => {
+          ran = true;
+          return 'should-not-run';
+        });
+        expect(skipped).toEqual({ acquired: false });
+        expect(ran).toBe(false);
+      } finally {
+        await release();
+      }
+
+      expect(await locks.isBusyCluster('e1')).toBe(false);
+
+      const ok = await locks.withIdleLock('e1', async () => {
+        expect(locks.busy('e1')).toBe(true);
+        expect(await locks.isBusyCluster('e1')).toBe(true);
+        const nested = await locks.withIdleLock('e1', async () => 'nested');
+        expect(nested).toEqual({ acquired: false });
+        return 42;
+      });
+      expect(ok).toEqual({ acquired: true, value: 42 });
+      expect(locks.busy('e1')).toBe(false);
+      expect(await locks.isBusyCluster('e1')).toBe(false);
+
+      await expect(
+        locks.withIdleLock('e1', async () => {
+          throw new Error('boom');
+        }),
+      ).rejects.toThrow('boom');
+      expect(locks.busy('e1')).toBe(false);
+      expect(await locks.isBusyCluster('e1')).toBe(false);
+    } finally {
+      await db.close();
+    }
+  });
+});
+
+describe.skipIf(!PG_URL)('多副本跨进程漂移写回与预演锁保护（真实 PG）', () => {
+  let platformPg: Awaited<ReturnType<typeof createTestDb>>;
+  let dbA: PlatformDb;
+  let dbB: PlatformDb;
+  let appA: ReturnType<typeof createApp>;
+  let appB: ReturnType<typeof createApp>;
+  let cookieA = '';
+  let groupId = '';
+  const extraTargets: Awaited<ReturnType<typeof createTestDb>>[] = [];
+
+  const callOn = async (
+    targetApp: ReturnType<typeof createApp>,
+    method: string,
+    path: string,
+    json?: unknown,
+    cookie = cookieA,
+  ) => {
+    const headers: Record<string, string> = {};
+    if (json !== undefined) headers['content-type'] = 'application/json';
+    if (cookie) headers.cookie = cookie;
+    const res = await targetApp.app.request(path, {
+      method,
+      headers,
+      body: json === undefined ? undefined : JSON.stringify(json),
+    });
+    const text = await res.text();
+    let data: unknown = text;
+    let events: ExecEvent[] = [];
+    if (res.headers.get('content-type')?.includes('text/event-stream'))
+      events = text
+        .split('\n\n')
+        .filter((x) => x.trim())
+        .map((chunk) => JSON.parse(chunk.replace(/^data: /, '')) as ExecEvent);
+    else
+      try {
+        data = JSON.parse(text);
+      } catch {}
+    return { status: res.status, data: data as Body, events };
+  };
+
+  const setupProject = async (name: string) => {
+    const p = await callOn(appA, 'POST', '/api/projects', { name, groupId });
+    expect(p.status).toBe(201);
+    const pid = p.data.id as string;
+    const target = await createTestDb('drift_ha_tgt');
+    extraTargets.push(target);
+    const e = await callOn(appA, 'POST', `/api/projects/${pid}/environments`, {
+      name: 'prod-like',
+      url: target.url,
+      production: false,
+      allowSameInstance: true,
+    });
+    expect(e.status).toBe(201);
+    const eid = e.data.id as string;
+    const versions: { id: string; number: number }[] = [];
+    for (let i = 1; i <= 2; i++) {
+      if (i === 1) await addTable(appA.rooms, dbA, pid);
+      else
+        await editModel(appA.rooms, dbA, pid, (m) => {
+          addColumn(m, tableOf(m), { name: `c${i}`, type: 'text' });
+        });
+      const r = await callOn(appA, 'POST', `/api/projects/${pid}/versions`, { name: `v${i}` });
+      expect(r.status, JSON.stringify(r.data)).toBe(201);
+      versions.push({ id: r.data.id as string, number: r.data.number as number });
+    }
+    const execRes = await callOn(appA, 'POST', `/api/projects/${pid}/environments/${eid}/execute`, {
+      to: versions[0]!.id,
+    });
+    expect(execRes.events.at(-1), JSON.stringify(execRes.events)).toMatchObject({ stage: 'done' });
+    return { pid, eid, target, v1: versions[0]!, v2: versions[1]! };
+  };
+
+  const readEnv = async (db: PlatformDb, eid: string): Promise<EnvRow> => {
+    const [row] = await db.query<EnvRow>('select * from environments where id = $1', [eid]);
+    return row!;
+  };
+
+  beforeAll(async () => {
+    platformPg = await createTestDb('drift_ha_platform');
+    dbA = await openPlatformDb(platformPg.url);
+    dbB = await openPlatformDb(platformPg.url);
+    const opts = () => ({
+      loginLimiter: new LoginLimiter({ limit: 10_000, ipLimit: 10_000 }),
+      connectionLimiter: new KeyedLimiter({ limit: 10_000, windowMs: 60_000 }),
+    });
+    appA = createApp(dbA, opts());
+    appB = createApp(dbB, opts());
+    await makeUser(dbA, 'admin', { name: '管理员', role: 'admin' });
+    const loginRes = await appA.app.request('/api/auth/login', {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ username: 'admin', password: PASSWORD }),
+    });
+    expect(loginRes.status).toBe(200);
+    cookieA = (loginRes.headers.get('set-cookie') ?? '').split(';')[0]!;
+    const g = await callOn(appA, 'POST', '/api/groups', { slug: 'ha-g', name: '多副本组' });
+    expect(g.status).toBe(201);
+    groupId = g.data.id as string;
+  });
+
+  afterAll(async () => {
+    flaky.onReadSnapshot = undefined;
+    flaky.readSnapshot = false;
+    await appA.rooms.flush();
+    await appB.rooms.flush();
+    await appA.shadows.close();
+    await appB.shadows.close();
+    await dbA.close();
+    await dbB.close();
+    await platformPg.close();
+    const adminConn = connect(PG_URL);
+    for (const t of extraTargets) {
+      await adminConn.db.exec(
+        `DROP DATABASE IF EXISTS ${new URL(t.url).pathname.slice(1)}_dowel WITH (FORCE)`,
+      );
+      await t.close();
+    }
+    await adminConn.close();
+  });
+
+  test('副本 A 持有 env:<id> 锁期间，副本 B 的 dryRunExecution / dryRunMark 快速短路拒绝且 checkEnvDriftDetailed 返回 skipped: busy', async () => {
+    const { pid, eid, v1, v2 } = await setupProject('ha-busy-shortcircuit');
+    const envBefore = await loadEnv(dbB, pid, eid);
+    const releaseA = await appA.exec.locks.acquire(eid);
+    try {
+      expect(appA.exec.locks.busy(eid)).toBe(true);
+      expect(appB.exec.locks.busy(eid)).toBe(false);
+      expect(await appB.exec.locks.isBusyCluster(eid)).toBe(true);
+
+      let ran = false;
+      expect(
+        await appB.exec.locks.withIdleLock(eid, async () => {
+          ran = true;
+          return true;
+        }),
+      ).toEqual({ acquired: false });
+      expect(ran).toBe(false);
+
+      // dryRunExecution 跨副本快速短路，不等目标库锁（远快于 DRY_RUN_LOCK_WAIT_MS）
+      const t0 = Date.now();
+      let dryErr: unknown;
+      try {
+        await dryRunExecution(appB.exec, {
+          pid,
+          projectName: 'ha-busy-shortcircuit',
+          env: envBefore,
+          mode: 'migrate',
+          to: v2.id,
+          direction: 'up',
+          userId: 'u-admin',
+        });
+      } catch (e) {
+        dryErr = e;
+      }
+      expect(dryErr).toBeInstanceOf(ExecutorError);
+      expect((dryErr as ExecutorError).code).toBe('lock_timeout');
+      expect(Date.now() - t0).toBeLessThan(DRY_RUN_LOCK_WAIT_MS);
+
+      // dryRunMark 同样跨副本快速短路
+      let markErr: unknown;
+      try {
+        await dryRunMark(appB.exec, {
+          pid,
+          projectName: 'ha-busy-shortcircuit',
+          env: envBefore,
+          to: v1.id,
+          userId: 'u-admin',
+        });
+      } catch (e) {
+        markErr = e;
+      }
+      expect(markErr).toBeInstanceOf(ExecutorError);
+      expect((markErr as ExecutorError).code).toBe('lock_timeout');
+
+      // checkEnvDriftDetailed 立即返回 skipped: 'busy'，且不写回平台库
+      const detailed = await checkEnvDriftDetailed(appB.exec, envBefore);
+      expect(detailed.result.skipped).toBe('busy');
+      expect(detailed.error).toBeUndefined();
+      const after = await readEnv(dbA, eid);
+      expect(after.drift_status).toBe(envBefore.drift_status);
+      expect(iso(after.last_drift_check)).toBe(iso(envBefore.last_drift_check));
+    } finally {
+      await releaseA();
+    }
+
+    // 释放锁后，副本 B 恢复正常
+    expect(await appB.exec.locks.isBusyCluster(eid)).toBe(false);
+    const dryOk = await dryRunExecution(appB.exec, {
+      pid,
+      projectName: 'ha-busy-shortcircuit',
+      env: await loadEnv(dbB, pid, eid),
+      mode: 'migrate',
+      to: v2.id,
+      direction: 'up',
+      userId: 'u-admin',
+    });
+    expect(dryOk.dryRun).toBeTruthy();
+    const driftOk = await checkEnvDriftDetailed(appB.exec, await loadEnv(dbB, pid, eid));
+    expect(driftOk.result).toMatchObject({ status: 'ok', skipped: null });
+  });
+
+  test('探测期间另一副本持锁未释放：正常 ok 与异常 recordError 两条路径均放弃写回', async () => {
+    const { pid, eid } = await setupProject('ha-inflight-lock');
+    const initialAt = '2026-11-20T00:00:00.000Z';
+    const initialSummary = {
+      versionId: null,
+      versionNumber: 1,
+      total: 1,
+      items: [
+        { kind: 'addColumn', target: 'public.orders.x', sql: 'ALTER TABLE public.orders ADD COLUMN x int' },
+      ],
+      message: '这些差异是上一次执行留下的，需要手工修正',
+    };
+    await setDrift(dbA, eid, 'drifted', initialSummary, initialAt);
+
+    // 1. 正常 ok 路径：探测途中副本 A 拿到锁，副本 B 写回时拿不到 env:<id> 锁，按 busy 放弃写回
+    let releaseA: () => Promise<void> = async () => {};
+    flaky.onReadSnapshot = async () => {
+      releaseA = await appA.exec.locks.acquire(eid);
+    };
+    try {
+      const detailed = await checkEnvDriftDetailed(appB.exec, await loadEnv(dbB, pid, eid));
+      expect(detailed.result).toMatchObject({ status: 'drifted', skipped: 'busy' });
+      expect(detailed.currentVersionId).toBeUndefined();
+      const row = await readEnv(dbA, eid);
+      expect(row.drift_status).toBe('drifted');
+      expect(iso(row.last_drift_check)).toBe(initialAt);
+    } finally {
+      flaky.onReadSnapshot = undefined;
+      await releaseA();
+      releaseA = async () => {};
+    }
+
+    // 2. 异常 recordError 路径：探测途中副本 A 拿到锁且探测抛错，副本 B 不得写回 error 覆盖 drifted
+    flaky.onReadSnapshot = async () => {
+      releaseA = await appA.exec.locks.acquire(eid);
+      throw new Error('simulated target disconnect');
+    };
+    try {
+      const detailed = await checkEnvDriftDetailed(appB.exec, await loadEnv(dbB, pid, eid));
+      expect(detailed.result).toMatchObject({ status: 'drifted', skipped: 'busy' });
+      expect(detailed.error).toBeUndefined();
+      const row = await readEnv(dbA, eid);
+      expect(row.drift_status).toBe('drifted');
+      expect(iso(row.last_drift_check)).toBe(initialAt);
+    } finally {
+      flaky.onReadSnapshot = undefined;
+      await releaseA();
+      releaseA = async () => {};
+    }
+  });
+
+  test('探测期间另一副本推进 drift_status（needsManual）或 current_version_id 后，旧探测（正常 ok 与 recordError）放弃写回不覆盖最新状态', async () => {
+    const { pid, eid, v1, v2 } = await setupProject('ha-stale-state');
+    const manualSummary = {
+      versionId: v1.id,
+      versionNumber: 1,
+      total: 1,
+      items: [{ kind: 'dropIndex', target: 'public.ix_extra', sql: 'DROP INDEX public.ix_extra' }],
+      message: '这些差异是上一次执行留下的，需要手工修正',
+      needsManual: { direction: 'up' as const, versionId: v2.id, versionNumber: 2 },
+    };
+
+    // 1. 正常 ok 路径：探测期间副本 A 完成执行失败写入 drifted + needsManual 并释放锁，旧探测不得写回 ok 覆盖
+    let pushedAt = '';
+    flaky.onReadSnapshot = async () => {
+      const rel = await appA.exec.locks.acquire(eid);
+      try {
+        pushedAt = new Date(Date.now() + 1000).toISOString();
+        await setDrift(dbA, eid, 'drifted', manualSummary, pushedAt);
+      } finally {
+        await rel();
+      }
+    };
+    try {
+      const detailed = await checkEnvDriftDetailed(appB.exec, await loadEnv(dbB, pid, eid));
+      expect(detailed.result).toMatchObject({
+        status: 'drifted',
+        skipped: 'busy',
+        summary: { needsManual: manualSummary.needsManual },
+      });
+      expect(detailed.currentVersionId).toBeUndefined();
+      const row = await readEnv(dbA, eid);
+      expect(row.drift_status).toBe('drifted');
+      expect(row.drift_summary?.needsManual).toEqual(manualSummary.needsManual);
+      expect(iso(row.last_drift_check)).toBe(pushedAt);
+    } finally {
+      flaky.onReadSnapshot = undefined;
+    }
+
+    // 2. 正常 ok 路径：探测期间另一副本推进了 current_version_id，旧探测放弃写回
+    const beforeAdvance = await readEnv(dbA, eid);
+    flaky.onReadSnapshot = async () => {
+      const rel = await appA.exec.locks.acquire(eid);
+      try {
+        await dbA.query('update environments set current_version_id = $2 where id = $1', [eid, v2.id]);
+      } finally {
+        await rel();
+      }
+    };
+    try {
+      const detailed = await checkEnvDriftDetailed(appB.exec, await loadEnv(dbB, pid, eid));
+      expect(detailed.result.skipped).toBe('busy');
+      const row = await readEnv(dbA, eid);
+      expect(row.current_version_id).toBe(v2.id);
+      expect(row.drift_status).toBe(beforeAdvance.drift_status);
+      expect(iso(row.last_drift_check)).toBe(iso(beforeAdvance.last_drift_check));
+    } finally {
+      flaky.onReadSnapshot = undefined;
+    }
+
+    // 3. 异常 recordError 路径：探测期间另一副本推进了 current_version_id 并写入 ok，旧探测抛错不得回写 error 覆盖
+    const okAt = new Date(Date.now() + 2000).toISOString();
+    flaky.onReadSnapshot = async () => {
+      const rel = await appA.exec.locks.acquire(eid);
+      try {
+        await dbA.query('update environments set current_version_id = $2 where id = $1', [eid, v1.id]);
+        await setDrift(dbA, eid, 'ok', null, okAt);
+      } finally {
+        await rel();
+      }
+      throw new Error('stale probe failure');
+    };
+    try {
+      const detailed = await checkEnvDriftDetailed(appB.exec, await loadEnv(dbB, pid, eid));
+      expect(detailed.result).toMatchObject({ status: 'ok', skipped: 'busy' });
+      expect(detailed.error).toBeUndefined();
+      const row = await readEnv(dbA, eid);
+      expect(row.drift_status).toBe('ok');
+      expect(row.drift_summary).toBeNull();
+      expect(iso(row.last_drift_check)).toBe(okAt);
+    } finally {
+      flaky.onReadSnapshot = undefined;
+    }
+  });
+
+  test('探测期间另一副本 PATCH 更换 url 重置为 unknown 后，旧探测（正常 ok 与异常 recordError）均放弃写回不污染新库记录', async () => {
+    const { pid, eid, target: target1 } = await setupProject('ha-url-replaced');
+    const target2 = await createTestDb('drift_ha_tgt2');
+    extraTargets.push(target2);
+
+    // 1. 正常 ok 路径：副本 B 拿着旧连接串探测 target1 期间，副本 A PATCH 更换 url 到 target2
+    flaky.onReadSnapshot = async () => {
+      const patch = await callOn(appA, 'PATCH', `/api/projects/${pid}/environments/${eid}`, {
+        url: target2.url,
+      });
+      expect(patch.status, JSON.stringify(patch.data)).toBe(200);
+    };
+    try {
+      const detailed = await checkEnvDriftDetailed(appB.exec, await loadEnv(dbB, pid, eid));
+      expect(detailed.result).toEqual({
+        status: 'unknown',
+        checkedAt: null,
+        summary: null,
+        skipped: 'busy',
+      });
+      expect(detailed.currentVersionId).toBeUndefined();
+      const row = await readEnv(dbA, eid);
+      expect(row.drift_status).toBe('unknown');
+      expect(row.drift_summary).toBeNull();
+      expect(row.last_drift_check).toBeNull();
+      expect(row.current_version_id).toBeNull();
+    } finally {
+      flaky.onReadSnapshot = undefined;
+    }
+
+    // 2. 异常 recordError 路径：副本 B 拿着 target2 探测抛错期间，副本 A PATCH 更换 url 回 target1
+    flaky.onReadSnapshot = async () => {
+      const patch = await callOn(appA, 'PATCH', `/api/projects/${pid}/environments/${eid}`, {
+        url: target1.url,
+      });
+      expect(patch.status, JSON.stringify(patch.data)).toBe(200);
+      throw new Error('old target unavailable after cutover');
+    };
+    try {
+      const detailed = await checkEnvDriftDetailed(appB.exec, await loadEnv(dbB, pid, eid));
+      expect(detailed.result).toEqual({
+        status: 'unknown',
+        checkedAt: null,
+        summary: null,
+        skipped: 'busy',
+      });
+      expect(detailed.error).toBeUndefined();
+      const row = await readEnv(dbA, eid);
+      expect(row.drift_status).toBe('unknown');
+      expect(row.drift_summary).toBeNull();
+      expect(row.last_drift_check).toBeNull();
+      expect(row.current_version_id).toBeNull();
+    } finally {
+      flaky.onReadSnapshot = undefined;
+    }
   });
 });
 
