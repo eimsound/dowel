@@ -88,6 +88,8 @@ jobs:
       - run: pnpm vitest run packages/engines/test/roundtrip.test.ts packages/engines/test/pagila.test.ts packages/verifier/test/pg-matrix.test.ts
         env:
           DOWEL_PG_IMAGE: pgvector/pgvector:pg${{ matrix.pg }}
+          DOWEL_TEST_MYSQL: skip
+          DOWEL_TEST_MSSQL: skip
 
   mysql-matrix:
     name: MySQL 多版本矩阵（MySQL ${{ matrix.mysql }}）

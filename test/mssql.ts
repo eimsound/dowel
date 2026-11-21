@@ -1,6 +1,6 @@
 // 测试用 MSSQL（SQL Server 2019 / 2022 / 2025）辅助封装：
 // - 优先读取 globalSetup 注入的共享 `mssqlUrl`；
-// - DOWEL_TEST_MSSQL=skip 或未设置 MSSQL_VERSION/DOWEL_TEST_MSSQL 时干净跳过，绝不把 'skip' 当 URL 或多 worker 并行拉容器；
+// - DOWEL_TEST_MSSQL=skip|0|false|none|off 或未设置 MSSQL_VERSION/DOWEL_TEST_MSSQL 时干净跳过，绝不把跳过标记当 URL 或多 worker 并行拉容器；
 // - 每个测试通过独立 CREATE DATABASE / DROP DATABASE 隔离。
 import { type Db, fromMssql } from '@dowel/engines';
 import sql from 'mssql';
@@ -11,6 +11,8 @@ import { mssqlIdent, mssqlLiteral } from '../packages/core/src/mssql/quote.ts';
 import { MSSQL_IMAGE, MSSQL_VERSION, type MssqlTestVersion, startMssql } from './mssql-container.ts';
 
 export { MSSQL_IMAGE, MSSQL_VERSION, type MssqlTestVersion };
+
+const SKIP_RE = /^(?:skip|0|false|none|off)$/i;
 
 let fallbackPromise: Promise<{ url: string; stop: () => Promise<void> } | null> | null = null;
 let cleanupRegistered = false;
@@ -26,13 +28,18 @@ const injectedMssqlUrl = (): string => {
 /** 获取全局共享 MSSQL 测试实例的 master 管理连接串；跳过或不可用时返回 null */
 export const getMssqlAdminUrl = async (): Promise<string | null> => {
   const given = process.env.DOWEL_TEST_MSSQL?.trim();
-  if (given === 'skip') return null;
-  if (given) return given;
+  if (given) {
+    if (SKIP_RE.test(given)) return null;
+    return given;
+  }
 
   const provided = injectedMssqlUrl().trim();
-  if (provided && provided !== 'skip') return provided;
+  if (provided) {
+    if (SKIP_RE.test(provided)) return null;
+    return provided;
+  }
 
-  if (!process.env.MSSQL_VERSION && !process.env.DOWEL_MSSQL_IMAGE) return null;
+  if (!process.env.MSSQL_VERSION?.trim() && !process.env.DOWEL_MSSQL_IMAGE?.trim()) return null;
 
   fallbackPromise ??= (async () => {
     const started = await startMssql();

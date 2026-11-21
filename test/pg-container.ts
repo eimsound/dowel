@@ -1,13 +1,20 @@
-// 测试用的 PostgreSQL：优先用 DOWEL_TEST_PG 指定的实例；否则用 Testcontainers 起一个容器（带 pgvector 的 PG 18）。
-// 没有 Docker 时返回 null，需要 PG 的测试跳过并给出警告；CI 上没有 Docker 直接报错，避免悄悄跳过。
+// 测试用的 PostgreSQL：
+// - DOWEL_TEST_PG=skip|0|false|none|off：显式跳过；
+// - DOWEL_TEST_PG=<url>：直接使用外部实例；
+// - 否则用 Testcontainers 起一个容器（带 pgvector 的 PG 18）；没有 Docker 时返回 null 并给出警告，CI 上直接报错避免悄悄跳过。
 import { PostgreSqlContainer } from '@testcontainers/postgresql';
 import { getContainerRuntimeClient } from 'testcontainers';
+
+const SKIP_RE = /^(?:skip|0|false|none|off)$/i;
 
 export const PG_IMAGE = process.env.DOWEL_PG_IMAGE ?? 'pgvector/pgvector:pg18';
 
 export const startPg = async (): Promise<{ url: string; stop: () => Promise<void> } | null> => {
-  const given = process.env.DOWEL_TEST_PG;
-  if (given) return { url: given, stop: async () => {} };
+  const given = process.env.DOWEL_TEST_PG?.trim();
+  if (given) {
+    if (SKIP_RE.test(given)) return null;
+    return { url: given, stop: async () => {} };
+  }
   try {
     await getContainerRuntimeClient();
   } catch (e) {
