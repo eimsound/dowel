@@ -702,4 +702,103 @@ describe('MSSQL core dialect: quote, lexer, batch splitter, naming, types, nontx
       (mDropSeq.objects[cSeq] as { ext?: { mssql?: { defaultName?: string } } }).ext?.mssql?.defaultName,
     ).toBeUndefined();
   });
+
+  it('closes R2 review gaps: sp_rename parsing, class-qualified TRANSFER, multi-word ON scope::, query hints, qualified datename, and trigger obj namespace', () => {
+    // 1. sp_rename: block trailing statement override, duplicates, positional+named overwrite, bad arity, numbered procs, trailing junk, empty string, concatenation, dangling comma
+    for (const bad of [
+      "EXEC sys.sp_rename @objname = N'[dowel].[history]', @newname = N'evil'\nSELECT @a = 1, @objname = N'[dbo].[ok]';",
+      "EXEC sys.sp_rename @objname = N'[dowel].[history]', @objname = N'[dbo].[ok]', @newname = N'evil';",
+      "EXEC sys.sp_rename N'[dowel].[history]', @objname = N'[dbo].[ok]', @newname = N'evil';",
+      "EXEC sys.sp_rename N'[dbo].[users]'",
+      "EXEC sys.sp_rename N'[dbo].[users]', N'members', N'OBJECT', N'extra'",
+      "EXEC sys.sp_rename;1 N'[dowel].[history]', N'evil';",
+      "EXEC sys.sp_rename;1 N'[dbo].[users]', N'members';",
+      "EXEC sys.sp_rename N'[dbo].[users] extra', N'members'",
+      "EXEC sys.sp_rename N'', N'members'",
+      "EXEC sys.sp_rename N'[dow' + N'el].[history]', N'evil'",
+      "EXEC sys.sp_rename @objname = N'[dbo].[users]', N'members'",
+      "EXEC sys.sp_rename N'[dbo].[users]', N'members',",
+      "EXEC sys.sp_rename N'[dbo].[users]', N'members',;",
+      // Class-qualified ALTER SCHEMA ... TRANSFER
+      'ALTER SCHEMA [dbo] TRANSFER OBJECT::[dowel].[history];',
+      'ALTER SCHEMA [dbo] TRANSFER TYPE::[dowel].[my_type];',
+      'ALTER SCHEMA [dbo] TRANSFER XML SCHEMA COLLECTION::[dowel].[my_xml];',
+      // Multi-word ON <scope>::
+      'GRANT CONTROL ON SERVER ROLE::[sysadmin] TO [u]',
+      'ALTER AUTHORIZATION ON AVAILABILITY GROUP::[ag1] TO [sa]',
+      'GRANT CONTROL ON XML SCHEMA COLLECTION::[dowel].[x] TO [u]',
+      // Top-level USE remains blocked in migration / nontx guard
+      'USE hint (SELECT 1)',
+      'USE [MyDb]\nGO\nCREATE TABLE [dbo].[t] ([id] int)',
+    ]) {
+      expect(findInstanceLevelStatement(bad, 'mssql'), `expected block: ${bad}`).not.toBeNull();
+    }
+
+    // Legitimate scripts without semicolons, class-qualified app TRANSFER, and USE HINT/PLAN query hints must pass
+    for (const ok of [
+      "EXEC sys.sp_rename N'[dbo].[users]', N'members'\nSELECT 1, 2, 3",
+      "EXEC sys.sp_rename N'[dbo].[users]', N'members'\nEXEC sys.sp_rename N'[dbo].[orders]', N'purchases'",
+      'ALTER SCHEMA [core] TRANSFER OBJECT::[app].[items];',
+      "SELECT 1 OPTION (USE HINT ('FORCE_LEGACY_CARDINALITY_ESTIMATION'))",
+      "SELECT 1 OPTION (RECOMPILE, USE PLAN N'<ShowPlanXML/>')",
+    ]) {
+      expect(findInstanceLevelStatement(ok, 'mssql'), `expected allow: ${ok}`).toBeNull();
+    }
+
+    // 2. mssqlColumnRefs handles schema-qualified datename/datepart vs built-in calls
+    expect(mssqlColumnRefs('dbo.datename([col])').map((t) => t.text)).toEqual(['col']);
+    expect(mssqlColumnRefs('dbo.datename(year, [col])').map((t) => t.text)).toEqual(['year', 'col']);
+    expect(mssqlColumnRefs('DATENAME([col], [other])').map((t) => t.text)).toEqual(['col', 'other']);
+    expect(mssqlColumnRefs('DATEDIFF(day, [created_at], GETDATE())').map((t) => t.text)).toEqual([
+      'created_at',
+    ]);
+
+    // 3. P6d spacesOf places table-level triggers in their table's schema obj namespace
+    const mTrig0 = emptyModel('mssql');
+    const sDbo = createSchema(mTrig0, 'dbo', 's-dbo');
+    const sApp = createSchema(mTrig0, 'app', 's-app');
+    const tOrders = createTable(mTrig0, sDbo, 'orders', 't-orders');
+    addColumn(mTrig0, tOrders, { id: 'c-o-id', name: 'id', type: 'int', notNull: true });
+    const tUsers = createTable(mTrig0, sDbo, 'users', 't-users');
+    addColumn(mTrig0, tUsers, { id: 'c-u-id', name: 'id', type: 'int', notNull: true });
+    mTrig0.objects['tr-audit'] = {
+      id: 'tr-audit',
+      kind: 'opaque',
+      objType: 'trigger',
+      parent: tOrders,
+      name: 'tr_audit',
+      ddl: ['CREATE TRIGGER [dbo].[tr_audit] ON [dbo].[orders] AFTER INSERT AS BEGIN SET NOCOUNT ON END'],
+      drop: 'DROP TRIGGER [dbo].[tr_audit]',
+      deps: [tOrders],
+      order: 1,
+      comment: null,
+    };
+
+    const mTrigConflict = structuredClone(mTrig0);
+    (mTrigConflict.objects[tUsers] as { name: string }).name = 'tr_audit';
+    expect(() => plan(mTrig0, mTrigConflict)).toThrow(PlanError);
+
+    const mTrigConflictCi = structuredClone(mTrig0);
+    (mTrigConflictCi.objects[tUsers] as { name: string }).name = 'TR_AUDIT';
+    expect(() => plan(mTrig0, mTrigConflictCi)).toThrow(PlanError);
+
+    // A trigger in another schema ([app]) must NOT conflict with renaming [dbo].[users] to tr_app_only
+    const tAppItems = createTable(mTrig0, sApp, 'items', 't-items');
+    addColumn(mTrig0, tAppItems, { id: 'c-i-id', name: 'id', type: 'int', notNull: true });
+    mTrig0.objects['tr-app'] = {
+      id: 'tr-app',
+      kind: 'opaque',
+      objType: 'trigger',
+      parent: tAppItems,
+      name: 'tr_app_only',
+      ddl: ['CREATE TRIGGER [app].[tr_app_only] ON [app].[items] AFTER INSERT AS BEGIN SET NOCOUNT ON END'],
+      drop: 'DROP TRIGGER [app].[tr_app_only]',
+      deps: [tAppItems],
+      order: 2,
+      comment: null,
+    };
+    const mTrigOtherSchema = structuredClone(mTrig0);
+    renameTable(mTrigOtherSchema, tUsers, 'tr_app_only');
+    expect(() => plan(mTrig0, mTrigOtherSchema)).not.toThrow();
+  });
 });

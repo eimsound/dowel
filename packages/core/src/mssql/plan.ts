@@ -891,8 +891,10 @@ export const mssqlPlan = (from: Model, to: Model, opts?: MssqlPlanOptions): Step
         return [`idx:${o.parent}`];
       case 'column':
         return [`col:${o.parent}`];
-      case 'opaque':
-        return [`obj:${o.parent}`];
+      case 'opaque': {
+        const p = cur.objects[o.parent];
+        return [`obj:${p?.kind === 'table' ? p.parent : o.parent}`];
+      }
       default:
         return [];
     }

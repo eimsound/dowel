@@ -270,10 +270,11 @@ const risksOf = async (
  * 真正的边界是影子库的账号权限和“生产环境默认不在同一实例上建影子库”。
  */
 export const assertImportable = (sql: string, dialect: Dialect = 'pg'): ImportableSql => {
-  const hit = findInstanceLevelStatement(sql, dialect);
+  const checked = dialect === 'mssql' ? getEngine('mssql').stripImportNoise(sql) : sql;
+  const hit = findInstanceLevelStatement(checked, dialect);
   if (hit !== null)
     throw new ShadowError(`导入的 SQL 含实例级语句（${hit}）。${instanceLevelDescription(dialect)}`);
-  return sql as ImportableSql;
+  return checked as ImportableSql;
 };
 
 export const shadowOps = (
@@ -357,6 +358,7 @@ export const shadowOps = (
         if (c.generated && e.generated) {
           c.generated = { ...c.generated, expr: e.generated.expr };
           c.type = e.type;
+          if (dDialect === 'mssql' && c.generated.stored) c.notNull = e.notNull;
         }
         if (c.default && 'expr' in c.default && e.default && 'expr' in e.default)
           c.default = { expr: e.default.expr };

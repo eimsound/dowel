@@ -225,10 +225,15 @@ export const mssqlColumnRefs = (expr: string): Token[] => {
       i++;
       continue;
     }
-    if (x.kind === 'ident' && DATEPART_FIRST_ARG_FNS.has(x.text) && sig[i + 1]?.text === '(') {
-      i += 2; // 跳过函数名与 '('
-      if (sig[i]?.kind === 'ident' && sig[i + 1]?.text === ',') {
-        i += 1; // 跳过 datepart 单位标识符，下一轮指向逗号之后
+    if (
+      x.kind === 'ident' &&
+      sig[i - 1]?.text !== '.' &&
+      DATEPART_FIRST_ARG_FNS.has(x.text) &&
+      sig[i + 1]?.text === '('
+    ) {
+      i += 1; // 停在 '('，下一轮默认进入首参
+      if (sig[i + 1]?.kind === 'ident' && sig[i + 2]?.text === ',') {
+        i += 2; // 跳过 datepart 单位标识符并停在 ','，下一轮进入第二参
       }
       continue;
     }

@@ -118,66 +118,97 @@ const unwrapSqlString = (t: Token | undefined): string | null => {
  * - 禁止非静态字面量的动态目标/类型表达式（如变量或字符串拼接绕过）
  */
 const spRenameIsDangerous = (toks: Token[], afterProcIdx: number): boolean => {
-  const args: Token[][] = [];
-  let cur: Token[] = [];
-  let depth = 0;
-  for (let i = afterProcIdx; i < toks.length; i++) {
-    const t = toks[i]!;
-    if (depth === 0 && t.text === ';') break;
-    if (t.text === '(') {
-      depth++;
-      cur.push(t);
-    } else if (t.text === ')') {
-      depth = Math.max(0, depth - 1);
-      cur.push(t);
-    } else if (depth === 0 && t.text === ',') {
-      args.push(cur);
-      cur = [];
-    } else {
-      cur.push(t);
-    }
-  }
-  if (cur.length > 0) args.push(cur);
-
-  let objNameToks: Token[] | null = null;
-  let objTypeToks: Token[] | null = null;
+  let argCount = 0;
   let posIdx = 0;
-  for (const arg of args) {
-    if (arg.length >= 2 && arg[0]!.kind === 'other' && arg[0]!.text.startsWith('@') && arg[1]!.text === '=') {
-      const pname = arg[0]!.text.toLowerCase();
-      const val = arg.slice(2);
-      if (pname === '@objname') objNameToks = val;
-      else if (pname === '@objtype') objTypeToks = val;
+  let sawNamed = false;
+  const seenNamed = new Set<string>();
+  let objNameTok: Token | undefined;
+  let newNameTok: Token | undefined;
+  let objTypeTok: Token | undefined;
+
+  let i = afterProcIdx;
+  while (i < toks.length) {
+    const t = toks[i]!;
+    if (t.text === ';') break;
+
+    let paramName: string | null = null;
+    if (t.kind === 'other' && t.text.startsWith('@') && toks[i + 1]?.text === '=') {
+      paramName = t.text.toLowerCase();
+      sawNamed = true;
+      i += 2;
+    } else if (sawNamed) {
+      return true;
+    }
+
+    const valTok = toks[i];
+    if (!valTok || unwrapSqlString(valTok) === null) return true;
+    i += 1;
+    argCount++;
+
+    const afterVal = toks[i];
+    if (afterVal && (afterVal.text === '+' || afterVal.text === '|' || isWord(afterVal, 'collate'))) {
+      return true;
+    }
+
+    if (paramName !== null) {
+      if (seenNamed.has(paramName)) return true;
+      seenNamed.add(paramName);
+      if (paramName === '@objname') {
+        if (objNameTok) return true;
+        objNameTok = valTok;
+      } else if (paramName === '@newname') {
+        if (newNameTok) return true;
+        newNameTok = valTok;
+      } else if (paramName === '@objtype') {
+        if (objTypeTok) return true;
+        objTypeTok = valTok;
+      } else {
+        return true;
+      }
     } else {
-      if (posIdx === 0) objNameToks = arg;
-      else if (posIdx === 2) objTypeToks = arg;
+      if (posIdx === 0) {
+        if (objNameTok) return true;
+        objNameTok = valTok;
+      } else if (posIdx === 1) {
+        if (newNameTok) return true;
+        newNameTok = valTok;
+      } else if (posIdx === 2) {
+        if (objTypeTok) return true;
+        objTypeTok = valTok;
+      } else {
+        return true;
+      }
       posIdx++;
     }
+
+    if (argCount > 3) return true;
+    if (afterVal?.text !== ',') break;
+    i += 1;
+    if (i >= toks.length || toks[i]!.text === ';') return true;
   }
 
+  if (argCount < 2 || argCount > 3 || !objNameTok || !newNameTok) return true;
+
   let objType: string | null = null;
-  if (objTypeToks && objTypeToks.length > 0) {
-    if (objTypeToks.length !== 1) return true;
-    const rawType = unwrapSqlString(objTypeToks[0]);
+  if (objTypeTok) {
+    const rawType = unwrapSqlString(objTypeTok);
     if (rawType === null) return true;
     objType = rawType.trim().toLowerCase();
     if (objType === 'database') return true;
   }
 
-  if (objNameToks && objNameToks.length > 0) {
-    if (objNameToks.length !== 1) return true;
-    const rawTarget = unwrapSqlString(objNameToks[0]);
-    if (rawTarget === null) return true;
-    const innerToks = mssqlTokenize(rawTarget).filter(isSignificant);
-    const { parts } = readMultipartName(innerToks, 0);
-    if (parts.some((p) => p === '')) return true;
-    if (parts.length >= 4) return true;
-    if (parts.length === 3 && objType !== 'column' && objType !== 'index' && objType !== 'statistics') {
-      return true;
-    }
-    if (parts.length >= 2 && parts[0] === 'dowel') return true;
-    if (parts.length >= 3 && parts[1] === 'dowel') return true;
+  const rawTarget = unwrapSqlString(objNameTok);
+  if (rawTarget === null) return true;
+  const innerToks = mssqlTokenize(rawTarget).filter(isSignificant);
+  const { parts, next } = readMultipartName(innerToks, 0);
+  if (parts.length === 0 || next !== innerToks.length) return true;
+  if (parts.some((p) => p === '')) return true;
+  if (parts.length >= 4) return true;
+  if (parts.length === 3 && objType !== 'column' && objType !== 'index' && objType !== 'statistics') {
+    return true;
   }
+  if (parts.length >= 2 && parts[0] === 'dowel') return true;
+  if (parts.length >= 3 && parts[1] === 'dowel') return true;
 
   return false;
 };
@@ -223,7 +254,16 @@ const batchIsInstanceLevel = (batch: string): boolean => {
     ) {
       return true;
     }
-    if (t.text === 'use' && isIdentToken(toks[i + 1])) return true;
+    if (t.text === 'use' && isIdentToken(toks[i + 1])) {
+      const prev = toks[i - 1];
+      const next = toks[i + 1];
+      const after = toks[i + 2];
+      const isQueryHint =
+        (prev?.text === '(' || prev?.text === ',') &&
+        ((isWord(next, 'hint') && after?.text === '(') ||
+          (isWord(next, 'plan') && unwrapSqlString(after) !== null));
+      if (!isQueryHint) return true;
+    }
     if (t.text === 'bulk' && isWord(toks[i + 1], 'insert')) return true;
 
     // 2. CREATE / ALTER / DROP 实例级对象 & [dowel] schema 对象
@@ -246,14 +286,30 @@ const batchIsInstanceLevel = (batch: string): boolean => {
       if (objKind.text === 'resource' && isWord(toks[j + 1], 'pool')) return true;
       if (objKind.text === 'workload' && isWord(toks[j + 1], 'group')) return true;
 
-      // CREATE / ALTER / DROP SCHEMA [dowel] 或 ALTER SCHEMA [x] TRANSFER [dowel].[y]
+      // CREATE / ALTER / DROP SCHEMA [dowel] 或 ALTER SCHEMA [x] TRANSFER [OBJECT::|TYPE::|XML SCHEMA COLLECTION::][dowel].[y]
       if (objKind.text === 'schema') {
         let k = j + 1;
         if (isWord(toks[k], 'if') && isWord(toks[k + 1], 'exists')) k += 2;
         const { parts, next } = readMultipartName(toks, k);
         if (parts.length > 0 && parts[0] === 'dowel') return true;
         if (t.text === 'alter' && isWord(toks[next], 'transfer')) {
-          const src = readMultipartName(toks, next + 1);
+          let srcIdx = next + 1;
+          if (
+            isWord(toks[srcIdx], 'xml') &&
+            isWord(toks[srcIdx + 1], 'schema') &&
+            isWord(toks[srcIdx + 2], 'collection') &&
+            toks[srcIdx + 3]?.text === ':' &&
+            toks[srcIdx + 4]?.text === ':'
+          ) {
+            srcIdx += 5;
+          } else if (
+            toks[srcIdx]?.kind === 'ident' &&
+            toks[srcIdx + 1]?.text === ':' &&
+            toks[srcIdx + 2]?.text === ':'
+          ) {
+            srcIdx += 3;
+          }
+          const src = readMultipartName(toks, srcIdx);
           if (isDowelSchemaRef(src.parts)) return true;
         }
         continue;
@@ -289,11 +345,29 @@ const batchIsInstanceLevel = (batch: string): boolean => {
 
     // 3. ON 目标检查：
     //    - ON DATABASE / ON ALL SERVER（含 DISABLE/ENABLE/CREATE/DROP TRIGGER、GRANT/DENY/REVOKE、ALTER AUTHORIZATION）
-    //    - ON SCHEMA::[dowel] / ON OBJECT::[dowel].* / ON TYPE::[dowel].* / ON SERVER::* / ON LOGIN::* / ON ENDPOINT::*
+    //    - ON SCHEMA::[dowel] / ON OBJECT::[dowel].* / ON TYPE::[dowel].* / ON XML SCHEMA COLLECTION::[dowel].* / ON SERVER::* / ON SERVER ROLE::* / ON AVAILABILITY GROUP::* / ON LOGIN::* / ON ENDPOINT::*
     //    - ON [dowel].*（如 CREATE TRIGGER/INDEX / DROP INDEX / GRANT ... ON [dowel].[history]）
     if (t.text === 'on') {
       if (isWord(toks[i + 1], 'database')) return true;
       if (isWord(toks[i + 1], 'all') && isWord(toks[i + 2], 'server')) return true;
+      if (
+        toks[i + 3]?.text === ':' &&
+        toks[i + 4]?.text === ':' &&
+        ((isWord(toks[i + 1], 'server') && isWord(toks[i + 2], 'role')) ||
+          (isWord(toks[i + 1], 'availability') && isWord(toks[i + 2], 'group')))
+      ) {
+        return true;
+      }
+      if (
+        isWord(toks[i + 1], 'xml') &&
+        isWord(toks[i + 2], 'schema') &&
+        isWord(toks[i + 3], 'collection') &&
+        toks[i + 4]?.text === ':' &&
+        toks[i + 5]?.text === ':'
+      ) {
+        const target = readMultipartName(toks, i + 6);
+        if (isDowelSchemaRef(target.parts)) return true;
+      }
       if (toks[i + 2]?.text === ':' && toks[i + 3]?.text === ':') {
         const scope = toks[i + 1]?.kind === 'ident' ? toks[i + 1]!.text : '';
         if (

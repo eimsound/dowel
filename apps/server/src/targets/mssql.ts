@@ -37,6 +37,7 @@ import {
 } from './types.ts';
 
 const MSSQL_SCHEME = /^(?:mssql|sqlserver):\/\//i;
+const MSSQL_SYSTEM_DATABASES = new Set(['master', 'tempdb', 'model', 'msdb']);
 const SHADOW_PROP_NAME = 'dowel_shadow';
 const SHADOW_LIFECYCLE_LOCK_TIMEOUT_MS = 15_000;
 
@@ -491,13 +492,19 @@ const releaseAppLock = async (db: Db, resource: string): Promise<boolean> => {
   return Number(r?.rc ?? -999) >= 0;
 };
 
-/** 认领影子库：核对 dowel_shadow 扩展属性或确认空库，然后打上 SHADOW_MARK 防误删业务库 */
-export const claimMssqlShadow = async (url: string, guard?: ConnectionGuard): Promise<void> => {
-  const c = connectMssql(url, CHECK_CONNECT_TIMEOUT, guard);
+/** 在已有连接上认领影子库：先拒绝系统库/空库名，再核对 dowel_shadow 扩展属性或确认空库，然后打上 SHADOW_MARK */
+export const claimMssqlShadowOn = async (db: Db): Promise<void> => {
   let phase: 'claim-read' | 'claim' = 'claim-read';
   try {
-    if (await isMarkedMssql(c.db)) return;
-    const [counts] = await c.db.query<{
+    const [ctx] = await db.query<{ dbName: string | null }>(`SELECT DB_NAME() AS dbName`);
+    const currentDb = ctx?.dbName?.trim() ?? '';
+    if (!currentDb || MSSQL_SYSTEM_DATABASES.has(currentDb.toLowerCase())) {
+      throw new ShadowError(
+        `拒绝使用 SQL Server 系统库或未指定数据库（${currentDb || '(empty)'}）作影子库，请指定独立的空用户数据库`,
+      );
+    }
+    if (await isMarkedMssql(db)) return;
+    const [counts] = await db.query<{
       objs: number;
       schemas: number;
       types: number;
@@ -533,7 +540,7 @@ export const claimMssqlShadow = async (url: string, guard?: ConnectionGuard): Pr
       );
     }
     phase = 'claim';
-    const [existingProp] = await c.db.query<{ n: number }>(
+    const [existingProp] = await db.query<{ n: number }>(
       `SELECT COUNT(*) AS n FROM sys.extended_properties
         WHERE class = 0 AND major_id = 0 AND minor_id = 0 AND name = @p1`,
       [SHADOW_PROP_NAME],
@@ -541,16 +548,30 @@ export const claimMssqlShadow = async (url: string, guard?: ConnectionGuard): Pr
     const proc =
       Number(existingProp?.n ?? 0) > 0 ? 'sys.sp_updateextendedproperty' : 'sys.sp_addextendedproperty';
     try {
-      await c.db.exec(
+      await db.exec(
         `EXEC ${proc} @name = ${mssqlLiteral(SHADOW_PROP_NAME)}, @value = ${mssqlLiteral(SHADOW_MARK)}`,
       );
     } catch (e) {
       // 并发认领可能同时写入同一个扩展属性（15233 Property already exists）
-      if (mssqlErrorNumber(e) === 15233 && (await isMarkedMssql(c.db).catch(() => false))) return;
+      if (mssqlErrorNumber(e) === 15233 && (await isMarkedMssql(db).catch(() => false))) return;
       throw e;
     }
   } catch (e) {
     throw shadowSetupError(e, phase);
+  }
+};
+
+/** 认领影子库：先校验非系统库，再核对 dowel_shadow 扩展属性或确认空库，然后打上 SHADOW_MARK 防误删业务库 */
+export const claimMssqlShadow = async (url: string, guard?: ConnectionGuard): Promise<void> => {
+  const parsed = parseMssqlUrl(url);
+  if (parsed.database && MSSQL_SYSTEM_DATABASES.has(parsed.database.toLowerCase())) {
+    throw new ShadowError(
+      `拒绝使用 SQL Server 系统库或未指定数据库（${parsed.database}）作影子库，请指定独立的空用户数据库`,
+    );
+  }
+  const c = connectMssql(url, CHECK_CONNECT_TIMEOUT, guard);
+  try {
+    await claimMssqlShadowOn(c.db);
   } finally {
     await c.close();
   }
@@ -658,8 +679,8 @@ export const mssqlShadow = (
   };
   const checkDbMatches = async (db: Db): Promise<boolean> => {
     const [r] = await db.query<{ dbName: string | null }>(`SELECT DB_NAME() AS dbName`);
-    const cur = r?.dbName ?? '';
-    if (!cur) return false;
+    const cur = r?.dbName?.trim() ?? '';
+    if (!cur || MSSQL_SYSTEM_DATABASES.has(cur.toLowerCase())) return false;
     return !expectedDb || cur.toLowerCase() === expectedDb.toLowerCase();
   };
   const run = <T>(fn: (ops: ReturnType<typeof shadowOps>) => Promise<T>): Promise<T> => {

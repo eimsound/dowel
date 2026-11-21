@@ -30,9 +30,18 @@ import {
 
 const SYSTEM_DATABASES = new Set(['master', 'tempdb', 'model', 'msdb']);
 
+const isSqlStringToken = (t: { kind: string; text: string } | undefined): boolean => {
+  if (!t || t.kind !== 'other') return false;
+  const s = t.text;
+  return (
+    ((s.startsWith("N'") || s.startsWith("n'")) && s.endsWith("'") && s.length >= 3) ||
+    (s.startsWith("'") && s.endsWith("'") && s.length >= 2)
+  );
+};
+
 /**
- * 词法级剥离导入 SQL 中顶层的 `USE <ident>[;]` 语句（支持与下一条语句位于同一行、带注释/方括号/双引号）。
- * 绝不误删字符串字面量、注释或标识符内部的 `USE`。
+ * 词法级剥离导入 SQL 中顶层的 `USE <ident>[;]` 语句（支持无分号连续出现、与下一条语句位于同一行、带注释/方括号/双引号）。
+ * 排除查询提示 `OPTION (USE HINT (...))` 与 `OPTION (USE PLAN N'...')`，绝不误删字符串字面量、注释或标识符内部的 `USE`。
  */
 export const stripMssqlImportNoise = (sql: string): string => {
   const toks = mssqlTokenize(sql);
@@ -48,12 +57,14 @@ export const stripMssqlImportNoise = (sql: string): string => {
     const t = toks[sigIdx[s]!]!;
     if (t.kind !== 'ident' || t.text !== 'use') continue;
     const prev = s > 0 ? toks[sigIdx[s - 1]!] : undefined;
-    const atStmtStart = !prev || prev.text === ';' || (prev.kind === 'ident' && prev.text === 'go');
-    if (!atStmtStart) continue;
+    if (prev?.text === '.') continue;
     const next = s + 1 < sigIdx.length ? toks[sigIdx[s + 1]!] : undefined;
     if (!next || (next.kind !== 'ident' && next.kind !== 'qident')) continue;
-    let end = next.end;
     const after = s + 2 < sigIdx.length ? toks[sigIdx[s + 2]!] : undefined;
+    const isUseHint = next.kind === 'ident' && next.text === 'hint' && after?.text === '(';
+    const isUsePlan = next.kind === 'ident' && next.text === 'plan' && isSqlStringToken(after);
+    if (isUseHint || isUsePlan) continue;
+    let end = next.end;
     if (after?.text === ';') {
       end = after.end;
       s += 2;
@@ -150,21 +161,29 @@ export const resetMssqlShadow = async (db: Db): Promise<void> => {
         AND o.type IN ('V', 'P', 'FN', 'IF', 'TF')
       ORDER BY o.object_id DESC`,
   );
-  let remaining = [...routines];
-  for (let pass = 0; pass < 5 && remaining.length > 0; pass++) {
-    const failed: typeof remaining = [];
-    for (const r of remaining) {
-      const t = r.type.trim();
-      const kind = t === 'V' ? 'VIEW' : t === 'P' ? 'PROCEDURE' : 'FUNCTION';
-      try {
-        await db.exec(`DROP ${kind} IF EXISTS ${mssqlQualified(r.schema, r.name)}`);
-      } catch {
-        failed.push(r);
+  const dropRoutines = async (
+    items: { schema: string; name: string; type: string }[],
+  ): Promise<{ remaining: typeof items; lastErr: unknown }> => {
+    let rem = [...items];
+    let lastErr: unknown = null;
+    while (rem.length > 0) {
+      const failed: typeof items = [];
+      for (const r of rem) {
+        const t = r.type.trim();
+        const kind = t === 'V' ? 'VIEW' : t === 'P' ? 'PROCEDURE' : 'FUNCTION';
+        try {
+          await db.exec(`DROP ${kind} IF EXISTS ${mssqlQualified(r.schema, r.name)}`);
+        } catch (e) {
+          lastErr = e;
+          failed.push(r);
+        }
       }
+      if (failed.length === rem.length) break;
+      rem = failed;
     }
-    if (failed.length === remaining.length) break;
-    remaining = failed;
-  }
+    return { remaining: rem, lastErr };
+  };
+  const { remaining } = await dropRoutines(routines);
 
   // 4. 删除所有用户表
   const tables = await db.query<{ schema: string; name: string }>(
@@ -177,6 +196,33 @@ export const resetMssqlShadow = async (db: Db): Promise<void> => {
   );
   for (const t of tables) {
     await db.exec(`DROP TABLE ${mssqlQualified(t.schema, t.name)}`);
+  }
+
+  // 4b. 补删因表约束或计算列引用而在 Step 3 暂未能删除的残留例程
+  if (remaining.length > 0) {
+    const afterTables = await dropRoutines(remaining);
+    if (afterTables.remaining.length > 0) {
+      const names = afterTables.remaining.map((r) => `${r.schema}.${r.name}`).join(', ');
+      const reason =
+        afterTables.lastErr instanceof Error
+          ? afterTables.lastErr.message
+          : typeof afterTables.lastErr === 'string'
+            ? afterTables.lastErr
+            : afterTables.lastErr === null || afterTables.lastErr === undefined
+              ? 'unknown error'
+              : JSON.stringify(afterTables.lastErr);
+      const err = new Error(`清理 MSSQL 影子库残留例程失败（${names}）：${reason}`, {
+        cause: afterTables.lastErr,
+      });
+      const num = mssqlErrorNumber(afterTables.lastErr);
+      const code = mssqlErrorCode(afterTables.lastErr);
+      if (num !== null) Object.assign(err, { number: num });
+      if (code !== null) Object.assign(err, { code });
+      if (afterTables.lastErr && typeof afterTables.lastErr === 'object') {
+        Object.assign(err, { originalError: afterTables.lastErr });
+      }
+      throw err;
+    }
   }
 
   // 5. 删除所有序列

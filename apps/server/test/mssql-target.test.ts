@@ -3,18 +3,31 @@
 // - inspectTarget / pullSchema / 同实例影子库 claimShadow 扩展属性防误删业务库与清理；
 // - 服务端项目创建、SQL 导入、验证、发布与执行端到端闭环。
 import type { ProjectCreated, ProjectInfo, TargetInfo, VersionCreated, WizardEvent } from '@dowel/api';
-import { addColumn, all, mssqlIdent, mssqlLiteral } from '@dowel/core';
-import { isMetadataOnlyMssqlSql, stripMssqlImportNoise } from '@dowel/engines';
+import { addColumn, all, createSchema, createTable, emptyModel, mssqlIdent, mssqlLiteral } from '@dowel/core';
+import {
+  type Db,
+  isMetadataOnlyMssqlSql,
+  mssqlErrorNumber,
+  resetMssqlShadow,
+  stripMssqlImportNoise,
+} from '@dowel/engines';
 import { StepError } from '@dowel/verifier';
 import { afterAll, beforeAll, describe, expect, test } from 'vitest';
 
 import { connectTestMssql, createTestMssqlDb, getMssqlAdminUrl, MSSQL_VERSION } from '../../../test/mssql.ts';
 import { createApp, openPlatformDb, type PlatformDb } from '../src/index.ts';
 import { KeyedLimiter } from '../src/rate-limit.ts';
-import { isConnectionFailure, isInfraFailure, ShadowError } from '../src/shadow.ts';
+import {
+  assertImportable,
+  isConnectionFailure,
+  isInfraFailure,
+  ShadowError,
+  shadowOps,
+} from '../src/shadow.ts';
 import { scrubUrl } from '../src/targets.ts';
 import {
   claimMssqlShadow,
+  claimMssqlShadowOn,
   dropMssqlSameInstanceShadow,
   ensureSameInstanceMssqlShadow,
   inspectMssqlTarget,
@@ -117,6 +130,253 @@ describe('MSSQL URL parsing and shadow naming (pure unit)', () => {
       isMetadataOnlyMssqlSql('ALTER TABLE [dbo].[users] ALTER COLUMN [code] nvarchar(64) NOT NULL'),
     ).toBe(false);
     expect(isMetadataOnlyMssqlSql('CREATE INDEX [IX_u] ON [dbo].[users] ([code])')).toBe(false);
+  });
+
+  test('stripMssqlImportNoise & assertImportable strip consecutive/inline USE while preserving query hints and blocking instance-level bypasses', () => {
+    // 连续无分号 USE、SET 语句后跟 USE、GO 2 后跟 USE 均应完整剥离
+    const multiUse = stripMssqlImportNoise(
+      'USE [app]\nUSE [master]\nCREATE TABLE [dbo].[t] ([id] int);\nSET ANSI_NULLS ON\nUSE [app]\nGO 2\nUSE [app]\nSELECT 1;',
+    );
+    expect(multiUse).not.toMatch(/\bUSE\s+\[/i);
+    expect(multiUse).toContain('CREATE TABLE [dbo].[t] ([id] int);');
+    expect(multiUse).toContain('SET ANSI_NULLS ON');
+    expect(multiUse).toContain('GO 2');
+
+    // 查询提示 USE HINT / USE PLAN 必须原样保留
+    const withHints = [
+      "SELECT 1 OPTION (USE HINT ('FORCE_LEGACY_CARDINALITY_ESTIMATION'));",
+      "SELECT 1 OPTION (RECOMPILE, USE PLAN N'<ShowPlanXML/>');",
+    ].join('\n');
+    expect(stripMssqlImportNoise(withHints)).toBe(withHints);
+
+    // 导入入口 assertImportable 允许 SSMS 带 USE [MyDb]\nGO 的建表脚本并已剥离 USE
+    const clean = assertImportable('USE [MyDb]\nGO\nCREATE TABLE [dbo].[t] ([id] int);', 'mssql');
+    expect(clean).not.toMatch(/\bUSE\b/i);
+    expect(clean).toContain('CREATE TABLE [dbo].[t] ([id] int);');
+
+    // 不可借 USE 夹带或绕过实例级语句拦截
+    for (const bad of [
+      'USE [MyDb]\nGO\nDROP DATABASE [prod];',
+      "EXEC USE [x] xp_cmdshell 'whoami'",
+      'USE hint (SELECT 1)',
+    ]) {
+      expect(() => assertImportable(bad, 'mssql'), `expected block: ${bad}`).toThrow(ShadowError);
+    }
+  });
+
+  test('resetMssqlShadow retries remaining routines after DROP TABLE and fails loudly if routines remain undeletable', async () => {
+    const makeFakeResetDb = (stillFailAfterDropTable: boolean): { db: Db; execs: string[] } => {
+      const execs: string[] = [];
+      let tableDropped = false;
+      const db: Db = {
+        query: async <T>(q: string): Promise<T[]> => {
+          if (q.includes('SELECT DB_NAME()')) return [{ dbName: 'app_dowel' }] as T[];
+          if (q.includes('FROM sys.objects o')) {
+            return [{ schema: 'app', name: 'fn_check', type: 'FN' }] as T[];
+          }
+          if (q.includes('FROM sys.tables t')) {
+            return [{ schema: 'app', name: 'orders' }] as T[];
+          }
+          if (q.includes('FROM sys.schemas s')) {
+            return [{ name: 'app' }] as T[];
+          }
+          return [] as T[];
+        },
+        exec: async (q: string) => {
+          execs.push(q);
+          if (q === 'DROP FUNCTION IF EXISTS [app].[fn_check]') {
+            if (!tableDropped || stillFailAfterDropTable) {
+              throw Object.assign(
+                new Error(
+                  "Cannot DROP FUNCTION 'app.fn_check' because it is being referenced by object 'orders'.",
+                ),
+                { number: 3729 },
+              );
+            }
+          }
+          if (q === 'DROP TABLE [app].[orders]') {
+            tableDropped = true;
+          }
+          if (q === 'DROP SCHEMA [app]' && !execs.includes('DROP FUNCTION IF EXISTS [app].[fn_check]')) {
+            throw new Error('schema still has objects');
+          }
+        },
+      };
+      return { db, execs };
+    };
+
+    // 1. 表依赖函数在 Step 3 报 3729，Step 4 删表后 Step 4b 补删函数成功，然后正常 DROP SCHEMA
+    const okCase = makeFakeResetDb(false);
+    await expect(resetMssqlShadow(okCase.db)).resolves.toBeUndefined();
+    const dropTableIdx = okCase.execs.indexOf('DROP TABLE [app].[orders]');
+    const dropSchemaIdx = okCase.execs.indexOf('DROP SCHEMA [app]');
+    const lastDropFnIdx = okCase.execs.lastIndexOf('DROP FUNCTION IF EXISTS [app].[fn_check]');
+    expect(dropTableIdx).toBeGreaterThan(-1);
+    expect(lastDropFnIdx).toBeGreaterThan(dropTableIdx);
+    expect(dropSchemaIdx).toBeGreaterThan(lastDropFnIdx);
+
+    // 2. Step 4 删表后若例程仍无法删除，必须显式抛错并保留底层错误号（不静默忽略）
+    const failCase = makeFakeResetDb(true);
+    const err = await resetMssqlShadow(failCase.db).catch((e: unknown) => e);
+    expect(err).toBeInstanceOf(Error);
+    expect((err as Error).message).toContain('app.fn_check');
+    expect(mssqlErrorNumber(err)).toBe(3729);
+  });
+
+  test('claimMssqlShadow and claimMssqlShadowOn reject system databases and empty DB_NAME()', async () => {
+    await expect(claimMssqlShadow('mssql://sa:pw@127.0.0.1:1433/master')).rejects.toThrow(ShadowError);
+    await expect(claimMssqlShadow('mssql://sa:pw@127.0.0.1:1433/MSDB')).rejects.toThrow(ShadowError);
+
+    for (const dbName of ['master', 'tempdb', 'model', 'msdb', 'Master', '', null]) {
+      const execs: string[] = [];
+      const fakeDb: Db = {
+        query: async <T>(q: string): Promise<T[]> => {
+          if (q.includes('SELECT DB_NAME()')) return [{ dbName }] as T[];
+          throw new Error(`unexpected query for ${String(dbName)}: ${q}`);
+        },
+        exec: async (q: string) => {
+          execs.push(q);
+        },
+      };
+      await expect(claimMssqlShadowOn(fakeDb), `expected reject for ${String(dbName)}`).rejects.toThrow(
+        ShadowError,
+      );
+      expect(execs).toEqual([]);
+    }
+  });
+
+  test('shadowOps.canonicalize syncs notNull for MSSQL PERSISTED computed columns without touching virtual computed columns', async () => {
+    const prev = emptyModel('mssql');
+    createSchema(prev, 'dbo', 's-dbo');
+    const next = structuredClone(prev);
+    const tbl = createTable(next, 's-dbo', 'items', 't-items');
+    addColumn(next, tbl, { id: 'c-code', name: 'code', type: 'nvarchar(32)', notNull: false });
+    addColumn(next, tbl, {
+      id: 'c-persisted',
+      name: 'display_code',
+      type: 'nvarchar(32)',
+      notNull: false,
+      generated: { expr: "(isnull([code],N''))", stored: true },
+    });
+    addColumn(next, tbl, {
+      id: 'c-virtual',
+      name: 'virt_code',
+      type: 'nvarchar(32)',
+      notNull: true,
+      generated: { expr: "(isnull([code],N''))", stored: false },
+    });
+
+    let tableBuilt = false;
+    const fakeDb: Db = {
+      query: async <T>(q: string): Promise<T[]> => {
+        if (q.includes('SELECT DB_NAME()')) return [{ dbName: 'app_dowel' }] as T[];
+        if (q.includes('ProductMajorVersion') && q.includes('dbCollation')) {
+          return [
+            {
+              version: '16.0.1000.6',
+              major: 16,
+              minor: 0,
+              dbCollation: 'SQL_Latin1_General_CP1_CI_AS',
+            },
+          ] as T[];
+        }
+        if (q.includes('ProductMajorVersion')) {
+          return [{ major: 16, minor: 0 }] as T[];
+        }
+        if (q.includes('FROM sys.schemas s') && q.includes('MS_Description')) {
+          return [{ name: 'dbo', comment: null }] as T[];
+        }
+        if (q.includes('FROM sys.tables t') && q.includes('MS_Description')) {
+          return (tableBuilt ? [{ objectId: 100, schema: 'dbo', name: 'items', comment: null }] : []) as T[];
+        }
+        if (q.includes('FROM sys.columns c') && q.includes('sys.computed_columns')) {
+          return (
+            tableBuilt
+              ? [
+                  {
+                    objectId: 100,
+                    columnId: 1,
+                    name: 'code',
+                    typeName: 'nvarchar',
+                    maxLength: 64,
+                    precision: 0,
+                    scale: 0,
+                    isNullable: true,
+                    collationName: 'SQL_Latin1_General_CP1_CI_AS',
+                    isSparse: false,
+                    isRowguidcol: false,
+                    isIdentity: false,
+                    seedValue: null,
+                    incrementValue: null,
+                    defaultName: null,
+                    defaultDef: null,
+                    isComputed: false,
+                    computedDef: null,
+                    isPersisted: null,
+                    comment: null,
+                  },
+                  {
+                    objectId: 100,
+                    columnId: 2,
+                    name: 'display_code',
+                    typeName: 'nvarchar',
+                    maxLength: 64,
+                    precision: 0,
+                    scale: 0,
+                    isNullable: false,
+                    collationName: 'SQL_Latin1_General_CP1_CI_AS',
+                    isSparse: false,
+                    isRowguidcol: false,
+                    isIdentity: false,
+                    seedValue: null,
+                    incrementValue: null,
+                    defaultName: null,
+                    defaultDef: null,
+                    isComputed: true,
+                    computedDef: "(isnull([code],N''))",
+                    isPersisted: true,
+                    comment: null,
+                  },
+                  {
+                    objectId: 100,
+                    columnId: 3,
+                    name: 'virt_code',
+                    typeName: 'nvarchar',
+                    maxLength: 64,
+                    precision: 0,
+                    scale: 0,
+                    isNullable: false,
+                    collationName: 'SQL_Latin1_General_CP1_CI_AS',
+                    isSparse: false,
+                    isRowguidcol: false,
+                    isIdentity: false,
+                    seedValue: null,
+                    incrementValue: null,
+                    defaultName: null,
+                    defaultDef: null,
+                    isComputed: true,
+                    computedDef: "(isnull([code],N''))",
+                    isPersisted: false,
+                    comment: null,
+                  },
+                ]
+              : []
+          ) as T[];
+        }
+        return [] as T[];
+      },
+      exec: async (q: string) => {
+        if (q.includes('CREATE TABLE [dbo].[items]')) tableBuilt = true;
+      },
+    };
+
+    const changed = await shadowOps(async () => fakeDb, null, { dialect: 'mssql' }).canonicalize(prev, next);
+    expect(changed).toHaveLength(1);
+    expect(changed[0]).toMatchObject({
+      id: 'c-persisted',
+      kind: 'column',
+      notNull: true,
+    });
   });
 });
 
