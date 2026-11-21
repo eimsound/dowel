@@ -91,13 +91,15 @@ const statementIsNontransactional = (s: string): boolean =>
   // REINDEX DATABASE / SYSTEM（可带 (选项)）不能在事务块里执行；REINDEX INDEX / TABLE / SCHEMA 可以
   /^\s*reindex\s*(?:\([^)]*\)\s*)?(?:database|system)\b/i.test(s) ||
   // 不带表名的 CLUSTER（整库重排，可带 (选项) 或老写法的 VERBOSE）不能在事务块里；CLUSTER 表名 可以
-  /^\s*cluster\s*(?:\([^)]*\)|verbose)?\s*$/i.test(s);
+  /^\s*cluster\s*(?:\([^)]*\)|verbose)?\s*$/i.test(s) ||
+  // PG 19+ 不带表名的 REPACK（整库重排，可带 (选项)）不能在事务块里；带 CONCURRENTLY 已被上面规则覆盖，单表 REPACK 表名 可以
+  /^\s*repack\s*(?:\([^)]*\))?\s*$/i.test(s);
 
 /**
  * 能不能放进事务。判断依据是 PG“不能在事务块里执行”的命令，外加一条保守的规则：
- * - 任何带 CONCURRENTLY 的语句：CREATE INDEX / DROP INDEX / REINDEX / ALTER TABLE … DETACH PARTITION …；
+ * - 任何带 CONCURRENTLY 的语句：CREATE INDEX / DROP INDEX / REINDEX / REPACK (CONCURRENTLY) / ALTER TABLE … DETACH PARTITION …；
  * - VACUUM、ALTER SYSTEM、CREATE / DROP DATABASE、CREATE / DROP TABLESPACE、DISCARD ALL、
- *   REINDEX DATABASE / SYSTEM、不带表名的 CLUSTER（带表名的 CLUSTER 和 REINDEX TABLE / INDEX / SCHEMA 可以进事务）；
+ *   REINDEX DATABASE / SYSTEM、不带表名的 CLUSTER 与 REPACK（带表名的 CLUSTER / REPACK 和 REINDEX TABLE / INDEX / SCHEMA 可以进事务）；
  * - ALTER TYPE … ADD VALUE：PG 12 起可以在事务里执行，但新值在同一事务里不能使用（后面的步骤可能立刻
  *   用到它：默认值、索引条件），所以单独作为非事务步骤最稳妥（规划器会生成这条语句）。
  * 一步里可以有多条语句（用户手写的脚本）：先去掉字符串、注释、带引号标识符和 $$ 函数体（分号出现在这些地方

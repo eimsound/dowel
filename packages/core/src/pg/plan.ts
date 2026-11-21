@@ -22,7 +22,8 @@ import type {
 } from '../ir.ts';
 import { EARLY_OPAQUE } from '../ir.ts';
 import { deepEqual } from '../json.ts';
-import { all, childrenOf, columnsOf, find, get, qname } from '../model.ts';
+import { all, childrenOf, columnsOf, find, get, partitionBySql, qname } from '../model.ts';
+import { checkPgCompatibility, LATEST_PG_MAJOR, pgCapabilities, type PlanOptions } from './capabilities.ts';
 import { ident, literal, qualified } from './quote.ts';
 
 export interface Step {
@@ -129,7 +130,17 @@ const pickExprs = (o: Obj): Partial<Obj> =>
       ? { elements: structuredClone(o.elements), where: o.where }
       : {};
 
-export const plan = (from: Model, to: Model): Step[] => {
+export const plan = (from: Model, to: Model, opts?: PlanOptions): Step[] => {
+  const targetMajor = opts?.pgMajor ?? null;
+  const cap = pgCapabilities(targetMajor ?? LATEST_PG_MAJOR);
+  if (targetMajor !== null) {
+    const errors = checkPgCompatibility(to, targetMajor).filter((i) => i.severity === 'error');
+    if (errors.length > 0) {
+      throw new PlanError(
+        `目标 PostgreSQL ${targetMajor} 不支持以下特性：\n${errors.map((e) => `- ${e.message}`).join('\n')}`,
+      );
+    }
+  }
   const cur = clone(from);
   const steps: Step[] = [];
   const emit = (kind: string, target: string, sql: string) => steps.push({ kind, target, sql });
@@ -205,7 +216,8 @@ export const plan = (from: Model, to: Model): Step[] => {
     if (c.identity) s += ` ${identityClause(c, table)}`;
     const d = defaultOf(c);
     if (d) s += ` DEFAULT ${d}`;
-    if (c.notNull) s += c.notNullName ? ` CONSTRAINT ${ident(c.notNullName)} NOT NULL` : ' NOT NULL';
+    if (c.notNull)
+      s += cap.namedNotNull && c.notNullName ? ` CONSTRAINT ${ident(c.notNullName)} NOT NULL` : ' NOT NULL';
     return s;
   };
   const constraintDef = (k: PrimaryKey | Unique | Check | ForeignKey): string => {
@@ -637,7 +649,14 @@ export const plan = (from: Model, to: Model): Step[] => {
     // 列附带的两个名字：NOT NULL 约束、identity 序列
     if (o.kind === 'column' && c.kind === 'column') {
       const w = was(o);
-      if (w.notNull && o.notNull && c.notNullName && o.notNullName && c.notNullName !== o.notNullName) {
+      if (
+        cap.namedNotNull &&
+        w.notNull &&
+        o.notNull &&
+        c.notNullName &&
+        o.notNullName &&
+        c.notNullName !== o.notNullName
+      ) {
         items.push({
           id: `${o.id}#nn`,
           spaces: [`con:${o.parent}`],
@@ -686,7 +705,8 @@ export const plan = (from: Model, to: Model): Step[] => {
     for (const o of Object.values(cur.objects)) {
       if (o.name === name && spacesOf(o).includes(space)) return o.id;
       if (o.kind === 'column') {
-        if (o.notNull && o.notNullName === name && space === `con:${o.parent}`) return `${o.id}#nn`;
+        if (cap.namedNotNull && o.notNull && o.notNullName === name && space === `con:${o.parent}`)
+          return `${o.id}#nn`;
         if (o.identity?.sequenceName === name && space === `rel:${schemaOfTable(o.parent)}`)
           return `${o.id}#seq`;
       }
@@ -827,7 +847,8 @@ export const plan = (from: Model, to: Model): Step[] => {
     const columns = columnsOf(to, o.id);
     for (const c of columns) cur.objects[c.id] = fresh(c);
     const body = columns.length ? `\n  ${columns.map((c) => columnDef(c, o)).join(',\n  ')}\n` : '';
-    const part = o.partitionBy ? ` PARTITION BY ${o.partitionBy}` : '';
+    const partSql = partitionBySql(cur, o);
+    const part = partSql ? ` PARTITION BY ${partSql}` : '';
     emit('createTable', o.id, `CREATE TABLE ${T(o.id)} (${body})${part}`);
     // 分区子表与 pg_dump 一样：先作为普通表建出来（保留自己的列定义和约束名），再挂到父表上
     if (o.partitionOf)
@@ -902,12 +923,12 @@ export const plan = (from: Model, to: Model): Step[] => {
       emit(
         'setNotNull',
         o.id,
-        o.notNullName
+        cap.namedNotNull && o.notNullName
           ? `ALTER TABLE ${T(c.parent)} ADD CONSTRAINT ${ident(o.notNullName)} NOT NULL ${C(c.id)}`
           : `${A(c)} SET NOT NULL`,
       );
       c.notNull = true;
-      c.notNullName = o.notNullName;
+      c.notNullName = cap.namedNotNull ? o.notNullName : null;
     }
     c.notNullNameMode = o.notNullNameMode;
   }
@@ -1084,4 +1105,4 @@ const spacesOfTo = (m: Model, o: Obj): string[] => {
 };
 
 /** 把整个模型从零建出来的语句（导出 DDL 用） */
-export const createAll = (m: Model): Step[] => plan({ ...m, objects: {} }, m);
+export const createAll = (m: Model, opts?: PlanOptions): Step[] => plan({ ...m, objects: {} }, m, opts);

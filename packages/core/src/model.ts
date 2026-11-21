@@ -1,7 +1,7 @@
 // 在扁平模型上查询对象的工具函数，以及模型的一致性校验。
 import { EditError } from './errors.ts';
 import type { Column, Enum, Index, Kind, Model, Obj, ObjOf, Sequence, Table } from './ir.ts';
-import { qualified } from './pg/quote.ts';
+import { ident, qualified } from './pg/quote.ts';
 
 export const get = <K extends Kind>(m: Model, id: string, kind?: K): ObjOf<K> => {
   const o = m.objects[id];
@@ -33,6 +33,23 @@ export const schemaName = (m: Model, o: Table | Enum | Sequence): string => get(
 export const qname = (m: Model, o: Table | Enum | Sequence): string => qualified(schemaName(m, o), o.name);
 
 export const tableOfColumn = (m: Model, col: string): Table => get(m, get(m, col, 'column').parent, 'table');
+
+/** 将表的 partitionBy 渲染为 PG `PARTITION BY` 之后的分句（兼容存量原始字符串与结构化 PartitionSpec） */
+export const partitionBySql = (m: Model, table: Pick<Table, 'partitionBy'>): string | null => {
+  const p = table.partitionBy;
+  if (!p) return null;
+  if (typeof p === 'string') return p;
+  const keys = p.keys
+    .map((k) => {
+      if (!k.column && !k.expr) throw new EditError('分区键必须指定列或表达式');
+      let s = k.column ? ident(get(m, k.column, 'column').name) : `(${k.expr})`;
+      if (k.collation) s += ` COLLATE ${k.collation}`;
+      if (k.opclass) s += ` ${k.opclass}`;
+      return s;
+    })
+    .join(', ');
+  return `${p.strategy.toUpperCase()} (${keys})`;
+};
 
 /** 索引元素在自动命名中使用的名字：列取列名，表达式取最外层函数名，否则为 expr；重复时加数字 */
 export const indexElementNames = (m: Model, idx: Pick<Index, 'elements' | 'include'>): string[] => {

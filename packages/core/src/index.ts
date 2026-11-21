@@ -5,6 +5,7 @@ export * from './ir.ts';
 export * from './json.ts';
 export * from './model.ts';
 export * from './mutators.ts';
+export * from './pg/capabilities.ts';
 export * from './pg/naming.ts';
 export * from './pg/nontx.ts';
 export { createAll, PlanError, plan, type Step } from './pg/plan.ts';

@@ -47,14 +47,28 @@ export const Sequence = z.object({
   comment,
 });
 
+export const PartitionStrategy = z.enum(['range', 'list', 'hash']);
+
+export const PartitionKey = z.object({
+  column: id.nullable().default(null),
+  expr: z.string().nullable().default(null),
+  opclass: z.string().nullable().default(null),
+  collation: z.string().nullable().default(null),
+});
+
+export const PartitionSpec = z.object({
+  strategy: PartitionStrategy,
+  keys: z.array(PartitionKey).min(1),
+});
+
 export const Table = z.object({
   id,
   kind: z.literal('table'),
   parent: id, // schema
   name,
-  /** 分区表的分区键（pg_get_partkeydef 的输出，如 `RANGE (payment_date)`）。M1 只读 */
-  partitionBy: z.string().nullable().default(null),
-  /** 分区子表：所属的分区表和分区边界（如 `FOR VALUES FROM (...) TO (...)`）。M1 只读 */
+  /** 分区表的分区键：结构化 PartitionSpec 或兼容存量 format 1 中的 pg_get_partkeydef 字符串 */
+  partitionBy: z.union([PartitionSpec, z.string()]).nullable().default(null),
+  /** 分区子表：所属的分区表和分区边界（如 `FOR VALUES FROM (...) TO (...)`） */
   partitionOf: z.object({ parent: id, bound: z.string() }).nullable().default(null),
   comment,
 });
@@ -237,6 +251,9 @@ export type OpaqueType = z.infer<typeof OpaqueType>;
 export type Enum = z.infer<typeof Enum>;
 export type SequenceOptions = z.infer<typeof SequenceOptions>;
 export type Sequence = z.infer<typeof Sequence>;
+export type PartitionStrategy = z.infer<typeof PartitionStrategy>;
+export type PartitionKey = z.infer<typeof PartitionKey>;
+export type PartitionSpec = z.infer<typeof PartitionSpec>;
 export type Table = z.infer<typeof Table>;
 export type ColumnDefault = z.infer<typeof ColumnDefault>;
 export type Column = z.infer<typeof Column>;
