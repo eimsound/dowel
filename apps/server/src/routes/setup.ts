@@ -17,7 +17,7 @@ import {
   setupTokenMatches,
 } from '../setup.ts';
 import { countUsers } from '../users.ts';
-import { type AppContext, body, createUserOrConflict, type Env } from './context.ts';
+import { type AppContext, createUserOrConflict, type Env } from './context.ts';
 
 export const registerSetup = (app: Hono<Env>, ctx: AppContext) => {
   const { db } = ctx;
@@ -36,45 +36,45 @@ export const registerSetup = (app: Hono<Env>, ctx: AppContext) => {
   });
 
   app.post('/api/setup', async (c) => {
-    const b = await body(c, setupSchema);
-    // 已经有用户之后，setup 一律 409（不管令牌对不对）
-    if (!(await needsSetup(db))) throw new HTTPException(409, { message: '这个实例已经初始化过了' });
+    const raw = await c.req.json().catch(() => null);
+    const user = await db.transaction(async (tx) => {
+      if (db.dialect === 'pg') {
+        await tx.query('select pg_advisory_xact_lock(hashtext($1))', [SETUP_LOCK_KEY]);
+      }
+      // 事务锁内优先判断是否已有用户：实例一旦初始化，无论令牌正确、错误还是为空一律返回 409
+      if ((await countUsers(tx)) > 0) throw new HTTPException(409, { message: '这个实例已经初始化过了' });
 
-    // 多副本优先校验持久化在平台库的共享 setup_token；未持久化或单测显式传入自定义 setupToken 时兼容内存令牌
-    const stored = ctx.setupTokenCustom ? { exists: false, token: null } : await readStoredSetupToken(db);
-    const expected = stored.exists ? stored.token : ctx.setupToken;
-    if (!setupTokenMatches(b.token, expected))
-      throw new HTTPException(403, { message: '初始化令牌不正确，请查看服务启动时的日志' });
+      const parsed = setupSchema.safeParse(raw);
+      if (!parsed.success)
+        throw new HTTPException(400, { message: parsed.error.issues[0]?.message ?? '请求不合法' });
+      const b = parsed.data;
 
-    // 使用本地内存令牌时同步认领，防止本进程内并发请求双写；持久化共享令牌则由下方数据库事务锁串行化
-    let claimedLocalToken: string | null = null;
-    if (!stored.exists) {
-      claimedLocalToken = ctx.setupToken;
-      ctx.setupToken = null;
-    }
+      // 事务锁内校验令牌：
+      // - custom：单测显式注入的内存令牌优先；
+      // - shared：生产多副本共享令牌，只认持久化在平台库的 setup_token，绝不回落随机内存值；
+      // - local：单测默认模式，优先读持久化令牌，未持久化时兼容本进程内存令牌。
+      const stored =
+        ctx.setupTokenMode === 'custom' ? { exists: false, token: null } : await readStoredSetupToken(tx);
+      const expected =
+        ctx.setupTokenMode === 'shared'
+          ? stored.exists
+            ? stored.token
+            : null
+          : stored.exists
+            ? stored.token
+            : ctx.setupToken;
+      if (!setupTokenMatches(b.token, expected))
+        throw new HTTPException(403, { message: '初始化令牌不正确，请查看服务启动时的日志' });
 
-    let user: Awaited<ReturnType<typeof createUserOrConflict>>;
-    try {
-      user = await db.transaction(async (tx) => {
-        if (db.dialect === 'pg') {
-          await tx.query('select pg_advisory_xact_lock(hashtext($1))', [SETUP_LOCK_KEY]);
-        }
-        // 事务里再确认没有用户，防止多副本或本进程并发路径建出第二个“第一个管理员”
-        if ((await countUsers(tx)) > 0) throw new HTTPException(409, { message: '这个实例已经初始化过了' });
-        const created = await createUserOrConflict(tx, {
-          username: b.username,
-          name: b.name,
-          password: b.password,
-          role: 'admin',
-        });
-        await tx.query('delete from instance_settings where key = $1', [SETUP_TOKEN_KEY]);
-        return created;
+      const created = await createUserOrConflict(tx, {
+        username: b.username,
+        name: b.name,
+        password: b.password,
+        role: 'admin',
       });
-    } catch (e) {
-      // 失败（比如数据库写入出错）就把本地令牌还回去，让用户可以用同一个令牌重试；共享令牌随事务回滚自然保留
-      if (claimedLocalToken !== null && ctx.setupToken === null) ctx.setupToken = claimedLocalToken;
-      throw e;
-    }
+      await tx.query('delete from instance_settings where key = $1', [SETUP_TOKEN_KEY]);
+      return created;
+    });
     ctx.setupToken = null;
     // 初始化完直接登录：和登录接口一样更新 last_login_at
     const me = { ...user, lastLoginAt: await markLogin(db, user.id) };

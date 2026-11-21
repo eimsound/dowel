@@ -57,8 +57,10 @@ export interface AppOptions {
   tokenFailLimiter?: KeyedLimiter;
   /** 每个 CI 令牌的请求限速；默认 DOWEL_TOKEN_RATE_LIMIT（120）次 / DOWEL_TOKEN_RATE_WINDOW_MS（60000ms） */
   tokenLimiter?: KeyedLimiter;
-  /** 自定义一次性初始化令牌（测试用；未给出时在冷启动时生成并由 ensureSetupToken 跨副本共享） */
+  /** 自定义一次性初始化令牌（测试用，优先于平台库中持久化的共享令牌） */
   setupToken?: string;
+  /** 多副本冷启动经 ensureSetupToken 持久化并共享的初始化令牌（由 main.ts 传入；传 null 表示实例已初始化） */
+  sharedSetupToken?: string | null;
   /** 跨副本事件总线配置（测试可注入自定义 replicaId / channel） */
   bus?: EventBusOptions;
   /** 副本租约与分布式任务协调器配置 */
@@ -124,6 +126,15 @@ export const createApp = (db: PlatformDb, options: AppOptions = {}) => {
   });
   bus.onReconnect(() => activeTokens.markStale());
 
+  const setupTokenMode: AppContext['setupTokenMode'] =
+    options.setupToken !== undefined ? 'custom' : options.sharedSetupToken !== undefined ? 'shared' : 'local';
+  const setupToken =
+    options.setupToken !== undefined
+      ? options.setupToken
+      : options.sharedSetupToken !== undefined
+        ? options.sharedSetupToken
+        : newSetupToken();
+
   const ctx: AppContext = {
     db,
     bus,
@@ -143,9 +154,9 @@ export const createApp = (db: PlatformDb, options: AppOptions = {}) => {
     requests,
     webhooks,
     security,
-    // 一次性初始化令牌：冷启动时由 main.ts 调用 ensureSetupToken 跨副本共享；单测未调用时仍可直接用内存令牌
-    setupToken: options.setupToken ?? newSetupToken(),
-    setupTokenCustom: options.setupToken !== undefined,
+    // 一次性初始化令牌：生产冷启动由 main.ts 经 ensureSetupToken 获取后同步传入 sharedSetupToken；单测可直接用内存令牌
+    setupToken,
+    setupTokenMode,
     allowPasswordLogin: options.allowPasswordLogin ?? passwordLoginForced(),
     replace,
     upgradeWebSocket,

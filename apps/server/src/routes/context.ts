@@ -75,10 +75,15 @@ export interface AppContext {
   /** 组级 Webhook 的投递队列（P5b，进程内，重启丢失） */
   webhooks: Webhooks;
   security: SecurityConfig;
-  /** 一次性初始化令牌：多副本冷启动时由 ensureSetupToken 持久化到 instance_settings，初始化成功后置空 */
+  /** 一次性初始化令牌：多副本冷启动时由 ensureSetupToken 持久化到 instance_settings 并同步至此，初始化成功后置空 */
   setupToken: string | null;
-  /** 是否由单测显式注入了自定义 setupToken（优先于平台库中持久化的共享令牌） */
-  setupTokenCustom: boolean;
+  /**
+   * 初始化令牌来源模式：
+   * - 'custom'：单测显式注入 options.setupToken，优先校验内存令牌；
+   * - 'shared'：生产冷启动由 ensureSetupToken 持久化并跨副本共享，仅校验库内持久化令牌，绝不回落随机内存值；
+   * - 'local'：未传令牌的默认模式（单测常用），优先校验库内持久化令牌，未持久化时兼容内存令牌。
+   */
+  setupTokenMode: 'local' | 'shared' | 'custom';
   /** DOWEL_ALLOW_PASSWORD_LOGIN=1：设置里关了密码登录也能用密码登录的应急入口 */
   allowPasswordLogin: boolean;
   /** 导入、拉取、恢复历史后替换模型；新模型就是引擎读出的，作为派生数据的基线；传入 expectedSeq 时原子校验当前 seq */

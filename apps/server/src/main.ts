@@ -11,21 +11,6 @@ import { autoSetup, ensureSetupToken, needsSetup } from './setup.ts';
 import { createShutdown } from './shutdown.ts';
 
 const db = await openPlatformDb(process.env.DOWEL_DB || './data/dowel.db');
-const {
-  app,
-  injectWebSocket,
-  wss,
-  bus,
-  ha,
-  rooms,
-  shadows,
-  refresher,
-  drift,
-  exec,
-  requests,
-  webhooks,
-  setupToken,
-} = createApp(db);
 const port = Number(process.env.PORT ?? 4600);
 
 // 无人值守初始化：设置了 DOWEL_ADMIN_USERNAME / DOWEL_ADMIN_PASSWORD 并且还没有用户时直接建管理员。
@@ -40,8 +25,11 @@ try {
 }
 if (created) console.log(`已创建实例管理员 ${created.username}（来自 DOWEL_ADMIN_USERNAME）。`);
 const needsInit = !created && (await needsSetup(db));
-// 多副本同时冷启动时共享持久化在平台库的同一个初始化令牌
-const sharedSetupToken = needsInit ? await ensureSetupToken(db, setupToken ?? undefined) : null;
+// 多副本同时冷启动时共享持久化在平台库的同一个初始化令牌，并同步到应用上下文
+const sharedSetupToken = needsInit ? await ensureSetupToken(db) : null;
+
+const { app, injectWebSocket, wss, bus, ha, rooms, shadows, refresher, drift, exec, requests, webhooks } =
+  createApp(db, { sharedSetupToken });
 
 // 前端构建产物（pnpm build 生成）：静态文件直接返回，其余路径交给前端路由
 const web = process.env.DOWEL_WEB ?? fileURLToPath(new URL('../../web/dist', import.meta.url));
