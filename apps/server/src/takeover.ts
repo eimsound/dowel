@@ -154,6 +154,9 @@ export const verifyVersionChain = async (o: {
   return reports;
 };
 
+/** 恢复版本并非由当前画布提交序列发布，seq 统一写哨兵值 -1（正常画布提交 seq >= 0） */
+const RESTORED_VERSION_SEQ = -1;
+
 /** 写入从目标库恢复并已验证通过的版本行（接手整条链与接入领先版本共用） */
 export const insertRestoredVersions = async (
   tx: Db,
@@ -178,7 +181,7 @@ export const insertRestoredVersions = async (
         v.versionId,
         o.pid,
         o.branch,
-        v.number,
+        RESTORED_VERSION_SEQ,
         v.name,
         JSON.stringify(v.model),
         v.publishedAt,

@@ -1031,9 +1031,10 @@ export class Rooms {
     minSeq: number,
     maxSeq: number,
   ): Promise<Map<number, CanvasHistoryVersionRef>> {
+    // 仅关联在当前画布序列上真实发布的版本，排除接手/接入恢复的版本（restored_at 非空，避免历史遗留 seq 与画布提交撞号）
     const rows = await this.db.query<{ id: string; seq: string | number; number: number; name: string }>(
       `select id, seq, number, name from versions
-        where branch_id = $1 and seq >= $2 and seq <= $3
+        where branch_id = $1 and seq >= $2 and seq <= $3 and restored_at is null
         order by number desc`,
       [branchId, minSeq, maxSeq],
     );

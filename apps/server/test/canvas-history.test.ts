@@ -2,10 +2,12 @@
 // 权限控制、workingSeq 乐观并发冲突、被 replace 覆盖后查看与恢复草稿且历史链不断裂。
 import type { CanvasHistoryConflict, CanvasHistoryDetail, CanvasHistoryList, ModelUpdate } from '@dowel/api';
 import { addColumn, all, createSchema, createTable, emptyModel, type Model, newId } from '@dowel/core';
+import { type HistoryVersionRow, stepsChecksum } from '@dowel/engines';
 import { afterEach, beforeEach, expect, test } from 'vitest';
 import { createApp, openPlatformDb, type PlatformDb } from '../src/index.ts';
 import { LoginLimiter } from '../src/rate-limit.ts';
 import type { Peer } from '../src/rooms.ts';
+import { insertRestoredVersions } from '../src/takeover.ts';
 import { makeUser, PASSWORD } from './support.ts';
 
 process.env.DOWEL_SECRET ??= 'canvas-history-test-secret-0123456789';
@@ -398,4 +400,166 @@ test('权限控制、workingSeq 并发冲突 409 与 replace 覆盖后找回草�
     target_id: pid,
     data: { fromSeq: 2, restoredSeq: 1, newSeq: 3 },
   });
+});
+
+test('恢复版本不与画布提交序号撞号，遗留数据过滤 restored_at 且新发布版本仍准确标记（#13）', async () => {
+  // 构造接手恢复的 v0..v3 版本链，并将 seq = 0 初始快照对齐到链头 v3.model（模拟 restoreChain 后的项目）
+  const baseModel = emptyModel();
+  const publicId = createSchema(baseModel, 'public');
+  const legacyTable = createTable(baseModel, publicId, 'legacy_users');
+  addColumn(baseModel, legacyTable, { name: 'id', type: 'bigint', notNull: true });
+
+  const emptyChecksum = stepsChecksum([], []);
+  const versionIds = [newId(), newId(), newId(), newId()];
+  const restored: HistoryVersionRow[] = versionIds.map((versionId, i) => ({
+    projectId: pid,
+    versionId,
+    number: i,
+    parentId: i === 0 ? null : versionIds[i - 1]!,
+    name: i === 0 ? '初始基线' : `恢复版本 v${i}`,
+    scope: null,
+    upSteps: [],
+    downSteps: [],
+    checksum: emptyChecksum,
+    model: structuredClone(baseModel),
+    fingerprint: `fp-${i}`,
+    publishedAt: new Date(Date.UTC(2026, 0, 1, 0, i)).toISOString(),
+    publishedBy: null,
+  }));
+
+  await db.query('update room_snapshots set model = $2::text::jsonb where branch_id = $1 and seq = 0', [
+    branchId,
+    JSON.stringify(baseModel),
+  ]);
+  await insertRestoredVersions(db, {
+    pid,
+    branch: branchId,
+    versions: restored,
+    verifiedReports: new Map(),
+  });
+
+  // 1. 验证 insertRestoredVersions 写入 seq = -1 且 restored_at 非空
+  const storedRestored = await db.query<{
+    id: string;
+    number: number;
+    seq: number;
+    restored_at: string | null;
+  }>('select id, number, seq, restored_at from versions where project_id = $1 order by number', [pid]);
+  expect(storedRestored).toHaveLength(4);
+  for (const row of storedRestored) {
+    expect(Number(row.seq)).toBe(-1);
+    expect(row.restored_at).not.toBeNull();
+  }
+
+  // 在接手后的画布上执行 3 次普通编辑（seq = 1, 2, 3）
+  const [editorUser] = await db.query<{ id: string; username: string; name: string; role: 'member' }>(
+    "select id, username, name, role from users where username = 'editor'",
+  );
+  const peer: Peer = {
+    user: {
+      id: editorUser!.id,
+      username: editorUser!.username,
+      name: editorUser!.name,
+      email: null,
+      role: editorUser!.role,
+      status: 'active',
+      createdAt: '',
+      lastLoginAt: null,
+      hasPassword: true,
+    },
+    role: 'editor',
+    send: () => {},
+  };
+  await rooms.join(branchId, peer);
+  await rooms.message(branchId, peer, { t: 'hello', client: 'c-takeover', lastSeq: 0 });
+
+  const ordersId = newId();
+  await sendOp(peer, 'c-takeover', 1, 'createTable', { id: ordersId, schema: publicId, name: 'orders' });
+  await sendOp(peer, 'c-takeover', 2, 'addColumn', {
+    table: ordersId,
+    column: { id: newId(), name: 'id', type: 'bigint', notNull: true },
+  });
+  await sendOp(peer, 'c-takeover', 3, 'addColumn', {
+    table: ordersId,
+    column: { id: newId(), name: 'status', type: 'text', notNull: false },
+  });
+
+  // listHistory 与 historyEntry 对 seq = 0, 1, 2, 3 均不应错标为已发布版本
+  const listAfterTakeover = await rooms.listHistory(branchId, { limit: 10 });
+  expect(listAfterTakeover.entries.map((e) => [e.seq, e.version])).toEqual([
+    [3, null],
+    [2, null],
+    [1, null],
+    [0, null],
+  ]);
+  for (const seq of [0, 1, 2, 3]) {
+    expect((await rooms.historyEntry(branchId, seq)).version).toBeNull();
+  }
+
+  // 2. 模拟历史遗留数据：restored_at 非空且旧 seq 被写成版本号 v.number（0, 1, 2, 3）
+  await db.query('update versions set seq = number where project_id = $1 and restored_at is not null', [pid]);
+  const legacySeqs = await db.query<{ number: number; seq: number }>(
+    'select number, seq from versions where project_id = $1 order by number',
+    [pid],
+  );
+  expect(legacySeqs.map((r) => [Number(r.number), Number(r.seq)])).toEqual([
+    [0, 0],
+    [1, 1],
+    [2, 2],
+    [3, 3],
+  ]);
+
+  const listWithLegacy = await rooms.listHistory(branchId, { limit: 10 });
+  expect(listWithLegacy.entries.map((e) => [e.seq, e.version])).toEqual([
+    [3, null],
+    [2, null],
+    [1, null],
+    [0, null],
+  ]);
+  for (const seq of [0, 1, 2, 3]) {
+    expect((await rooms.historyEntry(branchId, seq)).version).toBeNull();
+  }
+
+  // 3. 接手后正常发布新版本 v4（restored_at is null，对应 seq = 3），再继续一次普通编辑 seq = 4
+  const pub = await call('POST', `/api/projects/${pid}/versions`, { name: '接手后新版本' }, editorCookie);
+  expect(pub.status).toBe(201);
+  const v4 = pub.data as { id: string; number: number; seq: number; name: string };
+  expect(v4).toMatchObject({ number: 4, seq: 3, name: '接手后新版本' });
+
+  await sendOp(peer, 'c-takeover', 4, 'addColumn', {
+    table: ordersId,
+    column: { id: newId(), name: 'note', type: 'text', notNull: false },
+  });
+  await rooms.leave(branchId, peer);
+
+  const expectedV4 = { id: v4.id, number: 4, name: '接手后新版本' };
+  const listAfterPublish = await rooms.listHistory(branchId, { limit: 10 });
+  expect(listAfterPublish.entries.map((e) => [e.seq, e.version])).toEqual([
+    [4, null],
+    [3, expectedV4],
+    [2, null],
+    [1, null],
+    [0, null],
+  ]);
+  for (const seq of [0, 1, 2, 4]) {
+    expect((await rooms.historyEntry(branchId, seq)).version).toBeNull();
+  }
+  expect((await rooms.historyEntry(branchId, 3)).version).toEqual(expectedV4);
+
+  // 通过 HTTP 接口核对列表与单条详情
+  const httpList = await call('GET', `/api/projects/${pid}/history`, undefined, viewerCookie);
+  expect(httpList.status).toBe(200);
+  expect((httpList.data as CanvasHistoryList).entries.map((e) => [e.seq, e.version])).toEqual([
+    [4, null],
+    [3, expectedV4],
+    [2, null],
+    [1, null],
+    [0, null],
+  ]);
+  const httpDetail3 = await call('GET', `/api/projects/${pid}/history/3`, undefined, viewerCookie);
+  expect(httpDetail3.status).toBe(200);
+  expect((httpDetail3.data as CanvasHistoryDetail<Model>).entry.version).toEqual(expectedV4);
+  const httpDetail0 = await call('GET', `/api/projects/${pid}/history/0`, undefined, viewerCookie);
+  expect(httpDetail0.status).toBe(200);
+  expect((httpDetail0.data as CanvasHistoryDetail<Model>).entry.version).toBeNull();
 });
