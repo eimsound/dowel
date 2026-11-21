@@ -10,18 +10,27 @@
 | 内部包       | **tsdown 分层构建 + `@dowel/source` 条件导出**：`packages/*` 与 `apps/server` 经根目录 `tsdown.config.ts`（`workspace` 模式）构建为纯 ESM `.js` + `.d.ts` 产物；默认 `exports` 指向 `./dist/`，同时暴露 `"@dowel/source": "./src/index.ts"`，配合 `tsconfig.json` `customConditions`、Vite / Vitest `resolve.conditions` 及 `dev:server` `--conditions=@dowel/source` 保持本地开发 / 测试 / `tsc` 零重编。只用可擦除的 TS 语法（`erasableSyntaxOnly`），源码导入写 `.ts` 后缀 |
 | Turborepo    | 暂不使用：tsdown 单进程 `workspace` 模式构建全仓仅 ~3 秒，本地开发与测试经 `@dowel/source` 直读源码无需预构建，不需要额外编排层                                                                                                                                                                                                                                                                                                                                               |
 | 检查命令     | `pnpm check`（= `pnpm lint`（`oxlint --type-aware --deny-warnings && oxfmt --check`）+ `tsc --noEmit` + `vitest run`）                                                                                                                                                                                                                                                                                                                                                        |
-| 测试用 PG    | `test/pg-container.ts`：有 `DOWEL_TEST_PG` 就用它；否则 Testcontainers 起 `pgvector/pgvector:pg18`（账号 `postgres`）。Vitest 的 `globalSetup`（`test/global-setup.ts`）和 Playwright 的 `globalSetup`（`e2e/global-setup.ts`）共用；每个测试文件用 `test/pg.ts` 的 `useTestDb` / `createTestDb` 建自己的库。没有 Docker 时打印警告、跳过需要 PG 的测试；`CI` 环境下没有 Docker 直接失败。拉不到 Docker Hub 时可设 `TESTCONTAINERS_HUB_IMAGE_NAME_PREFIX=mirror.gcr.io/`      |
-| CI           | `.github/workflows/ci.yml`：check（lint、类型检查、单元测试、全仓 `pnpm build` 及无 `@dowel/source` 条件的 `apps/server/dist/main.js` 启动冒烟）、heavy（随机闭环 + 命名规则 `RUNS=5000`）、e2e（Playwright）。本地默认用例少（随机闭环 100 轮约 20 秒），大规模随机测试靠 CI                                                                                                                                                                                                 |
+| 测试用数据库 | `test/pg-container.ts`、`test/mysql-container.ts`、`test/mssql-container.ts`：分别支持 `DOWEL_TEST_PG` / `DOWEL_TEST_MYSQL` / `DOWEL_TEST_MSSQL` 或通过 Testcontainers 启动真实容器（`pgvector/pgvector:pg15`～`pg19`、MySQL 8.4/9.7、SQL Server 2019/2022/2025）；SQLite 测试直接使用 Node 26 内置 `node:sqlite`。无 Docker 时跳过需要容器的测试并警告，`CI` 环境下缺失直接失败                                                                                              |
+| CI           | `.github/workflows/ci.yml`：check（lint、类型检查、单元测试、全仓 `pnpm build` 及生产冒烟）、`pg-matrix`（PG 15–19 多版本矩阵）、heavy（随机闭环 + 命名规则 `RUNS=5000`）、e2e（Playwright）；`.github/workflows/docs.yml`：Zensical 0.1.3 严格文档构建校验与按需 Pages 发布                                                                                                                                                                                                  |
 | 随机测试参数 | `RUNS=轮数`、`SEED=种子`、`TIME_LIMIT=毫秒`（缩小反例的总时长上限）、`TIMING=1` 打印每轮耗时；`STATS=1` 运行生成器覆盖面统计；`CASE='<反例 JSON>'` 运行调试用例，打印两个版本和迁移语句                                                                                                                                                                                                                                                                                       |
 
 ## 2. 代码结构
 
 ```
 packages/
-  core/       IR（ir.ts）、模型查询与校验（model.ts）、编辑操作 = 未来的 mutator（edit.ts）、
-              PG 命名规则（pg/naming.ts）、标识符引用（pg/quote.ts）、迁移规划器（pg/plan.ts）
-  engines/    PG 快照读取（pg/snapshot.ts、pg/opaque.ts）、快照 → IR 导入（pg/import.ts）、Db 接口（pg/db.ts）
-  verifier/   影子库清空、执行步骤、闭环验证（src/index.ts）；随机生成器和随机测试（test/）
+  api/        共享 zod 请求/响应契约（@dowel/api）
+  core/       IR（ir.ts）、模型查询与校验（model.ts）、mutator 注册表（mutators.ts）、
+              方言契约与静态注册表（dialect.ts / registry.ts）、
+              PG（pg/：含 capabilities.ts、partition.ts）、SQLite（sqlite/）、
+              MySQL（mysql/）、MSSQL（mssql/：含 batch.ts）命名/引用/规划/高危语句检查
+  engines/    EngineAdapter 注册表（registry.ts）、四方言数据库适配/快照/导入/历史/风险分析（pg/、sqlite/、mysql/、mssql/）
+  executor/   跨方言执行器、预演、漂移检测、认领、标记与多环境合并（execute.ts、drift.ts、claim.ts、mark.ts、merge.ts）
+  sync/       无状态实时协作房间、客户端待确认队列与 rebase
+  verifier/   影子库闭环验证执行器与四方言随机属性测试（random.test.ts、sqlite-random.test.ts、mysql-random.test.ts、mssql-random.test.ts）
+apps/
+  server/     Hono API、WebSocket 协作、HA 协调、targets/{pg,sqlite,mysql,mssql}.ts 目标库驱动注册表
+  web/        React 19 + Vite 8 + @xyflow/react 画布，dialects.ts 多方言 UI 规格表与中英文 i18n
+docs/         Zensical 0.1.3 用户文档站点（根目录 zensical.toml + README.md）
 ```
 
 ### 2.1 规划器 `plan(from, to)` 的阶段
@@ -602,6 +611,26 @@ P3 审查后的修正（2026-11-19）：
 - **V4 生产启动、Docker、CI 与文档**：`pnpm build` 覆盖 `tsdown && pnpm --filter @dowel/web build`，`pnpm start` 切换为 `node apps/server/dist/main.js`；`Dockerfile` 运行阶段仅复制各包 `package.json`（安装 `--prod` 依赖）及 `packages/*/dist`、`apps/server/dist`、`apps/web/dist`，完全剥离 `src/` 与 `tsconfig.json`；`.github/workflows/ci.yml` 的 `check` job 补充 `pnpm build` 及不带 `@dowel/source` 条件的 `apps/server/dist/main.js` 启动冒烟（验证 `GET /api/instance` 与首页 `/`）；同步更新 `docs/getting-started.md` 与架构文档。
 - **收尾结果**（2026-11-21）：`pnpm lint` 通过（0 errors / 0 warnings，280 文件 lint + 334 文件格式校验）、`pnpm typecheck` 通过、`pnpm build` 通过（全部 6 个内部包 `.js` + `.d.ts`、`apps/server/dist/main.js`、`apps/web/dist`）、删 `dist/` 零重编验证通过（`tsc` + `vitest` 无需预构建直接通过）、无 `@dowel/source` 产物启动冒烟通过、`TMPDIR=/tmp pnpm test` 63 个文件通过（2 个跳过）、1361 项通过（3 项跳过）、Docker 多阶段构建 + 无源码/无 `tsconfig.json` 校验 + 容器启动冒烟通过。
 
+### 4.14 Stage 2：PostgreSQL 15–19 多版本支持与分区表编辑（2026-11-21）
+
+- **PG 15–19 版本能力与推导**：新增 `packages/core/src/pg/capabilities.ts`，`envs.ts` 探测并记录各环境 `engine_version` / `engine_version_num`，取全部环境大版本最小值推导项目目标版本；`checkPgCompatibility` 在规划期硬拦截不兼容特性（`NULLS NOT DISTINCT` 15+、分区表 `IDENTITY`/排他约束 17+、`VIRTUAL` 生成列与显式命名 `NOT NULL` 18+）并对 `uuidv7()` 发出 18+ 警告；多版本环境下 `shadows.ts` 与 `routes/versions.ts` 按 PG 大版本组分别实测，缺最低目标版本可用影子库时拒绝标为已验证。
+- **分区表编辑**：新增 `packages/core/src/pg/partition.ts` 与结构化 `PartitionSpec`（`RANGE` / `LIST` / `HASH`、列或表达式分区键、边界校验），支持挂载普通表（`ATTACH PARTITION`）、脱离普通表（`DETACH PARTITION`）与增删改子分区（含 `DEFAULT`）；已发布分区表的策略在界面锁定只读，多级子分区以只读徽标展示。新增 `pg-matrix.test.ts`、`pg-multiversion.test.ts` 与 `e2e/partitions.spec.ts`，`.github/workflows/ci.yml` 增加 `pg-matrix`（15–19）任务。
+
+### 4.15 Stage 2：多方言抽象骨架与 SQLite 目标库（2026-11-21）
+
+- **统一抽象三层解耦**：在 `@dowel/core` 建立 `DialectSpec` + `DialectCapabilities`（`dialect.ts` / `registry.ts`），在 `@dowel/engines` 建立 `EngineAdapter` + `HistoryStore`（`registry.ts`），在 `apps/server/src/targets/` 建立 `TargetDriver` 注册表，清理全仓 `'pg'` 硬编码。
+- **SQLite 目标库与 12 步表重建**：基于 Node 26 内置 `node:sqlite` 实现 SQLite 规划器（12 步重建表、外键开关、`PRAGMA foreign_key_check` 校验、`STRICT` / `WITHOUT ROWID` / `AUTOINCREMENT`）、内置 `:memory:` 影子库（免环境配置导入与验证）、同库 `dowel_` 前缀历史表（`BEFORE UPDATE`/`BEFORE DELETE` 防篡改触发器），以及受 `DOWEL_SQLITE_ROOTS` 目录白名单、逐段软链消解、禁指 `DOWEL_DB` 保护与 `enableDefensive`/authorizer 沙箱隔离的本地目标库驱动。新增 `e2e/sqlite.spec.ts` 与 `sqlite-random.test.ts`。
+
+### 4.16 Stage 2：MySQL（8.4 / 9.7）与 SQL Server（2019 / 2022 / 2025）目标库（2026-11-22）
+
+- **MySQL 目标库（`mysql2`）**：实现 `engine`/`charset`/`collation`、`UNSIGNED`/`ZEROFILL`/`AUTO_INCREMENT`/`ON UPDATE CURRENT_TIMESTAMP`/列级 `enum`/`set`、`BTREE`/`HASH`/`FULLTEXT`/`SPATIAL` 索引、列顺序调整（`FIRST`/`AFTER`）与 InnoDB 外键隐式索引追踪；实现 `{原库名}_dowel` 同实例影子库（`__dowel_shadow_mark` 哨兵表与 `GET_LOCK`）、8.4 vs 9.7 版本分组验证与 `VECTOR(n)` 静态拦截；实现 DDL 自动提交断点续跑及崩溃重跑幂等探测（`detectMysqlStepAlreadyApplied`），并通过 `INSTANT` → `INPLACE (LOCK=NONE/SHARED)` → `COPY` 渐进试跑实测风险。
+- **SQL Server 目标库（`mssql` / `tedious`）**：实现 `host\instance` 命名实例与严格 TLS 解析（自签名证书需显式 `trustServerCertificate=true`）、`IDENTITY(seed, increment)`、带名默认值约束（`DF_*`）前置清理、`sp_rename`、`CLUSTERED`/`FILLFACTOR`、`PERSISTED`/`SPARSE`/`ROWGUIDCOL` 与独占行 `GO [count]` 批切分；支持 SQL Server 2019/2022/2025（2025 原生 `json` 与 `vector(n)` 静态检查）；实现 `{原库名}_dowel` 影子库（`dowel_shadow` 扩展属性、`sys.sp_getapplock`、拒系统库）、`[dowel]` schema 历史表与 `sys.dm_tran_locks`/`hobt_id` 风险实测。新增对应引擎/执行器/目标驱动及随机闭环测试，并更新前端 `dialects.ts` 多方言 UI 规格表。
+
+### 4.17 Stage 2 Track 5C：Zensical 0.1.3 用户文档站点与架构文档同步（2026-11-22）
+
+- 引入 `zensical==0.1.3`（通过 `uvx` 无污染运行，不引入 `pyproject.toml` / `.venv`），配置 `zensical.toml`（开启 `attr_list = {}` 与全中文标题显式 ASCII `{#anchor-id}`）、`package.json` `docs:dev` / `docs:build` 脚本、`.github/workflows/docs.yml`（全 SHA 锁定校验与按需 Pages 部署），并在 `.gitignore` / `.oxfmtrc.jsonc` / `.oxlintrc.json` / `.dockerignore` 忽略 `site/` 与 `.cache/`。
+- 新建根目录 `README.md`、将臃肿的 `docs/getting-started.md` 拆分为 14 篇结构清晰的专题页面（新增 `index.md`、`deployment.md`、`accounts-and-access.md`、`modeling.md`、`dialects.md`、`takeover.md`、`ci-action.md`、`glossary.md`），全面对齐 4 方言（PostgreSQL 15–19、SQLite、MySQL 8.4/9.7、SQL Server 2019/2022/2025）、20 项服务端环境变量、画布修改历史与 HA 部署实情，清理全部 `../` 站外相对链接与过时表述，并同步更新 `.agents/docs/{02-consensus,04-ir-design,05-implementation}.md` 与 `GLOSSARY.md`。
+
 ## 5. 下一步
 
-M2：SQLite（12 步重建表）、PG 多版本（14～18）与版本能力表、多环境分别验证、分区表编辑。
+M3：模型分支、语义冲突检测与合并、变更评审流程、Flyway / Prisma / Atlas 导出格式、本地离线浏览与 MCP 服务。
