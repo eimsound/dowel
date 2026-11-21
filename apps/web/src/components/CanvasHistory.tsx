@@ -44,6 +44,20 @@ const outside = (e: PointerEvent, d: HTMLDialogElement) => {
   return e.clientX < r.left || e.clientX > r.right || e.clientY < r.top || e.clientY > r.bottom;
 };
 
+const parseWorkingChangedConflict = (e: unknown): CanvasHistoryConflict | null => {
+  if (!(e instanceof ApiError) || e.status !== 409) return null;
+  const body = e.body as Partial<CanvasHistoryConflict> | undefined;
+  if (body?.code !== 'working_changed' || typeof body.currentSeq !== 'number' || !body.diffToCurrent) {
+    return null;
+  }
+  return {
+    error: body.error ?? e.message,
+    code: 'working_changed',
+    currentSeq: body.currentSeq,
+    diffToCurrent: body.diffToCurrent,
+  };
+};
+
 /** 历史画布只读预览：使用独立本地布局，不改动工作区协作布局 */
 const HistoryCanvasPreview = ({ model, seedLayout }: { model: Model; seedLayout: Layout }) => {
   const { t } = useTranslation();
@@ -255,6 +269,7 @@ export const CanvasHistory = ({
   const [stateView, setStateView] = useState<StateView>('canvas');
   const [confirmOpen, setConfirmOpen] = useState(false);
   const [conflict, setConflict] = useState<CanvasHistoryConflict | null>(null);
+  const [restoreError, setRestoreError] = useState<string | null>(null);
 
   const confirmOpenRef = useRef(confirmOpen);
   confirmOpenRef.current = confirmOpen;
@@ -292,6 +307,7 @@ export const CanvasHistory = ({
       setSelectedSeq(null);
       setConfirmOpen(false);
       setConflict(null);
+      setRestoreError(null);
     }
   }, [open]);
 
@@ -348,45 +364,57 @@ export const CanvasHistory = ({
   const restore = useMutation({
     mutationFn: ({ seq, workingSeq }: { seq: number; workingSeq: number }) =>
       api<ModelUpdate>('POST', `/api/projects/${pid}/history/${seq}/restore`, { workingSeq }),
+    onMutate: () => {
+      setRestoreError(null);
+    },
     onSuccess: (res, vars) => {
       void qc.invalidateQueries({ queryKey: ['canvas-history', pid] });
       void qc.invalidateQueries({ queryKey: ['canvas-history-detail', pid] });
       void qc.invalidateQueries({ queryKey: ['activity', pid] });
       setConfirmOpen(false);
       setConflict(null);
+      setRestoreError(null);
       toast(t('hist.restored', { seq: vars.seq, newSeq: res.seq }));
       onClose();
     },
     onError: (e) => {
-      if (e instanceof ApiError && e.status === 409) {
-        const body = e.body as Partial<CanvasHistoryConflict> | undefined;
-        if (body?.code === 'working_changed' && typeof body.currentSeq === 'number' && body.diffToCurrent) {
-          setConflict({
-            error: body.error ?? e.message,
-            code: 'working_changed',
-            currentSeq: body.currentSeq,
-            diffToCurrent: body.diffToCurrent,
-          });
-          void qc.invalidateQueries({ queryKey: ['canvas-history', pid] });
-          void qc.invalidateQueries({ queryKey: ['canvas-history-detail', pid] });
-        }
+      const nextConflict = parseWorkingChangedConflict(e);
+      if (nextConflict) {
+        setConflict(nextConflict);
+        setRestoreError(null);
+        void qc.invalidateQueries({ queryKey: ['canvas-history', pid] });
+        void qc.invalidateQueries({ queryKey: ['canvas-history-detail', pid] });
+        return;
       }
+      setRestoreError(e.message || String(e));
     },
   });
+
+  const { reset: resetRestore } = restore;
 
   const opText = (opName: string) => t(`hist.op.${opName}`, { defaultValue: opName });
 
   const openConfirm = () => {
+    if (readOnly) return;
     setConflict(null);
-    restore.reset();
+    setRestoreError(null);
+    resetRestore();
     setConfirmOpen(true);
   };
 
-  const closeConfirm = () => {
+  const closeConfirm = useCallback(() => {
     setConfirmOpen(false);
     setConflict(null);
-    restore.reset();
-  };
+    setRestoreError(null);
+    resetRestore();
+  }, [resetRestore]);
+
+  // 确认框打开期间若权限被实时降级为只读，自动关闭确认框并清空恢复错误与冲突态
+  useEffect(() => {
+    if (readOnly && confirmOpen) {
+      closeConfirm();
+    }
+  }, [readOnly, confirmOpen, closeConfirm]);
 
   const canRestore = !readOnly && !!detail && !detail.entry.isCurrent && detail.diffToCurrent.total > 0;
 
@@ -496,6 +524,8 @@ export const CanvasHistory = ({
                             onClick={() => {
                               setSelectedSeq(entry.seq);
                               setConflict(null);
+                              setRestoreError(null);
+                              resetRestore();
                             }}
                             className={cx(
                               'flex w-full flex-col gap-1 rounded-sm border border-transparent px-2.5 py-2 text-left transition-colors',
@@ -781,15 +811,15 @@ export const CanvasHistory = ({
             <button
               type="button"
               className="btn primary"
-              disabled={restore.isPending || confirmDiff.total === 0}
+              disabled={readOnly || restore.isPending || confirmDiff.total === 0}
               aria-busy={restore.isPending}
-              onClick={() =>
-                detail &&
+              onClick={() => {
+                if (readOnly || !detail) return;
                 restore.mutate({
                   seq: detail.entry.seq,
                   workingSeq: confirmWorkingSeq,
-                })
-              }
+                });
+              }}
             >
               {restore.isPending
                 ? t('hist.restoring')
@@ -802,15 +832,16 @@ export const CanvasHistory = ({
       >
         {detail && (
           <div className="space-y-3 text-sm">
-            {conflict ? (
+            {conflict && (
               <Banner kind="warn" role="alert" title={t('hist.conflictTitle')}>
                 {t('hist.conflictBody', { currentSeq: conflict.currentSeq })}
               </Banner>
-            ) : restore.error ? (
+            )}
+            {restoreError && (
               <Banner kind="danger" role="alert">
-                {restore.error.message}
+                {restoreError}
               </Banner>
-            ) : null}
+            )}
 
             <p className="m-0 text-text-2">
               {t('hist.confirmBody', {
