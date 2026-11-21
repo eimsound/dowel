@@ -131,6 +131,19 @@ export const registerWizard = (app: Hono<Env>, ctx: AppContext) => {
     });
     const targetPgMajor =
       b.dialect === 'pg' ? deriveTargetPgMajor(envRows.map((e) => pgMajorOf(e.engineVersionNum))) : null;
+    const mysqlNums =
+      b.dialect === 'mysql'
+        ? envRows
+            .map((e) => e.engineVersionNum)
+            .filter((v): v is number => typeof v === 'number' && Number.isInteger(v) && v > 0)
+        : [];
+    const targetMysqlVersionNum = mysqlNums.length ? Math.min(...mysqlNums) : null;
+    const baselinePlanOpts =
+      targetPgMajor !== null
+        ? { pgMajor: targetPgMajor }
+        : targetMysqlVersionNum !== null
+          ? { mysqlVersionNum: targetMysqlVersionNum }
+          : undefined;
     const project: ProjectCreated = {
       id: newId(),
       name: b.name,
@@ -202,9 +215,7 @@ export const registerWizard = (app: Hono<Env>, ctx: AppContext) => {
         await send({ stage });
         const imported = kind !== 'blank';
 
-        const baseline = imported
-          ? freezeBaseline(model, scope, targetPgMajor !== null ? { pgMajor: targetPgMajor } : undefined)
-          : null;
+        const baseline = imported ? freezeBaseline(model, scope, baselinePlanOpts) : null;
         let baselineReport: StoredVerifyReport | null = null;
         if (baseline) {
           try {

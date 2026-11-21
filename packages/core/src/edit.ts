@@ -41,6 +41,7 @@ import {
   requiredUniquePartitionKeys,
   rootTableId,
 } from './model.ts';
+import { MYSQL_SAFE_IDENT_RE } from './mysql/naming.ts';
 import { exprReferences, renameInExpr, renameQualifiedInExpr, type Token, tokenize } from './pg/expr.ts';
 import {
   derivedUuid,
@@ -62,7 +63,7 @@ export { EditError, exprReferences, renameInExpr, renameQualifiedInExpr, type To
  */
 export const checkExprColumns = (m: Model, table: string, expr: string) => {
   const d = getDialect(m.dialect);
-  const caseInsensitive = m.dialect === 'sqlite';
+  const caseInsensitive = m.dialect === 'sqlite' || m.dialect === 'mysql';
   const names = new Set(
     effectiveColumnsOf(m, table).map((c) => (caseInsensitive ? c.name.toLowerCase() : c.name)),
   );
@@ -113,6 +114,12 @@ const typeTaken = (m: Model, schema: string, name: string, self: string) =>
 const assertIdent = (m: Model, name: string, kind: IdentKind) => {
   const err = getDialect(m.dialect).validateIdent(name, kind);
   if (err) throw new EditError(err);
+};
+
+const assertMysqlSafeOption = (val: string | null | undefined, label: string) => {
+  if (val !== undefined && val !== null && !MYSQL_SAFE_IDENT_RE.test(val)) {
+    throw new EditError(`MySQL ${label} ${val} 格式不合法（仅允许 1-64 位字母、数字与下划线）`);
+  }
 };
 
 /** 清除列上的 SQLite AUTOINCREMENT 标记（表变为 WITHOUT ROWID、主键改为多列或换列、或列类型不再为 INTEGER 时调用） */
@@ -279,6 +286,11 @@ export const createTable = (
   if (id in m.objects) throw new EditError(`对象 ID ${id} 已存在`);
   if (relTaken(m, schema, name, '') || typeTaken(m, schema, name, ''))
     throw new EditError(`名字 ${name} 已被占用`);
+  if (m.dialect === 'mysql' && ext?.mysql) {
+    assertMysqlSafeOption(ext.mysql.engine, '存储引擎名');
+    assertMysqlSafeOption(ext.mysql.charset, '字符集名');
+    assertMysqlSafeOption(ext.mysql.collation, '排序规则名');
+  }
   const o: Table = {
     id,
     kind: 'table',
@@ -323,6 +335,11 @@ export const setTableExt = (m: Model, id: string, ext: TableExt | null) => {
         }
       }
     }
+  }
+  if (m.dialect === 'mysql' && ext?.mysql) {
+    assertMysqlSafeOption(ext.mysql.engine, '存储引擎名');
+    assertMysqlSafeOption(ext.mysql.charset, '字符集名');
+    assertMysqlSafeOption(ext.mysql.collation, '排序规则名');
   }
   const cleaned = cleanExt(ext);
   if (cleaned) t.ext = cleaned as TableExt;
@@ -997,10 +1014,14 @@ export const addColumn = (m: Model, table: string, spec: ColumnSpec): string => 
   }
   const cols = columnsOf(m, table);
   const dup =
-    m.dialect === 'sqlite'
+    m.dialect === 'sqlite' || m.dialect === 'mysql'
       ? cols.some((c) => c.name.toLowerCase() === spec.name.toLowerCase())
       : cols.some((c) => c.name === spec.name);
   if (dup) throw new EditError(`列 ${spec.name} 已存在`);
+  if (m.dialect === 'mysql') {
+    assertMysqlSafeOption(spec.ext?.mysql?.charset, '字符集名');
+    assertMysqlSafeOption(spec.collation, '排序规则名');
+  }
   if (
     m.dialect === 'sqlite' &&
     t.ext?.sqlite?.strict &&
@@ -1070,6 +1091,9 @@ export const setColumnExt = (m: Model, id: string, ext: ColumnExt | null) => {
       throw new EditError('AUTOINCREMENT 只能用于单列主键');
     }
   }
+  if (m.dialect === 'mysql' && ext?.mysql) {
+    assertMysqlSafeOption(ext.mysql.charset, '字符集名');
+  }
   const cleaned = cleanExt(ext);
   if (cleaned) c.ext = cleaned as ColumnExt;
   else delete c.ext;
@@ -1085,7 +1109,7 @@ export const renameColumn = (m: Model, id: string, name: string) => {
   assertNotPartitionChild(m, c.parent);
   normalizePartitionFamily(m, c.parent);
   const dup =
-    m.dialect === 'sqlite'
+    m.dialect === 'sqlite' || m.dialect === 'mysql'
       ? columnsOf(m, c.parent).some((x) => x.id !== id && x.name.toLowerCase() === name.toLowerCase())
       : columnsOf(m, c.parent).some((x) => x.name === name && x.id !== id);
   if (dup) throw new EditError(`列 ${name} 已存在`);
@@ -1121,7 +1145,7 @@ export const dropColumn = (m: Model, id: string) => {
   assertNotPartitionChild(m, c.parent);
   normalizePartitionFamily(m, c.parent);
   assertNotPartitionKeyCol(m, id, '删除');
-  if (m.dialect === 'sqlite') {
+  if (m.dialect === 'sqlite' || m.dialect === 'mysql') {
     const tableCols = columnsOf(m, c.parent);
     const willDrop = new Set<string>([id]);
     for (let changed = true; changed;) {
@@ -1136,7 +1160,9 @@ export const dropColumn = (m: Model, id: string) => {
       }
     }
     if (tableCols.length - willDrop.size <= 0) {
-      throw new EditError('SQLite 表至少需要保留一列，无法删除最后一列');
+      throw new EditError(
+        `${m.dialect === 'mysql' ? 'MySQL' : 'SQLite'} 表至少需要保留一列，无法删除最后一列`,
+      );
     }
   }
   const affected = new Set([c.parent, ...partitionDescendants(m, c.parent).map((x) => x.id)]);

@@ -321,7 +321,11 @@ const runMigration = async (
               resumeFromCrash &&
               isResumeStep &&
               engine.detectStepAlreadyApplied &&
-              (await engine.detectStepAlreadyApplied(conn, steps[i]!))
+              (await engine.detectStepAlreadyApplied(
+                conn,
+                steps[i]!,
+                stepErr instanceof StepFailure ? stepErr.cause : stepErr,
+              ))
             ) {
               // 崩溃前 DDL 已提交但尚未落盘 markStep：幂等跳过
             } else {

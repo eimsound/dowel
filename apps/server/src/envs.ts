@@ -11,7 +11,7 @@ import type {
   EnvVersionRef,
 } from '@dowel/api';
 import { needsManualSchema } from '@dowel/api';
-import { deriveTargetPgMajor, type Dialect, type Model, pgMajorOf } from '@dowel/core';
+import { deriveTargetPgMajor, type Dialect, type Model, pgMajorOf, type PlanOptions } from '@dowel/core';
 import type { Db, ScriptStep } from '@dowel/engines';
 import { type ChainVersion, isNonTx, runTouched, runVersionId, type TargetState } from '@dowel/executor';
 import { HTTPException } from 'hono/http-exception';
@@ -48,12 +48,18 @@ export interface EnvRow {
   engine_version_num?: number | null;
 }
 
-/** 从版本号数值回退格式化简洁版本串（PG: 160004 → "16.4"；SQLite: 3054001 → "3.54.1"） */
+/** 从版本号数值回退格式化简洁版本串（PG: 160004 → "16.4"；MySQL: 80413 → "8.4.13"；SQLite: 3054001 → "3.54.1"） */
 export const formatVersionNum = (versionNum: number, dialect: Dialect = 'pg'): string => {
   if (dialect === 'sqlite') {
     const major = Math.floor(versionNum / 1_000_000);
     const minor = Math.floor((versionNum % 1_000_000) / 1000);
     const patch = versionNum % 1000;
+    return `${major}.${minor}.${patch}`;
+  }
+  if (dialect === 'mysql') {
+    const major = Math.floor(versionNum / 10000);
+    const minor = Math.floor((versionNum % 10000) / 100);
+    const patch = versionNum % 100;
     return `${major}.${minor}.${patch}`;
   }
   const major = Math.floor(versionNum / 10000);
@@ -114,6 +120,39 @@ export const projectPgVersionSummary = async (
 /** 推导项目目标兼容的最低 PG 大版本（无已探测环境时为 null） */
 export const projectTargetPgMajor = async (db: Db, projectId: string): Promise<number | null> =>
   (await projectPgVersionSummary(db, projectId)).targetPgMajor;
+
+/** 推导 MySQL 项目下全部已探测环境的最低数值版本号（如 80400；非 MySQL 或无已探测环境时为 null） */
+export const projectTargetMysqlVersionNum = async (db: Db, projectId: string): Promise<number | null> => {
+  const [proj] = await db.query<{ dialect: Dialect }>('select dialect from projects where id = $1', [
+    projectId,
+  ]);
+  if (!proj || proj.dialect !== 'mysql') return null;
+  const rows = await db.query<{ engine_version_num: number | null }>(
+    'select engine_version_num from environments where project_id = $1',
+    [projectId],
+  );
+  const nums = rows
+    .map((r) => r.engine_version_num)
+    .filter((v): v is number => typeof v === 'number' && Number.isInteger(v) && v > 0);
+  return nums.length ? Math.min(...nums) : null;
+};
+
+/** 推导项目规划器所需的方言版本选项（PG 传递 pgMajor，MySQL 传递 mysqlVersionNum） */
+export const projectPlanOptions = async (
+  db: Db,
+  projectId: string,
+  dialect: Dialect,
+): Promise<PlanOptions | undefined> => {
+  if (dialect === 'pg') {
+    const pgMajor = await projectTargetPgMajor(db, projectId);
+    return pgMajor !== null ? { pgMajor } : undefined;
+  }
+  if (dialect === 'mysql') {
+    const mysqlVersionNum = await projectTargetMysqlVersionNum(db, projectId);
+    return mysqlVersionNum !== null ? { mysqlVersionNum } : undefined;
+  }
+  return undefined;
+};
 
 export const loadEnv = async (db: Db, pid: string, eid: string): Promise<EnvRow> => {
   const [r] = await db.query<EnvRow>('select * from environments where id = $1 and project_id = $2', [

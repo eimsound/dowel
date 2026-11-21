@@ -66,14 +66,22 @@ export const readShadowPgMajor = async (db: Db): Promise<number | null> => {
   return vNum !== null && vNum !== undefined ? pgMajorOf(vNum) : null;
 };
 
+const hasExplicitVersionOpt = (dialect: Dialect, opts?: PlanOptions): boolean => {
+  if (!opts) return false;
+  if (dialect === 'pg') return opts.pgMajor !== undefined;
+  if (dialect === 'mysql') return opts.mysqlVersionNum !== undefined;
+  return true;
+};
+
 /** 多方言：在影子库里从零建出模型，返回统一的 TargetSnapshot */
 export const buildTarget = async (db: Db, m: Model, opts?: PlanOptions): Promise<TargetSnapshot> => {
   const engine = getEngine(m.dialect);
   await engine.resetShadow(db);
   let buildOpts: PlanOptions | undefined = opts;
-  if (m.dialect === 'pg' && opts?.pgMajor === undefined) {
-    const vNum = await engine.readVersionNum?.(db);
-    buildOpts = vNum !== null && vNum !== undefined ? engine.planOptionsForVersion?.(vNum) : undefined;
+  if (!hasExplicitVersionOpt(m.dialect, opts) && engine.readVersionNum && engine.planOptionsForVersion) {
+    const vNum = await engine.readVersionNum(db);
+    const detected = vNum !== null && vNum !== undefined ? engine.planOptionsForVersion(vNum) : undefined;
+    buildOpts = detected ? { ...opts, ...detected } : opts;
   }
   await runSteps(db, createAll(m, buildOpts), m.dialect);
   return engine.readSnapshot(db);
@@ -101,11 +109,18 @@ export const verify = async (db: Db, from: Model, to: Model, opts?: PlanOptions)
   let shadowMajor: number | null = null;
   let planOpts: PlanOptions | undefined = opts;
   let buildOpts: PlanOptions | undefined = opts;
-  if (dialect === 'pg') {
-    shadowMajor = await readShadowPgMajor(db);
-    const planMajor = opts?.pgMajor ?? shadowMajor;
-    planOpts = planMajor !== null ? { pgMajor: planMajor } : undefined;
-    buildOpts = shadowMajor !== null ? { pgMajor: shadowMajor } : undefined;
+  if (engine.readVersionNum && engine.planOptionsForVersion) {
+    const vNum = await engine.readVersionNum(db);
+    const shadowOpts = vNum !== null && vNum !== undefined ? engine.planOptionsForVersion(vNum) : undefined;
+    if (dialect === 'pg') {
+      shadowMajor = vNum !== null && vNum !== undefined ? pgMajorOf(vNum) : null;
+      const planMajor = opts?.pgMajor ?? shadowMajor;
+      planOpts = planMajor !== null ? { pgMajor: planMajor } : undefined;
+      buildOpts = shadowMajor !== null ? { pgMajor: shadowMajor } : undefined;
+    } else {
+      planOpts = hasExplicitVersionOpt(dialect, opts) ? opts : shadowOpts;
+      buildOpts = shadowOpts ?? opts;
+    }
   }
   const up = plan(from, to, planOpts);
   const down = plan(to, from, planOpts);
@@ -166,6 +181,9 @@ export const verifyScripts = async (
     shadowMajor = await readShadowPgMajor(db);
     const pgMajor = options.pgMajor !== undefined ? options.pgMajor : shadowMajor;
     buildOpts = pgMajor !== null ? { pgMajor } : undefined;
+  } else if (engine.readVersionNum && engine.planOptionsForVersion) {
+    const vNum = await engine.readVersionNum(db);
+    buildOpts = vNum !== null && vNum !== undefined ? engine.planOptionsForVersion(vNum) : undefined;
   }
   const toSnap = await buildTarget(db, to, buildOpts);
   const fromSnap = await buildTarget(db, from, buildOpts);

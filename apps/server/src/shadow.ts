@@ -19,7 +19,6 @@ import {
   analyze,
   buildTarget,
   InstanceLevelStatementError,
-  readShadowPgMajor,
   runSteps,
   StepError,
   type VerifyScriptsOptions,
@@ -91,6 +90,10 @@ const codeOf = (e: unknown): string | null => {
   const code = ((e instanceof StepError ? e.cause : e) as { code?: unknown } | null)?.code;
   return typeof code === 'string' ? code : null;
 };
+const errnoOf = (e: unknown): number | null => {
+  const n = ((e instanceof StepError ? e.cause : e) as { errno?: unknown } | null)?.errno;
+  return typeof n === 'number' ? n : null;
+};
 const messageOf = (e: unknown): string => {
   const cause = e instanceof StepError ? e.cause : e;
   return cause instanceof Error ? cause.message : String(cause);
@@ -100,19 +103,18 @@ const messageOf = (e: unknown): string => {
 export const SHADOW_STATEMENT_TIMEOUT_MS = 120_000;
 
 /**
- * 57014（query_canceled）里**语句超时**这一种：影子库设了 statement_timeout，用户模型里的 DDL（很慢的物化视图、
- * 死循环的函数）也会走到这里。满足下面任一条就算语句超时：
- * - 错误消息里有 "statement timeout"（PG 的消息是 "canceling statement due to statement timeout"）；
- * - 这一步的耗时 ≥ 会话 statement_timeout 的 90%——lc_messages 可能是本地化的，消息里不一定有英文，
- *   而我们自己 SET 了超时的值、执行时又计了时。
- * 其他 57014，例如被管理员 pg_cancel_backend（很快就被取消）不是用户造成的。
- * 按耗时判断可能误判：脚本里自己 SET statement_timeout 把超时改短 / 改长，或者管理员拖了很久才取消。这两种可以接受——
- * 误判的最坏结果只是把基础设施问题记成“验证失败”，或者把用户的超时当成“影子库不可用 → 未验证”，
- * 都不会把版本误判成“已验证”。
+ * 语句超时识别（PG 57014 query_canceled / MySQL 3024 ER_QUERY_TIMEOUT / 1969）：
+ * - PG：错误消息含 "statement timeout"，或耗时 ≥ 会话 statement_timeout 的 90%；
+ * - MySQL：errno === 3024 或 1969。
  */
-const isStatementTimeout = (e: unknown, timeoutMs: number) =>
-  codeOf(e) === '57014' &&
-  (/statement timeout/i.test(messageOf(e)) || (e instanceof StepError && e.elapsedMs >= timeoutMs * 0.9));
+const isStatementTimeout = (e: unknown, timeoutMs: number) => {
+  const errno = errnoOf(e);
+  if (errno === 3024 || errno === 1969) return true;
+  return (
+    codeOf(e) === '57014' &&
+    (/statement timeout/i.test(messageOf(e)) || (e instanceof StepError && e.elapsedMs >= timeoutMs * 0.9))
+  );
+};
 
 const errorOf = (e: unknown, timeoutMs: number) =>
   e instanceof StepError
@@ -157,18 +159,23 @@ export const storedReport = (
  */
 const CONNECTION_SQLSTATE = /^(08|53|57P)|^(55P03|58030)$/;
 const CONNECTION_CODE =
-  /^(CONNECTION_|CONNECT_TIMEOUT|ECONN|ETIMEDOUT|EPIPE|ENOTFOUND|EAI_AGAIN|ENETUNREACH|EHOSTUNREACH)/;
+  /^(CONNECTION_|CONNECT_TIMEOUT|PROTOCOL_|HANDSHAKE_|ER_CON_COUNT_ERROR|ER_SERVER_SHUTDOWN|ECONN|ETIMEDOUT|EPIPE|ENOTFOUND|EAI_AGAIN|ENETUNREACH|EHOSTUNREACH)/;
+const MYSQL_CONNECTION_ERRNOS = new Set([1040, 1053, 1205, 2002, 2003, 2006, 2013]);
 
-/** 连接类故障（任何地方出现都是影子库的问题） */
+/** 连接类故障（任何地方出现都是影子库的问题；涵盖 PG / MySQL / Node 网络错误） */
 export const isConnectionFailure = (e: unknown): boolean => {
   if ((e instanceof StepError ? e.cause : e) instanceof ShadowError) return true;
   const code = codeOf(e);
-  return code !== null && (CONNECTION_SQLSTATE.test(code) || CONNECTION_CODE.test(code));
+  if (code !== null && (CONNECTION_SQLSTATE.test(code) || CONNECTION_CODE.test(code))) return true;
+  const errno = errnoOf(e);
+  return errno !== null && MYSQL_CONNECTION_ERRNOS.has(errno);
 };
 
-/** 影子库的问题：连接类故障，或者不是“用户的步骤自己造成的” 57014 / 58 类 */
+/** 影子库的问题：连接类故障，或者不是“用户的步骤自己造成的”超时 / 58 类错误 */
 export const isInfraFailure = (e: unknown, timeoutMs = SHADOW_STATEMENT_TIMEOUT_MS): boolean => {
   if (isConnectionFailure(e)) return true;
+  const errno = errnoOf(e);
+  if (errno === 3024 || errno === 1969) return !(e instanceof StepError);
   const code = codeOf(e);
   if (code === null || !(code === '57014' || code.startsWith('58'))) return false;
   return !(e instanceof StepError && (code.startsWith('58') || isStatementTimeout(e, timeoutMs)));
@@ -280,8 +287,8 @@ export const shadowOps = (
     const d = await db();
     const dDialect = next.dialect;
     const engine = getEngine(dDialect);
-    const pgMajor = dDialect === 'pg' ? await readShadowPgMajor(d) : null;
-    const planOpts = pgMajor !== null ? { pgMajor } : undefined;
+    const vNum = await engine.readVersionNum?.(d);
+    const planOpts = vNum !== null && vNum !== undefined ? engine.planOptionsForVersion?.(vNum) : undefined;
     let steps: Step[] | null = null;
     try {
       steps = plan(prev, next, planOpts);

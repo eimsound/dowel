@@ -87,6 +87,74 @@ describe('MySQL verifier & random roundtrip (8.4 / 9.7)', () => {
     const r24 = await verify(handle.db, m2, m4);
     expect(r24.upDiff).toEqual([]);
     expect(r24.downDiff).toEqual([]);
+
+    // 5. 多 FK 演进：v1(fk_z(parent_id)) -> v2(+fk_a(parent_id)) -> v3(-fk_a(parent_id)) 闭环
+    const v1 = structuredClone(m0);
+    const fkZ = E.addForeignKey(v1, child, [pRef], parent, [pid]);
+    E.renameKey(v1, fkZ, 'fk_z');
+
+    const v2 = structuredClone(v1);
+    const fkA = E.addForeignKey(v2, child, [pRef], parent, [pid]);
+    E.renameKey(v2, fkA, 'fk_a');
+
+    const v3 = structuredClone(v2);
+    E.dropKey(v3, fkA);
+
+    const rv12 = await verify(handle.db, v1, v2);
+    expect(rv12.upDiff).toEqual([]);
+    expect(rv12.downDiff).toEqual([]);
+    const rv23 = await verify(handle.db, v2, v3);
+    expect(rv23.upDiff).toEqual([]);
+    expect(rv23.downDiff).toEqual([]);
+
+    // 6. 前缀重叠多 FK 演进：v1(fk_z(a, b)) -> v2(+fk_a(a)) -> v3(-fk_z(a, b)) 闭环
+    const p2Tbl = E.createTable(m0, s, 'p_comp');
+    const pa = E.addColumn(m0, p2Tbl, { name: 'a', type: 'bigint', notNull: true });
+    const pb = E.addColumn(m0, p2Tbl, { name: 'b', type: 'bigint', notNull: true });
+    E.addPrimaryKey(m0, p2Tbl, [pa, pb]);
+    E.addUnique(m0, p2Tbl, [pa]);
+
+    const c2Tbl = E.createTable(m0, s, 'c_comp');
+    const c2id = E.addColumn(m0, c2Tbl, { name: 'id', type: 'bigint', notNull: true });
+    const ca = E.addColumn(m0, c2Tbl, { name: 'a', type: 'bigint', notNull: true });
+    const cb = E.addColumn(m0, c2Tbl, { name: 'b', type: 'bigint', notNull: true });
+    E.addPrimaryKey(m0, c2Tbl, [c2id]);
+
+    const o1 = structuredClone(m0);
+    const oFkZ = E.addForeignKey(o1, c2Tbl, [ca, cb], p2Tbl, [pa, pb]);
+    E.renameKey(o1, oFkZ, 'fk_z');
+    const o2 = structuredClone(o1);
+    const oFkA = E.addForeignKey(o2, c2Tbl, [ca], p2Tbl, [pa]);
+    E.renameKey(o2, oFkA, 'fk_a');
+    const o3 = structuredClone(o2);
+    E.dropKey(o3, oFkZ);
+
+    const ro12 = await verify(handle.db, o1, o2);
+    expect(ro12.upDiff).toEqual([]);
+    expect(ro12.downDiff).toEqual([]);
+    const ro23 = await verify(handle.db, o2, o3);
+    expect(ro23.upDiff).toEqual([]);
+    expect(ro23.downDiff).toEqual([]);
+
+    // 7. 表级 charset/collation 迁移闭环（保留显式列级 collation，转换继承字符列）
+    const cs0 = emptyModel('mysql');
+    const sc = E.createSchema(cs0, 'default');
+    const tcs = E.createTable(cs0, sc, 'i18n_docs');
+    E.setTableExt(cs0, tcs, {
+      mysql: { engine: 'InnoDB', charset: 'utf8mb4', collation: 'utf8mb4_0900_ai_ci' },
+    });
+    const dId = E.addColumn(cs0, tcs, { name: 'id', type: 'int', notNull: true });
+    E.addColumn(cs0, tcs, { name: 'title', type: 'varchar(120)', notNull: true });
+    E.addColumn(cs0, tcs, { name: 'code', type: 'varchar(32)', notNull: true, collation: 'utf8mb4_bin' });
+    E.addPrimaryKey(cs0, tcs, [dId]);
+
+    const cs1 = structuredClone(cs0);
+    E.setTableExt(cs1, tcs, {
+      mysql: { engine: 'InnoDB', charset: 'utf8mb4', collation: 'utf8mb4_unicode_ci' },
+    });
+    const rcs = await verify(handle.db, cs0, cs1);
+    expect(rcs.upDiff).toEqual([]);
+    expect(rcs.downDiff).toEqual([]);
   });
 
   it('analyzes MySQL ALTER TABLE risk (INSTANT / INPLACE / COPY) and handles VECTOR by version', async () => {

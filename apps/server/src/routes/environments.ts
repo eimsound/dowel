@@ -26,7 +26,7 @@ import {
   loadEnv,
   loadVersionMetas,
   loadVersionRefs,
-  projectTargetPgMajor,
+  projectPlanOptions,
   toEnvInfo,
   updateEnvVersion,
   type VersionRefRow,
@@ -388,8 +388,7 @@ export const registerEnvironments = (app: Hono<Env>, ctx: AppContext) => {
       const [headModel] = head
         ? await db.query<{ model: Model }>('select model from versions where id = $1', [head.id])
         : [];
-      const targetPgMajor = await projectTargetPgMajor(db, a.pid);
-      const planOpts = targetPgMajor !== null ? { pgMajor: targetPgMajor } : undefined;
+      const planOpts = await projectPlanOptions(db, a.pid, a.dialect);
       const diff = planDiff(w, live.model, planOpts);
       return {
         items: diff.items,

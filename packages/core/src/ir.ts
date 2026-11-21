@@ -21,10 +21,12 @@ export const SqliteTableExt = z.object({
   strict: z.boolean().optional(),
 });
 
+const mysqlSafeIdent = z.string().regex(/^[A-Za-z0-9_]{1,64}$/);
+
 export const MysqlTableExt = z.object({
-  engine: z.string().min(1).optional(),
-  charset: z.string().min(1).optional(),
-  collation: z.string().min(1).optional(),
+  engine: mysqlSafeIdent.optional(),
+  charset: mysqlSafeIdent.optional(),
+  collation: mysqlSafeIdent.optional(),
 });
 
 export const MssqlTableExt = z.object({});
@@ -43,7 +45,7 @@ export const MysqlColumnExt = z.object({
   unsigned: z.boolean().optional(),
   zerofill: z.boolean().optional(),
   autoIncrement: z.boolean().optional(),
-  charset: z.string().min(1).optional(),
+  charset: mysqlSafeIdent.optional(),
   onUpdateCurrentTimestamp: z.boolean().optional(),
   enumValues: z.array(z.string()).optional(),
   setValues: z.array(z.string()).optional(),

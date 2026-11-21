@@ -269,6 +269,24 @@ export const isMysqlNumericType = (type: string): boolean => {
   );
 };
 
+/** 是否为受表/列字符集与排序规则影响的 MySQL 字符类型 */
+export const isMysqlCharType = (type: string): boolean => {
+  const base = splitMysqlTypeModifiers(type)
+    .baseType.replace(/\([\s\S]*\)$/, '')
+    .trim()
+    .toLowerCase();
+  return (
+    base === 'char' ||
+    base === 'varchar' ||
+    base === 'tinytext' ||
+    base === 'text' ||
+    base === 'mediumtext' ||
+    base === 'longtext' ||
+    base === 'enum' ||
+    base === 'set'
+  );
+};
+
 /** 提取 datetime(n) / timestamp(n) / time(n) 的小数秒精度（无精度返回 null） */
 export const mysqlTemporalPrecision = (type: string): number | null => {
   const m = /^(?:datetime|timestamp|time)\s*\((\d+)\)$/i.exec(type.trim());

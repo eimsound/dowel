@@ -1,84 +1,37 @@
-// 测试用 MySQL 容器与数据库隔离封装：
-// - 支持 DOWEL_TEST_MYSQL 直接指向外部 MySQL 实例（如 mysql://root:pass@127.0.0.1:3306/mysql）；
-// - 否则使用 @testcontainers/mysql 启动全局单容器，支持 MYSQL_VERSION=8.4|9.7（默认 8.4，镜像 mysql:${ver}）；
+// 测试用 MySQL 数据库隔离封装：
+// - 全局单容器由 test/global-setup.ts（通过 test/mysql-container.ts）统一启停，并通过 inject('mysqlUrl') 注入到各 worker；
+// - 未设置 MYSQL_VERSION / DOWEL_MYSQL_IMAGE / 有效 DOWEL_TEST_MYSQL 时 MYSQL_URL 为空字符串，相关测试自动跳过；
 // - 每个测试或测试套件通过独立 CREATE DATABASE / DROP DATABASE 隔离，互不干扰。
 import { type Db, fromMysql2, MYSQL_POOL_DEFAULTS, parseMysqlVersion } from '@dowel/engines';
-import { MySqlContainer, type StartedMySqlContainer } from '@testcontainers/mysql';
 import { createPool } from 'mysql2/promise';
-import { getContainerRuntimeClient } from 'testcontainers';
-import { afterAll, beforeAll } from 'vitest';
+import { afterAll, beforeAll, inject } from 'vitest';
 
-const MYSQL_VERSION = process.env.MYSQL_VERSION ?? '8.4';
-export const MYSQL_IMAGE = process.env.DOWEL_MYSQL_IMAGE ?? `mysql:${MYSQL_VERSION}`;
+export const MYSQL_URL = inject('mysqlUrl');
 
 interface ManagedMysql {
   adminUrl: string;
   version: string;
   versionNum: number;
-  container: StartedMySqlContainer | null;
 }
 
-let shared: ManagedMysql | null = null;
-let starting: Promise<ManagedMysql | null> | null = null;
-let activeRefs = 0;
+let cachedMeta: ManagedMysql | null = null;
+let loadingMeta: Promise<ManagedMysql | null> | null = null;
 
 export const ensureMysqlInstance = async (): Promise<ManagedMysql | null> => {
-  if (shared) return shared;
-  starting ??= (async () => {
-    const given = process.env.DOWEL_TEST_MYSQL;
-    if (given) {
-      const pool = createPool({ uri: given, ...MYSQL_POOL_DEFAULTS, connectionLimit: 1 });
-      try {
-        const db = fromMysql2(pool);
-        const [r] = await db.query<{ v: string }>('SELECT VERSION() AS v');
-        const parsed = parseMysqlVersion(String(r?.v ?? '8.4.0'));
-        shared = { adminUrl: given, ...parsed, container: null };
-        return shared;
-      } finally {
-        await pool.end();
-      }
-    }
-
+  if (!MYSQL_URL) return null;
+  if (cachedMeta) return cachedMeta;
+  loadingMeta ??= (async () => {
+    const conn = connectMysqlPool(MYSQL_URL);
     try {
-      await getContainerRuntimeClient();
-    } catch (e) {
-      if (process.env.CI) throw e;
-      console.warn(
-        `\n⚠ 没有可用的 Docker（${e instanceof Error ? e.message.split('\n')[0] : String(e)}）：跳过需要 MySQL 的测试。` +
-          '\n  启动 Docker 或设置 DOWEL_TEST_MYSQL=mysql://root:pass@127.0.0.1:3306/mysql。\n',
-      );
-      return null;
-    }
-
-    const container = await new MySqlContainer(MYSQL_IMAGE)
-      .withDatabase('mysql')
-      .withUsername('dowel')
-      .withUserPassword('dowel-test-secret')
-      .withRootPassword('dowel-root-secret')
-      .start();
-
-    const adminUrl = `mysql://root:${encodeURIComponent(container.getRootPassword())}@${container.getHost()}:${container.getPort()}/mysql`;
-    const pool = createPool({ uri: adminUrl, ...MYSQL_POOL_DEFAULTS, connectionLimit: 1 });
-    try {
-      const db = fromMysql2(pool);
-      const [r] = await db.query<{ v: string }>('SELECT VERSION() AS v');
+      const [r] = await conn.db.query<{ v: string }>('SELECT VERSION() AS v');
       const parsed = parseMysqlVersion(String(r?.v ?? '8.4.0'));
-      shared = { adminUrl, ...parsed, container };
-      return shared;
+      cachedMeta = { adminUrl: MYSQL_URL, ...parsed };
+      return cachedMeta;
     } finally {
-      await pool.end();
+      await conn.close();
     }
   })();
-  return starting;
-};
-
-export const stopMysqlInstance = async (): Promise<void> => {
-  const cur = shared;
-  shared = null;
-  starting = null;
-  if (cur?.container) {
-    await cur.container.stop().catch(() => {});
-  }
+  return loadingMeta;
 };
 
 export const mysqlDbUrl = (adminUrl: string, dbName: string): string => {
@@ -89,9 +42,10 @@ export const mysqlDbUrl = (adminUrl: string, dbName: string): string => {
 
 export const connectMysqlPool = (url: string) => {
   const u = new URL(url);
+  const host = u.hostname.startsWith('[') && u.hostname.endsWith(']') ? u.hostname.slice(1, -1) : u.hostname;
   const pool = createPool({
     ...MYSQL_POOL_DEFAULTS,
-    host: u.hostname,
+    host,
     port: u.port ? Number(u.port) : 3306,
     user: decodeURIComponent(u.username),
     password: decodeURIComponent(u.password),
@@ -111,7 +65,7 @@ export interface MysqlTestDb {
   close: () => Promise<void>;
 }
 
-/** 在全局测试 MySQL 容器里创建独立隔离库，close() 时自动清理库 */
+/** 在全局测试 MySQL 实例里创建独立隔离库，close() 时自动清理该库 */
 export const createMysqlTestDb = async (prefix: string): Promise<MysqlTestDb | null> => {
   const inst = await ensureMysqlInstance();
   if (!inst) return null;
@@ -143,18 +97,15 @@ export const createMysqlTestDb = async (prefix: string): Promise<MysqlTestDb | n
   };
 };
 
-/** 在 Vitest 测试文件内注册独立的 MySQL 测试库，并在套件结束时自动销毁库与容器 */
+/** 在 Vitest 测试文件内注册独立的 MySQL 测试库，并在套件结束时自动销毁该库（全局容器由 globalSetup 统一回收） */
 export const useMysqlTestDb = (prefix: string) => {
   let handle: MysqlTestDb | null = null;
   beforeAll(async () => {
-    activeRefs++;
     handle = await createMysqlTestDb(prefix);
   }, 120_000);
   afterAll(async () => {
     await handle?.close();
     handle = null;
-    activeRefs = Math.max(0, activeRefs - 1);
-    if (activeRefs === 0) await stopMysqlInstance();
   }, 60_000);
   return () => handle;
 };

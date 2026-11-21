@@ -250,6 +250,6 @@ export interface EngineAdapter {
   classifyTimeout(err: unknown, applied: AppliedTimeouts): TimeoutInfo | undefined;
   beforeNonTxStep?(conn: Db, sql: string, isResume: boolean): Promise<{ sql?: string; hint?: string }>;
   afterNonTxStep?(conn: Db, sql: string): Promise<void>;
-  /** DDL 自动提交方言（MySQL）：断点续跑前判断该步是否已生效 */
-  detectStepAlreadyApplied?(conn: Db, step: ScriptStep): Promise<boolean>;
+  /** DDL 自动提交方言（MySQL）：断点续跑前结合错误码与目录状态判断该步是否已生效 */
+  detectStepAlreadyApplied?(conn: Db, step: ScriptStep, stepErr?: unknown): Promise<boolean>;
 }

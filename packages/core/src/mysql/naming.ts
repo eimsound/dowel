@@ -4,6 +4,9 @@ export const MAX_MYSQL_IDENT = 64;
 
 export const MYSQL_SHADOW_MARK_TABLE = '__dowel_shadow_mark';
 
+/** MySQL 表/列选项（ENGINE / CHARACTER SET / COLLATE）允许的安全标识符格式 */
+export const MYSQL_SAFE_IDENT_RE = /^[A-Za-z0-9_]{1,64}$/;
+
 const clipChars = (s: string, max: number): string => Array.from(s).slice(0, Math.max(0, max)).join('');
 const charLen = (s: string): number => Array.from(s).length;
 

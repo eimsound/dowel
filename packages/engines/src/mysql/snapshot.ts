@@ -489,7 +489,16 @@ export const readMysqlSnapshot = async (db: Db): Promise<MysqlSnapshot> => {
     }
   }
 
-  // 3. 二级索引（排除 PRIMARY、纯 UNIQUE 约束与 InnoDB 隐式 FK 辅助索引）
+  // 3. 二级索引（排除 PRIMARY、纯 UNIQUE 约束与与 computeImplicitFkOwners 对称的 InnoDB 隐式 FK 辅助索引）
+  interface CandidateIndex {
+    indexName: string;
+    unique: boolean;
+    indexType: MysqlIdxSnap['indexType'];
+    elements: MysqlIdxElemSnap[];
+    comment: string | null;
+    matchesFkName: string | null;
+  }
+  const candidatesByTable = new Map<string, CandidateIndex[]>();
   for (const [key, rows] of statsByTableAndIdx) {
     const first = rows[0]!;
     const tbl = tables[first.tableName];
@@ -507,7 +516,7 @@ export const readMysqlSnapshot = async (db: Db): Promise<MysqlSnapshot> => {
       desc: r.collation === 'D',
     }));
 
-    // 过滤 InnoDB 自动生成的隐式外键辅助索引（非唯一 BTREE、无注释、纯升序列、名称与列与同表 FK 一致）
+    let matchesFkName: string | null = null;
     if (
       !unique &&
       indexType === 'BTREE' &&
@@ -515,21 +524,66 @@ export const readMysqlSnapshot = async (db: Db): Promise<MysqlSnapshot> => {
       elements.every((e) => e.column !== null && e.expr === null && e.length === null && !e.desc)
     ) {
       const idxCols = elements.map((e) => e.column!);
-      const matchesFk = Object.values(tbl.foreignKeys).some(
+      const matched = Object.values(tbl.foreignKeys).find(
         (fk) =>
           fk.name.toLowerCase() === first.indexName.toLowerCase() &&
           fk.columns.length === idxCols.length &&
           fk.columns.every((c, i) => c.toLowerCase() === idxCols[i]!.toLowerCase()),
       );
-      if (matchesFk) continue;
+      if (matched) matchesFkName = matched.name.toLowerCase();
     }
 
-    tbl.indexes[first.indexName] = {
-      unique,
-      indexType,
-      elements,
-      comment,
-    };
+    const list = candidatesByTable.get(first.tableName) ?? [];
+    list.push({ indexName: first.indexName, unique, indexType, elements, comment, matchesFkName });
+    candidatesByTable.set(first.tableName, list);
+  }
+
+  const snapPrefixMatches = (keyCols: readonly string[], fkCols: readonly string[]): boolean => {
+    if (keyCols.length < fkCols.length) return false;
+    for (let i = 0; i < fkCols.length; i++) {
+      if (keyCols[i]!.toLowerCase() !== fkCols[i]!.toLowerCase()) return false;
+    }
+    return true;
+  };
+
+  for (const [tableName, candidates] of candidatesByTable) {
+    const tbl = tables[tableName]!;
+    // 先收集所有明确为显式的覆盖键前缀（PK / UNIQUE / 不与 FK 同名的合法二级索引）
+    const covering: string[][] = [];
+    if (tbl.primaryKey) covering.push(tbl.primaryKey.columns);
+    for (const u of Object.values(tbl.uniques)) covering.push(u.columns);
+    for (const cand of candidates) {
+      if (cand.matchesFkName !== null) continue;
+      if (cand.indexType === 'FULLTEXT' || cand.indexType === 'SPATIAL') continue;
+      const cols: string[] = [];
+      for (const el of cand.elements) {
+        if (!el.column || el.expr !== null || (el.length && el.length > 0)) break;
+        cols.push(el.column);
+      }
+      if (cols.length > 0) covering.push(cols);
+    }
+
+    // 与 computeImplicitFkOwners 严格对称：按 fk.name 升序计算哪些 FK 应当拥有隐式索引
+    const expectedImplicitFkNames = new Set<string>();
+    const sortedFks = Object.values(tbl.foreignKeys).sort((a, b) => a.name.localeCompare(b.name));
+    for (const fk of sortedFks) {
+      if (!covering.some((k) => snapPrefixMatches(k, fk.columns))) {
+        expectedImplicitFkNames.add(fk.name.toLowerCase());
+        covering.push(fk.columns);
+      }
+    }
+
+    for (const cand of candidates) {
+      if (cand.matchesFkName !== null && expectedImplicitFkNames.has(cand.matchesFkName)) {
+        continue;
+      }
+      tbl.indexes[cand.indexName] = {
+        unique: cand.unique,
+        indexType: cand.indexType,
+        elements: cand.elements,
+        comment: cand.comment,
+      };
+    }
   }
 
   // 4. 不透明对象（视图、触发器、函数、存储过程）

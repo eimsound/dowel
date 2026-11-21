@@ -10,8 +10,10 @@ import { deepEqual } from '../json.ts';
 import { all, childrenOf, columnsOf, get } from '../model.ts';
 import type { PlanOptions } from '../pg/capabilities.ts';
 import { PlanError, type Step } from '../plan-types.ts';
+import { MYSQL_SAFE_IDENT_RE } from './naming.ts';
 import { mysqlExprReferences, mysqlIdent, mysqlLiteral, mysqlRenameInExpr, mysqlTokenize } from './quote.ts';
 import {
+  isMysqlCharType,
   isMysqlExprOnlyDefaultType,
   isMysqlVectorType,
   mysqlTemporalPrecision,
@@ -24,6 +26,18 @@ export interface MysqlPlanOptions extends PlanOptions {
 }
 
 const same = deepEqual;
+
+const assertSafeMysqlOption = (val: string, label: string): string => {
+  if (!MYSQL_SAFE_IDENT_RE.test(val)) {
+    throw new PlanError(`MySQL ${label} ${val} 格式不合法（仅允许 1-64 位字母、数字与下划线）`);
+  }
+  return val;
+};
+
+const isAutoIncCoveringIndex = (ix: Index): boolean => {
+  const idxType = (ix.ext?.mysql?.indexType ?? ix.method).toUpperCase();
+  return idxType !== 'FULLTEXT' && idxType !== 'SPATIAL' && Boolean(ix.elements[0]?.column);
+};
 
 const FK_ACTION: Record<ForeignKey['onDelete'], string> = {
   noAction: 'NO ACTION',
@@ -97,10 +111,10 @@ export const renderMysqlColumnDef = (c: Column, opts: { suppressAutoIncrement?: 
   parts.push(typeSql);
 
   if (c.ext?.mysql?.charset) {
-    parts.push(`CHARACTER SET ${c.ext.mysql.charset}`);
+    parts.push(`CHARACTER SET ${assertSafeMysqlOption(c.ext.mysql.charset, '字符集名')}`);
   }
   if (c.collation) {
-    parts.push(`COLLATE ${c.collation}`);
+    parts.push(`COLLATE ${assertSafeMysqlOption(c.collation, '排序规则名')}`);
   }
 
   if (c.generated) {
@@ -136,10 +150,14 @@ export const renderMysqlColumnDef = (c: Column, opts: { suppressAutoIncrement?: 
 
 const renderTableOptions = (t: Table): string => {
   const opts: string[] = [];
-  const engine = t.ext?.mysql?.engine ?? 'InnoDB';
+  const engine = assertSafeMysqlOption(t.ext?.mysql?.engine ?? 'InnoDB', '存储引擎名');
   opts.push(`ENGINE=${engine}`);
-  if (t.ext?.mysql?.charset) opts.push(`DEFAULT CHARSET=${t.ext.mysql.charset}`);
-  if (t.ext?.mysql?.collation) opts.push(`COLLATE=${t.ext.mysql.collation}`);
+  if (t.ext?.mysql?.charset) {
+    opts.push(`DEFAULT CHARSET=${assertSafeMysqlOption(t.ext.mysql.charset, '字符集名')}`);
+  }
+  if (t.ext?.mysql?.collation) {
+    opts.push(`COLLATE=${assertSafeMysqlOption(t.ext.mysql.collation, '排序规则名')}`);
+  }
   if (t.comment !== null && t.comment !== '') opts.push(`COMMENT=${mysqlLiteral(t.comment)}`);
   return opts.join(' ');
 };
@@ -541,13 +559,21 @@ export const mysqlPlan = (from: Model, to: Model, opts?: MysqlPlanOptions): Step
   const commonTables = toTables.filter((t) => inFrom(t.id));
   const removedTableIds = new Set(removedTables.map((t) => t.id));
 
-  // 每张公共表的列改名与列类型变更分析
+  // 每张公共表的列改名、表级字符集/排序规则变更与列类型变更分析
   const colRenamesByTable = new Map<string, [string, string][]>();
   const renamedColIds = new Set<string>();
   const typeChangedCols = new Set<string>();
+  const tableCharsetChangedTables = new Set<string>();
+  const tableCharsetAffectedCols = new Set<string>();
   const regenCols = new Set<string>();
 
   for (const t of commonTables) {
+    const ft = from.objects[t.id] as Table;
+    const prevOpt = normTableExt(ft);
+    const nextOpt = normTableExt(t);
+    const tblCharsetChanged = prevOpt.charset !== nextOpt.charset || prevOpt.collation !== nextOpt.collation;
+    if (tblCharsetChanged) tableCharsetChangedTables.add(t.id);
+
     const renames: [string, string][] = [];
     for (const tc of columnsOf(to, t.id)) {
       const fc = from.objects[tc.id];
@@ -556,14 +582,19 @@ export const mysqlPlan = (from: Model, to: Model, opts?: MysqlPlanOptions): Step
         renames.push([fc.name, tc.name]);
         renamedColIds.add(tc.id);
       }
-      if (!same(colTypeKeySignature(fc), colTypeKeySignature(tc))) {
+      const inheritsNewTableCharset =
+        tblCharsetChanged && isMysqlCharType(tc.type) && !tc.ext?.mysql?.charset && !tc.collation;
+      if (inheritsNewTableCharset) {
+        tableCharsetAffectedCols.add(tc.id);
+      }
+      if (!same(colTypeKeySignature(fc), colTypeKeySignature(tc)) || inheritsNewTableCharset) {
         typeChangedCols.add(tc.id);
       }
     }
     colRenamesByTable.set(t.id, renames);
   }
 
-  // 生成列：普通列↔生成列互转、生成表达式变化、VIRTUAL↔STORED 变化、类型/非空/注释变化或依赖列改名/改类型/重建 -> 删后重建（不动点闭包支持链式生成列）
+  // 生成列：普通列↔生成列互转、生成表达式变化、VIRTUAL↔STORED 变化、类型/非空/注释/继承字符集变化或依赖列改名/改类型/重建 -> 删后重建（不动点闭包支持链式生成列）
   for (let changed = true; changed;) {
     changed = false;
     for (const t of commonTables) {
@@ -587,6 +618,7 @@ export const mysqlPlan = (from: Model, to: Model, opts?: MysqlPlanOptions): Step
           fc.generated!.stored !== tc.generated!.stored ||
           migrateExprForRenames(fc.generated!.expr, renames) !== tc.generated!.expr ||
           exprTouchesUnstable ||
+          tableCharsetAffectedCols.has(tc.id) ||
           !same(colSignature(fc), colSignature(tc))
         ) {
           regenCols.add(tc.id);
@@ -664,10 +696,14 @@ export const mysqlPlan = (from: Model, to: Model, opts?: MysqlPlanOptions): Step
     }
   }
 
-  // 计算源模型中每张表的隐式 FK 索引拥有者
+  // 计算源模型与目标模型中每张表的隐式 FK 索引拥有者
   const fromImplicitOwnersByTable = new Map<string, Set<string>>();
   for (const t of fromTables) {
     fromImplicitOwnersByTable.set(t.id, computeImplicitFkOwners(from, t.id));
+  }
+  const toImplicitOwnersByTable = new Map<string, Set<string>>();
+  for (const t of toTables) {
+    toImplicitOwnersByTable.set(t.id, computeImplicitFkOwners(to, t.id));
   }
 
   // 键/索引即将被删除或重建的集合
@@ -703,23 +739,32 @@ export const mysqlPlan = (from: Model, to: Model, opts?: MysqlPlanOptions): Step
     }
   }
 
-  // 不动点闭包：
-  // 1) 若某存活 FK 在 from 中依赖显式覆盖索引，而所有显式覆盖索引都被删/重建（且无其他存活隐式索引覆盖它），必须重建该 FK；
-  // 2) 若某隐式索引拥有者 FK 被删除/重建，同表上依赖该隐式索引的存活 FK 也必须重建。
+  // 不动点闭包（严格维护增量迁移后物理隐式 FK 索引集合 === computeImplicitFkOwners(to, t.id)）：
+  // 1) 若某存活 FK 在 from 中依赖的显式或隐式覆盖索引全部被删/重建，必须重建该 FK；
+  // 2) 若某存活 FK 的隐式索引拥有权在 from 与 to 之间发生变化（如新增显式覆盖索引、或更早字典序 FK 接管拥有权），必须重建该 FK（在 P2 显式清理旧隐式索引，避免状态分裂或 mysqldump 显式索引残留）；
+  // 3) 若某存活隐式拥有者 FK 的列前缀覆盖了某新增/重建且应在 to 中拥有隐式索引的 FK（如 v1(fk_z(a,b)) -> v2(+fk_a(a))），必须重建该存活 FK，使 P14 按字典序先建 fk_a 再建 fk_z。
   for (let changed = true; changed;) {
     changed = false;
     for (const t of commonTables) {
-      const owners = fromImplicitOwnersByTable.get(t.id) ?? new Set<string>();
+      const fromOwners = fromImplicitOwnersByTable.get(t.id) ?? new Set<string>();
+      const toOwners = toImplicitOwnersByTable.get(t.id) ?? new Set<string>();
       const survivingExplicit = explicitCoveringKeyPrefixes(from, t.id, droppedOrRebuiltKeys);
       const survivingImplicit = childrenOf(from, t.id, 'foreignKey')
-        .filter((f) => inTo(f.id) && !fkRebuild.has(f.id) && owners.has(f.id))
+        .filter((f) => inTo(f.id) && !fkRebuild.has(f.id) && fromOwners.has(f.id))
         .map((f) => f.columns);
+      const addedOrRebuiltToOwners = childrenOf(to, t.id, 'foreignKey').filter(
+        (g) => toOwners.has(g.id) && (!inFrom(g.id) || fkRebuild.has(g.id)),
+      );
       for (const fk of childrenOf(from, t.id, 'foreignKey')) {
         if (!inTo(fk.id) || fkRebuild.has(fk.id)) continue;
         const stillCovered =
           survivingExplicit.some((k) => prefixMatches(k, fk.columns)) ||
           survivingImplicit.some((k) => prefixMatches(k, fk.columns));
-        if (!stillCovered) {
+        const ownershipChanged = fromOwners.has(fk.id) !== toOwners.has(fk.id);
+        const shadowsIncomingOwner =
+          fromOwners.has(fk.id) &&
+          addedOrRebuiltToOwners.some((g) => g.id !== fk.id && prefixMatches(fk.columns, g.columns));
+        if (!stillCovered || ownershipChanged || shadowsIncomingOwner) {
           fkRebuild.add(fk.id);
           changed = true;
         }
@@ -848,8 +893,8 @@ export const mysqlPlan = (from: Model, to: Model, opts?: MysqlPlanOptions): Step
       if (!droppedOrRebuiltKeys.has(u.id) && u.columns[0]) survivingKeyFirstCols.add(u.columns[0]);
     }
     for (const ix of childrenOf(from, t.id, 'index')) {
-      if (!droppedOrRebuiltKeys.has(ix.id) && ix.elements[0]?.column) {
-        survivingKeyFirstCols.add(ix.elements[0]!.column);
+      if (!droppedOrRebuiltKeys.has(ix.id) && isAutoIncCoveringIndex(ix)) {
+        survivingKeyFirstCols.add(ix.elements[0]!.column!);
       }
     }
     for (const fc of columnsOf(from, t.id)) {
@@ -975,6 +1020,21 @@ export const mysqlPlan = (from: Model, to: Model, opts?: MysqlPlanOptions): Step
     const fromCols = columnsOf(from, t.id);
     const toCols = columnsOf(to, t.id);
 
+    // 9.0 若表级默认字符集或排序规则变更，先更新表默认字符集，使后续 MODIFY COLUMN / ADD COLUMN 自动继承新默认值
+    if (tableCharsetChangedTables.has(t.id)) {
+      const cs = assertSafeMysqlOption(t.ext?.mysql?.charset ?? 'utf8mb4', '字符集名');
+      const coll = t.ext?.mysql?.collation
+        ? assertSafeMysqlOption(t.ext.mysql.collation, '排序规则名')
+        : cs.toLowerCase() === 'utf8mb4'
+          ? 'utf8mb4_0900_ai_ci'
+          : null;
+      emit(
+        'alterTable',
+        t.name,
+        `ALTER TABLE ${mysqlIdent(t.name)} DEFAULT CHARACTER SET ${cs}${coll ? ` COLLATE ${coll}` : ''}`,
+      );
+    }
+
     // 计算当前仍在表上且未删的列
     const curColName = new Map<string, string>();
     for (const fc of fromCols) {
@@ -1078,8 +1138,8 @@ export const mysqlPlan = (from: Model, to: Model, opts?: MysqlPlanOptions): Step
       if (!droppedOrRebuiltKeys.has(u.id) && u.columns[0]) survivingKeyFirstCols.add(u.columns[0]);
     }
     for (const ix of childrenOf(from, t.id, 'index')) {
-      if (!droppedOrRebuiltKeys.has(ix.id) && ix.elements[0]?.column) {
-        survivingKeyFirstCols.add(ix.elements[0]!.column);
+      if (!droppedOrRebuiltKeys.has(ix.id) && isAutoIncCoveringIndex(ix)) {
+        survivingKeyFirstCols.add(ix.elements[0]!.column!);
       }
     }
 
@@ -1099,14 +1159,16 @@ export const mysqlPlan = (from: Model, to: Model, opts?: MysqlPlanOptions): Step
       const fc = from.objects[tc.id] as Column;
       const wantsAutoInc = Boolean(tc.ext?.mysql?.autoIncrement);
       const canSetAutoIncNow = !wantsAutoInc || survivingKeyFirstCols.has(tc.id);
+      const fcEffective = strippedAutoInc.has(fc.id)
+        ? { ...fc, ext: { ...fc.ext, mysql: { ...fc.ext?.mysql, autoIncrement: false } } }
+        : fc;
       const needsModify =
-        !same(colSignature(fc), colSignature(tc)) || (strippedAutoInc.has(fc.id) && wantsAutoInc);
+        !same(colSignature(fcEffective), colSignature(tc)) || tableCharsetAffectedCols.has(tc.id);
       if (needsModify) {
         if (wantsAutoInc && !canSetAutoIncNow) {
           // 若仅是剥离了 AUTO_INCREMENT 而其他定义相同，无需重复 MODIFY，留给 P12 恢复 AUTO_INCREMENT
-          const fcNoAi = { ...fc, ext: { ...fc.ext, mysql: { ...fc.ext?.mysql, autoIncrement: false } } };
           const tcNoAi = { ...tc, ext: { ...tc.ext, mysql: { ...tc.ext?.mysql, autoIncrement: false } } };
-          if (!same(colSignature(fcNoAi), colSignature(tcNoAi))) {
+          if (!same(colSignature(fcEffective), colSignature(tcNoAi)) || tableCharsetAffectedCols.has(tc.id)) {
             emit(
               'alterColumn',
               `${t.name}.${tc.name}`,
@@ -1153,17 +1215,13 @@ export const mysqlPlan = (from: Model, to: Model, opts?: MysqlPlanOptions): Step
       );
     }
 
-    // 9f. 表级选项（ENGINE / CHARSET / COLLATE / COMMENT）
+    // 9f. 表级选项（ENGINE / COMMENT；DEFAULT CHARACTER SET / COLLATE 已在 P9 开头提前下发）
     const prevOpt = normTableExt(ft);
     const nextOpt = normTableExt(t);
-    if (!same(prevOpt, nextOpt)) {
+    if (prevOpt.engine !== nextOpt.engine || prevOpt.comment !== nextOpt.comment) {
       const clauses: string[] = [];
-      if (prevOpt.engine !== nextOpt.engine) clauses.push(`ENGINE=${t.ext?.mysql?.engine ?? 'InnoDB'}`);
-      if (prevOpt.charset !== nextOpt.charset || prevOpt.collation !== nextOpt.collation) {
-        const cs = t.ext?.mysql?.charset ?? 'utf8mb4';
-        const coll =
-          t.ext?.mysql?.collation ?? (cs.toLowerCase() === 'utf8mb4' ? 'utf8mb4_0900_ai_ci' : null);
-        clauses.push(`DEFAULT CHARACTER SET ${cs}${coll ? ` COLLATE ${coll}` : ''}`);
+      if (prevOpt.engine !== nextOpt.engine) {
+        clauses.push(`ENGINE=${assertSafeMysqlOption(t.ext?.mysql?.engine ?? 'InnoDB', '存储引擎名')}`);
       }
       if (prevOpt.comment !== nextOpt.comment) {
         clauses.push(`COMMENT=${mysqlLiteral(t.comment ?? '')}`);

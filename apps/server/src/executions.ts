@@ -9,7 +9,14 @@ import type {
   RunInfo,
 } from '@dowel/api';
 import type { Dialect, Model } from '@dowel/core';
-import { type Db, getEngine, HistoryError, parseSqliteVersionNum, ScopeError } from '@dowel/engines';
+import {
+  type Db,
+  getEngine,
+  HistoryError,
+  parseMysqlVersion,
+  parseSqliteVersionNum,
+  ScopeError,
+} from '@dowel/engines';
 import {
   type ChainVersion,
   checkDrift,
@@ -670,6 +677,14 @@ export const runExecution = async (
             const num = parseSqliteVersionNum(v.version);
             if (env.engine_version !== v.version || env.engine_version_num !== num) {
               await updateEnvVersion(db, env.id, v.version, num, env.url_enc);
+            }
+          }
+        } else if (dialect === 'mysql') {
+          const [v] = await conn.db.query<{ version: string }>('SELECT VERSION() AS version');
+          if (v) {
+            const parsed = parseMysqlVersion(v.version);
+            if (env.engine_version !== parsed.version || env.engine_version_num !== parsed.versionNum) {
+              await updateEnvVersion(db, env.id, parsed.version, parsed.versionNum, env.url_enc);
             }
           }
         }

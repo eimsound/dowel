@@ -88,6 +88,104 @@ export const resetMysqlShadow = async (db: Db): Promise<void> => {
   }
 };
 
+const sigTokens = (sql: string) =>
+  mysqlTokenize(sql).filter(
+    (t) =>
+      !/^\s+$/.test(t.text) &&
+      !t.text.startsWith('--') &&
+      !t.text.startsWith('#') &&
+      !t.text.startsWith('/*') &&
+      t.text !== '*/',
+  );
+
+const isIdentTok = (t: { kind: string; text: string } | undefined): t is { kind: string; text: string } =>
+  !!t && (t.kind === 'ident' || t.kind === 'qident');
+
+const readTableIdent = (
+  toks: { kind: string; text: string }[],
+  start: number,
+): { name: string; next: number } | null => {
+  const first = toks[start];
+  if (!isIdentTok(first)) return null;
+  if (toks[start + 1]?.text === '.' && isIdentTok(toks[start + 2])) {
+    return { name: toks[start + 2]!.text.toLowerCase(), next: start + 3 };
+  }
+  return { name: first.text.toLowerCase(), next: start + 1 };
+};
+
+/** 跟随已执行的 DROP TABLE / RENAME TABLE / ALTER TABLE ... RENAME 动态同步既有表集合 */
+const updateExistingTablesAfterStep = (sql: string, existingTables: Set<string>): void => {
+  for (const stmt of splitMysqlStatements(sql)) {
+    const toks = sigTokens(stmt);
+    if (toks.length < 3) continue;
+    const isWord = (idx: number, w: string) => toks[idx]?.kind === 'ident' && toks[idx]!.text === w;
+
+    // DROP [TEMPORARY] TABLE [IF EXISTS] t1, t2, ...
+    if (isWord(0, 'drop')) {
+      let pos = 1;
+      if (isWord(pos, 'temporary')) pos++;
+      if (!isWord(pos, 'table')) continue;
+      pos++;
+      if (isWord(pos, 'if') && isWord(pos + 1, 'exists')) pos += 2;
+      for (;;) {
+        const tbl = readTableIdent(toks, pos);
+        if (!tbl) break;
+        existingTables.delete(tbl.name);
+        pos = tbl.next;
+        if (toks[pos]?.text === ',') {
+          pos++;
+          continue;
+        }
+        break;
+      }
+      continue;
+    }
+
+    // RENAME TABLE old1 TO new1, old2 TO new2, ...
+    if (isWord(0, 'rename') && isWord(1, 'table')) {
+      const pairs: [string, string][] = [];
+      let pos = 2;
+      while (pos < toks.length) {
+        const src = readTableIdent(toks, pos);
+        if (!src || !isWord(src.next, 'to')) break;
+        const dst = readTableIdent(toks, src.next + 1);
+        if (!dst) break;
+        pairs.push([src.name, dst.name]);
+        pos = dst.next;
+        if (toks[pos]?.text === ',') pos++;
+        else break;
+      }
+      const had = pairs.map(([src]) => existingTables.has(src));
+      for (const [src] of pairs) existingTables.delete(src);
+      pairs.forEach(([, dst], idx) => {
+        if (had[idx]) existingTables.add(dst);
+      });
+      continue;
+    }
+
+    // ALTER TABLE old RENAME [TO|AS] new
+    if (isWord(0, 'alter') && isWord(1, 'table')) {
+      const src = readTableIdent(toks, 2);
+      if (!src) continue;
+      for (let k = src.next; k < toks.length; k++) {
+        if (
+          isWord(k, 'rename') &&
+          (isWord(k + 1, 'to') || isWord(k + 1, 'as')) &&
+          !isWord(k - 1, 'column') &&
+          !isWord(k - 1, 'index')
+        ) {
+          const dst = readTableIdent(toks, k + 2);
+          if (dst && existingTables.has(src.name)) {
+            existingTables.delete(src.name);
+            existingTables.add(dst.name);
+          }
+          break;
+        }
+      }
+    }
+  }
+};
+
 const extractSingleAlterTable = (sql: string): { table: string; baseSql: string } | null => {
   const stmts = splitMysqlStatements(sql);
   if (stmts.length !== 1) return null;
@@ -253,6 +351,7 @@ export const analyzeMysqlStepRisk = async (
           });
         }
       }
+      updateExistingTablesAfterStep(s.sql, existingTables);
       continue;
     }
 
@@ -262,6 +361,7 @@ export const analyzeMysqlStepRisk = async (
     } catch (e) {
       throw new EngineStepError(s, e, performance.now() - t0);
     }
+    updateExistingTablesAfterStep(s.sql, existingTables);
 
     const idxTable = extractCreateIndexTable(s.sql);
     if (idxTable && existingTables.has(idxTable.toLowerCase())) {

@@ -9,6 +9,7 @@ import {
   fromMysql2,
   importMysqlSnapshot,
   MYSQL_POOL_DEFAULTS,
+  mysqlGrantMatchesDb,
   parseMysqlVersion,
   readMysqlSnapshot,
 } from '@dowel/engines';
@@ -70,16 +71,25 @@ const parseTlsFromParams = (params: URLSearchParams): PoolOptions['ssl'] => {
   const rawSsl = params.get('ssl');
   const rawMode = (params.get('ssl-mode') ?? params.get('sslmode') ?? '').trim().toUpperCase();
 
-  if (rawMode === 'DISABLED' || rawSsl === 'false' || rawSsl === '0') return undefined;
-
-  if (
-    rawMode === 'REQUIRED' ||
-    rawMode === 'VERIFY_CA' ||
-    rawMode === 'VERIFY_IDENTITY' ||
-    rawMode === 'PREFERRED'
-  ) {
-    return { rejectUnauthorized: true };
+  if (rawMode !== '') {
+    if (rawMode === 'DISABLED') return undefined;
+    if (
+      rawMode === 'REQUIRED' ||
+      rawMode === 'REQUIRE' ||
+      rawMode === 'VERIFY_CA' ||
+      rawMode === 'VERIFY-CA' ||
+      rawMode === 'VERIFY_IDENTITY' ||
+      rawMode === 'VERIFY-FULL' ||
+      rawMode === 'PREFERRED'
+    ) {
+      return { rejectUnauthorized: true };
+    }
+    throw new HTTPException(422, {
+      message: `不支持的 MySQL ssl-mode 参数：${rawMode}（允许 DISABLED、PREFERRED、REQUIRED/REQUIRE、VERIFY_CA/VERIFY-CA、VERIFY_IDENTITY/VERIFY-FULL）`,
+    });
   }
+
+  if (rawSsl === 'false' || rawSsl === '0') return undefined;
 
   if (rawSsl !== null) {
     const trimmed = rawSsl.trim();
@@ -109,7 +119,7 @@ const parseTlsFromParams = (params: URLSearchParams): PoolOptions['ssl'] => {
   return undefined;
 };
 
-/** 解析 mysql:// 连接串为安全的 mysql2 PoolOptions（拒绝 socketPath、强制 multipleStatements: false） */
+/** 解析 mysql:// 连接串为安全的 mysql2 PoolOptions（拒绝 socketPath、强制 multipleStatements: false、兼容 IPv6） */
 export const parseMysqlUrl = (url: string, connectTimeoutSec = 10): PoolOptions => {
   let u: URL;
   try {
@@ -130,6 +140,7 @@ export const parseMysqlUrl = (url: string, connectTimeoutSec = 10): PoolOptions 
   if (!u.hostname) {
     throw new HTTPException(422, { message: 'MySQL 连接串缺少主机名' });
   }
+  const host = u.hostname.startsWith('[') && u.hostname.endsWith(']') ? u.hostname.slice(1, -1) : u.hostname;
   const database = decodeURIComponent(u.pathname.replace(/^\/+/, ''));
   const port = u.port ? Number.parseInt(u.port, 10) : 3306;
   if (!Number.isInteger(port) || port <= 0 || port > 65535) {
@@ -139,7 +150,7 @@ export const parseMysqlUrl = (url: string, connectTimeoutSec = 10): PoolOptions 
 
   return {
     ...MYSQL_POOL_DEFAULTS,
-    host: u.hostname,
+    host,
     port,
     user: decodeURIComponent(u.username),
     password: decodeURIComponent(u.password),
@@ -337,20 +348,16 @@ export const inspectMysqlTargetOn = async (tdb: Db, url: string): Promise<Target
     let canCreateDb = false;
     let superuser = false;
     try {
-      const grants = await tdb.query<Record<string, unknown>>('SHOW GRANTS FOR CURRENT_USER()');
+      const grants = await tdb.query<Record<string, unknown>>('SHOW GRANTS');
       const lines = grants.map((row) => {
         const v = Object.values(row)[0];
         return typeof v === 'string' ? v : '';
       });
-      const escapedShadow = shadow.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
-      const shadowDbRe = new RegExp(`ON\\s+\`?${escapedShadow}\`?\\.\\*`, 'i');
       superuser = lines.some((l) => /GRANT\s+(?:ALL\s+PRIVILEGES|[^;]*\bSUPER\b)[^;]*ON\s+\*\.\*/i.test(l));
       canCreateDb =
         superuser ||
         lines.some(
-          (l) =>
-            (/ON\s+\*\.\*/i.test(l) || shadowDbRe.test(l)) &&
-            /GRANT\s+(?:ALL\s+PRIVILEGES|[^;]*\bCREATE\b)/i.test(l),
+          (l) => mysqlGrantMatchesDb(l, shadow) && /GRANT\s+(?:ALL\s+PRIVILEGES|[^;]*\bCREATE\b)/i.test(l),
         );
     } catch {
       canCreateDb = false;
@@ -466,7 +473,15 @@ export const ensureSameInstanceMysqlShadow = async (
 
   try {
     const deadline = Date.now() + SHADOW_LIFECYCLE_LOCK_TIMEOUT_MS;
-    while (!(await tryMysqlLock(conn, lockName))) {
+    for (;;) {
+      let ok: boolean;
+      try {
+        ok = await tryMysqlLock(conn, lockName);
+      } catch (e) {
+        broken = true;
+        throw e;
+      }
+      if (ok) break;
       if (Date.now() > deadline) {
         throw new ShadowUnavailableError('MySQL 影子库正在被其他请求初始化或清理，请稍后再试');
       }
@@ -523,7 +538,12 @@ export const dropMysqlSameInstanceShadow = async (
 
   try {
     conn = await c.db.reserve!();
-    if (!(await tryMysqlLock(conn, lifecycleLock))) return;
+    try {
+      if (!(await tryMysqlLock(conn, lifecycleLock))) return;
+    } catch (e) {
+      broken = true;
+      throw e;
+    }
     locked = true;
 
     const probe = connectMysql(withDb(targetUrl, name), CHECK_CONNECT_TIMEOUT, guard);
@@ -532,7 +552,12 @@ export const dropMysqlSameInstanceShadow = async (
     let probeBroken = false;
     try {
       probeConn = await probe.db.reserve!();
-      if (!(await tryMysqlLock(probeConn, runLock))) return;
+      try {
+        if (!(await tryMysqlLock(probeConn, runLock))) return;
+      } catch (e) {
+        probeBroken = true;
+        throw e;
+      }
       probeLocked = true;
       if (!(await isMarked(probeConn))) return;
     } catch (e) {

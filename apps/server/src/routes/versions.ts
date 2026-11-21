@@ -38,7 +38,7 @@ import {
   versionExecutedAnywhere,
 } from '../chain.ts';
 import { isUniqueViolation } from '../db.ts';
-import { projectTargetPgMajor } from '../envs.ts';
+import { projectPlanOptions } from '../envs.ts';
 import { scrubSecrets } from '../secrets.ts';
 import { ShadowError, storedReport } from '../shadow.ts';
 import type { Shadows } from '../shadows.ts';
@@ -344,12 +344,8 @@ export const registerVersions = (app: Hono<Env>, ctx: AppContext) => {
     }
     const parent = await chainHeadWithModel(db, a.pid);
     const from = chainFrom(parent, model, a.schemas);
-    const targetPgMajor = await projectTargetPgMajor(db, a.pid);
-    const frozen = freezeScripts(
-      from,
-      model,
-      targetPgMajor !== null ? { pgMajor: targetPgMajor } : undefined,
-    );
+    const planOpts = await projectPlanOptions(db, a.pid, a.dialect);
+    const frozen = freezeScripts(from, model, planOpts);
     // 兜底：规划器正常不会生成实例/文件级语句，真出现了就不发布（验证会真的执行它们）
     const instanceLevel = instanceLevelProblem(frozen.up, frozen.down, a.dialect);
     if (instanceLevel) throw new HTTPException(422, { message: instanceLevel });
@@ -608,8 +604,7 @@ export const registerVersions = (app: Hono<Env>, ctx: AppContext) => {
     const a = await access(c, ctx, 'migration.read');
     const to = await resolve(a.pid, a.branch, c.req.query('to'));
     const from = await resolve(a.pid, a.branch, c.req.query('from') ?? 'empty', to, a.schemas);
-    const targetPgMajor = await projectTargetPgMajor(db, a.pid);
-    const planOpts = targetPgMajor !== null ? { pgMajor: targetPgMajor } : undefined;
+    const planOpts = await projectPlanOptions(db, a.pid, a.dialect);
     const up = plan(from, to, planOpts);
     const down = plan(to, from, planOpts);
     if (c.req.query('format') === 'sql') {
@@ -626,17 +621,10 @@ export const registerVersions = (app: Hono<Env>, ctx: AppContext) => {
   app.get('/api/projects/:pid/ddl', async (c) => {
     const a = await access(c, ctx, 'ddl.read');
     const m = await resolve(a.pid, a.branch, c.req.query('version'));
-    const targetPgMajor = await projectTargetPgMajor(db, a.pid);
-    return c.text(
-      `${formatScript(
-        createAll(m, targetPgMajor !== null ? { pgMajor: targetPgMajor } : undefined),
-        a.dialect,
-      )}\n`,
-      200,
-      {
-        'content-type': 'application/sql; charset=utf-8',
-      },
-    );
+    const planOpts = await projectPlanOptions(db, a.pid, a.dialect);
+    return c.text(`${formatScript(createAll(m, planOpts), a.dialect)}\n`, 200, {
+      'content-type': 'application/sql; charset=utf-8',
+    });
   });
 
   app.post('/api/projects/:pid/verify', async (c) => {
@@ -644,10 +632,10 @@ export const registerVersions = (app: Hono<Env>, ctx: AppContext) => {
     const b = await body(c, verifyRequestSchema);
     const to = await resolve(a.pid, a.branch, b.to);
     const from = await resolve(a.pid, a.branch, b.from, to, a.schemas);
-    const targetPgMajor = await projectTargetPgMajor(db, a.pid);
+    const planOpts = await projectPlanOptions(db, a.pid, a.dialect);
     const s = await shadows.forProject(a.pid, b.env);
     return c.json<VerifyResponse>({
-      ...(await s.shadow.verify(from, to, targetPgMajor !== null ? { pgMajor: targetPgMajor } : undefined)),
+      ...(await s.shadow.verify(from, to, planOpts)),
       shadow: s.label,
     });
   });

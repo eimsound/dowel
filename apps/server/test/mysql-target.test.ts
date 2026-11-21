@@ -14,12 +14,31 @@ import type {
   VersionCreated,
   WizardEvent,
 } from '@dowel/api';
-import { addColumn, all, MYSQL_SHADOW_MARK_TABLE } from '@dowel/core';
+import {
+  addCheck,
+  addColumn,
+  addPrimaryKey,
+  all,
+  createSchema,
+  createTable,
+  emptyModel,
+  MYSQL_SHADOW_MARK_TABLE,
+} from '@dowel/core';
+import {
+  alignMysqlImportedLive,
+  type Db,
+  detectMysqlStepAlreadyApplied,
+  mysqlExprCanonEqual,
+  mysqlGrantMatchesDb,
+} from '@dowel/engines';
+import { StepError } from '@dowel/verifier';
 import { afterAll, beforeAll, describe, expect, test } from 'vitest';
 
 import { createMysqlTestDb, mysqlDbUrl, useMysqlTestDb } from '../../../test/mysql.ts';
+import { formatVersionNum } from '../src/envs.ts';
 import { createApp, openPlatformDb, type PlatformDb } from '../src/index.ts';
 import { KeyedLimiter } from '../src/rate-limit.ts';
+import { isConnectionFailure, isInfraFailure } from '../src/shadow.ts';
 import {
   claimMysqlShadow,
   dropMysqlSameInstanceShadow,
@@ -43,6 +62,7 @@ describe('MySQL 目标库服务端驱动与全栈', () => {
 
   let tmpDir = '';
   let pdb: PlatformDb;
+  let createdApp: ReturnType<typeof createApp>;
   let app: ReturnType<typeof createApp>['app'];
   let rooms: ReturnType<typeof createApp>['rooms'];
   let shadows: ReturnType<typeof createApp>['shadows'];
@@ -63,12 +83,12 @@ describe('MySQL 目标库服务端驱动与全栈', () => {
   beforeAll(async () => {
     tmpDir = mkdtempSync(path.join(tmpdir(), 'dowel-mysql-target-'));
     pdb = await openPlatformDb(path.join(tmpDir, 'platform.sqlite'));
-    const created = createApp(pdb, {
+    createdApp = createApp(pdb, {
       connectionLimiter: new KeyedLimiter({ limit: 1000, windowMs: 60_000 }),
     });
-    app = created.app;
-    rooms = created.rooms;
-    shadows = created.shadows;
+    app = createdApp.app;
+    rooms = createdApp.rooms;
+    shadows = createdApp.shadows;
 
     await makeUser(pdb, 'alice', { role: 'admin' });
     const loginRes = await app.request('/api/auth/login', {
@@ -90,7 +110,14 @@ describe('MySQL 目标库服务端驱动与全栈', () => {
   });
 
   afterAll(async () => {
-    await shadows?.close();
+    createdApp?.requests.stop();
+    createdApp?.refresher.stop();
+    await Promise.all([createdApp?.requests.drain(), createdApp?.refresher.drain()]);
+    await createdApp?.webhooks.close();
+    await createdApp?.rooms.flush();
+    await createdApp?.shadows.close();
+    await createdApp?.bus.close();
+    await createdApp?.ha.stop();
     await pdb?.close();
     rmSync(tmpDir, { recursive: true, force: true });
   });
@@ -124,6 +151,117 @@ describe('MySQL 目标库服务端驱动与全栈', () => {
       url: 'postgres://user:pass@127.0.0.1:5432/app',
     });
     expect(mismatch.status).toBe(422);
+
+    // M2: IPv6 去括号、ssl-mode 别名兼容、非法 ssl-mode 严格 422
+    const ipv6Opts = parseMysqlUrl('mysql://root:pw@[::1]:3307/app?ssl-mode=VERIFY-FULL');
+    expect(ipv6Opts.host).toBe('::1');
+    expect(ipv6Opts.port).toBe(3307);
+    expect(ipv6Opts.ssl).toEqual({ rejectUnauthorized: true });
+    expect(parseMysqlUrl('mysql://root:pw@db.example.com/app?sslmode=require').ssl).toEqual({
+      rejectUnauthorized: true,
+    });
+    expect(parseMysqlUrl('mysql://root:pw@db.example.com/app?ssl-mode=verify-ca').ssl).toEqual({
+      rejectUnauthorized: true,
+    });
+    expect(parseMysqlUrl('mysql://root:pw@db.example.com/app?ssl-mode=DISABLED').ssl).toBeUndefined();
+    expect(() => parseMysqlUrl('mysql://root:pw@db.example.com/app?ssl-mode=TYPO_MODE')).toThrow(
+      /不支持的 MySQL ssl-mode/,
+    );
+
+    // H5: MySQL 基础设施错误分类与版本号格式化
+    expect(isConnectionFailure({ code: 'PROTOCOL_CONNECTION_LOST' })).toBe(true);
+    expect(isConnectionFailure({ code: 'HANDSHAKE_NO_SSL_SUPPORT' })).toBe(true);
+    expect(isConnectionFailure({ errno: 2006 })).toBe(true);
+    expect(isConnectionFailure({ errno: 1205 })).toBe(true);
+    expect(isInfraFailure({ errno: 2013 })).toBe(true);
+    expect(isInfraFailure({ errno: 3024 })).toBe(true);
+    expect(
+      isInfraFailure(
+        new StepError({ kind: 'frozen', target: 'up#1', sql: 'SELECT 1' }, { errno: 3024 }, 500),
+      ),
+    ).toBe(false);
+    expect(formatVersionNum(80413, 'mysql')).toBe('8.4.13');
+    expect(formatVersionNum(90700, 'mysql')).toBe('9.7.0');
+
+    // M1: SHOW GRANTS 的 LIKE 转义与通配符匹配
+    expect(mysqlGrantMatchesDb('GRANT CREATE ON `my\\_app`.* TO `u`@`%`', 'my_app')).toBe(true);
+    expect(mysqlGrantMatchesDb('GRANT CREATE ON `my\\_app`.* TO `u`@`%`', 'myXapp')).toBe(false);
+    expect(mysqlGrantMatchesDb('GRANT CREATE ON `app\\_%`.* TO `u`@`%`', 'app_dowel')).toBe(true);
+    expect(mysqlGrantMatchesDb('GRANT ALL PRIVILEGES ON *.* TO `root`@`localhost`', 'anydb')).toBe(true);
+
+    // M5: MySQL 表达式规范化等价与 alignMysqlImportedLive
+    expect(
+      mysqlExprCanonEqual(
+        "((`status` in (_utf8mb4'open',_utf8mb4'closed')))",
+        "status IN ('open', 'closed')",
+      ),
+    ).toBe(true);
+    expect(mysqlExprCanonEqual('((`age` >= 18) and (`score` <> 0))', 'age >= 18 AND score != 0')).toBe(true);
+    expect(mysqlExprCanonEqual("(_utf8mb4'it\\'s')", "'it''s'")).toBe(true);
+    expect(mysqlExprCanonEqual('(a + b) * 2', 'a + b * 2')).toBe(false);
+
+    const refM = emptyModel('mysql');
+    const rs = createSchema(refM, 'default');
+    const rt = createTable(refM, rs, 'users');
+    const rid = addColumn(refM, rt, { name: 'id', type: 'int', notNull: true });
+    const rst = addColumn(refM, rt, {
+      name: 'status',
+      type: 'varchar(20)',
+      notNull: true,
+      default: { expr: "'open'" },
+    });
+    addPrimaryKey(refM, rt, [rid]);
+    const rck = addCheck(refM, rt, "status IN ('open', 'closed')");
+
+    const liveM = structuredClone(refM);
+    (liveM.objects[rck] as { expr: string }).expr = "(`status` in (_utf8mb4'open',_utf8mb4'closed'))";
+    (liveM.objects[rst] as { default: { expr: string } }).default = { expr: "(_utf8mb4'open')" };
+    const aligned = alignMysqlImportedLive(liveM, refM);
+    expect((aligned.objects[rck] as { expr: string }).expr).toBe("status IN ('open', 'closed')");
+    expect((aligned.objects[rst] as { default: { expr: string } }).default).toEqual({ expr: "'open'" });
+
+    // M4: detectMysqlStepAlreadyApplied 错误码过滤、拒绝跨库限定与 KEY_COLUMN_USAGE 列序核对
+    const mockConn: Db = {
+      query: async <T>(sql: string) => {
+        if (sql.includes('TABLE_CONSTRAINTS')) return [{ n: 1 }] as T[];
+        if (sql.includes('KEY_COLUMN_USAGE')) {
+          return [{ columnName: 'b' }, { columnName: 'a' }] as T[];
+        }
+        return [{ n: 1 }] as T[];
+      },
+      exec: async () => {},
+    };
+    // 非幂等错误码（如 1064 语法错误 / 1142 权限错误）必须拒绝跳过
+    expect(
+      await detectMysqlStepAlreadyApplied(
+        mockConn,
+        { sql: 'CREATE TABLE `users` (`id` INT)', transactional: false },
+        { errno: 1142 },
+      ),
+    ).toBe(false);
+    // 跨库限定 db.tbl 必须拒绝跳过
+    expect(
+      await detectMysqlStepAlreadyApplied(
+        mockConn,
+        { sql: 'CREATE TABLE `otherdb`.`users` (`id` INT)', transactional: false },
+        { errno: 1050 },
+      ),
+    ).toBe(false);
+    // PRIMARY KEY 列序不匹配 (a, b) vs (b, a) 必须返回 false；匹配 (b, a) 返回 true
+    expect(
+      await detectMysqlStepAlreadyApplied(
+        mockConn,
+        { sql: 'ALTER TABLE `users` ADD PRIMARY KEY (`a`, `b`)', transactional: false },
+        { errno: 1068 },
+      ),
+    ).toBe(false);
+    expect(
+      await detectMysqlStepAlreadyApplied(
+        mockConn,
+        { sql: 'ALTER TABLE `users` ADD PRIMARY KEY (`b`, `a`)', transactional: false },
+        { errno: 1068 },
+      ),
+    ).toBe(true);
   });
 
   test('真实 MySQL：inspectTarget、pullSchema、claimShadow 防误删非空业务库与同实例影子库生命周期', async () => {
@@ -184,6 +322,7 @@ describe('MySQL 目标库服务端驱动与全栈', () => {
     if (!tdb) return;
 
     const shadowName = mysqlShadowDbName(tdb.name);
+    let pid: string | undefined;
     try {
       await tdb.db.exec(`
         CREATE TABLE \`notes\` (
@@ -226,7 +365,7 @@ describe('MySQL 目标库服务端驱动与全栈', () => {
       });
       expect(wizRes.status).toBe(200);
       const wizEvents = parseSse<WizardEvent>(await wizRes.text());
-      const pid = wizEvents.find((e) => e.stage === 'done')?.project?.id;
+      pid = wizEvents.find((e) => e.stage === 'done')?.project?.id;
       expect(pid).toBeTruthy();
 
       const envs = (await (await req('GET', `/api/projects/${pid}/environments`)).json()) as {
@@ -272,7 +411,7 @@ describe('MySQL 目标库服务端驱动与全栈', () => {
 
       expect(MYSQL_SHADOW_MARK_TABLE).toBe('__dowel_shadow_mark');
     } finally {
-      await shadows.close();
+      if (pid) await shadows.forgetProject(pid);
       await dropMysqlSameInstanceShadow(tdb.url, shadowName).catch(() => {});
       await tdb.close();
     }

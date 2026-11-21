@@ -147,6 +147,33 @@ const readHistoryFormat = async (db: Db): Promise<number | null> => {
   return stored;
 };
 
+/**
+ * 判断一条 MySQL `SHOW GRANTS` 行是否覆盖指定数据库名（支持 `*.*`、`\`db\_name\`.*` LIKE 转义与 `%`/`_` 通配符）。
+ */
+export const mysqlGrantMatchesDb = (line: string, dbName: string): boolean => {
+  if (/\bON\s+\*\.\*/i.test(line)) return true;
+  if (!dbName) return false;
+  const m = /\bON\s+(?:`((?:[^`]|``)+)`|([^\s.`]+))\.\*/i.exec(line);
+  if (!m) return false;
+  const rawPattern = (m[1] ?? m[2] ?? '').replaceAll('``', '`');
+  let re = '^';
+  for (let i = 0; i < rawPattern.length; i++) {
+    const ch = rawPattern[i]!;
+    if (ch === '\\' && i + 1 < rawPattern.length) {
+      const next = rawPattern[++i]!;
+      re += next.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+    } else if (ch === '%') {
+      re += '.*';
+    } else if (ch === '_') {
+      re += '.';
+    } else {
+      re += ch.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+    }
+  }
+  re += '$';
+  return new RegExp(re, 'i').test(dbName);
+};
+
 const historyWriteProblem = async (db: Db): Promise<HistoryError | null> => {
   try {
     await readHistoryFormat(db);
@@ -155,8 +182,18 @@ const historyWriteProblem = async (db: Db): Promise<HistoryError | null> => {
     throw e;
   }
   try {
-    const [ro] = await db.query<{ ro: number | string; sro: number | string; dbName: string | null }>(
-      'SELECT @@read_only AS ro, @@super_read_only AS sro, DATABASE() AS dbName',
+    const [ro] = await db.query<{
+      ro: number | string;
+      sro: number | string;
+      logBin: number | string;
+      trustFc: number | string;
+      dbName: string | null;
+    }>(
+      `SELECT @@read_only AS ro,
+              @@super_read_only AS sro,
+              @@log_bin AS logBin,
+              @@log_bin_trust_function_creators AS trustFc,
+              DATABASE() AS dbName`,
     );
     if (Number(ro?.ro) === 1 || Number(ro?.sro) === 1) {
       return new HistoryError(
@@ -165,14 +202,12 @@ const historyWriteProblem = async (db: Db): Promise<HistoryError | null> => {
       );
     }
     const dbName = ro?.dbName ?? '';
-    const grants = await db.query<Record<string, unknown>>('SHOW GRANTS FOR CURRENT_USER()');
+    const grants = await db.query<Record<string, unknown>>('SHOW GRANTS');
     const grantLines = grants.map((r) => asStr(Object.values(r)[0]));
-    const relevant = grantLines.filter((line) => {
-      if (/ON \*\.\*/i.test(line)) return true;
-      if (!dbName) return false;
-      const escaped = dbName.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
-      return new RegExp(`ON\\s+\`?${escaped}\`?\\.\\*`, 'i').test(line);
-    });
+    const relevant = grantLines.filter((line) => mysqlGrantMatchesDb(line, dbName));
+    const hasGlobalSuper = grantLines.some((l) =>
+      /GRANT\s+(?:ALL\s+PRIVILEGES|[^;]*\bSUPER\b)[^;]*\bON\s+\*\.\*/i.test(l),
+    );
     if (relevant.length > 0) {
       const hasAll = relevant.some((l) => /GRANT\s+ALL\s+PRIVILEGES\b/i.test(l));
       if (!hasAll) {
@@ -186,6 +221,17 @@ const historyWriteProblem = async (db: Db): Promise<HistoryError | null> => {
             `当前 MySQL 账号缺少在库 \`${dbName}\` 初始化迁移历史所需的权限（缺少 ${missing.join('、')}）`,
           );
         }
+      }
+      if (
+        Number(ro?.logBin) === 1 &&
+        Number(ro?.trustFc) === 0 &&
+        !hasGlobalSuper &&
+        !(await historyExists(db))
+      ) {
+        return new HistoryError(
+          'no_schema_privilege',
+          '目标 MySQL 开启了 binlog（log_bin=1）且 log_bin_trust_function_creators=0，初始化迁移历史只追加触发器需要 SUPER 权限（或将 log_bin_trust_function_creators 设为 1）',
+        );
       }
     }
   } catch {
@@ -230,7 +276,12 @@ const ensureHistory = async (db: Db): Promise<void> => {
   let broken = false;
 
   try {
-    await acquireMysqlAdvisoryLock(conn, lockName, 15_000);
+    try {
+      await acquireMysqlAdvisoryLock(conn, lockName, 15_000);
+    } catch (e) {
+      if (!(e instanceof HistoryError && e.code === 'lock_timeout')) broken = true;
+      throw e;
+    }
     locked = true;
 
     const ddlStatements = [
@@ -662,7 +713,12 @@ const withProjectLock = async <T>(
   let broken = false;
 
   try {
-    await acquireMysqlAdvisoryLock(conn, lockName, timeoutMs);
+    try {
+      await acquireMysqlAdvisoryLock(conn, lockName, timeoutMs);
+    } catch (e) {
+      if (!(e instanceof HistoryError && e.code === 'lock_timeout')) broken = true;
+      throw e;
+    }
     locked = true;
     return await fn(conn);
   } finally {

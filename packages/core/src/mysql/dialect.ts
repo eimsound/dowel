@@ -2,7 +2,13 @@
 import type { DialectCapabilities, DialectSpec, IdentKind } from '../dialect.ts';
 import { emptyModel, type Model, type Obj } from '../ir.ts';
 import { all, childrenOf, columnsOf, get, indexElementNames } from '../model.ts';
-import { MAX_MYSQL_IDENT, MYSQL_SHADOW_MARK_TABLE, mysqlChooseName, mysqlJoinNames } from './naming.ts';
+import {
+  MAX_MYSQL_IDENT,
+  MYSQL_SAFE_IDENT_RE,
+  MYSQL_SHADOW_MARK_TABLE,
+  mysqlChooseName,
+  mysqlJoinNames,
+} from './naming.ts';
 import {
   MYSQL_INSTANCE_LEVEL_DESCRIPTION,
   mysqlFindInstanceLevelStatement,
@@ -195,6 +201,21 @@ const validateMysqlModel = (m: Model): string[] => {
         if (o.partitionBy !== null || o.partitionOf !== null) {
           errs.push(`table ${o.name}：MySQL 暂不支持声明式分区表编辑`);
         }
+        if (o.ext?.mysql?.engine !== undefined && !MYSQL_SAFE_IDENT_RE.test(o.ext.mysql.engine)) {
+          errs.push(
+            `table ${o.name}：存储引擎名 ${o.ext.mysql.engine} 格式不合法（仅允许字母、数字与下划线）`,
+          );
+        }
+        if (o.ext?.mysql?.charset !== undefined && !MYSQL_SAFE_IDENT_RE.test(o.ext.mysql.charset)) {
+          errs.push(
+            `table ${o.name}：字符集名 ${o.ext.mysql.charset} 格式不合法（仅允许字母、数字与下划线）`,
+          );
+        }
+        if (o.ext?.mysql?.collation !== undefined && !MYSQL_SAFE_IDENT_RE.test(o.ext.mysql.collation)) {
+          errs.push(
+            `table ${o.name}：排序规则名 ${o.ext.mysql.collation} 格式不合法（仅允许字母、数字与下划线）`,
+          );
+        }
         claim('rel', o.name, o);
         break;
       }
@@ -203,6 +224,12 @@ const validateMysqlModel = (m: Model): string[] => {
         if (o.identity) errs.push(`列 ${o.name}：MySQL 不支持 PG IDENTITY，请使用 AUTO_INCREMENT`);
         if (o.typeRef) errs.push(`列 ${o.name}：MySQL 不支持独立枚举类型引用`);
         if (o.default && 'nextval' in o.default) errs.push(`列 ${o.name}：MySQL 不支持序列默认值`);
+        if (o.ext?.mysql?.charset !== undefined && !MYSQL_SAFE_IDENT_RE.test(o.ext.mysql.charset)) {
+          errs.push(`列 ${o.name}：字符集名 ${o.ext.mysql.charset} 格式不合法（仅允许字母、数字与下划线）`);
+        }
+        if (o.collation !== null && !MYSQL_SAFE_IDENT_RE.test(o.collation)) {
+          errs.push(`列 ${o.name}：排序规则名 ${o.collation} 格式不合法（仅允许字母、数字与下划线）`);
+        }
         break;
       case 'primaryKey':
         break;

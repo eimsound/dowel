@@ -50,6 +50,8 @@ export const pgCapabilities = (major: number): PgCapabilities => ({
 
 export interface PlanOptions {
   pgMajor?: number | null;
+  /** 目标 MySQL 数值版本号（如 80400 = 8.4.0、90700 = 9.7.0） */
+  mysqlVersionNum?: number | null;
 }
 
 export type CompatibilityCode =
