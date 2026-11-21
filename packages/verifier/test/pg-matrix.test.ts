@@ -16,7 +16,7 @@ import {
   setNotNull,
 } from '@dowel/core';
 import { diffSnapshots, importSnapshot, readSnapshot, toScriptSteps } from '@dowel/engines';
-import { diffAgainst } from '@dowel/executor';
+import { diffAgainst, importLive, planDiff } from '@dowel/executor';
 import { describe, expect, test } from 'vitest';
 
 import { PG_URL, useTestDb } from '../../../test/pg.ts';
@@ -129,11 +129,45 @@ describe.skipIf(!PG_URL)('PG 15–19 多版本矩阵验证', () => {
     expect(vr.upDiff).toEqual([]);
     expect(vr.downDiff).toEqual([]);
 
-    // 3) 模拟线上执行按 PG 15 冻结的 up 脚本，执行器 diffAgainst 读回比对必须零漂移（无 readback_mismatch）
+    // 3) 模拟线上执行按 PG 15 冻结的 up 脚本，执行器 diffAgainst 与 importLive（pull 链路）必须零漂移且不污染 explicit 约束名
     await build(db, m1);
     await runSteps(db, upSteps);
     const afterUpSnap = await readSnapshot(db);
     expect(diffAgainst(afterUpSnap, m2)).toEqual({ total: 0, items: [] });
+    const pulled = importLive(afterUpSnap, m2);
+    expect(planDiff(m2, pulled, { pgMajor: 15 })).toEqual({ total: 0, items: [] });
+
+    // 4) 模拟从 PG 15–17 导入的模型（notNullName: null, notNullNameMode: 'explicit'）改表名/列名后在 PG 15–19 验证与拉取
+    const imported15 = structuredClone(m1);
+    for (const o of Object.values(imported15.objects)) {
+      if (o.kind === 'column' && o.notNull) {
+        o.notNullName = null;
+        o.notNullNameMode = 'explicit';
+      }
+    }
+    const imported15Next = structuredClone(imported15);
+    renameTable(imported15Next, t, 'orders');
+    renameColumn(imported15Next, oldCol, 'customer_email');
+    const up15 = plan(imported15, imported15Next, { pgMajor: 15 });
+    const down15 = plan(imported15Next, imported15, { pgMajor: 15 });
+    const r15 = await verifyScripts(
+      db,
+      imported15,
+      imported15Next,
+      toScriptSteps(up15),
+      toScriptSteps(down15),
+    );
+    expect(r15.upDiff).toEqual([]);
+    expect(r15.downDiff).toEqual([]);
+    const vr15 = await verify(db, imported15, imported15Next, { pgMajor: 15 });
+    expect(vr15.upDiff).toEqual([]);
+    expect(vr15.downDiff).toEqual([]);
+    await build(db, imported15);
+    await runSteps(db, up15);
+    const after15Snap = await readSnapshot(db);
+    expect(diffAgainst(after15Snap, imported15Next)).toEqual({ total: 0, items: [] });
+    const pulled15 = importLive(after15Snap, imported15Next);
+    expect(planDiff(imported15Next, pulled15, { pgMajor: 15 })).toEqual({ total: 0, items: [] });
   });
 
   test('CREATE DOMAIN ... NOT NULL 与 CHECK (VALUE IS NOT NULL) 在 PG 15–19 产出一致 DDL 且往返通过', async () => {

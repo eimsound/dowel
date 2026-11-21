@@ -36,11 +36,34 @@ export const ignoreDefaultPublicComment = (snapshot: Snapshot, model: Model): Sn
 };
 
 /**
- * 线上结构导入成模型，对象 ID 按名字沿用 `reference` 里的（reconcileIds），全新库里 public 自带的默认注释按 reference 的规则忽略。
- * **漂移检查、标记的核对、导入线上结构（保留线上的修改）都用它**——同一套规则，导入预览和漂移检查看到的是同一份结构。
+ * 当目标模型某列未显式命名 NOT NULL 约束（derived 或 PG 15–17 导入的 notNullName === null）且线上快照对应列同样为 NOT NULL 时，
+ * 将线上导入列的 notNullName 与 notNullNameMode 对齐到 reference：消除 PG 15–17 冻结的 renameTable/renameColumn 脚本
+ * 在 PG 18/19 目标库执行或 pull 时因旧默认约束名残留触发的假漂移、unresolvable 预览与工作副本污染；
+ * 真正显式命名（explicit 且 notNullName 非空）的约束仍严格比对。
+ */
+const alignDerivedNotNullNames = (live: Model, target: Model): Model => {
+  let objects: Model['objects'] | null = null;
+  for (const tObj of Object.values(target.objects)) {
+    if (tObj.kind !== 'column' || !tObj.notNull) continue;
+    if (tObj.notNullNameMode === 'explicit' && tObj.notNullName !== null) continue;
+    const lObj = live.objects[tObj.id];
+    if (lObj?.kind !== 'column' || !lObj.notNull) continue;
+    if (lObj.notNullName === tObj.notNullName && lObj.notNullNameMode === tObj.notNullNameMode) continue;
+    objects ??= { ...live.objects };
+    objects[tObj.id] = { ...lObj, notNullName: tObj.notNullName, notNullNameMode: tObj.notNullNameMode };
+  }
+  return objects ? { ...live, objects } : live;
+};
+
+/**
+ * 线上结构导入成模型，对象 ID 按名字沿用 `reference` 里的（reconcileIds），全新库里 public 自带的默认注释按 reference 的规则忽略，
+ * 并对齐非显式 NOT NULL 约束名。**漂移检查、标记的核对、导入线上结构（保留线上的修改）都用它**——同一套规则，导入预览和漂移检查看到的是同一份结构。
  */
 export const importLive = (snapshot: Snapshot, reference: Model): Model =>
-  reconcileIds(reference, importSnapshot(ignoreDefaultPublicComment(snapshot, reference)));
+  alignDerivedNotNullNames(
+    reconcileIds(reference, importSnapshot(ignoreDefaultPublicComment(snapshot, reference))),
+    reference,
+  );
 
 /**
  * plan(from, to) 的差异（最多 MAX_DIFF 项，另给总数）；规划器对这对模型报错时作为一项 `unresolvable`，不让调用方崩溃。
@@ -64,29 +87,11 @@ const unresolvable = (e: unknown): DiffResult => ({
   items: [{ kind: 'unresolvable', target: '', sql: e instanceof Error ? e.message : String(e) }],
 });
 
-/**
- * 当目标模型某列为推导 NOT NULL 约束名（notNullNameMode === 'derived'）且线上快照对应列同样为 NOT NULL 时，
- * 将线上导入列的 notNullName 对齐到目标模型：消除 PG 15–17 冻结的 renameTable/renameColumn 脚本
- * 在 PG 18/19 目标库执行后因旧默认约束名残留触发的假漂移与 readback_mismatch；显式约束名（explicit）仍严格比对。
- */
-const alignDerivedNotNullNames = (live: Model, target: Model): Model => {
-  let objects: Model['objects'] | null = null;
-  for (const tObj of Object.values(target.objects)) {
-    if (tObj.kind !== 'column' || !tObj.notNull || tObj.notNullNameMode !== 'derived') continue;
-    const lObj = live.objects[tObj.id];
-    if (lObj?.kind !== 'column' || !lObj.notNull) continue;
-    if (lObj.notNullName === tObj.notNullName && lObj.notNullNameMode === 'derived') continue;
-    objects ??= { ...live.objects };
-    objects[tObj.id] = { ...lObj, notNullName: tObj.notNullName, notNullNameMode: 'derived' };
-  }
-  return objects ? { ...live, objects } : live;
-};
-
 /** 线上结构 → 版本模型的差异；total = 0 表示相等 */
 export const diffAgainst = (snapshot: Snapshot, model: Model): DiffResult => {
   try {
     const pgMajor = pgMajorOf(snapshot.version);
-    const live = alignDerivedNotNullNames(importLive(snapshot, model), model);
+    const live = importLive(snapshot, model);
     return planDiff(live, model, pgMajor !== null ? { pgMajor } : undefined);
   } catch (e) {
     // 线上结构怪到连导入都做不了：也算不一致，把原因当作一项差异

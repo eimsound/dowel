@@ -93,14 +93,14 @@ export const build = async (db: Db, m: Model, opts?: PlanOptions): Promise<Snaps
 };
 
 /**
- * 对模型中非显式命名的 NOT NULL 列（notNullNameMode !== 'explicit'），将快照里该列的 notNullName 归一为 null：
+ * 对模型中非显式命名的 NOT NULL 列（derived 或 PG 15–17 导入的 notNullName === null），将快照里该列的 notNullName 归一为 null：
  * PG 15–17 冻结的 renameTable/renameColumn 脚本不含 PG 18+ 的 RENAME CONSTRAINT ... NOT NULL，
- * 在 PG 18/19 影子库重放后仅推导约束名会残留旧名；归一化后仍严格比对 notNull 布尔值与 explicit 显式约束名。
+ * 在 PG 18/19 影子库重放后仅推导约束名会残留旧名；归一化后仍严格比对 notNull 布尔值与 explicit 非空约束名。
  */
 const normalizeDerivedNotNullNames = (snap: Snapshot, model: Model): Snapshot => {
   const explicitCols = new Set<string>();
   for (const col of all(model, 'column')) {
-    if (!col.notNull || col.notNullNameMode !== 'explicit') continue;
+    if (!col.notNull || col.notNullName === null || col.notNullNameMode !== 'explicit') continue;
     const table = find(model, col.parent);
     if (table?.kind !== 'table') continue;
     const schema = find(model, table.parent);
