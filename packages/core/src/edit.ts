@@ -448,6 +448,31 @@ export const normalizePartitionFamily = (m: Model, tableId: string) => {
   }
 };
 
+/**
+ * 返回归一化后的模型副本：对模型中所有分区根表幂等执行 `normalizePartitionFamily`，
+ * 统一升级存量 `partitionBy: string` 并清理子分区冗余列；不修改入参对象，
+ * 且对无法结构化解析的残留 `partitionBy: string` 保持原样不抛错。
+ */
+export const normalizeAllPartitionFamilies = (m: Model): Model => {
+  const tables = all(m, 'table');
+  const needsWork = tables.some(
+    (t) =>
+      typeof t.partitionBy === 'string' ||
+      (t.partitionOf !== null && childrenOf(m, t.id, 'column').length > 0),
+  );
+  if (!needsWork) return m;
+  const out = structuredClone(m);
+  const seen = new Set<string>();
+  for (const t of all(out, 'table')) {
+    if (t.partitionBy === null && t.partitionOf === null) continue;
+    const rootId = rootTableId(out, t.id);
+    if (seen.has(rootId)) continue;
+    seen.add(rootId);
+    normalizePartitionFamily(out, rootId);
+  }
+  return out;
+};
+
 const assertPartitionConstraintCompat = (
   req: { directCols: string[]; hasExprKey: boolean },
   kind: 'primaryKey' | 'unique' | 'index',

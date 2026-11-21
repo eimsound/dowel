@@ -306,7 +306,10 @@ export const registerVersions = (app: Hono<Env>, ctx: AppContext) => {
       db.dialect === 'pg'
         ? await db.query<{ id: string }>(
             `select distinct e.key as id
-               from versions v, jsonb_each(v.model -> 'objects') as e(key, val)
+               from versions v,
+                    jsonb_each(
+                      case when jsonb_typeof(v.model -> 'objects') = 'object' then v.model -> 'objects' end
+                    ) as e(key, val)
               where v.project_id = $1 and e.val ->> 'kind' = 'table'`,
             [a.pid],
           )

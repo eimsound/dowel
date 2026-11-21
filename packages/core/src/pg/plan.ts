@@ -2,7 +2,12 @@
 // 规划时维护一份“当前状态” cur：每生成一步就把它更新到执行这一步之后的样子，
 // 所以每条语句引用的都是当时实际存在的名字；结束时断言 cur 等于目标版本。
 
-import { exprReferences, renameInExpr, renameQualifiedInExpr } from '../edit.ts';
+import {
+  exprReferences,
+  normalizeAllPartitionFamilies,
+  renameInExpr,
+  renameQualifiedInExpr,
+} from '../edit.ts';
 import type {
   Check,
   Column,
@@ -145,7 +150,9 @@ const pickExprs = (o: Obj): Partial<Obj> =>
       ? { elements: structuredClone(o.elements), where: o.where }
       : {};
 
-export const plan = (from: Model, to: Model, opts?: PlanOptions): Step[] => {
+export const plan = (rawFrom: Model, rawTo: Model, opts?: PlanOptions): Step[] => {
+  const from = normalizeAllPartitionFamilies(rawFrom);
+  const to = normalizeAllPartitionFamilies(rawTo);
   const targetMajor = opts?.pgMajor ?? null;
   if (targetMajor !== null && (!Number.isInteger(targetMajor) || targetMajor <= 0)) {
     throw new PlanError(`无效的目标 PostgreSQL 主版本号：${String(targetMajor)}`);
@@ -223,48 +230,6 @@ export const plan = (from: Model, to: Model, opts?: PlanOptions): Step[] => {
     attachColMap.set(tId, map);
   }
 
-  // 存量旧格式子分区冗余列升级清理：from 和 to 均为子分区、但 to 已移除冗余列对象，不发 DROP COLUMN
-  const legacyChildCols = new Set<string>();
-  const legacyAddedChildCols = new Set<string>();
-  const legacyColMap = new Map<string, Map<string, string>>(); // tableId → (fromColId → toColId)
-  for (const o of removed) {
-    if (o.kind !== 'column') continue;
-    const ft = find(from, o.parent);
-    const tt = find(to, o.parent);
-    if (ft?.kind === 'table' && tt?.kind === 'table' && ft.partitionOf && tt.partitionOf) {
-      legacyChildCols.add(o.id);
-      const rc = columnsOf(to, rootTableId(to, tt.id)).find((x) => x.name === o.name);
-      if (rc) {
-        let map = legacyColMap.get(tt.id);
-        if (!map) {
-          map = new Map();
-          legacyColMap.set(tt.id, map);
-        }
-        map.set(o.id, rc.id);
-      }
-    }
-  }
-  // 对称处理反向迁移（新格式 → 存量旧格式）：from 和 to 均为子分区、但 to 带旧格式冗余子分区列，不发 ADD COLUMN
-  for (const o of added) {
-    if (o.kind !== 'column') continue;
-    const ft = find(from, o.parent);
-    const tt = find(to, o.parent);
-    if (ft?.kind === 'table' && tt?.kind === 'table' && ft.partitionOf && tt.partitionOf) {
-      legacyAddedChildCols.add(o.id);
-      const rc = columnsOf(from, rootTableId(from, ft.id)).find((x) => x.name === o.name);
-      if (rc) {
-        let map = legacyColMap.get(tt.id);
-        if (!map) {
-          map = new Map();
-          legacyColMap.set(tt.id, map);
-        }
-        map.set(rc.id, o.id);
-      }
-    }
-  }
-  const legacyAllColMap = new Map<string, string>();
-  for (const map of legacyColMap.values()) for (const [k, v] of map) legacyAllColMap.set(k, v);
-
   // ───── 改名带来的表达式变化：PG 按 OID 记录引用，改名时会自动更新表达式，不需要重建 ─────
   // 把旧版本表达式里的 schema、枚举、列名换成新名字后再比较；相同就说明只是改名带来的变化
   const schemaRenames = common
@@ -297,14 +262,18 @@ export const plan = (from: Model, to: Model, opts?: PlanOptions): Step[] => {
     return e;
   };
   const remapIdsForTable = (tableId: string): Map<string, string> | undefined =>
-    attachColMap.get(tableId) ?? detachRootToNewCol.get(tableId) ?? legacyColMap.get(tableId);
+    attachColMap.get(tableId) ?? detachRootToNewCol.get(tableId);
   const migrated = <T extends Obj>(w: T): T => {
     const o = clone(w) as Obj;
-    if (o.kind === 'table' && o.partitionBy && typeof o.partitionBy !== 'string') {
-      const rm = remapIdsForTable(o.id);
-      for (const k of o.partitionBy.keys) {
-        if (k.column && rm?.has(k.column)) k.column = rm.get(k.column)!;
-        if (k.expr) k.expr = migrateExpr(k.expr, o.id);
+    if (o.kind === 'table' && o.partitionBy) {
+      if (typeof o.partitionBy === 'string') {
+        o.partitionBy = migrateExpr(o.partitionBy, o.id);
+      } else {
+        const rm = remapIdsForTable(o.id);
+        for (const k of o.partitionBy.keys) {
+          if (k.column && rm?.has(k.column)) k.column = rm.get(k.column)!;
+          if (k.expr) k.expr = migrateExpr(k.expr, o.id);
+        }
       }
     }
     if (o.kind === 'check') o.expr = migrateExpr(o.expr, o.parent);
@@ -330,9 +299,6 @@ export const plan = (from: Model, to: Model, opts?: PlanOptions): Step[] => {
     if (o.kind === 'column') {
       if (o.generated) o.generated.expr = migrateExpr(o.generated.expr, o.parent);
       if (o.default && 'expr' in o.default) o.default.expr = migrateExpr(o.default.expr, o.parent);
-    }
-    if (o.kind === 'sequence' && o.ownedBy && legacyAllColMap.has(o.ownedBy)) {
-      o.ownedBy = legacyAllColMap.get(o.ownedBy)!;
     }
     return o as T;
   };
@@ -378,9 +344,7 @@ export const plan = (from: Model, to: Model, opts?: PlanOptions): Step[] => {
               attachColMap.get(o.id)?.get(fromColId) ??
               attachColMap.get(fromRoot)?.get(fromColId) ??
               detachRootToNewCol.get(o.id)?.get(fromColId) ??
-              detachRootToNewCol.get(toRoot)?.get(fromColId) ??
-              legacyColMap.get(o.id)?.get(fromColId) ??
-              legacyColMap.get(fromRoot)?.get(fromColId);
+              detachRootToNewCol.get(toRoot)?.get(fromColId);
             if (mapped && inTo(mapped)) return mapped;
             if (!isRemoved(fromColId)) return fromColId;
             return null;
@@ -1121,45 +1085,9 @@ export const plan = (from: Model, to: Model, opts?: PlanOptions): Step[] => {
       (o): o is Column => o.kind === 'column' && syntheticDetached.has(o.id) && detaching.has(o.parent),
     ),
   ].sort((x, y) => (x.generated ? 0 : 1) - (y.generated ? 0 : 1));
-  const applyLegacyColRemap = (tableId: string) => {
-    const map = legacyColMap.get(tableId);
-    if (!map?.size) return;
-    const mapCol = (c: string) => map.get(c) ?? c;
-    for (const obj of Object.values(cur.objects)) {
-      if (
-        obj.kind === 'table' &&
-        obj.id === tableId &&
-        obj.partitionBy &&
-        typeof obj.partitionBy !== 'string'
-      ) {
-        for (const k of obj.partitionBy.keys) if (k.column) k.column = mapCol(k.column);
-      }
-      if (obj.kind === 'sequence' && obj.ownedBy && map.has(obj.ownedBy)) {
-        obj.ownedBy = map.get(obj.ownedBy)!;
-      }
-      if (!('parent' in obj) || obj.parent !== tableId) continue;
-      if (obj.kind === 'primaryKey' || obj.kind === 'unique') obj.columns = obj.columns.map(mapCol);
-      else if (obj.kind === 'foreignKey') {
-        obj.columns = obj.columns.map(mapCol);
-        if (obj.refTable === tableId) obj.refColumns = obj.refColumns.map(mapCol);
-      } else if (obj.kind === 'index') {
-        for (const el of obj.elements) if (el.column) el.column = mapCol(el.column);
-        obj.include = obj.include.map(mapCol);
-      }
-    }
-  };
-  const legacyRemappedTables = new Set<string>();
   for (const o of colsToDrop) {
     if (!(o.id in cur.objects)) continue;
     if (attachKeptCols.has(o.id)) continue; // 将在 P12h 随 ATTACH 吸收
-    if (legacyChildCols.has(o.id)) {
-      if (!legacyRemappedTables.has(o.parent)) {
-        legacyRemappedTables.add(o.parent);
-        applyLegacyColRemap(o.parent);
-      }
-      delete cur.objects[o.id];
-      continue;
-    }
     emit('dropColumn', o.id, `ALTER TABLE ${T(o.parent)} DROP COLUMN ${C(o.id)}`);
     dropWithColumn(o.id);
     delete cur.objects[o.id];
@@ -1590,10 +1518,10 @@ export const plan = (from: Model, to: Model, opts?: PlanOptions): Step[] => {
   for (const o of addedTables) {
     cur.objects[o.id] = fresh(o);
     const columns = columnsOf(to, o.id);
-    if (o.partitionOf && columns.length === 0) {
+    if (o.partitionOf) {
       const partSql = partitionBySql(cur, o);
       const part = partSql ? ` PARTITION BY ${partSql}` : '';
-      // 标准分区子表：不冗余存列，直接使用 CREATE TABLE ... PARTITION OF 继承父表列与约束
+      // 标准分区子表（含入口归一化后的存量旧格式）：直接使用 CREATE TABLE ... PARTITION OF 继承父表列与约束
       emit(
         'createTable',
         o.id,
@@ -1605,13 +1533,6 @@ export const plan = (from: Model, to: Model, opts?: PlanOptions): Step[] => {
       const part = partSql ? ` PARTITION BY ${partSql}` : '';
       const body = columns.length ? `\n  ${columns.map((c) => columnDef(c, o)).join(',\n  ')}\n` : '';
       emit('createTable', o.id, `CREATE TABLE ${T(o.id)} (${body})${part}`);
-      // 兼容存量旧格式（子分区带冗余列）：先作为普通表建出来，再 ATTACH 到父表上
-      if (o.partitionOf)
-        emit(
-          'attachPartition',
-          o.id,
-          `ALTER TABLE ${T(o.partitionOf.parent)} ATTACH PARTITION ${T(o.id)} ${o.partitionOf.bound}`,
-        );
     }
     // 新建分区父表时，在创建其子分区之前先把父表自身的 PK / UNIQUE / INDEX 建好，
     // 防止后续先建子分区再建索引时 PG 自动生成的子分区继承索引名抢占父表显式索引名（63 字节截断重名）
@@ -1626,14 +1547,6 @@ export const plan = (from: Model, to: Model, opts?: PlanOptions): Step[] => {
   }
   // ───── P11 加列（生成列在改完列之后再加，见 P12g） ─────
   const addColumn = (c: Column) => {
-    if (legacyAddedChildCols.has(c.id)) {
-      cur.objects[c.id] = fresh(c);
-      if (!legacyRemappedTables.has(c.parent)) {
-        legacyRemappedTables.add(c.parent);
-        applyLegacyColRemap(c.parent);
-      }
-      return;
-    }
     const table = get(cur, c.parent, 'table');
     cur.objects[c.id] = fresh(c);
     emit('addColumn', c.id, `ALTER TABLE ${T(c.parent)} ADD COLUMN ${columnDef(c, table)}`);

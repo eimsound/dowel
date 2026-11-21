@@ -291,13 +291,25 @@ describe.skipIf(!PG_URL)('PG 分区表闭环与往返验证', () => {
     // 反向迁移（新格式 → 旧格式）同样不产生非法 ALTER TABLE <child> ADD COLUMN
     expect(plan(upgraded, legacy)).toEqual([]);
 
-    // 存量旧格式直接画布编辑（增列）并发布：双向闭环 verify(legacy, edited) up/down 全绿
-    const edited = structuredClone(legacy);
-    E.addColumn(edited, 'p', { name: 'note', type: 'text' });
-    expect(validate(edited)).toEqual([]);
-    const rLegacy = await verify(db, legacy, edited);
-    expect(rLegacy.upDiff).toEqual([]);
-    expect(rLegacy.downDiff).toEqual([]);
+    // 存量旧格式直接画布编辑（增列、改分区键列名、改子分区边界、脱离子分区、改父表名）双向闭环全绿
+    const cases: [string, (m: E.Model) => void][] = [
+      ['addColumn', (m) => void E.addColumn(m, 'p', { name: 'note', type: 'text' })],
+      ['renameColumn', (m) => E.renameColumn(m, 'p_day', 'day_num')],
+      ['setPartitionBound', (m) => E.setPartitionBound(m, 'c1', 'FOR VALUES FROM (0) TO (20)')],
+      ['detachPartition', (m) => E.detachPartition(m, 'c1')],
+      ['renameTable', (m) => E.renameTable(m, 'p', 'sales_v2')],
+    ];
+    for (const [label, edit] of cases) {
+      const legacyCopy = structuredClone(legacy);
+      const edited = structuredClone(legacy);
+      edit(edited);
+      expect(validate(edited), label).toEqual([]);
+      const rLegacy = await verify(db, legacy, edited);
+      expect(rLegacy.upDiff, `${label} upDiff`).toEqual([]);
+      expect(rLegacy.downDiff, `${label} downDiff`).toEqual([]);
+      // 确认 plan 入口归一化未修改调用方传入的 legacy 入参
+      expect(legacy).toEqual(legacyCopy);
+    }
   });
 
   test('R2 High #6: 多级子分区表挂载（attachPartition）与脱离闭环通过', async () => {
