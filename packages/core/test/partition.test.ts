@@ -14,6 +14,7 @@ import {
   createTable,
   detachPartition,
   dropColumn,
+  dropKey,
   dropTable,
   EditError,
   emptyModel,
@@ -32,10 +33,13 @@ import {
   plan,
   readsOf,
   renameColumn,
+  renameKey,
+  resetKeyName,
   resolvePartitionBy,
   rootTableId,
   runMutator,
   type Sequence,
+  setCheckExpr,
   setColumnType,
   setPartitionBy,
   type Table,
@@ -677,5 +681,124 @@ describe('edit mutators & plan Stage 0 review regression', () => {
     // Dropping the detached column DOES cascade-delete the view
     dropColumn(m, detCol.id);
     expect(m.objects.v1).toBeUndefined();
+  });
+
+  test('R2 Low #1-#4: duplicate ID guard, dropTable cycle guard, legacy key ops, sibling shared view, and NO INHERIT check attach', () => {
+    // Low #1: duplicate ID in createTable / createPartition & cycle guard in dropTable
+    const { m, s } = base();
+    const p = createTable(m, s, 'p', 'p');
+    const cId = addColumn(m, p, { id: 'cId', name: 'id', type: 'integer', notNull: true });
+    setPartitionBy(m, p, {
+      strategy: 'range',
+      keys: [{ column: cId, expr: null, opclass: null, collation: null }],
+    });
+    expect(() => createTable(m, s, 'p2', 'p')).toThrow(EditError);
+    expect(() => createPartition(m, p, 'p_self', 'DEFAULT', p)).toThrow(EditError);
+    const ch1 = createPartition(m, p, 'p_1', 'FOR VALUES FROM (0) TO (10)', 'ch1');
+    const ch2 = createPartition(m, p, 'p_2', 'FOR VALUES FROM (10) TO (20)', 'ch2');
+
+    // Low #3: view shared by ch1 and sibling ch2 retains root col dep after detaching ch1
+    m.objects.vShared = {
+      id: 'vShared',
+      kind: 'opaque',
+      parent: s,
+      objType: 'view',
+      name: 'v_shared',
+      ddl: ['CREATE VIEW public.v_shared AS SELECT id FROM public.p_1 UNION ALL SELECT id FROM public.p_2'],
+      drop: 'DROP VIEW public.v_shared',
+      deps: [ch1, ch2, cId],
+      order: 1,
+      comment: null,
+    };
+    detachPartition(m, ch1);
+    const detCol = columnsOf(m, ch1)[0]!;
+    expect((m.objects.vShared as Opaque).deps).toContain(cId);
+    expect((m.objects.vShared as Opaque).deps).toContain(detCol.id);
+
+    // dropTable cycle guard does not stack-overflow
+    const mCycle = emptyModel();
+    const sc = createSchema(mCycle, 'public', 'sc');
+    const a = createTable(mCycle, sc, 'a', 'a');
+    const b = createTable(mCycle, sc, 'b', 'b');
+    (mCycle.objects[a] as Table).partitionOf = { parent: b, bound: 'DEFAULT' };
+    (mCycle.objects[b] as Table).partitionOf = { parent: a, bound: 'DEFAULT' };
+    expect(() => dropTable(mCycle, a)).not.toThrow();
+
+    // Low #2: setCheckExpr / renameKey / resetKeyName / dropKey upgrade legacy model
+    const mLeg = emptyModel();
+    const sl = createSchema(mLeg, 'public', 'sl');
+    mLeg.objects.lp = {
+      id: 'lp',
+      kind: 'table',
+      parent: sl,
+      name: 'leg',
+      partitionBy: 'RANGE (day)',
+      partitionOf: null,
+      comment: null,
+    };
+    mLeg.objects.lp_day = {
+      id: 'lp_day',
+      kind: 'column',
+      parent: 'lp',
+      name: 'day',
+      pos: 'a0',
+      type: 'integer',
+      typeRef: null,
+      notNull: true,
+      notNullName: null,
+      notNullNameMode: 'derived',
+      default: null,
+      identity: null,
+      generated: null,
+      collation: null,
+      comment: null,
+    };
+    mLeg.objects.lc = {
+      id: 'lc',
+      kind: 'table',
+      parent: sl,
+      name: 'leg_1',
+      partitionBy: null,
+      partitionOf: { parent: 'lp', bound: 'FOR VALUES FROM (0) TO (10)' },
+      comment: null,
+    };
+    mLeg.objects.lc_day = {
+      ...structuredClone(mLeg.objects.lp_day),
+      id: 'lc_day',
+      parent: 'lc',
+    };
+    mLeg.objects.lc_ck = {
+      id: 'lc_ck',
+      kind: 'check',
+      parent: 'lc',
+      name: 'leg_1_day_check',
+      nameMode: 'derived',
+      expr: '(day > 0)',
+      noInherit: false,
+      comment: null,
+    };
+    setCheckExpr(mLeg, 'lc_ck', '(day >= 0)');
+    expect(typeof (mLeg.objects.lp as Table).partitionBy).toBe('object');
+    expect(columnsOf(mLeg, 'lc')).toEqual([]);
+    renameKey(mLeg, 'lc_ck', 'custom_ck');
+    resetKeyName(mLeg, 'lc_ck');
+    dropKey(mLeg, 'lc_ck');
+    expect(validate(mLeg)).toEqual([]);
+
+    // Low #4: attachPartition rejects same-name CHECK with noInherit: true
+    const { m: mNi, s: sNi } = base();
+    const pNi = createTable(mNi, sNi, 'ni_p', 'pNi');
+    const pNiId = addColumn(mNi, pNi, { id: 'pNiId', name: 'id', type: 'integer', notNull: true });
+    setPartitionBy(mNi, pNi, {
+      strategy: 'range',
+      keys: [{ column: pNiId, expr: null, opclass: null, collation: null }],
+    });
+    const pCk = addCheck(mNi, pNi, '(id > 0)', 'pCk');
+    (mNi.objects[pCk] as { name: string }).name = 'chk_pos';
+    const cNi = createTable(mNi, sNi, 'ni_c', 'cNi');
+    addColumn(mNi, cNi, { id: 'cNiId', name: 'id', type: 'integer', notNull: true });
+    const cCk = addCheck(mNi, cNi, '(id > 0)', 'cCk', true);
+    (mNi.objects[cCk] as { name: string }).name = 'chk_pos';
+    expect(() => attachPartition(mNi, pNi, cNi, 'FOR VALUES FROM (0) TO (10)')).toThrow(EditError);
   });
 });

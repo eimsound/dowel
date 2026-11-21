@@ -225,7 +225,8 @@ export const plan = (from: Model, to: Model, opts?: PlanOptions): Step[] => {
 
   // 存量旧格式子分区冗余列升级清理：from 和 to 均为子分区、但 to 已移除冗余列对象，不发 DROP COLUMN
   const legacyChildCols = new Set<string>();
-  const legacyColMap = new Map<string, Map<string, string>>(); // tableId → (fromLegacyColId → toRootColId)
+  const legacyAddedChildCols = new Set<string>();
+  const legacyColMap = new Map<string, Map<string, string>>(); // tableId → (fromColId → toColId)
   for (const o of removed) {
     if (o.kind !== 'column') continue;
     const ft = find(from, o.parent);
@@ -243,6 +244,26 @@ export const plan = (from: Model, to: Model, opts?: PlanOptions): Step[] => {
       }
     }
   }
+  // 对称处理反向迁移（新格式 → 存量旧格式）：from 和 to 均为子分区、但 to 带旧格式冗余子分区列，不发 ADD COLUMN
+  for (const o of added) {
+    if (o.kind !== 'column') continue;
+    const ft = find(from, o.parent);
+    const tt = find(to, o.parent);
+    if (ft?.kind === 'table' && tt?.kind === 'table' && ft.partitionOf && tt.partitionOf) {
+      legacyAddedChildCols.add(o.id);
+      const rc = columnsOf(from, rootTableId(from, ft.id)).find((x) => x.name === o.name);
+      if (rc) {
+        let map = legacyColMap.get(tt.id);
+        if (!map) {
+          map = new Map();
+          legacyColMap.set(tt.id, map);
+        }
+        map.set(rc.id, o.id);
+      }
+    }
+  }
+  const legacyAllColMap = new Map<string, string>();
+  for (const map of legacyColMap.values()) for (const [k, v] of map) legacyAllColMap.set(k, v);
 
   // ───── 改名带来的表达式变化：PG 按 OID 记录引用，改名时会自动更新表达式，不需要重建 ─────
   // 把旧版本表达式里的 schema、枚举、列名换成新名字后再比较；相同就说明只是改名带来的变化
@@ -310,6 +331,9 @@ export const plan = (from: Model, to: Model, opts?: PlanOptions): Step[] => {
       if (o.generated) o.generated.expr = migrateExpr(o.generated.expr, o.parent);
       if (o.default && 'expr' in o.default) o.default.expr = migrateExpr(o.default.expr, o.parent);
     }
+    if (o.kind === 'sequence' && o.ownedBy && legacyAllColMap.has(o.ownedBy)) {
+      o.ownedBy = legacyAllColMap.get(o.ownedBy)!;
+    }
     return o as T;
   };
 
@@ -347,19 +371,25 @@ export const plan = (from: Model, to: Model, opts?: PlanOptions): Step[] => {
         if (samePartBy) {
           const fromKeyCols = partitionKeyColumns(from, w).all;
           const toKeyCols = new Set(partitionKeyColumns(to, o).all);
+          const fromRoot = rootTableId(from, w.id);
           const toRoot = rootTableId(to, o.id);
           const mapFromColToTo = (fromColId: string): string | null => {
+            const mapped =
+              attachColMap.get(o.id)?.get(fromColId) ??
+              attachColMap.get(fromRoot)?.get(fromColId) ??
+              detachRootToNewCol.get(o.id)?.get(fromColId) ??
+              detachRootToNewCol.get(toRoot)?.get(fromColId) ??
+              legacyColMap.get(o.id)?.get(fromColId) ??
+              legacyColMap.get(fromRoot)?.get(fromColId);
+            if (mapped && inTo(mapped)) return mapped;
             if (!isRemoved(fromColId)) return fromColId;
-            for (const [toColId, rc] of detachToRootCol) {
-              const tc = find(to, toColId);
-              if (rc.id === fromColId && tc?.kind === 'column' && tc.parent === toRoot) return toColId;
-            }
             return null;
           };
           const mappedFromCols = fromKeyCols.map(mapFromColToTo);
+          const mappedSet = new Set(mappedFromCols.filter((cid): cid is string => cid !== null));
           if (
             mappedFromCols.some((cid) => cid === null || !toKeyCols.has(cid)) ||
-            mappedFromCols.length !== toKeyCols.size
+            mappedSet.size !== toKeyCols.size
           ) {
             samePartBy = false;
           }
@@ -579,6 +609,18 @@ export const plan = (from: Model, to: Model, opts?: PlanOptions): Step[] => {
       .map((c) => c.id),
   );
 
+  // PG 中 ALTER TABLE RENAME COLUMN 不会更新分区父表索引关系（relkind='I'）上的 pg_attribute.attname，
+  // 导致后续新建或重挂子分区时 PG 仍按旧列名生成继承 UNIQUE/INDEX 约束与索引名；
+  // 当分区父表的 UNIQUE 或 INDEX 直接引用的列改名时重建该约束/索引，确保索引 attname 与当前列名一致。
+  const renamedColIds = new Set(
+    common.filter((o): o is Column => o.kind === 'column' && o.name !== was(o).name).map((o) => o.id),
+  );
+  const usesRenamedDirectCol = (o: Unique | Index): boolean =>
+    o.kind === 'unique'
+      ? o.columns.some((c) => renamedColIds.has(c))
+      : o.elements.some((e) => e.column !== null && renamedColIds.has(e.column)) ||
+        o.include.some((c) => renamedColIds.has(c));
+
   const rebuild = new Set<string>();
   const isKey = (o: Obj): o is Constraint | Index =>
     o.kind === 'primaryKey' || o.kind === 'unique' || o.kind === 'check' || o.kind === 'index';
@@ -587,11 +629,16 @@ export const plan = (from: Model, to: Model, opts?: PlanOptions): Step[] => {
     const w = was(o);
     const exprs =
       w.kind === 'check' ? [w.expr] : w.kind === 'index' ? [...w.elements.map((e) => e.expr), w.where] : [];
+    const partParentRenamedKeyCol =
+      (w.kind === 'unique' || w.kind === 'index') &&
+      (to.objects[o.parent] as Table).partitionBy !== null &&
+      usesRenamedDirectCol(w);
     if (
       !same(definition(o), definition(migrated(w))) ||
       usesCols(w, regen) ||
       usesCols(w, typeChanged) ||
-      exprs.some(mentionsRebuiltEnum)
+      exprs.some(mentionsRebuiltEnum) ||
+      partParentRenamedKeyCol
     )
       rebuild.add(o.id);
   }
@@ -1074,10 +1121,42 @@ export const plan = (from: Model, to: Model, opts?: PlanOptions): Step[] => {
       (o): o is Column => o.kind === 'column' && syntheticDetached.has(o.id) && detaching.has(o.parent),
     ),
   ].sort((x, y) => (x.generated ? 0 : 1) - (y.generated ? 0 : 1));
+  const applyLegacyColRemap = (tableId: string) => {
+    const map = legacyColMap.get(tableId);
+    if (!map?.size) return;
+    const mapCol = (c: string) => map.get(c) ?? c;
+    for (const obj of Object.values(cur.objects)) {
+      if (
+        obj.kind === 'table' &&
+        obj.id === tableId &&
+        obj.partitionBy &&
+        typeof obj.partitionBy !== 'string'
+      ) {
+        for (const k of obj.partitionBy.keys) if (k.column) k.column = mapCol(k.column);
+      }
+      if (obj.kind === 'sequence' && obj.ownedBy && map.has(obj.ownedBy)) {
+        obj.ownedBy = map.get(obj.ownedBy)!;
+      }
+      if (!('parent' in obj) || obj.parent !== tableId) continue;
+      if (obj.kind === 'primaryKey' || obj.kind === 'unique') obj.columns = obj.columns.map(mapCol);
+      else if (obj.kind === 'foreignKey') {
+        obj.columns = obj.columns.map(mapCol);
+        if (obj.refTable === tableId) obj.refColumns = obj.refColumns.map(mapCol);
+      } else if (obj.kind === 'index') {
+        for (const el of obj.elements) if (el.column) el.column = mapCol(el.column);
+        obj.include = obj.include.map(mapCol);
+      }
+    }
+  };
+  const legacyRemappedTables = new Set<string>();
   for (const o of colsToDrop) {
     if (!(o.id in cur.objects)) continue;
     if (attachKeptCols.has(o.id)) continue; // 将在 P12h 随 ATTACH 吸收
     if (legacyChildCols.has(o.id)) {
+      if (!legacyRemappedTables.has(o.parent)) {
+        legacyRemappedTables.add(o.parent);
+        applyLegacyColRemap(o.parent);
+      }
       delete cur.objects[o.id];
       continue;
     }
@@ -1547,6 +1626,14 @@ export const plan = (from: Model, to: Model, opts?: PlanOptions): Step[] => {
   }
   // ───── P11 加列（生成列在改完列之后再加，见 P12g） ─────
   const addColumn = (c: Column) => {
+    if (legacyAddedChildCols.has(c.id)) {
+      cur.objects[c.id] = fresh(c);
+      if (!legacyRemappedTables.has(c.parent)) {
+        legacyRemappedTables.add(c.parent);
+        applyLegacyColRemap(c.parent);
+      }
+      return;
+    }
     const table = get(cur, c.parent, 'table');
     cur.objects[c.id] = fresh(c);
     emit('addColumn', c.id, `ALTER TABLE ${T(c.parent)} ADD COLUMN ${columnDef(c, table)}`);

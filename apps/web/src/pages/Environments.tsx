@@ -180,6 +180,7 @@ const EnvForm = ({ pid }: { pid: string }) => {
       setOverwriteAsk(null);
       void qc.invalidateQueries({ queryKey: ['envs', pid] });
       void qc.invalidateQueries({ queryKey: ['versions', pid] });
+      void qc.invalidateQueries({ queryKey: ['published-tables', pid] });
       void qc.invalidateQueries({ queryKey: ['project', pid] });
       void qc.invalidateQueries({ queryKey: ['activity', pid] });
       void qc.invalidateQueries({ queryKey: ['migration', pid] });

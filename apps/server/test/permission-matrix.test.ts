@@ -460,6 +460,10 @@ const matrix: Record<string, Spec> = {
     access: { kind: 'project', min: 'viewer', statuses: [200] },
     path: () => `${P()}/versions`,
   },
+  'GET /api/projects/:pid/published-tables': {
+    access: { kind: 'project', min: 'viewer', statuses: [200] },
+    path: () => `${P()}/published-tables`,
+  },
   'GET /api/projects/:pid/versions/:vid': {
     access: { kind: 'project', min: 'viewer', statuses: [200] },
     path: (ctx) => `${P()}/versions/${ctx.versionId}`,

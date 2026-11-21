@@ -296,6 +296,7 @@ export const createTable = (
   partitionBy: PartitionSpec | null = null,
 ): string => {
   get(m, schema, 'schema');
+  if (id in m.objects) throw new EditError(`对象 ID ${id} 已存在`);
   if (relTaken(m, schema, name, '') || typeTaken(m, schema, name, ''))
     throw new EditError(`名字 ${name} 已被占用`);
   const o: Table = {
@@ -342,10 +343,12 @@ const dropDependentOpaques = (m: Model, ids: Set<string>) => {
   }
 };
 
-export const dropTable = (m: Model, id: string) => {
+export const dropTable = (m: Model, id: string, seen = new Set<string>()) => {
+  if (seen.has(id)) return;
+  seen.add(id);
   get(m, id, 'table');
-  // 级联删除其下所有子分区（支持多级），不留悬空 partitionOf
-  for (const child of partitionsOf(m, id)) dropTable(m, child.id);
+  // 级联删除其下所有子分区（支持多级），带环保护，不留悬空 partitionOf
+  for (const child of partitionsOf(m, id)) dropTable(m, child.id, seen);
   dropDependentOpaques(m, new Set([id, ...childrenOf(m, id, 'column').map((c) => c.id)]));
   for (const fk of all(m, 'foreignKey')) if (fk.refTable === id && fk.parent !== id) delete m.objects[fk.id];
   for (const c of childrenOf(m, id, 'column')) {
@@ -397,7 +400,7 @@ const assertSpecKeysValid = (m: Model, tableId: string, spec: PartitionSpec) => 
  * 1) 清理子分区上的冗余列对象，并把其本地约束/索引/外键/序列归属/不透明对象依赖映射到根父表列 ID；
  * 2) 将 `typeof partitionBy === 'string'` 经 `resolvePartitionBy` 升级为结构化 `PartitionSpec`。
  */
-const normalizePartitionFamily = (m: Model, tableId: string) => {
+export const normalizePartitionFamily = (m: Model, tableId: string) => {
   const rootId = rootTableId(m, tableId);
   const root = find(m, rootId);
   if (root?.kind !== 'table') return;
@@ -510,6 +513,7 @@ export const createPartition = (
 ): string => {
   const parent = get(m, parentId, 'table');
   normalizePartitionFamily(m, parentId);
+  if (id in m.objects) throw new EditError(`对象 ID ${id} 已存在`);
   if (!parent.partitionBy) throw new EditError(`表 ${parent.name} 不是分区父表`);
   const spec = resolvePartitionBy(m, parent);
   if (!spec) throw new EditError(`无法解析表 ${parent.name} 的分区定义`);
@@ -672,11 +676,15 @@ export const attachPartition = (m: Model, parentId: string, childId: string, bou
     }
   }
 
-  // 校验同名异义 CHECK 约束（PG 禁止子表携带与父表同名但表达式不同的 CHECK）
+  // 校验同名异义或带 NO INHERIT 的 CHECK 约束（覆盖子表及其全部后代，PG 禁止挂载）
   const ancChecks = all(m, 'check').filter((k) => ancestorIds.has(k.parent));
-  for (const ck of childrenOf(m, childId, 'check')) {
-    if (ancChecks.some((ak) => ak.name === ck.name && ak.expr !== ck.expr)) {
-      throw new EditError(`表 ${child.name} 的检查约束 ${ck.name} 与分区父表同名但表达式不同，不能挂载`);
+  for (const sub of [child, ...partitionDescendants(m, childId)]) {
+    for (const ck of childrenOf(m, sub.id, 'check')) {
+      if (ancChecks.some((ak) => ak.name === ck.name && (ak.expr !== ck.expr || ck.noInherit))) {
+        throw new EditError(
+          `表 ${sub.name} 的检查约束 ${ck.name} 与分区父表同名但表达式不同或设为 NO INHERIT，不能挂载`,
+        );
+      }
     }
   }
 
@@ -720,7 +728,8 @@ export const attachPartition = (m: Model, parentId: string, childId: string, bou
       delete m.objects[u.id];
   }
   for (const ck of childrenOf(m, childId, 'check')) {
-    if (ancChecks.some((ak) => ak.name === ck.name && ak.expr === ck.expr)) delete m.objects[ck.id];
+    if (!ck.noInherit && ancChecks.some((ak) => ak.name === ck.name && ak.expr === ck.expr))
+      delete m.objects[ck.id];
   }
   for (const fk of childrenOf(m, childId, 'foreignKey')) {
     if (
@@ -799,7 +808,8 @@ export const detachPartition = (m: Model, childId: string) => {
   // 先将子表已有本地约束/索引、后代分区键及直接依赖子分区的不透明对象（含 schema 级视图）列引用映射到新物化的列 ID
   remapColRefsOnTable(m, childId, colMap);
   const childTree = new Set([childId, ...partitionDescendants(m, childId).map((d) => d.id)]);
-  const ancTree = new Set(ancestors.map((a) => a.id));
+  // child.partitionOf 已置空，rootId 及其剩余后代覆盖全部祖先与兄弟分区表，防止共享视图丢失根列依赖
+  const ancTree = new Set([rootId, ...partitionDescendants(m, rootId).map((d) => d.id)]);
   for (const o of all(m, 'opaque')) {
     const touchesChild = childTree.has(o.parent) || o.deps.some((d) => childTree.has(d));
     if (!touchesChild || !o.deps.some((d) => colMap.has(d))) continue;
@@ -1283,6 +1293,7 @@ export const dropKey = (m: Model, id: string) => {
     )
   )
     throw new EditError('不是约束或索引');
+  normalizePartitionFamily(m, o.parent);
   const keyCols =
     o.kind === 'primaryKey' || o.kind === 'unique'
       ? o.columns
@@ -1310,6 +1321,7 @@ export const renameKey = (m: Model, id: string, name: string) => {
     )
   )
     throw new EditError('不是约束或索引');
+  normalizePartitionFamily(m, o.parent);
   const rel = o.kind !== 'check' && o.kind !== 'foreignKey';
   const con = o.kind !== 'index';
   if ((rel && relTaken(m, schemaOf(m, o.parent), name, id)) || (con && conTaken(m, o.parent, name, id)))
@@ -1322,6 +1334,7 @@ export const renameKey = (m: Model, id: string, name: string) => {
 export const resetKeyName = (m: Model, id: string) => {
   const o = get(m, id);
   if ('nameMode' in o && o.kind !== 'sequence') {
+    normalizePartitionFamily(m, o.parent);
     o.nameMode = 'derived';
     refreshDerivedNames(m, o.parent);
   }

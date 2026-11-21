@@ -137,6 +137,7 @@ export const VersionDialog = ({ pid, open, onClose }: Base) => {
     mutationFn: () => api<VersionCreated>('POST', `/api/projects/${pid}/versions`, { name }),
     onSuccess: (v) => {
       void qc.invalidateQueries({ queryKey: ['versions', pid] });
+      void qc.invalidateQueries({ queryKey: ['published-tables', pid] });
       setName('');
       const args = {
         name: v.name,

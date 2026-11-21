@@ -284,6 +284,7 @@ export const ExecDialog = ({
   const refresh = () =>
     Promise.all([
       qc.invalidateQueries({ queryKey: ['envs', pid] }),
+      qc.invalidateQueries({ queryKey: ['project', pid] }),
       qc.invalidateQueries({ queryKey: ['env-status', pid, eid] }),
       qc.invalidateQueries({ queryKey: ['env-history', pid, eid] }),
       qc.invalidateQueries({ queryKey: ['versions', pid] }),

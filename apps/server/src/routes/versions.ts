@@ -301,16 +301,22 @@ export const registerVersions = (app: Hono<Env>, ctx: AppContext) => {
 
   app.get('/api/projects/:pid/published-tables', async (c) => {
     const a = await access(c, ctx, 'project.read');
-    const rows = await db.query<{ model: Model }>('select model from versions where project_id = $1', [
-      a.pid,
-    ]);
-    const ids = new Set<string>();
-    for (const row of rows) {
-      for (const o of Object.values(row.model.objects)) {
-        if (o.kind === 'table') ids.add(o.id);
-      }
-    }
-    return c.json<PublishedTables>({ tableIds: [...ids] });
+    // 下推 JSON 键提取与去重到数据库侧，避免拉取并反序列化所有历史版本的完整模型
+    const rows =
+      db.dialect === 'pg'
+        ? await db.query<{ id: string }>(
+            `select distinct e.key as id
+               from versions v, jsonb_each(v.model -> 'objects') as e(key, val)
+              where v.project_id = $1 and e.val ->> 'kind' = 'table'`,
+            [a.pid],
+          )
+        : await db.query<{ id: string }>(
+            `select distinct e.key as id
+               from versions v, json_each(v.model, '$.objects') as e
+              where v.project_id = $1 and json_extract(e.value, '$.kind') = 'table'`,
+            [a.pid],
+          );
+    return c.json<PublishedTables>({ tableIds: rows.map((r) => r.id) });
   });
 
   app.get('/api/projects/:pid/versions/:vid', async (c) => {

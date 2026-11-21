@@ -93,6 +93,7 @@ export const ProjectSettings = () => {
       qc.removeQueries({ queryKey: ['project', pid] });
       qc.removeQueries({ queryKey: ['access', pid] });
       qc.removeQueries({ queryKey: ['versions', pid] });
+      qc.removeQueries({ queryKey: ['published-tables', pid] });
       qc.removeQueries({ queryKey: ['envs', pid] });
       qc.removeQueries({ queryKey: ['activity', pid] });
       await Promise.all([

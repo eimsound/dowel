@@ -288,6 +288,92 @@ describe.skipIf(!PG_URL)('PG 分区表闭环与往返验证', () => {
     // 从旧格式模型迁移到新格式模型：不产生多余 DROP COLUMN 或重建索引 SQL
     const steps = plan(legacy, upgraded);
     expect(steps).toEqual([]);
+    // 反向迁移（新格式 → 旧格式）同样不产生非法 ALTER TABLE <child> ADD COLUMN
+    expect(plan(upgraded, legacy)).toEqual([]);
+
+    // 存量旧格式直接画布编辑（增列）并发布：双向闭环 verify(legacy, edited) up/down 全绿
+    const edited = structuredClone(legacy);
+    E.addColumn(edited, 'p', { name: 'note', type: 'text' });
+    expect(validate(edited)).toEqual([]);
+    const rLegacy = await verify(db, legacy, edited);
+    expect(rLegacy.upDiff).toEqual([]);
+    expect(rLegacy.downDiff).toEqual([]);
+  });
+
+  test('R2 High #6: 多级子分区表挂载（attachPartition）与脱离闭环通过', async () => {
+    const db = conn();
+    const v1 = emptyModel();
+    const s = E.createSchema(v1, 'public');
+    const gp = E.createTable(v1, s, 'gp');
+    const gpYr = E.addColumn(v1, gp, { name: 'yr', type: 'integer', notNull: true });
+    const gpReg = E.addColumn(v1, gp, { name: 'region', type: 'text', notNull: true });
+    E.setPartitionBy(v1, gp, {
+      strategy: 'range',
+      keys: [{ column: gpYr, expr: null, opclass: null, collation: null }],
+    });
+    E.addPrimaryKey(v1, gp, [gpYr, gpReg]);
+
+    // 独立的多级分区表 sub（自带 PARTITION BY LIST (region) 和叶分区 sub_us）
+    const sub = E.createTable(v1, s, 'gp_2025');
+    E.addColumn(v1, sub, { name: 'yr', type: 'integer', notNull: true });
+    const subReg = E.addColumn(v1, sub, { name: 'region', type: 'text', notNull: true });
+    E.setPartitionBy(v1, sub, {
+      strategy: 'list',
+      keys: [{ column: subReg, expr: null, opclass: null, collation: null }],
+    });
+    E.createPartition(v1, sub, 'gp_2025_us', "FOR VALUES IN ('us')");
+
+    const v2 = structuredClone(v1);
+    E.attachPartition(v2, gp, sub, 'FOR VALUES FROM (2025) TO (2026)');
+    expect(validate(v2)).toEqual([]);
+    const r = await verify(db, v1, v2);
+    expect(r.upDiff).toEqual([]);
+    expect(r.downDiff).toEqual([]);
+  });
+
+  test('Fuzz seed 1444353190 回归：分区父表重命名列 + 子分区重绑边界与后续新建/脱离闭环一致', async () => {
+    const db = conn();
+    const v1 = emptyModel();
+    const s = E.createSchema(v1, 'public');
+    const p = E.createTable(v1, s, 'pt_a');
+    const cPk = E.addColumn(v1, p, { name: 'pk_key', type: 'integer', notNull: true });
+    const cVal = E.addColumn(v1, p, { name: 'val', type: 'integer', default: { expr: '0' } });
+    E.setPartitionBy(v1, p, {
+      strategy: 'range',
+      keys: [{ column: cPk, expr: null, opclass: null, collation: null }],
+    });
+    E.addPrimaryKey(v1, p, [cPk]);
+    E.addUnique(v1, p, [cPk, cVal]);
+    E.addUnique(v1, p, [cPk]);
+    E.addIndex(v1, p, [{ column: cVal }]);
+    const ch0 = E.createPartition(v1, p, 'pt_a_p_0', 'DEFAULT');
+
+    // v1 → v2：同时重命名父表列 pk_key → user、val → amount 并重绑 DEFAULT 子分区边界
+    const v2 = structuredClone(v1);
+    E.renameColumn(v2, cPk, 'user');
+    E.renameColumn(v2, cVal, 'amount');
+    E.setPartitionBound(v2, ch0, 'FOR VALUES FROM (1400) TO (1500)');
+    expect(validate(v2)).toEqual([]);
+    const r12 = await verify(db, v1, v2);
+    expect(r12.upDiff).toEqual([]);
+    expect(r12.downDiff).toEqual([]);
+
+    // v2 → v3：在改名后的父表上新建子分区
+    const v3 = structuredClone(v2);
+    const ch1 = E.createPartition(v3, p, 'pt_a_p_1', 'FOR VALUES FROM (1500) TO (1600)');
+    expect(validate(v3)).toEqual([]);
+    const r23 = await verify(db, v2, v3);
+    expect(r23.upDiff).toEqual([]);
+    expect(r23.downDiff).toEqual([]);
+
+    // v3 → v4：脱离新建的子分区并删掉其脱离后的 UNIQUE 约束（验证 PG 约束名已按新列名生成）
+    const v4 = structuredClone(v3);
+    E.detachPartition(v4, ch1);
+    for (const u of E.childrenOf(v4, ch1, 'unique')) E.dropKey(v4, u.id);
+    expect(validate(v4)).toEqual([]);
+    const r34 = await verify(db, v3, v4);
+    expect(r34.upDiff).toEqual([]);
+    expect(r34.downDiff).toEqual([]);
   });
 
   test('High #3: 子分区改名与父表列改名同步重命名 PG 隐式继承约束/索引（同迁移占名新建 + 跨版本 Detach 闭环）', async () => {

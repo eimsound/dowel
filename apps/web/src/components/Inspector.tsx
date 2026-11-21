@@ -526,7 +526,7 @@ const compatiblePlainTables = (model: Model, parent: Table): Table[] => {
       if (!ancPks.some((pk) => deepEqual(pk.columns, mapped))) return false;
     }
     for (const ck of childrenOf(model, cand.id, 'check')) {
-      if (ancChecks.some((ak) => ak.name === ck.name && ak.expr !== ck.expr)) return false;
+      if (ancChecks.some((ak) => ak.name === ck.name && (ak.expr !== ck.expr || ck.noInherit))) return false;
     }
     return true;
   });
@@ -567,11 +567,13 @@ const TableInspector = ({
     enabled: versionCount > 0,
     staleTime: Infinity,
   });
-  // Fail-closed：版本列表或已发布表集合仍在加载/出错时，默认锁定策略编辑，避免短暂暴露非法操作
+  // Fail-closed：版本列表或已发布表集合仍在加载/重拉/出错时，默认锁定策略编辑，避免发布后短暂暴露非法操作
   const publishedUnknown =
     versions.isPending ||
+    versions.isFetching ||
     versions.isError ||
-    (versionCount > 0 && (publishedTables.isPending || publishedTables.isError));
+    (versionCount > 0 &&
+      (publishedTables.isPending || publishedTables.isFetching || publishedTables.isError));
   const isPublished = !publishedUnknown && versionCount > 0 && !!publishedTables.data?.has(table.id);
   const pgBlocksPartitionIdentity = project.targetPgMajor !== null && project.targetPgMajor < 17;
 

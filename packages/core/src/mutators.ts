@@ -21,6 +21,7 @@ const name = z.string().min(1).max(63);
 export const setCheckExpr = (m: Model, checkId: string, expr: string) => {
   const o = m.objects[checkId];
   if (o?.kind !== 'check') throw new E.EditError('不是 CHECK 约束');
+  E.normalizePartitionFamily(m, o.parent);
   E.checkExprColumns(m, o.parent, expr);
   o.expr = expr;
   E.refreshDerivedNames(m, o.parent);

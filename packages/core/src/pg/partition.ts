@@ -283,6 +283,10 @@ const findRootTableId = (m: Model, tableId: string): string => {
 
 const tableColumns = (m: Model, tableId: string): Column[] => {
   const root = findRootTableId(m, tableId);
+  const rootCols = Object.values(m.objects).filter(
+    (o): o is Column => o.kind === 'column' && o.parent === root,
+  );
+  if (root !== tableId && rootCols.length > 0) return rootCols;
   return Object.values(m.objects).filter(
     (o): o is Column => o.kind === 'column' && (o.parent === root || o.parent === tableId),
   );

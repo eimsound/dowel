@@ -103,6 +103,7 @@ export const Sidebar = ({
     strat: string | null;
     totalChildren: number;
     children: TableNode[];
+    hasSelfMatch: boolean;
     forceExpand: boolean;
   }
   const buildTableNode = (tb: Table, ancestorMatched: boolean, seen: Set<string>): TableNode | null => {
@@ -115,13 +116,15 @@ export const Sidebar = ({
       .map((ch) => buildTableNode(ch, ancestorMatched || selfMatched, seen))
       .filter((x): x is TableNode => x !== null);
     if (!ancestorMatched && !selfMatched && visibleChildren.length === 0) return null;
+    const childHasSelfMatch = visibleChildren.some((ch) => ch.hasSelfMatch);
     return {
       table: tb,
       label,
       strat: strategyLabel(tb),
       totalChildren: rawChildren.length,
       children: visibleChildren,
-      forceExpand: !!q && !selfMatched && visibleChildren.length > 0,
+      hasSelfMatch: (!!q && selfMatched) || childHasSelfMatch,
+      forceExpand: !!q && childHasSelfMatch,
     };
   };
   const filteredTables = byName(all(model, 'table').filter((x) => !x.partitionOf))
@@ -140,7 +143,7 @@ export const Sidebar = ({
         />
       );
     }
-    const isOpen = forceExpand || !!expanded[table.id];
+    const isOpen = expanded[table.id] ?? forceExpand;
     const hasChildren = children.length > 0;
     const isChild = depth > 0;
     const indentPx = depth * 14;

@@ -83,6 +83,7 @@ const RunDialog = ({
       running.current = false;
       void invalidateRequests(qc);
       void qc.invalidateQueries({ queryKey: ['envs', pid] });
+      void qc.invalidateQueries({ queryKey: ['project', pid] });
       void qc.invalidateQueries({ queryKey: ['env-status', pid, r.environment.id] });
       void qc.invalidateQueries({ queryKey: ['env-history', pid, r.environment.id] });
     }
