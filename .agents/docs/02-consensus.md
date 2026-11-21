@@ -178,8 +178,8 @@ IR(v1), IR(v2)
 | 语言          | TypeScript 7（strict）                                                                            | 核心代码在浏览器、服务端、CLI 共用；协作生态在 JS；CLI 分发简单（MSSQL 驱动 tedious 是纯 JS）                                        |
 | 运行时        | Node.js 26 LTS                                                                                    | 内置 `node:sqlite`，少一个原生依赖                                                                                                   |
 | 版本固定      | 项目根目录 `.tool-versions`（mise 读取）：`node 26.13.0`                                          | 让 `node` / `npx` 在项目目录里直接可用                                                                                               |
-| 包管理 / 构建 | pnpm workspaces；内部包不设构建步骤，直接导出 TS 源码                                             | Node 26 能直接运行 TS，Vite / Vitest 直接编译；因此暂不需要 Turborepo（2026-11-18，见 [05-implementation.md](05-implementation.md)） |
-| 代码规范      | Biome                                                                                             | 格式化和 lint 一个工具搞定，速度快                                                                                                   |
+| 包管理 / 构建 | pnpm workspaces + **tsdown**（根目录 `workspace` 模式分层构建 `packages/*` 与 `apps/server`，本地开发/测试通过自定义 condition `@dowel/source` 直读源码） | **2026-11-21 改**（原 2026-11-18 为“内部包不设构建步骤”）：排入 P7.5 统一到 VoidZero 独立组件工具链（暂不引入 `vite-plus` / `vp`）；生产运行（`pnpm start` / Docker）走编译后的纯 JS `dist` 产物并产出 `.d.ts` 边界，同时借助 `@dowel/source` 条件导出保持本地 `dev` / `test` / `tsc` 零重编，仍不需要 Turborepo |
+| 代码规范      | **Oxlint**（含 `oxlint-tsgolint@7` `--type-aware` + 官方内置插件）+ **Oxfmt**（内置 import 排序与 Tailwind 类名排序）                                           | **2026-11-21 改**（原为 Biome）：排入 P7.5 统一到 VoidZero/Oxc 工具链，补齐基于 TypeScript 7 内核的类型感知 lint 与内置 Tailwind 类名排序；`tsc --noEmit` 保留为独立类型检查门禁 |
 | 测试          | Vitest、fast-check（随机测试）、Testcontainers（MySQL / MSSQL / 多版本 PG）、Playwright（端到端） | 2026-11-18 用户决定：需要 PG 的测试一律用 Testcontainers 起真实 PG（不用 PGlite）；没有 Docker 时跳过并警告；大规模随机测试靠 CI     |
 
 不选 Python 的原因（详见讨论记录）：前端反正是 TS，选 Python 会变成两种语言；核心代码无法在浏览器里运行；CLI 代理分发困难（MSSQL 需要 ODBC 驱动）。Python 唯一的优势是 SQLAlchemy / sqlglot 的方言覆盖面，而本项目最难的部分（改名识别、在线安全拆分、按版本读结构）Python 生态同样没有，且正确性由真实引擎验证。**以后若要支持 Oracle、DB2、Snowflake 等长尾方言，再把这部分做成独立的 Python 服务。**
@@ -272,7 +272,7 @@ docs/           面向用户的项目文档
 项目公开开发，不单独定义“首个公开版本”；每个里程碑完成即可发布。
 
 **2026-11-19**：M1 与 M2 之间插入“产品化”阶段（账户与组、应用外壳、新建项目向导、目标库迁移历史与执行、执行策略与审批、CI 令牌），决策见第 11 节；原 M3 的迁移历史表和 apply 提前到这个阶段。
-**2026-11-21**：P6 完成后、进入 M2 之前，增加 **P6.5（收尾、清理与 Docker 冒烟）** 与 **P7（HA 纯平台 PG 多活）**；同时清理当前不做的公域待办（移除 M3 的“GitHub 集成”）。
+**2026-11-21**：P6 完成后、进入 M2 之前，增加 **P6.5（收尾、清理与 Docker 冒烟）**、**P7（HA 纯平台 PG 多活）** 与 **P7.5（VoidZero 工具链迁移：Oxlint + Oxfmt + tsdown）**；同时清理当前不做的公域待办（移除 M3 的“GitHub 集成”）。
 
 **M1 的内部顺序**（按“先做能自动验证的部分”）：
 
