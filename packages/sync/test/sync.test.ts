@@ -3,6 +3,7 @@
 import { all, emptyModel, exprReferences, type Model, newId, validate } from '@dowel/core';
 import fc from 'fast-check';
 import { describe, expect, test } from 'vitest';
+
 import {
   emptyRoomState,
   isValidClientId,

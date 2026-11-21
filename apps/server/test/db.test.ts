@@ -1,5 +1,6 @@
 // SQLite 平台库适配器：JSON / 布尔列按“表.列”识别，同名列在不同表里互不影响。
 import { expect, test } from 'vitest';
+
 import { inList, isUniqueViolation, openPlatformDb, registerColumnKind } from '../src/db.ts';
 
 test('同名列在不同表里可以一个是 JSON、一个是布尔、一个是普通值', async () => {

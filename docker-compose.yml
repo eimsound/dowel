@@ -4,7 +4,7 @@ services:
   dowel:
     build: .
     ports:
-      - "4600:4600"
+      - '4600:4600'
     environment:
       # 加密保存的数据库连接信息用的主密钥：部署前改成一段随机字符串，之后不要再改
       DOWEL_SECRET: change-me-to-a-long-random-string

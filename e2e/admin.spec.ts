@@ -1,6 +1,7 @@
 // 管理后台（S4 第二部分）：只有实例管理员能进；建用户、停用、最后一个管理员保护、
 // 邀请（生成 → 接受）、登录方式（配置 mock OIDC 提供方、回调地址、停用、删除）、审计筛选。
 import { expect, test } from '@playwright/test';
+
 import { adminPage, newUser } from './helpers.ts';
 
 const login = async (page: import('@playwright/test').Page, username: string, password: string) => {

@@ -9,6 +9,7 @@ import type { AddressInfo, Socket } from 'node:net';
 import { tmpdir } from 'node:os';
 import { join, resolve } from 'node:path';
 import { promisify } from 'node:util';
+
 import { afterAll, beforeAll, beforeEach, describe, expect, test } from 'vitest';
 
 const execFileAsync = promisify(execFile);

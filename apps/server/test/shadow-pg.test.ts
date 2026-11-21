@@ -4,6 +4,7 @@
 import { addColumn, createSchema, createTable, emptyModel, type Model } from '@dowel/core';
 import { analyze, InstanceLevelStatementError, NON_TRANSACTIONAL_NOTE, StepError } from '@dowel/verifier';
 import { afterAll, beforeAll, describe, expect, test, vi } from 'vitest';
+
 import { connect, createTestDb, dbUrl, PG_URL } from '../../../test/pg.ts';
 import { createApp } from '../src/app.ts';
 import { type ClusterEvent, EventBus } from '../src/bus.ts';

@@ -7,6 +7,7 @@
 // 以系统身份写回（期间被别人改过的对象不写）。
 import { deepEqual, type Model, type Obj } from '@dowel/core';
 import type { Versions } from '@dowel/sync';
+
 import type { HaCoordinator } from './ha.ts';
 import type { Rooms } from './rooms.ts';
 import type { Shadow } from './shadow.ts';

@@ -157,7 +157,9 @@ export const openEnvironment = async (page: Page, name: string) => {
  */
 export const instanceAdmin = async (browser: Browser, scheme: 'light' | 'dark' = 'light') => {
   const username = `admin-${Math.random().toString(36).slice(2, 8)}`;
-  const res = await (await adminPage(browser)).request.post('/api/admin/users', {
+  const res = await (
+    await adminPage(browser)
+  ).request.post('/api/admin/users', {
     data: { username, name: '实例管理员', password: 'password123', role: 'admin' },
   });
   expect(res.ok(), await res.text()).toBe(true);

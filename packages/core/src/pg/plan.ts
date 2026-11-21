@@ -453,7 +453,7 @@ export const plan = (from: Model, to: Model): Step[] => {
     ...opaqueChanged,
   ]);
   const lateRebuild = new Set([...opaqueChanged].filter((id) => isLate(from.objects[id] as Opaque)));
-  for (let changed = true; changed; ) {
+  for (let changed = true; changed;) {
     changed = false;
     for (const o of all(from, 'opaque')) {
       if (!isLate(o) || !inTo(o.id) || lateRebuild.has(o.id)) continue;
@@ -701,7 +701,7 @@ export const plan = (from: Model, to: Model): Step[] => {
   };
   // 先让出被占用的名字（互换、链式改名），再一次改到目标名
   for (const it of items) if (!it.target) toTemp(it);
-  for (let changed = true; changed; ) {
+  for (let changed = true; changed;) {
     changed = false;
     for (const it of items) {
       if (!it.target) continue;

@@ -1,6 +1,7 @@
 // 审计日志：注册、登录成功 / 失败、退出、创建项目、添加成员、发布版本都写一条记录。
 import type { Context } from 'hono';
 import { afterEach, beforeEach, expect, test } from 'vitest';
+
 import { audit } from '../src/audit.ts';
 import { createApp, openPlatformDb, type PlatformDb } from '../src/index.ts';
 import type { SecurityConfig } from '../src/security.ts';

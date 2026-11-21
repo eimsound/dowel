@@ -2,6 +2,7 @@
 import { X } from 'lucide-react';
 import { type ReactNode, useEffect, useId, useRef } from 'react';
 import { useTranslation } from 'react-i18next';
+
 import { Banner, IconButton } from './ui.tsx';
 
 const outside = (e: PointerEvent, d: HTMLDialogElement) => {

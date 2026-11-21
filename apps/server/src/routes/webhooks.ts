@@ -11,6 +11,7 @@ import {
 import { newId } from '@dowel/core';
 import type { Context, Hono } from 'hono';
 import { HTTPException } from 'hono/http-exception';
+
 import { audit, auditIn } from '../audit.ts';
 import { decrypt, encrypt } from '../secrets.ts';
 import { readSettings } from '../settings.ts';

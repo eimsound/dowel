@@ -454,7 +454,5 @@ export const normalizeSettings = (s: PolicySettings | null | undefined): PolicyS
 };
 
 /** 从一层（实例 / 组 / 项目）的配置里取出某一套 */
-export const pickSet = (
-  l: LayerPolicy | null | undefined,
-  production: boolean,
-): PolicySettings | undefined => (l ? (production ? l.production : l.nonProduction) : undefined);
+export const pickSet = (l: LayerPolicy | null | undefined, production: boolean): PolicySettings | undefined =>
+  l ? (production ? l.production : l.nonProduction) : undefined;

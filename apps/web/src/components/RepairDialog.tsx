@@ -4,6 +4,7 @@ import type { RepairScript } from '@dowel/api';
 import { useQuery } from '@tanstack/react-query';
 import { Copy } from 'lucide-react';
 import { useTranslation } from 'react-i18next';
+
 import { api } from '../api.ts';
 import { DiffList } from './ExecDialog.tsx';
 import { Modal } from './Modal.tsx';
@@ -103,7 +104,7 @@ export const RepairDialog = ({
                 aria-label={t('dr.repairTitle')}
                 // oxlint-disable-next-line jsx-a11y/no-noninteractive-tabindex -- 可滚动的代码区需要能用键盘滚动
                 tabIndex={0}
-                className="max-h-80 overflow-auto rounded-sm border border-border bg-code-bg p-2"
+                className="bg-code-bg max-h-80 overflow-auto rounded-sm border border-border p-2"
               >
                 <pre className="m-0 font-mono text-xs whitespace-pre-wrap" data-testid="repair-script">
                   {r.script}

@@ -1,5 +1,6 @@
 // 测试辅助：公开注册接口已经删除（只接受邀请注册），测试里直接写库建用户，再走登录接口拿会话。
 import { addColumn, all, createSchema, createTable, type Model } from '@dowel/core';
+
 import type { PlatformDb } from '../src/db.ts';
 import type { Rooms } from '../src/rooms.ts';
 import { createUser, type NewUser } from '../src/users.ts';

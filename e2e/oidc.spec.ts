@@ -1,6 +1,7 @@
 // 端到端：实例管理员配置本地 mock OIDC 提供方 → 生成邀请 → 新用户打开邀请链接，
 // 点“用 Mock 账户接受” → 回调完成开户并登录。
 import { expect, test } from '@playwright/test';
+
 import { adminPage } from './helpers.ts';
 
 const ISSUER = 'http://localhost:4652';

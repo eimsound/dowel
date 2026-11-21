@@ -1,6 +1,7 @@
 // 认领确认对话框：说明后果（原实例之后执行会被拒绝；只读的漂移检查和读历史不受影响；认领会写进目标库的 dowel 历史），
 // 只有实例管理员能确认。向导里的接手、环境页的“认领”、添加环境时接入由别的实例认领的库，都用它。
 import { useTranslation } from 'react-i18next';
+
 import { Modal } from './Modal.tsx';
 import { Banner } from './ui.tsx';
 

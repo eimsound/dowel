@@ -4,6 +4,7 @@ import type { CanvasHistoryConflict, CanvasHistoryDetail, CanvasHistoryList, Mod
 import { addColumn, all, createSchema, createTable, emptyModel, type Model, newId } from '@dowel/core';
 import { type HistoryVersionRow, stepsChecksum } from '@dowel/engines';
 import { afterEach, beforeEach, expect, test } from 'vitest';
+
 import { createApp, openPlatformDb, type PlatformDb } from '../src/index.ts';
 import { LoginLimiter } from '../src/rate-limit.ts';
 import type { Peer } from '../src/rooms.ts';

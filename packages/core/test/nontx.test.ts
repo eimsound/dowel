@@ -1,5 +1,6 @@
 // 哪些语句不能放进事务：每一类各一条（前后端共用，服务端冻结迁移和界面编辑脚本都按这个判断）
 import { describe, expect, test } from 'vitest';
+
 import {
   findInstanceLevelStatement,
   INSTANCE_LEVEL_DESCRIPTION,

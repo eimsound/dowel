@@ -1,5 +1,6 @@
 // can() 的表驱动单测：项目动作 × 项目角色，组动作 × 组里的身份（含 default 设置），实例动作（含建组设置）。
 import { describe, expect, test } from 'vitest';
+
 import {
   ACTION_MIN_ROLE,
   type Actor,

@@ -3,6 +3,7 @@
 import type { DefaultAccess, GrantInfo, GrantRole, GrantScopeKind, GrantSubjectKind, Role } from '@dowel/api';
 import { newId } from '@dowel/core';
 import type { Db } from '@dowel/engines';
+
 import { defaultRoleOf, type GrantRow, type ProjectRow } from './roles.ts';
 
 export interface GrantInput {

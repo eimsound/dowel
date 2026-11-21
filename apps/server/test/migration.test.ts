@@ -5,10 +5,12 @@ import { mkdtempSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { DatabaseSync } from 'node:sqlite';
+
 import { BASELINE_VERSION_NAME } from '@dowel/api';
 import { addColumn, createSchema, createTable, emptyModel, type Model } from '@dowel/core';
 import { type ScriptStep, stepsChecksum } from '@dowel/engines';
 import { afterAll, describe, expect, test } from 'vitest';
+
 import { createTestDb, PG_URL } from '../../../test/pg.ts';
 import { hashPassword } from '../src/auth.ts';
 import { isUniqueViolation, MIGRATIONS, openPlatformDb, type PlatformDb } from '../src/db.ts';

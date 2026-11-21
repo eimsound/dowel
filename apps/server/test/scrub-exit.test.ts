@@ -4,6 +4,7 @@ import { PlanError } from '@dowel/core';
 import { HTTPException } from 'hono/http-exception';
 import type { SSEStreamingApi } from 'hono/streaming';
 import { afterAll, beforeAll, describe, expect, test, vi } from 'vitest';
+
 import { createApp, openPlatformDb, type PlatformDb, ShadowError } from '../src/index.ts';
 import { SecretError } from '../src/secrets.ts';
 import { scrubDeep, sseSender } from '../src/sse.ts';

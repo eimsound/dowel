@@ -1,5 +1,6 @@
 // 转组（P2）：成功后跳到新地址，面包屑和图标栏显示新组，相关缓存全部失效。
 import { expect, test } from '@playwright/test';
+
 import { createGroup, createProject, gotoPage, newUser } from './helpers.ts';
 
 test('转组后跳到新地址，面包屑和图标栏都是新组', async ({ browser }) => {

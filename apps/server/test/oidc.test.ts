@@ -2,6 +2,7 @@
 // 走真实的 discovery、authorize、token、userinfo、PKCE、state 和 nonce 校验。
 import { Events, OAuth2Server } from 'oauth2-mock-server';
 import { afterAll, afterEach, beforeAll, beforeEach, describe, expect, test } from 'vitest';
+
 import { createApp, openPlatformDb, type PlatformDb } from '../src/index.ts';
 import { clearDiscoveryCache, countEnabledProviders, hasOtherLoginMethod, safeNext } from '../src/oidc.ts';
 import { LoginLimiter } from '../src/rate-limit.ts';

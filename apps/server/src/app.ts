@@ -7,6 +7,7 @@ import { ExecutorError } from '@dowel/executor';
 import { createNodeWebSocket } from '@hono/node-ws';
 import { Hono } from 'hono';
 import { HTTPException } from 'hono/http-exception';
+
 import { assertUrlAllowed } from './allowlist.ts';
 import { EventBus, type EventBusOptions } from './bus.ts';
 import type { PlatformDb } from './db.ts';

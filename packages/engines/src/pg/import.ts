@@ -11,6 +11,7 @@ import {
   type SequenceOptions,
 } from '@dowel/core';
 import { generateKeyBetween } from 'fractional-indexing';
+
 import type { SeqSnap, Snapshot } from './snapshot.ts';
 
 const TYPE_LIMITS: Record<string, [string, string]> = {

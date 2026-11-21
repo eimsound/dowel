@@ -2,8 +2,10 @@
 // 用 app.request 直接打 HTTP（不需要真实端口）；SQLite 用内存库，PostgreSQL 用测试实例（没有 Docker 时跳过）。
 
 import { spawnSync } from 'node:child_process';
+
 import type { InstanceInfo, Me, SessionInfo } from '@dowel/api';
 import { afterEach, beforeEach, describe, expect, test } from 'vitest';
+
 import { createTestDb, PG_URL } from '../../../test/pg.ts';
 import { hashToken } from '../src/auth.ts';
 import { autoSetup, createApp, openPlatformDb, type PlatformDb, writeSettings } from '../src/index.ts';

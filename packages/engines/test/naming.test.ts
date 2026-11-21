@@ -3,6 +3,7 @@
 import { chooseName, ident, joinNames } from '@dowel/core';
 import fc from 'fast-check';
 import { expect, test } from 'vitest';
+
 import { PG_URL, useTestDb } from '../../../test/pg.ts';
 import { resetShadow } from '../../verifier/src/index.ts';
 import { readSnapshot } from '../src/index.ts';

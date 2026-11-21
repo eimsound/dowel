@@ -1,5 +1,6 @@
 // 需要 PG 作影子库（Testcontainers 或 DOWEL_TEST_PG，见 e2e/global-setup.ts），没有 Docker 时跳过
 import { expect, test } from '@playwright/test';
+
 import { connectPg } from '../apps/server/src/targets.ts';
 import { openEnv } from './exec-helpers.ts';
 import { createProject, gotoPage, newUser, openEnvironment } from './helpers.ts';
@@ -17,7 +18,8 @@ test('添加环境、从数据库导入、在同实例影子库验证', async ({
   const u = new URL(ADMIN!);
   u.pathname = '/e2e_shop';
   const shop = connectPg(u.toString());
-  await shop.db.exec(`create table products (id serial primary key, name text not null, price numeric(10,2) check (price > 0));
+  await shop.db
+    .exec(`create table products (id serial primary key, name text not null, price numeric(10,2) check (price > 0));
                       create view cheap as select id, name from products where price < 10;`);
   await shop.close();
 

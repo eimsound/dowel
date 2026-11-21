@@ -2,6 +2,7 @@
 import type { DriftInfo, ExecPolicy } from '@dowel/api';
 import { CircleCheck, CircleHelp, TriangleAlert } from 'lucide-react';
 import { useTranslation } from 'react-i18next';
+
 import { formatTime } from '../format.ts';
 
 /** 漂移状态徽标：无漂移 / 漂移 / 检查失败 / 未检查，带最近检查时间 */

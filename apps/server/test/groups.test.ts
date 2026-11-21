@@ -2,11 +2,13 @@
 // 邀请加入组，以及 WebSocket 上的即时生效（降级为查看者、被移出组后断开）。
 // 平台库在 SQLite 和 PostgreSQL 上各跑一遍（PG 需要 Docker）。
 import type { AddressInfo } from 'node:net';
+
 import { all } from '@dowel/core';
 import { SyncClient, type ToClient } from '@dowel/sync';
 import { serve } from '@hono/node-server';
 import { afterAll, beforeAll, describe, expect, test } from 'vitest';
 import WebSocket from 'ws';
+
 import { createTestDb, PG_URL } from '../../../test/pg.ts';
 import { createApp, openPlatformDb, type PlatformDb } from '../src/index.ts';
 import { effectiveRole, type GrantRow, type ProjectRow, type RoleContext } from '../src/roles.ts';

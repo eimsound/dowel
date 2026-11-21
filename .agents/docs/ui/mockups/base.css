@@ -1,69 +1,69 @@
 /* 三套静态稿共用的结构样式：只引用 token，颜色、字体、圆角、密度由 themes/*.css 定义。 */
 
 @font-face {
-  font-family: "Inter Variable";
-  src: url("fonts/inter-latin-wght-normal.woff2") format("woff2-variations");
+  font-family: 'Inter Variable';
+  src: url('fonts/inter-latin-wght-normal.woff2') format('woff2-variations');
   font-weight: 100 900;
   font-display: swap;
 }
 @font-face {
-  font-family: "JetBrains Mono Variable";
-  src: url("fonts/jetbrains-mono-latin-wght-normal.woff2") format("woff2-variations");
+  font-family: 'JetBrains Mono Variable';
+  src: url('fonts/jetbrains-mono-latin-wght-normal.woff2') format('woff2-variations');
   font-weight: 100 800;
   font-display: swap;
 }
 @font-face {
-  font-family: "Geist Variable";
-  src: url("fonts/geist-latin-wght-normal.woff2") format("woff2-variations");
+  font-family: 'Geist Variable';
+  src: url('fonts/geist-latin-wght-normal.woff2') format('woff2-variations');
   font-weight: 100 900;
   font-display: swap;
 }
 @font-face {
-  font-family: "Geist Mono Variable";
-  src: url("fonts/geist-mono-latin-wght-normal.woff2") format("woff2-variations");
+  font-family: 'Geist Mono Variable';
+  src: url('fonts/geist-mono-latin-wght-normal.woff2') format('woff2-variations');
   font-weight: 100 900;
   font-display: swap;
 }
 @font-face {
-  font-family: "IBM Plex Sans";
-  src: url("fonts/ibm-plex-sans-latin-400-normal.woff2") format("woff2");
+  font-family: 'IBM Plex Sans';
+  src: url('fonts/ibm-plex-sans-latin-400-normal.woff2') format('woff2');
   font-weight: 400;
   font-display: swap;
 }
 @font-face {
-  font-family: "IBM Plex Sans";
-  src: url("fonts/ibm-plex-sans-latin-500-normal.woff2") format("woff2");
+  font-family: 'IBM Plex Sans';
+  src: url('fonts/ibm-plex-sans-latin-500-normal.woff2') format('woff2');
   font-weight: 500;
   font-display: swap;
 }
 @font-face {
-  font-family: "IBM Plex Sans";
-  src: url("fonts/ibm-plex-sans-latin-600-normal.woff2") format("woff2");
+  font-family: 'IBM Plex Sans';
+  src: url('fonts/ibm-plex-sans-latin-600-normal.woff2') format('woff2');
   font-weight: 600;
   font-display: swap;
 }
 @font-face {
-  font-family: "IBM Plex Mono";
-  src: url("fonts/ibm-plex-mono-latin-400-normal.woff2") format("woff2");
+  font-family: 'IBM Plex Mono';
+  src: url('fonts/ibm-plex-mono-latin-400-normal.woff2') format('woff2');
   font-weight: 400;
   font-display: swap;
 }
 @font-face {
-  font-family: "IBM Plex Mono";
-  src: url("fonts/ibm-plex-mono-latin-500-normal.woff2") format("woff2");
+  font-family: 'IBM Plex Mono';
+  src: url('fonts/ibm-plex-mono-latin-500-normal.woff2') format('woff2');
   font-weight: 500;
   font-display: swap;
 }
 @font-face {
-  font-family: "IBM Plex Mono";
-  src: url("fonts/ibm-plex-mono-latin-600-normal.woff2") format("woff2");
+  font-family: 'IBM Plex Mono';
+  src: url('fonts/ibm-plex-mono-latin-600-normal.woff2') format('woff2');
   font-weight: 600;
   font-display: swap;
 }
 
 :root {
   color-scheme: light dark;
-  --cjk: "PingFang SC", "Hiragino Sans GB", "Noto Sans CJK SC", "Microsoft YaHei", sans-serif;
+  --cjk: 'PingFang SC', 'Hiragino Sans GB', 'Noto Sans CJK SC', 'Microsoft YaHei', sans-serif;
   /* 画布节点的几何尺寸三套一致（连线坐标按它算） */
   --node-head-h: 34px;
   --node-row-h: 26px;
@@ -228,7 +228,7 @@ pre,
   position: relative;
 }
 .logo::after {
-  content: "";
+  content: '';
   position: absolute;
   inset: 6px 9px;
   border-radius: 2px;
@@ -432,8 +432,8 @@ kbd {
   font-size: var(--fs-sm);
   cursor: pointer;
 }
-.canvas-tabs button[aria-selected="true"],
-.seg button[aria-selected="true"] {
+.canvas-tabs button[aria-selected='true'],
+.seg button[aria-selected='true'] {
   background: var(--surface-active);
   color: var(--text);
   font-weight: 500;
@@ -518,7 +518,7 @@ kbd {
   color: var(--text);
 }
 .row .n.nullable::after {
-  content: "?";
+  content: '?';
   color: var(--text-3);
   margin-left: 1px;
 }
@@ -1391,10 +1391,10 @@ kbd {
 .sheet {
   display: none;
 }
-html[data-screen="components"] .app {
+html[data-screen='components'] .app {
   display: none;
 }
-html[data-screen="components"] .sheet {
+html[data-screen='components'] .sheet {
   display: block;
   max-width: 1040px;
   margin: 0 auto;

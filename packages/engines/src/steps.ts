@@ -7,6 +7,7 @@
 //   （CONCURRENTLY、VACUUM、CREATE/DROP DATABASE / TABLESPACE、ALTER SYSTEM、ALTER TYPE … ADD VALUE 等）；
 //   规划器以后能直接给出明确的值时，优先用它。
 import { createHash } from 'node:crypto';
+
 import { isNontransactionalSql, type Step, stableJson } from '@dowel/core';
 
 export interface ScriptStep {

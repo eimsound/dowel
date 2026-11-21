@@ -1,6 +1,7 @@
 // 选项卡：分段控件的外观（DESIGN.md：选择与切换）。focusgroup 提供方向键在选项卡间移动（不支持的浏览器由 polyfill 补上）。
 import type { ReactNode } from 'react';
 import { useId } from 'react';
+
 import { cx } from './ui.tsx';
 
 export const Tabs = <K extends string>({

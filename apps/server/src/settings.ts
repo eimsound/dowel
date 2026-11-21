@@ -4,6 +4,7 @@
 // webhook_allowlist 是 P5b 加的 Webhook 出站额外放行列表（默认只允许公网地址，见 webhooks.ts）。
 import type { GroupCreation, InstanceSettings, InstanceSettingsPatch } from '@dowel/api';
 import type { Db } from '@dowel/engines';
+
 import { countEnabledProviders } from './oidc.ts';
 
 /** instanceId 不在默认值里：它是首次启动（迁移）时生成的，只读 */

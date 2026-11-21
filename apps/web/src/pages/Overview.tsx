@@ -5,6 +5,7 @@ import { useQuery } from '@tanstack/react-query';
 import { Link } from '@tanstack/react-router';
 import { Database, ShieldAlert, Workflow } from 'lucide-react';
 import { useTranslation } from 'react-i18next';
+
 import { api } from '../api.ts';
 import { ActivityList } from '../components/ActivityList.tsx';
 import { DriftBadge } from '../components/EnvBits.tsx';

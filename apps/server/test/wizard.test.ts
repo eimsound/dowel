@@ -2,6 +2,7 @@
 // 失败时不留残留、自动发布 v0 基线，以及“只读账号导入后目标库结构完全不变”。
 // 用测试 PG 实例（Testcontainers 或 DOWEL_TEST_PG，见 test/pg-container.ts），没有 Docker 时跳过。
 import type { AddressInfo } from 'node:net';
+
 import {
   BASELINE_VERSION_NAME,
   type ProjectCreated,
@@ -14,6 +15,7 @@ import { diffSnapshots, readSnapshot, stepsChecksum } from '@dowel/engines';
 import { serve } from '@hono/node-server';
 import { HTTPException } from 'hono/http-exception';
 import { afterAll, beforeAll, describe, expect, test, vi } from 'vitest';
+
 import { dbUrl, PG_URL } from '../../../test/pg.ts';
 import { createApp, openPlatformDb, type PlatformDb } from '../src/index.ts';
 import { KeyedLimiter } from '../src/rate-limit.ts';

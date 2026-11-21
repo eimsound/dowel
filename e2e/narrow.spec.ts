@@ -1,6 +1,7 @@
 // 窄屏（S7，视口 900 宽）：侧面板变成抽屉——默认收起，打开后焦点进入抽屉，
 // Esc / 点遮罩关闭并把焦点还给“打开侧面板”；属性面板覆盖在内容上。
 import { expect, test } from '@playwright/test';
+
 import { createProject, gotoPage, newUser } from './helpers.ts';
 
 const NARROW = { width: 900, height: 900 };

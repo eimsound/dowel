@@ -4,7 +4,9 @@
 // 只追加：模块本身只提供“插入版本行”和“把 running 改成 done / failed”，其余改写由 history 表上的触发器
 // 禁止（见 ensureHistory 里的 history_guard）。
 import { createHash } from 'node:crypto';
+
 import { type Model, stableJson } from '@dowel/core';
+
 import { canonicalSteps, type ScriptStep, stepsChecksum } from '../steps.ts';
 import type { Db } from './db.ts';
 import { DOWEL_SCHEMA, normalize, type Snapshot } from './snapshot.ts';

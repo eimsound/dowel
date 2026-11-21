@@ -3,6 +3,7 @@
 // 轮数：POLICY_RUNS（默认 500，纯函数很快）。
 import fc from 'fast-check';
 import { describe, expect, test } from 'vitest';
+
 import {
   type ApprovalStage,
   approvalAtLeast,

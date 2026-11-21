@@ -2,6 +2,7 @@
 
 import { createAll, plan } from '@dowel/core';
 import { test } from 'vitest';
+
 import { createTestDb, PG_URL } from '../../../test/pg.ts';
 import { verify } from '../src/index.ts';
 import { makeVersions } from './gen.ts';

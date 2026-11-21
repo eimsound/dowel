@@ -15,11 +15,13 @@ import { createHash, randomUUID } from 'node:crypto';
 import { mkdirSync } from 'node:fs';
 import { dirname } from 'node:path';
 import { DatabaseSync, type SQLInputValue, type StatementColumnMetadata } from 'node:sqlite';
+
 import { BASELINE_VERSION_NAME } from '@dowel/api';
 import type { Model } from '@dowel/core';
 import { newId } from '@dowel/core';
 import { type Db, stepsChecksum } from '@dowel/engines';
 import postgres from 'postgres';
+
 import { emptyBase, type FrozenScripts, freezeBaseline, freezeScripts } from './chain.ts';
 import { scrubSecrets } from './secrets.ts';
 import { uniqueSlug, uniqueUsername } from './usernames.ts';

@@ -27,6 +27,7 @@ import {
 } from 'lucide-react';
 import { useId, useState } from 'react';
 import { useTranslation } from 'react-i18next';
+
 import { ApiError, api } from '../api.ts';
 import { ClaimDialog } from '../components/ClaimDialog.tsx';
 import { DriftBadge, driftLabel, useDeniedHint } from '../components/EnvBits.tsx';

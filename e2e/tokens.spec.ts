@@ -3,6 +3,7 @@
 // 以及亮 / 暗配色下的 axe 无障碍扫描。
 import AxeBuilder from '@axe-core/playwright';
 import { expect, type Page, test } from '@playwright/test';
+
 import { addEnv, newTargetDb, openEnv, publishTable } from './exec-helpers.ts';
 import { createGroup, createProjectIn, gotoPage, instanceAdmin, newUser } from './helpers.ts';
 

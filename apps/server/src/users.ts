@@ -5,6 +5,7 @@
 import type { InstanceRole } from '@dowel/api';
 import { newId } from '@dowel/core';
 import type { Db } from '@dowel/engines';
+
 import { hashPassword, toUser, USER_COLUMNS, type User } from './auth.ts';
 import { normalizeUsername } from './usernames.ts';
 

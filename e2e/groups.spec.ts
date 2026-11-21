@@ -1,6 +1,7 @@
 // 组与可见性：管理员建组 → 邀请用户加入组 → 用户能看到组里的项目；移出组后项目当作不存在；
 // 旧地址 /p/:pid 跳转到 /project/:owner/:project。
 import { expect, test } from '@playwright/test';
+
 import { adminPage, createGroup, createProjectIn, newUser } from './helpers.ts';
 
 test('管理员建组 → 邀请加入组 → 能看到组里的项目；移出后项目返回不存在；旧地址跳转', async ({ browser }) => {

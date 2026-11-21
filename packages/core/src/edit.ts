@@ -1,6 +1,7 @@
 // 编辑操作：在模型上做一次有语义的修改（直接修改传入的模型）。
 // 这些操作就是同步层的 mutator（04-ir-design.md 第 2 节）：客户端乐观执行，服务器在最新状态上重新执行并校验。
 import { generateKeyBetween } from 'fractional-indexing';
+
 import { EditError } from './errors.ts';
 import { newId } from './ids.ts';
 import type {
@@ -380,7 +381,7 @@ export const renameTable = (m: Model, id: string, name: string) => {
 
 /** 删除依赖这些对象的不透明对象（视图、触发器等），与 PG 的 CASCADE 一致 */
 const dropDependentOpaques = (m: Model, ids: Set<string>) => {
-  for (let changed = true; changed; ) {
+  for (let changed = true; changed;) {
     changed = false;
     for (const o of all(m, 'opaque')) {
       if (o.deps.some((d) => ids.has(d)) || ids.has(o.parent)) {

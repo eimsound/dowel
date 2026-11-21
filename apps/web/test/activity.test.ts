@@ -1,7 +1,9 @@
 // 审计动作文案与画布历史操作名 i18n 覆盖测试（#33）。
 import { readFileSync } from 'node:fs';
 import { resolve } from 'node:path';
+
 import { afterEach, expect, test } from 'vitest';
+
 import { actionText } from '../src/activity.ts';
 import i18n from '../src/i18n.ts';
 

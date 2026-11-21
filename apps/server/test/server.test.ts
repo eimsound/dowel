@@ -1,11 +1,13 @@
 // 服务端集成测试：真实的 HTTP + WebSocket，两个用户协作。平台库在 SQLite 和 PostgreSQL 上各跑一遍。
 // 需要 PG 的部分（PG 平台库、影子库验证、导入）在没有 Docker 时跳过（见 test/pg-container.ts）。
 import type { AddressInfo } from 'node:net';
+
 import { all, type Model } from '@dowel/core';
 import { SyncClient, type ToClient } from '@dowel/sync';
 import { serve } from '@hono/node-server';
 import { afterAll, beforeAll, describe, expect, test } from 'vitest';
 import WebSocket from 'ws';
+
 import { createTestDb, dbUrl, PG_URL } from '../../../test/pg.ts';
 import { createApp, openPlatformDb, type PlatformDb } from '../src/index.ts';
 import { connectPg } from '../src/targets.ts';

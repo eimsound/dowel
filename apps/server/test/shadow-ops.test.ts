@@ -10,6 +10,7 @@ import { addColumn, createSchema, createTable, emptyModel, type Model } from '@d
 import type { Db } from '@dowel/engines';
 import { StepError } from '@dowel/verifier';
 import { describe, expect, test } from 'vitest';
+
 import { assertImportable, isInfraFailure, ShadowError, shadowOps } from '../src/shadow.ts';
 
 const modelWith = (schema: string): Model => {

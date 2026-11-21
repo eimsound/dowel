@@ -1,11 +1,13 @@
 // M1b 验收：在真实 PG 实例上跑通“导入 → 修改 → 生成迁移 → 验证（同实例影子库）→ 执行 → 再导入一致”。
 // 用测试 PG 实例（Testcontainers 或 DOWEL_TEST_PG，见 test/pg-container.ts），没有 Docker 时跳过。
 import type { AddressInfo } from 'node:net';
+
 import { all, plan } from '@dowel/core';
 import { SyncClient, type ToClient } from '@dowel/sync';
 import { serve } from '@hono/node-server';
 import { afterAll, beforeAll, describe, expect, test } from 'vitest';
 import WebSocket from 'ws';
+
 import { dbUrl, PG_URL } from '../../../test/pg.ts';
 import { createApp, openPlatformDb, type PlatformDb } from '../src/index.ts';
 import { decrypt, encrypt, maskUrl } from '../src/secrets.ts';

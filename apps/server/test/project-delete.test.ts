@@ -2,9 +2,11 @@
 // 平台库里这个项目的数据在一个事务里全部删掉，审计记录保留；在线的连接用 4403 断开。
 // SQLite 和 PG 各跑一遍（删除顺序、外键、事务行为都要在两种方言上一致）。
 import type { AddressInfo } from 'node:net';
+
 import { serve } from '@hono/node-server';
 import { afterAll, beforeAll, describe, expect, test, vi } from 'vitest';
 import WebSocket from 'ws';
+
 import { createTestDb, PG_URL } from '../../../test/pg.ts';
 import { createApp, openPlatformDb, type PlatformDb } from '../src/index.ts';
 import { addTable, makeUser, PASSWORD } from './support.ts';

@@ -1,5 +1,6 @@
 // 需要 PG 作影子库（Testcontainers 或 DOWEL_TEST_PG，见 e2e/global-setup.ts），没有 Docker 时跳过
 import { expect, test } from '@playwright/test';
+
 import { addEnvironment, commit, createProject, gotoPage, newUser, openModel } from './helpers.ts';
 
 test.skip(!process.env.DOWEL_TEST_PG, '没有可用的 PostgreSQL（需要 Docker）');

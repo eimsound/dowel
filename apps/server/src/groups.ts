@@ -3,6 +3,7 @@
 import type { DefaultRole, GroupRole, ProjectCreation } from '@dowel/api';
 import type { Db } from '@dowel/engines';
 import { HTTPException } from 'hono/http-exception';
+
 import { uniqueSlug } from './usernames.ts';
 
 export interface GroupRow {

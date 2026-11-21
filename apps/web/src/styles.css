@@ -1,14 +1,14 @@
 /* 设计 token 与组件样式。数值以仓库根目录的 DESIGN.md 为准（YAML 部分），
    参考实现见 .agents/docs/ui/mockups/（theme.css、base.css），三处保持一致。 */
-@import "tailwindcss";
+@import 'tailwindcss';
 
 /* ---------- token ---------- */
 :root {
   color-scheme: light dark;
 
-  --cjk: "PingFang SC", "Hiragino Sans GB", "Noto Sans CJK SC", "Microsoft YaHei", sans-serif;
-  --font-ui: "Inter Variable", var(--cjk);
-  --font-code: "JetBrains Mono Variable", ui-monospace, monospace;
+  --cjk: 'PingFang SC', 'Hiragino Sans GB', 'Noto Sans CJK SC', 'Microsoft YaHei', sans-serif;
+  --font-ui: 'Inter Variable', var(--cjk);
+  --font-code: 'JetBrains Mono Variable', ui-monospace, monospace;
   --fs: 13px;
   --fs-sm: 12.5px;
   --fs-xs: 11.5px;
@@ -287,15 +287,15 @@ dialog::backdrop {
     width: 22px;
   }
   .btn:disabled,
-  .btn[aria-disabled="true"] {
+  .btn[aria-disabled='true'] {
     opacity: 0.45;
     cursor: not-allowed;
   }
-  .btn[aria-busy="true"]:disabled {
+  .btn[aria-busy='true']:disabled {
     opacity: 0.8;
     cursor: progress;
   }
-  .btn[aria-expanded="true"] {
+  .btn[aria-expanded='true'] {
     background: var(--surface-active);
   }
 
@@ -335,10 +335,10 @@ dialog::backdrop {
     opacity: 0.55;
     cursor: not-allowed;
   }
-  .input[aria-invalid="true"] {
+  .input[aria-invalid='true'] {
     border-color: var(--danger);
   }
-  .input[aria-invalid="true"]:focus {
+  .input[aria-invalid='true']:focus {
     box-shadow: 0 0 0 3px var(--danger-ring);
   }
   /* 行内编辑：看起来是文字，悬停显出边框，聚焦时是输入框 */
@@ -375,13 +375,12 @@ dialog::backdrop {
     }
     /* 箭头换成与 lucide 一致的 chevron-down */
     .select::picker-icon {
-      content: "";
+      content: '';
       width: 14px;
       height: 14px;
       margin-left: auto;
       background-color: var(--text-3);
-      mask:
-        url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 24 24' fill='none' stroke='black' stroke-width='2' stroke-linecap='round' stroke-linejoin='round'%3E%3Cpath d='m6 9 6 6 6-6'/%3E%3C/svg%3E")
+      mask: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 24 24' fill='none' stroke='black' stroke-width='2' stroke-linecap='round' stroke-linejoin='round'%3E%3Cpath d='m6 9 6 6 6-6'/%3E%3C/svg%3E")
         center / contain no-repeat;
       transition: rotate var(--motion-state);
     }
@@ -479,8 +478,8 @@ dialog::backdrop {
     font-size: var(--fs-sm);
     cursor: pointer;
   }
-  .seg > button[aria-selected="true"],
-  .seg > button[aria-pressed="true"] {
+  .seg > button[aria-selected='true'],
+  .seg > button[aria-pressed='true'] {
     background: var(--surface-active);
     color: var(--text);
     font-weight: 500;
@@ -706,7 +705,7 @@ dialog::backdrop {
   .menu button.danger > svg {
     color: var(--danger);
   }
-  .menu button[aria-checked="true"] {
+  .menu button[aria-checked='true'] {
     font-weight: 500;
   }
   .menu button .check-mark {
@@ -875,8 +874,8 @@ dialog::backdrop {
     background: var(--danger);
     box-shadow: 0 0 0 2px var(--bg);
   }
-  .rail-item[aria-current="page"],
-  .rail-item[aria-current="true"] {
+  .rail-item[aria-current='page'],
+  .rail-item[aria-current='true'] {
     background: var(--surface-active);
     color: var(--text);
   }
@@ -900,7 +899,7 @@ dialog::backdrop {
     border: 1px dashed var(--border-strong);
   }
   .rail-orgs .rail-item[data-current]::before {
-    content: "";
+    content: '';
     position: absolute;
     top: 6px;
     bottom: 6px;
@@ -992,7 +991,7 @@ dialog::backdrop {
     text-align: left;
     cursor: pointer;
   }
-  .cmdk-item[aria-selected="true"] {
+  .cmdk-item[aria-selected='true'] {
     background: var(--primary-soft);
     color: var(--primary-text);
   }

@@ -30,6 +30,7 @@ import {
 import type { Db } from '@dowel/engines';
 import type { Context, Hono } from 'hono';
 import { HTTPException } from 'hono/http-exception';
+
 import { auditIn } from '../audit.ts';
 import { can, userActor } from '../authz.ts';
 import { applyEnvPolicy } from '../env-policy.ts';

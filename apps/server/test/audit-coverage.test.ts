@@ -4,6 +4,7 @@
 // 它们的路由级覆盖在 targets / oidc 集成测试里；这里用 audit() 直接写入，保证动作名不漂移。
 import type { Context } from 'hono';
 import { afterEach, beforeEach, expect, test } from 'vitest';
+
 import { audit } from '../src/audit.ts';
 import { hashToken } from '../src/auth.ts';
 import { createApp, openPlatformDb, type PlatformDb } from '../src/index.ts';

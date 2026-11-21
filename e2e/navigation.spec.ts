@@ -1,6 +1,7 @@
 // 应用外壳的导航（P2）：我的项目 → 项目概览 → 每个项目页面 → 组首页 → 回到项目；
 // 断言图标栏的 aria-current，以及 `[` 能收起 / 展开侧面板。
 import { expect, test } from '@playwright/test';
+
 import { createProject, newUser } from './helpers.ts';
 
 const rail = (page: import('@playwright/test').Page) => page.getByRole('navigation', { name: '实例与项目' });

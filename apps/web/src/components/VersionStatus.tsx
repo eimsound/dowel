@@ -4,6 +4,7 @@ import type { StoredVerifyReport, VerifyResponse, VersionInfo } from '@dowel/api
 import { BASELINE_VERSION_NAME } from '@dowel/api';
 import { CircleCheck, CircleHelp, DatabaseBackup, Pencil } from 'lucide-react';
 import { useTranslation } from 'react-i18next';
+
 import { Banner } from './ui.tsx';
 
 /** 版本在界面上的名字：v0 基线的名字本身已经带着 v0，这里换成“基线”，避免和 v0 标记重复 */

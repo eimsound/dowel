@@ -1,5 +1,6 @@
 // 执行申请、审批与收件箱（P5b，E3 / E4 / E5 / E7）的接口契约。规则见 ADR 0006，实现在 apps/server/src/requests.ts。
 import { z } from 'zod';
+
 import type { Approver } from './policy.ts';
 
 /**

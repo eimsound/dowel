@@ -7,6 +7,7 @@ import { Link, Outlet, useRouterState } from '@tanstack/react-router';
 import { KeyRound, Link2, MonitorSmartphone, Palette, Trash2, UserRound } from 'lucide-react';
 import { useState } from 'react';
 import { useTranslation } from 'react-i18next';
+
 import { ApiError, api } from '../api.ts';
 import { SettingsNav } from '../components/SettingsNav.tsx';
 import { AppShell, PageHeader, useShellPanel } from '../components/Shell.tsx';

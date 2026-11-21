@@ -3,6 +3,7 @@
 // userinfo 的匹配会一路吃到同一行里最后一个 @，JSON 里没有空白，会把别的字段一起吞掉），
 // 所以调用方不用、也不该再各自脱敏。客户端断开（写失败）只丢掉后续进度，不影响正在做的事。
 import type { SSEStreamingApi } from 'hono/streaming';
+
 import { scrubSecrets } from './secrets.ts';
 
 export const scrubDeep = <T>(v: T): T => {

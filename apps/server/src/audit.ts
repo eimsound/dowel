@@ -4,6 +4,7 @@
 import { newId } from '@dowel/core';
 import type { Db } from '@dowel/engines';
 import type { Context } from 'hono';
+
 import type { PlatformDb } from './db.ts';
 import { clientIp, type SecurityConfig, securityConfigFromEnv } from './security.ts';
 

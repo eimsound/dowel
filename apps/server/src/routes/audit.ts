@@ -3,6 +3,7 @@
 import type { AuditEvent, AuditPage } from '@dowel/api';
 import type { Hono } from 'hono';
 import { HTTPException } from 'hono/http-exception';
+
 import { atOf } from '../time.ts';
 import type { AppContext, Env } from './context.ts';
 

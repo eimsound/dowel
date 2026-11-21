@@ -16,6 +16,7 @@ import { addColumn, addIndex, addUnique, all, type Model } from '@dowel/core';
 import { stepsChecksum } from '@dowel/engines';
 import type { TargetState } from '@dowel/executor';
 import { afterAll, beforeAll, describe, expect, test, vi } from 'vitest';
+
 import { connect, createTestDb, PG_URL } from '../../../test/pg.ts';
 import { versionExecutedAnywhere } from '../src/chain.ts';
 import { type EnvRow, syncEnvCache } from '../src/envs.ts';

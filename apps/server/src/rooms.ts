@@ -20,6 +20,7 @@ import {
   type Versions,
 } from '@dowel/sync';
 import { HTTPException } from 'hono/http-exception';
+
 import type { User } from './auth.ts';
 import {
   type ClusterEvent,

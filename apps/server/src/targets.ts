@@ -1,11 +1,13 @@
 // 连接用户的 PostgreSQL 实例：检查连接、建同实例影子库 {原库名}_dowel、在影子库里执行检查、从线上库读结构。
 // 共识 4.4：在目标实例上建影子库（版本、扩展、排序规则与目标一致）；没有可用的影子库就报错，不用任何兜底。
 import { createHash } from 'node:crypto';
+
 import type { SchemaInfo, TargetInfo, VerifyReport } from '@dowel/api';
 import { ident, literal, type Model } from '@dowel/core';
 import { type Db, DOWEL_SCHEMA, fromPostgres, importSnapshot, readSnapshot } from '@dowel/engines';
 import { HTTPException } from 'hono/http-exception';
 import postgres from 'postgres';
+
 import { maskUrl, scrubSecrets } from './secrets.ts';
 import {
   isInfraFailure,

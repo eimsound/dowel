@@ -4,6 +4,7 @@
 import type { InviteInfo, InviteListItem } from '@dowel/api';
 import { newId } from '@dowel/core';
 import type { Db } from '@dowel/engines';
+
 import { hashToken, newToken } from './auth.ts';
 
 export type InviteKind = 'invite' | 'reset';

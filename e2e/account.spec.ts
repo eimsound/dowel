@@ -2,6 +2,7 @@
 // 登录方式里的“最后一种可用方式不能解除”需要先把密码登录关掉，让关联的外部账户成为唯一方式；
 // 关掉密码登录是实例级设置，所以用例结束时一定要恢复（try/finally）。
 import { expect, test } from '@playwright/test';
+
 import { adminPage, newUser } from './helpers.ts';
 
 const NEW_PASSWORD = 'new-password-1';

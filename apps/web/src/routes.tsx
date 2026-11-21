@@ -13,6 +13,7 @@ import {
 } from '@tanstack/react-router';
 import { useEffect, useMemo } from 'react';
 import { useTranslation } from 'react-i18next';
+
 import { ApiError, api } from './api.ts';
 import { AppShell } from './components/Shell.tsx';
 import { instanceQuery } from './instance.ts';
@@ -43,8 +44,8 @@ import { Login } from './pages/Login.tsx';
 import { Members } from './pages/Members.tsx';
 import { NewProject } from './pages/NewProject.tsx';
 import { Overview } from './pages/Overview.tsx';
-import { ProjectSettings } from './pages/ProjectSettings.tsx';
 import { Projects } from './pages/Projects.tsx';
+import { ProjectSettings } from './pages/ProjectSettings.tsx';
 import { RequestDetail } from './pages/Request.tsx';
 import { VersionDetail, Versions } from './pages/Versions.tsx';
 import { Model } from './pages/Workspace.tsx';

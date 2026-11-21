@@ -35,6 +35,7 @@ import {
 } from 'lucide-react';
 import { type ReactNode, useId, useRef, useState } from 'react';
 import { useTranslation } from 'react-i18next';
+
 import type { Workspace } from '../workspace.ts';
 import { shortType, typeLabel } from './Canvas.tsx';
 import { Modal } from './Modal.tsx';
@@ -123,7 +124,7 @@ const Section = ({
   children: ReactNode;
 }) => (
   <section className="space-y-1.5 border-t border-border pt-3">
-    <h3 className="section-title ">
+    <h3 className="section-title">
       {title}
       {count !== undefined && <span className="count">{count}</span>}
       <span className="ml-auto">{action}</span>

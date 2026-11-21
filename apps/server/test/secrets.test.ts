@@ -1,5 +1,6 @@
 // 脱敏：任意文本用 scrubSecrets；已知连接串的显示用 maskUrl（URL.password），scrubUrl 两者都用并替换单独出现的密码
 import { describe, expect, test } from 'vitest';
+
 import { maskUrl, scrubSecrets } from '../src/secrets.ts';
 import { scrubUrl } from '../src/targets.ts';
 

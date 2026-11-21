@@ -1,6 +1,7 @@
 // 派生数据刷新：写回被拒绝时不覆盖基线并自动重试、runWithReset 异常回滚与并发提交不污染基线。
 import { emptyModel, type Model, type Obj, runMutator } from '@dowel/core';
 import { expect, test } from 'vitest';
+
 import { OpaqueRefresher } from '../src/derive.ts';
 import type { Rooms } from '../src/rooms.ts';
 import type { Shadow } from '../src/shadow.ts';

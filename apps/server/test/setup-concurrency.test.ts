@@ -4,6 +4,7 @@
 // 3. 实例已初始化后，携带正确令牌、错误令牌或空令牌调用 POST /api/setup 一律返回 409 而非 403/400；
 // 4. 未初始化时携带错误令牌返回 403、空令牌返回 400，且 sharedSetupToken 模式绝不回退随机内存令牌。
 import { afterAll, describe, expect, test } from 'vitest';
+
 import { createTestDb, PG_URL } from '../../../test/pg.ts';
 import { createApp } from '../src/app.ts';
 import { openPlatformDb, type PlatformDb } from '../src/db.ts';

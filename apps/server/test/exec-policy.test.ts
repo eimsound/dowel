@@ -5,6 +5,7 @@
 // 模型的编辑和发布不受约束。不需要真实 PG：环境直接写库，授权检查在连接目标库之前。
 import { type EnvInfo, type ExecPolicy, POLICY_DEFAULTS, type Role, resolvePolicy } from '@dowel/api';
 import { afterAll, beforeAll, describe, expect, test } from 'vitest';
+
 import {
   type Actor,
   can,

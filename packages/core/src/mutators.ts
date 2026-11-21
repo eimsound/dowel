@@ -1,6 +1,7 @@
 // mutator 注册表：同步层里每个修改都是“操作名 + 参数”（04-ir-design.md 第 2 节）。
 // 客户端乐观执行，服务器在最新状态上重新执行；参数由服务器用 zod 校验，不信任客户端。
 import { z } from 'zod';
+
 import * as E from './edit.ts';
 import { ColumnDefault, FkAction, IndexElement, type Model, SequenceOptions } from './ir.ts';
 import { columnsOf } from './model.ts';

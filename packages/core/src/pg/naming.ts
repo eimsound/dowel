@@ -46,7 +46,7 @@ export const chooseName = (
   taken: (n: string) => boolean = () => false,
 ): string => {
   let mod = label;
-  for (let pass = 0; ; ) {
+  for (let pass = 0; ;) {
     const n = makeObjectName(name1, name2, mod);
     if (!taken(n)) return n;
     mod = `${label}${++pass}`;

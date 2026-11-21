@@ -1,6 +1,7 @@
 // 接入环境成功提示文案测试：覆盖认领/未认领、有无领先版本、有无当前版本的中英文输出，确保无双标点且无 v—（#36）。
 import type { AttachResult } from '@dowel/api';
 import { afterEach, expect, test } from 'vitest';
+
 import { attachSuccessMessage } from '../src/envs.ts';
 import i18n from '../src/i18n.ts';
 

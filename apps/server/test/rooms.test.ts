@@ -3,6 +3,7 @@
 import { all, emptyModel, type Model, readsOf } from '@dowel/core';
 import { type Commit, SyncClient, type ToClient } from '@dowel/sync';
 import { afterAll, beforeAll, expect, test } from 'vitest';
+
 import type { User } from '../src/auth.ts';
 import {
   type ClusterEvent,

@@ -1,6 +1,7 @@
 // ⌘K / Ctrl+K 命令面板（S6）：打开、搜索项目、回车跳转、Esc 关闭；G 加字母跳项目页面。
 // 还有“当前模型里的表”只在模型页可搜，选中后直接在画布上选中它。
 import { expect, test } from '@playwright/test';
+
 import { createProject, newUser, openModel } from './helpers.ts';
 
 const palette = (page: import('@playwright/test').Page) => page.getByRole('dialog', { name: '命令面板' });

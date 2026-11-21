@@ -14,9 +14,11 @@ import { lookup as dnsLookupAsync } from 'node:dns/promises';
 import { request as httpRequest, type IncomingMessage } from 'node:http';
 import { request as httpsRequest } from 'node:https';
 import { isIP, type LookupFunction } from 'node:net';
+
 import type { WebhookDelivery, WebhookEventInput, WebhookEventType, WebhookFormat } from '@dowel/api';
 import { newId } from '@dowel/core';
 import type { Db } from '@dowel/engines';
+
 import { bytesOf, inCidr, isCidr, parseAllowlist, v6Bytes } from './allowlist.ts';
 import type { EventBus } from './bus.ts';
 import { inList, type PlatformDb } from './db.ts';

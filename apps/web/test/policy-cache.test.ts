@@ -2,6 +2,7 @@
 // 刚保存的那一个（已经用响应写回）不失效；无关的查询不动。
 import { QueryClient } from '@tanstack/react-query';
 import { expect, test } from 'vitest';
+
 import { invalidatePolicyDependents } from '../src/policy-cache.ts';
 
 test('保存项目层后：环境列表、环境状态、环境层配置页、其他层配置页都失效，刚保存的和无关的不动', async () => {

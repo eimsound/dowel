@@ -1,8 +1,10 @@
 // M1a 验收：导入一个真实的 schema（pagila，约 20 张业务表 + 55 个分区、视图、函数、触发器、域、聚合、pgvector），
 // 从 IR 重建后结构必须与原库完全一致。
 import { readFileSync } from 'node:fs';
+
 import { all, plan, validate } from '@dowel/core';
 import { expect, test } from 'vitest';
+
 import { createTestDb, PG_URL, useTestDb } from '../../../test/pg.ts';
 import { build, verify } from '../../verifier/src/index.ts';
 import { diffSnapshots, importSnapshot, readSnapshot } from '../src/index.ts';

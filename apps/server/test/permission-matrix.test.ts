@@ -7,6 +7,7 @@
 // - 公开端点显式标成 public，只断言它不被登录中间件拦住（各端点自己的错误码写在 statuses 里）。
 // - WebSocket 端点单独测：未登录 / 停用 / 无关用户被拒，查看者只读。
 import type { AddressInfo } from 'node:net';
+
 import type { GroupRole, Role } from '@dowel/api';
 import { all, emptyModel } from '@dowel/core';
 import { stepsChecksum } from '@dowel/engines';
@@ -14,6 +15,7 @@ import { SyncClient, type ToClient } from '@dowel/sync';
 import { serve } from '@hono/node-server';
 import { afterAll, beforeAll, expect, test } from 'vitest';
 import WebSocket from 'ws';
+
 import { createApp, openPlatformDb, type PlatformDb } from '../src/index.ts';
 import { KeyedLimiter, LoginLimiter } from '../src/rate-limit.ts';
 import { encrypt } from '../src/secrets.ts';

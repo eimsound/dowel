@@ -1,6 +1,7 @@
 // 项目动态列表：谁、什么时候、做了什么（DESIGN.md：时间是相对时间，操作用动词）。
 import type { ProjectActivityEvent } from '@dowel/api';
 import { useTranslation } from 'react-i18next';
+
 import { actionText } from '../activity.ts';
 import { formatTime } from '../format.ts';
 import { Avatar } from './ui.tsx';

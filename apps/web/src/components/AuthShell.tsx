@@ -3,6 +3,7 @@
 import type { Me } from '@dowel/api';
 import { useQueryClient } from '@tanstack/react-query';
 import type { ReactNode } from 'react';
+
 import { Logo } from './Shell.tsx';
 
 export const AuthShell = ({

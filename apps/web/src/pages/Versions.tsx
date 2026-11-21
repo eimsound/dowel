@@ -13,6 +13,7 @@ import { Link, useParams } from '@tanstack/react-router';
 import { ArrowRight, BookmarkPlus, Download, Pencil, Plus, ShieldCheck, Trash2 } from 'lucide-react';
 import { useId, useRef, useState } from 'react';
 import { useTranslation } from 'react-i18next';
+
 import { api, apiText } from '../api.ts';
 import { StepList, VersionDialog } from '../components/Dialogs.tsx';
 import { EmptyHint, ProjectPage, Row, Rows, Section } from '../components/ProjectPage.tsx';

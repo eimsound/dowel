@@ -8,7 +8,7 @@
   "sortImports": true,
   "sortTailwindcss": {
     "stylesheet": "./apps/web/src/styles.css",
-    "functions": ["cx"]
+    "functions": ["cx"],
   },
-  "ignorePatterns": [".agents/skills/**", "DESIGN.md", "**/dist/**", "pnpm-lock.yaml"]
+  "ignorePatterns": [".agents/skills/**", "DESIGN.md", "**/dist/**", "pnpm-lock.yaml"],
 }

@@ -2,11 +2,13 @@
 // 规则见 02-consensus.md 11.1：按“提供方 + subject”识别，邮箱绝不用于自动关联；
 // 未被邀请者被拒绝，除非该提供方开了 auto_provision。
 import { randomBytes, timingSafeEqual } from 'node:crypto';
+
 import type { OidcProviderInfo, OidcProviderPreset } from '@dowel/api';
 import type { Db } from '@dowel/engines';
 import type { Context } from 'hono';
 import { HTTPException } from 'hono/http-exception';
 import { allowInsecureRequests, type Configuration, discovery, fetchUserInfo } from 'openid-client';
+
 import { hashToken, type User } from './auth.ts';
 import type { PlatformDb } from './db.ts';
 import { claimInvite, inviteByToken, inviteState, setInviteUsedBy } from './invites.ts';

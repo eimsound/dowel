@@ -1,6 +1,7 @@
 // 风险分析：每一步的全表扫描只算这一步自己的（PG 15+ 的 pg_stat_xact_* 会残留前面步骤的计数）。
 import { emptyModel, type Model, plan, runMutator } from '@dowel/core';
 import { expect, test } from 'vitest';
+
 import { PG_URL, useTestDb } from '../../../test/pg.ts';
 import { analyze } from '../src/index.ts';
 

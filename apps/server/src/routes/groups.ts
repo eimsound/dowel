@@ -18,6 +18,7 @@ import { newId } from '@dowel/core';
 import type { Db } from '@dowel/engines';
 import type { Hono } from 'hono';
 import { HTTPException } from 'hono/http-exception';
+
 import { audit } from '../audit.ts';
 import { can, userActor } from '../authz.ts';
 import { isUniqueViolation } from '../db.ts';

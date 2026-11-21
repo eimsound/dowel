@@ -2,6 +2,7 @@
 // 所有消息均为轻量小负载（远小于 PG NOTIFY 8 KB 上限），业务数据从平台库按需读取；
 // 单机 SQLite 模式下走进程内回调，保持上层接口一致。
 import { randomUUID } from 'node:crypto';
+
 import type { PlatformDb } from './db.ts';
 
 export const CLUSTER_EVENTS_CHANNEL = 'dowel_events';

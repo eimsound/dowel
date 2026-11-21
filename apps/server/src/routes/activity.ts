@@ -2,6 +2,7 @@
 // 只读，权限是项目查看者；按时间倒序，最多 50 条。配额下不翻页：动态页先看最近发生了什么。
 import type { ProjectActivity, ProjectActivityEvent } from '@dowel/api';
 import type { Hono } from 'hono';
+
 import { atOf } from '../time.ts';
 import { type AppContext, access, type Env } from './context.ts';
 
@@ -35,16 +36,14 @@ export const registerActivity = (app: Hono<Env>, ctx: AppContext) => {
       [a.pid],
     );
     return c.json<ProjectActivity>({
-      events: rows.map(
-        (r): ProjectActivityEvent => ({
-          id: r.id,
-          at: atOf(r.at),
-          action: r.action,
-          actorName: r.actorName,
-          actorUsername: r.actorUsername,
-          data: r.data,
-        }),
-      ),
+      events: rows.map((r): ProjectActivityEvent => ({
+        id: r.id,
+        at: atOf(r.at),
+        action: r.action,
+        actorName: r.actorName,
+        actorUsername: r.actorUsername,
+        data: r.data,
+      })),
     });
   });
 };

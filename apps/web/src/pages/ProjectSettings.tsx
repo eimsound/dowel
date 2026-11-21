@@ -5,6 +5,7 @@ import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query';
 import { useNavigate } from '@tanstack/react-router';
 import { useEffect, useRef, useState } from 'react';
 import { useTranslation } from 'react-i18next';
+
 import { api } from '../api.ts';
 import { PolicyLayerPanel } from '../components/PolicyEditor.tsx';
 import { ProjectPage, Section } from '../components/ProjectPage.tsx';

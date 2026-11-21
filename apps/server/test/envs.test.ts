@@ -2,6 +2,7 @@
 import type { DriftSummary } from '@dowel/api';
 import { runTouched, runVersionId } from '@dowel/executor';
 import { expect, test } from 'vitest';
+
 import { sanitizeSummary } from '../src/envs.ts';
 
 const base: DriftSummary = { versionId: 'v', versionNumber: 2, total: 1, items: [], message: '短句' };

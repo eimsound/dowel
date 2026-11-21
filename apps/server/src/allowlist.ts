@@ -5,6 +5,7 @@
 // PG 协议没有重定向，所以不需要考虑跟随重定向。
 import { lookup } from 'node:dns/promises';
 import { isIP } from 'node:net';
+
 import { HTTPException } from 'hono/http-exception';
 
 const IPV4 = /^(\d{1,3})\.(\d{1,3})\.(\d{1,3})\.(\d{1,3})$/;

@@ -2,6 +2,7 @@
 import type { ProjectActivity } from '@dowel/api';
 import { useQuery } from '@tanstack/react-query';
 import { useTranslation } from 'react-i18next';
+
 import { api } from '../api.ts';
 import { ActivityList } from '../components/ActivityList.tsx';
 import { ProjectPage } from '../components/ProjectPage.tsx';

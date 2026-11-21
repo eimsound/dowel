@@ -52,7 +52,7 @@ jobs:
           project: acme/shop
           environment: staging
           to: latest
-          dry-run: "true"
+          dry-run: 'true'
 
       - name: 执行迁移
         id: migrate
@@ -63,7 +63,7 @@ jobs:
           project: acme/shop
           environment: staging
           to: latest
-          lock-timeout: "30"
+          lock-timeout: '30'
 
       - name: 打印结果
         run: |

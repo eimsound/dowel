@@ -24,6 +24,7 @@ import { ScopeError } from '@dowel/engines';
 import type { Hono } from 'hono';
 import { HTTPException } from 'hono/http-exception';
 import { streamSSE } from 'hono/streaming';
+
 import { audit } from '../audit.ts';
 import { freezeBaseline } from '../chain.ts';
 import { insertGrant } from '../grants.ts';

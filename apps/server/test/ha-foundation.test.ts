@@ -7,7 +7,9 @@ import { createServer, type Socket } from 'node:net';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { DatabaseSync } from 'node:sqlite';
+
 import { afterAll, describe, expect, test, vi } from 'vitest';
+
 import { createTestDb, PG_URL } from '../../../test/pg.ts';
 import { createApp } from '../src/app.ts';
 import { type ClusterEvent, EventBus } from '../src/bus.ts';

@@ -3,6 +3,7 @@
 // connection_allowlist、再按用户限速；检查本身只读，不执行任何写语句。
 import { connectionCheckSchema, type TargetInfo } from '@dowel/api';
 import type { Hono } from 'hono';
+
 import { CHECK_CONNECT_TIMEOUT, inspectTarget } from '../targets.ts';
 import { type AppContext, body, connectionLimit, createProjectGroup, type Env } from './context.ts';
 

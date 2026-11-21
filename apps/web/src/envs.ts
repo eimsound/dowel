@@ -10,6 +10,7 @@ import type {
 } from '@dowel/api';
 import { useQuery } from '@tanstack/react-query';
 import type { TFunction } from 'i18next';
+
 import { ApiError, api } from './api.ts';
 import { readSse } from './sse.ts';
 

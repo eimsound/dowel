@@ -6,6 +6,7 @@
 // 所以不会因为写法不同误报。
 import { type Model, plan } from '@dowel/core';
 import { importSnapshot, reconcileIds, type Snapshot } from '@dowel/engines';
+
 import type { ChainVersion, DiffItem } from './types.ts';
 
 /** 差异列表最多保留多少项（完整数量另给 total） */

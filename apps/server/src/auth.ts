@@ -3,10 +3,12 @@
 // 邮箱只是用户资料里的一个字段，不是登录凭据（02-consensus.md 11.1）。
 import { createHash, randomBytes, scrypt as scryptCb, timingSafeEqual } from 'node:crypto';
 import { promisify } from 'node:util';
+
 import type { InstanceRole, UserStatus } from '@dowel/api';
 import { newId } from '@dowel/core';
 import type { Context } from 'hono';
 import { deleteCookie, getCookie, setCookie } from 'hono/cookie';
+
 import type { PlatformDb } from './db.ts';
 import { clientIp, type SecurityConfig, securityConfigFromEnv } from './security.ts';
 import { normalizeUsername } from './usernames.ts';

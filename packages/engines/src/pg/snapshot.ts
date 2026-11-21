@@ -4,6 +4,7 @@
 // schema 范围（P3）：`readSnapshot(db, only)` 只读给定的 schema，在 SQL 层面就过滤掉，
 // 不读出来再丢弃；`dowel` 是 Dowel 自己的迁移历史 schema（ADR 0003），永远不读。（引擎层写死）
 import { literal } from '@dowel/core';
+
 import { type Db, pinSession } from './db.ts';
 import { type OpaqueSnap, readOpaques } from './opaque.ts';
 import { checkScope } from './scope.ts';

@@ -11,6 +11,7 @@ import { deepEqual, type Model } from '@dowel/core';
 import { planDiff } from '@dowel/executor';
 import type { Hono } from 'hono';
 import { HTTPException } from 'hono/http-exception';
+
 import { audit } from '../audit.ts';
 import { WorkingChangedError } from '../rooms.ts';
 import { type AppContext, access, body, type Env } from './context.ts';

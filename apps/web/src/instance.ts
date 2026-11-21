@@ -1,6 +1,7 @@
 // 登录页需要、但不需要登录就能读的实例信息（名称、能不能用密码登录、是否需要初始化）。
 import type { InstanceInfo } from '@dowel/api';
 import { queryOptions, useQuery } from '@tanstack/react-query';
+
 import { api } from './api.ts';
 
 export const instanceQuery = queryOptions({

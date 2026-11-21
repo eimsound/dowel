@@ -3,7 +3,9 @@
 //   2. 默认：目标实例上的 {原库名}_dowel（生产环境需要明确同意才用同一实例）；
 //   项目没有环境、或影子库不可用时直接报错。
 import { createHash } from 'node:crypto';
+
 import { HTTPException } from 'hono/http-exception';
+
 import type { ClusterEvent, ClusterEventPayload, EventBus } from './bus.ts';
 import type { PlatformDb } from './db.ts';
 import { decrypt } from './secrets.ts';

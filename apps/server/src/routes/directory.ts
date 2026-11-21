@@ -2,6 +2,7 @@
 // 只返回公开信息：用户是显示名 + 用户名，组是组名 + slug。
 import type { Directory, DirectoryEntry } from '@dowel/api';
 import type { Hono } from 'hono';
+
 import type { AppContext, Env } from './context.ts';
 
 const LIMIT = 20;

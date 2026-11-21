@@ -5,8 +5,10 @@
 import { createHmac } from 'node:crypto';
 import { createServer, type IncomingHttpHeaders, type Server } from 'node:http';
 import type { AddressInfo } from 'node:net';
+
 import AxeBuilder from '@axe-core/playwright';
 import { expect, type Page, test } from '@playwright/test';
+
 import { adminPage, createGroup, newUser } from './helpers.ts';
 
 const scan = async (page: Page, label: string) => {

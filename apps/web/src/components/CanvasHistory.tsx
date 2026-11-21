@@ -24,6 +24,7 @@ import {
 } from 'lucide-react';
 import { useCallback, useEffect, useId, useLayoutEffect, useMemo, useRef, useState } from 'react';
 import { useTranslation } from 'react-i18next';
+
 import { ApiError, api } from '../api.ts';
 import { formatTime } from '../format.ts';
 import type { Layout } from '../workspace.ts';

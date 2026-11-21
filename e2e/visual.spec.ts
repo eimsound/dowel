@@ -4,6 +4,7 @@
 // 另外用 SHOOT_APP=1 跑这个文件时，会把外壳各页面的 1440 宽截图写到 .agents/docs/ui/shots/app-*.png
 // （个人设置、后台各页、命令面板、窄屏抽屉等）；这是文档配图，不参与截图对比。
 import { expect, test } from '@playwright/test';
+
 import { connectPg } from '../apps/server/src/targets.ts';
 import { adminPage, createProject, gotoPage, newUser, openModel } from './helpers.ts';
 

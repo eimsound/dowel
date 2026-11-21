@@ -3,6 +3,7 @@
 import { createSchema, emptyModel, type Model, plan } from '@dowel/core';
 import postgres from 'postgres';
 import { afterAll, describe, expect, test } from 'vitest';
+
 import { connect, createTestDb, dbUrl, PG_URL, useTestDb } from '../../../test/pg.ts';
 import { build, resetShadow } from '../../verifier/src/index.ts';
 import {

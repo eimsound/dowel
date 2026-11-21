@@ -1,6 +1,7 @@
 // 路由组装：认证 → WebSocket Origin → requireUser → 各项目接口。
 // Hono 的 app.use 只对之后注册的路由生效，所以这里的顺序就是行为的一部分。
 import type { Hono } from 'hono';
+
 import { wsOriginGuard } from '../security.ts';
 import { registerInvites, registerMe } from './account.ts';
 import { registerActivity } from './activity.ts';

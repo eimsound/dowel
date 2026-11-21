@@ -23,6 +23,7 @@ import {
   verify,
   verifyScripts,
 } from '@dowel/verifier';
+
 import { scrubSecrets } from './secrets.ts';
 
 /**

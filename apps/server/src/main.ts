@@ -2,8 +2,10 @@
 // 实例里还没有用户时，这里打印一次性初始化令牌（也可以用 DOWEL_ADMIN_USERNAME / DOWEL_ADMIN_PASSWORD 无人值守初始化）。
 import { existsSync, readFileSync } from 'node:fs';
 import { fileURLToPath } from 'node:url';
+
 import { serve } from '@hono/node-server';
 import { serveStatic } from '@hono/node-server/serve-static';
+
 import { createApp } from './app.ts';
 import { openPlatformDb } from './db.ts';
 import { DEFAULT_DRIFT_INTERVAL_MS } from './drift-scheduler.ts';

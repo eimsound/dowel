@@ -27,6 +27,7 @@ import { ExecutorError, type ExecutorErrorCode } from '@dowel/executor';
 import type { Context, Hono, MiddlewareHandler } from 'hono';
 import { HTTPException } from 'hono/http-exception';
 import type { ContentfulStatusCode } from 'hono/utils/http-status';
+
 import { audit } from '../audit.ts';
 import { hashToken } from '../auth.ts';
 import { can } from '../authz.ts';
@@ -682,15 +683,13 @@ export const registerCi = (app: Hono<Env>, ctx: AppContext) => {
                     },
                   ]
                 : []),
-              ...plan.migrations.map(
-                (m): CiMigration => ({
-                  number: m.number,
-                  name: m.name,
-                  direction: m.direction === 'down' ? 'up' : (m.direction as 'up' | 'baseline'),
-                  steps: m.steps.length,
-                  nonTransactional: m.nonTransactional,
-                }),
-              ),
+              ...plan.migrations.map((m): CiMigration => ({
+                number: m.number,
+                name: m.name,
+                direction: m.direction === 'down' ? 'up' : (m.direction as 'up' | 'baseline'),
+                steps: m.steps.length,
+                nonTransactional: m.nonTransactional,
+              })),
             ],
             noop: plan.migrations.length === 0 && !plan.baseline,
             durationMs: Date.now() - started,

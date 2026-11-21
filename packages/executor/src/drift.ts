@@ -1,6 +1,7 @@
 // 漂移检测：读目标库结构，和环境当前版本的模型比较。只读；不建 dowel schema。
 import { emptyBase } from '@dowel/core';
 import { type Db, fingerprint, readSnapshot, withProjectLock } from '@dowel/engines';
+
 import { classifyFirstRun, type DiffResult, diffAgainst } from './compare.ts';
 import { ExecutorError } from './errors.ts';
 import { readState, runVersionId } from './state.ts';

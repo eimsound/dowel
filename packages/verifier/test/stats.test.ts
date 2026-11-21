@@ -2,6 +2,7 @@
 import { plan } from '@dowel/core';
 import fc from 'fast-check';
 import { expect, test } from 'vitest';
+
 import { makeVersions, versions } from './gen.ts';
 
 test.runIf(process.env.STATS)('生成器覆盖面', () => {

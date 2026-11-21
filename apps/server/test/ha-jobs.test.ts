@@ -5,9 +5,11 @@
 // 4. 分布式巡检互斥与影子库派生防重：双 DriftScheduler 并发 runOnce 仅一个执行、双 OpaqueRefresher 同分支互斥。
 import { createServer, type IncomingMessage, type ServerResponse } from 'node:http';
 import type { AddressInfo } from 'node:net';
+
 import type { InboxEvent, WebhookEventInput } from '@dowel/api';
 import { emptyModel, type Model, type Obj, runMutator } from '@dowel/core';
 import { afterAll, describe, expect, test } from 'vitest';
+
 import { createTestDb, PG_URL } from '../../../test/pg.ts';
 import { EventBus } from '../src/bus.ts';
 import { openPlatformDb, type PlatformDb } from '../src/db.ts';

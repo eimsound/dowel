@@ -12,6 +12,7 @@ import type { AddressInfo } from 'node:net';
 import { tmpdir } from 'node:os';
 import { join, resolve } from 'node:path';
 import { promisify } from 'node:util';
+
 import {
   type AuditPage,
   type CiDriftResult,
@@ -39,6 +40,7 @@ import {
 import { addColumn, all, type Model } from '@dowel/core';
 import { serve } from '@hono/node-server';
 import { afterAll, beforeAll, describe, expect, test } from 'vitest';
+
 import { connect, createTestDb, PG_URL } from '../../../test/pg.ts';
 import { hashToken } from '../src/auth.ts';
 import { createApp, openPlatformDb, type PlatformDb } from '../src/index.ts';

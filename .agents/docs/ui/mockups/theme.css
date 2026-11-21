@@ -1,7 +1,7 @@
 /* 主题 token（风格「精密」，2026-11-18 选定）。数值与 DESIGN.md 的 YAML 一致，改动时两边同步。 */
 :root {
-  --font-ui: "Inter Variable", var(--cjk);
-  --font-mono: "JetBrains Mono Variable", ui-monospace, monospace;
+  --font-ui: 'Inter Variable', var(--cjk);
+  --font-mono: 'JetBrains Mono Variable', ui-monospace, monospace;
   --fs: 13px;
   --fs-sm: 12.5px;
   --fs-xs: 11.5px;

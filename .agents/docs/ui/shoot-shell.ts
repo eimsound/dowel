@@ -7,6 +7,7 @@ import { createServer } from 'node:http';
 import type { AddressInfo } from 'node:net';
 import { extname, join } from 'node:path';
 import { fileURLToPath } from 'node:url';
+
 import { chromium } from '@playwright/test';
 
 const dir = fileURLToPath(new URL('./mockups/', import.meta.url));

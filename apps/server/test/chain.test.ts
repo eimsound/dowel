@@ -3,6 +3,7 @@
 // - 范围不含 public（例如 ['app']）：不带，冻结的基线和第一个版本都不碰 public。
 import { addColumn, createSchema, createTable, emptyModel, type Model } from '@dowel/core';
 import { describe, expect, test } from 'vitest';
+
 import {
   chainFrom,
   emptyBase,

@@ -3,6 +3,7 @@ import type { Me } from '@dowel/api';
 import { QueryClient, queryOptions, useQuery, useQueryClient } from '@tanstack/react-query';
 import { useNavigate } from '@tanstack/react-router';
 import { useCallback } from 'react';
+
 import { ApiError, api } from './api.ts';
 
 export const queryClient = new QueryClient({

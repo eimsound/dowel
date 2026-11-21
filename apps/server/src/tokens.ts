@@ -4,6 +4,7 @@
 // - 令牌属于项目：创建者离职、被停用都不影响；吊销和过期立即生效（每个请求都查库）。
 // - 能力只有“只读 + 执行”（authz.ts 的 CiAction），只能访问 /api/ci/…，别的接口一律 403（routes/index.ts 的 rejectTokens）。
 import { randomBytes } from 'node:crypto';
+
 import {
   type CiTokenInfo,
   type CiTokenStatus,
@@ -12,6 +13,7 @@ import {
   TOKEN_PREFIX,
 } from '@dowel/api';
 import type { Db } from '@dowel/engines';
+
 import { hashToken } from './auth.ts';
 import type { Actor } from './authz.ts';
 import { iso } from './envs.ts';
@@ -294,10 +296,7 @@ const TOKEN_SELECT = `select t.id, t.name, t.description, t.prefix, t.created_by
   left join users cu on cu.id = t.created_by
   left join users ru on ru.id = t.revoked_by`;
 
-export const tokenStatus = (
-  r: { revokedAt: unknown; expiresAt: unknown },
-  now = Date.now(),
-): CiTokenStatus =>
+export const tokenStatus = (r: { revokedAt: unknown; expiresAt: unknown }, now = Date.now()): CiTokenStatus =>
   r.revokedAt !== null && r.revokedAt !== undefined
     ? 'revoked'
     : Date.parse(iso(r.expiresAt)!) <= now

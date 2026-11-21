@@ -2,6 +2,7 @@
 // 连接期间角色可能被改（成员 / 授权 / 默认权限 / 转组 / 删组），由 rooms.refreshLoaded() 发 role 消息或直接断开；
 // join 时还会再算一次（升级和 join 之间可能已经变了），成功后总会发一条 role。
 import type { Hono } from 'hono';
+
 import { can, userActor } from '../authz.ts';
 import { effectiveRole, loadRoleContext, projectRow } from '../roles.ts';
 import type { ExtraIn, Peer } from '../rooms.ts';

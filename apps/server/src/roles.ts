@@ -15,6 +15,7 @@ import {
   tokenCreatorAllows,
 } from '@dowel/api';
 import type { Db } from '@dowel/engines';
+
 import type { PlatformDb } from './db.ts';
 import { hasGroupCondition, loadTokenRules, type TokenRuleStore, tokenRulesFor } from './token-rules.ts';
 

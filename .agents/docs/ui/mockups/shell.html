@@ -23,55 +23,254 @@
     <link rel="stylesheet" href="shell.css" />
   </head>
   <body>
-    <svg xmlns="http://www.w3.org/2000/svg" style="display:none" aria-hidden="true">
-    <!-- lucide v1.73.0, ISC -->
-    <symbol id="i-plus" viewBox="0 0 24 24"><path d="M5 12h14" /> <path d="M12 5v14" /></symbol>
-    <symbol id="i-network" viewBox="0 0 24 24"><rect x="16" y="16" width="6" height="6" rx="1" /> <rect x="2" y="16" width="6" height="6" rx="1" /> <rect x="9" y="2" width="6" height="6" rx="1" /> <path d="M5 16v-3a1 1 0 0 1 1-1h12a1 1 0 0 1 1 1v3" /> <path d="M12 12V8" /></symbol>
-    <symbol id="i-file-input" viewBox="0 0 24 24"><path d="M4 11V4a2 2 0 0 1 2-2h8a2.4 2.4 0 0 1 1.706.706l3.588 3.588A2.4 2.4 0 0 1 20 8v12a2 2 0 0 1-2 2H6a2 2 0 0 1-2-2v-1" /> <path d="M14 2v5a1 1 0 0 0 1 1h5" /> <path d="M2 15h10" /> <path d="m9 18 3-3-3-3" /></symbol>
-    <symbol id="i-bookmark-plus" viewBox="0 0 24 24"><path d="M12 7v6" /> <path d="M15 10H9" /> <path d="M17 3a2 2 0 0 1 2 2v15a1 1 0 0 1-1.496.868l-4.512-2.578a2 2 0 0 0-1.984 0l-4.512 2.578A1 1 0 0 1 5 20V5a2 2 0 0 1 2-2z" /></symbol>
-    <symbol id="i-git-compare-arrows" viewBox="0 0 24 24"><circle cx="5" cy="6" r="3" /> <path d="M12 6h5a2 2 0 0 1 2 2v7" /> <path d="m15 9-3-3 3-3" /> <circle cx="19" cy="18" r="3" /> <path d="M12 18H7a2 2 0 0 1-2-2V9" /> <path d="m9 15 3 3-3 3" /></symbol>
-    <symbol id="i-database" viewBox="0 0 24 24"><ellipse cx="12" cy="5" rx="9" ry="3" /> <path d="M3 5V19A9 3 0 0 0 21 19V5" /> <path d="M3 12A9 3 0 0 0 21 12" /></symbol>
-    <symbol id="i-users" viewBox="0 0 24 24"><path d="M16 21v-2a4 4 0 0 0-4-4H6a4 4 0 0 0-4 4v2" /> <path d="M16 3.128a4 4 0 0 1 0 7.744" /> <path d="M22 21v-2a4 4 0 0 0-3-3.87" /> <circle cx="9" cy="7" r="4" /></symbol>
-    <symbol id="i-search" viewBox="0 0 24 24"><path d="m21 21-4.34-4.34" /> <circle cx="11" cy="11" r="8" /></symbol>
-    <symbol id="i-table-2" viewBox="0 0 24 24"><path d="M3 9h18" /> <path d="M9 3v18" /> <rect x="3" y="3" width="18" height="18" rx="2" /></symbol>
-    <symbol id="i-list" viewBox="0 0 24 24"><path d="M3 5h.01" /> <path d="M3 12h.01" /> <path d="M3 19h.01" /> <path d="M8 5h13" /> <path d="M8 12h13" /> <path d="M8 19h13" /></symbol>
-    <symbol id="i-eye" viewBox="0 0 24 24"><path d="M2.062 12.348a1 1 0 0 1 0-.696 10.75 10.75 0 0 1 19.876 0 1 1 0 0 1 0 .696 10.75 10.75 0 0 1-19.876 0" /> <circle cx="12" cy="12" r="3" /></symbol>
-    <symbol id="i-key-round" viewBox="0 0 24 24"><path d="M2.586 17.414A2 2 0 0 0 2 18.828V21a1 1 0 0 0 1 1h3a1 1 0 0 0 1-1v-1a1 1 0 0 1 1-1h1a1 1 0 0 0 1-1v-1a1 1 0 0 1 1-1h.172a2 2 0 0 0 1.414-.586l.814-.814a6.5 6.5 0 1 0-4-4z" /> <circle cx="16.5" cy="7.5" r=".5" fill="currentColor" /></symbol>
-    <symbol id="i-link" viewBox="0 0 24 24"><path d="M10 13a5 5 0 0 0 7.54.54l3-3a5 5 0 0 0-7.07-7.07l-1.72 1.71" /> <path d="M14 11a5 5 0 0 0-7.54-.54l-3 3a5 5 0 0 0 7.07 7.07l1.71-1.71" /></symbol>
-    <symbol id="i-chevron-down" viewBox="0 0 24 24"><path d="m6 9 6 6 6-6" /></symbol>
-    <symbol id="i-chevron-right" viewBox="0 0 24 24"><path d="m9 18 6-6-6-6" /></symbol>
-    <symbol id="i-chevron-left" viewBox="0 0 24 24"><path d="m15 18-6-6 6-6" /></symbol>
-    <symbol id="i-grip-vertical" viewBox="0 0 24 24"><circle cx="9" cy="12" r="1" /> <circle cx="9" cy="5" r="1" /> <circle cx="9" cy="19" r="1" /> <circle cx="15" cy="12" r="1" /> <circle cx="15" cy="5" r="1" /> <circle cx="15" cy="19" r="1" /></symbol>
-    <symbol id="i-ellipsis" viewBox="0 0 24 24"><circle cx="12" cy="12" r="1" /> <circle cx="19" cy="12" r="1" /> <circle cx="5" cy="12" r="1" /></symbol>
-    <symbol id="i-check" viewBox="0 0 24 24"><path d="M20 6 9 17l-5-5" /></symbol>
-    <symbol id="i-circle-check" viewBox="0 0 24 24"><circle cx="12" cy="12" r="10" /> <path d="m16 9-5.5 5.5L8 12" /></symbol>
-    <symbol id="i-zoom-in" viewBox="0 0 24 24"><circle cx="11" cy="11" r="8" /> <line x1="21" x2="16.65" y1="21" y2="16.65" /> <line x1="11" x2="11" y1="8" y2="14" /> <line x1="8" x2="14" y1="11" y2="11" /></symbol>
-    <symbol id="i-zoom-out" viewBox="0 0 24 24"><circle cx="11" cy="11" r="8" /> <line x1="21" x2="16.65" y1="21" y2="16.65" /> <line x1="8" x2="14" y1="11" y2="11" /></symbol>
-    <symbol id="i-maximize" viewBox="0 0 24 24"><path d="M8 3H5a2 2 0 0 0-2 2v3" /> <path d="M21 8V5a2 2 0 0 0-2-2h-3" /> <path d="M3 16v3a2 2 0 0 0 2 2h3" /> <path d="M16 21h3a2 2 0 0 0 2-2v-3" /></symbol>
-    <symbol id="i-git-branch" viewBox="0 0 24 24"><path d="M15 6a9 9 0 0 0-9 9V3" /> <circle cx="18" cy="6" r="3" /> <circle cx="6" cy="18" r="3" /></symbol>
-    <symbol id="i-cloud-check" viewBox="0 0 24 24"><path d="m17 15-5.5 5.5L9 18" /> <path d="M5.516 16.07A7 7 0 1 1 15.71 8h1.79a4.5 4.5 0 0 1 3.501 7.327" /></symbol>
-    <symbol id="i-list-tree" viewBox="0 0 24 24"><path d="M8 5h13" /> <path d="M13 12h8" /> <path d="M13 19h8" /> <path d="M3 10a2 2 0 0 0 2 2h3" /> <path d="M3 5v12a2 2 0 0 0 2 2h3" /></symbol>
-    <symbol id="i-file-code" viewBox="0 0 24 24"><path d="M6 22a2 2 0 0 1-2-2V4a2 2 0 0 1 2-2h8a2.4 2.4 0 0 1 1.704.706l3.588 3.588A2.4 2.4 0 0 1 20 8v12a2 2 0 0 1-2 2z" /> <path d="M14 2v5a1 1 0 0 0 1 1h5" /> <path d="M10 12.5 8 15l2 2.5" /> <path d="m14 12.5 2 2.5-2 2.5" /></symbol>
-    <symbol id="i-workflow" viewBox="0 0 24 24"><rect width="8" height="8" x="3" y="3" rx="2" /> <path d="M7 11v4a2 2 0 0 0 2 2h4" /> <rect width="8" height="8" x="13" y="13" rx="2" /></symbol>
-    <symbol id="i-panel-left" viewBox="0 0 24 24"><rect width="18" height="18" x="3" y="3" rx="2" /> <path d="M9 3v18" /></symbol>
-    <symbol id="i-panel-left-close" viewBox="0 0 24 24"><rect width="18" height="18" x="3" y="3" rx="2" /> <path d="M9 3v18" /> <path d="m16 15-3-3 3-3" /></symbol>
-    <symbol id="i-panel-left-open" viewBox="0 0 24 24"><rect width="18" height="18" x="3" y="3" rx="2" /> <path d="M9 3v18" /> <path d="m14 9 3 3-3 3" /></symbol>
-    <symbol id="i-layout-dashboard" viewBox="0 0 24 24"><rect width="7" height="9" x="3" y="3" rx="1" /> <rect width="7" height="5" x="14" y="3" rx="1" /> <rect width="7" height="9" x="14" y="12" rx="1" /> <rect width="7" height="5" x="3" y="16" rx="1" /></symbol>
-    <symbol id="i-activity" viewBox="0 0 24 24"><path d="M22 12h-2.48a2 2 0 0 0-1.93 1.46l-2.35 8.36a.25.25 0 0 1-.48 0L9.24 2.18a.25.25 0 0 0-.48 0l-2.35 8.36A2 2 0 0 1 4.49 12H2" /></symbol>
-    <symbol id="i-settings" viewBox="0 0 24 24"><path d="M9.671 4.136a2.34 2.34 0 0 1 4.659 0 2.34 2.34 0 0 0 3.319 1.915 2.34 2.34 0 0 1 2.33 4.033 2.34 2.34 0 0 0 0 3.831 2.34 2.34 0 0 1-2.33 4.033 2.34 2.34 0 0 0-3.319 1.915 2.34 2.34 0 0 1-4.659 0 2.34 2.34 0 0 0-3.32-1.915 2.34 2.34 0 0 1-2.33-4.033 2.34 2.34 0 0 0 0-3.831A2.34 2.34 0 0 1 6.35 6.051a2.34 2.34 0 0 0 3.319-1.915" /> <circle cx="12" cy="12" r="3" /></symbol>
-    <symbol id="i-bookmark" viewBox="0 0 24 24"><path d="M17 3a2 2 0 0 1 2 2v15a1 1 0 0 1-1.496.868l-4.512-2.578a2 2 0 0 0-1.984 0l-4.512 2.578A1 1 0 0 1 5 20V5a2 2 0 0 1 2-2z" /></symbol>
-    <symbol id="i-folders" viewBox="0 0 24 24"><path d="M20 5a2 2 0 0 1 2 2v7a2 2 0 0 1-2 2H9a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h2.5a1.5 1.5 0 0 1 1.2.6l.6.8a1.5 1.5 0 0 0 1.2.6z" /> <path d="M3 8.268a2 2 0 0 0-1 1.738V19a2 2 0 0 0 2 2h11a2 2 0 0 0 1.732-1" /></symbol>
-    <symbol id="i-chevrons-up-down" viewBox="0 0 24 24"><path d="m7 15 5 5 5-5" /> <path d="m7 9 5-5 5 5" /></symbol>
-    <symbol id="i-inbox" viewBox="0 0 24 24"><polyline points="22 12 16 12 14 15 10 15 8 12 2 12" /> <path d="M5.45 5.11 2 12v6a2 2 0 0 0 2 2h16a2 2 0 0 0 2-2v-6l-3.45-6.89A2 2 0 0 0 16.76 4H7.24a2 2 0 0 0-1.79 1.11z" /></symbol>
-    <symbol id="i-circle-dashed" viewBox="0 0 24 24"><path d="M10.1 2.182a10 10 0 0 1 3.8 0" /> <path d="M13.9 21.818a10 10 0 0 1-3.8 0" /> <path d="M17.609 3.721a10 10 0 0 1 2.69 2.7" /> <path d="M2.182 13.9a10 10 0 0 1 0-3.8" /> <path d="M20.279 17.609a10 10 0 0 1-2.7 2.69" /> <path d="M21.818 10.1a10 10 0 0 1 0 3.8" /> <path d="M3.721 6.391a10 10 0 0 1 2.7-2.69" /> <path d="M6.391 20.279a10 10 0 0 1-2.69-2.7" /></symbol>
-    <symbol id="i-info" viewBox="0 0 24 24"><circle cx="12" cy="12" r="10" /> <path d="M12 16v-4" /> <path d="M12 8h.01" /></symbol>
-    <symbol id="i-refresh-cw" viewBox="0 0 24 24"><path d="M3 12a9 9 0 0 1 9-9 9.75 9.75 0 0 1 6.74 2.74L21 8" /> <path d="M21 3v5h-5" /> <path d="M21 12a9 9 0 0 1-9 9 9.75 9.75 0 0 1-6.74-2.74L3 16" /> <path d="M8 16H3v5" /></symbol>
-    <symbol id="i-hash" viewBox="0 0 24 24"><line x1="4" x2="20" y1="9" y2="9" /> <line x1="4" x2="20" y1="15" y2="15" /> <line x1="10" x2="8" y1="3" y2="21" /> <line x1="16" x2="14" y1="3" y2="21" /></symbol>
-    <symbol id="i-triangle-alert" viewBox="0 0 24 24"><path d="m21.73 18-8-14a2 2 0 0 0-3.48 0l-8 14A2 2 0 0 0 4 21h16a2 2 0 0 0 1.73-3" /> <path d="M12 9v4" /> <path d="M12 17h.01" /></symbol>
-    <symbol id="i-circle-alert" viewBox="0 0 24 24"><circle cx="12" cy="12" r="10" /> <line x1="12" x2="12" y1="8" y2="12" /> <line x1="12" x2="12.01" y1="16" y2="16" /></symbol>
-    <symbol id="i-history" viewBox="0 0 24 24"><path d="M3 12a9 9 0 1 0 9-9 9.75 9.75 0 0 0-6.74 2.74L3 8" /> <path d="M3 3v5h5" /> <path d="M12 7v5l4 2" /></symbol>
-    <symbol id="i-play" viewBox="0 0 24 24"><path d="M5 5a2 2 0 0 1 3.008-1.728l11.997 6.998a2 2 0 0 1 .003 3.458l-12 7A2 2 0 0 1 5 19z" /></symbol>
-    <symbol id="i-arrow-right" viewBox="0 0 24 24"><path d="M5 12h14" /> <path d="m12 5 7 7-7 7" /></symbol>
+    <svg xmlns="http://www.w3.org/2000/svg" style="display: none" aria-hidden="true">
+      <!-- lucide v1.73.0, ISC -->
+      <symbol id="i-plus" viewBox="0 0 24 24">
+        <path d="M5 12h14" />
+        <path d="M12 5v14" />
+      </symbol>
+      <symbol id="i-network" viewBox="0 0 24 24">
+        <rect x="16" y="16" width="6" height="6" rx="1" />
+        <rect x="2" y="16" width="6" height="6" rx="1" />
+        <rect x="9" y="2" width="6" height="6" rx="1" />
+        <path d="M5 16v-3a1 1 0 0 1 1-1h12a1 1 0 0 1 1 1v3" />
+        <path d="M12 12V8" />
+      </symbol>
+      <symbol id="i-file-input" viewBox="0 0 24 24">
+        <path
+          d="M4 11V4a2 2 0 0 1 2-2h8a2.4 2.4 0 0 1 1.706.706l3.588 3.588A2.4 2.4 0 0 1 20 8v12a2 2 0 0 1-2 2H6a2 2 0 0 1-2-2v-1"
+        />
+        <path d="M14 2v5a1 1 0 0 0 1 1h5" />
+        <path d="M2 15h10" />
+        <path d="m9 18 3-3-3-3" />
+      </symbol>
+      <symbol id="i-bookmark-plus" viewBox="0 0 24 24">
+        <path d="M12 7v6" />
+        <path d="M15 10H9" />
+        <path
+          d="M17 3a2 2 0 0 1 2 2v15a1 1 0 0 1-1.496.868l-4.512-2.578a2 2 0 0 0-1.984 0l-4.512 2.578A1 1 0 0 1 5 20V5a2 2 0 0 1 2-2z"
+        />
+      </symbol>
+      <symbol id="i-git-compare-arrows" viewBox="0 0 24 24">
+        <circle cx="5" cy="6" r="3" />
+        <path d="M12 6h5a2 2 0 0 1 2 2v7" />
+        <path d="m15 9-3-3 3-3" />
+        <circle cx="19" cy="18" r="3" />
+        <path d="M12 18H7a2 2 0 0 1-2-2V9" />
+        <path d="m9 15 3 3-3 3" />
+      </symbol>
+      <symbol id="i-database" viewBox="0 0 24 24">
+        <ellipse cx="12" cy="5" rx="9" ry="3" />
+        <path d="M3 5V19A9 3 0 0 0 21 19V5" />
+        <path d="M3 12A9 3 0 0 0 21 12" />
+      </symbol>
+      <symbol id="i-users" viewBox="0 0 24 24">
+        <path d="M16 21v-2a4 4 0 0 0-4-4H6a4 4 0 0 0-4 4v2" />
+        <path d="M16 3.128a4 4 0 0 1 0 7.744" />
+        <path d="M22 21v-2a4 4 0 0 0-3-3.87" />
+        <circle cx="9" cy="7" r="4" />
+      </symbol>
+      <symbol id="i-search" viewBox="0 0 24 24">
+        <path d="m21 21-4.34-4.34" />
+        <circle cx="11" cy="11" r="8" />
+      </symbol>
+      <symbol id="i-table-2" viewBox="0 0 24 24">
+        <path d="M3 9h18" />
+        <path d="M9 3v18" />
+        <rect x="3" y="3" width="18" height="18" rx="2" />
+      </symbol>
+      <symbol id="i-list" viewBox="0 0 24 24">
+        <path d="M3 5h.01" />
+        <path d="M3 12h.01" />
+        <path d="M3 19h.01" />
+        <path d="M8 5h13" />
+        <path d="M8 12h13" />
+        <path d="M8 19h13" />
+      </symbol>
+      <symbol id="i-eye" viewBox="0 0 24 24">
+        <path
+          d="M2.062 12.348a1 1 0 0 1 0-.696 10.75 10.75 0 0 1 19.876 0 1 1 0 0 1 0 .696 10.75 10.75 0 0 1-19.876 0"
+        />
+        <circle cx="12" cy="12" r="3" />
+      </symbol>
+      <symbol id="i-key-round" viewBox="0 0 24 24">
+        <path
+          d="M2.586 17.414A2 2 0 0 0 2 18.828V21a1 1 0 0 0 1 1h3a1 1 0 0 0 1-1v-1a1 1 0 0 1 1-1h1a1 1 0 0 0 1-1v-1a1 1 0 0 1 1-1h.172a2 2 0 0 0 1.414-.586l.814-.814a6.5 6.5 0 1 0-4-4z"
+        />
+        <circle cx="16.5" cy="7.5" r=".5" fill="currentColor" />
+      </symbol>
+      <symbol id="i-link" viewBox="0 0 24 24">
+        <path d="M10 13a5 5 0 0 0 7.54.54l3-3a5 5 0 0 0-7.07-7.07l-1.72 1.71" />
+        <path d="M14 11a5 5 0 0 0-7.54-.54l-3 3a5 5 0 0 0 7.07 7.07l1.71-1.71" />
+      </symbol>
+      <symbol id="i-chevron-down" viewBox="0 0 24 24"><path d="m6 9 6 6 6-6" /></symbol>
+      <symbol id="i-chevron-right" viewBox="0 0 24 24"><path d="m9 18 6-6-6-6" /></symbol>
+      <symbol id="i-chevron-left" viewBox="0 0 24 24"><path d="m15 18-6-6 6-6" /></symbol>
+      <symbol id="i-grip-vertical" viewBox="0 0 24 24">
+        <circle cx="9" cy="12" r="1" />
+        <circle cx="9" cy="5" r="1" />
+        <circle cx="9" cy="19" r="1" />
+        <circle cx="15" cy="12" r="1" />
+        <circle cx="15" cy="5" r="1" />
+        <circle cx="15" cy="19" r="1" />
+      </symbol>
+      <symbol id="i-ellipsis" viewBox="0 0 24 24">
+        <circle cx="12" cy="12" r="1" />
+        <circle cx="19" cy="12" r="1" />
+        <circle cx="5" cy="12" r="1" />
+      </symbol>
+      <symbol id="i-check" viewBox="0 0 24 24"><path d="M20 6 9 17l-5-5" /></symbol>
+      <symbol id="i-circle-check" viewBox="0 0 24 24">
+        <circle cx="12" cy="12" r="10" />
+        <path d="m16 9-5.5 5.5L8 12" />
+      </symbol>
+      <symbol id="i-zoom-in" viewBox="0 0 24 24">
+        <circle cx="11" cy="11" r="8" />
+        <line x1="21" x2="16.65" y1="21" y2="16.65" />
+        <line x1="11" x2="11" y1="8" y2="14" />
+        <line x1="8" x2="14" y1="11" y2="11" />
+      </symbol>
+      <symbol id="i-zoom-out" viewBox="0 0 24 24">
+        <circle cx="11" cy="11" r="8" />
+        <line x1="21" x2="16.65" y1="21" y2="16.65" />
+        <line x1="8" x2="14" y1="11" y2="11" />
+      </symbol>
+      <symbol id="i-maximize" viewBox="0 0 24 24">
+        <path d="M8 3H5a2 2 0 0 0-2 2v3" />
+        <path d="M21 8V5a2 2 0 0 0-2-2h-3" />
+        <path d="M3 16v3a2 2 0 0 0 2 2h3" />
+        <path d="M16 21h3a2 2 0 0 0 2-2v-3" />
+      </symbol>
+      <symbol id="i-git-branch" viewBox="0 0 24 24">
+        <path d="M15 6a9 9 0 0 0-9 9V3" />
+        <circle cx="18" cy="6" r="3" />
+        <circle cx="6" cy="18" r="3" />
+      </symbol>
+      <symbol id="i-cloud-check" viewBox="0 0 24 24">
+        <path d="m17 15-5.5 5.5L9 18" />
+        <path d="M5.516 16.07A7 7 0 1 1 15.71 8h1.79a4.5 4.5 0 0 1 3.501 7.327" />
+      </symbol>
+      <symbol id="i-list-tree" viewBox="0 0 24 24">
+        <path d="M8 5h13" />
+        <path d="M13 12h8" />
+        <path d="M13 19h8" />
+        <path d="M3 10a2 2 0 0 0 2 2h3" />
+        <path d="M3 5v12a2 2 0 0 0 2 2h3" />
+      </symbol>
+      <symbol id="i-file-code" viewBox="0 0 24 24">
+        <path
+          d="M6 22a2 2 0 0 1-2-2V4a2 2 0 0 1 2-2h8a2.4 2.4 0 0 1 1.704.706l3.588 3.588A2.4 2.4 0 0 1 20 8v12a2 2 0 0 1-2 2z"
+        />
+        <path d="M14 2v5a1 1 0 0 0 1 1h5" />
+        <path d="M10 12.5 8 15l2 2.5" />
+        <path d="m14 12.5 2 2.5-2 2.5" />
+      </symbol>
+      <symbol id="i-workflow" viewBox="0 0 24 24">
+        <rect width="8" height="8" x="3" y="3" rx="2" />
+        <path d="M7 11v4a2 2 0 0 0 2 2h4" />
+        <rect width="8" height="8" x="13" y="13" rx="2" />
+      </symbol>
+      <symbol id="i-panel-left" viewBox="0 0 24 24">
+        <rect width="18" height="18" x="3" y="3" rx="2" />
+        <path d="M9 3v18" />
+      </symbol>
+      <symbol id="i-panel-left-close" viewBox="0 0 24 24">
+        <rect width="18" height="18" x="3" y="3" rx="2" />
+        <path d="M9 3v18" />
+        <path d="m16 15-3-3 3-3" />
+      </symbol>
+      <symbol id="i-panel-left-open" viewBox="0 0 24 24">
+        <rect width="18" height="18" x="3" y="3" rx="2" />
+        <path d="M9 3v18" />
+        <path d="m14 9 3 3-3 3" />
+      </symbol>
+      <symbol id="i-layout-dashboard" viewBox="0 0 24 24">
+        <rect width="7" height="9" x="3" y="3" rx="1" />
+        <rect width="7" height="5" x="14" y="3" rx="1" />
+        <rect width="7" height="9" x="14" y="12" rx="1" />
+        <rect width="7" height="5" x="3" y="16" rx="1" />
+      </symbol>
+      <symbol id="i-activity" viewBox="0 0 24 24">
+        <path
+          d="M22 12h-2.48a2 2 0 0 0-1.93 1.46l-2.35 8.36a.25.25 0 0 1-.48 0L9.24 2.18a.25.25 0 0 0-.48 0l-2.35 8.36A2 2 0 0 1 4.49 12H2"
+        />
+      </symbol>
+      <symbol id="i-settings" viewBox="0 0 24 24">
+        <path
+          d="M9.671 4.136a2.34 2.34 0 0 1 4.659 0 2.34 2.34 0 0 0 3.319 1.915 2.34 2.34 0 0 1 2.33 4.033 2.34 2.34 0 0 0 0 3.831 2.34 2.34 0 0 1-2.33 4.033 2.34 2.34 0 0 0-3.319 1.915 2.34 2.34 0 0 1-4.659 0 2.34 2.34 0 0 0-3.32-1.915 2.34 2.34 0 0 1-2.33-4.033 2.34 2.34 0 0 0 0-3.831A2.34 2.34 0 0 1 6.35 6.051a2.34 2.34 0 0 0 3.319-1.915"
+        />
+        <circle cx="12" cy="12" r="3" />
+      </symbol>
+      <symbol id="i-bookmark" viewBox="0 0 24 24">
+        <path
+          d="M17 3a2 2 0 0 1 2 2v15a1 1 0 0 1-1.496.868l-4.512-2.578a2 2 0 0 0-1.984 0l-4.512 2.578A1 1 0 0 1 5 20V5a2 2 0 0 1 2-2z"
+        />
+      </symbol>
+      <symbol id="i-folders" viewBox="0 0 24 24">
+        <path
+          d="M20 5a2 2 0 0 1 2 2v7a2 2 0 0 1-2 2H9a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h2.5a1.5 1.5 0 0 1 1.2.6l.6.8a1.5 1.5 0 0 0 1.2.6z"
+        />
+        <path d="M3 8.268a2 2 0 0 0-1 1.738V19a2 2 0 0 0 2 2h11a2 2 0 0 0 1.732-1" />
+      </symbol>
+      <symbol id="i-chevrons-up-down" viewBox="0 0 24 24">
+        <path d="m7 15 5 5 5-5" />
+        <path d="m7 9 5-5 5 5" />
+      </symbol>
+      <symbol id="i-inbox" viewBox="0 0 24 24">
+        <polyline points="22 12 16 12 14 15 10 15 8 12 2 12" />
+        <path
+          d="M5.45 5.11 2 12v6a2 2 0 0 0 2 2h16a2 2 0 0 0 2-2v-6l-3.45-6.89A2 2 0 0 0 16.76 4H7.24a2 2 0 0 0-1.79 1.11z"
+        />
+      </symbol>
+      <symbol id="i-circle-dashed" viewBox="0 0 24 24">
+        <path d="M10.1 2.182a10 10 0 0 1 3.8 0" />
+        <path d="M13.9 21.818a10 10 0 0 1-3.8 0" />
+        <path d="M17.609 3.721a10 10 0 0 1 2.69 2.7" />
+        <path d="M2.182 13.9a10 10 0 0 1 0-3.8" />
+        <path d="M20.279 17.609a10 10 0 0 1-2.7 2.69" />
+        <path d="M21.818 10.1a10 10 0 0 1 0 3.8" />
+        <path d="M3.721 6.391a10 10 0 0 1 2.7-2.69" />
+        <path d="M6.391 20.279a10 10 0 0 1-2.69-2.7" />
+      </symbol>
+      <symbol id="i-info" viewBox="0 0 24 24">
+        <circle cx="12" cy="12" r="10" />
+        <path d="M12 16v-4" />
+        <path d="M12 8h.01" />
+      </symbol>
+      <symbol id="i-refresh-cw" viewBox="0 0 24 24">
+        <path d="M3 12a9 9 0 0 1 9-9 9.75 9.75 0 0 1 6.74 2.74L21 8" />
+        <path d="M21 3v5h-5" />
+        <path d="M21 12a9 9 0 0 1-9 9 9.75 9.75 0 0 1-6.74-2.74L3 16" />
+        <path d="M8 16H3v5" />
+      </symbol>
+      <symbol id="i-hash" viewBox="0 0 24 24">
+        <line x1="4" x2="20" y1="9" y2="9" />
+        <line x1="4" x2="20" y1="15" y2="15" />
+        <line x1="10" x2="8" y1="3" y2="21" />
+        <line x1="16" x2="14" y1="3" y2="21" />
+      </symbol>
+      <symbol id="i-triangle-alert" viewBox="0 0 24 24">
+        <path d="m21.73 18-8-14a2 2 0 0 0-3.48 0l-8 14A2 2 0 0 0 4 21h16a2 2 0 0 0 1.73-3" />
+        <path d="M12 9v4" />
+        <path d="M12 17h.01" />
+      </symbol>
+      <symbol id="i-circle-alert" viewBox="0 0 24 24">
+        <circle cx="12" cy="12" r="10" />
+        <line x1="12" x2="12" y1="8" y2="12" />
+        <line x1="12" x2="12.01" y1="16" y2="16" />
+      </symbol>
+      <symbol id="i-history" viewBox="0 0 24 24">
+        <path d="M3 12a9 9 0 1 0 9-9 9.75 9.75 0 0 0-6.74 2.74L3 8" />
+        <path d="M3 3v5h5" />
+        <path d="M12 7v5l4 2" />
+      </symbol>
+      <symbol id="i-play" viewBox="0 0 24 24">
+        <path d="M5 5a2 2 0 0 1 3.008-1.728l11.997 6.998a2 2 0 0 1 .003 3.458l-12 7A2 2 0 0 1 5 19z" />
+      </symbol>
+      <symbol id="i-arrow-right" viewBox="0 0 24 24">
+        <path d="M5 12h14" />
+        <path d="m12 5 7 7-7 7" />
+      </symbol>
     </svg>
 
     <!-- ===== 可复用片段：脚本克隆到各个位置 ===== -->
@@ -82,8 +281,18 @@
           <span class="org-name">星河科技</span>
           <svg aria-hidden="true" class="ic sm"><use href="#i-chevron-down" /></svg>
         </button>
-        <button type="button" class="btn icon ghost only-merged" aria-label="搜索" title="搜索 ⌘K"><svg aria-hidden="true" class="ic"><use href="#i-search" /></svg></button>
-        <button type="button" class="btn icon ghost" data-act="collapse" aria-label="收起侧栏" title="收起侧栏 ["><svg aria-hidden="true" class="ic"><use href="#i-panel-left" /></svg></button>
+        <button type="button" class="btn icon ghost only-merged" aria-label="搜索" title="搜索 ⌘K">
+          <svg aria-hidden="true" class="ic"><use href="#i-search" /></svg>
+        </button>
+        <button
+          type="button"
+          class="btn icon ghost"
+          data-act="collapse"
+          aria-label="收起侧栏"
+          title="收起侧栏 ["
+        >
+          <svg aria-hidden="true" class="ic"><use href="#i-panel-left" /></svg>
+        </button>
       </div>
     </template>
 
@@ -98,13 +307,32 @@
     </template>
 
     <template id="tpl-subnav">
-      <a href="#overview" class="nitem" data-go="overview"><svg aria-hidden="true" class="ic"><use href="#i-layout-dashboard" /></svg>概览</a>
-      <a href="#model" class="nitem" data-go="model"><svg aria-hidden="true" class="ic"><use href="#i-workflow" /></svg>模型</a>
-      <a href="#versions" class="nitem" data-go="versions"><svg aria-hidden="true" class="ic"><use href="#i-bookmark" /></svg>版本<span class="n-count">3</span></a>
-      <a href="#environments" class="nitem" data-go="environments"><svg aria-hidden="true" class="ic"><use href="#i-database" /></svg>环境<span class="n-dot warn" title="prod 有漂移"></span></a>
-      <a href="#activity" class="nitem" data-go="activity"><svg aria-hidden="true" class="ic"><use href="#i-activity" /></svg>动态</a>
-      <a href="#members" class="nitem" data-go="members"><svg aria-hidden="true" class="ic"><use href="#i-users" /></svg>成员</a>
-      <a href="#settings" class="nitem" data-go="settings"><svg aria-hidden="true" class="ic"><use href="#i-settings" /></svg>设置</a>
+      <a href="#overview" class="nitem" data-go="overview"
+        ><svg aria-hidden="true" class="ic"><use href="#i-layout-dashboard" /></svg>概览</a
+      >
+      <a href="#model" class="nitem" data-go="model"
+        ><svg aria-hidden="true" class="ic"><use href="#i-workflow" /></svg>模型</a
+      >
+      <a href="#versions" class="nitem" data-go="versions"
+        ><svg aria-hidden="true" class="ic"><use href="#i-bookmark" /></svg>版本<span class="n-count"
+          >3</span
+        ></a
+      >
+      <a href="#environments" class="nitem" data-go="environments"
+        ><svg aria-hidden="true" class="ic"><use href="#i-database" /></svg>环境<span
+          class="n-dot warn"
+          title="prod 有漂移"
+        ></span
+      ></a>
+      <a href="#activity" class="nitem" data-go="activity"
+        ><svg aria-hidden="true" class="ic"><use href="#i-activity" /></svg>动态</a
+      >
+      <a href="#members" class="nitem" data-go="members"
+        ><svg aria-hidden="true" class="ic"><use href="#i-users" /></svg>成员</a
+      >
+      <a href="#settings" class="nitem" data-go="settings"
+        ><svg aria-hidden="true" class="ic"><use href="#i-settings" /></svg>设置</a
+      >
     </template>
 
     <template id="tpl-tree">
@@ -115,22 +343,53 @@
       </label>
       <div class="tree">
         <div class="tree-group">
-          <div class="tree-head"><svg aria-hidden="true" class="ic sm"><use href="#i-chevron-down" /></svg>表<span class="count">4</span></div>
-          <button type="button" class="tree-item"><svg aria-hidden="true" class="ic"><use href="#i-table-2" /></svg>customers<span class="peer-dot" title="李四正在编辑"></span></button>
-          <button type="button" class="tree-item active" aria-current="true"><svg aria-hidden="true" class="ic"><use href="#i-table-2" /></svg>orders</button>
-          <button type="button" class="tree-item"><svg aria-hidden="true" class="ic"><use href="#i-table-2" /></svg>order_items</button>
-          <button type="button" class="tree-item"><svg aria-hidden="true" class="ic"><use href="#i-table-2" /></svg>products</button>
+          <div class="tree-head">
+            <svg aria-hidden="true" class="ic sm"><use href="#i-chevron-down" /></svg>表<span class="count"
+              >4</span
+            >
+          </div>
+          <button type="button" class="tree-item">
+            <svg aria-hidden="true" class="ic"><use href="#i-table-2" /></svg>customers<span
+              class="peer-dot"
+              title="李四正在编辑"
+            ></span>
+          </button>
+          <button type="button" class="tree-item active" aria-current="true">
+            <svg aria-hidden="true" class="ic"><use href="#i-table-2" /></svg>orders
+          </button>
+          <button type="button" class="tree-item">
+            <svg aria-hidden="true" class="ic"><use href="#i-table-2" /></svg>order_items
+          </button>
+          <button type="button" class="tree-item">
+            <svg aria-hidden="true" class="ic"><use href="#i-table-2" /></svg>products
+          </button>
         </div>
         <div class="tree-group">
-          <div class="tree-head"><svg aria-hidden="true" class="ic sm"><use href="#i-chevron-down" /></svg>枚举<span class="count">1</span></div>
-          <button type="button" class="tree-item"><svg aria-hidden="true" class="ic"><use href="#i-list" /></svg>order_status</button>
+          <div class="tree-head">
+            <svg aria-hidden="true" class="ic sm"><use href="#i-chevron-down" /></svg>枚举<span class="count"
+              >1</span
+            >
+          </div>
+          <button type="button" class="tree-item">
+            <svg aria-hidden="true" class="ic"><use href="#i-list" /></svg>order_status
+          </button>
         </div>
         <div class="tree-group">
-          <div class="tree-head"><svg aria-hidden="true" class="ic sm"><use href="#i-chevron-down" /></svg>视图<span class="count">1</span></div>
-          <button type="button" class="tree-item"><svg aria-hidden="true" class="ic"><use href="#i-eye" /></svg>paid_orders</button>
+          <div class="tree-head">
+            <svg aria-hidden="true" class="ic sm"><use href="#i-chevron-down" /></svg>视图<span class="count"
+              >1</span
+            >
+          </div>
+          <button type="button" class="tree-item">
+            <svg aria-hidden="true" class="ic"><use href="#i-eye" /></svg>paid_orders
+          </button>
         </div>
         <div class="tree-group collapsed">
-          <div class="tree-head"><svg aria-hidden="true" class="ic sm"><use href="#i-chevron-right" /></svg>序列<span class="count">3</span></div>
+          <div class="tree-head">
+            <svg aria-hidden="true" class="ic sm"><use href="#i-chevron-right" /></svg>序列<span class="count"
+              >3</span
+            >
+          </div>
         </div>
       </div>
       <div class="side-foot">
@@ -141,17 +400,31 @@
     <div class="shell" id="shell">
       <!-- 方案 a：图标栏（48px） -->
       <nav class="rail" aria-label="导航（已收起）">
-        <div class="rail-top"><button type="button" class="org-btn rail-org" title="星河科技"><span class="org-av" aria-hidden="true">星</span></button></div>
+        <div class="rail-top">
+          <button type="button" class="org-btn rail-org" title="星河科技">
+            <span class="org-av" aria-hidden="true">星</span>
+          </button>
+        </div>
         <div class="rail-body">
-          <button type="button" class="rbtn" title="搜索 ⌘K" aria-label="搜索"><svg aria-hidden="true" class="ic"><use href="#i-search" /></svg></button>
-          <button type="button" class="rbtn" title="我的项目" aria-label="我的项目"><svg aria-hidden="true" class="ic"><use href="#i-folders" /></svg></button>
-          <button type="button" class="rbtn" title="最近动态" aria-label="最近动态"><svg aria-hidden="true" class="ic"><use href="#i-activity" /></svg></button>
+          <button type="button" class="rbtn" title="搜索 ⌘K" aria-label="搜索">
+            <svg aria-hidden="true" class="ic"><use href="#i-search" /></svg>
+          </button>
+          <button type="button" class="rbtn" title="我的项目" aria-label="我的项目">
+            <svg aria-hidden="true" class="ic"><use href="#i-folders" /></svg>
+          </button>
+          <button type="button" class="rbtn" title="最近动态" aria-label="最近动态">
+            <svg aria-hidden="true" class="ic"><use href="#i-activity" /></svg>
+          </button>
           <hr />
           <span class="rail-proj" title="商城示例"><span class="proj-av" aria-hidden="true">商</span></span>
           <div class="rail-sub"></div>
           <span class="grow"></span>
-          <button type="button" class="rbtn" data-act="peek" title="展开侧栏 [" aria-label="展开侧栏"><svg aria-hidden="true" class="ic"><use href="#i-panel-left-open" /></svg></button>
-          <button type="button" class="rbtn" title="张三" aria-label="账户菜单"><span class="avatar me sm" aria-hidden="true">张</span></button>
+          <button type="button" class="rbtn" data-act="peek" title="展开侧栏 [" aria-label="展开侧栏">
+            <svg aria-hidden="true" class="ic"><use href="#i-panel-left-open" /></svg>
+          </button>
+          <button type="button" class="rbtn" title="张三" aria-label="账户菜单">
+            <span class="avatar me sm" aria-hidden="true">张</span>
+          </button>
         </div>
       </nav>
 
@@ -159,25 +432,50 @@
       <nav class="gnav" aria-label="导航">
         <div class="slot-org"></div>
         <div class="gnav-body">
-          <button type="button" class="gsearch"><svg aria-hidden="true" class="ic sm"><use href="#i-search" /></svg>搜索<kbd>⌘K</kbd></button>
+          <button type="button" class="gsearch">
+            <svg aria-hidden="true" class="ic sm"><use href="#i-search" /></svg>搜索<kbd>⌘K</kbd>
+          </button>
           <div class="nlist">
-            <a href="#nav" class="nitem"><svg aria-hidden="true" class="ic"><use href="#i-folders" /></svg>我的项目</a>
-            <a href="#nav" class="nitem"><svg aria-hidden="true" class="ic"><use href="#i-activity" /></svg>最近动态<span class="n-count">5</span></a>
+            <a href="#nav" class="nitem"
+              ><svg aria-hidden="true" class="ic"><use href="#i-folders" /></svg>我的项目</a
+            >
+            <a href="#nav" class="nitem"
+              ><svg aria-hidden="true" class="ic"><use href="#i-activity" /></svg>最近动态<span
+                class="n-count"
+                >5</span
+              ></a
+            >
           </div>
           <div class="nsec">
-            <div class="nsec-head">项目<button type="button" class="btn icon ghost sm" aria-label="新建项目" title="新建项目"><svg aria-hidden="true" class="ic sm"><use href="#i-plus" /></svg></button></div>
+            <div class="nsec-head">
+              项目<button type="button" class="btn icon ghost sm" aria-label="新建项目" title="新建项目">
+                <svg aria-hidden="true" class="ic sm"><use href="#i-plus" /></svg>
+              </button>
+            </div>
             <div class="proj open">
-              <a href="#nav" class="nitem proj-row"><svg aria-hidden="true" class="ic sm chev"><use href="#i-chevron-down" /></svg><span class="proj-av" aria-hidden="true">商</span>商城示例</a>
+              <a href="#nav" class="nitem proj-row"
+                ><svg aria-hidden="true" class="ic sm chev"><use href="#i-chevron-down" /></svg
+                ><span class="proj-av" aria-hidden="true">商</span>商城示例</a
+              >
               <div class="nlist sub slot-subnav"></div>
             </div>
             <div class="proj">
-              <a href="#nav" class="nitem proj-row"><svg aria-hidden="true" class="ic sm chev"><use href="#i-chevron-right" /></svg><span class="proj-av" aria-hidden="true">支</span>支付网关</a>
+              <a href="#nav" class="nitem proj-row"
+                ><svg aria-hidden="true" class="ic sm chev"><use href="#i-chevron-right" /></svg
+                ><span class="proj-av" aria-hidden="true">支</span>支付网关</a
+              >
             </div>
             <div class="proj">
-              <a href="#nav" class="nitem proj-row"><svg aria-hidden="true" class="ic sm chev"><use href="#i-chevron-right" /></svg><span class="proj-av" aria-hidden="true">用</span>用户中心</a>
+              <a href="#nav" class="nitem proj-row"
+                ><svg aria-hidden="true" class="ic sm chev"><use href="#i-chevron-right" /></svg
+                ><span class="proj-av" aria-hidden="true">用</span>用户中心</a
+              >
             </div>
             <div class="proj">
-              <a href="#nav" class="nitem proj-row"><svg aria-hidden="true" class="ic sm chev"><use href="#i-chevron-right" /></svg><span class="proj-av" aria-hidden="true">数</span>数据仓库</a>
+              <a href="#nav" class="nitem proj-row"
+                ><svg aria-hidden="true" class="ic sm chev"><use href="#i-chevron-right" /></svg
+                ><span class="proj-av" aria-hidden="true">数</span>数据仓库</a
+              >
             </div>
           </div>
         </div>
@@ -188,8 +486,14 @@
       <nav class="pnav" aria-label="项目导航与对象">
         <div class="slot-org"></div>
         <div class="pnav-proj">
-          <button type="button" class="btn icon ghost sm" aria-label="返回所有项目" title="返回所有项目"><svg aria-hidden="true" class="ic sm"><use href="#i-chevron-left" /></svg></button>
-          <button type="button" class="proj-switch" title="切换项目"><span class="proj-av" aria-hidden="true">商</span>商城示例<svg aria-hidden="true" class="ic sm"><use href="#i-chevron-down" /></svg></button>
+          <button type="button" class="btn icon ghost sm" aria-label="返回所有项目" title="返回所有项目">
+            <svg aria-hidden="true" class="ic sm"><use href="#i-chevron-left" /></svg>
+          </button>
+          <button type="button" class="proj-switch" title="切换项目">
+            <span class="proj-av" aria-hidden="true">商</span>商城示例<svg aria-hidden="true" class="ic sm">
+              <use href="#i-chevron-down" />
+            </svg>
+          </button>
         </div>
         <div class="nlist slot-subnav"></div>
         <div class="pnav-objs">
@@ -202,71 +506,167 @@
       <!-- 方案 d 第一层：图标栏，所有页面都有，宽度不变 -->
       <nav class="drail" aria-label="组织与项目">
         <div class="drail-orgs">
-          <button type="button" class="dorg" aria-current="true" data-tip="星河科技" aria-label="星河科技"><span class="org-av" aria-hidden="true">星</span></button>
-          <button type="button" class="dorg" data-tip="开源社区" aria-label="开源社区"><span class="org-av" aria-hidden="true">开</span></button>
-          <button type="button" class="dorg" data-tip="云图实验室" aria-label="云图实验室"><span class="org-av" aria-hidden="true">云</span></button>
-          <button type="button" class="dorg add" data-tip="创建或加入组织" aria-label="创建或加入组织"><svg aria-hidden="true" class="ic"><use href="#i-plus" /></svg></button>
+          <button type="button" class="dorg" aria-current="true" data-tip="星河科技" aria-label="星河科技">
+            <span class="org-av" aria-hidden="true">星</span>
+          </button>
+          <button type="button" class="dorg" data-tip="开源社区" aria-label="开源社区">
+            <span class="org-av" aria-hidden="true">开</span>
+          </button>
+          <button type="button" class="dorg" data-tip="云图实验室" aria-label="云图实验室">
+            <span class="org-av" aria-hidden="true">云</span>
+          </button>
+          <button type="button" class="dorg add" data-tip="创建或加入组织" aria-label="创建或加入组织">
+            <svg aria-hidden="true" class="ic"><use href="#i-plus" /></svg>
+          </button>
         </div>
         <hr />
-        <button type="button" class="rbtn" data-tip="我的项目" aria-label="我的项目"><svg aria-hidden="true" class="ic"><use href="#i-folders" /></svg></button>
-        <button type="button" class="rbtn" data-tip="最近动态" aria-label="最近动态"><svg aria-hidden="true" class="ic"><use href="#i-activity" /></svg></button>
+        <button type="button" class="rbtn" data-tip="我的项目" aria-label="我的项目">
+          <svg aria-hidden="true" class="ic"><use href="#i-folders" /></svg>
+        </button>
+        <button type="button" class="rbtn" data-tip="最近动态" aria-label="最近动态">
+          <svg aria-hidden="true" class="ic"><use href="#i-activity" /></svg>
+        </button>
         <hr />
         <div class="rail-sub"></div>
         <span class="grow"></span>
-        <button type="button" class="rbtn" data-tip="张三 · 账户菜单" aria-label="账户菜单"><span class="avatar me sm" aria-hidden="true">张</span></button>
+        <button type="button" class="rbtn" data-tip="张三 · 账户菜单" aria-label="账户菜单">
+          <span class="avatar me sm" aria-hidden="true">张</span>
+        </button>
       </nav>
 
       <!-- 方案 d 第二层：上下文面板，内容随页面变化；按 [ 收起 -->
       <nav class="dpanel" aria-label="项目">
         <div class="dpanel-head">
-          <button type="button" class="proj-switch" popovertarget="proj-menu" title="切换项目"><span class="proj-av" aria-hidden="true">商</span>商城示例<svg aria-hidden="true" class="ic sm"><use href="#i-chevron-down" /></svg></button>
-          <button type="button" class="btn icon ghost" data-act="collapse" aria-label="收起面板" title="收起面板 ["><svg aria-hidden="true" class="ic"><use href="#i-panel-left" /></svg></button>
+          <button type="button" class="proj-switch" popovertarget="proj-menu" title="切换项目">
+            <span class="proj-av" aria-hidden="true">商</span>商城示例<svg aria-hidden="true" class="ic sm">
+              <use href="#i-chevron-down" />
+            </svg>
+          </button>
+          <button
+            type="button"
+            class="btn icon ghost"
+            data-act="collapse"
+            aria-label="收起面板"
+            title="收起面板 ["
+          >
+            <svg aria-hidden="true" class="ic"><use href="#i-panel-left" /></svg>
+          </button>
         </div>
         <div class="dpanel-body page-model slot-tree"></div>
         <div class="dpanel-body page-envd">
-          <div class="nsec-head">环境<span class="count">4</span><button type="button" class="btn icon ghost sm" aria-label="添加环境" title="添加环境"><svg aria-hidden="true" class="ic sm"><use href="#i-plus" /></svg></button></div>
+          <div class="nsec-head">
+            环境<span class="count">4</span
+            ><button type="button" class="btn icon ghost sm" aria-label="添加环境" title="添加环境">
+              <svg aria-hidden="true" class="ic sm"><use href="#i-plus" /></svg>
+            </button>
+          </div>
           <div class="nlist envlist">
-            <a href="#nav" class="nitem"><svg aria-hidden="true" class="ic sm st-ok"><use href="#i-circle-check" /></svg><span class="mono">dev</span><span class="n-count">v3</span></a>
-            <a href="#nav" class="nitem"><svg aria-hidden="true" class="ic sm st-ok"><use href="#i-circle-check" /></svg><span class="mono">staging</span><span class="n-count">v2</span></a>
-            <a href="#nav" class="nitem" aria-current="page"><svg aria-hidden="true" class="ic sm st-warn"><use href="#i-triangle-alert" /></svg><span class="mono">prod</span><span class="n-count">v1</span></a>
-            <a href="#nav" class="nitem"><svg aria-hidden="true" class="ic sm st-none"><use href="#i-circle-dashed" /></svg><span class="mono">analytics</span><span class="n-count">—</span></a>
+            <a href="#nav" class="nitem"
+              ><svg aria-hidden="true" class="ic sm st-ok"><use href="#i-circle-check" /></svg
+              ><span class="mono">dev</span><span class="n-count">v3</span></a
+            >
+            <a href="#nav" class="nitem"
+              ><svg aria-hidden="true" class="ic sm st-ok"><use href="#i-circle-check" /></svg
+              ><span class="mono">staging</span><span class="n-count">v2</span></a
+            >
+            <a href="#nav" class="nitem" aria-current="page"
+              ><svg aria-hidden="true" class="ic sm st-warn"><use href="#i-triangle-alert" /></svg
+              ><span class="mono">prod</span><span class="n-count">v1</span></a
+            >
+            <a href="#nav" class="nitem"
+              ><svg aria-hidden="true" class="ic sm st-none"><use href="#i-circle-dashed" /></svg
+              ><span class="mono">analytics</span><span class="n-count">—</span></a
+            >
           </div>
         </div>
       </nav>
       <div class="menu" id="proj-menu" popover role="menu" aria-label="切换项目">
-        <button type="button" role="menuitem"><span class="proj-av" aria-hidden="true">商</span>商城示例<svg aria-hidden="true" class="ic sm check"><use href="#i-check" /></svg></button>
-        <button type="button" role="menuitem"><span class="proj-av" aria-hidden="true">支</span>支付网关</button>
-        <button type="button" role="menuitem"><span class="proj-av" aria-hidden="true">用</span>用户中心</button>
-        <button type="button" role="menuitem"><span class="proj-av" aria-hidden="true">数</span>数据仓库</button>
+        <button type="button" role="menuitem">
+          <span class="proj-av" aria-hidden="true">商</span>商城示例<svg
+            aria-hidden="true"
+            class="ic sm check"
+          >
+            <use href="#i-check" />
+          </svg>
+        </button>
+        <button type="button" role="menuitem">
+          <span class="proj-av" aria-hidden="true">支</span>支付网关
+        </button>
+        <button type="button" role="menuitem">
+          <span class="proj-av" aria-hidden="true">用</span>用户中心
+        </button>
+        <button type="button" role="menuitem">
+          <span class="proj-av" aria-hidden="true">数</span>数据仓库
+        </button>
         <hr />
-        <button type="button" role="menuitem"><svg aria-hidden="true" class="ic"><use href="#i-plus" /></svg>新建项目</button>
+        <button type="button" role="menuitem">
+          <svg aria-hidden="true" class="ic"><use href="#i-plus" /></svg>新建项目
+        </button>
       </div>
 
       <div class="content">
         <!-- ===== 模型页 ===== -->
         <header class="phead page-model">
           <div class="ph-left">
-            <button type="button" class="btn icon ghost only-hidden" data-act="expand" aria-label="展开侧栏" title="展开侧栏 ["><svg aria-hidden="true" class="ic"><use href="#i-panel-left-open" /></svg></button>
+            <button
+              type="button"
+              class="btn icon ghost only-hidden"
+              data-act="expand"
+              aria-label="展开侧栏"
+              title="展开侧栏 ["
+            >
+              <svg aria-hidden="true" class="ic"><use href="#i-panel-left-open" /></svg>
+            </button>
             <div class="crumbs">
               <span class="crumb-parent">商城示例</span>
               <span class="sep">/</span>
               <span class="crumb-cur">模型</span>
             </div>
-            <button type="button" class="chip"><svg aria-hidden="true" class="ic"><use href="#i-git-branch" /></svg>main<svg aria-hidden="true" class="ic sm"><use href="#i-chevron-down" /></svg></button>
-            <span class="sync ok" title="已同步"><svg aria-hidden="true" class="ic sm"><use href="#i-cloud-check" /></svg><span class="lbl-opt">已同步</span></span>
+            <button type="button" class="chip">
+              <svg aria-hidden="true" class="ic"><use href="#i-git-branch" /></svg>main<svg
+                aria-hidden="true"
+                class="ic sm"
+              >
+                <use href="#i-chevron-down" />
+              </svg>
+            </button>
+            <span class="sync ok" title="已同步"
+              ><svg aria-hidden="true" class="ic sm"><use href="#i-cloud-check" /></svg
+              ><span class="lbl-opt">已同步</span></span
+            >
           </div>
           <div class="tb-center">
             <div class="group">
-              <button type="button" class="btn" title="新建表"><svg aria-hidden="true" class="ic"><use href="#i-plus" /></svg><span class="lbl-opt2">新建表</span></button>
-              <button type="button" class="btn icon" aria-label="自动布局" title="自动布局"><svg aria-hidden="true" class="ic"><use href="#i-network" /></svg></button>
+              <button type="button" class="btn" title="新建表">
+                <svg aria-hidden="true" class="ic"><use href="#i-plus" /></svg
+                ><span class="lbl-opt2">新建表</span>
+              </button>
+              <button type="button" class="btn icon" aria-label="自动布局" title="自动布局">
+                <svg aria-hidden="true" class="ic"><use href="#i-network" /></svg>
+              </button>
             </div>
             <div class="group">
-              <button type="button" class="btn" title="导入 SQL"><svg aria-hidden="true" class="ic"><use href="#i-file-input" /></svg><span class="lbl-opt">导入 SQL</span></button>
-              <button type="button" class="btn" title="环境"><svg aria-hidden="true" class="ic"><use href="#i-database" /></svg>dev<svg aria-hidden="true" class="ic sm"><use href="#i-chevron-down" /></svg></button>
+              <button type="button" class="btn" title="导入 SQL">
+                <svg aria-hidden="true" class="ic"><use href="#i-file-input" /></svg
+                ><span class="lbl-opt">导入 SQL</span>
+              </button>
+              <button type="button" class="btn" title="环境">
+                <svg aria-hidden="true" class="ic"><use href="#i-database" /></svg>dev<svg
+                  aria-hidden="true"
+                  class="ic sm"
+                >
+                  <use href="#i-chevron-down" />
+                </svg>
+              </button>
             </div>
             <div class="group">
-              <button type="button" class="btn" title="发布"><svg aria-hidden="true" class="ic"><use href="#i-bookmark-plus" /></svg><span class="lbl-opt">发布</span></button>
-              <button type="button" class="btn primary"><svg aria-hidden="true" class="ic"><use href="#i-git-compare-arrows" /></svg>迁移</button>
+              <button type="button" class="btn" title="发布">
+                <svg aria-hidden="true" class="ic"><use href="#i-bookmark-plus" /></svg
+                ><span class="lbl-opt">发布</span>
+              </button>
+              <button type="button" class="btn primary">
+                <svg aria-hidden="true" class="ic"><use href="#i-git-compare-arrows" /></svg>迁移
+              </button>
             </div>
           </div>
           <div class="ph-right">
@@ -282,77 +682,173 @@
 
           <section class="canvas-wrap" id="canvas">
             <div class="canvas-tabs" role="tablist">
-              <button type="button" role="tab" aria-selected="true"><svg aria-hidden="true" class="ic sm"><use href="#i-workflow" /></svg>画布</button>
-              <button type="button" role="tab" aria-selected="false"><svg aria-hidden="true" class="ic sm"><use href="#i-file-code" /></svg>SQL</button>
+              <button type="button" role="tab" aria-selected="true">
+                <svg aria-hidden="true" class="ic sm"><use href="#i-workflow" /></svg>画布
+              </button>
+              <button type="button" role="tab" aria-selected="false">
+                <svg aria-hidden="true" class="ic sm"><use href="#i-file-code" /></svg>SQL
+              </button>
             </div>
             <div class="canvas">
               <svg aria-hidden="true" class="edges" width="100%" height="100%">
                 <defs>
-                  <marker id="many" viewBox="0 0 12 12" refX="1" refY="6" markerWidth="12" markerHeight="12" orient="auto-start-reverse">
+                  <marker
+                    id="many"
+                    viewBox="0 0 12 12"
+                    refX="1"
+                    refY="6"
+                    markerWidth="12"
+                    markerHeight="12"
+                    orient="auto-start-reverse"
+                  >
                     <path d="M11 6 L1 1 M11 6 L1 6 M11 6 L1 11" class="mk" />
                   </marker>
-                  <marker id="one" viewBox="0 0 12 12" refX="11" refY="6" markerWidth="12" markerHeight="12" orient="auto">
+                  <marker
+                    id="one"
+                    viewBox="0 0 12 12"
+                    refX="11"
+                    refY="6"
+                    markerWidth="12"
+                    markerHeight="12"
+                    orient="auto"
+                  >
                     <path d="M8 1 L8 11" class="mk" />
                   </marker>
                 </defs>
-                <path class="edge" d="M300 113 C 277 113, 277 107, 254 107" marker-start="url(#many)" marker-end="url(#one)" />
-                <path class="edge" d="M300 403 C 255 403, 255 87, 300 87" marker-start="url(#many)" marker-end="url(#one)" />
-                <path class="edge" d="M550 429 C 575 429, 575 347, 600 347" marker-start="url(#many)" marker-end="url(#one)" />
+                <path
+                  class="edge"
+                  d="M300 113 C 277 113, 277 107, 254 107"
+                  marker-start="url(#many)"
+                  marker-end="url(#one)"
+                />
+                <path
+                  class="edge"
+                  d="M300 403 C 255 403, 255 87, 300 87"
+                  marker-start="url(#many)"
+                  marker-end="url(#one)"
+                />
+                <path
+                  class="edge"
+                  d="M550 429 C 575 429, 575 347, 600 347"
+                  marker-start="url(#many)"
+                  marker-end="url(#one)"
+                />
                 <path class="edge dep" d="M600 104 C 575 104, 575 165, 550 165" />
               </svg>
 
               <div class="node peer-editing" style="left: 24px; top: 60px; width: 230px">
                 <span class="peer-tag">李四 正在编辑</span>
-                <div class="node-head"><svg aria-hidden="true" class="ic sm"><use href="#i-table-2" /></svg>customers</div>
-                <div class="row"><span class="k pk">PK</span><span class="n">id</span><span class="t">bigint</span></div>
-                <div class="row"><span class="k uq">UQ</span><span class="n">email</span><span class="t">text</span></div>
-                <div class="row"><span class="k"></span><span class="n">name</span><span class="t">text</span></div>
-                <div class="row"><span class="k"></span><span class="n">created_at</span><span class="t">timestamptz</span></div>
+                <div class="node-head">
+                  <svg aria-hidden="true" class="ic sm"><use href="#i-table-2" /></svg>customers
+                </div>
+                <div class="row">
+                  <span class="k pk">PK</span><span class="n">id</span><span class="t">bigint</span>
+                </div>
+                <div class="row">
+                  <span class="k uq">UQ</span><span class="n">email</span><span class="t">text</span>
+                </div>
+                <div class="row">
+                  <span class="k"></span><span class="n">name</span><span class="t">text</span>
+                </div>
+                <div class="row">
+                  <span class="k"></span><span class="n">created_at</span><span class="t">timestamptz</span>
+                </div>
               </div>
 
               <div class="node selected" style="left: 300px; top: 40px; width: 250px">
-                <div class="node-head"><svg aria-hidden="true" class="ic sm"><use href="#i-table-2" /></svg>orders</div>
-                <div class="row"><span class="k pk">PK</span><span class="n">id</span><span class="t">integer</span></div>
-                <div class="row"><span class="k fk">FK</span><span class="n">customer_id</span><span class="t">bigint</span></div>
-                <div class="row"><span class="k"></span><span class="n">status</span><span class="t enum">order_status</span></div>
-                <div class="row hl"><span class="k"></span><span class="n">total</span><span class="t">numeric(12,2)</span></div>
-                <div class="row"><span class="k"></span><span class="n nullable">note</span><span class="t">text</span></div>
-                <div class="row"><span class="k"></span><span class="n">created_at</span><span class="t">timestamptz</span></div>
+                <div class="node-head">
+                  <svg aria-hidden="true" class="ic sm"><use href="#i-table-2" /></svg>orders
+                </div>
+                <div class="row">
+                  <span class="k pk">PK</span><span class="n">id</span><span class="t">integer</span>
+                </div>
+                <div class="row">
+                  <span class="k fk">FK</span><span class="n">customer_id</span><span class="t">bigint</span>
+                </div>
+                <div class="row">
+                  <span class="k"></span><span class="n">status</span><span class="t enum">order_status</span>
+                </div>
+                <div class="row hl">
+                  <span class="k"></span><span class="n">total</span><span class="t">numeric(12,2)</span>
+                </div>
+                <div class="row">
+                  <span class="k"></span><span class="n nullable">note</span><span class="t">text</span>
+                </div>
+                <div class="row">
+                  <span class="k"></span><span class="n">created_at</span><span class="t">timestamptz</span>
+                </div>
               </div>
 
               <div class="node" style="left: 300px; top: 330px; width: 250px">
-                <div class="node-head"><svg aria-hidden="true" class="ic sm"><use href="#i-table-2" /></svg>order_items</div>
-                <div class="row"><span class="k pk">PK</span><span class="n">id</span><span class="t">bigint</span></div>
-                <div class="row"><span class="k fk">FK</span><span class="n">order_id</span><span class="t">integer</span></div>
-                <div class="row"><span class="k fk">FK</span><span class="n">product_id</span><span class="t">bigint</span></div>
-                <div class="row"><span class="k"></span><span class="n">quantity</span><span class="t">integer</span></div>
-                <div class="row"><span class="k"></span><span class="n">unit_price</span><span class="t">numeric(12,2)</span></div>
+                <div class="node-head">
+                  <svg aria-hidden="true" class="ic sm"><use href="#i-table-2" /></svg>order_items
+                </div>
+                <div class="row">
+                  <span class="k pk">PK</span><span class="n">id</span><span class="t">bigint</span>
+                </div>
+                <div class="row">
+                  <span class="k fk">FK</span><span class="n">order_id</span><span class="t">integer</span>
+                </div>
+                <div class="row">
+                  <span class="k fk">FK</span><span class="n">product_id</span><span class="t">bigint</span>
+                </div>
+                <div class="row">
+                  <span class="k"></span><span class="n">quantity</span><span class="t">integer</span>
+                </div>
+                <div class="row">
+                  <span class="k"></span><span class="n">unit_price</span><span class="t">numeric(12,2)</span>
+                </div>
               </div>
 
               <div class="node" style="left: 600px; top: 300px; width: 210px">
-                <div class="node-head"><svg aria-hidden="true" class="ic sm"><use href="#i-table-2" /></svg>products</div>
-                <div class="row"><span class="k pk">PK</span><span class="n">id</span><span class="t">bigint</span></div>
-                <div class="row"><span class="k uq">UQ</span><span class="n">sku</span><span class="t">text</span></div>
-                <div class="row"><span class="k"></span><span class="n">name</span><span class="t">text</span></div>
-                <div class="row"><span class="k"></span><span class="n nullable">price</span><span class="t">numeric(12,2)</span></div>
+                <div class="node-head">
+                  <svg aria-hidden="true" class="ic sm"><use href="#i-table-2" /></svg>products
+                </div>
+                <div class="row">
+                  <span class="k pk">PK</span><span class="n">id</span><span class="t">bigint</span>
+                </div>
+                <div class="row">
+                  <span class="k uq">UQ</span><span class="n">sku</span><span class="t">text</span>
+                </div>
+                <div class="row">
+                  <span class="k"></span><span class="n">name</span><span class="t">text</span>
+                </div>
+                <div class="row">
+                  <span class="k"></span><span class="n nullable">price</span
+                  ><span class="t">numeric(12,2)</span>
+                </div>
               </div>
 
               <div class="node view" style="left: 600px; top: 60px; width: 210px">
-                <div class="node-head"><svg aria-hidden="true" class="ic sm"><use href="#i-eye" /></svg>paid_orders<span class="badge">view</span></div>
-                <pre class="view-sql">select id, total
+                <div class="node-head">
+                  <svg aria-hidden="true" class="ic sm"><use href="#i-eye" /></svg>paid_orders<span
+                    class="badge"
+                    >view</span
+                  >
+                </div>
+                <pre class="view-sql">
+select id, total
 from orders
 where status = 'paid'</pre>
               </div>
 
               <div class="cursor" style="left: 690px; top: 470px">
-                <svg aria-hidden="true" width="16" height="16" viewBox="0 0 16 16"><path d="M1 1 L1 13 L4.5 9.8 L7 15 L9 14 L6.6 8.9 L11.5 8.6 Z" /></svg>
+                <svg aria-hidden="true" width="16" height="16" viewBox="0 0 16 16">
+                  <path d="M1 1 L1 13 L4.5 9.8 L7 15 L9 14 L6.6 8.9 L11.5 8.6 Z" />
+                </svg>
                 <span>李四</span>
               </div>
 
               <div class="zoom">
-                <button type="button" class="btn icon ghost" aria-label="放大"><svg aria-hidden="true" class="ic"><use href="#i-zoom-in" /></svg></button>
-                <button type="button" class="btn icon ghost" aria-label="缩小"><svg aria-hidden="true" class="ic"><use href="#i-zoom-out" /></svg></button>
-                <button type="button" class="btn icon ghost" aria-label="适应画布"><svg aria-hidden="true" class="ic"><use href="#i-maximize" /></svg></button>
+                <button type="button" class="btn icon ghost" aria-label="放大">
+                  <svg aria-hidden="true" class="ic"><use href="#i-zoom-in" /></svg>
+                </button>
+                <button type="button" class="btn icon ghost" aria-label="缩小">
+                  <svg aria-hidden="true" class="ic"><use href="#i-zoom-out" /></svg>
+                </button>
+                <button type="button" class="btn icon ghost" aria-label="适应画布">
+                  <svg aria-hidden="true" class="ic"><use href="#i-maximize" /></svg>
+                </button>
                 <span class="zoom-val">100%</span>
               </div>
               <div class="minimap" aria-hidden="true">
@@ -370,7 +866,9 @@ where status = 'paid'</pre>
             <div class="insp-head">
               <svg aria-hidden="true" class="ic"><use href="#i-table-2" /></svg>
               <div class="insp-title"><span class="schema">public.</span>orders</div>
-              <button type="button" class="btn icon ghost" aria-label="更多"><svg aria-hidden="true" class="ic"><use href="#i-ellipsis" /></svg></button>
+              <button type="button" class="btn icon ghost" aria-label="更多">
+                <svg aria-hidden="true" class="ic"><use href="#i-ellipsis" /></svg>
+              </button>
             </div>
             <div class="insp-body">
               <div class="field">
@@ -382,19 +880,48 @@ where status = 'paid'</pre>
                 <input id="tcomment" placeholder="添加注释" />
               </div>
               <div class="sec">
-                <div class="sec-head"><span>列</span><span class="count">6</span><button type="button" class="btn icon ghost sm" aria-label="添加列"><svg aria-hidden="true" class="ic sm"><use href="#i-plus" /></svg></button></div>
+                <div class="sec-head">
+                  <span>列</span><span class="count">6</span
+                  ><button type="button" class="btn icon ghost sm" aria-label="添加列">
+                    <svg aria-hidden="true" class="ic sm"><use href="#i-plus" /></svg>
+                  </button>
+                </div>
                 <div class="cols">
-                  <div class="col"><svg aria-hidden="true" class="ic sm grip"><use href="#i-grip-vertical" /></svg><span class="n">id</span><span class="t">integer</span><span class="flags"><b class="pk">PK</b></span></div>
-                  <div class="col"><svg aria-hidden="true" class="ic sm grip"><use href="#i-grip-vertical" /></svg><span class="n">customer_id</span><span class="t">bigint</span><span class="flags"><b class="fk">FK</b><b>NN</b></span></div>
-                  <div class="col"><svg aria-hidden="true" class="ic sm grip"><use href="#i-grip-vertical" /></svg><span class="n">status</span><span class="t enum">order_status</span><span class="flags"><b>NN</b></span></div>
+                  <div class="col">
+                    <svg aria-hidden="true" class="ic sm grip"><use href="#i-grip-vertical" /></svg
+                    ><span class="n">id</span><span class="t">integer</span
+                    ><span class="flags"><b class="pk">PK</b></span>
+                  </div>
+                  <div class="col">
+                    <svg aria-hidden="true" class="ic sm grip"><use href="#i-grip-vertical" /></svg
+                    ><span class="n">customer_id</span><span class="t">bigint</span
+                    ><span class="flags"><b class="fk">FK</b><b>NN</b></span>
+                  </div>
+                  <div class="col">
+                    <svg aria-hidden="true" class="ic sm grip"><use href="#i-grip-vertical" /></svg
+                    ><span class="n">status</span><span class="t enum">order_status</span
+                    ><span class="flags"><b>NN</b></span>
+                  </div>
                   <div class="col open">
-                    <div class="col-line"><svg aria-hidden="true" class="ic sm grip"><use href="#i-grip-vertical" /></svg><span class="n">total</span><span class="t">numeric(12,2)</span><span class="flags"><b>NN</b></span></div>
+                    <div class="col-line">
+                      <svg aria-hidden="true" class="ic sm grip"><use href="#i-grip-vertical" /></svg
+                      ><span class="n">total</span><span class="t">numeric(12,2)</span
+                      ><span class="flags"><b>NN</b></span>
+                    </div>
                     <div class="col-edit">
                       <div class="field-row">
-                        <div class="field"><label for="cname">列名</label><input id="cname" class="mono" value="total" /></div>
-                        <div class="field"><label for="ctype">类型</label><input id="ctype" class="mono" value="numeric(12,2)" /></div>
+                        <div class="field">
+                          <label for="cname">列名</label><input id="cname" class="mono" value="total" />
+                        </div>
+                        <div class="field">
+                          <label for="ctype">类型</label
+                          ><input id="ctype" class="mono" value="numeric(12,2)" />
+                        </div>
                       </div>
-                      <div class="field"><label for="cdefault">默认值</label><input id="cdefault" class="mono" placeholder="无" /></div>
+                      <div class="field">
+                        <label for="cdefault">默认值</label
+                        ><input id="cdefault" class="mono" placeholder="无" />
+                      </div>
                       <div class="checks">
                         <label><input type="checkbox" checked />非空</label>
                         <label><input type="checkbox" />主键</label>
@@ -402,22 +929,51 @@ where status = 'paid'</pre>
                       </div>
                     </div>
                   </div>
-                  <div class="col"><svg aria-hidden="true" class="ic sm grip"><use href="#i-grip-vertical" /></svg><span class="n">note</span><span class="t">text</span><span class="flags"></span></div>
-                  <div class="col"><svg aria-hidden="true" class="ic sm grip"><use href="#i-grip-vertical" /></svg><span class="n">created_at</span><span class="t">timestamptz</span><span class="flags"><b>NN</b></span></div>
+                  <div class="col">
+                    <svg aria-hidden="true" class="ic sm grip"><use href="#i-grip-vertical" /></svg
+                    ><span class="n">note</span><span class="t">text</span><span class="flags"></span>
+                  </div>
+                  <div class="col">
+                    <svg aria-hidden="true" class="ic sm grip"><use href="#i-grip-vertical" /></svg
+                    ><span class="n">created_at</span><span class="t">timestamptz</span
+                    ><span class="flags"><b>NN</b></span>
+                  </div>
                 </div>
               </div>
               <div class="sec">
-                <div class="sec-head"><span>约束</span><span class="count">3</span><button type="button" class="btn icon ghost sm" aria-label="添加约束"><svg aria-hidden="true" class="ic sm"><use href="#i-plus" /></svg></button></div>
+                <div class="sec-head">
+                  <span>约束</span><span class="count">3</span
+                  ><button type="button" class="btn icon ghost sm" aria-label="添加约束">
+                    <svg aria-hidden="true" class="ic sm"><use href="#i-plus" /></svg>
+                  </button>
+                </div>
                 <div class="cons">
-                  <div class="con"><svg aria-hidden="true" class="ic sm pk"><use href="#i-key-round" /></svg><span class="cn">orders_pkey</span><code>(id)</code></div>
-                  <div class="con"><svg aria-hidden="true" class="ic sm fk"><use href="#i-link" /></svg><span class="cn">orders_customer_id_fkey</span><code>customer_id → customers.id</code></div>
-                  <div class="con"><svg aria-hidden="true" class="ic sm"><use href="#i-check" /></svg><span class="cn">orders_total_check</span><code>(total &gt;= (0)::numeric)</code></div>
+                  <div class="con">
+                    <svg aria-hidden="true" class="ic sm pk"><use href="#i-key-round" /></svg
+                    ><span class="cn">orders_pkey</span><code>(id)</code>
+                  </div>
+                  <div class="con">
+                    <svg aria-hidden="true" class="ic sm fk"><use href="#i-link" /></svg
+                    ><span class="cn">orders_customer_id_fkey</span><code>customer_id → customers.id</code>
+                  </div>
+                  <div class="con">
+                    <svg aria-hidden="true" class="ic sm"><use href="#i-check" /></svg
+                    ><span class="cn">orders_total_check</span><code>(total &gt;= (0)::numeric)</code>
+                  </div>
                 </div>
               </div>
               <div class="sec">
-                <div class="sec-head"><span>索引</span><span class="count">1</span><button type="button" class="btn icon ghost sm" aria-label="添加索引"><svg aria-hidden="true" class="ic sm"><use href="#i-plus" /></svg></button></div>
+                <div class="sec-head">
+                  <span>索引</span><span class="count">1</span
+                  ><button type="button" class="btn icon ghost sm" aria-label="添加索引">
+                    <svg aria-hidden="true" class="ic sm"><use href="#i-plus" /></svg>
+                  </button>
+                </div>
                 <div class="cons">
-                  <div class="con"><svg aria-hidden="true" class="ic sm"><use href="#i-list-tree" /></svg><span class="cn">orders_customer_id_idx</span><code>btree (customer_id)</code></div>
+                  <div class="con">
+                    <svg aria-hidden="true" class="ic sm"><use href="#i-list-tree" /></svg
+                    ><span class="cn">orders_customer_id_idx</span><code>btree (customer_id)</code>
+                  </div>
                 </div>
               </div>
             </div>
@@ -435,7 +991,15 @@ where status = 'paid'</pre>
         <!-- ===== 环境页（普通页面示例） ===== -->
         <header class="phead page-env">
           <div class="ph-left">
-            <button type="button" class="btn icon ghost only-hidden" data-act="expand" aria-label="展开侧栏" title="展开侧栏 ["><svg aria-hidden="true" class="ic"><use href="#i-panel-left-open" /></svg></button>
+            <button
+              type="button"
+              class="btn icon ghost only-hidden"
+              data-act="expand"
+              aria-label="展开侧栏"
+              title="展开侧栏 ["
+            >
+              <svg aria-hidden="true" class="ic"><use href="#i-panel-left-open" /></svg>
+            </button>
             <div class="crumbs">
               <span class="crumb-parent">商城示例</span>
               <span class="sep">/</span>
@@ -444,17 +1008,26 @@ where status = 'paid'</pre>
           </div>
           <span class="grow"></span>
           <div class="ph-right">
-            <button type="button" class="btn primary"><svg aria-hidden="true" class="ic"><use href="#i-plus" /></svg>添加环境</button>
+            <button type="button" class="btn primary">
+              <svg aria-hidden="true" class="ic"><use href="#i-plus" /></svg>添加环境
+            </button>
           </div>
         </header>
 
         <main class="env page-env" aria-label="环境">
           <div class="env-wrap">
-            <p class="env-lead">项目要部署到的数据库。迁移先在每个环境的影子库 <code>{原库名}_dowel</code> 里验证；Dowel 每小时检查一次数据库与当前版本是否一致。最新版本 <code>v3</code>。</p>
+            <p class="env-lead">
+              项目要部署到的数据库。迁移先在每个环境的影子库 <code>{原库名}_dowel</code> 里验证；Dowel
+              每小时检查一次数据库与当前版本是否一致。最新版本 <code>v3</code>。
+            </p>
 
             <div class="banner warn">
               <svg aria-hidden="true" class="ic"><use href="#i-triangle-alert" /></svg>
-              <div><strong>prod 有漂移</strong>：数据库里有 2 处修改不在版本 <code>v1</code> 中（列 <code>orders.legacy_ref</code>、索引 <code>orders_created_at_idx</code>）。迁移前先查看差异，决定保留还是撤销。</div>
+              <div>
+                <strong>prod 有漂移</strong>：数据库里有 2 处修改不在版本 <code>v1</code> 中（列
+                <code>orders.legacy_ref</code>、索引
+                <code>orders_created_at_idx</code>）。迁移前先查看差异，决定保留还是撤销。
+              </div>
               <button type="button" class="btn">查看差异</button>
             </div>
 
@@ -470,53 +1043,105 @@ where status = 'paid'</pre>
               <div class="env-row">
                 <span class="env-name">
                   <svg aria-hidden="true" class="ic"><use href="#i-database" /></svg>
-                  <span><b class="mono">dev</b><small class="mono">postgres://dowel:***@localhost:5432/shop</small></span>
+                  <span
+                    ><b class="mono">dev</b
+                    ><small class="mono">postgres://dowel:***@localhost:5432/shop</small></span
+                  >
                 </span>
                 <span><span class="ver">v3</span><small>3 小时前</small></span>
-                <span class="pending none"><svg aria-hidden="true" class="ic sm ok"><use href="#i-circle-check" /></svg>已是最新</span>
-                <span class="drift ok"><span><svg aria-hidden="true" class="ic sm"><use href="#i-circle-check" /></svg>无漂移</span><small>3 分钟前检查</small></span>
-                <span class="env-act"><button type="button" class="btn icon ghost" aria-label="更多" title="更多"><svg aria-hidden="true" class="ic"><use href="#i-ellipsis" /></svg></button></span>
+                <span class="pending none"
+                  ><svg aria-hidden="true" class="ic sm ok"><use href="#i-circle-check" /></svg>已是最新</span
+                >
+                <span class="drift ok"
+                  ><span
+                    ><svg aria-hidden="true" class="ic sm"><use href="#i-circle-check" /></svg>无漂移</span
+                  ><small>3 分钟前检查</small></span
+                >
+                <span class="env-act"
+                  ><button type="button" class="btn icon ghost" aria-label="更多" title="更多">
+                    <svg aria-hidden="true" class="ic"><use href="#i-ellipsis" /></svg></button
+                ></span>
               </div>
 
               <div class="env-row">
                 <span class="env-name">
                   <svg aria-hidden="true" class="ic"><use href="#i-database" /></svg>
-                  <span><b class="mono">staging</b><small class="mono">postgres://dowel:***@staging-db:5432/shop</small></span>
+                  <span
+                    ><b class="mono">staging</b
+                    ><small class="mono">postgres://dowel:***@staging-db:5432/shop</small></span
+                  >
                 </span>
                 <span><span class="ver">v2</span><small>2026-11-12 16:40</small></span>
-                <span class="pending"><span><b>1</b> 个</span><small class="mono">v2 → v3</small></span>
-                <span class="drift ok"><span><svg aria-hidden="true" class="ic sm"><use href="#i-circle-check" /></svg>无漂移</span><small>12 分钟前检查</small></span>
+                <span class="pending"
+                  ><span><b>1</b> 个</span><small class="mono">v2 → v3</small></span
+                >
+                <span class="drift ok"
+                  ><span
+                    ><svg aria-hidden="true" class="ic sm"><use href="#i-circle-check" /></svg>无漂移</span
+                  ><small>12 分钟前检查</small></span
+                >
                 <span class="env-act">
-                  <button type="button" class="btn"><svg aria-hidden="true" class="ic"><use href="#i-play" /></svg>执行</button>
-                  <button type="button" class="btn icon ghost" aria-label="更多" title="更多"><svg aria-hidden="true" class="ic"><use href="#i-ellipsis" /></svg></button>
+                  <button type="button" class="btn">
+                    <svg aria-hidden="true" class="ic"><use href="#i-play" /></svg>执行
+                  </button>
+                  <button type="button" class="btn icon ghost" aria-label="更多" title="更多">
+                    <svg aria-hidden="true" class="ic"><use href="#i-ellipsis" /></svg>
+                  </button>
                 </span>
               </div>
 
               <div class="env-row">
                 <span class="env-name">
                   <svg aria-hidden="true" class="ic"><use href="#i-database" /></svg>
-                  <span><b class="mono">prod</b><small class="mono">postgres://dowel:***@prod-db.internal:5432/shop</small></span>
+                  <span
+                    ><b class="mono">prod</b
+                    ><small class="mono">postgres://dowel:***@prod-db.internal:5432/shop</small></span
+                  >
                 </span>
                 <span><span class="ver">v1</span><small>2026-10-28 09:15</small></span>
-                <span class="pending"><span><b>2</b> 个</span><small class="mono">v1 → v3</small></span>
-                <span class="drift warn"><span><svg aria-hidden="true" class="ic sm"><use href="#i-triangle-alert" /></svg>有漂移 · 2 处</span><small>8 分钟前检查</small></span>
+                <span class="pending"
+                  ><span><b>2</b> 个</span><small class="mono">v1 → v3</small></span
+                >
+                <span class="drift warn"
+                  ><span
+                    ><svg aria-hidden="true" class="ic sm"><use href="#i-triangle-alert" /></svg>有漂移 · 2
+                    处</span
+                  ><small>8 分钟前检查</small></span
+                >
                 <span class="env-act">
-                  <button type="button" class="btn"><svg aria-hidden="true" class="ic"><use href="#i-play" /></svg>执行</button>
-                  <button type="button" class="btn icon ghost" aria-label="更多" title="更多"><svg aria-hidden="true" class="ic"><use href="#i-ellipsis" /></svg></button>
+                  <button type="button" class="btn">
+                    <svg aria-hidden="true" class="ic"><use href="#i-play" /></svg>执行
+                  </button>
+                  <button type="button" class="btn icon ghost" aria-label="更多" title="更多">
+                    <svg aria-hidden="true" class="ic"><use href="#i-ellipsis" /></svg>
+                  </button>
                 </span>
               </div>
 
               <div class="env-row">
                 <span class="env-name">
                   <svg aria-hidden="true" class="ic"><use href="#i-database" /></svg>
-                  <span><b class="mono">analytics</b><small class="mono">postgres://dowel:***@olap-db:5432/shop_ro</small></span>
+                  <span
+                    ><b class="mono">analytics</b
+                    ><small class="mono">postgres://dowel:***@olap-db:5432/shop_ro</small></span
+                  >
                 </span>
                 <span><span class="ver none">—</span><small>未部署</small></span>
-                <span class="pending"><span><b>3</b> 个</span><small class="mono">空库 → v3</small></span>
-                <span class="drift none"><span><svg aria-hidden="true" class="ic sm"><use href="#i-circle-dashed" /></svg>未检查</span><small>连接后自动检查</small></span>
+                <span class="pending"
+                  ><span><b>3</b> 个</span><small class="mono">空库 → v3</small></span
+                >
+                <span class="drift none"
+                  ><span
+                    ><svg aria-hidden="true" class="ic sm"><use href="#i-circle-dashed" /></svg>未检查</span
+                  ><small>连接后自动检查</small></span
+                >
                 <span class="env-act">
-                  <button type="button" class="btn"><svg aria-hidden="true" class="ic"><use href="#i-play" /></svg>执行</button>
-                  <button type="button" class="btn icon ghost" aria-label="更多" title="更多"><svg aria-hidden="true" class="ic"><use href="#i-ellipsis" /></svg></button>
+                  <button type="button" class="btn">
+                    <svg aria-hidden="true" class="ic"><use href="#i-play" /></svg>执行
+                  </button>
+                  <button type="button" class="btn icon ghost" aria-label="更多" title="更多">
+                    <svg aria-hidden="true" class="ic"><use href="#i-ellipsis" /></svg>
+                  </button>
                 </span>
               </div>
             </div>
@@ -526,7 +1151,15 @@ where status = 'paid'</pre>
         <!-- ===== 方案 d 的环境页：左侧面板是环境列表，这里是选中环境的详情 ===== -->
         <header class="phead page-envd">
           <div class="ph-left">
-            <button type="button" class="btn icon ghost only-hidden" data-act="expand" aria-label="展开面板" title="展开面板 ["><svg aria-hidden="true" class="ic"><use href="#i-panel-left-open" /></svg></button>
+            <button
+              type="button"
+              class="btn icon ghost only-hidden"
+              data-act="expand"
+              aria-label="展开面板"
+              title="展开面板 ["
+            >
+              <svg aria-hidden="true" class="ic"><use href="#i-panel-left-open" /></svg>
+            </button>
             <div class="crumbs">
               <span class="crumb-parent">商城示例</span>
               <span class="sep">/</span>
@@ -537,8 +1170,12 @@ where status = 'paid'</pre>
           </div>
           <span class="grow"></span>
           <div class="ph-right">
-            <button type="button" class="btn icon ghost" aria-label="更多" title="更多"><svg aria-hidden="true" class="ic"><use href="#i-ellipsis" /></svg></button>
-            <button type="button" class="btn primary" title="执行 v1 → v3（2 个迁移）"><svg aria-hidden="true" class="ic"><use href="#i-play" /></svg>执行</button>
+            <button type="button" class="btn icon ghost" aria-label="更多" title="更多">
+              <svg aria-hidden="true" class="ic"><use href="#i-ellipsis" /></svg>
+            </button>
+            <button type="button" class="btn primary" title="执行 v1 → v3（2 个迁移）">
+              <svg aria-hidden="true" class="ic"><use href="#i-play" /></svg>执行
+            </button>
           </div>
         </header>
 
@@ -551,15 +1188,36 @@ where status = 'paid'</pre>
             </div>
 
             <dl class="envd-facts">
-              <div><dt>当前版本</dt><dd><span class="ver">v1</span><small>2026-10-28 09:15 由 张三 执行</small></dd></div>
-              <div><dt>最新版本</dt><dd><span class="ver">v3</span><small>2026-11-17 18:02 发布</small></dd></div>
-              <div><dt>漂移</dt><dd class="drift warn"><span><svg aria-hidden="true" class="ic sm"><use href="#i-triangle-alert" /></svg>有漂移 · 2 处</span><small>8 分钟前检查</small></dd></div>
-              <div><dt>影子库</dt><dd><span class="mono">shop_dowel</span><small>验证迁移用</small></dd></div>
+              <div>
+                <dt>当前版本</dt>
+                <dd><span class="ver">v1</span><small>2026-10-28 09:15 由 张三 执行</small></dd>
+              </div>
+              <div>
+                <dt>最新版本</dt>
+                <dd><span class="ver">v3</span><small>2026-11-17 18:02 发布</small></dd>
+              </div>
+              <div>
+                <dt>漂移</dt>
+                <dd class="drift warn">
+                  <span
+                    ><svg aria-hidden="true" class="ic sm"><use href="#i-triangle-alert" /></svg>有漂移 · 2
+                    处</span
+                  ><small>8 分钟前检查</small>
+                </dd>
+              </div>
+              <div>
+                <dt>影子库</dt>
+                <dd><span class="mono">shop_dowel</span><small>验证迁移用</small></dd>
+              </div>
             </dl>
 
             <div class="banner warn">
               <svg aria-hidden="true" class="ic"><use href="#i-triangle-alert" /></svg>
-              <div><strong>有漂移</strong>：数据库里有 2 处修改不在版本 <code>v1</code> 中（列 <code>orders.legacy_ref</code>、索引 <code>orders_created_at_idx</code>）。执行前先查看差异，决定保留还是撤销。</div>
+              <div>
+                <strong>有漂移</strong>：数据库里有 2 处修改不在版本 <code>v1</code> 中（列
+                <code>orders.legacy_ref</code>、索引
+                <code>orders_created_at_idx</code>）。执行前先查看差异，决定保留还是撤销。
+              </div>
               <button type="button" class="btn">查看差异</button>
             </div>
 
@@ -567,17 +1225,24 @@ where status = 'paid'</pre>
               <h2>待执行迁移<span class="count">2</span></h2>
               <ol class="mig-list">
                 <li>
-                  <span class="mig-ver mono">v1 <svg aria-hidden="true" class="ic sm"><use href="#i-arrow-right" /></svg> v2</span>
+                  <span class="mig-ver mono"
+                    >v1 <svg aria-hidden="true" class="ic sm"><use href="#i-arrow-right" /></svg> v2</span
+                  >
                   <span class="risk low">低</span>
                   <span class="mig-title">添加订单备注和状态枚举<small>2026-11-05 发布 · 3 步</small></span>
                   <span class="mig-time">已在影子库验证</span>
                 </li>
                 <li>
-                  <span class="mig-ver mono">v2 <svg aria-hidden="true" class="ic sm"><use href="#i-arrow-right" /></svg> v3</span>
+                  <span class="mig-ver mono"
+                    >v2 <svg aria-hidden="true" class="ic sm"><use href="#i-arrow-right" /></svg> v3</span
+                  >
                   <span class="risk high">高</span>
                   <span class="mig-title">从 dev 导入<small>2026-11-17 发布 · 5 步</small></span>
                   <span class="mig-time muted">未验证</span>
-                  <span class="why"><svg aria-hidden="true" class="ic sm"><use href="#i-triangle-alert" /></svg>第 5 步重写整表 <code>orders</code>；期间阻塞所有读写</span>
+                  <span class="why"
+                    ><svg aria-hidden="true" class="ic sm"><use href="#i-triangle-alert" /></svg>第 5
+                    步重写整表 <code>orders</code>；期间阻塞所有读写</span
+                  >
                 </li>
               </ol>
             </section>
@@ -636,7 +1301,8 @@ where status = 'paid'</pre>
 
       // 把片段克隆到各个位置
       const fill = (sel, tpl) => {
-        for (const slot of document.querySelectorAll(sel)) slot.append(document.getElementById(tpl).content.cloneNode(true));
+        for (const slot of document.querySelectorAll(sel))
+          slot.append(document.getElementById(tpl).content.cloneNode(true));
       };
       fill('.slot-org', 'tpl-org');
       fill('.slot-user', 'tpl-user');
@@ -701,7 +1367,8 @@ where status = 'paid'</pre>
       };
 
       const updateMeasure = () => {
-        measure.textContent = state.page === 'model' ? `画布宽 ${Math.round(canvas.getBoundingClientRect().width)} px` : '';
+        measure.textContent =
+          state.page === 'model' ? `画布宽 ${Math.round(canvas.getBoundingClientRect().width)} px` : '';
       };
       new ResizeObserver(updateMeasure).observe(canvas);
 

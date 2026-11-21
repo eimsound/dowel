@@ -1,6 +1,7 @@
 // 删除项目（P2a 遗留）：必须原样输入项目标识；删除后回“我的项目”，旧地址 404。
 // 平台库里的数据是否删干净由 apps/server/test/project-delete.test.ts 覆盖，这里验证界面路径。
 import { expect, test } from '@playwright/test';
+
 import { createProject, gotoPage, newUser } from './helpers.ts';
 
 test('删除项目：确认文字必须匹配，删除后回我的项目，旧地址 404', async ({ browser }) => {

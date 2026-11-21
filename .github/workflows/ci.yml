@@ -50,9 +50,9 @@ jobs:
       - run: pnpm install --frozen-lockfile
       - run: pnpm vitest run packages/verifier/test/random.test.ts packages/engines/test/naming.test.ts
         env:
-          RUNS: "5000"
+          RUNS: '5000'
           # 整个属性测试（含缩小反例）的总时限：5000 例正常 8～10 分钟，留到 30 分钟
-          TIME_LIMIT: "1800000"
+          TIME_LIMIT: '1800000'
 
   e2e:
     name: 端到端测试

@@ -1,5 +1,6 @@
 // 组头像的首字母与配色：中文取第一个字，西文取首字母大写；同一个 slug 总是同一种颜色。
 import { expect, test } from 'vitest';
+
 import { groupColor, groupInitial } from '../src/avatar.ts';
 
 test('组名首字母：中文取第一个字，西文取首字母大写', () => {

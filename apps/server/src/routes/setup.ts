@@ -5,6 +5,7 @@
 import { type InstanceInfo, type Me, type SetupStatus, setupSchema } from '@dowel/api';
 import type { Hono } from 'hono';
 import { HTTPException } from 'hono/http-exception';
+
 import { audit } from '../audit.ts';
 import { markLogin, startSession } from '../auth.ts';
 import { publicProviders } from '../oidc.ts';

@@ -1,5 +1,6 @@
 // 环境执行相关用例的公共步骤：建目标库、在界面上添加环境、发布版本、进入环境详情。
 import { expect, type Page } from '@playwright/test';
+
 import { connectPg } from '../apps/server/src/targets.ts';
 import { commit, gotoPage, openModel } from './helpers.ts';
 

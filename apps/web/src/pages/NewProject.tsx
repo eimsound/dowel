@@ -15,6 +15,7 @@ import { useNavigate, useSearch } from '@tanstack/react-router';
 import { Check, CircleCheck, Database, FileUp, Plus, Trash2, TriangleAlert } from 'lucide-react';
 import { useRef, useState } from 'react';
 import { useTranslation } from 'react-i18next';
+
 import { api } from '../api.ts';
 import { ClaimDialog } from '../components/ClaimDialog.tsx';
 import { AppShell, PageHeader } from '../components/Shell.tsx';
@@ -423,7 +424,7 @@ export const NewProject = () => {
                     className={cx(
                       'grid size-[18px] place-items-center rounded-full border text-[11px]',
                       i === step
-                        ? 'border-primary bg-primary text-on-primary'
+                        ? 'text-on-primary border-primary bg-primary'
                         : i < step
                           ? 'border-primary text-primary-text'
                           : 'border-border-strong',
@@ -921,7 +922,7 @@ export const NewProject = () => {
                     <span className="ml-2 font-mono text-xs text-text-3">{sourceEnv.name}</span>
                   )}
                   {kind === 'sql' && (
-                    <div className="mt-1 max-h-40 overflow-auto rounded-sm border border-border bg-code-bg p-2 font-mono text-xs whitespace-pre-wrap">
+                    <div className="bg-code-bg mt-1 max-h-40 overflow-auto rounded-sm border border-border p-2 font-mono text-xs whitespace-pre-wrap">
                       {sql.slice(0, 2000)}
                     </div>
                   )}

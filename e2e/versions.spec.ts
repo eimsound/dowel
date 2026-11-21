@@ -1,6 +1,7 @@
 // 发布 = 冻结迁移（P4a）：没有环境（没有影子库）时可以发布，但版本标为“未验证”；
 // 空迁移不能发布；v1 的迁移从空库建出来。不需要 PG，没有 Docker 也能跑。
 import { expect, type Page, test } from '@playwright/test';
+
 import { addEnvironment, commit, createProject, gotoPage, newUser, openModel } from './helpers.ts';
 
 test('没有影子库：发布成功但未验证；没有变更不能发布；详情显示冻结的迁移', async ({ browser }) => {

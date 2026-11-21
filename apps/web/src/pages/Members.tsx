@@ -5,6 +5,7 @@ import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query';
 import { Trash2 } from 'lucide-react';
 import { useState } from 'react';
 import { useTranslation } from 'react-i18next';
+
 import { api } from '../api.ts';
 import { ProjectPage, Section } from '../components/ProjectPage.tsx';
 import { Avatar, Banner, IconButton } from '../components/ui.tsx';

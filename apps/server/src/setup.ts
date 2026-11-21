@@ -4,6 +4,7 @@
 
 import { passwordSchema, usernameSchema } from '@dowel/api';
 import type { Db } from '@dowel/engines';
+
 import type { User } from './auth.ts';
 import { newToken } from './auth.ts';
 import { isUniqueViolation, type PlatformDb } from './db.ts';

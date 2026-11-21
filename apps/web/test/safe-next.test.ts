@@ -1,5 +1,6 @@
 // 登录后跳转校验的单元测试：用例与服务端 safeNext 相同（apps/server/test/oidc.test.ts）。
 import { expect, test } from 'vitest';
+
 import { safeNext } from '../src/safe-next.ts';
 
 const ORIGIN = 'http://dowel.invalid';

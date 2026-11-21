@@ -15,6 +15,7 @@ import { useQueryClient } from '@tanstack/react-query';
 import { CircleCheck, CircleDashed, LoaderCircle } from 'lucide-react';
 import { useEffect, useId, useRef, useState } from 'react';
 import { useTranslation } from 'react-i18next';
+
 import { ApiError, api } from '../api.ts';
 import { streamExec } from '../envs.ts';
 import { Modal } from './Modal.tsx';

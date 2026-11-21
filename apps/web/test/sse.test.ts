@@ -1,5 +1,6 @@
 // SSE 帧解析：多行 data、CRLF、注释、结尾没有空行的最后一帧、分块边界
 import { describe, expect, test } from 'vitest';
+
 import { parseSseFrame, readSse } from '../src/sse.ts';
 
 const responseOf = (chunks: string[]) => {

@@ -1,6 +1,7 @@
 // 环境执行（P4b）：非生产环境执行 / 回滚、生产环境输入环境名确认、漂移检查与拦截、概览版本列表。
 // 需要 PG 作目标库和影子库（Testcontainers 或 DOWEL_TEST_PG，见 e2e/global-setup.ts），没有 Docker 时跳过。
 import { expect, test } from '@playwright/test';
+
 import { addEnv, execDialog, newTargetDb, openEnv, publishTable } from './exec-helpers.ts';
 import { createProject, gotoPage, newUser } from './helpers.ts';
 

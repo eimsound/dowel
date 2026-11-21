@@ -13,6 +13,7 @@ import {
 import { type ChainVersion, claimInstance, execute, mergeHistories, readState } from '@dowel/executor';
 import fc from 'fast-check';
 import { expect, test } from 'vitest';
+
 import { PG_URL, useTestDb } from '../../../test/pg.ts';
 import { build, resetShadow, verify, verifyScripts } from '../src/index.ts';
 import { makeVersions, versions } from './gen.ts';

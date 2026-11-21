@@ -14,6 +14,7 @@ import type {
 import { addColumn, all, type Model, renameColumn } from '@dowel/core';
 import { type Db, ensureHistory, recordVersion, stepsChecksum } from '@dowel/engines';
 import { afterAll, beforeAll, describe, expect, test, vi } from 'vitest';
+
 import { connect, createTestDb, PG_URL } from '../../../test/pg.ts';
 import { versionExecutedAnywhere } from '../src/chain.ts';
 import { createApp, openPlatformDb, type PlatformDb } from '../src/index.ts';

@@ -15,6 +15,7 @@ import {
 } from '@dowel/api';
 import type { Context, Hono } from 'hono';
 import { HTTPException } from 'hono/http-exception';
+
 import { parseAllowlist, validAllowlistEntry } from '../allowlist.ts';
 import { audit } from '../audit.ts';
 import { revokeSessions } from '../auth.ts';

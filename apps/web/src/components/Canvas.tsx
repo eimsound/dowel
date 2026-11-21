@@ -16,11 +16,13 @@ import {
   useReactFlow,
   useViewport,
 } from '@xyflow/react';
+
 import '@xyflow/react/dist/style.css';
 import ELK from 'elkjs/lib/elk.bundled.js';
 import { Maximize, Table2, ZoomIn, ZoomOut } from 'lucide-react';
 import { memo, useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState } from 'react';
 import { useTranslation } from 'react-i18next';
+
 import type { Layout } from '../workspace.ts';
 import { IconButton } from './ui.tsx';
 

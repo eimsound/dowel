@@ -12,6 +12,7 @@
 // 状态变化、审批人资格判断都在执行策略锁（withPolicyLock）里，用锁内重新读到的申请、策略、成员关系和环境状态；
 // 收件箱的通知、审计与 Webhook 持久化入队（webhook_jobs）在同一个事务里原子写库，实时推送与 Webhook 队列唤醒在提交之后发（Effects）。
 import { createHash } from 'node:crypto';
+
 import {
   type ApprovalStage,
   approvalAtLeast,
@@ -36,6 +37,7 @@ import { newId } from '@dowel/core';
 import type { Db } from '@dowel/engines';
 import type { Context } from 'hono';
 import { HTTPException } from 'hono/http-exception';
+
 import { auditIn } from './audit.ts';
 import { can, userActor } from './authz.ts';
 import type { EventBus } from './bus.ts';

@@ -1,6 +1,7 @@
 // 新建项目向导（P3）：三条创建路径——从数据库导入（勾选 schema）、空白、从 SQL 导入。
 // 需要真实 PG（Testcontainers 或 DOWEL_TEST_PG）作为目标库 / 影子库；没有 Docker 时跳过。
 import { expect, type Page, test } from '@playwright/test';
+
 import { connectPg } from '../apps/server/src/targets.ts';
 import { createGroup, newUser } from './helpers.ts';
 

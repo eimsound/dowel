@@ -3,6 +3,7 @@
 // 基于旧状态的写入覆盖”：后到的写入必须在收紧之后的状态上判断（放宽 → 403），不能把收紧覆盖掉。
 import type { PolicyLayerView } from '@dowel/api';
 import { afterAll, beforeAll, describe, expect, test } from 'vitest';
+
 import { connect, createTestDb, PG_URL } from '../../../test/pg.ts';
 import { createApp, openPlatformDb, type PlatformDb } from '../src/index.ts';
 import { POLICY_LOCK_KEY } from '../src/policy.ts';

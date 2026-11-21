@@ -20,6 +20,7 @@ import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query';
 import { Check, Copy, KeyRound, Lock, Plus, Trash2 } from 'lucide-react';
 import { type Dispatch, type SetStateAction, useEffect, useId, useRef, useState } from 'react';
 import { useTranslation } from 'react-i18next';
+
 import { api } from '../api.ts';
 import { formatTime } from '../format.ts';
 import { Confirm } from './Modal.tsx';
@@ -306,7 +307,7 @@ export const TokenPolicyPanel = ({ path, queryKey }: { path: string; queryKey: u
       </fieldset>
 
       {draft !== null && (
-        <div className="space-y-3 rounded-md border border-border bg-surface-1 p-3">
+        <div className="bg-surface-1 space-y-3 rounded-md border border-border p-3">
           <fieldset className="space-y-1.5 border-0 p-0">
             <legend className="label mb-1">{t('tok.policy.rolesLabel')}</legend>
             <div className="checks">

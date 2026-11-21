@@ -43,10 +43,10 @@
   background: var(--chrome);
   border-right: 1px solid var(--border);
 }
-html[data-left="rail"] .rail,
-html[data-left="rail"] .gnav,
-html[data-left="full"] .gnav,
-html[data-left="merged"] .pnav {
+html[data-left='rail'] .rail,
+html[data-left='rail'] .gnav,
+html[data-left='full'] .gnav,
+html[data-left='merged'] .pnav {
   display: flex;
 }
 .gnav {
@@ -181,12 +181,12 @@ html[data-left="merged"] .pnav {
   color: var(--text);
 }
 /* 当前页面用中性色高亮；靛蓝留给内容里的选中对象（对象树、画布） */
-.nitem[aria-current="page"] {
+.nitem[aria-current='page'] {
   background: var(--surface-active);
   color: var(--text);
   font-weight: 500;
 }
-.nitem[aria-current="page"] > .ic {
+.nitem[aria-current='page'] > .ic {
   color: var(--text);
 }
 .n-count {
@@ -313,7 +313,7 @@ html[data-left="merged"] .pnav {
   background: var(--surface-hover);
   color: var(--text);
 }
-.rbtn[aria-current="page"] {
+.rbtn[aria-current='page'] {
   background: var(--surface-active);
   color: var(--text);
 }
@@ -337,7 +337,7 @@ html[data-left="merged"] .pnav {
 }
 
 /* 浮层：悬停图标栏（停留 250ms）、按 [ 或点“展开侧栏”时出现，覆盖在对象树上，不挤压画布 */
-html[data-left="rail"] .gnav {
+html[data-left='rail'] .gnav {
   position: fixed;
   inset: 0 auto 0 0;
   z-index: 50;
@@ -350,10 +350,10 @@ html[data-left="rail"] .gnav {
     translate var(--motion-exit),
     visibility 0s 120ms;
 }
-html[data-left="rail"][data-peek] .gnav,
-html[data-left="rail"] .rail:hover ~ .gnav,
-html[data-left="rail"] .gnav:hover,
-html[data-left="rail"] .gnav:focus-within {
+html[data-left='rail'][data-peek] .gnav,
+html[data-left='rail'] .rail:hover ~ .gnav,
+html[data-left='rail'] .gnav:hover,
+html[data-left='rail'] .gnav:focus-within {
   opacity: 1;
   translate: 0;
   visibility: visible;
@@ -363,7 +363,7 @@ html[data-left="rail"] .gnav:focus-within {
     visibility 0s;
 }
 /* 悬停意图：停留一会儿才展开，快速点图标栏按钮时不会被浮层挡住；用 [ 或按钮打开时立即出现 */
-html[data-left="rail"]:not([data-peek]) .rail:hover ~ .gnav {
+html[data-left='rail']:not([data-peek]) .rail:hover ~ .gnav {
   transition-delay: 250ms;
 }
 
@@ -424,8 +424,8 @@ html[data-left="rail"]:not([data-peek]) .rail:hover ~ .gnav {
   grid-template-rows: var(--topbar-h) minmax(0, 1fr) auto;
   container: content / inline-size;
 }
-html[data-page="model"] .page-env,
-html[data-page="environments"] .page-model {
+html[data-page='model'] .page-env,
+html[data-page='environments'] .page-model {
   display: none;
 }
 .phead {
@@ -447,8 +447,8 @@ html[data-page="environments"] .page-model {
 .phead .only-hidden {
   display: none;
 }
-html[data-left="none"] .phead .only-hidden,
-html[data-left="dual-min"] .phead .only-hidden {
+html[data-left='none'] .phead .only-hidden,
+html[data-left='dual-min'] .phead .only-hidden {
   display: inline-flex;
 }
 .crumb-parent {
@@ -466,20 +466,20 @@ html[data-left="dual-min"] .phead .only-hidden {
   min-width: 0;
   overflow: hidden;
 }
-html[data-left="merged"] .content > .main,
-html[data-left^="dual"] .content > .main {
+html[data-left='merged'] .content > .main,
+html[data-left^='dual'] .content > .main {
   grid-template-columns: minmax(0, 1fr) var(--inspector-w);
 }
-html[data-left="merged"] .content > .main > .sidebar,
-html[data-left^="dual"] .content > .main > .sidebar {
+html[data-left='merged'] .content > .main > .sidebar,
+html[data-left^='dual'] .content > .main > .sidebar {
   display: none;
 }
 /* 属性面板按需：没有选中对象时隐藏，画布占满右侧 */
 html[data-no-inspector] .content > .main {
   grid-template-columns: var(--sidebar-w) minmax(0, 1fr);
 }
-html[data-no-inspector][data-left="merged"] .content > .main,
-html[data-no-inspector][data-left^="dual"] .content > .main {
+html[data-no-inspector][data-left='merged'] .content > .main,
+html[data-no-inspector][data-left^='dual'] .content > .main {
   grid-template-columns: minmax(0, 1fr);
 }
 html[data-no-inspector] .content > .main > .inspector {
@@ -590,7 +590,7 @@ html[data-unselected] .minimap i.sel {
   font-weight: 600;
   color: var(--text-3);
 }
-.env-row > [role="cell"] {
+.env-row > [role='cell'] {
   display: flex;
   flex-direction: column;
   align-items: flex-start;
@@ -685,8 +685,8 @@ html[data-unselected] .minimap i.sel {
   min-height: 0;
   border-right: 1px solid var(--border);
 }
-html[data-left^="dual"] .drail,
-html[data-left="dual"] .dpanel {
+html[data-left^='dual'] .drail,
+html[data-left='dual'] .dpanel {
   display: flex;
 }
 /* 第一层比面板低一阶，两层一眼能分开 */
@@ -739,13 +739,13 @@ html[data-left="dual"] .dpanel {
   background: var(--surface-hover);
   color: var(--text);
 }
-.dorg[aria-current="true"] .org-av {
+.dorg[aria-current='true'] .org-av {
   background: var(--primary);
   color: var(--on-primary);
 }
 /* 当前组织：左边缘一道竖条（Discord 的做法），不只靠颜色 */
-.dorg[aria-current="true"]::before {
-  content: "";
+.dorg[aria-current='true']::before {
+  content: '';
   position: absolute;
   left: -8px;
   top: 6px;
@@ -806,9 +806,9 @@ html[data-left="dual"] .dpanel {
 .dpanel .nsec-head .count {
   margin-left: 6px;
 }
-html[data-page="environments"]:not([data-shell="d"]) .page-envd,
-html[data-page="model"] .page-envd,
-html[data-shell="d"] .page-env {
+html[data-page='environments']:not([data-shell='d']) .page-envd,
+html[data-page='model'] .page-envd,
+html[data-shell='d'] .page-env {
   display: none;
 }
 .envlist .nitem {

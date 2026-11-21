@@ -6,6 +6,7 @@ import { Link } from '@tanstack/react-router';
 import { Inbox as InboxIcon } from 'lucide-react';
 import { useState } from 'react';
 import { useTranslation } from 'react-i18next';
+
 import { api } from '../api.ts';
 import { PageHeader } from '../components/Shell.tsx';
 import { Tabs } from '../components/Tabs.tsx';
@@ -95,7 +96,7 @@ const NoticeRow = ({ n, onRead }: { n: InboxItem; onRead: (id: string) => void }
           </button>
         )}
       </div>
-      {n.data.body && <p className="whitespace-pre-wrap text-xs text-text-2">{n.data.body}</p>}
+      {n.data.body && <p className="text-xs whitespace-pre-wrap text-text-2">{n.data.body}</p>}
     </li>
   );
 };

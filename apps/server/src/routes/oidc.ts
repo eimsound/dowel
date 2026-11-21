@@ -25,6 +25,7 @@ import {
   randomPKCECodeVerifier,
   randomState,
 } from 'openid-client';
+
 import { audit } from '../audit.ts';
 import { currentUser, hashToken, markLogin, startSession } from '../auth.ts';
 import { isUniqueViolation, type PlatformDb } from '../db.ts';

@@ -7,6 +7,7 @@
 // - 优雅停机时有界等待在途续租并主动删除自身租约行，既不卡死停机又便于其他副本立即感知接管；
 // - 提供 tryWithJobLock(jobName, fn)，通过平台库 advisory lock 防止多副本重复跑同一轮巡检。
 import { randomUUID } from 'node:crypto';
+
 import type { AdvisoryLockResult, PlatformDb } from './db.ts';
 
 export const DEFAULT_LEASE_TTL_MS = 15_000;

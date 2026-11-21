@@ -1,5 +1,6 @@
 // 数据库连接信息的加密（Q12：环境变量提供主密钥）。AES-256-GCM，密文格式 v1:iv:tag:data（base64url）。
 import { createCipheriv, createDecipheriv, createHash, createHmac, randomBytes } from 'node:crypto';
+
 import { scrubSecrets } from '@dowel/core';
 
 export class SecretError extends Error {}

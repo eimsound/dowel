@@ -3,6 +3,7 @@
 // 一键恢复到此状态（二次确认）→ 验证画布恢复且新历史记录追加成功，含亮 / 暗主题与 axe 无障碍扫描。
 import AxeBuilder from '@axe-core/playwright';
 import { expect, type Page, test } from '@playwright/test';
+
 import { commit, createProject, newUser, openModel } from './helpers.ts';
 
 const scan = async (page: Page, label: string) => {
