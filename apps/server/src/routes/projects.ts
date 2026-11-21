@@ -21,6 +21,7 @@ import { audit } from '../audit.ts';
 import { can, userActor } from '../authz.ts';
 import { inList, isUniqueViolation } from '../db.ts';
 import { pinForTransfer } from '../env-policy.ts';
+import { projectPgVersionSummary } from '../envs.ts';
 import { insertGrant } from '../grants.ts';
 import { groupById, groupBySlug, groupRoleOf, pickProjectSlug, projectSlugTaken } from '../groups.ts';
 import { accessIn, deletePolicies, withPolicyLock } from '../policy.ts';
@@ -118,8 +119,9 @@ export const registerProjects = (app: Hono<Env>, ctx: AppContext) => {
     );
   });
 
-  const info = async (c: Parameters<typeof access>[0], a: Awaited<ReturnType<typeof access>>) =>
-    ({
+  const info = async (c: Parameters<typeof access>[0], a: Awaited<ReturnType<typeof access>>) => {
+    const pgVersions = await projectPgVersionSummary(db, a.id);
+    return {
       id: a.id,
       name: a.name,
       slug: a.slug,
@@ -130,12 +132,15 @@ export const registerProjects = (app: Hono<Env>, ctx: AppContext) => {
       groupDefaultRole: a.groupDefaultRole,
       groupRole: await groupRoleOf(db, a.groupId, c.get('user').id),
       schemas: a.schemas ?? null,
+      targetPgMajor: pgVersions.targetPgMajor,
+      envPgMajors: pgVersions.envPgMajors,
       canListTokens: can(userActor(c.get('user')), 'token.list', {
         kind: 'project',
         role: a.role,
         tokenCreator: canCreateToken(a.rc, a),
       }),
-    }) satisfies ProjectInfo;
+    } satisfies ProjectInfo;
+  };
 
   app.get('/api/projects/:pid', async (c) => {
     const a = await access(c, ctx, 'project.read');

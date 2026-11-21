@@ -25,7 +25,9 @@ import {
   loadEnv,
   loadVersionMetas,
   loadVersionRefs,
+  projectTargetPgMajor,
   toEnvInfo,
+  updateEnvVersion,
   type VersionRefRow,
   versionRef,
 } from '../envs.ts';
@@ -39,7 +41,7 @@ import {
   withPolicyLock,
 } from '../policy.ts';
 import { WorkingChangedError } from '../rooms.ts';
-import { encrypt } from '../secrets.ts';
+import { decrypt, encrypt } from '../secrets.ts';
 import { CHECK_CONNECT_TIMEOUT, claimShadow, inspectTarget } from '../targets.ts';
 import { type AppContext, access, body, connectionLimit, type Env } from './context.ts';
 
@@ -74,8 +76,9 @@ export const registerEnvironments = (app: Hono<Env>, ctx: AppContext) => {
     if (b.shadowUrl) await claimShadow(b.shadowUrl, ctx.guard);
     const id = newId();
     await db.query(
-      `insert into environments (id, project_id, name, url_enc, production, allow_same_instance, shadow_url_enc)
-       values ($1, $2, $3, $4, $5, $6, $7)`,
+      `insert into environments (id, project_id, name, url_enc, production, allow_same_instance, shadow_url_enc,
+                                 engine_version, engine_version_num)
+       values ($1, $2, $3, $4, $5, $6, $7, $8, $9)`,
       [
         id,
         a.pid,
@@ -84,6 +87,8 @@ export const registerEnvironments = (app: Hono<Env>, ctx: AppContext) => {
         b.production,
         b.allowSameInstance,
         b.shadowUrl ? encrypt(b.shadowUrl) : null,
+        info.version,
+        info.versionNum,
       ],
     );
     // 有了真实的影子库，补做表达式和不透明对象 DDL 的规范化
@@ -183,7 +188,8 @@ export const registerEnvironments = (app: Hono<Env>, ctx: AppContext) => {
     let done: { r: EnvPolicyResult; row: EnvRow };
     try {
       // 外部检查在写库之前：新连接串要连得上（白名单在连接层检查），影子库要能认领
-      if (b.url !== undefined) await inspectTarget(b.url, CHECK_CONNECT_TIMEOUT, ctx.guard);
+      const inspected =
+        b.url !== undefined ? await inspectTarget(b.url, CHECK_CONNECT_TIMEOUT, ctx.guard) : null;
       if (b.shadowUrl) await claimShadow(b.shadowUrl, ctx.guard);
       done = await withPolicyLock(db, async (tx) => {
         // 锁内重新读环境行、四层配置、项目当前的组和调用者的角色，按它们重新决定改什么、重新检查权限
@@ -203,7 +209,11 @@ export const registerEnvironments = (app: Hono<Env>, ctx: AppContext) => {
           vals.push(v);
           sets.push(`${col} = $${vals.length}`);
         };
-        if (b.url !== undefined) set('url_enc', encrypt(b.url));
+        if (b.url !== undefined) {
+          set('url_enc', encrypt(b.url));
+          set('engine_version', inspected?.version ?? null);
+          set('engine_version_num', inspected?.versionNum ?? null);
+        }
         if (b.shadowUrl !== undefined) set('shadow_url_enc', b.shadowUrl ? encrypt(b.shadowUrl) : null);
         if (fields.includes('allowSameInstance')) set('allow_same_instance', b.allowSameInstance);
         if (fields.includes('production')) set('production', b.production);
@@ -322,9 +332,16 @@ export const registerEnvironments = (app: Hono<Env>, ctx: AppContext) => {
 
   app.post('/api/projects/:pid/environments/:eid/test', async (c) => {
     const a = await access(c, ctx, 'environment.read');
-    const env = await shadows.env(a.pid, c.req.param('eid'));
+    const row = await loadEnv(db, a.pid, c.req.param('eid')!);
+    const url = decrypt(row.url_enc);
     // 白名单在连接层检查，所以实例设置之后改严也会在这里生效
-    return c.json<TargetInfo>(await inspectTarget(env.url, CHECK_CONNECT_TIMEOUT, ctx.guard));
+    const info = await inspectTarget(url, CHECK_CONNECT_TIMEOUT, ctx.guard);
+    // 探测成功后按 url_enc 条件原子回写最新版本（防与并发 PATCH 改连接串发生倒挂）
+    if (row.engine_version !== info.version || row.engine_version_num !== info.versionNum) {
+      const updated = await updateEnvVersion(db, row.id, info.version, info.versionNum, row.url_enc);
+      if (updated) await shadows.forget(row.id);
+    }
+    return c.json<TargetInfo>(info);
   });
 
   /**
@@ -352,7 +369,9 @@ export const registerEnvironments = (app: Hono<Env>, ctx: AppContext) => {
       const [headModel] = head
         ? await db.query<{ model: Model }>('select model from versions where id = $1', [head.id])
         : [];
-      const diff = planDiff(w, live.model);
+      const targetPgMajor = await projectTargetPgMajor(db, a.pid);
+      const planOpts = targetPgMajor !== null ? { pgMajor: targetPgMajor } : undefined;
+      const diff = planDiff(w, live.model, planOpts);
       return {
         items: diff.items,
         total: diff.total,
@@ -366,7 +385,7 @@ export const registerEnvironments = (app: Hono<Env>, ctx: AppContext) => {
               : null,
           unfinished: live.state?.unfinished != null,
           readbackFailure: live.state?.readbackFailure != null,
-          workingDirty: headModel ? planDiff(headModel.model, w).total > 0 : false,
+          workingDirty: headModel ? planDiff(headModel.model, w, planOpts).total > 0 : false,
         },
       };
     };

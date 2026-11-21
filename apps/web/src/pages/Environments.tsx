@@ -423,6 +423,9 @@ export const Environments = () => {
                   >
                     {e.name}
                   </Link>
+                  {(e.engineVersion || e.engineMajor !== null) && (
+                    <span className="chip shrink-0 font-mono">PG {e.engineVersion ?? e.engineMajor}</span>
+                  )}
                   {e.production ? (
                     <span className="badge danger">{t('envp.production')}</span>
                   ) : (
@@ -639,7 +642,7 @@ const EnvironmentDetailView = ({ eid }: { eid: string }) => {
 
   const test = useMutation({
     mutationFn: () => api<TargetInfo>('POST', `/api/projects/${pid}/environments/${eid}/test`),
-    onSuccess: (r) =>
+    onSuccess: (r) => {
       setResult({
         ok: true,
         text: t('dlg.envTested', {
@@ -647,7 +650,11 @@ const EnvironmentDetailView = ({ eid }: { eid: string }) => {
           exists: r.shadowExists ? t('dlg.envShadowExists') : '',
           createdb: r.canCreateDb ? t('dlg.envCanCreate') : t('dlg.envCannotCreate'),
         }),
-      }),
+      });
+      void qc.invalidateQueries({ queryKey: ['envs', pid] });
+      void qc.invalidateQueries({ queryKey: ['project', pid] });
+      void qc.invalidateQueries({ queryKey: ['migration', pid] });
+    },
     onError: (e) => setResult({ ok: false, text: e.message }),
   });
   const checkDrift = useMutation({
@@ -692,6 +699,8 @@ const EnvironmentDetailView = ({ eid }: { eid: string }) => {
     mutationFn: () => api('DELETE', `/api/projects/${pid}/environments/${eid}`),
     onSuccess: () => {
       void qc.invalidateQueries({ queryKey: ['envs', pid] });
+      void qc.invalidateQueries({ queryKey: ['project', pid] });
+      void qc.invalidateQueries({ queryKey: ['migration', pid] });
       toast(t('envp.deleted', { name: env?.name ?? '' }));
       setConfirm(false);
       void nav({ to: '/project/$owner/$project/environments', params });
@@ -804,6 +813,9 @@ const EnvironmentDetailView = ({ eid }: { eid: string }) => {
           <div className="flex flex-wrap items-baseline gap-x-3 gap-y-1">
             <Database size={20} aria-hidden="true" className="text-text-3" />
             <span className="font-mono text-[length:var(--fs-headline)] font-semibold">{env.name}</span>
+            {(env.engineVersion || env.engineMajor !== null) && (
+              <span className="chip font-mono">PG {env.engineVersion ?? env.engineMajor}</span>
+            )}
             {env.production ? (
               <span className="badge danger">{t('envp.production')}</span>
             ) : (
@@ -1137,6 +1149,14 @@ const EnvironmentDetailView = ({ eid }: { eid: string }) => {
             <dl className="grid grid-cols-[auto_1fr] gap-x-6 gap-y-2 rounded-md border border-border bg-panel px-4 py-3 text-sm">
               <dt className="text-text-2">{t('dlg.envUrl')}</dt>
               <dd className="m-0 truncate font-mono text-xs">{env.url}</dd>
+              <dt className="text-text-2">{t('envp.pgVersion')}</dt>
+              <dd className="m-0">
+                {env.engineVersion || env.engineMajor !== null ? (
+                  <span className="font-mono text-xs">PostgreSQL {env.engineVersion ?? env.engineMajor}</span>
+                ) : (
+                  <span className="text-text-2">{t('envp.pgVersionUnknown')}</span>
+                )}
+              </dd>
               <dt className="text-text-2">{t('dlg.envProduction')}</dt>
               <dd className="m-0 flex flex-wrap items-center gap-2">
                 <span>{env.production ? t('envp.production') : t('envp.notProduction')}</span>

@@ -95,7 +95,7 @@ export const createApp = (db: PlatformDb, options: AppOptions = {}) => {
         branchId,
       ]);
       if (!b) return null;
-      return (await shadows.forProject(b.project_id).catch(() => null))?.shadow ?? null;
+      return (await shadows.forProjectTarget(b.project_id).catch(() => null))?.shadow ?? null;
     },
     {
       load: async (branchId) =>

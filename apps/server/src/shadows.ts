@@ -4,11 +4,12 @@
 //   项目没有环境、或影子库不可用时直接报错。
 import { createHash } from 'node:crypto';
 
+import { deriveTargetPgMajor, pgMajorOf } from '@dowel/core';
 import { HTTPException } from 'hono/http-exception';
 
 import type { ClusterEvent, ClusterEventPayload, EventBus } from './bus.ts';
 import type { PlatformDb } from './db.ts';
-import { decrypt } from './secrets.ts';
+import { decrypt, scrubSecrets } from './secrets.ts';
 import { type Shadow, ShadowError, ShadowUnavailableError } from './shadow.ts';
 import { ConnectError, type ConnectionGuard, ensureSameInstanceShadow, pgShadow } from './targets.ts';
 
@@ -21,6 +22,34 @@ export interface Env {
   shadowUrl: string | null;
   /** 项目的 schema 范围（null 表示全部，dowel 永远排除） */
   schemas: string[] | null;
+  /** 目标库 server_version_num（尚未探测为 null） */
+  engineVersionNum: number | null;
+  /** 目标库 PG 大版本（尚未探测为 null） */
+  engineMajor: number | null;
+}
+
+export interface VersionShadowEntry {
+  /** 该代表影子库对应的 PG 大版本号；未探测版本时为 null */
+  major: number | null;
+  envId: string;
+  shadow: Shadow;
+  label: string;
+}
+
+export interface SkippedMajorEntry {
+  major: number | null;
+  reason: string;
+}
+
+export interface ProjectVersionShadows {
+  /** 按大版本升序排列（已知大版本在前，null 在后），每个大版本至多 1 个代表影子库 */
+  entries: VersionShadowEntry[];
+  /** 无法获取可用影子库的大版本及其首个失败原因 */
+  skippedMajors: SkippedMajorEntry[];
+  /** 项目所有环境推导出的最低目标 PG 大版本（仅已知版本） */
+  targetPgMajor: number | null;
+  /** 项目所有环境去重升序的已知 PG 大版本 */
+  envPgMajors: number[];
 }
 
 /** 选影子库需要的环境信息（Env 和向导里还没入库的环境都满足） */
@@ -92,9 +121,22 @@ const configFingerprint = (env: Env): string =>
         production: env.production,
         allowSameInstance: env.allowSameInstance,
         schemas: env.schemas ?? [],
+        engineVersionNum: env.engineVersionNum,
       }),
     )
     .digest('hex');
+
+/** 同大版本内候选环境选影优先级：显式 shadowUrl(0) > 非生产(1) > 允许同实例生产(2) > 其余(3) */
+const candidatePriority = (r: {
+  shadow_url_enc: string | null;
+  production: boolean;
+  allow_same_instance: boolean;
+}): number => {
+  if (r.shadow_url_enc) return 0;
+  if (!r.production) return 1;
+  if (r.allow_same_instance) return 2;
+  return 3;
+};
 
 export class Shadows {
   private db: PlatformDb;
@@ -129,13 +171,16 @@ export class Shadows {
       allow_same_instance: boolean;
       shadow_url_enc: string | null;
       schemas: string[] | null;
+      engine_version_num: number | null;
     }>(
-      `select e.id, e.name, e.url_enc, e.production, e.allow_same_instance, e.shadow_url_enc, p.schemas
+      `select e.id, e.name, e.url_enc, e.production, e.allow_same_instance, e.shadow_url_enc, p.schemas,
+              e.engine_version_num
          from environments e join projects p on p.id = e.project_id
         where e.id = $1 and e.project_id = $2`,
       [eid, pid],
     );
     if (!r) throw new HTTPException(404, { message: '环境不存在' });
+    const engineVersionNum = r.engine_version_num ?? null;
     return {
       id: r.id,
       name: r.name,
@@ -144,6 +189,8 @@ export class Shadows {
       allowSameInstance: r.allow_same_instance,
       shadowUrl: r.shadow_url_enc ? decrypt(r.shadow_url_enc) : null,
       schemas: r.schemas ?? null,
+      engineVersionNum,
+      engineMajor: pgMajorOf(engineVersionNum),
     };
   }
 
@@ -235,6 +282,96 @@ export class Shadows {
     }
 
     throw new ShadowUnavailableError('影子库配置已变更，请重试');
+  }
+
+  /**
+   * 按项目全部环境的 PG 大版本分组（去重升序，未知版本归为 null 组），为每个大版本选出 1 个代表影子库：
+   * 优先级：显式 shadowUrl > 非生产环境 > 允许同实例的生产环境；该大版本全部不可用时记入 skippedMajors。
+   * 兼容测试中直接覆写实例级 `forProject` 的场景。
+   */
+  async forProjectVersions(pid: string): Promise<ProjectVersionShadows> {
+    if (this.forProject !== Shadows.prototype.forProject) {
+      const s = await this.forProject(pid);
+      return {
+        entries: [{ major: null, envId: '', shadow: s.shadow, label: s.label }],
+        skippedMajors: [],
+        targetPgMajor: null,
+        envPgMajors: [],
+      };
+    }
+
+    const rows = await this.db.query<{
+      id: string;
+      production: boolean;
+      allow_same_instance: boolean;
+      shadow_url_enc: string | null;
+      engine_version_num: number | null;
+    }>(
+      `select id, production, allow_same_instance, shadow_url_enc, engine_version_num
+         from environments where project_id = $1 order by created_at`,
+      [pid],
+    );
+    const liveIds = new Set(rows.map((r) => r.id));
+    await this.pruneRemovedForProject(pid, liveIds);
+    if (!rows.length) {
+      throw new ShadowError(
+        '项目还没有配置环境。导入 SQL、验证迁移都需要一个真实的 PostgreSQL 实例作影子库，请先在“环境”里添加项目要部署到的数据库',
+      );
+    }
+
+    const groups = new Map<number | null, typeof rows>();
+    const knownMajors = new Set<number>();
+    for (const r of rows) {
+      const major = pgMajorOf(r.engine_version_num);
+      if (major !== null) knownMajors.add(major);
+      const list = groups.get(major);
+      if (list) list.push(r);
+      else groups.set(major, [r]);
+    }
+    const envPgMajors = [...knownMajors].sort((a, b) => a - b);
+    const targetPgMajor = deriveTargetPgMajor(envPgMajors);
+    const orderedKeys: (number | null)[] = [...envPgMajors, ...(groups.has(null) ? [null] : [])];
+
+    const entries: VersionShadowEntry[] = [];
+    const skippedMajors: SkippedMajorEntry[] = [];
+    for (const major of orderedKeys) {
+      const candidates = [...(groups.get(major) ?? [])].sort(
+        (a, b) => candidatePriority(a) - candidatePriority(b),
+      );
+      let picked = false;
+      let firstReason = '没有可用的影子库';
+      for (const cand of candidates) {
+        try {
+          const s = await this.forProject(pid, cand.id);
+          entries.push({ major, envId: cand.id, shadow: s.shadow, label: s.label });
+          picked = true;
+          break;
+        } catch (e) {
+          if (!(e instanceof ShadowError)) throw e;
+          if (firstReason === '没有可用的影子库') firstReason = scrubSecrets(e.message);
+        }
+      }
+      if (!picked) {
+        skippedMajors.push({ major, reason: firstReason });
+      }
+    }
+
+    return { entries, skippedMajors, targetPgMajor, envPgMajors };
+  }
+
+  /**
+   * 为 OpaqueRefresher 等单影子库派生场景选影：优先选择 `engineMajor === targetPgMajor` 的可用环境影子库，
+   * 若无可用则回退到首个可用环境影子库。
+   */
+  async forProjectTarget(pid: string): Promise<{ shadow: Shadow; label: string }> {
+    const res = await this.forProjectVersions(pid);
+    if (res.targetPgMajor !== null) {
+      const exact = res.entries.find((e) => e.major === res.targetPgMajor);
+      if (exact) return { shadow: exact.shadow, label: exact.label };
+    }
+    const first = res.entries[0];
+    if (first) return { shadow: first.shadow, label: first.label };
+    throw new ShadowError(res.skippedMajors[0]?.reason ?? '没有可用的影子库');
   }
 
   /** 项目的 schema 范围变了或项目被删除：关闭并移除该项目下所有环境的影子库缓存，并广播给其他副本 */

@@ -55,7 +55,10 @@ export const VersionBadges = ({
   );
 };
 
-type Report = Pick<StoredVerifyReport, 'ok' | 'upDiff' | 'downDiff' | 'error' | 'risks' | 'riskError'> & {
+type Report = Pick<
+  StoredVerifyReport,
+  'ok' | 'upDiff' | 'downDiff' | 'error' | 'risks' | 'riskError' | 'targets' | 'missingTargetMajor'
+> & {
   shadow?: string;
 };
 
@@ -73,11 +76,21 @@ export const RiskNote = ({ report }: { report: Pick<Report, 'riskError'> | null 
   ) : null;
 };
 
-/** 验证报告：通过（可能带高风险提示）或失败（出错的步骤和原因、结构差异），role=status */
+/** 验证报告：通过（可能带高风险提示）、缺失低版本影子库警告、或失败（出错的步骤和原因、结构差异），role=status */
 export const VerifyBanner = ({ report }: { report: Report | VerifyResponse }) => {
   const { t } = useTranslation();
   const highs = report.risks.filter((x) => x.level === 'high').length;
   const diffs = [...report.upDiff, ...report.downDiff];
+  const targets = report.targets ?? [];
+  const targetsOkSummary = targets.length > 0 ? targets.map((item) => `PG ${item.major}`).join(' · ') : null;
+  const targetsStatusSummary =
+    targets.length > 0
+      ? targets
+          .map((item) =>
+            t(item.ok ? 'dlg.verifyTargetPassed' : 'dlg.verifyTargetFailed', { major: item.major }),
+          )
+          .join(' · ')
+      : null;
   const shadow = report.shadow ? (
     <span className="text-text-2"> {t('dlg.usedShadow', { s: report.shadow })}</span>
   ) : null;
@@ -85,17 +98,36 @@ export const VerifyBanner = ({ report }: { report: Report | VerifyResponse }) =>
     return (
       <Banner kind={highs ? 'warn' : 'ok'} title={t('dlg.verifyOkTitle')} role="status">
         {t('dlg.verifyOk')}
+        {targetsOkSummary && (
+          <span className="ml-1.5 font-mono text-xs text-text-2">
+            {targets.length > 1
+              ? t('dlg.verifyTargetsAllPassed', { versions: targetsOkSummary })
+              : t('dlg.verifyTargetSinglePassed', { version: targetsOkSummary })}
+          </span>
+        )}
         {highs > 0 && ` ${t('dlg.highRisks', { count: highs })}`}
         {shadow}
       </Banner>
     );
+  if (report.missingTargetMajor != null)
+    return (
+      <Banner kind="warn" title={t('dlg.verifyMissingTargetTitle')} role="status">
+        {report.error?.message ?? t('dlg.verifyMissingTargetBody', { major: report.missingTargetMajor })}
+        {targetsStatusSummary && (
+          <span className="mt-1 block font-mono text-xs text-text-2">{targetsStatusSummary}</span>
+        )}
+      </Banner>
+    );
   return (
     <Banner kind="danger" title={t('dlg.verifyFail')} role="status">
+      {targetsStatusSummary && (
+        <span className="mr-1.5 font-mono text-xs text-text-2">{targetsStatusSummary}</span>
+      )}
       {shadow}
       {report.error && (
         <pre className="mt-1.5 mb-0 font-mono text-xs whitespace-pre-wrap">
           {report.error.step?.sql}
-          {'\n'}
+          {report.error.step?.sql ? '\n' : ''}
           {report.error.message}
         </pre>
       )}

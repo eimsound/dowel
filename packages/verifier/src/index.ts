@@ -5,6 +5,8 @@ import {
   INSTANCE_LEVEL_DESCRIPTION,
   isNontransactionalSql,
   type Model,
+  pgMajorOf,
+  type PlanOptions,
   plan,
   type Step,
 } from '@dowel/core';
@@ -72,10 +74,19 @@ export const runSteps = async (db: Db, steps: Step[]) => {
   }
 };
 
+/** 从影子库读取 server_version_num 并提取大版本号（用于按影子库实际 PG 版本生成建库语句） */
+export const readShadowPgMajor = async (db: Db): Promise<number | null> => {
+  const rows = await db.query<{ v?: unknown; server_version_num?: unknown }>('SHOW server_version_num');
+  const raw = rows[0]?.server_version_num ?? rows[0]?.v;
+  const num = typeof raw === 'number' ? raw : typeof raw === 'string' ? Number.parseInt(raw, 10) : Number.NaN;
+  return Number.isInteger(num) ? pgMajorOf(num) : null;
+};
+
 /** 在影子库里从零建出模型，返回读到的快照 */
-export const build = async (db: Db, m: Model): Promise<Snapshot> => {
+export const build = async (db: Db, m: Model, opts?: PlanOptions): Promise<Snapshot> => {
   await resetShadow(db);
-  await runSteps(db, createAll(m));
+  const pgMajor = opts?.pgMajor !== undefined ? opts.pgMajor : await readShadowPgMajor(db);
+  await runSteps(db, createAll(m, pgMajor !== null ? { pgMajor } : undefined));
   return readSnapshot(db);
 };
 
@@ -89,12 +100,17 @@ export interface VerifyResult {
 }
 
 /** 闭环验证（只用一个影子库，依次建目标版本、建原版本、执行迁移、执行反向迁移）。任一步执行失败抛出 StepError。 */
-export const verify = async (db: Db, from: Model, to: Model): Promise<VerifyResult> => {
-  const up = plan(from, to);
-  const down = plan(to, from);
+export const verify = async (db: Db, from: Model, to: Model, opts?: PlanOptions): Promise<VerifyResult> => {
+  const shadowMajor = await readShadowPgMajor(db);
+  const planMajor = opts?.pgMajor ?? shadowMajor;
+  const planOpts: PlanOptions | undefined = planMajor !== null ? { pgMajor: planMajor } : undefined;
+  const buildOpts: PlanOptions | undefined =
+    (opts?.pgMajor ?? shadowMajor) !== null ? { pgMajor: opts?.pgMajor ?? shadowMajor } : undefined;
+  const up = plan(from, to, planOpts);
+  const down = plan(to, from, planOpts);
   assertNoInstanceLevel([...up, ...down]); // 规划器正常不会生成，兜底
-  const toSnap = await build(db, to);
-  const fromSnap = await build(db, from);
+  const toSnap = await build(db, to, buildOpts);
+  const fromSnap = await build(db, from, buildOpts);
   await runSteps(db, up);
   const afterUp = await readSnapshot(db);
   await runSteps(db, down);
@@ -114,6 +130,8 @@ const frozenSteps = (dir: 'up' | 'down', steps: ScriptStep[]): Step[] =>
 export interface VerifyScriptsOptions {
   /** 是否检查回滚。v0 基线没有回滚脚本（down 为空），只检查建库那一半 */
   checkDown?: boolean;
+  /** 构建 from / to 基准结构时使用的 PG 大版本；缺省自动从影子库读取 server_version_num */
+  pgMajor?: number | null;
 }
 
 /**
@@ -134,8 +152,10 @@ export const verifyScripts = async (
   const downSteps = frozenSteps('down', down);
   // 任何一步（包括建 from / to）执行之前先检查整份脚本：有实例级语句就一条都不执行
   assertNoInstanceLevel([...upSteps, ...downSteps]);
-  const toSnap = await build(db, to);
-  const fromSnap = await build(db, from);
+  const pgMajor = options.pgMajor !== undefined ? options.pgMajor : await readShadowPgMajor(db);
+  const buildOpts: PlanOptions | undefined = pgMajor !== null ? { pgMajor } : undefined;
+  const toSnap = await build(db, to, buildOpts);
+  const fromSnap = await build(db, from, buildOpts);
   await runSteps(db, upSteps);
   const afterUp = await readSnapshot(db);
   const upDiff = diffSnapshots(afterUp, toSnap);
@@ -181,9 +201,10 @@ export const analyze = async (
   from: Model,
   /** step.transactional 是用户 / 冻结脚本给的标记：只用于“从文本看不出来的非事务步骤”的兜底（见下），不决定要不要放进事务 */
   steps: Step[],
+  opts?: PlanOptions,
 ): Promise<StepRisk[]> => {
   assertNoInstanceLevel(steps); // 重放也会真的执行这些步骤：有实例级语句就一条都不执行
-  await build(db, from);
+  await build(db, from, opts);
   const existing = new Set(
     (
       await db.query<{ oid: number }>(

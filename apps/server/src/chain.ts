@@ -5,6 +5,7 @@ import {
   findInstanceLevelStep,
   INSTANCE_LEVEL_DESCRIPTION,
   type Model,
+  type PlanOptions,
   plan,
   scopeCoversPublic,
 } from '@dowel/core';
@@ -19,10 +20,10 @@ export interface FrozenScripts {
   checksum: string;
 }
 
-/** 冻结 from → to 的迁移：up = plan(from, to)，down = plan(to, from) */
-export const freezeScripts = (from: Model, to: Model): FrozenScripts => {
-  const up = toScriptSteps(plan(from, to));
-  const down = toScriptSteps(plan(to, from));
+/** 冻结 from → to 的迁移：up = plan(from, to, opts)，down = plan(to, from, opts) */
+export const freezeScripts = (from: Model, to: Model, opts?: PlanOptions): FrozenScripts => {
+  const up = toScriptSteps(plan(from, to, opts));
+  const down = toScriptSteps(plan(to, from, opts));
   return { up, down, checksum: stepsChecksum(up, down) };
 };
 
@@ -33,9 +34,10 @@ export const freezeScripts = (from: Model, to: Model): FrozenScripts => {
 export const freezeBaseline = (
   model: Model,
   scope: string[] | null | undefined,
+  opts?: PlanOptions,
 ): FrozenScripts & { /** 基线的 from（空库模型）：验证时直接用，不用再构建一遍 */ from: Model } => {
   const from = emptyBase(model, scope);
-  const up = toScriptSteps(plan(from, model));
+  const up = toScriptSteps(plan(from, model, opts));
   return { up, down: [], checksum: stepsChecksum(up, []), from };
 };
 

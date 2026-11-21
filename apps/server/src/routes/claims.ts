@@ -13,12 +13,11 @@ import {
   type ClaimResult,
   environmentAttachSchema,
   resolvePolicy,
-  type SchemaInfo,
   type StoredVerifyReport,
   type TargetInfo,
 } from '@dowel/api';
 import { type Model, newId } from '@dowel/core';
-import { type Db, DOWEL_SCHEMA, HistoryError, withProjectLock } from '@dowel/engines';
+import { type Db, HistoryError, withProjectLock } from '@dowel/engines';
 import { claimInstance, inspectAttach, planDiff, readState, type TargetState } from '@dowel/executor';
 import type { Context, Hono } from 'hono';
 import { HTTPException } from 'hono/http-exception';
@@ -44,72 +43,12 @@ import {
 } from '../takeover.ts';
 import {
   CHECK_CONNECT_TIMEOUT,
-  ConnectError,
   claimShadow,
   connectPg,
   dropSameInstanceShadow,
-  scrubUrl,
-  shadowDbName,
+  inspectTargetOn,
 } from '../targets.ts';
 import { type AppContext, access, body, connectionLimit, type Env } from './context.ts';
-
-/** 在已有目标库连接上做基础探测（与 targets.ts 的 inspectTarget 完全等价，避免和 inspectAttach 重复建连） */
-const inspectTargetOn = async (tdb: Db, url: string): Promise<TargetInfo> => {
-  try {
-    const [r] = await tdb.query<{
-      version: string;
-      num: number;
-      database: string;
-      createdb: boolean;
-      currentUser: string;
-      superuser: boolean;
-      canCreateSchema: boolean;
-    }>(
-      `select current_setting('server_version') as version, current_setting('server_version_num')::int as num,
-              current_database() as database,
-              (select rolcreatedb or rolsuper from pg_roles where rolname = current_user) as createdb,
-              current_user as "currentUser",
-              (select rolsuper from pg_roles where rolname = current_user) as superuser,
-              has_database_privilege(current_database(), 'CREATE') as "canCreateSchema"`,
-    );
-    const shadow = shadowDbName(r!.database);
-    const [ex] = await tdb.query<{ n: number }>(
-      'select count(*)::int as n from pg_database where datname = $1',
-      [shadow],
-    );
-    const schemas = await tdb.query<SchemaInfo>(
-      `select n.nspname as name, count(c.oid)::int as tables
-         from pg_namespace n
-         left join pg_class c on c.relnamespace = n.oid and c.relkind in ('r', 'p')
-        where n.nspname !~ '^pg_' and n.nspname <> 'information_schema' and n.nspname <> $1
-        group by n.nspname order by n.nspname`,
-      [DOWEL_SCHEMA],
-    );
-    const [dowel] = await tdb.query<{ schema: boolean; meta: boolean }>(
-      `select exists(select 1 from pg_namespace where nspname = $1) as schema,
-              exists(select 1 from pg_class c join pg_namespace n on n.oid = c.relnamespace
-                      where n.nspname = $1 and c.relname = 'meta' and c.relkind in ('r', 'p')) as meta`,
-      [DOWEL_SCHEMA],
-    );
-    return {
-      version: r!.version,
-      versionNum: r!.num,
-      database: r!.database,
-      canCreateDb: r!.createdb,
-      shadow,
-      shadowExists: ex!.n > 0,
-      currentUser: r!.currentUser,
-      superuser: r!.superuser,
-      canCreateSchema: r!.canCreateSchema,
-      schemas,
-      dowelSchema: dowel!.schema,
-      dowelMeta: dowel!.meta,
-    };
-  } catch (e) {
-    if (e instanceof HTTPException) throw e;
-    throw new ConnectError(`连接失败：${scrubUrl(e instanceof Error ? e.message : String(e), url)}`);
-  }
-};
 
 /** 在已有目标库连接上读取历史并同步到平台库缓存（在目标库项目锁里做，拿不到锁就只读不同步） */
 const syncTargetOn = async (x: AppContext['exec'], env: EnvRow, tdb: Db): Promise<TargetState> => {
@@ -402,8 +341,9 @@ export const registerClaims = (app: Hono<Env>, ctx: AppContext) => {
           );
           if (dup) throw new HTTPException(409, { message: `环境“${b.name}”已经存在` });
           await tx.query(
-            `insert into environments (id, project_id, name, url_enc, production, allow_same_instance, shadow_url_enc)
-             values ($1, $2, $3, $4, $5, $6, $7)`,
+            `insert into environments (id, project_id, name, url_enc, production, allow_same_instance, shadow_url_enc,
+                                       engine_version, engine_version_num)
+             values ($1, $2, $3, $4, $5, $6, $7, $8, $9)`,
             [
               id,
               a.pid,
@@ -412,6 +352,8 @@ export const registerClaims = (app: Hono<Env>, ctx: AppContext) => {
               b.production,
               b.allowSameInstance,
               b.shadowUrl ? encrypt(b.shadowUrl) : null,
+              info.version,
+              info.versionNum,
             ],
           );
           await auditIn(

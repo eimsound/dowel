@@ -63,7 +63,7 @@ export const readOpaques = async (
     return t ? key(t.schema, t.name) : null;
   };
 
-  // 域
+  // 域（PG 15/16 不把域 NOT NULL 存入 pg_constraint，只记在 pg_type.typnotnull；PG 17+ 存入 pg_constraint contype='n'）
   for (const r of await db.query<{
     oid: number;
     schema: string;
@@ -71,6 +71,7 @@ export const readOpaques = async (
     base: string;
     collation: string | null;
     def: string | null;
+    notnull: boolean;
     cons: string[];
     comment: string | null;
   }>(
@@ -80,6 +81,7 @@ export const readOpaques = async (
                          from pg_collation co join pg_namespace cn on cn.oid = co.collnamespace where co.oid = t.typcollation)
             end as collation,
             t.typdefault as def,
+            t.typnotnull as notnull,
             array(select 'CONSTRAINT ' || quote_ident(k.conname) || ' ' || pg_get_constraintdef(k.oid)
                     from pg_constraint k where k.contypid = t.oid order by k.conname) as cons,
             obj_description(t.oid, 'pg_type') as comment
@@ -90,6 +92,8 @@ export const readOpaques = async (
     let ddl = `CREATE DOMAIN ${q} AS ${r.base}`;
     if (r.collation) ddl += ` COLLATE ${r.collation}`;
     if (r.def) ddl += ` DEFAULT ${r.def}`;
+    const hasNotNull = r.cons.some((c) => /\bNOT\s+NULL\b/i.test(c));
+    if (r.notnull && !hasNotNull) ddl += ' NOT NULL';
     for (const c of r.cons) ddl += ` ${c}`;
     add(
       {

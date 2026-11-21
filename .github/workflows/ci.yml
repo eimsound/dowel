@@ -67,6 +67,28 @@ jobs:
           kill -TERM "$SERVER_PID"
           wait "$SERVER_PID"
 
+  pg-matrix:
+    name: PG 多版本矩阵（PG ${{ matrix.pg }}）
+    runs-on: ubuntu-latest
+    timeout-minutes: 25
+    strategy:
+      fail-fast: false
+      matrix:
+        pg: ['15', '16', '17', '18', '19']
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: pnpm/action-setup@73e46992e05b19abd31f2f3c20e0e7370d762115 # v6.1.1
+      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
+        with:
+          node-version-file: .tool-versions
+          cache: pnpm
+      - run: pnpm install --frozen-lockfile
+      - run: pnpm vitest run packages/engines/test/roundtrip.test.ts packages/engines/test/pagila.test.ts packages/verifier/test/pg-matrix.test.ts
+        env:
+          DOWEL_PG_IMAGE: pgvector/pgvector:pg${{ matrix.pg }}
+
   heavy:
     name: 随机闭环测试（5000 例）
     runs-on: ubuntu-latest

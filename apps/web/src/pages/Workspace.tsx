@@ -113,15 +113,17 @@ export const Model = () => {
     return () => window.removeEventListener('keydown', onKey);
   }, []);
 
-  const ddl = useMemo(
-    () =>
-      tab === 'sql'
-        ? createAll(model)
-            .map((s) => `${s.sql};`)
-            .join('\n\n')
-        : '',
-    [model, tab],
-  );
+  const ddl = useMemo(() => {
+    if (tab !== 'sql') return '';
+    try {
+      return createAll(model, project.targetPgMajor !== null ? { pgMajor: project.targetPgMajor } : undefined)
+        .map((s) => `${s.sql};`)
+        .join('\n\n');
+    } catch (e) {
+      const msg = e instanceof Error ? e.message : String(e);
+      return `-- ${msg}`;
+    }
+  }, [model, tab, project.targetPgMajor]);
   const onMove = useCallback((l: Parameters<typeof ws.move>[0]) => !readOnly && ws.move(l), [ws, readOnly]);
   const close = () => setDialog(null);
   const people = useMemo(() => {
@@ -161,6 +163,17 @@ export const Model = () => {
   const env = envs.data?.[0];
   const latest = versions.data?.[0];
   const showInspector = pinned || selected !== null;
+  const pgTargetLabel =
+    project.targetPgMajor !== null ? `PostgreSQL ${project.targetPgMajor}+` : 'PostgreSQL';
+  const pgTargetTip =
+    project.targetPgMajor !== null
+      ? project.envPgMajors.length > 1
+        ? t('ws.pgTargetMultiTip', {
+            target: project.targetPgMajor,
+            versions: project.envPgMajors.map((v) => `PG ${v}`).join(' · '),
+          })
+        : t('ws.pgTargetSingleTip', { target: project.targetPgMajor })
+      : t('ws.pgTargetUnknownTip');
 
   return (
     <>
@@ -338,7 +351,9 @@ export const Model = () => {
         <span>{env ? t('ws.shadowOf', { env: env.name }) : t('ws.noEnv')}</span>
         <span className="flex-1" />
         {latest && <span className="font-mono">{latest.name}</span>}
-        <span>PostgreSQL</span>
+        <span className="font-mono" title={pgTargetTip}>
+          {pgTargetLabel}
+        </span>
       </footer>
 
       <ImportDialog pid={pid} open={dialog === 'import'} onClose={close} />

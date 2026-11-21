@@ -38,6 +38,8 @@ export interface DriftOptions {
   db: Db;
   projectId: string;
   chain: ChainVersion[];
+  /** 可选回调：读取快照后上报目标库的 server_version_num（零额外查询感知原地升级） */
+  onVersion?: (versionNum: number) => void;
 }
 
 /**
@@ -63,6 +65,7 @@ export const checkDrift = async (o: DriftOptions): Promise<DriftReport> => {
           : undefined;
         if (state.current === null) {
           const snapshot = await readSnapshot(conn, first.scope);
+          o.onVersion?.(snapshot.version);
           const c = classifyFirstRun(snapshot, first, emptyBase(first.model, first.scope));
           return c.kind === 'drift'
             ? ({
@@ -81,6 +84,7 @@ export const checkDrift = async (o: DriftOptions): Promise<DriftReport> => {
             `目标库历史里的当前版本 ${state.current} 不在平台库的版本链上`,
           );
         const snapshot = await readSnapshot(conn, cur.scope);
+        o.onVersion?.(snapshot.version);
         const recorded = state.versions.find((v) => v.versionId === cur.id)?.fingerprint;
         if (recorded && recorded === fingerprint(snapshot)) return { status: 'ok', version: cur.id } as const;
         const diff = diffAgainst(snapshot, cur.model);

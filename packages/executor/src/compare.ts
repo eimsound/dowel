@@ -4,7 +4,7 @@
 // 迁移规划器本来就只比较“定义”（不比展示顺序、不比 ID），空数组就是相等；非空就是“线上结构要怎么改才能回到
 // 这个版本”，直接拿来作差异列表。版本模型是发布时规范化过的（表达式、不透明对象 DDL 是引擎的规范形式），
 // 所以不会因为写法不同误报。
-import { type Model, plan } from '@dowel/core';
+import { type Model, pgMajorOf, type PlanOptions, plan } from '@dowel/core';
 import { importSnapshot, reconcileIds, type Snapshot } from '@dowel/engines';
 
 import type { ChainVersion, DiffItem } from './types.ts';
@@ -46,9 +46,9 @@ export const importLive = (snapshot: Snapshot, reference: Model): Model =>
  * plan(from, to) 的差异（最多 MAX_DIFF 项，另给总数）；规划器对这对模型报错时作为一项 `unresolvable`，不让调用方崩溃。
  * 漂移差异、导入预览、修复脚本用同一个函数。
  */
-export const planDiff = (from: Model, to: Model): DiffResult => {
+export const planDiff = (from: Model, to: Model, opts?: PlanOptions): DiffResult => {
   try {
-    const steps = plan(from, to);
+    const steps = plan(from, to, opts);
     if (!steps.length) return SAME;
     return {
       total: steps.length,
@@ -67,7 +67,8 @@ const unresolvable = (e: unknown): DiffResult => ({
 /** 线上结构 → 版本模型的差异；total = 0 表示相等 */
 export const diffAgainst = (snapshot: Snapshot, model: Model): DiffResult => {
   try {
-    return planDiff(importLive(snapshot, model), model);
+    const pgMajor = pgMajorOf(snapshot.version);
+    return planDiff(importLive(snapshot, model), model, pgMajor !== null ? { pgMajor } : undefined);
   } catch (e) {
     // 线上结构怪到连导入都做不了：也算不一致，把原因当作一项差异
     return unresolvable(e);

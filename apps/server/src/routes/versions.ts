@@ -6,7 +6,9 @@ import {
   type PublishRejected,
   type StoredVerifyReport,
   stepsPatchSchema,
+  type VerifyReport,
   type VerifyResponse,
+  type VerifyTargetReport,
   type VersionCreated,
   type VersionDetail,
   type VersionInfo,
@@ -35,8 +37,10 @@ import {
   versionExecutedAnywhere,
 } from '../chain.ts';
 import { isUniqueViolation } from '../db.ts';
+import { projectTargetPgMajor } from '../envs.ts';
 import { scrubSecrets } from '../secrets.ts';
 import { ShadowError, storedReport } from '../shadow.ts';
+import type { Shadows } from '../shadows.ts';
 import { type AppContext, access, body, type Env } from './context.ts';
 
 /** 概要字段：版本列表用 */
@@ -125,6 +129,142 @@ const toDetail = (v: VersionRow, latestId: string | null): VersionDetail => ({
 
 const CHAIN_CHANGED = '版本链刚刚发生了变化（有人先发布了），请刷新后重试';
 
+type MultiVersionVerifyOutcome =
+  | { kind: 'ok'; stored: StoredVerifyReport }
+  | { kind: 'failed'; report: VerifyResponse; stored: StoredVerifyReport; failedMajor: number | null }
+  | { kind: 'missing_target'; missingMajor: number; reason: string; stored: StoredVerifyReport };
+
+/**
+ * 跨大版本影子库闭环验证冻结脚本（按大版本升序逐一执行，风险分析仅在首个可用影子库执行一次）：
+ * - 任一大版本闭环验证失败 → 整体失败并指出具体 PG 版本；
+ * - 存在多个 PG 大版本且最低目标版本 targetPgMajor 缺少可用影子库 → 不得标为已验证（missing_target），
+ *   在报告与原因中明确写明缺少 PG <targetPgMajor> 影子库；
+ * - 全部可用影子库均遇到 ShadowError 或项目无任何可用影子库 → 抛出 ShadowError（按基础设施/配置不可用处理）。
+ */
+const verifyAcrossVersions = async (
+  shadows: Shadows,
+  pid: string,
+  from: Model,
+  to: Model,
+  up: ScriptStep[],
+  down: ScriptStep[],
+  checkDown = true,
+): Promise<MultiVersionVerifyOutcome> => {
+  const selection = await shadows.forProjectVersions(pid);
+  if (!selection.entries.length) {
+    throw new ShadowError(selection.skippedMajors[0]?.reason ?? '没有可用的影子库');
+  }
+
+  const targets: VerifyTargetReport[] = [];
+  const passedShadows: { major: number | null; label: string }[] = [];
+  const runtimeSkipped = new Map<number | null, string>();
+  let primaryReport: VerifyReport | null = null;
+  let ranRisk = false;
+
+  for (const entry of selection.entries) {
+    let report: VerifyReport;
+    try {
+      report = await entry.shadow.verifyScripts(from, to, up, down, {
+        checkDown,
+        skipRisk: ranRisk,
+      });
+    } catch (e) {
+      if (!(e instanceof ShadowError)) throw e;
+      runtimeSkipped.set(entry.major, scrubSecrets(e.message));
+      continue;
+    }
+
+    if (!ranRisk) {
+      primaryReport = report;
+      ranRisk = true;
+    }
+
+    if (entry.major !== null) {
+      targets.push({
+        major: entry.major,
+        shadow: entry.label,
+        ok: report.ok,
+        error: report.error?.message ?? null,
+        upDiffCount: report.upDiff.length,
+        downDiffCount: report.downDiff.length,
+      });
+    }
+
+    if (!report.ok) {
+      const shadowLabel = entry.major !== null ? `PG ${entry.major}（${entry.label}）` : entry.label;
+      const withPrefix =
+        entry.major !== null && report.error
+          ? {
+              ...report,
+              error: {
+                ...report.error,
+                message: `PG ${entry.major} 验证失败：${report.error.message}`,
+              },
+            }
+          : report;
+      const extra = targets.length ? { targets } : undefined;
+      return {
+        kind: 'failed',
+        failedMajor: entry.major,
+        report: {
+          ...withPrefix,
+          shadow: shadowLabel,
+          ...(targets.length ? { targets } : {}),
+        },
+        stored: storedReport(withPrefix, shadowLabel, extra),
+      };
+    }
+
+    passedShadows.push({ major: entry.major, label: entry.label });
+  }
+
+  // 所有候选影子库在运行期都遇到 ShadowError：回退为基础设施不可用
+  if (!passedShadows.length || !primaryReport) {
+    const firstErr =
+      runtimeSkipped.values().next().value ?? selection.skippedMajors[0]?.reason ?? '影子库不可用';
+    throw new ShadowError(firstErr);
+  }
+
+  const shadowSummary =
+    passedShadows.length === 1
+      ? passedShadows[0]!.label
+      : passedShadows.map((s) => (s.major !== null ? `PG ${s.major}（${s.label}）` : s.label)).join(' · ');
+
+  // 严格安全规则：项目存在多个 PG 大版本时，若最低目标版本 targetPgMajor 缺少可用影子库，不得仅凭高版本通过就标为已验证
+  if (selection.envPgMajors.length > 1 && selection.targetPgMajor !== null) {
+    const targetCovered = passedShadows.some((s) => s.major === selection.targetPgMajor);
+    if (!targetCovered) {
+      const skippedReason =
+        runtimeSkipped.get(selection.targetPgMajor) ??
+        selection.skippedMajors.find((s) => s.major === selection.targetPgMajor)?.reason;
+      const reason = skippedReason
+        ? `缺少 PG ${selection.targetPgMajor} 影子库，无法验证最低目标版本兼容性（${skippedReason}）。请为 PG ${selection.targetPgMajor} 环境配置独立影子库或允许使用同实例影子库`
+        : `缺少 PG ${selection.targetPgMajor} 影子库，无法验证最低目标版本兼容性。请为 PG ${selection.targetPgMajor} 环境配置独立影子库或允许使用同实例影子库`;
+      const incompleteReport: VerifyReport = {
+        ...primaryReport,
+        ok: false,
+        error: { step: null, message: reason },
+      };
+      return {
+        kind: 'missing_target',
+        missingMajor: selection.targetPgMajor,
+        reason,
+        stored: storedReport(incompleteReport, shadowSummary, {
+          targets: targets.length ? targets : undefined,
+          missingTargetMajor: selection.targetPgMajor,
+        }),
+      };
+    }
+  }
+
+  return {
+    kind: 'ok',
+    stored: storedReport(primaryReport, shadowSummary, {
+      targets: targets.length ? targets : undefined,
+    }),
+  };
+};
+
 export const registerVersions = (app: Hono<Env>, ctx: AppContext) => {
   const { db, rooms, shadows, refresher } = ctx;
 
@@ -165,7 +305,12 @@ export const registerVersions = (app: Hono<Env>, ctx: AppContext) => {
     const { model, seq } = await rooms.model(a.branch);
     const parent = await chainHeadWithModel(db, a.pid);
     const from = chainFrom(parent, model, a.schemas);
-    const frozen = freezeScripts(from, model);
+    const targetPgMajor = await projectTargetPgMajor(db, a.pid);
+    const frozen = freezeScripts(
+      from,
+      model,
+      targetPgMajor !== null ? { pgMajor: targetPgMajor } : undefined,
+    );
     // 兜底：规划器正常不会生成实例级语句，真出现了就不发布（验证会真的执行它们）
     const instanceLevel = instanceLevelProblem(frozen.up, frozen.down);
     if (instanceLevel) throw new HTTPException(422, { message: instanceLevel });
@@ -176,34 +321,32 @@ export const registerVersions = (app: Hono<Env>, ctx: AppContext) => {
           : '没有变更：工作副本还是空的，没有需要执行的 SQL',
       });
 
-    let verified: StoredVerifyReport | null = null;
+    let verifiedAt: string | null = null;
+    let verifyReport: StoredVerifyReport | null = null;
     let unverifiedReason: string | null = null;
     // 只放过预期的“没有影子库 / 影子库不可用”（ShadowError：没有环境、生产环境不让用同实例、连不上、被占用）；
     // 密钥解密失败（SecretError）、白名单拒绝（HTTPException）、平台库错误都继续抛出
-    const shadow = await shadows.forProject(a.pid).catch((e: unknown) => {
+    try {
+      const outcome = await verifyAcrossVersions(shadows, a.pid, from, model, frozen.up, frozen.down, true);
+      if (outcome.kind === 'failed') {
+        const msg =
+          outcome.failedMajor !== null
+            ? `PG ${outcome.failedMajor} 影子库闭环验证没有通过，版本没有发布。请先修正模型`
+            : '闭环验证没有通过，版本没有发布。请先修正模型';
+        return c.json<PublishRejected>({ error: msg, report: outcome.report }, 422);
+      }
+      if (outcome.kind === 'missing_target') {
+        verifyReport = outcome.stored;
+        unverifiedReason = outcome.reason;
+      } else {
+        verifiedAt = outcome.stored.at;
+        verifyReport = outcome.stored;
+      }
+    } catch (e) {
+      // 连接断开、超时、被占用这类基础设施故障（shadow.ts 统一抛 ShadowError）不是“脚本有问题”：
+      // 和“没有影子库”同样处理，发布但标为未验证，原因写明
       if (!(e instanceof ShadowError)) throw e;
       unverifiedReason = scrubSecrets(e.message);
-      return null;
-    });
-    if (shadow) {
-      try {
-        // 验证的就是要冻结的这一份脚本，而不是重新 plan 一遍
-        const report = await shadow.shadow.verifyScripts(from, model, frozen.up, frozen.down);
-        if (!report.ok)
-          return c.json<PublishRejected>(
-            {
-              error: '闭环验证没有通过，版本没有发布。请先修正模型',
-              report: { ...report, shadow: shadow.label },
-            },
-            422,
-          );
-        verified = storedReport(report, shadow.label);
-      } catch (e) {
-        // 连接断开、超时、被占用这类基础设施故障（shadow.ts 统一抛 ShadowError）不是“脚本有问题”：
-        // 和“没有影子库”同样处理，发布但标为未验证，原因写明
-        if (!(e instanceof ShadowError)) throw e;
-        unverifiedReason = scrubSecrets(e.message);
-      }
     }
 
     const id = newId();
@@ -234,8 +377,8 @@ export const registerVersions = (app: Hono<Env>, ctx: AppContext) => {
             JSON.stringify(frozen.up),
             JSON.stringify(frozen.down),
             frozen.checksum,
-            verified?.at ?? null,
-            verified ? JSON.stringify(verified) : null,
+            verifiedAt,
+            verifyReport ? JSON.stringify(verifyReport) : null,
             a.schemas?.length ? JSON.stringify(a.schemas) : null,
           ],
         );
@@ -260,7 +403,7 @@ export const registerVersions = (app: Hono<Env>, ctx: AppContext) => {
           name: b.name,
           seq,
           number,
-          verified: verified !== null,
+          verified: verifiedAt !== null,
           checksum: frozen.checksum,
         },
       },
@@ -272,10 +415,10 @@ export const registerVersions = (app: Hono<Env>, ctx: AppContext) => {
         name: b.name,
         seq,
         number,
-        verified: verified !== null,
+        verified: verifiedAt !== null,
         unverifiedReason,
         // 验证通过但风险分析没有完成：界面要让用户看到，不能悄悄当成“没有风险”
-        riskError: verified?.riskError ?? null,
+        riskError: verifiedAt !== null ? (verifyReport?.riskError ?? null) : null,
       },
       201,
     );
@@ -366,16 +509,22 @@ export const registerVersions = (app: Hono<Env>, ctx: AppContext) => {
     const from = chainFrom(parent, v.model, v.scope);
     const checkDown = !(v.number === 0 && v.downSteps.length === 0);
     // 影子库的故障（拿不到、连接断开、超时……）是 ShadowError，直接抛出（422），不写回任何验证状态
-    const s = await shadows.forProject(a.pid);
-    const report = storedReport(
-      await s.shadow.verifyScripts(from, v.model, v.upSteps, v.downSteps, { checkDown }),
-      s.label,
+    const outcome = await verifyAcrossVersions(
+      shadows,
+      a.pid,
+      from,
+      v.model,
+      v.upSteps,
+      v.downSteps,
+      checkDown,
     );
+    const report = outcome.stored;
+    const verifiedAt = outcome.kind === 'ok' ? report.at : null;
     // 只在脚本没有被同时改动时写回（checksum 没变）；否则这份报告属于旧脚本，丢弃
     const written = await db.query<{ id: string }>(
       `update versions set verified_at = $3, verify_report = $4::text::jsonb
         where id = $1 and checksum = $2 returning id`,
-      [v.id, v.checksum, report.ok ? report.at : null, JSON.stringify(report)],
+      [v.id, v.checksum, verifiedAt, JSON.stringify(report)],
     );
     if (!written.length)
       throw new HTTPException(409, { message: '验证期间脚本被改动了，这次的结果作废，请重新验证' });
@@ -389,11 +538,11 @@ export const registerVersions = (app: Hono<Env>, ctx: AppContext) => {
         targetKind: 'version',
         targetId: v.id,
         projectId: a.pid,
-        data: { projectId: a.pid, number: v.number, ok: report.ok, checksum: v.checksum },
+        data: { projectId: a.pid, number: v.number, ok: verifiedAt !== null, checksum: v.checksum },
       },
       ctx.security,
     );
-    return c.json<VersionVerifyResponse>({ report, verifiedAt: report.ok ? report.at : null });
+    return c.json<VersionVerifyResponse>({ report, verifiedAt });
   });
 
   /** 解析版本引用：`empty` 空模型，`head` 当前工作副本，其余是版本 ID */
@@ -420,8 +569,10 @@ export const registerVersions = (app: Hono<Env>, ctx: AppContext) => {
     const a = await access(c, ctx, 'migration.read');
     const to = await resolve(a.pid, a.branch, c.req.query('to'));
     const from = await resolve(a.pid, a.branch, c.req.query('from') ?? 'empty', to, a.schemas);
-    const up = plan(from, to);
-    const down = plan(to, from);
+    const targetPgMajor = await projectTargetPgMajor(db, a.pid);
+    const planOpts = targetPgMajor !== null ? { pgMajor: targetPgMajor } : undefined;
+    const up = plan(from, to, planOpts);
+    const down = plan(to, from, planOpts);
     if (c.req.query('format') === 'sql') {
       // 迁移脚本开头带上固定的会话设置（04-ir-design.md 1.6），保证在任何会话下执行结果相同
       const header = SESSION_SETTINGS.map((x) => `${x};`).join('\n');
@@ -434,8 +585,9 @@ export const registerVersions = (app: Hono<Env>, ctx: AppContext) => {
   app.get('/api/projects/:pid/ddl', async (c) => {
     const a = await access(c, ctx, 'ddl.read');
     const m = await resolve(a.pid, a.branch, c.req.query('version'));
+    const targetPgMajor = await projectTargetPgMajor(db, a.pid);
     return c.text(
-      `${createAll(m)
+      `${createAll(m, targetPgMajor !== null ? { pgMajor: targetPgMajor } : undefined)
         .map((s) => `${s.sql};`)
         .join('\n\n')}\n`,
       200,
