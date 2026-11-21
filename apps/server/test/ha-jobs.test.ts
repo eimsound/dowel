@@ -977,10 +977,10 @@ describe.skipIf(!PG_URL)('P7 HA Wave 2B：持久化队列、分布式巡检、�
     });
 
     const hooksB: { type: string; requestId: unknown; status: unknown }[] = [];
-    const origEmitB = whB.emit.bind(whB);
-    whB.emit = (gid, event) => {
+    const origEnqueueInB = whB.enqueueIn.bind(whB);
+    whB.enqueueIn = async (tx, gid, event) => {
       hooksB.push({ type: event.type, requestId: event.data.requestId, status: event.data.status });
-      origEmitB(gid, event);
+      return origEnqueueInB(tx, gid, event);
     };
 
     try {
@@ -1160,7 +1160,7 @@ describe.skipIf(!PG_URL)('P7 HA Wave 2B：持久化队列、分布式巡检、�
       expect(finishedExp!.status).toBe('executed');
       expect(finishedExp!.result).toMatchObject({ ok: true, current: { number: 2 } });
     } finally {
-      whB.emit = origEmitB;
+      whB.enqueueIn = origEnqueueInB;
       requestsA.stop();
       requestsB.stop();
       await requestsA.drain();
@@ -1171,6 +1171,124 @@ describe.skipIf(!PG_URL)('P7 HA Wave 2B：持久化队列、分布式巡检、�
       await busB.close();
       await haA.stop();
       await haB.stop();
+      await dbA.close();
+      await dbB.close();
+    }
+  });
+
+  test('9. 业务事务内 enqueueIn(tx) 原子性（PG 双副本）：回滚不残留且不广播，提交后即时落表并唤醒集群投递（#20）', async () => {
+    const t = await createTestDb('ha_wh_tx');
+    closers.push(t.close);
+    const dbA = await openPlatformDb(t.url);
+    const dbB = await openPlatformDb(t.url);
+    const busA = new EventBus(dbA, { replicaId: 'tx-wh-a' });
+    const busB = new EventBus(dbB, { replicaId: 'tx-wh-b' });
+    const haA = new HaCoordinator(dbA, { replicaId: 'tx-wh-a' });
+    const haB = new HaCoordinator(dbB, { replicaId: 'tx-wh-b' });
+    const rx = await startReceiver();
+    // 副本 A 调长轮询间隔，副本 B 依靠跨副本 webhooks.wake 广播立即拾取并投递
+    const whA = new Webhooks(dbA, { bus: busA, ha: haA, pollIntervalMs: 60_000, retryBaseMs: 60_000 });
+    const whB = new Webhooks(dbB, { bus: busB, ha: haB, pollIntervalMs: 60_000, retryBaseMs: 60_000 });
+    const security = securityConfigFromEnv();
+    const guard = async () => {};
+    const requestsA = new Requests(dbA, { db: dbA, guard, locks: new EnvLocks(dbA) }, whA, security, {
+      bus: busA,
+      ha: haA,
+    });
+
+    try {
+      await busA.start();
+      await busB.start();
+      await dbA.query(
+        `insert into instance_settings (key, value) values ('webhook_allowlist', $1::text::jsonb)
+         on conflict (key) do update set value = excluded.value`,
+        [JSON.stringify(['127.0.0.0/8'])],
+      );
+      const user = await makeUser(dbA, 'tx_wh_user', { name: '管理员', role: 'admin' });
+      await dbA.query("insert into groups (id, slug, name) values ('g-tx-ha', 'g-tx-ha', '事务组')");
+      await dbA.query("insert into group_members (group_id, user_id, role) values ('g-tx-ha', $1, 'admin')", [
+        user.id,
+      ]);
+      await dbA.query(
+        "insert into projects (id, name, group_id, slug) values ('p-tx-ha', '事务项目', 'g-tx-ha', 'p-tx-ha')",
+      );
+      await dbA.query("insert into branches (id, project_id, name) values ('b-tx-ha', 'p-tx-ha', 'main')");
+      await dbA.query(
+        `insert into environments (id, project_id, name, url_enc, production)
+         values ('e-tx-ha', 'p-tx-ha', 'prod', $1, true)`,
+        [encrypt('postgres://u:p@127.0.0.1:5432/x')],
+      );
+      await dbA.query(
+        `insert into versions (id, project_id, branch_id, seq, name, model, number, up_steps, down_steps, checksum)
+         values ('v-tx-1', 'p-tx-ha', 'b-tx-ha', 1, 'v1', $1::text::jsonb, 1, '[]'::jsonb, '[]'::jsonb, 'sum1')`,
+        [JSON.stringify(emptyModel())],
+      );
+      await dbA.query(
+        `insert into webhooks (id, group_id, name, format, url_enc, events, enabled)
+         values ('w-tx-ha', 'g-tx-ha', 'tx-hook', 'json', $1, $2::text::jsonb, true)`,
+        [encrypt(`${rx.base}/tx-hook`), JSON.stringify(['request.executed'])],
+      );
+      await dbA.query(
+        `insert into exec_requests
+           (id, project_id, environment_id, requested_by, direction, to_version_id, migrations, flow, conn_hash, production, status, expires_at, updated_at)
+         values ('req-tx-1', 'p-tx-ha', 'e-tx-ha', $1, 'up', 'v-tx-1', '[]'::jsonb, $2::text::jsonb, 'h', true, 'executing', $3, $4)`,
+        [
+          user.id,
+          JSON.stringify({ implicit: true, stages: [] }),
+          new Date(Date.now() + 3600_000),
+          new Date(),
+        ],
+      );
+
+      // (a) 副本 A 事务内 queueHook 后回滚：PG 上 webhook_jobs 零残留，副本 B 收不到任何请求
+      const [reqRow] = await dbA.query<RequestRow>("select * from exec_requests where id = 'req-tx-1'");
+      const scope = (await requestsA.scopeOf(dbA, reqRow!))!;
+      const rbFx = new Effects();
+      await expect(
+        dbA.transaction(async (tx) => {
+          const inserted = await requestsA.queueHook(tx, rbFx, 'request.executed', reqRow!, scope, {
+            actor: user.name,
+            status: 'executed',
+          });
+          expect(inserted).toBe(1);
+          throw new Error('rollback-pg-tx');
+        }),
+      ).rejects.toThrow('rollback-pg-tx');
+      expect(await dbB.query('select id from webhook_jobs')).toEqual([]);
+      expect(rx.received).toHaveLength(0);
+
+      // (b) 副本 A finish() 提交：即使关闭副本 A 的本地拉取（仅广播唤醒），副本 B 仍通过 webhooks.wake 立即拾取并投递 1 次
+      const origWakeA = whA.wake.bind(whA);
+      let wakeBroadcasts = 0;
+      whA.wake = (broadcast = true) => {
+        if (broadcast) {
+          wakeBroadcasts++;
+          void busA.publish({ t: 'webhooks.wake' });
+        }
+      };
+      try {
+        await requestsA.finish(
+          null,
+          'req-tx-1',
+          { id: user.id, name: user.name },
+          { ok: true, current: { id: 'v-tx-1', number: 1, name: 'v1' }, error: null },
+        );
+      } finally {
+        whA.wake = origWakeA;
+      }
+      expect(wakeBroadcasts).toBe(1);
+      await waitFor(() => rx.received.length === 1);
+      expect(rx.received).toHaveLength(1);
+      expect(rx.received[0]!.headers['x-dowel-event']).toBe('request.executed');
+      await whB.flush();
+      expect(await dbB.query('select id from webhook_jobs')).toEqual([]);
+    } finally {
+      requestsA.stop();
+      await requestsA.drain();
+      await whA.close();
+      await whB.close();
+      await busA.close();
+      await busB.close();
       await dbA.close();
       await dbB.close();
     }

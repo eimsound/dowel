@@ -202,7 +202,10 @@ const decideIn = async (
           "update exec_requests set stage = $2, status = 'approved', updated_at = $3 where id = $1",
           [req.id, req.stage, now],
         );
-        requests.queueHook(fx, 'request.approved', req, s, { actor: user.name, status: 'approved' });
+        await requests.queueHook(tx, fx, 'request.approved', req, s, {
+          actor: user.name,
+          status: 'approved',
+        });
         if (!startExecute) {
           if (req.requested_by)
             await requests.notify(tx, [req.requested_by], 'request_result', req, s, fx, {
@@ -462,7 +465,7 @@ export const registerRequests = (app: Hono<Env>, ctx: AppContext) => {
         fx,
         { event: 'needs', action: 'approve', actor: user.name, stage: 0 },
       );
-      requests.queueHook(fx, 'request.created', req, s, { actor: user.name, status: 'pending' });
+      await requests.queueHook(tx, fx, 'request.created', req, s, { actor: user.name, status: 'pending' });
       fx.requestsChanged = true;
       return id;
     });

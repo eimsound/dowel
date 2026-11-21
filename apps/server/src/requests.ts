@@ -10,7 +10,7 @@
 // （或是执行者）。审批流程只会多加限制、不会给谁执行权，所以下级追加环节（ADR 0005 里算收紧）不可能借审批绕过上级的“仅限执行者”。
 //
 // 状态变化、审批人资格判断都在执行策略锁（withPolicyLock）里，用锁内重新读到的申请、策略、成员关系和环境状态；
-// 收件箱的通知和审计在同一个事务里写，Webhook 和实时推送在提交之后发（Effects）。
+// 收件箱的通知、审计与 Webhook 持久化入队（webhook_jobs）在同一个事务里原子写库，实时推送与 Webhook 队列唤醒在提交之后发（Effects）。
 import { createHash } from 'node:crypto';
 import {
   type ApprovalStage,
@@ -424,12 +424,12 @@ export const bindingProblem = async (
   return null;
 };
 
-// ───── 副作用：事务提交之后才发 ─────
+// ───── 副作用：事务提交之后才触发 ─────
 
-/** 在事务里收集、提交之后再发的东西：实时推送给哪些用户、要投递的 Webhook */
+/** 在事务里收集、提交之后再触发的东西：实时推送给哪些用户、事务内已持久化入队的 Webhook 任务数 */
 export class Effects {
   users = new Set<string>();
-  hooks: { groupId: string; event: WebhookEventInput }[] = [];
+  enqueuedHooksCount = 0;
   requestsChanged = false;
 }
 
@@ -970,7 +970,7 @@ export class Requests {
               ? 'request.executed'
               : null;
     if (hook)
-      this.queueHook(fx, hook, req, ctx, {
+      await this.queueHook(tx, fx, hook, req, ctx, {
         actor: actor?.name ?? null,
         reason: req.emergency && status === 'executed' ? req.reason : reason,
         status,
@@ -1165,8 +1165,9 @@ export class Requests {
     return `${base}/project/${s.project.groupSlug}/${s.project.slug}/requests/${rid}`;
   }
 
-  /** 排一个 Webhook 事件（提交之后才投递）。消息里只有项目、环境、版本号、人名、状态和原因，没有连接信息 */
-  queueHook(
+  /** 在当前事务内持久化入队一个 Webhook 事件（提交后再由 flushEffects 唤醒投递）。消息里只有项目、环境、版本号、人名、状态和原因，没有连接信息 */
+  async queueHook(
+    tx: Db,
     fx: Effects,
     type: WebhookEventType,
     req: RequestRow,
@@ -1178,7 +1179,7 @@ export class Requests {
       ok?: boolean;
       error?: string | null;
     } = {},
-  ) {
+  ): Promise<number> {
     const to = req.migrations.at(-1);
     const toNum = to ? (req.direction === 'down' ? to.number - 1 : to.number) : null;
     const what = `${req.direction === 'down' ? '回滚' : '执行'}${toNum !== null ? `到 v${toNum}` : ''}`;
@@ -1206,39 +1207,38 @@ export class Requests {
       ...(req.reason && !extra.reason ? [`**申请说明**：${req.reason}`] : []),
       ...(extra.error ? [`**错误**：${extra.error}`] : []),
     ].map((l) => scrubSecrets(l));
-    fx.hooks.push({
-      groupId: s.project.groupId,
-      event: {
-        type,
-        title: `${titles[type]}：${s.project.name} / ${s.env.name}`,
-        lines,
-        url: this.requestUrl(s, req.id),
-        data: {
-          requestId: req.id,
-          emergency: req.emergency,
-          status: extra.status ?? req.status,
-          project: {
-            id: s.project.id,
-            name: s.project.name,
-            slug: s.project.slug,
-            group: s.project.groupSlug,
-          },
-          environment: { id: s.env.id, name: s.env.name, production: s.env.production },
-          direction: req.direction,
-          fromVersionId: req.from_version_id,
-          toVersionId: req.to_version_id,
-          migrations: req.migrations.map((m) => ({ number: m.number, name: m.name, direction: m.direction })),
-          actor: extra.actor ?? null,
-          reason: extra.reason ?? null,
-          ...(extra.ok !== undefined ? { ok: extra.ok } : {}),
+    const inserted = await this.webhooks.enqueueIn(tx, s.project.groupId, {
+      type,
+      title: `${titles[type]}：${s.project.name} / ${s.env.name}`,
+      lines,
+      url: this.requestUrl(s, req.id),
+      data: {
+        requestId: req.id,
+        emergency: req.emergency,
+        status: extra.status ?? req.status,
+        project: {
+          id: s.project.id,
+          name: s.project.name,
+          slug: s.project.slug,
+          group: s.project.groupSlug,
         },
+        environment: { id: s.env.id, name: s.env.name, production: s.env.production },
+        direction: req.direction,
+        fromVersionId: req.from_version_id,
+        toVersionId: req.to_version_id,
+        migrations: req.migrations.map((m) => ({ number: m.number, name: m.name, direction: m.direction })),
+        actor: extra.actor ?? null,
+        reason: extra.reason ?? null,
+        ...(extra.ok !== undefined ? { ok: extra.ok } : {}),
       },
     });
+    fx.enqueuedHooksCount += inserted;
+    return inserted;
   }
 
-  /** 事务提交之后：实时推送未读数、广播“申请有变化”、跨副本通知并投递 Webhook */
+  /** 事务提交之后：唤醒已入队的 Webhook 投递、实时推送未读数、广播“申请有变化”与跨副本通知 */
   async flushEffects(fx: Effects) {
-    for (const h of fx.hooks) this.webhooks.emit(h.groupId, h.event);
+    if (fx.enqueuedHooksCount > 0) this.webhooks.wake(true);
     const userIds = [...fx.users];
     for (const u of userIds) await this.publishUnreadLocal(u);
     if (userIds.length) await this.publishInboxChanged(userIds);
@@ -1330,7 +1330,7 @@ export class Requests {
             )[0]
           : undefined;
         const what = `${run.direction === 'down' ? '回滚' : '执行'}${toRef ? `到 v${toRef.number}` : ''}`;
-        this.webhooks.emit(s.project.groupId, {
+        const hookEvent: WebhookEventInput = {
           type: 'execution.finished',
           title: `${r.ok ? '执行完成' : '执行失败'}：${s.project.name} / ${s.env.name}`,
           lines: [
@@ -1356,7 +1356,13 @@ export class Requests {
             ok: r.ok,
             code: r.error?.code ?? null,
           },
-        });
+        };
+        try {
+          const inserted = await this.webhooks.enqueueIn(this.db, s.project.groupId, hookEvent);
+          if (inserted > 0) this.webhooks.wake(true);
+        } catch (e) {
+          console.error('直接执行 Webhook 入队失败', e instanceof Error ? scrubSecrets(e.message) : e);
+        }
       })(),
     );
   }
@@ -1390,7 +1396,7 @@ export class Requests {
         if (!s) return;
         const who = `CI 令牌 ${token.name}（${token.prefix}…）`;
         const where = `${s.project.name} / ${s.env.name}`;
-        this.webhooks.emit(s.project.groupId, {
+        const hookEvent: WebhookEventInput = {
           type: 'token.executed',
           title: `${r.ok ? 'CI 令牌执行完成' : 'CI 令牌执行失败'}：${where}`,
           lines: [
@@ -1423,51 +1429,64 @@ export class Requests {
             ok: r.ok,
             code: r.error?.code ?? null,
           },
-        });
-        // 生产环境无变更的幂等空跑（noop）不向收件箱刷屏
-        if (!s.env.production || (r.ok && r.noop)) return;
-        const fx = new Effects();
-        await this.db.transaction(async (tx) => {
-          const audience = await loadAudience(tx, s.project);
-          const scope: StageScope = {
-            project: s.project,
-            env: { id: s.env.id, production: s.env.production },
-            resolved: s.resolved,
-            direction: 'up',
-          };
-          const stages = stagesOf(flowOf(s.resolved));
-          const data = {
-            title: `${r.ok ? 'CI 令牌执行了生产环境' : 'CI 令牌执行生产环境失败'}：${where}`,
-            body: `${who} 执行到 v${target.number}${
-              r.ok
-                ? `，当前版本 ${r.current ? `v${r.current.number}` : '（无）'}`
-                : `：${scrubSecrets(r.error?.error ?? '')}`
-            }`,
-            event: r.ok ? 'token_executed' : 'token_failed',
-            actor: who,
-            params: {
-              project: s.project.name,
-              env: s.env.name,
-              to: target.number,
-              current: r.current?.number ?? null,
-              token: token.name,
-              prefix: token.prefix,
-              code: r.error?.code ?? null,
-            },
-          };
-          for (const u of audience.values()) {
-            const role = effectiveRole(u, s.project);
-            if (!role) continue;
-            if (role !== 'admin' && !stages.some((spec) => eligibleFor(u, spec, scope))) continue;
-            await tx.query(
-              `insert into inbox_items (id, user_id, kind, project_id, environment_id, request_id, data, created_at)
-               values ($1, $2, 'token_execution', $3, $4, null, $5::text::jsonb, $6)`,
-              [newId(), u.userId, s.project.id, s.env.id, JSON.stringify(data), new Date().toISOString()],
-            );
-            fx.users.add(u.userId);
+        };
+        // 生产环境无变更的幂等空跑（noop）或非生产环境：不向收件箱刷屏，同步持久化 Webhook 后立即唤醒
+        if (!s.env.production || (r.ok && r.noop)) {
+          try {
+            const inserted = await this.webhooks.enqueueIn(this.db, s.project.groupId, hookEvent);
+            if (inserted > 0) this.webhooks.wake(true);
+          } catch (e) {
+            console.error('令牌执行 Webhook 入队失败', e instanceof Error ? scrubSecrets(e.message) : e);
           }
-        });
-        await this.flushEffects(fx);
+          return;
+        }
+        const fx = new Effects();
+        try {
+          await this.db.transaction(async (tx) => {
+            fx.enqueuedHooksCount += await this.webhooks.enqueueIn(tx, s.project.groupId, hookEvent);
+            const audience = await loadAudience(tx, s.project);
+            const scope: StageScope = {
+              project: s.project,
+              env: { id: s.env.id, production: s.env.production },
+              resolved: s.resolved,
+              direction: 'up',
+            };
+            const stages = stagesOf(flowOf(s.resolved));
+            const data = {
+              title: `${r.ok ? 'CI 令牌执行了生产环境' : 'CI 令牌执行生产环境失败'}：${where}`,
+              body: `${who} 执行到 v${target.number}${
+                r.ok
+                  ? `，当前版本 ${r.current ? `v${r.current.number}` : '（无）'}`
+                  : `：${scrubSecrets(r.error?.error ?? '')}`
+              }`,
+              event: r.ok ? 'token_executed' : 'token_failed',
+              actor: who,
+              params: {
+                project: s.project.name,
+                env: s.env.name,
+                to: target.number,
+                current: r.current?.number ?? null,
+                token: token.name,
+                prefix: token.prefix,
+                code: r.error?.code ?? null,
+              },
+            };
+            for (const u of audience.values()) {
+              const role = effectiveRole(u, s.project);
+              if (!role) continue;
+              if (role !== 'admin' && !stages.some((spec) => eligibleFor(u, spec, scope))) continue;
+              await tx.query(
+                `insert into inbox_items (id, user_id, kind, project_id, environment_id, request_id, data, created_at)
+                 values ($1, $2, 'token_execution', $3, $4, null, $5::text::jsonb, $6)`,
+                [newId(), u.userId, s.project.id, s.env.id, JSON.stringify(data), new Date().toISOString()],
+              );
+              fx.users.add(u.userId);
+            }
+          });
+          await this.flushEffects(fx);
+        } catch (e) {
+          console.error('令牌执行通知写库失败', e instanceof Error ? scrubSecrets(e.message) : e);
+        }
       })(),
     );
   }

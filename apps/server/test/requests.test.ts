@@ -12,11 +12,15 @@ import type {
   PendingRequest,
   PolicySettings,
 } from '@dowel/api';
-import { addColumn, all, type Model } from '@dowel/core';
+import { addColumn, all, emptyModel, type Model } from '@dowel/core';
 import { afterAll, beforeAll, describe, expect, test, vi } from 'vitest';
 import { connect, createTestDb, PG_URL } from '../../../test/pg.ts';
+import type { EnvRow } from '../src/envs.ts';
 import { createApp, openPlatformDb, type PlatformDb } from '../src/index.ts';
+import { withPolicyLock } from '../src/policy.ts';
 import { KeyedLimiter, LoginLimiter } from '../src/rate-limit.ts';
+import { connHash, Effects, type RequestRow } from '../src/requests.ts';
+import { encrypt } from '../src/secrets.ts';
 import { addTable, editModel, makeUser, PASSWORD } from './support.ts';
 
 process.env.DOWEL_SECRET ??= 'requests-test-secret-0123456789';
@@ -862,10 +866,10 @@ describe.skipIf(!PG_URL)('第一轮审查的修复（目标库 PG）', () => {
     });
     // 记下这个项目发出的 Webhook 事件
     const hooks: { type: string; requestId: unknown }[] = [];
-    const emit = created.webhooks.emit.bind(created.webhooks);
-    created.webhooks.emit = (groupId, event) => {
+    const enqueueIn = created.webhooks.enqueueIn.bind(created.webhooks);
+    created.webhooks.enqueueIn = async (tx, groupId, event) => {
       hooks.push({ type: event.type, requestId: event.data.requestId });
-      emit(groupId, event);
+      return enqueueIn(tx, groupId, event);
     };
     try {
       const path = `/api/projects/${pid}/environments/${prod.eid}/emergency`;
@@ -888,7 +892,7 @@ describe.skipIf(!PG_URL)('第一轮审查的修复（目标库 PG）', () => {
       // A 的 Webhook 只有失败那一次
       expect(hooks.filter((h) => h.requestId === a.id).map((h) => h.type)).toEqual(['emergency.executed']);
     } finally {
-      created.webhooks.emit = emit;
+      created.webhooks.enqueueIn = enqueueIn;
     }
   });
 
@@ -945,10 +949,10 @@ describe.skipIf(!PG_URL)('中断申请巡检保护与重试限制（#18）', () 
     const [v1, v2] = await publishChain(pid, 2);
 
     const hooks: { type: string; requestId: unknown; status: unknown }[] = [];
-    const emit = created.webhooks.emit.bind(created.webhooks);
-    created.webhooks.emit = (gid, event) => {
+    const enqueueIn = created.webhooks.enqueueIn.bind(created.webhooks);
+    created.webhooks.enqueueIn = async (tx, gid, event) => {
       hooks.push({ type: event.type, requestId: event.data.requestId, status: event.data.status });
-      emit(gid, event);
+      return enqueueIn(tx, gid, event);
     };
 
     try {
@@ -1024,7 +1028,7 @@ describe.skipIf(!PG_URL)('中断申请巡检保护与重试限制（#18）', () 
         result: { ok: true, current: { number: 2 } },
       });
     } finally {
-      created.webhooks.emit = emit;
+      created.webhooks.enqueueIn = enqueueIn;
     }
   });
 
@@ -1034,10 +1038,10 @@ describe.skipIf(!PG_URL)('中断申请巡检保护与重试限制（#18）', () 
     const [v1] = await publishChain(pid, 1);
 
     const hooks: { type: string; requestId: unknown }[] = [];
-    const emit = created.webhooks.emit.bind(created.webhooks);
-    created.webhooks.emit = (gid, event) => {
+    const enqueueIn = created.webhooks.enqueueIn.bind(created.webhooks);
+    created.webhooks.enqueueIn = async (tx, gid, event) => {
       hooks.push({ type: event.type, requestId: event.data.requestId });
-      emit(gid, event);
+      return enqueueIn(tx, gid, event);
     };
 
     try {
@@ -1100,7 +1104,49 @@ describe.skipIf(!PG_URL)('中断申请巡检保护与重试限制（#18）', () 
       expect(await created.requests.sweep()).toBe(1);
       expect((await rowOf(rNormal.id)).status).toBe('invalid');
     } finally {
-      created.webhooks.emit = emit;
+      created.webhooks.enqueueIn = enqueueIn;
+    }
+  });
+
+  test('创建执行申请返回瞬间 webhook_jobs 已同步持久化落库（不依赖异步 emit）', async () => {
+    const pid = await newProject('wh-create-sync');
+    const prod = await realEnv(pid, 'prod');
+    const [v1] = await publishChain(pid, 1);
+    const hookId = `wh-create-${Date.now()}`;
+    await db.query(
+      `insert into webhooks (id, group_id, name, format, url_enc, events, enabled)
+       values ($1, $2, 'sync-create', 'json', $3, $4::text::jsonb, true)`,
+      [hookId, groupId, encrypt('https://example.invalid/hook'), JSON.stringify(['request.created'])],
+    );
+    const wakeCalls: boolean[] = [];
+    const emitCalls: unknown[] = [];
+    const origWake = created.webhooks.wake.bind(created.webhooks);
+    const origEmit = created.webhooks.emit.bind(created.webhooks);
+    // 拦截 wake 阻止立即拉取消费，同时拦截 emit 断言全路径零调用
+    created.webhooks.wake = (broadcast = true) => {
+      wakeCalls.push(broadcast);
+    };
+    created.webhooks.emit = (gid, ev) => {
+      emitCalls.push({ gid, ev });
+      origEmit(gid, ev);
+    };
+    try {
+      const res = await submit(pid, prod.eid, v1!.id, 'dev');
+      expect(res.status).toBe(201);
+      const rid = (res.data as unknown as ExecRequestDetail).id;
+      const jobs = await db.query<{ event_type: string; payload: { data: { requestId?: string } } }>(
+        'select event_type, payload from webhook_jobs where webhook_id = $1',
+        [hookId],
+      );
+      expect(jobs).toHaveLength(1);
+      expect(jobs[0]!.event_type).toBe('request.created');
+      expect(jobs[0]!.payload.data.requestId).toBe(rid);
+      expect(wakeCalls).toEqual([true]);
+      expect(emitCalls).toHaveLength(0);
+    } finally {
+      created.webhooks.wake = origWake;
+      created.webhooks.emit = origEmit;
+      await db.query('delete from webhooks where id = $1', [hookId]);
     }
   });
 });
@@ -1307,6 +1353,351 @@ describe('收件箱 SSE 实时流（#26）', () => {
       await restartedSse.waitDone(1000);
     } finally {
       vi.restoreAllMocks();
+      await cleanup();
+    }
+  });
+});
+
+// ───── Webhook 事务内持久化入队（#20） ─────
+
+describe('Webhook 事务内持久化入队（#20）', () => {
+  const setupTxEnv = async () => {
+    const memDb = await openPlatformDb(':memory:');
+    const appObj = createApp(memDb, {
+      loginLimiter: new LoginLimiter({ limit: 10_000, ipLimit: 10_000 }),
+      connectionLimiter: new KeyedLimiter({ limit: 10_000, windowMs: 60_000 }),
+      // 调长 pollIntervalMs，配合拦截 wake 精确验证业务返回瞬间的 webhook_jobs 持久化状态
+      webhooks: { pollIntervalMs: 60_000, retryBaseMs: 60_000 },
+    });
+    const admin = await makeUser(memDb, 'wh_admin', { name: '管理员', role: 'admin' });
+    const dev = await makeUser(memDb, 'wh_dev', { name: '开发者' });
+    const login = async (username: string) => {
+      const r = await appObj.app.request('/api/auth/login', {
+        method: 'POST',
+        headers: { 'content-type': 'application/json' },
+        body: JSON.stringify({ username, password: PASSWORD }),
+      });
+      expect(r.status).toBe(200);
+      return (r.headers.get('set-cookie') ?? '').split(';')[0]!;
+    };
+    const adminCookie = await login('wh_admin');
+    const devCookie = await login('wh_dev');
+
+    await memDb.query("insert into groups (id, slug, name) values ('g-wh-tx', 'g-wh-tx', '事务钩子组')");
+    await memDb.query("insert into group_members (group_id, user_id, role) values ('g-wh-tx', $1, 'admin')", [
+      admin.id,
+    ]);
+    await memDb.query(
+      "insert into group_members (group_id, user_id, role) values ('g-wh-tx', $1, 'member')",
+      [dev.id],
+    );
+    await memDb.query(
+      "insert into projects (id, name, group_id, slug) values ('p-wh-tx', '事务项目', 'g-wh-tx', 'p-wh-tx')",
+    );
+    await memDb.query("insert into branches (id, project_id, name) values ('b-wh-tx', 'p-wh-tx', 'main')");
+    const prodUrlEnc = encrypt('postgres://u:p@127.0.0.1:5432/prod');
+    const stgUrlEnc = encrypt('postgres://u:p@127.0.0.1:5432/stg');
+    await memDb.query(
+      `insert into environments (id, project_id, name, url_enc, production)
+       values ('e-prod', 'p-wh-tx', 'prod', $1, true), ('e-stg', 'p-wh-tx', 'staging', $2, false)`,
+      [prodUrlEnc, stgUrlEnc],
+    );
+    await memDb.query(
+      `insert into versions (id, project_id, branch_id, seq, name, model, number, up_steps, down_steps, checksum)
+       values ('v-wh-1', 'p-wh-tx', 'b-wh-tx', 1, 'init', $1::text::jsonb, 1, '[]', '[]', 'chk-wh-1')`,
+      [JSON.stringify(emptyModel())],
+    );
+    const allEvents = [
+      'request.created',
+      'request.approved',
+      'request.rejected',
+      'request.withdrawn',
+      'request.invalidated',
+      'request.executed',
+      'execution.finished',
+      'emergency.executed',
+      'token.executed',
+    ];
+    await memDb.query(
+      `insert into webhooks (id, group_id, name, format, url_enc, events, enabled)
+       values ('w-tx', 'g-wh-tx', 'tx-hook', 'json', $1, $2::text::jsonb, true)`,
+      [encrypt('https://example.invalid/hook'), JSON.stringify(allEvents)],
+    );
+
+    const prodConnHash = connHash({ url_enc: prodUrlEnc });
+    const insertReq = async (
+      id: string,
+      opts: { status?: string; expiresAt?: string; lastApproverExecutes?: boolean } = {},
+    ) => {
+      const flow = {
+        implicit: false,
+        stages: [
+          {
+            approvers: { kind: 'project_admins' },
+            count: 1,
+            lastApproverExecutes: opts.lastApproverExecutes ?? false,
+          },
+        ],
+      };
+      await memDb.query(
+        `insert into exec_requests
+           (id, project_id, environment_id, requested_by, direction, from_version_id, to_version_id,
+            migrations, dry_run, reason, flow, conn_hash, production, status, stage, expires_at, created_at, updated_at)
+         values ($1, 'p-wh-tx', 'e-prod', $2, 'up', null, 'v-wh-1', $3::text::jsonb, null, '发布', $4::text::jsonb, $5, true, $6, 0, $7, $8, $8)`,
+        [
+          id,
+          dev.id,
+          JSON.stringify([
+            { versionId: 'v-wh-1', number: 1, name: 'init', direction: 'up', checksum: 'chk-wh-1', steps: 1 },
+          ]),
+          JSON.stringify(flow),
+          prodConnHash,
+          opts.status ?? 'pending',
+          opts.expiresAt ?? new Date(Date.now() + 3600_000).toISOString(),
+          new Date().toISOString(),
+        ],
+      );
+    };
+
+    const jobsOf = () =>
+      memDb.query<{
+        id: string;
+        webhook_id: string;
+        event_type: string;
+        attempts: number;
+        locked_by: string | null;
+        payload: { type: string; data: Record<string, unknown> };
+      }>(
+        'select id, webhook_id, event_type, attempts, locked_by, payload from webhook_jobs order by created_at, rowid',
+      );
+
+    const cleanup = async () => {
+      appObj.requests.stop();
+      await appObj.requests.drain();
+      await appObj.webhooks.close();
+      await appObj.rooms.flush();
+      await appObj.shadows.close();
+      await memDb.close();
+    };
+
+    return { memDb, appObj, admin, dev, adminCookie, devCookie, insertReq, jobsOf, cleanup };
+  };
+
+  test('业务事务回滚时，同事务内 enqueueIn(tx) 写入的 webhook_jobs 一并回滚不残留且不唤醒队列', async () => {
+    const { memDb, appObj, admin, adminCookie, insertReq, jobsOf, cleanup } = await setupTxEnv();
+    const wakeCalls: boolean[] = [];
+    const origWake = appObj.webhooks.wake.bind(appObj.webhooks);
+    appObj.webhooks.wake = (broadcast = true) => {
+      wakeCalls.push(broadcast);
+    };
+    try {
+      // 1. 审批接口事务中：queueHook(tx) 写完 webhook_jobs 后，随后的 inbox_items 写库抛错 → 整个事务回滚
+      await insertReq('req-rb-approve');
+      const origTx = memDb.transaction.bind(memDb);
+      let injectedApproveFail = false;
+      memDb.transaction = (async <T>(fn: (tx: Parameters<Parameters<typeof origTx>[0]>[0]) => Promise<T>) =>
+        origTx(async (tx) => {
+          const origQuery = tx.query.bind(tx);
+          tx.query = (async (sql: string, params?: unknown[]) => {
+            if (!injectedApproveFail && sql.includes('insert into inbox_items')) {
+              injectedApproveFail = true;
+              throw new Error('模拟：审批通知落库失败触发事务回滚');
+            }
+            return origQuery(sql, params);
+          }) as typeof tx.query;
+          return fn(tx);
+        })) as typeof memDb.transaction;
+
+      try {
+        const res = await appObj.app.request('/api/projects/p-wh-tx/requests/req-rb-approve/approve', {
+          method: 'POST',
+          headers: { cookie: adminCookie, 'content-type': 'application/json' },
+          body: JSON.stringify({ stage: 0, comment: 'ok' }),
+        });
+        expect(res.status).toBe(500);
+      } finally {
+        memDb.transaction = origTx;
+      }
+      expect(injectedApproveFail).toBe(true);
+      // 审批状态与 webhook_jobs 一并回滚，且未唤醒队列
+      const [reqRow] = await memDb.query<{ status: string }>(
+        "select status from exec_requests where id = 'req-rb-approve'",
+      );
+      expect(reqRow!.status).toBe('pending');
+      expect(await jobsOf()).toEqual([]);
+      expect(wakeCalls).toEqual([]);
+
+      // 2. withPolicyLock 事务内 queueHook(tx) 后抛错 → webhook_jobs 同样完整回滚
+      const [row] = await memDb.query<RequestRow>("select * from exec_requests where id = 'req-rb-approve'");
+      const scope = (await appObj.requests.scopeOf(memDb, row!))!;
+      const fx = new Effects();
+      await expect(
+        withPolicyLock(memDb, async (tx) => {
+          const inserted = await appObj.requests.queueHook(tx, fx, 'request.created', row!, scope, {
+            actor: admin.name,
+            status: 'pending',
+          });
+          expect(inserted).toBe(1);
+          throw new Error('模拟：业务事务后续失败');
+        }),
+      ).rejects.toThrow('模拟：业务事务后续失败');
+      expect(await jobsOf()).toEqual([]);
+      expect(wakeCalls).toEqual([]);
+
+      // 3. 生产环境 afterTokenRun 事务内 enqueueIn(tx) 后 inbox_items 失败 → 两者同事务回滚且不阻断主响应
+      const [prodEnv] = await memDb.query<EnvRow>("select * from environments where id = 'e-prod'");
+      let injectedTokenFail = false;
+      memDb.transaction = (async <T>(fn: (tx: Parameters<Parameters<typeof origTx>[0]>[0]) => Promise<T>) =>
+        origTx(async (tx) => {
+          const origQuery = tx.query.bind(tx);
+          tx.query = (async (sql: string, params?: unknown[]) => {
+            if (!injectedTokenFail && sql.includes('insert into inbox_items')) {
+              injectedTokenFail = true;
+              throw new Error('模拟：令牌生产通知写库失败');
+            }
+            return origQuery(sql, params);
+          }) as typeof tx.query;
+          return fn(tx);
+        })) as typeof memDb.transaction;
+      const errSpy = vi.spyOn(console, 'error').mockImplementation(() => {});
+      try {
+        await appObj.requests.afterTokenRun(
+          { id: 'tok-1', name: 'deploy', prefix: 'dwl_abc', createdByName: admin.name },
+          { pid: 'p-wh-tx', env: prodEnv! },
+          { id: 'v-wh-1', number: 1, name: 'init' },
+          {
+            ok: true,
+            noop: false,
+            current: { id: 'v-wh-1', number: 1, name: 'init' },
+            ran: [1],
+            error: null,
+          },
+        );
+      } finally {
+        memDb.transaction = origTx;
+        errSpy.mockRestore();
+      }
+      expect(injectedTokenFail).toBe(true);
+      expect(await jobsOf()).toEqual([]);
+      expect(await memDb.query('select id from inbox_items')).toEqual([]);
+      expect(wakeCalls).toEqual([]);
+    } finally {
+      appObj.webhooks.wake = origWake;
+      await cleanup();
+    }
+  });
+
+  test('审批 / 过期 / finish / afterDirectRun / afterTokenRun 返回瞬间 webhook_jobs 已同步落库且不经过异步 emit', async () => {
+    const { memDb, appObj, admin, adminCookie, insertReq, jobsOf, cleanup } = await setupTxEnv();
+    const wakeCalls: boolean[] = [];
+    const emitCalls: unknown[] = [];
+    const origWake = appObj.webhooks.wake.bind(appObj.webhooks);
+    const origEmit = appObj.webhooks.emit.bind(appObj.webhooks);
+    appObj.webhooks.wake = (broadcast = true) => {
+      wakeCalls.push(broadcast);
+    };
+    appObj.webhooks.emit = (gid, ev) => {
+      emitCalls.push({ gid, ev });
+      origEmit(gid, ev);
+    };
+    try {
+      // 1. 审批通过（POST /approve）
+      await insertReq('req-ok-approve');
+      const approveRes = await appObj.app.request('/api/projects/p-wh-tx/requests/req-ok-approve/approve', {
+        method: 'POST',
+        headers: { cookie: adminCookie, 'content-type': 'application/json' },
+        body: JSON.stringify({ stage: 0, comment: '同意' }),
+      });
+      expect(approveRes.status).toBe(200);
+      let jobs = await jobsOf();
+      expect(jobs.map((j) => j.event_type)).toEqual(['request.approved']);
+      expect(jobs[0]!.payload.data.requestId).toBe('req-ok-approve');
+      expect(jobs[0]!.attempts).toBe(0);
+      expect(jobs[0]!.locked_by).toBeNull();
+      expect(wakeCalls).toEqual([true]);
+
+      // 2. 过期巡检（sweep -> closeStale）
+      await insertReq('req-ok-expire', { expiresAt: '2000-01-01T00:00:00.000Z' });
+      expect(await appObj.requests.sweep()).toBe(1);
+      jobs = await jobsOf();
+      expect(jobs.map((j) => j.event_type)).toEqual(['request.approved', 'request.invalidated']);
+      expect(jobs[1]!.payload.data).toMatchObject({ requestId: 'req-ok-expire', status: 'expired' });
+      expect(wakeCalls).toEqual([true, true]);
+
+      // 3. 执行收尾（finish）
+      await insertReq('req-ok-finish', { status: 'executing' });
+      await appObj.requests.finish(
+        null,
+        'req-ok-finish',
+        { id: admin.id, name: admin.name },
+        { ok: true, current: { id: 'v-wh-1', number: 1, name: 'init' }, error: null },
+      );
+      jobs = await jobsOf();
+      expect(jobs.map((j) => j.event_type)).toEqual([
+        'request.approved',
+        'request.invalidated',
+        'request.executed',
+      ]);
+      expect(jobs[2]!.payload.data).toMatchObject({ requestId: 'req-ok-finish', status: 'executed' });
+      expect(wakeCalls).toEqual([true, true, true]);
+
+      // 4. 直接执行收尾（afterDirectRun）
+      const [stgEnv] = await memDb.query<EnvRow>("select * from environments where id = 'e-stg'");
+      const [prodEnv] = await memDb.query<EnvRow>("select * from environments where id = 'e-prod'");
+      await appObj.requests.afterDirectRun(
+        { id: admin.id, name: admin.name },
+        { pid: 'p-wh-tx', env: stgEnv! },
+        { mode: 'migrate', to: 'v-wh-1', direction: 'up' },
+        { ok: true, current: { id: 'v-wh-1', number: 1, name: 'init' }, ran: 1, error: null },
+      );
+      jobs = await jobsOf();
+      expect(jobs.map((j) => j.event_type)).toEqual([
+        'request.approved',
+        'request.invalidated',
+        'request.executed',
+        'execution.finished',
+      ]);
+      expect(wakeCalls).toEqual([true, true, true, true]);
+
+      // 5. CI 令牌执行收尾（afterTokenRun：非生产环境 + 生产环境同事务写收件箱）
+      await appObj.requests.afterTokenRun(
+        { id: 'tok-stg', name: 'ci-stg', prefix: 'dwl_stg', createdByName: admin.name },
+        { pid: 'p-wh-tx', env: stgEnv! },
+        { id: 'v-wh-1', number: 1, name: 'init' },
+        { ok: true, noop: false, current: { id: 'v-wh-1', number: 1, name: 'init' }, ran: [1], error: null },
+      );
+      jobs = await jobsOf();
+      expect(jobs.at(-1)!.event_type).toBe('token.executed');
+      expect(jobs.at(-1)!.payload.data).toMatchObject({
+        environment: { id: 'e-stg', name: 'staging', production: false },
+      });
+
+      await appObj.requests.afterTokenRun(
+        { id: 'tok-prod', name: 'ci-prod', prefix: 'dwl_prd', createdByName: admin.name },
+        { pid: 'p-wh-tx', env: prodEnv! },
+        { id: 'v-wh-1', number: 1, name: 'init' },
+        { ok: true, noop: false, current: { id: 'v-wh-1', number: 1, name: 'init' }, ran: [1], error: null },
+      );
+      jobs = await jobsOf();
+      expect(jobs.map((j) => j.event_type)).toEqual([
+        'request.approved',
+        'request.invalidated',
+        'request.executed',
+        'execution.finished',
+        'token.executed',
+        'token.executed',
+      ]);
+      const tokenInbox = await memDb.query<{ id: string }>(
+        "select id from inbox_items where kind = 'token_execution' and environment_id = 'e-prod'",
+      );
+      expect(tokenInbox.length).toBeGreaterThanOrEqual(1);
+      expect(wakeCalls).toEqual([true, true, true, true, true, true]);
+
+      // 全程没有经过异步 emit()
+      expect(emitCalls).toHaveLength(0);
+    } finally {
+      appObj.webhooks.wake = origWake;
+      appObj.webhooks.emit = origEmit;
       await cleanup();
     }
   });

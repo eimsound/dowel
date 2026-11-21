@@ -623,7 +623,8 @@ export class Webhooks {
     this.pump();
     if (broadcast && this.bus) {
       void this.bus.publish({ t: 'webhooks.wake' }).catch((e) => {
-        console.error('Webhook 唤醒广播失败：', scrubSecrets(String(e)));
+        if (!this.closed && !isDbClosedError(e))
+          console.error('Webhook 唤醒广播失败：', scrubSecrets(String(e)));
       });
     }
   }

@@ -1,7 +1,7 @@
 // 优雅停机（#19）单元测试与集成测试：
 // 1. 信号防重入幂等（连续 SIGINT / SIGTERM 只执行一次停机序列并返回同一 Promise）；
 // 2. 在途 HTTP 请求 + 在途环境锁（EnvLocks）+ 在途派生刷新排空期间，webhooks / ha 租约 / db 保持存活，
-//    confirmVersion、requests.finish 与收尾 webhooks.emit 不丢失，排空后再按严格顺序关闭基础设施；
+//    confirmVersion、requests.finish 与同事务 Webhook 入队不丢失，排空后再按严格顺序关闭基础设施；
 // 3. 活跃 WebSocket 与活跃收件箱 SSE 连接在停机时主动优雅关闭，不会无限阻塞 server.close；
 // 4. 超过兜底超时时间时触发超时回调强制终止残留连接并退出（且不二次触发退出）；
 // 5. EnvLocks.drain() 与 OpaqueRefresher.stop() / drain() 边界行为。
@@ -327,7 +327,7 @@ describe('优雅停机（#19）', () => {
     expect(order).toEqual([]);
     expect(await ha.isNodeAlive(ha.replicaId)).toBe(true);
 
-    // 5. 模拟在途迁移提交后的收尾落库：confirmVersion + requests.finish（含 webhooks.emit）
+    // 5. 模拟在途迁移提交后的收尾落库：confirmVersion + requests.finish（同事务写入 webhook_jobs）
     await confirmVersion(db, 'e1', 'v1');
     await requests.finish(
       null,
@@ -375,7 +375,7 @@ describe('优雅停机（#19）', () => {
       expect(req?.status).toBe('executed');
       expect(req?.executed_at).toBeTruthy();
 
-      // Webhook 事件已通过 webhooks.emit() 落入 webhook_jobs 或已记录到 webhook_deliveries，没有被静默丢弃
+      // Webhook 事件已随业务事务通过 enqueueIn(tx) 落入 webhook_jobs 或已记录到 webhook_deliveries，没有被静默丢弃
       const jobs = await verifyDb.query<{ id: string; event_type: string; locked_by: string | null }>(
         "select id, event_type, locked_by from webhook_jobs where webhook_id = 'w1'",
       );
