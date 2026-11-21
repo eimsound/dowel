@@ -7,8 +7,12 @@ export const actionText = (action: string, data: unknown) => {
   const d = (data ?? {}) as Record<string, unknown>;
   const key = `act.${action}`;
   if (!i18n.exists(key)) return i18n.t('act.unknown');
+  const environment = typeof d.environment === 'string' ? d.environment.trim() : '';
+  const name = typeof d.name === 'string' ? d.name : environment;
   return i18n.t(key, {
-    name: typeof d.name === 'string' ? d.name : '',
+    name,
+    environment,
+    ...(environment ? { context: 'env' } : {}),
     count: typeof d.objects === 'number' ? d.objects : 0,
     role: typeof d.role === 'string' ? i18n.t(`projects.role.${d.role}`) : '',
     username: typeof d.username === 'string' ? d.username : '',

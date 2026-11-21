@@ -646,6 +646,9 @@ const zh = {
     },
     project: {
       create: '创建了项目',
+      takeover: '接手了项目',
+      claim: '认领了项目',
+      claim_env: '认领了环境 {{environment}} 的项目',
       update: '修改了项目设置',
       slug: '修改了项目标识',
       default_role: '修改了项目默认权限',
@@ -1618,6 +1621,7 @@ const zh = {
     conflictBody: '在你查看期间画布已更新至 #{{currentSeq}}。请核对下方最新的结构差异后再次确认恢复。',
     op: {
       init: '初始状态',
+      edit: '编辑模型',
       createSchema: '新建 Schema',
       renameSchema: '重命名 Schema',
       dropSchema: '删除 Schema',
@@ -2340,6 +2344,9 @@ const en: typeof zh = {
     },
     project: {
       create: 'created the project',
+      takeover: 'took over the project',
+      claim: 'claimed the project',
+      claim_env: 'claimed the project on {{environment}}',
       update: 'changed project settings',
       slug: 'changed the project identifier',
       default_role: 'changed the project default permission',
@@ -3348,6 +3355,7 @@ const en: typeof zh = {
       'The canvas advanced to #{{currentSeq}} while you were viewing history. Review the updated diff below before confirming.',
     op: {
       init: 'Initial state',
+      edit: 'Edit model',
       createSchema: 'Create schema',
       renameSchema: 'Rename schema',
       dropSchema: 'Drop schema',
@@ -3390,10 +3398,14 @@ const en: typeof zh = {
   err: { generic: 'Error: {{msg}}', notFound: 'This page does not exist.' },
 };
 
-const saved = localStorage.getItem('dowel.lang');
+const saved =
+  typeof localStorage !== 'undefined' && typeof localStorage.getItem === 'function'
+    ? localStorage.getItem('dowel.lang')
+    : null;
+const browserLang = typeof navigator !== 'undefined' ? navigator.language : '';
 void i18n.use(initReactI18next).init({
   resources: { zh: { translation: zh }, en: { translation: en } },
-  lng: saved ?? (navigator.language.startsWith('zh') ? 'zh' : 'en'),
+  lng: saved ?? (browserLang.startsWith('zh') ? 'zh' : 'en'),
   fallbackLng: 'zh',
   interpolation: { escapeValue: false },
 });
