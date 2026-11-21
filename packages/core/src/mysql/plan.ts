@@ -310,12 +310,15 @@ const explicitCoveringKeyPrefixes = (
 
 /**
  * 确定性推导某张表上哪些 FK 拥有 InnoDB 自动创建的隐式辅助索引（名字与 FK 同名）。
- * 与 `mysqlCreateAll` 建外键的顺序（按 fk.name 升序，在建完显式索引后加外键）严格一致。
+ * MySQL 8.0+/8.4/9.7 在 ALTER TABLE ADD FOREIGN KEY 时会用更长前缀或后加入的同列外键替换旧 KEY_GENERATED 索引，
+ * 因此当建外键按 (columns.length ASC, fk.name ASC) 执行时，最终拥有者严格对应 (columns.length DESC, fk.name DESC)。
  */
 const computeImplicitFkOwners = (m: Model, tableId: string): Set<string> => {
   const covering = explicitCoveringKeyPrefixes(m, tableId);
   const owners = new Set<string>();
-  const fks = childrenOf(m, tableId, 'foreignKey').sort((a, b) => a.name.localeCompare(b.name));
+  const fks = childrenOf(m, tableId, 'foreignKey').sort(
+    (a, b) => b.columns.length - a.columns.length || b.name.localeCompare(a.name),
+  );
   for (const fk of fks) {
     if (!covering.some((k) => prefixMatches(k, fk.columns))) {
       owners.add(fk.id);
@@ -488,10 +491,11 @@ export const mysqlCreateAll = (m: Model, opts?: MysqlPlanOptions): Step[] => {
     );
   }
 
-  // 3. 加外键（按表名 + 外键名排序，确定性处理循环与自引用外键）
+  // 3. 加外键（按表名 + 列数升序 + 外键名升序：确保长前缀与同列字典序最大者最后创建并成为确定性 KEY_GENERATED 拥有者）
   const fks = all(m, 'foreignKey').sort(
     (a, b) =>
       get(m, a.parent, 'table').name.localeCompare(get(m, b.parent, 'table').name) ||
+      a.columns.length - b.columns.length ||
       a.name.localeCompare(b.name),
   );
   for (const fk of fks) {
@@ -752,9 +756,10 @@ export const mysqlPlan = (from: Model, to: Model, opts?: MysqlPlanOptions): Step
       const survivingImplicit = childrenOf(from, t.id, 'foreignKey')
         .filter((f) => inTo(f.id) && !fkRebuild.has(f.id) && fromOwners.has(f.id))
         .map((f) => f.columns);
-      const addedOrRebuiltToOwners = childrenOf(to, t.id, 'foreignKey').filter(
-        (g) => toOwners.has(g.id) && (!inFrom(g.id) || fkRebuild.has(g.id)),
+      const addedOrRebuiltAll = childrenOf(to, t.id, 'foreignKey').filter(
+        (g) => !inFrom(g.id) || fkRebuild.has(g.id),
       );
+      const addedOrRebuiltToOwners = addedOrRebuiltAll.filter((g) => toOwners.has(g.id));
       for (const fk of childrenOf(from, t.id, 'foreignKey')) {
         if (!inTo(fk.id) || fkRebuild.has(fk.id)) continue;
         const stillCovered =
@@ -764,7 +769,17 @@ export const mysqlPlan = (from: Model, to: Model, opts?: MysqlPlanOptions): Step
         const shadowsIncomingOwner =
           fromOwners.has(fk.id) &&
           addedOrRebuiltToOwners.some((g) => g.id !== fk.id && prefixMatches(fk.columns, g.columns));
-        if (!stillCovered || ownershipChanged || shadowsIncomingOwner) {
+        // 若有新增/重建的等长同列 FK：MySQL 8.0+ 在 ADD CONSTRAINT 时会用后加 FK 覆盖旧 KEY_GENERATED 索引名，
+        // 需将现有拥有者纳入重建，使 P14 按 (列数升序, 名字升序) 最后重加拥有者以保持物理索引名确定。
+        const overwrittenBySameCols =
+          fromOwners.has(fk.id) &&
+          addedOrRebuiltAll.some(
+            (g) =>
+              g.id !== fk.id &&
+              g.columns.length === fk.columns.length &&
+              prefixMatches(fk.columns, g.columns),
+          );
+        if (!stillCovered || ownershipChanged || shadowsIncomingOwner || overwrittenBySameCols) {
           fkRebuild.add(fk.id);
           changed = true;
         }
@@ -846,11 +861,14 @@ export const mysqlPlan = (from: Model, to: Model, opts?: MysqlPlanOptions): Step
       }
       return !inTo(fk.id) || fkRebuild.has(fk.id) || removedTableIds.has(fk.refTable);
     })
-    .sort(
-      (a, b) =>
-        get(from, a.parent, 'table').name.localeCompare(get(from, b.parent, 'table').name) ||
-        a.name.localeCompare(b.name),
-    );
+    .sort((a, b) => {
+      const tableCmp = get(from, a.parent, 'table').name.localeCompare(get(from, b.parent, 'table').name);
+      if (tableCmp !== 0) return tableCmp;
+      // 先删非隐式索引拥有者 FK、最后删拥有者 FK：避免先删拥有者时 MySQL 8.0+ 为其余存活 FK 重算 KEY_GENERATED 索引名
+      const aOwner = fromImplicitOwnersByTable.get(a.parent)?.has(a.id) ? 1 : 0;
+      const bOwner = fromImplicitOwnersByTable.get(b.parent)?.has(b.id) ? 1 : 0;
+      return aOwner - bOwner || a.name.localeCompare(b.name);
+    });
 
   // 被删表之间的外键：若存在多张被删表，先解掉它们之间的外键，彻底免疫删除顺序环路
   const removedTableCycleFks = all(from, 'foreignKey').filter(
@@ -1350,12 +1368,13 @@ export const mysqlPlan = (from: Model, to: Model, opts?: MysqlPlanOptions): Step
   // ───── P13: MySQL 8.0+/8.4/9.7 在 CREATE INDEX / ADD UNIQUE / ADD PRIMARY KEY 新增显式覆盖索引时，
   // 会由 InnoDB 自动移除原有的 KEY_GENERATED 隐式外键索引，因此此处不再重复发射 DROP INDEX。 ─────
 
-  // ───── P14: 新增或重建外键 ─────
+  // ───── P14: 新增或重建外键（按表名 + 列数升序 + 外键名升序，与 mysqlCreateAll 和 computeImplicitFkOwners 严格对称） ─────
   const fksToAdd = all(to, 'foreignKey')
     .filter((fk) => !inFrom(fk.id) || fkRebuild.has(fk.id))
     .sort(
       (a, b) =>
         get(to, a.parent, 'table').name.localeCompare(get(to, b.parent, 'table').name) ||
+        a.columns.length - b.columns.length ||
         a.name.localeCompare(b.name),
     );
   for (const fk of fksToAdd) {

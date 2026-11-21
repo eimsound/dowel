@@ -563,9 +563,11 @@ export const readMysqlSnapshot = async (db: Db): Promise<MysqlSnapshot> => {
       if (cols.length > 0) covering.push(cols);
     }
 
-    // 与 computeImplicitFkOwners 严格对称：按 fk.name 升序计算哪些 FK 应当拥有隐式索引
+    // 与 computeImplicitFkOwners 严格对称：按 (columns.length DESC, fk.name DESC) 计算哪些 FK 应当拥有隐式索引
     const expectedImplicitFkNames = new Set<string>();
-    const sortedFks = Object.values(tbl.foreignKeys).sort((a, b) => a.name.localeCompare(b.name));
+    const sortedFks = Object.values(tbl.foreignKeys).sort(
+      (a, b) => b.columns.length - a.columns.length || b.name.localeCompare(a.name),
+    );
     for (const fk of sortedFks) {
       if (!covering.some((k) => snapPrefixMatches(k, fk.columns))) {
         expectedImplicitFkNames.add(fk.name.toLowerCase());

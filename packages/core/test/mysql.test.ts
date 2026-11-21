@@ -514,12 +514,8 @@ describe('MySQL dialect core (MySQL 8.4 & 9.7)', () => {
     const v3 = structuredClone(v2);
     dropKey(v3, fkA);
     const s23 = plan(v2, v3);
-    expect(s23.map((st) => st.sql)).toEqual([
-      'ALTER TABLE `children` DROP FOREIGN KEY `fk_a`',
-      'ALTER TABLE `children` DROP FOREIGN KEY `fk_z`',
-      'DROP INDEX `fk_a` ON `children`',
-      'ALTER TABLE `children` ADD CONSTRAINT `fk_z` FOREIGN KEY (`a`) REFERENCES `parents` (`a`)',
-    ]);
+    // v2 物理隐式索引由最后加入的 fk_z 持有，删非拥有者 fk_a 时仅需 DROP FOREIGN KEY fk_a
+    expect(s23.map((st) => st.sql)).toEqual(['ALTER TABLE `children` DROP FOREIGN KEY `fk_a`']);
 
     // 场景 2: v1(fk_z(a, b)) -> v2(+fk_a(a)) -> v3(-fk_z(a, b))
     const p1 = structuredClone(m0);
@@ -531,21 +527,20 @@ describe('MySQL dialect core (MySQL 8.4 & 9.7)', () => {
     renameKey(p2, pFkA, 'fk_a');
 
     const sp12 = plan(p1, p2);
-    // fk_z(a,b) 前缀遮蔽 fk_a(a)，必须先拆 fk_z + DROP INDEX fk_z，再按字典序建 fk_a(a) 与 fk_z(a,b)
+    // 长前缀 fk_z(a,b) 已覆盖短前缀 fk_a(a)，MySQL 8.0+ 直接复用 KEY fk_z(a,b)，无需重建 fk_z
     expect(sp12.map((st) => st.sql)).toEqual([
-      'ALTER TABLE `children` DROP FOREIGN KEY `fk_z`',
-      'DROP INDEX `fk_z` ON `children`',
       'ALTER TABLE `children` ADD CONSTRAINT `fk_a` FOREIGN KEY (`a`) REFERENCES `parents` (`a`)',
-      'ALTER TABLE `children` ADD CONSTRAINT `fk_z` FOREIGN KEY (`a`, `b`) REFERENCES `parents` (`a`, `b`)',
     ]);
 
     const p3 = structuredClone(p2);
     dropKey(p3, pFkZ);
     const sp23 = plan(p2, p3);
-    // v2 已独立持有隐式索引 fk_a(a) 和 fk_z(a,b)，删 fk_z 不再影响 fk_a
+    // 删拥有者 fk_z(a,b) 时，先删非拥有者 fk_a 再删 fk_z + DROP INDEX fk_z，随后重建 fk_a(a) 获得独立隐式索引
     expect(sp23.map((st) => st.sql)).toEqual([
+      'ALTER TABLE `children` DROP FOREIGN KEY `fk_a`',
       'ALTER TABLE `children` DROP FOREIGN KEY `fk_z`',
       'DROP INDEX `fk_z` ON `children`',
+      'ALTER TABLE `children` ADD CONSTRAINT `fk_a` FOREIGN KEY (`a`) REFERENCES `parents` (`a`)',
     ]);
   });
 
