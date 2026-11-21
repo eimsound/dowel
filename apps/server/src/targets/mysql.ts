@@ -10,6 +10,7 @@ import {
   importMysqlSnapshot,
   MYSQL_POOL_DEFAULTS,
   mysqlGrantMatchesDb,
+  parseMysqlGrantPrivileges,
   parseMysqlVersion,
   readMysqlSnapshot,
 } from '@dowel/engines';
@@ -353,12 +354,18 @@ export const inspectMysqlTargetOn = async (tdb: Db, url: string): Promise<Target
         const v = Object.values(row)[0];
         return typeof v === 'string' ? v : '';
       });
-      superuser = lines.some((l) => /GRANT\s+(?:ALL\s+PRIVILEGES|[^;]*\bSUPER\b)[^;]*ON\s+\*\.\*/i.test(l));
+      superuser = lines.some((l) => {
+        if (!/^\s*GRANT\s+(?![`'"]).+?\s+ON\s+\*\.\*(?:\s|$)/i.test(l)) return false;
+        const privs = parseMysqlGrantPrivileges(l);
+        return privs.has('ALL PRIVILEGES') || privs.has('ALL') || privs.has('SUPER');
+      });
       canCreateDb =
         superuser ||
-        lines.some(
-          (l) => mysqlGrantMatchesDb(l, shadow) && /GRANT\s+(?:ALL\s+PRIVILEGES|[^;]*\bCREATE\b)/i.test(l),
-        );
+        lines.some((l) => {
+          if (!mysqlGrantMatchesDb(l, shadow)) return false;
+          const privs = parseMysqlGrantPrivileges(l);
+          return privs.has('ALL PRIVILEGES') || privs.has('ALL') || privs.has('CREATE');
+        });
     } catch {
       canCreateDb = false;
       superuser = false;
@@ -466,12 +473,13 @@ export const ensureSameInstanceMysqlShadow = async (
   const url = withDb(targetUrl, info.shadow);
   let created = false;
   const c = connectMysql(targetUrl, 10, guard);
-  const conn = await c.db.reserve!();
+  let conn: Db | null = null;
   const lockName = mysqlShadowLockName('dowel:shadow:', info.shadow);
   let locked = false;
   let broken = false;
 
   try {
+    conn = await c.db.reserve!();
     const deadline = Date.now() + SHADOW_LIFECYCLE_LOCK_TIMEOUT_MS;
     for (;;) {
       let ok: boolean;
@@ -513,12 +521,14 @@ export const ensureSameInstanceMysqlShadow = async (
   } catch (e) {
     throw mysqlShadowSetupError(e, 'create');
   } finally {
-    if (locked) {
+    if (locked && conn) {
       const ok = await unlockMysqlLock(conn, lockName);
       if (!ok) broken = true;
     }
-    if (broken) destroyMysqlConn(conn);
-    else conn.release?.();
+    if (conn) {
+      if (broken) destroyMysqlConn(conn);
+      else conn.release?.();
+    }
     await c.close().catch(() => {});
   }
   return { url, shadow: info.shadow, created };

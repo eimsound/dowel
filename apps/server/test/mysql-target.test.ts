@@ -33,30 +33,52 @@ import {
   type Db,
   detectMysqlStepAlreadyApplied,
   fromMysql2,
+  HistoryError,
   mysqlExprCanonEqual,
   mysqlGrantMatchesDb,
   mysqlHistory,
+  parseMysqlGrantPrivileges,
   updateExistingTablesAfterStep,
 } from '@dowel/engines';
 import { StepError, verifyScripts } from '@dowel/verifier';
-import { afterAll, beforeAll, describe, expect, test } from 'vitest';
+import { afterAll, beforeAll, describe, expect, test, vi } from 'vitest';
 
 import { createMysqlTestDb, mysqlDbUrl, useMysqlTestDb } from '../../../test/mysql.ts';
 import { formatVersionNum } from '../src/envs.ts';
 import { createApp, openPlatformDb, type PlatformDb } from '../src/index.ts';
 import { KeyedLimiter } from '../src/rate-limit.ts';
 import { encrypt } from '../src/secrets.ts';
-import { isConnectionFailure, isInfraFailure, type Shadow, shadowOps } from '../src/shadow.ts';
+import {
+  isConnectionFailure,
+  isInfraFailure,
+  type Shadow,
+  ShadowError,
+  shadowOps,
+  ShadowUnavailableError,
+} from '../src/shadow.ts';
 import { Shadows } from '../src/shadows.ts';
 import {
   claimMysqlShadow,
   dropMysqlSameInstanceShadow,
   ensureSameInstanceMysqlShadow,
+  inspectMysqlTargetOn,
   mysqlShadowDbName,
   parseMysqlUrl,
   pullMysqlSchema,
 } from '../src/targets/mysql.ts';
 import { editModel, makeUser, PASSWORD } from './support.ts';
+
+const mysqlPoolOverride = vi.hoisted(() => ({
+  createPool: null as ((opts: unknown) => unknown) | null,
+}));
+vi.mock('mysql2/promise', async (orig) => {
+  const m = await orig<typeof import('mysql2/promise')>();
+  return {
+    ...m,
+    createPool: (...args: Parameters<typeof m.createPool>) =>
+      mysqlPoolOverride.createPool ? mysqlPoolOverride.createPool(...args) : m.createPool(...args),
+  };
+});
 
 process.env.DOWEL_SECRET ??= 'test-secret-0123456789';
 
@@ -516,6 +538,217 @@ describe('MySQL 目标库服务端驱动与全栈', () => {
 
     updateExistingTablesAfterStep('ALTER TABLE `d` RENAME COLUMN `x` TO `y`', chainSet);
     expect([...chainSet]).toEqual(['d']);
+  });
+
+  test('ensureSameInstanceMysqlShadow 在 reserve() 失败时关闭连接池并正确脱敏包装错误', async () => {
+    const runReserveFailure = async (reserveError: Error) => {
+      let poolCall = 0;
+      const pool1End = vi.fn(async () => {});
+      const pool2End = vi.fn(async () => {});
+      mysqlPoolOverride.createPool = () => {
+        poolCall++;
+        if (poolCall === 1) {
+          return {
+            query: async (sql: string) => {
+              if (sql.includes('CURRENT_USER()')) {
+                return [[{ ver: '8.4.0', db: 'app', currentUser: 'root@%', lowerCaseTableNames: 0 }], []];
+              }
+              if (sql.includes('information_schema.SCHEMATA')) return [[{ n: 0 }], []];
+              if (sql.includes('COUNT(*) AS n')) return [[{ n: 0 }], []];
+              if (sql.includes('SHOW GRANTS')) {
+                return [[{ 'Grants for root@%': 'GRANT ALL PRIVILEGES ON *.* TO `root`@`%`' }], []];
+              }
+              return [[], []];
+            },
+            end: pool1End,
+          };
+        }
+        return {
+          query: async () => [[], []],
+          getConnection: async () => {
+            throw reserveError;
+          },
+          end: pool2End,
+        };
+      };
+
+      try {
+        await ensureSameInstanceMysqlShadow('mysql://root:supersecret@127.0.0.1:3306/app');
+        throw new Error('expected ensureSameInstanceMysqlShadow to reject');
+      } catch (e) {
+        expect(poolCall).toBe(2);
+        expect(pool1End).toHaveBeenCalled();
+        expect(pool2End).toHaveBeenCalled();
+        return e;
+      } finally {
+        mysqlPoolOverride.createPool = null;
+      }
+    };
+
+    const infraErr = Object.assign(
+      new Error('connect ECONNREFUSED mysql://root:supersecret@127.0.0.1:3306/app'),
+      {
+        code: 'ECONNREFUSED',
+        errno: 2003,
+      },
+    );
+    const caughtInfra = await runReserveFailure(infraErr);
+    expect(caughtInfra).toBeInstanceOf(ShadowUnavailableError);
+    expect((caughtInfra as Error).message).not.toContain('supersecret');
+
+    const nonInfraErr = new Error('Access denied for mysql://root:supersecret@127.0.0.1:3306/app');
+    const caughtNonInfra = await runReserveFailure(nonInfraErr);
+    expect(caughtNonInfra).toBeInstanceOf(ShadowError);
+    expect(caughtNonInfra).not.toBeInstanceOf(ShadowUnavailableError);
+    expect((caughtNonInfra as Error).message).toMatch(/建 MySQL 影子库失败/);
+    expect((caughtNonInfra as Error).message).not.toContain('supersecret');
+  });
+
+  test('SHOW GRANTS 精确权限解析：排除复合 CREATE *、用户名/库名误匹配、角色授予与列级权限', async () => {
+    // 1. parseMysqlGrantPrivileges 纯函数校验
+    const compoundPrivs = parseMysqlGrantPrivileges(
+      'GRANT CREATE VIEW, CREATE USER, CREATE ROUTINE, CREATE TEMPORARY TABLES, CREATE TABLESPACE, CREATE ROLE ON `app`.* TO `create`@`%`',
+    );
+    expect(compoundPrivs.has('CREATE')).toBe(false);
+    expect([...compoundPrivs].sort()).toEqual([
+      'CREATE ROLE',
+      'CREATE ROUTINE',
+      'CREATE TABLESPACE',
+      'CREATE TEMPORARY TABLES',
+      'CREATE USER',
+      'CREATE VIEW',
+    ]);
+
+    expect([...parseMysqlGrantPrivileges("GRANT USAGE ON *.* TO 'create'@'%'")]).toEqual(['USAGE']);
+    expect([...parseMysqlGrantPrivileges('GRANT SELECT ON `create`.* TO `super`@`%`')]).toEqual(['SELECT']);
+    expect(parseMysqlGrantPrivileges('GRANT `create`@`%` TO `u`@`%`').size).toBe(0);
+    expect([
+      ...parseMysqlGrantPrivileges(
+        'GRANT SELECT (id, create), INSERT (col1, col2), UPDATE (`a,b`), TRIGGER ON `app`.`t` TO `u`@`%`',
+      ),
+    ]).toEqual(['TRIGGER']);
+    expect([...parseMysqlGrantPrivileges('GRANT ALL ON `app_dowel`.* TO `u`@`%`')]).toEqual(['ALL']);
+    expect([...parseMysqlGrantPrivileges('GRANT ALL PRIVILEGES ON *.* TO `u`@`%`')]).toEqual([
+      'ALL PRIVILEGES',
+    ]);
+    expect(mysqlGrantMatchesDb('GRANT `u_on_*.*`@`%` TO `x`@`%`', 'app')).toBe(false);
+
+    // 2. inspectMysqlTargetOn 校验
+    const makeInspectDb = (grantLines: string[]): Db => ({
+      query: async <T>(sql: string) => {
+        if (sql.includes('CURRENT_USER()')) {
+          return [{ ver: '8.4.0', db: 'app', currentUser: 'create@%', lowerCaseTableNames: 0 }] as T[];
+        }
+        if (sql.includes('information_schema.SCHEMATA')) return [{ n: 0 }] as T[];
+        if (sql.includes('COUNT(*) AS n')) return [{ n: 0 }] as T[];
+        if (sql.includes('SHOW GRANTS')) {
+          return grantLines.map((g, i) => ({ [`Grants#${i}`]: g })) as T[];
+        }
+        return [] as T[];
+      },
+      exec: async () => {},
+    });
+
+    const falseCreateInfo = await inspectMysqlTargetOn(
+      makeInspectDb([
+        "GRANT USAGE ON *.* TO 'create'@'%'",
+        "GRANT CREATE VIEW, CREATE USER, CREATE ROUTINE, CREATE TEMPORARY TABLES, CREATE TABLESPACE, CREATE ROLE ON `app_dowel`.* TO 'create'@'%'",
+        "GRANT `super`@`%` TO 'create'@'%'",
+      ]),
+      'mysql://create:pw@127.0.0.1:3306/app',
+    );
+    expect(falseCreateInfo.canCreateDb).toBe(false);
+    expect(falseCreateInfo.superuser).toBe(false);
+
+    const exactCreateInfo = await inspectMysqlTargetOn(
+      makeInspectDb(["GRANT CREATE ON `app_dowel`.* TO 'u'@'%'"]),
+      'mysql://u:pw@127.0.0.1:3306/app',
+    );
+    expect(exactCreateInfo.canCreateDb).toBe(true);
+    expect(exactCreateInfo.superuser).toBe(false);
+
+    const allShadowInfo = await inspectMysqlTargetOn(
+      makeInspectDb(["GRANT ALL ON `app_dowel`.* TO 'u'@'%'"]),
+      'mysql://u:pw@127.0.0.1:3306/app',
+    );
+    expect(allShadowInfo.canCreateDb).toBe(true);
+    expect(allShadowInfo.superuser).toBe(false);
+
+    const globalAllInfo = await inspectMysqlTargetOn(
+      makeInspectDb(["GRANT ALL ON *.* TO 'u'@'%'"]),
+      'mysql://u:pw@127.0.0.1:3306/app',
+    );
+    expect(globalAllInfo.superuser).toBe(true);
+    expect(globalAllInfo.canCreateDb).toBe(true);
+
+    const globalSuperInfo = await inspectMysqlTargetOn(
+      makeInspectDb(["GRANT SUPER ON *.* TO 'u'@'%'"]),
+      'mysql://u:pw@127.0.0.1:3306/app',
+    );
+    expect(globalSuperInfo.superuser).toBe(true);
+    expect(globalSuperInfo.canCreateDb).toBe(true);
+
+    // 3. mysqlHistory.historyWriteProblem 校验
+    const makeHistoryDb = (opts: { logBin: number; trustFc: number; grants: string[] }): Db => ({
+      query: async <T>(sql: string) => {
+        if (sql.includes('@@read_only')) {
+          return [{ ro: 0, sro: 0, logBin: opts.logBin, trustFc: opts.trustFc, dbName: 'app' }] as T[];
+        }
+        if (sql.includes('SHOW GRANTS')) {
+          return opts.grants.map((g, i) => ({ [`Grants#${i}`]: g })) as T[];
+        }
+        return [] as T[];
+      },
+      exec: async () => {},
+    });
+
+    const missingCreateErr = await mysqlHistory.historyWriteProblem(
+      makeHistoryDb({
+        logBin: 0,
+        trustFc: 1,
+        grants: [
+          "GRANT USAGE ON *.* TO 'create'@'%'",
+          "GRANT CREATE VIEW, CREATE USER, INSERT, UPDATE, TRIGGER ON `app`.* TO 'create'@'%'",
+        ],
+      }),
+    );
+    expect(missingCreateErr).toBeInstanceOf(HistoryError);
+    expect(missingCreateErr?.code).toBe('no_schema_privilege');
+    expect(missingCreateErr?.message).toContain('CREATE');
+
+    const missingSuperErr = await mysqlHistory.historyWriteProblem(
+      makeHistoryDb({
+        logBin: 1,
+        trustFc: 0,
+        grants: [
+          "GRANT USAGE ON *.* TO 'super'@'%'",
+          "GRANT CREATE, INSERT, UPDATE, TRIGGER ON `app`.* TO 'super'@'%'",
+        ],
+      }),
+    );
+    expect(missingSuperErr).toBeInstanceOf(HistoryError);
+    expect(missingSuperErr?.code).toBe('no_schema_privilege');
+    expect(missingSuperErr?.message).toContain('SUPER');
+
+    expect(
+      await mysqlHistory.historyWriteProblem(
+        makeHistoryDb({
+          logBin: 0,
+          trustFc: 1,
+          grants: ["GRANT CREATE, INSERT, UPDATE, TRIGGER ON `app`.* TO 'u'@'%'"],
+        }),
+      ),
+    ).toBeNull();
+
+    expect(
+      await mysqlHistory.historyWriteProblem(
+        makeHistoryDb({
+          logBin: 0,
+          trustFc: 1,
+          grants: ["GRANT ALL ON `app`.* TO 'u'@'%'"],
+        }),
+      ),
+    ).toBeNull();
   });
 
   test('真实 MySQL：inspectTarget、pullSchema、claimShadow 防误删非空业务库与同实例影子库生命周期', async () => {

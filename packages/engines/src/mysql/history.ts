@@ -147,13 +147,16 @@ const readHistoryFormat = async (db: Db): Promise<number | null> => {
   return stored;
 };
 
+const isMysqlGlobalGrant = (line: string): boolean =>
+  /^\s*GRANT\s+(?![`'"]).+?\s+ON\s+\*\.\*(?:\s|$)/i.test(line);
+
 /**
  * 判断一条 MySQL `SHOW GRANTS` 行是否覆盖指定数据库名（支持 `*.*`、`\`db\_name\`.*` LIKE 转义与 `%`/`_` 通配符）。
  */
 export const mysqlGrantMatchesDb = (line: string, dbName: string): boolean => {
-  if (/\bON\s+\*\.\*/i.test(line)) return true;
+  if (isMysqlGlobalGrant(line)) return true;
   if (!dbName) return false;
-  const m = /\bON\s+(?:`((?:[^`]|``)+)`|([^\s.`]+))\.\*/i.exec(line);
+  const m = /^\s*GRANT\s+(?![`'"]).+?\s+ON\s+(?:`((?:[^`]|``)+)`|([^\s.`]+))\.\*(?:\s|$)/i.exec(line);
   if (!m) return false;
   const rawPattern = (m[1] ?? m[2] ?? '').replaceAll('``', '`');
   let re = '^';
@@ -172,6 +175,49 @@ export const mysqlGrantMatchesDb = (line: string, dbName: string): boolean => {
   }
   re += '$';
   return new RegExp(re, 'i').test(dbName);
+};
+
+/**
+ * 精确解析 MySQL `SHOW GRANTS` 行中 `GRANT <privs> ON ...` 的表/库/全局级权限名称集合（大写、单空格规范化）。
+ * 自动跳过 `GRANT <role> TO ...` 行、用户名/库名以及带列列表的列级权限（如 `INSERT (col)`、`UPDATE (a, b)`）。
+ */
+export const parseMysqlGrantPrivileges = (line: string): Set<string> => {
+  const out = new Set<string>();
+  const m = /^\s*GRANT\s+(?![`'"])(.+?)\s+ON\s+/i.exec(line);
+  if (!m) return out;
+  const raw = m[1]!;
+  const parts: string[] = [];
+  let start = 0;
+  let depth = 0;
+  let inBacktick = false;
+  for (let i = 0; i < raw.length; i++) {
+    const ch = raw[i]!;
+    if (inBacktick) {
+      if (ch === '`') {
+        if (raw[i + 1] === '`') i++;
+        else inBacktick = false;
+      }
+      continue;
+    }
+    if (ch === '`') {
+      inBacktick = true;
+    } else if (ch === '(') {
+      depth++;
+    } else if (ch === ')') {
+      if (depth > 0) depth--;
+    } else if (ch === ',' && depth === 0) {
+      parts.push(raw.slice(start, i));
+      start = i + 1;
+    }
+  }
+  parts.push(raw.slice(start));
+
+  for (const part of parts) {
+    const normalized = part.trim().replace(/\s+/g, ' ').toUpperCase();
+    if (!normalized || normalized.includes('(')) continue;
+    out.add(normalized);
+  }
+  return out;
 };
 
 const historyWriteProblem = async (db: Db): Promise<HistoryError | null> => {
@@ -204,17 +250,19 @@ const historyWriteProblem = async (db: Db): Promise<HistoryError | null> => {
     const dbName = ro?.dbName ?? '';
     const grants = await db.query<Record<string, unknown>>('SHOW GRANTS');
     const grantLines = grants.map((r) => asStr(Object.values(r)[0]));
-    const relevant = grantLines.filter((line) => mysqlGrantMatchesDb(line, dbName));
-    const hasGlobalSuper = grantLines.some((l) =>
-      /GRANT\s+(?:ALL\s+PRIVILEGES|[^;]*\bSUPER\b)[^;]*\bON\s+\*\.\*/i.test(l),
-    );
-    if (relevant.length > 0) {
-      const hasAll = relevant.some((l) => /GRANT\s+ALL\s+PRIVILEGES\b/i.test(l));
+    const relevantPrivs = grantLines
+      .filter((line) => mysqlGrantMatchesDb(line, dbName))
+      .map(parseMysqlGrantPrivileges);
+    const hasGlobalSuper = grantLines.some((l) => {
+      if (!isMysqlGlobalGrant(l)) return false;
+      const privs = parseMysqlGrantPrivileges(l);
+      return privs.has('ALL PRIVILEGES') || privs.has('ALL') || privs.has('SUPER');
+    });
+    if (relevantPrivs.length > 0) {
+      const hasAll = relevantPrivs.some((privs) => privs.has('ALL PRIVILEGES') || privs.has('ALL'));
       if (!hasAll) {
         const needed = ['CREATE', 'INSERT', 'UPDATE', 'TRIGGER'] as const;
-        const missing = needed.filter(
-          (priv) => !relevant.some((l) => new RegExp(`\\b${priv}\\b`, 'i').test(l)),
-        );
+        const missing = needed.filter((priv) => !relevantPrivs.some((privs) => privs.has(priv)));
         if (missing.length > 0 && !(await historyExists(db))) {
           return new HistoryError(
             'no_schema_privilege',

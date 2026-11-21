@@ -179,10 +179,16 @@ const scanTableRefList = (toks: Token[], start: number): boolean => {
     if (isWord(toks[pos], 'partition') && toks[pos + 1]?.text === '(') {
       pos = skipBalancedParens(toks, pos + 1);
     }
+    let hasAlias = false;
     if (isWord(toks[pos], 'as') && isIdentToken(toks[pos + 1])) {
       pos += 2;
+      hasAlias = true;
     } else if (isIdentToken(toks[pos]) && !CLAUSE_END_WORDS.has(toks[pos]!.text.toLowerCase())) {
       pos++;
+      hasAlias = true;
+    }
+    if (hasAlias && toks[pos]?.text === '(') {
+      pos = skipBalancedParens(toks, pos);
     }
     while (
       (isWord(toks[pos], 'use') || isWord(toks[pos], 'force') || isWord(toks[pos], 'ignore')) &&
@@ -224,6 +230,9 @@ const scanTableRefList = (toks: Token[], start: number): boolean => {
       if (!target) break;
       if (isForbiddenTarget(target)) return true;
       pos = target.next;
+      if (toks[pos]?.text === '(') {
+        pos = skipBalancedParens(toks, pos);
+      }
       skipOptionalTableTail();
     }
 
@@ -432,9 +441,18 @@ const SET_STOP_WORDS = new Set(['where', 'end', 'from', 'order', 'limit', 'group
  */
 const isDangerousSet = (toks: Token[], setIdx: number): boolean => {
   const prev = toks[setIdx - 1];
-  if (isWord(prev, 'character') || isWord(prev, 'char')) return false;
+  if (
+    prev?.text === '.' ||
+    isWord(prev, 'character') ||
+    isWord(prev, 'char') ||
+    isWord(prev, 'delete') ||
+    isWord(prev, 'update')
+  ) {
+    return false;
+  }
 
   const second = toks[setIdx + 1];
+  if (second?.text === '(') return false;
   if (
     isWord(second, 'role') ||
     isWord(second, 'password') ||
@@ -706,7 +724,7 @@ const statementIsInstanceLevel = (stmt: string): boolean => {
               if (isForbiddenTarget(readQualifiedObj(toks, pos + 1))) return true;
               break;
             }
-            if (isWord(kw, 'table') && toks[pos]?.text === ',') {
+            if ((isWord(kw, 'table') || isWord(kw, 'view')) && toks[pos]?.text === ',') {
               pos++;
               continue;
             }

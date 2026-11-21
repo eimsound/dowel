@@ -762,4 +762,38 @@ describe('MySQL dialect core (MySQL 8.4 & 9.7)', () => {
     expect(latinSteps[0]!.sql).not.toContain('utf8mb4');
     expect(latinSteps.some((st) => st.sql.includes('MODIFY COLUMN `code`'))).toBe(true);
   });
+
+  it('guards DROP VIEW lists and JSON_TABLE table lists while allowing SET(...) enum types and ON DELETE/UPDATE SET actions', () => {
+    for (const bad of [
+      'DROP VIEW v1, prod.v2;',
+      'DROP VIEW IF EXISTS v1, dowel_v;',
+      'DROP VIEW v1, v2, prod.v3;',
+      "SELECT * FROM JSON_TABLE('[{\"a\":1}]', '$[*]' COLUMNS (a INT PATH '$.a')) AS jt, prod.users;",
+      "SELECT * FROM JSON_TABLE('[{\"a\":1}]', '$[*]' COLUMNS (a INT PATH '$.a')) AS jt, dowel_history;",
+      "DELETE u FROM JSON_TABLE('[{\"a\":1}]', '$[*]' COLUMNS (a INT PATH '$.a')) AS jt, prod.users AS u;",
+      "DELETE FROM t1 USING JSON_TABLE('[{\"a\":1}]', '$[*]' COLUMNS (a INT PATH '$.a')) AS jt, prod.users;",
+      "SELECT * FROM (JSON_TABLE('[{\"a\":1}]', '$[*]' COLUMNS (a INT PATH '$.a')) AS jt, prod.users);",
+      "UPDATE JSON_TABLE('[{\"a\":1}]', '$[*]' COLUMNS (a INT PATH '$.a')) AS jt, prod.users u SET u.name = 'x';",
+      'SELECT * FROM (SELECT 1) AS sub (c1), prod.users;',
+      "CREATE PROCEDURE p() BEGIN DECLARE flags SET('a','b'); SET GLOBAL read_only = 1; END;",
+      "CREATE TRIGGER tr AFTER DELETE ON users FOR EACH ROW SET sql_mode = 'ANSI';",
+      'CREATE TRIGGER tr AFTER UPDATE ON users FOR EACH ROW BEGIN SET RESOURCE GROUP usr_default; END;',
+    ]) {
+      expect(findInstanceLevelStatement(bad, 'mysql'), `should block: ${bad}`).not.toBeNull();
+    }
+
+    for (const ok of [
+      'DROP VIEW IF EXISTS v1, v2;',
+      "SELECT * FROM JSON_TABLE('[{\"a\":1}]', '$[*]' COLUMNS (a INT PATH '$.a')) AS jt;",
+      "SELECT jt.a, u.name FROM JSON_TABLE('[{\"a\":1}]', '$[*]' COLUMNS (a INT PATH '$.a')) AS jt JOIN users u ON jt.a = u.id;",
+      "CREATE TABLE t (flags SET('a', 'b'), sql_mode VARCHAR(64));",
+      "CREATE TABLE t (flags SET('a', 'b'), global INT);",
+      "CREATE TABLE t (flags SET('a', 'b'), id INT, `sql_mode` VARCHAR(64));",
+      "CREATE TABLE t (flags SET('a', 'b'), persist INT, persist_only INT);",
+      'CREATE TABLE t (id INT REFERENCES p(id) ON DELETE SET NULL, sql_mode VARCHAR(64), global INT);',
+      'CREATE TABLE t (id INT REFERENCES p(id) ON UPDATE SET DEFAULT, sql_mode VARCHAR(64), persist INT);',
+    ]) {
+      expect(findInstanceLevelStatement(ok, 'mysql'), `should allow: ${ok}`).toBeNull();
+    }
+  });
 });
