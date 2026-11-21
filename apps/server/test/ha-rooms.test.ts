@@ -9,7 +9,7 @@ import { createTestDb, PG_URL } from '../../../test/pg.ts';
 import { createApp } from '../src/app.ts';
 import type { User } from '../src/auth.ts';
 import { openPlatformDb, type PlatformDb } from '../src/db.ts';
-import { type Extra, type Peer, WorkingChangedError } from '../src/rooms.ts';
+import { type Extra, type Peer, type RoomsOptions, WorkingChangedError } from '../src/rooms.ts';
 import { makeUser, PASSWORD } from './support.ts';
 
 const waitFor = async (predicate: () => boolean, timeoutMs = 8000, stepMs = 20): Promise<void> => {
@@ -96,7 +96,11 @@ interface DualReplicaFixture {
   close: () => Promise<void>;
 }
 
-const createDualReplicas = async (tag: string, startBus = true): Promise<DualReplicaFixture> => {
+const createDualReplicas = async (
+  tag: string,
+  startBus = true,
+  roomOpts?: { roomsA?: RoomsOptions; roomsB?: RoomsOptions },
+): Promise<DualReplicaFixture> => {
   const safeTag = tag.replace(/[^a-z0-9_]/gi, '_').toLowerCase();
   const pg = await createTestDb(safeTag);
   const dbA = await openPlatformDb(pg.url);
@@ -106,8 +110,14 @@ const createDualReplicas = async (tag: string, startBus = true): Promise<DualRep
     .slice(0, 8)
     .toLowerCase();
   const channel = `dowel_ha_rooms_${safeTag}_${suffix}`;
-  const appA = createApp(dbA, { bus: { replicaId: `replica-a-${safeTag}`, channel } });
-  const appB = createApp(dbB, { bus: { replicaId: `replica-b-${safeTag}`, channel } });
+  const appA = createApp(dbA, {
+    bus: { replicaId: `replica-a-${safeTag}`, channel },
+    rooms: roomOpts?.roomsA,
+  });
+  const appB = createApp(dbB, {
+    bus: { replicaId: `replica-b-${safeTag}`, channel },
+    rooms: roomOpts?.roomsB,
+  });
 
   try {
     if (startBus) {
@@ -217,8 +227,12 @@ describe.skipIf(!PG_URL)('P7 HA2：无状态实时协作房间（真实 PG 双�
     }
   });
 
-  const boot = async (tag: string, startBus = true) => {
-    const f = await createDualReplicas(tag, startBus);
+  const boot = async (
+    tag: string,
+    startBus = true,
+    roomOpts?: { roomsA?: RoomsOptions; roomsB?: RoomsOptions },
+  ) => {
+    const f = await createDualReplicas(tag, startBus, roomOpts);
     fixtures.push(f);
     return f;
   };
@@ -1572,6 +1586,68 @@ describe.skipIf(!PG_URL)('P7 HA2：无状态实时协作房间（真实 PG 双�
         true,
       );
     } finally {
+      f.dbB.transaction = origTxB;
+    }
+  });
+
+  test('16. PG 双副本空闲房间超时卸载后不再响应 room.commit 查库追赶，再次访问透明重载（#45）', async () => {
+    const f = await boot('idle-evict-pg', true, { roomsB: { idleEvictMs: 60 } });
+    // 副本 B 仅通过只读 model() 加载房间，无任何在线 peer
+    expect((await f.appB.rooms.model(f.branchId)).seq).toBe(0);
+    expect(f.appB.rooms.has(f.branchId)).toBe(true);
+
+    // 超过 idleEvictMs 后副本 B 自动卸载该房间
+    await waitFor(() => !f.appB.rooms.has(f.branchId), 3000);
+    expect(f.appB.rooms.has(f.branchId)).toBe(false);
+
+    // 拦截副本 B 上对 room_commits 的查询计数，并记录是否确实收到了 room.commit 总线事件
+    let bCommitQueries = 0;
+    const origTxB = f.dbB.transaction.bind(f.dbB);
+    f.dbB.transaction = (async (fn, opts) =>
+      origTxB(async (tx) => {
+        const tracedTx: typeof tx = {
+          exec: (q) => tx.exec(q),
+          query: async <T>(q: string, params?: unknown[]) => {
+            if (q.includes('from room_commits')) bCommitQueries += 1;
+            return tx.query<T>(q, params);
+          },
+        };
+        return fn(tracedTx);
+      }, opts)) as typeof f.dbB.transaction;
+
+    let commitEventReceived = false;
+    const offEvent = f.appB.bus.onEvent((ev) => {
+      if (ev.t === 'room.commit' && ev.branchId === f.branchId) commitEventReceived = true;
+    });
+
+    try {
+      const peerA = makePeer(f.alice);
+      await f.appA.rooms.join(f.branchId, peerA.peer);
+      await f.appA.rooms.message(f.branchId, peerA.peer, { t: 'hello', client: 'c-a', lastSeq: 0 });
+      await f.appA.rooms.message(f.branchId, peerA.peer, {
+        t: 'op',
+        op: {
+          client: 'c-a',
+          n: 1,
+          name: 'createTable',
+          args: { id: 'tbl_after_evict', schema: f.schemaId, name: 'after_evict_pg' },
+          reads: [[f.schemaId, 0]],
+        },
+      });
+
+      // 确认副本 B 确实收到了 room.commit，但因已卸载未触发任何 room_commits 查询，也未重新加载
+      await waitFor(() => commitEventReceived, 5000);
+      await new Promise((r) => setTimeout(r, 80));
+      expect(f.appB.rooms.has(f.branchId)).toBe(false);
+      expect(bCommitQueries).toBe(0);
+
+      // 再次访问副本 B，透明重载并读到副本 A 的最新提交
+      const reloaded = await f.appB.rooms.model(f.branchId);
+      expect(reloaded.seq).toBe(1);
+      expect(all(reloaded.model, 'table').map((t) => t.name)).toEqual(['after_evict_pg']);
+      expect(f.appB.rooms.has(f.branchId)).toBe(true);
+    } finally {
+      offEvent();
       f.dbB.transaction = origTxB;
     }
   });

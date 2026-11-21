@@ -24,7 +24,7 @@ import {
 } from './rate-limit.ts';
 import { Requests } from './requests.ts';
 import { effectiveProjectRole } from './roles.ts';
-import { Rooms } from './rooms.ts';
+import { Rooms, type RoomsOptions } from './rooms.ts';
 import type { AppContext, Env } from './routes/context.ts';
 import { registerRoutes } from './routes/index.ts';
 import { SecretError, scrubSecrets } from './secrets.ts';
@@ -65,6 +65,8 @@ export interface AppOptions {
   bus?: EventBusOptions;
   /** 副本租约与分布式任务协调器配置 */
   ha?: HaCoordinatorOptions;
+  /** 协作房间配置（如空闲超时卸载间隔） */
+  rooms?: RoomsOptions;
 }
 
 export const createApp = (db: PlatformDb, options: AppOptions = {}) => {
@@ -72,7 +74,13 @@ export const createApp = (db: PlatformDb, options: AppOptions = {}) => {
   const bus = new EventBus(db, options.bus);
   const ha = new HaCoordinator(db, { replicaId: bus.replicaId, ...options.ha });
   // 房间和 HTTP 用同一套生效角色规则；join 复查时也要能算；多副本下经 EventBus 同步房间事件并借助 HA 租约清理离线副本成员
-  const rooms = new Rooms(db, (user, pid, lookup) => effectiveProjectRole(db, user, pid, lookup), bus, ha);
+  const rooms = new Rooms(
+    db,
+    (user, pid, lookup) => effectiveProjectRole(db, user, pid, lookup),
+    bus,
+    ha,
+    options.rooms,
+  );
   // 所有目标库 / 影子库连接都要过的检查：实例的白名单（服务端替用户连地址 = SSRF 面）
   const guard: ConnectionGuard = async (url) => {
     const { connectionAllowlist } = await readSettings(db);

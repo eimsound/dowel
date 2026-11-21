@@ -1166,3 +1166,386 @@ test('catchUp 按游标增量拉取 room_rejections（不反复全表扫描历�
     await testRooms.flush();
   }
 });
+
+const waitForCond = async (predicate: () => boolean, timeoutMs = 3000, stepMs = 10): Promise<void> => {
+  const deadline = Date.now() + timeoutMs;
+  while (!predicate()) {
+    if (Date.now() >= deadline) throw new Error(`等待条件超时（${timeoutMs}ms）`);
+    await new Promise((r) => setTimeout(r, stepMs));
+  }
+};
+
+test('空闲房间在 HTTP 访问或所有 peer 离开后自动卸载，卸载后忽略总线事件不查库并支持透明重载（#45）', async () => {
+  const u = await makeUser(db, 'idle-evict-user', { name: '空闲淘汰测试' });
+  await db.query(
+    "insert into grants (id, scope_kind, scope_id, subject_kind, subject_id, role) values ($1, 'project', $2, 'user', $3, 'editor')",
+    ['g-idle-evict', pid, u.id],
+  );
+  const branchIdle = `${branchId}-idle-evict`;
+  await db.query("insert into branches (id, project_id, name) values ($1, $2, 'idle-evict')", [
+    branchIdle,
+    pid,
+  ]);
+  await rooms.init(branchIdle, model);
+
+  let commitQueries = 0;
+  const countedDb: PlatformDb = {
+    ...db,
+    query: async <T>(sql: string, params?: unknown[]) => {
+      if (sql.includes('from room_commits')) commitQueries += 1;
+      return db.query<T>(sql, params);
+    },
+    transaction: (fn, opts) =>
+      db.transaction(async (tx) => {
+        const wrappedTx: typeof tx = {
+          exec: (q) => tx.exec(q),
+          query: async <T>(q: string, params?: unknown[]) => {
+            if (q.includes('from room_commits')) commitQueries += 1;
+            return tx.query<T>(q, params);
+          },
+        };
+        return fn(wrappedTx);
+      }, opts),
+  };
+
+  const fake = makeFakeBus('replica-idle');
+  const idleRooms = new Rooms(
+    countedDb,
+    (user, projectId, lookup) => effectiveProjectRole(db, user, projectId, lookup),
+    fake.bus,
+    undefined,
+    { idleEvictMs: 40 },
+  );
+  const noEvictZero = new Rooms(
+    db,
+    (user, projectId, lookup) => effectiveProjectRole(db, user, projectId, lookup),
+    undefined,
+    undefined,
+    { idleEvictMs: 0 },
+  );
+  const noEvictInf = new Rooms(
+    db,
+    (user, projectId, lookup) => effectiveProjectRole(db, user, projectId, lookup),
+    undefined,
+    undefined,
+    { idleEvictMs: Number.POSITIVE_INFINITY },
+  );
+
+  try {
+    // 1. 仅 HTTP 只读接口加载房间（无 peer），超过 idleEvictMs 后自动卸载
+    const initial = await idleRooms.model(branchIdle);
+    expect(initial.seq).toBe(0);
+    expect(idleRooms.has(branchIdle)).toBe(true);
+    await waitForCond(() => !idleRooms.has(branchIdle));
+    expect(idleRooms.has(branchIdle)).toBe(false);
+
+    // 2. 卸载后收到外部 room.commit / room.layout 广播：直接忽略，不重载也不查库
+    const nextModel = structuredClone(model);
+    nextModel.objects.tbl_ext = {
+      kind: 'table',
+      id: 'tbl_ext',
+      parent: schemaId,
+      name: 'after_evict',
+      partitionBy: null,
+      partitionOf: null,
+      comment: null,
+    };
+    await rooms.replace(branchIdle, '外部副本', nextModel, 'externalReplace', 0);
+
+    commitQueries = 0;
+    await fake.emit({ t: 'room.commit', origin: 'replica-other', branchId: branchIdle, seq: 1 });
+    await fake.emit({
+      t: 'room.layout',
+      origin: 'replica-other',
+      branchId: branchIdle,
+      positions: { tbl_ext: { x: 10, y: 20 } },
+    });
+    expect(idleRooms.has(branchIdle)).toBe(false);
+    expect(commitQueries).toBe(0);
+
+    // 3. 再次访问时透明重新加载，并读到最新已提交模型
+    const reloaded = await idleRooms.state(branchIdle);
+    expect(reloaded.seq).toBe(1);
+    expect(all(reloaded.model, 'table').map((t) => t.name)).toEqual(['after_evict']);
+    expect(idleRooms.has(branchIdle)).toBe(true);
+
+    // 4. peer 加入后取消空闲卸载：保持在线超过 2 * idleEvictMs 仍常驻；离开后重新进入空闲淘汰
+    const p = peerOf(u);
+    await idleRooms.join(branchIdle, p.peer);
+    await new Promise((r) => setTimeout(r, 100));
+    expect(idleRooms.has(branchIdle)).toBe(true);
+
+    await idleRooms.leave(branchIdle, p.peer);
+    await waitForCond(() => !idleRooms.has(branchIdle));
+    expect(idleRooms.has(branchIdle)).toBe(false);
+
+    // 5. 被 kickUserLocal 踢掉最后一个 peer 后同样触发空闲卸载
+    const p2 = peerOf(u);
+    await idleRooms.join(branchIdle, p2.peer);
+    expect(idleRooms.has(branchIdle)).toBe(true);
+    await idleRooms.kickUserLocal(u.id, '测试踢出');
+    expect(p2.closed()).toBe(4403);
+    await waitForCond(() => !idleRooms.has(branchIdle));
+    expect(idleRooms.has(branchIdle)).toBe(false);
+
+    // 6. idleEvictMs = 0 / Infinity 时禁用空闲卸载
+    await noEvictZero.model(branchIdle);
+    await noEvictInf.model(branchIdle);
+    await new Promise((r) => setTimeout(r, 80));
+    expect(noEvictZero.has(branchIdle)).toBe(true);
+    expect(noEvictInf.has(branchIdle)).toBe(true);
+  } finally {
+    idleRooms.close();
+    noEvictZero.close();
+    noEvictInf.close();
+    await Promise.all([idleRooms.flush(), noEvictZero.flush(), noEvictInf.flush()]);
+  }
+});
+
+test('有待落盘布局或在途 flushLayout 时不被误卸载，落盘后自动淘汰；close() 清理全部空闲定时器（#45）', async () => {
+  const u = await makeUser(db, 'idle-layout-user', { name: '空闲布局保护' });
+  await db.query(
+    "insert into grants (id, scope_kind, scope_id, subject_kind, subject_id, role) values ($1, 'project', $2, 'user', $3, 'editor')",
+    ['g-idle-layout', pid, u.id],
+  );
+  const branchIdleLayout = `${branchId}-idle-layout`;
+  await db.query("insert into branches (id, project_id, name) values ($1, $2, 'idle-layout')", [
+    branchIdleLayout,
+    pid,
+  ]);
+  await rooms.init(branchIdleLayout, model);
+
+  let holdLayoutUpdate = false;
+  const layoutUpdateEntered = deferred();
+  const layoutUpdateRelease = deferred();
+  const hookedDb: PlatformDb = {
+    ...db,
+    query: async <T>(sql: string, params?: unknown[]) => {
+      if (holdLayoutUpdate && sql.includes('update branches set layout')) {
+        holdLayoutUpdate = false;
+        layoutUpdateEntered.resolve();
+        await layoutUpdateRelease.promise;
+      }
+      return db.query<T>(sql, params);
+    },
+  };
+
+  const idleRooms = new Rooms(
+    hookedDb,
+    (user, projectId, lookup) => effectiveProjectRole(db, user, projectId, lookup),
+    undefined,
+    undefined,
+    { idleEvictMs: 40 },
+  );
+
+  try {
+    const p = peerOf(u);
+    await idleRooms.join(branchIdleLayout, p.peer);
+    await idleRooms.message(branchIdleLayout, p.peer, { t: 'hello', client: 'c-idle-layout', lastSeq: 0 });
+
+    // 发送 layout 后立即离开：此时 peers.size === 0，但有 pendingLayout + layoutTimer（500ms）
+    holdLayoutUpdate = true;
+    await idleRooms.message(branchIdleLayout, p.peer, {
+      t: 'layout',
+      positions: { tbl_keep: { x: 77, y: 88 } },
+    });
+    await idleRooms.leave(branchIdleLayout, p.peer);
+
+    // 等待超过 idleEvictMs（40ms），防抖落盘尚未触发，房间绝不能被误卸载
+    await new Promise((r) => setTimeout(r, 120));
+    expect(idleRooms.has(branchIdleLayout)).toBe(true);
+
+    // 等 500ms 防抖触发进入 flushLayout SQL（在途 layoutFlushing 期间同样不能卸载）
+    await layoutUpdateEntered.promise;
+    await new Promise((r) => setTimeout(r, 100));
+    expect(idleRooms.has(branchIdleLayout)).toBe(true);
+
+    // 放行落盘：布局完整持久化，且 flushLayout 完成后自动重新调度空闲卸载
+    layoutUpdateRelease.resolve();
+    await waitForCond(() => !idleRooms.has(branchIdleLayout));
+    expect(idleRooms.has(branchIdleLayout)).toBe(false);
+
+    const [saved] = await db.query<{ layout: Record<string, { x: number; y: number }> }>(
+      'select layout from branches where id = $1',
+      [branchIdleLayout],
+    );
+    expect(saved?.layout.tbl_keep).toEqual({ x: 77, y: 88 });
+
+    // close() 必须同步清理全部空闲卸载定时器，不再触发卸载
+    await idleRooms.model(branchIdleLayout);
+    expect(idleRooms.has(branchIdleLayout)).toBe(true);
+    idleRooms.close();
+    await new Promise((r) => setTimeout(r, 100));
+    expect(idleRooms.has(branchIdleLayout)).toBe(true);
+  } finally {
+    idleRooms.close();
+    await idleRooms.flush();
+  }
+});
+
+test('SQLite 模式下并发写入在 COMMIT 前挂起并最终回滚：并发 state / model / modelAt / listHistory 严格等锁且绝不脏读（#45）', async () => {
+  const u = await makeUser(db, 'sqlite-dirty-user', { name: '脏读防护测试' });
+  await db.query(
+    "insert into grants (id, scope_kind, scope_id, subject_kind, subject_id, role) values ($1, 'project', $2, 'user', $3, 'editor')",
+    ['g-sqlite-dirty', pid, u.id],
+  );
+  const branchDirty = `${branchId}-sqlite-dirty`;
+  await db.query("insert into branches (id, project_id, name) values ($1, $2, 'sqlite-dirty')", [
+    branchDirty,
+    pid,
+  ]);
+  await rooms.init(branchDirty, model);
+
+  let holdWrite = false;
+  let txEntered = deferred();
+  let txRelease = deferred();
+  const hookedDb: PlatformDb = {
+    ...db,
+    transaction: (fn, opts) =>
+      db.transaction(async (tx) => {
+        const res = await fn(tx);
+        if (!opts?.readOnly && holdWrite) {
+          holdWrite = false;
+          txEntered.resolve();
+          await txRelease.promise;
+          throw new Error('模拟提交前事务回滚');
+        }
+        return res;
+      }, opts),
+  };
+
+  const testRooms = new Rooms(hookedDb, (user, projectId, lookup) =>
+    effectiveProjectRole(db, user, projectId, lookup),
+  );
+
+  try {
+    // 预热加载房间，使 !r.dirty（历史上 SQLite 模式此时会绕过 withRoomLock 直接读内存）
+    const base = await testRooms.state(branchDirty);
+    expect(base.seq).toBe(0);
+    expect(all(base.model, 'table')).toEqual([]);
+
+    // 1. replace 路径：在事务 COMMIT 前已就地改写内存态，并发只读必须阻塞等锁，回滚后读到干净态
+    const dirtyModel = structuredClone(base.model);
+    dirtyModel.objects.tbl_dirty = {
+      kind: 'table',
+      id: 'tbl_dirty',
+      parent: schemaId,
+      name: 'uncommitted_replace',
+      partitionBy: null,
+      partitionOf: null,
+      comment: null,
+    };
+
+    holdWrite = true;
+    txEntered = deferred();
+    txRelease = deferred();
+    const writePromise = testRooms.replace(branchDirty, '脏写', dirtyModel, 'replaceModel', 0);
+    await txEntered.promise;
+
+    let stateDone = false;
+    let modelDone = false;
+    let modelAt0Done = false;
+    let modelAt1Done = false;
+    let histDone = false;
+
+    const pState = testRooms.state(branchDirty).then((r) => {
+      stateDone = true;
+      return r;
+    });
+    const pModel = testRooms.model(branchDirty).then((r) => {
+      modelDone = true;
+      return r;
+    });
+    const pModelAt0 = testRooms.modelAt(branchDirty, 0).then((r) => {
+      modelAt0Done = true;
+      return r;
+    });
+    const pModelAt1 = testRooms.modelAt(branchDirty, 1).then(
+      () => {
+        modelAt1Done = true;
+        return 'ok';
+      },
+      (err) => {
+        modelAt1Done = true;
+        return err;
+      },
+    );
+    const pHist = testRooms.listHistory(branchDirty).then((r) => {
+      histDone = true;
+      return r;
+    });
+
+    // 写事务挂起期间，所有并发只读查询均必须阻塞等待房间锁
+    await new Promise((r) => setTimeout(r, 40));
+    expect(stateDone).toBe(false);
+    expect(modelDone).toBe(false);
+    expect(modelAt0Done).toBe(false);
+    expect(modelAt1Done).toBe(false);
+    expect(histDone).toBe(false);
+
+    // 放行并触发事务回滚
+    txRelease.resolve();
+    await expect(writePromise).rejects.toThrow('模拟提交前事务回滚');
+
+    const [st, md, at0, at1Err, hist] = await Promise.all([pState, pModel, pModelAt0, pModelAt1, pHist]);
+    expect(st.seq).toBe(0);
+    expect(all(st.model, 'table')).toEqual([]);
+    expect(md.seq).toBe(0);
+    expect(all(md.model, 'table')).toEqual([]);
+    expect(all(at0, 'table')).toEqual([]);
+    expect((at1Err as { status?: number })?.status).toBe(404);
+    expect(hist.currentSeq).toBe(0);
+
+    // 2. WS op 路径同样受锁保护，绝不读到未提交的 op 建表态
+    const p = peerOf(u);
+    await testRooms.join(branchDirty, p.peer);
+    await testRooms.message(branchDirty, p.peer, { t: 'hello', client: 'c-dirty-op', lastSeq: 0 });
+
+    holdWrite = true;
+    txEntered = deferred();
+    txRelease = deferred();
+    const opPromise = testRooms.message(branchDirty, p.peer, {
+      t: 'op',
+      op: {
+        client: 'c-dirty-op',
+        n: 1,
+        name: 'createTable',
+        args: { id: 'tbl_dirty_op', schema: schemaId, name: 'uncommitted_op' },
+        reads: [[schemaId, 0]],
+      },
+    });
+    await txEntered.promise;
+
+    let opReadDone = false;
+    const pOpRead = testRooms.model(branchDirty).then((r) => {
+      opReadDone = true;
+      return r;
+    });
+    await new Promise((r) => setTimeout(r, 40));
+    expect(opReadDone).toBe(false);
+
+    txRelease.resolve();
+    await expect(opPromise).rejects.toThrow('模拟提交前事务回滚');
+    const afterOpRollback = await pOpRead;
+    expect(afterOpRollback.seq).toBe(0);
+    expect(all(afterOpRollback.model, 'table')).toEqual([]);
+
+    // 3. 返回值必须为独立快照副本：调用方修改返回对象不影响房间内部态
+    afterOpRollback.model.objects.mutated_by_caller = {
+      kind: 'table',
+      id: 'mutated_by_caller',
+      parent: schemaId,
+      name: 'should_not_leak',
+      partitionBy: null,
+      partitionOf: null,
+      comment: null,
+    };
+    const freshCheck = await testRooms.state(branchDirty);
+    expect(freshCheck.model.objects.mutated_by_caller).toBeUndefined();
+    freshCheck.versions[schemaId] = 999;
+    expect((await testRooms.state(branchDirty)).versions[schemaId]).toBeUndefined();
+  } finally {
+    testRooms.close();
+    await testRooms.flush();
+  }
+});

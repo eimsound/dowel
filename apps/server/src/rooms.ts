@@ -45,6 +45,13 @@ const LAYOUT_INLINE_MAX_BYTES = 7000;
 const PEERS_EVENT_MAX_BYTES = 7000;
 /** 定期结合 HA 租约清理已离线副本残留 remotePeers 的间隔（毫秒） */
 const PEER_PRUNE_INTERVAL_MS = 10_000;
+/** 空闲房间（无在线成员且无待落盘布局）默认超时卸载时间（毫秒） */
+const DEFAULT_IDLE_EVICT_MS = 5 * 60_000;
+
+export interface RoomsOptions {
+  /** 空闲房间超时卸载时间（毫秒）；默认 5 分钟，传入 0 或 Infinity 禁用 */
+  idleEvictMs?: number;
+}
 
 type RefreshTarget = 'all' | Set<string>;
 
@@ -174,6 +181,14 @@ interface Loaded {
   layoutTimer?: ReturnType<typeof setTimeout>;
   /** 当前在途的布局落库任务（串行化落库并确保 flush() 等待 SQL 真正完成） */
   layoutFlushing: Promise<void> | null;
+  /** 空闲卸载定时器（仅在无在线成员、无在途操作且无待落盘布局时存在） */
+  idleTimer?: ReturnType<typeof setTimeout>;
+  /** 当前在途/等待房间锁的活跃操作计数（避免等待锁期间被空闲卸载误删） */
+  activeOps: number;
+  /** 是否已被卸载或随分支删除移除（防止滞后回调误操作旧条目） */
+  evicted: boolean;
+  /** 指向 this.rooms 中登记的当前 Promise 条目，用于同步核验归属 */
+  entry?: Promise<Loaded>;
   /** 进程内按分支串行化的互斥队列（保护 catchUp / 事务写 / 失败重建不交错） */
   lock: Promise<void>;
   /** 上次事务回滚后重建失败时置为 true，下次操作前强制重载 */
@@ -207,6 +222,9 @@ export class Rooms {
   private ha?: Pick<HaCoordinator, 'replicaId' | 'aliveNodes'>;
   private unsubBus: (() => void)[] = [];
   private closed = false;
+  private idleEvictMs: number;
+  /** 追踪所有活跃的空闲卸载定时器，确保 close() 时同步彻底清理 */
+  private idleTimers = new Map<Loaded, ReturnType<typeof setTimeout>>();
   private peerPruneTimer: ReturnType<typeof setInterval> | null = null;
   private pruneInFlight: Promise<void> | null = null;
   /** 追踪非阻塞路径（load / close）发起的在途事件发布，供 flush() 排空避免与 db.close() 竞态 */
@@ -234,11 +252,15 @@ export class Rooms {
     resolveRole: ResolveRole,
     bus?: EventBus,
     ha?: Pick<HaCoordinator, 'replicaId' | 'aliveNodes'>,
+    options?: RoomsOptions,
   ) {
     this.db = db;
     this.resolveRole = resolveRole;
     this.bus = bus;
     this.ha = ha;
+    const rawIdle = options?.idleEvictMs;
+    this.idleEvictMs =
+      rawIdle === undefined ? DEFAULT_IDLE_EVICT_MS : rawIdle <= 0 || !Number.isFinite(rawIdle) ? 0 : rawIdle;
     if (bus) {
       this.unsubBus.push(
         bus.onEvent((event) => this.handleClusterEvent(event)),
@@ -256,7 +278,7 @@ export class Rooms {
     }
   }
 
-  /** 取消集群事件总线订阅与后台清理定时器，并在仍有未清空本地成员时广播离线快照（关闭实例或测试清理时调用） */
+  /** 取消集群事件总线订阅、空闲卸载定时器与后台清理定时器，并在仍有未清空本地成员时广播离线快照（关闭实例或测试清理时调用） */
   close() {
     if (this.closed) return;
     this.closed = true;
@@ -266,6 +288,11 @@ export class Rooms {
       clearInterval(this.peerPruneTimer);
       this.peerPruneTimer = null;
     }
+    for (const [r, timer] of this.idleTimers) {
+      clearTimeout(timer);
+      if (r.idleTimer === timer) r.idleTimer = undefined;
+    }
+    this.idleTimers.clear();
     if (this.bus) {
       for (const [branchId, pending] of this.rooms) {
         const p = pending
@@ -293,13 +320,22 @@ export class Rooms {
   }
 
   get(branchId: string): Promise<Loaded> {
-    let r = this.rooms.get(branchId);
-    if (!r) {
-      r = this.load(branchId);
-      this.rooms.set(branchId, r);
-      r.catch(() => this.rooms.delete(branchId));
+    let p = this.rooms.get(branchId);
+    if (!p) {
+      p = this.load(branchId).then(
+        (r) => {
+          r.entry = p!;
+          this.scheduleIdleEvictIfNeeded(branchId, r);
+          return r;
+        },
+        (err) => {
+          if (this.rooms.get(branchId) === p) this.rooms.delete(branchId);
+          throw err;
+        },
+      );
+      this.rooms.set(branchId, p);
     }
-    return r;
+    return p;
   }
 
   private makeStore(db: Db, branchId: string, onRejectionId?: (id: number) => void): RoomStore {
@@ -437,6 +473,8 @@ export class Rooms {
       layoutClock: 0,
       layoutVersions: new Map(),
       layoutFlushing: null,
+      activeOps: 0,
+      evicted: false,
       lock: Promise.resolve(),
       dirty: false,
     };
@@ -454,6 +492,57 @@ export class Rooms {
     r.dirty = false;
   }
 
+  private isCurrentEntry(branchId: string, r: Loaded): boolean {
+    return !r.evicted && r.entry !== undefined && this.rooms.get(branchId) === r.entry;
+  }
+
+  private hasPendingLayout(r: Loaded): boolean {
+    return (
+      Object.keys(r.pendingLayout).length > 0 || r.layoutFlushing !== null || r.layoutTimer !== undefined
+    );
+  }
+
+  private isIdle(r: Loaded): boolean {
+    return r.peers.size === 0 && r.activeOps === 0 && !this.hasPendingLayout(r);
+  }
+
+  private clearIdleEvict(r: Loaded) {
+    if (r.idleTimer !== undefined) {
+      clearTimeout(r.idleTimer);
+      r.idleTimer = undefined;
+    }
+    this.idleTimers.delete(r);
+  }
+
+  private scheduleIdleEvictIfNeeded(branchId: string, r: Loaded) {
+    if (this.closed || this.idleEvictMs <= 0) return;
+    if (!this.isCurrentEntry(branchId, r)) return;
+    if (!this.isIdle(r)) {
+      this.clearIdleEvict(r);
+      return;
+    }
+    this.clearIdleEvict(r);
+    const timer = setTimeout(() => {
+      if (r.idleTimer === timer) r.idleTimer = undefined;
+      this.idleTimers.delete(r);
+      void this.evictIfIdle(branchId, r);
+    }, this.idleEvictMs);
+    timer.unref?.();
+    r.idleTimer = timer;
+    this.idleTimers.set(r, timer);
+  }
+
+  private async evictIfIdle(branchId: string, r: Loaded): Promise<void> {
+    if (this.closed || !this.isCurrentEntry(branchId, r) || !this.isIdle(r)) return;
+    await this.withRoomLock(r, async () => {
+      if (this.closed || !this.isCurrentEntry(branchId, r) || !this.isIdle(r)) return;
+      this.clearIdleEvict(r);
+      r.evicted = true;
+      this.rooms.delete(branchId);
+      this.branchRefreshGen.delete(branchId);
+    });
+  }
+
   /** 按分支在当前进程内串行执行，避免同一房间并发修改 / 追赶交错 */
   private async withRoomLock<T>(r: Loaded, fn: () => Promise<T>): Promise<T> {
     let release!: () => void;
@@ -467,6 +556,40 @@ export class Rooms {
       return await fn();
     } finally {
       release();
+    }
+  }
+
+  /**
+   * 获取当前活跃房间条目并在 withRoomLock 内串行执行：
+   * - 若拿锁前该条目已被空闲卸载或删除，则透明重新加载并重试；
+   * - 排队与执行期间通过 activeOps 与清除定时器阻止空闲卸载；
+   * - 退出时（含异常路径）若房间处于空闲态，重新调度空闲卸载定时器。
+   */
+  private async withActiveRoomLock<T>(
+    branchId: string,
+    fn: (r: Loaded) => Promise<T>,
+  ): Promise<{ r: Loaded; value: T }> {
+    for (;;) {
+      const r = await this.get(branchId);
+      if (!this.isCurrentEntry(branchId, r)) continue;
+      this.clearIdleEvict(r);
+      r.activeOps += 1;
+      let stale = false;
+      try {
+        const value = await this.withRoomLock(r, async () => {
+          if (!this.isCurrentEntry(branchId, r)) {
+            stale = true;
+            return undefined as T;
+          }
+          this.clearIdleEvict(r);
+          return fn(r);
+        });
+        if (stale) continue;
+        return { r, value };
+      } finally {
+        r.activeOps -= 1;
+        if (!stale) this.scheduleIdleEvictIfNeeded(branchId, r);
+      }
     }
   }
 
@@ -532,40 +655,44 @@ export class Rooms {
     return applied;
   }
 
+  private async reloadAndMissedLocked(branchId: string, r: Loaded): Promise<Commit[]> {
+    const missed: Commit[] = [];
+    const prevSeq = r.room.seq;
+    await this.reloadLocked(branchId, r);
+    if (r.room.seq > prevSeq) {
+      const rows = await this.db.query<{
+        seq: string | number;
+        client: string;
+        n: number;
+        user_name: string;
+        changes: Commit['changes'];
+      }>(
+        'select seq, client, n, user_name, changes from room_commits where branch_id = $1 and seq > $2 and seq <= $3 order by seq',
+        [branchId, prevSeq, r.room.seq],
+      );
+      for (const row of rows) {
+        missed.push({
+          t: 'commit',
+          seq: Number(row.seq),
+          client: row.client,
+          n: Number(row.n),
+          user: row.user_name,
+          changes: row.changes,
+        });
+      }
+    }
+    return missed;
+  }
+
   private async catchUpLoaded(
     branchId: string,
     r: Loaded,
     opts?: { excludePeer?: Peer; minSeq?: number },
   ): Promise<Commit[]> {
     const caughtUp = await this.withRoomLock(r, async () => {
+      if (!this.isCurrentEntry(branchId, r)) return [];
       if (opts?.minSeq !== undefined && !r.dirty && r.room.seq >= opts.minSeq) return [];
-      const missed: Commit[] = [];
-      if (r.dirty) {
-        const prevSeq = r.room.seq;
-        await this.reloadLocked(branchId, r);
-        if (r.room.seq > prevSeq) {
-          const rows = await this.db.query<{
-            seq: string | number;
-            client: string;
-            n: number;
-            user_name: string;
-            changes: Commit['changes'];
-          }>(
-            'select seq, client, n, user_name, changes from room_commits where branch_id = $1 and seq > $2 and seq <= $3 order by seq',
-            [branchId, prevSeq, r.room.seq],
-          );
-          for (const row of rows) {
-            missed.push({
-              t: 'commit',
-              seq: Number(row.seq),
-              client: row.client,
-              n: Number(row.n),
-              user: row.user_name,
-              changes: row.changes,
-            });
-          }
-        }
-      }
+      const missed = r.dirty ? await this.reloadAndMissedLocked(branchId, r) : [];
       const fresh = await this.catchUpReadOnly(branchId, r);
       return [...missed, ...fresh];
     });
@@ -578,17 +705,23 @@ export class Rooms {
     const pending = this.rooms.get(branchId);
     if (!pending) return [];
     const r = await pending.catch(() => null);
-    if (!r) return [];
+    if (!r || !this.isCurrentEntry(branchId, r)) return [];
     return this.catchUpLoaded(branchId, r, opts);
   }
 
-  /** 读取前确保内存态与平台库一致（PG 模式下追赶外部副本提交，SQLite 下仅在脏态时重载） */
-  private async getFresh(branchId: string): Promise<Loaded> {
-    const r = await this.get(branchId);
-    if (this.db.dialect === 'pg' || r.dirty) {
-      await this.catchUpLoaded(branchId, r);
-    }
-    return r;
+  /**
+   * 在 withRoomLock 内确保内存房间态与平台库一致（PG 追赶外部副本提交，SQLite/PG 脏态重载），
+   * 并在持锁期间同步提取只读快照副本，彻底消除 SQLite/PG 并发写事务 COMMIT 前的未提交脏读窗口。
+   */
+  private async readFresh<T>(branchId: string, read: (room: Room) => T): Promise<T> {
+    const { r, value } = await this.withActiveRoomLock(branchId, async (loaded) => {
+      const missed = loaded.dirty ? await this.reloadAndMissedLocked(branchId, loaded) : [];
+      const fresh = this.db.dialect === 'pg' ? await this.catchUpReadOnly(branchId, loaded) : [];
+      const caughtUp = missed.length > 0 ? [...missed, ...fresh] : fresh;
+      return { caughtUp, snapshot: read(loaded.room) };
+    });
+    if (value.caughtUp.length) this.broadcastCommits(r, value.caughtUp);
+    return value.snapshot;
   }
 
   /** 修改之后：每隔一段写一次快照，加快下次加载（传入事务 tx 以与 commit 同事务提交） */
@@ -664,6 +797,7 @@ export class Rooms {
   }
 
   private scheduleLayoutFlush(branchId: string, r: Loaded) {
+    this.clearIdleEvict(r);
     if (r.layoutTimer) clearTimeout(r.layoutTimer);
     r.layoutTimer = setTimeout(() => {
       r.layoutTimer = undefined;
@@ -674,7 +808,7 @@ export class Rooms {
     r.layoutTimer.unref?.();
   }
 
-  private clearPendingLayoutKeys(r: Loaded, keys: Iterable<string>) {
+  private clearPendingLayoutKeys(branchId: string, r: Loaded, keys: Iterable<string>) {
     for (const key of keys) {
       delete r.pendingLayout[key];
     }
@@ -682,6 +816,7 @@ export class Rooms {
       clearTimeout(r.layoutTimer);
       r.layoutTimer = undefined;
     }
+    this.scheduleIdleEvictIfNeeded(branchId, r);
   }
 
   private async reloadLayoutFromDb(branchId: string, r: Loaded, incoming?: LayoutVersion) {
@@ -689,7 +824,7 @@ export class Rooms {
     const [b] = await this.db.query<{ layout: Layout }>('select layout from branches where id = $1', [
       branchId,
     ]);
-    if (!b?.layout) return;
+    if (!b?.layout || !this.isCurrentEntry(branchId, r)) return;
     const clearedKeys: string[] = [];
     for (const [key, pos] of Object.entries(b.layout)) {
       if (!pos || typeof pos.x !== 'number' || typeof pos.y !== 'number') continue;
@@ -701,7 +836,7 @@ export class Rooms {
       if (incoming) r.layoutVersions.set(key, incoming);
       r.layout[key] = { x: pos.x, y: pos.y };
     }
-    if (clearedKeys.length > 0) this.clearPendingLayoutKeys(r, clearedKeys);
+    if (clearedKeys.length > 0) this.clearPendingLayoutKeys(branchId, r, clearedKeys);
     for (const p of r.peers) this.safeSend(p, { t: 'layout', positions: r.layout });
   }
 
@@ -717,7 +852,7 @@ export class Rooms {
         const pending = this.rooms.get(event.branchId);
         if (!pending) return;
         const r = await pending.catch(() => null);
-        if (!r) return;
+        if (!r || !this.isCurrentEntry(event.branchId, r)) return;
         const incomingVer = typeof event.ver === 'number' ? event.ver : r.layoutClock + 1;
         if (incomingVer > r.layoutClock) r.layoutClock = incomingVer;
         const incoming: LayoutVersion = { ver: incomingVer, origin: event.origin };
@@ -732,7 +867,7 @@ export class Rooms {
         }
         const acceptedKeys = Object.keys(accepted);
         if (acceptedKeys.length === 0) return;
-        this.clearPendingLayoutKeys(r, acceptedKeys);
+        this.clearPendingLayoutKeys(event.branchId, r, acceptedKeys);
         for (const p of r.peers) this.safeSend(p, { t: 'layout', positions: accepted });
         break;
       }
@@ -740,7 +875,7 @@ export class Rooms {
         const pending = this.rooms.get(event.branchId);
         if (!pending) return;
         const r = await pending.catch(() => null);
-        if (!r) return;
+        if (!r || !this.isCurrentEntry(event.branchId, r)) return;
         const incomingVer = typeof event.ver === 'number' ? event.ver : r.layoutClock + 1;
         if (incomingVer > r.layoutClock) r.layoutClock = incomingVer;
         await this.reloadLayoutFromDb(event.branchId, r, { ver: incomingVer, origin: event.origin });
@@ -750,7 +885,7 @@ export class Rooms {
         const pending = this.rooms.get(event.branchId);
         if (!pending) return;
         const r = await pending.catch(() => null);
-        if (!r) return;
+        if (!r || !this.isCurrentEntry(event.branchId, r)) return;
         const normalized: RoomPeerInfo[] = Array.isArray(event.peers)
           ? event.peers
               .filter(
@@ -777,7 +912,7 @@ export class Rooms {
           const pending = this.rooms.get(event.branchId);
           if (!pending) return;
           const r = await pending.catch(() => null);
-          if (!r) return;
+          if (!r || !this.isCurrentEntry(event.branchId, r)) return;
           if (this.localPeerList(r).length > 0) {
             await this.publishRoomPeers(event.branchId, r);
           }
@@ -785,7 +920,7 @@ export class Rooms {
         }
         for (const [branchId, pending] of this.rooms) {
           const r = await pending.catch(() => null);
-          if (!r) continue;
+          if (!r || !this.isCurrentEntry(branchId, r)) continue;
           await this.publishRoomPeers(branchId, r);
         }
         break;
@@ -794,7 +929,7 @@ export class Rooms {
         const pending = this.rooms.get(event.branchId);
         if (!pending) return;
         const r = await pending.catch(() => null);
-        if (!r) return;
+        if (!r || !this.isCurrentEntry(event.branchId, r)) return;
         for (const p of r.peers) {
           const isSameSender = event.userId
             ? p.user.id === event.userId && p.client === event.client
@@ -824,11 +959,11 @@ export class Rooms {
         await this.catchUp(branchId);
         const pending = this.rooms.get(branchId);
         const r = pending ? await pending.catch(() => null) : null;
-        if (r) {
+        if (r && this.isCurrentEntry(branchId, r)) {
           const [b] = await this.db.query<{ layout: Layout }>('select layout from branches where id = $1', [
             branchId,
           ]);
-          if (b?.layout) {
+          if (b?.layout && this.isCurrentEntry(branchId, r)) {
             r.layout = { ...b.layout, ...r.pendingLayout };
             for (const p of r.peers) this.safeSend(p, { t: 'layout', positions: r.layout });
           }
@@ -1013,7 +1148,12 @@ export class Rooms {
    * join 成功（含重连）后总会发一条 role，前端以它为准校正本地状态。
    */
   async join(branchId: string, peer: Peer) {
-    const r = await this.get(branchId);
+    let r: Loaded;
+    for (;;) {
+      r = await this.get(branchId);
+      if (this.isCurrentEntry(branchId, r)) break;
+    }
+    this.clearIdleEvict(r);
     r.peers.add(peer);
 
     const abort = (reason: string) => {
@@ -1027,6 +1167,7 @@ export class Rooms {
         });
         this.pendingBackgroundPublishes.add(p);
       }
+      this.scheduleIdleEvictIfNeeded(branchId, r);
     };
 
     for (let attempt = 0; attempt < MAX_JOIN_VERIFY_ATTEMPTS; attempt++) {
@@ -1066,21 +1207,30 @@ export class Rooms {
   }
 
   async leave(branchId: string, peer: Peer) {
-    // 分支可能已经被删掉（项目删除）：加载失败就当没进过房间，不能抛出去
-    const r = await this.get(branchId).catch(() => null);
+    // 房间未加载或分支已被删掉时直接返回，避免滞后的 onClose 误触发重新加载
+    const pending = this.rooms.get(branchId);
+    if (!pending) return;
+    const r = await pending.catch(() => null);
     if (!r) return;
     const hadClient = Boolean(peer.client);
     // 已经被踢掉的连接走 onClose 时不用再广播一次
     if (!r.peers.delete(peer)) return;
     this.broadcastPeers(r);
-    if (hadClient) await this.publishRoomPeers(branchId, r);
+    try {
+      if (hadClient) await this.publishRoomPeers(branchId, r);
+    } finally {
+      this.scheduleIdleEvictIfNeeded(branchId, r);
+    }
   }
 
   private async flushLayout(branchId: string, r: Loaded): Promise<void> {
     while (r.layoutFlushing) {
       await r.layoutFlushing.catch(() => {});
     }
-    if (Object.keys(r.pendingLayout).length === 0) return;
+    if (Object.keys(r.pendingLayout).length === 0) {
+      this.scheduleIdleEvictIfNeeded(branchId, r);
+      return;
+    }
     const task = (async () => {
       while (Object.keys(r.pendingLayout).length > 0) {
         const snapshot: Layout = { ...r.pendingLayout };
@@ -1110,11 +1260,15 @@ export class Rooms {
       await task;
     } finally {
       if (r.layoutFlushing === task) r.layoutFlushing = null;
+      this.scheduleIdleEvictIfNeeded(branchId, r);
     }
   }
 
   async message(branchId: string, peer: Peer, msg: ToServer | ExtraIn) {
-    const r = await this.get(branchId);
+    const pending = this.rooms.get(branchId);
+    if (!pending) return;
+    const r = await pending.catch(() => null);
+    if (!r || !this.isCurrentEntry(branchId, r)) return;
     // 不在房间里（例如账号刚被停用踢掉）就直接丢弃：不提交、不广播、不回消息
     if (!r.peers.has(peer)) return;
     if (!msg || typeof msg !== 'object') return;
@@ -1125,9 +1279,13 @@ export class Rooms {
         const hadClient = Boolean(peer.client);
         r.peers.delete(peer);
         peer.close?.(4400, '无效的客户端标识');
-        if (hadClient) {
-          this.broadcastPeers(r);
-          await this.publishRoomPeers(branchId, r);
+        try {
+          if (hadClient) {
+            this.broadcastPeers(r);
+            await this.publishRoomPeers(branchId, r);
+          }
+        } finally {
+          this.scheduleIdleEvictIfNeeded(branchId, r);
         }
         return;
       }
@@ -1135,7 +1293,11 @@ export class Rooms {
         r.peers.delete(peer);
         peer.close?.(4400, '客户端标识不可变更');
         this.broadcastPeers(r);
-        await this.publishRoomPeers(branchId, r);
+        try {
+          await this.publishRoomPeers(branchId, r);
+        } finally {
+          this.scheduleIdleEvictIfNeeded(branchId, r);
+        }
         return;
       }
       // 同一用户带着相同 client 重连时，踢掉尚未触发 close 的旧连接，避免同键并发乱序
@@ -1149,15 +1311,25 @@ export class Rooms {
       const syncClient = scopeClient(peer.user.id, msg.client);
       const scopedHello: ToServer = { t: 'hello', client: syncClient, lastSeq: msg.lastSeq };
       this.broadcastPeers(r);
-      const { caughtUp, outs } = await this.withRoomLock(r, async () => {
-        if (!r.peers.has(peer)) return { caughtUp: [] as Commit[], outs: [] as Out[] };
-        if (r.dirty) await this.reloadLocked(branchId, r);
-        const caughtUp = this.db.dialect === 'pg' ? await this.catchUpReadOnly(branchId, r) : [];
-        const outs = await r.room.handle(syncClient, peer.user.name, scopedHello, {
-          readOnly: peer.role === 'viewer',
+      r.activeOps += 1;
+      let caughtUp: Commit[] = [];
+      let outs: Out[] = [];
+      try {
+        const res = await this.withRoomLock(r, async () => {
+          if (!r.peers.has(peer)) return { caughtUp: [] as Commit[], outs: [] as Out[] };
+          if (r.dirty) await this.reloadLocked(branchId, r);
+          const caughtUp = this.db.dialect === 'pg' ? await this.catchUpReadOnly(branchId, r) : [];
+          const outs = await r.room.handle(syncClient, peer.user.name, scopedHello, {
+            readOnly: peer.role === 'viewer',
+          });
+          return { caughtUp, outs };
         });
-        return { caughtUp, outs };
-      });
+        caughtUp = res.caughtUp;
+        outs = res.outs;
+      } finally {
+        r.activeOps -= 1;
+        this.scheduleIdleEvictIfNeeded(branchId, r);
+      }
       if (caughtUp.length) this.broadcastCommits(r, caughtUp, peer);
       this.deliver(r, peer, outs);
       await this.publishRoomPeers(branchId, r);
@@ -1187,6 +1359,7 @@ export class Rooms {
       };
       let caughtUp: Commit[] = [];
       let result: { outs: Out[]; committed: boolean; seq: number } | null = null;
+      r.activeOps += 1;
       try {
         result = await this.withRoomLock(r, async () => {
           if (!r.peers.has(peer)) return null;
@@ -1235,6 +1408,9 @@ export class Rooms {
       } catch (err) {
         if (caughtUp.length) this.broadcastCommits(r, caughtUp);
         throw err;
+      } finally {
+        r.activeOps -= 1;
+        this.scheduleIdleEvictIfNeeded(branchId, r);
       }
       if (!result) return;
       if (caughtUp.length) this.broadcastCommits(r, caughtUp);
@@ -1321,21 +1497,23 @@ export class Rooms {
 
   /** 服务器以系统身份替换整个模型（导入 DDL、恢复历史、接入领先环境等）；传入 expectedSeq 时原子校验当前 seq */
   async replace(branchId: string, user: string, next: Model, opName?: string, expectedSeq?: number) {
-    const r = await this.get(branchId);
+    let loadedRef: Loaded | null = null;
     let caughtUp: Commit[] = [];
     let result: { outs: Out[]; committed: boolean; seq: number };
     try {
-      result = await this.withRoomLock(r, async () => {
+      const locked = await this.withActiveRoomLock(branchId, async (r) => {
+        loadedRef = r;
+        caughtUp = [];
         if (r.dirty) await this.reloadLocked(branchId, r);
         let mutated = false;
         try {
           return await this.db.transaction(async (tx) => {
             if (this.db.dialect === 'pg') {
-              const [locked] = await tx.query<{ id: string }>(
+              const [branch] = await tx.query<{ id: string }>(
                 'select id from branches where id = $1 for update',
                 [branchId],
               );
-              if (!locked) throw new Error(`分支 ${branchId} 不存在`);
+              if (!branch) throw new Error(`分支 ${branchId} 不存在`);
               caughtUp = await this.catchUpFrom(tx, branchId, r);
             }
             if (expectedSeq !== undefined && r.room.seq !== expectedSeq) {
@@ -1356,12 +1534,14 @@ export class Rooms {
           throw err;
         }
       });
+      loadedRef = locked.r;
+      result = locked.value;
     } catch (err) {
-      if (caughtUp.length) this.broadcastCommits(r, caughtUp);
+      if (loadedRef && caughtUp.length) this.broadcastCommits(loadedRef, caughtUp);
       throw err;
     }
-    if (caughtUp.length) this.broadcastCommits(r, caughtUp);
-    for (const o of result.outs) for (const p of r.peers) this.safeSend(p, this.forPeer(p, o.msg));
+    if (caughtUp.length) this.broadcastCommits(loadedRef, caughtUp);
+    for (const o of result.outs) for (const p of loadedRef.peers) this.safeSend(p, this.forPeer(p, o.msg));
     if (result.committed) {
       await this.publish({ t: 'room.commit', branchId, seq: result.seq });
     }
@@ -1374,21 +1554,23 @@ export class Rooms {
     objects: Obj[],
     expect: Versions,
   ): Promise<{ committed: boolean; rejected: boolean; seq: number }> {
-    const r = await this.get(branchId);
+    let loadedRef: Loaded | null = null;
     let caughtUp: Commit[] = [];
     let result: { outs: Out[]; committed: boolean; rejected: boolean; seq: number };
     try {
-      result = await this.withRoomLock(r, async () => {
+      const locked = await this.withActiveRoomLock(branchId, async (r) => {
+        loadedRef = r;
+        caughtUp = [];
         if (r.dirty) await this.reloadLocked(branchId, r);
         let mutated = false;
         try {
           return await this.db.transaction(async (tx) => {
             if (this.db.dialect === 'pg') {
-              const [locked] = await tx.query<{ id: string }>(
+              const [branch] = await tx.query<{ id: string }>(
                 'select id from branches where id = $1 for update',
                 [branchId],
               );
-              if (!locked) throw new Error(`分支 ${branchId} 不存在`);
+              if (!branch) throw new Error(`分支 ${branchId} 不存在`);
               caughtUp = await this.catchUpFrom(tx, branchId, r);
             }
             const rejected = objects.some(
@@ -1409,12 +1591,14 @@ export class Rooms {
           throw err;
         }
       });
+      loadedRef = locked.r;
+      result = locked.value;
     } catch (err) {
-      if (caughtUp.length) this.broadcastCommits(r, caughtUp);
+      if (loadedRef && caughtUp.length) this.broadcastCommits(loadedRef, caughtUp);
       throw err;
     }
-    if (caughtUp.length) this.broadcastCommits(r, caughtUp);
-    for (const o of result.outs) for (const p of r.peers) this.safeSend(p, this.forPeer(p, o.msg));
+    if (caughtUp.length) this.broadcastCommits(loadedRef, caughtUp);
+    for (const o of result.outs) for (const p of loadedRef.peers) this.safeSend(p, this.forPeer(p, o.msg));
     if (result.committed) {
       await this.publish({ t: 'room.commit', branchId, seq: result.seq });
     }
@@ -1422,13 +1606,18 @@ export class Rooms {
   }
 
   async state(branchId: string): Promise<{ model: Model; versions: Versions; seq: number }> {
-    const r = await this.getFresh(branchId);
-    return { model: structuredClone(r.room.model), versions: { ...r.room.versions }, seq: r.room.seq };
+    return this.readFresh(branchId, (room) => ({
+      model: structuredClone(room.model),
+      versions: { ...room.versions },
+      seq: room.seq,
+    }));
   }
 
   async model(branchId: string): Promise<{ model: Model; seq: number }> {
-    const r = await this.getFresh(branchId);
-    return { model: structuredClone(r.room.model), seq: r.room.seq };
+    return this.readFresh(branchId, (room) => ({
+      model: structuredClone(room.model),
+      seq: room.seq,
+    }));
   }
 
   /**
@@ -1436,18 +1625,20 @@ export class Rooms {
    * seq < 0 或超过当前最新 seq 时抛 404。
    */
   async modelAt(branchId: string, seq: number): Promise<Model> {
-    const r = await this.getFresh(branchId);
-    const currentSeq = r.room.seq;
-    if (!Number.isInteger(seq) || seq < 0 || seq > currentSeq)
+    const snap = await this.readFresh(branchId, (room) => ({
+      currentSeq: room.seq,
+      currentModel: seq === room.seq ? structuredClone(room.model) : null,
+    }));
+    if (!Number.isInteger(seq) || seq < 0 || seq > snap.currentSeq)
       throw new HTTPException(404, { message: `修改记录 #${seq} 不存在` });
-    if (seq === currentSeq) return structuredClone(r.room.model);
-    const [snap] = await this.db.query<{ seq: string | number; model: Model }>(
+    if (snap.currentModel) return snap.currentModel;
+    const [snapRow] = await this.db.query<{ seq: string | number; model: Model }>(
       'select seq, model from room_snapshots where branch_id = $1 and seq <= $2 order by seq desc limit 1',
       [branchId, seq],
     );
-    if (!snap) throw new HTTPException(404, { message: `修改记录 #${seq} 缺少可用快照` });
-    const model = structuredClone(snap.model);
-    const snapSeq = Number(snap.seq);
+    if (!snapRow) throw new HTTPException(404, { message: `修改记录 #${seq} 缺少可用快照` });
+    const model = structuredClone(snapRow.model);
+    const snapSeq = Number(snapRow.seq);
     if (snapSeq < seq) {
       const commits = await this.db.query<{ seq: string | number; changes: Commit['changes'] }>(
         'select seq, changes from room_commits where branch_id = $1 and seq > $2 and seq <= $3 order by seq',
@@ -1519,10 +1710,13 @@ export class Rooms {
     branchId: string,
     opts: { beforeSeq?: number; limit?: number } = {},
   ): Promise<CanvasHistoryList> {
-    const r = await this.getFresh(branchId);
-    const currentSeq = r.room.seq;
     const limit = Math.min(100, Math.max(1, opts.limit ?? 30));
     const beforeSeq = opts.beforeSeq;
+    const needObjects = beforeSeq === undefined || beforeSeq > 0;
+    const { currentSeq, currentObjects } = await this.readFresh(branchId, (room) => ({
+      currentSeq: room.seq,
+      currentObjects: needObjects ? structuredClone(room.model.objects) : null,
+    }));
     if (beforeSeq !== undefined && beforeSeq <= 0) {
       return { entries: [], currentSeq, nextBeforeSeq: null };
     }
@@ -1561,7 +1755,7 @@ export class Rooms {
       : new Map<number, CanvasHistoryVersionRef>();
 
     // 从当前模型与本页提交收集对象名，便于为删除操作解析对象名称
-    const knownObjects: Record<string, Obj> = { ...r.room.model.objects };
+    const knownObjects: Record<string, Obj> = { ...(currentObjects ?? {}) };
     for (const row of rows) for (const ch of row.changes) if (ch.obj) knownObjects[ch.id] = ch.obj;
     const knownNames = new Map<string, string>();
     for (const [id, obj] of Object.entries(knownObjects)) knownNames.set(id, objectLabel(obj, knownObjects));
@@ -1595,8 +1789,10 @@ export class Rooms {
     seq: number,
     context?: { prevModel?: Model | null; targetModel?: Model; currentSeq?: number },
   ): Promise<CanvasHistoryEntry> {
-    const r = await this.getFresh(branchId);
-    const currentSeq = context?.currentSeq ?? r.room.seq;
+    const currentSeq =
+      context?.currentSeq !== undefined
+        ? context.currentSeq
+        : await this.readFresh(branchId, (room) => room.seq);
     if (!Number.isInteger(seq) || seq < 0 || seq > currentSeq)
       throw new HTTPException(404, { message: `修改记录 #${seq} 不存在` });
     const versions = await this.versionsInRange(branchId, seq, seq);
@@ -1650,7 +1846,11 @@ export class Rooms {
       }
       if (removed) {
         this.broadcastPeers(r);
-        if (removedClient) await this.publishRoomPeers(branchId, r);
+        try {
+          if (removedClient) await this.publishRoomPeers(branchId, r);
+        } finally {
+          this.scheduleIdleEvictIfNeeded(branchId, r);
+        }
       }
     }
   }
@@ -1765,12 +1965,14 @@ export class Rooms {
       const projectId = projectByBranch.get(branchId);
       if (!projectId) {
         const hadClients = this.localPeerList(r).length > 0;
+        this.clearIdleEvict(r);
         if (r.layoutTimer) {
           clearTimeout(r.layoutTimer);
           r.layoutTimer = undefined;
         }
+        r.evicted = true;
         for (const peer of [...r.peers]) kick(r, peer, '项目已被删除');
-        this.rooms.delete(branchId);
+        if (this.rooms.get(branchId) === pending) this.rooms.delete(branchId);
         this.branchRefreshGen.delete(branchId);
         if (hadClients) await this.publish({ t: 'room.peers', branchId, peers: [] });
         continue;
@@ -1813,7 +2015,11 @@ export class Rooms {
       // 只给真正踢掉了人的房间广播在线列表
       if (removed) {
         this.broadcastPeers(r);
-        if (removedClient) await this.publishRoomPeers(branchId, r);
+        try {
+          if (removedClient) await this.publishRoomPeers(branchId, r);
+        } finally {
+          this.scheduleIdleEvictIfNeeded(branchId, r);
+        }
       }
     }
   }
@@ -1840,16 +2046,18 @@ export class Rooms {
       let hadClients = false;
       if (r) {
         hadClients = this.localPeerList(r).length > 0;
+        this.clearIdleEvict(r);
         if (r.layoutTimer) {
           clearTimeout(r.layoutTimer);
           r.layoutTimer = undefined;
         }
+        r.evicted = true;
         for (const peer of [...r.peers]) {
           r.peers.delete(peer);
           peer.close?.(4403, reason);
         }
       }
-      this.rooms.delete(branchId);
+      if (this.rooms.get(branchId) === pending) this.rooms.delete(branchId);
       this.branchRefreshGen.delete(branchId);
       if (hadClients) await this.publish({ t: 'room.peers', branchId, peers: [] });
     }
@@ -1875,7 +2083,11 @@ export class Rooms {
           peer.close?.(code, reason);
         } catch {}
       }
-      if (hadClients) await this.publish({ t: 'room.peers', branchId, peers: [] });
+      try {
+        if (hadClients) await this.publish({ t: 'room.peers', branchId, peers: [] });
+      } finally {
+        this.scheduleIdleEvictIfNeeded(branchId, r);
+      }
     }
   }
 
@@ -1900,6 +2112,8 @@ export class Rooms {
       }
       if (r.layoutFlushing || Object.keys(r.pendingLayout).length > 0) {
         await this.flushLayout(branchId, r);
+      } else {
+        this.scheduleIdleEvictIfNeeded(branchId, r);
       }
     }
   }
