@@ -28,6 +28,7 @@ jobs:
       mysql: ${{ steps.filter.outputs.mysql }}
       mssql: ${{ steps.filter.outputs.mssql }}
       e2e: ${{ steps.filter.outputs.e2e }}
+      heavy: ${{ steps.filter.outputs.heavy }}
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
@@ -45,19 +46,20 @@ jobs:
           shopt -s extglob
 
           emit_outputs() {
-            local code="$1" pg="$2" mysql="$3" mssql="$4" e2e="$5"
+            local code="$1" pg="$2" mysql="$3" mssql="$4" e2e="$5" heavy="$6"
             {
               echo "code=$code"
               echo "pg=$pg"
               echo "mysql=$mysql"
               echo "mssql=$mssql"
               echo "e2e=$e2e"
+              echo "heavy=$heavy"
             } >> "$GITHUB_OUTPUT"
-            echo "outputs: code=$code pg=$pg mysql=$mysql mssql=$mssql e2e=$e2e"
+            echo "outputs: code=$code pg=$pg mysql=$mysql mssql=$mssql e2e=$e2e heavy=$heavy"
           }
 
           classify_files() {
-            local code=false pg=false mysql=false mssql=false e2e=false
+            local code=false pg=false mysql=false mssql=false e2e=false heavy=false
             local count=0
             local file
             while IFS= read -r file; do
@@ -76,8 +78,14 @@ jobs:
                 actions/*)
                   code=true
                   ;;
-                # PG 单方言纯测试（不含跨方言源码导入）
-                packages/core/test/partition* | packages/core/test/pg-* | packages/engines/test/roundtrip* | packages/engines/test/pagila* | packages/engines/test/naming* | packages/verifier/test/random.test.ts | packages/verifier/test/gen.ts | packages/verifier/test/debug.test.ts | packages/verifier/test/partition.test.ts | packages/verifier/test/pg-matrix.test.ts | packages/verifier/test/analyze.test.ts | packages/verifier/test/stats.test.ts)
+                # PG 随机闭环 / 命名 fuzz 测试及其分片设施
+                packages/engines/test/naming* | packages/verifier/test/random.test.ts | packages/verifier/test/gen.ts | packages/verifier/test/fc-shard.test.ts | test/fc-shard.ts)
+                  code=true
+                  pg=true
+                  heavy=true
+                  ;;
+                # 其他 PG 单方言纯测试（不含跨方言源码导入）
+                packages/core/test/partition* | packages/core/test/pg-* | packages/engines/test/roundtrip* | packages/engines/test/pagila* | packages/verifier/test/debug.test.ts | packages/verifier/test/partition.test.ts | packages/verifier/test/pg-matrix.test.ts | packages/verifier/test/analyze.test.ts | packages/verifier/test/stats.test.ts)
                   code=true
                   pg=true
                   ;;
@@ -95,6 +103,14 @@ jobs:
                 packages/+([^/])/test/sqlite* | apps/server/test/sqlite*)
                   code=true
                   ;;
+                # 服务端 / API / 协作同步（core/engines/executor/verifier 不反向依赖它们，无需触发 heavy）
+                apps/server/* | packages/api/* | packages/sync/*)
+                  code=true
+                  pg=true
+                  mysql=true
+                  mssql=true
+                  e2e=true
+                  ;;
                 # 其余一切文件（跨方言源码、共享测试设施、根配置、CI 自身等）：保守全部跑
                 *)
                   code=true
@@ -102,17 +118,18 @@ jobs:
                   mysql=true
                   mssql=true
                   e2e=true
+                  heavy=true
                   break
                   ;;
               esac
             done
 
             if [[ "$count" -eq 0 ]]; then
-              emit_outputs true true true true true
+              emit_outputs true true true true true true
               return
             fi
 
-            emit_outputs "$code" "$pg" "$mysql" "$mssql" "$e2e"
+            emit_outputs "$code" "$pg" "$mysql" "$mssql" "$e2e" "$heavy"
           }
 
           # --- diff extraction ---
@@ -141,20 +158,20 @@ jobs:
               ;;
             *)
               echo "event=${EVENT_NAME:-unknown}, fail-open: run all jobs"
-              emit_outputs true true true true true
+              emit_outputs true true true true true true
               exit 0
               ;;
           esac
 
           if [[ "$DIFF_OK" != "true" ]]; then
             echo "diff extraction failed or unavailable, fail-open: run all jobs"
-            emit_outputs true true true true true
+            emit_outputs true true true true true true
             exit 0
           fi
 
           if [[ -z "${FILES//[[:space:]]/}" ]]; then
             echo "empty changed files list, fail-open: run all jobs"
-            emit_outputs true true true true true
+            emit_outputs true true true true true true
             exit 0
           fi
 
@@ -290,9 +307,9 @@ jobs:
   heavy:
     name: 随机闭环测试（5000 例）
     needs: changes
-    if: needs.changes.outputs.pg == 'true'
+    if: needs.changes.outputs.heavy == 'true'
     runs-on: ubuntu-latest
-    timeout-minutes: 60
+    timeout-minutes: 10
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
@@ -301,8 +318,12 @@ jobs:
       - run: pnpm vitest run packages/verifier/test/random.test.ts packages/engines/test/naming.test.ts
         env:
           RUNS: '5000'
-          # 整个属性测试（含缩小反例）的总时限：5000 例正常 8～10 分钟，留到 30 分钟
-          TIME_LIMIT: '1800000'
+          HEAVY_WORKERS: '4'
+          # 主搜索时限 4 分钟 + 失败后独立有界 shrink 时限 1 分钟
+          TIME_LIMIT: '240000'
+          SHRINK_TIME_LIMIT: '60000'
+          DOWEL_TEST_MYSQL: 'skip'
+          DOWEL_TEST_MSSQL: 'skip'
 
   e2e:
     name: 端到端测试

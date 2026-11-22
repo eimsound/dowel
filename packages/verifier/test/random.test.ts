@@ -15,7 +15,13 @@ import { type ChainVersion, claimInstance, execute, mergeHistories, readState } 
 import fc from 'fast-check';
 import { expect, test } from 'vitest';
 
-import { PG_URL, useTestDb } from '../../../test/pg.ts';
+import {
+  parseExplicitSeed,
+  parsePositiveMs,
+  resolveHeavyWorkers,
+  runShardedProperty,
+} from '../../../test/fc-shard.ts';
+import { createTestDb, PG_URL, useTestDb } from '../../../test/pg.ts';
 import { build, resetShadow, verify, verifyScripts } from '../src/index.ts';
 import { makeVersions, versions } from './gen.ts';
 
@@ -25,6 +31,10 @@ const target = useTestDb('random_target');
 const RUNS = Number(process.env.RUNS ?? 100);
 // 经由执行器的那条：默认最多 30 轮（每轮要建两个库），想深挖时用 EXEC_RUNS 单独调大
 const EXEC_RUNS = Number(process.env.EXEC_RUNS ?? Math.min(RUNS, 30));
+const EXPLICIT_SEED = parseExplicitSeed(process.env.SEED);
+const WORKERS = resolveHeavyWorkers(RUNS, process.env.HEAVY_WORKERS, EXPLICIT_SEED);
+const TIME_LIMIT = parsePositiveMs(process.env.TIME_LIMIT, 180_000);
+const SHRINK_TIME_LIMIT = parsePositiveMs(process.env.SHRINK_TIME_LIMIT, 60_000);
 
 const queryPgMajor = async (db: Db): Promise<number> => {
   const [{ v }] = (await db.query<{ v: number }>(
@@ -38,29 +48,32 @@ test.skipIf(!PG_URL)(
   async () => {
     const db = conn();
     const pgMajor = await queryPgMajor(db);
-    await fc.assert(
-      fc.asyncProperty(versions, async (vs) => {
-        const { v1, v2 } = makeVersions(vs, { pgMajor });
-        expect(validate(v1)).toEqual([]);
-        expect(validate(v2)).toEqual([]);
-        const t0 = performance.now();
-        const r = await verify(db, v1, v2);
-        if (process.env.TIMING)
-          console.log(`${Object.keys(v2.objects).length} 个对象，${(performance.now() - t0).toFixed(0)}ms`);
-        expect(r.upDiff).toEqual([]);
-        expect(r.downDiff).toEqual([]);
-      }),
-      {
-        numRuns: RUNS,
-        seed: process.env.SEED ? Number(process.env.SEED) : undefined,
-        // 整个属性测试（跑用例 + 缩小反例）的总时限，超时算失败；防止失败后的缩小过程卡住很久。
-        // CI 上 5000 例正常要 8～10 分钟，时限要留够余量（见 ci.yml）
-        interruptAfterTimeLimit: Number(process.env.TIME_LIMIT ?? 180_000),
-        markInterruptAsFailure: true,
-      },
-    );
+    await runShardedProperty({
+      prefix: 'random',
+      defaultDb: db,
+      createDb: createTestDb,
+      runs: RUNS,
+      workers: WORKERS,
+      seed: EXPLICIT_SEED,
+      timeLimitMs: TIME_LIMIT,
+      shrinkTimeLimitMs: SHRINK_TIME_LIMIT,
+      makeProperty: (shardDb, checkAbort) =>
+        fc.asyncProperty(versions, async (vs) => {
+          checkAbort();
+          const { v1, v2 } = makeVersions(vs, { pgMajor });
+          expect(validate(v1)).toEqual([]);
+          expect(validate(v2)).toEqual([]);
+          checkAbort();
+          const t0 = performance.now();
+          const r = await verify(shardDb, v1, v2);
+          if (process.env.TIMING)
+            console.log(`${Object.keys(v2.objects).length} 个对象，${(performance.now() - t0).toFixed(0)}ms`);
+          expect(r.upDiff).toEqual([]);
+          expect(r.downDiff).toEqual([]);
+        }),
+    });
   },
-  60_000 + RUNS * 1_000,
+  Math.max(60_000 + RUNS * 1_000, TIME_LIMIT + SHRINK_TIME_LIMIT + 60_000),
 );
 
 // 发布时冻结的脚本：plan() 的输出经 toScriptSteps 冻结，之后执行的是这份文本而不是重新规划。
@@ -83,8 +96,8 @@ test.skipIf(!PG_URL)(
       }),
       {
         numRuns: Math.min(RUNS, 50),
-        seed: process.env.SEED ? Number(process.env.SEED) : undefined,
-        interruptAfterTimeLimit: Math.min(Number(process.env.TIME_LIMIT ?? 180_000), 90_000),
+        seed: EXPLICIT_SEED,
+        interruptAfterTimeLimit: Math.min(TIME_LIMIT, 90_000),
         markInterruptAsFailure: true,
       },
     );
@@ -211,11 +224,8 @@ test.skipIf(!PG_URL)(
       }),
       {
         numRuns: EXEC_RUNS,
-        seed: process.env.SEED ? Number(process.env.SEED) : undefined,
-        interruptAfterTimeLimit: Math.min(
-          Number(process.env.TIME_LIMIT ?? 180_000),
-          90_000 + EXEC_RUNS * 1_500,
-        ),
+        seed: EXPLICIT_SEED,
+        interruptAfterTimeLimit: Math.min(TIME_LIMIT, 90_000 + EXEC_RUNS * 1_500),
         markInterruptAsFailure: true,
       },
     );

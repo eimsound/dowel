@@ -26,9 +26,23 @@ export const startPg = async (): Promise<{ url: string; stop: () => Promise<void
     return null;
   }
   // 用 postgres 账号：导入的 schema（如 pagila）里常有 OWNER TO postgres
+  // 启动非持久化调优参数（仅用于临时测试容器；不影响外部 DOWEL_TEST_PG）
   const c = await new PostgreSqlContainer(PG_IMAGE)
     .withUsername('postgres')
     .withPassword('dowel-test-secret')
+    .withCommand([
+      'postgres',
+      '-c',
+      'fsync=off',
+      '-c',
+      'synchronous_commit=off',
+      '-c',
+      'full_page_writes=off',
+      '-c',
+      'max_wal_size=2GB',
+      '-c',
+      'checkpoint_timeout=1h',
+    ])
     .start();
   return { url: c.getConnectionUri(), stop: async () => void (await c.stop()) };
 };
