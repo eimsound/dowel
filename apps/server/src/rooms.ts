@@ -190,6 +190,14 @@ const isNewerLayoutVersion = (incoming: LayoutVersion, existing: LayoutVersion |
   return incoming.origin >= existing.origin;
 };
 
+const parseClock = (value: unknown): number => {
+  const n = typeof value === 'number' ? value : typeof value === 'string' ? Number(value) : 0;
+  return Number.isSafeInteger(n) && n > 0 ? n : 0;
+};
+
+const resolveIncomingClock = (ver: number | undefined, fallback: number): number =>
+  typeof ver === 'number' && Number.isSafeInteger(ver) && ver >= 0 ? ver : fallback;
+
 interface Loaded {
   room: Room;
   /** 已同步到内存的 room_rejections 最大游标 id（同分支写事务由 branches FOR UPDATE 串行提交，可安全按 id > 游标增量拉取） */
@@ -535,10 +543,14 @@ export class Rooms {
 
   private async load(branchId: string): Promise<Loaded> {
     const { room, lastRejectionId } = await this.loadRoom(branchId);
-    const [b] = await this.db.query<{ layout: Layout; sections: CanvasSection[] }>(
-      'select layout, sections from branches where id = $1',
-      [branchId],
-    );
+    const [b] = await this.db.query<{
+      layout: Layout;
+      sections: CanvasSection[];
+      layout_ver: number | string;
+      sections_ver: number | string;
+    }>('select layout, sections, layout_ver, sections_ver from branches where id = $1', [branchId]);
+    const layoutClock = parseClock(b?.layout_ver);
+    const sectionsClock = parseClock(b?.sections_ver);
     const loaded: Loaded = {
       room,
       lastRejectionId,
@@ -546,14 +558,14 @@ export class Rooms {
       remotePeers: new Map(),
       layout: b?.layout ?? {},
       pendingLayout: {},
-      layoutClock: 0,
+      layoutClock,
       layoutVersions: new Map(),
       layoutFlushing: null,
       layoutRetries: 0,
       sections: sanitizeSections(b?.sections),
       sectionsPending: false,
-      sectionsClock: 0,
-      sectionsVersion: null,
+      sectionsClock,
+      sectionsVersion: sectionsClock > 0 ? { ver: sectionsClock, origin: '' } : null,
       sectionsFlushing: null,
       sectionsRetries: 0,
       sectionsWriteSeq: 0,
@@ -971,10 +983,15 @@ export class Rooms {
 
   private async reloadLayoutFromDb(branchId: string, r: Loaded, incoming?: LayoutVersion) {
     const pendingBefore: Layout = { ...r.pendingLayout };
-    const [b] = await this.db.query<{ layout: Layout }>('select layout from branches where id = $1', [
-      branchId,
-    ]);
-    if (!b?.layout || !this.isCurrentEntry(branchId, r)) return;
+    const [b] = await this.db.query<{ layout: Layout; layout_ver: number | string }>(
+      'select layout, layout_ver from branches where id = $1',
+      [branchId],
+    );
+    if (!b || !this.isCurrentEntry(branchId, r)) return;
+    const persistedVer = parseClock(b.layout_ver);
+    if (persistedVer > r.layoutClock) r.layoutClock = persistedVer;
+    if (incoming && incoming.ver > r.layoutClock) r.layoutClock = incoming.ver;
+    if (!b.layout) return;
     const clearedKeys: string[] = [];
     for (const [key, pos] of Object.entries(b.layout)) {
       if (!pos || typeof pos.x !== 'number' || typeof pos.y !== 'number') continue;
@@ -1051,16 +1068,18 @@ export class Rooms {
     if (!this.isCurrentEntry(branchId, r)) return;
     if (r.sectionsWriteSeq !== writeSeqBefore) return;
     if (!isNewerLayoutVersion(incoming, r.sectionsVersion ?? undefined)) return;
-    const [b] = await this.db.query<{ sections: CanvasSection[] }>(
-      'select sections from branches where id = $1',
+    const [b] = await this.db.query<{ sections: CanvasSection[]; sections_ver: number | string }>(
+      'select sections, sections_ver from branches where id = $1',
       [branchId],
     );
     if (!b || !this.isCurrentEntry(branchId, r)) return;
+    const persistedVer = parseClock(b.sections_ver);
+    if (persistedVer > r.sectionsClock) r.sectionsClock = persistedVer;
     if (r.sectionsWriteSeq !== writeSeqBefore) return;
     if (!isNewerLayoutVersion(incoming, r.sectionsVersion ?? undefined)) return;
     const sections = sanitizeSections(b.sections);
     r.sections = sections;
-    r.sectionsVersion = incoming;
+    r.sectionsVersion = persistedVer > incoming.ver ? { ver: persistedVer, origin: '' } : incoming;
     r.sectionsPending = false;
     r.sectionsRetries = 0;
     this.clearSectionsTimer(r);
@@ -1081,7 +1100,7 @@ export class Rooms {
         if (!pending) return;
         const r = await pending.catch(() => null);
         if (!r || !this.isCurrentEntry(event.branchId, r)) return;
-        const incomingVer = typeof event.ver === 'number' ? event.ver : r.layoutClock + 1;
+        const incomingVer = resolveIncomingClock(event.ver, r.layoutClock + 1);
         if (incomingVer > r.layoutClock) r.layoutClock = incomingVer;
         const incoming: LayoutVersion = { ver: incomingVer, origin: event.origin };
         const accepted: Layout = {};
@@ -1104,7 +1123,7 @@ export class Rooms {
         if (!pending) return;
         const r = await pending.catch(() => null);
         if (!r || !this.isCurrentEntry(event.branchId, r)) return;
-        const incomingVer = typeof event.ver === 'number' ? event.ver : r.layoutClock + 1;
+        const incomingVer = resolveIncomingClock(event.ver, r.layoutClock + 1);
         if (incomingVer > r.layoutClock) r.layoutClock = incomingVer;
         await this.reloadLayoutFromDb(event.branchId, r, { ver: incomingVer, origin: event.origin });
         break;
@@ -1114,7 +1133,7 @@ export class Rooms {
         if (!pending) return;
         const r = await pending.catch(() => null);
         if (!r || !this.isCurrentEntry(event.branchId, r)) return;
-        const incomingVer = typeof event.ver === 'number' ? event.ver : r.sectionsClock + 1;
+        const incomingVer = resolveIncomingClock(event.ver, r.sectionsClock + 1);
         if (incomingVer > r.sectionsClock) r.sectionsClock = incomingVer;
         const incoming: LayoutVersion = { ver: incomingVer, origin: event.origin };
         if (!isNewerLayoutVersion(incoming, r.sectionsVersion ?? undefined)) return;
@@ -1133,7 +1152,7 @@ export class Rooms {
         if (!pending) return;
         const r = await pending.catch(() => null);
         if (!r || !this.isCurrentEntry(event.branchId, r)) return;
-        const incomingVer = typeof event.ver === 'number' ? event.ver : r.sectionsClock + 1;
+        const incomingVer = resolveIncomingClock(event.ver, r.sectionsClock + 1);
         if (incomingVer > r.sectionsClock) r.sectionsClock = incomingVer;
         await this.reloadSectionsFromDb(event.branchId, r, { ver: incomingVer, origin: event.origin });
         break;
@@ -1217,18 +1236,33 @@ export class Rooms {
         const pending = this.rooms.get(branchId);
         const r = pending ? await pending.catch(() => null) : null;
         if (r && this.isCurrentEntry(branchId, r)) {
-          const [b] = await this.db.query<{ layout: Layout; sections: CanvasSection[] }>(
-            'select layout, sections from branches where id = $1',
-            [branchId],
-          );
+          const [b] = await this.db.query<{
+            layout: Layout;
+            sections: CanvasSection[];
+            layout_ver: number | string;
+            sections_ver: number | string;
+          }>('select layout, sections, layout_ver, sections_ver from branches where id = $1', [branchId]);
           if (b && this.isCurrentEntry(branchId, r)) {
+            const persistedLayoutVer = parseClock(b.layout_ver);
+            if (persistedLayoutVer > r.layoutClock) r.layoutClock = persistedLayoutVer;
+            const persistedSectionsVer = parseClock(b.sections_ver);
+            if (persistedSectionsVer > r.sectionsClock) r.sectionsClock = persistedSectionsVer;
             if (b.layout) {
               r.layout = { ...b.layout, ...r.pendingLayout };
               for (const p of r.peers) this.safeSend(p, { t: 'layout', positions: r.layout });
             }
             if (!r.sectionsPending && !r.sectionsFlushing) {
-              r.sections = sanitizeSections(b.sections);
-              for (const p of r.peers) this.safeSend(p, { t: 'sections', sections: r.sections });
+              const staleDb =
+                r.sectionsVersion !== null &&
+                persistedSectionsVer > 0 &&
+                persistedSectionsVer < r.sectionsVersion.ver;
+              if (!staleDb) {
+                if (persistedSectionsVer > (r.sectionsVersion?.ver ?? 0)) {
+                  r.sectionsVersion = { ver: persistedSectionsVer, origin: '' };
+                }
+                r.sections = sanitizeSections(b.sections);
+                for (const p of r.peers) this.safeSend(p, { t: 'sections', sections: r.sections });
+              }
             }
           }
           await this.publishRoomPeers(branchId, r);
@@ -1510,20 +1544,23 @@ export class Rooms {
     const task = (async () => {
       while (Object.keys(r.pendingLayout).length > 0) {
         const snapshot: Layout = { ...r.pendingLayout };
+        const fullLayout = this.db.dialect === 'pg' ? null : { ...r.layout };
+        const layoutVer = Math.max(0, r.layoutClock);
         currentSnapshot = snapshot;
         const keys = Object.keys(snapshot);
         if (keys.length === 0) break;
-        if (this.db.dialect === 'pg') {
-          await this.db.query(
-            "update branches set layout = coalesce(layout, '{}'::jsonb) || $2::text::jsonb where id = $1",
-            [branchId, JSON.stringify(snapshot)],
-          );
-        } else {
-          await this.db.query('update branches set layout = $2::text::jsonb where id = $1', [
-            branchId,
-            JSON.stringify(r.layout),
-          ]);
-        }
+        const rows =
+          this.db.dialect === 'pg'
+            ? await this.db.query<{ layout_ver: number | string }>(
+                "update branches set layout = coalesce(layout, '{}'::jsonb) || $2::text::jsonb, layout_ver = greatest(layout_ver, $3::bigint) where id = $1 returning layout_ver",
+                [branchId, JSON.stringify(snapshot), layoutVer],
+              )
+            : await this.db.query<{ layout_ver: number | string }>(
+                'update branches set layout = $2::text::jsonb, layout_ver = max(layout_ver, $3) where id = $1 returning layout_ver',
+                [branchId, JSON.stringify(fullLayout), layoutVer],
+              );
+        const persistedVer = parseClock(rows[0]?.layout_ver);
+        if (persistedVer > r.layoutClock) r.layoutClock = persistedVer;
         // SQL 落库成功后再清理快照中未被新坐标替换的键（按对象引用精确判定）
         for (const key of keys) {
           if (r.pendingLayout[key] === snapshot[key]) {
@@ -1565,12 +1602,21 @@ export class Rooms {
         const snapshot = r.sections;
         const writeSeq = r.sectionsWriteSeq;
         const versionBefore = r.sectionsVersion;
+        const sectionsVer = Math.max(0, r.sectionsClock, versionBefore?.ver ?? 0);
         currentWriteSeq = writeSeq;
         currentVersion = versionBefore;
-        await this.db.query('update branches set sections = $2::text::jsonb where id = $1', [
-          branchId,
-          JSON.stringify(snapshot),
-        ]);
+        const rows =
+          this.db.dialect === 'pg'
+            ? await this.db.query<{ sections_ver: number | string }>(
+                'update branches set sections = $2::text::jsonb, sections_ver = greatest(sections_ver, $3::bigint) where id = $1 returning sections_ver',
+                [branchId, JSON.stringify(snapshot), sectionsVer],
+              )
+            : await this.db.query<{ sections_ver: number | string }>(
+                'update branches set sections = $2::text::jsonb, sections_ver = max(sections_ver, $3) where id = $1 returning sections_ver',
+                [branchId, JSON.stringify(snapshot), sectionsVer],
+              );
+        const persistedVer = parseClock(rows[0]?.sections_ver);
+        if (persistedVer > r.sectionsClock) r.sectionsClock = persistedVer;
         if (r.sectionsWriteSeq === writeSeq && r.sectionsVersion === versionBefore) {
           r.sectionsPending = false;
           r.sectionsRetries = 0;

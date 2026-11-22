@@ -175,7 +175,11 @@ describe.skipIf(!PG_URL)('PG HA 双副本画布板块同步与大负载 reload �
     }
   });
 
-  const boot = async (tag: string, roomsOpts?: RoomsOptions) => {
+  const boot = async (
+    tag: string,
+    roomsOpts?: RoomsOptions | { roomsA?: RoomsOptions; roomsB?: RoomsOptions },
+    replicaIds?: { a?: string; b?: string },
+  ) => {
     const safeTag = tag.replace(/[^a-z0-9_]/gi, '_').toLowerCase();
     const pg = await createTestDb(safeTag);
     const dbA = await openPlatformDb(pg.url);
@@ -185,8 +189,20 @@ describe.skipIf(!PG_URL)('PG HA 双副本画布板块同步与大负载 reload �
       .slice(0, 8)
       .toLowerCase();
     const channel = `dowel_ha_sec_${safeTag}_${suffix}`;
-    const appA = createApp(dbA, { bus: { replicaId: `sec-a-${safeTag}`, channel }, rooms: roomsOpts });
-    const appB = createApp(dbB, { bus: { replicaId: `sec-b-${safeTag}`, channel }, rooms: roomsOpts });
+    const splitOpts =
+      roomsOpts && ('roomsA' in roomsOpts || 'roomsB' in roomsOpts)
+        ? (roomsOpts as { roomsA?: RoomsOptions; roomsB?: RoomsOptions })
+        : undefined;
+    const roomsAOpts = splitOpts ? splitOpts.roomsA : (roomsOpts as RoomsOptions | undefined);
+    const roomsBOpts = splitOpts ? splitOpts.roomsB : (roomsOpts as RoomsOptions | undefined);
+    const appA = createApp(dbA, {
+      bus: { replicaId: replicaIds?.a ?? `sec-a-${safeTag}`, channel },
+      rooms: roomsAOpts,
+    });
+    const appB = createApp(dbB, {
+      bus: { replicaId: replicaIds?.b ?? `sec-b-${safeTag}`, channel },
+      rooms: roomsBOpts,
+    });
     await appA.bus.start();
     await appB.bus.start();
 
@@ -234,7 +250,7 @@ describe.skipIf(!PG_URL)('PG HA 双副本画布板块同步与大负载 reload �
       "select id from branches where project_id = $1 and name = 'main'",
       [pid],
     );
-    return { dbA, dbB, appA, appB, branchId: b!.id, admin, alice, bob };
+    return { dbA, dbB, appA, appB, projectId: pid, branchId: b!.id, admin, alice, bob };
   };
 
   test('小负载板块经 room.sections 跨副本同步，大负载（> 7500B）立即落库经 room.sections.reload 同步且不被旧 pending 覆写', async () => {
@@ -309,6 +325,190 @@ describe.skipIf(!PG_URL)('PG HA 双副本画布板块同步与大负载 reload �
     } finally {
       off();
     }
+  });
+
+  test('冷启动副本（含 N > 1 与 N = 1 字典序落败场景）从 DB 恢复 sections_ver 后首批 sections 更新被热副本接收且收敛（#63）', async () => {
+    const f = await boot(
+      'cold-sections-clock',
+      { layoutDebounceMs: 250 },
+      { a: 'sec-z-cold', b: 'sec-a-cold' },
+    );
+    expect(f.appB.rooms.has(f.branchId)).toBe(false);
+
+    const peerA = makePeer(f.alice);
+    await f.appA.rooms.join(f.branchId, peerA.peer);
+
+    // 1. 热副本 A 连续推进 sectionsClock 至 N = 3 并落库
+    for (let step = 1; step <= 3; step++) {
+      await f.appA.rooms.message(f.branchId, peerA.peer, {
+        t: 'sections',
+        sections: [{ id: `sec-a-${step}`, name: `热副本-${step}`, color: 'peer-1', tables: ['t1'] }],
+      });
+    }
+    await f.appA.rooms.flush();
+    const [afterHotA] = await f.dbA.query<{ sections_ver: number }>(
+      'select sections_ver from branches where id = $1',
+      [f.branchId],
+    );
+    expect(Number(afterHotA?.sections_ver)).toBe(3);
+
+    // 2. 冷副本 B 首次加载分支并提交首笔 sections 编辑，热副本 A 必须接收而不静默丢弃
+    const peerB = makePeer(f.bob);
+    await f.appB.rooms.join(f.branchId, peerB.peer);
+    expect(peerB.sent.find((m) => m.t === 'sections')).toEqual({
+      t: 'sections',
+      sections: [{ id: 'sec-a-3', name: '热副本-3', color: 'peer-1', tables: ['t1'] }],
+    });
+
+    const bCold: CanvasSection[] = [
+      { id: 'sec-b-cold', name: '冷启动首笔', color: 'peer-2', tables: ['t1', 't2'] },
+    ];
+    await f.appB.rooms.message(f.branchId, peerB.peer, { t: 'sections', sections: bCold });
+    await waitFor(() => peerA.sent.some((m) => m.t === 'sections' && m.sections[0]?.id === 'sec-b-cold'));
+
+    await f.appB.rooms.flush();
+    const [dbAfterB] = await f.dbA.query<{ sections: CanvasSection[]; sections_ver: number }>(
+      'select sections, sections_ver from branches where id = $1',
+      [f.branchId],
+    );
+    expect(dbAfterB?.sections).toEqual(bCold);
+    expect(Number(dbAfterB?.sections_ver)).toBe(4);
+
+    // 3. 字典序平局场景：N = 1 且 'sec-z-cold' > 'sec-a-cold'
+    const branchTie = `${f.branchId}-tie`;
+    await f.dbA.query("insert into branches (id, project_id, name) values ($1, $2, 'tie')", [
+      branchTie,
+      f.projectId,
+    ]);
+    await f.appA.rooms.init(branchTie, emptyModel());
+
+    const peerATie = makePeer(f.alice);
+    await f.appA.rooms.join(branchTie, peerATie.peer);
+    await f.appA.rooms.message(branchTie, peerATie.peer, {
+      t: 'sections',
+      sections: [{ id: 'sec-tie-a1', name: '热副本-1', color: 'peer-3', tables: ['t1'] }],
+    });
+    await f.appA.rooms.flush();
+    const [tieDbA] = await f.dbA.query<{ sections_ver: number }>(
+      'select sections_ver from branches where id = $1',
+      [branchTie],
+    );
+    expect(Number(tieDbA?.sections_ver)).toBe(1);
+
+    const peerBTie = makePeer(f.bob);
+    await f.appB.rooms.join(branchTie, peerBTie.peer);
+    const bTie: CanvasSection[] = [{ id: 'sec-tie-b', name: '冷副本反超', color: 'peer-4', tables: ['t2'] }];
+    await f.appB.rooms.message(branchTie, peerBTie.peer, { t: 'sections', sections: bTie });
+    await waitFor(() => peerATie.sent.some((m) => m.t === 'sections' && m.sections[0]?.id === 'sec-tie-b'));
+
+    await f.appB.rooms.flush();
+    const [tieDbFinal] = await f.dbA.query<{ sections: CanvasSection[]; sections_ver: number }>(
+      'select sections, sections_ver from branches where id = $1',
+      [branchTie],
+    );
+    expect(tieDbFinal?.sections).toEqual(bTie);
+    expect(Number(tieDbFinal?.sections_ver)).toBe(2);
+  });
+
+  test('空闲卸载后重载副本的首批小负载与大负载（room.sections.reload）更新均被热副本接收且收敛（#63）', async () => {
+    const f = await boot(
+      'evict-sections-clock',
+      {
+        roomsA: { layoutDebounceMs: 250 },
+        roomsB: { idleEvictMs: 60, layoutDebounceMs: 250 },
+      },
+      { a: 'sec-z-evict', b: 'sec-a-evict' },
+    );
+
+    // 1. 副本 B 先加载并离开，等待其通过 evictIfIdle() 卸载
+    const peerB1 = makePeer(f.bob);
+    await f.appB.rooms.join(f.branchId, peerB1.peer);
+    await f.appB.rooms.leave(f.branchId, peerB1.peer);
+    await waitFor(() => !f.appB.rooms.has(f.branchId), 3000);
+    expect(f.appB.rooms.has(f.branchId)).toBe(false);
+
+    // 2. 热副本 A 推进 sectionsClock（含 1 次 > 7500B room.sections.reload 立即落库）
+    const peerA = makePeer(f.alice);
+    await f.appA.rooms.join(f.branchId, peerA.peer);
+    await f.appA.rooms.message(f.branchId, peerA.peer, {
+      t: 'sections',
+      sections: [{ id: 'sec-a-s1', name: 'A1', color: 'peer-1', tables: ['t1'] }],
+    });
+    const largeA: CanvasSection[] = Array.from({ length: 160 }, (_, i) => ({
+      id: `sec_a_big_${String(i).padStart(3, '0')}`,
+      name: `A大板块_${i}`,
+      color: SECTION_COLORS[i % SECTION_COLORS.length]!,
+      tables: [`tbl_a_${i}_1`, `tbl_a_${i}_2`],
+    }));
+    expect(Buffer.byteLength(JSON.stringify(largeA), 'utf8')).toBeGreaterThan(MAX_EVENT_BYTES);
+    await f.appA.rooms.message(f.branchId, peerA.peer, { t: 'sections', sections: largeA });
+    await f.appA.rooms.flush();
+
+    const [afterHotA] = await f.dbA.query<{ sections_ver: number }>(
+      'select sections_ver from branches where id = $1',
+      [f.branchId],
+    );
+    const verAfterHotA = Number(afterHotA?.sections_ver);
+    expect(verAfterHotA).toBe(2);
+
+    // 3. 副本 B 重载后提交首批小负载 sections 编辑：热副本 A 接收且 DB 收敛
+    const peerB2 = makePeer(f.bob);
+    await f.appB.rooms.join(f.branchId, peerB2.peer);
+    const smallB: CanvasSection[] = [
+      { id: 'sec-b-after-evict', name: '重载后小板块', color: 'peer-3', tables: ['t1'] },
+    ];
+    await f.appB.rooms.message(f.branchId, peerB2.peer, { t: 'sections', sections: smallB });
+    await waitFor(() =>
+      peerA.sent.some((m) => m.t === 'sections' && m.sections[0]?.id === 'sec-b-after-evict'),
+    );
+
+    await f.appB.rooms.flush();
+    const [dbAfterSmallB] = await f.dbA.query<{ sections: CanvasSection[]; sections_ver: number }>(
+      'select sections, sections_ver from branches where id = $1',
+      [f.branchId],
+    );
+    expect(dbAfterSmallB?.sections).toEqual(smallB);
+    expect(Number(dbAfterSmallB?.sections_ver)).toBe(verAfterHotA + 1);
+
+    // 4. 副本 B 再次空闲卸载，热副本 A 继续推进时钟；副本 B 重载后直接发 > 7500B（room.sections.reload 路径）
+    await f.appB.rooms.leave(f.branchId, peerB2.peer);
+    await waitFor(() => !f.appB.rooms.has(f.branchId), 3000);
+    await f.appA.rooms.message(f.branchId, peerA.peer, {
+      t: 'sections',
+      sections: [{ id: 'sec-a-s3', name: 'A3', color: 'peer-4', tables: ['t2'] }],
+    });
+    await f.appA.rooms.flush();
+
+    const [beforeLargeB] = await f.dbA.query<{ sections_ver: number }>(
+      'select sections_ver from branches where id = $1',
+      [f.branchId],
+    );
+    expect(Number(beforeLargeB?.sections_ver)).toBe(verAfterHotA + 2);
+
+    const peerB3 = makePeer(f.bob);
+    await f.appB.rooms.join(f.branchId, peerB3.peer);
+    const largeB: CanvasSection[] = Array.from({ length: 160 }, (_, i) => ({
+      id: `sec_b_big_${String(i).padStart(3, '0')}`,
+      name: `B大板块_${i}`,
+      color: SECTION_COLORS[i % SECTION_COLORS.length]!,
+      tables: [`tbl_b_${i}_1`, `tbl_b_${i}_2`],
+    }));
+    expect(Buffer.byteLength(JSON.stringify(largeB), 'utf8')).toBeGreaterThan(MAX_EVENT_BYTES);
+    await f.appB.rooms.message(f.branchId, peerB3.peer, { t: 'sections', sections: largeB });
+
+    const [dbAfterLargeB] = await f.dbA.query<{ sections: CanvasSection[]; sections_ver: number }>(
+      'select sections, sections_ver from branches where id = $1',
+      [f.branchId],
+    );
+    expect(dbAfterLargeB?.sections).toHaveLength(160);
+    expect(dbAfterLargeB?.sections[0]?.id).toBe('sec_b_big_000');
+    expect(Number(dbAfterLargeB?.sections_ver)).toBe(verAfterHotA + 3);
+
+    await waitFor(() =>
+      peerA.sent.some(
+        (m) => m.t === 'sections' && m.sections.length === 160 && m.sections[0]?.id === 'sec_b_big_000',
+      ),
+    );
   });
 });
 
@@ -504,7 +704,7 @@ describe('画布板块在途落库与重载竞态回归', () => {
           events.push('update:end');
           return res;
         }
-        if (sql.includes('select sections from branches')) {
+        if (sql.includes('select sections') && sql.includes('from branches')) {
           events.push('select:start');
           const res = await origQuery<T>(sql, params);
           events.push('select:end');
@@ -557,7 +757,7 @@ describe('画布板块在途落库与重载竞态回归', () => {
       ]);
 
       db.query = (async <T = Record<string, unknown>>(sql: string, params?: unknown[]) => {
-        if (sql.includes('select sections from branches')) {
+        if (sql.includes('select sections') && sql.includes('from branches')) {
           enteredSelect.resolve();
           await releaseSelect.promise;
         }
@@ -596,6 +796,45 @@ describe('画布板块在途落库与重载竞态回归', () => {
       expect(row?.sections).toEqual(b3);
     } finally {
       db.query = origQuery;
+      rooms.close();
+      await rooms.flush();
+    }
+  });
+
+  test('flushLayout / flushSections 写入较小版本号时绝不降级已持久化的 layout_ver / sections_ver，且回传后推进内存时钟（#63）', async () => {
+    const { branchId, rooms, peerB } = await setupRaceRoom();
+    try {
+      // 模拟外部已将 DB 时钟推进到 10，而本地房间早先载入时时钟为 0
+      await db.query('update branches set layout_ver = 10, sections_ver = 10 where id = $1', [branchId]);
+
+      await rooms.message(branchId, peerB.peer, { t: 'layout', positions: { tbl_mono: { x: 1, y: 2 } } });
+      await rooms.message(branchId, peerB.peer, {
+        t: 'sections',
+        sections: [{ id: 'sec-mono', name: '单调性', color: 'peer-1', tables: ['tbl_mono'] }],
+      });
+      await rooms.flush();
+
+      // 第 1 轮本地时钟为 1：DB 保持 10 不被降级
+      const [afterFirst] = await db.query<{ layout_ver: number; sections_ver: number }>(
+        'select layout_ver, sections_ver from branches where id = $1',
+        [branchId],
+      );
+      expect(afterFirst).toEqual({ layout_ver: 10, sections_ver: 10 });
+
+      // RETURNING 已将内存时钟追齐到 10：下一次编辑直接推进到 11
+      await rooms.message(branchId, peerB.peer, { t: 'layout', positions: { tbl_mono: { x: 3, y: 4 } } });
+      await rooms.message(branchId, peerB.peer, {
+        t: 'sections',
+        sections: [{ id: 'sec-mono-2', name: '单调性-2', color: 'peer-2', tables: ['tbl_mono'] }],
+      });
+      await rooms.flush();
+
+      const [afterSecond] = await db.query<{ layout_ver: number; sections_ver: number }>(
+        'select layout_ver, sections_ver from branches where id = $1',
+        [branchId],
+      );
+      expect(afterSecond).toEqual({ layout_ver: 11, sections_ver: 11 });
+    } finally {
       rooms.close();
       await rooms.flush();
     }

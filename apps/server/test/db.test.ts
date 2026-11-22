@@ -1,7 +1,12 @@
 // SQLite 平台库适配器：JSON / 布尔列按“表.列”识别，同名列在不同表里互不影响。
-import { expect, test } from 'vitest';
+import { mkdtempSync, rmSync } from 'node:fs';
+import { tmpdir } from 'node:os';
+import { join } from 'node:path';
 
-import { inList, isUniqueViolation, openPlatformDb, registerColumnKind } from '../src/db.ts';
+import { describe, expect, test } from 'vitest';
+
+import { createTestDb, PG_URL } from '../../../test/pg.ts';
+import { inList, isUniqueViolation, MIGRATIONS, openPlatformDb, registerColumnKind } from '../src/db.ts';
 
 test('同名列在不同表里可以一个是 JSON、一个是布尔、一个是普通值', async () => {
   const db = await openPlatformDb(':memory:');
@@ -81,4 +86,106 @@ test('inList：in (…) 列表的占位符，可以指定起始序号', () => {
   expect(inList(['a'])).toBe('$1');
   expect(inList(['a', 'b', 'c'])).toBe('$1, $2, $3');
   expect(inList(['a', 'b'], 3)).toBe('$3, $4');
+});
+
+const verifyClockMigrationAndMonotonicity = async (platform: 'sqlite' | 'pg') => {
+  let dir: string | null = null;
+  let closePg: (() => Promise<void>) | null = null;
+  let url: string;
+  if (platform === 'sqlite') {
+    dir = mkdtempSync(join(tmpdir(), 'dowel-clock-mig-'));
+    url = join(dir, 'clock.db');
+  } else {
+    const pg = await createTestDb('clock_mig');
+    closePg = pg.close;
+    url = pg.url;
+  }
+
+  try {
+    // 1. 建到最新版本后回退最后一条（layout_ver / sections_ver）迁移并插入存量数据
+    const base = await openPlatformDb(url);
+    try {
+      await base.exec(
+        'alter table branches drop column layout_ver; alter table branches drop column sections_ver;',
+      );
+      await base.query('delete from dowel_migrations where version >= $1', [MIGRATIONS.length]);
+      await base.query("insert into groups (id, slug, name) values ('g1', 'g1', '组')");
+      await base.query("insert into projects (id, name, group_id, slug) values ('p1', 'p1', 'g1', 'p1')");
+      await base.query(
+        `insert into branches (id, project_id, name, layout, sections)
+         values ('b1', 'p1', 'main', $1::text::jsonb, $2::text::jsonb)`,
+        [
+          JSON.stringify({ tbl_existing: { x: 12, y: 34 } }),
+          JSON.stringify([{ id: 's-existing', name: '存量板块', color: 'peer-1', tables: ['tbl_existing'] }]),
+        ],
+      );
+    } finally {
+      await base.close();
+    }
+
+    // 2. 重开升级：既有行获得默认值 0，且保留既有 layout / sections 数据
+    const upgraded = await openPlatformDb(url);
+    try {
+      const [ver] = await upgraded.query<{ v: number }>('select max(version) as v from dowel_migrations');
+      expect(Number(ver?.v)).toBe(MIGRATIONS.length);
+
+      const [row] = await upgraded.query<{
+        layout: Record<string, { x: number; y: number }>;
+        sections: { id: string; name: string; color: string; tables: string[] }[];
+        layout_ver: number;
+        sections_ver: number;
+      }>('select layout, sections, layout_ver, sections_ver from branches where id = $1', ['b1']);
+      expect(row?.layout).toEqual({ tbl_existing: { x: 12, y: 34 } });
+      expect(row?.sections).toEqual([
+        { id: 's-existing', name: '存量板块', color: 'peer-1', tables: ['tbl_existing'] },
+      ]);
+      expect(Number(row?.layout_ver)).toBe(0);
+      expect(Number(row?.sections_ver)).toBe(0);
+
+      // 3. 设更高时钟并重跑最后一条迁移：验证幂等性，不覆盖既有值
+      await upgraded.query('update branches set layout_ver = 7, sections_ver = 9 where id = $1', ['b1']);
+      await upgraded.query('delete from dowel_migrations where version >= $1', [MIGRATIONS.length]);
+    } finally {
+      await upgraded.close();
+    }
+
+    const rerun = await openPlatformDb(url);
+    try {
+      const [afterRerun] = await rerun.query<{ layout_ver: number; sections_ver: number }>(
+        'select layout_ver, sections_ver from branches where id = $1',
+        ['b1'],
+      );
+      expect(Number(afterRerun?.layout_ver)).toBe(7);
+      expect(Number(afterRerun?.sections_ver)).toBe(9);
+
+      // 4. 单调性 SQL（PG greatest / SQLite max）用较低版本（3）更新绝不降级
+      const [afterLower] =
+        platform === 'pg'
+          ? await rerun.query<{ layout_ver: number; sections_ver: number }>(
+              'update branches set layout_ver = greatest(layout_ver, $2::bigint), sections_ver = greatest(sections_ver, $2::bigint) where id = $1 returning layout_ver, sections_ver',
+              ['b1', 3],
+            )
+          : await rerun.query<{ layout_ver: number; sections_ver: number }>(
+              'update branches set layout_ver = max(layout_ver, $2), sections_ver = max(sections_ver, $2) where id = $1 returning layout_ver, sections_ver',
+              ['b1', 3],
+            );
+      expect(Number(afterLower?.layout_ver)).toBe(7);
+      expect(Number(afterLower?.sections_ver)).toBe(9);
+    } finally {
+      await rerun.close();
+    }
+  } finally {
+    if (closePg) await closePg().catch(() => {});
+    if (dir) rmSync(dir, { recursive: true, force: true });
+  }
+};
+
+test('SQLite 存量分支升级补齐 layout_ver/sections_ver = 0，重跑幂等且单调更新不降级', async () => {
+  await verifyClockMigrationAndMonotonicity('sqlite');
+});
+
+describe.skipIf(!PG_URL)('PG 存量分支时钟迁移与单调性', () => {
+  test('PG 存量分支升级补齐 layout_ver/sections_ver = 0，重跑幂等且单调更新不降级', async () => {
+    await verifyClockMigrationAndMonotonicity('pg');
+  });
 });
