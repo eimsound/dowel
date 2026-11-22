@@ -1079,4 +1079,243 @@ describe.skipIf(!PG_URL)('PG 分区表闭环与往返验证', () => {
     expect(r.upDiff).toEqual([]);
     expect(r.downDiff).toEqual([]);
   });
+
+  test('Issue #71: PG 18+ P12h ATTACH PARTITION 显式 notNullName 与祖先 FOREIGN KEY 冲突双向闭环通过', async () => {
+    const db = conn();
+    const pgMajor = E.pgMajorOf(
+      (
+        (await db.query<{ v: number }>(`select current_setting('server_version_num')::int as v`)) as [
+          { v: number },
+        ]
+      )[0].v,
+    )!;
+    if (pgMajor < 18) return;
+
+    // 1a. 单层祖先 FK 与 plain 列显式 notNullName 冲突，且另一列占着目标根列 notNullName
+    const v1 = emptyModel();
+    const s = E.createSchema(v1, 'public');
+    const ref = E.createTable(v1, s, 'ref_t');
+    const refId = E.addColumn(v1, ref, { name: 'id', type: 'integer', notNull: true });
+    E.addPrimaryKey(v1, ref, [refId]);
+
+    const p = E.createTable(v1, s, 'p_fk');
+    const pId = E.addColumn(v1, p, { name: 'id', type: 'integer', notNull: true });
+    E.addColumn(v1, p, { name: 'val', type: 'integer', notNull: true });
+    E.setPartitionBy(v1, p, {
+      strategy: 'range',
+      keys: [{ column: pId, expr: null, opclass: null, collation: null }],
+    });
+    E.addPrimaryKey(v1, p, [pId]);
+    const pFk = E.addForeignKey(v1, p, [pId], ref, [refId]);
+    E.renameKey(v1, pFk, 'fk_p_ref');
+
+    const plain = E.createTable(v1, s, 'p_fk_plain');
+    const plId = E.addColumn(v1, plain, { name: 'id', type: 'integer', notNull: true });
+    const plVal = E.addColumn(v1, plain, { name: 'val', type: 'integer', notNull: true });
+    (v1.objects[plId] as E.Column).notNullName = 'fk_p_ref';
+    (v1.objects[plId] as E.Column).notNullNameMode = 'explicit';
+    (v1.objects[plVal] as E.Column).notNullName = 'p_fk_id_not_null';
+    (v1.objects[plVal] as E.Column).notNullNameMode = 'explicit';
+
+    const v2 = structuredClone(v1);
+    E.attachPartition(v2, p, plain, 'FOR VALUES FROM (0) TO (100)');
+    expect(validate(v1)).toEqual([]);
+    expect(validate(v2)).toEqual([]);
+    const r1 = await verify(db, v1, v2, { pgMajor });
+    expect(r1.upDiff).toEqual([]);
+    expect(r1.downDiff).toEqual([]);
+
+    // 1b. 多级祖先 FK + 祖先 CHECK + 根列 notNullName 互换组合冲突
+    const m1 = emptyModel();
+    const sm = E.createSchema(m1, 'public');
+    const mRef = E.createTable(m1, sm, 'm_ref');
+    const mRefId = E.addColumn(m1, mRef, { name: 'id', type: 'integer', notNull: true });
+    E.addPrimaryKey(m1, mRef, [mRefId]);
+
+    const gp = E.createTable(m1, sm, 'gp_fk');
+    const gpId = E.addColumn(m1, gp, { name: 'id', type: 'integer', notNull: true });
+    const gpReg = E.addColumn(m1, gp, { name: 'region', type: 'text', notNull: true });
+    E.addColumn(m1, gp, { name: 'val', type: 'integer', notNull: true });
+    E.addColumn(m1, gp, { name: 'extra', type: 'integer', notNull: true });
+    E.setPartitionBy(m1, gp, {
+      strategy: 'range',
+      keys: [{ column: gpId, expr: null, opclass: null, collation: null }],
+    });
+    E.addPrimaryKey(m1, gp, [gpId, gpReg]);
+    const gpFk = E.addForeignKey(m1, gp, [gpId], mRef, [mRefId]);
+    E.renameKey(m1, gpFk, 'fk_gp_ref');
+    const gpCk = E.addCheck(m1, gp, '(val > 0)');
+    E.renameKey(m1, gpCk, 'ck_gp_val');
+
+    const sub = E.createPartition(m1, gp, 'gp_sub', 'FOR VALUES FROM (0) TO (100)');
+    E.setPartitionBy(m1, sub, {
+      strategy: 'list',
+      keys: [{ column: gpReg, expr: null, opclass: null, collation: null }],
+    });
+
+    const mPlain = E.createTable(m1, sm, 'gp_sub_us');
+    const mpId = E.addColumn(m1, mPlain, { name: 'id', type: 'integer', notNull: true });
+    const mpReg = E.addColumn(m1, mPlain, { name: 'region', type: 'text', notNull: true });
+    const mpVal = E.addColumn(m1, mPlain, { name: 'val', type: 'integer', notNull: true });
+    const mpExtra = E.addColumn(m1, mPlain, { name: 'extra', type: 'integer', notNull: true });
+    (m1.objects[mpId] as E.Column).notNullName = 'fk_gp_ref';
+    (m1.objects[mpId] as E.Column).notNullNameMode = 'explicit';
+    (m1.objects[mpReg] as E.Column).notNullName = 'gp_fk_id_not_null';
+    (m1.objects[mpReg] as E.Column).notNullNameMode = 'explicit';
+    (m1.objects[mpVal] as E.Column).notNullName = 'ck_gp_val';
+    (m1.objects[mpVal] as E.Column).notNullNameMode = 'explicit';
+    (m1.objects[mpExtra] as E.Column).notNullName = 'gp_fk_region_not_null';
+    (m1.objects[mpExtra] as E.Column).notNullNameMode = 'explicit';
+
+    const m2 = structuredClone(m1);
+    E.attachPartition(m2, sub, mPlain, "FOR VALUES IN ('us')");
+    expect(validate(m1)).toEqual([]);
+    expect(validate(m2)).toEqual([]);
+    const r2 = await verify(db, m1, m2, { pgMajor });
+    expect(r2.upDiff).toEqual([]);
+    expect(r2.downDiff).toEqual([]);
+  });
+
+  test('Issue #71: PG 18+ P11/P12d/P12g 根表显式 notNullName 与子分区隐式 PK/UNIQUE 冲突双向闭环通过', async () => {
+    const db = conn();
+    const pgMajor = E.pgMajorOf(
+      (
+        (await db.query<{ v: number }>(`select current_setting('server_version_num')::int as v`)) as [
+          { v: number },
+        ]
+      )[0].v,
+    )!;
+    if (pgMajor < 18) return;
+
+    // 2a. P10 新建子分区 + P11(ch_pkey) + P12d(ch_id_tag_key)
+    const v1a = emptyModel();
+    const sA = E.createSchema(v1a, 'public');
+    const pA = E.createTable(v1a, sA, 'p_imp_a');
+    const aId = E.addColumn(v1a, pA, { name: 'id', type: 'integer', notNull: true });
+    const aTag = E.addColumn(v1a, pA, { name: 'tag', type: 'integer', notNull: true });
+    const aVal = E.addColumn(v1a, pA, { name: 'val', type: 'integer', notNull: false });
+    E.setPartitionBy(v1a, pA, {
+      strategy: 'range',
+      keys: [{ column: aId, expr: null, opclass: null, collation: null }],
+    });
+    E.addPrimaryKey(v1a, pA, [aId]);
+    E.addUnique(v1a, pA, [aId, aTag]);
+
+    const v2a = structuredClone(v1a);
+    E.createPartition(v2a, pA, 'ch', 'DEFAULT');
+    const aExtra = E.addColumn(v2a, pA, { name: 'extra', type: 'integer', notNull: true });
+    (v2a.objects[aExtra] as E.Column).notNullName = 'ch_pkey';
+    (v2a.objects[aExtra] as E.Column).notNullNameMode = 'explicit';
+    E.setNotNull(v2a, aVal, true);
+    (v2a.objects[aVal] as E.Column).notNullName = 'ch_id_tag_key';
+    (v2a.objects[aVal] as E.Column).notNullNameMode = 'explicit';
+    expect(validate(v1a)).toEqual([]);
+    expect(validate(v2a)).toEqual([]);
+    const r2a = await verify(db, v1a, v2a, { pgMajor });
+    expect(r2a.upDiff).toEqual([]);
+    expect(r2a.downDiff).toEqual([]);
+
+    // 2b. P10 新建子分区 + P12g 存储生成列 notNullName = ch_pkey
+    const v1b = emptyModel();
+    const sB = E.createSchema(v1b, 'public');
+    const pB = E.createTable(v1b, sB, 'p_imp_b');
+    const bId = E.addColumn(v1b, pB, { name: 'id', type: 'integer', notNull: true });
+    E.setPartitionBy(v1b, pB, {
+      strategy: 'range',
+      keys: [{ column: bId, expr: null, opclass: null, collation: null }],
+    });
+    E.addPrimaryKey(v1b, pB, [bId]);
+
+    const v2b = structuredClone(v1b);
+    E.createPartition(v2b, pB, 'ch', 'DEFAULT');
+    const bGen = E.addColumn(v2b, pB, {
+      name: 'g',
+      type: 'integer',
+      notNull: true,
+      generated: { expr: '(id * 2)', stored: true },
+    });
+    (v2b.objects[bGen] as E.Column).notNullName = 'ch_pkey';
+    (v2b.objects[bGen] as E.Column).notNullNameMode = 'explicit';
+    expect(validate(v1b)).toEqual([]);
+    expect(validate(v2b)).toEqual([]);
+    const r2b = await verify(db, v1b, v2b, { pgMajor });
+    expect(r2b.upDiff).toEqual([]);
+    expect(r2b.downDiff).toEqual([]);
+
+    // 2c. 已有子分区 ch：P11/P12d 冲突 -> P6 显式 notNullName 互换 -> DETACH 验证真实隐式 PK/UNIQUE 名
+    const v1c = emptyModel();
+    const sC = E.createSchema(v1c, 'public');
+    const pC = E.createTable(v1c, sC, 'p_imp_c');
+    const cId = E.addColumn(v1c, pC, { name: 'id', type: 'integer', notNull: true });
+    const cTag = E.addColumn(v1c, pC, { name: 'tag', type: 'integer', notNull: true });
+    const cVal = E.addColumn(v1c, pC, { name: 'val', type: 'integer', notNull: false });
+    const cNote = E.addColumn(v1c, pC, { name: 'note', type: 'text', notNull: true });
+    E.setPartitionBy(v1c, pC, {
+      strategy: 'range',
+      keys: [{ column: cId, expr: null, opclass: null, collation: null }],
+    });
+    E.addPrimaryKey(v1c, pC, [cId]);
+    E.addUnique(v1c, pC, [cId, cTag]);
+    const chC = E.createPartition(v1c, pC, 'ch', 'DEFAULT');
+
+    const v2c = structuredClone(v1c);
+    const cExtra = E.addColumn(v2c, pC, { name: 'extra', type: 'integer', notNull: true });
+    (v2c.objects[cExtra] as E.Column).notNullName = 'ch_pkey';
+    (v2c.objects[cExtra] as E.Column).notNullNameMode = 'explicit';
+    E.setNotNull(v2c, cVal, true);
+    (v2c.objects[cVal] as E.Column).notNullName = 'ch_id_tag_key';
+    (v2c.objects[cVal] as E.Column).notNullNameMode = 'explicit';
+    expect(validate(v1c)).toEqual([]);
+    expect(validate(v2c)).toEqual([]);
+    const r2c12 = await verify(db, v1c, v2c, { pgMajor });
+    expect(r2c12.upDiff).toEqual([]);
+    expect(r2c12.downDiff).toEqual([]);
+
+    const v3c = structuredClone(v2c);
+    (v3c.objects[cNote] as E.Column).notNullName = 'ch_pkey';
+    (v3c.objects[cNote] as E.Column).notNullNameMode = 'explicit';
+    (v3c.objects[cExtra] as E.Column).notNullName = 'p_imp_c_note_not_null';
+    (v3c.objects[cExtra] as E.Column).notNullNameMode = 'explicit';
+    expect(validate(v3c)).toEqual([]);
+    const r2c23 = await verify(db, v2c, v3c, { pgMajor });
+    expect(r2c23.upDiff).toEqual([]);
+    expect(r2c23.downDiff).toEqual([]);
+
+    const v4c = structuredClone(v2c);
+    E.detachPartition(v4c, chC);
+    expect(validate(v4c)).toEqual([]);
+    const r2c24 = await verify(db, v2c, v4c, { pgMajor });
+    expect(r2c24.upDiff).toEqual([]);
+    expect(r2c24.downDiff).toEqual([]);
+
+    // 2d. 多级分区 gp -> sub -> leaf：同迁移重绑 sub 边界 + P12d 将 gp.val 显式 notNullName 设为 leaf_pkey
+    const v1d = emptyModel();
+    const sD = E.createSchema(v1d, 'public');
+    const gpD = E.createTable(v1d, sD, 'gp_imp');
+    const dId = E.addColumn(v1d, gpD, { name: 'id', type: 'integer', notNull: true });
+    const dReg = E.addColumn(v1d, gpD, { name: 'region', type: 'text', notNull: true });
+    const dVal = E.addColumn(v1d, gpD, { name: 'val', type: 'integer', notNull: false });
+    E.setPartitionBy(v1d, gpD, {
+      strategy: 'range',
+      keys: [{ column: dId, expr: null, opclass: null, collation: null }],
+    });
+    E.addPrimaryKey(v1d, gpD, [dId, dReg]);
+    const subD = E.createPartition(v1d, gpD, 'sub', 'FOR VALUES FROM (0) TO (10)');
+    E.setPartitionBy(v1d, subD, {
+      strategy: 'list',
+      keys: [{ column: dReg, expr: null, opclass: null, collation: null }],
+    });
+    E.createPartition(v1d, subD, 'leaf', "FOR VALUES IN ('us')");
+
+    const v2d = structuredClone(v1d);
+    E.setPartitionBound(v2d, subD, 'FOR VALUES FROM (0) TO (20)');
+    E.setNotNull(v2d, dVal, true);
+    (v2d.objects[dVal] as E.Column).notNullName = 'leaf_pkey';
+    (v2d.objects[dVal] as E.Column).notNullNameMode = 'explicit';
+    expect(validate(v1d)).toEqual([]);
+    expect(validate(v2d)).toEqual([]);
+    const r2d = await verify(db, v1d, v2d, { pgMajor });
+    expect(r2d.upDiff).toEqual([]);
+    expect(r2d.downDiff).toEqual([]);
+  });
 });
