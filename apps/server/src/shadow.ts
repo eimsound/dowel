@@ -6,6 +6,7 @@ import {
   deepEqual,
   type Dialect,
   findInstanceLevelStatement,
+  ident,
   instanceLevelDescription,
   type Model,
   type Obj,
@@ -131,16 +132,50 @@ const isStatementTimeout = (e: unknown, timeoutMs: number) => {
   return false;
 };
 
-const errorOf = (e: unknown, timeoutMs: number) =>
-  e instanceof StepError
-    ? {
-        step: e.step,
-        // 报告会存进版本、发给客户端：错误消息里可能带着连接串（含密码），先脱敏
-        message: scrubSecrets(
-          isStatementTimeout(e, timeoutMs) ? `执行超时（超过影子库的语句超时限制）：${e.reason}` : e.reason,
-        ),
-      }
-    : { step: null, message: scrubSecrets(e instanceof Error ? e.message : String(e)) };
+const errorOf = (e: unknown, timeoutMs: number, dialect: Dialect = 'pg') => {
+  if (!(e instanceof StepError)) {
+    return { step: null, message: scrubSecrets(e instanceof Error ? e.message : String(e)) };
+  }
+  let msg: string;
+  if (isStatementTimeout(e, timeoutMs)) {
+    msg = `执行超时（超过影子库的语句超时限制）：${e.reason}`;
+  } else if (dialect === 'pg' && codeOf(e) === '42501') {
+    msg = `影子库权限不足（${e.reason}）。请确认当前账号拥有影子库及 schema 所有权（如 ALTER DATABASE ... OWNER TO ...;）`;
+  } else {
+    msg = e.reason;
+  }
+  // 报告会存进版本、发给客户端：错误消息里可能带着连接串（含密码），先脱敏
+  return {
+    step: e.step,
+    message: scrubSecrets(msg),
+  };
+};
+
+const isPgPrivilegeError = (e: unknown, dialect: Dialect): boolean =>
+  dialect === 'pg' && codeOf(e) === '42501';
+
+const pgShadowPrivilegeError = async (e: unknown, d: Db): Promise<ShadowError> => {
+  const msg = scrubSecrets(messageOf(e));
+  let dbName: string | undefined;
+  let currentUser: string | undefined;
+  try {
+    const [r] = await d.query<{ d?: unknown; u?: unknown }>(
+      'select current_database() as d, current_user as u',
+    );
+    if (typeof r?.d === 'string' && r.d) dbName = r.d;
+    if (typeof r?.u === 'string' && r.u) currentUser = r.u;
+  } catch {
+    // 连接不可查或测试桩返回空数组时回退通用 SQL 占位提示
+  }
+  const alterSql =
+    dbName && currentUser
+      ? `ALTER DATABASE ${ident(dbName)} OWNER TO ${ident(currentUser)};`
+      : 'ALTER DATABASE <影子库> OWNER TO <当前账号>;';
+  const ownerTarget = currentUser ? ident(currentUser) : '<当前账号>';
+  return new ShadowError(
+    `清理影子库失败：当前账号缺少清空或操作影子库及 schema 的权限（${msg}）。请将影子库及 schema 所有权授予当前账号，例如执行：${alterSql}（如存在其他角色创建的 schema，亦需执行 ALTER SCHEMA <schema> OWNER TO ${ownerTarget};）`,
+  );
+};
 
 /** 影子库给的完整报告 → 存进版本里的报告（up / down 就是冻结的脚本本身，不重复存） */
 export const storedReport = (
@@ -225,7 +260,7 @@ export const toShadowError = (e: unknown): ShadowError => {
  *   不能把“影子库出了问题”记成“脚本没通过”。
  * 既不是 StepError、也不是已知的基础设施故障的异常（读结构时出了意外等）原样抛出。
  */
-const failedReport = (e: unknown, timeoutMs: number): VerifyReport => {
+const failedReport = (e: unknown, timeoutMs: number, dialect: Dialect = 'pg'): VerifyReport => {
   // 脚本里有实例级语句：一条都没有执行，直接判验证失败并说明原因
   if (e instanceof InstanceLevelStatementError)
     return {
@@ -239,7 +274,15 @@ const failedReport = (e: unknown, timeoutMs: number): VerifyReport => {
     };
   if (isInfraFailure(e, timeoutMs)) throw toShadowError(e);
   if (!(e instanceof StepError)) throw e;
-  return { ok: false, up: [], down: [], upDiff: [], downDiff: [], risks: [], error: errorOf(e, timeoutMs) };
+  return {
+    ok: false,
+    up: [],
+    down: [],
+    upDiff: [],
+    downDiff: [],
+    risks: [],
+    error: errorOf(e, timeoutMs, dialect),
+  };
 };
 
 /**
@@ -253,16 +296,20 @@ const risksOf = async (
   from: Model,
   steps: Step[],
   timeoutMs: number,
+  dialect: Dialect = 'pg',
 ): Promise<{ risks: StepRisk[]; riskError?: string }> => {
   try {
     return { risks: await analyze(d, from, steps) };
   } catch (e) {
     if (isInfraFailure(e, timeoutMs)) throw toShadowError(e);
+    if (!(e instanceof StepError) && isPgPrivilegeError(e, dialect)) {
+      throw await pgShadowPrivilegeError(e, d);
+    }
     // riskError 只存原因本身，不带“风险分析没有完成：”——这个前缀由界面的标题 / i18n 模板提供
     // errorOf 已经脱敏；其他错误的消息同样脱敏（riskError 会存进版本、发给客户端）
     const reason =
       e instanceof StepError
-        ? errorOf(e, timeoutMs).message
+        ? errorOf(e, timeoutMs, dialect).message
         : scrubSecrets(e instanceof Error ? e.message : String(e));
     return { risks: [], riskError: reason };
   }
@@ -295,8 +342,14 @@ export const shadowOps = (
   importSql: async (sql: ImportableSql): Promise<Model> => {
     const d = await db();
     const engine = getEngine(dialect);
-    await engine.resetShadow(d);
-    await engine.prepareImportShadow(d);
+    try {
+      await engine.resetShadow(d);
+      await engine.prepareImportShadow(d);
+    } catch (e) {
+      if (isInfraFailure(e, statementTimeoutMs)) throw toShadowError(e);
+      if (isPgPrivilegeError(e, dialect)) throw await pgShadowPrivilegeError(e, d);
+      throw e;
+    }
     try {
       const cleaned = engine.stripImportNoise(sql);
       if (dialect === 'pg') {
@@ -305,6 +358,8 @@ export const shadowOps = (
         await engine.execStepSql(d, cleaned);
       }
     } catch (e) {
+      if (isInfraFailure(e, statementTimeoutMs)) throw toShadowError(e);
+      if (isPgPrivilegeError(e, dialect)) throw await pgShadowPrivilegeError(e, d);
       // 不在这里脱敏：错误只会走全局 onError（422）或 SSE 的 send，出口统一过 scrubSecrets
       throw new ShadowError(e instanceof Error ? e.message : String(e));
     }
@@ -322,12 +377,19 @@ export const shadowOps = (
     } catch (e) {
       if (!(e instanceof PlanError)) throw e;
     }
-    if (steps !== null) {
-      await buildTarget(d, prev, planOpts);
-      await runSteps(d, steps, dDialect);
-    } else {
-      // 未发布表发生普通表↔分区表互转或分区策略变更时无法增量规划：回退为从空库直接建出 next
-      await buildTarget(d, next, planOpts);
+    try {
+      if (steps !== null) {
+        await buildTarget(d, prev, planOpts);
+        await runSteps(d, steps, dDialect);
+      } else {
+        // 未发布表发生普通表↔分区表互转或分区策略变更时无法增量规划：回退为从空库直接建出 next
+        await buildTarget(d, next, planOpts);
+      }
+    } catch (e) {
+      if (!(e instanceof StepError) && isPgPrivilegeError(e, dDialect)) {
+        throw await pgShadowPrivilegeError(e, d);
+      }
+      throw e;
     }
     // 读回引擎里的结构，按名字对回 next 的 ID，取出规范形式
     const imported = reconcileIds(next, engine.importSnapshot(await engine.readSnapshot(d, schemas)));
@@ -381,9 +443,12 @@ export const shadowOps = (
     options?: ShadowVerifyScriptsOptions,
   ): Promise<VerifyReport> => {
     const d = await db();
+    const dDialect = to.dialect;
     try {
       const r = await verifyScripts(d, from, to, up, down, options);
-      const risk = options?.skipRisk ? { risks: [] } : await risksOf(d, from, r.up, statementTimeoutMs);
+      const risk = options?.skipRisk
+        ? { risks: [] }
+        : await risksOf(d, from, r.up, statementTimeoutMs, dDialect);
       return {
         ok: !r.upDiff.length && !r.downDiff.length,
         ...r,
@@ -404,14 +469,18 @@ export const shadowOps = (
           error: { step: null, message: scrubSecrets(e.message) },
         };
       }
-      return failedReport(e, statementTimeoutMs);
+      if (!(e instanceof StepError) && isPgPrivilegeError(e, dDialect)) {
+        throw await pgShadowPrivilegeError(e, d);
+      }
+      return failedReport(e, statementTimeoutMs, dDialect);
     }
   },
   verify: async (from: Model, to: Model, opts?: PlanOptions): Promise<VerifyReport> => {
     const d = await db();
+    const dDialect = to.dialect;
     try {
       const r = await verify(d, from, to, opts);
-      const risk = await risksOf(d, from, r.up, statementTimeoutMs);
+      const risk = await risksOf(d, from, r.up, statementTimeoutMs, dDialect);
       return {
         ok: !r.upDiff.length && !r.downDiff.length,
         ...r,
@@ -421,7 +490,10 @@ export const shadowOps = (
         shadowVersionNum: r.shadowVersionNum,
       };
     } catch (e) {
-      return failedReport(e, statementTimeoutMs);
+      if (!(e instanceof StepError) && isPgPrivilegeError(e, dDialect)) {
+        throw await pgShadowPrivilegeError(e, d);
+      }
+      return failedReport(e, statementTimeoutMs, dDialect);
     }
   },
 });

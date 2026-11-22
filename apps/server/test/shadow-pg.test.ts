@@ -8,10 +8,13 @@ import {
   createSchema,
   createTable,
   emptyModel,
+  ident,
+  literal,
   type Model,
   setPartitionBy,
   type Table,
 } from '@dowel/core';
+import type { Db } from '@dowel/engines';
 import { analyze, InstanceLevelStatementError, NON_TRANSACTIONAL_NOTE, StepError } from '@dowel/verifier';
 import { afterAll, beforeAll, describe, expect, test, vi } from 'vitest';
 
@@ -22,12 +25,16 @@ import { openPlatformDb } from '../src/db.ts';
 import { OpaqueRefresher } from '../src/derive.ts';
 import { Rooms } from '../src/rooms.ts';
 import { encrypt, scrubSecrets } from '../src/secrets.ts';
-import { ShadowError, ShadowUnavailableError, toShadowError } from '../src/shadow.ts';
+import { assertImportable, ShadowError, ShadowUnavailableError, toShadowError } from '../src/shadow.ts';
 import { Shadows } from '../src/shadows.ts';
 import {
+  appendPgPoolerHint,
   claimShadow,
   dropSameInstanceShadow,
   ensureSameInstanceShadow,
+  inspectPgTargetOn,
+  isLikelyPgTransactionPoolerUrl,
+  isPgPoolerError,
   pgShadow,
   SHADOW_MARK,
   shadowSetupError,
@@ -1069,6 +1076,367 @@ describe.skipIf(!PG_URL)('Shadows 配置指纹校验、跨副本事件失效与�
       await dbB.close();
       if (prevSecret === undefined) delete process.env.DOWEL_SECRET;
       else process.env.DOWEL_SECRET = prevSecret;
+    }
+  });
+});
+
+describe('PG Transaction Pooler 诊断与权限 SQL 提示（纯单元测试）', () => {
+  test('isLikelyPgTransactionPoolerUrl：准确区分事务池化端点与普通直连 / Supabase Session Mode', () => {
+    expect(
+      isLikelyPgTransactionPoolerUrl('postgres://u:p@ep-cool-123-pooler.us-east-2.aws.neon.tech/app'),
+    ).toBe(true);
+    expect(
+      isLikelyPgTransactionPoolerUrl('postgresql://u:p@EP-COOL-123-POOLER.us-east-2.aws.neon.tech:5432/app'),
+    ).toBe(true);
+    expect(
+      isLikelyPgTransactionPoolerUrl('postgres://u:p@aws-0-ap-southeast-1.pooler.supabase.com:6543/postgres'),
+    ).toBe(true);
+    expect(isLikelyPgTransactionPoolerUrl('postgres://u:p@pgbouncer.internal:6543/app')).toBe(true);
+    expect(isLikelyPgTransactionPoolerUrl('postgres://u:p@db.internal:5432/app?pgbouncer=true')).toBe(true);
+    expect(isLikelyPgTransactionPoolerUrl('postgresql://u:p@db.internal:5432/app?PgBouncer=TRUE')).toBe(true);
+    expect(isLikelyPgTransactionPoolerUrl('postgres://u:p@db.internal:5432/app?pool_mode=transaction')).toBe(
+      true,
+    );
+    expect(isLikelyPgTransactionPoolerUrl('postgres://u:p@db.internal:5432/app?POOL_MODE=Transaction')).toBe(
+      true,
+    );
+
+    // 直连 5432、Supabase Session Mode（5432 / 默认端口）、非法 URL 不应误报
+    expect(isLikelyPgTransactionPoolerUrl('postgres://u:p@db.internal:5432/app')).toBe(false);
+    expect(isLikelyPgTransactionPoolerUrl('postgres://u:p@db.internal/app')).toBe(false);
+    expect(
+      isLikelyPgTransactionPoolerUrl('postgres://u:p@aws-0-ap-southeast-1.pooler.supabase.com:5432/postgres'),
+    ).toBe(false);
+    expect(
+      isLikelyPgTransactionPoolerUrl('postgres://u:p@aws-0-ap-southeast-1.pooler.supabase.com/postgres'),
+    ).toBe(false);
+    expect(isLikelyPgTransactionPoolerUrl('postgres://u:p@db.internal:5432/app?pgbouncer=false')).toBe(false);
+    expect(isLikelyPgTransactionPoolerUrl('postgres://u:p@db.internal:5432/app?pool_mode=session')).toBe(
+      false,
+    );
+    expect(isLikelyPgTransactionPoolerUrl('mysql://u:p@pgbouncer.internal:6543/app')).toBe(false);
+    expect(isLikelyPgTransactionPoolerUrl('not-a-url')).toBe(false);
+    expect(isLikelyPgTransactionPoolerUrl('')).toBe(false);
+  });
+
+  test('isPgPoolerError 与 appendPgPoolerHint：识别池化器典型错误并幂等追加提示', () => {
+    for (const msg of [
+      'PgBouncer error: server closed the connection unexpectedly',
+      'Supavisor: Tenant or user not found',
+      'advisory locks are not supported in transaction mode',
+      'invalid pool_mode configuration',
+      'ERROR: unsupported startup parameter: extra_float_digits',
+      'ERROR: prepared statement "s1" already exists',
+      'ERROR: prepared statement "s1" does not exist',
+    ]) {
+      expect(isPgPoolerError(new Error(msg)), msg).toBe(true);
+      expect(isPgPoolerError({ message: msg }), msg).toBe(true);
+    }
+
+    expect(isPgPoolerError(new Error('permission denied for schema public'))).toBe(false);
+    expect(
+      isPgPoolerError(
+        Object.assign(new Error('CREATE DATABASE cannot run inside a transaction block'), { code: '25001' }),
+      ),
+    ).toBe(false);
+
+    const once = appendPgPoolerHint('连接失败：超时', {
+      url: 'postgres://u:p@db.internal:6543/app',
+    });
+    expect(once).toContain('Transaction Pooler');
+    expect(once).toContain('Session Mode');
+    expect(once).not.toContain('。。');
+    // 幂等：重复调用不再追加第二遍提示
+    expect(appendPgPoolerHint(once, { url: 'postgres://u:p@db.internal:6543/app' })).toBe(once);
+  });
+
+  test('shadowSetupError(..., ctx) 与 inspectPgTargetOn：池化器提示、25001 create 提示、特殊密码脱敏与 claim SQL', async () => {
+    // 1. create 阶段 25001 或 cannot run inside a transaction block 附带事务池化器提示；非 create 不误附带
+    const err25001 = Object.assign(new Error('CREATE DATABASE cannot run inside a transaction block'), {
+      code: '25001',
+    });
+    const createTx = shadowSetupError(err25001, 'create');
+    expect(createTx).toBeInstanceOf(ShadowError);
+    expect(createTx).not.toBeInstanceOf(ShadowUnavailableError);
+    expect(createTx.message).toContain('建影子库失败');
+    expect(createTx.message).toContain('Transaction Pooler');
+
+    const check25001 = shadowSetupError(err25001, 'check');
+    expect(check25001.message).not.toContain('Transaction Pooler');
+
+    // 2. 带特殊字符 URL 编码密码的 pooler URL：不泄露编码后和解码后的明文密码
+    const encodedPw = 'p%40ss%23sec%251';
+    const decodedPw = decodeURIComponent(encodedPw);
+    const poolerUrl = `postgres://dowel:${encodedPw}@ep-demo-pooler.us-east-2.aws.neon.tech:5432/app`;
+    const leakyErr = Object.assign(
+      new Error(
+        `failed connecting ${poolerUrl} password=${decodedPw} prepared statement "q1" does not exist`,
+      ),
+      { code: '08006' },
+    );
+    const setupErr = shadowSetupError(leakyErr, 'create', { url: poolerUrl });
+    expect(setupErr).toBeInstanceOf(ShadowUnavailableError);
+    expect(setupErr.message).toContain('Transaction Pooler');
+    expect(setupErr.message).not.toContain(encodedPw);
+    expect(setupErr.message).not.toContain(decodedPw);
+
+    const failingDb: Db = {
+      query: async () => {
+        throw new Error(`connect failed for ${poolerUrl} (${decodedPw})`);
+      },
+      exec: async () => {},
+    };
+    const inspectErr = await inspectPgTargetOn(failingDb, poolerUrl).then(
+      () => null,
+      (e: unknown) => e,
+    );
+    expect(inspectErr).toBeInstanceOf(ShadowError);
+    expect((inspectErr as Error).message).toContain('Transaction Pooler');
+    expect((inspectErr as Error).message).not.toContain(encodedPw);
+    expect((inspectErr as Error).message).not.toContain(decodedPw);
+
+    // 3. claim 阶段 42501 且传入 dbName / currentUser：保留原前缀并输出精确可执行 SQL
+    const err42501 = Object.assign(new Error('must be owner of database shop_dowel'), { code: '42501' });
+    const claimPlain = shadowSetupError(err42501, 'claim', {
+      dbName: 'shop_dowel',
+      currentUser: 'dowel_user',
+    });
+    expect(claimPlain.message).toMatch(/^认领影子库失败：当前账号不是该库的所有者/);
+    expect(claimPlain.message).toContain('ALTER DATABASE shop_dowel OWNER TO dowel_user;');
+    expect(claimPlain.message).toContain(`COMMENT ON DATABASE shop_dowel IS ${literal(SHADOW_MARK)};`);
+
+    const claimQuoted = shadowSetupError(err42501, 'claim', {
+      dbName: 'Shop-DB',
+      currentUser: 'app-user',
+    });
+    expect(claimQuoted.message).toMatch(/^认领影子库失败：当前账号不是该库的所有者/);
+    expect(claimQuoted.message).toContain('ALTER DATABASE "Shop-DB" OWNER TO "app-user";');
+    expect(claimQuoted.message).toContain(`COMMENT ON DATABASE "Shop-DB" IS ${literal(SHADOW_MARK)};`);
+  });
+});
+
+describe.skipIf(!PG_URL)('受限权限账号与影子库生命周期测试（真实 PG）', () => {
+  const admin = PG_URL ? connect(PG_URL) : (null as never);
+
+  const randomTag = () => Math.random().toString(36).slice(2, 8);
+
+  const roleUrlFor = (role: string, password: string, dbName: string) => {
+    const u = new URL(dbUrl(dbName));
+    u.username = role;
+    u.password = password;
+    return u.toString();
+  };
+
+  const shadowLockIsFree = async (url: string) => {
+    const c = connect(url);
+    try {
+      const [r] = await c.db.query<{ ok: boolean }>(
+        "select pg_try_advisory_lock(hashtext('dowel_shadow')) as ok",
+      );
+      if (r?.ok) await c.db.exec("select pg_advisory_unlock(hashtext('dowel_shadow'))");
+      return r?.ok === true;
+    } finally {
+      await c.close();
+    }
+  };
+
+  afterAll(async () => {
+    if (!PG_URL) return;
+    await admin.close();
+  });
+
+  test('Case A：NOSUPERUSER + CREATEDB 自动建 {db}_dowel 并跑通 importSql / verify / canonicalize 且无残留锁', async () => {
+    const tag = randomTag();
+    const role = `dowel_a_${tag}`;
+    const pw = `pw-a-${tag}`;
+    const targetDb = `q7_a_${tag}`;
+    const shadowDb = `${targetDb}_dowel`;
+    let shadow: ReturnType<typeof pgShadow> | null = null;
+
+    await admin.db.exec(`CREATE ROLE ${ident(role)} NOSUPERUSER CREATEDB LOGIN PASSWORD ${literal(pw)}`);
+    await admin.db.exec(`CREATE DATABASE ${ident(targetDb)} OWNER ${ident(role)}`);
+    try {
+      const prepared = await ensureSameInstanceShadow(roleUrlFor(role, pw, targetDb));
+      expect(prepared.created).toBe(true);
+      expect(prepared.shadow).toBe(shadowDb);
+
+      const [mark] = await admin.db.query<{ c: string | null }>(
+        "select shobj_description(oid, 'pg_database') as c from pg_database where datname = $1",
+        [shadowDb],
+      );
+      expect(mark?.c).toBe(SHADOW_MARK);
+
+      shadow = pgShadow(prepared.url);
+      const imported = await shadow.importSql(
+        assertImportable('CREATE TABLE public.accounts (id bigint primary key, email text not null)'),
+      );
+      expect(Object.values(imported.objects).some((o) => o.kind === 'table' && o.name === 'accounts')).toBe(
+        true,
+      );
+      expect(await shadowLockIsFree(prepared.url)).toBe(true);
+
+      const vRep = await shadow.verify(FROM, TO);
+      expect(vRep.ok).toBe(true);
+      expect(vRep.error).toBeNull();
+      expect(await shadowLockIsFree(prepared.url)).toBe(true);
+
+      const withCheck = ordersModel();
+      const tblId = Object.values(withCheck.objects).find((o) => o.kind === 'table')!.id;
+      const ckId = addCheck(withCheck, tblId, 'id > 0', 'ck-id-pos');
+      const changed = await shadow.canonicalize(FROM, withCheck);
+      expect(changed.some((o) => o.kind === 'check' && o.id === ckId)).toBe(true);
+      expect(await shadowLockIsFree(prepared.url)).toBe(true);
+    } finally {
+      await shadow?.close();
+      await admin.db.exec(`DROP DATABASE IF EXISTS ${ident(shadowDb)} WITH (FORCE)`).catch(() => {});
+      await admin.db.exec(`DROP DATABASE IF EXISTS ${ident(targetDb)} WITH (FORCE)`).catch(() => {});
+      await admin.db.exec(`DROP ROLE IF EXISTS ${ident(role)}`).catch(() => {});
+    }
+  });
+
+  test('Case B：NOSUPERUSER + NOCREATEDB 报错给出精确 CREATE DATABASE ... OWNER SQL；DBA 执行后可认领并完成验证', async () => {
+    const tag = randomTag();
+    const role = `dowel_b_${tag}`;
+    const pw = `pw-b-${tag}`;
+    const targetDb = `q7_b_${tag}`;
+    const shadowDb = `${targetDb}_dowel`;
+    let shadow: ReturnType<typeof pgShadow> | null = null;
+
+    await admin.db.exec(`CREATE ROLE ${ident(role)} NOSUPERUSER NOCREATEDB LOGIN PASSWORD ${literal(pw)}`);
+    await admin.db.exec(`CREATE DATABASE ${ident(targetDb)} OWNER ${ident(role)}`);
+    try {
+      const targetRoleUrl = roleUrlFor(role, pw, targetDb);
+      const err = await ensureSameInstanceShadow(targetRoleUrl).then(
+        () => null,
+        (e: unknown) => e,
+      );
+      expect(err).toBeInstanceOf(ShadowError);
+      expect(err).not.toBeInstanceOf(ShadowUnavailableError);
+      const msg = (err as Error).message;
+      expect(msg).not.toContain(pw);
+      const expectedSql = `CREATE DATABASE ${ident(shadowDb)} OWNER ${ident(role)};`;
+      expect(msg).toContain(expectedSql);
+      expect(msg).toContain('独立');
+
+      // 管理员直接执行报错中给出的 SQL
+      await admin.db.exec(expectedSql);
+
+      const prepared = await ensureSameInstanceShadow(targetRoleUrl);
+      expect(prepared.created).toBe(false);
+      expect(prepared.shadow).toBe(shadowDb);
+
+      shadow = pgShadow(prepared.url);
+      const imported = await shadow.importSql(
+        assertImportable('CREATE TABLE public.invoices (id bigint primary key)'),
+      );
+      expect(Object.values(imported.objects).some((o) => o.kind === 'table' && o.name === 'invoices')).toBe(
+        true,
+      );
+      const rep = await shadow.verify(FROM, TO);
+      expect(rep.ok).toBe(true);
+      expect(await shadowLockIsFree(prepared.url)).toBe(true);
+    } finally {
+      await shadow?.close();
+      await admin.db.exec(`DROP DATABASE IF EXISTS ${ident(shadowDb)} WITH (FORCE)`).catch(() => {});
+      await admin.db.exec(`DROP DATABASE IF EXISTS ${ident(targetDb)} WITH (FORCE)`).catch(() => {});
+      await admin.db.exec(`DROP ROLE IF EXISTS ${ident(role)}`).catch(() => {});
+    }
+  });
+
+  test('Case C：NOSUPERUSER 非库所有者认领未打标空库给出精确 ALTER DATABASE ... OWNER TO SQL；移交后认领与验证成功', async () => {
+    const tag = randomTag();
+    const role = `dowel_c_${tag}`;
+    const pw = `pw-c-${tag}`;
+    const dbName = `q7_c_${tag}`;
+    let shadow: ReturnType<typeof pgShadow> | null = null;
+
+    await admin.db.exec(`CREATE ROLE ${ident(role)} NOSUPERUSER NOCREATEDB LOGIN PASSWORD ${literal(pw)}`);
+    await admin.db.exec(`CREATE DATABASE ${ident(dbName)}`);
+    try {
+      const roleDbUrl = roleUrlFor(role, pw, dbName);
+      const err = await claimShadow(roleDbUrl).then(
+        () => null,
+        (e: unknown) => e,
+      );
+      expect(err).toBeInstanceOf(ShadowError);
+      expect(err).not.toBeInstanceOf(ShadowUnavailableError);
+      const msg = (err as Error).message;
+      expect(msg).toMatch(/^认领影子库失败：当前账号不是该库的所有者/);
+      expect(msg).not.toContain(pw);
+      const expectedAlter = `ALTER DATABASE ${ident(dbName)} OWNER TO ${ident(role)};`;
+      expect(msg).toContain(expectedAlter);
+      expect(msg).toContain(`COMMENT ON DATABASE ${ident(dbName)} IS ${literal(SHADOW_MARK)};`);
+
+      await admin.db.exec(expectedAlter);
+      await claimShadow(roleDbUrl);
+
+      shadow = pgShadow(roleDbUrl);
+      const rep = await shadow.verify(FROM, TO);
+      expect(rep.ok).toBe(true);
+      expect(await shadowLockIsFree(roleDbUrl)).toBe(true);
+    } finally {
+      await shadow?.close();
+      await admin.db.exec(`DROP DATABASE IF EXISTS ${ident(dbName)} WITH (FORCE)`).catch(() => {});
+      await admin.db.exec(`DROP ROLE IF EXISTS ${ident(role)}`).catch(() => {});
+    }
+  });
+
+  test('Case D：DBA 预打标但未移交所有权时 resetShadow 42501 不误判为基础设施故障且释放锁；补交所有权后立即恢复', async () => {
+    const tag = randomTag();
+    const role = `dowel_d_${tag}`;
+    const pw = `pw-d-${tag}`;
+    const dbName = `q7_d_${tag}`;
+    const roleDbUrl = roleUrlFor(role, pw, dbName);
+    let shadow: ReturnType<typeof pgShadow> | null = null;
+
+    await admin.db.exec(`CREATE ROLE ${ident(role)} NOSUPERUSER NOCREATEDB LOGIN PASSWORD ${literal(pw)}`);
+    await admin.db.exec(`CREATE DATABASE ${ident(dbName)}`);
+    await admin.db.exec(`COMMENT ON DATABASE ${ident(dbName)} IS ${literal(SHADOW_MARK)}`);
+    try {
+      shadow = pgShadow(roleDbUrl);
+      const expectedAlter = `ALTER DATABASE ${ident(dbName)} OWNER TO ${ident(role)};`;
+
+      const verifyErr = await shadow.verify(FROM, TO).then(
+        () => null,
+        (e: unknown) => e,
+      );
+      expect(verifyErr).toBeInstanceOf(ShadowError);
+      expect(verifyErr).not.toBeInstanceOf(ShadowUnavailableError);
+      expect((verifyErr as Error).message).not.toContain('影子库不可用');
+      expect((verifyErr as Error).message).not.toContain(pw);
+      expect((verifyErr as Error).message).toContain(expectedAlter);
+      expect(await shadowLockIsFree(roleDbUrl)).toBe(true);
+
+      const importErr = await shadow
+        .importSql(assertImportable('CREATE TABLE public.tmp_check (id int)'))
+        .then(
+          () => null,
+          (e: unknown) => e,
+        );
+      expect(importErr).toBeInstanceOf(ShadowError);
+      expect(importErr).not.toBeInstanceOf(ShadowUnavailableError);
+      expect((importErr as Error).message).not.toContain('影子库不可用');
+      expect((importErr as Error).message).not.toContain(pw);
+      expect((importErr as Error).message).toContain(expectedAlter);
+      expect(await shadowLockIsFree(roleDbUrl)).toBe(true);
+
+      // 管理员补交所有权后，同一 pgShadow 实例立即恢复正常
+      await admin.db.exec(expectedAlter);
+
+      const rep = await shadow.verify(FROM, TO);
+      expect(rep.ok).toBe(true);
+      expect(rep.error).toBeNull();
+      const imported = await shadow.importSql(
+        assertImportable('CREATE TABLE public.restored_ok (id bigint primary key)'),
+      );
+      expect(
+        Object.values(imported.objects).some((o) => o.kind === 'table' && o.name === 'restored_ok'),
+      ).toBe(true);
+      expect(await shadowLockIsFree(roleDbUrl)).toBe(true);
+    } finally {
+      await shadow?.close();
+      await admin.db.exec(`DROP DATABASE IF EXISTS ${ident(dbName)} WITH (FORCE)`).catch(() => {});
+      await admin.db.exec(`DROP ROLE IF EXISTS ${ident(role)}`).catch(() => {});
     }
   });
 });

@@ -29,13 +29,77 @@ import {
 
 export type ShadowSetupStep = 'create' | 'claim' | 'claim-read' | 'check';
 
+export interface ShadowSetupErrorContext {
+  url?: string;
+  dbName?: string;
+  currentUser?: string;
+}
+
 const pgCode = (e: unknown): string | null => {
   const code = (e as { code?: unknown } | null)?.code;
   return typeof code === 'string' ? code : null;
 };
 
-const rawError = (e: unknown) => (e instanceof Error ? e.message : String(e));
+const rawError = (e: unknown): string => {
+  if (e instanceof Error) return e.message;
+  if (
+    e &&
+    typeof e === 'object' &&
+    'message' in e &&
+    typeof (e as { message?: unknown }).message === 'string'
+  ) {
+    return (e as { message: string }).message;
+  }
+  return String(e);
+};
 const pgError = (e: unknown) => scrubSecrets(rawError(e));
+
+const PG_POOLER_HINT =
+  '提示：检测到可能正在使用 PostgreSQL Transaction Pooler（事务池化器）。Dowel 的影子库与生命周期检查依赖会话级 advisory lock、SET 参数以及非事务块建库，不支持 Transaction Pooler，请改用直连地址或 Session Mode（通常为端口 5432）。';
+
+export const isLikelyPgTransactionPoolerUrl = (url: string): boolean => {
+  let u: URL;
+  try {
+    u = new URL(url);
+  } catch {
+    return false;
+  }
+  if (!/^postgres(?:ql)?:$/i.test(u.protocol)) return false;
+  const host = u.hostname.toLowerCase();
+  if (host.includes('-pooler.')) return true;
+  if (host.endsWith('.pooler.supabase.com') && u.port === '6543') return true;
+  if (u.port === '6543') return true;
+  for (const [rawKey, rawVal] of u.searchParams.entries()) {
+    const key = rawKey.trim().toLowerCase();
+    const val = rawVal.trim().toLowerCase();
+    if (key === 'pgbouncer' && val === 'true') return true;
+    if (key === 'pool_mode' && val === 'transaction') return true;
+  }
+  return false;
+};
+
+export const isPgPoolerError = (e: unknown): boolean =>
+  /pgbouncer|supavisor|transaction\s+mode|pool_mode|unsupported startup parameter|prepared statement[\s\S]*?(?:already exists|does not exist)/i.test(
+    rawError(e),
+  );
+
+const isCreateInTransactionError = (e: unknown): boolean =>
+  pgCode(e) === '25001' || /cannot run inside a transaction block/i.test(rawError(e));
+
+export const appendPgPoolerHint = (
+  message: string,
+  ctx?: { url?: string; error?: unknown; step?: ShadowSetupStep },
+): string => {
+  if (message.includes(PG_POOLER_HINT)) return message;
+  const matched =
+    Boolean(ctx?.url && isLikelyPgTransactionPoolerUrl(ctx.url)) ||
+    (ctx?.error !== undefined && isPgPoolerError(ctx.error)) ||
+    (ctx?.step === 'create' && ctx?.error !== undefined && isCreateInTransactionError(ctx.error));
+  if (!matched) return message;
+  const trimmed = message.trimEnd();
+  const sep = /[。！？.!?]$/.test(trimmed) ? '' : '。';
+  return `${trimmed}${sep}${PG_POOLER_HINT}`;
+};
 
 const extractRawPassword = (url: string): string => {
   try {
@@ -70,23 +134,32 @@ export const scrubUrl = (message: string, url: string): string => {
   return out;
 };
 
-export const shadowSetupError = (e: unknown, step: ShadowSetupStep): Error => {
+export const shadowSetupError = (e: unknown, step: ShadowSetupStep, ctx?: ShadowSetupErrorContext): Error => {
   if (e instanceof HTTPException || e instanceof ShadowError) return e;
-  const msg = pgError(e);
-  if (isInfraFailure(e)) return new ShadowUnavailableError(msg);
-  if (step === 'create') return new ShadowError(`建影子库失败：${msg}`);
-  if (step === 'check') return new ShadowError(`检查影子库失败：${msg}`);
+  const msg = ctx?.url ? scrubUrl(rawError(e), ctx.url) : pgError(e);
+  const withHint = (text: string) => appendPgPoolerHint(text, { url: ctx?.url, error: e, step });
+  if (isInfraFailure(e)) return new ShadowUnavailableError(withHint(msg));
+  if (step === 'create') return new ShadowError(withHint(`建影子库失败：${msg}`));
+  if (step === 'check') return new ShadowError(withHint(`检查影子库失败：${msg}`));
   const noPrivilege = pgCode(e) === '42501';
   if (step === 'claim-read')
     return new ShadowError(
-      noPrivilege
-        ? `认领影子库失败：当前账号缺少读取目录的权限，没法核对这个库是不是空库或已经标记过（${msg}）`
-        : `认领影子库失败：${msg}`,
+      withHint(
+        noPrivilege
+          ? `认领影子库失败：当前账号缺少读取目录的权限，没法核对这个库是不是空库或已经标记过（${msg}）`
+          : `认领影子库失败：${msg}`,
+      ),
     );
+  const claimSuffix =
+    ctx?.dbName && ctx?.currentUser
+      ? `。请让管理员执行：ALTER DATABASE ${ident(ctx.dbName)} OWNER TO ${ident(ctx.currentUser)};（或由库所有者在移交库与 schema 所有权后执行：COMMENT ON DATABASE ${ident(ctx.dbName)} IS ${literal(SHADOW_MARK)};）`
+      : '。请用库的所有者账号，或让 DBA 先建好并标记这个库';
   return new ShadowError(
-    noPrivilege
-      ? `认领影子库失败：当前账号不是该库的所有者，没法给它打 Dowel 影子库标记（${msg}）。请用库的所有者账号，或让 DBA 先建好并标记这个库`
-      : `认领影子库失败：${msg}`,
+    withHint(
+      noPrivilege
+        ? `认领影子库失败：当前账号不是该库的所有者，没法给它打 Dowel 影子库标记（${msg}）${claimSuffix}`
+        : `认领影子库失败：${msg}`,
+    ),
   );
 };
 
@@ -192,7 +265,7 @@ export const inspectPgTargetOn = async (tdb: Db, url: string): Promise<TargetInf
     };
   } catch (e) {
     if (e instanceof HTTPException) throw e;
-    throw new ConnectError(`连接失败：${scrubUrl(rawError(e), url)}`);
+    throw new ConnectError(appendPgPoolerHint(`连接失败：${scrubUrl(rawError(e), url)}`, { url, error: e }));
   }
 };
 
@@ -235,6 +308,8 @@ const isMarked = async (db: Db) => {
 export const claimPgShadow = async (url: string, guard?: ConnectionGuard) => {
   const c = connectPg(url, CHECK_CONNECT_TIMEOUT, guard);
   let phase: ShadowSetupStep = 'claim-read';
+  let dbName: string | undefined;
+  let currentUser: string | undefined;
   try {
     if (await isMarked(c.db)) return;
     const [r] = await c.db.query<{ n: number }>(
@@ -245,7 +320,11 @@ export const claimPgShadow = async (url: string, guard?: ConnectionGuard) => {
       throw new ShadowError(
         '拒绝使用这个库作影子库：它不是空库，也没有 Dowel 影子库标记。影子库每次检查前都会被清空',
       );
-    const [d] = await c.db.query<{ d: string }>('select current_database() as d');
+    const [d] = await c.db.query<{ d: string; u: string }>(
+      'select current_database() as d, current_user as u',
+    );
+    dbName = d?.d;
+    currentUser = d?.u;
     phase = 'claim';
     try {
       await c.db.exec(`COMMENT ON DATABASE ${ident(d!.d)} IS ${literal(SHADOW_MARK)}`);
@@ -254,7 +333,7 @@ export const claimPgShadow = async (url: string, guard?: ConnectionGuard) => {
       throw e;
     }
   } catch (e) {
-    throw shadowSetupError(e, phase);
+    throw shadowSetupError(e, phase, { url, dbName, currentUser });
   } finally {
     await c.close();
   }
@@ -273,7 +352,9 @@ export const ensureSameInstanceShadow = async (
     const deadline = Date.now() + SHADOW_LIFECYCLE_LOCK_TIMEOUT_MS;
     while (!(await tryShadowLifecycleLock(c.db, info.shadow))) {
       if (Date.now() > deadline)
-        throw new ShadowUnavailableError('影子库正在被其他请求初始化或清理，请稍后再试');
+        throw new ShadowUnavailableError(
+          appendPgPoolerHint('影子库正在被其他请求初始化或清理，请稍后再试', { url: targetUrl }),
+        );
       await new Promise((r) => setTimeout(r, 100));
     }
     locked = true;
@@ -284,19 +365,19 @@ export const ensureSameInstanceShadow = async (
     if ((ex?.n ?? 0) === 0) {
       if (!info.canCreateDb)
         throw new ShadowError(
-          `当前账号没有建库权限。请在目标实例上手动执行：CREATE DATABASE ${ident(info.shadow)} OWNER <Dowel 使用的账号>;`,
+          `当前账号没有建库权限。请在目标实例上手动执行：CREATE DATABASE ${ident(info.shadow)} OWNER ${ident(info.currentUser)};（也可为该环境配置独立的影子库连接串）`,
         );
       try {
         await c.db.exec(`CREATE DATABASE ${ident(info.shadow)}`);
         created = true;
       } catch (e) {
         const code = pgCode(e);
-        if (code !== '42P04' && code !== '23505') throw shadowSetupError(e, 'create');
+        if (code !== '42P04' && code !== '23505') throw shadowSetupError(e, 'create', { url: targetUrl });
       }
     }
     await claimPgShadow(url, guard);
   } catch (e) {
-    throw shadowSetupError(e, 'create');
+    throw shadowSetupError(e, 'create', { url: targetUrl });
   } finally {
     if (locked) await unlockShadowLifecycle(c.db, info.shadow);
     await c.close().catch(() => {});
@@ -367,16 +448,28 @@ export const pgShadow = (shadowUrl: string, schemas?: string[] | null, guard?: C
             await db.query<{ ok: boolean }>("select pg_try_advisory_lock(hashtext('dowel_shadow')) as ok")
           )[0]!.ok
         ) {
-          if (Date.now() > deadline) throw new ShadowUnavailableError('正被其他检查占用，请稍后再试');
+          if (Date.now() > deadline)
+            throw new ShadowUnavailableError(
+              appendPgPoolerHint('正被其他检查占用，请稍后再试', { url: shadowUrl }),
+            );
           await new Promise((r) => setTimeout(r, 500));
         }
       } catch (e) {
         await discard();
-        throw e instanceof ShadowError ? e : new ShadowUnavailableError(`连接失败：${pgError(e)}`);
+        throw e instanceof ShadowError
+          ? e
+          : new ShadowUnavailableError(
+              appendPgPoolerHint(`连接失败：${scrubUrl(rawError(e), shadowUrl)}`, {
+                url: shadowUrl,
+                error: e,
+              }),
+            );
       }
       let clean = false;
       try {
-        if (!(await isMarked(db).catch((e) => Promise.reject(shadowSetupError(e, 'check')))))
+        if (
+          !(await isMarked(db).catch((e) => Promise.reject(shadowSetupError(e, 'check', { url: shadowUrl }))))
+        )
           throw new ShadowError('拒绝执行：影子库的 Dowel 标记不见了');
         const result = await fn(shadowOps(async () => db, schemas, { dialect: 'pg' }));
         clean = true;
@@ -417,7 +510,9 @@ export const pullPgSchema = async (
     return importSnapshot(await readSnapshot(c.db, schemas));
   } catch (e) {
     if (e instanceof HTTPException) throw e;
-    throw new ConnectError(`读取结构失败：${scrubUrl(rawError(e), url)}`);
+    throw new ConnectError(
+      appendPgPoolerHint(`读取结构失败：${scrubUrl(rawError(e), url)}`, { url, error: e }),
+    );
   } finally {
     await c.close();
   }

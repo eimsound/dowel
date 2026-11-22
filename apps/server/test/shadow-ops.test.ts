@@ -11,7 +11,13 @@ import type { Db } from '@dowel/engines';
 import { StepError } from '@dowel/verifier';
 import { describe, expect, test } from 'vitest';
 
-import { assertImportable, isInfraFailure, ShadowError, shadowOps } from '../src/shadow.ts';
+import {
+  assertImportable,
+  isInfraFailure,
+  ShadowError,
+  shadowOps,
+  ShadowUnavailableError,
+} from '../src/shadow.ts';
 
 const modelWith = (schema: string): Model => {
   const m = emptyModel();
@@ -95,6 +101,13 @@ describe('isInfraFailure', () => {
     expect(isInfraFailure(new ShadowError('被占用'))).toBe(true);
     expect(isInfraFailure(new StepError(step, new ShadowError('被占用')))).toBe(true);
     expect(isInfraFailure(new Error('boom'))).toBe(false);
+  });
+
+  test('42501（权限不足）无论在步骤内还是步骤外都不是基础设施故障', () => {
+    expect(isInfraFailure(pgError('42501', 'must be owner of schema public'))).toBe(false);
+    expect(isInfraFailure(new StepError(step, pgError('42501', 'permission denied for schema public')))).toBe(
+      false,
+    );
   });
 });
 
@@ -529,5 +542,57 @@ describe('报告和 riskError 里的错误消息脱敏', () => {
     expect(r.ok).toBe(true);
     expect(r.riskError).toContain('postgres://u:***@h/db');
     expect(JSON.stringify(r)).not.toContain('pw');
+  });
+});
+
+describe('resetShadow 权限不足（PG 42501）归类与 SQL 提示', () => {
+  const privDb = (hook: (sql: string) => unknown): Db => ({
+    query: async (q) => {
+      const err = hook(q);
+      if (err) throw err;
+      if (q.includes('server_version_num')) return [{ v: 180000 }] as never;
+      if (q.includes('pg_namespace')) return [{ n: 'public' }] as never;
+      if (q.includes('current_database()')) return [{ d: 'shop_dowel', u: 'dowel_app' }] as never;
+      return [] as never;
+    },
+    exec: async (q) => {
+      const err = hook(q);
+      if (err) throw err;
+    },
+  });
+
+  test('verify / verifyScripts / importSql / canonicalize 在 resetShadow 遇 42501 时抛非不可用类 ShadowError 并附精确 SQL', async () => {
+    const dropDenied = (sql: string) =>
+      sql.startsWith('DROP SCHEMA') ? pgError('42501', 'must be owner of schema public') : undefined;
+    const ops = shadowOps(async () => privDb(dropDenied));
+
+    for (const run of [
+      () => ops.verify(FROM, TO),
+      () => ops.verifyScripts(FROM, TO, FROZEN_UP, FROZEN_DOWN),
+      () => ops.importSql(assertImportable('CREATE TABLE public.t (id int)')),
+      () => ops.canonicalize(FROM, TO),
+    ]) {
+      const e = await run().then(
+        () => null,
+        (x: unknown) => x,
+      );
+      expect(e).toBeInstanceOf(ShadowError);
+      expect(e).not.toBeInstanceOf(ShadowUnavailableError);
+      expect((e as Error).message).not.toContain('影子库不可用');
+      expect((e as Error).message).toContain('ALTER DATABASE shop_dowel OWNER TO dowel_app;');
+    }
+  });
+
+  test('importSql 在 resetShadow 遇基础设施连接故障时仍抛 ShadowUnavailableError', async () => {
+    const connDropped = (sql: string) =>
+      sql.startsWith('DROP SCHEMA') ? pgError('CONNECTION_CLOSED', '连接断开了') : undefined;
+    const e = await shadowOps(async () => privDb(connDropped))
+      .importSql(assertImportable('CREATE TABLE public.t (id int)'))
+      .then(
+        () => null,
+        (x: unknown) => x,
+      );
+    expect(e).toBeInstanceOf(ShadowUnavailableError);
+    expect((e as Error).message).toBe('影子库不可用：连接断开了');
   });
 });

@@ -26,6 +26,7 @@ Dowel 的每个项目在创建时绑定一种目标数据库方言，并在全�
 
 - **多版本环境验证**：当项目同时连接不同大版本的环境（例如 `dev` 为 PG 18、`prod` 为 PG 15）时，点击“在影子库验证”会按环境大版本分组依次在对应版本的代表影子库上实测迁移。
 - **最低版本强制门禁**：若缺少项目最低目标版本对应的可用影子库（例如未给 PG 15 生产环境配置独立影子库且不允许同实例），Dowel 会保留各版本组的实测结果但拒绝将该版本标为“已验证”，也不允许执行到目标库。
+- **连接模式与托管库配置**：PostgreSQL 需使用直连地址或 Session Mode（如端口 `5432`），请勿使用 Supabase `6543`、Neon `-pooler` 等 Transaction Pooler；托管库拓扑与最小权限 SQL 见 [托管数据库与受限权限配置](modeling.md#managed-shadow-db)。
 
 ### PostgreSQL 15–19 版本能力与静态检查 {#pg-capabilities}
 
@@ -64,7 +65,7 @@ Dowel 的每个项目在创建时绑定一种目标数据库方言，并在全�
 
 - 连接串格式为 `mysql://user:password@host:3306/dbname`（必须包含数据库名，禁用 `?socketPath=` 与 unix socket）。
 - **TLS 参数**：支持查询参数 `ssl`、`ssl-mode` 或 `sslmode`（`DISABLED`、`PREFERRED`、`REQUIRED`/`REQUIRE`、`VERIFY_CA`/`VERIFY-CA`、`VERIFY_IDENTITY`/`VERIFY-FULL`）；启用 TLS 时默认严格校验证书（如需自定义参数可传合法 `ssl` JSON）。
-- **同实例影子库**：默认在同实例自动建 `{原库名}_dowel`（超长时截断加 8 位哈希后缀，总长不超过 64 字符），在库内创建 `__dowel_shadow_mark` 哨兵表防误删，并使用会话级 `GET_LOCK` / `RELEASE_LOCK` 串行排队。
+- **同实例影子库**：默认在同实例自动建 `{原库名}_dowel`（超长时截断加 8 位哈希后缀，总长不超过 64 字符），在库内创建 `__dowel_shadow_mark` 哨兵表防误删，并使用会话级 `GET_LOCK` / `RELEASE_LOCK` 串行排队；受限权限预建影子库 SQL 见 [托管数据库与受限权限配置](modeling.md#managed-shadow-db)。
 
 ### 专属特性与版本能力 {#mysql-features}
 
@@ -79,7 +80,7 @@ Dowel 的每个项目在创建时绑定一种目标数据库方言，并在全�
 
 - 连接串支持 `mssql://` 或 `sqlserver://`，端口默认 `1433`，支持 `host\instance` 命名实例语法与大小写不敏感查询参数（`encrypt`、`trustServerCertificate`、`connectTimeout`、`requestTimeout`、`appName`）。
 - **自签名证书提示**：Dowel 默认启用严格的 TLS 校验（`encrypt=true`、`trustServerCertificate=false`）。当连接测试环境、Docker 容器或使用自签名证书的 SQL Server 实例时，需在连接串后显式加上 `?encrypt=true&trustServerCertificate=true`。
-- **同实例影子库**：默认在同实例建 `{原库名}_dowel`（上限 128 字符），明确拒绝使用系统库（`master`、`tempdb`、`model`、`msdb`），使用数据库扩展属性 `dowel_shadow` 标记并使用 `sys.sp_getapplock`（Session 级）互斥。
+- **同实例影子库**：默认在同实例建 `{原库名}_dowel`（上限 128 字符），明确拒绝使用系统库（`master`、`tempdb`、`model`、`msdb`），使用数据库扩展属性 `dowel_shadow` 标记并使用 `sys.sp_getapplock`（Session 级）互斥；受限权限预建影子库 SQL 见 [托管数据库与受限权限配置](modeling.md#managed-shadow-db)。
 
 ### 专属特性与版本能力 {#mssql-features}
 
