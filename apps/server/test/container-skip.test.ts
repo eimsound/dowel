@@ -4,6 +4,7 @@ import { afterEach, beforeEach, describe, expect, test, vi } from 'vitest';
 const mocks = vi.hoisted(() => ({
   getContainerRuntimeClient: vi.fn(),
   pgCtor: vi.fn(),
+  pgCommand: vi.fn(),
   pgStart: vi.fn(),
   mysqlCtor: vi.fn(),
   mysqlStart: vi.fn(),
@@ -24,6 +25,10 @@ vi.mock('@testcontainers/postgresql', () => ({
       return this;
     }
     withPassword() {
+      return this;
+    }
+    withCommand(cmd: string[]) {
+      mocks.pgCommand(cmd);
       return this;
     }
     start() {
@@ -172,6 +177,7 @@ describe('测试容器跳过标记与连接串规范化', () => {
     await expect(pg?.stop()).resolves.toBeUndefined();
     expect(mocks.getContainerRuntimeClient).not.toHaveBeenCalled();
     expect(mocks.pgCtor).not.toHaveBeenCalled();
+    expect(mocks.pgCommand).not.toHaveBeenCalled();
     expect(mocks.pgStart).not.toHaveBeenCalled();
 
     const mysqlUrl = 'mysql://root:pass@127.0.0.1:3306/mysql';
@@ -192,6 +198,35 @@ describe('测试容器跳过标记与连接串规范化', () => {
     expect(mocks.getContainerRuntimeClient).not.toHaveBeenCalled();
     expect(mocks.mssqlCtor).not.toHaveBeenCalled();
     expect(mocks.mssqlStart).not.toHaveBeenCalled();
+  });
+
+  test('startPg 启动容器时配置非持久化 PostgreSQL 参数且不影响外部连接串', async () => {
+    const stop = vi.fn(async () => {});
+    mocks.getContainerRuntimeClient.mockResolvedValueOnce({} as never);
+    mocks.pgStart.mockResolvedValueOnce({
+      getConnectionUri: () => 'postgres://postgres:dowel-test-secret@127.0.0.1:5432/postgres',
+      stop,
+    });
+
+    const pg = await startPg();
+    expect(pg?.url).toBe('postgres://postgres:dowel-test-secret@127.0.0.1:5432/postgres');
+    expect(mocks.pgCtor).toHaveBeenCalledTimes(1);
+    expect(mocks.pgCommand).toHaveBeenCalledWith([
+      'postgres',
+      '-c',
+      'fsync=off',
+      '-c',
+      'synchronous_commit=off',
+      '-c',
+      'full_page_writes=off',
+      '-c',
+      'max_wal_size=2GB',
+      '-c',
+      'checkpoint_timeout=1h',
+    ]);
+    expect(mocks.pgStart).toHaveBeenCalledTimes(1);
+    await expect(pg?.stop()).resolves.toBeUndefined();
+    expect(stop).toHaveBeenCalledTimes(1);
   });
 
   test('e2e globalSetup 在 DOWEL_TEST_PG=skip 时删除环境变量，在有效 URL 时写入 trim 后值', async () => {
