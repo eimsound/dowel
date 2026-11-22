@@ -1,13 +1,19 @@
 // 画布板块（Section）的服务端验证、持久化与 HA 跨副本同步测试。
 import { type CanvasSection, SECTION_COLORS } from '@dowel/api';
-import { newId } from '@dowel/core';
+import { emptyModel, newId } from '@dowel/core';
 import type { ToClient } from '@dowel/sync';
 import { afterAll, afterEach, beforeAll, describe, expect, test } from 'vitest';
 
 import { createTestDb, PG_URL } from '../../../test/pg.ts';
 import { createApp } from '../src/app.ts';
 import type { User } from '../src/auth.ts';
-import { MAX_EVENT_BYTES } from '../src/bus.ts';
+import {
+  type ClusterEvent,
+  type ClusterEventHandler,
+  type EventBus,
+  MAX_EVENT_BYTES,
+  type ReconnectHandler,
+} from '../src/bus.ts';
 import { openPlatformDb, type PlatformDb } from '../src/db.ts';
 import { effectiveProjectRole } from '../src/roles.ts';
 import { type Extra, type Peer, Rooms, type RoomsOptions } from '../src/rooms.ts';
@@ -302,6 +308,296 @@ describe.skipIf(!PG_URL)('PG HA 双副本画布板块同步与大负载 reload �
       expect(afterFlushB?.sections[0]?.id).toBe('sec_large_000');
     } finally {
       off();
+    }
+  });
+});
+
+const deferred = () => {
+  let resolve!: () => void;
+  const promise = new Promise<void>((res) => {
+    resolve = res;
+  });
+  return { promise, resolve };
+};
+
+const makeFakeBus = (replicaId: string) => {
+  const eventHandlers = new Set<ClusterEventHandler>();
+  const reconnectHandlers = new Set<ReconnectHandler>();
+  const bus = {
+    replicaId,
+    channel: 'sections_race_test',
+    onEvent: (handler: ClusterEventHandler) => {
+      eventHandlers.add(handler);
+      return () => {
+        eventHandlers.delete(handler);
+      };
+    },
+    onReconnect: (handler: ReconnectHandler) => {
+      reconnectHandlers.add(handler);
+      return () => {
+        reconnectHandlers.delete(handler);
+      };
+    },
+    start: () => Promise.resolve(),
+    close: () => Promise.resolve(),
+    publish: () => Promise.resolve(),
+  } as unknown as EventBus;
+  const emit = async (event: ClusterEvent) => {
+    for (const handler of [...eventHandlers]) {
+      await handler(event);
+    }
+  };
+  return { bus, emit };
+};
+
+describe('画布板块在途落库与重载竞态回归', () => {
+  let db: PlatformDb;
+  let created: ReturnType<typeof createApp>;
+  let projectId: string;
+  let editorUser: User;
+  let branchCounter = 0;
+
+  beforeAll(async () => {
+    db = await openPlatformDb(':memory:');
+    created = createApp(db);
+
+    await makeUser(db, 'sec-race-admin', { name: '竞态测试管理员' });
+    editorUser = await makeUser(db, 'sec-race-editor', { name: '竞态测试编辑者' });
+
+    const login = await created.app.request('/api/auth/login', {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ username: 'sec-race-admin', password: PASSWORD }),
+    });
+    const cookie = login.headers.get('set-cookie')!.split(';')[0]!;
+    const grp = await created.app.request('/api/groups', {
+      method: 'POST',
+      headers: { cookie, 'content-type': 'application/json' },
+      body: JSON.stringify({ slug: 'sections-race-g', name: '板块竞态测试组', defaultRole: 'none' }),
+    });
+    const groupId = ((await grp.json()) as { id: string }).id;
+    const proj = await created.app.request('/api/projects', {
+      method: 'POST',
+      headers: { cookie, 'content-type': 'application/json' },
+      body: JSON.stringify({ name: '板块竞态项目', groupId }),
+    });
+    projectId = ((await proj.json()) as { id: string }).id;
+    await db.query(
+      `insert into grants (id, subject_kind, subject_id, role, scope_kind, scope_id)
+       values ($1, 'user', $2, 'editor', 'project', $3)`,
+      [newId(), editorUser.id, projectId],
+    );
+  });
+
+  afterAll(async () => {
+    created.rooms.close();
+    await created.rooms.flush();
+    await created.shadows.close();
+    await created.bus.close();
+    await db.close();
+  });
+
+  const setupRaceRoom = async () => {
+    branchCounter += 1;
+    const branchId = `sec-race-${branchCounter}-${newId()}`;
+    await db.query('insert into branches (id, project_id, name) values ($1, $2, $3)', [
+      branchId,
+      projectId,
+      `race-${branchCounter}`,
+    ]);
+    const fakeBus = makeFakeBus('replica-b');
+    const rooms = new Rooms(
+      db,
+      (u, pid, lookup) => effectiveProjectRole(db, u, pid, lookup),
+      fakeBus.bus,
+      undefined,
+      { layoutDebounceMs: 5000 },
+    );
+    await rooms.init(branchId, emptyModel());
+    const peerB = makePeer(editorUser);
+    await rooms.join(branchId, peerB.peer);
+    return { branchId, fakeBus, rooms, peerB };
+  };
+
+  test('在途旧 flushSections(B1) 与更新远端 room.sections(A2) 并发时，DB 自动幂等自愈为 A2 且无多余循环', async () => {
+    const { branchId, fakeBus, rooms, peerB } = await setupRaceRoom();
+    const origQuery = db.query.bind(db);
+    const enteredFirstUpdate = deferred();
+    const releaseFirstUpdate = deferred();
+    let updateCount = 0;
+
+    const b1: CanvasSection[] = [{ id: 'sec-b1', name: '本地旧板块', color: 'peer-1', tables: ['t1'] }];
+    const a2: CanvasSection[] = [{ id: 'sec-a2', name: '远端新板块', color: 'peer-2', tables: ['t2'] }];
+
+    try {
+      await rooms.message(branchId, peerB.peer, { t: 'sections', sections: b1 });
+
+      db.query = (async <T = Record<string, unknown>>(sql: string, params?: unknown[]) => {
+        if (sql.includes('update branches set sections')) {
+          updateCount += 1;
+          if (updateCount === 1) {
+            enteredFirstUpdate.resolve();
+            await releaseFirstUpdate.promise;
+          }
+        }
+        return origQuery<T>(sql, params);
+      }) as typeof db.query;
+
+      const flushPromise = rooms.flush();
+      await enteredFirstUpdate.promise;
+
+      // 在途 B1 尚未落库时，副本 A 已将 A2 写入 DB 并广播 room.sections
+      await origQuery('update branches set sections = $2::text::jsonb where id = $1', [
+        branchId,
+        JSON.stringify(a2),
+      ]);
+      await fakeBus.emit({ t: 'room.sections', origin: 'replica-a', branchId, sections: a2, ver: 2 });
+      expect(peerB.sent.at(-1)).toEqual({ t: 'sections', sections: a2 });
+
+      // 放行在途旧 SQL B1（后落盘覆写 DB 为 B1），flushSections 应感知版本变更并自愈回写 A2
+      releaseFirstUpdate.resolve();
+      await flushPromise;
+
+      expect(updateCount).toBe(2);
+      const [row] = await origQuery<{ sections: CanvasSection[] }>(
+        'select sections from branches where id = $1',
+        [branchId],
+      );
+      expect(row?.sections).toEqual(a2);
+
+      // 再次 flush 不再触发额外写库（无无限循环）
+      await rooms.flush();
+      expect(updateCount).toBe(2);
+    } finally {
+      db.query = origQuery;
+      rooms.close();
+      await rooms.flush();
+    }
+  });
+
+  test('reloadSectionsFromDb 严格等待在途 sectionsFlushing 排空后再查询 DB', async () => {
+    const { branchId, fakeBus, rooms, peerB } = await setupRaceRoom();
+    const origQuery = db.query.bind(db);
+    const enteredUpdate = deferred();
+    const releaseUpdate = deferred();
+    const events: string[] = [];
+
+    const b1: CanvasSection[] = [{ id: 'sec-b1', name: '本地先刷板块', color: 'peer-3', tables: ['t1'] }];
+    const a2: CanvasSection[] = [
+      { id: 'sec-a2', name: '远端重载板块', color: 'peer-4', tables: ['t2', 't3'] },
+    ];
+
+    try {
+      await rooms.message(branchId, peerB.peer, { t: 'sections', sections: b1 });
+
+      db.query = (async <T = Record<string, unknown>>(sql: string, params?: unknown[]) => {
+        if (sql.includes('update branches set sections')) {
+          events.push('update:start');
+          enteredUpdate.resolve();
+          await releaseUpdate.promise;
+          const res = await origQuery<T>(sql, params);
+          // 模拟 B1 写完后远端 A2 落库（reload 应当在 sectionsFlushing 完成后再读取到此结果）
+          await origQuery('update branches set sections = $2::text::jsonb where id = $1', [
+            branchId,
+            JSON.stringify(a2),
+          ]);
+          events.push('update:end');
+          return res;
+        }
+        if (sql.includes('select sections from branches')) {
+          events.push('select:start');
+          const res = await origQuery<T>(sql, params);
+          events.push('select:end');
+          return res;
+        }
+        return origQuery<T>(sql, params);
+      }) as typeof db.query;
+
+      const flushPromise = rooms.flush();
+      await enteredUpdate.promise;
+
+      const reloadPromise = fakeBus.emit({
+        t: 'room.sections.reload',
+        origin: 'replica-a',
+        branchId,
+        ver: 2,
+      });
+      await Promise.resolve();
+      await new Promise((r) => setTimeout(r, 20));
+      expect(events).toEqual(['update:start']);
+
+      releaseUpdate.resolve();
+      await Promise.all([flushPromise, reloadPromise]);
+
+      expect(events).toEqual(['update:start', 'update:end', 'select:start', 'select:end']);
+      expect(peerB.sent.at(-1)).toEqual({ t: 'sections', sections: a2 });
+    } finally {
+      db.query = origQuery;
+      rooms.close();
+      await rooms.flush();
+    }
+  });
+
+  test('reloadSectionsFromDb 查库挂起期间出现更新的本地写入（sectionsWriteSeq 递增）时，跳过旧重载不覆盖新状态', async () => {
+    const { branchId, fakeBus, rooms, peerB } = await setupRaceRoom();
+    const peerObserver = makePeer(editorUser);
+    await rooms.join(branchId, peerObserver.peer);
+
+    const origQuery = db.query.bind(db);
+    const enteredSelect = deferred();
+    const releaseSelect = deferred();
+
+    const a2: CanvasSection[] = [{ id: 'sec-a2', name: '过时远端重载', color: 'peer-5', tables: ['t1'] }];
+    const b3: CanvasSection[] = [{ id: 'sec-b3', name: '最新本地写入', color: 'peer-6', tables: ['t9'] }];
+
+    try {
+      await origQuery('update branches set sections = $2::text::jsonb where id = $1', [
+        branchId,
+        JSON.stringify(a2),
+      ]);
+
+      db.query = (async <T = Record<string, unknown>>(sql: string, params?: unknown[]) => {
+        if (sql.includes('select sections from branches')) {
+          enteredSelect.resolve();
+          await releaseSelect.promise;
+        }
+        return origQuery<T>(sql, params);
+      }) as typeof db.query;
+
+      const reloadPromise = fakeBus.emit({
+        t: 'room.sections.reload',
+        origin: 'replica-a',
+        branchId,
+        ver: 2,
+      });
+      await enteredSelect.promise;
+
+      // 查库挂起期间本地收到更新的板块写入 B3
+      await rooms.message(branchId, peerB.peer, { t: 'sections', sections: b3 });
+
+      releaseSelect.resolve();
+      await reloadPromise;
+
+      // 旧重载被拦截，不会向节点推送过时的 A2，也不会清掉待刷的 B3
+      expect(peerB.sent.some((m) => m.t === 'sections' && m.sections.some((s) => s.id === 'sec-a2'))).toBe(
+        false,
+      );
+      expect(
+        peerObserver.sent.some((m) => m.t === 'sections' && m.sections.some((s) => s.id === 'sec-a2')),
+      ).toBe(false);
+      expect(peerObserver.sent.at(-1)).toEqual({ t: 'sections', sections: b3 });
+
+      db.query = origQuery;
+      await rooms.flush();
+      const [row] = await origQuery<{ sections: CanvasSection[] }>(
+        'select sections from branches where id = $1',
+        [branchId],
+      );
+      expect(row?.sections).toEqual(b3);
+    } finally {
+      db.query = origQuery;
+      rooms.close();
+      await rooms.flush();
     }
   });
 });

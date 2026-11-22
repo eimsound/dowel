@@ -998,12 +998,15 @@ export class Rooms {
       if (r.sectionsTimer === timer) r.sectionsTimer = undefined;
       this.sectionsTimers.delete(r);
       if (this.closed || !this.isCurrentEntry(branchId, r)) return;
-      let failedWriteSeq = -1;
-      this.flushSections(branchId, r, (writeSeq) => {
-        failedWriteSeq = writeSeq;
+      let failedState: { writeSeq: number; version: LayoutVersion | null } = {
+        writeSeq: -1,
+        version: null,
+      };
+      this.flushSections(branchId, r, (state) => {
+        failedState = state;
       }).catch((e) => {
         console.error(`保存画布板块失败（branchId=${branchId}）`, e);
-        this.handleSectionsFlushFailure(branchId, r, failedWriteSeq);
+        this.handleSectionsFlushFailure(branchId, r, failedState);
       });
     }, delayMs ?? this.layoutDebounceMs);
     timer.unref?.();
@@ -1011,7 +1014,11 @@ export class Rooms {
     this.sectionsTimers.set(r, timer);
   }
 
-  private handleSectionsFlushFailure(branchId: string, r: Loaded, failedWriteSeq: number) {
+  private handleSectionsFlushFailure(
+    branchId: string,
+    r: Loaded,
+    failedState: { writeSeq: number; version: LayoutVersion | null },
+  ) {
     if (this.closed || !this.isCurrentEntry(branchId, r)) return;
     if (!r.sectionsPending) {
       r.sectionsRetries = 0;
@@ -1024,8 +1031,8 @@ export class Rooms {
       this.scheduleSectionsFlush(branchId, r, backoffMs);
       return;
     }
-    // 连续失败达重试上限：若期间无更新写入则清 pending，防止空闲房间永久卡死无法卸载
-    if (r.sectionsWriteSeq === failedWriteSeq) {
+    // 连续失败达重试上限：若期间无更新写入或更高版本覆盖则清 pending，防止空闲房间永久卡死无法卸载
+    if (r.sectionsWriteSeq === failedState.writeSeq && r.sectionsVersion === failedState.version) {
       r.sectionsPending = false;
       r.sectionsRetries = 0;
       this.clearSectionsTimer(r);
@@ -1038,12 +1045,18 @@ export class Rooms {
 
   private async reloadSectionsFromDb(branchId: string, r: Loaded, incoming: LayoutVersion) {
     const writeSeqBefore = r.sectionsWriteSeq;
+    while (r.sectionsFlushing) {
+      await r.sectionsFlushing.catch(() => {});
+    }
+    if (!this.isCurrentEntry(branchId, r)) return;
+    if (r.sectionsWriteSeq !== writeSeqBefore) return;
+    if (!isNewerLayoutVersion(incoming, r.sectionsVersion ?? undefined)) return;
     const [b] = await this.db.query<{ sections: CanvasSection[] }>(
       'select sections from branches where id = $1',
       [branchId],
     );
     if (!b || !this.isCurrentEntry(branchId, r)) return;
-    if (r.sectionsWriteSeq !== writeSeqBefore && r.sectionsVersion === null) return;
+    if (r.sectionsWriteSeq !== writeSeqBefore) return;
     if (!isNewerLayoutVersion(incoming, r.sectionsVersion ?? undefined)) return;
     const sections = sanitizeSections(b.sections);
     r.sections = sections;
@@ -1213,7 +1226,7 @@ export class Rooms {
               r.layout = { ...b.layout, ...r.pendingLayout };
               for (const p of r.peers) this.safeSend(p, { t: 'layout', positions: r.layout });
             }
-            if (!r.sectionsPending) {
+            if (!r.sectionsPending && !r.sectionsFlushing) {
               r.sections = sanitizeSections(b.sections);
               for (const p of r.peers) this.safeSend(p, { t: 'sections', sections: r.sections });
             }
@@ -1535,7 +1548,7 @@ export class Rooms {
   private async flushSections(
     branchId: string,
     r: Loaded,
-    onErrorWriteSeq?: (writeSeq: number) => void,
+    onErrorState?: (state: { writeSeq: number; version: LayoutVersion | null }) => void,
   ): Promise<void> {
     while (r.sectionsFlushing) {
       await r.sectionsFlushing.catch(() => {});
@@ -1546,18 +1559,25 @@ export class Rooms {
       return;
     }
     let currentWriteSeq = r.sectionsWriteSeq;
+    let currentVersion = r.sectionsVersion;
     const task = (async () => {
       while (r.sectionsPending) {
         const snapshot = r.sections;
         const writeSeq = r.sectionsWriteSeq;
+        const versionBefore = r.sectionsVersion;
         currentWriteSeq = writeSeq;
+        currentVersion = versionBefore;
         await this.db.query('update branches set sections = $2::text::jsonb where id = $1', [
           branchId,
           JSON.stringify(snapshot),
         ]);
-        if (r.sectionsWriteSeq === writeSeq) {
+        if (r.sectionsWriteSeq === writeSeq && r.sectionsVersion === versionBefore) {
           r.sectionsPending = false;
           r.sectionsRetries = 0;
+          this.clearSectionsTimer(r);
+        } else {
+          // 落库期间有新本地写入或收到更高版本远端板块（旧快照可能已覆写 DB），保持待刷状态幂等写回当前获胜版本
+          r.sectionsPending = true;
         }
       }
     })();
@@ -1565,7 +1585,7 @@ export class Rooms {
     try {
       await task;
     } catch (err) {
-      onErrorWriteSeq?.(currentWriteSeq);
+      onErrorState?.({ writeSeq: currentWriteSeq, version: currentVersion });
       throw err;
     } finally {
       if (r.sectionsFlushing === task) r.sectionsFlushing = null;

@@ -455,23 +455,57 @@ export const Canvas = ({
   }, [visibleTables, savedPos, collapsedGroups, summaryPositions, summaryGridPos, model, readOnly, onMove]);
 
   // 点击“自动布局”时仅对当前可见表重新布局；在纯汇总视图下重置本地卡片网格坐标
-  const latest = useRef({ model, visibleTables, onMove, readOnly });
+  const latest = useRef({
+    model,
+    visibleTables,
+    collapsedGroups,
+    summaryPositions,
+    summaryGridPos,
+    onMove,
+    readOnly,
+  });
   useLayoutEffect(() => {
-    latest.current = { model, visibleTables, onMove, readOnly };
+    latest.current = {
+      model,
+      visibleTables,
+      collapsedGroups,
+      summaryPositions,
+      summaryGridPos,
+      onMove,
+      readOnly,
+    };
   });
   useEffect(() => {
     if (!relayout) return;
-    const { model: m, visibleTables: vis, onMove: move, readOnly: ro } = latest.current;
+    let alive = true;
+    const {
+      model: m,
+      visibleTables: vis,
+      collapsedGroups: collapsed,
+      summaryPositions: sumPos,
+      summaryGridPos: gridPos,
+      onMove: move,
+      readOnly: ro,
+    } = latest.current;
     if (!vis.length) {
       setSummaryPositions({});
       fitted.current = false;
       return;
     }
-    void autoLayout(m, vis, {}).then((l) => {
+    const fixed: Layout = {};
+    for (const g of collapsed) {
+      const gp = sumPos[`${SUMMARY_NODE_PREFIX}${g.id}`] ?? gridPos.get(g.id);
+      if (gp) fixed[`${SUMMARY_NODE_PREFIX}${g.id}`] = gp;
+    }
+    void autoLayout(m, vis, fixed).then((l) => {
+      if (!alive || !Object.keys(l).length) return;
       if (ro) setLocalFallback((prev) => ({ ...prev, ...l }));
       else move(l);
       fitted.current = false;
     });
+    return () => {
+      alive = false;
+    };
   }, [relayout]);
 
   // 切换模式、聚焦目标、跳数或展开状态时重新触发一次适配视角
