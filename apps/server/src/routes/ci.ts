@@ -3,7 +3,7 @@
 // - 令牌只能访问它所属的项目：路径里的项目不是它的项目时和不存在一样（404 project_not_found，不泄露存在）。
 // - 执行只受环境生效的“允许令牌执行”约束（不看“谁能执行”，不走审批）；漂移、完整性、认领、超时等检查照常，
 //   和界面执行共用同一套环境锁 / 目标库项目锁（runExecution）。目标版本必须显式给出（latest 或 v5），令牌不能回滚。
-// - 同步等待执行结束再返回 JSON（CI 里最简单）；错误码与 HTTP 状态码的对应见 @dowel/api 的 CI_ERROR_STATUS 和 docs/api.md。
+// - 同步等待执行结束再返回 JSON（CI 里最简单）；错误码与 HTTP 状态码的对应见 @dowel/api 的 CI_ERROR_STATUS 和 docs/en/api.md / docs/zh/api.md。
 import {
   CI_ERROR_STATUS,
   type CiDriftResult,

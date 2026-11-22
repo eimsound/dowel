@@ -1,6 +1,6 @@
 // CI 令牌（P6，T1～T3）的接口契约：令牌管理、“谁能创建令牌”的三层规则（纯函数，服务端和界面共用）、
 // 面向 CI 的 HTTP API（/api/ci/…）的请求体、响应和错误码。规则见 ADR 0009 / 0010，实现在 apps/server/src/tokens.ts、
-// routes/tokens.ts、routes/ci.ts；用户文档 docs/api.md。
+// routes/tokens.ts、routes/ci.ts；用户文档 docs/en/api.md 与 docs/zh/api.md。
 import { z } from 'zod';
 
 // ───── 令牌本身 ─────
@@ -152,7 +152,7 @@ export interface TokenPolicyView {
 // ───── 面向 CI 的 HTTP API（/api/ci/…）：令牌认证，结构化的 JSON 错误 ─────
 
 /**
- * 错误码 → HTTP 状态码（每个 code 固定对应一个状态码；一个状态码可以对应多个 code）。docs/api.md 有完整的表。
+ * 错误码 → HTTP 状态码（每个 code 固定对应一个状态码；一个状态码可以对应多个 code）。docs/en/api.md 与 docs/zh/api.md 有完整的表。
  */
 export const CI_ERROR_STATUS = {
   /** 请求体 / 参数不合法 */

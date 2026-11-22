@@ -11,7 +11,7 @@
 | Turborepo    | 暂不使用：tsdown 单进程 `workspace` 模式构建全仓仅 ~3 秒，本地开发与测试经 `@dowel/source` 直读源码无需预构建，不需要额外编排层                                                                                                                                                                                                                                                                                                                                               |
 | 检查命令     | `pnpm check`（= `pnpm lint`（`oxlint --type-aware --deny-warnings && oxfmt --check`）+ `tsc --noEmit` + `vitest run`）                                                                                                                                                                                                                                                                                                                                                        |
 | 测试用数据库 | `test/pg-container.ts`、`test/mysql-container.ts`、`test/mssql-container.ts`：分别支持 `DOWEL_TEST_PG` / `DOWEL_TEST_MYSQL` / `DOWEL_TEST_MSSQL` 或通过 Testcontainers 启动真实容器（`pgvector/pgvector:pg15`～`pg19`、MySQL 8.4/9.7、SQL Server 2019/2022/2025）；SQLite 测试直接使用 Node 26 内置 `node:sqlite`。无 Docker 时跳过需要容器的测试并警告，`CI` 环境下缺失直接失败                                                                                              |
-| CI           | `.github/workflows/ci.yml`：check（lint、类型检查、单元测试、全仓 `pnpm build` 及生产冒烟）、`pg-matrix`（PG 15–19 多版本矩阵）、heavy（随机闭环 + 命名规则 `RUNS=5000`）、e2e（Playwright）；`.github/workflows/docs.yml`：Zensical 0.1.3 严格文档构建校验与按需 Pages 发布                                                                                                                                                                                                  |
+| CI           | `.github/workflows/ci.yml`：check（lint、类型检查、单元测试、全仓 `pnpm build` 及生产冒烟）、`pg-matrix`（PG 15–19 多版本矩阵）、heavy（随机闭环 + 命名规则 `RUNS=5000`）、e2e（Playwright）；`.github/workflows/docs.yml`：Zensical 0.1.3 中英双语严格文档构建校验与 `main` / 手动触发自动发布 GitHub Pages                                                                                                                                                                  |
 | 随机测试参数 | `RUNS=轮数`、`SEED=种子`、`TIME_LIMIT=毫秒`（缩小反例的总时长上限）、`TIMING=1` 打印每轮耗时；`STATS=1` 运行生成器覆盖面统计；`CASE='<反例 JSON>'` 运行调试用例，打印两个版本和迁移语句                                                                                                                                                                                                                                                                                       |
 
 ## 2. 代码结构
@@ -30,7 +30,7 @@ packages/
 apps/
   server/     Hono API、WebSocket 协作、HA 协调、targets/{pg,sqlite,mysql,mssql}.ts 目标库驱动注册表
   web/        React 19 + Vite 8 + @xyflow/react 画布，dialects.ts 多方言 UI 规格表与中英文 i18n
-docs/         Zensical 0.1.3 用户文档站点（根目录 zensical.toml + README.md）
+docs/         Zensical 0.1.3 中英双语用户文档站点（docs/en/、docs/zh/、docs/zensical*.toml） + 根目录 README.md
 ```
 
 ### 2.1 规划器 `plan(from, to)` 的阶段
@@ -318,7 +318,7 @@ P3 审查后的修正（2026-11-19）：
 
 ### 产品化 P4b 执行器、漂移检测与基础执行权限（2026-11-19）
 
-范围：H3 执行器、H4 漂移检测、H6 基础执行权限、H7 接口与界面、H8 用户文档（执行部分，见 [docs/execution.md](../../docs/execution.md)），以及 P4a 的几项遗留。接手与认领（H5）、实例标识的认领确认、执行策略四层合并 / 审批 / 执行申请 / 执行者授权 / 前置环境、CI 令牌不在本轮。设计依据：[ADR 0002](adr/0002-frozen-migration-chain.md)、[ADR 0003](adr/0003-version-content-in-target-db.md)、02-consensus.md 的 4.5、4.7、11.3、11.5。
+范围：H3 执行器、H4 漂移检测、H6 基础执行权限、H7 接口与界面、H8 用户文档（执行部分，见 [docs/zh/execution.md](../../docs/zh/execution.md)），以及 P4a 的几项遗留。接手与认领（H5）、实例标识的认领确认、执行策略四层合并 / 审批 / 执行申请 / 执行者授权 / 前置环境、CI 令牌不在本轮。设计依据：[ADR 0002](adr/0002-frozen-migration-chain.md)、[ADR 0003](adr/0003-version-content-in-target-db.md)、02-consensus.md 的 4.5、4.7、11.3、11.5。
 
 - **执行器放在新包 `packages/executor`**（只依赖 core 和 engines）。理由：① 它是仓库里**唯一会写用户生产库**的代码，verifier 的约定是“只碰影子库”，放进去会把这条边界弄糊；单独成包以后审计“谁会写目标库”只看这一个包，将来不论是服务端、CI 还是隔离网络里的执行代理都只需引用它。② 它不需要影子库、不需要服务端的任何东西：平台里的东西（版本链、环境缓存）由调用方整理成 `ChainVersion[]` 传进来，要写平台库的地方用 `beforeMigration` / `afterMigration` 回调。③ 为了让它不依赖服务端，把 `scrubSecrets`（`packages/core/src/scrub.ts`）和 `emptyBase` / `scopeCoversPublic`（`packages/core/src/empty.ts`）从 apps/server 挪进 core，服务端的 `secrets.ts` / `chain.ts` 重新导出，仍然只有一个实现。随机闭环测试（verifier 的测试）把 executor 作为 devDependency 引用。
 - **入口**：`execute({ db, projectId, chain, scope, mode: 'migrate' | 'baseline', to, direction, … })`、`checkDrift(…)`、`readState(…)`。`execute` 拿 `withProjectLock` 独占连接（默认等 30 秒）后依次做：①（拿锁前）平台库的版本链过 `verifyChain`；② 目标库历史已存在时先 `ensureHistory`（只为检查格式版本，`format_too_new` 要在读历史之前拒绝），再 `readState`，目标库历史过 `verifyChain`（**冻结脚本按内容重算 checksum**，篡改校验和或脚本都会被发现），并与平台库的链互相对一遍（版本在不在链上、checksum / 序号 / parent 一致），项目行的实例标识必须是本实例；③ 判断路线（沿 up 链还是 down 链），漂移检查（见下）；④ 每个要执行的迁移必须 `verified`（拒绝“未验证”，提示去重新验证，执行前不重新验证）、不含实例级语句（`findInstanceLevelStep`）；⑤ 逐个迁移执行，每个迁移后读回结构必须等于目标版本的模型。**所有检查都在第一次写目标库之前做完**，拒绝时目标库里不会多出任何东西（连 `dowel` schema 都不建）。
@@ -388,7 +388,7 @@ P3 审查后的修正（2026-11-19）：
 
 ### 产品化 P4c 接手、认领与预演（2026-11-20）
 
-范围：H5 接手与认领（含多环境合并、接入已有历史）、只预演不执行（dry run）、H8 里与接手 / 认领 / 预演有关的用户文档（[docs/getting-started.md](../../docs/getting-started.md) 的“接手现有项目”“灾难恢复”，[docs/execution.md](../../docs/execution.md) 的“预演”“认领”）。**处理漂移 / 接受线上结构未实现**（见下面“未实现”）。设计依据：[ADR 0002](adr/0002-frozen-migration-chain.md)、[ADR 0003](adr/0003-version-content-in-target-db.md)、02-consensus.md 11.5。
+范围：H5 接手与认领（含多环境合并、接入已有历史）、只预演不执行（dry run）、H8 里与接手 / 认领 / 预演有关的用户文档（[docs/zh/getting-started.md](../../docs/zh/getting-started.md) 的“接手现有项目”“灾难恢复”，[docs/zh/execution.md](../../docs/zh/execution.md) 的“预演”“认领”）。**处理漂移 / 接受线上结构未实现**（见下面“未实现”）。设计依据：[ADR 0002](adr/0002-frozen-migration-chain.md)、[ADR 0003](adr/0003-version-content-in-target-db.md)、02-consensus.md 11.5。
 
 - **目标库 dowel 历史的格式（`packages/engines/src/pg/history.ts`）**：`HISTORY_FORMAT = 1`，注释写明“**只有破坏性变更**（旧版 Dowel 照旧读写会出错）才 +1，兼容的变更不动它”。还没有发过版，所以**没有任何升级路径**：`versions.scope jsonb`（接手要靠它恢复 schema 范围和空库判断，直接取这一列，不做任何推断）、`projects.previous_instance_id`、新表 `dowel.claims`（认领事件，只追加，触发器 `claims_guard` 禁止修改和删除）、`history.direction` 约束里的 `mark` 都直接写进建表语句。（这一轮审查前做过 1→2 的升级逻辑，用户决定发版前不需要，已全部删除：`UPGRADE_1_TO_2`、升级分支、“不是表的所有者”报错、锁里重读格式的 DO 块和对应的模拟旧格式测试。）**保留 `format_too_new`**：库里的格式值比代码新、或不是整数时拒绝执行，也拒绝读历史（`readHistoryFormat` / `ensureHistory` / `historyWriteProblem` 都检查）；建表时写入 1。这个检查必须从第一个发布版就有，以后补不上。读 `readHistory` / `readProject` 用 `to_jsonb(行)` 整行读再按字段取，读历史、检查漂移、接手前的检查都是**只读**。`historyWriteProblem(db)` 是预演用的只读写权限检查：不能建 schema / 建表、格式过新，都在这里提前报，不建任何东西。
 - **认领事件为什么另建 `dowel.claims`，不放进 `history`**：`history` 的 `direction` / `status` 约束和 `history_guard` 触发器是给“执行”设计的（只允许改 `running` 的行，标识字段不能变），而当前版本 = 最后一条 `done` 的 `to_version`，认领事件混进去会污染这个判断，也要改约束。`claimProject(db, input)` 必须在调用方的事务和项目锁里执行：`select … for update` 项目行，写项目行（`instance_id` = 新实例，`claimed_at` / `claimed_by` 更新，`previous_instance_id` = 换手前的实例）并追加一条事件；本来就是该实例认领的什么都不写（`changed = false`，幂等）；没有项目行（被手工删了）也能认领，上一个实例记为未知。执行器的 `claimInstance`（`packages/executor/src/claim.ts`）：取目标库项目锁（原实例正在执行时 `lock_timeout`，不能换手）→ 先 `ensureHistory`（升级旧格式）→ `verifyChain` 不过就拒绝（`history_broken`，不认领一个被改坏的历史）→ 事务里 `claimProject`。
@@ -440,7 +440,7 @@ P3 审查后的修正（2026-11-19）：
 
 ### 产品化 P5a 执行策略与执行者（2026-11-20）
 
-范围：E1 四层执行策略（含审批流程的数据结构，P5b 才有运行逻辑）、E2 执行者授权、E6 前置环境、语句超时与锁等待超时（P4b 遗留）、E9 里的策略配置界面。**不在本轮**：执行申请、审批运行逻辑、紧急执行、收件箱、Webhook、审批时间线（P5b），CI 令牌（P6），多进程部署。设计依据：02-consensus.md 11.2、11.3，[ADR 0005](adr/0005-execution-policy-layers.md)。用户文档：[docs/execution-policy.md](../../docs/execution-policy.md)，`docs/execution.md` 的“谁能执行”“失败与恢复”随之更新。
+范围：E1 四层执行策略（含审批流程的数据结构，P5b 才有运行逻辑）、E2 执行者授权、E6 前置环境、语句超时与锁等待超时（P4b 遗留）、E9 里的策略配置界面。**不在本轮**：执行申请、审批运行逻辑、紧急执行、收件箱、Webhook、审批时间线（P5b），CI 令牌（P6），多进程部署。设计依据：02-consensus.md 11.2、11.3，[ADR 0005](adr/0005-execution-policy-layers.md)。用户文档：[docs/zh/execution-policy.md](../../docs/zh/execution-policy.md)，`docs/zh/execution.md` 的“谁能执行”“失败与恢复”随之更新。
 
 - **纯函数放在 `@dowel/api` 的 `policy.ts`**（服务端和界面共用，`index.ts` 重新导出）：`resolvePolicy(四层输入, production, at)` 输出每个字段的生效值、来源层（`instance / group / project / environment / default`）、本层自己的值 `own`、上级合并出来的下限 `floor` 和它的来源 `floorSource`（界面的“由组锁定：至少 …”），审批流程输出拼接后的环节（每个带来源、是否锁定）；`compareField`（标量字段的全序比较）、`approvalAtLeast`（审批流程的子序列偏序）、`validateLayer`（写入校验：本层不能比下限宽）、`loosenedFields`（改动前后比较，哪些字段变宽）、`pinOnProductionChange`（改生产标记时固定变宽的字段）、`checkPrerequisite`（前置环境检查，执行接口 / 预演 / 确认对话框共用，P6 的令牌执行也用它）、`prerequisiteCycle`。放 api 包而不是新建包：它只依赖 zod，和请求体 schema 同处一处（schema 本身就是策略的形状），新建包要多一套 workspace 配置却没有别的收益。
 - **严格程度（ADR 0005）**：谁能执行 `executor > admin > editor`；允许令牌 `false > true`；两个超时越短越严，`0` = 不限最宽（超时保护的是目标库上的业务，越早放弃越安全）；审批流程用子序列偏序，每层存“本层追加的环节”，生效流程 = 按层拼接，上级的生效流程总是前缀——下级在结构上就删不掉上级的环节；「最后一个审批人即执行者」不参与比较，拼接后只有最后一个环节的标记生效（schema 也只允许本层最后一个环节带它）。前置环境只在环境层（实例 / 组层没法指定某个环境；项目层统一指定“生产环境的前置环境”会让前置环境自己也是生产时自指，环境通常只有几个，没必要），不参与跨层合并，但去掉或换掉它算放宽。
@@ -514,7 +514,7 @@ P3 审查后的修正（2026-11-19）：
 
 ### 产品化 P5b 执行申请、审批、紧急执行、收件箱与组级 Webhook（2026-11-20）
 
-范围：E3 执行申请、E4 审批流程的运行逻辑、E5 紧急执行、E7 收件箱、E8 组级 Webhook、E9 剩余界面（申请详情与审批时间线、确认对话框的申请模式、环境页的待处理申请、紧急执行入口、“指定用户”的搜索选择器、配置页的审批人重叠提示、收件箱页与图标栏未读数、组设置里的 Webhook）。**不在本轮**：P6（CI 令牌；只预留了收件箱的 `token_execution` 类型，前置环境检查仍是 `checkPrerequisite` 一处）、多进程部署、邮件通知。设计依据：02-consensus.md 11.3，ADR [0005](adr/0005-execution-policy-layers.md)、[0006](adr/0006-approval-snapshot-and-execution-right.md)（审批快照、资格、审批不给执行权、自批、放宽不走审批、紧急执行）、[0007](adr/0007-request-invalidation.md)（申请绑定与失效）、[0008](adr/0008-webhook-outbound.md)（Webhook 出站）。用户文档：[docs/approvals.md](../../docs/approvals.md)、[docs/webhooks.md](../../docs/webhooks.md)，`docs/execution-policy.md` 的审批一节和 `docs/execution.md` 随之更新。
+范围：E3 执行申请、E4 审批流程的运行逻辑、E5 紧急执行、E7 收件箱、E8 组级 Webhook、E9 剩余界面（申请详情与审批时间线、确认对话框的申请模式、环境页的待处理申请、紧急执行入口、“指定用户”的搜索选择器、配置页的审批人重叠提示、收件箱页与图标栏未读数、组设置里的 Webhook）。**不在本轮**：P6（CI 令牌；只预留了收件箱的 `token_execution` 类型，前置环境检查仍是 `checkPrerequisite` 一处）、多进程部署、邮件通知。设计依据：02-consensus.md 11.3，ADR [0005](adr/0005-execution-policy-layers.md)、[0006](adr/0006-approval-snapshot-and-execution-right.md)（审批快照、资格、审批不给执行权、自批、放宽不走审批、紧急执行）、[0007](adr/0007-request-invalidation.md)（申请绑定与失效）、[0008](adr/0008-webhook-outbound.md)（Webhook 出站）。用户文档：[docs/zh/approvals.md](../../docs/zh/approvals.md)、[docs/zh/webhooks.md](../../docs/zh/webhooks.md)，`docs/zh/execution-policy.md` 的审批一节和 `docs/zh/execution.md` 随之更新。
 
 - **策略模型加一个字段**：`requestTtlHours`（执行申请有效期，1～720 小时，默认 24）进 `SCALAR_FIELDS`，`compareField` 越短越严（没有“不限”），参与四层逐层取更严、写入校验、放宽检测、转组 / 改生产标记时的固定；随机测试的生成器加上它（三条随机测试原样通过）。
 - **存储**（平台库迁移第 20 条）：`exec_requests`（绑定的迁移快照 `migrations`、预演摘要 `dry_run`、审批流程快照 `flow`、连接串指纹 `conn_hash`、提交时的生产标记、状态 / 当前环节 / 原因 / 有效期 / 执行人 / 结果、`emergency`）、`exec_approvals`（每环节每人一次决定，唯一约束 `(request_id, stage, user_id)`）、`inbox_items`、`webhooks`、`webhook_deliveries`；环境 / 项目 / 组删除时级联删除（审计里有完整记录）。
@@ -630,6 +630,11 @@ P3 审查后的修正（2026-11-19）：
 
 - 引入 `zensical==0.1.3`（通过 `uvx` 无污染运行，不引入 `pyproject.toml` / `.venv`），配置 `zensical.toml`（开启 `attr_list = {}` 与全中文标题显式 ASCII `{#anchor-id}`）、`package.json` `docs:dev` / `docs:build` 脚本、`.github/workflows/docs.yml`（全 SHA 锁定校验与按需 Pages 部署），并在 `.gitignore` / `.oxfmtrc.jsonc` / `.oxlintrc.json` / `.dockerignore` 忽略 `site/` 与 `.cache/`。
 - 新建根目录 `README.md`、将臃肿的 `docs/getting-started.md` 拆分为 14 篇结构清晰的专题页面（新增 `index.md`、`deployment.md`、`accounts-and-access.md`、`modeling.md`、`dialects.md`、`takeover.md`、`ci-action.md`、`glossary.md`），全面对齐 4 方言（PostgreSQL 15–19、SQLite、MySQL 8.4/9.7、SQL Server 2019/2022/2025）、20 项服务端环境变量、画布修改历史与 HA 部署实情，清理全部 `../` 站外相对链接与过时表述，并同步更新 `.agents/docs/{02-consensus,04-ir-design,05-implementation}.md` 与 `GLOSSARY.md`。
+
+### 4.18 双语 Zensical 文档站点收口与 Pages 自动部署（2026-11-23）
+
+- 将全量用户文档与 Zensical 配置统一收拢至 `docs/`：删除根目录 `zensical.toml`，原 14 篇中文文档移入 `docs/zh/`，新增英文主文档 `docs/en/`（14 篇，术语对齐 `GLOSSARY.md` 并保留一致 `{#anchor-id}` 锚点），配置 `docs/zensical.toml`（英文主站，输出 `docs/site/`，对应 `/dowel/`）与 `docs/zensical.zh.toml`（简体中文站，输出 `docs/site/zh/`，对应 `/dowel/zh/`），页眉启用 `English` / `简体中文` 语言切换器（`alternate`）。
+- 更新 `package.json`（`docs:dev`、`docs:dev:zh`、`docs:build`）、`.gitignore` / `.oxfmtrc.jsonc` / `.oxlintrc.json`（忽略 `docs/site/` 与 `docs/.cache/`）、`.dockerignore`、`README.md` 与 `.github/workflows/ci.yml`（移除根目录 `zensical.toml`）；`.github/workflows/docs.yml` 改为在 `docs/` 下双构建严格校验并随 `push` 至 `main` 与 `workflow_dispatch` 自动发布到 GitHub Pages。
 
 ## 5. 下一步
 
