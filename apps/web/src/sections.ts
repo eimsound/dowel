@@ -330,11 +330,17 @@ export const defaultCanvasViewPrefs = (): CanvasViewPrefs => ({
   focus: null,
 });
 
+interface StorageLike {
+  getItem(key: string): string | null;
+  setItem(key: string, value: string): void;
+}
+
+const defaultStorage = (): StorageLike | null =>
+  (globalThis as { localStorage?: StorageLike }).localStorage ?? null;
+
 export const readCanvasViewPrefs = (
   pid: string,
-  storage: Pick<Storage, 'getItem'> | null | undefined = typeof localStorage !== 'undefined'
-    ? localStorage
-    : null,
+  storage: Pick<StorageLike, 'getItem'> | null | undefined = defaultStorage(),
 ): CanvasViewPrefs => {
   const fallback = defaultCanvasViewPrefs();
   if (!storage) return fallback;
@@ -372,9 +378,7 @@ export const readCanvasViewPrefs = (
 export const writeCanvasViewPrefs = (
   pid: string,
   prefs: CanvasViewPrefs,
-  storage: Pick<Storage, 'setItem'> | null | undefined = typeof localStorage !== 'undefined'
-    ? localStorage
-    : null,
+  storage: Pick<StorageLike, 'setItem'> | null | undefined = defaultStorage(),
 ): void => {
   if (!storage) return;
   try {

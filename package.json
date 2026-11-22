@@ -15,12 +15,21 @@
     "e2e": "playwright test",
     "docs:dev": "cd docs && uvx zensical==0.1.3 serve -f zensical.toml",
     "docs:dev:zh": "cd docs && uvx zensical==0.1.3 serve -f zensical.zh.toml",
-    "docs:build": "rm -rf docs/site docs/.cache && cd docs && uvx zensical==0.1.3 build -f zensical.toml --clean --strict && uvx zensical==0.1.3 build -f zensical.zh.toml --clean --strict"
+    "docs:build": "rm -rf docs/site docs/.cache && cd docs && uvx zensical==0.1.3 build -f zensical.toml --clean --strict && uvx zensical==0.1.3 build -f zensical.zh.toml --clean --strict",
+    "bench:core": "node --expose-gc --conditions=@dowel/source bench/core.ts",
+    "bench:ui": "node --conditions=@dowel/source bench/ui.ts",
+    "bench:shadow": "node --expose-gc --conditions=@dowel/source bench/shadow.ts",
+    "bench:all": "pnpm bench:core && pnpm bench:ui && pnpm bench:shadow"
   },
   "devDependencies": {
     "@axe-core/playwright": "^4.14.0",
+    "@dowel/api": "workspace:*",
+    "@dowel/core": "workspace:*",
     "@dowel/engines": "workspace:*",
     "@dowel/executor": "workspace:*",
+    "@dowel/server": "workspace:*",
+    "@dowel/sync": "workspace:*",
+    "@dowel/verifier": "workspace:*",
     "@playwright/test": "^1.65.1",
     "@testcontainers/mssqlserver": "12.2.1",
     "@testcontainers/mysql": "12.2.1",
