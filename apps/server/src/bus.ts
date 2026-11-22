@@ -3,6 +3,8 @@
 // 单机 SQLite 模式下走进程内回调，保持上层接口一致。
 import { randomUUID } from 'node:crypto';
 
+import type { CanvasSection } from '@dowel/api';
+
 import type { PlatformDb } from './db.ts';
 
 export const CLUSTER_EVENTS_CHANNEL = 'dowel_events';
@@ -52,6 +54,15 @@ export type ClusterEvent =
       ver?: number;
     }
   | { t: 'room.layout.reload'; origin: string; branchId: string; ver?: number }
+  | {
+      t: 'room.sections';
+      origin: string;
+      branchId: string;
+      sections: CanvasSection[];
+      /** 房间级 Lamport 逻辑时钟，用于跨副本并发修改板块时的确定性 LWW 裁决 */
+      ver?: number;
+    }
+  | { t: 'room.sections.reload'; origin: string; branchId: string; ver?: number }
   | {
       t: 'room.peers';
       origin: string;

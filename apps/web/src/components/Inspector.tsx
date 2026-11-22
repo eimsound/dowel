@@ -1,6 +1,6 @@
 // 属性面板（DESIGN.md：属性面板）：编辑选中的表、枚举、序列；不透明对象只读显示 DDL。
 // 输入框是“草稿”：获得焦点时记下所依据对象的版本，保存时一并提交——期间别人改过这些对象，保存会被拒绝（04-ir-design.md 2.3）。
-import type { PublishedTables, VersionInfo } from '@dowel/api';
+import type { CanvasSection, PublishedTables, VersionInfo } from '@dowel/api';
 import {
   all,
   type Column,
@@ -46,6 +46,7 @@ import {
   Eye,
   FileCode,
   Fingerprint,
+  Focus,
   Hash,
   KeyRound,
   Layers,
@@ -65,6 +66,7 @@ import { useTranslation } from 'react-i18next';
 import { api } from '../api.ts';
 import { dialectUiSpec } from '../dialects.ts';
 import { useProject } from '../project.tsx';
+import { resolveTopLevelTableId } from '../sections.ts';
 import type { Workspace } from '../workspace.ts';
 import { shortType, typeLabel } from './Canvas.tsx';
 import { Modal } from './Modal.tsx';
@@ -639,7 +641,14 @@ const TableInspector = ({
   model,
   readOnly,
   onSelect,
-}: Ctx & { table: Table; onSelect: (id: string | null) => void }) => {
+  sections,
+  onSetSections,
+}: Ctx & {
+  table: Table;
+  onSelect: (id: string | null) => void;
+  sections?: CanvasSection[];
+  onSetSections?: (next: CanvasSection[]) => void;
+}) => {
   const { t } = useTranslation();
   const { pid, project } = useProject();
   const dialectSpec = getDialect(model.dialect);
@@ -2596,6 +2605,36 @@ const TableInspector = ({
           )}
         </Section>
       )}
+
+      {!isChild && sections && sections.length > 0 && onSetSections && (
+        <Section title={t('sec.tableSection')}>
+          <select
+            aria-label={t('sec.tableSection')}
+            className="select"
+            disabled={locked}
+            value={sections.find((s) => s.tables.includes(table.id))?.id ?? ''}
+            onChange={(e) => {
+              const targetId = e.target.value;
+              onSetSections(
+                sections.map((s) => ({
+                  ...s,
+                  tables:
+                    s.id === targetId
+                      ? [...s.tables.filter((x) => x !== table.id), table.id]
+                      : s.tables.filter((x) => x !== table.id),
+                })),
+              );
+            }}
+          >
+            <option value="">{t('sec.unassigned')}</option>
+            {sections.map((s) => (
+              <option key={s.id} value={s.id}>
+                {s.name}
+              </option>
+            ))}
+          </select>
+        </Section>
+      )}
     </fieldset>
   );
 };
@@ -2605,8 +2644,23 @@ const KIND_ICON = { table: Table2, enum: List, sequence: Hash } as const;
 const InspectorContent = ({
   o,
   onSelect,
+  sections,
+  onSetSections,
+  onOpenSectionManager,
+  focusedTableId,
+  onFocusTable,
+  onExitFocus,
   ...ctx
-}: Ctx & { o: NonNullable<Model['objects'][string]>; onSelect: (id: string | null) => void }) => {
+}: Ctx & {
+  o: NonNullable<Model['objects'][string]>;
+  onSelect: (id: string | null) => void;
+  sections?: CanvasSection[];
+  onSetSections?: (next: CanvasSection[]) => void;
+  onOpenSectionManager?: () => void;
+  focusedTableId?: string | null;
+  onFocusTable?: (tableId: string) => void;
+  onExitFocus?: () => void;
+}) => {
   const { t } = useTranslation();
   const [confirm, setConfirm] = useState(false);
   const { ws, readOnly, model } = ctx;
@@ -2621,6 +2675,8 @@ const InspectorContent = ({
         : KIND_ICON[o.kind as keyof typeof KIND_ICON];
   const canDelete = o.kind === 'table' && !readOnly;
   const canDeleteSequence = o.kind === 'sequence' && !readOnly && !o.ownedBy;
+  const focusTargetId = o.kind === 'table' ? (resolveTopLevelTableId(model, o.id) ?? o.id) : null;
+  const isFocusedTable = focusTargetId !== null && focusedTableId === focusTargetId;
 
   return (
     <>
@@ -2635,16 +2691,39 @@ const InspectorContent = ({
           {o.name}
         </h2>
         {o.kind === 'opaque' && <span className="badge">{o.objType}</span>}
+        {o.kind === 'table' && focusTargetId && (onFocusTable || onExitFocus) && (
+          <IconButton
+            label={t('sec.focusAction')}
+            aria-pressed={isFocusedTable}
+            onClick={() => (isFocusedTable ? onExitFocus?.() : onFocusTable?.(focusTargetId))}
+          >
+            <Focus
+              size={16}
+              aria-hidden="true"
+              className={isFocusedTable ? 'text-primary-text' : undefined}
+            />
+          </IconButton>
+        )}
         {(canDelete || canDeleteSequence) && (
           <Menu
             label={t('insp.more')}
             trigger={<Ellipsis size={16} aria-hidden="true" />}
             items={[
+              ...(o.kind === 'table' && onOpenSectionManager
+                ? [
+                    {
+                      label: t('sec.manage'),
+                      icon: <Layers size={16} aria-hidden="true" />,
+                      onSelect: onOpenSectionManager,
+                    },
+                  ]
+                : []),
               canDelete
                 ? {
                     label: t('insp.deleteTable'),
                     icon: <Trash2 size={16} aria-hidden="true" />,
                     danger: true,
+                    separatorBefore: o.kind === 'table' && Boolean(onOpenSectionManager),
                     onSelect: () => setConfirm(true),
                   }
                 : {
@@ -2660,7 +2739,15 @@ const InspectorContent = ({
         )}
       </div>
       <div className="min-h-0 flex-1 overflow-auto px-3.5 pt-3 pb-5">
-        {o.kind === 'table' && <TableInspector table={o} onSelect={onSelect} {...ctx} />}
+        {o.kind === 'table' && (
+          <TableInspector
+            table={o}
+            onSelect={onSelect}
+            sections={sections}
+            onSetSections={onSetSections}
+            {...ctx}
+          />
+        )}
         {o.kind === 'enum' && (
           <fieldset disabled={readOnly} className="min-w-0 space-y-3 border-0 p-0">
             <Labeled label={t('insp.name')}>
@@ -2776,8 +2863,23 @@ const InspectorContent = ({
 export const Inspector = ({
   selected,
   onSelect,
+  sections,
+  onSetSections,
+  onOpenSectionManager,
+  focusedTableId,
+  onFocusTable,
+  onExitFocus,
   ...ctx
-}: Ctx & { selected: string | null; onSelect: (id: string | null) => void }) => {
+}: Ctx & {
+  selected: string | null;
+  onSelect: (id: string | null) => void;
+  sections?: CanvasSection[];
+  onSetSections?: (next: CanvasSection[]) => void;
+  onOpenSectionManager?: () => void;
+  focusedTableId?: string | null;
+  onFocusTable?: (tableId: string) => void;
+  onExitFocus?: () => void;
+}) => {
   const { t } = useTranslation();
   const { readOnly, model } = ctx;
 
@@ -2795,5 +2897,18 @@ export const Inspector = ({
     );
 
   // 通过对象 ID 与只读状态联合 key 挂载内容，实时降级只读时自动彻底重置全部内联表单与确认弹窗状态
-  return <InspectorContent key={`${o.id}:${readOnly ? 'ro' : 'rw'}`} o={o} onSelect={onSelect} {...ctx} />;
+  return (
+    <InspectorContent
+      key={`${o.id}:${readOnly ? 'ro' : 'rw'}`}
+      o={o}
+      onSelect={onSelect}
+      sections={sections}
+      onSetSections={onSetSections}
+      onOpenSectionManager={onOpenSectionManager}
+      focusedTableId={focusedTableId}
+      onFocusTable={onFocusTable}
+      onExitFocus={onExitFocus}
+      {...ctx}
+    />
+  );
 };

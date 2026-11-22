@@ -1,5 +1,5 @@
-// 工作区状态：WebSocket 连接同步房间（断线自动重连），SyncClient 维护模型，另外管理画布布局和在线成员。
-import type { Role } from '@dowel/api';
+// 工作区状态：WebSocket 连接同步房间（断线自动重连），SyncClient 维护模型，另外管理画布布局、板块和在线成员。
+import { type CanvasSection, type Role, sanitizeSections } from '@dowel/api';
 import { EditError, emptyModel, type Model, newId } from '@dowel/core';
 import { SyncClient, type ToClient, type Versions } from '@dowel/sync';
 import { useEffect, useLayoutEffect, useState, useSyncExternalStore } from 'react';
@@ -13,6 +13,7 @@ export interface Snapshot {
   pending: number;
   seq: number;
   layout: Layout;
+  sections: CanvasSection[];
   peers: { client: string; user: string }[];
   /** 服务端推来的生效角色（授权、组成员变动后即时生效）；还没收到时为 null */
   role: Role | null;
@@ -44,6 +45,7 @@ export class Workspace {
       pending: 0,
       seq: 0,
       layout: {},
+      sections: [],
       peers: [],
       role: null,
     };
@@ -89,6 +91,9 @@ export class Workspace {
           break;
         case 'layout':
           this.update({ layout: { ...this.snap.layout, ...(m.positions as Layout) } });
+          break;
+        case 'sections':
+          this.update({ sections: sanitizeSections(m.sections) });
           break;
         case 'peers':
           this.update({ peers: m.peers as Snapshot['peers'] });
@@ -137,6 +142,15 @@ export class Workspace {
   move(positions: Layout) {
     this.update({ layout: { ...this.snap.layout, ...positions } });
     if (this.ws?.readyState === WebSocket.OPEN) this.ws.send(JSON.stringify({ t: 'layout', positions }));
+  }
+
+  /** 更新画布板块定义（纯布局层：名称、颜色、成员表），先本地清洗并乐观更新再通过 WS 同步 */
+  setSections(sections: CanvasSection[]) {
+    const clean = sanitizeSections(sections);
+    this.update({ sections: clean });
+    if (this.ws?.readyState === WebSocket.OPEN) {
+      this.ws.send(JSON.stringify({ t: 'sections', sections: clean }));
+    }
   }
 
   setOnNotice(fn: Workspace['onNotice']) {

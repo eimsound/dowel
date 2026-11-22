@@ -1,7 +1,14 @@
 // 同步房间的管理：每个分支一个房间，按需从数据库加载（最新快照 + 之后的操作日志），
 // 修改持久化后广播给房间里的所有连接；另外转发画布布局和在线状态这两类不进操作日志的消息。
 
-import type { CanvasHistoryEntry, CanvasHistoryList, CanvasHistoryVersionRef, Role } from '@dowel/api';
+import {
+  type CanvasHistoryEntry,
+  type CanvasHistoryList,
+  type CanvasHistoryVersionRef,
+  type CanvasSection,
+  type Role,
+  sanitizeSections,
+} from '@dowel/api';
 import type { Model, Obj } from '@dowel/core';
 import type { Db } from '@dowel/engines';
 import {
@@ -42,6 +49,8 @@ const HISTORY_SUMMARY_LIMIT = 5;
 const MAX_JOIN_VERIFY_ATTEMPTS = 8;
 /** 单条 room.layout 集群事件内联发送的安全字节上限（留足余量，低于 PG NOTIFY 7500B 上限） */
 const LAYOUT_INLINE_MAX_BYTES = 7000;
+/** 单条 room.sections 集群事件内联发送的安全字节上限（留足余量，低于 PG NOTIFY 7500B 上限） */
+const SECTIONS_INLINE_MAX_BYTES = 7000;
 /** 单条 room.peers 集群事件的安全字节上限 */
 const PEERS_EVENT_MAX_BYTES = 7000;
 /** 定期结合 HA 租约清理已离线副本残留 remotePeers 的间隔（毫秒） */
@@ -146,12 +155,16 @@ export type Layout = Record<string, { x: number; y: number }>;
 /** 服务器发给客户端的、同步协议之外的消息 */
 export type Extra =
   | { t: 'layout'; positions: Layout }
+  | { t: 'sections'; sections: CanvasSection[] }
   | { t: 'presence'; client: string; user: string; data: unknown }
   | { t: 'peers'; peers: { client: string; user: string }[] }
   // 生效角色变了（授权、组成员、默认权限变动后）：客户端据此切换只读 / 可编辑
   | { t: 'role'; role: Role };
 /** 客户端发给服务器的、同步协议之外的消息 */
-export type ExtraIn = { t: 'layout'; positions: Layout } | { t: 'presence'; data: unknown };
+export type ExtraIn =
+  | { t: 'layout'; positions: Layout }
+  | { t: 'sections'; sections: CanvasSection[] }
+  | { t: 'presence'; data: unknown };
 
 export interface Peer {
   user: User;
@@ -196,7 +209,22 @@ interface Loaded {
   layoutFlushing: Promise<void> | null;
   /** 连续防抖落盘失败的重试次数（收到新本地布局或落盘成功后清零） */
   layoutRetries: number;
-  /** 空闲卸载定时器（仅在无在线成员、无在途操作且无待落盘布局时存在） */
+  /** 画布板块定义（纯布局层，绝不进入 IR） */
+  sections: CanvasSection[];
+  /** 是否有尚未落库的本地板块改动 */
+  sectionsPending: boolean;
+  /** 板块逻辑时钟（Lamport clock），配合 origin 做确定性 LWW 裁决 */
+  sectionsClock: number;
+  /** 最近一次生效的板块版本 */
+  sectionsVersion: LayoutVersion | null;
+  sectionsTimer?: ReturnType<typeof setTimeout>;
+  /** 当前在途的板块落库任务 */
+  sectionsFlushing: Promise<void> | null;
+  /** 连续防抖落盘失败的重试次数 */
+  sectionsRetries: number;
+  /** 本机单调递增的板块写代次，避免异步落库/重载期间覆盖更新的本地编辑 */
+  sectionsWriteSeq: number;
+  /** 空闲卸载定时器（仅在无在线成员、无在途操作且无待落盘布局/板块时存在） */
   idleTimer?: ReturnType<typeof setTimeout>;
   /** 当前在途/等待房间锁的活跃操作计数（避免等待锁期间被空闲卸载误删） */
   activeOps: number;
@@ -245,6 +273,8 @@ export class Rooms {
   private idleTimers = new Map<Loaded, ReturnType<typeof setTimeout>>();
   /** 追踪所有活跃的布局防抖/重试定时器，确保 close() 时同步彻底清理 */
   private layoutTimers = new Map<Loaded, ReturnType<typeof setTimeout>>();
+  /** 追踪所有活跃的板块防抖/重试定时器，确保 close() 时同步彻底清理 */
+  private sectionsTimers = new Map<Loaded, ReturnType<typeof setTimeout>>();
   private peerPruneTimer: ReturnType<typeof setInterval> | null = null;
   private pruneInFlight: Promise<void> | null = null;
   /** 追踪非阻塞路径（load / close）发起的在途事件发布，供 flush() 排空避免与 db.close() 竞态 */
@@ -333,6 +363,11 @@ export class Rooms {
       if (r.layoutTimer === timer) r.layoutTimer = undefined;
     }
     this.layoutTimers.clear();
+    for (const [r, timer] of this.sectionsTimers) {
+      clearTimeout(timer);
+      if (r.sectionsTimer === timer) r.sectionsTimer = undefined;
+    }
+    this.sectionsTimers.clear();
     if (this.bus) {
       for (const [branchId, pending] of this.rooms) {
         const p = pending
@@ -500,9 +535,10 @@ export class Rooms {
 
   private async load(branchId: string): Promise<Loaded> {
     const { room, lastRejectionId } = await this.loadRoom(branchId);
-    const [b] = await this.db.query<{ layout: Layout }>('select layout from branches where id = $1', [
-      branchId,
-    ]);
+    const [b] = await this.db.query<{ layout: Layout; sections: CanvasSection[] }>(
+      'select layout, sections from branches where id = $1',
+      [branchId],
+    );
     const loaded: Loaded = {
       room,
       lastRejectionId,
@@ -514,6 +550,13 @@ export class Rooms {
       layoutVersions: new Map(),
       layoutFlushing: null,
       layoutRetries: 0,
+      sections: sanitizeSections(b?.sections),
+      sectionsPending: false,
+      sectionsClock: 0,
+      sectionsVersion: null,
+      sectionsFlushing: null,
+      sectionsRetries: 0,
+      sectionsWriteSeq: 0,
       activeOps: 0,
       evicted: false,
       lock: Promise.resolve(),
@@ -543,8 +586,14 @@ export class Rooms {
     );
   }
 
+  private hasPendingSections(r: Loaded): boolean {
+    return r.sectionsPending || r.sectionsFlushing !== null || r.sectionsTimer !== undefined;
+  }
+
   private isIdle(r: Loaded): boolean {
-    return r.peers.size === 0 && r.activeOps === 0 && !this.hasPendingLayout(r);
+    return (
+      r.peers.size === 0 && r.activeOps === 0 && !this.hasPendingLayout(r) && !this.hasPendingSections(r)
+    );
   }
 
   private clearIdleEvict(r: Loaded) {
@@ -561,6 +610,14 @@ export class Rooms {
       r.layoutTimer = undefined;
     }
     this.layoutTimers.delete(r);
+  }
+
+  private clearSectionsTimer(r: Loaded) {
+    if (r.sectionsTimer !== undefined) {
+      clearTimeout(r.sectionsTimer);
+      r.sectionsTimer = undefined;
+    }
+    this.sectionsTimers.delete(r);
   }
 
   private scheduleIdleEvictIfNeeded(branchId: string, r: Loaded) {
@@ -933,6 +990,84 @@ export class Rooms {
     for (const p of r.peers) this.safeSend(p, { t: 'layout', positions: r.layout });
   }
 
+  private scheduleSectionsFlush(branchId: string, r: Loaded, delayMs?: number) {
+    if (this.closed || !this.isCurrentEntry(branchId, r)) return;
+    this.clearIdleEvict(r);
+    this.clearSectionsTimer(r);
+    const timer = setTimeout(() => {
+      if (r.sectionsTimer === timer) r.sectionsTimer = undefined;
+      this.sectionsTimers.delete(r);
+      if (this.closed || !this.isCurrentEntry(branchId, r)) return;
+      let failedState: { writeSeq: number; version: LayoutVersion | null } = {
+        writeSeq: -1,
+        version: null,
+      };
+      this.flushSections(branchId, r, (state) => {
+        failedState = state;
+      }).catch((e) => {
+        console.error(`保存画布板块失败（branchId=${branchId}）`, e);
+        this.handleSectionsFlushFailure(branchId, r, failedState);
+      });
+    }, delayMs ?? this.layoutDebounceMs);
+    timer.unref?.();
+    r.sectionsTimer = timer;
+    this.sectionsTimers.set(r, timer);
+  }
+
+  private handleSectionsFlushFailure(
+    branchId: string,
+    r: Loaded,
+    failedState: { writeSeq: number; version: LayoutVersion | null },
+  ) {
+    if (this.closed || !this.isCurrentEntry(branchId, r)) return;
+    if (!r.sectionsPending) {
+      r.sectionsRetries = 0;
+      this.scheduleIdleEvictIfNeeded(branchId, r);
+      return;
+    }
+    if (r.sectionsRetries < this.layoutMaxRetries) {
+      r.sectionsRetries += 1;
+      const backoffMs = this.layoutRetryBaseMs * 2 ** (r.sectionsRetries - 1);
+      this.scheduleSectionsFlush(branchId, r, backoffMs);
+      return;
+    }
+    // 连续失败达重试上限：若期间无更新写入或更高版本覆盖则清 pending，防止空闲房间永久卡死无法卸载
+    if (r.sectionsWriteSeq === failedState.writeSeq && r.sectionsVersion === failedState.version) {
+      r.sectionsPending = false;
+      r.sectionsRetries = 0;
+      this.clearSectionsTimer(r);
+      this.scheduleIdleEvictIfNeeded(branchId, r);
+      return;
+    }
+    r.sectionsRetries = 0;
+    this.scheduleSectionsFlush(branchId, r);
+  }
+
+  private async reloadSectionsFromDb(branchId: string, r: Loaded, incoming: LayoutVersion) {
+    const writeSeqBefore = r.sectionsWriteSeq;
+    while (r.sectionsFlushing) {
+      await r.sectionsFlushing.catch(() => {});
+    }
+    if (!this.isCurrentEntry(branchId, r)) return;
+    if (r.sectionsWriteSeq !== writeSeqBefore) return;
+    if (!isNewerLayoutVersion(incoming, r.sectionsVersion ?? undefined)) return;
+    const [b] = await this.db.query<{ sections: CanvasSection[] }>(
+      'select sections from branches where id = $1',
+      [branchId],
+    );
+    if (!b || !this.isCurrentEntry(branchId, r)) return;
+    if (r.sectionsWriteSeq !== writeSeqBefore) return;
+    if (!isNewerLayoutVersion(incoming, r.sectionsVersion ?? undefined)) return;
+    const sections = sanitizeSections(b.sections);
+    r.sections = sections;
+    r.sectionsVersion = incoming;
+    r.sectionsPending = false;
+    r.sectionsRetries = 0;
+    this.clearSectionsTimer(r);
+    this.scheduleIdleEvictIfNeeded(branchId, r);
+    for (const p of r.peers) this.safeSend(p, { t: 'sections', sections });
+  }
+
   private async handleClusterEvent(event: ClusterEvent) {
     if (!this.bus || event.origin === this.bus.replicaId) return;
     switch (event.t) {
@@ -972,6 +1107,35 @@ export class Rooms {
         const incomingVer = typeof event.ver === 'number' ? event.ver : r.layoutClock + 1;
         if (incomingVer > r.layoutClock) r.layoutClock = incomingVer;
         await this.reloadLayoutFromDb(event.branchId, r, { ver: incomingVer, origin: event.origin });
+        break;
+      }
+      case 'room.sections': {
+        const pending = this.rooms.get(event.branchId);
+        if (!pending) return;
+        const r = await pending.catch(() => null);
+        if (!r || !this.isCurrentEntry(event.branchId, r)) return;
+        const incomingVer = typeof event.ver === 'number' ? event.ver : r.sectionsClock + 1;
+        if (incomingVer > r.sectionsClock) r.sectionsClock = incomingVer;
+        const incoming: LayoutVersion = { ver: incomingVer, origin: event.origin };
+        if (!isNewerLayoutVersion(incoming, r.sectionsVersion ?? undefined)) return;
+        const sections = sanitizeSections(event.sections);
+        r.sections = sections;
+        r.sectionsVersion = incoming;
+        r.sectionsPending = false;
+        r.sectionsRetries = 0;
+        this.clearSectionsTimer(r);
+        this.scheduleIdleEvictIfNeeded(event.branchId, r);
+        for (const p of r.peers) this.safeSend(p, { t: 'sections', sections });
+        break;
+      }
+      case 'room.sections.reload': {
+        const pending = this.rooms.get(event.branchId);
+        if (!pending) return;
+        const r = await pending.catch(() => null);
+        if (!r || !this.isCurrentEntry(event.branchId, r)) return;
+        const incomingVer = typeof event.ver === 'number' ? event.ver : r.sectionsClock + 1;
+        if (incomingVer > r.sectionsClock) r.sectionsClock = incomingVer;
+        await this.reloadSectionsFromDb(event.branchId, r, { ver: incomingVer, origin: event.origin });
         break;
       }
       case 'room.peers': {
@@ -1053,12 +1217,19 @@ export class Rooms {
         const pending = this.rooms.get(branchId);
         const r = pending ? await pending.catch(() => null) : null;
         if (r && this.isCurrentEntry(branchId, r)) {
-          const [b] = await this.db.query<{ layout: Layout }>('select layout from branches where id = $1', [
-            branchId,
-          ]);
-          if (b?.layout && this.isCurrentEntry(branchId, r)) {
-            r.layout = { ...b.layout, ...r.pendingLayout };
-            for (const p of r.peers) this.safeSend(p, { t: 'layout', positions: r.layout });
+          const [b] = await this.db.query<{ layout: Layout; sections: CanvasSection[] }>(
+            'select layout, sections from branches where id = $1',
+            [branchId],
+          );
+          if (b && this.isCurrentEntry(branchId, r)) {
+            if (b.layout) {
+              r.layout = { ...b.layout, ...r.pendingLayout };
+              for (const p of r.peers) this.safeSend(p, { t: 'layout', positions: r.layout });
+            }
+            if (!r.sectionsPending && !r.sectionsFlushing) {
+              r.sections = sanitizeSections(b.sections);
+              for (const p of r.peers) this.safeSend(p, { t: 'sections', sections: r.sections });
+            }
           }
           await this.publishRoomPeers(branchId, r);
         }
@@ -1294,6 +1465,7 @@ export class Rooms {
         peer.role = role;
         this.safeSend(peer, { t: 'role', role });
         this.safeSend(peer, { t: 'layout', positions: r.layout });
+        this.safeSend(peer, { t: 'sections', sections: r.sections });
         return;
       }
     } catch (err) {
@@ -1369,6 +1541,54 @@ export class Rooms {
       throw err;
     } finally {
       if (r.layoutFlushing === task) r.layoutFlushing = null;
+      this.scheduleIdleEvictIfNeeded(branchId, r);
+    }
+  }
+
+  private async flushSections(
+    branchId: string,
+    r: Loaded,
+    onErrorState?: (state: { writeSeq: number; version: LayoutVersion | null }) => void,
+  ): Promise<void> {
+    while (r.sectionsFlushing) {
+      await r.sectionsFlushing.catch(() => {});
+    }
+    if (!r.sectionsPending) {
+      r.sectionsRetries = 0;
+      this.scheduleIdleEvictIfNeeded(branchId, r);
+      return;
+    }
+    let currentWriteSeq = r.sectionsWriteSeq;
+    let currentVersion = r.sectionsVersion;
+    const task = (async () => {
+      while (r.sectionsPending) {
+        const snapshot = r.sections;
+        const writeSeq = r.sectionsWriteSeq;
+        const versionBefore = r.sectionsVersion;
+        currentWriteSeq = writeSeq;
+        currentVersion = versionBefore;
+        await this.db.query('update branches set sections = $2::text::jsonb where id = $1', [
+          branchId,
+          JSON.stringify(snapshot),
+        ]);
+        if (r.sectionsWriteSeq === writeSeq && r.sectionsVersion === versionBefore) {
+          r.sectionsPending = false;
+          r.sectionsRetries = 0;
+          this.clearSectionsTimer(r);
+        } else {
+          // 落库期间有新本地写入或收到更高版本远端板块（旧快照可能已覆写 DB），保持待刷状态幂等写回当前获胜版本
+          r.sectionsPending = true;
+        }
+      }
+    })();
+    r.sectionsFlushing = task;
+    try {
+      await task;
+    } catch (err) {
+      onErrorState?.({ writeSeq: currentWriteSeq, version: currentVersion });
+      throw err;
+    } finally {
+      if (r.sectionsFlushing === task) r.sectionsFlushing = null;
       this.scheduleIdleEvictIfNeeded(branchId, r);
     }
   }
@@ -1585,6 +1805,45 @@ export class Rooms {
       }
 
       await this.publish({ t: 'room.layout', branchId, positions, ver });
+      return;
+    }
+    if (msg.t === 'sections') {
+      if (peer.role === 'viewer') return;
+      if (!r.peers.has(peer)) return;
+      if (!Array.isArray(msg.sections)) return;
+      const sections = sanitizeSections(msg.sections);
+      r.sections = sections;
+      r.sectionsPending = true;
+      r.sectionsRetries = 0;
+      r.sectionsClock += 1;
+      r.sectionsWriteSeq += 1;
+      const ver = r.sectionsClock;
+      r.sectionsVersion = { ver, origin: this.bus?.replicaId ?? '' };
+
+      // 写入内存待落盘状态后立即调度防抖定时器，避免在 await publish 挂起窗口内漏刷
+      this.scheduleSectionsFlush(branchId, r);
+      for (const p of r.peers) if (p !== peer) this.safeSend(p, { t: 'sections', sections });
+
+      const needsReloadBroadcast =
+        this.bus !== undefined &&
+        Buffer.byteLength(
+          JSON.stringify({ t: 'room.sections', origin: this.bus.replicaId, branchId, sections, ver }),
+          'utf8',
+        ) > SECTIONS_INLINE_MAX_BYTES;
+
+      if (needsReloadBroadcast) {
+        this.clearSectionsTimer(r);
+        try {
+          await this.flushSections(branchId, r);
+        } catch (e) {
+          if (r.sectionsPending) this.scheduleSectionsFlush(branchId, r);
+          throw e;
+        }
+        await this.publish({ t: 'room.sections.reload', branchId, ver });
+        return;
+      }
+
+      await this.publish({ t: 'room.sections', branchId, sections, ver });
       return;
     }
     if (msg.t === 'presence' && peer.client) {
@@ -2074,6 +2333,7 @@ export class Rooms {
         const hadClients = this.localPeerList(r).length > 0;
         this.clearIdleEvict(r);
         this.clearLayoutTimer(r);
+        this.clearSectionsTimer(r);
         r.evicted = true;
         for (const peer of [...r.peers]) kick(r, peer, '项目已被删除');
         if (this.rooms.get(branchId) === pending) this.rooms.delete(branchId);
@@ -2152,6 +2412,7 @@ export class Rooms {
         hadClients = this.localPeerList(r).length > 0;
         this.clearIdleEvict(r);
         this.clearLayoutTimer(r);
+        this.clearSectionsTimer(r);
         r.evicted = true;
         for (const peer of [...r.peers]) {
           r.peers.delete(peer);
@@ -2208,11 +2469,14 @@ export class Rooms {
       if (!r) continue;
       await r.lock.catch(() => {});
       this.clearLayoutTimer(r);
+      this.clearSectionsTimer(r);
       if (r.layoutFlushing || Object.keys(r.pendingLayout).length > 0) {
         await this.flushLayout(branchId, r);
-      } else {
-        this.scheduleIdleEvictIfNeeded(branchId, r);
       }
+      if (r.sectionsFlushing || r.sectionsPending) {
+        await this.flushSections(branchId, r);
+      }
+      this.scheduleIdleEvictIfNeeded(branchId, r);
     }
   }
 }

@@ -1008,7 +1008,8 @@ dialog::backdrop {
   --xy-minimap-mask-stroke-width: 2;
   --xy-attribution-background-color: transparent;
 }
-.react-flow__node-table {
+.react-flow__node-table,
+.react-flow__node-sectionSummary {
   padding: 0;
   border: none;
   background: transparent;
