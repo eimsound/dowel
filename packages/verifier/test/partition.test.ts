@@ -735,4 +735,142 @@ describe.skipIf(!PG_URL)('PG 分区表闭环与往返验证', () => {
     expect(rAttach.upDiff).toEqual([]);
     expect(rAttach.downDiff).toEqual([]);
   });
+
+  test('回归（缺陷 4）：父表含同列重复 UNIQUE/INDEX 时删第一个并重命名子分区双向闭环通过', async () => {
+    const db = conn();
+    const v1 = emptyModel();
+    const s = E.createSchema(v1, 's1');
+    const p = E.createTable(v1, s, 'pt_a');
+    const cPk = E.addColumn(v1, p, { name: 'pk_key', type: 'integer', notNull: true });
+    const cVal = E.addColumn(v1, p, { name: 'val', type: 'integer', default: { expr: '0' } });
+    E.setPartitionBy(v1, p, {
+      strategy: 'range',
+      keys: [{ column: cPk, expr: null, opclass: null, collation: null }],
+    });
+    E.addPrimaryKey(v1, p, [cPk]);
+    const u1 = E.addUnique(v1, p, [cPk, cVal], true);
+    const u2 = E.addUnique(v1, p, [cPk, cVal], true);
+    const i1 = E.addIndex(v1, p, [{ column: cVal }]);
+    const i2 = E.addIndex(v1, p, [{ column: cVal }]);
+    const ch0 = E.createPartition(v1, p, 'pt_a_p_0', 'DEFAULT');
+    const ch32 = E.createPartition(v1, p, 'pt_a_p_32', 'FOR VALUES FROM (1900) TO (2000)');
+
+    // 场景 A：删第一个 UNIQUE/INDEX + 删兄弟子分区 + schema 改名 + 重命名保留子分区
+    const v2 = structuredClone(v1);
+    E.dropKey(v2, u1);
+    E.dropKey(v2, i1);
+    E.dropTable(v2, ch0);
+    E.renameSchema(v2, s, 'user');
+    E.renameTable(v2, ch32, 'ch_user_5');
+    expect(validate(v2)).toEqual([]);
+    const rA = await verify(db, v1, v2);
+    expect(rA.upDiff).toEqual([]);
+    expect(rA.downDiff).toEqual([]);
+
+    // 场景 B：仅删第一个 UNIQUE/INDEX 后直接脱离剩余子分区并删除脱离后的第二个 UNIQUE/INDEX（验证 PG 隐式名已从 key1/idx1 同步为 key/idx）
+    const v2b = structuredClone(v1);
+    E.dropKey(v2b, u1);
+    E.dropKey(v2b, i1);
+    expect(validate(v2b)).toEqual([]);
+    const rB1 = await verify(db, v1, v2b);
+    expect(rB1.upDiff).toEqual([]);
+    expect(rB1.downDiff).toEqual([]);
+
+    const v3b = structuredClone(v2b);
+    E.detachPartition(v3b, ch32);
+    for (const u of E.childrenOf(v3b, ch32, 'unique')) E.dropKey(v3b, u.id);
+    for (const x of E.childrenOf(v3b, ch32, 'index')) E.dropKey(v3b, x.id);
+    expect(validate(v3b)).toEqual([]);
+    const rB2 = await verify(db, v2b, v3b);
+    expect(rB2.upDiff).toEqual([]);
+    expect(rB2.downDiff).toEqual([]);
+    expect(u2).toBeTruthy();
+    expect(i2).toBeTruthy();
+  });
+
+  test('回归（缺陷 5）：objects 键序反转零规划差异及多级分区同列索引/唯一约束双向闭环通过', async () => {
+    const db = conn();
+
+    // 1. 键序无关性与实库 readSnapshot/importSnapshot/reconcileIds 零多余步骤
+    const m1 = emptyModel();
+    const s1 = E.createSchema(m1, 'public');
+    const ptC = E.createTable(m1, s1, 'pt_c');
+    const cPk = E.addColumn(m1, ptC, { name: 'pk_key', type: 'integer', notNull: true });
+    const cVal = E.addColumn(m1, ptC, { name: 'val', type: 'integer', default: { expr: '0' } });
+    E.setPartitionBy(m1, ptC, {
+      strategy: 'range',
+      keys: [{ column: cPk, expr: null, opclass: null, collation: null }],
+    });
+    E.addPrimaryKey(m1, ptC, [cPk]);
+    E.addUnique(m1, ptC, [cPk, cVal], true);
+    E.addUnique(m1, ptC, [cPk, cVal], true);
+    E.addIndex(m1, ptC, [{ column: cVal }]);
+    E.addIndex(m1, ptC, [{ column: cVal }]);
+    E.createPartition(m1, ptC, 'pt_c_p_50', 'FOR VALUES FROM (0) TO (100)');
+    E.createPartition(m1, ptC, 'pt_c_p_87', 'FOR VALUES FROM (100) TO (200)');
+
+    const m2: E.Model = {
+      ...structuredClone(m1),
+      objects: Object.fromEntries(Object.entries(structuredClone(m1.objects)).reverse()),
+    };
+    expect(validate(m1)).toEqual([]);
+    expect(validate(m2)).toEqual([]);
+    expect(plan(m1, m2)).toEqual([]);
+    expect(plan(m2, m1)).toEqual([]);
+
+    await build(db, m1);
+    const live = reconcileIds(m1, importSnapshot(await readSnapshot(db)));
+    expect(plan(live, m1)).toEqual([]);
+    expect(plan(m1, live)).toEqual([]);
+
+    // 2. 两级分区：根父表与二级子父表均建同列 UNIQUE 与 INDEX，删根父表对象 + 子表改名 + 脱离全闭环
+    const v1 = emptyModel();
+    const s = E.createSchema(v1, 'public');
+    const gp = E.createTable(v1, s, 'gp');
+    const gpYr = E.addColumn(v1, gp, { name: 'yr', type: 'integer', notNull: true });
+    const gpReg = E.addColumn(v1, gp, { name: 'region', type: 'text', notNull: true });
+    const gpVal = E.addColumn(v1, gp, { name: 'val', type: 'integer', notNull: true });
+    const gpExtra = E.addColumn(v1, gp, { name: 'extra', type: 'integer', notNull: true });
+    E.setPartitionBy(v1, gp, {
+      strategy: 'range',
+      keys: [{ column: gpYr, expr: null, opclass: null, collation: null }],
+    });
+    E.addPrimaryKey(v1, gp, [gpYr, gpReg]);
+    const gu1 = E.addUnique(v1, gp, [gpYr, gpReg, gpVal]);
+    E.addUnique(v1, gp, [gpYr, gpReg, gpVal]);
+    const gi1 = E.addIndex(v1, gp, [{ column: gpVal }]);
+    E.addIndex(v1, gp, [{ column: gpVal }]);
+
+    const sub = E.createPartition(v1, gp, 'gp_2025', 'FOR VALUES FROM (2025) TO (2026)');
+    E.setPartitionBy(v1, sub, {
+      strategy: 'list',
+      keys: [{ column: gpReg, expr: null, opclass: null, collation: null }],
+    });
+    // sub 上建局部唯一约束（含 extra 列）与局部部分索引（与 gp 同在 val 列，令 leaf 上发生同名竞争但不被 PG 吸收）
+    const su1 = E.addUnique(v1, sub, [gpYr, gpReg, gpExtra]);
+    E.renameKey(v1, su1, 'sub_local_uniq');
+    const si1 = E.addIndex(v1, sub, [{ column: gpVal }], { where: '(yr >= 2025)' });
+    E.renameKey(v1, si1, 'sub_local_idx');
+    const leaf = E.createPartition(v1, sub, 'gp_2025_us', "FOR VALUES IN ('us')");
+
+    // 场景 A：删根父表第一条 UNIQUE 与 INDEX，同时重命名叶子分区（down 反向测试向两级分区新增）
+    const v2 = structuredClone(v1);
+    E.dropKey(v2, gu1);
+    E.dropKey(v2, gi1);
+    E.renameTable(v2, leaf, 'gp_2025_us_v2');
+    expect(validate(v2)).toEqual([]);
+    const rA = await verify(db, v1, v2);
+    expect(rA.upDiff).toEqual([]);
+    expect(rA.downDiff).toEqual([]);
+
+    // 场景 B：脱离叶子分区并删除其脱离后的全部 UNIQUE 与 INDEX
+    const v3 = structuredClone(v2);
+    E.detachPartition(v3, leaf);
+    for (const u of E.childrenOf(v3, leaf, 'unique')) E.dropKey(v3, u.id);
+    for (const x of E.childrenOf(v3, leaf, 'index')) E.dropKey(v3, x.id);
+    expect(validate(v3)).toEqual([]);
+    const rB = await verify(db, v2, v3);
+    expect(rB.upDiff).toEqual([]);
+    expect(rB.downDiff).toEqual([]);
+  });
 });

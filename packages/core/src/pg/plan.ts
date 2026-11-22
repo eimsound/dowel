@@ -739,7 +739,108 @@ export const plan = (rawFrom: Model, rawTo: Model, opts?: PlanOptions): Step[] =
     con: boolean,
   ) => chooseName(n1, n2, label, (n) => (rel && relTakenCur(schema, n)) || (con && conTakenCur(tableId, n)));
 
+  const cmpStr = (a: string, b: string) => (a < b ? -1 : a > b ? 1 : 0);
+  const cmpTableIn = (m: Model, a: Table, b: Table): number =>
+    partitionDepth(m, a.id) - partitionDepth(m, b.id) ||
+    cmpStr(get(m, a.parent, 'schema').name, get(m, b.parent, 'schema').name) ||
+    cmpStr(a.name, b.name) ||
+    cmpStr(a.id, b.id);
+  const cmpKeyIn = (
+    m: Model,
+    a: PrimaryKey | Unique | Check | Index,
+    b: PrimaryKey | Unique | Check | Index,
+  ): number => {
+    const ta = get(m, a.parent, 'table');
+    const tb = get(m, b.parent, 'table');
+    // 非分区表（含叶子分区本地对象）优先于分区父表创建，防止父表隐式索引名抢占子表本地对象名；
+    // 同为分区父表时按分区深度升序（根父表先于二级子父表），与 createAll (P10→P15) 及 PG 实际继承建索引顺序严格一致。
+    const partDiff = (ta.partitionBy !== null ? 1 : 0) - (tb.partitionBy !== null ? 1 : 0);
+    if (partDiff !== 0) return partDiff;
+    const depthDiff =
+      ta.partitionBy !== null
+        ? partitionDepth(m, ta.id) - partitionDepth(m, tb.id)
+        : partitionDepth(m, tb.id) - partitionDepth(m, ta.id);
+    return (
+      depthDiff ||
+      cmpStr(get(m, ta.parent, 'schema').name, get(m, tb.parent, 'schema').name) ||
+      cmpStr(ta.name, tb.name) ||
+      cmpStr(a.name, b.name) ||
+      cmpStr(a.id, b.id)
+    );
+  };
+  const relTakenIn = (m: Model, schemaId: string, name: string): boolean =>
+    Object.values(m.objects).some((o) => {
+      if ((o.kind === 'table' || o.kind === 'sequence') && o.parent === schemaId) return o.name === name;
+      if (
+        (o.kind === 'index' || o.kind === 'primaryKey' || o.kind === 'unique') &&
+        find(m, o.parent)?.kind === 'table' &&
+        (m.objects[o.parent] as Table).parent === schemaId
+      )
+        return o.name === name;
+      if (
+        o.kind === 'column' &&
+        o.identity &&
+        find(m, o.parent)?.kind === 'table' &&
+        (m.objects[o.parent] as Table).parent === schemaId
+      )
+        return o.identity.sequenceName === name;
+      return false;
+    });
+  const conTakenIn = (m: Model, tableId: string, name: string): boolean =>
+    Object.values(m.objects).some((o) => {
+      if (
+        (o.kind === 'primaryKey' || o.kind === 'unique' || o.kind === 'check' || o.kind === 'foreignKey') &&
+        o.parent === tableId
+      )
+        return o.name === name;
+      if (cap.namedNotNull && o.kind === 'column' && o.parent === tableId && o.notNull)
+        return o.notNullName === name;
+      return false;
+    });
+  const simulateImplicitNames = (m: Model): Map<string, string> => {
+    const out = new Map<string, string>();
+    if (!all(m, 'table').some((t) => t.partitionOf !== null)) return out;
+    const takenRel = new Set<string>();
+    const takenCon = new Set<string>();
+    for (const kind of ['primaryKey', 'unique', 'index'] as const) {
+      const label = kind === 'primaryKey' ? 'pkey' : kind === 'unique' ? 'key' : 'idx';
+      const isCon = kind !== 'index';
+      const ancObjs = Object.values(m.objects)
+        .filter(
+          (o): o is PrimaryKey | Unique | Index =>
+            o.kind === kind && get(m, o.parent, 'table').partitionBy !== null,
+        )
+        .sort((a, b) => cmpKeyIn(m, a, b));
+      for (const ancObj of ancObjs) {
+        const colPart =
+          kind === 'primaryKey'
+            ? null
+            : kind === 'unique'
+              ? joinNames((ancObj as Unique).columns.map((c) => get(m, c, 'column').name))
+              : joinNames(indexElementNames(m, ancObj as Index));
+        const descs = partitionDescendants(m, ancObj.parent).sort((a, b) => cmpTableIn(m, a, b));
+        for (const desc of descs) {
+          const name = chooseName(
+            desc.name,
+            colPart,
+            label,
+            (n) =>
+              relTakenIn(m, desc.parent, n) ||
+              takenRel.has(`${desc.parent}:${n}`) ||
+              (isCon && (conTakenIn(m, desc.id, n) || takenCon.has(`${desc.id}:${n}`))),
+          );
+          takenRel.add(`${desc.parent}:${name}`);
+          if (isCon) takenCon.add(`${desc.id}:${name}`);
+          out.set(`${desc.id}#imp#${ancObj.id}`, name);
+        }
+      }
+    }
+    return out;
+  };
+  const fromImplicitNames = simulateImplicitNames(from);
+
   const materialized = new Set<string>();
+  const detachedOrigin = new Map<string, string>();
   const syntheticDetached = new Set<string>();
   const retainedForReattach = new Set<string>();
   const keptForAttachCheck = new Set<string>();
@@ -752,7 +853,11 @@ export const plan = (rawFrom: Model, rawTo: Model, opts?: PlanOptions): Step[] =
 
   // ───── P0b 脱离需要脱离或改边界的子分区（按深度降序，先脱离最深层子分区） ─────
   let synSeq = 0;
-  for (const tId of [...willDetach].sort((a, b) => partitionDepth(from, b) - partitionDepth(from, a))) {
+  for (const tId of [...willDetach].sort(
+    (a, b) =>
+      partitionDepth(from, b) - partitionDepth(from, a) ||
+      cmpTableIn(from, get(from, a, 'table'), get(from, b, 'table')),
+  )) {
     const t = get(cur, tId, 'table');
     const oldParentId = t.partitionOf!.parent;
     const oldAncestors = ancestorsCur(oldParentId);
@@ -822,6 +927,16 @@ export const plan = (rawFrom: Model, rawTo: Model, opts?: PlanOptions): Step[] =
       if (isFullDetach) {
         const detId = derivedUuid(`${tId}:${seedPrefix}:${ancObj.id}`);
         let toMatch = toOnT.find((x) => x.id === detId && x.kind === detObj.kind && !matchedToObjs.has(x.id));
+        if (!toMatch && (detObj.kind === 'unique' || detObj.kind === 'index')) {
+          toMatch = toOnT.find(
+            (x) =>
+              x.kind === detObj.kind &&
+              !matchedToObjs.has(x.id) &&
+              !(x.id in cur.objects) &&
+              x.name === detObj.name &&
+              same(definition(x), definition(migrated(detObj))),
+          );
+        }
         if (!toMatch) {
           toMatch = toOnT.find((x) => {
             if (x.kind !== detObj.kind || matchedToObjs.has(x.id) || x.id in cur.objects) return false;
@@ -837,6 +952,7 @@ export const plan = (rawFrom: Model, rawTo: Model, opts?: PlanOptions): Step[] =
           const placed = { ...detObj, id: toMatch.id };
           cur.objects[toMatch.id] = placed;
           materialized.add(toMatch.id);
+          detachedOrigin.set(toMatch.id, ancObj.id);
           if (
             !same(definition(toMatch), definition(migrated(placed))) ||
             usesCols(placed, regen) ||
@@ -871,44 +987,53 @@ export const plan = (rawFrom: Model, rawTo: Model, opts?: PlanOptions): Step[] =
       }
     };
 
+    const ancIds = new Set(oldAncestors.map((a) => a.id));
+    for (const pk of Object.values(cur.objects)
+      .filter((o): o is PrimaryKey => o.kind === 'primaryKey' && ancIds.has(o.parent))
+      .sort((a, b) => cmpKeyIn(cur, a, b))) {
+      if (childrenOf(cur, tId, 'primaryKey').length > 0) continue;
+      const mappedCols = pk.columns.map(mapCol);
+      const detName =
+        fromImplicitNames.get(`${tId}#imp#${detachedOrigin.get(pk.id) ?? pk.id}`) ??
+        chooseInCur(t.parent, tId, t.name, null, 'pkey', true, true);
+      registerDetached(
+        pk,
+        {
+          id: '',
+          kind: 'primaryKey',
+          parent: tId,
+          name: detName,
+          nameMode: 'derived',
+          columns: mappedCols,
+          comment: null,
+        },
+        'con',
+      );
+    }
+    for (const u of Object.values(cur.objects)
+      .filter((o): o is Unique => o.kind === 'unique' && ancIds.has(o.parent))
+      .sort((a, b) => cmpKeyIn(cur, a, b))) {
+      const mappedCols = u.columns.map(mapCol);
+      const colNames = mappedCols.map((c) => get(cur, c, 'column').name);
+      const detName =
+        fromImplicitNames.get(`${tId}#imp#${detachedOrigin.get(u.id) ?? u.id}`) ??
+        chooseInCur(t.parent, tId, t.name, joinNames(colNames), 'key', true, true);
+      registerDetached(
+        u,
+        {
+          id: '',
+          kind: 'unique',
+          parent: tId,
+          name: detName,
+          nameMode: 'derived',
+          columns: mappedCols,
+          nullsNotDistinct: u.nullsNotDistinct,
+          comment: null,
+        },
+        'con',
+      );
+    }
     for (const anc of oldAncestors) {
-      for (const pk of childrenOf(cur, anc.id, 'primaryKey')) {
-        if (childrenOf(cur, tId, 'primaryKey').length > 0) continue;
-        const mappedCols = pk.columns.map(mapCol);
-        const detName = chooseInCur(t.parent, tId, t.name, null, 'pkey', true, true);
-        registerDetached(
-          pk,
-          {
-            id: '',
-            kind: 'primaryKey',
-            parent: tId,
-            name: detName,
-            nameMode: 'derived',
-            columns: mappedCols,
-            comment: null,
-          },
-          'con',
-        );
-      }
-      for (const u of childrenOf(cur, anc.id, 'unique')) {
-        const mappedCols = u.columns.map(mapCol);
-        const colNames = mappedCols.map((c) => get(cur, c, 'column').name);
-        const detName = chooseInCur(t.parent, tId, t.name, joinNames(colNames), 'key', true, true);
-        registerDetached(
-          u,
-          {
-            id: '',
-            kind: 'unique',
-            parent: tId,
-            name: detName,
-            nameMode: 'derived',
-            columns: mappedCols,
-            nullsNotDistinct: u.nullsNotDistinct,
-            comment: null,
-          },
-          'con',
-        );
-      }
       for (const ck of childrenOf(cur, anc.id, 'check')) {
         if (childrenOf(cur, tId, 'check').some((x) => x.name === ck.name)) continue;
         registerDetached(
@@ -949,32 +1074,28 @@ export const plan = (rawFrom: Model, rawTo: Model, opts?: PlanOptions): Step[] =
           'con',
         );
       }
-      for (const idx of childrenOf(cur, anc.id, 'index')) {
-        const mappedIdx: Index = {
-          id: '',
-          kind: 'index',
-          parent: tId,
-          name: '',
-          nameMode: 'derived',
-          unique: idx.unique,
-          method: idx.method,
-          elements: idx.elements.map((e) => ({ ...e, column: e.column ? mapCol(e.column) : null })),
-          include: idx.include.map(mapCol),
-          where: idx.where,
-          nullsNotDistinct: idx.nullsNotDistinct,
-          comment: null,
-        };
-        mappedIdx.name = chooseInCur(
-          t.parent,
-          tId,
-          t.name,
-          joinNames(indexElementNames(cur, mappedIdx)),
-          'idx',
-          true,
-          false,
-        );
-        registerDetached(idx, mappedIdx, 'idx');
-      }
+    }
+    for (const idx of Object.values(cur.objects)
+      .filter((o): o is Index => o.kind === 'index' && ancIds.has(o.parent))
+      .sort((a, b) => cmpKeyIn(cur, a, b))) {
+      const mappedIdx: Index = {
+        id: '',
+        kind: 'index',
+        parent: tId,
+        name: '',
+        nameMode: 'derived',
+        unique: idx.unique,
+        method: idx.method,
+        elements: idx.elements.map((e) => ({ ...e, column: e.column ? mapCol(e.column) : null })),
+        include: idx.include.map(mapCol),
+        where: idx.where,
+        nullsNotDistinct: idx.nullsNotDistinct,
+        comment: null,
+      };
+      mappedIdx.name =
+        fromImplicitNames.get(`${tId}#imp#${detachedOrigin.get(idx.id) ?? idx.id}`) ??
+        chooseInCur(t.parent, tId, t.name, joinNames(indexElementNames(cur, mappedIdx)), 'idx', true, false);
+      registerDetached(idx, mappedIdx, 'idx');
     }
   }
 
@@ -1235,85 +1356,25 @@ export const plan = (rawFrom: Model, rawTo: Model, opts?: PlanOptions): Step[] =
   const implicitState = new Map<string, { name: string; spaces: string[] }>();
   const attachedChildrenInCur = all(cur, 'table')
     .filter((t) => t.partitionOf !== null && inTo(t.id))
-    .sort((a, b) => partitionDepth(cur, a.id) - partitionDepth(cur, b.id) || a.id.localeCompare(b.id));
+    .sort((a, b) => cmpTableIn(cur, a, b));
   if (attachedChildrenInCur.length > 0) {
-    const takenOld = new Set<string>();
-    const takenNew = new Set<string>();
-    const toRelTaken = (schemaId: string, name: string): boolean =>
-      Object.values(to.objects).some((o) => {
-        if ((o.kind === 'table' || o.kind === 'sequence') && o.parent === schemaId) return o.name === name;
-        if (
-          (o.kind === 'index' || o.kind === 'primaryKey' || o.kind === 'unique') &&
-          find(to, o.parent)?.kind === 'table' &&
-          (to.objects[o.parent] as Table).parent === schemaId
-        )
-          return o.name === name;
-        if (
-          o.kind === 'column' &&
-          o.identity &&
-          find(to, o.parent)?.kind === 'table' &&
-          (to.objects[o.parent] as Table).parent === schemaId
-        )
-          return o.identity.sequenceName === name;
-        return false;
-      });
-    const toConTaken = (tableId: string, name: string): boolean =>
-      Object.values(to.objects).some((o) => {
-        if (
-          (o.kind === 'primaryKey' || o.kind === 'unique' || o.kind === 'check' || o.kind === 'foreignKey') &&
-          o.parent === tableId
-        )
-          return o.name === name;
-        if (cap.namedNotNull && o.kind === 'column' && o.parent === tableId && o.notNull)
-          return o.notNullName === name;
-        return false;
-      });
+    const oldNameMap = fromImplicitNames;
+    const newNameMap = simulateImplicitNames(to);
     for (const desc of attachedChildrenInCur) {
-      const toDesc = get(to, desc.id, 'table');
       const ancs = ancestorsCur(desc.partitionOf!.parent);
       const ancIds = new Set(ancs.map((a) => a.id));
       for (const kind of ['primaryKey', 'unique', 'index'] as const) {
+        const isCon = kind !== 'index';
         const ancObjs = Object.values(cur.objects)
           .filter(
             (o): o is PrimaryKey | Unique | Index => o.kind === kind && ancIds.has(o.parent) && inTo(o.id),
           )
-          .sort((a, b) => a.id.localeCompare(b.id));
+          .sort((a, b) => cmpKeyIn(cur, a, b));
         for (const ancObj of ancObjs) {
-          const toAncObj = get(to, ancObj.id, ancObj.kind);
-          const label = kind === 'primaryKey' ? 'pkey' : kind === 'unique' ? 'key' : 'idx';
-          const isCon = kind !== 'index';
-          const oldColPart =
-            kind === 'primaryKey'
-              ? null
-              : kind === 'unique'
-                ? joinNames((ancObj as Unique).columns.map((c) => get(cur, c, 'column').name))
-                : joinNames(indexElementNames(cur, ancObj as Index));
-          const newColPart =
-            kind === 'primaryKey'
-              ? null
-              : kind === 'unique'
-                ? joinNames((toAncObj as Unique).columns.map((c) => get(to, c, 'column').name))
-                : joinNames(indexElementNames(to, toAncObj as Index));
-          const oldName = chooseName(
-            desc.name,
-            oldColPart,
-            label,
-            (n) =>
-              relTakenCur(desc.parent, n) ||
-              (isCon && conTakenCur(desc.id, n)) ||
-              takenOld.has(`${desc.parent}:${n}`),
-          );
-          takenOld.add(`${desc.parent}:${oldName}`);
-          const newName = chooseName(
-            toDesc.name,
-            newColPart,
-            label,
-            (n) =>
-              toRelTaken(toDesc.parent, n) ||
-              (isCon && toConTaken(toDesc.id, n)) ||
-              takenNew.has(`${toDesc.parent}:${n}`),
-          );
-          takenNew.add(`${toDesc.parent}:${newName}`);
+          const origId = detachedOrigin.get(ancObj.id) ?? ancObj.id;
+          const oldName = oldNameMap.get(`${desc.id}#imp#${origId}`);
+          const newName = newNameMap.get(`${desc.id}#imp#${ancObj.id}`);
+          if (!oldName || !newName) continue;
           const impId = `${desc.id}#imp#${ancObj.id}`;
           const spaces = isCon ? [`rel:${desc.parent}`, `con:${desc.id}`] : [`rel:${desc.parent}`];
           implicitState.set(impId, { name: oldName, spaces });
@@ -1339,6 +1400,9 @@ export const plan = (rawFrom: Model, rawTo: Model, opts?: PlanOptions): Step[] =
   const toNames = new Set<string>();
   for (const o of Object.values(to.objects))
     for (const s of spacesOfTo(to, o)) toNames.add(`${s}\u0000${o.name}`);
+  for (const it of items) {
+    if (it.target) for (const s of it.spaces) toNames.add(`${s}\u0000${it.target}`);
+  }
   for (const o of removed) {
     const c = cur.objects[o.id];
     if (!c || !(c.kind === 'enum' || c.kind === 'sequence' || c.kind === 'schema')) continue;
@@ -1512,7 +1576,7 @@ export const plan = (rawFrom: Model, rawTo: Model, opts?: PlanOptions): Step[] =
   // ───── P10 建表（列内联；约束和索引后面统一加；按分区深度升序，父表先于子表，天然支持多级分区） ─────
   const addedTables = added
     .filter((o): o is Table => o.kind === 'table')
-    .sort((x, y) => partitionDepth(to, x.id) - partitionDepth(to, y.id));
+    .sort((x, y) => cmpTableIn(to, x, y));
   const emitConstraintOrIndex = (o: PrimaryKey | Unique | Check | Index) => {
     cur.objects[o.id] = fresh(o);
     if (o.kind === 'index') emit('createIndex', o.id, indexDef(o));
@@ -1553,7 +1617,7 @@ export const plan = (rawFrom: Model, rawTo: Model, opts?: PlanOptions): Step[] =
     // 防止后续先建子分区再建索引时 PG 自动生成的子分区继承索引名抢占父表显式索引名（63 字节截断重名）
     if (o.partitionBy !== null && !o.partitionOf) {
       for (const kind of ['primaryKey', 'unique', 'index'] as const) {
-        for (const k of childrenOf(to, o.id, kind)) {
+        for (const k of childrenOf(to, o.id, kind).sort((a, b) => cmpKeyIn(to, a, b))) {
           if (k.id in cur.objects || !allColRefsInCur(k)) continue;
           emitConstraintOrIndex(k);
         }
@@ -1919,12 +1983,20 @@ export const plan = (rawFrom: Model, rawTo: Model, opts?: PlanOptions): Step[] =
   // cur 里没有的就是新增的或前面删掉待重建的；子表本地对象先于父表创建，
   // 且当在已有子分区的父表上建 PK / UNIQUE / INDEX 时，若 PG 自动生成的子分区继承索引名抢占了待建对象的名字，立即改名为非冲突派生名
   const pendingRelNames = new Set<string>();
+  const pendingConNames = new Set<string>();
   for (const o of Object.values(to.objects)) {
+    if (
+      (o.kind === 'primaryKey' || o.kind === 'unique' || o.kind === 'check' || o.kind === 'foreignKey') &&
+      !(o.id in cur.objects)
+    ) {
+      pendingConNames.add(`${o.parent}:${o.name}`);
+    }
     if ((o.kind === 'primaryKey' || o.kind === 'unique' || o.kind === 'index') && !(o.id in cur.objects)) {
       pendingRelNames.add(`${get(to, o.parent, 'table').parent}:${o.name}`);
     }
   }
   const implicitRels = new Set<string>();
+  const implicitCons = new Set<string>();
   const implicitNameOf = (o: PrimaryKey | Unique | Index, desc: Table, skipPending: boolean): string => {
     const colPart =
       o.kind === 'primaryKey'
@@ -1933,6 +2005,7 @@ export const plan = (rawFrom: Model, rawTo: Model, opts?: PlanOptions): Step[] =
           ? joinNames(o.columns.map((c) => get(cur, c, 'column').name))
           : joinNames(indexElementNames(cur, o));
     const label = o.kind === 'primaryKey' ? 'pkey' : o.kind === 'unique' ? 'key' : 'idx';
+    const isCon = o.kind !== 'index';
     return chooseName(
       desc.name,
       colPart,
@@ -1940,33 +2013,50 @@ export const plan = (rawFrom: Model, rawTo: Model, opts?: PlanOptions): Step[] =
       (n) =>
         relTakenCur(desc.parent, n) ||
         implicitRels.has(`${desc.parent}:${n}`) ||
-        (skipPending && pendingRelNames.has(`${desc.parent}:${n}`)),
+        (skipPending && pendingRelNames.has(`${desc.parent}:${n}`)) ||
+        (isCon &&
+          (conTakenCur(desc.id, n) ||
+            implicitCons.has(`${desc.id}:${n}`) ||
+            (skipPending && pendingConNames.has(`${desc.id}:${n}`)))),
     );
   };
-  // 先登记 cur 中已存在的分区父表 PK / UNIQUE / INDEX 在其后代上已占用的隐式继承索引名
+  // 先登记 cur 中已存在的分区父表 PK / UNIQUE / INDEX 在其后代上已占用的隐式继承索引/约束名
   for (const kind of ['primaryKey', 'unique', 'index'] as const) {
-    for (const o of Object.values(cur.objects)) {
-      if (o.kind !== kind) continue;
+    const isCon = kind !== 'index';
+    const existingParents = Object.values(cur.objects)
+      .filter(
+        (o): o is PrimaryKey | Unique | Index =>
+          o.kind === kind && get(cur, o.parent, 'table').partitionBy !== null,
+      )
+      .sort((a, b) => cmpKeyIn(cur, a, b));
+    for (const o of existingParents) {
       const tbl = get(cur, o.parent, 'table');
-      if (tbl.partitionBy === null) continue;
-      for (const desc of partitionDescendants(cur, tbl.id)) {
-        implicitRels.add(`${desc.parent}:${implicitNameOf(o, desc, false)}`);
+      for (const desc of partitionDescendants(cur, tbl.id).sort((a, b) => cmpTableIn(cur, a, b))) {
+        const imp = implicitState.get(`${desc.id}#imp#${o.id}`);
+        const name = imp ? imp.name : implicitNameOf(o, desc, false);
+        implicitRels.add(`${desc.parent}:${name}`);
+        if (isCon) implicitCons.add(`${desc.id}:${name}`);
       }
     }
   }
   for (const kind of ['primaryKey', 'unique', 'check', 'index'] as const) {
     const todo = Object.values(to.objects)
       .filter((o): o is PrimaryKey | Unique | Check | Index => o.kind === kind && !(o.id in cur.objects))
-      .sort((a, b) => partitionDepth(to, b.parent) - partitionDepth(to, a.parent));
+      .sort((a, b) => cmpKeyIn(to, a, b));
     for (const o of todo) {
       emitConstraintOrIndex(o);
+      if (o.kind !== 'index') pendingConNames.delete(`${o.parent}:${o.name}`);
       if (o.kind === 'check') continue;
       const tbl = get(cur, o.parent, 'table');
       pendingRelNames.delete(`${tbl.parent}:${o.name}`);
       if (tbl.partitionBy === null) continue;
-      for (const desc of partitionDescendants(cur, tbl.id)) {
+      const isCon = o.kind !== 'index';
+      for (const desc of partitionDescendants(cur, tbl.id).sort((a, b) => cmpTableIn(cur, a, b))) {
         const pgName = implicitNameOf(o, desc, false);
-        if (pendingRelNames.has(`${desc.parent}:${pgName}`)) {
+        if (
+          pendingRelNames.has(`${desc.parent}:${pgName}`) ||
+          (isCon && pendingConNames.has(`${desc.id}:${pgName}`))
+        ) {
           const safeName = implicitNameOf(o, desc, true);
           if (o.kind === 'index') {
             emit(
@@ -1982,8 +2072,10 @@ export const plan = (rawFrom: Model, rawTo: Model, opts?: PlanOptions): Step[] =
             );
           }
           implicitRels.add(`${desc.parent}:${safeName}`);
+          if (isCon) implicitCons.add(`${desc.id}:${safeName}`);
         } else {
           implicitRels.add(`${desc.parent}:${pgName}`);
+          if (isCon) implicitCons.add(`${desc.id}:${pgName}`);
         }
       }
     }
