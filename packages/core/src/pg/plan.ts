@@ -1026,9 +1026,36 @@ export const plan = (rawFrom: Model, rawTo: Model, opts?: PlanOptions): Step[] =
   // 删表 / 删列会顺带删掉的对象：其上的约束和索引、属于它的序列
   const autoDropped = new Set<string>();
   const dropWithColumn = (colId: string) => {
+    const col = cur.objects[colId];
     for (const s of all(cur, 'sequence')) if (s.ownedBy === colId) autoDropped.add(s.id);
-    for (const o of Object.values(cur.objects))
-      if (isKey(o) && usesCols(o, new Set([colId]))) delete cur.objects[o.id];
+    for (const o of Object.values(cur.objects)) {
+      if (!isKey(o)) continue;
+      if (o.kind === 'primaryKey' || o.kind === 'unique') {
+        if (o.columns.includes(colId)) delete cur.objects[o.id];
+      } else if (o.kind === 'check') {
+        if (
+          col?.kind === 'column' &&
+          (o.parent === col.parent || rootTableId(cur, o.parent) === col.parent) &&
+          exprReferences(o.expr, col.name)
+        ) {
+          delete cur.objects[o.id];
+        }
+      } else if (o.kind === 'index') {
+        const sameFamily =
+          col?.kind === 'column' && (o.parent === col.parent || rootTableId(cur, o.parent) === col.parent);
+        if (
+          o.elements.some(
+            (e) =>
+              e.column === colId ||
+              (sameFamily && !e.column && e.expr !== null && exprReferences(e.expr, col.name)),
+          ) ||
+          o.include.includes(colId) ||
+          (sameFamily && o.where !== null && exprReferences(o.where, col.name))
+        ) {
+          delete cur.objects[o.id];
+        }
+      }
+    }
   };
   // ───── P3 删需要重建的生成列 ─────
   for (const id of regen) {
@@ -1688,6 +1715,7 @@ export const plan = (rawFrom: Model, rawTo: Model, opts?: PlanOptions): Step[] =
         const rc = rootCols.find((x) => x.name === cc.name);
         if (!rc) return true;
         if (!same(cc.generated, rc.generated)) return true;
+        if (cc.generated && typeChangingNames.has(cc.name)) return true;
         if (cc.generated && [...typeChangingNames].some((n) => exprReferences(cc.generated!.expr, n)))
           return true;
         return false;
@@ -1701,7 +1729,7 @@ export const plan = (rawFrom: Model, rawTo: Model, opts?: PlanOptions): Step[] =
     for (const id of autoDropped) delete cur.objects[id];
     const curChildCols = columnsOf(cur, tId);
     const childToRootCol = new Map<string, string>();
-    // 2. 补齐缺失的非生成列，并对齐已存在的非生成列
+    // 2. 补齐缺失的非生成列，并对齐已存在的列（含生成列的 NOT NULL 与列注释）
     for (const rc of rootCols) {
       const cc = curChildCols.find((x) => x.name === rc.name);
       if (!cc) {
@@ -1711,32 +1739,36 @@ export const plan = (rawFrom: Model, rawTo: Model, opts?: PlanOptions): Step[] =
           id: `__dowel_att_col_${++synSeq}`,
           parent: tId,
           identity: null,
-          notNullName: cap.namedNotNull ? rc.notNullName : null,
+          notNullName:
+            cap.namedNotNull && rc.notNull && rc.notNullName && !conTakenCur(tId, rc.notNullName)
+              ? rc.notNullName
+              : null,
           comment: null,
         };
         emit('addColumn', tId, `ALTER TABLE ${T(tId)} ADD COLUMN ${columnDef(addedCol, childTable)}`);
         continue;
       }
       childToRootCol.set(cc.id, rc.id);
-      if (cc.generated) continue;
       const Ac = `ALTER TABLE ${T(tId)} ALTER COLUMN ${ident(cc.name)}`;
-      if (cc.identity) {
-        emit('dropIdentity', cc.id, `${Ac} DROP IDENTITY`);
-        cc.identity = null;
-      }
-      if (cc.default && !same(cc.default, rc.default)) {
-        emit('dropDefault', cc.id, `${Ac} DROP DEFAULT`);
-        cc.default = null;
-      }
-      if (!same(pick(cc, ['type', 'typeRef', 'collation']), pick(rc, ['type', 'typeRef', 'collation']))) {
-        const viaText = !!(cc.typeRef || rc.typeRef) || !hasDirectCast(cc.type, rc.type);
-        const targetType = rc.typeRef ? qname(cur, get(cur, rc.typeRef, 'enum')) + rc.type : rc.type;
-        emit(
-          'alterType',
-          cc.id,
-          `${Ac} TYPE ${typeOf(rc)} USING ${ident(cc.name)}${viaText ? `::text${arrayDims(cc.type) === arrayDims(rc.type) ? arrayDims(cc.type) : ''}` : ''}::${targetType}`,
-        );
-        Object.assign(cc, { type: rc.type, typeRef: rc.typeRef, collation: rc.collation });
+      if (!cc.generated) {
+        if (cc.identity) {
+          emit('dropIdentity', cc.id, `${Ac} DROP IDENTITY`);
+          cc.identity = null;
+        }
+        if (cc.default && !same(cc.default, rc.default)) {
+          emitDefaultCascade(cc, 'dropDefault', 'DROP DEFAULT');
+          cc.default = null;
+        }
+        if (!same(pick(cc, ['type', 'typeRef', 'collation']), pick(rc, ['type', 'typeRef', 'collation']))) {
+          const viaText = !!(cc.typeRef || rc.typeRef) || !hasDirectCast(cc.type, rc.type);
+          const targetType = rc.typeRef ? qname(cur, get(cur, rc.typeRef, 'enum')) + rc.type : rc.type;
+          emit(
+            'alterType',
+            cc.id,
+            `${Ac} TYPE ${typeOf(rc)} USING ${ident(cc.name)}${viaText ? `::text${arrayDims(cc.type) === arrayDims(rc.type) ? arrayDims(cc.type) : ''}` : ''}::${targetType}`,
+          );
+          Object.assign(cc, { type: rc.type, typeRef: rc.typeRef, collation: rc.collation });
+        }
       }
       if (cc.notNull && !rc.notNull) {
         emit('dropNotNull', cc.id, `${Ac} DROP NOT NULL`);
@@ -1744,15 +1776,17 @@ export const plan = (rawFrom: Model, rawTo: Model, opts?: PlanOptions): Step[] =
         cc.notNullName = null;
       }
       if (!cc.notNull && rc.notNull) {
+        const nnName =
+          cap.namedNotNull && rc.notNullName && !conTakenCur(tId, rc.notNullName) ? rc.notNullName : null;
         emit(
           'setNotNull',
           cc.id,
-          cap.namedNotNull && rc.notNullName
-            ? `ALTER TABLE ${T(tId)} ADD CONSTRAINT ${ident(rc.notNullName)} NOT NULL ${ident(cc.name)}`
+          nnName
+            ? `ALTER TABLE ${T(tId)} ADD CONSTRAINT ${ident(nnName)} NOT NULL ${ident(cc.name)}`
             : `${Ac} SET NOT NULL`,
         );
         cc.notNull = true;
-        cc.notNullName = cap.namedNotNull ? rc.notNullName : null;
+        cc.notNullName = nnName;
       } else if (
         cap.namedNotNull &&
         cc.notNull &&
@@ -1769,9 +1803,13 @@ export const plan = (rawFrom: Model, rawTo: Model, opts?: PlanOptions): Step[] =
         );
         cc.notNullName = rc.notNullName;
       }
-      if (rc.default && !same(cc.default, rc.default)) {
+      if (!cc.generated && rc.default && !same(cc.default, rc.default)) {
         cc.default = clone(rc.default);
-        emit('setDefault', cc.id, `${Ac} SET DEFAULT ${defaultOf(rc)}`);
+        emitDefaultCascade(cc, 'setDefault', `SET DEFAULT ${defaultOf(rc)}`);
+      }
+      if (cc.comment !== null) {
+        emit('comment', cc.id, `COMMENT ON COLUMN ${T(tId)}.${ident(cc.name)} IS NULL`);
+        cc.comment = null;
       }
     }
     // 3. 最后补齐缺失或刚删除重建的生成列（此时其引用的普通列均已到位且类型已对齐）
@@ -1783,7 +1821,10 @@ export const plan = (rawFrom: Model, rawTo: Model, opts?: PlanOptions): Step[] =
         id: `__dowel_att_col_${++synSeq}`,
         parent: tId,
         identity: null,
-        notNullName: cap.namedNotNull ? rc.notNullName : null,
+        notNullName:
+          cap.namedNotNull && rc.notNull && rc.notNullName && !conTakenCur(tId, rc.notNullName)
+            ? rc.notNullName
+            : null,
         comment: null,
       };
       emit('addColumn', tId, `ALTER TABLE ${T(tId)} ADD COLUMN ${columnDef(addedCol, childTable)}`);

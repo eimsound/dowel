@@ -545,4 +545,194 @@ describe.skipIf(!PG_URL)('PG 分区表闭环与往返验证', () => {
     expect(r.upDiff).toEqual([]);
     expect(r.downDiff).toEqual([]);
   });
+
+  test('回归（缺陷 1）：脱离分区并删除父表或父表列时保留独立 CHECK 与表达式/部分索引', async () => {
+    const db = conn();
+    const v1 = emptyModel();
+    const s = E.createSchema(v1, 'public');
+    const p = E.createTable(v1, s, 'pt_a');
+    const cPk = E.addColumn(v1, p, { name: 'pk_key', type: 'integer', notNull: true });
+    const cVal = E.addColumn(v1, p, { name: 'val', type: 'integer', default: { expr: '0' } });
+    const cTag = E.addColumn(v1, p, { name: 'tag', type: 'text' });
+    E.setPartitionBy(v1, p, {
+      strategy: 'range',
+      keys: [{ column: cPk, expr: null, opclass: null, collation: null }],
+    });
+    E.addPrimaryKey(v1, p, [cPk]);
+    E.addCheck(v1, p, '(pk_key > 0)');
+    E.addCheck(v1, p, '(val >= 0)');
+    E.addIndex(v1, p, [{ expr: 'lower(tag)' }]);
+    E.addIndex(v1, p, [{ column: cPk }], { where: '(val > 0)' });
+    const ch0 = E.createPartition(v1, p, 'pt_a_p_0', 'DEFAULT');
+
+    // 场景 A：脱离后同迁移删除父表
+    const v2a = structuredClone(v1);
+    E.detachPartition(v2a, ch0);
+    E.dropTable(v2a, p);
+    expect(validate(v2a)).toEqual([]);
+    const upStepsA = plan(v1, v2a);
+    expect(
+      upStepsA.some((st) => st.target === ch0 && (st.kind === 'addCheck' || st.kind === 'createIndex')),
+    ).toBe(false);
+    const rA = await verify(db, v1, v2a);
+    expect(rA.upDiff).toEqual([]);
+    expect(rA.downDiff).toEqual([]);
+
+    // 场景 B：脱离后同迁移删除父表列（关联 CHECK 与部分索引随之从父表删除，但脱离表仍独立保留）
+    const v2b = structuredClone(v1);
+    E.detachPartition(v2b, ch0);
+    E.dropColumn(v2b, cVal);
+    E.dropColumn(v2b, cTag);
+    expect(validate(v2b)).toEqual([]);
+    const upStepsB = plan(v1, v2b);
+    expect(
+      upStepsB.some((st) => st.target === ch0 && (st.kind === 'addCheck' || st.kind === 'createIndex')),
+    ).toBe(false);
+    const rB = await verify(db, v1, v2b);
+    expect(rB.upDiff).toEqual([]);
+    expect(rB.downDiff).toEqual([]);
+  });
+
+  test('回归（缺陷 2）：改边界重挂分区时父表生成列增删 NOT NULL、改类型与约束名冲突回退', async () => {
+    const db = conn();
+    const [{ v: pgVer }] = (await db.query<{ v: number }>(
+      `select current_setting('server_version_num')::int as v`,
+    )) as [{ v: number }];
+    const pgMajor = E.pgMajorOf(pgVer) ?? E.LATEST_PG_MAJOR;
+
+    const v1 = emptyModel();
+    const s = E.createSchema(v1, 'public');
+    const p = E.createTable(v1, s, 'pt_a');
+    const cPk = E.addColumn(v1, p, { name: 'pk_key', type: 'integer', notNull: true });
+    E.addColumn(v1, p, { name: 'val', type: 'integer' });
+    const cGenStored = E.addColumn(v1, p, {
+      name: 'g_stored',
+      type: 'integer',
+      generated: { expr: '(pk_key * 2)', stored: true },
+    });
+    const cGenVirt =
+      pgMajor >= 18
+        ? E.addColumn(v1, p, {
+            name: 'g_virt',
+            type: 'integer',
+            generated: { expr: '(val + 1)', stored: false },
+          })
+        : null;
+    E.setPartitionBy(v1, p, {
+      strategy: 'range',
+      keys: [{ column: cPk, expr: null, opclass: null, collation: null }],
+    });
+    E.addPrimaryKey(v1, p, [cPk]);
+    const ch0 = E.createPartition(v1, p, 'pt_a_p_0', 'DEFAULT');
+
+    // v1 → v2：父表生成列加 NOT NULL（down 测删 NOT NULL）+ 子分区改边界重挂
+    const v2 = structuredClone(v1);
+    E.setNotNull(v2, cGenStored, true);
+    if (cGenVirt) E.setNotNull(v2, cGenVirt, true);
+    E.setPartitionBound(v2, ch0, 'FOR VALUES FROM (0) TO (100)');
+    expect(validate(v2)).toEqual([]);
+    const r12 = await verify(db, v1, v2, { pgMajor });
+    expect(r12.upDiff).toEqual([]);
+    expect(r12.downDiff).toEqual([]);
+
+    // v2 → v3：父表生成列改类型 + 子分区改边界重挂
+    const v3 = structuredClone(v2);
+    E.setColumnType(v3, cGenStored, 'bigint');
+    if (cGenVirt) E.setColumnType(v3, cGenVirt, 'bigint');
+    E.setPartitionBound(v3, ch0, 'FOR VALUES FROM (0) TO (200)');
+    expect(validate(v3)).toEqual([]);
+    const r23 = await verify(db, v2, v3, { pgMajor });
+    expect(r23.upDiff).toEqual([]);
+    expect(r23.downDiff).toEqual([]);
+
+    // 约束名冲突回退（PG 18+ 命名 NOT NULL）：待挂载表原有列占用目标父表 NOT NULL 约束名时回退为无名 NOT NULL
+    if (pgMajor >= 18) {
+      const vA = emptyModel();
+      const sA = E.createSchema(vA, 'public');
+      const p2 = E.createTable(vA, sA, 'p2');
+      const p2Pk = E.addColumn(vA, p2, { name: 'pk_key', type: 'integer', notNull: true });
+      const p2A = E.addColumn(vA, p2, { name: 'a_col', type: 'integer', notNull: false });
+      E.addColumn(vA, p2, { name: 'd_col', type: 'integer', notNull: true });
+      E.setPartitionBy(vA, p2, {
+        strategy: 'range',
+        keys: [{ column: p2Pk, expr: null, opclass: null, collation: null }],
+      });
+      E.addPrimaryKey(vA, p2, [p2Pk]);
+      const plain = E.createTable(vA, sA, 'p2_plain');
+      E.addColumn(vA, plain, { name: 'pk_key', type: 'integer', notNull: true });
+      E.addColumn(vA, plain, { name: 'a_col', type: 'integer', notNull: false });
+      const plD = E.addColumn(vA, plain, { name: 'd_col', type: 'integer', notNull: true });
+      // d_col 排在 a_col 与新列 new_col 之后，先占着 p2_a_col_not_null（触发 setNotNull 回退）；
+      // 另加 e_col 占着 p2_new_col_not_null（触发 addColumn 回退）
+      E.addColumn(vA, p2, { name: 'e_col', type: 'integer', notNull: true });
+      const plE = E.addColumn(vA, plain, { name: 'e_col', type: 'integer', notNull: true });
+      (vA.objects[plD] as E.Column).notNullName = 'p2_a_col_not_null';
+      (vA.objects[plD] as E.Column).notNullNameMode = 'explicit';
+      (vA.objects[plE] as E.Column).notNullName = 'p2_new_col_not_null';
+      (vA.objects[plE] as E.Column).notNullNameMode = 'explicit';
+
+      const vB = structuredClone(vA);
+      E.attachPartition(vB, p2, plain, 'FOR VALUES FROM (0) TO (100)');
+      E.setNotNull(vB, p2A, true);
+      const p2New = E.addColumn(vB, p2, { name: 'new_col', type: 'integer', notNull: true });
+      // 把 new_col 排在 d_col/e_col 之前，确保 P12h 处理 new_col 时 e_col 尚未改名
+      E.moveColumn(vB, p2New, p2A);
+      expect(validate(vB)).toEqual([]);
+      const rConflict = await verify(db, vA, vB, { pgMajor });
+      expect(rConflict.upDiff).toEqual([]);
+      expect(rConflict.downDiff).toEqual([]);
+    }
+  });
+
+  test('回归（缺陷 3）：独立表带列注释挂载及脱离后加列注释再反向挂载闭环通过', async () => {
+    const db = conn();
+    const v1 = emptyModel();
+    const s = E.createSchema(v1, 'public');
+    const p = E.createTable(v1, s, 'pt_a');
+    const cPk = E.addColumn(v1, p, { name: 'pk_key', type: 'integer', notNull: true });
+    E.addColumn(v1, p, { name: 'val', type: 'integer', default: { expr: '0' } });
+    E.addColumn(v1, p, {
+      name: 'g',
+      type: 'integer',
+      generated: { expr: '(pk_key * 2)', stored: true },
+    });
+    E.setPartitionBy(v1, p, {
+      strategy: 'range',
+      keys: [{ column: cPk, expr: null, opclass: null, collation: null }],
+    });
+    E.addPrimaryKey(v1, p, [cPk]);
+    const ch0 = E.createPartition(v1, p, 'pt_a_p_0', 'DEFAULT');
+
+    // 场景 A：脱离后给列加注释（含单引号与生成列），down 反向挂载回父表时须清注释
+    const v2 = structuredClone(v1);
+    E.detachPartition(v2, ch0);
+    for (const col of E.columnsOf(v2, ch0)) {
+      E.setComment(v2, col.id, col.name === 'pk_key' ? "注释 0 it's" : `列 ${col.name} 注释`);
+    }
+    expect(validate(v2)).toEqual([]);
+    const rDetach = await verify(db, v1, v2);
+    expect(rDetach.upDiff).toEqual([]);
+    expect(rDetach.downDiff).toEqual([]);
+
+    // 场景 B：原本带列注释的普通表直接挂载到父表
+    const v3 = structuredClone(v1);
+    const plain = E.createTable(v3, s, 'pt_a_plain');
+    const plPk = E.addColumn(v3, plain, { name: 'pk_key', type: 'integer', notNull: true });
+    const plVal = E.addColumn(v3, plain, { name: 'val', type: 'integer', default: { expr: '0' } });
+    const plGen = E.addColumn(v3, plain, {
+      name: 'g',
+      type: 'integer',
+      generated: { expr: '(pk_key * 2)', stored: true },
+    });
+    E.setComment(v3, plPk, "挂载前主键注释 it's");
+    E.setComment(v3, plVal, '挂载前普通列注释');
+    E.setComment(v3, plGen, '挂载前生成列注释');
+
+    const v4 = structuredClone(v3);
+    E.attachPartition(v4, p, plain, 'FOR VALUES FROM (0) TO (100)');
+    expect(validate(v4)).toEqual([]);
+    const rAttach = await verify(db, v3, v4);
+    expect(rAttach.upDiff).toEqual([]);
+    expect(rAttach.downDiff).toEqual([]);
+  });
 });
