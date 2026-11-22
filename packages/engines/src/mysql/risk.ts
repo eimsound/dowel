@@ -13,7 +13,7 @@ import {
   stripMysqlSql,
 } from '@dowel/core';
 
-import { type Db, EngineStepError, type StepRisk } from '../types.ts';
+import { type AnalyzeOptions, type Db, EngineStepError, type StepRisk } from '../types.ts';
 import { pinMysqlSession } from './db.ts';
 
 const mysqlErrno = (e: unknown): number | null => {
@@ -230,15 +230,17 @@ export const analyzeMysqlStepRisk = async (
   db: Db,
   from: Model,
   steps: Step[],
-  opts?: MysqlPlanOptions,
+  opts?: MysqlPlanOptions & AnalyzeOptions,
 ): Promise<StepRisk[]> => {
-  await resetMysqlShadow(db);
-  for (const s of createAll(from, opts)) {
-    const t0 = performance.now();
-    try {
-      await db.exec(s.sql);
-    } catch (e) {
-      throw new EngineStepError(s, e, performance.now() - t0);
+  if (!opts?.reuseShadowFrom) {
+    await resetMysqlShadow(db);
+    for (const s of createAll(from, opts)) {
+      const t0 = performance.now();
+      try {
+        await db.exec(s.sql);
+      } catch (e) {
+        throw new EngineStepError(s, e, performance.now() - t0);
+      }
     }
   }
 

@@ -6,11 +6,10 @@
 
 ### 仍待解决
 
-| 编号 | 问题                   | 最晚 | 下一步                                                                                                                                          |
-| ---- | ---------------------- | ---- | ----------------------------------------------------------------------------------------------------------------------------------------------- |
-| Q17  | 大型 schema 的性能     | 近期 | Phase 1 画布板块与 Phase 2 三层压测基线已落地（[benchmarks/q17-baseline.md](benchmarks/q17-baseline.md)），待完成 Phase 3（千表红线与底座治理） |
-| Q11  | CLI 代理协议与数据边界 | 暂缓 | 不做 SaaS                                                                                                                                       |
-| Q14  | CLI 单文件分发         | 暂缓 | 不做 CLI（2026-11-19）                                                                                                                          |
+| 编号 | 问题                   | 最晚 | 下一步                 |
+| ---- | ---------------------- | ---- | ---------------------- |
+| Q11  | CLI 代理协议与数据边界 | 暂缓 | 不做 SaaS              |
+| Q14  | CLI 单文件分发         | 暂缓 | 不做 CLI（2026-11-19） |
 
 ### 已解决
 
@@ -32,6 +31,7 @@
 | Q13  | 迁移历史表                                                     |
 | Q15  | ~~polyglot 的缺陷如何处理~~（作废，不引入外部 SQL AST 解析器） |
 | Q16  | 权限模型                                                       |
+| Q17  | 大型 schema 的性能                                             |
 | Q18  | ~~本地离线模式的范围~~（明确不做免登录 IndexedDB 纯本地模式）  |
 | Q19  | 协议与商业模式                                                 |
 | Q20  | 需要尽早做的技术验证                                           |
@@ -210,11 +210,11 @@
 
 ### Q17 大型 schema 的性能
 
-🔶 **分阶段方案与红线已确定（2026-11-22，执行顺序调整为板块优先，Phase 1/2 已落地，待完成 Phase 3 后关闭）**：
+✅ **已完成并关闭（2026-11-23）**：详见 [benchmarks/q17-baseline.md](benchmarks/q17-baseline.md) 与 [benchmarks/q17-phase3-results.md](benchmarks/q17-phase3-results.md)。
 
 - **Phase 1（画布板块与默认折叠聚焦 · 已落地）**：落地纯布局层画布 `板块（Section）`（持久化在 `branches.sections`，定义团队共享、单表最多归属 1 个板块、不支持嵌套，展开/折叠与聚焦状态本地私有、绝不进入 IR）与 `> 100` 表默认折叠/聚焦视图（`<= 100` 表保持原样完整平铺画布），提供按表名前缀一键生成建议板块、侧边栏 Schema/板块双视图及单表 1/2 跳外键邻域聚焦。
-- **Phase 2（压测基线 · 已落地）**：搭建可复现的 100 表 / 1,000 表（`1,932` / `19,093` IR 对象、`150` / `1,500` 外键、5 schema）三层按需压测套件（`pnpm bench:core` / `bench:ui` / `bench:shadow` / `bench:all`，不阻塞常规 CI）并产出实测基线报告 [benchmarks/q17-baseline.md](benchmarks/q17-baseline.md)。1,000 表实测关键基线：`validate` `11.86 s`、小改动 `plan` `15.74 s`、`sync mutate` 往返 `1.03 s`（`renameColumn 1.36 s`）、聚焦/摘要首屏 `4.14–5.44 s`（主线程长任务 `3.45–4.18 s`）、节点选中 `4.55 s` / 拖拽 `183.3 ms` p50、Sidebar 过滤 `3.94 s`、`elkjs` 100 表显式重排 `1.74 s`（TBT `1.02 s`）、PG 18 `shadowOps.verify()` `95.15 s`（最慢单句 SQL `importSql` `3.32 s` 仅占 `120_000 ms` 上限 `2.76%`）。
-- **Phase 3（千表红线与底座治理 · 待落地）**：确立千表级性能红线：`validate` < 100ms、小改动 `plan` < 200ms、单次 `mutate` < 30ms、聚焦首屏 < 1s、选中/拖拽/侧边栏搜索 < 50ms、`elkjs` 迁入 Web Worker 做到 0ms 主线程长任务阻塞；结合实测确认 `SHADOW_STATEMENT_TIMEOUT_MS`（当前 `120_000`）保持不变，优先治理核心/同步（索引化消除 `O(T × N)` 全表扫、增量状态对比避免单步全量 `structuredClone`/`deepEqual`）、前端（消除 `Sidebar.tsx` `O(T²)` `partitionsOf` 与无虚拟滚动、`Canvas.tsx` 拖拽期节点/边重算与 Handle 优化、`elkjs` Worker 化）及 `analyze()` 第 3 次冗余全库重建。
+- **Phase 2（压测基线 · 已落地）**：搭建可复现的 100 表 / 1,000 表（`1,932` / `19,093` IR 对象、`150` / `1,500` 外键、5 schema）三层按需压测套件（`pnpm bench:core` / `bench:ui` / `bench:shadow` / `bench:all`，不阻塞常规 CI）并产出实测基线报告 [benchmarks/q17-baseline.md](benchmarks/q17-baseline.md)。
+- **Phase 3（千表红线与底座治理 · 已落地验收）**：落地显式作用域/增量 `ModelIndex`、`@dowel/sync` 按键 Proxy Overlay 写时复制、`Sidebar` 虚拟滚动与状态隔离、`Canvas` 选态/拖拽解耦、`elkjs` Web Worker 化以及影子库 `reuseShadowFrom` 消除第 3 次全库重建。1,000 表（`19,093` 对象）实测结果全部优于红线：`validate` `37.08 ms`（320×）、小改动 `plan` `139.00 ms`（113×）、`sync mutate` 往返 `10.70 ms`（96×）、折叠首屏/1 跳/2 跳 `542–726 ms`、节点选中 `44.20 ms` / 拖拽 `rAF 16.70 ms` / Sidebar 搜索 `47.46 ms` / 视图切换 `30.30–31.24 ms`（均 0 长任务）、`elkjs` 主线程阻塞 `0 ms`（总重排 `154.13 ms`）、`shadowOps.verify()` `13.71 s`（`analyze()` 从 `19.30 s` 降至 `65.42 ms`），`SHADOW_STATEMENT_TIMEOUT_MS = 120_000` 保持不变。
 
 以下为历史问题记录。
 

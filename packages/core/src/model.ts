@@ -1,9 +1,39 @@
 // 在扁平模型上查询对象的工具函数，以及模型的一致性校验。
 import { EditError } from './errors.ts';
 import type { Column, Enum, Index, Kind, Model, Obj, ObjOf, PartitionSpec, Sequence, Table } from './ir.ts';
+import { buildModelIndex, type ModelIndex } from './model-index.ts';
 import { resolvePartitionBy } from './pg/partition.ts';
 import { ident } from './pg/quote.ts';
 import { getDialect } from './registry.ts';
+
+export { buildModelIndex, type ModelIndex, MutableModelIndex, OverlayModelIndex } from './model-index.ts';
+
+/**
+ * 仅在受控只读/作用域事务内有效的索引栈（进入前压栈，finally 必弹栈）。
+ * 绝不把索引长期挂在可变 Model 上，保证外部直接修改 m.objects 时永远读取实时数据。
+ */
+const scopedIndexes = new WeakMap<Model, ModelIndex[]>();
+
+export const getActiveModelIndex = (m: Model): ModelIndex | undefined => {
+  const stack = scopedIndexes.get(m);
+  return stack && stack.length > 0 ? stack[stack.length - 1] : undefined;
+};
+
+export const withModelIndex = <T>(m: Model, fn: (idx: ModelIndex) => T, existing?: ModelIndex): T => {
+  const idx = existing ?? buildModelIndex(m);
+  let stack = scopedIndexes.get(m);
+  if (!stack) {
+    stack = [];
+    scopedIndexes.set(m, stack);
+  }
+  stack.push(idx);
+  try {
+    return fn(idx);
+  } finally {
+    stack.pop();
+    if (stack.length === 0) scopedIndexes.delete(m);
+  }
+};
 
 export const get = <K extends Kind>(m: Model, id: string, kind?: K): ObjOf<K> => {
   const o = m.objects[id];
@@ -15,17 +45,35 @@ export const get = <K extends Kind>(m: Model, id: string, kind?: K): ObjOf<K> =>
 export const find = (m: Model, id: string | null | undefined): Obj | undefined =>
   id ? m.objects[id] : undefined;
 
-export const all = <K extends Kind>(m: Model, kind: K): ObjOf<K>[] =>
-  Object.values(m.objects).filter((o): o is ObjOf<K> => o.kind === kind);
+export const all = <K extends Kind>(m: Model, kind: K): ObjOf<K>[] => {
+  const idx = getActiveModelIndex(m);
+  if (idx) return idx.all(kind);
+  return Object.values(m.objects).filter((o): o is ObjOf<K> => o.kind === kind);
+};
 
-export const childrenOf = <K extends Kind>(m: Model, parent: string, kind: K): ObjOf<K>[] =>
-  all(m, kind).filter((o) => 'parent' in o && o.parent === parent);
+export const childrenOf = <K extends Kind>(m: Model, parent: string, kind: K): ObjOf<K>[] => {
+  const idx = getActiveModelIndex(m);
+  if (idx) return idx.childrenOf(parent, kind);
+  return Object.values(m.objects).filter(
+    (o): o is ObjOf<K> => o.kind === kind && 'parent' in o && o.parent === parent,
+  );
+};
+
+/** 某父对象下的全部直接子对象（不限 kind） */
+export const allChildrenOf = (m: Model, parent: string): Obj[] => {
+  const idx = getActiveModelIndex(m);
+  if (idx) return idx.allChildrenOf(parent);
+  return Object.values(m.objects).filter((o) => 'parent' in o && o.parent === parent);
+};
 
 /** 按展示顺序排列的列 */
-export const columnsOf = (m: Model, table: string): Column[] =>
-  childrenOf(m, table, 'column').sort((a, b) =>
+export const columnsOf = (m: Model, table: string): Column[] => {
+  const idx = getActiveModelIndex(m);
+  if (idx) return idx.columnsOf(table);
+  return childrenOf(m, table, 'column').sort((a, b) =>
     a.pos < b.pos ? -1 : a.pos > b.pos ? 1 : a.id < b.id ? -1 : 1,
   );
+};
 
 export const colName = (m: Model, id: string): string => get(m, id, 'column').name;
 
@@ -56,11 +104,16 @@ export const rootTableId = (m: Model, tableId: string): string => {
 };
 
 /** 某分区父表下的全部直接子分区 */
-export const partitionsOf = (m: Model, parentId: string): Table[] =>
-  all(m, 'table').filter((t) => t.partitionOf?.parent === parentId);
+export const partitionsOf = (m: Model, parentId: string): Table[] => {
+  const idx = getActiveModelIndex(m);
+  if (idx) return idx.partitionsOf(parentId);
+  return all(m, 'table').filter((t) => t.partitionOf?.parent === parentId);
+};
 
 /** 某分区父表下的全部后代子分区（按广度优先顺序，浅层在前；带环保护） */
 export const partitionDescendants = (m: Model, parentId: string): Table[] => {
+  const idx = getActiveModelIndex(m);
+  if (idx) return idx.partitionDescendants(parentId);
   const out: Table[] = [];
   const seen = new Set<string>([parentId]);
   const queue = [parentId];
@@ -190,98 +243,99 @@ export const indexElementNames = (m: Model, idx: Pick<Index, 'elements' | 'inclu
 };
 
 /** 模型的一致性校验：通用引用一致性 + 方言专属命名空间/长度/能力校验。返回错误列表（空表示通过）。 */
-export const validate = (m: Model): string[] => {
-  const errs: string[] = [];
-  const need = (o: Obj, ref: string | null | undefined, kind: Kind, what: string) => {
-    if (!ref) return;
-    const t = m.objects[ref];
-    if (!t || t.kind !== kind) errs.push(`${o.kind} ${o.name}：${what} 指向不存在的 ${kind} ${ref}`);
-  };
-  const colOfTable = (o: Obj, table: string, cols: string[], what: string) => {
-    const root = rootTableId(m, table);
-    for (const c of cols) {
-      const col = m.objects[c];
-      if (col?.kind !== 'column' || (col.parent !== table && col.parent !== root))
-        errs.push(`${o.kind} ${o.name}：${what} 引用的列 ${c} 不在表 ${table} 中`);
-    }
-  };
+export const validate = (m: Model): string[] =>
+  withModelIndex(m, (idx) => {
+    const errs: string[] = [];
+    const need = (o: Obj, ref: string | null | undefined, kind: Kind, what: string) => {
+      if (!ref) return;
+      const t = m.objects[ref];
+      if (!t || t.kind !== kind) errs.push(`${o.kind} ${o.name}：${what} 指向不存在的 ${kind} ${ref}`);
+    };
+    const colOfTable = (o: Obj, table: string, cols: string[], what: string) => {
+      const root = rootTableId(m, table);
+      for (const c of cols) {
+        const col = m.objects[c];
+        if (col?.kind !== 'column' || (col.parent !== table && col.parent !== root))
+          errs.push(`${o.kind} ${o.name}：${what} 引用的列 ${c} 不在表 ${table} 中`);
+      }
+    };
 
-  for (const [k, o] of Object.entries(m.objects)) {
-    if (o.id !== k) errs.push(`对象 ${o.id} 的键与 id 不一致`);
-    switch (o.kind) {
-      case 'schema':
-        break;
-      case 'extension':
-        need(o, o.parent, 'schema', 'parent');
-        break;
-      case 'opaque': {
-        const p = m.objects[o.parent];
-        if (!p || (p.kind !== 'schema' && p.kind !== 'table'))
-          errs.push(`${o.objType} ${o.name}：parent 不存在`);
-        for (const d of o.deps)
-          if (!m.objects[d]) errs.push(`${o.objType} ${o.name}：依赖的对象 ${d} 不存在`);
-        break;
-      }
-      case 'enum':
-        need(o, o.parent, 'schema', 'parent');
-        if (new Set(o.values).size !== o.values.length) errs.push(`enum ${o.name}：值重复`);
-        break;
-      case 'sequence':
-        need(o, o.parent, 'schema', 'parent');
-        need(o, o.ownedBy, 'column', 'ownedBy');
-        break;
-      case 'table':
-        need(o, o.parent, 'schema', 'parent');
-        need(o, o.partitionOf?.parent, 'table', 'partitionOf');
-        break;
-      case 'column':
-        need(o, o.parent, 'table', 'parent');
-        need(o, o.typeRef, 'enum', 'typeRef');
-        if (o.default && 'nextval' in o.default) need(o, o.default.nextval, 'sequence', 'default');
-        if (o.identity) {
-          if (o.default) errs.push(`列 ${o.name}：identity 列不能有默认值`);
-          if (!o.notNull) errs.push(`列 ${o.name}：identity 列必须 NOT NULL`);
+    for (const [k, o] of Object.entries(m.objects)) {
+      if (o.id !== k) errs.push(`对象 ${o.id} 的键与 id 不一致`);
+      switch (o.kind) {
+        case 'schema':
+          break;
+        case 'extension':
+          need(o, o.parent, 'schema', 'parent');
+          break;
+        case 'opaque': {
+          const p = m.objects[o.parent];
+          if (!p || (p.kind !== 'schema' && p.kind !== 'table'))
+            errs.push(`${o.objType} ${o.name}：parent 不存在`);
+          for (const d of o.deps)
+            if (!m.objects[d]) errs.push(`${o.objType} ${o.name}：依赖的对象 ${d} 不存在`);
+          break;
         }
-        if (o.generated && (o.default || o.identity))
-          errs.push(`列 ${o.name}：生成列不能有默认值或 identity`);
-        break;
-      case 'primaryKey':
-      case 'unique':
-      case 'foreignKey':
-      case 'check':
-      case 'index': {
-        need(o, o.parent, 'table', 'parent');
-        if (o.kind !== 'check') {
-          const cols =
-            o.kind === 'index'
-              ? [...o.elements.flatMap((e) => (e.column ? [e.column] : [])), ...o.include]
-              : o.columns;
-          colOfTable(o, o.parent, cols, 'columns');
-        }
-        if (o.kind === 'foreignKey') {
-          need(o, o.refTable, 'table', 'refTable');
-          colOfTable(o, o.refTable, o.refColumns, 'refColumns');
-          if (o.columns.length !== o.refColumns.length) errs.push(`外键 ${o.name}：两边列数不同`);
-        }
-        if (o.kind === 'index') {
-          for (const e of o.elements)
-            if (!!e.column === !!e.expr) errs.push(`索引 ${o.name}：元素必须是列或表达式之一`);
-        }
-        if (o.kind === 'primaryKey') {
-          for (const c of o.columns) {
-            const col = m.objects[c];
-            if (col?.kind === 'column' && !col.notNull)
-              errs.push(`主键 ${o.name}：列 ${col.name} 必须 NOT NULL`);
+        case 'enum':
+          need(o, o.parent, 'schema', 'parent');
+          if (new Set(o.values).size !== o.values.length) errs.push(`enum ${o.name}：值重复`);
+          break;
+        case 'sequence':
+          need(o, o.parent, 'schema', 'parent');
+          need(o, o.ownedBy, 'column', 'ownedBy');
+          break;
+        case 'table':
+          need(o, o.parent, 'schema', 'parent');
+          need(o, o.partitionOf?.parent, 'table', 'partitionOf');
+          break;
+        case 'column':
+          need(o, o.parent, 'table', 'parent');
+          need(o, o.typeRef, 'enum', 'typeRef');
+          if (o.default && 'nextval' in o.default) need(o, o.default.nextval, 'sequence', 'default');
+          if (o.identity) {
+            if (o.default) errs.push(`列 ${o.name}：identity 列不能有默认值`);
+            if (!o.notNull) errs.push(`列 ${o.name}：identity 列必须 NOT NULL`);
           }
+          if (o.generated && (o.default || o.identity))
+            errs.push(`列 ${o.name}：生成列不能有默认值或 identity`);
+          break;
+        case 'primaryKey':
+        case 'unique':
+        case 'foreignKey':
+        case 'check':
+        case 'index': {
+          need(o, o.parent, 'table', 'parent');
+          if (o.kind !== 'check') {
+            const cols =
+              o.kind === 'index'
+                ? [...o.elements.flatMap((e) => (e.column ? [e.column] : [])), ...o.include]
+                : o.columns;
+            colOfTable(o, o.parent, cols, 'columns');
+          }
+          if (o.kind === 'foreignKey') {
+            need(o, o.refTable, 'table', 'refTable');
+            colOfTable(o, o.refTable, o.refColumns, 'refColumns');
+            if (o.columns.length !== o.refColumns.length) errs.push(`外键 ${o.name}：两边列数不同`);
+          }
+          if (o.kind === 'index') {
+            for (const e of o.elements)
+              if (!!e.column === !!e.expr) errs.push(`索引 ${o.name}：元素必须是列或表达式之一`);
+          }
+          if (o.kind === 'primaryKey') {
+            for (const c of o.columns) {
+              const col = m.objects[c];
+              if (col?.kind === 'column' && !col.notNull)
+                errs.push(`主键 ${o.name}：列 ${col.name} 必须 NOT NULL`);
+            }
+          }
+          break;
         }
-        break;
       }
     }
-  }
-  for (const t of all(m, 'table')) {
-    const pks = childrenOf(m, t.id, 'primaryKey');
-    if (pks.length > 1) errs.push(`表 ${t.name}：主键不止一个`);
-  }
-  errs.push(...getDialect(m.dialect).validateModel(m));
-  return errs;
-};
+    for (const t of idx.allRef('table')) {
+      const pks = idx.childrenRef(t.id, 'primaryKey');
+      if (pks.length > 1) errs.push(`表 ${t.name}：主键不止一个`);
+    }
+    errs.push(...getDialect(m.dialect).validateModel(m));
+    return errs;
+  });

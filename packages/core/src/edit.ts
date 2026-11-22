@@ -28,9 +28,10 @@ import type {
   Unique,
   UniqueExt,
 } from './ir.ts';
-import { deepEqual } from './json.ts';
+import { clonePlain, deepEqual } from './json.ts';
 import {
   all,
+  allChildrenOf,
   childrenOf,
   columnsOf,
   effectiveColumnsOf,
@@ -82,19 +83,19 @@ export const rewriteExprs = (m: Model, f: (expr: string) => string) => {
   for (const t of all(m, 'table')) {
     if (typeof t.partitionBy === 'string') normalizePartitionFamily(m, t.id);
   }
-  for (const o of Object.values(m.objects)) {
-    if (o.kind === 'table' && o.partitionBy && typeof o.partitionBy !== 'string') {
-      for (const k of o.partitionBy.keys) if (k.expr) k.expr = f(k.expr);
+  for (const t of all(m, 'table')) {
+    if (t.partitionBy && typeof t.partitionBy !== 'string') {
+      for (const k of t.partitionBy.keys) if (k.expr) k.expr = f(k.expr);
     }
-    if (o.kind === 'check') o.expr = f(o.expr);
-    if (o.kind === 'index') {
-      for (const e of o.elements) if (e.expr) e.expr = f(e.expr);
-      if (o.where) o.where = f(o.where);
-    }
-    if (o.kind === 'column') {
-      if (o.generated) o.generated.expr = f(o.generated.expr);
-      if (o.default && 'expr' in o.default) o.default.expr = f(o.default.expr);
-    }
+  }
+  for (const o of all(m, 'check')) o.expr = f(o.expr);
+  for (const o of all(m, 'index')) {
+    for (const e of o.elements) if (e.expr) e.expr = f(e.expr);
+    if (o.where) o.where = f(o.where);
+  }
+  for (const o of all(m, 'column')) {
+    if (o.generated) o.generated.expr = f(o.generated.expr);
+    if (o.default && 'expr' in o.default) o.default.expr = f(o.default.expr);
   }
 };
 
@@ -411,7 +412,7 @@ export const dropTable = (m: Model, id: string, seen = new Set<string>()) => {
     for (const s of all(m, 'sequence')) if (s.ownedBy === c.id) delete m.objects[s.id];
     delete m.objects[c.id];
   }
-  for (const o of Object.values(m.objects)) if ('parent' in o && o.parent === id) delete m.objects[o.id];
+  for (const o of allChildrenOf(m, id)) delete m.objects[o.id];
   delete m.objects[id];
 };
 
@@ -499,7 +500,7 @@ export const normalizePartitionFamily = (m: Model, tableId: string) => {
   for (const t of family) {
     if (typeof t.partitionBy === 'string') {
       const spec = resolvePartitionBy(m, t);
-      if (spec) t.partitionBy = structuredClone(spec);
+      if (spec) t.partitionBy = clonePlain(spec);
     }
   }
 };
@@ -510,14 +511,23 @@ export const normalizePartitionFamily = (m: Model, tableId: string) => {
  * 且对无法结构化解析的残留 `partitionBy: string` 保持原样不抛错。
  */
 export const normalizeAllPartitionFamilies = (m: Model): Model => {
-  const tables = all(m, 'table');
-  const needsWork = tables.some(
-    (t) =>
-      typeof t.partitionBy === 'string' ||
-      (t.partitionOf !== null && childrenOf(m, t.id, 'column').length > 0),
-  );
+  let needsWork = false;
+  for (const id in m.objects) {
+    const o = m.objects[id]!;
+    if (o.kind === 'table' && typeof o.partitionBy === 'string') {
+      needsWork = true;
+      break;
+    }
+    if (o.kind === 'column') {
+      const p = m.objects[o.parent];
+      if (p?.kind === 'table' && p.partitionOf !== null) {
+        needsWork = true;
+        break;
+      }
+    }
+  }
   if (!needsWork) return m;
-  const out = structuredClone(m);
+  const out = clonePlain(m);
   const seen = new Set<string>();
   for (const t of all(out, 'table')) {
     if (t.partitionBy === null && t.partitionOf === null) continue;
@@ -582,7 +592,7 @@ export const setPartitionBy = (m: Model, tableId: string, spec: PartitionSpec | 
   }
   for (const ck of childrenOf(m, tableId, 'check'))
     if (ck.noInherit) throw new EditError(`检查约束 ${ck.name} 设为 NO INHERIT，分区父表不支持`);
-  t.partitionBy = structuredClone(spec);
+  t.partitionBy = clonePlain(spec);
 };
 
 export const createPartition = (
@@ -666,18 +676,20 @@ const ancestorsOf = (m: Model, tableId: string): Table[] => {
 const remapColRefsOnTable = (m: Model, tableId: string, colMap: Map<string, string>) => {
   const mapCol = (c: string) => colMap.get(c) ?? c;
   const targets = new Set([tableId, ...partitionDescendants(m, tableId).map((d) => d.id)]);
-  for (const o of Object.values(m.objects)) {
-    if (o.kind === 'table' && targets.has(o.id) && o.partitionBy && typeof o.partitionBy !== 'string') {
-      for (const k of o.partitionBy.keys) if (k.column) k.column = mapCol(k.column);
+  for (const tid of targets) {
+    const t = find(m, tid);
+    if (t?.kind === 'table' && t.partitionBy && typeof t.partitionBy !== 'string') {
+      for (const k of t.partitionBy.keys) if (k.column) k.column = mapCol(k.column);
     }
-    if (!('parent' in o) || !targets.has(o.parent)) continue;
-    if (o.kind === 'primaryKey' || o.kind === 'unique') o.columns = o.columns.map(mapCol);
-    else if (o.kind === 'foreignKey') {
-      o.columns = o.columns.map(mapCol);
-      if (targets.has(o.refTable)) o.refColumns = o.refColumns.map(mapCol);
-    } else if (o.kind === 'index') {
-      for (const el of o.elements) if (el.column) el.column = mapCol(el.column);
-      o.include = o.include.map(mapCol);
+    for (const o of allChildrenOf(m, tid)) {
+      if (o.kind === 'primaryKey' || o.kind === 'unique') o.columns = o.columns.map(mapCol);
+      else if (o.kind === 'foreignKey') {
+        o.columns = o.columns.map(mapCol);
+        if (targets.has(o.refTable)) o.refColumns = o.refColumns.map(mapCol);
+      } else if (o.kind === 'index') {
+        for (const el of o.elements) if (el.column) el.column = mapCol(el.column);
+        o.include = o.include.map(mapCol);
+      }
     }
   }
 };
@@ -921,9 +933,9 @@ export const detachPartition = (m: Model, childId: string) => {
       notNull: rc.notNull,
       notNullName: null,
       notNullNameMode: 'derived',
-      default: rc.default ? structuredClone(rc.default) : null,
+      default: rc.default ? clonePlain(rc.default) : null,
       identity: null, // PG 子分区不继承 attidentity
-      generated: rc.generated ? structuredClone(rc.generated) : null,
+      generated: rc.generated ? clonePlain(rc.generated) : null,
       collation: rc.collation,
       comment: null,
     };
@@ -1167,23 +1179,22 @@ export const renameColumn = (m: Model, id: string, name: string) => {
   const old = c.name;
   c.name = name;
   // 同表及所有后代子分区表达式里对这一列的引用一起改写
-  const affected = new Set([c.parent, ...partitionDescendants(m, c.parent).map((d) => d.id)]);
+  const affected = [c.parent, ...partitionDescendants(m, c.parent).map((d) => d.id)];
   for (const tid of affected) {
     const table = get(m, tid, 'table');
     if (table.partitionBy && typeof table.partitionBy !== 'string') {
       for (const k of table.partitionBy.keys) if (k.expr) k.expr = d.renameInExpr(k.expr, old, name);
     }
-  }
-  for (const o of Object.values(m.objects)) {
-    if (!('parent' in o) || !affected.has(o.parent)) continue;
-    if (o.kind === 'check') o.expr = d.renameInExpr(o.expr, old, name);
-    if (o.kind === 'index') {
-      for (const e of o.elements) if (e.expr) e.expr = d.renameInExpr(e.expr, old, name);
-      if (o.where) o.where = d.renameInExpr(o.where, old, name);
-    }
-    if (o.kind === 'column') {
-      if (o.generated) o.generated.expr = d.renameInExpr(o.generated.expr, old, name);
-      if (o.default && 'expr' in o.default) o.default.expr = d.renameInExpr(o.default.expr, old, name);
+    for (const o of allChildrenOf(m, tid)) {
+      if (o.kind === 'check') o.expr = d.renameInExpr(o.expr, old, name);
+      if (o.kind === 'index') {
+        for (const e of o.elements) if (e.expr) e.expr = d.renameInExpr(e.expr, old, name);
+        if (o.where) o.where = d.renameInExpr(o.where, old, name);
+      }
+      if (o.kind === 'column') {
+        if (o.generated) o.generated.expr = d.renameInExpr(o.generated.expr, old, name);
+        if (o.default && 'expr' in o.default) o.default.expr = d.renameInExpr(o.default.expr, old, name);
+      }
     }
   }
   for (const tid of affected) refreshDerivedNames(m, tid);
@@ -1216,37 +1227,40 @@ export const dropColumn = (m: Model, id: string) => {
       );
     }
   }
-  const affected = new Set([c.parent, ...partitionDescendants(m, c.parent).map((x) => x.id)]);
-  const uses = (o: Obj): boolean => {
-    switch (o.kind) {
-      case 'primaryKey':
-      case 'unique':
-        return o.columns.includes(id);
-      case 'foreignKey':
-        return o.columns.includes(id) || o.refColumns.includes(id);
-      case 'check':
-        return affected.has(o.parent) && d.exprReferences(o.expr, c.name);
-      case 'index':
-        return (
-          affected.has(o.parent) &&
-          (o.elements.some((e) => e.column === id || (e.expr && d.exprReferences(e.expr, c.name))) ||
-            o.include.includes(id) ||
-            (!!o.where && d.exprReferences(o.where, c.name)))
-        );
-      case 'column':
-        return (
-          o.id !== id && o.parent === c.parent && !!o.generated && d.exprReferences(o.generated.expr, c.name)
-        );
-      case 'sequence':
-        return o.ownedBy === id;
-      default:
-        return false;
+  const affected = [c.parent, ...partitionDescendants(m, c.parent).map((x) => x.id)];
+  for (const o of all(m, 'primaryKey')) {
+    if (o.columns.includes(id)) delete m.objects[o.id];
+  }
+  for (const o of all(m, 'unique')) {
+    if (o.columns.includes(id)) delete m.objects[o.id];
+  }
+  for (const o of all(m, 'foreignKey')) {
+    if (o.columns.includes(id) || o.refColumns.includes(id)) delete m.objects[o.id];
+  }
+  for (const s of all(m, 'sequence')) {
+    if (s.ownedBy === id) delete m.objects[s.id];
+  }
+  for (const tid of affected) {
+    for (const o of allChildrenOf(m, tid)) {
+      if (o.kind === 'check' && d.exprReferences(o.expr, c.name)) {
+        delete m.objects[o.id];
+      } else if (
+        o.kind === 'index' &&
+        (o.elements.some((e) => e.column === id || (e.expr && d.exprReferences(e.expr, c.name))) ||
+          o.include.includes(id) ||
+          (!!o.where && d.exprReferences(o.where, c.name)))
+      ) {
+        delete m.objects[o.id];
+      } else if (
+        o.kind === 'column' &&
+        o.id !== id &&
+        o.parent === c.parent &&
+        !!o.generated &&
+        d.exprReferences(o.generated.expr, c.name)
+      ) {
+        dropColumn(m, o.id);
+      }
     }
-  };
-  for (const o of Object.values(m.objects)) {
-    if (!uses(o)) continue;
-    if (o.kind === 'column') dropColumn(m, o.id);
-    else delete m.objects[o.id];
   }
   dropDependentOpaques(m, new Set([id]));
   delete m.objects[id];

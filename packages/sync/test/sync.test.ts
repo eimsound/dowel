@@ -1,11 +1,21 @@
 // 同步层：固定场景 + 随机测试（多客户端、随机延迟、断线重连、草稿）。
 // 原型和结论见 .agents/docs/01-research.md 第 9 节。
-import { all, emptyModel, exprReferences, type Model, newId, validate } from '@dowel/core';
+import {
+  all,
+  deepEqual as coreDeepEqual,
+  emptyModel,
+  exprReferences,
+  type Model,
+  MutableModelIndex,
+  newId,
+  validate,
+} from '@dowel/core';
 import fc from 'fast-check';
 import { describe, expect, test } from 'vitest';
 
 import {
   emptyRoomState,
+  execute,
   isValidClientId,
   memoryStore,
   type Rejection,
@@ -1035,3 +1045,141 @@ test('同步：随机测试（4 个客户端，随机延迟、断线、草稿）
     { numRuns: Number(process.env.SYNC_RUNS ?? 200) },
   );
 }, 600_000);
+
+describe('写时复制 execute 与单次执行优化一致性', () => {
+  test('execute() 成功与中途失败时绝不修改原模型，且与 MutableModelIndex 叠加一致', () => {
+    const m = emptyModel('pg');
+    let cur = execute(m, 'createSchema', { id: 's1', name: 'public' }).next;
+    cur = execute(cur, 'createEnum', {
+      id: 'e1',
+      schema: 's1',
+      name: 'status',
+      values: ['open', 'closed'],
+    }).next;
+    cur = execute(cur, 'createTable', { id: 't1', schema: 's1', name: 'orders' }).next;
+    cur = execute(cur, 'addColumn', {
+      table: 't1',
+      column: { id: 'c1', name: 'id', type: 'bigint', notNull: true },
+    }).next;
+    cur = execute(cur, 'addColumn', {
+      table: 't1',
+      column: { id: 'c2', name: 'amount', type: 'integer', notNull: false },
+    }).next;
+    cur = execute(cur, 'setPrimaryKey', { id: 'pk1', table: 't1', columns: ['c1'] }).next;
+    cur = execute(cur, 'addCheck', { id: 'ck1', table: 't1', expr: 'amount > 0' }).next;
+
+    const snapBefore = structuredClone(cur);
+    const idx = new MutableModelIndex(cur);
+
+    // 1. 枚举值追加 + 重命名（含 OverlayModelIndex 派生改名）
+    const r1 = execute(cur, 'addEnumValue', { id: 'e1', value: 'pending' }, idx);
+    expect(coreDeepEqual(cur, snapBefore)).toBe(true);
+    expect(
+      (r1.next.objects.e1 as Extract<(typeof r1.next.objects)[string], { kind: 'enum' }>).values,
+    ).toEqual(['open', 'closed', 'pending']);
+
+    const r2 = execute(cur, 'renameColumn', { id: 'c2', name: 'total_amount' }, idx);
+    expect(coreDeepEqual(cur, snapBefore)).toBe(true);
+    expect(r2.next.objects.ck1).toMatchObject({ expr: 'total_amount > 0' });
+    // 未修改的对象共享同一个引用（结构共享），且 ck1 与 c2 已生成新对象
+    expect(r2.next.objects.e1).toBe(cur.objects.e1);
+    expect(r2.next.objects.c2).not.toBe(cur.objects.c2);
+
+    // 2. 重命名冲突抛出 EditError：即使中途产生过代理访问或派生更新，原模型必须保持纯净
+    expect(() => execute(cur, 'renameColumn', { id: 'c2', name: 'id' }, idx)).toThrow();
+    expect(coreDeepEqual(cur, snapBefore)).toBe(true);
+
+    // 3. 删除表应级联清理子对象而不污染原模型
+    const r3 = execute(cur, 'dropTable', { id: 't1' }, idx);
+    expect(coreDeepEqual(cur, snapBefore)).toBe(true);
+    expect('t1' in r3.next.objects).toBe(false);
+    expect('c1' in r3.next.objects).toBe(false);
+    expect('pk1' in r3.next.objects).toBe(false);
+    expect('ck1' in r3.next.objects).toBe(false);
+  });
+
+  test('SyncClient.mutate() 跳过双倍重算并支持多次本地排队与服务端 rebase', async () => {
+    const base = emptyModel('pg');
+    const room = new Room(emptyRoomState(base), memoryStore());
+    const a = new SyncClient('a', base);
+    const b = new SyncClient('b', base);
+
+    const deliver = async (sender: SyncClient, msg: ToServer) => {
+      const outs = await room.handle(sender.id, sender.id, msg);
+      for (const o of outs) {
+        if (o.to === '*' || o.to === 'a') a.receive(structuredClone(o.msg));
+        if (o.to === '*' || o.to === 'b') b.receive(structuredClone(o.msg));
+      }
+    };
+
+    a.send = (m) => void deliver(a, m);
+    b.send = (m) => void deliver(b, m);
+    a.connect();
+    b.connect();
+    await Promise.resolve();
+
+    a.mutate('createSchema', { id: 's1', name: 'public' });
+    a.mutate('createTable', { id: 't1', schema: 's1', name: 'items' });
+    a.mutate('addColumn', {
+      table: 't1',
+      column: { id: 'c1', name: 'title', type: 'text', notNull: true },
+    });
+    a.mutate('setComment', { id: 'c1', comment: '标题' });
+    await new Promise((r) => setTimeout(r, 20));
+
+    expect(a.pending).toEqual([]);
+    expect(coreDeepEqual(a.view, room.model)).toBe(true);
+    expect(coreDeepEqual(b.view, room.model)).toBe(true);
+    expect(a.view.objects.c1).toMatchObject({ comment: '标题' });
+  });
+
+  test('SyncClient 接收 dropTable 提交后释放 PG 关系名缓存，允许安全复用同名表/主键/索引', async () => {
+    const base = emptyModel('pg');
+    const room = new Room(emptyRoomState(base), memoryStore());
+    const a = new SyncClient('a', base);
+    const deliver = async (msg: ToServer) => {
+      const outs = await room.handle(a.id, a.id, msg);
+      for (const o of outs) {
+        if (o.to === '*' || o.to === a.id) a.receive(structuredClone(o.msg));
+      }
+    };
+    a.send = (m) => void deliver(m);
+    a.connect();
+    await Promise.resolve();
+
+    a.mutate('createSchema', { id: 's1', name: 'public' });
+    a.mutate('createTable', { id: 't1', schema: 's1', name: 'orders' });
+    a.mutate('addColumn', {
+      table: 't1',
+      column: { id: 'c1', name: 'id', type: 'bigint', notNull: true },
+    });
+    a.mutate('setPrimaryKey', { id: 'pk1', table: 't1', columns: ['c1'] });
+    a.mutate('addIndex', {
+      id: 'idx1',
+      table: 't1',
+      elements: [{ column: 'c1', expr: null, opclass: null, order: null, nulls: null }],
+    });
+    await new Promise((r) => setTimeout(r, 20));
+
+    // 删除原表 t1 后等待服务端提交回推（会原地修改 confirmed 并更新 confirmedIndex）
+    a.mutate('dropTable', { id: 't1' });
+    await new Promise((r) => setTimeout(r, 20));
+
+    // 复用原名建新表、主键、索引，绝不应发生 orders_pkey_1 / orders_id_idx_1 误冲突
+    a.mutate('createTable', { id: 't2', schema: 's1', name: 'orders' });
+    a.mutate('addColumn', {
+      table: 't2',
+      column: { id: 'c2', name: 'id', type: 'bigint', notNull: true },
+    });
+    a.mutate('setPrimaryKey', { id: 'pk2', table: 't2', columns: ['c2'] });
+    a.mutate('addIndex', {
+      id: 'idx2',
+      table: 't2',
+      elements: [{ column: 'c2', expr: null, opclass: null, order: null, nulls: null }],
+    });
+    await new Promise((r) => setTimeout(r, 20));
+
+    expect(a.view.objects.pk2).toMatchObject({ name: 'orders_pkey' });
+    expect(a.view.objects.idx2).toMatchObject({ name: 'orders_id_idx' });
+  });
+});

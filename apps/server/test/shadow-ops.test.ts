@@ -596,3 +596,38 @@ describe('resetShadow 权限不足（PG 42501）归类与 SQL 提示', () => {
     expect((e as Error).message).toBe('影子库不可用：连接断开了');
   });
 });
+
+describe('verify / verifyScripts 复用 from 影子库，消除第 3 轮重建', () => {
+  const countShadowOps = async (run: (ops: ReturnType<typeof shadowOps>) => Promise<unknown>) => {
+    let createSrcCount = 0;
+    let resetCount = 0;
+    const ops = shadowOps(async () =>
+      fakeDb((sql) => {
+        if (sql === 'CREATE SCHEMA src') createSrcCount++;
+        if (sql.startsWith('select quote_ident(nspname) as n from pg_namespace')) resetCount++;
+        return undefined;
+      }),
+    );
+    await run(ops);
+    return { createSrcCount, resetCount };
+  };
+
+  test('verify() 闭环通过时直接复用当前处于 from 状态的影子库，跳过第 3 轮 reset 与建库', async () => {
+    const res = await countShadowOps((ops) => ops.verify(FROM, TO));
+    // resetShadow 仅在 buildTarget(to) 与 buildTarget(from) 各发生 1 次；analyze 复用当前影子库不再第 3 次 reset/create
+    expect(res.resetCount).toBe(2);
+    // verify(FROM, TO) 中 CREATE SCHEMA src 为 buildTarget(from) 1 次 + down 回滚重建 1 次 = 2 次（不再出现 analyze 第 3 次创建）
+    expect(res.createSrcCount).toBe(2);
+  });
+
+  test('verifyScripts() 默认检查 down 且通过时跳过第 3 轮建库；checkDown=false 时不得跳过重建', async () => {
+    const up = [{ sql: 'CREATE SCHEMA app', transactional: true }];
+    const down = [{ sql: 'DROP SCHEMA app CASCADE', transactional: true }];
+    const withDown = await countShadowOps((ops) => ops.verifyScripts(FROM, TO, up, down));
+    const withoutDown = await countShadowOps((ops) =>
+      ops.verifyScripts(FROM, TO, up, down, { checkDown: false }),
+    );
+    expect(withDown).toEqual({ resetCount: 2, createSrcCount: 1 });
+    expect(withoutDown).toEqual({ resetCount: 3, createSrcCount: 2 });
+  });
+});

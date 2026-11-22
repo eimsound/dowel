@@ -9,7 +9,13 @@ import {
   type Step,
 } from '@dowel/core';
 
-import { type Db, EngineStepError, NON_TRANSACTIONAL_NOTE, type StepRisk } from '../types.ts';
+import {
+  type AnalyzeOptions,
+  type Db,
+  EngineStepError,
+  NON_TRANSACTIONAL_NOTE,
+  type StepRisk,
+} from '../types.ts';
 import { mssqlErrorNumber, pinMssqlSession, runMssqlTransaction } from './db.ts';
 
 const METADATA_PROCS = new Set([
@@ -117,16 +123,21 @@ export const analyzeMssqlStepRisk = async (
   from: Model,
   steps: Step[],
   resetShadow: (db: Db) => Promise<void>,
+  opts?: AnalyzeOptions,
 ): Promise<StepRisk[]> => {
-  await resetShadow(db);
-  await pinMssqlSession(db);
-  for (const s of createAll(from)) {
-    const t0 = performance.now();
-    try {
-      await db.exec(s.sql);
-    } catch (e) {
-      throw new EngineStepError(s, e, performance.now() - t0);
+  if (!opts?.reuseShadowFrom) {
+    await resetShadow(db);
+    await pinMssqlSession(db);
+    for (const s of createAll(from)) {
+      const t0 = performance.now();
+      try {
+        await db.exec(s.sql);
+      } catch (e) {
+        throw new EngineStepError(s, e, performance.now() - t0);
+      }
     }
+  } else {
+    await pinMssqlSession(db);
   }
 
   const initialTables = await readExistingTables(db);

@@ -25,6 +25,7 @@ import {
 } from '@dowel/engines';
 import {
   analyze,
+  type AnalyzeOptions,
   buildTarget,
   InstanceLevelStatementError,
   runSteps,
@@ -297,9 +298,10 @@ const risksOf = async (
   steps: Step[],
   timeoutMs: number,
   dialect: Dialect = 'pg',
+  analyzeOpts?: AnalyzeOptions,
 ): Promise<{ risks: StepRisk[]; riskError?: string }> => {
   try {
-    return { risks: await analyze(d, from, steps) };
+    return { risks: await analyze(d, from, steps, analyzeOpts) };
   } catch (e) {
     if (isInfraFailure(e, timeoutMs)) throw toShadowError(e);
     if (!(e instanceof StepError) && isPgPrivilegeError(e, dialect)) {
@@ -448,7 +450,11 @@ export const shadowOps = (
       const r = await verifyScripts(d, from, to, up, down, options);
       const risk = options?.skipRisk
         ? { risks: [] }
-        : await risksOf(d, from, r.up, statementTimeoutMs, dDialect);
+        : await risksOf(d, from, r.up, statementTimeoutMs, dDialect, {
+            pgMajor: options?.pgMajor,
+            mysqlVersionNum: options?.mysqlVersionNum,
+            reuseShadowFrom: options?.checkDown !== false && r.upDiff.length === 0 && r.downDiff.length === 0,
+          });
       return {
         ok: !r.upDiff.length && !r.downDiff.length,
         ...r,
@@ -480,7 +486,10 @@ export const shadowOps = (
     const dDialect = to.dialect;
     try {
       const r = await verify(d, from, to, opts);
-      const risk = await risksOf(d, from, r.up, statementTimeoutMs, dDialect);
+      const risk = await risksOf(d, from, r.up, statementTimeoutMs, dDialect, {
+        ...opts,
+        reuseShadowFrom: r.upDiff.length === 0 && r.downDiff.length === 0,
+      });
       return {
         ok: !r.upDiff.length && !r.downDiff.length,
         ...r,

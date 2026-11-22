@@ -9,6 +9,7 @@ import {
 } from '@dowel/core';
 
 import {
+  type AnalyzeOptions,
   type AppliedTimeouts,
   type Db,
   type EngineAdapter,
@@ -119,10 +120,17 @@ const extractRebuiltTables = (sql: string): string[] => {
   return out;
 };
 
-const analyzeSqliteStepRisk = async (db: Db, from: Model, steps: Step[]): Promise<StepRisk[]> => {
-  await resetSqliteShadow(db);
-  for (const s of createAll(from)) {
-    await execSqliteStepSql(db, s.sql);
+const analyzeSqliteStepRisk = async (
+  db: Db,
+  from: Model,
+  steps: Step[],
+  opts?: AnalyzeOptions,
+): Promise<StepRisk[]> => {
+  if (!opts?.reuseShadowFrom) {
+    await resetSqliteShadow(db);
+    for (const s of createAll(from)) {
+      await execSqliteStepSql(db, s.sql);
+    }
   }
   const existingTables = new Set(
     (
@@ -265,7 +273,7 @@ export const sqliteEngine: EngineAdapter = {
       .filter((l) => !/^\s*(?:BEGIN\s+TRANSACTION|COMMIT)\s*;\s*$/i.test(l))
       .join('\n'),
 
-  analyzeStepRisk: (db, from, steps) => analyzeSqliteStepRisk(db, from, steps),
+  analyzeStepRisk: (db, from, steps, opts) => analyzeSqliteStepRisk(db, from, steps, opts),
 
   applyTimeouts: async (conn, timeouts): Promise<AppliedTimeouts> => {
     const ms = (n: number) => Math.max(0, Math.trunc(n));

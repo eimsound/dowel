@@ -12,5 +12,6 @@ export default defineConfig({
     // 开发时把接口和 WebSocket 转发给 apps/server
     proxy: { '/api': { target: 'http://localhost:4600', ws: true } },
   },
+  worker: { format: 'es' },
   build: { target: 'es2023' },
 });

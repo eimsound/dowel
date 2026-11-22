@@ -1105,6 +1105,10 @@ dialog::backdrop {
     }
   }
 }
+.react-flow__node-table,
+.react-flow__node-sectionSummary {
+  contain: layout style;
+}
 .react-flow__background {
   --xy-background-pattern-dots-color-default: var(--grid-dot);
 }

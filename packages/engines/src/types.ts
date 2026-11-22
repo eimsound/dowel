@@ -3,6 +3,14 @@ import type { Dialect, Model, PlanOptions, Step } from '@dowel/core';
 
 import type { ScriptStep } from './steps.ts';
 
+export interface AnalyzeOptions extends PlanOptions {
+  /**
+   * 紧接完整闭环验证（verify / verifyScripts 通过且已回滚到 from）后执行时，
+   * 影子库已处于 from 状态，可跳过第 3 轮 resetShadow + createAll(from) 重建。
+   */
+  reuseShadowFrom?: boolean;
+}
+
 /** 访问目标库 / 影子库的最小抽象接口 */
 export interface Db {
   query<T = Record<string, unknown>>(sql: string, params?: unknown[]): Promise<T[]>;
@@ -238,7 +246,7 @@ export interface EngineAdapter {
   resetShadow(db: Db): Promise<void>;
   prepareImportShadow(db: Db): Promise<void>;
   stripImportNoise(sql: string): string;
-  analyzeStepRisk(db: Db, from: Model, steps: Step[], opts?: PlanOptions): Promise<StepRisk[]>;
+  analyzeStepRisk(db: Db, from: Model, steps: Step[], opts?: AnalyzeOptions): Promise<StepRisk[]>;
 
   // 执行器钩子（executor 共用）
   applyTimeouts(

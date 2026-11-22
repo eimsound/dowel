@@ -3,6 +3,7 @@
 import type { CanvasSection, PublishedTables, VersionInfo } from '@dowel/api';
 import {
   all,
+  buildModelIndex,
   type Column,
   childrenOf,
   columnsOf,
@@ -16,6 +17,7 @@ import {
   isMssqlPkClustered,
   isMysqlAutoIncrementType,
   type Model,
+  type ModelIndex,
   MYSQL_SAFE_IDENT_RE,
   mssqlChooseName,
   mssqlDefaultNameOf,
@@ -23,16 +25,15 @@ import {
   newId,
   normalizeType,
   parsePartitionBound,
-  partitionDescendants,
   partitionKeyColumns,
   type PartitionKey,
   type PartitionSpec,
   type PartitionStrategy,
-  partitionsOf,
   resolvePartitionBy,
   splitMysqlTypeModifiers,
   type Table,
   validatePartitionBoundCode,
+  withModelIndex,
 } from '@dowel/core';
 import type { Versions } from '@dowel/sync';
 import { useQuery } from '@tanstack/react-query';
@@ -60,7 +61,7 @@ import {
   Trash2,
   Unlink,
 } from 'lucide-react';
-import { type ReactNode, useId, useMemo, useRef, useState } from 'react';
+import { memo, type ReactNode, useId, useMemo, useRef, useState } from 'react';
 import { useTranslation } from 'react-i18next';
 
 import { api } from '../api.ts';
@@ -72,7 +73,7 @@ import { shortType, typeLabel } from './Canvas.tsx';
 import { Modal } from './Modal.tsx';
 import { Banner, cx, Empty, IconButton, Menu, Sql } from './ui.tsx';
 
-type Ctx = { ws: Workspace; model: Model; readOnly: boolean };
+type Ctx = { ws: Workspace; model: Model; readOnly: boolean; modelIndex?: ModelIndex };
 
 /** 失焦或回车时提交，Esc 放弃；传入 validate 时仅在失焦/提交时校验并在输入时清除错误 */
 const Field = ({
@@ -304,11 +305,16 @@ const AddForm = ({
 };
 
 /** 解析类型输入：枚举名（可带 schema、可带 []）→ typeRef；否则规范化成当前方言的写法 */
-const parseType = (m: Model, text: string): { type: string; typeRef: string | null } => {
+const parseType = (m: Model, text: string, index?: ModelIndex): { type: string; typeRef: string | null } => {
   const arr = /(\[\])*$/.exec(text.trim())![0];
   const base = text.trim().slice(0, text.trim().length - arr.length);
-  const e = getDialect(m.dialect).capabilities.enums
-    ? all(m, 'enum').find((x) => x.name === base || `${m.objects[x.parent]?.name}.${x.name}` === base)
+  const enums = getDialect(m.dialect).capabilities.enums
+    ? index
+      ? index.allRef('enum')
+      : all(m, 'enum')
+    : null;
+  const e = enums
+    ? enums.find((x) => x.name === base || `${m.objects[x.parent]?.name}.${x.name}` === base)
     : undefined;
   return e ? { type: arr, typeRef: e.id } : { type: normalizeType(text, m.dialect), typeRef: null };
 };
@@ -537,57 +543,61 @@ const BoundInputs = ({
 };
 
 /** 筛选列定义、主键与 CHECK 约束均与分区父表兼容、可挂载为子分区的普通表（与 edit.ts attachPartition 对齐） */
-const compatiblePlainTables = (model: Model, parent: Table): Table[] => {
-  const rootCols = effectiveColumnsOf(model, parent.id);
-  const ancestorIds = new Set<string>();
-  for (let cur: Table | undefined = parent; cur && !ancestorIds.has(cur.id);) {
-    ancestorIds.add(cur.id);
-    cur = cur.partitionOf ? (model.objects[cur.partitionOf.parent] as Table | undefined) : undefined;
-  }
-  const ancPks = all(model, 'primaryKey').filter((k) => ancestorIds.has(k.parent));
-  const ancChecks = all(model, 'check').filter((k) => ancestorIds.has(k.parent));
-  const referencedByExternalFk = new Set(
-    all(model, 'foreignKey')
-      .filter((fk) => fk.refTable !== fk.parent)
-      .map((fk) => fk.refTable),
-  );
-  const ownedColIds = new Set(
-    all(model, 'sequence')
-      .map((s) => s.ownedBy)
-      .filter((x): x is string => x !== null),
-  );
-  return all(model, 'table').filter((cand) => {
-    if (cand.id === parent.id || cand.partitionBy !== null || cand.partitionOf !== null) return false;
-    if (referencedByExternalFk.has(cand.id)) return false;
-    const cols = columnsOf(model, cand.id);
-    if (cols.length !== rootCols.length) return false;
-    if (cols.some((c) => c.identity !== null || ownedColIds.has(c.id))) return false;
-    const colMap = new Map<string, string>();
-    for (const rc of rootCols) {
-      const cc = cols.find((x) => x.name === rc.name);
-      if (!cc) return false;
-      if (
-        cc.type !== rc.type ||
-        cc.typeRef !== rc.typeRef ||
-        cc.collation !== rc.collation ||
-        cc.notNull !== rc.notNull ||
-        !deepEqual(cc.generated, rc.generated) ||
-        !deepEqual(cc.default, rc.default)
-      ) {
-        return false;
+const compatiblePlainTables = (model: Model, parent: Table, index?: ModelIndex): Table[] => {
+  const compute = (): Table[] => {
+    const rootCols = effectiveColumnsOf(model, parent.id);
+    const ancestorIds = new Set<string>();
+    for (let cur: Table | undefined = parent; cur && !ancestorIds.has(cur.id);) {
+      ancestorIds.add(cur.id);
+      cur = cur.partitionOf ? (model.objects[cur.partitionOf.parent] as Table | undefined) : undefined;
+    }
+    const ancPks = all(model, 'primaryKey').filter((k) => ancestorIds.has(k.parent));
+    const ancChecks = all(model, 'check').filter((k) => ancestorIds.has(k.parent));
+    const referencedByExternalFk = new Set(
+      all(model, 'foreignKey')
+        .filter((fk) => fk.refTable !== fk.parent)
+        .map((fk) => fk.refTable),
+    );
+    const ownedColIds = new Set(
+      all(model, 'sequence')
+        .map((s) => s.ownedBy)
+        .filter((x): x is string => x !== null),
+    );
+    return all(model, 'table').filter((cand) => {
+      if (cand.id === parent.id || cand.partitionBy !== null || cand.partitionOf !== null) return false;
+      if (referencedByExternalFk.has(cand.id)) return false;
+      const cols = columnsOf(model, cand.id);
+      if (cols.length !== rootCols.length) return false;
+      if (cols.some((c) => c.identity !== null || ownedColIds.has(c.id))) return false;
+      const colMap = new Map<string, string>();
+      for (const rc of rootCols) {
+        const cc = cols.find((x) => x.name === rc.name);
+        if (!cc) return false;
+        if (
+          cc.type !== rc.type ||
+          cc.typeRef !== rc.typeRef ||
+          cc.collation !== rc.collation ||
+          cc.notNull !== rc.notNull ||
+          !deepEqual(cc.generated, rc.generated) ||
+          !deepEqual(cc.default, rc.default)
+        ) {
+          return false;
+        }
+        colMap.set(cc.id, rc.id);
       }
-      colMap.set(cc.id, rc.id);
-    }
-    const candPk = childrenOf(model, cand.id, 'primaryKey')[0];
-    if (candPk && ancPks.length > 0) {
-      const mapped = candPk.columns.map((c) => colMap.get(c) ?? c);
-      if (!ancPks.some((pk) => deepEqual(pk.columns, mapped))) return false;
-    }
-    for (const ck of childrenOf(model, cand.id, 'check')) {
-      if (ancChecks.some((ak) => ak.name === ck.name && (ak.expr !== ck.expr || ck.noInherit))) return false;
-    }
-    return true;
-  });
+      const candPk = childrenOf(model, cand.id, 'primaryKey')[0];
+      if (candPk && ancPks.length > 0) {
+        const mapped = candPk.columns.map((c) => colMap.get(c) ?? c);
+        if (!ancPks.some((pk) => deepEqual(pk.columns, mapped))) return false;
+      }
+      for (const ck of childrenOf(model, cand.id, 'check')) {
+        if (ancChecks.some((ak) => ak.name === ck.name && (ak.expr !== ck.expr || ck.noInherit)))
+          return false;
+      }
+      return true;
+    });
+  };
+  return index ? withModelIndex(model, compute, index) : compute();
 };
 
 interface KeyDraft {
@@ -639,6 +649,7 @@ const TableInspector = ({
   table,
   ws,
   model,
+  modelIndex,
   readOnly,
   onSelect,
   sections,
@@ -653,9 +664,11 @@ const TableInspector = ({
   const { pid, project } = useProject();
   const dialectSpec = getDialect(model.dialect);
   const uiSpec = dialectUiSpec(model.dialect);
+  const idx = useMemo(() => modelIndex ?? buildModelIndex(model), [model, modelIndex]);
   const versions = useQuery({
     queryKey: ['versions', pid],
     queryFn: () => api<VersionInfo[]>('GET', `/api/projects/${pid}/versions`),
+    refetchOnMount: false,
   });
   const versionCount = versions.data?.length ?? 0;
   const latestId = versions.data?.[0]?.id;
@@ -680,12 +693,14 @@ const TableInspector = ({
     model.dialect === 'pg' && project.targetPgMajor !== null && project.targetPgMajor < 17;
 
   const isChild = table.partitionOf !== null;
-  const cols = isChild ? effectiveColumnsOf(model, table.id) : columnsOf(model, table.id);
-  const pk = childrenOf(model, table.id, 'primaryKey')[0];
-  const checks = childrenOf(model, table.id, 'check');
-  const uniques = childrenOf(model, table.id, 'unique');
-  const fks = childrenOf(model, table.id, 'foreignKey');
-  const indexes = childrenOf(model, table.id, 'index');
+  const cols = isChild
+    ? withModelIndex(model, () => effectiveColumnsOf(model, table.id), idx)
+    : idx.columnsOf(table.id);
+  const pk = idx.childrenRef(table.id, 'primaryKey')[0];
+  const checks = idx.childrenRef(table.id, 'check');
+  const uniques = idx.childrenRef(table.id, 'unique');
+  const fks = idx.childrenRef(table.id, 'foreignKey');
+  const indexes = idx.childrenRef(table.id, 'index');
   const tableIds = [table.id, ...cols.map((c) => c.id)];
   const name = (id: string) => model.objects[id]?.name ?? '?';
   const locked = readOnly;
@@ -693,26 +708,26 @@ const TableInspector = ({
 
   const partKeyCols = useMemo(() => {
     const ids = new Set<string>();
-    const tablesToScan = isChild ? [table] : [table, ...partitionDescendants(model, table.id)];
+    const tablesToScan = isChild ? [table] : [table, ...idx.partitionDescendants(table.id)];
     for (const tb of tablesToScan) {
       if (tb.partitionBy) {
         for (const id of partitionKeyColumns(model, tb).all) ids.add(id);
       }
     }
     return ids;
-  }, [isChild, model, table]);
+  }, [idx, isChild, model, table]);
 
   const spec = table.partitionBy ? resolvePartitionBy(model, table) : null;
-  const children = partitionsOf(model, table.id);
+  const children = idx.partitionsOf(table.id);
   const parentTable = table.partitionOf
     ? (model.objects[table.partitionOf.parent] as Table | undefined)
     : undefined;
   const parentSpec = parentTable?.partitionBy ? resolvePartitionBy(model, parentTable) : null;
   const hasDefaultChild = children.some((c) => parsePartitionBound(c.partitionOf!.bound)?.kind === 'default');
   const parentHasDefault = parentTable
-    ? partitionsOf(model, parentTable.id).some(
-        (c) => parsePartitionBound(c.partitionOf!.bound)?.kind === 'default',
-      )
+    ? idx
+        .partitionsRef(parentTable.id)
+        .some((c) => parsePartitionBound(c.partitionOf!.bound)?.kind === 'default')
     : false;
   const selfIsDefault = !!(
     table.partitionOf && parsePartitionBound(table.partitionOf.bound)?.kind === 'default'
@@ -838,7 +853,7 @@ const TableInspector = ({
   };
   // 外键可引用的列：被引用表上单列主键或唯一约束的列
   const refCols = fk.ref
-    ? [...childrenOf(model, fk.ref, 'primaryKey'), ...childrenOf(model, fk.ref, 'unique')]
+    ? [...idx.childrenRef(fk.ref, 'primaryKey'), ...idx.childrenRef(fk.ref, 'unique')]
         .filter((k) => k.columns.length === 1)
         .map((k) => k.columns[0]!)
     : [];
@@ -908,7 +923,8 @@ const TableInspector = ({
   const openAddPartition = () => {
     if (!spec) return;
     let n = children.length + 1;
-    while (all(model, 'table').some((x) => x.name === `${table.name}_p${n}`)) n++;
+    const allTables = idx.allRef('table');
+    while (allTables.some((x) => x.name === `${table.name}_p${n}`)) n++;
     setChildName(`${table.name}_p${n}`);
     setBoundDraft(initBoundDraft(spec));
     setPartForm('add');
@@ -916,7 +932,7 @@ const TableInspector = ({
 
   const openAttachPartition = () => {
     if (!spec) return;
-    const cands = compatiblePlainTables(model, table);
+    const cands = compatiblePlainTables(model, table, idx);
     setAttachTableId(cands[0]?.id ?? '');
     setBoundDraft(initBoundDraft(spec));
     setPartForm('attach');
@@ -927,7 +943,11 @@ const TableInspector = ({
     setEditingBoundId(target.id);
   };
 
-  const attachCandidates = activePartForm === 'attach' ? compatiblePlainTables(model, table) : [];
+  const attachCandidates = activePartForm === 'attach' ? compatiblePlainTables(model, table, idx) : [];
+  const enumNames = useMemo(
+    () => (dialectSpec.capabilities.enums ? idx.allRef('enum').map((e) => e.name) : []),
+    [dialectSpec.capabilities.enums, idx],
+  );
   const formBoundEval = spec ? evaluateBoundDraft(spec, boundDraft) : { bound: '', errorKey: null };
   const formBoundStr = formBoundEval.bound;
   const formBoundError = formBoundEval.errorKey
@@ -1150,7 +1170,7 @@ const TableInspector = ({
             {[
               ...dialectSpec.commonTypes,
               ...(model.dialect === 'mysql' ? ["enum('a','b')", "set('x','y')"] : []),
-              ...(dialectSpec.capabilities.enums ? all(model, 'enum').map((e) => e.name) : []),
+              ...enumNames,
             ].map((x) => (
               <option key={x} value={x} />
             ))}
@@ -1232,7 +1252,7 @@ const TableInspector = ({
                           disabled={isPartKey}
                           describedBy={model.dialect === 'mysql' ? mysqlTypeHintId : undefined}
                           onCommit={(v, b) => {
-                            const parsed = parseType(model, v);
+                            const parsed = parseType(model, v, idx);
                             if (model.dialect === 'mysql') {
                               const { baseType, unsigned, zerofill } = splitMysqlTypeModifiers(parsed.type);
                               let usedTypeOp = false;
@@ -1933,7 +1953,8 @@ const TableInspector = ({
                   onChange={(e) => setFk({ ...fk, ref: e.target.value, refCol: '' })}
                 >
                   <option value="">—</option>
-                  {all(model, 'table')
+                  {idx
+                    .allRef('table')
                     .filter((x) => !x.partitionOf)
                     .map((x) => (
                       <option key={x.id} value={x.id}>
@@ -2827,9 +2848,9 @@ const InspectorContent = ({
           </div>
         )}
       </div>
-      {o.kind === 'table' && (
+      {o.kind === 'table' && confirm && !readOnly && (
         <Modal
-          open={confirm && !readOnly}
+          open
           onClose={() => setConfirm(false)}
           size="sm"
           title={t('insp.deleteTableTitle', { name: o.name })}
@@ -2860,55 +2881,59 @@ const InspectorContent = ({
   );
 };
 
-export const Inspector = ({
-  selected,
-  onSelect,
-  sections,
-  onSetSections,
-  onOpenSectionManager,
-  focusedTableId,
-  onFocusTable,
-  onExitFocus,
-  ...ctx
-}: Ctx & {
-  selected: string | null;
-  onSelect: (id: string | null) => void;
-  sections?: CanvasSection[];
-  onSetSections?: (next: CanvasSection[]) => void;
-  onOpenSectionManager?: () => void;
-  focusedTableId?: string | null;
-  onFocusTable?: (tableId: string) => void;
-  onExitFocus?: () => void;
-}) => {
-  const { t } = useTranslation();
-  const { readOnly, model } = ctx;
+export const Inspector = memo(
+  ({
+    selected,
+    onSelect,
+    sections,
+    onSetSections,
+    onOpenSectionManager,
+    focusedTableId,
+    onFocusTable,
+    onExitFocus,
+    ...ctx
+  }: Ctx & {
+    selected: string | null;
+    onSelect: (id: string | null) => void;
+    sections?: CanvasSection[];
+    onSetSections?: (next: CanvasSection[]) => void;
+    onOpenSectionManager?: () => void;
+    focusedTableId?: string | null;
+    onFocusTable?: (tableId: string) => void;
+    onExitFocus?: () => void;
+  }) => {
+    const { t } = useTranslation();
+    const { readOnly, model } = ctx;
+    const effectiveIndex = useMemo(() => ctx.modelIndex ?? buildModelIndex(model), [model, ctx.modelIndex]);
 
-  const o = selected ? model.objects[selected] : undefined;
-  if (!o || !['table', 'enum', 'sequence', 'opaque'].includes(o.kind))
+    const o = selected ? model.objects[selected] : undefined;
+    if (!o || !['table', 'enum', 'sequence', 'opaque'].includes(o.kind))
+      return (
+        <div className="p-4">
+          <Empty
+            icon={<MousePointerClick size={28} strokeWidth={1.5} aria-hidden="true" />}
+            title={t('insp.nothingTitle')}
+          >
+            {t('insp.nothing')}
+          </Empty>
+        </div>
+      );
+
+    // 通过对象 ID 与只读状态联合 key 挂载内容，实时降级只读时自动彻底重置全部内联表单与确认弹窗状态
     return (
-      <div className="p-4">
-        <Empty
-          icon={<MousePointerClick size={28} strokeWidth={1.5} aria-hidden="true" />}
-          title={t('insp.nothingTitle')}
-        >
-          {t('insp.nothing')}
-        </Empty>
-      </div>
+      <InspectorContent
+        key={`${o.id}:${readOnly ? 'ro' : 'rw'}`}
+        o={o}
+        onSelect={onSelect}
+        sections={sections}
+        onSetSections={onSetSections}
+        onOpenSectionManager={onOpenSectionManager}
+        focusedTableId={focusedTableId}
+        onFocusTable={onFocusTable}
+        onExitFocus={onExitFocus}
+        {...ctx}
+        modelIndex={effectiveIndex}
+      />
     );
-
-  // 通过对象 ID 与只读状态联合 key 挂载内容，实时降级只读时自动彻底重置全部内联表单与确认弹窗状态
-  return (
-    <InspectorContent
-      key={`${o.id}:${readOnly ? 'ro' : 'rw'}`}
-      o={o}
-      onSelect={onSelect}
-      sections={sections}
-      onSetSections={onSetSections}
-      onOpenSectionManager={onOpenSectionManager}
-      focusedTableId={focusedTableId}
-      onFocusTable={onFocusTable}
-      onExitFocus={onExitFocus}
-      {...ctx}
-    />
-  );
-};
+  },
+);

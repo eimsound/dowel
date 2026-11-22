@@ -2,7 +2,7 @@
 // 规划时维护当前状态 cur，确保每条语句引用的都是当时实际存在的表/列名。
 import type { Check, Column, ForeignKey, Index, Model, Opaque, PrimaryKey, Table, Unique } from '../ir.ts';
 import { deepEqual } from '../json.ts';
-import { all, childrenOf, columnsOf, get } from '../model.ts';
+import { all, childrenOf, columnsOf, get, withModelIndex } from '../model.ts';
 import { PlanError, type Step } from '../plan-types.ts';
 import {
   sqliteExprReferences,
@@ -307,24 +307,26 @@ const columnDef = (c: Column, renames: [string, string][]): unknown => ({
 /** 将一个 SQLite 模型从空库建出 */
 export const sqliteCreateAll = (m: Model): Step[] => {
   if (m.dialect !== 'sqlite') throw new PlanError(`预期 sqlite 模型，实际为 ${m.dialect}`);
-  const steps: Step[] = [];
-  const tableIds = topoTables(
-    m,
-    all(m, 'table').map((t) => t.id),
-  );
-  for (const tid of tableIds) {
-    const t = get(m, tid, 'table');
-    steps.push({ kind: 'createTable', target: t.name, sql: renderSqliteCreateTable(m, tid) });
-  }
-  for (const idx of all(m, 'index').sort((a, b) => a.name.localeCompare(b.name))) {
-    steps.push({ kind: 'createIndex', target: idx.name, sql: renderSqliteCreateIndex(m, idx) });
-  }
-  for (const op of topoOpaques(all(m, 'opaque'))) {
-    for (const ddl of op.ddl) {
-      steps.push({ kind: 'createOpaque', target: op.name, sql: ddl });
+  return withModelIndex(m, () => {
+    const steps: Step[] = [];
+    const tableIds = topoTables(
+      m,
+      all(m, 'table').map((t) => t.id),
+    );
+    for (const tid of tableIds) {
+      const t = get(m, tid, 'table');
+      steps.push({ kind: 'createTable', target: t.name, sql: renderSqliteCreateTable(m, tid) });
     }
-  }
-  return steps;
+    for (const idx of all(m, 'index').sort((a, b) => a.name.localeCompare(b.name))) {
+      steps.push({ kind: 'createIndex', target: idx.name, sql: renderSqliteCreateIndex(m, idx) });
+    }
+    for (const op of topoOpaques(all(m, 'opaque'))) {
+      for (const ddl of op.ddl) {
+        steps.push({ kind: 'createOpaque', target: op.name, sql: ddl });
+      }
+    }
+    return steps;
+  });
 };
 
 /** 比较两个 SQLite 模型，生成最小且安全可回滚的迁移步骤（按需触发官方 12 步表重建） */
@@ -332,557 +334,573 @@ export const sqlitePlan = (from: Model, to: Model): Step[] => {
   if (from.dialect !== 'sqlite' || to.dialect !== 'sqlite') {
     throw new PlanError(`sqlitePlan 需要 sqlite 模型，收到 ${from.dialect} -> ${to.dialect}`);
   }
-  const steps: Step[] = [];
-  const emit = (kind: string, target: string, sql: string, transactional?: boolean) =>
-    steps.push(transactional === undefined ? { kind, target, sql } : { kind, target, sql, transactional });
+  return withModelIndex(from, () =>
+    withModelIndex(to, () => {
+      const steps: Step[] = [];
+      const emit = (kind: string, target: string, sql: string, transactional?: boolean) =>
+        steps.push(
+          transactional === undefined ? { kind, target, sql } : { kind, target, sql, transactional },
+        );
 
-  const inFrom = (id: string) => id in from.objects;
-  const inTo = (id: string) => id in to.objects;
+      const inFrom = (id: string) => id in from.objects;
+      const inTo = (id: string) => id in to.objects;
 
-  // 维护当前真实表名与已占用名，保证临时名永不冲突
-  const usedNamesLower = new Set<string>();
-  const registerUsed = (m: Model) => {
-    for (const o of Object.values(m.objects)) {
-      if (o.kind === 'table' || o.kind === 'index' || o.kind === 'opaque') {
-        usedNamesLower.add(o.name.toLowerCase());
+      // 维护当前真实表名与已占用名，保证临时名永不冲突
+      const usedNamesLower = new Set<string>();
+      const registerUsed = (m: Model) => {
+        for (const o of Object.values(m.objects)) {
+          if (o.kind === 'table' || o.kind === 'index' || o.kind === 'opaque') {
+            usedNamesLower.add(o.name.toLowerCase());
+          }
+        }
+      };
+      registerUsed(from);
+      registerUsed(to);
+      let tmpSeq = 0;
+      const allocTmp = () => {
+        for (;;) {
+          const candidate = `_dowel_tmp_${++tmpSeq}`;
+          if (!usedNamesLower.has(candidate)) {
+            usedNamesLower.add(candidate);
+            return candidate;
+          }
+        }
+      };
+
+      const fromTables = all(from, 'table');
+      const toTables = all(to, 'table');
+      const removedTables = fromTables.filter((t) => !inTo(t.id));
+      const addedTables = toTables.filter((t) => !inFrom(t.id));
+      const commonTables = toTables.filter((t) => inFrom(t.id));
+
+      // 每张公共表的列改名映射
+      const colRenamesByTable = new Map<string, [string, string][]>();
+      for (const t of commonTables) {
+        const renames: [string, string][] = [];
+        for (const tc of columnsOf(to, t.id)) {
+          const fc = from.objects[tc.id];
+          if (fc?.kind === 'column' && fc.parent === t.id && fc.name !== tc.name) {
+            renames.push([fc.name, tc.name]);
+          }
+        }
+        colRenamesByTable.set(t.id, renames);
       }
-    }
-  };
-  registerUsed(from);
-  registerUsed(to);
-  let tmpSeq = 0;
-  const allocTmp = () => {
-    for (;;) {
-      const candidate = `_dowel_tmp_${++tmpSeq}`;
-      if (!usedNamesLower.has(candidate)) {
-        usedNamesLower.add(candidate);
-        return candidate;
-      }
-    }
-  };
 
-  const fromTables = all(from, 'table');
-  const toTables = all(to, 'table');
-  const removedTables = fromTables.filter((t) => !inTo(t.id));
-  const addedTables = toTables.filter((t) => !inFrom(t.id));
-  const commonTables = toTables.filter((t) => inFrom(t.id));
-
-  // 每张公共表的列改名映射
-  const colRenamesByTable = new Map<string, [string, string][]>();
-  for (const t of commonTables) {
-    const renames: [string, string][] = [];
-    for (const tc of columnsOf(to, t.id)) {
-      const fc = from.objects[tc.id];
-      if (fc?.kind === 'column' && fc.parent === t.id && fc.name !== tc.name) {
-        renames.push([fc.name, tc.name]);
-      }
-    }
-    colRenamesByTable.set(t.id, renames);
-  }
-
-  // 判断索引是否需要删建
-  const removedIndexes = all(from, 'index').filter((ix) => !inTo(ix.id));
-  const changedIndexIds = new Set<string>();
-  for (const ix of all(to, 'index')) {
-    if (!inFrom(ix.id)) continue;
-    const prev = from.objects[ix.id] as Index;
-    const renames = colRenamesByTable.get(ix.parent) ?? [];
-    if (!same(indexDef(prev, renames), indexDef(ix, []))) {
-      changedIndexIds.add(ix.id);
-    }
-  }
-
-  // 判断每张公共表是否必须走 12 步表重建
-  const rebuilding = new Set<string>();
-  const tableRenameIds = new Set<string>();
-  for (const t of commonTables) {
-    const prev = from.objects[t.id] as Table;
-    if (prev.name !== t.name) tableRenameIds.add(t.id);
-    const renames = colRenamesByTable.get(t.id) ?? [];
-
-    const needsRebuild = (): boolean => {
-      // 1. 表选项变更（STRICT / WITHOUT ROWID）
-      if (Boolean(prev.ext?.sqlite?.strict) !== Boolean(t.ext?.sqlite?.strict)) return true;
-      if (Boolean(prev.ext?.sqlite?.withoutRowid) !== Boolean(t.ext?.sqlite?.withoutRowid)) return true;
-
-      // 2. 任意表级约束（PK / UNIQUE / FK / CHECK）增删改名改定义
-      for (const kind of ['primaryKey', 'unique', 'foreignKey', 'check'] as const) {
-        const prevList = childrenOf(from, t.id, kind);
-        const nextList = childrenOf(to, t.id, kind);
-        if (prevList.length !== nextList.length) return true;
-        const prevMap = new Map(prevList.map((x) => [x.id, x]));
-        for (const nx of nextList) {
-          const px = prevMap.get(nx.id);
-          if (!px) return true;
-          if (!same(constraintDef(px, renames), constraintDef(nx, []))) return true;
+      // 判断索引是否需要删建
+      const removedIndexes = all(from, 'index').filter((ix) => !inTo(ix.id));
+      const changedIndexIds = new Set<string>();
+      for (const ix of all(to, 'index')) {
+        if (!inFrom(ix.id)) continue;
+        const prev = from.objects[ix.id] as Index;
+        const renames = colRenamesByTable.get(ix.parent) ?? [];
+        if (!same(indexDef(prev, renames), indexDef(ix, []))) {
+          changedIndexIds.add(ix.id);
         }
       }
 
-      // 3. 公共列定义变更
-      const fromCols = columnsOf(from, t.id);
-      const toCols = columnsOf(to, t.id);
-      const fromColMap = new Map(fromCols.map((c) => [c.id, c]));
-      const toColMap = new Map(toCols.map((c) => [c.id, c]));
-      for (const tc of toCols) {
-        const fc = fromColMap.get(tc.id);
-        if (fc) {
-          if (!same(columnDef(fc, renames), columnDef(tc, []))) return true;
-        } else {
-          // 新增列：是否满足 ALTER TABLE ADD COLUMN 的严格安全条件
-          if (tc.generated) return true;
-          if (tc.ext?.sqlite?.autoincrement) return true;
-          if (tc.notNull && !tc.default) return true;
-          if (tc.default) {
-            if ('nextval' in tc.default || !isSimpleConstantDefault(tc.default.expr)) return true;
+      // 判断每张公共表是否必须走 12 步表重建
+      const rebuilding = new Set<string>();
+      const tableRenameIds = new Set<string>();
+      for (const t of commonTables) {
+        const prev = from.objects[t.id] as Table;
+        if (prev.name !== t.name) tableRenameIds.add(t.id);
+        const renames = colRenamesByTable.get(t.id) ?? [];
+
+        const needsRebuild = (): boolean => {
+          // 1. 表选项变更（STRICT / WITHOUT ROWID）
+          if (Boolean(prev.ext?.sqlite?.strict) !== Boolean(t.ext?.sqlite?.strict)) return true;
+          if (Boolean(prev.ext?.sqlite?.withoutRowid) !== Boolean(t.ext?.sqlite?.withoutRowid)) return true;
+
+          // 2. 任意表级约束（PK / UNIQUE / FK / CHECK）增删改名改定义
+          for (const kind of ['primaryKey', 'unique', 'foreignKey', 'check'] as const) {
+            const prevList = childrenOf(from, t.id, kind);
+            const nextList = childrenOf(to, t.id, kind);
+            if (prevList.length !== nextList.length) return true;
+            const prevMap = new Map(prevList.map((x) => [x.id, x]));
+            for (const nx of nextList) {
+              const px = prevMap.get(nx.id);
+              if (!px) return true;
+              if (!same(constraintDef(px, renames), constraintDef(nx, []))) return true;
+            }
+          }
+
+          // 3. 公共列定义变更
+          const fromCols = columnsOf(from, t.id);
+          const toCols = columnsOf(to, t.id);
+          const fromColMap = new Map(fromCols.map((c) => [c.id, c]));
+          const toColMap = new Map(toCols.map((c) => [c.id, c]));
+          for (const tc of toCols) {
+            const fc = fromColMap.get(tc.id);
+            if (fc) {
+              if (!same(columnDef(fc, renames), columnDef(tc, []))) return true;
+            } else {
+              // 新增列：是否满足 ALTER TABLE ADD COLUMN 的严格安全条件
+              if (tc.generated) return true;
+              if (tc.ext?.sqlite?.autoincrement) return true;
+              if (tc.notNull && !tc.default) return true;
+              if (tc.default) {
+                if ('nextval' in tc.default || !isSimpleConstantDefault(tc.default.expr)) return true;
+              }
+            }
+          }
+
+          // 4. 删除列：是否满足 ALTER TABLE DROP COLUMN 的严格安全条件
+          const droppedCols = fromCols.filter((fc) => !toColMap.has(fc.id));
+          if (droppedCols.length > 0) {
+            // 如果删完剩余列为 0（随后又加新列），SQLite 不允许表无列，走重建
+            if (fromCols.length - droppedCols.length === 0) return true;
+            const droppedIds = new Set(droppedCols.map((c) => c.id));
+            const droppedNames = droppedCols.map((c) => c.name);
+            // 检查是否被本表保留约束/生成列/保留索引引用
+            for (const pk of childrenOf(to, t.id, 'primaryKey')) {
+              if (pk.columns.some((c) => droppedIds.has(c))) return true;
+            }
+            for (const u of childrenOf(to, t.id, 'unique')) {
+              if (u.columns.some((c) => droppedIds.has(c))) return true;
+            }
+            for (const fk of childrenOf(to, t.id, 'foreignKey')) {
+              if (fk.columns.some((c) => droppedIds.has(c))) return true;
+            }
+            for (const ck of childrenOf(to, t.id, 'check')) {
+              if (droppedNames.some((n) => sqliteExprReferences(ck.expr, n))) return true;
+            }
+            for (const tc of toCols) {
+              if (tc.generated && droppedNames.some((n) => sqliteExprReferences(tc.generated!.expr, n))) {
+                return true;
+              }
+            }
+            for (const ix of childrenOf(from, t.id, 'index')) {
+              if (!inTo(ix.id) || changedIndexIds.has(ix.id)) continue;
+              if (
+                ix.elements.some(
+                  (e) =>
+                    (e.column && droppedIds.has(e.column)) ||
+                    (e.expr && droppedNames.some((n) => sqliteExprReferences(e.expr!, n))),
+                ) ||
+                (ix.where && droppedNames.some((n) => sqliteExprReferences(ix.where!, n)))
+              ) {
+                return true;
+              }
+            }
+            // 被非重建、非删除的其它表的外键引用
+            for (const fk of all(from, 'foreignKey')) {
+              if (fk.refTable === t.id && fk.refColumns.some((c) => droppedIds.has(c)) && inTo(fk.id)) {
+                return true;
+              }
+            }
+          }
+
+          // 5. 若列改名涉及到大小写冲突或与其他被删除/新增列复杂交互，安全起见也可走原地（下面有两阶段改名）
+          return false;
+        };
+
+        if (needsRebuild()) rebuilding.add(t.id);
+      }
+
+      // H3 不动点闭包：若被引用表走 12 步重建且其被引用列同时改名，由于被引用表跳过 S5a 的 RENAME COLUMN，
+      // SQLite 不会自动改写子表外键中的被引用列名，必须将引用表一并纳入重建集合并在同一原子事务中重建。
+      for (let changed = true; changed;) {
+        changed = false;
+        for (const fk of all(to, 'foreignKey')) {
+          if (!inFrom(fk.parent) || rebuilding.has(fk.parent)) continue;
+          if (!rebuilding.has(fk.refTable)) continue;
+          const refColRenamed = fk.refColumns.some((rcId) => {
+            const fc = from.objects[rcId];
+            const tc = to.objects[rcId];
+            return fc?.kind === 'column' && tc?.kind === 'column' && fc.name !== tc.name;
+          });
+          if (refColRenamed) {
+            rebuilding.add(fk.parent);
+            changed = true;
           }
         }
       }
 
-      // 4. 删除列：是否满足 ALTER TABLE DROP COLUMN 的严格安全条件
-      const droppedCols = fromCols.filter((fc) => !toColMap.has(fc.id));
-      if (droppedCols.length > 0) {
-        // 如果删完剩余列为 0（随后又加新列），SQLite 不允许表无列，走重建
-        if (fromCols.length - droppedCols.length === 0) return true;
-        const droppedIds = new Set(droppedCols.map((c) => c.id));
-        const droppedNames = droppedCols.map((c) => c.name);
-        // 检查是否被本表保留约束/生成列/保留索引引用
-        for (const pk of childrenOf(to, t.id, 'primaryKey')) {
-          if (pk.columns.some((c) => droppedIds.has(c))) return true;
+      // ───── S1: 删除被移除 / 变更 / 依赖变更表的不透明对象（视图、触发器） ─────
+      const touchedTableIds = new Set<string>([
+        ...removedTables.map((t) => t.id),
+        ...rebuilding,
+        ...tableRenameIds,
+      ]);
+      const touchedColIds = new Set<string>();
+      for (const c of all(from, 'column')) {
+        if (touchedTableIds.has(c.parent) || !inTo(c.id)) {
+          touchedColIds.add(c.id);
+          continue;
         }
-        for (const u of childrenOf(to, t.id, 'unique')) {
-          if (u.columns.some((c) => droppedIds.has(c))) return true;
-        }
-        for (const fk of childrenOf(to, t.id, 'foreignKey')) {
-          if (fk.columns.some((c) => droppedIds.has(c))) return true;
-        }
-        for (const ck of childrenOf(to, t.id, 'check')) {
-          if (droppedNames.some((n) => sqliteExprReferences(ck.expr, n))) return true;
-        }
-        for (const tc of toCols) {
-          if (tc.generated && droppedNames.some((n) => sqliteExprReferences(tc.generated!.expr, n))) {
-            return true;
-          }
-        }
-        for (const ix of childrenOf(from, t.id, 'index')) {
-          if (!inTo(ix.id) || changedIndexIds.has(ix.id)) continue;
-          if (
-            ix.elements.some(
-              (e) =>
-                (e.column && droppedIds.has(e.column)) ||
-                (e.expr && droppedNames.some((n) => sqliteExprReferences(e.expr!, n))),
-            ) ||
-            (ix.where && droppedNames.some((n) => sqliteExprReferences(ix.where!, n)))
-          ) {
-            return true;
-          }
-        }
-        // 被非重建、非删除的其它表的外键引用
-        for (const fk of all(from, 'foreignKey')) {
-          if (fk.refTable === t.id && fk.refColumns.some((c) => droppedIds.has(c)) && inTo(fk.id)) {
-            return true;
-          }
-        }
+        const next = to.objects[c.id];
+        if (next?.kind === 'column' && next.name !== c.name) touchedColIds.add(c.id);
       }
-
-      // 5. 若列改名涉及到大小写冲突或与其他被删除/新增列复杂交互，安全起见也可走原地（下面有两阶段改名）
-      return false;
-    };
-
-    if (needsRebuild()) rebuilding.add(t.id);
-  }
-
-  // H3 不动点闭包：若被引用表走 12 步重建且其被引用列同时改名，由于被引用表跳过 S5a 的 RENAME COLUMN，
-  // SQLite 不会自动改写子表外键中的被引用列名，必须将引用表一并纳入重建集合并在同一原子事务中重建。
-  for (let changed = true; changed;) {
-    changed = false;
-    for (const fk of all(to, 'foreignKey')) {
-      if (!inFrom(fk.parent) || rebuilding.has(fk.parent)) continue;
-      if (!rebuilding.has(fk.refTable)) continue;
-      const refColRenamed = fk.refColumns.some((rcId) => {
-        const fc = from.objects[rcId];
-        const tc = to.objects[rcId];
-        return fc?.kind === 'column' && tc?.kind === 'column' && fc.name !== tc.name;
-      });
-      if (refColRenamed) {
-        rebuilding.add(fk.parent);
-        changed = true;
+      const touchedTableNamesLower = new Set<string>();
+      for (const tid of touchedTableIds) {
+        const ft = from.objects[tid];
+        const tt = to.objects[tid];
+        if (ft?.kind === 'table') touchedTableNamesLower.add(ft.name.toLowerCase());
+        if (tt?.kind === 'table') touchedTableNamesLower.add(tt.name.toLowerCase());
       }
-    }
-  }
-
-  // ───── S1: 删除被移除 / 变更 / 依赖变更表的不透明对象（视图、触发器） ─────
-  const touchedTableIds = new Set<string>([
-    ...removedTables.map((t) => t.id),
-    ...rebuilding,
-    ...tableRenameIds,
-  ]);
-  const touchedColIds = new Set<string>();
-  for (const c of all(from, 'column')) {
-    if (touchedTableIds.has(c.parent) || !inTo(c.id)) {
-      touchedColIds.add(c.id);
-      continue;
-    }
-    const next = to.objects[c.id];
-    if (next?.kind === 'column' && next.name !== c.name) touchedColIds.add(c.id);
-  }
-  const touchedTableNamesLower = new Set<string>();
-  for (const tid of touchedTableIds) {
-    const ft = from.objects[tid];
-    const tt = to.objects[tid];
-    if (ft?.kind === 'table') touchedTableNamesLower.add(ft.name.toLowerCase());
-    if (tt?.kind === 'table') touchedTableNamesLower.add(tt.name.toLowerCase());
-  }
-  const ddlMentionsTouchedTable = (ddl: string[]): boolean => {
-    if (touchedTableNamesLower.size === 0) return false;
-    for (const sql of ddl) {
-      for (const tok of sqliteTokenize(sql)) {
+      const ddlMentionsTouchedTable = (ddl: string[]): boolean => {
+        if (touchedTableNamesLower.size === 0) return false;
+        for (const sql of ddl) {
+          for (const tok of sqliteTokenize(sql)) {
+            if (
+              (tok.kind === 'ident' || tok.kind === 'qident') &&
+              touchedTableNamesLower.has(tok.text.toLowerCase())
+            ) {
+              return true;
+            }
+          }
+        }
+        return false;
+      };
+      const opaquesToDrop = new Set<string>();
+      const opaqueChanged = (op: Opaque): boolean => {
+        const next = to.objects[op.id];
+        if (!next || next.kind !== 'opaque') return true;
+        return !same([op.objType, op.name, op.ddl, op.drop], [next.objType, next.name, next.ddl, next.drop]);
+      };
+      for (const op of all(from, 'opaque')) {
         if (
-          (tok.kind === 'ident' || tok.kind === 'qident') &&
-          touchedTableNamesLower.has(tok.text.toLowerCase())
+          opaqueChanged(op) ||
+          touchedTableIds.has(op.parent) ||
+          op.deps.some((d) => touchedTableIds.has(d) || touchedColIds.has(d)) ||
+          (touchedTableIds.size > 0 && (op.objType === 'view' || ddlMentionsTouchedTable(op.ddl)))
         ) {
-          return true;
+          opaquesToDrop.add(op.id);
         }
       }
-    }
-    return false;
-  };
-  const opaquesToDrop = new Set<string>();
-  const opaqueChanged = (op: Opaque): boolean => {
-    const next = to.objects[op.id];
-    if (!next || next.kind !== 'opaque') return true;
-    return !same([op.objType, op.name, op.ddl, op.drop], [next.objType, next.name, next.ddl, next.drop]);
-  };
-  for (const op of all(from, 'opaque')) {
-    if (
-      opaqueChanged(op) ||
-      touchedTableIds.has(op.parent) ||
-      op.deps.some((d) => touchedTableIds.has(d) || touchedColIds.has(d)) ||
-      (touchedTableIds.size > 0 && (op.objType === 'view' || ddlMentionsTouchedTable(op.ddl)))
-    ) {
-      opaquesToDrop.add(op.id);
-    }
-  }
-  // 级联：依赖了要删除的不透明对象的其它不透明对象也先删后建
-  for (let changed = true; changed;) {
-    changed = false;
-    for (const op of all(from, 'opaque')) {
-      if (opaquesToDrop.has(op.id)) continue;
-      if (op.deps.some((d) => opaquesToDrop.has(d))) {
-        opaquesToDrop.add(op.id);
-        changed = true;
+      // 级联：依赖了要删除的不透明对象的其它不透明对象也先删后建
+      for (let changed = true; changed;) {
+        changed = false;
+        for (const op of all(from, 'opaque')) {
+          if (opaquesToDrop.has(op.id)) continue;
+          if (op.deps.some((d) => opaquesToDrop.has(d))) {
+            opaquesToDrop.add(op.id);
+            changed = true;
+          }
+        }
       }
-    }
-  }
-  const dropOpaqueList = topoOpaques(all(from, 'opaque').filter((o) => opaquesToDrop.has(o.id))).reverse();
-  for (const op of dropOpaqueList) {
-    emit('dropOpaque', op.name, op.drop);
-  }
-
-  // ───── S2: 删除被移除 / 变更 / 名字冲突的索引 ─────
-  // 注意：若某索引属于即将 DROP 的表且名字不与新表冲突，DROP TABLE 会自动删除它；
-  // 但为了彻底避免表名/索引名跨表复用时的冲突（SQLite 表和索引共享命名空间），显式删除全部移除或变更的索引。
-  const droppedIndexIds = new Set<string>();
-  for (const ix of [...removedIndexes, ...all(from, 'index').filter((x) => changedIndexIds.has(x.id))]) {
-    if (droppedIndexIds.has(ix.id)) continue;
-    droppedIndexIds.add(ix.id);
-    emit('dropIndex', ix.name, `DROP INDEX ${sqliteIdent(ix.name)}`);
-  }
-
-  // ───── S3: 删除无存活表外键指向的已移除表（其余记入 deferredDropTables） ─────
-  const removedTableIds = new Set(removedTables.map((t) => t.id));
-  const blockedRemoved = new Set<string>();
-  for (const fk of all(from, 'foreignKey')) {
-    if (!removedTableIds.has(fk.parent) && removedTableIds.has(fk.refTable)) {
-      blockedRemoved.add(fk.refTable);
-    }
-  }
-  // 若被移除表 A 引用了被移除表 B 且 B 被存活表引用，A 可以先删（A 引用 B，删 A 不影响 B）
-  const immediateDropIds = topoTables(
-    from,
-    removedTables.filter((t) => !blockedRemoved.has(t.id)).map((t) => t.id),
-  ).reverse();
-  for (const tid of immediateDropIds) {
-    const t = get(from, tid, 'table');
-    emit('dropTable', t.name, `DROP TABLE ${sqliteIdent(t.name)}`);
-  }
-
-  // 追踪当前库中每个未删除表的实际名字（含 deferredDropTables）
-  const curTableName = new Map<string, string>();
-  for (const t of fromTables) {
-    if (!removedTableIds.has(t.id) || blockedRemoved.has(t.id)) {
-      curTableName.set(t.id, t.name);
-    }
-  }
-
-  // 如果 deferredDropTables 中某张表的名字会与新表或改名后的表/索引冲突，先暂存到临时表名
-  const targetNamesLower = new Set<string>([
-    ...toTables.map((t) => t.name.toLowerCase()),
-    ...all(to, 'index').map((i) => i.name.toLowerCase()),
-  ]);
-  for (const tid of blockedRemoved) {
-    const cur = curTableName.get(tid)!;
-    if (targetNamesLower.has(cur.toLowerCase())) {
-      const tmp = allocTmp();
-      emit('renameTable', cur, `ALTER TABLE ${sqliteIdent(cur)} RENAME TO ${sqliteIdent(tmp)}`);
-      curTableName.set(tid, tmp);
-    }
-  }
-
-  // ───── S4: 表改名（处理环与碰撞，含大小写变更） ─────
-  const activeLowerToId = (): Map<string, string> => {
-    const map = new Map<string, string>();
-    for (const [id, name] of curTableName) map.set(name.toLowerCase(), id);
-    return map;
-  };
-  const pendingRenames = commonTables.filter((t) => curTableName.get(t.id) !== t.name);
-  if (pendingRenames.length > 0) {
-    // 第一轮：目标名被另一张存活表占用的，先移到临时名
-    for (const t of pendingRenames) {
-      const occupant = activeLowerToId().get(t.name.toLowerCase());
-      if (occupant && occupant !== t.id) {
-        const occName = curTableName.get(occupant)!;
-        const tmp = allocTmp();
-        emit('renameTable', occName, `ALTER TABLE ${sqliteIdent(occName)} RENAME TO ${sqliteIdent(tmp)}`);
-        curTableName.set(occupant, tmp);
+      const dropOpaqueList = topoOpaques(
+        all(from, 'opaque').filter((o) => opaquesToDrop.has(o.id)),
+      ).reverse();
+      for (const op of dropOpaqueList) {
+        emit('dropOpaque', op.name, op.drop);
       }
-      // 再次检查 cur（可能刚刚自己被挪到了 tmp）
-      const actualCur = curTableName.get(t.id)!;
-      if (actualCur !== t.name) {
-        emit('renameTable', t.name, `ALTER TABLE ${sqliteIdent(actualCur)} RENAME TO ${sqliteIdent(t.name)}`);
-        curTableName.set(t.id, t.name);
-      }
-    }
-    // 兜底：若还有被挪到临时名但本身无需改名的表（例如 A->B 且 B->A），把它归位到目标名
-    for (const t of commonTables) {
-      const actualCur = curTableName.get(t.id)!;
-      if (actualCur !== t.name) {
-        emit('renameTable', t.name, `ALTER TABLE ${sqliteIdent(actualCur)} RENAME TO ${sqliteIdent(t.name)}`);
-        curTableName.set(t.id, t.name);
-      }
-    }
-  }
 
-  // ───── S5a: 非重建表的列改名与列追加（先于 S6，确保新建/重建表的外键能引用新/改名列） ─────
-  const droppedColFinalNames = new Map<string, string>();
-  for (const t of commonTables) {
-    if (rebuilding.has(t.id)) continue;
-    const fromCols = columnsOf(from, t.id);
-    const toCols = columnsOf(to, t.id);
-    const curColName = new Map(fromCols.map((c) => [c.id, c.name]));
-    const activeColLower = () => {
-      const map = new Map<string, string>();
-      for (const [id, name] of curColName) map.set(name.toLowerCase(), id);
-      return map;
-    };
+      // ───── S2: 删除被移除 / 变更 / 名字冲突的索引 ─────
+      // 注意：若某索引属于即将 DROP 的表且名字不与新表冲突，DROP TABLE 会自动删除它；
+      // 但为了彻底避免表名/索引名跨表复用时的冲突（SQLite 表和索引共享命名空间），显式删除全部移除或变更的索引。
+      const droppedIndexIds = new Set<string>();
+      for (const ix of [...removedIndexes, ...all(from, 'index').filter((x) => changedIndexIds.has(x.id))]) {
+        if (droppedIndexIds.has(ix.id)) continue;
+        droppedIndexIds.add(ix.id);
+        emit('dropIndex', ix.name, `DROP INDEX ${sqliteIdent(ix.name)}`);
+      }
 
-    // 列改名（两阶段防环、防与即将删除列重名）
-    const colRenames = toCols.filter((tc) => curColName.has(tc.id) && curColName.get(tc.id) !== tc.name);
-    for (const tc of colRenames) {
-      const occupant = activeColLower().get(tc.name.toLowerCase());
-      if (occupant && occupant !== tc.id) {
-        const occName = curColName.get(occupant)!;
-        const tmp = allocTmp();
-        emit(
-          'renameColumn',
-          `${t.name}.${occName}`,
-          `ALTER TABLE ${sqliteIdent(t.name)} RENAME COLUMN ${sqliteIdent(occName)} TO ${sqliteIdent(tmp)}`,
-        );
-        curColName.set(occupant, tmp);
+      // ───── S3: 删除无存活表外键指向的已移除表（其余记入 deferredDropTables） ─────
+      const removedTableIds = new Set(removedTables.map((t) => t.id));
+      const blockedRemoved = new Set<string>();
+      for (const fk of all(from, 'foreignKey')) {
+        if (!removedTableIds.has(fk.parent) && removedTableIds.has(fk.refTable)) {
+          blockedRemoved.add(fk.refTable);
+        }
       }
-      const actualCur = curColName.get(tc.id)!;
-      if (actualCur !== tc.name) {
-        emit(
-          'renameColumn',
-          `${t.name}.${tc.name}`,
-          `ALTER TABLE ${sqliteIdent(t.name)} RENAME COLUMN ${sqliteIdent(actualCur)} TO ${sqliteIdent(tc.name)}`,
-        );
-        curColName.set(tc.id, tc.name);
+      // 若被移除表 A 引用了被移除表 B 且 B 被存活表引用，A 可以先删（A 引用 B，删 A 不影响 B）
+      const immediateDropIds = topoTables(
+        from,
+        removedTables.filter((t) => !blockedRemoved.has(t.id)).map((t) => t.id),
+      ).reverse();
+      for (const tid of immediateDropIds) {
+        const t = get(from, tid, 'table');
+        emit('dropTable', t.name, `DROP TABLE ${sqliteIdent(t.name)}`);
       }
-    }
-    // 归位可能被临时挪开的保留列
-    for (const tc of toCols) {
-      if (!curColName.has(tc.id)) continue;
-      const actualCur = curColName.get(tc.id)!;
-      if (actualCur !== tc.name) {
-        emit(
-          'renameColumn',
-          `${t.name}.${tc.name}`,
-          `ALTER TABLE ${sqliteIdent(t.name)} RENAME COLUMN ${sqliteIdent(actualCur)} TO ${sqliteIdent(tc.name)}`,
-        );
-        curColName.set(tc.id, tc.name);
-      }
-    }
 
-    // 若新增列与即将删除的列重名，先把待删除列挪走，或者等 S6c 删完再加；这里直接先挪到临时名更简单
-    const addedCols = toCols.filter((tc) => !curColName.has(tc.id));
-    for (const ac of addedCols) {
-      const occupant = activeColLower().get(ac.name.toLowerCase());
-      if (occupant) {
-        const occName = curColName.get(occupant)!;
-        const tmp = allocTmp();
-        emit(
-          'renameColumn',
-          `${t.name}.${occName}`,
-          `ALTER TABLE ${sqliteIdent(t.name)} RENAME COLUMN ${sqliteIdent(occName)} TO ${sqliteIdent(tmp)}`,
-        );
-        curColName.set(occupant, tmp);
+      // 追踪当前库中每个未删除表的实际名字（含 deferredDropTables）
+      const curTableName = new Map<string, string>();
+      for (const t of fromTables) {
+        if (!removedTableIds.has(t.id) || blockedRemoved.has(t.id)) {
+          curTableName.set(t.id, t.name);
+        }
       }
-      emit(
-        'addColumn',
-        `${t.name}.${ac.name}`,
-        `ALTER TABLE ${sqliteIdent(t.name)} ADD COLUMN ${renderColumnDef(ac, null)}`,
+
+      // 如果 deferredDropTables 中某张表的名字会与新表或改名后的表/索引冲突，先暂存到临时表名
+      const targetNamesLower = new Set<string>([
+        ...toTables.map((t) => t.name.toLowerCase()),
+        ...all(to, 'index').map((i) => i.name.toLowerCase()),
+      ]);
+      for (const tid of blockedRemoved) {
+        const cur = curTableName.get(tid)!;
+        if (targetNamesLower.has(cur.toLowerCase())) {
+          const tmp = allocTmp();
+          emit('renameTable', cur, `ALTER TABLE ${sqliteIdent(cur)} RENAME TO ${sqliteIdent(tmp)}`);
+          curTableName.set(tid, tmp);
+        }
+      }
+
+      // ───── S4: 表改名（处理环与碰撞，含大小写变更） ─────
+      const activeLowerToId = (): Map<string, string> => {
+        const map = new Map<string, string>();
+        for (const [id, name] of curTableName) map.set(name.toLowerCase(), id);
+        return map;
+      };
+      const pendingRenames = commonTables.filter((t) => curTableName.get(t.id) !== t.name);
+      if (pendingRenames.length > 0) {
+        // 第一轮：目标名被另一张存活表占用的，先移到临时名
+        for (const t of pendingRenames) {
+          const occupant = activeLowerToId().get(t.name.toLowerCase());
+          if (occupant && occupant !== t.id) {
+            const occName = curTableName.get(occupant)!;
+            const tmp = allocTmp();
+            emit('renameTable', occName, `ALTER TABLE ${sqliteIdent(occName)} RENAME TO ${sqliteIdent(tmp)}`);
+            curTableName.set(occupant, tmp);
+          }
+          // 再次检查 cur（可能刚刚自己被挪到了 tmp）
+          const actualCur = curTableName.get(t.id)!;
+          if (actualCur !== t.name) {
+            emit(
+              'renameTable',
+              t.name,
+              `ALTER TABLE ${sqliteIdent(actualCur)} RENAME TO ${sqliteIdent(t.name)}`,
+            );
+            curTableName.set(t.id, t.name);
+          }
+        }
+        // 兜底：若还有被挪到临时名但本身无需改名的表（例如 A->B 且 B->A），把它归位到目标名
+        for (const t of commonTables) {
+          const actualCur = curTableName.get(t.id)!;
+          if (actualCur !== t.name) {
+            emit(
+              'renameTable',
+              t.name,
+              `ALTER TABLE ${sqliteIdent(actualCur)} RENAME TO ${sqliteIdent(t.name)}`,
+            );
+            curTableName.set(t.id, t.name);
+          }
+        }
+      }
+
+      // ───── S5a: 非重建表的列改名与列追加（先于 S6，确保新建/重建表的外键能引用新/改名列） ─────
+      const droppedColFinalNames = new Map<string, string>();
+      for (const t of commonTables) {
+        if (rebuilding.has(t.id)) continue;
+        const fromCols = columnsOf(from, t.id);
+        const toCols = columnsOf(to, t.id);
+        const curColName = new Map(fromCols.map((c) => [c.id, c.name]));
+        const activeColLower = () => {
+          const map = new Map<string, string>();
+          for (const [id, name] of curColName) map.set(name.toLowerCase(), id);
+          return map;
+        };
+
+        // 列改名（两阶段防环、防与即将删除列重名）
+        const colRenames = toCols.filter((tc) => curColName.has(tc.id) && curColName.get(tc.id) !== tc.name);
+        for (const tc of colRenames) {
+          const occupant = activeColLower().get(tc.name.toLowerCase());
+          if (occupant && occupant !== tc.id) {
+            const occName = curColName.get(occupant)!;
+            const tmp = allocTmp();
+            emit(
+              'renameColumn',
+              `${t.name}.${occName}`,
+              `ALTER TABLE ${sqliteIdent(t.name)} RENAME COLUMN ${sqliteIdent(occName)} TO ${sqliteIdent(tmp)}`,
+            );
+            curColName.set(occupant, tmp);
+          }
+          const actualCur = curColName.get(tc.id)!;
+          if (actualCur !== tc.name) {
+            emit(
+              'renameColumn',
+              `${t.name}.${tc.name}`,
+              `ALTER TABLE ${sqliteIdent(t.name)} RENAME COLUMN ${sqliteIdent(actualCur)} TO ${sqliteIdent(tc.name)}`,
+            );
+            curColName.set(tc.id, tc.name);
+          }
+        }
+        // 归位可能被临时挪开的保留列
+        for (const tc of toCols) {
+          if (!curColName.has(tc.id)) continue;
+          const actualCur = curColName.get(tc.id)!;
+          if (actualCur !== tc.name) {
+            emit(
+              'renameColumn',
+              `${t.name}.${tc.name}`,
+              `ALTER TABLE ${sqliteIdent(t.name)} RENAME COLUMN ${sqliteIdent(actualCur)} TO ${sqliteIdent(tc.name)}`,
+            );
+            curColName.set(tc.id, tc.name);
+          }
+        }
+
+        // 若新增列与即将删除的列重名，先把待删除列挪走，或者等 S6c 删完再加；这里直接先挪到临时名更简单
+        const addedCols = toCols.filter((tc) => !curColName.has(tc.id));
+        for (const ac of addedCols) {
+          const occupant = activeColLower().get(ac.name.toLowerCase());
+          if (occupant) {
+            const occName = curColName.get(occupant)!;
+            const tmp = allocTmp();
+            emit(
+              'renameColumn',
+              `${t.name}.${occName}`,
+              `ALTER TABLE ${sqliteIdent(t.name)} RENAME COLUMN ${sqliteIdent(occName)} TO ${sqliteIdent(tmp)}`,
+            );
+            curColName.set(occupant, tmp);
+          }
+          emit(
+            'addColumn',
+            `${t.name}.${ac.name}`,
+            `ALTER TABLE ${sqliteIdent(t.name)} ADD COLUMN ${renderColumnDef(ac, null)}`,
+          );
+          curColName.set(ac.id, ac.name);
+        }
+
+        // 记下最终待删除列名供 S6c 使用
+        for (const fc of fromCols) {
+          if (!inTo(fc.id)) {
+            droppedColFinalNames.set(fc.id, curColName.get(fc.id)!);
+          }
+        }
+      }
+
+      // ───── S6: SCC 拓扑排序执行 CREATE TABLE（新表）与 12 步 rebuildTable（重建表） ─────
+      const s6Nodes = [...addedTables.map((t) => t.id), ...rebuilding].sort((a, b) =>
+        get(to, a, 'table').name.localeCompare(get(to, b, 'table').name),
       );
-      curColName.set(ac.id, ac.name);
-    }
+      const s6Set = new Set(s6Nodes);
+      const s6Deps = new Map<string, Set<string>>();
+      for (const id of s6Nodes) s6Deps.set(id, new Set());
 
-    // 记下最终待删除列名供 S6c 使用
-    for (const fc of fromCols) {
-      if (!inTo(fc.id)) {
-        droppedColFinalNames.set(fc.id, curColName.get(fc.id)!);
+      // 依赖边 u -> v 表示“v 必须在 u 之前完成”：
+      // 1) 在目标模型 to 中，如果表 u 有 FK 指向表 v，则 v 必须在 u 之前（保证 PRAGMA foreign_key_check 时目标表与键已就绪）
+      for (const fk of all(to, 'foreignKey')) {
+        if (s6Set.has(fk.parent) && s6Set.has(fk.refTable) && fk.parent !== fk.refTable) {
+          s6Deps.get(fk.parent)!.add(fk.refTable);
+        }
       }
-    }
-  }
+      // 2) 在源模型 from 中，如果重建表 c 有 FK 指向重建表 p，且该 FK 在目标模型中被移除或变更（或 p 的被引用键变了），
+      //    则 c 应在 p 之前重建（或与 p 合并为同一个 SCC 原子重建），避免 p 重建完跑 foreign_key_check 时 c 的旧 FK 报错
+      for (const fk of all(from, 'foreignKey')) {
+        if (rebuilding.has(fk.parent) && rebuilding.has(fk.refTable) && fk.parent !== fk.refTable) {
+          s6Deps.get(fk.refTable)!.add(fk.parent);
+        }
+      }
 
-  // ───── S6: SCC 拓扑排序执行 CREATE TABLE（新表）与 12 步 rebuildTable（重建表） ─────
-  const s6Nodes = [...addedTables.map((t) => t.id), ...rebuilding].sort((a, b) =>
-    get(to, a, 'table').name.localeCompare(get(to, b, 'table').name),
+      // 记录哪些索引已在 rebuildTable 事务块内重建，S7 跳过它们
+      const indexesRecreatedInRebuild = new Set<string>();
+
+      const buildRebuildStmts = (tid: string): string[] => {
+        const t = get(to, tid, 'table');
+        const tmpName = allocTmp();
+        const stmts: string[] = [];
+        stmts.push(renderSqliteCreateTable(to, tid, tmpName));
+
+        // 拷贝交集非生成列（按列 ID 映射，支持列改名）
+        const fromCols = new Map(columnsOf(from, tid).map((c) => [c.id, c]));
+        const copyPairs: [string, string][] = [];
+        for (const tc of columnsOf(to, tid)) {
+          if (tc.generated) continue;
+          const fc = fromCols.get(tc.id);
+          if (fc) copyPairs.push([tc.name, fc.name]);
+        }
+        if (copyPairs.length > 0) {
+          const dstCols = copyPairs.map(([dst]) => sqliteIdent(dst)).join(', ');
+          const srcCols = copyPairs.map(([, src]) => sqliteIdent(src)).join(', ');
+          stmts.push(
+            `INSERT INTO ${sqliteIdent(tmpName)} (${dstCols}) SELECT ${srcCols} FROM ${sqliteIdent(t.name)}`,
+          );
+        }
+        // 保留 AUTOINCREMENT 高水位（sqlite_sequence）：防止清空或删除末尾行后重建导致主键 ID 回退复用
+        if (columnsOf(to, tid).some((c) => c.ext?.sqlite?.autoincrement)) {
+          const oldLit = sqliteLiteral(t.name);
+          const tmpLit = sqliteLiteral(tmpName);
+          stmts.push(
+            `UPDATE sqlite_sequence SET seq = MAX(seq, COALESCE((SELECT seq FROM sqlite_sequence WHERE name = ${oldLit}), 0)) WHERE name = ${tmpLit}`,
+            `INSERT INTO sqlite_sequence (name, seq) SELECT ${tmpLit}, seq FROM sqlite_sequence WHERE name = ${oldLit} AND NOT EXISTS (SELECT 1 FROM sqlite_sequence WHERE name = ${tmpLit})`,
+          );
+        }
+        stmts.push(`DROP TABLE ${sqliteIdent(t.name)}`);
+        stmts.push(`ALTER TABLE ${sqliteIdent(tmpName)} RENAME TO ${sqliteIdent(t.name)}`);
+
+        // 在同一原子事务内重建该表上的未变更索引（被 DROP TABLE 带走）
+        for (const ix of childrenOf(to, tid, 'index').sort((a, b) => a.name.localeCompare(b.name))) {
+          if (inFrom(ix.id) && !changedIndexIds.has(ix.id)) {
+            stmts.push(renderSqliteCreateIndex(to, ix));
+            indexesRecreatedInRebuild.add(ix.id);
+          }
+        }
+        return stmts;
+      };
+
+      const sccs = topoSccs(s6Nodes, (id) => s6Deps.get(id) ?? []);
+      for (const comp of sccs) {
+        const hasRebuild = comp.some((id) => rebuilding.has(id));
+        if (!hasRebuild && comp.length === 1) {
+          const tid = comp[0]!;
+          const t = get(to, tid, 'table');
+          emit('createTable', t.name, renderSqliteCreateTable(to, tid));
+          continue;
+        }
+        // 单个或多个表需要 12 步表重建（或相互 FK 环需要原子重建）：
+        // 官方 12 步：事务外关闭外键检查 -> BEGIN IMMEDIATE -> 建新表/拷贝/删旧表/改名/重建索引 -> PRAGMA foreign_key_check -> COMMIT -> 事务外开启外键检查
+        const stmts: string[] = ['PRAGMA foreign_keys = OFF', 'BEGIN IMMEDIATE'];
+        const orderedComp = topoTables(to, comp);
+        for (const tid of orderedComp) {
+          if (rebuilding.has(tid)) {
+            stmts.push(...buildRebuildStmts(tid));
+          } else {
+            stmts.push(renderSqliteCreateTable(to, tid));
+          }
+        }
+        // PRAGMA foreign_key_check 供执行器产出明细错误；紧随的 _dowel_fk_guard 保证离线 sqlite3 CLI 遇违例也能强制中止并回滚事务
+        stmts.push(
+          'PRAGMA foreign_key_check',
+          'CREATE TEMP TABLE _dowel_fk_guard (x INT NOT NULL)',
+          'INSERT INTO temp._dowel_fk_guard SELECT NULL FROM pragma_foreign_key_check LIMIT 1',
+          'DROP TABLE temp._dowel_fk_guard',
+          'COMMIT',
+          'PRAGMA foreign_keys = ON',
+        );
+        const targetLabel = orderedComp.map((id) => get(to, id, 'table').name).join(', ');
+        emit('rebuildTable', targetLabel, stmts.join(';\n'), false);
+      }
+
+      // ───── S6b: 删除延迟移除的表（其存活引用表已在 S6 中完成重建脱离外键） ─────
+      if (blockedRemoved.size > 0) {
+        const deferredOrder = topoTables(from, [...blockedRemoved]).reverse();
+        for (const tid of deferredOrder) {
+          const name = curTableName.get(tid)!;
+          emit('dropTable', get(from, tid, 'table').name, `DROP TABLE ${sqliteIdent(name)}`);
+        }
+      }
+
+      // ───── S6c: 非重建表的安全 DROP COLUMN ─────
+      for (const t of commonTables) {
+        if (rebuilding.has(t.id)) continue;
+        for (const fc of columnsOf(from, t.id)) {
+          if (inTo(fc.id)) continue;
+          const actualName = droppedColFinalNames.get(fc.id) ?? fc.name;
+          emit(
+            'dropColumn',
+            `${t.name}.${fc.name}`,
+            `ALTER TABLE ${sqliteIdent(t.name)} DROP COLUMN ${sqliteIdent(actualName)}`,
+          );
+        }
+      }
+
+      // ───── S7: 创建新增或变更的索引 ─────
+      for (const ix of all(to, 'index').sort((a, b) => a.name.localeCompare(b.name))) {
+        if (indexesRecreatedInRebuild.has(ix.id)) continue;
+        if (!inFrom(ix.id) || changedIndexIds.has(ix.id)) {
+          emit('createIndex', ix.name, renderSqliteCreateIndex(to, ix));
+        }
+      }
+
+      // ───── S8: 创建新增或被删除重放的不透明对象（视图、触发器） ─────
+      const opaquesToCreate = all(to, 'opaque').filter((op) => !inFrom(op.id) || opaquesToDrop.has(op.id));
+      for (const op of topoOpaques(opaquesToCreate)) {
+        for (const ddl of op.ddl) {
+          emit('createOpaque', op.name, ddl);
+        }
+      }
+
+      return steps;
+    }),
   );
-  const s6Set = new Set(s6Nodes);
-  const s6Deps = new Map<string, Set<string>>();
-  for (const id of s6Nodes) s6Deps.set(id, new Set());
-
-  // 依赖边 u -> v 表示“v 必须在 u 之前完成”：
-  // 1) 在目标模型 to 中，如果表 u 有 FK 指向表 v，则 v 必须在 u 之前（保证 PRAGMA foreign_key_check 时目标表与键已就绪）
-  for (const fk of all(to, 'foreignKey')) {
-    if (s6Set.has(fk.parent) && s6Set.has(fk.refTable) && fk.parent !== fk.refTable) {
-      s6Deps.get(fk.parent)!.add(fk.refTable);
-    }
-  }
-  // 2) 在源模型 from 中，如果重建表 c 有 FK 指向重建表 p，且该 FK 在目标模型中被移除或变更（或 p 的被引用键变了），
-  //    则 c 应在 p 之前重建（或与 p 合并为同一个 SCC 原子重建），避免 p 重建完跑 foreign_key_check 时 c 的旧 FK 报错
-  for (const fk of all(from, 'foreignKey')) {
-    if (rebuilding.has(fk.parent) && rebuilding.has(fk.refTable) && fk.parent !== fk.refTable) {
-      s6Deps.get(fk.refTable)!.add(fk.parent);
-    }
-  }
-
-  // 记录哪些索引已在 rebuildTable 事务块内重建，S7 跳过它们
-  const indexesRecreatedInRebuild = new Set<string>();
-
-  const buildRebuildStmts = (tid: string): string[] => {
-    const t = get(to, tid, 'table');
-    const tmpName = allocTmp();
-    const stmts: string[] = [];
-    stmts.push(renderSqliteCreateTable(to, tid, tmpName));
-
-    // 拷贝交集非生成列（按列 ID 映射，支持列改名）
-    const fromCols = new Map(columnsOf(from, tid).map((c) => [c.id, c]));
-    const copyPairs: [string, string][] = [];
-    for (const tc of columnsOf(to, tid)) {
-      if (tc.generated) continue;
-      const fc = fromCols.get(tc.id);
-      if (fc) copyPairs.push([tc.name, fc.name]);
-    }
-    if (copyPairs.length > 0) {
-      const dstCols = copyPairs.map(([dst]) => sqliteIdent(dst)).join(', ');
-      const srcCols = copyPairs.map(([, src]) => sqliteIdent(src)).join(', ');
-      stmts.push(
-        `INSERT INTO ${sqliteIdent(tmpName)} (${dstCols}) SELECT ${srcCols} FROM ${sqliteIdent(t.name)}`,
-      );
-    }
-    // 保留 AUTOINCREMENT 高水位（sqlite_sequence）：防止清空或删除末尾行后重建导致主键 ID 回退复用
-    if (columnsOf(to, tid).some((c) => c.ext?.sqlite?.autoincrement)) {
-      const oldLit = sqliteLiteral(t.name);
-      const tmpLit = sqliteLiteral(tmpName);
-      stmts.push(
-        `UPDATE sqlite_sequence SET seq = MAX(seq, COALESCE((SELECT seq FROM sqlite_sequence WHERE name = ${oldLit}), 0)) WHERE name = ${tmpLit}`,
-        `INSERT INTO sqlite_sequence (name, seq) SELECT ${tmpLit}, seq FROM sqlite_sequence WHERE name = ${oldLit} AND NOT EXISTS (SELECT 1 FROM sqlite_sequence WHERE name = ${tmpLit})`,
-      );
-    }
-    stmts.push(`DROP TABLE ${sqliteIdent(t.name)}`);
-    stmts.push(`ALTER TABLE ${sqliteIdent(tmpName)} RENAME TO ${sqliteIdent(t.name)}`);
-
-    // 在同一原子事务内重建该表上的未变更索引（被 DROP TABLE 带走）
-    for (const ix of childrenOf(to, tid, 'index').sort((a, b) => a.name.localeCompare(b.name))) {
-      if (inFrom(ix.id) && !changedIndexIds.has(ix.id)) {
-        stmts.push(renderSqliteCreateIndex(to, ix));
-        indexesRecreatedInRebuild.add(ix.id);
-      }
-    }
-    return stmts;
-  };
-
-  const sccs = topoSccs(s6Nodes, (id) => s6Deps.get(id) ?? []);
-  for (const comp of sccs) {
-    const hasRebuild = comp.some((id) => rebuilding.has(id));
-    if (!hasRebuild && comp.length === 1) {
-      const tid = comp[0]!;
-      const t = get(to, tid, 'table');
-      emit('createTable', t.name, renderSqliteCreateTable(to, tid));
-      continue;
-    }
-    // 单个或多个表需要 12 步表重建（或相互 FK 环需要原子重建）：
-    // 官方 12 步：事务外关闭外键检查 -> BEGIN IMMEDIATE -> 建新表/拷贝/删旧表/改名/重建索引 -> PRAGMA foreign_key_check -> COMMIT -> 事务外开启外键检查
-    const stmts: string[] = ['PRAGMA foreign_keys = OFF', 'BEGIN IMMEDIATE'];
-    const orderedComp = topoTables(to, comp);
-    for (const tid of orderedComp) {
-      if (rebuilding.has(tid)) {
-        stmts.push(...buildRebuildStmts(tid));
-      } else {
-        stmts.push(renderSqliteCreateTable(to, tid));
-      }
-    }
-    // PRAGMA foreign_key_check 供执行器产出明细错误；紧随的 _dowel_fk_guard 保证离线 sqlite3 CLI 遇违例也能强制中止并回滚事务
-    stmts.push(
-      'PRAGMA foreign_key_check',
-      'CREATE TEMP TABLE _dowel_fk_guard (x INT NOT NULL)',
-      'INSERT INTO temp._dowel_fk_guard SELECT NULL FROM pragma_foreign_key_check LIMIT 1',
-      'DROP TABLE temp._dowel_fk_guard',
-      'COMMIT',
-      'PRAGMA foreign_keys = ON',
-    );
-    const targetLabel = orderedComp.map((id) => get(to, id, 'table').name).join(', ');
-    emit('rebuildTable', targetLabel, stmts.join(';\n'), false);
-  }
-
-  // ───── S6b: 删除延迟移除的表（其存活引用表已在 S6 中完成重建脱离外键） ─────
-  if (blockedRemoved.size > 0) {
-    const deferredOrder = topoTables(from, [...blockedRemoved]).reverse();
-    for (const tid of deferredOrder) {
-      const name = curTableName.get(tid)!;
-      emit('dropTable', get(from, tid, 'table').name, `DROP TABLE ${sqliteIdent(name)}`);
-    }
-  }
-
-  // ───── S6c: 非重建表的安全 DROP COLUMN ─────
-  for (const t of commonTables) {
-    if (rebuilding.has(t.id)) continue;
-    for (const fc of columnsOf(from, t.id)) {
-      if (inTo(fc.id)) continue;
-      const actualName = droppedColFinalNames.get(fc.id) ?? fc.name;
-      emit(
-        'dropColumn',
-        `${t.name}.${fc.name}`,
-        `ALTER TABLE ${sqliteIdent(t.name)} DROP COLUMN ${sqliteIdent(actualName)}`,
-      );
-    }
-  }
-
-  // ───── S7: 创建新增或变更的索引 ─────
-  for (const ix of all(to, 'index').sort((a, b) => a.name.localeCompare(b.name))) {
-    if (indexesRecreatedInRebuild.has(ix.id)) continue;
-    if (!inFrom(ix.id) || changedIndexIds.has(ix.id)) {
-      emit('createIndex', ix.name, renderSqliteCreateIndex(to, ix));
-    }
-  }
-
-  // ───── S8: 创建新增或被删除重放的不透明对象（视图、触发器） ─────
-  const opaquesToCreate = all(to, 'opaque').filter((op) => !inFrom(op.id) || opaquesToDrop.has(op.id));
-  for (const op of topoOpaques(opaquesToCreate)) {
-    for (const ddl of op.ddl) {
-      emit('createOpaque', op.name, ddl);
-    }
-  }
-
-  return steps;
 };

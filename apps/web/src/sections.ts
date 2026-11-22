@@ -1,7 +1,7 @@
 // 纯布局层画布板块（Section）、前缀建议、N 跳邻域聚焦、汇总分组与本地视图偏好。
 // 绝不读写或修改 @dowel/core IR，不影响 DDL、diff、迁移规划或版本快照。
 import { type CanvasSection, SECTION_COLORS, type SectionColor, sanitizeSections } from '@dowel/api';
-import { all, type Model, type Table } from '@dowel/core';
+import { all, type Model, type ModelIndex, type Table } from '@dowel/core';
 
 export const LARGE_SCHEMA_THRESHOLD = 100;
 export const UNASSIGNED_GROUP_ID = '__unassigned__';
@@ -104,6 +104,7 @@ const normalizePrefixToken = (token: string): string => {
 export const suggestSectionsByPrefix = (
   model: Model,
   existingSections: readonly CanvasSection[],
+  index?: ModelIndex,
 ): CanvasSection[] => {
   const assigned = new Set<string>();
   const usedIds = new Set<string>();
@@ -113,7 +114,7 @@ export const suggestSectionsByPrefix = (
   }
 
   const buckets = new Map<string, { rawTokens: Set<string>; tables: Table[] }>();
-  for (const t of all(model, 'table')) {
+  for (const t of index ? index.allRef('table') : all(model, 'table')) {
     if (t.partitionOf || assigned.has(t.id)) continue;
     const raw = extractPrefixToken(t.name);
     if (!raw) continue;
@@ -161,14 +162,13 @@ export const suggestSectionsByPrefix = (
   });
 };
 
-/**
- * 沿外键边做无向 BFS，收集以 rootTableId 为中心、深度 <= hops（1 或 2）的顶层表集合。
- * 总是包含 rootTableId（若其存在于模型中）；自动解析分区子表外键到其顶层父表。
- */
-export const collectNeighborhood = (model: Model, rootTableId: string, hops: 1 | 2): Set<string> => {
-  const root = resolveTopLevelTableId(model, rootTableId);
-  if (!root) return new Set();
+const fkAdjCache = new WeakMap<ModelIndex, Map<string, Set<string>>>();
 
+const getFkAdjacency = (model: Model, index?: ModelIndex): Map<string, Set<string>> => {
+  if (index) {
+    const cached = fkAdjCache.get(index);
+    if (cached) return cached;
+  }
   const adj = new Map<string, Set<string>>();
   const link = (a: string, b: string) => {
     if (a === b) return;
@@ -180,13 +180,31 @@ export const collectNeighborhood = (model: Model, rootTableId: string, hops: 1 |
     setA.add(b);
   };
 
-  for (const fk of all(model, 'foreignKey')) {
+  for (const fk of index ? index.allRef('foreignKey') : all(model, 'foreignKey')) {
     const src = resolveTopLevelTableId(model, fk.parent);
     const dst = resolveTopLevelTableId(model, fk.refTable);
     if (!src || !dst || src === dst) continue;
     link(src, dst);
     link(dst, src);
   }
+  if (index) fkAdjCache.set(index, adj);
+  return adj;
+};
+
+/**
+ * 沿外键边做无向 BFS，收集以 rootTableId 为中心、深度 <= hops（1 或 2）的顶层表集合。
+ * 总是包含 rootTableId（若其存在于模型中）；自动解析分区子表外键到其顶层父表。
+ */
+export const collectNeighborhood = (
+  model: Model,
+  rootTableId: string,
+  hops: 1 | 2,
+  index?: ModelIndex,
+): Set<string> => {
+  const root = resolveTopLevelTableId(model, rootTableId);
+  if (!root) return new Set();
+
+  const adj = getFkAdjacency(model, index);
 
   const visited = new Set<string>([root]);
   const queue: { id: string; depth: number }[] = [{ id: root, depth: 0 }];
@@ -222,12 +240,13 @@ export const effectiveCanvasMode = (
 export const buildCanvasGroups = (
   model: Model,
   sections: readonly CanvasSection[],
+  index?: ModelIndex,
 ): {
   groups: CanvasGroup[];
   summaryEdges: SummaryEdge[];
   tableToGroup: Map<string, string>;
 } => {
-  const topTables = all(model, 'table')
+  const topTables = (index ? index.allRef('table') : all(model, 'table'))
     .filter((t) => !t.partitionOf)
     .sort((a, b) => a.name.localeCompare(b.name) || a.id.localeCompare(b.id));
   const topTableIds = new Set(topTables.map((t) => t.id));
@@ -290,7 +309,7 @@ export const buildCanvasGroups = (
 
   const groupMap = new Map(groups.map((g) => [g.id, g]));
   const edgeMap = new Map<string, SummaryEdge>();
-  for (const fk of all(model, 'foreignKey')) {
+  for (const fk of index ? index.allRef('foreignKey') : all(model, 'foreignKey')) {
     const srcTable = resolveTopLevelTableId(model, fk.parent);
     const dstTable = resolveTopLevelTableId(model, fk.refTable);
     if (!srcTable || !dstTable) continue;

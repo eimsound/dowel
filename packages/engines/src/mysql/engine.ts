@@ -13,7 +13,15 @@ import {
 } from '@dowel/core';
 
 import type { ScriptStep } from '../steps.ts';
-import type { AppliedTimeouts, Db, EngineAdapter, TargetSnapshot, TimeoutInfo, TxHooks } from '../types.ts';
+import type {
+  AnalyzeOptions,
+  AppliedTimeouts,
+  Db,
+  EngineAdapter,
+  TargetSnapshot,
+  TimeoutInfo,
+  TxHooks,
+} from '../types.ts';
 import { MYSQL_SESSION_SETTINGS, pinMysqlSession } from './db.ts';
 import { mysqlHistory } from './history.ts';
 import { importMysqlSnapshot } from './import.ts';
@@ -799,7 +807,7 @@ export const mysqlEngine: EngineAdapter = {
       .join('\n'),
 
   analyzeStepRisk: (db, from, steps, opts) =>
-    analyzeMysqlStepRisk(db, from, steps, opts as MysqlPlanOptions | undefined),
+    analyzeMysqlStepRisk(db, from, steps, opts as (MysqlPlanOptions & AnalyzeOptions) | undefined),
 
   applyTimeouts: async (conn, timeouts): Promise<AppliedTimeouts> => {
     const ms = (n: number) => Math.max(0, Math.trunc(n));

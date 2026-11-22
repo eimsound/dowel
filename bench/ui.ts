@@ -368,10 +368,11 @@ const main = async () => {
     serverLogs += String(d);
   });
 
-  const browser = await chromium.launch({ headless: true });
+  let browser: Awaited<ReturnType<typeof chromium.launch>> | null = null;
 
   try {
     await waitServerReady(baseUrl, serverProc);
+    browser = await chromium.launch({ headless: true });
     const context = await browser.newContext({ viewport: { width: 1440, height: 900 }, locale: 'zh-CN' });
 
     // 登录并保留会话 Cookie
@@ -641,11 +642,35 @@ const main = async () => {
       return t.name;
     };
     const searchCases = [
-      { query: 'order_', expectText: firstTableOf('order'), minLis: 10 },
-      { query: 'billing_', expectText: firstTableOf('billing'), minLis: 10 },
-      { query: firstTableOf('auth'), expectText: firstTableOf('auth'), minLis: 1 },
-      { query: 'analytics_', expectText: firstTableOf('analytics'), minLis: 10 },
-      { query: '', expectText: firstTableOf('auth'), minLis: 1000 },
+      { query: 'order_', expectText: firstTableOf('order'), expectHeader: false, minLis: 10, maxLis: 400 },
+      {
+        query: 'billing_',
+        expectText: firstTableOf('billing'),
+        expectHeader: false,
+        minLis: 10,
+        maxLis: 400,
+      },
+      {
+        query: firstTableOf('auth'),
+        expectText: firstTableOf('auth'),
+        expectHeader: false,
+        minLis: 1,
+        maxLis: 400,
+      },
+      {
+        query: 'analytics_',
+        expectText: firstTableOf('analytics'),
+        expectHeader: false,
+        minLis: 10,
+        maxLis: 400,
+      },
+      {
+        query: '',
+        expectText: firstTableOf('analytics'),
+        expectHeader: true,
+        minLis: 15,
+        maxLis: 250,
+      },
     ];
     const searchInput = pMain.getByRole('navigation', { name: '对象' }).getByLabel('搜索对象…');
     const searchSamples: number[] = [];
@@ -654,17 +679,22 @@ const main = async () => {
       await resetLongTasks(pMain);
       const t0 = performance.now();
       await searchInput.fill(sc.query);
-      const maxLis = sc.minLis >= 1000 ? 5000 : 400;
       await pMain.waitForFunction(
-        ({ expectText, minLis, maxLis: hi }) => {
+        ({ expectText, expectHeader, minLis, maxLis }) => {
           const navEl = (globalThis as unknown as BrowserEnv).document.querySelector(
             'nav[aria-label="对象"]',
           );
           if (!navEl) return false;
           const lis = navEl.querySelectorAll('li').length;
-          return lis >= minLis && lis < hi && (navEl.textContent ?? '').includes(expectText);
+          const text = navEl.textContent ?? '';
+          return (
+            lis >= minLis &&
+            lis < maxLis &&
+            text.includes(expectText) &&
+            (!expectHeader || /表\s*1000/.test(text))
+          );
         },
-        { ...sc, maxLis },
+        sc,
         { timeout: 10_000 },
       );
       await waitTwoFrames(pMain);
@@ -672,8 +702,11 @@ const main = async () => {
       searchLts.push(await readLongTasks(pMain));
     }
 
-    // 5d. 侧边栏 按 Schema <-> 按板块 切换延迟（5 轮）
+    // 5d. 侧边栏 按 Schema <-> 按板块 切换延迟（5 轮，使用预解析坐标 + mouse.click 对齐节点点击测量口径）
     const nav = pMain.getByRole('navigation', { name: '对象' });
+    const sectionTabBox = await nav.getByRole('tab', { name: '按板块' }).boundingBox();
+    const schemaTabBox = await nav.getByRole('tab', { name: '按 Schema' }).boundingBox();
+    if (!sectionTabBox || !schemaTabBox) throw new Error('未找到侧边栏分组切换标签页');
     const toSectionSamples: number[] = [];
     const toSchemaSamples: number[] = [];
     const toSectionLts: LongTaskReport[] = [];
@@ -681,16 +714,42 @@ const main = async () => {
     for (let i = 0; i < 5; i++) {
       await resetLongTasks(pMain);
       const t0 = performance.now();
-      await nav.getByRole('tab', { name: '按板块' }).click();
-      await nav.getByRole('button', { name: '前缀建议' }).waitFor({ timeout: 10_000 });
+      await pMain.mouse.click(
+        sectionTabBox.x + sectionTabBox.width / 2,
+        sectionTabBox.y + sectionTabBox.height / 2,
+      );
+      await pMain.waitForFunction(
+        () => {
+          const doc = (globalThis as unknown as BrowserEnv).document;
+          const navEl = doc.querySelector('nav[aria-label="对象"]');
+          if (!navEl) return false;
+          const active = navEl.querySelector('[role="tab"][aria-selected="true"]');
+          return active?.textContent?.trim() === '按板块' && (navEl.textContent ?? '').includes('前缀建议');
+        },
+        null,
+        { timeout: 10_000 },
+      );
       await waitTwoFrames(pMain);
       toSectionSamples.push(performance.now() - t0);
       toSectionLts.push(await readLongTasks(pMain));
 
       await resetLongTasks(pMain);
       const t1 = performance.now();
-      await nav.getByRole('tab', { name: '按 Schema' }).click();
-      await nav.getByRole('button', { name: /^表\s*1000$/ }).waitFor({ timeout: 10_000 });
+      await pMain.mouse.click(
+        schemaTabBox.x + schemaTabBox.width / 2,
+        schemaTabBox.y + schemaTabBox.height / 2,
+      );
+      await pMain.waitForFunction(
+        () => {
+          const doc = (globalThis as unknown as BrowserEnv).document;
+          const navEl = doc.querySelector('nav[aria-label="对象"]');
+          if (!navEl) return false;
+          const active = navEl.querySelector('[role="tab"][aria-selected="true"]');
+          return active?.textContent?.trim() === '按 Schema' && /表\s*1000/.test(navEl.textContent ?? '');
+        },
+        null,
+        { timeout: 10_000 },
+      );
       await waitTwoFrames(pMain);
       toSchemaSamples.push(performance.now() - t1);
       toSchemaLts.push(await readLongTasks(pMain));
@@ -886,7 +945,7 @@ const main = async () => {
     console.error('UI 压测失败；服务端输出片段：\n' + serverLogs.slice(-2000));
     throw err;
   } finally {
-    await browser.close().catch(() => {});
+    await browser?.close().catch(() => {});
     if (serverProc.exitCode === null) {
       serverProc.kill('SIGTERM');
       await new Promise<void>((res) => {

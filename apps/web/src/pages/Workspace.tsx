@@ -1,7 +1,7 @@
 // 模型页：顶栏 + 画布 / SQL + 属性面板 + 状态栏（DESIGN.md：Layout）。
 // 对象树在应用外壳的侧面板里（由这里通过 useShellPanel 提供），属性面板默认按需出现、可固定。
 import type { CanvasSection, EnvInfo, VersionInfo } from '@dowel/api';
-import { all, createAll, formatScript, newId } from '@dowel/core';
+import { buildModelIndex, createAll, formatScript, newId } from '@dowel/core';
 import { useQuery, useQueryClient } from '@tanstack/react-query';
 import { Link } from '@tanstack/react-router';
 import {
@@ -20,7 +20,7 @@ import {
   Users,
   Workflow,
 } from 'lucide-react';
-import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
+import { useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState } from 'react';
 import { useTranslation } from 'react-i18next';
 
 import { api } from '../api.ts';
@@ -30,7 +30,7 @@ import { ImportDialog, MigrationDialog, VersionDialog } from '../components/Dial
 import { Inspector } from '../components/Inspector.tsx';
 import { SectionDialog } from '../components/SectionDialog.tsx';
 import { PageHeader, useNarrow, useShellPanel } from '../components/Shell.tsx';
-import { Sidebar } from '../components/Sidebar.tsx';
+import { type SelectedStore, Sidebar } from '../components/Sidebar.tsx';
 import { SqlView } from '../components/SqlView.tsx';
 import { Tabs } from '../components/Tabs.tsx';
 import { useToast } from '../components/Toasts.tsx';
@@ -73,7 +73,31 @@ export const Model = () => {
     queryFn: () => api<VersionInfo[]>('GET', `/api/projects/${pid}/versions`),
   });
   const { ws, model, status, pending, layout, sections, peers, role: liveRole } = useWorkspace(pid, toast);
+  const modelIndex = useMemo(() => buildModelIndex(model), [model]);
   const [selected, setSelected] = useState<string | null>(null);
+  const selectedRef = useRef<string | null>(selected);
+  const selectedListenersRef = useRef(new Set<() => void>());
+  const selectedStore = useMemo<SelectedStore>(
+    () => ({
+      getSnapshot: () => selectedRef.current,
+      subscribe: (fn) => {
+        selectedListenersRef.current.add(fn);
+        return () => selectedListenersRef.current.delete(fn);
+      },
+    }),
+    [],
+  );
+  const updateSelected = useCallback((id: string | null) => {
+    selectedRef.current = id;
+    for (const fn of selectedListenersRef.current) fn();
+    setSelected(id);
+  }, []);
+  useLayoutEffect(() => {
+    if (selectedRef.current !== selected) {
+      selectedRef.current = selected;
+      for (const fn of selectedListenersRef.current) fn();
+    }
+  }, [selected]);
   const [tab, setTab] = useState<'canvas' | 'sql'>('canvas');
   const [dialog, setDialog] = useState<DialogKey>(null);
   const [sectionDialogMode, setSectionDialogMode] = useState<'manage' | 'suggest'>('manage');
@@ -85,10 +109,21 @@ export const Model = () => {
     setPrevPid(pid);
     setViewPrefs(readCanvasViewPrefs(pid));
   }
+  const viewPrefsRef = useRef<CanvasViewPrefs>(viewPrefs);
+  const sidebarGroupingRef = useRef<SidebarGrouping>(viewPrefs.sidebarGrouping);
+  useLayoutEffect(() => {
+    viewPrefsRef.current = viewPrefs;
+    sidebarGroupingRef.current = viewPrefs.sidebarGrouping;
+  }, [pid, viewPrefs]);
+
   const updateViewPrefs = useCallback(
     (updater: (prev: CanvasViewPrefs) => CanvasViewPrefs) => {
       setViewPrefs((prev) => {
-        const next = updater(prev);
+        const base: CanvasViewPrefs = { ...prev, sidebarGrouping: sidebarGroupingRef.current };
+        const next = updater(base);
+        if (next === base) return prev;
+        sidebarGroupingRef.current = next.sidebarGrouping;
+        viewPrefsRef.current = next;
         writeCanvasViewPrefs(pid, next);
         return next;
       });
@@ -128,18 +163,25 @@ export const Model = () => {
     while (taken.has(`seq_${n}`)) n++;
     const id = newId();
     if (ws.act('createSequence', { id, schema: schema.id, name: `seq_${n}` })) {
-      setSelected(id);
+      updateSelected(id);
     }
-  }, [model.objects, readOnly, uiSpec.defaultSchema, uiSpec.sequences, ws]);
+  }, [model.objects, readOnly, uiSpec.defaultSchema, uiSpec.sequences, updateSelected, ws]);
 
   const openSectionManager = useCallback((mode: 'manage' | 'suggest' = 'manage') => {
     setSectionDialogMode(mode);
     setDialog('sections');
   }, []);
+  const openManageSections = useCallback(() => openSectionManager('manage'), [openSectionManager]);
 
-  const setSidebarGrouping = useCallback(
-    (sidebarGrouping: SidebarGrouping) => updateViewPrefs((prev) => ({ ...prev, sidebarGrouping })),
-    [updateViewPrefs],
+  const persistSidebarGrouping = useCallback(
+    (sidebarGrouping: SidebarGrouping) => {
+      if (sidebarGroupingRef.current === sidebarGrouping) return;
+      sidebarGroupingRef.current = sidebarGrouping;
+      const next: CanvasViewPrefs = { ...viewPrefsRef.current, sidebarGrouping };
+      viewPrefsRef.current = next;
+      writeCanvasViewPrefs(pid, next);
+    },
+    [pid],
   );
 
   const setCanvasViewMode = useCallback(
@@ -173,26 +215,33 @@ export const Model = () => {
   const focusTable = useCallback(
     (tableId: string) => {
       const topId = resolveTopLevelTableId(model, tableId) ?? tableId;
-      setSelected(tableId);
+      updateSelected(tableId);
       updateViewPrefs((prev) => ({
         ...prev,
         focus: { tableId: topId, hops: prev.focus?.hops ?? 1 },
       }));
     },
-    [model, updateViewPrefs],
+    [model, updateSelected, updateViewPrefs],
   );
 
-  const topTableCount = useMemo(() => all(model, 'table').filter((tb) => !tb.partitionOf).length, [model]);
+  const topTableCount = useMemo(
+    () => modelIndex.allRef('table').filter((tb) => !tb.partitionOf).length,
+    [modelIndex],
+  );
+  const canvasGroups = useMemo(
+    () => buildCanvasGroups(model, sections, modelIndex),
+    [model, sections, modelIndex],
+  );
 
   // 选中对象时若在汇总折叠视图下自动展开所属板块，若在聚焦模式外则切到以它为中心的邻域，确保画布可见
   const handleSelectObject = useCallback(
     (id: string | null) => {
-      setSelected(id);
+      updateSelected(id);
       if (!id) return;
       const topId = resolveTopLevelTableId(model, id);
       if (!topId) return;
       if (viewPrefs.focus) {
-        const nbrs = collectNeighborhood(model, viewPrefs.focus.tableId, viewPrefs.focus.hops);
+        const nbrs = collectNeighborhood(model, viewPrefs.focus.tableId, viewPrefs.focus.hops, modelIndex);
         if (!nbrs.has(topId)) {
           updateViewPrefs((prev) => ({
             ...prev,
@@ -202,8 +251,7 @@ export const Model = () => {
         return;
       }
       if (effectiveCanvasMode(viewPrefs.viewMode, topTableCount) === 'sections') {
-        const { tableToGroup } = buildCanvasGroups(model, sections);
-        const gid = tableToGroup.get(topId);
+        const gid = canvasGroups.tableToGroup.get(topId);
         if (gid && !viewPrefs.expandedGroups.includes(gid)) {
           updateViewPrefs((prev) =>
             prev.expandedGroups.includes(gid)
@@ -214,9 +262,11 @@ export const Model = () => {
       }
     },
     [
+      canvasGroups.tableToGroup,
       model,
-      sections,
+      modelIndex,
       topTableCount,
+      updateSelected,
       updateViewPrefs,
       viewPrefs.expandedGroups,
       viewPrefs.focus,
@@ -224,17 +274,19 @@ export const Model = () => {
     ],
   );
 
-  // 对象树放在应用外壳的侧面板里；选中项变化时更新
+  // 对象树放在应用外壳的侧面板里；通过 selectedStore 在叶行局部更新选中态，避免点击节点重渲染整棵树
   useShellPanel(
     t('ws.objects'),
     <Sidebar
+      key={pid}
       model={model}
-      selected={selected}
+      modelIndex={modelIndex}
+      selectedStore={selectedStore}
       onSelect={handleSelectObject}
       onAddSequence={!readOnly && uiSpec.sequences ? newSequence : undefined}
       sections={sections}
-      grouping={viewPrefs.sidebarGrouping}
-      onChangeGrouping={setSidebarGrouping}
+      defaultGrouping={viewPrefs.sidebarGrouping}
+      onChangeGrouping={persistSidebarGrouping}
       readOnly={readOnly}
       onOpenSectionManager={openSectionManager}
       onFocusTable={focusTable}
@@ -242,16 +294,17 @@ export const Model = () => {
       focusedTableId={viewPrefs.focus?.tableId ?? null}
     />,
     [
+      pid,
       model,
-      selected,
+      modelIndex,
+      selectedStore,
       handleSelectObject,
       t,
       readOnly,
       uiSpec.sequences,
       newSequence,
       sections,
-      viewPrefs.sidebarGrouping,
-      setSidebarGrouping,
+      persistSidebarGrouping,
       openSectionManager,
       focusTable,
       exitFocus,
@@ -278,11 +331,11 @@ export const Model = () => {
       if (e.key !== 'Escape') return;
       const el = e.target as HTMLElement | null;
       if (el?.closest('input, textarea, select, [contenteditable="true"], dialog, [popover]')) return;
-      setSelected(null);
+      updateSelected(null);
     };
     window.addEventListener('keydown', onKey);
     return () => window.removeEventListener('keydown', onKey);
-  }, []);
+  }, [updateSelected]);
 
   const ddl = useMemo(() => {
     if (tab !== 'sql') return '';
@@ -311,7 +364,7 @@ export const Model = () => {
     },
     [ws, readOnly],
   );
-  const close = () => setDialog(null);
+  const close = useCallback(() => setDialog(null), []);
   const people = useMemo(() => {
     const names = [...new Set(peers.map((p) => p.user))];
     return [me.name, ...names.filter((n) => n !== me.name)];
@@ -343,7 +396,7 @@ export const Model = () => {
       if (ws.act('addColumn', { table: id, column: col }) && uiSpec.autoPrimaryKey) {
         ws.act('addPrimaryKey', { id: newId(), table: id, columns: [colId] });
       }
-      setSelected(id);
+      updateSelected(id);
     }
   };
 
@@ -501,6 +554,7 @@ export const Model = () => {
                 <div className="h-full">
                   <Canvas
                     model={model}
+                    modelIndex={modelIndex}
                     layout={layout}
                     selected={selected}
                     onSelect={handleSelectObject}
@@ -540,11 +594,12 @@ export const Model = () => {
               selected={selected}
               ws={ws}
               model={model}
+              modelIndex={modelIndex}
               readOnly={readOnly}
               onSelect={handleSelectObject}
               sections={sections}
               onSetSections={onSetSections}
-              onOpenSectionManager={() => openSectionManager('manage')}
+              onOpenSectionManager={openManageSections}
               focusedTableId={viewPrefs.focus?.tableId ?? null}
               onFocusTable={focusTable}
               onExitFocus={exitFocus}

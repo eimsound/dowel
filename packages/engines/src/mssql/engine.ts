@@ -343,7 +343,7 @@ export const mssqlEngine: EngineAdapter = {
 
   stripImportNoise: stripMssqlImportNoise,
 
-  analyzeStepRisk: (db, from, steps) => analyzeMssqlStepRisk(db, from, steps, resetMssqlShadow),
+  analyzeStepRisk: (db, from, steps, opts) => analyzeMssqlStepRisk(db, from, steps, resetMssqlShadow, opts),
 
   applyTimeouts: async (conn, timeouts): Promise<AppliedTimeouts> => {
     const ms = (n: number) => Math.max(0, Math.trunc(n));
