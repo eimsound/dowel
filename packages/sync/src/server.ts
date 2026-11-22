@@ -1,5 +1,5 @@
 // 服务器端的房间：一个分支的工作副本。按到达顺序逐个处理修改，冲突或不合法就拒绝。
-import { deepEqual, EditError, type Model, type Obj } from '@dowel/core';
+import { clonePlain, deepEqual, EditError, type Model, MutableModelIndex, type Obj } from '@dowel/core';
 
 import {
   type Commit,
@@ -88,6 +88,8 @@ export class Room {
   private watermarkOverflowed = false;
   /** 外部提交跳号产生的待合入拒绝序号区间（用于 watermark 溢出后仍放行合法乱序的外部拒绝） */
   private externalRejectionGaps = new Map<string, { from: number; to: number }[]>();
+  /** 房间当前模型的可变增量索引（惰性创建，commit 时批量更新，replace 时清空） */
+  private modelIndex: MutableModelIndex | null = null;
   logLimit: number;
   readonly outcomeLimit: number;
   readonly rejectionsPerClientLimit: number;
@@ -175,6 +177,13 @@ export class Room {
     };
   }
 
+  private getModelIndex(): MutableModelIndex {
+    if (!this.modelIndex) {
+      this.modelIndex = new MutableModelIndex(this.s.model);
+    }
+    return this.modelIndex;
+  }
+
   /** 处理一条消息；按到达顺序串行执行。返回要发出的消息。readOnly：只读成员，修改一律拒绝 */
   handle(
     client: string,
@@ -192,14 +201,15 @@ export class Room {
       const targetStore = store ?? this.store;
       const changes = [];
       for (const [id, o] of Object.entries(next.objects))
-        if (!deepEqual(s.model.objects[id], o)) changes.push({ id, obj: structuredClone(o) });
+        if (!deepEqual(s.model.objects[id], o)) changes.push({ id, obj: clonePlain(o) });
       for (const id of Object.keys(s.model.objects))
         if (!(id in next.objects)) changes.push({ id, obj: null });
       const n = (s.processed[SYSTEM_CLIENT] ?? 0) + 1;
       const commit: Commit = { t: 'commit', seq: s.seq + 1, client: SYSTEM_CLIENT, n, user, changes };
       await targetStore.append(commit, { client: SYSTEM_CLIENT, n, name: opName, args: null, reads: [] });
       s.processed[SYSTEM_CLIENT] = n;
-      this.commit(commit, structuredClone(next), user);
+      this.modelIndex = null;
+      this.commit(commit, clonePlain(next), user);
       return [{ to: '*', msg: commit }];
     });
   }
@@ -221,9 +231,9 @@ export class Room {
       const changes = objects
         .filter((o) => o.id in s.model.objects && (s.versions[o.id] ?? 0) === (expect[o.id] ?? 0))
         .filter((o) => !deepEqual(s.model.objects[o.id], o))
-        .map((o) => ({ id: o.id, obj: structuredClone(o) }));
+        .map((o) => ({ id: o.id, obj: clonePlain(o) }));
       if (!changes.length) return [];
-      const next = structuredClone(s.model);
+      const next: Model = { ...s.model, objects: { ...s.model.objects } };
       for (const c of changes) next.objects[c.id] = c.obj;
       const n = (s.processed[SYSTEM_CLIENT] ?? 0) + 1;
       const commit: Commit = { t: 'commit', seq: s.seq + 1, client: SYSTEM_CLIENT, n, user, changes };
@@ -246,7 +256,7 @@ export class Room {
     }
     const next: Model = { ...s.model, objects: { ...s.model.objects } };
     for (const c of commit.changes) {
-      if (c.obj) next.objects[c.id] = structuredClone(c.obj);
+      if (c.obj) next.objects[c.id] = clonePlain(c.obj);
       else delete next.objects[c.id];
     }
     const prevProcessed = s.processed[commit.client] ?? 0;
@@ -422,6 +432,14 @@ export class Room {
 
   private commit(commit: Commit, next: Model, user: string) {
     const s = this.s;
+    if (this.modelIndex) {
+      const batch = commit.changes.map((c) => ({
+        id: c.id,
+        prev: s.model.objects[c.id],
+        next: c.obj ? next.objects[c.id] : undefined,
+      }));
+      this.modelIndex.applyBatch(next, batch);
+    }
     s.seq = commit.seq;
     s.model = next;
     for (const c of commit.changes) {
@@ -476,7 +494,7 @@ export class Room {
           msg: {
             t: 'snapshot',
             seq: s.seq,
-            model: structuredClone(s.model),
+            model: clonePlain(s.model),
             versions: { ...s.versions },
             lastProcessed,
           },
@@ -502,7 +520,7 @@ export class Room {
       this.checkReads(op);
       let result: ReturnType<typeof execute>;
       try {
-        result = execute(s.model, op.name, op.args); // 在最新状态上重新执行，校验以服务器为准
+        result = execute(s.model, op.name, op.args, this.getModelIndex()); // 在最新状态上重新执行，校验以服务器为准
       } catch (e) {
         if (e instanceof EditError) throw new Reject('invalid', e.message);
         throw e;

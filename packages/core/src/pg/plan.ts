@@ -27,9 +27,10 @@ import type {
   Unique,
 } from '../ir.ts';
 import { EARLY_OPAQUE } from '../ir.ts';
-import { deepEqual } from '../json.ts';
+import { clonePlain, deepEqual } from '../json.ts';
 import {
   all,
+  buildModelIndex,
   childrenOf,
   columnsOf,
   find,
@@ -41,6 +42,7 @@ import {
   partitionDescendants,
   qname,
   rootTableId,
+  withModelIndex,
 } from '../model.ts';
 import { PlanError, type Step } from '../plan-types.ts';
 import { checkPgCompatibility, LATEST_PG_MAJOR, pgCapabilities, type PlanOptions } from './capabilities.ts';
@@ -50,48 +52,148 @@ import { ident, literal, qualified } from './quote.ts';
 
 export { PlanError, type Step };
 
-const clone = <T>(x: T): T => structuredClone(x);
+const clone = clonePlain;
 /** 新建的对象此时还没有注释，注释在最后一个阶段统一加 */
-const fresh = <T extends Obj>(o: T): T => ({ ...structuredClone(o), comment: null });
+const fresh = <T extends Obj>(o: T): T => ({ ...clonePlain(o), comment: null });
 const same = deepEqual;
-const pick = <T extends object>(o: T, keys: (keyof T)[]) => keys.map((k) => o[k]);
 
-/** 对象中决定“定义”的字段（不含名字、注释、展示顺序），这些字段变了需要重建或修改 */
-const definition = (o: Obj, m?: Model, fallback?: Model): unknown => {
-  switch (o.kind) {
+const sameStrArr = (a: readonly string[], b: readonly string[]): boolean => {
+  if (a === b) return true;
+  if (a.length !== b.length) return false;
+  for (let i = 0; i < a.length; i++) if (a[i] !== b[i]) return false;
+  return true;
+};
+
+const sameSeqOpts = (a: SequenceOptions, b: SequenceOptions): boolean =>
+  a === b ||
+  (a.type === b.type &&
+    a.increment === b.increment &&
+    a.min === b.min &&
+    a.max === b.max &&
+    a.start === b.start &&
+    a.cache === b.cache &&
+    a.cycle === b.cycle);
+
+const sameDefault = (a: Column['default'], b: Column['default']): boolean => {
+  if (a === b) return true;
+  if (!a || !b) return false;
+  if ('expr' in a && 'expr' in b) return a.expr === b.expr;
+  if ('nextval' in a && 'nextval' in b) return a.nextval === b.nextval;
+  return false;
+};
+
+const sameIdentity = (a: Column['identity'], b: Column['identity']): boolean =>
+  a === b ||
+  (Boolean(a && b) &&
+    a!.always === b!.always &&
+    a!.sequenceName === b!.sequenceName &&
+    a!.sequenceNameMode === b!.sequenceNameMode &&
+    sameSeqOpts(a!.options, b!.options));
+
+const sameGenerated = (a: Column['generated'], b: Column['generated']): boolean =>
+  a === b || (Boolean(a && b) && a!.expr === b!.expr && a!.stored === b!.stored);
+
+const samePartitionOf = (a: Table['partitionOf'], b: Table['partitionOf']): boolean =>
+  a === b || (Boolean(a && b) && a!.parent === b!.parent && a!.bound === b!.bound);
+
+const sameIndexElements = (a: Index['elements'], b: Index['elements']): boolean => {
+  if (a === b) return true;
+  if (a.length !== b.length) return false;
+  for (let i = 0; i < a.length; i++) {
+    const x = a[i]!;
+    const y = b[i]!;
+    if (
+      x !== y &&
+      (x.column !== y.column ||
+        x.expr !== y.expr ||
+        x.desc !== y.desc ||
+        x.nullsFirst !== y.nullsFirst ||
+        x.opclass !== y.opclass ||
+        x.collation !== y.collation)
+    ) {
+      return false;
+    }
+  }
+  return true;
+};
+
+const sameColType = (a: Column, b: Column): boolean =>
+  a.type === b.type && a.typeRef === b.typeRef && a.collation === b.collation;
+
+/** 零分配判断两个同类对象定义是否相等，语义与 deepEqual(definition(a), definition(b)) 完全一致 */
+const sameDef = (a: Obj, b: Obj, mA?: Model, mB?: Model, fallbackA?: Model): boolean => {
+  if (a.kind !== b.kind) return false;
+  switch (a.kind) {
     case 'schema':
-      return null;
-    case 'table':
-      return [m ? partitionBySql(m, o, fallback) : o.partitionBy, o.partitionOf];
+      return true;
+    case 'table': {
+      const tb = b as Table;
+      if (!samePartitionOf(a.partitionOf, tb.partitionOf)) return false;
+      if (a.partitionBy === null && tb.partitionBy === null) return true;
+      const pa = mA ? partitionBySql(mA, a, fallbackA) : a.partitionBy;
+      const pb = mB ? partitionBySql(mB, tb) : tb.partitionBy;
+      return typeof pa === 'string' || typeof pb === 'string' ? pa === pb : same(pa, pb);
+    }
     case 'extension':
-      return [o.name, o.parent];
-    case 'opaque':
-      return [o.objType, o.name, o.ddl, o.drop];
+      return a.name === (b as typeof a).name && a.parent === (b as typeof a).parent;
+    case 'opaque': {
+      const ob = b as Opaque;
+      return (
+        a.objType === ob.objType && a.name === ob.name && a.drop === ob.drop && sameStrArr(a.ddl, ob.ddl)
+      );
+    }
     case 'enum':
-      return o.values;
-    case 'sequence':
-      return [o.options, o.ownedBy];
-    case 'column':
-      return pick(o, ['type', 'typeRef', 'collation', 'notNull', 'default', 'identity', 'generated']);
+      return sameStrArr(a.values, (b as Enum).values);
+    case 'sequence': {
+      const sb = b as Sequence;
+      return a.ownedBy === sb.ownedBy && sameSeqOpts(a.options, sb.options);
+    }
+    case 'column': {
+      const cb = b as Column;
+      return (
+        a.type === cb.type &&
+        a.typeRef === cb.typeRef &&
+        a.collation === cb.collation &&
+        a.notNull === cb.notNull &&
+        sameDefault(a.default, cb.default) &&
+        sameIdentity(a.identity, cb.identity) &&
+        sameGenerated(a.generated, cb.generated)
+      );
+    }
     case 'primaryKey':
-      return o.columns;
-    case 'unique':
-      return pick(o, ['columns', 'nullsNotDistinct']);
-    case 'foreignKey':
-      return pick(o, [
-        'columns',
-        'refTable',
-        'refColumns',
-        'onDelete',
-        'onUpdate',
-        'match',
-        'deferrable',
-        'initiallyDeferred',
-      ]);
-    case 'check':
-      return pick(o, ['expr', 'noInherit']);
-    case 'index':
-      return pick(o, ['unique', 'method', 'elements', 'include', 'where', 'nullsNotDistinct']);
+      return sameStrArr(a.columns, (b as PrimaryKey).columns);
+    case 'unique': {
+      const ub = b as Unique;
+      return a.nullsNotDistinct === ub.nullsNotDistinct && sameStrArr(a.columns, ub.columns);
+    }
+    case 'foreignKey': {
+      const fb = b as ForeignKey;
+      return (
+        a.refTable === fb.refTable &&
+        a.onDelete === fb.onDelete &&
+        a.onUpdate === fb.onUpdate &&
+        a.match === fb.match &&
+        a.deferrable === fb.deferrable &&
+        a.initiallyDeferred === fb.initiallyDeferred &&
+        sameStrArr(a.columns, fb.columns) &&
+        sameStrArr(a.refColumns, fb.refColumns)
+      );
+    }
+    case 'check': {
+      const kb = b as Check;
+      return a.expr === kb.expr && a.noInherit === kb.noInherit;
+    }
+    case 'index': {
+      const ib = b as Index;
+      return (
+        a.unique === ib.unique &&
+        a.method === ib.method &&
+        a.where === ib.where &&
+        a.nullsNotDistinct === ib.nullsNotDistinct &&
+        sameStrArr(a.include, ib.include) &&
+        sameIndexElements(a.elements, ib.elements)
+      );
+    }
   }
 };
 
@@ -136,12 +238,28 @@ const pickExprs = (o: Obj): Partial<Obj> =>
   o.kind === 'check'
     ? { expr: o.expr }
     : o.kind === 'index'
-      ? { elements: structuredClone(o.elements), where: o.where }
+      ? { elements: clonePlain(o.elements), where: o.where }
       : {};
 
 export const plan = (rawFrom: Model, rawTo: Model, opts?: PlanOptions): Step[] => {
   const from = normalizeAllPartitionFamilies(rawFrom);
   const to = normalizeAllPartitionFamilies(rawTo);
+  const fromIdx = buildModelIndex(from);
+  const toIdx = buildModelIndex(to);
+  return withModelIndex(
+    from,
+    () => withModelIndex(to, () => planWithIndexes(from, to, fromIdx, toIdx, opts), toIdx),
+    fromIdx,
+  );
+};
+
+const planWithIndexes = (
+  from: Model,
+  to: Model,
+  fromIdx: ReturnType<typeof buildModelIndex>,
+  toIdx: ReturnType<typeof buildModelIndex>,
+  opts?: PlanOptions,
+): Step[] => {
   const targetMajor = opts?.pgMajor ?? null;
   if (targetMajor !== null && (!Number.isInteger(targetMajor) || targetMajor <= 0)) {
     throw new PlanError(`无效的目标 PostgreSQL 主版本号：${String(targetMajor)}`);
@@ -161,9 +279,17 @@ export const plan = (rawFrom: Model, rawTo: Model, opts?: PlanOptions): Step[] =
 
   const inFrom = (id: string) => id in from.objects;
   const inTo = (id: string) => id in to.objects;
-  const removed = Object.values(from.objects).filter((o) => !inTo(o.id));
-  const added = Object.values(to.objects).filter((o) => !inFrom(o.id));
-  const common = Object.values(to.objects).filter((o) => inFrom(o.id));
+  const removed: Obj[] = [];
+  for (const id in from.objects) {
+    if (!inTo(id)) removed.push(from.objects[id]!);
+  }
+  const added: Obj[] = [];
+  const common: Obj[] = [];
+  for (const id in to.objects) {
+    const o = to.objects[id]!;
+    if (inFrom(id)) common.push(o);
+    else added.push(o);
+  }
   const was = <T extends Obj>(o: T): T => from.objects[o.id] as T;
   const isRemoved = (id: string) => inFrom(id) && !inTo(id);
 
@@ -171,12 +297,13 @@ export const plan = (rawFrom: Model, rawTo: Model, opts?: PlanOptions): Step[] =
   const detaching = new Set<string>();
   const attaching = new Set<string>();
   const rebinding = new Set<string>();
-  for (const o of common) {
-    if (o.kind !== 'table') continue;
+  for (const o of toIdx.allRef('table')) {
+    if (!inFrom(o.id)) continue;
     const w = was(o);
     if (w.partitionOf && !o.partitionOf) detaching.add(o.id);
     else if (!w.partitionOf && o.partitionOf) attaching.add(o.id);
-    else if (w.partitionOf && o.partitionOf && !same(w.partitionOf, o.partitionOf)) rebinding.add(o.id);
+    else if (w.partitionOf && o.partitionOf && !samePartitionOf(w.partitionOf, o.partitionOf))
+      rebinding.add(o.id);
   }
   const willDetach = new Set([...detaching, ...rebinding]);
   const willAttach = new Set([...attaching, ...rebinding]);
@@ -236,6 +363,9 @@ export const plan = (rawFrom: Model, rawTo: Model, opts?: PlanOptions): Step[] =
     if (tc.name !== rc.name)
       colRenames.set(tc.parent, [...(colRenames.get(tc.parent) ?? []), [rc.name, tc.name]]);
   }
+  const hasGlobalRename = schemaRenames.length > 0 || enumRenames.length > 0;
+  const hasAnyExprMigration =
+    hasGlobalRename || colRenames.size > 0 || willDetach.size > 0 || willAttach.size > 0;
   const migrateExpr = (expr: string, table: string): string => {
     let e = expr;
     for (const [a, b] of schemaRenames) e = renameQualifiedInExpr(e, a, null, { schema: b, name: null });
@@ -252,7 +382,31 @@ export const plan = (rawFrom: Model, rawTo: Model, opts?: PlanOptions): Step[] =
   };
   const remapIdsForTable = (tableId: string): Map<string, string> | undefined =>
     attachColMap.get(tableId) ?? detachRootToNewCol.get(tableId);
+  const tableNeedsMigration = (tableId: string): boolean => {
+    if (hasGlobalRename) return true;
+    if (attachColMap.has(tableId) || detachRootToNewCol.has(tableId)) return true;
+    if (colRenames.has(tableId) || colRenames.has(rootTableId(from, tableId))) return true;
+    return false;
+  };
   const migrated = <T extends Obj>(w: T): T => {
+    if (!hasAnyExprMigration) return w;
+    if (
+      w.kind === 'schema' ||
+      w.kind === 'extension' ||
+      w.kind === 'enum' ||
+      w.kind === 'sequence' ||
+      w.kind === 'opaque'
+    ) {
+      return w;
+    }
+    const tblId = w.kind === 'table' ? w.id : w.parent;
+    if (
+      !hasGlobalRename &&
+      !tableNeedsMigration(tblId) &&
+      !(w.kind === 'foreignKey' && tableNeedsMigration(w.refTable))
+    ) {
+      return w;
+    }
     const o = clone(w) as Obj;
     if (o.kind === 'table' && o.partitionBy) {
       if (typeof o.partitionBy === 'string') {
@@ -352,8 +506,7 @@ export const plan = (rawFrom: Model, rawTo: Model, opts?: PlanOptions): Step[] =
         }
       }
     }
-    if (o.kind === 'extension' && !same(definition(o), definition(was(o))))
-      throw new PlanError(`扩展暂不支持修改：${o.name}`);
+    if (o.kind === 'extension' && !sameDef(o, was(o))) throw new PlanError(`扩展暂不支持修改：${o.name}`);
   }
 
   // ───── 渲染（都基于 cur） ─────
@@ -438,19 +591,33 @@ export const plan = (rawFrom: Model, rawTo: Model, opts?: PlanOptions): Step[] =
   };
 
   // ───── 预先计算：需要重建的约束 / 索引、需要重建的生成列、类型变化的列 ─────
-  const typeChanged = new Set(
-    common
-      .filter((o): o is Column => o.kind === 'column')
-      .filter(
-        (c) =>
-          !same(pick(c, ['type', 'typeRef', 'collation']), pick(was(c), ['type', 'typeRef', 'collation'])),
-      )
-      .map((c) => c.id),
-  );
+  const typeChanged = new Set<string>();
+  const renamedColIds = new Set<string>();
+  const enumRebuild = new Set<string>();
+  const opaqueChanged = new Set<string>();
+  for (let i = 0; i < common.length; i++) {
+    const o = common[i]!;
+    if (o.kind === 'column') {
+      const w = was(o);
+      if (!sameColType(o, w)) typeChanged.add(o.id);
+      if (o.name !== w.name) renamedColIds.add(o.id);
+    } else if (o.kind === 'enum') {
+      const old = was(o).values;
+      if (
+        !sameStrArr(
+          o.values.filter((v) => old.includes(v)),
+          old,
+        )
+      ) {
+        enumRebuild.add(o.id);
+      }
+    } else if (o.kind === 'opaque') {
+      if (!sameDef(o, was(o))) opaqueChanged.add(o.id);
+    }
+  }
   for (const [toColId, rc] of detachToRootCol) {
     const tc = get(to, toColId, 'column');
-    if (!same(pick(tc, ['type', 'typeRef', 'collation']), pick(rc, ['type', 'typeRef', 'collation'])))
-      typeChanged.add(toColId);
+    if (!sameColType(tc, rc)) typeChanged.add(toColId);
   }
   /** 表达式是否引用了某些列（按旧名或新名） */
   const exprTouches = (expr: string | null | undefined, colIds: Iterable<string>) => {
@@ -475,12 +642,12 @@ export const plan = (rawFrom: Model, rawTo: Model, opts?: PlanOptions): Step[] =
 
   // 生成列：定义变了、或表达式引用的列类型变了 → 删掉重建（生成列的值可以重新算出，不丢数据）
   const regen = new Set<string>();
-  for (const c of common) {
-    if (c.kind !== 'column') continue;
+  for (const c of toIdx.allRef('column')) {
+    if (!inFrom(c.id)) continue;
     const w = was(c);
     if (!c.generated && !w.generated) continue;
     if (
-      !same(c.generated, migrated(w).generated) ||
+      !sameGenerated(c.generated, migrated(w).generated) ||
       typeChanged.has(c.id) ||
       (c.generated && exprTouches(c.generated.expr, colsOfTable(c.parent, typeChanged)))
     )
@@ -492,7 +659,7 @@ export const plan = (rawFrom: Model, rawTo: Model, opts?: PlanOptions): Step[] =
     const mrc = { ...clone(rc), parent: tc.parent };
     if (mrc.generated) mrc.generated.expr = migrateExpr(mrc.generated.expr, tc.parent);
     if (
-      !same(tc.generated, mrc.generated) ||
+      !sameGenerated(tc.generated, mrc.generated) ||
       typeChanged.has(toColId) ||
       (tc.generated && exprTouches(tc.generated.expr, colsOfTable(tc.parent, typeChanged)))
     )
@@ -501,13 +668,15 @@ export const plan = (rawFrom: Model, rawTo: Model, opts?: PlanOptions): Step[] =
   for (const id of regen) typeChanged.delete(id);
 
   // 分区键引用的列不允许改类型（PG 报错 cannot alter type of column named in partition key）
-  for (const o of common) {
-    if (o.kind !== 'table' || !o.partitionBy) continue;
-    const refIds = new Set([...partitionKeyColumns(to, o).all, ...partitionKeyColumns(from, was(o)).all]);
-    for (const colId of refIds) {
-      if (typeChanged.has(colId) || regen.has(colId)) {
-        const colName = find(to, colId)?.name ?? find(from, colId)?.name ?? colId;
-        throw new PlanError(`列 ${colName} 被分区表 ${o.name} 的分区键引用，不能修改类型`);
+  if (typeChanged.size > 0 || regen.size > 0) {
+    for (const o of toIdx.allRef('table')) {
+      if (!o.partitionBy || !inFrom(o.id)) continue;
+      const refIds = new Set([...partitionKeyColumns(to, o).all, ...partitionKeyColumns(from, was(o)).all]);
+      for (const colId of refIds) {
+        if (typeChanged.has(colId) || regen.has(colId)) {
+          const colName = find(to, colId)?.name ?? find(from, colId)?.name ?? colId;
+          throw new PlanError(`列 ${colName} 被分区表 ${o.name} 的分区键引用，不能修改类型`);
+        }
       }
     }
   }
@@ -534,19 +703,6 @@ export const plan = (rawFrom: Model, rawTo: Model, opts?: PlanOptions): Step[] =
     }
   };
 
-  // 枚举值被删除或重排：PG 不支持，只能重建类型（见 P8）
-  const enumRebuild = new Set(
-    common
-      .filter((o): o is Enum => o.kind === 'enum')
-      .filter((e) => {
-        const old = was(e).values;
-        return !same(
-          e.values.filter((v) => old.includes(v)),
-          old,
-        );
-      })
-      .map((e) => e.id),
-  );
   const mentionsRebuiltEnum = (expr: string | null | undefined) => {
     if (!expr || !enumRebuild.size) return false;
     const ids = identsIn(expr);
@@ -556,18 +712,16 @@ export const plan = (rawFrom: Model, rawTo: Model, opts?: PlanOptions): Step[] =
   };
 
   // 类型是被重建枚举的列：重建时会改到新类型，外键必须先删
-  const enumCols = new Set(
-    all(from, 'column')
-      .filter((c) => c.typeRef && enumRebuild.has(c.typeRef))
-      .map((c) => c.id),
-  );
+  const enumCols = new Set<string>();
+  if (enumRebuild.size > 0) {
+    for (const c of fromIdx.allRef('column')) {
+      if (c.typeRef && enumRebuild.has(c.typeRef)) enumCols.add(c.id);
+    }
+  }
 
   // PG 中 ALTER TABLE RENAME COLUMN 不会更新分区父表索引关系（relkind='I'）上的 pg_attribute.attname，
   // 导致后续新建或重挂子分区时 PG 仍按旧列名生成继承 UNIQUE/INDEX 约束与索引名；
   // 当分区父表的 UNIQUE 或 INDEX 直接引用的列改名时重建该约束/索引，确保索引 attname 与当前列名一致。
-  const renamedColIds = new Set(
-    common.filter((o): o is Column => o.kind === 'column' && o.name !== was(o).name).map((o) => o.id),
-  );
   const usesRenamedDirectCol = (o: Unique | Index): boolean =>
     o.kind === 'unique'
       ? o.columns.some((c) => renamedColIds.has(c))
@@ -577,40 +731,58 @@ export const plan = (rawFrom: Model, rawTo: Model, opts?: PlanOptions): Step[] =
   const rebuild = new Set<string>();
   const isKey = (o: Obj): o is Constraint | Index =>
     o.kind === 'primaryKey' || o.kind === 'unique' || o.kind === 'check' || o.kind === 'index';
-  for (const o of common) {
-    if (!isKey(o)) continue;
-    const w = was(o);
-    const exprs =
-      w.kind === 'check' ? [w.expr] : w.kind === 'index' ? [...w.elements.map((e) => e.expr), w.where] : [];
-    const partParentRenamedKeyCol =
-      (w.kind === 'unique' || w.kind === 'index') &&
-      (to.objects[o.parent] as Table).partitionBy !== null &&
-      usesRenamedDirectCol(w);
-    if (
-      !same(definition(o), definition(migrated(w))) ||
-      usesCols(w, regen) ||
-      usesCols(w, typeChanged) ||
-      exprs.some(mentionsRebuiltEnum) ||
-      partParentRenamedKeyCol
-    )
-      rebuild.add(o.id);
+  const refTablesWithGoneKey = new Set<string>();
+  for (const pk of fromIdx.allRef('primaryKey')) {
+    if (isRemoved(pk.id)) refTablesWithGoneKey.add(pk.parent);
+  }
+  for (const u of fromIdx.allRef('unique')) {
+    if (isRemoved(u.id)) refTablesWithGoneKey.add(u.parent);
+  }
+  for (const ix of fromIdx.allRef('index')) {
+    if (ix.unique && isRemoved(ix.id)) refTablesWithGoneKey.add(ix.parent);
+  }
+  for (const kind of ['primaryKey', 'unique', 'check', 'index'] as const) {
+    for (const o of toIdx.allRef(kind)) {
+      if (!inFrom(o.id)) continue;
+      const w = was(o);
+      const exprs =
+        enumRebuild.size > 0
+          ? w.kind === 'check'
+            ? [w.expr]
+            : w.kind === 'index'
+              ? [...w.elements.map((e) => e.expr), w.where]
+              : []
+          : [];
+      const partParentRenamedKeyCol =
+        renamedColIds.size > 0 &&
+        (w.kind === 'unique' || w.kind === 'index') &&
+        (to.objects[o.parent] as Table).partitionBy !== null &&
+        usesRenamedDirectCol(w);
+      if (
+        !sameDef(o, migrated(w)) ||
+        (regen.size > 0 && usesCols(w, regen)) ||
+        (typeChanged.size > 0 && usesCols(w, typeChanged)) ||
+        (exprs.length > 0 && exprs.some(mentionsRebuiltEnum)) ||
+        partParentRenamedKeyCol
+      ) {
+        rebuild.add(o.id);
+        if (o.kind === 'primaryKey' || o.kind === 'unique' || (o.kind === 'index' && o.unique)) {
+          refTablesWithGoneKey.add(o.parent);
+        }
+      }
+    }
   }
   // 外键：自身变了、两端列类型变了、或被引用表上的主键 / 唯一约束 / 唯一索引要删掉或重建
-  const refKeyGone = (refTable: string) =>
-    Object.values(from.objects).some(
-      (k) =>
-        (k.kind === 'primaryKey' || k.kind === 'unique' || (k.kind === 'index' && k.unique)) &&
-        k.parent === refTable &&
-        (isRemoved(k.id) || rebuild.has(k.id)),
-    );
-  for (const o of common) {
-    if (o.kind !== 'foreignKey') continue;
+  const refKeyGone = (refTable: string) => refTablesWithGoneKey.has(refTable);
+  for (const o of toIdx.allRef('foreignKey')) {
+    if (!inFrom(o.id)) continue;
+    const w = was(o);
     if (
-      !same(definition(o), definition(was(o))) ||
-      usesCols(was(o), typeChanged) ||
-      usesCols(was(o), regen) ||
-      usesCols(was(o), enumCols) ||
-      refKeyGone(was(o).refTable)
+      !sameDef(o, w) ||
+      (typeChanged.size > 0 && usesCols(w, typeChanged)) ||
+      (regen.size > 0 && usesCols(w, regen)) ||
+      (enumCols.size > 0 && usesCols(w, enumCols)) ||
+      refKeyGone(w.refTable)
     )
       rebuild.add(o.id);
   }
@@ -643,9 +815,6 @@ export const plan = (rawFrom: Model, rawTo: Model, opts?: PlanOptions): Step[] =
     lateMemo.set(k, late);
     return late;
   };
-  const opaqueChanged = new Set(
-    common.filter((o) => o.kind === 'opaque' && !same(definition(o), definition(was(o)))).map((o) => o.id),
-  );
   // 晚期对象（视图、触发器等）所依赖的对象被删除、重建、改类型时，要先删掉、最后重建
   const unstable = new Set<string>([
     ...removed.map((o) => o.id),
@@ -776,37 +945,44 @@ export const plan = (rawFrom: Model, rawTo: Model, opts?: PlanOptions): Step[] =
       cmpStr(a.id, b.id)
     );
   };
-  const relTakenIn = (m: Model, schemaId: string, name: string): boolean =>
-    Object.values(m.objects).some((o) => {
-      if ((o.kind === 'table' || o.kind === 'sequence') && o.parent === schemaId) return o.name === name;
-      if (
-        (o.kind === 'index' || o.kind === 'primaryKey' || o.kind === 'unique') &&
-        find(m, o.parent)?.kind === 'table' &&
-        (m.objects[o.parent] as Table).parent === schemaId
-      )
-        return o.name === name;
-      if (
-        o.kind === 'column' &&
-        o.identity &&
-        find(m, o.parent)?.kind === 'table' &&
-        (m.objects[o.parent] as Table).parent === schemaId
-      )
-        return o.identity.sequenceName === name;
-      return false;
-    });
-  const simulateImplicitNames = (m: Model): Map<string, string> => {
+  const conTakenSim = (
+    m: Model,
+    idx: ReturnType<typeof buildModelIndex>,
+    tableId: string,
+    name: string,
+  ): boolean => {
+    for (const kind of ['primaryKey', 'unique', 'check', 'foreignKey'] as const) {
+      for (const o of idx.childrenRef(tableId, kind)) {
+        if (o.name === name) return true;
+      }
+    }
+    if (cap.namedNotNull) {
+      for (const c of idx.childrenRef(tableId, 'column')) {
+        if (c.notNull && c.notNullName === name) return true;
+      }
+    }
+    for (const anc of partitionAncestors(m, tableId)) {
+      for (const k of idx.childrenRef(anc.id, 'check')) if (k.name === name) return true;
+      for (const k of idx.childrenRef(anc.id, 'foreignKey')) if (k.name === name) return true;
+      if (cap.namedNotNull) {
+        for (const c of idx.childrenRef(anc.id, 'column')) {
+          if (c.notNull && c.notNullName === name) return true;
+        }
+      }
+    }
+    return false;
+  };
+  const simulateImplicitNames = (m: Model, idx: ReturnType<typeof buildModelIndex>): Map<string, string> => {
     const out = new Map<string, string>();
-    if (!all(m, 'table').some((t) => t.partitionOf !== null)) return out;
+    if (!idx.allRef('table').some((t) => t.partitionOf !== null)) return out;
     const takenRel = new Set<string>();
     const takenCon = new Set<string>();
     for (const kind of ['primaryKey', 'unique', 'index'] as const) {
       const label = kind === 'primaryKey' ? 'pkey' : kind === 'unique' ? 'key' : 'idx';
       const isCon = kind !== 'index';
-      const ancObjs = Object.values(m.objects)
-        .filter(
-          (o): o is PrimaryKey | Unique | Index =>
-            o.kind === kind && get(m, o.parent, 'table').partitionBy !== null,
-        )
+      const ancObjs = idx
+        .allRef(kind)
+        .filter((o): o is PrimaryKey | Unique | Index => get(m, o.parent, 'table').partitionBy !== null)
         .sort((a, b) => cmpKeyIn(m, a, b));
       for (const ancObj of ancObjs) {
         const colPart =
@@ -815,16 +991,16 @@ export const plan = (rawFrom: Model, rawTo: Model, opts?: PlanOptions): Step[] =
             : kind === 'unique'
               ? joinNames((ancObj as Unique).columns.map((c) => get(m, c, 'column').name))
               : joinNames(indexElementNames(m, ancObj as Index));
-        const descs = partitionDescendants(m, ancObj.parent).sort((a, b) => cmpTableIn(m, a, b));
+        const descs = idx.partitionDescendants(ancObj.parent).sort((a, b) => cmpTableIn(m, a, b));
         for (const desc of descs) {
           const name = chooseName(
             desc.name,
             colPart,
             label,
             (n) =>
-              relTakenIn(m, desc.parent, n) ||
+              idx.isPgRelTaken(desc.parent, n, '') ||
               takenRel.has(`${desc.parent}:${n}`) ||
-              (isCon && (conTakenIn(m, desc.id, n) || takenCon.has(`${desc.id}:${n}`))),
+              (isCon && (conTakenSim(m, idx, desc.id, n) || takenCon.has(`${desc.id}:${n}`))),
           );
           takenRel.add(`${desc.parent}:${name}`);
           if (isCon) takenCon.add(`${desc.id}:${name}`);
@@ -834,8 +1010,8 @@ export const plan = (rawFrom: Model, rawTo: Model, opts?: PlanOptions): Step[] =
     }
     return out;
   };
-  const fromImplicitNames = simulateImplicitNames(from);
-  const toImplicitNames = simulateImplicitNames(to);
+  const fromImplicitNames = simulateImplicitNames(from, fromIdx);
+  const toImplicitNames = simulateImplicitNames(to, toIdx);
 
   const materialized = new Set<string>();
   const detachedOrigin = new Map<string, string>();
@@ -897,7 +1073,8 @@ export const plan = (rawFrom: Model, rawTo: Model, opts?: PlanOptions): Step[] =
     }
 
     // 2. 把该子分区（及其后代）原有本地约束/索引的列引用映射到新物化的列 ID
-    const subTree = new Set([tId, ...partitionDescendants(cur, tId).map((d) => d.id)]);
+    const subDescendants = partitionDescendants(cur, tId);
+    const subTree = new Set([tId, ...subDescendants.map((d) => d.id)]);
     const mapCol = (c: string) => rootToCurCol.get(c) ?? c;
     for (const o of Object.values(cur.objects)) {
       if (o.kind === 'table' && subTree.has(o.id) && o.partitionBy && typeof o.partitionBy !== 'string') {
@@ -926,14 +1103,13 @@ export const plan = (rawFrom: Model, rawTo: Model, opts?: PlanOptions): Step[] =
       (o): o is Index => o.kind === 'index' && ancIds.has(o.parent),
     );
     const hasDupAncDef = (ancObj: ForeignKey | Unique | Index): boolean => {
-      const def = definition(ancObj);
       const list =
         ancObj.kind === 'foreignKey'
           ? ancFksOnOld
           : ancObj.kind === 'unique'
             ? ancUniquesOnOld
             : ancIdxsOnOld;
-      return list.filter((x) => same(definition(x), def)).length > 1;
+      return list.filter((x) => sameDef(x, ancObj)).length > 1;
     };
     const matchedToObjs = new Set<string>();
     const toOnT = Object.values(to.objects).filter((o) => 'parent' in o && o.parent === tId);
@@ -952,7 +1128,7 @@ export const plan = (rawFrom: Model, rawTo: Model, opts?: PlanOptions): Step[] =
               !matchedToObjs.has(x.id) &&
               !(x.id in cur.objects) &&
               x.name === detObj.name &&
-              same(definition(x), definition(migrated(detObj))),
+              sameDef(x, migrated(detObj)),
           );
         }
         if (!toMatch) {
@@ -962,7 +1138,7 @@ export const plan = (rawFrom: Model, rawTo: Model, opts?: PlanOptions): Step[] =
             if (x.kind === 'check' && detObj.kind === 'check')
               return x.name === detObj.name || x.expr === migrateExpr(detObj.expr, tId);
             if (x.kind === 'foreignKey' && detObj.kind === 'foreignKey') return x.name === detObj.name;
-            return same(definition(x), definition(migrated(detObj)));
+            return sameDef(x, migrated(detObj));
           });
         }
         if (toMatch) {
@@ -972,12 +1148,19 @@ export const plan = (rawFrom: Model, rawTo: Model, opts?: PlanOptions): Step[] =
           materialized.add(toMatch.id);
           detachedOrigin.set(toMatch.id, ancObj.id);
           if (
-            !same(definition(toMatch), definition(migrated(placed))) ||
+            !sameDef(toMatch, migrated(placed)) ||
             usesCols(placed, regen) ||
             usesCols(placed, typeChanged) ||
             (placed.kind === 'foreignKey' && (usesCols(placed, enumCols) || refKeyGone(placed.refTable)))
           ) {
             rebuild.add(toMatch.id);
+            if (
+              placed.kind === 'primaryKey' ||
+              placed.kind === 'unique' ||
+              (placed.kind === 'index' && placed.unique)
+            ) {
+              refTablesWithGoneKey.add(placed.parent);
+            }
           }
           return;
         }
@@ -1014,12 +1197,12 @@ export const plan = (rawFrom: Model, rawTo: Model, opts?: PlanOptions): Step[] =
                   x.parent === tId &&
                   x.id !== synId &&
                   !syntheticDetached.has(x.id) &&
-                  same(definition(x), definition(detObj)),
+                  sameDef(x, detObj),
               )
             : !childRenamed &&
               !colRenamedInKey &&
               detObj.name === toImplicitNames.get(`${tId}#imp#${ancObj.id}`) &&
-              partitionDescendants(cur, tId).every(
+              subDescendants.every(
                 (d) =>
                   fromImplicitNames.get(`${d.id}#imp#${detachedOrigin.get(ancObj.id) ?? ancObj.id}`) ===
                   toImplicitNames.get(`${d.id}#imp#${ancObj.id}`),
@@ -1165,7 +1348,8 @@ export const plan = (rawFrom: Model, rawTo: Model, opts?: PlanOptions): Step[] =
   }
 
   // ───── P1 删外键 ─────
-  for (const o of Object.values(cur.objects)) {
+  for (const id in cur.objects) {
+    const o = cur.objects[id]!;
     if (o.kind !== 'foreignKey') continue;
     const shouldDrop = syntheticDetached.has(o.id)
       ? !retainedForReattach.has(o.id)
@@ -1175,7 +1359,8 @@ export const plan = (rawFrom: Model, rawTo: Model, opts?: PlanOptions): Step[] =
     delete cur.objects[o.id];
   }
   // ───── P2 删其他约束和索引（所在表要删的跳过，删表时一起删掉） ─────
-  for (const o of Object.values(cur.objects)) {
+  for (const id in cur.objects) {
+    const o = cur.objects[id]!;
     if (!isKey(o) || tableRemoved(o) || keptForAttachCheck.has(o.id)) continue;
     const shouldDrop = syntheticDetached.has(o.id)
       ? !retainedForReattach.has(o.id)
@@ -1277,9 +1462,8 @@ export const plan = (rawFrom: Model, rawTo: Model, opts?: PlanOptions): Step[] =
   for (const id of autoDropped) delete cur.objects[id];
 
   // ───── P5b 提前去掉 identity 和 NOT NULL：它们占用的序列名、约束名可能是后面改名的目标 ─────
-  const liveTargets = Object.values(to.objects).filter((o) => inFrom(o.id) || materialized.has(o.id));
-  for (const o of liveTargets) {
-    if (o.kind !== 'column' || regen.has(o.id)) continue;
+  for (const o of toIdx.allRef('column')) {
+    if (regen.has(o.id) || (!inFrom(o.id) && !materialized.has(o.id))) continue;
     const c = cur.objects[o.id];
     if (c?.kind !== 'column') continue;
     const A0 = `ALTER TABLE ${T(c.parent)} ALTER COLUMN ${C(c.id)}`;
@@ -1304,10 +1488,39 @@ export const plan = (rawFrom: Model, rawTo: Model, opts?: PlanOptions): Step[] =
   };
   const items: Renamable[] = [];
   const schemaOfTable = (tableId: string) => get(cur, tableId, 'table').parent;
-  const conFamilySpacesCur = (tableId: string) => [
-    `con:${tableId}`,
-    ...partitionDescendants(cur, tableId).map((d) => `con:${d.id}`),
-  ];
+  let curPartChildren: Map<string, string[]> | null = null;
+  const conFamilySpacesCache = new Map<string, string[]>();
+  const conFamilySpacesCur = (tableId: string): string[] => {
+    const cached = conFamilySpacesCache.get(tableId);
+    if (cached) return cached;
+    if (!curPartChildren) {
+      curPartChildren = new Map();
+      for (const o of Object.values(cur.objects)) {
+        if (o.kind !== 'table' || !o.partitionOf) continue;
+        let list = curPartChildren.get(o.partitionOf.parent);
+        if (!list) curPartChildren.set(o.partitionOf.parent, (list = []));
+        list.push(o.id);
+      }
+    }
+    const out = [`con:${tableId}`];
+    if (curPartChildren.has(tableId)) {
+      const seen = new Set<string>([tableId]);
+      const queue = [tableId];
+      for (let head = 0; head < queue.length; head++) {
+        const pid = queue[head]!;
+        const kids = curPartChildren.get(pid);
+        if (!kids) continue;
+        for (const cid of kids) {
+          if (seen.has(cid)) continue;
+          seen.add(cid);
+          out.push(`con:${cid}`);
+          queue.push(cid);
+        }
+      }
+    }
+    conFamilySpacesCache.set(tableId, out);
+    return out;
+  };
   const spacesOf = (o: Obj): string[] => {
     switch (o.kind) {
       case 'schema':
@@ -1353,8 +1566,10 @@ export const plan = (rawFrom: Model, rawTo: Model, opts?: PlanOptions): Step[] =
         return `ALTER TABLE ${T(o.parent)} RENAME CONSTRAINT ${ident(o.name)} TO ${ident(name)}`;
     }
   };
-  for (const o of liveTargets) {
-    const c = cur.objects[o.id];
+  for (const id in to.objects) {
+    if (!inFrom(id) && !materialized.has(id)) continue;
+    const o = to.objects[id]!;
+    const c = cur.objects[id];
     if (!c) continue; // 已在前面被删掉重建
     if (c.name !== o.name && c.kind !== 'opaque' && c.kind !== 'extension') {
       items.push({
@@ -1405,22 +1620,42 @@ export const plan = (rawFrom: Model, rawTo: Model, opts?: PlanOptions): Step[] =
   // 分区子表改名或父表约束/索引引用列改名时，同步重命名 PG 在后代子分区上自动生成的隐式继承 PK/UNIQUE/INDEX，
   // 避免旧名继续占用关系命名空间导致同迁移占名冲突，或跨版本 DETACH 时与派生名失步。
   const implicitState = new Map<string, { name: string; spaces: string[] }>();
-  const attachedChildrenInCur = all(cur, 'table')
-    .filter((t) => t.partitionOf !== null && inTo(t.id))
-    .sort((a, b) => cmpTableIn(cur, a, b));
+  const attachedChildrenInCur: Table[] = [];
+  for (const id in cur.objects) {
+    const t = cur.objects[id]!;
+    if (t.kind === 'table' && t.partitionOf !== null && inTo(t.id)) attachedChildrenInCur.push(t);
+  }
+  attachedChildrenInCur.sort((a, b) => cmpTableIn(cur, a, b));
   if (attachedChildrenInCur.length > 0) {
     const oldNameMap = fromImplicitNames;
     const newNameMap = toImplicitNames;
+    const curKeysByParent = new Map<
+      string,
+      Record<'primaryKey' | 'unique' | 'index', (PrimaryKey | Unique | Index)[]>
+    >();
+    const curFksByParent = new Map<string, ForeignKey[]>();
+    for (const id in cur.objects) {
+      const o = cur.objects[id]!;
+      if ((o.kind === 'primaryKey' || o.kind === 'unique' || o.kind === 'index') && inTo(o.id)) {
+        let g = curKeysByParent.get(o.parent);
+        if (!g) curKeysByParent.set(o.parent, (g = { primaryKey: [], unique: [], index: [] }));
+        g[o.kind].push(o);
+      } else if (o.kind === 'foreignKey') {
+        let g = curFksByParent.get(o.parent);
+        if (!g) curFksByParent.set(o.parent, (g = []));
+        g.push(o);
+      }
+    }
     for (const desc of attachedChildrenInCur) {
       const ancs = ancestorsCur(desc.partitionOf!.parent);
-      const ancIds = new Set(ancs.map((a) => a.id));
       for (const kind of ['primaryKey', 'unique', 'index'] as const) {
         const isCon = kind !== 'index';
-        const ancObjs = Object.values(cur.objects)
-          .filter(
-            (o): o is PrimaryKey | Unique | Index => o.kind === kind && ancIds.has(o.parent) && inTo(o.id),
-          )
-          .sort((a, b) => cmpKeyIn(cur, a, b));
+        const ancObjs: (PrimaryKey | Unique | Index)[] = [];
+        for (const a of ancs) {
+          const list = curKeysByParent.get(a.id)?.[kind];
+          if (list) ancObjs.push(...list);
+        }
+        ancObjs.sort((a, b) => cmpKeyIn(cur, a, b));
         for (const ancObj of ancObjs) {
           const origId = detachedOrigin.get(ancObj.id) ?? ancObj.id;
           const oldName = oldNameMap.get(`${desc.id}#imp#${origId}`);
@@ -1449,10 +1684,13 @@ export const plan = (rawFrom: Model, rawTo: Model, opts?: PlanOptions): Step[] =
     // PG 在子分区上克隆的继承 FOREIGN KEY 不会随父表 RENAME CONSTRAINT 自动改名，
     // 在此显式将其纳入 P6 改名图与 con:${desc.id} 命名空间，随父表同步改名并安全处理跨层互换。
     for (const desc of attachedChildrenInCur) {
-      const ancIds = new Set(ancestorsCur(desc.partitionOf!.parent).map((a) => a.id));
-      const ancFks = Object.values(cur.objects)
-        .filter((o): o is ForeignKey => o.kind === 'foreignKey' && ancIds.has(o.parent))
-        .sort((a, b) => cmpStr(a.id, b.id));
+      const ancs = ancestorsCur(desc.partitionOf!.parent);
+      const ancFks: ForeignKey[] = [];
+      for (const a of ancs) {
+        const list = curFksByParent.get(a.id);
+        if (list) ancFks.push(...list);
+      }
+      ancFks.sort((a, b) => cmpStr(a.id, b.id));
       for (const ancFk of ancFks) {
         const impId = `${desc.id}#impfk#${ancFk.id}`;
         const spaces = [`con:${desc.id}`];
@@ -1474,96 +1712,165 @@ export const plan = (rawFrom: Model, rawTo: Model, opts?: PlanOptions): Step[] =
     }
   }
   // 后面才删除的对象（枚举、序列、schema）如果占着新对象要用的名字，先改成临时名腾出来
-  const toNames = new Set<string>();
-  for (const o of Object.values(to.objects))
-    for (const s of spacesOfTo(to, o)) toNames.add(`${s}\u0000${o.name}`);
-  for (const it of items) {
-    if (it.target) for (const s of it.spaces) toNames.add(`${s}\u0000${it.target}`);
-  }
-  for (const o of removed) {
-    const c = cur.objects[o.id];
-    if (!c || !(c.kind === 'enum' || c.kind === 'sequence' || c.kind === 'schema')) continue;
-    if (spacesOf(c).some((s) => toNames.has(`${s}\u0000${c.name}`)))
-      items.push({
-        id: o.id,
-        spaces: spacesOf(c),
-        target: '',
-        rename: (n) => renameSql(cur.objects[o.id]!, n),
-        apply: (n) => {
-          cur.objects[o.id]!.name = n;
-        },
-      });
-  }
-  // 当前各命名空间里谁占着哪个名字
-  const occupant = (space: string, name: string): string | undefined => {
-    for (const o of Object.values(cur.objects)) {
-      if (o.name === name && spacesOf(o).includes(space)) return o.id;
-      if (o.kind === 'column') {
-        if (
-          cap.namedNotNull &&
-          o.notNull &&
-          o.notNullName === name &&
-          conFamilySpacesCur(o.parent).includes(space)
-        )
-          return `${o.id}#nn`;
-        if (o.identity?.sequenceName === name && space === `rel:${schemaOfTable(o.parent)}`)
-          return `${o.id}#seq`;
-      }
+  const removedNeedTmp = removed.filter(
+    (o) => (o.kind === 'enum' || o.kind === 'sequence' || o.kind === 'schema') && cur.objects[o.id],
+  );
+  if (removedNeedTmp.length > 0) {
+    const toNames = new Set<string>();
+    for (const o of Object.values(to.objects))
+      for (const s of spacesOfTo(to, o)) toNames.add(`${s}\u0000${o.name}`);
+    for (const it of items) {
+      if (it.target) for (const s of it.spaces) toNames.add(`${s}\u0000${it.target}`);
     }
-    for (const [impId, st] of implicitState) {
-      if (st.name === name && st.spaces.includes(space)) return impId;
+    for (const o of removedNeedTmp) {
+      const c = cur.objects[o.id]!;
+      if (spacesOf(c).some((s) => toNames.has(`${s}\u0000${c.name}`)))
+        items.push({
+          id: o.id,
+          spaces: spacesOf(c),
+          target: '',
+          rename: (n) => renameSql(cur.objects[o.id]!, n),
+          apply: (n) => {
+            cur.objects[o.id]!.name = n;
+          },
+        });
     }
-    return undefined;
-  };
-  const byId = new Map(items.map((i) => [i.id, i]));
-  const toTemp = (it: Renamable) => {
-    const n = `_dowel_tmp_${++tmp}`;
-    emit('rename', it.id, it.rename(n));
-    it.apply(n);
-  };
-  // 先让出被占用的名字（互换、链式改名），再一次改到目标名
-  for (const it of items) if (!it.target) toTemp(it);
-  for (let changed = true; changed;) {
-    changed = false;
+  }
+  if (items.length > 0) {
+    const targetNames = new Set<string>();
+    const targetKeys = new Set<string>();
     for (const it of items) {
       if (!it.target) continue;
-      for (const s of it.spaces) {
-        const occ = occupant(s, it.target);
-        if (occ && occ !== it.id) {
-          const blocker = byId.get(occ);
-          if (!blocker) throw new PlanError(`名字 ${it.target} 已被占用，无法改名`);
-          if (blocker.target === it.target) throw new PlanError(`名字冲突：${it.target}`);
-          toTemp(blocker);
-          changed = true;
+      targetNames.add(it.target);
+      for (const s of it.spaces) targetKeys.add(`${s}\u0000${it.target}`);
+    }
+    const hasTargetRenames = targetNames.size > 0;
+    // 仅收集目标命名空间键的占用情况，避免全量构建数万个无冲突 Set/Array
+    const occMap = new Map<string, Set<string>>();
+    const idToKeys = new Map<string, string[]>();
+    const addOcc = (id: string, space: string, name: string) => {
+      const k = `${space}\u0000${name}`;
+      if (!targetKeys.has(k)) return;
+      let set = occMap.get(k);
+      if (!set) occMap.set(k, (set = new Set()));
+      set.add(id);
+      let arr = idToKeys.get(id);
+      if (!arr) idToKeys.set(id, (arr = []));
+      arr.push(k);
+    };
+    const moveOcc = (id: string, spaces: string[], name: string) => {
+      const oldKeys = idToKeys.get(id);
+      if (oldKeys) {
+        for (const k of oldKeys) {
+          const set = occMap.get(k);
+          if (set) {
+            set.delete(id);
+            if (set.size === 0) occMap.delete(k);
+          }
+        }
+      }
+      idToKeys.delete(id);
+      for (const s of spaces) addOcc(id, s, name);
+    };
+    if (hasTargetRenames) {
+      for (const id in cur.objects) {
+        const o = cur.objects[id]!;
+        if (targetNames.has(o.name)) {
+          for (const s of spacesOf(o)) addOcc(o.id, s, o.name);
+        }
+        if (o.kind === 'column') {
+          if (cap.namedNotNull && o.notNull && o.notNullName && targetNames.has(o.notNullName)) {
+            for (const s of conFamilySpacesCur(o.parent)) addOcc(`${o.id}#nn`, s, o.notNullName);
+          }
+          if (o.identity?.sequenceName && targetNames.has(o.identity.sequenceName)) {
+            addOcc(`${o.id}#seq`, `rel:${schemaOfTable(o.parent)}`, o.identity.sequenceName);
+          }
+        }
+      }
+      for (const [impId, st] of implicitState) {
+        if (targetNames.has(st.name)) {
+          for (const s of st.spaces) addOcc(impId, s, st.name);
         }
       }
     }
-  }
-  for (const it of items) {
-    if (!it.target) continue;
-    emit('rename', it.id, it.rename(it.target));
-    it.apply(it.target);
+    const occupant = (space: string, name: string, selfId: string): string | undefined => {
+      const set = occMap.get(`${space}\u0000${name}`);
+      if (!set) return undefined;
+      for (const id of set) if (id !== selfId) return id;
+      return undefined;
+    };
+    const byId = new Map(items.map((i) => [i.id, i]));
+    const applyRename = (it: Renamable, n: string) => {
+      emit('rename', it.id, it.rename(n));
+      it.apply(n);
+      if (hasTargetRenames) moveOcc(it.id, it.spaces, n);
+    };
+    const toTemp = (it: Renamable) => applyRename(it, `_dowel_tmp_${++tmp}`);
+    // 先让出被占用的名字（互换、链式改名），再一次改到目标名
+    for (const it of items) if (!it.target) toTemp(it);
+    if (hasTargetRenames) {
+      for (let changed = true; changed;) {
+        changed = false;
+        for (const it of items) {
+          if (!it.target) continue;
+          for (const s of it.spaces) {
+            const occ = occupant(s, it.target, it.id);
+            if (occ) {
+              const blocker = byId.get(occ);
+              if (!blocker) throw new PlanError(`名字 ${it.target} 已被占用，无法改名`);
+              if (blocker.target === it.target) throw new PlanError(`名字冲突：${it.target}`);
+              toTemp(blocker);
+              changed = true;
+            }
+          }
+        }
+      }
+      for (const it of items) {
+        if (!it.target) continue;
+        applyRename(it, it.target);
+      }
+    }
   }
 
   // 改名完成后，PG 已自动更新了引用这些名字的表达式：把当前状态里的表达式同步成新文本
-  for (const o of liveTargets) {
-    const c = cur.objects[o.id];
-    if (!c) continue;
-    const base = inFrom(o.id) ? was(o) : c;
-    const m = migrated(base);
-    if (
-      c.kind === 'table' &&
-      o.kind === 'table' &&
-      m.kind === 'table' &&
-      same(partitionBySql(cur, m, from), partitionBySql(to, o))
-    ) {
-      c.partitionBy = clone(o.partitionBy);
-    }
-    if ((c.kind === 'check' || c.kind === 'index') && same(definition(m), definition(o)))
-      cur.objects[o.id] = { ...c, ...pickExprs(o) } as Obj;
-    if (c.kind === 'column' && o.kind === 'column' && m.kind === 'column') {
-      if (c.generated && same(m.generated, o.generated)) c.generated = clone(o.generated);
-      if (c.default && 'expr' in c.default && same(m.default, o.default)) c.default = clone(o.default);
+  if (hasAnyExprMigration) {
+    for (const id in to.objects) {
+      if (!inFrom(id) && !materialized.has(id)) continue;
+      const o = to.objects[id]!;
+      const c = cur.objects[id];
+      if (!c) continue;
+      if (
+        !(
+          (c.kind === 'table' && Boolean(c.partitionBy) && o.kind === 'table' && Boolean(o.partitionBy)) ||
+          (c.kind === 'check' && o.kind === 'check') ||
+          (c.kind === 'index' && o.kind === 'index') ||
+          (c.kind === 'column' &&
+            o.kind === 'column' &&
+            (Boolean(c.generated) || Boolean(c.default && 'expr' in c.default)))
+        )
+      ) {
+        continue;
+      }
+      const tblId = o.kind === 'table' ? o.id : o.parent;
+      if (!hasGlobalRename && !tableNeedsMigration(tblId)) continue;
+      const base = inFrom(o.id) ? was(o) : c;
+      const m = migrated(base);
+      if (
+        c.kind === 'table' &&
+        c.partitionBy &&
+        o.kind === 'table' &&
+        o.partitionBy &&
+        m.kind === 'table' &&
+        same(partitionBySql(cur, m, from), partitionBySql(to, o))
+      ) {
+        c.partitionBy = clone(o.partitionBy);
+      }
+      if ((c.kind === 'check' || c.kind === 'index') && sameDef(m, o))
+        cur.objects[o.id] = { ...c, ...pickExprs(o) } as Obj;
+      if (c.kind === 'column' && o.kind === 'column' && m.kind === 'column') {
+        if (c.generated && same(m.generated, o.generated)) c.generated = clone(o.generated);
+        if (c.default && 'expr' in c.default && same(m.default, o.default)) c.default = clone(o.default);
+      }
     }
   }
 
@@ -1585,8 +1892,8 @@ export const plan = (rawFrom: Model, rawTo: Model, opts?: PlanOptions): Step[] =
     cur.objects[o.id] = fresh(o);
     emit('createEnum', o.id, `CREATE TYPE ${qname(cur, o)} AS ENUM (${o.values.map(literal).join(', ')})`);
   }
-  for (const o of common) {
-    if (o.kind !== 'enum') continue;
+  for (const o of toIdx.allRef('enum')) {
+    if (!inFrom(o.id)) continue;
     const c = get(cur, o.id, 'enum');
     const old = c.values;
     if (same(old, o.values)) continue;
@@ -1648,10 +1955,10 @@ export const plan = (rawFrom: Model, rawTo: Model, opts?: PlanOptions): Step[] =
     cur.objects[o.id] = { ...fresh(o), ownedBy: null };
     emit('createSequence', o.id, `CREATE SEQUENCE ${qname(cur, o)} ${seqOptions(o.options, true)}`);
   }
-  for (const o of common) {
-    if (o.kind !== 'sequence') continue;
+  for (const o of toIdx.allRef('sequence')) {
+    if (!inFrom(o.id)) continue;
     const c = get(cur, o.id, 'sequence');
-    if (same(c.options, o.options)) continue;
+    if (sameSeqOpts(c.options, o.options)) continue;
     emit('alterSequence', o.id, `ALTER SEQUENCE ${qname(cur, c)} ${seqOptions(o.options, true)}`);
     c.options = clone(o.options);
   }
@@ -1710,23 +2017,38 @@ export const plan = (rawFrom: Model, rawTo: Model, opts?: PlanOptions): Step[] =
     const pendingRelNames = new Set<string>();
     const pendingConNames = new Set<string>();
     const triggerConNames = new Set<string>();
-    for (const o of Object.values(to.objects)) {
-      if (
-        (o.kind === 'primaryKey' || o.kind === 'unique' || o.kind === 'check' || o.kind === 'foreignKey') &&
-        !(o.id in cur.objects)
-      ) {
-        pendingConNames.add(`${o.parent}:${o.name}`);
-        if (o.kind === 'check' || o.kind === 'foreignKey') {
-          for (const desc of partitionDescendants(to, o.parent)) {
-            pendingConNames.add(`${desc.id}:${o.name}`);
+    for (const kind of ['primaryKey', 'unique', 'check', 'foreignKey', 'index'] as const) {
+      for (const o of toIdx.allRef(kind)) {
+        if (!(o.id in cur.objects)) {
+          if (kind !== 'index') {
+            pendingConNames.add(`${o.parent}:${o.name}`);
+            if ((kind === 'check' || kind === 'foreignKey') && toIdx.partitionsRef(o.parent).length > 0) {
+              for (const desc of toIdx.partitionDescendants(o.parent)) {
+                pendingConNames.add(`${desc.id}:${o.name}`);
+              }
+            }
+          }
+          if (kind === 'primaryKey' || kind === 'unique' || kind === 'index') {
+            pendingRelNames.add(`${get(to, o.parent, 'table').parent}:${o.name}`);
+          }
+        } else if (
+          mode === 'preP11' &&
+          (kind === 'check' || kind === 'foreignKey') &&
+          toIdx.partitionsRef(o.parent).length > 0
+        ) {
+          for (const desc of toIdx.partitionDescendants(o.parent)) {
+            const attachedInCur =
+              desc.id in cur.objects && ancestorsCur(desc.id).some((a) => a.id === o.parent);
+            if (!attachedInCur) {
+              pendingConNames.add(`${desc.id}:${o.name}`);
+              triggerConNames.add(`${desc.id}:${o.name}`);
+            }
           }
         }
       }
-      if ((o.kind === 'primaryKey' || o.kind === 'unique' || o.kind === 'index') && !(o.id in cur.objects)) {
-        pendingRelNames.add(`${get(to, o.parent, 'table').parent}:${o.name}`);
-      }
-      if (mode !== 'preP11') continue;
-      if (o.kind === 'column') {
+    }
+    if (mode === 'preP11') {
+      for (const o of toIdx.allRef('column')) {
         const curCol = cur.objects[o.id];
         if (o.identity && (curCol?.kind !== 'column' || !curCol.identity)) {
           pendingRelNames.add(`${get(to, o.parent, 'table').parent}:${o.identity.sequenceName}`);
@@ -1738,22 +2060,15 @@ export const plan = (rawFrom: Model, rawTo: Model, opts?: PlanOptions): Step[] =
             pendingConNames.add(`${o.parent}:${o.notNullName}`);
             triggerConNames.add(`${o.parent}:${o.notNullName}`);
           }
-          for (const desc of partitionDescendants(to, o.parent)) {
-            const attachedInCur =
-              desc.id in cur.objects && ancestorsCur(desc.id).some((a) => a.id === o.parent);
-            if (colPending || !attachedInCur) {
-              pendingConNames.add(`${desc.id}:${o.notNullName}`);
-              triggerConNames.add(`${desc.id}:${o.notNullName}`);
+          if (toIdx.partitionsRef(o.parent).length > 0) {
+            for (const desc of toIdx.partitionDescendants(o.parent)) {
+              const attachedInCur =
+                desc.id in cur.objects && ancestorsCur(desc.id).some((a) => a.id === o.parent);
+              if (colPending || !attachedInCur) {
+                pendingConNames.add(`${desc.id}:${o.notNullName}`);
+                triggerConNames.add(`${desc.id}:${o.notNullName}`);
+              }
             }
-          }
-        }
-      } else if ((o.kind === 'check' || o.kind === 'foreignKey') && o.id in cur.objects) {
-        for (const desc of partitionDescendants(to, o.parent)) {
-          const attachedInCur =
-            desc.id in cur.objects && ancestorsCur(desc.id).some((a) => a.id === o.parent);
-          if (!attachedInCur) {
-            pendingConNames.add(`${desc.id}:${o.name}`);
-            triggerConNames.add(`${desc.id}:${o.name}`);
           }
         }
       }
@@ -1764,7 +2079,127 @@ export const plan = (rawFrom: Model, rawTo: Model, opts?: PlanOptions): Step[] =
     const { pendingRelNames, pendingConNames, triggerConNames } = collectPendingNames(mode);
     const implicitRels = new Set<string>();
     const implicitCons = new Set<string>();
+    const noopRecord: (o: Obj) => void = () => {};
+    const emptyPartDescs: (parentId: string) => Table[] = () => [];
+    const unusedImplicitNameOf: (
+      o: PrimaryKey | Unique | Index,
+      desc: Table,
+      skipPending: boolean,
+    ) => string = () => '';
+
+    if (
+      (mode === 'p15' && pendingRelNames.size === 0 && pendingConNames.size === 0) ||
+      (mode === 'preP11' && triggerConNames.size === 0 && addedTables.length === 0 && willDetach.size === 0)
+    ) {
+      return {
+        hasCurPartitions: false,
+        pendingRelNames,
+        pendingConNames,
+        implicitRels,
+        implicitCons,
+        implicitNameOf: unusedImplicitNameOf,
+        partDescs: emptyPartDescs,
+        recordCurAdded: noopRecord,
+      };
+    }
+
+    const partChildren = new Map<string, Table[]>();
+    const existingParentKeys: Record<'primaryKey' | 'unique' | 'index', (PrimaryKey | Unique | Index)[]> = {
+      primaryKey: [],
+      unique: [],
+      index: [],
+    };
+    let hasCurPartitions = false;
+    for (const id in cur.objects) {
+      const o = cur.objects[id]!;
+      if (o.kind === 'table') {
+        if (o.partitionBy !== null) hasCurPartitions = true;
+        if (o.partitionOf !== null) {
+          hasCurPartitions = true;
+          let list = partChildren.get(o.partitionOf.parent);
+          if (!list) partChildren.set(o.partitionOf.parent, (list = []));
+          list.push(o);
+        }
+      } else if (o.kind === 'primaryKey' || o.kind === 'unique' || o.kind === 'index') {
+        if (get(cur, o.parent, 'table').partitionBy !== null) {
+          existingParentKeys[o.kind].push(o);
+        }
+      }
+    }
+    if (!hasCurPartitions) {
+      return {
+        hasCurPartitions: false,
+        pendingRelNames,
+        pendingConNames,
+        implicitRels,
+        implicitCons,
+        implicitNameOf: unusedImplicitNameOf,
+        partDescs: emptyPartDescs,
+        recordCurAdded: noopRecord,
+      };
+    }
+
+    const partDescs = (parentId: string): Table[] => {
+      if (!partChildren.has(parentId)) return [];
+      const out: Table[] = [];
+      const seen = new Set<string>([parentId]);
+      const queue = [parentId];
+      for (let head = 0; head < queue.length; head++) {
+        const kids = partChildren.get(queue[head]!);
+        if (!kids) continue;
+        for (const child of kids) {
+          if (seen.has(child.id)) continue;
+          seen.add(child.id);
+          out.push(child);
+          queue.push(child.id);
+        }
+      }
+      return out;
+    };
+
+    let nsReady = false;
+    const relOwners = new Map<string, Set<string>>();
+    const conLocal = new Map<string, Set<string>>();
+    const conProp = new Map<string, Set<string>>();
+    const addName = (map: Map<string, Set<string>>, k: string, name: string) => {
+      let s = map.get(k);
+      if (!s) map.set(k, (s = new Set()));
+      s.add(name);
+    };
+    const recordObj = (o: Obj) => {
+      if (o.kind === 'table' || o.kind === 'sequence') {
+        addName(relOwners, o.parent, o.name);
+      } else if (o.kind === 'index' || o.kind === 'primaryKey' || o.kind === 'unique') {
+        addName(relOwners, get(cur, o.parent, 'table').parent, o.name);
+        if (o.kind !== 'index') addName(conLocal, o.parent, o.name);
+      } else if (o.kind === 'check' || o.kind === 'foreignKey') {
+        addName(conLocal, o.parent, o.name);
+        addName(conProp, o.parent, o.name);
+      } else if (o.kind === 'column') {
+        if (o.identity) {
+          addName(relOwners, get(cur, o.parent, 'table').parent, o.identity.sequenceName);
+        }
+        if (cap.namedNotNull && o.notNull && o.notNullName) {
+          addName(conLocal, o.parent, o.notNullName);
+          addName(conProp, o.parent, o.notNullName);
+        }
+      }
+    };
+    const ensureNamespaces = () => {
+      if (nsReady) return;
+      nsReady = true;
+      for (const id in cur.objects) recordObj(cur.objects[id]!);
+    };
+    const relTaken = (schema: string, name: string) => relOwners.get(schema)?.has(name) ?? false;
+    const conTaken = (tableId: string, name: string): boolean => {
+      if (conLocal.get(tableId)?.has(name)) return true;
+      for (const anc of ancestorsCur(tableId)) {
+        if (anc.id !== tableId && conProp.get(anc.id)?.has(name)) return true;
+      }
+      return false;
+    };
     const implicitNameOf = (o: PrimaryKey | Unique | Index, desc: Table, skipPending: boolean): string => {
+      ensureNamespaces();
       const colPart =
         o.kind === 'primaryKey'
           ? null
@@ -1778,15 +2213,16 @@ export const plan = (rawFrom: Model, rawTo: Model, opts?: PlanOptions): Step[] =
         colPart,
         label,
         (n) =>
-          relTakenCur(desc.parent, n) ||
+          relTaken(desc.parent, n) ||
           implicitRels.has(`${desc.parent}:${n}`) ||
           (skipPending && pendingRelNames.has(`${desc.parent}:${n}`)) ||
           (isCon &&
-            (conTakenCur(desc.id, n) ||
+            (conTaken(desc.id, n) ||
               implicitCons.has(`${desc.id}:${n}`) ||
               (skipPending && pendingConNames.has(`${desc.id}:${n}`)))),
       );
     };
+
     const existingImplicits: {
       o: PrimaryKey | Unique | Index;
       desc: Table;
@@ -1795,15 +2231,10 @@ export const plan = (rawFrom: Model, rawTo: Model, opts?: PlanOptions): Step[] =
     }[] = [];
     for (const kind of ['primaryKey', 'unique', 'index'] as const) {
       const isCon = kind !== 'index';
-      const existingParents = Object.values(cur.objects)
-        .filter(
-          (o): o is PrimaryKey | Unique | Index =>
-            o.kind === kind && get(cur, o.parent, 'table').partitionBy !== null,
-        )
-        .sort((a, b) => cmpKeyIn(cur, a, b));
+      const existingParents = existingParentKeys[kind].sort((a, b) => cmpKeyIn(cur, a, b));
       for (const o of existingParents) {
         const tbl = get(cur, o.parent, 'table');
-        for (const desc of partitionDescendants(cur, tbl.id).sort((a, b) => cmpTableIn(cur, a, b))) {
+        for (const desc of partDescs(tbl.id).sort((a, b) => cmpTableIn(cur, a, b))) {
           const impKey = `${desc.id}#imp#${o.id}`;
           const imp = implicitState.get(impKey);
           const name = imp ? imp.name : implicitNameOf(o, desc, false);
@@ -1842,7 +2273,18 @@ export const plan = (rawFrom: Model, rawTo: Model, opts?: PlanOptions): Step[] =
         if (isCon) implicitCons.add(`${desc.id}:${safeName}`);
       }
     }
-    return { pendingRelNames, pendingConNames, implicitRels, implicitCons, implicitNameOf };
+    return {
+      hasCurPartitions: true,
+      pendingRelNames,
+      pendingConNames,
+      implicitRels,
+      implicitCons,
+      implicitNameOf,
+      partDescs,
+      recordCurAdded: (o: Obj) => {
+        if (nsReady) recordObj(o);
+      },
+    };
   };
   prepareExistingImplicits('preP11');
   // ───── P11 加列（生成列在改完列之后再加，见 P12g） ─────
@@ -1863,7 +2305,26 @@ export const plan = (rawFrom: Model, rawTo: Model, opts?: PlanOptions): Step[] =
   };
 
   // ───── P12 改列：分几轮，保证依赖顺序 ─────
-  const altered = liveTargets.filter((o): o is Column => o.kind === 'column' && !regen.has(o.id));
+  const altered: Column[] = [];
+  for (const o of toIdx.allRef('column')) {
+    if (regen.has(o.id) || (!inFrom(o.id) && !materialized.has(o.id))) continue;
+    if (typeChanged.has(o.id)) {
+      altered.push(o);
+      continue;
+    }
+    const c = cur.objects[o.id];
+    if (c?.kind !== 'column') continue;
+    if (
+      c.notNull !== o.notNull ||
+      c.pos !== o.pos ||
+      c.notNullNameMode !== o.notNullNameMode ||
+      (cap.namedNotNull && o.notNull && c.notNullName !== o.notNullName) ||
+      !sameIdentity(c.identity, o.identity) ||
+      !sameDefault(c.default, o.default)
+    ) {
+      altered.push(o);
+    }
+  }
   const A = (c: Column) => `ALTER TABLE ${T(c.parent)} ALTER COLUMN ${C(c.id)}`;
   const emitDefaultCascade = (c: Column, kind: 'dropDefault' | 'setDefault', clause: string) => {
     emit(kind, c.id, `${A(c)} ${clause}`);
@@ -1988,10 +2449,7 @@ export const plan = (rawFrom: Model, rawTo: Model, opts?: PlanOptions): Step[] =
       childCols
         .filter((cc) => {
           const rc = rootCols.find((x) => x.name === cc.name);
-          return (
-            rc &&
-            !same(pick(cc, ['type', 'typeRef', 'collation']), pick(rc, ['type', 'typeRef', 'collation']))
-          );
+          return rc && !sameColType(cc, rc);
         })
         .map((cc) => cc.name),
     );
@@ -2097,7 +2555,7 @@ export const plan = (rawFrom: Model, rawTo: Model, opts?: PlanOptions): Step[] =
           emitDefaultCascade(cc, 'dropDefault', 'DROP DEFAULT');
           cc.default = null;
         }
-        if (!same(pick(cc, ['type', 'typeRef', 'collation']), pick(rc, ['type', 'typeRef', 'collation']))) {
+        if (!sameColType(cc, rc)) {
           const viaText = !!(cc.typeRef || rc.typeRef) || !hasDirectCast(cc.type, rc.type);
           const targetType = rc.typeRef ? qname(cur, get(cur, rc.typeRef, 'enum')) + rc.type : rc.type;
           emit(
@@ -2248,59 +2706,83 @@ export const plan = (rawFrom: Model, rawTo: Model, opts?: PlanOptions): Step[] =
   // ───── P15 加主键、唯一、CHECK，建索引 ─────
   // cur 里没有的就是新增的或前面删掉待重建的；子表本地对象先于父表创建，
   // 且当在已有子分区的父表上建 PK / UNIQUE / INDEX 时，若 PG 自动生成的子分区继承索引名抢占了待建对象的名字，立即改名为非冲突派生名
-  const { pendingRelNames, pendingConNames, implicitRels, implicitCons, implicitNameOf } =
-    prepareExistingImplicits('p15');
-  for (const kind of ['primaryKey', 'unique', 'check', 'index'] as const) {
-    const todo = Object.values(to.objects)
-      .filter((o): o is PrimaryKey | Unique | Check | Index => o.kind === kind && !(o.id in cur.objects))
-      .sort((a, b) => cmpKeyIn(to, a, b));
-    for (const o of todo) {
-      emitConstraintOrIndex(o);
-      if (o.kind !== 'index') {
-        pendingConNames.delete(`${o.parent}:${o.name}`);
-        if (o.kind === 'check') {
-          for (const desc of partitionDescendants(cur, o.parent)) {
-            pendingConNames.delete(`${desc.id}:${o.name}`);
-          }
+  const {
+    hasCurPartitions,
+    pendingRelNames,
+    pendingConNames,
+    implicitRels,
+    implicitCons,
+    implicitNameOf,
+    partDescs,
+    recordCurAdded,
+  } = prepareExistingImplicits('p15');
+  if (pendingRelNames.size > 0 || pendingConNames.size > 0) {
+    if (!hasCurPartitions) {
+      for (const kind of ['primaryKey', 'unique', 'check', 'index'] as const) {
+        const todo = toIdx
+          .allRef(kind)
+          .filter((o) => !(o.id in cur.objects))
+          .sort((a, b) => cmpKeyIn(to, a, b));
+        for (const o of todo) {
+          emitConstraintOrIndex(o);
         }
       }
-      if (o.kind === 'check') continue;
-      const tbl = get(cur, o.parent, 'table');
-      pendingRelNames.delete(`${tbl.parent}:${o.name}`);
-      if (tbl.partitionBy === null) continue;
-      const isCon = o.kind !== 'index';
-      for (const desc of partitionDescendants(cur, tbl.id).sort((a, b) => cmpTableIn(cur, a, b))) {
-        const pgName = implicitNameOf(o, desc, false);
-        if (
-          pendingRelNames.has(`${desc.parent}:${pgName}`) ||
-          (isCon && pendingConNames.has(`${desc.id}:${pgName}`))
-        ) {
-          const safeName = implicitNameOf(o, desc, true);
-          if (o.kind === 'index') {
-            emit(
-              'rename',
-              `${o.id}#ci`,
-              `ALTER INDEX ${relIn(desc.id, pgName)} RENAME TO ${ident(safeName)}`,
-            );
-          } else {
-            emit(
-              'rename',
-              `${o.id}#cc`,
-              `ALTER TABLE ${T(desc.id)} RENAME CONSTRAINT ${ident(pgName)} TO ${ident(safeName)}`,
-            );
+    } else {
+      for (const kind of ['primaryKey', 'unique', 'check', 'index'] as const) {
+        const todo = toIdx
+          .allRef(kind)
+          .filter((o) => !(o.id in cur.objects))
+          .sort((a, b) => cmpKeyIn(to, a, b));
+        for (const o of todo) {
+          emitConstraintOrIndex(o);
+          recordCurAdded(cur.objects[o.id]!);
+          if (o.kind !== 'index') {
+            pendingConNames.delete(`${o.parent}:${o.name}`);
+            if (o.kind === 'check') {
+              for (const desc of partDescs(o.parent)) {
+                pendingConNames.delete(`${desc.id}:${o.name}`);
+              }
+            }
           }
-          implicitRels.add(`${desc.parent}:${safeName}`);
-          if (isCon) implicitCons.add(`${desc.id}:${safeName}`);
-        } else {
-          implicitRels.add(`${desc.parent}:${pgName}`);
-          if (isCon) implicitCons.add(`${desc.id}:${pgName}`);
+          if (o.kind === 'check') continue;
+          const tbl = get(cur, o.parent, 'table');
+          pendingRelNames.delete(`${tbl.parent}:${o.name}`);
+          if (tbl.partitionBy === null) continue;
+          const isCon = o.kind !== 'index';
+          for (const desc of partDescs(tbl.id).sort((a, b) => cmpTableIn(cur, a, b))) {
+            const pgName = implicitNameOf(o, desc, false);
+            if (
+              pendingRelNames.has(`${desc.parent}:${pgName}`) ||
+              (isCon && pendingConNames.has(`${desc.id}:${pgName}`))
+            ) {
+              const safeName = implicitNameOf(o, desc, true);
+              if (o.kind === 'index') {
+                emit(
+                  'rename',
+                  `${o.id}#ci`,
+                  `ALTER INDEX ${relIn(desc.id, pgName)} RENAME TO ${ident(safeName)}`,
+                );
+              } else {
+                emit(
+                  'rename',
+                  `${o.id}#cc`,
+                  `ALTER TABLE ${T(desc.id)} RENAME CONSTRAINT ${ident(pgName)} TO ${ident(safeName)}`,
+                );
+              }
+              implicitRels.add(`${desc.parent}:${safeName}`);
+              if (isCon) implicitCons.add(`${desc.id}:${safeName}`);
+            } else {
+              implicitRels.add(`${desc.parent}:${pgName}`);
+              if (isCon) implicitCons.add(`${desc.id}:${pgName}`);
+            }
+          }
         }
       }
     }
   }
   // ───── P16 加外键 ─────
-  for (const o of Object.values(to.objects)) {
-    if (o.kind !== 'foreignKey' || o.id in cur.objects) continue;
+  for (const o of toIdx.allRef('foreignKey')) {
+    if (o.id in cur.objects) continue;
     cur.objects[o.id] = fresh(o);
     emit(
       'addForeignKey',
@@ -2334,16 +2816,16 @@ export const plan = (rawFrom: Model, rawTo: Model, opts?: PlanOptions): Step[] =
         return `CONSTRAINT ${ident(o.name)} ON ${T(o.parent)}`;
     }
   };
-  for (const o of Object.values(to.objects)) {
-    const c = cur.objects[o.id];
+  for (const id in to.objects) {
+    const o = to.objects[id]!;
+    const c = cur.objects[id];
     if (!c) throw new PlanError(`内部错误：规划结束时缺少对象 ${o.kind} ${o.name}`);
-    if (c.name !== o.name || !same(definition(c, cur), definition(o, to)))
+    if (c.name !== o.name || !sameDef(c, o, cur, to, from))
       throw new PlanError(`内部错误：规划结束时 ${o.kind} ${o.name} 与目标不一致`);
     if ((c.comment ?? null) !== (o.comment ?? null) && o.kind !== 'opaque') {
       const what = commentTarget(o);
       emit('comment', o.id, `COMMENT ON ${what} IS ${o.comment === null ? 'NULL' : literal(o.comment)}`);
     }
-    cur.objects[o.id] = clone(o);
   }
 
   // 自检：规划结束时的状态必须等于目标版本

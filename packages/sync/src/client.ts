@@ -1,5 +1,5 @@
 // 客户端：已确认状态 + 待确认修改队列；收到服务器的提交后在新状态上重放队列（rebase）。
-import { EditError, type Model } from '@dowel/core';
+import { EditError, type Model, MutableModelIndex } from '@dowel/core';
 
 import {
   applyChanges,
@@ -34,12 +34,20 @@ export class SyncClient {
   private nextN = 1;
   private early = new Map<number, Commit>();
   private listeners = new Set<() => void>();
+  private confirmedIndex: MutableModelIndex | null = null;
   send: (m: ToServer) => void = () => {};
 
   constructor(id: string, model: Model) {
     this.id = id;
     this.confirmed = model;
     this.view = model;
+  }
+
+  private getConfirmedIndex(): MutableModelIndex {
+    if (!this.confirmedIndex) {
+      this.confirmedIndex = new MutableModelIndex(this.confirmed);
+    }
+    return this.confirmedIndex;
   }
 
   subscribe(fn: () => void): () => void {
@@ -52,13 +60,22 @@ export class SyncClient {
    * 本地执行不合法时直接抛 EditError，不发给服务器。
    */
   mutate(name: string, args: unknown, basis?: Versions): number {
-    const { changes } = execute(this.view, name, args);
+    const baseIdx = this.pending.length === 0 ? this.getConfirmedIndex() : undefined;
+    const { next, changes } = execute(this.view, name, args, baseIdx);
     let reads = opReads(this.view, this.viewVersions, args, changes);
     if (basis) reads = reads.map(([id, v]) => [id, id in basis ? basis[id]! : v]);
-    const op: PendingOp = { client: this.id, n: this.nextN++, name, args, reads };
+    const rawOp: Op = { client: this.id, n: this.nextN++, name, args, reads };
+    const op: PendingOp = { ...rawOp, stale: false };
     this.pending.push(op);
-    this.rebuild();
-    if (this.online && this.ready) this.send({ t: 'op', op });
+    this.view = next;
+    const nextVv = this.viewVersions === this.versions ? { ...this.versions } : this.viewVersions;
+    for (const c of changes) {
+      if (c.obj) nextVv[c.id] = `p:${op.client}:${op.n}` as Ver;
+      else delete nextVv[c.id];
+    }
+    this.viewVersions = nextVv;
+    for (const fn of this.listeners) fn();
+    if (this.online && this.ready) this.send({ t: 'op', op: rawOp });
     return op.n;
   }
 
@@ -81,6 +98,7 @@ export class SyncClient {
       this.confirmed = m.model;
       this.versions = m.versions;
       this.seq = m.seq;
+      this.confirmedIndex = null;
       for (const k of this.early.keys()) if (k <= m.seq) this.early.delete(k);
       this.pending = this.pending.filter((p) => p.n > m.lastProcessed);
     } else if (m.t === 'commit') {
@@ -88,8 +106,25 @@ export class SyncClient {
       this.early.set(m.seq, m);
       for (let c = this.early.get(this.seq + 1); c; c = this.early.get(this.seq + 1)) {
         this.early.delete(c.seq);
-        if (this.confirmed === this.view) this.confirmed = structuredClone(this.confirmed);
+        if (this.confirmed === this.view) {
+          this.confirmed = { ...this.confirmed, objects: { ...this.confirmed.objects } };
+          this.confirmedIndex?.setModel(this.confirmed);
+        }
+        const batch = this.confirmedIndex
+          ? c.changes.map((ch) => ({
+              id: ch.id,
+              prev: this.confirmed.objects[ch.id],
+              next: ch.obj ?? undefined,
+            }))
+          : null;
         applyChanges(this.confirmed, this.versions, c.changes, c.seq);
+        if (batch) {
+          for (let i = 0; i < batch.length; i++) {
+            const ch = c.changes[i]!;
+            batch[i]!.next = ch.obj ? this.confirmed.objects[ch.id] : undefined;
+          }
+          this.confirmedIndex!.applyBatch(this.confirmed, batch);
+        }
         this.seq = c.seq;
         if (c.client === this.id) this.pending = this.pending.filter((p) => p.n !== c.n);
       }
@@ -109,7 +144,8 @@ export class SyncClient {
       const vv: Versions = { ...this.versions };
       for (const op of this.pending) {
         try {
-          const { next, changes } = execute(view, op.name, op.args);
+          const baseIdx = view === this.confirmed ? this.getConfirmedIndex() : undefined;
+          const { next, changes } = execute(view, op.name, op.args, baseIdx);
           view = next;
           for (const c of changes) {
             if (c.obj) vv[c.id] = `p:${op.client}:${op.n}` as Ver;

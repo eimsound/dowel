@@ -6,7 +6,6 @@ import {
   collectHostEnv,
   formatBytes,
   formatMs,
-  measureAsync,
   measureSync,
   memorySnapshot,
   parseTablesArg,
@@ -185,13 +184,10 @@ const runScale = async (tableCount: number): Promise<CoreScaleResult> => {
     0,
   );
 
-  // 为保证每组对比干净，单独用 measureAsync 包一层统计后也直接调用 benchMutateRoundTrip
   const { mutateAll, mutateSetComment, mutateRenameColumn } = await benchMutateRoundTrip(
     gen,
     isLarge ? 8 : 15,
   );
-  // 让 measureAsync 保持引入被使用并在需要时可复测（此处直接使用分项测量）
-  void measureAsync;
 
   const memEnd = memorySnapshot(true);
 

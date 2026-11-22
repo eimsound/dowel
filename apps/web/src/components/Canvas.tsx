@@ -1,7 +1,15 @@
 // 画布：支持 <=100 表平铺、>100 表默认板块折叠汇总卡片、按需 elkjs 布局与单表 N 跳外键邻域聚焦（DESIGN.md：画布）。
 import { type CanvasSection, sectionColorCssVar } from '@dowel/api';
-import { all, columnsOf, type Model, partitionKeyColumns, resolvePartitionBy, type Table } from '@dowel/core';
 import {
+  buildModelIndex,
+  type Model,
+  type ModelIndex,
+  partitionKeyColumns,
+  resolvePartitionBy,
+  type Table,
+} from '@dowel/core';
+import {
+  applyNodeChanges,
   Background,
   BackgroundVariant,
   type Edge,
@@ -19,7 +27,6 @@ import {
 } from '@xyflow/react';
 
 import '@xyflow/react/dist/style.css';
-import ELK from 'elkjs/lib/elk.bundled.js';
 import { Focus, Maximize, Table2, ZoomIn, ZoomOut } from 'lucide-react';
 import { memo, useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState } from 'react';
 import { useTranslation } from 'react-i18next';
@@ -36,6 +43,7 @@ import {
   resolveTopLevelTableId,
   SUMMARY_NODE_PREFIX,
 } from '../sections.ts';
+import { runElkLayout, StaleLayoutError } from '../workers/elk-client.ts';
 import type { Layout } from '../workspace.ts';
 import { IconButton } from './ui.tsx';
 
@@ -47,6 +55,8 @@ type Col = {
   key: 'PK' | 'FK' | 'UQ' | '';
   notNull: boolean;
   isPartKey: boolean;
+  hasSourceHandle: boolean;
+  hasTargetHandle: boolean;
 };
 type TableData = {
   table: Table;
@@ -55,7 +65,6 @@ type TableData = {
   columns: Col[];
   partitions: number;
   partitionStrategy: string | null;
-  selected: boolean;
 };
 type TableNode = Node<TableData, 'table'>;
 
@@ -74,19 +83,30 @@ const HEAD_H = 34;
 const ROW_H = 26;
 const nodeHeight = (cols: number) => HEAD_H + ROW_H * Math.max(cols, 1) + 2;
 
-/** 每列左右各有一个起点和终点（不可见），连线连到具体的列 */
-const RowHandles = ({ id }: { id: string }) => (
+const DEFAULT_FK_STYLE = { strokeWidth: 1.5, stroke: 'var(--edge)' };
+const ACTIVE_FK_STYLE = { strokeWidth: 1.5, stroke: 'var(--primary)' };
+
+/** 仅为参与外键连线的列渲染起终点 Handle，显著降低大规模展开画布的 DOM 与 Observer 数量 */
+const RowHandles = ({ id, hasSource, hasTarget }: { id: string; hasSource: boolean; hasTarget: boolean }) => (
   <>
-    <Handle type="source" id={`${id}-sl`} position={Position.Left} isConnectable={false} />
-    <Handle type="source" id={`${id}-sr`} position={Position.Right} isConnectable={false} />
-    <Handle type="target" id={`${id}-tl`} position={Position.Left} isConnectable={false} />
-    <Handle type="target" id={`${id}-tr`} position={Position.Right} isConnectable={false} />
+    {hasSource && (
+      <>
+        <Handle type="source" id={`${id}-sl`} position={Position.Left} isConnectable={false} />
+        <Handle type="source" id={`${id}-sr`} position={Position.Right} isConnectable={false} />
+      </>
+    )}
+    {hasTarget && (
+      <>
+        <Handle type="target" id={`${id}-tl`} position={Position.Left} isConnectable={false} />
+        <Handle type="target" id={`${id}-tr`} position={Position.Right} isConnectable={false} />
+      </>
+    )}
   </>
 );
 
 const KEY_CLASS = { PK: 'text-pk', FK: 'text-fk', UQ: 'text-text-3', '': '' };
 
-const TableNodeView = memo(({ data }: NodeProps<TableNode>) => {
+const TableNodeView = memo(({ data, selected }: NodeProps<TableNode>) => {
   const { t } = useTranslation();
   const partBadge = data.partitionStrategy
     ? `${data.partitionStrategy} · ${data.partitions}`
@@ -97,7 +117,7 @@ const TableNodeView = memo(({ data }: NodeProps<TableNode>) => {
     <div
       style={{ width: NODE_W }}
       className={`rounded-md border bg-[var(--node-bg)] font-mono shadow-[var(--shadow-node)] ${
-        data.selected
+        selected
           ? 'border-primary shadow-[0_0_0_3px_var(--primary-ring),var(--shadow-node)]'
           : 'border-[var(--node-border)]'
       }`}
@@ -128,7 +148,7 @@ const TableNodeView = memo(({ data }: NodeProps<TableNode>) => {
           style={{ height: ROW_H }}
           className="relative flex items-center gap-1.5 px-2.5 text-sm"
         >
-          <RowHandles id={c.id} />
+          <RowHandles id={c.id} hasSource={c.hasSourceHandle} hasTarget={c.hasTargetHandle} />
           <span className={`w-5 text-[10px] font-semibold ${KEY_CLASS[c.key]}`}>{c.key}</span>
           <span className="min-w-0 flex-1 truncate">
             {c.name}
@@ -215,27 +235,36 @@ export const shortType = (t: string) =>
     .replace(/^double precision/, 'float8')
     .replace(/^bit varying/, 'varbit');
 
-/** 用 elkjs 仅计算当前需要渲染且缺少位置的表的位置（绝不对已折叠的百/千表运行布局） */
-const autoLayout = async (m: Model, tables: Table[], fixed: Layout): Promise<Layout> => {
-  const elk = new ELK();
+/** 在 Web Worker 中异步运行 elkjs，仅计算当前需要渲染且缺少位置的表（避免阻塞主线程） */
+const autoLayout = async (
+  m: Model,
+  tables: Table[],
+  fixed: Layout,
+  idx?: ModelIndex,
+  signal?: AbortSignal,
+): Promise<Layout> => {
+  const effectiveIdx = idx ?? buildModelIndex(m);
   const ids = new Set(tables.map((t) => t.id));
-  const res = await elk.layout({
-    id: 'root',
-    layoutOptions: {
-      'elk.algorithm': 'layered',
-      'elk.direction': 'RIGHT',
-      'elk.spacing.nodeNode': '40',
-      'elk.layered.spacing.nodeNodeBetweenLayers': '90',
-    },
-    children: tables.map((t) => ({ id: t.id, width: NODE_W, height: nodeHeight(columnsOf(m, t.id).length) })),
-    edges: all(m, 'foreignKey')
+  const positions = await runElkLayout(
+    tables.map((t) => ({
+      id: t.id,
+      width: NODE_W,
+      height: nodeHeight(effectiveIdx.columnsRef(t.id).length),
+    })),
+    effectiveIdx
+      .allRef('foreignKey')
       .filter((f) => ids.has(f.parent) && ids.has(f.refTable) && f.parent !== f.refTable)
       .map((f) => ({ id: f.id, sources: [f.parent], targets: [f.refTable] })),
-  });
+    { signal },
+  );
   const out: Layout = {};
   // 已有位置的表不动；新算出的整体平移到已有内容的右侧
   const maxX = Math.max(0, ...Object.values(fixed).map((p) => p.x + NODE_W + 80));
-  for (const c of res.children ?? []) if (!fixed[c.id]) out[c.id] = { x: (c.x ?? 0) + maxX, y: c.y ?? 0 };
+  for (const t of tables) {
+    if (fixed[t.id]) continue;
+    const p = positions[t.id];
+    if (p) out[t.id] = { x: p.x + maxX, y: p.y };
+  }
   return out;
 };
 
@@ -303,239 +332,280 @@ const ZoomPanel = () => {
 
 const EMPTY_SECTIONS: CanvasSection[] = [];
 const EMPTY_EXPANDED: string[] = [];
+const miniMapNodeClass = (n: CanvasNode) => (n.selected ? 'selected' : '');
 
-export const Canvas = ({
-  model,
-  layout,
-  selected,
-  onSelect,
-  onMove,
-  relayout,
-  sections = EMPTY_SECTIONS,
-  viewMode = 'auto',
-  expandedGroups,
-  onToggleGroup,
-  onCollapseAllGroups,
-  focus = null,
-  onChangeFocus,
-  onChangeViewMode,
-  readOnly = false,
-}: {
-  model: Model;
-  layout: Layout;
-  selected: string | null;
-  onSelect: (id: string | null) => void;
-  onMove: (l: Layout) => void;
-  /** 变化时对当前可见表重新自动布局 */
-  relayout: number;
-  sections?: CanvasSection[];
-  viewMode?: CanvasViewMode;
-  expandedGroups?: string[];
-  onToggleGroup?: (groupId: string) => void;
-  onCollapseAllGroups?: () => void;
-  focus?: FocusState | null;
-  onChangeFocus?: (next: FocusState | null) => void;
-  onChangeViewMode?: (mode: CanvasViewMode) => void;
-  readOnly?: boolean;
-}) => {
-  const { t } = useTranslation();
-  const [dragging, setDragging] = useState<Layout>({});
-  const [summaryPositions, setSummaryPositions] = useState<Layout>({});
-  const [localFallback, setLocalFallback] = useState<Layout>({});
-  const [localExpanded, setLocalExpanded] = useState<string[]>(EMPTY_EXPANDED);
-  const [flow, setFlow] = useState<ReactFlowInstance<CanvasNode> | null>(null);
-  const fitted = useRef(false);
-
-  const tables = useMemo(() => all(model, 'table').filter((tb) => !tb.partitionOf), [model]);
-  const activeExpanded = expandedGroups ?? localExpanded;
-  const toggleGroup = useCallback(
-    (groupId: string) => {
-      if (onToggleGroup) {
-        onToggleGroup(groupId);
-        return;
-      }
-      setLocalExpanded((prev) =>
-        prev.includes(groupId) ? prev.filter((x) => x !== groupId) : [...prev, groupId],
-      );
-    },
-    [onToggleGroup],
-  );
-
-  // 解析聚焦邻域（仅当目标表仍存在时激活）
-  const activeFocus = useMemo(() => {
-    if (!focus) return null;
-    const rootId = resolveTopLevelTableId(model, focus.tableId);
-    if (!rootId) return null;
-    return { tableId: rootId, hops: focus.hops };
-  }, [focus, model]);
-
-  const focusIds = useMemo(
-    () => (activeFocus ? collectNeighborhood(model, activeFocus.tableId, activeFocus.hops) : null),
-    [activeFocus, model],
-  );
-
-  const effectiveMode = effectiveCanvasMode(viewMode, tables.length);
-
-  const { groups, summaryEdges, tableToGroup } = useMemo(
-    () => buildCanvasGroups(model, sections),
-    [model, sections],
-  );
-  const expandedSet = useMemo(() => new Set(activeExpanded), [activeExpanded]);
-  const expandedGroupsList = useMemo(
-    () => groups.filter((g) => expandedSet.has(g.id)),
-    [groups, expandedSet],
-  );
-  const collapsedGroups = useMemo(
-    () => (effectiveMode === 'sections' && !activeFocus ? groups.filter((g) => !expandedSet.has(g.id)) : []),
-    [effectiveMode, activeFocus, groups, expandedSet],
-  );
-
-  const summaryGridPos = useMemo(() => {
-    const cols = Math.min(5, Math.max(1, Math.ceil(Math.sqrt(Math.max(1, collapsedGroups.length)))));
-    const map = new Map<string, { x: number; y: number }>();
-    collapsedGroups.forEach((g, idx) => {
-      const col = idx % cols;
-      const row = Math.floor(idx / cols);
-      map.set(g.id, { x: col * (SUMMARY_W + 64), y: row * (SUMMARY_H + 56) });
-    });
-    return map;
-  }, [collapsedGroups]);
-
-  const groupPos = useCallback(
-    (groupId: string) => {
-      const nodeId = `${SUMMARY_NODE_PREFIX}${groupId}`;
-      return dragging[nodeId] ?? summaryPositions[nodeId] ?? summaryGridPos.get(groupId);
-    },
-    [dragging, summaryPositions, summaryGridPos],
-  );
-
-  // 当前视图应当渲染并布局的表（性能关键：折叠时不含未展开表，不触发 elkjs）
-  const visibleTables = useMemo(() => {
-    if (focusIds) return tables.filter((tb) => focusIds.has(tb.id));
-    if (effectiveMode === 'flat') return tables;
-    if (expandedGroupsList.length === 0) return [];
-    const visibleIds = new Set<string>();
-    for (const g of expandedGroupsList) for (const tid of g.tableIds) visibleIds.add(tid);
-    return tables.filter((tb) => visibleIds.has(tb.id));
-  }, [focusIds, effectiveMode, tables, expandedGroupsList]);
-
-  const visibleTableIds = useMemo(() => new Set(visibleTables.map((tb) => tb.id)), [visibleTables]);
-  const savedPos = useCallback((id: string) => layout[id] ?? localFallback[id], [layout, localFallback]);
-  const pos = useCallback(
-    (id: string) => dragging[id] ?? layout[id] ?? localFallback[id],
-    [dragging, layout, localFallback],
-  );
-
-  // 仅对当前可见且尚未拥有坐标的表执行自动布局
-  useEffect(() => {
-    const missing = visibleTables.filter((tb) => !savedPos(tb.id));
-    if (!missing.length) return;
-    let alive = true;
-    const occupied: Layout = {};
-    for (const tb of visibleTables) {
-      const p = savedPos(tb.id);
-      if (p) occupied[tb.id] = p;
-    }
-    for (const g of collapsedGroups) {
-      const gp = summaryPositions[`${SUMMARY_NODE_PREFIX}${g.id}`] ?? summaryGridPos.get(g.id);
-      if (gp) occupied[`${SUMMARY_NODE_PREFIX}${g.id}`] = gp;
-    }
-    void autoLayout(model, missing, occupied).then((l) => {
-      if (!alive || !Object.keys(l).length) return;
-      if (readOnly) {
-        setLocalFallback((prev) => ({ ...prev, ...l }));
-      } else {
-        onMove(l);
-      }
-      fitted.current = false;
-    });
-    return () => {
-      alive = false;
-    };
-  }, [visibleTables, savedPos, collapsedGroups, summaryPositions, summaryGridPos, model, readOnly, onMove]);
-
-  // 点击“自动布局”时仅对当前可见表重新布局；在纯汇总视图下重置本地卡片网格坐标
-  const latest = useRef({
+export const Canvas = memo(
+  ({
     model,
-    visibleTables,
-    collapsedGroups,
-    summaryPositions,
-    summaryGridPos,
+    modelIndex,
+    layout,
+    selected,
+    onSelect,
     onMove,
-    readOnly,
-  });
-  useLayoutEffect(() => {
-    latest.current = {
+    relayout,
+    sections = EMPTY_SECTIONS,
+    viewMode = 'auto',
+    expandedGroups,
+    onToggleGroup,
+    onCollapseAllGroups,
+    focus = null,
+    onChangeFocus,
+    onChangeViewMode,
+    readOnly = false,
+  }: {
+    model: Model;
+    modelIndex?: ModelIndex;
+    layout: Layout;
+    selected: string | null;
+    onSelect: (id: string | null) => void;
+    onMove: (l: Layout) => void;
+    /** 变化时对当前可见表重新自动布局 */
+    relayout: number;
+    sections?: CanvasSection[];
+    viewMode?: CanvasViewMode;
+    expandedGroups?: string[];
+    onToggleGroup?: (groupId: string) => void;
+    onCollapseAllGroups?: () => void;
+    focus?: FocusState | null;
+    onChangeFocus?: (next: FocusState | null) => void;
+    onChangeViewMode?: (mode: CanvasViewMode) => void;
+    readOnly?: boolean;
+  }) => {
+    const { t } = useTranslation();
+    const draggingIdsRef = useRef(new Set<string>());
+    const [summaryPositions, setSummaryPositions] = useState<Layout>({});
+    const [localFallback, setLocalFallback] = useState<Layout>({});
+    const [localExpanded, setLocalExpanded] = useState<string[]>(EMPTY_EXPANDED);
+    const [flow, setFlow] = useState<ReactFlowInstance<CanvasNode> | null>(null);
+    const fitted = useRef(false);
+
+    const effectiveIdx = useMemo(() => modelIndex ?? buildModelIndex(model), [model, modelIndex]);
+    const tables = useMemo(
+      () => effectiveIdx.allRef('table').filter((tb) => !tb.partitionOf),
+      [effectiveIdx],
+    );
+    const activeExpanded = expandedGroups ?? localExpanded;
+    const toggleGroup = useCallback(
+      (groupId: string) => {
+        if (onToggleGroup) {
+          onToggleGroup(groupId);
+          return;
+        }
+        setLocalExpanded((prev) =>
+          prev.includes(groupId) ? prev.filter((x) => x !== groupId) : [...prev, groupId],
+        );
+      },
+      [onToggleGroup],
+    );
+
+    // 解析聚焦邻域（仅当目标表仍存在时激活）
+    const activeFocus = useMemo(() => {
+      if (!focus) return null;
+      const rootId = resolveTopLevelTableId(model, focus.tableId);
+      if (!rootId) return null;
+      return { tableId: rootId, hops: focus.hops };
+    }, [focus, model]);
+
+    const focusIds = useMemo(
+      () =>
+        activeFocus ? collectNeighborhood(model, activeFocus.tableId, activeFocus.hops, effectiveIdx) : null,
+      [activeFocus, model, effectiveIdx],
+    );
+
+    const effectiveMode = effectiveCanvasMode(viewMode, tables.length);
+
+    const { groups, summaryEdges, tableToGroup } = useMemo(
+      () => buildCanvasGroups(model, sections, effectiveIdx),
+      [model, sections, effectiveIdx],
+    );
+    const expandedSet = useMemo(() => new Set(activeExpanded), [activeExpanded]);
+    const expandedGroupsList = useMemo(
+      () => groups.filter((g) => expandedSet.has(g.id)),
+      [groups, expandedSet],
+    );
+    const collapsedGroups = useMemo(
+      () =>
+        effectiveMode === 'sections' && !activeFocus ? groups.filter((g) => !expandedSet.has(g.id)) : [],
+      [effectiveMode, activeFocus, groups, expandedSet],
+    );
+
+    const summaryGridPos = useMemo(() => {
+      const cols = Math.min(5, Math.max(1, Math.ceil(Math.sqrt(Math.max(1, collapsedGroups.length)))));
+      const map = new Map<string, { x: number; y: number }>();
+      collapsedGroups.forEach((g, idx) => {
+        const col = idx % cols;
+        const row = Math.floor(idx / cols);
+        map.set(g.id, { x: col * (SUMMARY_W + 64), y: row * (SUMMARY_H + 56) });
+      });
+      return map;
+    }, [collapsedGroups]);
+
+    const savedGroupPos = useCallback(
+      (groupId: string) => {
+        const nodeId = `${SUMMARY_NODE_PREFIX}${groupId}`;
+        return summaryPositions[nodeId] ?? summaryGridPos.get(groupId);
+      },
+      [summaryPositions, summaryGridPos],
+    );
+
+    // 当前视图应当渲染并布局的表（性能关键：折叠时不含未展开表，不触发 elkjs）
+    const visibleTables = useMemo(() => {
+      if (focusIds) return tables.filter((tb) => focusIds.has(tb.id));
+      if (effectiveMode === 'flat') return tables;
+      if (expandedGroupsList.length === 0) return [];
+      const visibleIds = new Set<string>();
+      for (const g of expandedGroupsList) for (const tid of g.tableIds) visibleIds.add(tid);
+      return tables.filter((tb) => visibleIds.has(tb.id));
+    }, [focusIds, effectiveMode, tables, expandedGroupsList]);
+
+    const visibleTableIds = useMemo(() => new Set(visibleTables.map((tb) => tb.id)), [visibleTables]);
+    const savedPos = useCallback((id: string) => layout[id] ?? localFallback[id], [layout, localFallback]);
+
+    // 仅对当前可见且尚未拥有坐标的表执行自动布局（在 Web Worker 中异步计算）
+    useEffect(() => {
+      const missing = visibleTables.filter((tb) => !savedPos(tb.id));
+      if (!missing.length) return;
+      let alive = true;
+      const ac = new AbortController();
+      const occupied: Layout = {};
+      for (const tb of visibleTables) {
+        const p = savedPos(tb.id);
+        if (p) occupied[tb.id] = p;
+      }
+      for (const g of collapsedGroups) {
+        const gp = summaryPositions[`${SUMMARY_NODE_PREFIX}${g.id}`] ?? summaryGridPos.get(g.id);
+        if (gp) occupied[`${SUMMARY_NODE_PREFIX}${g.id}`] = gp;
+      }
+      void autoLayout(model, missing, occupied, effectiveIdx, ac.signal)
+        .then((l) => {
+          if (!alive || !Object.keys(l).length) return;
+          if (readOnly) {
+            setLocalFallback((prev) => ({ ...prev, ...l }));
+          } else {
+            onMove(l);
+          }
+          fitted.current = false;
+        })
+        .catch((err) => {
+          if (err instanceof StaleLayoutError) return;
+          throw err;
+        });
+      return () => {
+        alive = false;
+        ac.abort();
+      };
+    }, [
+      visibleTables,
+      savedPos,
+      collapsedGroups,
+      summaryPositions,
+      summaryGridPos,
       model,
+      effectiveIdx,
+      readOnly,
+      onMove,
+    ]);
+
+    // 点击“自动布局”时仅对当前可见表重新布局；在纯汇总视图下重置本地卡片网格坐标
+    const latest = useRef({
+      model,
+      effectiveIdx,
       visibleTables,
       collapsedGroups,
       summaryPositions,
       summaryGridPos,
       onMove,
       readOnly,
-    };
-  });
-  useEffect(() => {
-    if (!relayout) return;
-    let alive = true;
-    const {
-      model: m,
-      visibleTables: vis,
-      collapsedGroups: collapsed,
-      summaryPositions: sumPos,
-      summaryGridPos: gridPos,
-      onMove: move,
-      readOnly: ro,
-    } = latest.current;
-    if (!vis.length) {
-      setSummaryPositions({});
-      fitted.current = false;
-      return;
-    }
-    const fixed: Layout = {};
-    for (const g of collapsed) {
-      const gp = sumPos[`${SUMMARY_NODE_PREFIX}${g.id}`] ?? gridPos.get(g.id);
-      if (gp) fixed[`${SUMMARY_NODE_PREFIX}${g.id}`] = gp;
-    }
-    void autoLayout(m, vis, fixed).then((l) => {
-      if (!alive || !Object.keys(l).length) return;
-      if (ro) setLocalFallback((prev) => ({ ...prev, ...l }));
-      else move(l);
-      fitted.current = false;
     });
-    return () => {
-      alive = false;
-    };
-  }, [relayout]);
+    useLayoutEffect(() => {
+      latest.current = {
+        model,
+        effectiveIdx,
+        visibleTables,
+        collapsedGroups,
+        summaryPositions,
+        summaryGridPos,
+        onMove,
+        readOnly,
+      };
+    });
+    useEffect(() => {
+      if (!relayout) return;
+      let alive = true;
+      const ac = new AbortController();
+      const {
+        model: m,
+        effectiveIdx: curIdx,
+        visibleTables: vis,
+        collapsedGroups: collapsed,
+        summaryPositions: sumPos,
+        summaryGridPos: gridPos,
+        onMove: move,
+        readOnly: ro,
+      } = latest.current;
+      if (!vis.length) {
+        setSummaryPositions({});
+        fitted.current = false;
+        return;
+      }
+      const fixed: Layout = {};
+      for (const g of collapsed) {
+        const gp = sumPos[`${SUMMARY_NODE_PREFIX}${g.id}`] ?? gridPos.get(g.id);
+        if (gp) fixed[`${SUMMARY_NODE_PREFIX}${g.id}`] = gp;
+      }
+      void autoLayout(m, vis, fixed, curIdx, ac.signal)
+        .then((l) => {
+          if (!alive || !Object.keys(l).length) return;
+          if (ro) setLocalFallback((prev) => ({ ...prev, ...l }));
+          else move(l);
+          fitted.current = false;
+        })
+        .catch((err) => {
+          if (err instanceof StaleLayoutError) return;
+          throw err;
+        });
+      return () => {
+        alive = false;
+        ac.abort();
+      };
+    }, [relayout]);
 
-  // 切换模式、聚焦目标、跳数或展开状态时重新触发一次适配视角
-  const expandedKey = useMemo(() => [...activeExpanded].sort().join(','), [activeExpanded]);
-  const fitContextKey = activeFocus
-    ? `focus:${activeFocus.tableId}:${activeFocus.hops}`
-    : `${effectiveMode}:${expandedKey}:${groups.length}`;
-  const prevFitKey = useRef(fitContextKey);
-  useEffect(() => {
-    if (prevFitKey.current !== fitContextKey) {
-      prevFitKey.current = fitContextKey;
-      fitted.current = false;
-    }
-  }, [fitContextKey]);
+    // 切换模式、聚焦目标、跳数或展开状态时重新触发一次适配视角
+    const expandedKey = useMemo(() => [...activeExpanded].sort().join(','), [activeExpanded]);
+    const fitContextKey = activeFocus
+      ? `focus:${activeFocus.tableId}:${activeFocus.hops}`
+      : `${effectiveMode}:${expandedKey}:${groups.length}`;
+    const prevFitKey = useRef(fitContextKey);
+    useEffect(() => {
+      if (prevFitKey.current !== fitContextKey) {
+        prevFitKey.current = fitContextKey;
+        fitted.current = false;
+      }
+    }, [fitContextKey]);
 
-  const tableNodes: TableNode[] = useMemo(() => {
-    if (!visibleTables.length) return [];
-    const fkCols = new Set(all(model, 'foreignKey').flatMap((f) => f.columns));
-    const pkCols = new Set(all(model, 'primaryKey').flatMap((p) => p.columns));
-    const uqCols = new Set(
-      all(model, 'unique')
-        .filter((u) => u.columns.length === 1)
-        .flatMap((u) => u.columns),
-    );
-    const parts = new Map<string, number>();
-    for (const tb of all(model, 'table'))
-      if (tb.partitionOf) parts.set(tb.partitionOf.parent, (parts.get(tb.partitionOf.parent) ?? 0) + 1);
-    return visibleTables
-      .filter((tb) => pos(tb.id))
-      .map((tb) => {
+    // 结构数据仅随 model / visibleTables 变化，不依赖拖拽坐标与选中状态
+    const tableDataMap = useMemo(() => {
+      const map = new Map<string, { data: TableData; height: number }>();
+      if (!visibleTables.length) return map;
+      const fks = effectiveIdx.allRef('foreignKey');
+      const fkCols = new Set<string>();
+      const fkSourceCols = new Set<string>();
+      const fkTargetCols = new Set<string>();
+      for (const f of fks) {
+        for (const cid of f.columns) fkCols.add(cid);
+        if (f.columns[0]) fkSourceCols.add(f.columns[0]);
+        if (f.refColumns[0]) fkTargetCols.add(f.refColumns[0]);
+      }
+      const pkCols = new Set(effectiveIdx.allRef('primaryKey').flatMap((p) => p.columns));
+      const uqCols = new Set(
+        effectiveIdx
+          .allRef('unique')
+          .filter((u) => u.columns.length === 1)
+          .flatMap((u) => u.columns),
+      );
+      const defSchema = defaultSchemaOf(model);
+      for (const tb of visibleTables) {
+        const cols = effectiveIdx.columnsRef(tb.id);
         const partSpec = tb.partitionBy ? resolvePartitionBy(model, tb) : null;
         const partStrategy = partSpec
           ? partSpec.strategy.toUpperCase()
@@ -543,351 +613,439 @@ export const Canvas = ({
             ? (tb.partitionBy.trim().split(/\s+/)[0]?.toUpperCase() ?? null)
             : null;
         const partKeySet = new Set(tb.partitionBy ? partitionKeyColumns(model, tb).all : []);
-        return {
+        const data: TableData = {
+          table: tb,
+          schema: model.objects[tb.parent]?.name ?? '',
+          defaultSchema: defSchema,
+          columns: cols.map((c) => ({
+            id: c.id,
+            name: c.name,
+            type: shortType(typeLabel(model, c)),
+            isEnum: !!c.typeRef,
+            key: pkCols.has(c.id) ? 'PK' : fkCols.has(c.id) ? 'FK' : uqCols.has(c.id) ? 'UQ' : '',
+            notNull: c.notNull || pkCols.has(c.id),
+            isPartKey: partKeySet.has(c.id),
+            hasSourceHandle: fkSourceCols.has(c.id),
+            hasTargetHandle: fkTargetCols.has(c.id),
+          })),
+          partitions: effectiveIdx.partitionsRef(tb.id).length,
+          partitionStrategy: partStrategy,
+        };
+        map.set(tb.id, { data, height: nodeHeight(cols.length) });
+      }
+      return map;
+    }, [model, effectiveIdx, visibleTables]);
+
+    const desiredNodes: CanvasNode[] = useMemo(() => {
+      const out: CanvasNode[] = [];
+      if (collapsedGroups.length > 0) {
+        const hasSections = sections.length > 0;
+        for (const g of collapsedGroups) {
+          const gp = savedGroupPos(g.id);
+          if (!gp) continue;
+          out.push({
+            id: `${SUMMARY_NODE_PREFIX}${g.id}`,
+            type: 'sectionSummary',
+            position: gp,
+            initialWidth: SUMMARY_W,
+            initialHeight: SUMMARY_H,
+            selectable: false,
+            data: {
+              group: g,
+              hasSections,
+              onExpand: toggleGroup,
+            },
+          });
+        }
+      }
+      for (const tb of visibleTables) {
+        const tp = savedPos(tb.id);
+        const td = tableDataMap.get(tb.id);
+        if (!tp || !td) continue;
+        out.push({
           id: tb.id,
           type: 'table',
-          position: pos(tb.id)!,
-          selected: tb.id === selected,
-          data: {
-            table: tb,
-            schema: model.objects[tb.parent]?.name ?? '',
-            defaultSchema: defaultSchemaOf(model),
-            columns: columnsOf(model, tb.id).map((c) => ({
-              id: c.id,
-              name: c.name,
-              type: shortType(typeLabel(model, c)),
-              isEnum: !!c.typeRef,
-              key: pkCols.has(c.id) ? 'PK' : fkCols.has(c.id) ? 'FK' : uqCols.has(c.id) ? 'UQ' : '',
-              notNull: c.notNull || pkCols.has(c.id),
-              isPartKey: partKeySet.has(c.id),
-            })),
-            partitions: parts.get(tb.id) ?? 0,
-            partitionStrategy: partStrategy,
-            selected: tb.id === selected,
-          },
-        };
-      });
-  }, [model, visibleTables, pos, selected]);
-
-  const summaryNodes: SummaryNode[] = useMemo(() => {
-    if (!collapsedGroups.length) return [];
-    const hasSections = sections.length > 0;
-    return collapsedGroups
-      .filter((g) => groupPos(g.id))
-      .map((g) => ({
-        id: `${SUMMARY_NODE_PREFIX}${g.id}`,
-        type: 'sectionSummary',
-        position: groupPos(g.id)!,
-        selectable: false,
-        data: {
-          group: g,
-          hasSections,
-          onExpand: toggleGroup,
-        },
-      }));
-  }, [collapsedGroups, sections.length, groupPos, toggleGroup]);
-
-  const nodes: CanvasNode[] = useMemo(
-    () => (summaryNodes.length === 0 ? tableNodes : [...summaryNodes, ...tableNodes]),
-    [summaryNodes, tableNodes],
-  );
-
-  // 当前视图中所有可见表（及汇总卡片）就位之后适配一次视图
-  useEffect(() => {
-    if (!flow || fitted.current || nodes.length === 0 || visibleTables.some((tb) => !savedPos(tb.id))) return;
-    fitted.current = true;
-    requestAnimationFrame(() => void flow.fitView({ padding: 0.15, maxZoom: 1 }));
-  }, [flow, nodes.length, visibleTables, savedPos, fitContextKey]);
-
-  const edges: Edge[] = useMemo(() => {
-    const out: Edge[] = [];
-    const fks = all(model, 'foreignKey');
-
-    // 1. 可见表之间的精确列级外键连线
-    for (const f of fks) {
-      if (!visibleTableIds.has(f.parent) || !visibleTableIds.has(f.refTable)) continue;
-      const a = pos(f.parent);
-      const b = pos(f.refTable);
-      if (!a || !b) continue;
-      const self = f.parent === f.refTable;
-      const toRight = !self && a.x + NODE_W / 2 < b.x + NODE_W / 2;
-      const active = f.parent === selected || f.refTable === selected;
-      out.push({
-        id: f.id,
-        source: f.parent,
-        target: f.refTable,
-        sourceHandle: `${f.columns[0]}-${self || toRight ? 'sr' : 'sl'}`,
-        targetHandle: `${f.refColumns[0]}-${self || !toRight ? 'tr' : 'tl'}`,
-        markerStart: 'dowel-many',
-        markerEnd: 'dowel-one',
-        style: { strokeWidth: 1.5, stroke: active ? 'var(--primary)' : 'var(--edge)' },
-        zIndex: active ? 1 : 0,
-      });
-    }
-
-    if (effectiveMode !== 'sections' || activeFocus) return out;
-
-    // 2. 折叠汇总卡片之间的跨板块 / 跨 Schema 汇总边
-    for (const se of summaryEdges) {
-      if (expandedSet.has(se.sourceGroupId) || expandedSet.has(se.targetGroupId)) continue;
-      const a = groupPos(se.sourceGroupId);
-      const b = groupPos(se.targetGroupId);
-      if (!a || !b) continue;
-      const toRight = a.x + SUMMARY_W / 2 <= b.x + SUMMARY_W / 2;
-      out.push({
-        id: se.id,
-        source: `${SUMMARY_NODE_PREFIX}${se.sourceGroupId}`,
-        target: `${SUMMARY_NODE_PREFIX}${se.targetGroupId}`,
-        sourceHandle: toRight ? 'sr' : 'sl',
-        targetHandle: toRight ? 'tl' : 'tr',
-        markerEnd: 'dowel-one',
-        label: String(se.count),
-        labelStyle: { fill: 'var(--text-2)', fontSize: 11, fontFamily: 'var(--font-code)' },
-        labelBgStyle: { fill: 'var(--surface)', fillOpacity: 0.9 },
-        labelBgPadding: [4, 2],
-        labelBgBorderRadius: 4,
-        style: { strokeWidth: 1.5, stroke: 'var(--edge)', strokeDasharray: '5 4' },
-      });
-    }
-
-    // 3. 已展开可见表与折叠汇总卡片之间的跨边界汇总边（每对聚合为一条虚线）
-    const crossBoundary = new Map<
-      string,
-      {
-        source: string;
-        target: string;
-        tablePos: { x: number; y: number };
-        groupPos: { x: number; y: number };
-        tableIsSource: boolean;
-        colId: string;
-        count: number;
+          position: tp,
+          initialWidth: NODE_W,
+          initialHeight: td.height,
+          data: td.data,
+        });
       }
-    >();
-    for (const f of fks) {
-      const srcVis = visibleTableIds.has(f.parent);
-      const dstVis = visibleTableIds.has(f.refTable);
-      if (srcVis === dstVis) continue;
-      if (srcVis) {
-        const dstGroup = tableToGroup.get(f.refTable);
-        if (!dstGroup || expandedSet.has(dstGroup)) continue;
-        const tp = pos(f.parent);
-        const gp = groupPos(dstGroup);
-        if (!tp || !gp || !f.columns[0]) continue;
-        const key = `${f.parent}->${dstGroup}`;
-        const cur = crossBoundary.get(key);
-        if (cur) cur.count += 1;
-        else
-          crossBoundary.set(key, {
-            source: f.parent,
-            target: `${SUMMARY_NODE_PREFIX}${dstGroup}`,
-            tablePos: tp,
-            groupPos: gp,
-            tableIsSource: true,
-            colId: f.columns[0],
-            count: 1,
-          });
-      } else {
-        const srcGroup = tableToGroup.get(f.parent);
-        if (!srcGroup || expandedSet.has(srcGroup)) continue;
-        const gp = groupPos(srcGroup);
-        const tp = pos(f.refTable);
-        if (!gp || !tp || !f.refColumns[0]) continue;
-        const key = `${srcGroup}->${f.refTable}`;
-        const cur = crossBoundary.get(key);
-        if (cur) cur.count += 1;
-        else
-          crossBoundary.set(key, {
-            source: `${SUMMARY_NODE_PREFIX}${srcGroup}`,
-            target: f.refTable,
-            tablePos: tp,
-            groupPos: gp,
-            tableIsSource: false,
-            colId: f.refColumns[0],
-            count: 1,
-          });
-      }
-    }
-    for (const [key, item] of crossBoundary) {
-      const tableLeftOfGroup = item.tablePos.x + NODE_W / 2 <= item.groupPos.x + SUMMARY_W / 2;
-      out.push({
-        id: `cross:${key}`,
-        source: item.source,
-        target: item.target,
-        sourceHandle: item.tableIsSource
-          ? `${item.colId}-${tableLeftOfGroup ? 'sr' : 'sl'}`
-          : tableLeftOfGroup
-            ? 'sl'
-            : 'sr',
-        targetHandle: item.tableIsSource
-          ? tableLeftOfGroup
-            ? 'tl'
-            : 'tr'
-          : `${item.colId}-${tableLeftOfGroup ? 'tr' : 'tl'}`,
-        markerEnd: 'dowel-one',
-        label: String(item.count),
-        labelStyle: { fill: 'var(--text-2)', fontSize: 11, fontFamily: 'var(--font-code)' },
-        labelBgStyle: { fill: 'var(--surface)', fillOpacity: 0.9 },
-        labelBgPadding: [4, 2],
-        labelBgBorderRadius: 4,
-        style: { strokeWidth: 1.5, stroke: 'var(--edge)', strokeDasharray: '5 4' },
+      return out;
+    }, [collapsedGroups, sections.length, savedGroupPos, toggleGroup, visibleTables, savedPos, tableDataMap]);
+
+    const [rfNodes, setRfNodes] = useState<CanvasNode[]>(desiredNodes);
+    useLayoutEffect(() => {
+      setRfNodes((prev) => {
+        const prevMap = new Map(prev.map((n) => [n.id, n]));
+        let changed = prev.length !== desiredNodes.length;
+        const next: CanvasNode[] = desiredNodes.map((dn) => {
+          const old = prevMap.get(dn.id);
+          if (!old) {
+            changed = true;
+            return dn;
+          }
+          const isDragging = draggingIdsRef.current.has(dn.id);
+          const curPos = isDragging ? old.position : dn.position;
+          if (old.data === dn.data && old.position.x === curPos.x && old.position.y === curPos.y) {
+            return old;
+          }
+          changed = true;
+          return {
+            ...dn,
+            position: curPos,
+            dragging: isDragging ? old.dragging : dn.dragging,
+          } as CanvasNode;
+        });
+        return changed ? next : prev;
       });
-    }
+    }, [desiredNodes]);
 
-    return out;
-  }, [
-    model,
-    visibleTableIds,
-    pos,
-    selected,
-    effectiveMode,
-    activeFocus,
-    summaryEdges,
-    expandedSet,
-    groupPos,
-    tableToGroup,
-  ]);
+    const renderedNodes = useMemo(() => {
+      let next: CanvasNode[] | null = null;
+      for (let i = 0; i < rfNodes.length; i++) {
+        const n = rfNodes[i]!;
+        const want = n.type === 'table' && n.id === selected;
+        if (Boolean(n.selected) !== want) {
+          next ??= rfNodes.slice();
+          next[i] = { ...n, selected: want } as CanvasNode;
+        }
+      }
+      return next ?? rfNodes;
+    }, [rfNodes, selected]);
 
-  const onNodesChange = useCallback((changes: NodeChange<CanvasNode>[]) => {
-    for (const ch of changes)
-      if (ch.type === 'position' && ch.position) setDragging((d) => ({ ...d, [ch.id]: ch.position! }));
-  }, []);
+    // 当前视图中所有可见表（及汇总卡片）就位之后适配一次视图
+    useEffect(() => {
+      if (
+        !flow ||
+        fitted.current ||
+        desiredNodes.length === 0 ||
+        visibleTables.some((tb) => !savedPos(tb.id))
+      )
+        return;
+      fitted.current = true;
+      requestAnimationFrame(() => void flow.fitView({ padding: 0.15, maxZoom: 1 }));
+    }, [flow, desiredNodes.length, visibleTables, savedPos, fitContextKey]);
 
-  const showViewBar =
-    !activeFocus &&
-    Boolean(onChangeViewMode) &&
-    (tables.length > LARGE_SCHEMA_THRESHOLD || sections.length > 0 || viewMode !== 'auto');
+    // 基础边仅依赖布局坐标与模型结构，不依赖拖拽帧坐标或选中项
+    const baseEdges: Edge[] = useMemo(() => {
+      const out: Edge[] = [];
+      const fks = effectiveIdx.allRef('foreignKey');
 
-  const focusTableObj = activeFocus ? model.objects[activeFocus.tableId] : undefined;
-  const focusTableLabel = useMemo(() => {
-    if (!focusTableObj || focusTableObj.kind !== 'table') return '';
-    const schemaName = model.objects[focusTableObj.parent]?.name ?? '';
-    const defSchema = defaultSchemaOf(model);
-    return schemaName && schemaName !== defSchema
-      ? `${schemaName}.${focusTableObj.name}`
-      : focusTableObj.name;
-  }, [focusTableObj, model]);
+      // 1. 可见表之间的精确列级外键连线
+      for (const f of fks) {
+        if (!visibleTableIds.has(f.parent) || !visibleTableIds.has(f.refTable)) continue;
+        const a = savedPos(f.parent);
+        const b = savedPos(f.refTable);
+        if (!a || !b) continue;
+        const self = f.parent === f.refTable;
+        const toRight = !self && a.x + NODE_W / 2 < b.x + NODE_W / 2;
+        out.push({
+          id: f.id,
+          source: f.parent,
+          target: f.refTable,
+          sourceHandle: `${f.columns[0]}-${self || toRight ? 'sr' : 'sl'}`,
+          targetHandle: `${f.refColumns[0]}-${self || !toRight ? 'tr' : 'tl'}`,
+          markerStart: 'dowel-many',
+          markerEnd: 'dowel-one',
+          style: DEFAULT_FK_STYLE,
+          zIndex: 0,
+        });
+      }
 
-  return (
-    <ReactFlow<CanvasNode>
-      nodes={nodes}
-      edges={edges}
-      nodeTypes={nodeTypes}
-      onNodesChange={onNodesChange}
-      onNodeDragStop={(_, node) => {
+      if (effectiveMode !== 'sections' || activeFocus) return out;
+
+      // 2. 折叠汇总卡片之间的跨板块 / 跨 Schema 汇总边
+      for (const se of summaryEdges) {
+        if (expandedSet.has(se.sourceGroupId) || expandedSet.has(se.targetGroupId)) continue;
+        const a = savedGroupPos(se.sourceGroupId);
+        const b = savedGroupPos(se.targetGroupId);
+        if (!a || !b) continue;
+        const toRight = a.x + SUMMARY_W / 2 <= b.x + SUMMARY_W / 2;
+        out.push({
+          id: se.id,
+          source: `${SUMMARY_NODE_PREFIX}${se.sourceGroupId}`,
+          target: `${SUMMARY_NODE_PREFIX}${se.targetGroupId}`,
+          sourceHandle: toRight ? 'sr' : 'sl',
+          targetHandle: toRight ? 'tl' : 'tr',
+          markerEnd: 'dowel-one',
+          label: String(se.count),
+          labelStyle: { fill: 'var(--text-2)', fontSize: 11, fontFamily: 'var(--font-code)' },
+          labelBgStyle: { fill: 'var(--surface)', fillOpacity: 0.9 },
+          labelBgPadding: [4, 2],
+          labelBgBorderRadius: 4,
+          style: { strokeWidth: 1.5, stroke: 'var(--edge)', strokeDasharray: '5 4' },
+        });
+      }
+
+      // 3. 已展开可见表与折叠汇总卡片之间的跨边界汇总边（每对聚合为一条虚线）
+      const crossBoundary = new Map<
+        string,
+        {
+          source: string;
+          target: string;
+          tablePos: { x: number; y: number };
+          groupPos: { x: number; y: number };
+          tableIsSource: boolean;
+          colId: string;
+          count: number;
+        }
+      >();
+      for (const f of fks) {
+        const srcVis = visibleTableIds.has(f.parent);
+        const dstVis = visibleTableIds.has(f.refTable);
+        if (srcVis === dstVis) continue;
+        if (srcVis) {
+          const dstGroup = tableToGroup.get(f.refTable);
+          if (!dstGroup || expandedSet.has(dstGroup)) continue;
+          const tp = savedPos(f.parent);
+          const gp = savedGroupPos(dstGroup);
+          if (!tp || !gp || !f.columns[0]) continue;
+          const key = `${f.parent}->${dstGroup}`;
+          const cur = crossBoundary.get(key);
+          if (cur) cur.count += 1;
+          else
+            crossBoundary.set(key, {
+              source: f.parent,
+              target: `${SUMMARY_NODE_PREFIX}${dstGroup}`,
+              tablePos: tp,
+              groupPos: gp,
+              tableIsSource: true,
+              colId: f.columns[0],
+              count: 1,
+            });
+        } else {
+          const srcGroup = tableToGroup.get(f.parent);
+          if (!srcGroup || expandedSet.has(srcGroup)) continue;
+          const gp = savedGroupPos(srcGroup);
+          const tp = savedPos(f.refTable);
+          if (!gp || !tp || !f.refColumns[0]) continue;
+          const key = `${srcGroup}->${f.refTable}`;
+          const cur = crossBoundary.get(key);
+          if (cur) cur.count += 1;
+          else
+            crossBoundary.set(key, {
+              source: `${SUMMARY_NODE_PREFIX}${srcGroup}`,
+              target: f.refTable,
+              tablePos: tp,
+              groupPos: gp,
+              tableIsSource: false,
+              colId: f.refColumns[0],
+              count: 1,
+            });
+        }
+      }
+      for (const [key, item] of crossBoundary) {
+        const tableLeftOfGroup = item.tablePos.x + NODE_W / 2 <= item.groupPos.x + SUMMARY_W / 2;
+        out.push({
+          id: `cross:${key}`,
+          source: item.source,
+          target: item.target,
+          sourceHandle: item.tableIsSource
+            ? `${item.colId}-${tableLeftOfGroup ? 'sr' : 'sl'}`
+            : tableLeftOfGroup
+              ? 'sl'
+              : 'sr',
+          targetHandle: item.tableIsSource
+            ? tableLeftOfGroup
+              ? 'tl'
+              : 'tr'
+            : `${item.colId}-${tableLeftOfGroup ? 'tr' : 'tl'}`,
+          markerEnd: 'dowel-one',
+          label: String(item.count),
+          labelStyle: { fill: 'var(--text-2)', fontSize: 11, fontFamily: 'var(--font-code)' },
+          labelBgStyle: { fill: 'var(--surface)', fillOpacity: 0.9 },
+          labelBgPadding: [4, 2],
+          labelBgBorderRadius: 4,
+          style: { strokeWidth: 1.5, stroke: 'var(--edge)', strokeDasharray: '5 4' },
+        });
+      }
+
+      return out;
+    }, [
+      effectiveIdx,
+      visibleTableIds,
+      savedPos,
+      effectiveMode,
+      activeFocus,
+      summaryEdges,
+      expandedSet,
+      savedGroupPos,
+      tableToGroup,
+    ]);
+
+    const edges: Edge[] = useMemo(() => {
+      if (!selected) return baseEdges;
+      let anyActive = false;
+      const next = baseEdges.map((e) => {
+        if (e.id.startsWith('sum-edge:') || e.id.startsWith('cross:')) return e;
+        if (e.source === selected || e.target === selected) {
+          anyActive = true;
+          return { ...e, style: ACTIVE_FK_STYLE, zIndex: 1 };
+        }
+        return e;
+      });
+      return anyActive ? next : baseEdges;
+    }, [baseEdges, selected]);
+
+    const onNodesChange = useCallback((changes: NodeChange<CanvasNode>[]) => {
+      const filtered: NodeChange<CanvasNode>[] = [];
+      for (const ch of changes) {
+        if (ch.type === 'select') continue;
+        if (ch.type === 'position') {
+          if (ch.dragging === true) draggingIdsRef.current.add(ch.id);
+          else if (ch.dragging === false) draggingIdsRef.current.delete(ch.id);
+        }
+        filtered.push(ch);
+      }
+      if (filtered.length > 0) setRfNodes((nds) => applyNodeChanges(filtered, nds));
+    }, []);
+
+    const showViewBar =
+      !activeFocus &&
+      Boolean(onChangeViewMode) &&
+      (tables.length > LARGE_SCHEMA_THRESHOLD || sections.length > 0 || viewMode !== 'auto');
+
+    const focusTableObj = activeFocus ? model.objects[activeFocus.tableId] : undefined;
+    const focusTableLabel = useMemo(() => {
+      if (!focusTableObj || focusTableObj.kind !== 'table') return '';
+      const schemaName = model.objects[focusTableObj.parent]?.name ?? '';
+      const defSchema = defaultSchemaOf(model);
+      return schemaName && schemaName !== defSchema
+        ? `${schemaName}.${focusTableObj.name}`
+        : focusTableObj.name;
+    }, [focusTableObj, model]);
+
+    const handleNodeDragStop = useCallback(
+      (_: unknown, node: CanvasNode) => {
+        draggingIdsRef.current.delete(node.id);
         if (node.type === 'sectionSummary') {
           setSummaryPositions((prev) => ({ ...prev, [node.id]: node.position }));
         } else {
           onMove({ [node.id]: node.position });
         }
-        setDragging((d) => {
-          const { [node.id]: _x, ...rest } = d;
-          return rest;
-        });
-      }}
-      onNodeClick={(_, n) => {
+      },
+      [onMove],
+    );
+
+    const handleNodeClick = useCallback(
+      (_: unknown, n: CanvasNode) => {
         if (n.type === 'table') onSelect(n.id);
-      }}
-      onPaneClick={() => onSelect(null)}
-      onInit={setFlow}
-      minZoom={0.1}
-      maxZoom={2}
-    >
-      <Markers />
-      <Background variant={BackgroundVariant.Dots} gap={20} size={1.2} />
-      {activeFocus && (
-        <Panel
-          position="top-center"
-          className="flex flex-wrap items-center gap-2 rounded-sm border border-border bg-surface px-2.5 py-1 shadow-[var(--shadow-sm)]"
-        >
-          <Focus size={14} aria-hidden="true" className="text-primary-text" />
-          <span className="text-xs text-text-2">{t('sec.focusLabel')}</span>
-          <span className="font-mono text-sm font-semibold">{focusTableLabel}</span>
-          <span className="badge font-mono">{t('sec.tableCount', { count: visibleTables.length })}</span>
-          <div
-            role="tablist"
-            {...({ focusgroup: 'tablist nomemory' } as object)}
-            aria-label={t('sec.hopsLabel')}
-            className="seg"
+      },
+      [onSelect],
+    );
+
+    const handlePaneClick = useCallback(() => onSelect(null), [onSelect]);
+
+    return (
+      <ReactFlow<CanvasNode>
+        nodes={renderedNodes}
+        edges={edges}
+        nodeTypes={nodeTypes}
+        onlyRenderVisibleElements
+        onNodesChange={onNodesChange}
+        onNodeDragStop={handleNodeDragStop}
+        onNodeClick={handleNodeClick}
+        onPaneClick={handlePaneClick}
+        onInit={setFlow}
+        minZoom={0.05}
+        maxZoom={2}
+      >
+        <Markers />
+        <Background variant={BackgroundVariant.Dots} gap={20} size={1.2} />
+        {activeFocus && (
+          <Panel
+            position="top-center"
+            className="flex flex-wrap items-center gap-2 rounded-sm border border-border bg-surface px-2.5 py-1 shadow-[var(--shadow-sm)]"
           >
-            {([1, 2] as const).map((h) => (
-              <button
-                key={h}
-                type="button"
-                role="tab"
-                aria-selected={activeFocus.hops === h}
-                {...(activeFocus.hops === h ? { focusgroupstart: '' } : {})}
-                onFocus={() => onChangeFocus?.({ tableId: activeFocus.tableId, hops: h })}
-                onClick={() => onChangeFocus?.({ tableId: activeFocus.tableId, hops: h })}
-              >
-                {t(h === 1 ? 'sec.hop1' : 'sec.hop2')}
-              </button>
-            ))}
-          </div>
-          <button type="button" className="btn sm" onClick={() => onChangeFocus?.(null)}>
-            {t('sec.exitFocus')}
-          </button>
-        </Panel>
-      )}
-      {showViewBar && (
-        <Panel position="top-right" className="flex max-w-[460px] flex-wrap items-center justify-end gap-1.5">
-          {effectiveMode === 'sections' && expandedGroupsList.length > 0 && (
-            <div className="flex flex-wrap items-center gap-1 rounded-sm border border-border bg-surface px-1.5 py-0.5 shadow-[var(--shadow-sm)]">
-              {expandedGroupsList.map((g) => {
-                const label = g.kind === 'unassigned' ? t('sec.unassigned') : g.name;
-                return (
-                  <button
-                    key={g.id}
-                    type="button"
-                    className="btn ghost sm gap-1.5 px-1.5 text-xs"
-                    aria-label={t('sec.collapseGroupLabel', { name: label })}
-                    onClick={() => toggleGroup(g.id)}
-                  >
-                    <span
-                      aria-hidden="true"
-                      className="size-2 rounded-full"
-                      style={{ background: g.color ? sectionColorCssVar(g.color) : 'var(--border-strong)' }}
-                    />
-                    <span className="max-w-[110px] truncate">{label}</span>
-                    <span className="text-text-3">{t('sec.collapse')}</span>
-                  </button>
-                );
-              })}
-              {expandedGroupsList.length > 1 && onCollapseAllGroups && (
-                <button type="button" className="btn ghost sm px-1.5 text-xs" onClick={onCollapseAllGroups}>
-                  {t('sec.collapseAll')}
+            <Focus size={14} aria-hidden="true" className="text-primary-text" />
+            <span className="text-xs text-text-2">{t('sec.focusLabel')}</span>
+            <span className="font-mono text-sm font-semibold">{focusTableLabel}</span>
+            <span className="badge font-mono">{t('sec.tableCount', { count: visibleTables.length })}</span>
+            <div
+              role="tablist"
+              {...({ focusgroup: 'tablist nomemory' } as object)}
+              aria-label={t('sec.hopsLabel')}
+              className="seg"
+            >
+              {([1, 2] as const).map((h) => (
+                <button
+                  key={h}
+                  type="button"
+                  role="tab"
+                  aria-selected={activeFocus.hops === h}
+                  {...(activeFocus.hops === h ? { focusgroupstart: '' } : {})}
+                  onFocus={() => onChangeFocus?.({ tableId: activeFocus.tableId, hops: h })}
+                  onClick={() => onChangeFocus?.({ tableId: activeFocus.tableId, hops: h })}
+                >
+                  {t(h === 1 ? 'sec.hop1' : 'sec.hop2')}
                 </button>
-              )}
+              ))}
             </div>
-          )}
-          <div
-            role="tablist"
-            {...({ focusgroup: 'tablist nomemory' } as object)}
-            aria-label={t('sec.canvasViewMode')}
-            className="seg floating"
+            <button type="button" className="btn sm" onClick={() => onChangeFocus?.(null)}>
+              {t('sec.exitFocus')}
+            </button>
+          </Panel>
+        )}
+        {showViewBar && (
+          <Panel
+            position="top-right"
+            className="flex max-w-[460px] flex-wrap items-center justify-end gap-1.5"
           >
-            {(['sections', 'flat'] as const).map((m) => (
-              <button
-                key={m}
-                type="button"
-                role="tab"
-                aria-selected={effectiveMode === m}
-                {...(effectiveMode === m ? { focusgroupstart: '' } : {})}
-                onFocus={() => onChangeViewMode!(m)}
-                onClick={() => onChangeViewMode!(m)}
-              >
-                {t(m === 'sections' ? 'sec.viewSections' : 'sec.viewFlat')}
-              </button>
-            ))}
-          </div>
-        </Panel>
-      )}
-      <ZoomPanel />
-      <MiniMap
-        pannable
-        zoomable
-        nodeClassName={(n) => (n.id === selected ? 'selected' : '')}
-        nodeBorderRadius={2}
-      />
-    </ReactFlow>
-  );
-};
+            {effectiveMode === 'sections' && expandedGroupsList.length > 0 && (
+              <div className="flex flex-wrap items-center gap-1 rounded-sm border border-border bg-surface px-1.5 py-0.5 shadow-[var(--shadow-sm)]">
+                {expandedGroupsList.map((g) => {
+                  const label = g.kind === 'unassigned' ? t('sec.unassigned') : g.name;
+                  return (
+                    <button
+                      key={g.id}
+                      type="button"
+                      className="btn ghost sm gap-1.5 px-1.5 text-xs"
+                      aria-label={t('sec.collapseGroupLabel', { name: label })}
+                      onClick={() => toggleGroup(g.id)}
+                    >
+                      <span
+                        aria-hidden="true"
+                        className="size-2 rounded-full"
+                        style={{ background: g.color ? sectionColorCssVar(g.color) : 'var(--border-strong)' }}
+                      />
+                      <span className="max-w-[110px] truncate">{label}</span>
+                      <span className="text-text-3">{t('sec.collapse')}</span>
+                    </button>
+                  );
+                })}
+                {expandedGroupsList.length > 1 && onCollapseAllGroups && (
+                  <button type="button" className="btn ghost sm px-1.5 text-xs" onClick={onCollapseAllGroups}>
+                    {t('sec.collapseAll')}
+                  </button>
+                )}
+              </div>
+            )}
+            <div
+              role="tablist"
+              {...({ focusgroup: 'tablist nomemory' } as object)}
+              aria-label={t('sec.canvasViewMode')}
+              className="seg floating"
+            >
+              {(['sections', 'flat'] as const).map((m) => (
+                <button
+                  key={m}
+                  type="button"
+                  role="tab"
+                  aria-selected={effectiveMode === m}
+                  {...(effectiveMode === m ? { focusgroupstart: '' } : {})}
+                  onFocus={() => onChangeViewMode!(m)}
+                  onClick={() => onChangeViewMode!(m)}
+                >
+                  {t(m === 'sections' ? 'sec.viewSections' : 'sec.viewFlat')}
+                </button>
+              ))}
+            </div>
+          </Panel>
+        )}
+        <ZoomPanel />
+        <MiniMap pannable zoomable nodeClassName={miniMapNodeClass} nodeBorderRadius={2} />
+      </ReactFlow>
+    );
+  },
+);

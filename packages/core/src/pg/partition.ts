@@ -1,5 +1,6 @@
 // PostgreSQL 分区边界解析/格式化/校验、存量 partitionBy 字符串解析与分区键列引用提取。
 import type { Column, Model, PartitionKey, PartitionSpec, PartitionStrategy, Table } from '../ir.ts';
+import { getActiveModelIndex } from '../model.ts';
 import { exprReferences } from './expr.ts';
 
 export type PartitionBound =
@@ -283,6 +284,13 @@ const findRootTableId = (m: Model, tableId: string): string => {
 
 const tableColumns = (m: Model, tableId: string): Column[] => {
   const root = findRootTableId(m, tableId);
+  const idx = getActiveModelIndex(m);
+  if (idx) {
+    const rootCols = idx.childrenOf(root, 'column');
+    if (root !== tableId && rootCols.length > 0) return rootCols;
+    if (root === tableId) return rootCols;
+    return [...rootCols, ...idx.childrenRef(tableId, 'column')];
+  }
   const rootCols = Object.values(m.objects).filter(
     (o): o is Column => o.kind === 'column' && o.parent === root,
   );

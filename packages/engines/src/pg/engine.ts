@@ -1,16 +1,8 @@
 // PostgreSQL EngineAdapter 实现：封装既有 PG 快照/导入/历史/锁与重写分析/非事务续跑钩子。
-import {
-  all,
-  createAll,
-  find,
-  isNontransactionalSql,
-  type Model,
-  pgMajorOf,
-  type PlanOptions,
-  type Step,
-} from '@dowel/core';
+import { all, createAll, find, isNontransactionalSql, type Model, pgMajorOf, type Step } from '@dowel/core';
 
 import {
+  type AnalyzeOptions,
   type AppliedTimeouts,
   type Db,
   type EngineAdapter,
@@ -231,19 +223,23 @@ const analyzePgStepRisk = async (
   db: Db,
   from: Model,
   steps: Step[],
-  opts?: PlanOptions,
+  opts?: AnalyzeOptions,
 ): Promise<StepRisk[]> => {
-  await resetPgShadow(db);
-  const vNum = opts?.pgMajor !== undefined ? null : await readPgVersionNum(db);
-  const pgMajor = opts?.pgMajor !== undefined ? opts.pgMajor : vNum !== null ? pgMajorOf(vNum) : null;
-  await pinSession(db);
-  for (const s of createAll(from, pgMajor !== null ? { pgMajor } : undefined)) {
-    const t0 = performance.now();
-    try {
-      await db.exec(s.sql);
-    } catch (e) {
-      throw new EngineStepError(s, e, performance.now() - t0);
+  if (!opts?.reuseShadowFrom) {
+    await resetPgShadow(db);
+    const vNum = opts?.pgMajor !== undefined ? null : await readPgVersionNum(db);
+    const pgMajor = opts?.pgMajor !== undefined ? opts.pgMajor : vNum !== null ? pgMajorOf(vNum) : null;
+    await pinSession(db);
+    for (const s of createAll(from, pgMajor !== null ? { pgMajor } : undefined)) {
+      const t0 = performance.now();
+      try {
+        await db.exec(s.sql);
+      } catch (e) {
+        throw new EngineStepError(s, e, performance.now() - t0);
+      }
     }
+  } else {
+    await pinSession(db);
   }
 
   const existing = new Set(

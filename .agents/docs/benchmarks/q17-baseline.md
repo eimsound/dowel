@@ -1,6 +1,8 @@
 # Q17 Phase 2：100 / 1,000 表三层基准压测基线报告
 
 > 本文档记录 Q17 Phase 2 在真实代码库、Chromium 浏览器与 PostgreSQL 18 影子库上的首次实测基线数据，作为 Phase 3 千表红线验收与瓶颈治理的对照基准。不阻塞常规 CI，所有脚本按需执行。
+>
+> **Phase 3 验收结果（已全部达标并关闭 Q17）**：见 [q17-phase3-results.md](q17-phase3-results.md)。
 
 ---
 

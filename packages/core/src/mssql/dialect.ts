@@ -1,7 +1,7 @@
 // MSSQL（SQL Server 2019 / 2022 / 2025）方言规格实现（注册到 @dowel/core registry）。
 import type { DialectCapabilities, DialectSpec, IdentKind } from '../dialect.ts';
 import { emptyModel, type Model } from '../ir.ts';
-import { all, childrenOf, columnsOf, get, indexElementNames } from '../model.ts';
+import { all, allChildrenOf, childrenOf, columnsOf, get, indexElementNames } from '../model.ts';
 import { formatMssqlScript } from './batch.ts';
 import { isReservedMssqlSchema, MAX_MSSQL_IDENT, mssqlChooseName, mssqlJoinNames } from './naming.ts';
 import {
@@ -107,7 +107,8 @@ const refreshMssqlDerivedNames = (m: Model, tableId: string): void => {
   const joinCols = (ids: string[]) => mssqlJoinNames(ids.map((c) => get(m, c, 'column').name));
 
   // 同步列上的带名 DEFAULT 约束推导名
-  for (const c of columnsOf(m, tableId)) {
+  const tableCols = columnsOf(m, tableId);
+  for (const c of tableCols) {
     if (c.default) {
       const mode = c.ext?.mssql?.defaultNameMode ?? 'derived';
       if (mode === 'derived') {
@@ -131,8 +132,8 @@ const refreshMssqlDerivedNames = (m: Model, tableId: string): void => {
     }
   }
 
-  for (const o of Object.values(m.objects)) {
-    if (!('parent' in o) || o.parent !== tableId || !('nameMode' in o) || o.nameMode !== 'derived') continue;
+  for (const o of allChildrenOf(m, tableId)) {
+    if (!('nameMode' in o) || o.nameMode !== 'derived') continue;
     switch (o.kind) {
       case 'primaryKey':
         o.name = chooseObj(o.id, 'PK', t.name, null, true);
@@ -144,7 +145,7 @@ const refreshMssqlDerivedNames = (m: Model, tableId: string): void => {
         o.name = chooseObj(o.id, 'FK', t.name, joinCols(o.columns), false);
         break;
       case 'check': {
-        const refs = columnsOf(m, tableId).filter((c) => mssqlExprReferences(o.expr, c.name));
+        const refs = tableCols.filter((c) => mssqlExprReferences(o.expr, c.name));
         o.name = chooseObj(o.id, 'CK', t.name, refs.length === 1 ? refs[0]!.name : null, false);
         break;
       }

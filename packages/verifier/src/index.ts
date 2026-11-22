@@ -14,6 +14,7 @@ import {
   type Step,
 } from '@dowel/core';
 import {
+  type AnalyzeOptions,
   type Db,
   EngineStepError,
   getEngine,
@@ -24,7 +25,7 @@ import {
   type TargetSnapshot,
 } from '@dowel/engines';
 
-export { EngineStepError as StepError, NON_TRANSACTIONAL_NOTE, type StepRisk };
+export { type AnalyzeOptions, EngineStepError as StepError, NON_TRANSACTIONAL_NOTE, type StepRisk };
 
 /** 清空影子库（按方言委托给 EngineAdapter.resetShadow） */
 export const resetShadow = async (db: Db, dialect: Dialect = 'pg'): Promise<void> =>
@@ -243,7 +244,7 @@ export const analyze = async (
   db: Db,
   from: Model,
   steps: Step[],
-  opts?: PlanOptions,
+  opts?: AnalyzeOptions,
 ): Promise<StepRisk[]> => {
   assertNoInstanceLevel(steps, from.dialect);
   return getEngine(from.dialect).analyzeStepRisk(db, from, steps, opts);

@@ -584,17 +584,13 @@ describe.each([
     expect((await detail(pid, v1.id)).verifiedAt).toBeNull();
   });
 
-  /** 风险分析（analyze）阶段出错的假影子库连接：1 = 建 to，2 = 被验证的脚本，3 = analyze 重放，在第 3 次 CREATE TABLE 时报错 */
-  const analysisFailsDb = (code: string): Db => {
-    let creates = 0;
-    return {
-      query: async (q) => (q.includes('server_version_num') ? ([{ v: 180000 }] as never) : ([] as never)),
-      exec: async (sql) => {
-        if (sql.startsWith('CREATE TABLE') && ++creates === 3)
-          throw Object.assign(new Error('分析时出事了'), { code });
-      },
-    };
-  };
+  /** 风险分析（analyze）阶段出错的假影子库连接：仅 analyze 阶段的 measureInTransaction 会进入 BEGIN，在分析首步事务开启时报错 */
+  const analysisFailsDb = (code: string): Db => ({
+    query: async (q) => (q.includes('server_version_num') ? ([{ v: 180000 }] as never) : ([] as never)),
+    exec: async (sql) => {
+      if (sql === 'BEGIN') throw Object.assign(new Error('分析时出事了'), { code });
+    },
+  });
 
   test.skipIf(skip)(
     '风险分析没有完成：验证结论不变，如实写进报告（riskError），发布路径和 /verify 路径都一样',

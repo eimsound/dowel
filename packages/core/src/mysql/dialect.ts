@@ -1,7 +1,7 @@
 // MySQL 方言规格实现（注册到 @dowel/core registry）。
 import type { DialectCapabilities, DialectSpec, IdentKind } from '../dialect.ts';
 import { emptyModel, type Model, type Obj } from '../ir.ts';
-import { all, childrenOf, columnsOf, get, indexElementNames } from '../model.ts';
+import { all, allChildrenOf, childrenOf, columnsOf, get, indexElementNames } from '../model.ts';
 import {
   MAX_MYSQL_IDENT,
   MYSQL_SAFE_IDENT_RE,
@@ -104,8 +104,9 @@ const isMysqlConTaken = (m: Model, tableId: string, name: string, selfId: string
 const refreshMysqlDerivedNames = (m: Model, tableId: string): void => {
   const t = get(m, tableId, 'table');
   const joinCols = (ids: string[]) => mysqlJoinNames(ids.map((c) => get(m, c, 'column').name));
-  for (const o of Object.values(m.objects)) {
-    if (!('parent' in o) || o.parent !== tableId || !('nameMode' in o) || o.nameMode !== 'derived') continue;
+  const tableCols = columnsOf(m, tableId);
+  for (const o of allChildrenOf(m, tableId)) {
+    if (!('nameMode' in o) || o.nameMode !== 'derived') continue;
     switch (o.kind) {
       case 'primaryKey':
         o.name = 'PRIMARY';
@@ -124,7 +125,7 @@ const refreshMysqlDerivedNames = (m: Model, tableId: string): void => {
         );
         break;
       case 'check': {
-        const refs = columnsOf(m, tableId).filter((c) => mysqlExprReferences(o.expr, c.name));
+        const refs = tableCols.filter((c) => mysqlExprReferences(o.expr, c.name));
         o.name = mysqlChooseName(t.name, refs.length === 1 ? refs[0]!.name : null, 'check', (n) =>
           isMysqlSchemaConstraintTaken(m, n, o.id),
         );

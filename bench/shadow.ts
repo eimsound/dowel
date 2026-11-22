@@ -270,7 +270,7 @@ const runScale = async (
 
     inst.setPhase('verify:analyze');
     const tAnalyze0 = performance.now();
-    const risks = await analyze(db, gen.model, up, opts);
+    const risks = await analyze(db, gen.model, up, { ...opts, reuseShadowFrom: true });
     const analyzeMs = performance.now() - tAnalyze0;
 
     const totalShadowVerifyMs = performance.now() - tVerifyStart;
@@ -415,7 +415,7 @@ const main = async () => {
           detail: `downDiff=${r.verify.downDiffCount}`,
         },
         {
-          phase: 'verify: analyze() [3rd rebuild]',
+          phase: 'verify: analyze() [reuse v1]',
           ms: formatMs(r.verify.analyzeMs),
           detail: `risks=${r.verify.riskCount}`,
         },
