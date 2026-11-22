@@ -184,12 +184,27 @@ importers:
       '@axe-core/playwright':
         specifier: ^4.14.0
         version: 4.14.0(playwright-core@1.65.1)
+      '@dowel/api':
+        specifier: workspace:*
+        version: link:packages/api
+      '@dowel/core':
+        specifier: workspace:*
+        version: link:packages/core
       '@dowel/engines':
         specifier: workspace:*
         version: link:packages/engines
       '@dowel/executor':
         specifier: workspace:*
         version: link:packages/executor
+      '@dowel/server':
+        specifier: workspace:*
+        version: link:apps/server
+      '@dowel/sync':
+        specifier: workspace:*
+        version: link:packages/sync
+      '@dowel/verifier':
+        specifier: workspace:*
+        version: link:packages/verifier
       '@playwright/test':
         specifier: ^1.65.1
         version: 1.65.1
