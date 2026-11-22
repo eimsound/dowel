@@ -1159,6 +1159,25 @@ export const MIGRATIONS: MigrationStep[] = [
       }
     },
   },
+  // 持久化房间级 layout / sections Lamport 逻辑时钟，防止冷启动或空闲卸载重载副本时钟归零导致首批 LWW 更新被热副本静默丢弃
+  {
+    run: async (tx, d) => {
+      if (d === 'pg') {
+        await tx.exec(
+          `alter table branches add column if not exists layout_ver bigint not null default 0;
+           alter table branches add column if not exists sections_ver bigint not null default 0;`,
+        );
+        return;
+      }
+      const cols = await tx.query<{ name: string }>('pragma table_info(branches)');
+      if (!cols.some((c) => c.name === 'layout_ver')) {
+        await tx.exec('alter table branches add column layout_ver integer not null default 0;');
+      }
+      if (!cols.some((c) => c.name === 'sections_ver')) {
+        await tx.exec('alter table branches add column sections_ver integer not null default 0;');
+      }
+    },
+  },
 ];
 
 /** PG 启动迁移使用的跨副本 advisory lock 键 */
