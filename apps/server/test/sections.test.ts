@@ -547,7 +547,12 @@ const makeFakeBus = (replicaId: string) => {
       await handler(event);
     }
   };
-  return { bus, emit };
+  const emitReconnect = async () => {
+    for (const handler of [...reconnectHandlers]) {
+      await handler();
+    }
+  };
+  return { bus, emit, emitReconnect };
 };
 
 describe('画布板块在途落库与重载竞态回归', () => {
@@ -835,6 +840,444 @@ describe('画布板块在途落库与重载竞态回归', () => {
       );
       expect(afterSecond).toEqual({ layout_ver: 11, sections_ver: 11 });
     } finally {
+      rooms.close();
+      await rooms.flush();
+    }
+  });
+
+  test('handleBusReconnect 绝不用 ver = 0 或较旧 DB 快照回退较新内存 layout / sections，且防护 await 期间并发 >7500B 写入（#63）', async () => {
+    const { branchId, fakeBus, rooms, peerB } = await setupRaceRoom();
+    const s1: CanvasSection[] = [{ id: 'sec-r1', name: '内存新版板块', color: 'peer-1', tables: ['tbl_1'] }];
+    const s2: CanvasSection[] = [{ id: 'sec-r2', name: 'DB追赶板块', color: 'peer-2', tables: ['tbl_1'] }];
+    try {
+      // 1. DB 仍停留在初始 layout_ver = 0 / sections_ver = 0，内存收到远端 ver = 1 更新
+      await db.query(
+        'update branches set layout = $2::text::jsonb, layout_ver = 0, sections = $3::text::jsonb, sections_ver = 0 where id = $1',
+        [branchId, JSON.stringify({ tbl_1: { x: 10, y: 10 } }), JSON.stringify([])],
+      );
+      await fakeBus.emit({
+        t: 'room.layout',
+        origin: 'replica-a',
+        branchId,
+        positions: { tbl_1: { x: 500, y: 500 }, tbl_mem_only: { x: 77, y: 88 } },
+        ver: 1,
+      });
+      await fakeBus.emit({
+        t: 'room.sections',
+        origin: 'replica-a',
+        branchId,
+        sections: s1,
+        ver: 1,
+      });
+
+      const sentAfterRemote = peerB.sent.length;
+      await fakeBus.emitReconnect();
+      expect(peerB.sent.slice(sentAfterRemote).some((m) => m.t === 'layout' || m.t === 'sections')).toBe(
+        false,
+      );
+
+      const peerCheck1 = makePeer(editorUser);
+      await rooms.join(branchId, peerCheck1.peer);
+      expect(peerCheck1.sent).toContainEqual({
+        t: 'layout',
+        positions: { tbl_1: { x: 500, y: 500 }, tbl_mem_only: { x: 77, y: 88 } },
+      });
+      expect(peerCheck1.sent).toContainEqual({ t: 'sections', sections: s1 });
+      await rooms.leave(branchId, peerCheck1.peer);
+
+      // 2. DB 停留在 layout_ver = 1（含 tbl_db_only），内存 tbl_1 已在 ver = 2：只合入缺失表，绝不回退 tbl_1
+      await db.query('update branches set layout = $2::text::jsonb, layout_ver = 1 where id = $1', [
+        branchId,
+        JSON.stringify({ tbl_1: { x: 100, y: 100 }, tbl_db_only: { x: 200, y: 200 } }),
+      ]);
+      await fakeBus.emit({
+        t: 'room.layout',
+        origin: 'replica-a',
+        branchId,
+        positions: { tbl_1: { x: 600, y: 600 } },
+        ver: 2,
+      });
+
+      const sentBeforeSub2 = peerB.sent.length;
+      await fakeBus.emitReconnect();
+      const layoutMsgsSub2 = peerB.sent
+        .slice(sentBeforeSub2)
+        .filter((m): m is Extract<ToClient | Extra, { t: 'layout' }> => m.t === 'layout');
+      expect(layoutMsgsSub2).toHaveLength(1);
+      expect(layoutMsgsSub2[0]?.positions).toEqual({
+        tbl_1: { x: 600, y: 600 },
+        tbl_mem_only: { x: 77, y: 88 },
+        tbl_db_only: { x: 200, y: 200 },
+      });
+
+      // 3. DB 真正领先（layout_ver = 3, sections_ver = 2）时，重连正常追赶到 DB 最新状态
+      await db.query(
+        'update branches set layout = $2::text::jsonb, layout_ver = 3, sections = $3::text::jsonb, sections_ver = 2 where id = $1',
+        [branchId, JSON.stringify({ tbl_1: { x: 900, y: 900 } }), JSON.stringify(s2)],
+      );
+      const sentBeforeSub3 = peerB.sent.length;
+      await fakeBus.emitReconnect();
+      const msgsSub3 = peerB.sent.slice(sentBeforeSub3);
+      expect(msgsSub3).toContainEqual({
+        t: 'layout',
+        positions: {
+          tbl_1: { x: 900, y: 900 },
+          tbl_mem_only: { x: 77, y: 88 },
+          tbl_db_only: { x: 200, y: 200 },
+        },
+      });
+      expect(msgsSub3).toContainEqual({ t: 'sections', sections: s2 });
+    } finally {
+      rooms.close();
+      await rooms.flush();
+    }
+
+    // 4. 跨 await 并发竞态：handleBusReconnect 查库刚读完 ver = 0 旧快照并挂起时，本机完成 >7500B 编辑并排空，恢复后绝不回退
+    const race2 = await setupRaceRoom();
+    const peerObs = makePeer(editorUser);
+    await race2.rooms.join(race2.branchId, peerObs.peer);
+    const origQuery = db.query.bind(db);
+    const enteredSelect = deferred();
+    const releaseSelect = deferred();
+    let pausedOnce = false;
+
+    const bigPositions: Record<string, { x: number; y: number }> = { tbl_0: { x: 777, y: 888 } };
+    for (let i = 0; i < 200; i++) {
+      bigPositions[`tbl_recon_big_${String(i).padStart(4, '0')}`] = { x: i * 10, y: i * 20 };
+    }
+    const largeSections: CanvasSection[] = Array.from({ length: 160 }, (_, i) => ({
+      id: `sec_recon_big_${String(i).padStart(3, '0')}`,
+      name: `重连大板块_${i}`,
+      color: SECTION_COLORS[i % SECTION_COLORS.length]!,
+      tables: [`tbl_recon_big_${String(i).padStart(4, '0')}`],
+    }));
+    expect(Buffer.byteLength(JSON.stringify(bigPositions), 'utf8')).toBeGreaterThan(MAX_EVENT_BYTES);
+    expect(Buffer.byteLength(JSON.stringify(largeSections), 'utf8')).toBeGreaterThan(MAX_EVENT_BYTES);
+
+    try {
+      await origQuery(
+        'update branches set layout = $2::text::jsonb, layout_ver = 0, sections = $3::text::jsonb, sections_ver = 0 where id = $1',
+        [race2.branchId, JSON.stringify({ tbl_0: { x: 1, y: 1 } }), JSON.stringify([])],
+      );
+
+      db.query = (async <T = Record<string, unknown>>(sql: string, params?: unknown[]) => {
+        const res = await origQuery<T>(sql, params);
+        if (!pausedOnce && sql.includes('select layout, sections, layout_ver, sections_ver from branches')) {
+          pausedOnce = true;
+          enteredSelect.resolve();
+          await releaseSelect.promise;
+        }
+        return res;
+      }) as typeof db.query;
+
+      const reconnectPromise = race2.fakeBus.emitReconnect();
+      await enteredSelect.promise;
+
+      await race2.rooms.message(race2.branchId, race2.peerB.peer, { t: 'layout', positions: bigPositions });
+      await race2.rooms.message(race2.branchId, race2.peerB.peer, { t: 'sections', sections: largeSections });
+      const sentBeforeResume = peerObs.sent.length;
+
+      releaseSelect.resolve();
+      await reconnectPromise;
+
+      expect(peerObs.sent.slice(sentBeforeResume).some((m) => m.t === 'layout' || m.t === 'sections')).toBe(
+        false,
+      );
+
+      db.query = origQuery;
+      const peerAfter = makePeer(editorUser);
+      await race2.rooms.join(race2.branchId, peerAfter.peer);
+      const layoutAfter = peerAfter.sent.find(
+        (m): m is Extract<ToClient | Extra, { t: 'layout' }> => m.t === 'layout',
+      );
+      const sectionsAfter = peerAfter.sent.find(
+        (m): m is Extract<ToClient | Extra, { t: 'sections' }> => m.t === 'sections',
+      );
+      expect(layoutAfter?.positions.tbl_0).toEqual({ x: 777, y: 888 });
+      expect(layoutAfter?.positions.tbl_recon_big_0199).toEqual({ x: 1990, y: 3980 });
+      expect(sectionsAfter?.sections).toHaveLength(160);
+      expect(sectionsAfter?.sections[0]?.id).toBe('sec_recon_big_000');
+    } finally {
+      db.query = origQuery;
+      race2.rooms.close();
+      await race2.rooms.flush();
+    }
+  });
+
+  test('Rooms.load() 与 evictIfIdle() 重载为 DB 已有表预填 layoutVersions，拒绝迟到 N - 1 事件且接受新表与 N + 1（#63）', async () => {
+    branchCounter += 1;
+    const branchId = `sec-race-${branchCounter}-${newId()}`;
+    await db.query('insert into branches (id, project_id, name) values ($1, $2, $3)', [
+      branchId,
+      projectId,
+      `race-${branchCounter}`,
+    ]);
+    const fakeBus = makeFakeBus('replica-b');
+    const rooms = new Rooms(
+      db,
+      (u, pid, lookup) => effectiveProjectRole(db, u, pid, lookup),
+      fakeBus.bus,
+      undefined,
+      { idleEvictMs: 25, layoutDebounceMs: 5000 },
+    );
+    await rooms.init(branchId, emptyModel());
+    try {
+      await db.query('update branches set layout = $2::text::jsonb, layout_ver = 3 where id = $1', [
+        branchId,
+        JSON.stringify({ tbl_1: { x: 300, y: 300 } }),
+      ]);
+
+      // 1. 冷加载预填 layoutVersions：拒绝 N - 1 的 room.layout 与 room.layout.reload
+      const peer1 = makePeer(editorUser);
+      await rooms.join(branchId, peer1.peer);
+      expect(peer1.sent).toContainEqual({ t: 'layout', positions: { tbl_1: { x: 300, y: 300 } } });
+      const count0 = peer1.sent.length;
+
+      await fakeBus.emit({
+        t: 'room.layout',
+        origin: 'replica-a',
+        branchId,
+        positions: { tbl_1: { x: 11, y: 22 } },
+        ver: 2,
+      });
+      expect(peer1.sent).toHaveLength(count0);
+
+      // 即使 DB 被篡改，迟到 ver = 2 的 room.layout.reload 也不得覆盖已载入 tbl_1，且无多余广播
+      await db.query('update branches set layout = $2::text::jsonb, layout_ver = 3 where id = $1', [
+        branchId,
+        JSON.stringify({ tbl_1: { x: 99, y: 99 } }),
+      ]);
+      await fakeBus.emit({ t: 'room.layout.reload', origin: 'replica-a', branchId, ver: 2 });
+      expect(peer1.sent).toHaveLength(count0);
+
+      // 2. DB 加载时不存在的新表不设基线版本，ver = 2 合法新表事件可被正常接收
+      await fakeBus.emit({
+        t: 'room.layout',
+        origin: 'replica-a',
+        branchId,
+        positions: { tbl_new: { x: 44, y: 55 } },
+        ver: 2,
+      });
+      expect(peer1.sent.at(-1)).toEqual({ t: 'layout', positions: { tbl_new: { x: 44, y: 55 } } });
+
+      // 3. ver = N + 1 对已有表正常生效
+      await fakeBus.emit({
+        t: 'room.layout',
+        origin: 'replica-a',
+        branchId,
+        positions: { tbl_1: { x: 400, y: 400 } },
+        ver: 4,
+      });
+      expect(peer1.sent.at(-1)).toEqual({ t: 'layout', positions: { tbl_1: { x: 400, y: 400 } } });
+
+      // 4. 空闲卸载后重载同样预填 layoutVersions，拒绝 ver = 3 并接受 ver = 5
+      await db.query('update branches set layout = $2::text::jsonb, layout_ver = 4 where id = $1', [
+        branchId,
+        JSON.stringify({ tbl_1: { x: 400, y: 400 }, tbl_new: { x: 44, y: 55 } }),
+      ]);
+      await rooms.leave(branchId, peer1.peer);
+      await waitFor(() => !rooms.has(branchId), 3000);
+
+      const peer2 = makePeer(editorUser);
+      await rooms.join(branchId, peer2.peer);
+      expect(peer2.sent).toContainEqual({
+        t: 'layout',
+        positions: { tbl_1: { x: 400, y: 400 }, tbl_new: { x: 44, y: 55 } },
+      });
+      const countB2 = peer2.sent.length;
+
+      await fakeBus.emit({
+        t: 'room.layout',
+        origin: 'replica-a',
+        branchId,
+        positions: { tbl_1: { x: 1, y: 2 } },
+        ver: 3,
+      });
+      await db.query('update branches set layout = $2::text::jsonb, layout_ver = 4 where id = $1', [
+        branchId,
+        JSON.stringify({ tbl_1: { x: 77, y: 77 }, tbl_new: { x: 44, y: 55 } }),
+      ]);
+      await fakeBus.emit({ t: 'room.layout.reload', origin: 'replica-a', branchId, ver: 3 });
+      expect(peer2.sent).toHaveLength(countB2);
+
+      await fakeBus.emit({
+        t: 'room.layout',
+        origin: 'replica-a',
+        branchId,
+        positions: { tbl_1: { x: 500, y: 500 } },
+        ver: 5,
+      });
+      expect(peer2.sent.at(-1)).toEqual({ t: 'layout', positions: { tbl_1: { x: 500, y: 500 } } });
+    } finally {
+      rooms.close();
+      await rooms.flush();
+    }
+  });
+
+  test('reloadLayoutFromDb 严格等待在途 layoutFlushing 排空后再查询 DB（#63）', async () => {
+    const { branchId, fakeBus, rooms, peerB } = await setupRaceRoom();
+    const origQuery = db.query.bind(db);
+    const enteredUpdate = deferred();
+    const releaseUpdate = deferred();
+    const events: string[] = [];
+
+    const a2 = { tbl_1: { x: 222, y: 222 } };
+
+    try {
+      await rooms.message(branchId, peerB.peer, { t: 'layout', positions: { tbl_1: { x: 111, y: 111 } } });
+
+      db.query = (async <T = Record<string, unknown>>(sql: string, params?: unknown[]) => {
+        if (sql.includes('update branches set layout')) {
+          events.push('update:start');
+          enteredUpdate.resolve();
+          await releaseUpdate.promise;
+          const res = await origQuery<T>(sql, params);
+          await origQuery('update branches set layout = $2::text::jsonb, layout_ver = 2 where id = $1', [
+            branchId,
+            JSON.stringify(a2),
+          ]);
+          events.push('update:end');
+          return res;
+        }
+        if (sql.includes('select layout') && sql.includes('from branches')) {
+          events.push('select:start');
+          const res = await origQuery<T>(sql, params);
+          events.push('select:end');
+          return res;
+        }
+        return origQuery<T>(sql, params);
+      }) as typeof db.query;
+
+      const flushPromise = rooms.flush();
+      await enteredUpdate.promise;
+
+      const reloadPromise = fakeBus.emit({
+        t: 'room.layout.reload',
+        origin: 'replica-a',
+        branchId,
+        ver: 2,
+      });
+      await Promise.resolve();
+      await new Promise((r) => setTimeout(r, 20));
+      expect(events).toEqual(['update:start']);
+
+      releaseUpdate.resolve();
+      await Promise.all([flushPromise, reloadPromise]);
+
+      expect(events).toEqual(['update:start', 'update:end', 'select:start', 'select:end']);
+      expect(peerB.sent.at(-1)).toEqual({ t: 'layout', positions: a2 });
+    } finally {
+      db.query = origQuery;
+      rooms.close();
+      await rooms.flush();
+    }
+  });
+
+  test('在途旧 flushLayout(B1) 与更新远端 room.layout(A2) 并发时，DB 自动幂等自愈为 A2 且无多余循环（#63）', async () => {
+    const { branchId, fakeBus, rooms, peerB } = await setupRaceRoom();
+    const origQuery = db.query.bind(db);
+    const enteredFirstUpdate = deferred();
+    const releaseFirstUpdate = deferred();
+    let updateCount = 0;
+
+    const b1 = { tbl_1: { x: 111, y: 111 } };
+    const a2 = { tbl_1: { x: 222, y: 222 } };
+
+    try {
+      await rooms.message(branchId, peerB.peer, { t: 'layout', positions: b1 });
+
+      db.query = (async <T = Record<string, unknown>>(sql: string, params?: unknown[]) => {
+        if (sql.includes('update branches set layout')) {
+          updateCount += 1;
+          if (updateCount === 1) {
+            enteredFirstUpdate.resolve();
+            await releaseFirstUpdate.promise;
+          }
+        }
+        return origQuery<T>(sql, params);
+      }) as typeof db.query;
+
+      const flushPromise = rooms.flush();
+      await enteredFirstUpdate.promise;
+
+      // 在途 B1 尚未落库时，副本 A 已将 A2 写入 DB 并广播 room.layout(ver = 2)
+      await origQuery('update branches set layout = $2::text::jsonb, layout_ver = 2 where id = $1', [
+        branchId,
+        JSON.stringify(a2),
+      ]);
+      await fakeBus.emit({ t: 'room.layout', origin: 'replica-a', branchId, positions: a2, ver: 2 });
+      expect(peerB.sent.at(-1)).toEqual({ t: 'layout', positions: a2 });
+
+      // 放行在途旧 SQL B1（后落盘将 DB 覆写回 B1），flushLayout 应感知版本变更并自愈回写 A2
+      releaseFirstUpdate.resolve();
+      await flushPromise;
+
+      expect(updateCount).toBe(2);
+      const [row] = await origQuery<{ layout: Record<string, { x: number; y: number }>; layout_ver: number }>(
+        'select layout, layout_ver from branches where id = $1',
+        [branchId],
+      );
+      expect(row?.layout).toEqual(a2);
+      expect(Number(row?.layout_ver)).toBe(2);
+
+      // 再次 flush 不再触发额外写库（无无限循环）
+      await rooms.flush();
+      expect(updateCount).toBe(2);
+    } finally {
+      db.query = origQuery;
+      rooms.close();
+      await rooms.flush();
+    }
+  });
+
+  test('reloadSectionsFromDb 当 DB 持久化版本高于事件版本时以 effectiveIncoming 胜出（#63）', async () => {
+    const { branchId, fakeBus, rooms, peerB } = await setupRaceRoom();
+    const origQuery = db.query.bind(db);
+    const enteredSelect = deferred();
+    const releaseSelect = deferred();
+
+    const s5: CanvasSection[] = [{ id: 'sec-s5', name: 'DB高版本', color: 'peer-5', tables: ['t5'] }];
+    const s3: CanvasSection[] = [{ id: 'sec-s3', name: '并发中间版', color: 'peer-3', tables: ['t3'] }];
+
+    try {
+      await origQuery('update branches set sections = $2::text::jsonb, sections_ver = 5 where id = $1', [
+        branchId,
+        JSON.stringify(s5),
+      ]);
+
+      db.query = (async <T = Record<string, unknown>>(sql: string, params?: unknown[]) => {
+        const res = await origQuery<T>(sql, params);
+        if (sql.includes('select sections') && sql.includes('from branches')) {
+          enteredSelect.resolve();
+          await releaseSelect.promise;
+        }
+        return res;
+      }) as typeof db.query;
+
+      const reloadPromise = fakeBus.emit({
+        t: 'room.sections.reload',
+        origin: 'replica-a',
+        branchId,
+        ver: 2,
+      });
+      await enteredSelect.promise;
+
+      // 查库返回前收到 ver = 3 的内存事件，但 DB 持久化的是 ver = 5，effectiveIncoming 应以 ver = 5 胜出
+      await fakeBus.emit({
+        t: 'room.sections',
+        origin: 'replica-c',
+        branchId,
+        sections: s3,
+        ver: 3,
+      });
+      expect(peerB.sent.at(-1)).toEqual({ t: 'sections', sections: s3 });
+
+      releaseSelect.resolve();
+      await reloadPromise;
+
+      expect(peerB.sent.at(-1)).toEqual({ t: 'sections', sections: s5 });
+    } finally {
+      db.query = origQuery;
       rooms.close();
       await rooms.flush();
     }

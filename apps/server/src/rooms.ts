@@ -549,17 +549,24 @@ export class Rooms {
       layout_ver: number | string;
       sections_ver: number | string;
     }>('select layout, sections, layout_ver, sections_ver from branches where id = $1', [branchId]);
+    const layout = b?.layout ?? {};
     const layoutClock = parseClock(b?.layout_ver);
     const sectionsClock = parseClock(b?.sections_ver);
+    const layoutVersions = new Map<string, LayoutVersion>();
+    if (layoutClock > 0) {
+      for (const key of Object.keys(layout)) {
+        layoutVersions.set(key, { ver: layoutClock, origin: '' });
+      }
+    }
     const loaded: Loaded = {
       room,
       lastRejectionId,
       peers: new Set(),
       remotePeers: new Map(),
-      layout: b?.layout ?? {},
+      layout,
       pendingLayout: {},
       layoutClock,
-      layoutVersions: new Map(),
+      layoutVersions,
       layoutFlushing: null,
       layoutRetries: 0,
       sections: sanitizeSections(b?.sections),
@@ -982,6 +989,10 @@ export class Rooms {
   }
 
   private async reloadLayoutFromDb(branchId: string, r: Loaded, incoming?: LayoutVersion) {
+    while (r.layoutFlushing) {
+      await r.layoutFlushing.catch(() => {});
+    }
+    if (!this.isCurrentEntry(branchId, r)) return;
     const pendingBefore: Layout = { ...r.pendingLayout };
     const [b] = await this.db.query<{ layout: Layout; layout_ver: number | string }>(
       'select layout, layout_ver from branches where id = $1',
@@ -993,6 +1004,7 @@ export class Rooms {
     if (incoming && incoming.ver > r.layoutClock) r.layoutClock = incoming.ver;
     if (!b.layout) return;
     const clearedKeys: string[] = [];
+    let updatedAny = false;
     for (const [key, pos] of Object.entries(b.layout)) {
       if (!pos || typeof pos.x !== 'number' || typeof pos.y !== 'number') continue;
       const cur = r.pendingLayout[key];
@@ -1002,9 +1014,12 @@ export class Rooms {
       if (cur !== undefined) clearedKeys.push(key);
       if (incoming) r.layoutVersions.set(key, incoming);
       r.layout[key] = { x: pos.x, y: pos.y };
+      updatedAny = true;
     }
     if (clearedKeys.length > 0) this.clearPendingLayoutKeys(branchId, r, clearedKeys);
-    for (const p of r.peers) this.safeSend(p, { t: 'layout', positions: r.layout });
+    if (updatedAny) {
+      for (const p of r.peers) this.safeSend(p, { t: 'layout', positions: r.layout });
+    }
   }
 
   private scheduleSectionsFlush(branchId: string, r: Loaded, delayMs?: number) {
@@ -1076,10 +1091,12 @@ export class Rooms {
     const persistedVer = parseClock(b.sections_ver);
     if (persistedVer > r.sectionsClock) r.sectionsClock = persistedVer;
     if (r.sectionsWriteSeq !== writeSeqBefore) return;
-    if (!isNewerLayoutVersion(incoming, r.sectionsVersion ?? undefined)) return;
+    const effectiveIncoming: LayoutVersion =
+      persistedVer > incoming.ver ? { ver: persistedVer, origin: '' } : incoming;
+    if (!isNewerLayoutVersion(effectiveIncoming, r.sectionsVersion ?? undefined)) return;
     const sections = sanitizeSections(b.sections);
     r.sections = sections;
-    r.sectionsVersion = persistedVer > incoming.ver ? { ver: persistedVer, origin: '' } : incoming;
+    r.sectionsVersion = effectiveIncoming;
     r.sectionsPending = false;
     r.sectionsRetries = 0;
     this.clearSectionsTimer(r);
@@ -1236,6 +1253,18 @@ export class Rooms {
         const pending = this.rooms.get(branchId);
         const r = pending ? await pending.catch(() => null) : null;
         if (r && this.isCurrentEntry(branchId, r)) {
+          while (r.layoutFlushing) {
+            await r.layoutFlushing.catch(() => {});
+          }
+          while (r.sectionsFlushing) {
+            await r.sectionsFlushing.catch(() => {});
+          }
+          if (!this.isCurrentEntry(branchId, r)) continue;
+          const pendingLayoutBefore: Layout = { ...r.pendingLayout };
+          const layoutVersionsBefore = new Map(r.layoutVersions);
+          const sectionsPendingBefore = r.sectionsPending;
+          const sectionsWriteSeqBefore = r.sectionsWriteSeq;
+          const sectionsVersionBefore = r.sectionsVersion;
           const [b] = await this.db.query<{
             layout: Layout;
             sections: CanvasSection[];
@@ -1248,14 +1277,32 @@ export class Rooms {
             const persistedSectionsVer = parseClock(b.sections_ver);
             if (persistedSectionsVer > r.sectionsClock) r.sectionsClock = persistedSectionsVer;
             if (b.layout) {
-              r.layout = { ...b.layout, ...r.pendingLayout };
-              for (const p of r.peers) this.safeSend(p, { t: 'layout', positions: r.layout });
+              const dbLayoutVersion: LayoutVersion = { ver: persistedLayoutVer, origin: '' };
+              let layoutUpdated = false;
+              for (const [key, pos] of Object.entries(b.layout)) {
+                if (!pos || typeof pos.x !== 'number' || typeof pos.y !== 'number') continue;
+                if (key in r.pendingLayout || key in pendingLayoutBefore) continue;
+                const existingVer = r.layoutVersions.get(key);
+                if (existingVer !== layoutVersionsBefore.get(key)) continue;
+                if (!isNewerLayoutVersion(dbLayoutVersion, existingVer)) continue;
+                r.layout[key] = { x: pos.x, y: pos.y };
+                if (persistedLayoutVer > 0) {
+                  r.layoutVersions.set(key, dbLayoutVersion);
+                }
+                layoutUpdated = true;
+              }
+              if (layoutUpdated) {
+                for (const p of r.peers) this.safeSend(p, { t: 'layout', positions: r.layout });
+              }
             }
-            if (!r.sectionsPending && !r.sectionsFlushing) {
-              const staleDb =
-                r.sectionsVersion !== null &&
-                persistedSectionsVer > 0 &&
-                persistedSectionsVer < r.sectionsVersion.ver;
+            if (
+              !sectionsPendingBefore &&
+              !r.sectionsPending &&
+              !r.sectionsFlushing &&
+              r.sectionsWriteSeq === sectionsWriteSeqBefore &&
+              r.sectionsVersion === sectionsVersionBefore
+            ) {
+              const staleDb = r.sectionsVersion !== null && persistedSectionsVer < r.sectionsVersion.ver;
               if (!staleDb) {
                 if (persistedSectionsVer > (r.sectionsVersion?.ver ?? 0)) {
                   r.sectionsVersion = { ver: persistedSectionsVer, origin: '' };
@@ -1265,7 +1312,9 @@ export class Rooms {
               }
             }
           }
-          await this.publishRoomPeers(branchId, r);
+          if (this.isCurrentEntry(branchId, r)) {
+            await this.publishRoomPeers(branchId, r);
+          }
         }
       } catch (e) {
         console.error(`事件总线重连后追赶房间失败（branchId=${branchId}）`, e);
@@ -1537,6 +1586,7 @@ export class Rooms {
     }
     if (Object.keys(r.pendingLayout).length === 0) {
       r.layoutRetries = 0;
+      this.clearLayoutTimer(r);
       this.scheduleIdleEvictIfNeeded(branchId, r);
       return;
     }
@@ -1545,10 +1595,24 @@ export class Rooms {
       while (Object.keys(r.pendingLayout).length > 0) {
         const snapshot: Layout = { ...r.pendingLayout };
         const fullLayout = this.db.dialect === 'pg' ? null : { ...r.layout };
-        const layoutVer = Math.max(0, r.layoutClock);
-        currentSnapshot = snapshot;
         const keys = Object.keys(snapshot);
         if (keys.length === 0) break;
+        const versionsBefore = new Map<string, LayoutVersion | undefined>();
+        let maxVersion = r.layoutClock;
+        if (this.db.dialect === 'pg') {
+          for (const key of keys) {
+            const ver = r.layoutVersions.get(key);
+            versionsBefore.set(key, ver);
+            if (ver && ver.ver > maxVersion) maxVersion = ver.ver;
+          }
+        } else {
+          for (const [key, ver] of r.layoutVersions) {
+            versionsBefore.set(key, ver);
+            if (ver.ver > maxVersion) maxVersion = ver.ver;
+          }
+        }
+        const layoutVer = Math.max(0, maxVersion);
+        currentSnapshot = snapshot;
         const rows =
           this.db.dialect === 'pg'
             ? await this.db.query<{ layout_ver: number | string }>(
@@ -1561,11 +1625,30 @@ export class Rooms {
               );
         const persistedVer = parseClock(rows[0]?.layout_ver);
         if (persistedVer > r.layoutClock) r.layoutClock = persistedVer;
-        // SQL 落库成功后再清理快照中未被新坐标替换的键（按对象引用精确判定）
+        // SQL 落库成功后再清理快照中未被新坐标或更高版本替换的键；若落库期间远端更新胜出并清掉了 pendingLayout，则重新入队以自愈 DB
         for (const key of keys) {
-          if (r.pendingLayout[key] === snapshot[key]) {
+          const versionChanged = r.layoutVersions.get(key) !== versionsBefore.get(key);
+          if (r.pendingLayout[key] === snapshot[key] && !versionChanged) {
             delete r.pendingLayout[key];
+          } else if (!(key in r.pendingLayout) && versionChanged) {
+            const winningPos = r.layout[key];
+            if (winningPos) {
+              r.pendingLayout[key] = winningPos;
+            }
           }
+        }
+        if (this.db.dialect !== 'pg') {
+          for (const [key, currentVer] of r.layoutVersions) {
+            if (currentVer !== versionsBefore.get(key) && !(key in r.pendingLayout)) {
+              const winningPos = r.layout[key];
+              if (winningPos) {
+                r.pendingLayout[key] = winningPos;
+              }
+            }
+          }
+        }
+        if (Object.keys(r.pendingLayout).length === 0) {
+          this.clearLayoutTimer(r);
         }
         r.layoutRetries = 0;
       }

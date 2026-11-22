@@ -1841,6 +1841,246 @@ describe.skipIf(!PG_URL)('P7 HA2：无状态实时协作房间（真实 PG 双�
       ),
     );
   });
+
+  test('19. 冷加载与空闲卸载重载的 PG 副本按持久化 layout_ver 预填表版本，拒绝迟到 N - 1 事件且接受新表与 N + 1（#63）', async () => {
+    const f = await boot(
+      'cold-layout-prepopulate',
+      true,
+      {
+        roomsA: { layoutDebounceMs: 250 },
+        roomsB: { idleEvictMs: 60, layoutDebounceMs: 250 },
+      },
+      { a: 'replica-a-prepop', b: 'replica-b-prepop' },
+    );
+
+    const peerA = makePeer(f.alice);
+    await f.appA.rooms.join(f.branchId, peerA.peer);
+    for (let step = 1; step <= 3; step++) {
+      await f.appA.rooms.message(f.branchId, peerA.peer, {
+        t: 'layout',
+        positions: { tbl_1: { x: step * 100, y: step * 100 } },
+      });
+    }
+    await f.appA.rooms.flush();
+
+    // 1. 副本 B 冷加载（layout_ver = 3），对已载入 tbl_1 预填版本 3
+    const peerB1 = makePeer(f.bob);
+    await f.appB.rooms.join(f.branchId, peerB1.peer);
+    await waitFor(() =>
+      peerB1.sent.some(
+        (m) => m.t === 'layout' && m.positions.tbl_1?.x === 300 && m.positions.tbl_1?.y === 300,
+      ),
+    );
+
+    // 经 PG NOTIFY 按顺序发出迟到 ver = 2 的 tbl_1 与全新表 tbl_probe_cold：前者被拒、后者被接收
+    await f.appA.bus.publish({
+      t: 'room.layout',
+      branchId: f.branchId,
+      positions: { tbl_1: { x: 11, y: 22 } },
+      ver: 2,
+    });
+    await f.appA.bus.publish({
+      t: 'room.layout',
+      branchId: f.branchId,
+      positions: { tbl_probe_cold: { x: 44, y: 55 } },
+      ver: 2,
+    });
+    await waitFor(() => peerB1.sent.some((m) => m.t === 'layout' && m.positions.tbl_probe_cold?.x === 44));
+    expect(peerB1.sent.some((m) => m.t === 'layout' && m.positions.tbl_1?.x === 11)).toBe(false);
+
+    // 迟到 ver = 2 的 room.layout.reload 同样被拦截，即使 DB 已被篡改也不覆盖 tbl_1
+    const origQueryB = f.dbB.query.bind(f.dbB);
+    let resolveReload1!: () => void;
+    const reload1Done = new Promise<void>((res) => {
+      resolveReload1 = res;
+    });
+    f.dbB.query = (async <T = Record<string, unknown>>(sql: string, params?: unknown[]) => {
+      const res = await origQueryB<T>(sql, params);
+      if (sql.includes('select layout, layout_ver from branches')) {
+        resolveReload1();
+      }
+      return res;
+    }) as typeof f.dbB.query;
+
+    try {
+      await f.dbA.query('update branches set layout = $2::text::jsonb where id = $1', [
+        f.branchId,
+        JSON.stringify({ tbl_1: { x: 99, y: 99 } }),
+      ]);
+      await f.appA.bus.publish({ t: 'room.layout.reload', branchId: f.branchId, ver: 2 });
+      await reload1Done;
+      await new Promise((r) => setTimeout(r, 30));
+      expect(peerB1.sent.some((m) => m.t === 'layout' && m.positions.tbl_1?.x === 99)).toBe(false);
+    } finally {
+      f.dbB.query = origQueryB;
+    }
+
+    // 发送 N + 1 (ver = 4) 正常被接收并落盘
+    await f.appA.rooms.message(f.branchId, peerA.peer, {
+      t: 'layout',
+      positions: { tbl_1: { x: 400, y: 400 } },
+    });
+    await waitFor(() =>
+      peerB1.sent.some(
+        (m) => m.t === 'layout' && m.positions.tbl_1?.x === 400 && m.positions.tbl_1?.y === 400,
+      ),
+    );
+    await f.appA.rooms.flush();
+
+    // 2. 副本 B 空闲卸载后重载（layout_ver = 4），同样拒绝 ver = 3 且接受新表与 ver = 5
+    await f.appB.rooms.leave(f.branchId, peerB1.peer);
+    await waitFor(() => !f.appB.rooms.has(f.branchId), 3000);
+
+    const peerB2 = makePeer(f.bob);
+    await f.appB.rooms.join(f.branchId, peerB2.peer);
+    await waitFor(() =>
+      peerB2.sent.some(
+        (m) => m.t === 'layout' && m.positions.tbl_1?.x === 400 && m.positions.tbl_1?.y === 400,
+      ),
+    );
+
+    await f.appA.bus.publish({
+      t: 'room.layout',
+      branchId: f.branchId,
+      positions: { tbl_1: { x: 1, y: 2 } },
+      ver: 3,
+    });
+    await f.appA.bus.publish({
+      t: 'room.layout',
+      branchId: f.branchId,
+      positions: { tbl_probe_evict: { x: 66, y: 77 } },
+      ver: 3,
+    });
+    await waitFor(() => peerB2.sent.some((m) => m.t === 'layout' && m.positions.tbl_probe_evict?.x === 66));
+    expect(peerB2.sent.some((m) => m.t === 'layout' && m.positions.tbl_1?.x === 1)).toBe(false);
+
+    let resolveReload2!: () => void;
+    const reload2Done = new Promise<void>((res) => {
+      resolveReload2 = res;
+    });
+    f.dbB.query = (async <T = Record<string, unknown>>(sql: string, params?: unknown[]) => {
+      const res = await origQueryB<T>(sql, params);
+      if (sql.includes('select layout, layout_ver from branches')) {
+        resolveReload2();
+      }
+      return res;
+    }) as typeof f.dbB.query;
+
+    try {
+      await f.dbA.query('update branches set layout = $2::text::jsonb where id = $1', [
+        f.branchId,
+        JSON.stringify({ tbl_1: { x: 88, y: 88 } }),
+      ]);
+      await f.appA.bus.publish({ t: 'room.layout.reload', branchId: f.branchId, ver: 3 });
+      await reload2Done;
+      await new Promise((r) => setTimeout(r, 30));
+      expect(peerB2.sent.some((m) => m.t === 'layout' && m.positions.tbl_1?.x === 88)).toBe(false);
+    } finally {
+      f.dbB.query = origQueryB;
+    }
+
+    await f.appA.rooms.message(f.branchId, peerA.peer, {
+      t: 'layout',
+      positions: { tbl_1: { x: 500, y: 500 } },
+    });
+    await waitFor(() =>
+      peerB2.sent.some(
+        (m) => m.t === 'layout' && m.positions.tbl_1?.x === 500 && m.positions.tbl_1?.y === 500,
+      ),
+    );
+  });
+
+  test('20. PG LISTEN 断线重连后（handleBusReconnect），不回退未落盘的较新内存 layout 与 sections（#63）', async () => {
+    const f = await boot('reconnect-stale-guard', true, {
+      roomsA: { layoutDebounceMs: 30_000 },
+      roomsB: { layoutDebounceMs: 30_000 },
+    });
+
+    const peerA = makePeer(f.alice);
+    const peerB = makePeer(f.bob);
+    await f.appA.rooms.join(f.branchId, peerA.peer);
+    await f.appB.rooms.join(f.branchId, peerB.peer);
+
+    // 1. 副本 A 处于 30s 防抖窗口（DB 仍为 layout_ver = 0, sections_ver = 0），广播 ver = 1 到副本 B
+    const s1 = [{ id: 'sec-recon-1', name: '防抖未落盘板块', color: 'peer-1' as const, tables: ['tbl_1'] }];
+    await f.appA.rooms.message(f.branchId, peerA.peer, {
+      t: 'layout',
+      positions: { tbl_1: { x: 500, y: 500 } },
+    });
+    await f.appA.rooms.message(f.branchId, peerA.peer, {
+      t: 'sections',
+      sections: s1,
+    });
+    await waitFor(
+      () =>
+        peerB.sent.some((m) => m.t === 'layout' && m.positions.tbl_1?.x === 500) &&
+        peerB.sent.some((m) => m.t === 'sections' && m.sections[0]?.id === 'sec-recon-1'),
+    );
+
+    const origQueryB = f.dbB.query.bind(f.dbB);
+    let selectCount = 0;
+    let reconnectedCount = 0;
+    const off = f.appB.bus.onReconnect(() => {
+      reconnectedCount += 1;
+    });
+    f.dbB.query = (async <T = Record<string, unknown>>(sql: string, params?: unknown[]) => {
+      const res = await origQueryB<T>(sql, params);
+      if (sql.includes('select layout, sections, layout_ver, sections_ver from branches')) {
+        selectCount += 1;
+      }
+      return res;
+    }) as typeof f.dbB.query;
+
+    try {
+      const killListenAndWaitReconnect = async (targetSelectCount: number) => {
+        const targetReconnect = reconnectedCount + 1;
+        await f.dbA.query(
+          `select pg_terminate_backend(pid)
+           from pg_stat_activity
+           where datname = current_database()
+             and pid <> pg_backend_pid()
+             and query ilike 'listen%'`,
+        );
+        await waitFor(() => reconnectedCount >= targetReconnect && selectCount >= targetSelectCount, 10_000);
+        await new Promise((r) => setTimeout(r, 40));
+      };
+
+      // 第 1 次断线重连：DB 仍为 ver = 0，内存 ver = 1 的 layout 与 sections 绝不被回退
+      await killListenAndWaitReconnect(1);
+      const check1 = makePeer(f.bob);
+      await f.appB.rooms.join(f.branchId, check1.peer);
+      expect(check1.sent).toContainEqual({ t: 'layout', positions: { tbl_1: { x: 500, y: 500 } } });
+      expect(check1.sent).toContainEqual({ t: 'sections', sections: s1 });
+      await f.appB.rooms.leave(f.branchId, check1.peer);
+
+      // 2. 将第 1 笔刷库使 DB 停留在 layout_ver = 1，随后副本 A 发第 2 笔处于防抖窗口（ver = 2），再触发第 2 次断线重连
+      await f.appA.rooms.flush();
+      const [dbMid] = await f.dbA.query<{ layout_ver: number }>(
+        'select layout_ver from branches where id = $1',
+        [f.branchId],
+      );
+      expect(Number(dbMid?.layout_ver)).toBe(1);
+
+      await f.appA.rooms.message(f.branchId, peerA.peer, {
+        t: 'layout',
+        positions: { tbl_1: { x: 650, y: 750 } },
+      });
+      await waitFor(() =>
+        peerB.sent.some(
+          (m) => m.t === 'layout' && m.positions.tbl_1?.x === 650 && m.positions.tbl_1?.y === 750,
+        ),
+      );
+
+      await killListenAndWaitReconnect(2);
+      const check2 = makePeer(f.bob);
+      await f.appB.rooms.join(f.branchId, check2.peer);
+      expect(check2.sent).toContainEqual({ t: 'layout', positions: { tbl_1: { x: 650, y: 750 } } });
+      expect(check2.sent).toContainEqual({ t: 'sections', sections: s1 });
+    } finally {
+      f.dbB.query = origQueryB;
+      off();
+    }
+  });
 });
 
 describe('Room.applyExternalCommit / applyExternalRejection 单元测试', () => {
