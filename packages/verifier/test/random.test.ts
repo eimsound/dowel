@@ -84,7 +84,7 @@ test.skipIf(!PG_URL)(
       {
         numRuns: Math.min(RUNS, 50),
         seed: process.env.SEED ? Number(process.env.SEED) : undefined,
-        interruptAfterTimeLimit: Number(process.env.TIME_LIMIT ?? 180_000),
+        interruptAfterTimeLimit: Math.min(Number(process.env.TIME_LIMIT ?? 180_000), 90_000),
         markInterruptAsFailure: true,
       },
     );
@@ -212,7 +212,10 @@ test.skipIf(!PG_URL)(
       {
         numRuns: EXEC_RUNS,
         seed: process.env.SEED ? Number(process.env.SEED) : undefined,
-        interruptAfterTimeLimit: Number(process.env.TIME_LIMIT ?? 180_000),
+        interruptAfterTimeLimit: Math.min(
+          Number(process.env.TIME_LIMIT ?? 180_000),
+          90_000 + EXEC_RUNS * 1_500,
+        ),
         markInterruptAsFailure: true,
       },
     );
