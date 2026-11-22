@@ -36,6 +36,73 @@ Dowel 支持**从已连接环境导入**和**从 SQL 文件导入**两种方式�
   - 建议为影子库配置独立的低权限账号（仅拥有影子库自身的所有权或建表/删表权限，不赋予超级用户权限）；
   - 规划与导入前会对脚本做词法级高危检查，拦截跨库或实例级语句（如 PG `CREATE DATABASE`/`ALTER SYSTEM`/`TABLESPACE`/`ROLE`；SQLite `ATTACH`/`DETACH`/`VACUUM INTO`/危险 `PRAGMA`；MySQL `CREATE DATABASE`/`GRANT`/`SET GLOBAL`、跨库 `db.obj` 与危险 `sql_mode`；MSSQL `USE`/`KILL`/`xp_cmdshell`/`OPENROWSET`/`BULK INSERT`/跨库三段名），以及任何试图修改 `dowel` / `dowel_*` 历史对象的操作。该静态检查用于防范误操作，真正的安全隔离边界仍取决于影子库账号权限与实例隔离。
 
+### 托管数据库与受限权限配置 {#managed-shadow-db}
+
+#### 推荐拓扑：独立近端影子库 {#managed-shadow-topology}
+
+使用 AWS RDS / Aurora、Google Cloud SQL、Neon、Supabase、Azure 等托管数据库时，推荐在**同地域私网或近端自托管实例**上为环境显式配置独立的 `shadowUrl`（保持与目标库主版本一致）：
+
+- **降低网络往返开销**：闭环验证与风险实测包含多个串行数据库往返；公网直连远端托管库时较高的网络延迟（RTT）会显著拖慢发布、导入与规范化体验；
+- **保护生产环境资源**：生产环境默认禁止同实例自动建影子库（检查与清库会消耗实例连接数与 I/O）；使用独立影子库实例即可在不放开生产限制的前提下完成闭环验证。
+
+#### PostgreSQL 连接模式要求（禁用 Transaction Pooler） {#pg-connection-mode}
+
+PostgreSQL 目标库与影子库均必须配置为**直连端点**或 **Session Mode**（通常为端口 `5432`），**不要使用 Transaction Pooler（事务池化器）**，例如：
+
+- Supabase Supavisor Transaction Mode（`*.pooler.supabase.com:6543`）；
+- Neon 池化端点（主机名含 `-pooler.`）；
+- PgBouncer `pool_mode = transaction`（常见于端口 `6543` 或查询参数 `?pgbouncer=true`）。
+
+原因在于 Dowel 的影子库与生命周期操作依赖**会话级**机制（`pg_try_advisory_lock` / `pg_advisory_unlock` 会话级咨询锁、跨语句持久的 `SET lock_timeout` / `SET statement_timeout` 会话参数，以及非事务块执行的 `CREATE DATABASE`）。如果连接串使用事务池化器，连接在事务结束后会被归还池中，导致锁状态丢失或会话参数失效。
+
+#### 最小权限 SQL 配置指南 {#shadow-minimal-privileges}
+
+##### PostgreSQL（15–19） {#pg-shadow-privileges}
+
+- **方式 1（允许自动建 `{原库名}_dowel` 同实例影子库）**：为 Dowel 使用的数据库角色授予 `CREATEDB` 权限（无需 `SUPERUSER`）：
+
+  ```sql
+  CREATE ROLE dowel_user NOSUPERUSER CREATEDB LOGIN PASSWORD '<强密码>';
+  ```
+
+- **方式 2（无 `CREATEDB` 权限 / 由 DBA 预建独立影子库）**：由管理员预先创建空数据库，并将新库**所有权（`OWNER`）**直接交给 Dowel 角色：
+
+  ```sql
+  CREATE ROLE dowel_user NOSUPERUSER NOCREATEDB LOGIN PASSWORD '<强密码>';
+  CREATE DATABASE app_dowel OWNER dowel_user;
+  ```
+
+- **托管 PG 常见坑与说明**：
+  - 在 RDS / Aurora / Cloud SQL 等非真超级用户托管实例上，管理账号执行 `CREATE DATABASE ... OWNER dowel_user` 前需先让自己成为目标角色的成员：`GRANT dowel_user TO admin_user;`；
+  - 仅执行 `GRANT ALL PRIVILEGES ON DATABASE app_dowel TO dowel_user` **不够**：Dowel 认领影子库时需执行 `COMMENT ON DATABASE`（要求当前角色为库所有者），且 PG 15+ 每次验证前清空影子库会执行 `DROP SCHEMA public CASCADE`（要求当前角色拥有 `public` 及相关 schema 所有权，设置数据库 `OWNER` 即可让其通过 `pg_database_owner` 默认拥有 `public`）；
+  - 如影子库内存在其他角色创建的残留 schema，还需补授所有权：`ALTER SCHEMA <schema> OWNER TO dowel_user;`。
+
+##### MySQL（8.4 / 9.7） {#mysql-shadow-privileges}
+
+当 Dowel 使用的数据库用户没有实例级建库权限时，由管理员预建空库（推荐使用 `utf8mb4` 字符集），并仅授予该影子库上的完整 DDL/DML 权限（供维护 `__dowel_shadow_mark` 哨兵表及清空重放）：
+
+```sql
+CREATE DATABASE app_dowel CHARACTER SET utf8mb4 COLLATE utf8mb4_0900_ai_ci;
+GRANT ALL PRIVILEGES ON `app_dowel`.* TO 'dowel_user'@'%';
+```
+
+##### SQL Server（2019–2025） {#mssql-shadow-privileges}
+
+由管理员预先创建独立空用户数据库（切勿使用 `master`、`tempdb`、`model`、`msdb` 系统库），并在该影子库内为 Dowel 用户授予 `db_owner` 角色（供写入 `dowel_shadow` 数据库扩展属性、`sys.sp_getapplock` 会话锁与清空重放）：
+
+```sql
+CREATE DATABASE [app_dowel];
+GO
+USE [app_dowel];
+GO
+CREATE USER [dowel_user] FOR LOGIN [dowel_user];
+ALTER ROLE [db_owner] ADD MEMBER [dowel_user];
+GO
+```
+
+!!! danger "安全红线：切勿将包含业务数据的数据库设置为影子库"
+每次执行导入 SQL、闭环验证或规范化前，Dowel 都会先核对专属标记并将影子库内的全部用户对象彻底清空。切勿将存放业务数据的数据库填入环境的影子库地址，也不要人为给非空数据库打上影子库标记。
+
 ## 实时协作与画布修改历史 {#collab-and-history}
 
 ### 先到先得的并发冲突控制 {#optimistic-concurrency}

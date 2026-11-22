@@ -96,7 +96,7 @@ pnpm check        # 依次执行 pnpm lint（Oxlint --type-aware --deny-warnings
 - 主机名会先解析为 IP 再比对，因此 `localhost`、`127.0.0.1`、`::1` 需按实际使用情况分别允许（或配置 `127.0.0.0/8`、`::1/128`）。解析失败的主机名一律拒绝。
 - **留空表示不限制**（自托管默认）。配置后不在列表中的地址在连接检查和创建/更新环境时返回 `422`。
 - 为确保白名单有效，服务端强制要求使用标准 TCP authority 格式：
-  - **PostgreSQL**：拒绝 `?host=`、`?hostaddr=` 查询参数及 unix socket（`/var/run/postgresql`）；逗号分隔多主机时逐一校验全部主机；
+  - **PostgreSQL**：拒绝 `?host=`、`?hostaddr=` 查询参数及 unix socket（`/var/run/postgresql`）；逗号分隔多主机时逐一校验全部主机（托管库连接模式要求与影子库最小权限 SQL 配置见 [托管数据库与受限权限配置](modeling.md#managed-shadow-db)）；
   - **MySQL**：拒绝 `?socketPath=` 查询参数及 unix socket；
   - **SQL Server**：支持标准 `host[:port]` 与 `host\instance` 命名实例格式的主机名校验。
 
