@@ -246,7 +246,7 @@ packages/
   verifier/     闭环验证执行器与各方言随机属性测试
 actions/
   execute/      内置纯 bash + curl 复合 Action 与 CI 脚本
-docs/           面向最终用户的 Zensical 文档站点源码（zensical.toml 构建）
+docs/           面向最终用户的 Zensical 双语文档站点源码（docs/en/、docs/zh/、docs/zensical*.toml）
 .agents/docs/   AI 协作与架构/决策文档（调研、共识、设计、ADR、进展）
 ```
 

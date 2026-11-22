@@ -23,8 +23,8 @@ test-results/
 data/
 
 # 文档站点构建产物（Zensical）
-site/
-.cache/
+docs/site/
+docs/.cache/
 
 # 本地规划文件
 ROADMAP.local.md

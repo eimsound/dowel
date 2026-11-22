@@ -1,5 +1,5 @@
 // M1a 验收：随机修改 IR，迁移在 PG 18 上必须 100% 闭环通过。
-// 本地默认跑少量用例；CI 的 heavy 任务用 RUNS=5000 跑大量用例（.github/workflows/ci.yml）。
+// 本地默认跑少量用例；CI 的 heavy 任务按 PR 2000 / main 5000 跑大量用例（.github/workflows/ci.yml）。
 
 import { emptyBase, LATEST_PG_MAJOR, type Model, pgMajorOf, plan, validate } from '@dowel/core';
 import {
@@ -17,6 +17,7 @@ import { expect, test } from 'vitest';
 
 import {
   parseExplicitSeed,
+  parseNonNegativeMs,
   parsePositiveMs,
   resolveHeavyWorkers,
   runShardedProperty,
@@ -34,7 +35,7 @@ const EXEC_RUNS = Number(process.env.EXEC_RUNS ?? Math.min(RUNS, 30));
 const EXPLICIT_SEED = parseExplicitSeed(process.env.SEED);
 const WORKERS = resolveHeavyWorkers(RUNS, process.env.HEAVY_WORKERS, EXPLICIT_SEED);
 const TIME_LIMIT = parsePositiveMs(process.env.TIME_LIMIT, 180_000);
-const SHRINK_TIME_LIMIT = parsePositiveMs(process.env.SHRINK_TIME_LIMIT, 60_000);
+const SHRINK_TIME_LIMIT = parseNonNegativeMs(process.env.SHRINK_TIME_LIMIT, 60_000);
 
 const queryPgMajor = async (db: Db): Promise<number> => {
   const [{ v }] = (await db.query<{ v: number }>(
@@ -55,6 +56,7 @@ test.skipIf(!PG_URL)(
       runs: RUNS,
       workers: WORKERS,
       seed: EXPLICIT_SEED,
+      // 仅用于常规模糊测试（遭遇首例失败即停），缩小反例另受 SHRINK_TIME_LIMIT 独立约束
       timeLimitMs: TIME_LIMIT,
       shrinkTimeLimitMs: SHRINK_TIME_LIMIT,
       makeProperty: (shardDb, checkAbort) =>
@@ -73,7 +75,7 @@ test.skipIf(!PG_URL)(
         }),
     });
   },
-  Math.max(60_000 + RUNS * 1_000, TIME_LIMIT + SHRINK_TIME_LIMIT + 60_000),
+  Math.max(TIME_LIMIT, 60_000 + RUNS * 1_000) + SHRINK_TIME_LIMIT + 60_000,
 );
 
 // 发布时冻结的脚本：plan() 的输出经 toScriptSteps 冻结，之后执行的是这份文本而不是重新规划。
@@ -83,26 +85,30 @@ test.skipIf(!PG_URL)(
   async () => {
     const db = conn();
     const pgMajor = await queryPgMajor(db);
-    await fc.assert(
-      fc.asyncProperty(versions, async (vs) => {
-        const { v1, v2 } = makeVersions(vs, { pgMajor });
-        const up = toScriptSteps(plan(v1, v2));
-        const down = toScriptSteps(plan(v2, v1));
-        const r = await verifyScripts(db, v1, v2, up, down);
-        expect(r.upDiff).toEqual([]);
-        expect(r.downDiff).toEqual([]);
-        // 冻结的步骤与规划器的输出逐条一致
-        expect(r.up.map((s) => s.sql)).toEqual(up.map((s) => s.sql));
-      }),
-      {
-        numRuns: Math.min(RUNS, 50),
-        seed: EXPLICIT_SEED,
-        interruptAfterTimeLimit: Math.min(TIME_LIMIT, 90_000),
-        markInterruptAsFailure: true,
-      },
-    );
+    await runShardedProperty({
+      prefix: 'random_scripts',
+      defaultDb: db,
+      runs: Math.min(RUNS, 50),
+      workers: 1,
+      seed: EXPLICIT_SEED,
+      timeLimitMs: Math.min(TIME_LIMIT, 90_000),
+      shrinkTimeLimitMs: Math.min(SHRINK_TIME_LIMIT, 60_000),
+      makeProperty: (shardDb, checkAbort) =>
+        fc.asyncProperty(versions, async (vs) => {
+          checkAbort();
+          const { v1, v2 } = makeVersions(vs, { pgMajor });
+          const up = toScriptSteps(plan(v1, v2));
+          const down = toScriptSteps(plan(v2, v1));
+          checkAbort();
+          const r = await verifyScripts(shardDb, v1, v2, up, down);
+          expect(r.upDiff).toEqual([]);
+          expect(r.downDiff).toEqual([]);
+          // 冻结的步骤与规划器的输出逐条一致
+          expect(r.up.map((s) => s.sql)).toEqual(up.map((s) => s.sql));
+        }),
+    });
   },
-  60_000 + 50 * 1_000,
+  60_000 + 50 * 1_000 + Math.min(SHRINK_TIME_LIMIT, 60_000) + 30_000,
 );
 
 // 经由执行器 + 历史表（P4b）：发布时冻结的脚本放进版本链，在一个真正的“目标库”上由执行器逐个执行（v1 → v2）、
@@ -115,9 +121,9 @@ test.skipIf(!PG_URL)(
     const scratch = conn();
     const tdb = target();
     const pgMajor = await queryPgMajor(scratch);
-    const canon = async (m: Model): Promise<Model> => {
-      await build(scratch, m);
-      return reconcileIds(m, importSnapshot(await readSnapshot(scratch)));
+    const canon = async (d: Db, m: Model): Promise<Model> => {
+      await build(d, m);
+      return reconcileIds(m, importSnapshot(await readSnapshot(d)));
     };
     const version = (models: Model[], i: number): ChainVersion => {
       const model = models[i]!;
@@ -139,96 +145,100 @@ test.skipIf(!PG_URL)(
         scope: null,
       };
     };
-    await fc.assert(
-      fc.asyncProperty(versions, async (vs) => {
-        const { v1, v2 } = makeVersions(vs, { pgMajor });
-        const models = [await canon(v1), await canon(v2)];
-        const chain = [version(models, 0), version(models, 1)];
-        // 全新的目标库：清空（包括上一轮留下的 dowel schema），再建一个干净的 public
-        await resetShadow(tdb);
-        await tdb.exec('CREATE SCHEMA public');
-        const base = {
-          db: tdb,
-          projectId: 'random',
-          projectName: null,
-          instanceId: 'random-instance',
-          chain,
-          executedBy: null,
-        };
-        const up = await execute({ ...base, to: 'v2' });
-        // v1 本来就等于全新的库（模型里几乎什么都没有）时，库的结构已经是 v1：只写基线，不执行 SQL
-        const first = up.ran[0]!.direction;
-        expect(['up', 'baseline']).toContain(first);
-        expect(up.ran.map((r) => [r.number, r.direction])).toEqual([
-          [1, first],
-          [2, 'up'],
-        ]);
-        const down = await execute({ ...base, to: 'v1' });
-        expect(down.ran.map((r) => [r.number, r.direction])).toEqual([[2, 'down']]);
-        const again = await execute({ ...base, to: 'v2' });
-        expect(again.ran.map((r) => [r.number, r.direction])).toEqual([[2, 'up']]);
-        const h = await readHistory(tdb, 'random');
-        expect(h.currentVersion).toBe('v2');
-        expect(h.history.map((x) => [x.direction, x.status])).toEqual([
-          [first, 'done'],
-          ['up', 'done'],
-          ['down', 'done'],
-          ['up', 'done'],
-        ]);
+    await runShardedProperty({
+      prefix: 'random_exec',
+      defaultDb: scratch,
+      runs: EXEC_RUNS,
+      workers: 1,
+      seed: EXPLICIT_SEED,
+      timeLimitMs: Math.min(TIME_LIMIT, 90_000 + EXEC_RUNS * 1_500),
+      shrinkTimeLimitMs: Math.min(SHRINK_TIME_LIMIT, 60_000),
+      makeProperty: (shardDb, checkAbort) =>
+        fc.asyncProperty(versions, async (vs) => {
+          checkAbort();
+          const { v1, v2 } = makeVersions(vs, { pgMajor });
+          const models = [await canon(shardDb, v1), await canon(shardDb, v2)];
+          const chain = [version(models, 0), version(models, 1)];
+          checkAbort();
+          // 全新的目标库：清空（包括上一轮留下的 dowel schema），再建一个干净的 public
+          await resetShadow(tdb);
+          await tdb.exec('CREATE SCHEMA public');
+          const base = {
+            db: tdb,
+            projectId: 'random',
+            projectName: null,
+            instanceId: 'random-instance',
+            chain,
+            executedBy: null,
+          };
+          const up = await execute({ ...base, to: 'v2' });
+          // v1 本来就等于全新的库（模型里几乎什么都没有）时，库的结构已经是 v1：只写基线，不执行 SQL
+          const first = up.ran[0]!.direction;
+          expect(['up', 'baseline']).toContain(first);
+          expect(up.ran.map((r) => [r.number, r.direction])).toEqual([
+            [1, first],
+            [2, 'up'],
+          ]);
+          const down = await execute({ ...base, to: 'v1' });
+          expect(down.ran.map((r) => [r.number, r.direction])).toEqual([[2, 'down']]);
+          const again = await execute({ ...base, to: 'v2' });
+          expect(again.ran.map((r) => [r.number, r.direction])).toEqual([[2, 'up']]);
+          const h = await readHistory(tdb, 'random');
+          expect(h.currentVersion).toBe('v2');
+          expect(h.history.map((x) => [x.direction, x.status])).toEqual([
+            [first, 'done'],
+            ['up', 'done'],
+            ['down', 'done'],
+            ['up', 'done'],
+          ]);
 
-        // 新实例接手（P4c）：只靠目标库里的 dowel 历史恢复版本链——模型（含对象 ID）、冻结脚本、checksum 与原来的完全一致；
-        // 认领之后原实例被拒绝；新实例用恢复出来的链继续执行 / 回滚，每一步读回的结构仍然等于恢复出来的模型
-        const merged = mergeHistories([{ name: 'target', state: await readState(tdb, 'random') }]);
-        expect(merged.versions.map((r) => [r.versionId, r.number, r.parentId, r.checksum])).toEqual(
-          chain.map((v) => [v.id, v.number, v.parentId, v.checksum]),
-        );
-        for (const [i, r] of merged.versions.entries()) {
-          expect(r.model, `v${i + 1} 的模型（含对象 ID）`).toEqual(chain[i]!.model);
-          expect(r.upSteps).toEqual(chain[i]!.upSteps);
-          expect(r.downSteps).toEqual(chain[i]!.downSteps);
-        }
-        expect(merged.envs[0]).toMatchObject({ current: 'v2', behind: 0 });
-        const restored: ChainVersion[] = merged.versions.map((r) => ({
-          id: r.versionId,
-          number: r.number,
-          parentId: r.parentId,
-          name: r.name,
-          model: r.model,
-          upSteps: r.upSteps,
-          downSteps: r.downSteps,
-          checksum: r.checksum,
-          // 接手恢复的版本在平台上是“未验证”的；这里模拟用户在影子库里重新验证过
-          verified: true,
-          publishedAt: r.publishedAt,
-          publishedBy: r.publishedBy,
-          scope: r.scope?.length ? r.scope : null,
-        }));
-        const claimed = await claimInstance({
-          chain: restored,
-          db: tdb,
-          projectId: 'random',
-          projectName: null,
-          instanceId: 'random-instance-2',
-          claimedBy: null,
-          claimedByName: null,
-        });
-        expect(claimed).toEqual({ changed: true, previousInstanceId: 'random-instance' });
-        await expect(execute({ ...base, to: 'v1' })).rejects.toMatchObject({ code: 'foreign_instance' });
-        const b2 = { ...base, chain: restored, instanceId: 'random-instance-2' };
-        expect((await execute({ ...b2, to: 'v1' })).ran.map((r) => [r.number, r.direction])).toEqual([
-          [2, 'down'],
-        ]);
-        expect((await execute({ ...b2, to: 'v2' })).ran.map((r) => [r.number, r.direction])).toEqual([
-          [2, 'up'],
-        ]);
-      }),
-      {
-        numRuns: EXEC_RUNS,
-        seed: EXPLICIT_SEED,
-        interruptAfterTimeLimit: Math.min(TIME_LIMIT, 90_000 + EXEC_RUNS * 1_500),
-        markInterruptAsFailure: true,
-      },
-    );
+          // 新实例接手（P4c）：只靠目标库里的 dowel 历史恢复版本链——模型（含对象 ID）、冻结脚本、checksum 与原来的完全一致；
+          // 认领之后原实例被拒绝；新实例用恢复出来的链继续执行 / 回滚，每一步读回的结构仍然等于恢复出来的模型
+          const merged = mergeHistories([{ name: 'target', state: await readState(tdb, 'random') }]);
+          expect(merged.versions.map((r) => [r.versionId, r.number, r.parentId, r.checksum])).toEqual(
+            chain.map((v) => [v.id, v.number, v.parentId, v.checksum]),
+          );
+          for (const [i, r] of merged.versions.entries()) {
+            expect(r.model, `v${i + 1} 的模型（含对象 ID）`).toEqual(chain[i]!.model);
+            expect(r.upSteps).toEqual(chain[i]!.upSteps);
+            expect(r.downSteps).toEqual(chain[i]!.downSteps);
+          }
+          expect(merged.envs[0]).toMatchObject({ current: 'v2', behind: 0 });
+          const restored: ChainVersion[] = merged.versions.map((r) => ({
+            id: r.versionId,
+            number: r.number,
+            parentId: r.parentId,
+            name: r.name,
+            model: r.model,
+            upSteps: r.upSteps,
+            downSteps: r.downSteps,
+            checksum: r.checksum,
+            // 接手恢复的版本在平台上是“未验证”的；这里模拟用户在影子库里重新验证过
+            verified: true,
+            publishedAt: r.publishedAt,
+            publishedBy: r.publishedBy,
+            scope: r.scope?.length ? r.scope : null,
+          }));
+          const claimed = await claimInstance({
+            chain: restored,
+            db: tdb,
+            projectId: 'random',
+            projectName: null,
+            instanceId: 'random-instance-2',
+            claimedBy: null,
+            claimedByName: null,
+          });
+          expect(claimed).toEqual({ changed: true, previousInstanceId: 'random-instance' });
+          await expect(execute({ ...base, to: 'v1' })).rejects.toMatchObject({ code: 'foreign_instance' });
+          const b2 = { ...base, chain: restored, instanceId: 'random-instance-2' };
+          expect((await execute({ ...b2, to: 'v1' })).ran.map((r) => [r.number, r.direction])).toEqual([
+            [2, 'down'],
+          ]);
+          expect((await execute({ ...b2, to: 'v2' })).ran.map((r) => [r.number, r.direction])).toEqual([
+            [2, 'up'],
+          ]);
+        }),
+    });
   },
-  120_000 + EXEC_RUNS * 2_000,
+  120_000 + EXEC_RUNS * 2_000 + Math.min(SHRINK_TIME_LIMIT, 60_000) + 30_000,
 );

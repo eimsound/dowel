@@ -762,14 +762,98 @@ export const attachPartition = (m: Model, parentId: string, childId: string, bou
     }
   }
 
-  // 校验同名异义或带 NO INHERIT 的 CHECK 约束（覆盖子表及其全部后代，PG 禁止挂载）
+  // 预计算将被父表吸收的重复约束/索引与跨层同名冲突校验（先于任何状态修改，保证失败时不留半残状态）
+  const subtree = [child, ...partitionDescendants(m, childId)];
+  const subtreeIds = new Set(subtree.map((s) => s.id));
+  const mapCol = (c: string) => colMap.get(c) ?? c;
+
+  const ancUniques = all(m, 'unique').filter((u) => ancestorIds.has(u.parent));
   const ancChecks = all(m, 'check').filter((k) => ancestorIds.has(k.parent));
-  for (const sub of [child, ...partitionDescendants(m, childId)]) {
+  const ancFks = all(m, 'foreignKey').filter((f) => ancestorIds.has(f.parent));
+  const ancIdxs = all(m, 'index').filter((x) => ancestorIds.has(x.parent));
+
+  const ancPropagatedConNames = new Set<string>();
+  for (const ak of ancChecks) ancPropagatedConNames.add(ak.name);
+  for (const af of ancFks) ancPropagatedConNames.add(af.name);
+  for (const rc of rootCols) {
+    if (rc.notNull && rc.notNullName) ancPropagatedConNames.add(rc.notNullName);
+  }
+
+  const absorbedIds = new Set<string>();
+  if (childPk && ancPks.length > 0) absorbedIds.add(childPk.id);
+  for (const u of childrenOf(m, childId, 'unique')) {
+    const mappedCols = u.columns.map(mapCol);
+    if (
+      ancUniques.some((au) => au.nullsNotDistinct === u.nullsNotDistinct && deepEqual(au.columns, mappedCols))
+    ) {
+      absorbedIds.add(u.id);
+    }
+  }
+  for (const sub of subtree) {
     for (const ck of childrenOf(m, sub.id, 'check')) {
-      if (ancChecks.some((ak) => ak.name === ck.name && (ak.expr !== ck.expr || ck.noInherit))) {
+      if (!ck.noInherit && ancChecks.some((ak) => ak.name === ck.name && ak.expr === ck.expr)) {
+        absorbedIds.add(ck.id);
+      }
+    }
+  }
+  for (const fk of childrenOf(m, childId, 'foreignKey')) {
+    const mappedCols = fk.columns.map(mapCol);
+    const mappedRefCols = subtreeIds.has(fk.refTable) ? fk.refColumns.map(mapCol) : fk.refColumns;
+    if (
+      ancFks.some(
+        (af) =>
+          deepEqual(af.columns, mappedCols) &&
+          af.refTable === fk.refTable &&
+          deepEqual(af.refColumns, mappedRefCols) &&
+          af.onDelete === fk.onDelete &&
+          af.onUpdate === fk.onUpdate &&
+          af.match === fk.match &&
+          af.deferrable === fk.deferrable &&
+          af.initiallyDeferred === fk.initiallyDeferred,
+      )
+    ) {
+      absorbedIds.add(fk.id);
+    }
+  }
+  for (const idx of childrenOf(m, childId, 'index')) {
+    const mappedEls = idx.elements.map((el) => ({ ...el, column: el.column ? mapCol(el.column) : null }));
+    const mappedInc = idx.include.map(mapCol);
+    if (
+      ancIdxs.some(
+        (ax) =>
+          ax.unique === idx.unique &&
+          ax.method === idx.method &&
+          deepEqual(ax.elements, mappedEls) &&
+          deepEqual(ax.include, mappedInc) &&
+          ax.where === idx.where &&
+          ax.nullsNotDistinct === idx.nullsNotDistinct,
+      )
+    ) {
+      absorbedIds.add(idx.id);
+    }
+  }
+
+  // 校验同名异义/NO INHERIT CHECK 约束及待挂载子树全部约束名不与祖先下传约束（CHECK / FK / 根列 NOT NULL）冲突
+  for (const sub of subtree) {
+    for (const ck of childrenOf(m, sub.id, 'check')) {
+      if (absorbedIds.has(ck.id)) continue;
+      if (ancChecks.some((ak) => ak.name === ck.name)) {
         throw new EditError(
           `表 ${sub.name} 的检查约束 ${ck.name} 与分区父表同名但表达式不同或设为 NO INHERIT，不能挂载`,
         );
+      }
+      if (ancPropagatedConNames.has(ck.name)) {
+        throw new EditError(`表 ${sub.name} 的约束 ${ck.name} 与分区祖先表继承的约束同名冲突，不能挂载`);
+      }
+    }
+    for (const k of [
+      ...childrenOf(m, sub.id, 'primaryKey'),
+      ...childrenOf(m, sub.id, 'unique'),
+      ...childrenOf(m, sub.id, 'foreignKey'),
+    ]) {
+      if (absorbedIds.has(k.id)) continue;
+      if (ancPropagatedConNames.has(k.name)) {
+        throw new EditError(`表 ${sub.name} 的约束 ${k.name} 与分区祖先表继承的约束同名冲突，不能挂载`);
       }
     }
   }
@@ -802,53 +886,7 @@ export const attachPartition = (m: Model, parentId: string, childId: string, bou
   }
 
   // 移除将被父表吸收的重复约束/索引
-  const ancUniques = all(m, 'unique').filter((u) => ancestorIds.has(u.parent));
-  const ancFks = all(m, 'foreignKey').filter((f) => ancestorIds.has(f.parent));
-  const ancIdxs = all(m, 'index').filter((x) => ancestorIds.has(x.parent));
-
-  if (childPk && ancPks.length > 0) delete m.objects[childPk.id];
-  for (const u of childrenOf(m, childId, 'unique')) {
-    if (
-      ancUniques.some((au) => au.nullsNotDistinct === u.nullsNotDistinct && deepEqual(au.columns, u.columns))
-    )
-      delete m.objects[u.id];
-  }
-  for (const ck of childrenOf(m, childId, 'check')) {
-    if (!ck.noInherit && ancChecks.some((ak) => ak.name === ck.name && ak.expr === ck.expr))
-      delete m.objects[ck.id];
-  }
-  for (const fk of childrenOf(m, childId, 'foreignKey')) {
-    if (
-      ancFks.some(
-        (af) =>
-          deepEqual(af.columns, fk.columns) &&
-          af.refTable === fk.refTable &&
-          deepEqual(af.refColumns, fk.refColumns) &&
-          af.onDelete === fk.onDelete &&
-          af.onUpdate === fk.onUpdate &&
-          af.match === fk.match &&
-          af.deferrable === fk.deferrable &&
-          af.initiallyDeferred === fk.initiallyDeferred,
-      )
-    ) {
-      delete m.objects[fk.id];
-    }
-  }
-  for (const idx of childrenOf(m, childId, 'index')) {
-    if (
-      ancIdxs.some(
-        (ax) =>
-          ax.unique === idx.unique &&
-          ax.method === idx.method &&
-          deepEqual(ax.elements, idx.elements) &&
-          deepEqual(ax.include, idx.include) &&
-          ax.where === idx.where &&
-          ax.nullsNotDistinct === idx.nullsNotDistinct,
-      )
-    ) {
-      delete m.objects[idx.id];
-    }
-  }
+  for (const id of absorbedIds) delete m.objects[id];
 
   // 删除子表自有列对象，改为继承父表列定义
   for (const cc of childCols) delete m.objects[cc.id];

@@ -99,4 +99,4 @@ jobs:
 
 - 任意检查未通过或执行失败时，脚本输出错误码与原因（在 GitHub Actions 里用 `::error::[code] …` 标出），并以退出码 `1` 失败。
 - 建连或整次请求超时、网络不可达时返回 `code=network_error` 并以退出码 `1` 失败；由于 `POST /api/ci/.../execute` 并非严格幂等接口（如 `to: "latest"`、含非事务 DDL 步骤、写审计与发 Webhook），脚本**不会**自动重试，超时后请先确认目标环境当前状态再决定是否重新执行。
-- 完整的接口契约与错误码表见 [docs/api.md](../../docs/api.md)。
+- 完整的接口契约与错误码表见 [docs/en/api.md](../../docs/en/api.md) / [docs/zh/api.md](../../docs/zh/api.md)。

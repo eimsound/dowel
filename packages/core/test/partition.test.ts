@@ -3,10 +3,14 @@ import { describe, expect, test } from 'vitest';
 import {
   addCheck,
   addColumn,
+  addForeignKey,
   addIndex,
   addPrimaryKey,
   addUnique,
   attachPartition,
+  type Check,
+  type Column,
+  childrenOf,
   columnsOf,
   createAll,
   createPartition,
@@ -34,6 +38,7 @@ import {
   readsOf,
   renameColumn,
   renameKey,
+  renameTable,
   resetKeyName,
   resolvePartitionBy,
   rootTableId,
@@ -41,6 +46,7 @@ import {
   type Sequence,
   setCheckExpr,
   setColumnType,
+  setNotNull,
   setPartitionBy,
   type Table,
   validate,
@@ -800,5 +806,169 @@ describe('edit mutators & plan Stage 0 review regression', () => {
     const cCk = addCheck(mNi, cNi, '(id > 0)', 'cCk', true);
     (mNi.objects[cCk] as { name: string }).name = 'chk_pos';
     expect(() => attachPartition(mNi, pNi, cNi, 'FOR VALUES FROM (0) TO (10)')).toThrow(EditError);
+  });
+
+  test('Issue #65 exact reproduction: detach, rename ck1, rename table, re-attach, resetKeyName avoids collision', () => {
+    const { m: v1, s } = base();
+    const ptA = createTable(v1, s, 'pt_a', 'pt_a');
+    const cPk = addColumn(v1, ptA, { id: 'cPk', name: 'pk_key', type: 'integer', notNull: true });
+    setPartitionBy(v1, ptA, {
+      strategy: 'range',
+      keys: [{ column: cPk, expr: null, opclass: null, collation: null }],
+    });
+    const ck1 = addCheck(v1, ptA, '(pk_key > 0)', 'ck1');
+    const ck2 = addCheck(v1, ptA, '(pk_key > 1)', 'ck2');
+    const ch = createPartition(v1, ptA, 'pt_a_p_39', 'DEFAULT', 'ch');
+    expect((v1.objects[ck1] as Check).name).toBe('pt_a_pk_key_check');
+    expect((v1.objects[ck2] as Check).name).toBe('pt_a_pk_key_check1');
+
+    const v2 = structuredClone(v1);
+    detachPartition(v2, ch);
+    renameKey(v2, ck1, 'k_yyyy');
+    renameTable(v2, ch, 'b');
+    attachPartition(v2, ptA, ch, 'DEFAULT');
+    resetKeyName(v2, ck2);
+
+    expect((v2.objects[ck2] as Check).name).toBe('pt_a_pk_key_check1');
+    const childLocalCk = childrenOf(v2, ch, 'check');
+    expect(childLocalCk.map((c) => c.name)).toEqual(['pt_a_pk_key_check']);
+    expect(validate(v2)).toEqual([]);
+
+    const up = plan(v1, v2);
+    const down = plan(v2, v1);
+    expect(up.length).toBeGreaterThan(0);
+    expect(down.length).toBeGreaterThan(0);
+  });
+
+  test('Issue #65 cross-level constraint namespace: renameKey, derived names, attachPartition, and validate', () => {
+    const { m, s } = base();
+    const ref = createTable(m, s, 'ref', 'ref');
+    const refId = addColumn(m, ref, { id: 'refId', name: 'id', type: 'integer', notNull: true });
+    addPrimaryKey(m, ref, [refId], 'ref_pk');
+
+    const gp = createTable(m, s, 'gp', 'gp');
+    const gpA = addColumn(m, gp, { id: 'gpA', name: 'a', type: 'integer', notNull: true });
+    const gpB = addColumn(m, gp, { id: 'gpB', name: 'b', type: 'integer', notNull: true });
+    addColumn(m, gp, { id: 'gpC', name: 'c', type: 'integer' });
+    setPartitionBy(m, gp, {
+      strategy: 'range',
+      keys: [{ column: gpA, expr: null, opclass: null, collation: null }],
+    });
+    const gpPk = addPrimaryKey(m, gp, [gpA, gpB], 'gp_pk');
+    const gpCk = addCheck(m, gp, '(c > 0)', 'gp_ck');
+    renameKey(m, gpCk, 'anc_ck');
+    const gpFk = addForeignKey(m, gp, [gpA], ref, [refId], {}, 'gp_fk');
+    renameKey(m, gpFk, 'anc_fk');
+
+    const sub = createPartition(m, gp, 'sub', 'FOR VALUES FROM (0) TO (100)', 'sub');
+    setPartitionBy(m, sub, {
+      strategy: 'range',
+      keys: [{ column: gpB, expr: null, opclass: null, collation: null }],
+    });
+    const leaf = createPartition(m, sub, 'leaf', 'FOR VALUES FROM (0) TO (100)', 'leaf');
+
+    // Derived CHECK / FK on descendant avoids ancestor CHECK, FK, and root notNullName
+    const childCk = addCheck(m, leaf, '(c > 0)', 'leaf_ck');
+    renameKey(m, childCk, 'leaf_local_ck');
+    const childFk = addForeignKey(m, leaf, [gpB], ref, [refId], {}, 'leaf_fk');
+    renameKey(m, childFk, 'leaf_local_fk');
+    const childUq = addUnique(m, leaf, [gpA, gpB], false, 'leaf_uq');
+    renameKey(m, childUq, 'leaf_local_uq');
+
+    // Child local constraint cannot be renamed to ancestor CHECK, FK, or root notNullName
+    const rootNn = (m.objects[gpA] as Column).notNullName!;
+    expect(rootNn).toBe('gp_a_not_null');
+    for (const target of ['anc_ck', 'anc_fk', rootNn]) {
+      expect(() => renameKey(m, childCk, target)).toThrow(EditError);
+      expect(() => renameKey(m, childFk, target)).toThrow(EditError);
+      expect(() => renameKey(m, childUq, target)).toThrow(EditError);
+    }
+
+    // Ancestor CHECK / FK cannot be renamed to grandchild local constraint names
+    for (const childTarget of ['leaf_local_ck', 'leaf_local_fk', 'leaf_local_uq']) {
+      expect(() => renameKey(m, gpCk, childTarget)).toThrow(EditError);
+      expect(() => renameKey(m, gpFk, childTarget)).toThrow(EditError);
+    }
+
+    // Parent PK/UNIQUE CAN share name with child local CHECK (PG does not inherit parent PK/UNIQUE conname)
+    const mPkOk = structuredClone(m);
+    renameKey(mPkOk, gpPk, 'leaf_local_ck');
+    expect(validate(mPkOk)).toEqual([]);
+
+    // Derived names automatically avoid cross-level collisions
+    const autoCk = addCheck(m, gp, '(b > 0)', 'auto_ck');
+    renameKey(m, autoCk, 'leaf_b_check');
+    const leafAutoCk = addCheck(m, leaf, '(b >= 0)', 'leaf_auto_ck');
+    expect((m.objects[leafAutoCk] as Check).name).toBe('leaf_b_check1');
+
+    const rootCol = addColumn(m, gp, { id: 'gpD', name: 'd', type: 'integer' });
+    const leafPreCk = addCheck(m, leaf, '(d IS NULL OR d > 0)', 'leaf_pre_ck');
+    renameKey(m, leafPreCk, 'gp_d_not_null');
+    setNotNull(m, rootCol, true);
+    expect((m.objects[rootCol] as Column).notNullName).toBe('gp_d_not_null1');
+    expect(validate(m)).toEqual([]);
+
+    // validate(m) catches manually crafted cross-level collisions (CHECK, FK, root notNullName)
+    for (const [label, corrupt] of [
+      ['CHECK collision', (c: Model) => ((c.objects[childCk] as Check).name = 'anc_ck')],
+      ['FK collision', (c: Model) => ((c.objects[childCk] as Check).name = 'anc_fk')],
+      ['notNullName collision', (c: Model) => ((c.objects[childCk] as Check).name = rootNn)],
+    ] as const) {
+      const bad = structuredClone(m);
+      corrupt(bad);
+      expect(
+        validate(bad).some((e) => e.includes('名字冲突')),
+        label,
+      ).toBe(true);
+    }
+
+    // attachPartition rejects collisions across child and grandchild without mutating model
+    const mkSubtree = (kind: 'none' | 'diff_ck' | 'fk_vs_ck' | 'ck_vs_fk' | 'ck_vs_nn') => {
+      const m2 = structuredClone(m);
+      const cand = createTable(m2, s, 'sub2', 'sub2');
+      addColumn(m2, cand, { id: 'ca', name: 'a', type: 'integer', notNull: true });
+      const cb = addColumn(m2, cand, { id: 'cb', name: 'b', type: 'integer', notNull: true });
+      addColumn(m2, cand, { id: 'cc', name: 'c', type: 'integer' });
+      addColumn(m2, cand, { id: 'cd', name: 'd', type: 'integer', notNull: true });
+      setPartitionBy(m2, cand, {
+        strategy: 'range',
+        keys: [{ column: cb, expr: null, opclass: null, collation: null }],
+      });
+      const gch = createPartition(m2, cand, 'leaf2', 'FOR VALUES FROM (0) TO (10)', 'leaf2');
+      const mkCheck = (tid: string, id: string, name: string, expr: string) => {
+        const ckId = addCheck(m2, tid, expr, id);
+        renameKey(m2, ckId, name);
+      };
+      mkCheck(cand, 'm_ck1', 'anc_ck', '(c > 0)');
+      if (kind !== 'diff_ck' && kind !== 'fk_vs_ck') {
+        mkCheck(cand, 'm_ck2', 'leaf_b_check', '(b > 0)');
+      }
+      mkCheck(gch, 'g_local', 'g_local_ck', '(c < 100)');
+
+      if (kind === 'diff_ck') {
+        mkCheck(cand, 'bad_ck', 'leaf_b_check', '(b > 99)');
+      } else if (kind === 'fk_vs_ck') {
+        const badFk = addForeignKey(m2, cand, [cb], ref, [refId], {}, 'bad_cand_fk');
+        renameKey(m2, badFk, 'leaf_b_check');
+      } else if (kind === 'ck_vs_fk') {
+        mkCheck(gch, 'bad_gch_ck', 'anc_fk', '(c > 5)');
+      } else if (kind === 'ck_vs_nn') {
+        mkCheck(gch, 'bad_gch_nn', rootNn, '(c > 5)');
+      }
+      return { m2, cand, gch };
+    };
+
+    for (const kind of ['diff_ck', 'fk_vs_ck', 'ck_vs_fk', 'ck_vs_nn'] as const) {
+      const { m2, cand } = mkSubtree(kind);
+      const snapBefore = structuredClone(m2);
+      expect(() => attachPartition(m2, gp, cand, 'FOR VALUES FROM (100) TO (200)'), kind).toThrow(EditError);
+      expect(m2, `${kind} leaves model unmutated`).toEqual(snapBefore);
+    }
+
+    const { m2: mAttachOk, cand: candOk, gch: gchOk } = mkSubtree('none');
+    attachPartition(mAttachOk, gp, candOk, 'FOR VALUES FROM (100) TO (200)');
+    expect(childrenOf(mAttachOk, candOk, 'check')).toEqual([]);
+    expect(childrenOf(mAttachOk, gchOk, 'check').map((c) => c.name)).toEqual(['g_local_ck']);
+    expect(validate(mAttachOk)).toEqual([]);
   });
 });

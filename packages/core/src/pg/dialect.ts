@@ -9,6 +9,7 @@ import {
   effectiveColumnsOf,
   get,
   indexElementNames,
+  partitionAncestors,
   partitionDescendants,
   partitionsOf,
   requiredUniquePartitionKeys,
@@ -64,18 +65,38 @@ const pgRelTaken = (m: Model, schema: string, name: string, self: string): boole
     return false;
   });
 
-const pgConTaken = (m: Model, table: string, name: string, self: string): boolean =>
-  Object.values(m.objects).some((o) => {
+const pgConTaken = (m: Model, table: string, name: string, self: string): boolean => {
+  const selfObj = self && !self.endsWith('#nn') ? m.objects[self] : undefined;
+  const selfPropagates =
+    self === '' || self.endsWith('#nn') || selfObj?.kind === 'check' || selfObj?.kind === 'foreignKey';
+  const ancIds = new Set(partitionAncestors(m, table).map((a) => a.id));
+  const descIds = selfPropagates
+    ? new Set(partitionDescendants(m, table).map((d) => d.id))
+    : new Set<string>();
+  return Object.values(m.objects).some((o) => {
     if (o.id === self) return false;
-    if (
-      (o.kind === 'primaryKey' || o.kind === 'unique' || o.kind === 'check' || o.kind === 'foreignKey') &&
-      o.parent === table
-    )
-      return o.name === name;
-    if (o.kind === 'column' && o.parent === table && o.notNull && self !== `${o.id}#nn`)
-      return o.notNullName === name;
+    if (o.kind === 'column' && o.notNull && self !== `${o.id}#nn` && o.notNullName === name) {
+      return o.parent === table || ancIds.has(o.parent) || descIds.has(o.parent);
+    }
+    if (!('parent' in o)) return false;
+    if (o.parent === table) {
+      return (
+        (o.kind === 'primaryKey' || o.kind === 'unique' || o.kind === 'check' || o.kind === 'foreignKey') &&
+        o.name === name
+      );
+    }
+    if (ancIds.has(o.parent)) {
+      return (o.kind === 'check' || o.kind === 'foreignKey') && o.name === name;
+    }
+    if (descIds.has(o.parent)) {
+      return (
+        (o.kind === 'primaryKey' || o.kind === 'unique' || o.kind === 'check' || o.kind === 'foreignKey') &&
+        o.name === name
+      );
+    }
     return false;
   });
+};
 
 const pgTypeTaken = (m: Model, schema: string, name: string, self: string): boolean =>
   Object.values(m.objects).some(
@@ -229,7 +250,18 @@ const validatePgModel = (m: Model): string[] => {
         claim(`col:${o.parent}`, o.name, o);
         if (o.notNull && o.notNullName) {
           checkBytes(o, o.notNullName);
-          claim(`con:${o.parent}`, o.notNullName, o);
+          const isLegacyChildSameNn =
+            parentTable?.kind === 'table' &&
+            parentTable.partitionOf !== null &&
+            columnsOf(m, rootTableId(m, parentTable.id)).some(
+              (rc) => rc.name === o.name && rc.notNull && rc.notNullName === o.notNullName,
+            );
+          if (!isLegacyChildSameNn) {
+            claim(`con:${o.parent}`, o.notNullName, o);
+            for (const desc of partitionDescendants(m, o.parent)) {
+              claim(`con:${desc.id}`, o.notNullName, o);
+            }
+          }
         }
         if (o.identity) {
           checkBytes(o, o.identity.sequenceName);
@@ -263,7 +295,14 @@ const validatePgModel = (m: Model): string[] => {
             }
           }
         }
-        if (o.kind !== 'index') claim(`con:${o.parent}`, o.name, o);
+        if (o.kind !== 'index') {
+          claim(`con:${o.parent}`, o.name, o);
+          if (o.kind === 'check' || o.kind === 'foreignKey') {
+            for (const desc of partitionDescendants(m, o.parent)) {
+              claim(`con:${desc.id}`, o.name, o);
+            }
+          }
+        }
         if ((o.kind === 'primaryKey' || o.kind === 'unique' || o.kind === 'index') && t?.kind === 'table')
           claim(`rel:${t.parent}`, o.name, o);
         break;

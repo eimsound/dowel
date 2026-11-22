@@ -6,6 +6,7 @@ import { expect, test } from 'vitest';
 
 import {
   parseExplicitSeed,
+  parseNonNegativeMs,
   parsePositiveMs,
   resolveHeavyWorkers,
   runShardedProperty,
@@ -31,12 +32,12 @@ const fit = (s: string) => {
 };
 const nameArb = fc.tuple(part, part).map(([a, b]) => fit(a + b));
 
-/** 本地默认少量用例；CI 的 heavy 任务用 RUNS=5000 */
+/** 本地默认少量用例；CI 的 heavy 任务按 PR 2000 / main 5000 */
 const RUNS = Number(process.env.RUNS ?? 150);
 const EXPLICIT_SEED = parseExplicitSeed(process.env.SEED);
 const WORKERS = resolveHeavyWorkers(RUNS, process.env.HEAVY_WORKERS, EXPLICIT_SEED);
 const TIME_LIMIT = parsePositiveMs(process.env.TIME_LIMIT, 180_000);
-const SHRINK_TIME_LIMIT = parsePositiveMs(process.env.SHRINK_TIME_LIMIT, 60_000);
+const SHRINK_TIME_LIMIT = parseNonNegativeMs(process.env.SHRINK_TIME_LIMIT, 60_000);
 
 test.skipIf(!PG_URL)(
   '推导名与 PG 实际起的名字一致',
@@ -99,5 +100,5 @@ test.skipIf(!PG_URL)(
         ),
     });
   },
-  Math.max(60_000 + RUNS * 200, TIME_LIMIT + SHRINK_TIME_LIMIT + 60_000),
+  Math.max(TIME_LIMIT, 60_000 + RUNS * 200) + SHRINK_TIME_LIMIT + 60_000,
 );

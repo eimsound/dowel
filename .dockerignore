@@ -7,7 +7,4 @@ e2e
 test-results
 playwright-report
 data
-site
-.cache
 docs
-zensical.toml

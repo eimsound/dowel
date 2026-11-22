@@ -406,7 +406,7 @@ type Step =
 
 ## 7. 目标库里的 `dowel` 迁移历史（P4a / Stage 2 四方言开发者说明）
 
-决策见 [ADR 0003](adr/0003-version-content-in-target-db.md)，各引擎实现位于 `packages/engines/src/{pg,sqlite,mysql,mssql}/history.ts`（统一实现 `HistoryStore` 接口，只依赖 `Db` 接口）。用户文档见 [docs/execution.md](../../docs/execution.md)，执行器读写逻辑位于 `packages/executor/src/`。
+决策见 [ADR 0003](adr/0003-version-content-in-target-db.md)，各引擎实现位于 `packages/engines/src/{pg,sqlite,mysql,mssql}/history.ts`（统一实现 `HistoryStore` 接口，只依赖 `Db` 接口）。用户文档见 [docs/en/execution.md](../../docs/en/execution.md) / [中文](../../docs/zh/execution.md)，执行器读写逻辑位于 `packages/executor/src/`。
 
 **双存储模型（`DialectCapabilities.historyStorage`）**：
 

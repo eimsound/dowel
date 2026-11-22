@@ -67,7 +67,7 @@ jobs:
               count=$((count + 1))
               case "$file" in
                 # 仅文档 / 元信息白名单：命中则跳过，不置任何 true
-                *.md | docs/* | .agents/* | zensical.toml | LICENSE | .github/workflows/docs.yml | .github/dependabot.yml | .dockerignore | .gitignore)
+                *.md | docs/* | .agents/* | LICENSE | .github/workflows/docs.yml | .github/dependabot.yml | .dockerignore | .gitignore)
                   ;;
                 # 纯前端 / E2E
                 apps/web/* | e2e/* | playwright.config.ts)
@@ -79,7 +79,7 @@ jobs:
                   code=true
                   ;;
                 # PG 随机闭环 / 命名 fuzz 测试及其分片设施
-                packages/engines/test/naming* | packages/verifier/test/random.test.ts | packages/verifier/test/gen.ts | packages/verifier/test/fc-shard.test.ts | test/fc-shard.ts)
+                packages/engines/test/naming* | packages/verifier/test/random.test.ts | packages/verifier/test/gen.ts | packages/verifier/test/fc-shard.test.ts | test/fc-shard*)
                   code=true
                   pg=true
                   heavy=true
@@ -305,7 +305,7 @@ jobs:
           DOWEL_TEST_MYSQL: skip
 
   heavy:
-    name: 随机闭环测试（5000 例）
+    name: 随机闭环测试（PR 2000 / main 5000）
     needs: changes
     if: needs.changes.outputs.heavy == 'true'
     runs-on: ubuntu-latest
@@ -317,10 +317,10 @@ jobs:
       - uses: ./.github/actions/setup-node-pnpm
       - run: pnpm vitest run packages/verifier/test/random.test.ts packages/engines/test/naming.test.ts
         env:
-          RUNS: '5000'
+          RUNS: ${{ github.event_name == 'pull_request' && '2000' || '5000' }}
           HEAVY_WORKERS: '4'
-          # 主搜索时限 4 分钟 + 失败后独立有界 shrink 时限 1 分钟
-          TIME_LIMIT: '240000'
+          # 主搜索时限（PR 4 分钟 / main 与手动触发 6 分钟）+ 失败后独立有界 shrink 时限 1 分钟
+          TIME_LIMIT: ${{ github.event_name == 'pull_request' && '240000' || '360000' }}
           SHRINK_TIME_LIMIT: '60000'
           DOWEL_TEST_MYSQL: 'skip'
           DOWEL_TEST_MSSQL: 'skip'

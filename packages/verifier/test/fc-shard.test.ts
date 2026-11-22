@@ -5,6 +5,7 @@ import { describe, expect, test, vi } from 'vitest';
 import {
   deriveShardSeeds,
   parseExplicitSeed,
+  parseNonNegativeMs,
   parsePositiveMs,
   partitionRuns,
   resolveHeavyWorkers,
@@ -29,6 +30,15 @@ describe('fc-shard 参数解析与分片分配', () => {
     expect(parsePositiveMs('-100', 60_000)).toBe(60_000);
     expect(parsePositiveMs('abc', 60_000)).toBe(60_000);
     expect(parsePositiveMs(' 45000 ', 60_000)).toBe(45_000);
+  });
+
+  test('parseNonNegativeMs 允许 0 且拒绝负数与非法输入', () => {
+    expect(parseNonNegativeMs(undefined, 60_000)).toBe(60_000);
+    expect(parseNonNegativeMs(' ', 60_000)).toBe(60_000);
+    expect(parseNonNegativeMs('0', 60_000)).toBe(0);
+    expect(parseNonNegativeMs('-100', 60_000)).toBe(60_000);
+    expect(parseNonNegativeMs('abc', 60_000)).toBe(60_000);
+    expect(parseNonNegativeMs(' 45000 ', 60_000)).toBe(45_000);
   });
 
   test('resolveHeavyWorkers 支持钳制与显式 SEED 退回单 worker', () => {
@@ -169,8 +179,12 @@ describe('runShardedProperty 执行与错误控制', () => {
     expect(err).toBeInstanceOf(Error);
     const msg = (err as Error).message;
     expect(msg).toMatch(/\[shard 1\/4, SEED=-?\d+, shardRuns=100\]/);
+    expect(msg).toContain('seed:');
     expect(msg).toContain('Counterexample: [50]');
     expect(msg).toContain('path: "');
+    expect(msg).not.toContain('shrink interrupted');
+    expect((err as Error).cause).toBeInstanceOf(Error);
+    expect(((err as Error).cause as Error).message).toBe('boom:50');
     expect(closed.sort((a, b) => a - b)).toEqual([0, 1, 2, 3]);
     // 兄弟分片应该显著少于 100 轮就被中止
     const siblingTotal = (perShardRuns.get(1) ?? 0) + (perShardRuns.get(2) ?? 0) + (perShardRuns.get(3) ?? 0);
@@ -213,7 +227,13 @@ describe('runShardedProperty 执行与错误控制', () => {
 
     const elapsed = performance.now() - t0;
     expect(err).toBeInstanceOf(Error);
-    expect((err as Error).message).toContain('(shrink interrupted after 60ms; best counterexample shown)');
+    const e = err as Error;
+    expect(e.message).toContain(
+      '(shrink interrupted after 60ms (SHRINK_TIME_LIMIT); best counterexample shown)',
+    );
+    expect(e.message).toContain('Counterexample:');
+    expect(e.cause).toBeInstanceOf(Error);
+    expect((e.cause as Error).message).toBe('slow fail');
     expect(elapsed).toBeLessThan(2_000);
     expect(inFlight).toBe(0);
     expect(close).not.toHaveBeenCalled();
@@ -256,10 +276,120 @@ describe('runShardedProperty 执行与错误控制', () => {
     }
 
     expect(err).toBeInstanceOf(Error);
-    expect((err as Error).message).toContain(
+    const e = err as Error;
+    expect(e.message).toContain(
       '(shrink replay did not reproduce failure; reporting original unshrunk counterexample)',
     );
+    expect(e.message).toContain('Counterexample:');
+    expect(e.cause).toBeInstanceOf(Error);
+    expect((e.cause as Error).message).toBe('transient');
     expect(closed).toEqual(['db_0', 'db_1']);
+  });
+
+  test('shrinkTimeLimitMs 为 0 时跳过缩小直接报告原始失败', async () => {
+    let calls = 0;
+    let err: unknown;
+    try {
+      await runShardedProperty({
+        prefix: 'no_shrink',
+        defaultDb: { ok: true },
+        runs: 5,
+        workers: 1,
+        seed: 7,
+        timeLimitMs: 5_000,
+        shrinkTimeLimitMs: 0,
+        makeProperty: () =>
+          fc.asyncProperty(fc.integer({ min: 10, max: 100 }), async () => {
+            calls += 1;
+            throw new Error('no-shrink boom');
+          }),
+      });
+    } catch (e) {
+      err = e;
+    }
+
+    expect(calls).toBe(1);
+    expect(err).toBeInstanceOf(Error);
+    const e = err as Error;
+    expect(e.message).toContain('seed: 7');
+    expect(e.message).toContain('Shrunk 0 time(s)');
+    expect(e.message).toContain('Counterexample:');
+    expect(e.cause).toBeInstanceOf(Error);
+    expect((e.cause as Error).message).toBe('no-shrink boom');
+  });
+
+  test('主阶段超时中断时直接报错且不触发缩小阶段', async () => {
+    let calls = 0;
+    let err: unknown;
+    try {
+      await runShardedProperty({
+        prefix: 'primary_timeout',
+        defaultDb: { ok: true },
+        runs: 100,
+        workers: 1,
+        seed: 9,
+        timeLimitMs: 60,
+        shrinkTimeLimitMs: 5_000,
+        makeProperty: () =>
+          fc.asyncProperty(fc.integer(), async () => {
+            calls += 1;
+            await new Promise((r) => setTimeout(r, 40));
+          }),
+      });
+    } catch (e) {
+      err = e;
+    }
+
+    expect(err).toBeInstanceOf(Error);
+    expect((err as Error).message).toContain('Property interrupted');
+    expect(calls).toBeLessThan(10);
+
+    const closed: string[] = [];
+    let idx = 0;
+    let multiErr: unknown;
+    try {
+      await runShardedProperty({
+        prefix: 'primary_timeout_multi',
+        defaultDb: { id: 'default' },
+        createDb: async () => {
+          const name = `db_${idx++}`;
+          return {
+            db: { id: name },
+            close: async () => {
+              closed.push(name);
+            },
+          };
+        },
+        runs: 100,
+        workers: 2,
+        timeLimitMs: 60,
+        shrinkTimeLimitMs: 5_000,
+        makeProperty: () =>
+          fc.asyncProperty(fc.integer(), async () => {
+            await new Promise((r) => setTimeout(r, 40));
+          }),
+      });
+    } catch (e) {
+      multiErr = e;
+    }
+
+    expect(multiErr).toBeInstanceOf(Error);
+    expect((multiErr as Error).message).toContain('Property interrupted');
+    expect(closed).toEqual(['db_0', 'db_1']);
+  });
+
+  test('workers > 1 且未提供 createDb 时立即报错', async () => {
+    await expect(
+      runShardedProperty({
+        prefix: 'missing_create_db',
+        defaultDb: { id: 'default' },
+        runs: 10,
+        workers: 2,
+        timeLimitMs: 5_000,
+        shrinkTimeLimitMs: 1_000,
+        makeProperty: () => fc.asyncProperty(fc.boolean(), async () => {}),
+      }),
+    ).rejects.toThrow('createDb');
   });
 
   test('createDb 中途失败时仍会关闭此前已创建的 DB', async () => {

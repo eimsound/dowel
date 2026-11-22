@@ -873,4 +873,210 @@ describe.skipIf(!PG_URL)('PG 分区表闭环与往返验证', () => {
     expect(rB.upDiff).toEqual([]);
     expect(rB.downDiff).toEqual([]);
   });
+
+  test('Issue #65 exact CI reproduction: detach -> rename check -> rename table -> attach -> resetKeyName roundtrips on PG', async () => {
+    const db = conn();
+    const v1 = emptyModel();
+    const s = E.createSchema(v1, 'public');
+    const ptA = E.createTable(v1, s, 'pt_a');
+    const cPk = E.addColumn(v1, ptA, { name: 'pk_key', type: 'integer', notNull: true });
+    E.setPartitionBy(v1, ptA, {
+      strategy: 'range',
+      keys: [{ column: cPk, expr: null, opclass: null, collation: null }],
+    });
+    const ck1 = E.addCheck(v1, ptA, '(pk_key > 0)');
+    const ck2 = E.addCheck(v1, ptA, '(pk_key > 1)');
+    const ch = E.createPartition(v1, ptA, 'pt_a_p_39', 'DEFAULT');
+
+    const v2 = structuredClone(v1);
+    E.detachPartition(v2, ch);
+    E.renameKey(v2, ck1, 'k_yyyy');
+    E.renameTable(v2, ch, 'b');
+    E.attachPartition(v2, ptA, ch, 'DEFAULT');
+    E.resetKeyName(v2, ck2);
+
+    expect(validate(v2)).toEqual([]);
+    const r = await verify(db, v1, v2);
+    expect(r.upDiff).toEqual([]);
+    expect(r.downDiff).toEqual([]);
+  });
+
+  test('Issue #65: cross-level constraint rename swaps, parent CHECK named child_pkey, and multi-level attach roundtrip on PG', async () => {
+    const db = conn();
+    const pgMajor = E.pgMajorOf(
+      (
+        (await db.query<{ v: number }>(`select current_setting('server_version_num')::int as v`)) as [
+          { v: number },
+        ]
+      )[0].v,
+    )!;
+
+    // 1. Parent CHECK <-> child local CHECK swap + parent FK <-> child local CHECK swap + subsequent DETACH
+    const v1 = emptyModel();
+    const s = E.createSchema(v1, 'public');
+    const ref = E.createTable(v1, s, 'ref_t');
+    const rId = E.addColumn(v1, ref, { name: 'id', type: 'integer', notNull: true });
+    E.addPrimaryKey(v1, ref, [rId]);
+
+    const pt = E.createTable(v1, s, 'pt_swap');
+    const pId = E.addColumn(v1, pt, { name: 'id', type: 'integer', notNull: true });
+    E.addColumn(v1, pt, { name: 'val', type: 'integer', notNull: true });
+    E.setPartitionBy(v1, pt, {
+      strategy: 'range',
+      keys: [{ column: pId, expr: null, opclass: null, collation: null }],
+    });
+    E.addPrimaryKey(v1, pt, [pId]);
+    const pCk = E.addCheck(v1, pt, '(val > 0)');
+    E.renameKey(v1, pCk, 'ck_alpha');
+    const pFk = E.addForeignKey(v1, pt, [pId], ref, [rId]);
+    E.renameKey(v1, pFk, 'fk_alpha');
+
+    const ch = E.createPartition(v1, pt, 'pt_swap_1', 'FOR VALUES FROM (0) TO (10)');
+    const cCk1 = E.addCheck(v1, ch, '(val < 100)');
+    E.renameKey(v1, cCk1, 'ck_beta');
+    const cCk2 = E.addCheck(v1, ch, '(val < 200)');
+    E.renameKey(v1, cCk2, 'ck_gamma');
+
+    const v2 = structuredClone(v1);
+    E.renameKey(v2, pCk, 'tmp_ck');
+    E.renameKey(v2, cCk1, 'ck_alpha');
+    E.renameKey(v2, pCk, 'ck_beta');
+    E.renameKey(v2, pFk, 'tmp_fk');
+    E.renameKey(v2, cCk2, 'fk_alpha');
+    E.renameKey(v2, pFk, 'ck_gamma');
+
+    expect(validate(v2)).toEqual([]);
+    const rSwap = await verify(db, v1, v2);
+    expect(rSwap.upDiff).toEqual([]);
+    expect(rSwap.downDiff).toEqual([]);
+
+    // Detach after cross-level FK rename ensures child's cloned FK matches renamed parent FK in PG
+    const v3 = structuredClone(v2);
+    E.detachPartition(v3, ch);
+    expect(validate(v3)).toEqual([]);
+    const rDetach = await verify(db, v2, v3);
+    expect(rDetach.upDiff).toEqual([]);
+    expect(rDetach.downDiff).toEqual([]);
+
+    // 2. PG 18+: root column notNullName swap with child local CHECK via renameColumn + renameKey
+    if (pgMajor >= 18) {
+      const mNn1 = emptyModel();
+      const sNn = E.createSchema(mNn1, 'public');
+      const pNn = E.createTable(mNn1, sNn, 'pt_nn');
+      const nnId = E.addColumn(mNn1, pNn, { name: 'id', type: 'integer', notNull: true });
+      const nnVal = E.addColumn(mNn1, pNn, { name: 'old_col', type: 'integer', notNull: true });
+      E.setPartitionBy(mNn1, pNn, {
+        strategy: 'range',
+        keys: [{ column: nnId, expr: null, opclass: null, collation: null }],
+      });
+      const chNn = E.createPartition(mNn1, pNn, 'pt_nn_1', 'DEFAULT');
+      const chNnCk = E.addCheck(mNn1, chNn, '(id > 0)');
+      E.renameKey(mNn1, chNnCk, 'pt_nn_new_col_not_null');
+
+      const mNn2 = structuredClone(mNn1);
+      E.renameKey(mNn2, chNnCk, 'tmp_ck_nn');
+      E.renameColumn(mNn2, nnVal, 'new_col');
+      E.renameKey(mNn2, chNnCk, 'pt_nn_old_col_not_null');
+
+      expect(validate(mNn2)).toEqual([]);
+      const rNn = await verify(db, mNn1, mNn2, { pgMajor });
+      expect(rNn.upDiff).toEqual([]);
+      expect(rNn.downDiff).toEqual([]);
+    }
+
+    // 3. Parent CHECK explicitly named child_pkey alongside parent PRIMARY KEY (createAll + incremental add + down)
+    const mPk1 = emptyModel();
+    const sPk = E.createSchema(mPk1, 'public');
+    const pPk = E.createTable(mPk1, sPk, 'pt_pk');
+    const pkId = E.addColumn(mPk1, pPk, { name: 'id', type: 'integer', notNull: true });
+    E.addColumn(mPk1, pPk, { name: 'v', type: 'integer' });
+    E.setPartitionBy(mPk1, pPk, {
+      strategy: 'range',
+      keys: [{ column: pkId, expr: null, opclass: null, collation: null }],
+    });
+    E.addPrimaryKey(mPk1, pPk, [pkId]);
+    E.createPartition(mPk1, pPk, 'pt_pk_1', 'DEFAULT');
+
+    const mPk2 = structuredClone(mPk1);
+    const ckPkey = E.addCheck(mPk2, pPk, '(v > 0)');
+    E.renameKey(mPk2, ckPkey, 'pt_pk_1_pkey');
+
+    expect(validate(mPk2)).toEqual([]);
+    const rPk = await verify(db, mPk1, mPk2);
+    expect(rPk.upDiff).toEqual([]);
+    expect(rPk.downDiff).toEqual([]);
+
+    // 4. Multi-level gp -> sub -> leaf attach with grandchild matching CHECK absorption + cross-level rename
+    const mMl1 = emptyModel();
+    const sMl = E.createSchema(mMl1, 'public');
+    const gpMl = E.createTable(mMl1, sMl, 'ml_gp');
+    const mlA = E.addColumn(mMl1, gpMl, { name: 'a', type: 'integer', notNull: true });
+    const mlB = E.addColumn(mMl1, gpMl, { name: 'b', type: 'integer', notNull: true });
+    E.addColumn(mMl1, gpMl, { name: 'c', type: 'integer' });
+    E.setPartitionBy(mMl1, gpMl, {
+      strategy: 'range',
+      keys: [{ column: mlA, expr: null, opclass: null, collation: null }],
+    });
+    E.addPrimaryKey(mMl1, gpMl, [mlA, mlB]);
+    const gpMlCk = E.addCheck(mMl1, gpMl, '(c > 0)');
+    E.renameKey(mMl1, gpMlCk, 'shared_ml_ck');
+
+    const subMl = E.createTable(mMl1, sMl, 'ml_sub');
+    E.addColumn(mMl1, subMl, { name: 'a', type: 'integer', notNull: true });
+    const subB = E.addColumn(mMl1, subMl, { name: 'b', type: 'integer', notNull: true });
+    E.addColumn(mMl1, subMl, { name: 'c', type: 'integer' });
+    E.setPartitionBy(mMl1, subMl, {
+      strategy: 'range',
+      keys: [{ column: subB, expr: null, opclass: null, collation: null }],
+    });
+    const subCk = E.addCheck(mMl1, subMl, '(c > 0)');
+    E.renameKey(mMl1, subCk, 'shared_ml_ck');
+    const leafMl = E.createPartition(mMl1, subMl, 'ml_leaf', 'FOR VALUES FROM (0) TO (10)');
+    const leafLocal = E.addCheck(mMl1, leafMl, '(c < 100)');
+    E.renameKey(mMl1, leafLocal, 'leaf_only_ck');
+
+    const mMl2 = structuredClone(mMl1);
+    E.attachPartition(mMl2, gpMl, subMl, 'FOR VALUES FROM (0) TO (10)');
+    E.renameKey(mMl2, gpMlCk, 'shared_ml_ck_v2');
+
+    expect(validate(mMl2)).toEqual([]);
+    const rMl = await verify(db, mMl1, mMl2);
+    expect(rMl.upDiff).toEqual([]);
+    expect(rMl.downDiff).toEqual([]);
+  });
+
+  test('Issue #65 fuzz #365 regression: sameParentRebind with duplicate-definition FKs and partial FK rename roundtrips on PG', async () => {
+    const db = conn();
+    const v1 = emptyModel();
+    const s = E.createSchema(v1, 'public');
+    const ptA = E.createTable(v1, s, 'pt_a');
+    const cPk = E.addColumn(v1, ptA, { name: 'pk_key', type: 'integer', notNull: true });
+    const cVal = E.addColumn(v1, ptA, { name: 'val', type: 'integer', default: { expr: '0' } });
+    E.setPartitionBy(v1, ptA, {
+      strategy: 'range',
+      keys: [{ column: cPk, expr: null, opclass: null, collation: null }],
+    });
+    E.addPrimaryKey(v1, ptA, [cPk, cVal]);
+    E.addUnique(v1, ptA, [cPk, cVal]);
+    const fk1 = E.addForeignKey(v1, ptA, [cVal, cPk], ptA, [cPk, cVal], {
+      onDelete: 'restrict',
+      onUpdate: 'cascade',
+    });
+    E.addForeignKey(v1, ptA, [cVal, cPk], ptA, [cPk, cVal], {
+      onDelete: 'restrict',
+      onUpdate: 'cascade',
+    });
+    E.createPartition(v1, ptA, 'pt_a_p_46', 'FOR VALUES FROM (1000) TO (1100)');
+    const chDef = E.createPartition(v1, ptA, 'pt_a_p_52', 'DEFAULT');
+
+    const v2 = structuredClone(v1);
+    E.renameKey(v2, fk1, 'k_yyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyy');
+    E.renameTable(v2, chDef, 'b');
+    E.setPartitionBound(v2, chDef, 'FOR VALUES FROM (200) TO (300)');
+
+    expect(validate(v2)).toEqual([]);
+    const r = await verify(db, v1, v2);
+    expect(r.upDiff).toEqual([]);
+    expect(r.downDiff).toEqual([]);
+  });
 });

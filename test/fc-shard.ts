@@ -14,7 +14,7 @@ export interface ShardDbHandle<TDb> {
 export interface ShardedPropertyOptions<TDb, Ts> {
   prefix: string;
   defaultDb: TDb;
-  createDb: (prefix: string) => Promise<ShardDbHandle<TDb>>;
+  createDb?: (prefix: string) => Promise<ShardDbHandle<TDb>>;
   runs: number;
   workers: number;
   seed?: number;
@@ -37,6 +37,14 @@ export const parsePositiveMs = (raw: string | undefined, fallback: number): numb
   if (!trimmed) return fallback;
   const parsed = Number(trimmed);
   return Number.isFinite(parsed) && parsed > 0 ? Math.trunc(parsed) : fallback;
+};
+
+/** 解析非负整数毫秒数（允许 0，例如 SHRINK_TIME_LIMIT=0 跳过缩小）；空白、负数或非法值返回 fallback */
+export const parseNonNegativeMs = (raw: string | undefined, fallback: number): number => {
+  const trimmed = raw?.trim();
+  if (!trimmed) return fallback;
+  const parsed = Number(trimmed);
+  return Number.isFinite(parsed) && parsed >= 0 ? Math.trunc(parsed) : fallback;
 };
 
 /**
@@ -141,9 +149,13 @@ export const runShardedProperty = async <TDb, Ts>(opts: ShardedPropertyOptions<T
     if (workers === 1) {
       dbs.push(opts.defaultDb);
     } else {
+      const { createDb } = opts;
+      if (!createDb) {
+        throw new Error('runShardedProperty requires createDb when workers > 1');
+      }
       // 顺序建库避免并发 CREATE DATABASE 争抢 template1；任一步失败仍由 finally 清理已建库
       for (let i = 0; i < workers; i++) {
-        const handle = await opts.createDb(`${opts.prefix}_s${i}`);
+        const handle = await createDb(`${opts.prefix}_s${i}`);
         createdHandles.push(handle);
         dbs.push(handle.db);
       }
@@ -208,6 +220,7 @@ export const runShardedProperty = async <TDb, Ts>(opts: ShardedPropertyOptions<T
             seed: counterexampleWinner.seed,
             path: counterexampleWinner.details.counterexamplePath!,
             numRuns: 1,
+            endOnFailure: false,
             interruptAfterTimeLimit: opts.shrinkTimeLimitMs + HARD_WATCHDOG_GRACE_MS,
             markInterruptAsFailure: false,
             plugins: [shrinkPlugin],
@@ -216,14 +229,14 @@ export const runShardedProperty = async <TDb, Ts>(opts: ShardedPropertyOptions<T
         if (shrunk.failed && shrunk.counterexamplePath !== null) {
           reportDetails = { ...shrunk, numRuns: counterexampleWinner.details.numRuns };
           if (shrunk.interrupted || shrinkTimedOut) {
-            shrinkNote = `\n(shrink interrupted after ${opts.shrinkTimeLimitMs}ms; best counterexample shown)`;
+            shrinkNote = `\n(shrink interrupted after ${opts.shrinkTimeLimitMs}ms (SHRINK_TIME_LIMIT); best counterexample shown)`;
           }
         } else {
           shrinkNote =
             '\n(shrink replay did not reproduce failure; reporting original unshrunk counterexample)';
         }
       }
-      const report = fc.defaultReportMessage(reportDetails) ?? 'Property failed';
+      const report = (await fc.asyncDefaultReportMessage(reportDetails)) ?? 'Property failed';
       const header = formatShardHeader(
         counterexampleWinner.index,
         workers,
@@ -238,7 +251,7 @@ export const runShardedProperty = async <TDb, Ts>(opts: ShardedPropertyOptions<T
     const otherFailure =
       outcomes.find((o) => o.details.failed && !o.abortedBySibling) ?? outcomes.find((o) => o.details.failed);
     if (otherFailure) {
-      const report = fc.defaultReportMessage(otherFailure.details) ?? 'Property failed';
+      const report = (await fc.asyncDefaultReportMessage(otherFailure.details)) ?? 'Property failed';
       const header = formatShardHeader(otherFailure.index, workers, otherFailure.seed, otherFailure.runs);
       throw new Error(`${header}${report}`, {
         cause: otherFailure.details.errorInstance ?? undefined,
