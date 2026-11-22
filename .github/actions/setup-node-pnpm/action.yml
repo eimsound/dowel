@@ -1,0 +1,12 @@
+name: Setup Node and pnpm
+description: 安装并配置 Node.js、pnpm（带缓存）及项目依赖
+runs:
+  using: composite
+  steps:
+    - uses: pnpm/action-setup@73e46992e05b19abd31f2f3c20e0e7370d762115 # v6.1.1
+    - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
+      with:
+        node-version-file: .tool-versions
+        cache: pnpm
+    - shell: bash
+      run: pnpm install --frozen-lockfile --prefer-offline
