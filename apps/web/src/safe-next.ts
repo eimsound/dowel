@@ -21,3 +21,19 @@ export const safeNext = (next: string | undefined, origin = FALLBACK_ORIGIN): st
     return '/';
   return normalized;
 };
+
+/** 重定向回跳禁止落地的认证页面路径前缀 */
+export const AUTH_NEXT_EXCLUDES = ['/login', '/change-password', '/setup'] as const;
+
+/** 额外过滤禁止落点的站内路径前缀（如 /login、/change-password、/setup） */
+export const safeNextPath = (
+  next: string | undefined,
+  disallow: readonly string[] = [],
+  origin = FALLBACK_ORIGIN,
+): string | null => {
+  const safe = safeNext(next, origin);
+  if (!safe) return null;
+  const pathname = new URL(safe, origin).pathname;
+  if (disallow.some((prefix) => pathname === prefix || pathname.startsWith(`${prefix}/`))) return '/';
+  return safe;
+};

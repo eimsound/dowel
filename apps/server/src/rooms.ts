@@ -1523,15 +1523,18 @@ export class Rooms {
     for (const id of target) this.pendingRefreshTarget.add(id);
   }
 
-  /** 查询用户最新的实例角色与账号状态：停用或角色变更后不能沿用 WS 升级时的快照 */
+  /** 查询用户最新的实例角色、账号状态与是否须改密：停用、改密要求或角色变更后不能沿用 WS 升级时的快照 */
   private async fetchUserState(
     userId: string,
-  ): Promise<{ role: User['role']; status: User['status'] } | null> {
-    const [row] = await this.db.query<{ role: User['role']; status: User['status'] }>(
-      'select role, status from users where id = $1',
-      [userId],
-    );
-    return row ?? null;
+  ): Promise<{ role: User['role']; status: User['status']; mustChangePassword: boolean } | null> {
+    const [row] = await this.db.query<{
+      role: User['role'];
+      status: User['status'];
+      mustChangePassword: boolean | number;
+    }>('select role, status, must_change_password as "mustChangePassword" from users where id = $1', [
+      userId,
+    ]);
+    return row ? { ...row, mustChangePassword: Boolean(row.mustChangePassword) } : null;
   }
 
   /** 分支属于哪个项目（join 复查角色、刷新已加载房间时用） */
@@ -1585,6 +1588,10 @@ export class Rooms {
         if (this.refreshGenFor(branchId) !== gen) continue;
         if (current?.status !== 'active') {
           removePeer('账号已被停用');
+          return;
+        }
+        if (current.mustChangePassword) {
+          removePeer('密码已重置，请重新登录并修改密码');
           return;
         }
         if (peer.user.role !== current.role) {
@@ -2490,8 +2497,11 @@ export class Rooms {
       targets,
     );
     const projectByBranch = new Map(projects.map((p) => [p.branchId, p.projectId]));
-    // 整次刷新共用：用户当前状态（可能刚被停用 / 改了实例角色）+ 角色上下文 / 项目缓存
-    const users = new Map<string, { role: User['role']; status: User['status'] } | null>();
+    // 整次刷新共用：用户当前状态（可能刚被停用 / 改了实例角色 / 重置了临时密码）+ 角色上下文 / 项目缓存
+    const users = new Map<
+      string,
+      { role: User['role']; status: User['status']; mustChangePassword: boolean } | null
+    >();
     const lookup: RoleLookup = { contexts: new Map(), projects: new Map() };
     const kick = (r: Loaded, peer: Peer, reason: string) => {
       r.peers.delete(peer);
@@ -2531,6 +2541,12 @@ export class Rooms {
         if (current?.status !== 'active') {
           if (peer.client) removedClient = true;
           kick(r, peer, '账号已被停用');
+          removed = true;
+          continue;
+        }
+        if (current.mustChangePassword) {
+          if (peer.client) removedClient = true;
+          kick(r, peer, '密码已重置，请重新登录并修改密码');
           removed = true;
           continue;
         }

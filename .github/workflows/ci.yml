@@ -211,7 +211,8 @@ jobs:
       - name: 生产构建产物启动冒烟（无 @dowel/source 条件）
         run: |
           set -euo pipefail
-          SMOKE_DB="$(mktemp -u /tmp/dowel-smoke-XXXXXX.db)"
+          SMOKE_DIR="$(mktemp -d /tmp/dowel-smoke-XXXXXX)"
+          SMOKE_DB="$SMOKE_DIR/dowel.db"
           PORT=4699 DOWEL_DB="$SMOKE_DB" DOWEL_SECRET="ci-smoke-secret-0123456789" \
             DOWEL_DRIFT_INTERVAL_MINUTES=0 node apps/server/dist/main.js &
           SERVER_PID=$!
@@ -220,7 +221,7 @@ jobs:
               kill -TERM "$SERVER_PID" 2>/dev/null || true
               wait "$SERVER_PID" || true
             fi
-            rm -f "$SMOKE_DB" "${SMOKE_DB}-wal" "${SMOKE_DB}-shm"
+            rm -rf "$SMOKE_DIR"
           }
           trap cleanup EXIT
           for _ in $(seq 1 30); do
@@ -234,7 +235,10 @@ jobs:
           done
           INSTANCE_JSON="$(curl -fsS --max-time 5 http://127.0.0.1:4699/api/instance)"
           echo "GET /api/instance -> $INSTANCE_JSON"
-          grep -q '"needsSetup":true' <<<"$INSTANCE_JSON"
+          grep -q '"passwordLogin":true' <<<"$INSTANCE_JSON"
+          ! grep -q '"needsSetup"' <<<"$INSTANCE_JSON"
+          test -f "$SMOKE_DIR/initial-admin-password"
+          [ "$(stat -c %a "$SMOKE_DIR/initial-admin-password")" = "600" ]
           INDEX_HTML="$(curl -fsS --max-time 5 http://127.0.0.1:4699/)"
           grep -qi '<!doctype html>' <<<"$INDEX_HTML"
           grep -q 'id="root"' <<<"$INDEX_HTML"

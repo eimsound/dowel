@@ -21,7 +21,16 @@ export {
 } from './db.ts';
 export { HaCoordinator, type HaCoordinatorOptions } from './ha.ts';
 export { readSettings, writeSettings } from './settings.ts';
-export { autoSetup, ensureSetupToken, needsSetup } from './setup.ts';
+export {
+  bootstrapAdmin,
+  type BootstrapAdminResult,
+  DEFAULT_ADMIN_USERNAME,
+  generateTempPassword,
+  INITIAL_PASSWORD_FILENAME,
+  removeInitialAdminPasswordFile,
+  resolveInitialPasswordFile,
+  SETUP_LOCK_KEY,
+} from './setup.ts';
 export { type Shadow, ShadowError } from './shadow.ts';
 export {
   type ClosableServer,

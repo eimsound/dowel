@@ -2,6 +2,7 @@
 // 导航和“个人设置”一样放在外壳的侧面板里（useShellPanel）；每节是独立的嵌套路由。
 // 涉及“最后一个管理员”“关闭密码登录”这类保护时，服务端返回 422，界面原样显示它的说明。
 import type {
+  AdminResetPasswordResult,
   AdminUser,
   AuditEvent,
   AuditPage,
@@ -15,7 +16,6 @@ import type {
   InviteListItem,
   OidcProviderInfo,
   OidcProviderPreset,
-  ResetLink,
   UserStatus,
 } from '@dowel/api';
 import { useInfiniteQuery, useMutation, useQuery, useQueryClient } from '@tanstack/react-query';
@@ -32,12 +32,12 @@ import {
   UserPlus,
   Users,
 } from 'lucide-react';
-import { useState } from 'react';
+import { useId, useRef, useState } from 'react';
 import { useTranslation } from 'react-i18next';
 
 import { actionText } from '../activity.ts';
 import { api } from '../api.ts';
-import { Confirm } from '../components/Modal.tsx';
+import { Confirm, Modal } from '../components/Modal.tsx';
 import { PolicyLayerPanel } from '../components/PolicyEditor.tsx';
 import { Row, Rows, Section } from '../components/ProjectPage.tsx';
 import { SettingsNav } from '../components/SettingsNav.tsx';
@@ -154,14 +154,190 @@ const OneTimeLink = ({
   );
 };
 
+/** 一次性临时密码：只显示这一次，带复制按钮 */
+const OneTimeSecret = ({
+  label,
+  hint,
+  secret,
+  onDismiss,
+}: {
+  label: string;
+  hint: string;
+  secret: string;
+  onDismiss: () => void;
+}) => {
+  const { t } = useTranslation();
+  const [copied, setCopied] = useState(false);
+  const copy = async () => {
+    await navigator.clipboard.writeText(secret);
+    setCopied(true);
+  };
+  return (
+    <Banner
+      kind="ok"
+      title={label}
+      action={
+        <span className="flex items-center gap-1.5">
+          <button type="button" className="btn sm" onClick={() => void copy()}>
+            <Copy size={14} aria-hidden="true" />
+            {copied ? t('adm.copied') : t('adm.copy')}
+          </button>
+          <button type="button" className="btn ghost sm" onClick={onDismiss}>
+            {t('adm.cancel')}
+          </button>
+        </span>
+      }
+      role="status"
+    >
+      <span className="block">{hint}</span>
+      <code className="mt-1 block truncate rounded-xs bg-surface-2 px-1.5 py-1 font-mono text-xs select-all">
+        {secret}
+      </code>
+    </Banner>
+  );
+};
+
+const ResetPasswordModal = ({
+  user,
+  onClose,
+  onReset,
+}: {
+  user: AdminUser | null;
+  onClose: () => void;
+  onReset: (res: AdminResetPasswordResult, username: string) => void;
+}) => {
+  const { t } = useTranslation();
+  const [password, setPassword] = useState('');
+  const [dirty, setDirty] = useState(false);
+  const [error, setError] = useState<string | undefined>();
+  const inputRef = useRef<HTMLInputElement>(null);
+  const formId = useId();
+  const hintId = useId();
+  const errId = useId();
+
+  const validate = (val: string) =>
+    val.length > 0 && val.length < 8 ? t('account.passwordTooShort') : undefined;
+
+  const resetFormState = () => {
+    setPassword('');
+    setDirty(false);
+    setError(undefined);
+    resetMutation();
+  };
+
+  const handleClose = () => {
+    resetFormState();
+    onClose();
+  };
+
+  const {
+    mutate,
+    reset: resetMutation,
+    isPending,
+    error: apiError,
+  } = useMutation({
+    mutationFn: (body: { id: string; password?: string }) =>
+      api<AdminResetPasswordResult>(
+        'POST',
+        `/api/admin/users/${body.id}/reset-password`,
+        body.password ? { password: body.password } : {},
+      ),
+    onSuccess: (res) => {
+      const username = user?.username ?? '';
+      resetFormState();
+      onReset(res, username);
+    },
+  });
+
+  const onSubmit = (e: React.FormEvent) => {
+    e.preventDefault();
+    if (!user) return;
+    const nextError = validate(password);
+    if (nextError) {
+      setDirty(true);
+      setError(nextError);
+      inputRef.current?.focus();
+      return;
+    }
+    mutate({ id: user.id, password: password || undefined });
+  };
+
+  return (
+    <Modal
+      open={!!user}
+      onClose={handleClose}
+      size="sm"
+      title={user ? t('adm.resetPasswordTitle', { username: user.username }) : ''}
+      footer={
+        <>
+          <span className="flex-1" />
+          <button type="button" className="btn" disabled={isPending} onClick={handleClose}>
+            {t('adm.cancel')}
+          </button>
+          <button
+            type="submit"
+            form={formId}
+            className="btn primary"
+            disabled={isPending}
+            aria-busy={isPending}
+          >
+            {t('adm.resetPasswordSubmit')}
+          </button>
+        </>
+      }
+    >
+      <form id={formId} className="space-y-3" noValidate onSubmit={onSubmit}>
+        <p className="text-sm text-text-2">{t('adm.resetPasswordBody')}</p>
+        <label className="field">
+          <span className="label">{t('adm.resetPasswordField')}</span>
+          <input
+            ref={inputRef}
+            className="input"
+            type="password"
+            value={password}
+            autoComplete="new-password"
+            aria-invalid={error ? 'true' : 'false'}
+            aria-describedby={error ? `${errId} ${hintId}` : hintId}
+            onChange={(e) => {
+              setPassword(e.target.value);
+              setDirty(true);
+              setError(undefined);
+              if (apiError) resetMutation();
+            }}
+            onBlur={() => {
+              if (!dirty) return;
+              setError(validate(password));
+            }}
+          />
+          <p id={hintId} className="hint">
+            {t('adm.resetPasswordHint')}
+          </p>
+          {error && (
+            <p id={errId} className="hint error">
+              {error}
+            </p>
+          )}
+        </label>
+        {apiError && (
+          <Banner kind="danger" role="alert">
+            {apiError.message}
+          </Banner>
+        )}
+      </form>
+    </Modal>
+  );
+};
+
 const ROLE_OPTIONS: InstanceRole[] = ['member', 'admin'];
 
 export const AdminUsers = () => {
   const { t } = useTranslation();
   const qc = useQueryClient();
   const toast = useToast();
+  const me = useMe().data;
   const [q, setQ] = useState('');
-  const [reset, setReset] = useState<{ username: string; link: ResetLink } | null>(null);
+  const [tempPassword, setTempPassword] = useState<{ username: string; password: string } | null>(null);
+  const [resetTarget, setResetTarget] = useState<AdminUser | null>(null);
   const [create, setCreate] = useState({
     username: '',
     name: '',
@@ -183,14 +359,6 @@ export const AdminUsers = () => {
       refresh();
     },
   });
-  const resetLink = useMutation({
-    mutationFn: (u: AdminUser) =>
-      api<ResetLink>('POST', `/api/admin/users/${u.id}/reset-link`, {}).then((link) => ({
-        username: u.username,
-        link,
-      })),
-    onSuccess: setReset,
-  });
   const add = useMutation({
     mutationFn: () =>
       api<AdminUser>('POST', '/api/admin/users', {
@@ -206,7 +374,7 @@ export const AdminUsers = () => {
       refresh();
     },
   });
-  const error = patch.error ?? resetLink.error ?? add.error;
+  const error = patch.error ?? add.error;
 
   return (
     <>
@@ -225,12 +393,12 @@ export const AdminUsers = () => {
               {error.message}
             </Banner>
           )}
-          {reset && (
-            <OneTimeLink
-              label={`${t('adm.resetLink')} · ${reset.username}`}
-              hint={t('adm.resetLinkHint')}
-              url={reset.link.url}
-              onDismiss={() => setReset(null)}
+          {tempPassword && (
+            <OneTimeSecret
+              label={t('adm.resetPasswordTempTitle', { username: tempPassword.username })}
+              hint={t('adm.resetPasswordTempHint')}
+              secret={tempPassword.password}
+              onDismiss={() => setTempPassword(null)}
             />
           )}
           <div className="overflow-x-auto rounded-md border border-border bg-panel">
@@ -242,7 +410,7 @@ export const AdminUsers = () => {
                   <th scope="col">{t('adm.status')}</th>
                   <th scope="col">{t('adm.lastLogin')}</th>
                   <th scope="col">
-                    <span className="sr-only">{t('adm.resetLink')}</span>
+                    <span className="sr-only">{t('adm.actions')}</span>
                   </th>
                 </tr>
               </thead>
@@ -253,7 +421,12 @@ export const AdminUsers = () => {
                       <span className="flex items-center gap-2">
                         <Avatar name={u.name} color="var(--peer-2)" />
                         <span className="min-w-0">
-                          <span className="block truncate text-base">{u.name}</span>
+                          <span className="flex items-center gap-1.5">
+                            <span className="truncate text-base">{u.name}</span>
+                            {u.mustChangePassword && (
+                              <span className="badge warn shrink-0">{t('adm.mustChangePassword')}</span>
+                            )}
+                          </span>
                           <span className="block truncate font-mono text-xs text-text-3">
                             {u.username}
                             {u.email ? ` · ${u.email}` : ''}
@@ -314,10 +487,10 @@ export const AdminUsers = () => {
                       <button
                         type="button"
                         className="btn sm"
-                        disabled={resetLink.isPending}
-                        onClick={() => resetLink.mutate(u)}
+                        disabled={patch.isPending || u.id === me?.id}
+                        onClick={() => setResetTarget(u)}
                       >
-                        {t('adm.resetLink')}
+                        {t('adm.resetPassword')}
                       </button>
                     </td>
                   </tr>
@@ -403,6 +576,16 @@ export const AdminUsers = () => {
           <p className="hint w-full">{t('adm.passwordHint')}</p>
         </form>
       </Section>
+      <ResetPasswordModal
+        user={resetTarget}
+        onClose={() => setResetTarget(null)}
+        onReset={(res, username) => {
+          setResetTarget(null);
+          setTempPassword({ username, password: res.password });
+          toast(t('adm.resetPasswordDone'));
+          refresh();
+        }}
+      />
     </>
   );
 };

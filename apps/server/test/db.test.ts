@@ -102,13 +102,13 @@ const verifyClockMigrationAndMonotonicity = async (platform: 'sqlite' | 'pg') =>
   }
 
   try {
-    // 1. 建到最新版本后回退最后一条（layout_ver / sections_ver）迁移并插入存量数据
+    // 1. 建到最新版本后回退迁移 27（layout_ver / sections_ver）并插入存量数据
     const base = await openPlatformDb(url);
     try {
       await base.exec(
         'alter table branches drop column layout_ver; alter table branches drop column sections_ver;',
       );
-      await base.query('delete from dowel_migrations where version >= $1', [MIGRATIONS.length]);
+      await base.query('delete from dowel_migrations where version >= $1', [27]);
       await base.query("insert into groups (id, slug, name) values ('g1', 'g1', '组')");
       await base.query("insert into projects (id, name, group_id, slug) values ('p1', 'p1', 'g1', 'p1')");
       await base.query(
@@ -142,9 +142,9 @@ const verifyClockMigrationAndMonotonicity = async (platform: 'sqlite' | 'pg') =>
       expect(Number(row?.layout_ver)).toBe(0);
       expect(Number(row?.sections_ver)).toBe(0);
 
-      // 3. 设更高时钟并重跑最后一条迁移：验证幂等性，不覆盖既有值
+      // 3. 设更高时钟并重跑迁移 27：验证幂等性，不覆盖既有值
       await upgraded.query('update branches set layout_ver = 7, sections_ver = 9 where id = $1', ['b1']);
-      await upgraded.query('delete from dowel_migrations where version >= $1', [MIGRATIONS.length]);
+      await upgraded.query('delete from dowel_migrations where version >= $1', [27]);
     } finally {
       await upgraded.close();
     }

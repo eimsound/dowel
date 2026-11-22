@@ -100,8 +100,21 @@ test('认证与项目动作写入审计', async () => {
     data: { username: 'zhang', role: 'member', password: true },
   });
 
+  expect(zhang.data.mustChangePassword).toBe(true);
   const login = await call('POST', '/api/auth/login', { username: 'zhang', password: 'password1' });
   expect(login.status).toBe(200);
+  expect(login.data.mustChangePassword).toBe(true);
+  // 管理员直接创建的用户初始带临时密码，必须先改密才能创建组/项目
+  expect(
+    (
+      await call(
+        'POST',
+        '/api/me/password',
+        { oldPassword: 'password1', newPassword: 'password1-new' },
+        login.cookie,
+      )
+    ).status,
+  ).toBe(200);
 
   const group = await call('POST', '/api/groups', { slug: 'shop', name: '商城组' }, login.cookie);
   expect(group.status).toBe(201);

@@ -10,7 +10,7 @@ import { hashToken } from '../src/auth.ts';
 import { createApp, openPlatformDb, type PlatformDb } from '../src/index.ts';
 import { LoginLimiter } from '../src/rate-limit.ts';
 import type { SecurityConfig } from '../src/security.ts';
-import { addTable, PASSWORD } from './support.ts';
+import { addTable, makeUser, PASSWORD } from './support.ts';
 
 process.env.DOWEL_SECRET ??= 'audit-coverage-secret-0123456789';
 
@@ -18,7 +18,6 @@ let db: PlatformDb;
 let app: ReturnType<typeof createApp>['app'];
 let stop: () => Promise<void>;
 let rooms: ReturnType<typeof createApp>['rooms'];
-let setupToken: string;
 let adminCookie = '';
 
 const call = async (method: string, path: string, json?: unknown, cookie = '') => {
@@ -47,19 +46,14 @@ beforeEach(async () => {
   const created = createApp(db, { loginLimiter: new LoginLimiter({ limit: 10_000, ipLimit: 10_000 }) });
   app = created.app;
   rooms = created.rooms;
-  setupToken = created.setupToken!;
   stop = async () => {
     await created.rooms.flush();
     await created.shadows.close();
   };
-  const setup = await call('POST', '/api/setup', {
-    token: setupToken,
-    username: 'admin',
-    name: '管理员',
-    password: PASSWORD,
-  });
-  expect(setup.status).toBe(200);
-  adminCookie = setup.cookie;
+  await makeUser(db, 'admin', { name: '管理员', role: 'admin' });
+  const login = await call('POST', '/api/auth/login', { username: 'admin', password: PASSWORD });
+  expect(login.status).toBe(200);
+  adminCookie = login.cookie;
 });
 
 afterEach(async () => {
@@ -77,9 +71,6 @@ test('每个应审计的动作都能在 audit_events 里找到', async () => {
   const directAudit = (action: string, targetKind: string | null = null, targetId: string | null = null) =>
     audit(db, fakeContext, { action, actorKind: 'user', actorId: null, targetKind, targetId }, security);
 
-  const loginAdmin = await call('POST', '/api/auth/login', { username: 'admin', password: PASSWORD });
-  expect(loginAdmin.status).toBe(200);
-  adminCookie = loginAdmin.cookie;
   const loginMember = await call(
     'POST',
     '/api/admin/users',
@@ -119,11 +110,6 @@ test('每个应审计的动作都能在 audit_events 里找到', async () => {
         ).toBe(200),
     },
     {
-      action: 'user.update_self',
-      run: async () =>
-        expect((await call('PATCH', '/api/me', { name: '成员三' }, memberCookie)).status).toBe(200),
-    },
-    {
       action: 'user.password_change',
       run: async () =>
         expect(
@@ -136,6 +122,11 @@ test('每个应审计的动作都能在 audit_events 里找到', async () => {
             )
           ).status,
         ).toBe(200),
+    },
+    {
+      action: 'user.update_self',
+      run: async () =>
+        expect((await call('PATCH', '/api/me', { name: '成员三' }, memberCookie)).status).toBe(200),
     },
     {
       // 纯 OIDC 用户第一次设置密码（没有密码就登录不了，所以直接插一个会话）
@@ -173,6 +164,14 @@ test('每个应审计的动作都能在 audit_events 里找到', async () => {
         expect((await call('POST', `/api/admin/users/${memberId}/reset-link`, {}, adminCookie)).status).toBe(
           200,
         ),
+    },
+    {
+      action: 'user.password_reset_temp',
+      run: async () => {
+        const res = await call('POST', `/api/admin/users/${memberId}/reset-password`, {}, adminCookie);
+        expect(res.status).toBe(200);
+        expect(res.data.mustChangePassword).toBe(true);
+      },
     },
     // 邀请与注册
     {
@@ -605,12 +604,12 @@ test('每个应审计的动作都能在 audit_events 里找到', async () => {
     { action: 'identity.unlink', run: () => directAudit('identity.unlink', 'user', 'u1') },
   ];
 
-  // instance.setup 已经在 beforeEach 里执行；user.create 在准备 member 时执行
+  // user.create 在准备 member 时执行
   for (const row of rows) await row.run();
 
   const seenRows = await db.query<{ action: string }>('select distinct action from audit_events');
   const seen = new Set(seenRows.map((r) => r.action));
-  const expected = new Set([...rows.map((r) => r.action), 'instance.setup', 'user.create']);
+  const expected = new Set([...rows.map((r) => r.action), 'user.create']);
   for (const action of expected) expect(seen.has(action), `缺少审计动作：${action}`).toBe(true);
   expect([...seen].sort()).toEqual([...expected].sort());
 });

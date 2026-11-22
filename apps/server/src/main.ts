@@ -1,5 +1,6 @@
 // 启动服务：DOWEL_DB（平台数据库：postgres://… 或 SQLite 文件路径，默认 ./data/dowel.db）、PORT（默认 4600）。
-// 实例里还没有用户时，这里打印一次性初始化令牌（也可以用 DOWEL_ADMIN_USERNAME / DOWEL_ADMIN_PASSWORD 无人值守初始化）。
+// 实例尚无用户时自动创建初始管理员（默认 admin）：提供 DOWEL_ADMIN_PASSWORD_FILE / DOWEL_ADMIN_PASSWORD 则直接启用，
+// 否则生成 0600 权限的临时密码文件并要求首次登录后改密。
 import { existsSync, readFileSync } from 'node:fs';
 import { fileURLToPath } from 'node:url';
 
@@ -10,29 +11,38 @@ import { DEFAULT_SQLITE_PLATFORM_DB } from './allowlist.ts';
 import { createApp } from './app.ts';
 import { openPlatformDb } from './db.ts';
 import { DEFAULT_DRIFT_INTERVAL_MS } from './drift-scheduler.ts';
-import { autoSetup, ensureSetupToken, needsSetup } from './setup.ts';
+import { bootstrapAdmin, type BootstrapAdminResult } from './setup.ts';
 import { createShutdown } from './shutdown.ts';
 
 const db = await openPlatformDb(process.env.DOWEL_DB || DEFAULT_SQLITE_PLATFORM_DB);
 const port = Number(process.env.PORT ?? 4600);
 
-// 无人值守初始化：设置了 DOWEL_ADMIN_USERNAME / DOWEL_ADMIN_PASSWORD 并且还没有用户时直接建管理员。
-// 这两个值要能登录、也会被记进审计，规则和接口一致；不合法就直接启动失败。
-let created = null;
+let bootstrap: BootstrapAdminResult;
 try {
-  created = await autoSetup(db);
+  bootstrap = await bootstrapAdmin(db);
 } catch (e) {
   console.error(`Dowel 启动失败：${e instanceof Error ? e.message : String(e)}`);
   await db.close();
   process.exit(1);
 }
-if (created) console.log(`已创建实例管理员 ${created.username}（来自 DOWEL_ADMIN_USERNAME）。`);
-const needsInit = !created && (await needsSetup(db));
-// 多副本同时冷启动时共享持久化在平台库的同一个初始化令牌，并同步到应用上下文
-const sharedSetupToken = needsInit ? await ensureSetupToken(db) : null;
+
+if (bootstrap.created) {
+  if (bootstrap.source === 'file') {
+    console.log(`已创建实例管理员 ${bootstrap.created.username}（密码来自 DOWEL_ADMIN_PASSWORD_FILE）。`);
+  } else if (bootstrap.source === 'env') {
+    console.log(`已创建实例管理员 ${bootstrap.created.username}（密码来自 DOWEL_ADMIN_PASSWORD）。`);
+  } else if (bootstrap.source === 'generated') {
+    console.log(
+      `已创建初始实例管理员 ${bootstrap.created.username}，临时密码已写入 ${bootstrap.initialAdminPasswordFile}（首次登录后必须修改密码）。`,
+    );
+  }
+}
 
 const { app, injectWebSocket, wss, bus, ha, rooms, shadows, refresher, drift, exec, requests, webhooks } =
-  createApp(db, { sharedSetupToken });
+  createApp(db, {
+    initialAdminPasswordFile: bootstrap.initialAdminPasswordFile,
+    bootstrapUsername: bootstrap.bootstrapUsername,
+  });
 
 // 前端构建产物（pnpm build 生成）：静态文件直接返回，其余路径交给前端路由
 const web = process.env.DOWEL_WEB ?? fileURLToPath(new URL('../../web/dist', import.meta.url));
@@ -53,10 +63,6 @@ webhooks.start();
 
 const server = serve({ fetch: app.fetch, port }, (info) => {
   console.log(`Dowel 已启动：http://localhost:${info.port}`);
-  if (sharedSetupToken)
-    console.log(
-      `实例还没有用户。打开 http://localhost:${info.port}/setup 初始化，初始化令牌：${sharedSetupToken}`,
-    );
 });
 injectWebSocket(server);
 

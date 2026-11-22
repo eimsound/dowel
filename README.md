@@ -22,7 +22,7 @@ docker compose up -d
 ```
 
 2. 部署前修改 [docker-compose.yml](docker-compose.yml) 中的 `DOWEL_SECRET` 为至少 16 个字符的随机字符串（用于加密保存数据库连接串和 Webhook 密钥，配置后不要更改）。
-3. 打开 <http://localhost:4600>，使用容器日志打印的一次性初始化令牌完成 `/setup` 创建首个实例管理员（或在环境变量中预设 `DOWEL_ADMIN_USERNAME` 与 `DOWEL_ADMIN_PASSWORD`）。
+3. 首次启动会自动创建 `admin` 实例管理员：从容器数据卷里的 `initial-admin-password`（权限 `0600`，路径可在启动日志查看）读取一次性临时密码并在登录后修改密码；也可以在启动前通过环境变量 `DOWEL_ADMIN_PASSWORD_FILE` 或 `DOWEL_ADMIN_PASSWORD`（可选配合 `DOWEL_ADMIN_USERNAME`）直接预设初始管理员密码。
 
 详细步骤与各数据库配置见 [Getting started](docs/en/getting-started.md) 与 [上手指南](docs/zh/getting-started.md)。
 
@@ -34,7 +34,7 @@ docker compose up -d
 | ------------------------------------------------------------- | --------------------------------------------------- | ------------------------------------------------------------------------------------ |
 | [Home](docs/en/index.md)                                      | [文档首页](docs/zh/index.md)                        | 产品概览、核心工作流与角色入口                                                       |
 | [Getting started](docs/en/getting-started.md)                 | [上手指南](docs/zh/getting-started.md)              | 5 分钟启动、初始化、建项目、发布、验证与执行最小闭环                                 |
-| [Deployment and configuration](docs/en/deployment.md)         | [部署与配置](docs/zh/deployment.md)                 | Docker Compose、源码构建、20 项环境变量、外部 PG 多副本 HA、反代与白名单             |
+| [Deployment and configuration](docs/en/deployment.md)         | [部署与配置](docs/zh/deployment.md)                 | Docker Compose、源码构建、22 项环境变量、外部 PG 多副本 HA、反代与白名单             |
 | [Accounts, OIDC, and access](docs/en/accounts-and-access.md)  | [账户、OIDC 与权限](docs/zh/accounts-and-access.md) | 单公司模型、邀请与重置、OIDC（Google / GitLab）、组与授权、项目转组/删除、审计与设置 |
 | [Modeling, versions, and canvas history](docs/en/modeling.md) | [建模、版本与画布历史](docs/zh/modeling.md)         | 稳定 ID、导入与影子库边界、实时协作与画布修改历史、板块与聚焦、发布与风险、PG 分区表 |
 | [Dialects and version support](docs/en/dialects.md)           | [多方言与版本支持](docs/zh/dialects.md)             | PostgreSQL 15–19、SQLite、MySQL 8.4/9.7、SQL Server 2019/2022/2025 能力与限制矩阵    |

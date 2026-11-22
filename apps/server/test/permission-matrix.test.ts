@@ -65,6 +65,7 @@ interface Ctx {
   groupId: string;
   targetUserId: string;
   outsiderId: string;
+  resetTargetId: string;
   inviteToken: string;
   envId: string;
   envName: string;
@@ -183,12 +184,7 @@ const matrix: Record<string, Spec> = {
   },
   'GET /api/auth/oidc/confirm': { access: { kind: 'public', statuses: [410] } },
   'POST /api/auth/oidc/confirm': { access: { kind: 'public', statuses: [410] }, body: () => ({}) },
-  'GET /api/setup': { access: { kind: 'public', statuses: [200] } },
   'GET /api/instance': { access: { kind: 'public', statuses: [200] } },
-  'POST /api/setup': {
-    access: { kind: 'public', statuses: [409] },
-    body: () => ({ token: 'x', username: 'nobody', name: 'Nobody', password: 'password1' }),
-  },
   'GET /api/invites/:token': {
     access: { kind: 'public', statuses: [200] },
     path: (ctx) => `/api/invites/${ctx.inviteToken}`,
@@ -232,6 +228,11 @@ const matrix: Record<string, Spec> = {
   'POST /api/admin/users/:id/reset-link': {
     access: { kind: 'instance', statuses: [200] },
     path: (ctx) => `/api/admin/users/${ctx.outsiderId}/reset-link`,
+    body: () => ({}),
+  },
+  'POST /api/admin/users/:id/reset-password': {
+    access: { kind: 'instance', statuses: [200] },
+    path: (ctx) => `/api/admin/users/${ctx.resetTargetId}/reset-password`,
     body: () => ({}),
   },
   'GET /api/admin/grants': { access: { kind: 'instance', statuses: [200] } },
@@ -905,6 +906,7 @@ beforeAll(async () => {
   const pa = await makeUser(db, 'pa', { name: '直接项目管理员' });
   const gg = await makeUser(db, 'gg', { name: '组授权成员' });
   const outsider = await makeUser(db, 'outsider', { name: '无关用户' });
+  const resetTarget = await makeUser(db, 'reset-target', { name: '重置目标' });
   const target = await makeUser(db, 'target', { name: '组成员目标' });
   const disabled = await makeUser(db, 'disabled', { name: '停用用户' });
 
@@ -1009,6 +1011,7 @@ beforeAll(async () => {
     groupId,
     targetUserId: target.id,
     outsiderId: outsider.id,
+    resetTargetId: resetTarget.id,
     inviteToken: invite.data.token as string,
     envId: '',
     envName: '',
@@ -1223,4 +1226,74 @@ test('CI 令牌：访问所有非 /api/ci 端点一律 403 forbidden（不回落
     ws.on('error', () => resolve(-1));
   });
   expect(wsStatus).toBe(403);
+});
+
+test('mustChangePassword：强制改密期间仅放行 me/password/logout 与公开端点，其余全部 403 password_change_required', async () => {
+  const forcedUser = await makeUser(db, 'forced-matrix', {
+    name: '强制改密用户',
+    role: 'admin',
+    mustChangePassword: true,
+  });
+  const forcedCookie = await login('forced-matrix');
+  const forcedIdentity: Identity = {
+    name: 'forced',
+    cookie: forcedCookie,
+    active: true,
+    instanceAdmin: true,
+    groupRole: null,
+    projectRole: 'admin',
+    userId: forcedUser.id,
+  };
+
+  expect((await call('GET', '/api/auth/me', undefined, forcedCookie)).status).toBe(200);
+  expect((await call('GET', '/api/auth/me', undefined, forcedCookie)).data).toMatchObject({
+    mustChangePassword: true,
+  });
+  expect((await call('POST', '/api/me/password', {}, forcedCookie)).status).toBe(400);
+
+  for (const route of app.routes.filter((r) => r.method !== 'ALL')) {
+    const key = `${route.method} ${route.path}`;
+    const spec = matrix[key]!;
+    if (spec.access.kind === 'public' || spec.access.kind === 'ci' || spec.access.kind === 'ws') continue;
+    if (key === 'POST /api/me/password') continue;
+    const ctx: Ctx = { ...currentCtx };
+    await spec.prepare?.(ctx, forcedIdentity);
+    const path = spec.path?.(ctx) ?? route.path;
+    const res = await call(route.method, path, spec.body?.(ctx), forcedCookie);
+    expect(res.status, `forced 用户访问 ${key} 应返回 403`).toBe(403);
+    expect(res.data, key).toMatchObject({ code: 'password_change_required' });
+  }
+
+  // OIDC 关联入口同样拦截强制改密用户
+  await db.query(
+    `insert into oidc_providers (id, slug, name, issuer, client_id, client_secret_enc, enabled, auto_provision)
+     values ('forced-oidc-id', 'forced-oidc', 'Forced OIDC', 'https://idp.example', 'cid', 'enc', true, false)`,
+  );
+  try {
+    const linkStart = await call(
+      'GET',
+      '/api/auth/oidc/forced-oidc/start?mode=link',
+      undefined,
+      forcedCookie,
+    );
+    expect(linkStart.status).toBe(403);
+    expect(linkStart.data).toMatchObject({ code: 'password_change_required' });
+  } finally {
+    await db.query("delete from oidc_providers where id = 'forced-oidc-id'");
+  }
+
+  // WebSocket 同步端点升级返回 403
+  const wsUrl = `${base.replace('http', 'ws')}/api/projects/${currentCtx.pid}/sync`;
+  const wsStatus = await new Promise<number>((resolve) => {
+    const ws = new WebSocket(wsUrl, { headers: { cookie: forcedCookie } });
+    ws.on('unexpected-response', (_req, res) => {
+      resolve(res.statusCode ?? 0);
+      res.resume();
+    });
+    ws.on('error', () => resolve(-1));
+  });
+  expect(wsStatus).toBe(403);
+
+  // 允许退出登录
+  expect((await call('POST', '/api/auth/logout', undefined, forcedCookie)).status).toBe(200);
 });

@@ -4,6 +4,7 @@
 import { type Browser, type BrowserContextOptions, expect, type Page } from '@playwright/test';
 
 const ADMIN = { username: 'admin', password: 'e2e-admin-password' };
+const TEMP_PASSWORD = 'temp-password-123';
 const PASSWORD = 'password123';
 
 let n = 0;
@@ -24,26 +25,51 @@ export const adminPage = async (browser: Browser) => {
   return adminPageRef;
 };
 
+/** 管理员建用户并用临时密码完成首次强制改密（最终密码统一为 PASSWORD） */
+const createAndLoginUser = async (
+  browser: Browser,
+  opts: {
+    username: string;
+    name: string;
+    role?: 'admin' | 'member';
+    contextOptions?: BrowserContextOptions;
+  },
+) => {
+  const a = await adminPage(browser);
+  const res = await a.request.post('/api/admin/users', {
+    data: {
+      username: opts.username,
+      name: opts.name,
+      password: TEMP_PASSWORD,
+      ...(opts.role ? { role: opts.role } : {}),
+    },
+  });
+  expect(res.ok(), `创建用户 ${opts.username} 失败：${await res.text()}`).toBe(true);
+
+  const ctx = await browser.newContext(opts.contextOptions);
+  const loginRes = await ctx.request.post('/api/auth/login', {
+    data: { username: opts.username, password: TEMP_PASSWORD },
+  });
+  expect(loginRes.ok(), `登录 ${opts.username} 失败：${await loginRes.text()}`).toBe(true);
+  const changeRes = await ctx.request.post('/api/me/password', {
+    data: { oldPassword: TEMP_PASSWORD, newPassword: PASSWORD },
+  });
+  expect(changeRes.ok(), `修改临时密码失败：${await changeRes.text()}`).toBe(true);
+
+  const page = await ctx.newPage();
+  await page.goto('/');
+  await expect(page.getByRole('heading', { name: '我的项目' })).toBeVisible();
+  return page;
+};
+
 /**
- * 新建一个用户并登录：管理员通过接口建用户，再用用户名 + 密码登录。
+ * 新建一个用户并登录：管理员通过接口建用户，完成首次强制改密后进入首页。
  * 返回的 username 用来把用户加进项目（成员按用户名添加）。
  */
 export const newUser = async (browser: Browser, name: string, options?: BrowserContextOptions) => {
   // 每个 test 文件在独立的模块上下文里跑，n 会重新开始；加随机后缀避免和别的文件撞用户名
   const username = `user${++n}-${Math.random().toString(36).slice(2, 7)}`;
-  const a = await adminPage(browser);
-  const res = await a.request.post('/api/admin/users', {
-    data: { username, name, password: PASSWORD },
-  });
-  expect(res.ok(), `创建用户 ${username} 失败：${await res.text()}`).toBe(true);
-
-  const ctx = await browser.newContext(options);
-  const page = await ctx.newPage();
-  await page.goto('/login');
-  await page.getByLabel('用户名').fill(username);
-  await page.getByLabel('密码').fill(PASSWORD);
-  await page.getByRole('button', { name: '登录', exact: true }).click();
-  await expect(page.getByRole('heading', { name: '我的项目' })).toBeVisible();
+  const page = await createAndLoginUser(browser, { username, name, contextOptions: options });
   return { page, username };
 };
 
@@ -157,18 +183,10 @@ export const openEnvironment = async (page: Page, name: string) => {
  */
 export const instanceAdmin = async (browser: Browser, scheme: 'light' | 'dark' = 'light') => {
   const username = `admin-${Math.random().toString(36).slice(2, 8)}`;
-  const res = await (
-    await adminPage(browser)
-  ).request.post('/api/admin/users', {
-    data: { username, name: '实例管理员', password: 'password123', role: 'admin' },
+  return createAndLoginUser(browser, {
+    username,
+    name: '实例管理员',
+    role: 'admin',
+    contextOptions: { colorScheme: scheme },
   });
-  expect(res.ok(), await res.text()).toBe(true);
-  const ctx = await browser.newContext({ colorScheme: scheme });
-  const page = await ctx.newPage();
-  await page.goto('/login');
-  await page.getByLabel('用户名').fill(username);
-  await page.getByLabel('密码').fill('password123');
-  await page.getByRole('button', { name: '登录', exact: true }).click();
-  await expect(page.getByRole('heading', { name: '我的项目' })).toBeVisible();
-  return page;
 };

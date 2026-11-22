@@ -1,8 +1,8 @@
 // P7 HA Wave 1 底座测试（ADR 0011）：
 // 覆盖 SQLite + 真实 PG：迁移 23、PG LISTEN/NOTIFY 跨连接事件总线与断线重连、
 // withAdvisoryLock 跨连接互斥与超时、HaCoordinator 心跳续租与停机释放、
-// 跨副本 EnvLocks 互斥、多副本共享 setupToken 与并发 autoSetup 幂等。
-import { mkdtempSync, rmSync } from 'node:fs';
+// 跨副本 EnvLocks 互斥与多副本并发 bootstrapAdmin 幂等。
+import { mkdtempSync, readFileSync, rmSync, statSync, writeFileSync } from 'node:fs';
 import { createServer, type Socket } from 'node:net';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
@@ -28,7 +28,7 @@ import {
   HaCoordinator,
 } from '../src/ha.ts';
 import { encrypt } from '../src/secrets.ts';
-import { autoSetup, ensureSetupToken, SETUP_TOKEN_KEY } from '../src/setup.ts';
+import { bootstrapAdmin } from '../src/setup.ts';
 import { makeUser, PASSWORD } from './support.ts';
 
 const waitFor = async (
@@ -1495,170 +1495,105 @@ describe.skipIf(!PG_URL)('跨副本 EnvLocks 互斥（真实 PG）', () => {
   });
 });
 
-// ───── 6. 多副本共享 setupToken 与并发 autoSetup 幂等 ─────
+// ───── 6. 多副本并发 bootstrapAdmin 幂等 ─────
 
 describe.each([
   { platform: 'sqlite' as const, skip: false },
   { platform: 'pg' as const, skip: !PG_URL },
-])('HA4：多副本共享 setupToken 与并发 autoSetup 幂等（$platform）', ({ platform, skip }) => {
+])('HA4：多副本并发 bootstrapAdmin 幂等与临时密码文件契约（$platform）', ({ platform, skip }) => {
   const closers: (() => Promise<void>)[] = [];
   afterAll(async () => {
     for (const c of closers) await c();
   });
 
-  test.skipIf(skip)('双副本并发冷启动共享同一个 setupToken，跨副本初始化成功并删除持久化令牌', async () => {
-    const prevSecret = process.env.DOWEL_SECRET;
-    process.env.DOWEL_SECRET = 'ha-setup-token-secret-16chars';
+  test.skipIf(skip)('双副本并发 bootstrapAdmin（自动生成临时密码）：仅建一个 0600 临时密码用户', async () => {
+    const dir = mkdtempSync(join(tmpdir(), `dowel-ha-bootstrap-${platform}-`));
+    const pwFile = join(dir, 'initial-admin-password');
+    closers.push(async () => rmSync(dir, { recursive: true, force: true }));
+
     let dbA: PlatformDb;
     let dbB: PlatformDb;
     if (platform === 'sqlite') {
       dbA = await openPlatformDb(':memory:');
       dbB = dbA;
     } else {
-      const t = await createTestDb('ha_setup');
+      const t = await createTestDb('ha_bootstrap_gen');
       closers.push(t.close);
       dbA = await openPlatformDb(t.url);
       dbB = await openPlatformDb(t.url);
     }
 
-    const appA = createApp(dbA);
-    const appB = createApp(dbB);
     try {
-      // 双副本并发冷启动生成/获取共享 setupToken，必须拿到完全相同的值
-      const [tokenA, tokenB] = await Promise.all([
-        ensureSetupToken(dbA, appA.setupToken!),
-        ensureSetupToken(dbB, appB.setupToken!),
+      const results = await Promise.all([
+        bootstrapAdmin(dbA, { env: { DOWEL_INITIAL_PASSWORD_FILE: pwFile } }),
+        bootstrapAdmin(dbB, { env: { DOWEL_INITIAL_PASSWORD_FILE: pwFile } }),
       ]);
-      expect(tokenA).toBeTruthy();
-      expect(tokenB).toBe(tokenA);
-
-      // 存储的值已加密（配置了 DOWEL_SECRET 时不存明文）
-      const [storedRow] = await dbA.query<{ value: { enc?: string; plain?: string } }>(
-        'select value from instance_settings where key = $1',
-        [SETUP_TOKEN_KEY],
-      );
-      expect(typeof storedRow?.value.enc).toBe('string');
-      expect(storedRow?.value.plain).toBeUndefined();
-
-      // 副本 B 用副本 A 的共享令牌发起并发 POST /api/setup：严格 1 个成功，1 个 409，库里仅 1 个管理员
-      const [r1, r2] = await Promise.all([
-        callJson(appA.app, 'POST', '/api/setup', {
-          token: tokenA,
-          username: 'admin1',
-          name: '管理员一',
-          password: PASSWORD,
-        }),
-        callJson(appB.app, 'POST', '/api/setup', {
-          token: tokenB,
-          username: 'admin2',
-          name: '管理员二',
-          password: PASSWORD,
-        }),
-      ]);
-      expect([r1.status, r2.status].sort((a, b) => a - b)).toEqual([200, 409]);
-      expect(await dbA.query('select id from users')).toHaveLength(1);
-
-      // 创建管理员的同一事务里已删除 instance_settings 中的 setup_token
-      expect(
-        await dbA.query('select value from instance_settings where key = $1', [SETUP_TOKEN_KEY]),
-      ).toEqual([]);
-      // 已经有用户后 ensureSetupToken 返回 null
-      expect(await ensureSetupToken(dbB)).toBeNull();
+      const winners = results.filter((r) => r.created !== null);
+      const losers = results.filter((r) => r.created === null);
+      expect(winners).toHaveLength(1);
+      expect(losers).toHaveLength(1);
+      expect(winners[0]!.source).toBe('generated');
+      expect(winners[0]!.created).toMatchObject({
+        username: 'admin',
+        role: 'admin',
+        mustChangePassword: true,
+      });
+      expect(await dbA.query('select username from users')).toEqual([{ username: 'admin' }]);
+      const stat = statSync(pwFile);
+      expect(stat.mode & 0o777).toBe(0o600);
+      const tempPw = readFileSync(pwFile, 'utf8').trim();
+      expect(tempPw.length).toBeGreaterThanOrEqual(8);
     } finally {
-      await appA.rooms.flush();
-      await appB.rooms.flush();
-      await appA.shadows.close();
-      await appB.shadows.close();
       await dbA.close();
       if (dbB !== dbA) await dbB.close();
-      if (prevSecret === undefined) delete process.env.DOWEL_SECRET;
-      else process.env.DOWEL_SECRET = prevSecret;
     }
   });
 
-  test.skipIf(skip)('DOWEL_SECRET 缺失或变更时安全降级，且兼容 options.setupToken 自定义令牌', async () => {
-    const prevSecret = process.env.DOWEL_SECRET;
-    delete process.env.DOWEL_SECRET;
-    let db: PlatformDb;
-    if (platform === 'sqlite') {
-      db = await openPlatformDb(':memory:');
-    } else {
-      const t = await createTestDb('ha_setup_fallback');
-      closers.push(t.close);
-      db = await openPlatformDb(t.url);
-    }
+  test.skipIf(skip)(
+    '双副本并发 DOWEL_ADMIN_PASSWORD_FILE / DOWEL_ADMIN_PASSWORD 且互斥校验证据',
+    async () => {
+      const dir = mkdtempSync(join(tmpdir(), `dowel-ha-bootstrap-file-${platform}-`));
+      const opFile = join(dir, 'op-pass');
+      writeFileSync(opFile, `${PASSWORD}-ha-file\n`, { mode: 0o600 });
+      closers.push(async () => rmSync(dir, { recursive: true, force: true }));
 
-    try {
-      // 无 DOWEL_SECRET 时降级明文持久化，多次调用拿到同一个令牌
-      const t1 = await ensureSetupToken(db, 'plain-shared-token');
-      const t2 = await ensureSetupToken(db, 'another-candidate');
-      expect(t1).toBe('plain-shared-token');
-      expect(t2).toBe('plain-shared-token');
-
-      // 模拟历史密文因 DOWEL_SECRET 变化无法解密：ensureSetupToken 安全覆盖并生成新令牌
-      process.env.DOWEL_SECRET = 'first-secret-value-16chars';
-      await db.query(
-        `insert into instance_settings (key, value) values ($1, $2::text::jsonb)
-         on conflict (key) do update set value = excluded.value`,
-        [SETUP_TOKEN_KEY, JSON.stringify({ enc: encrypt('stale-secret-token') })],
-      );
-      process.env.DOWEL_SECRET = 'rotated-secret-value-16chars';
-      const healed = await ensureSetupToken(db, 'healed-token');
-      expect(healed).toBe('healed-token');
-
-      // 自定义 options.setupToken 在单测中优先生效
-      const customApp = createApp(db, { setupToken: 'custom-unit-test-token' });
-      try {
-        const res = await callJson(customApp.app, 'POST', '/api/setup', {
-          token: 'custom-unit-test-token',
-          username: 'customadmin',
-          name: '测试管理员',
-          password: PASSWORD,
-        });
-        expect(res.status).toBe(200);
-        expect(
-          await db.query('select value from instance_settings where key = $1', [SETUP_TOKEN_KEY]),
-        ).toEqual([]);
-      } finally {
-        await customApp.rooms.flush();
-        await customApp.shadows.close();
+      let dbA: PlatformDb;
+      let dbB: PlatformDb;
+      if (platform === 'sqlite') {
+        dbA = await openPlatformDb(':memory:');
+        dbB = dbA;
+      } else {
+        const t = await createTestDb('ha_bootstrap_file');
+        closers.push(t.close);
+        dbA = await openPlatformDb(t.url);
+        dbB = await openPlatformDb(t.url);
       }
-    } finally {
-      await db.close();
-      if (prevSecret === undefined) delete process.env.DOWEL_SECRET;
-      else process.env.DOWEL_SECRET = prevSecret;
-    }
-  });
 
-  test.skipIf(skip)('双副本并发 autoSetup 幂等：只建一个管理员，另一副本优雅返回 null', async () => {
-    let dbA: PlatformDb;
-    let dbB: PlatformDb;
-    if (platform === 'sqlite') {
-      dbA = await openPlatformDb(':memory:');
-      dbB = dbA;
-    } else {
-      const t = await createTestDb('ha_autosetup');
-      closers.push(t.close);
-      dbA = await openPlatformDb(t.url);
-      dbB = await openPlatformDb(t.url);
-    }
+      try {
+        await expect(
+          bootstrapAdmin(dbA, {
+            env: { DOWEL_ADMIN_PASSWORD_FILE: opFile, DOWEL_ADMIN_PASSWORD: PASSWORD },
+          }),
+        ).rejects.toThrow(/DOWEL_ADMIN_PASSWORD_FILE/);
 
-    try {
-      await ensureSetupToken(dbA, 'token-to-be-cleaned');
-      const env = { DOWEL_ADMIN_USERNAME: 'root', DOWEL_ADMIN_PASSWORD: PASSWORD };
-      const results = await Promise.all([autoSetup(dbA, env), autoSetup(dbB, env)]);
-      const created = results.filter((u) => u !== null);
-      expect(created).toHaveLength(1);
-      expect(created[0]).toMatchObject({ username: 'root', role: 'admin' });
-      expect(results.filter((u) => u === null)).toHaveLength(1);
-      expect(await dbA.query('select username from users')).toEqual([{ username: 'root' }]);
-      // autoSetup 同时清理了持久化的 setup_token
-      expect(
-        await dbA.query('select value from instance_settings where key = $1', [SETUP_TOKEN_KEY]),
-      ).toEqual([]);
-    } finally {
-      await dbA.close();
-      if (dbB !== dbA) await dbB.close();
-    }
-  });
+        const env = { DOWEL_ADMIN_USERNAME: 'root', DOWEL_ADMIN_PASSWORD_FILE: opFile };
+        const results = await Promise.all([bootstrapAdmin(dbA, { env }), bootstrapAdmin(dbB, { env })]);
+        const created = results.filter((r) => r.created !== null);
+        expect(created).toHaveLength(1);
+        expect(created[0]!.source).toBe('file');
+        expect(created[0]!.initialAdminPasswordFile).toBeNull();
+        expect(created[0]!.created).toMatchObject({
+          username: 'root',
+          role: 'admin',
+          mustChangePassword: false,
+        });
+        expect(results.filter((r) => r.created === null)).toHaveLength(1);
+        expect(await dbA.query('select username from users')).toEqual([{ username: 'root' }]);
+        expect(readFileSync(opFile, 'utf8')).toBe(`${PASSWORD}-ha-file\n`);
+      } finally {
+        await dbA.close();
+        if (dbB !== dbA) await dbB.close();
+      }
+    },
+  );
 });

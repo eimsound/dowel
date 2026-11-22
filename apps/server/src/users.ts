@@ -6,7 +6,7 @@ import type { InstanceRole } from '@dowel/api';
 import { newId } from '@dowel/core';
 import type { Db } from '@dowel/engines';
 
-import { hashPassword, toUser, USER_COLUMNS, type User } from './auth.ts';
+import { hashPassword, type RawUserRow, toUser, USER_COLUMNS, type User } from './auth.ts';
 import { normalizeUsername } from './usernames.ts';
 
 export interface NewUser {
@@ -16,6 +16,7 @@ export interface NewUser {
   /** 不给密码时创建的用户暂时不能密码登录（以后由 OIDC 或重置链接设置） */
   password?: string | null;
   role?: InstanceRole;
+  mustChangePassword?: boolean;
 }
 
 /** 用户名在库里只存小写；比较前统一规范化 */
@@ -33,7 +34,7 @@ export const usernameTaken = async (db: Db, username: string, exceptId?: string)
 };
 
 export const userById = async (db: Db, id: string): Promise<User | null> => {
-  const [u] = await db.query<User & { password_hash: string | null }>(
+  const [u] = await db.query<RawUserRow>(
     `select ${USER_COLUMNS}, u.password_hash from users u where u.id = $1`,
     [id],
   );
@@ -41,7 +42,7 @@ export const userById = async (db: Db, id: string): Promise<User | null> => {
 };
 
 export const userByUsername = async (db: Db, username: string): Promise<User | null> => {
-  const [u] = await db.query<User & { password_hash: string | null }>(
+  const [u] = await db.query<RawUserRow>(
     `select ${USER_COLUMNS}, u.password_hash from users u where u.username = $1`,
     [normalizeUsername(username)],
   );
@@ -52,8 +53,8 @@ export const createUser = async (db: Db, input: NewUser): Promise<User> => {
   const id = newId();
   const email = input.email?.trim() || null;
   await db.query(
-    `insert into users (id, username, name, email, password_hash, role, status)
-     values ($1, $2, $3, $4, $5, $6, 'active')`,
+    `insert into users (id, username, name, email, password_hash, role, status, must_change_password)
+     values ($1, $2, $3, $4, $5, $6, 'active', $7)`,
     [
       id,
       normalizeUsername(input.username),
@@ -61,6 +62,7 @@ export const createUser = async (db: Db, input: NewUser): Promise<User> => {
       email,
       input.password ? await hashPassword(input.password) : null,
       input.role ?? 'member',
+      Boolean(input.mustChangePassword),
     ],
   );
   return (await userById(db, id))!;

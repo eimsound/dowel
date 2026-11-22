@@ -58,7 +58,6 @@ test('服务端 audit-coverage 覆盖的全部审计动作在 zh / en 词典中�
   const covPath = resolve(import.meta.dirname, '../../server/test/audit-coverage.test.ts');
   const covSrc = readFileSync(covPath, 'utf8');
   const actions = new Set([...covSrc.matchAll(/action:\s*'([^']+)'/g)].map((m) => m[1]!));
-  actions.add('instance.setup');
   actions.add('user.create');
 
   for (const lng of ['zh', 'en'] as const) {

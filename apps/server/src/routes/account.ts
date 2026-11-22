@@ -35,6 +35,7 @@ import {
   setInviteUsedBy,
 } from '../invites.ts';
 import { readSettings } from '../settings.ts';
+import { removeInitialAdminPasswordFile } from '../setup.ts';
 import { userById, usernameTaken } from '../users.ts';
 import { type AppContext, body, createUserOrConflict, type Env } from './context.ts';
 
@@ -110,13 +111,13 @@ export const registerMe = (app: Hono<Env>, ctx: AppContext) => {
   app.post('/api/me/password', async (c) => {
     const me = c.get('user');
     const b = await body(c, passwordChangeSchema);
-    const [row] = await db.query<{ password_hash: string | null }>(
-      'select password_hash from users where id = $1',
+    const [row] = await db.query<{ password_hash: string | null; mustChangePassword: boolean | number }>(
+      'select password_hash, must_change_password as "mustChangePassword" from users where id = $1',
       [me.id],
     );
     if (!row) throw new HTTPException(404, { message: '用户不存在' });
     const firstSet = !row.password_hash;
-    const hash = await hashPassword(b.newPassword);
+    const forced = Boolean(row.mustChangePassword);
 
     if (firstSet) {
       // 纯 OIDC 用户第一次“设置密码”不需要旧密码，但必须证明这个人刚刚登录过：
@@ -134,10 +135,11 @@ export const registerMe = (app: Hono<Env>, ctx: AppContext) => {
         throw new HTTPException(403, {
           message: '设置密码需要最近 10 分钟内登录的会话，请重新登录后再设置密码',
         });
+      const hash = await hashPassword(b.newPassword);
       // 条件更新：并发请求里只有一个能把 password_hash 从 null 改成值，另一个拿到 409。
       const updated = await db.query<{ id: string }>(
-        'update users set password_hash = $2 where id = $1 and password_hash is null returning id',
-        [me.id, hash],
+        'update users set password_hash = $2, must_change_password = $3 where id = $1 and password_hash is null returning id',
+        [me.id, hash, false],
       );
       if (!updated.length) throw new HTTPException(409, { message: '密码已经被设置，请刷新后重试' });
     } else {
@@ -145,9 +147,21 @@ export const registerMe = (app: Hono<Env>, ctx: AppContext) => {
       if (!b.oldPassword) throw new HTTPException(400, { message: '请输入旧密码' });
       if (!(await verifyPassword(b.oldPassword, row.password_hash!)))
         throw new HTTPException(403, { message: '旧密码不正确' });
-      await db.query('update users set password_hash = $2 where id = $1', [me.id, hash]);
+      if (forced && b.newPassword === b.oldPassword) {
+        throw new HTTPException(400, { message: '新密码不能与临时密码相同' });
+      }
+      const hash = await hashPassword(b.newPassword);
+      await db.query('update users set password_hash = $2, must_change_password = $3 where id = $1', [
+        me.id,
+        hash,
+        false,
+      ]);
       // 修改密码才吊销其他会话；首次设置不吊销（那样只会帮攻击者把主人踢下线）
       await revokeSessions(db, me.id, sessionToken(c));
+    }
+
+    if (me.username === ctx.bootstrapUsername) {
+      await removeInitialAdminPasswordFile(ctx.initialAdminPasswordFile);
     }
 
     await audit(
@@ -160,7 +174,7 @@ export const registerMe = (app: Hono<Env>, ctx: AppContext) => {
         actorId: me.id,
         targetKind: 'user',
         targetId: me.id,
-        data: { firstSet },
+        data: firstSet ? { firstSet: true } : { firstSet: false, forced },
       },
       ctx.security,
     );
@@ -306,11 +320,19 @@ export const registerInvites = (app: Hono<Env>, ctx: AppContext) => {
       }
       const target = await userById(tx, claimed.userId);
       if (!target) throw new HTTPException(404, { message: '用户不存在' });
-      await tx.query('update users set password_hash = $2 where id = $1', [target.id, hash]);
+      await tx.query('update users set password_hash = $2, must_change_password = $3 where id = $1', [
+        target.id,
+        hash,
+        false,
+      ]);
       // 设完新密码，这个用户的所有会话都失效
       await tx.query('delete from sessions where user_id = $1', [target.id]);
       return target;
     });
+    await ctx.rooms.kickUser(user.id, '密码已重置，请重新登录');
+    if (user.username === ctx.bootstrapUsername) {
+      await removeInitialAdminPasswordFile(ctx.initialAdminPasswordFile);
+    }
     await audit(
       db,
       c,

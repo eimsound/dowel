@@ -16,9 +16,11 @@ For building from source, using an external PostgreSQL platform database, runnin
 
 ## 2. Set up the instance and create a group {#setup-and-group}
 
-1. Open <http://localhost:4600>. When no users exist yet, Dowel redirects to `/setup`.
-2. Copy the one-time setup token from the server startup logs and enter a username and password to create the first instance admin. You can also set `DOWEL_ADMIN_USERNAME` and `DOWEL_ADMIN_PASSWORD` as environment variables for unattended setup.
-3. After signing in, open the Admin section or the home page and create a group. Every project belongs to a group and lives at `/project/<group-slug>/<project-slug>`.
+1. On first startup when no users exist yet, Dowel automatically creates the initial instance admin (username defaults to `admin`, or the value of `DOWEL_ADMIN_USERNAME`):
+   - When no preset password is configured, the server generates a random temporary password and writes it with mode `0600` to `initial-admin-password` in the data directory (`/data/initial-admin-password` inside the `dowel-data` volume under Docker Compose). Startup logs print the file path only, never the plaintext password.
+   - Open <http://localhost:4600> and sign in as `admin` with that temporary password. Dowel routes you directly to the password-change page, and automatically removes `initial-admin-password` once you set your new password.
+   - To supply an operator-managed password without forcing a password change on first login, set `DOWEL_ADMIN_PASSWORD_FILE` or `DOWEL_ADMIN_PASSWORD` before startup (setting both causes startup to fail).
+2. After signing in, open Admin or the home page and create a group. Every project belongs to a group and lives at `/project/<group-slug>/<project-slug>`.
 
 For user invites, OIDC sign-in, and access rules, read [Accounts, OIDC, and access](accounts-and-access.md).
 
