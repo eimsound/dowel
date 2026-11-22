@@ -64,6 +64,8 @@ const DEFAULTS: CoreWebhookOptions = {
 export const KEEP_DELIVERIES = 50;
 /** 响应体最多读这么多字节（只用来判断钉钉 / 飞书 / 企业微信的业务错误码和给失败原因带一小段） */
 const MAX_RESPONSE_BYTES = 4096;
+/** Node.js setTimeout 32 位有符号整数上限，避免远未来 next_run_at 溢出成 1ms 忙等 */
+const MAX_WAKE_DELAY_MS = 2_147_483_647;
 
 // ───── 出站限制（SSRF） ─────
 
@@ -791,7 +793,10 @@ export class Webhooks {
 
   private scheduleWake(delayMs: number): void {
     if (this.closed) return;
-    const wait = Math.max(1, Math.ceil(delayMs));
+    // +1ms 缓冲：Node.js / libuv 的 setTimeout 基于截断到整毫秒的单调时钟（uv_now），
+    // 可能比 Date.now() / PG now() 提前最多 ~1ms 触发；即便因时钟回拨或跨机漂移仍早于 next_run_at，
+    // claimBatch 也会返回剩余 nextDelayMs 并由 pump() 自动续订唤醒定时器。
+    const wait = Math.min(MAX_WAKE_DELAY_MS, Math.max(1, Math.ceil(delayMs) + 1));
     const target = Date.now() + wait;
     if (this.wakeTimer && this.wakeAt <= target) return;
     if (this.wakeTimer) clearTimeout(this.wakeTimer);
@@ -823,7 +828,8 @@ export class Webhooks {
         while (!this.closed) {
           const free = this.options.concurrency - this.running;
           if (free <= 0) break;
-          const jobs = await this.claimBatch(free);
+          const { rows: jobs, nextDelayMs } = await this.claimBatch(free);
+          if (nextDelayMs !== null && !this.closed) this.scheduleWake(nextDelayMs);
           if (!jobs.length) break;
           for (const row of jobs) {
             this.running++;
@@ -856,8 +862,8 @@ export class Webhooks {
     this.trackSet(this.inFlight, p);
   }
 
-  private async claimBatch(limit: number): Promise<JobRow[]> {
-    if (limit <= 0 || this.closed) return [];
+  private async claimBatch(limit: number): Promise<{ rows: JobRow[]; nextDelayMs: number | null }> {
+    if (limit <= 0 || this.closed) return { rows: [], nextDelayMs: null };
     if (this.db.dialect === 'pg') {
       return this.db.transaction(async (tx) => {
         const rows = await tx.query<JobRow>(
@@ -871,16 +877,30 @@ export class Webhooks {
               for update skip locked`,
           [limit],
         );
-        if (!rows.length) return [];
-        const ids = rows.map((r) => r.id);
-        await tx.query(
-          `update webhook_jobs
-              set locked_by = $1,
-                  locked_until = now() + ($2::double precision * interval '1 millisecond')
-            where id in (${inList(ids, 3)})`,
-          [this.workerId, this.leaseMs, ...ids],
-        );
-        return rows;
+        if (rows.length > 0) {
+          const ids = rows.map((r) => r.id);
+          await tx.query(
+            `update webhook_jobs
+                set locked_by = $1,
+                    locked_until = now() + ($2::double precision * interval '1 millisecond')
+              where id in (${inList(ids, 3)})`,
+            [this.workerId, this.leaseMs, ...ids],
+          );
+        }
+        let nextDelayMs: number | null = null;
+        if (rows.length < limit) {
+          const [next] = await tx.query<{ delayMs: number | string | null }>(
+            `select (extract(epoch from (min(next_run_at) - now())) * 1000)::double precision as "delayMs"
+               from webhook_jobs
+              where next_run_at > now()
+                and (locked_until is null or locked_until <= now())`,
+          );
+          if (next?.delayMs !== null && next?.delayMs !== undefined) {
+            const ms = Number(next.delayMs);
+            if (Number.isFinite(ms)) nextDelayMs = Math.max(1, Math.ceil(ms));
+          }
+        }
+        return { rows, nextDelayMs };
       });
     }
     return this.db.transaction(async (tx) => {
@@ -895,17 +915,32 @@ export class Webhooks {
           limit $2`,
         [now, limit],
       );
-      if (!rows.length) return [];
-      const ids = rows.map((r) => r.id);
-      const lockedUntil = new Date(now.getTime() + this.leaseMs);
-      await tx.query(
-        `update webhook_jobs
-            set locked_by = $1,
-                locked_until = $2
-          where id in (${inList(ids, 3)})`,
-        [this.workerId, lockedUntil, ...ids],
-      );
-      return rows;
+      if (rows.length > 0) {
+        const ids = rows.map((r) => r.id);
+        const lockedUntil = new Date(now.getTime() + this.leaseMs);
+        await tx.query(
+          `update webhook_jobs
+              set locked_by = $1,
+                  locked_until = $2
+            where id in (${inList(ids, 3)})`,
+          [this.workerId, lockedUntil, ...ids],
+        );
+      }
+      let nextDelayMs: number | null = null;
+      if (rows.length < limit) {
+        const [next] = await tx.query<{ nextRunAt: unknown }>(
+          `select min(next_run_at) as "nextRunAt"
+             from webhook_jobs
+            where next_run_at > $1
+              and (locked_until is null or locked_until <= $1)`,
+          [now],
+        );
+        if (next?.nextRunAt !== null && next?.nextRunAt !== undefined) {
+          const ms = new Date(atOf(next.nextRunAt)).getTime() - now.getTime();
+          if (Number.isFinite(ms)) nextDelayMs = Math.max(1, Math.ceil(ms));
+        }
+      }
+      return { rows, nextDelayMs };
     });
   }
 

@@ -1361,11 +1361,124 @@ describe('显式 start() 与后台轮询生命周期（#25）', () => {
     });
     try {
       whNoPoll.emit('g-start', event());
-      const deadline = Date.now() + 2000;
-      while (rx.received.length < 2 && Date.now() < deadline) {
-        await new Promise((r) => setTimeout(r, 15));
-      }
+      await waitReceived(rx, 2);
       expect(rx.received).toHaveLength(2);
+      await whNoPoll.flush();
+      expect(await localDb.query('select id from webhook_jobs')).toEqual([]);
+    } finally {
+      await whNoPoll.close();
+      await localDb.close();
+    }
+  });
+});
+
+const seedRetryEnv = async (localDb: PlatformDb, url: string) => {
+  await localDb.query(
+    `insert into instance_settings (key, value) values ('webhook_allowlist', $1::text::jsonb)
+     on conflict (key) do update set value = excluded.value`,
+    [JSON.stringify(['127.0.0.0/8'])],
+  );
+  await localDb.query("insert into groups (id, slug, name) values ('g-64', 'g-64', '重试组')");
+  await localDb.query(
+    `insert into webhooks (id, group_id, name, format, url_enc, events, enabled)
+     values ('w-64', 'g-64', 'retry-hook', 'json', $1, $2::text::jsonb, true)`,
+    [encrypt(url), JSON.stringify(['request.created'])],
+  );
+};
+
+const installEarlyFirstWake = (wh: Webhooks): number[] => {
+  const armedDelays: number[] = [];
+  const internal = wh as unknown as {
+    wakeTimer: ReturnType<typeof setTimeout> | null;
+    scheduleWake: (ms: number) => void;
+  };
+  const origScheduleWake = internal.scheduleWake.bind(wh);
+  internal.scheduleWake = (ms: number) => {
+    if (internal.wakeTimer === null) {
+      armedDelays.push(ms);
+      if (armedDelays.length === 1) {
+        // 首次实际装入定时器时强制 1ms 唤醒，确定性复现早于 next_run_at 触发
+        origScheduleWake(1);
+        return;
+      }
+    }
+    origScheduleWake(ms);
+  };
+  return armedDelays;
+};
+
+const waitReceived = async (rx: Receiver, count: number, timeoutMs = 5000) => {
+  const deadline = Date.now() + timeoutMs;
+  while (rx.received.length < count && Date.now() < deadline) {
+    await new Promise((r) => setTimeout(r, 15));
+  }
+};
+
+describe('退避重试唤醒调度确定性（#64）', () => {
+  test('wakeTimer 早于 next_run_at 触发时，claimBatch 自动续订剩余唤醒并完成重试（SQLite）', async () => {
+    const rx = await startReceiver();
+    rx.replies.push((res) => {
+      res.writeHead(500);
+      res.end('retry once');
+    });
+    const localDb = await openPlatformDb(':memory:');
+    await seedRetryEnv(localDb, `${rx.base}/early-wake`);
+
+    const whNoPoll = new Webhooks(localDb, {
+      retryBaseMs: 80,
+      pollIntervalMs: 60_000,
+      timeoutMs: 2000,
+    });
+    const armedDelays = installEarlyFirstWake(whNoPoll);
+
+    try {
+      whNoPoll.emit('g-64', event());
+      await waitReceived(rx, 2);
+      expect(rx.received).toHaveLength(2);
+      expect(armedDelays.length).toBeGreaterThanOrEqual(2);
+      expect(armedDelays[1]).toBeGreaterThan(0);
+      await whNoPoll.flush();
+      expect(await localDb.query('select id from webhook_jobs')).toEqual([]);
+    } finally {
+      await whNoPoll.close();
+      await localDb.close();
+    }
+  });
+
+  test('多任务错峰重试（40ms 与 160ms）被更早唤醒覆盖后，pump() 自动续订较晚任务唤醒（SQLite）', async () => {
+    const rx = await startReceiver();
+    rx.replies.push(
+      (res) => {
+        res.writeHead(500);
+        res.end('fail-first');
+      },
+      (res) => {
+        res.writeHead(500);
+        res.end('fail-second');
+      },
+    );
+    const localDb = await openPlatformDb(':memory:');
+    await seedRetryEnv(localDb, `${rx.base}/staggered-wake`);
+
+    // 预插一条 attempts=1 的到期任务（500 后退避 40 * 4^1 = 160ms），与 emit() 新任务（40ms）同批认领
+    const now = new Date();
+    await localDb.query(
+      `insert into webhook_jobs
+         (id, webhook_id, delivery_id, event_type, payload, attempts, max_retries, next_run_at, created_at)
+       values ('job-stagger', 'w-64', 'del-stagger', 'request.created', $1::text::jsonb, 1, 3, $2, $3)`,
+      [JSON.stringify(event()), now, new Date(now.getTime() - 1000)],
+    );
+
+    const whNoPoll = new Webhooks(localDb, {
+      retryBaseMs: 40,
+      pollIntervalMs: 60_000,
+      timeoutMs: 2000,
+    });
+    try {
+      whNoPoll.emit('g-64', event());
+      await waitReceived(rx, 4);
+      expect(rx.received).toHaveLength(4);
+      expect(rx.received.filter((r) => r.headers['x-dowel-delivery'] === 'del-stagger')).toHaveLength(2);
       await whNoPoll.flush();
       expect(await localDb.query('select id from webhook_jobs')).toEqual([]);
     } finally {
@@ -1439,6 +1552,38 @@ describe.skipIf(!PG_URL)('平台库 PG', () => {
       await app.webhooks.close();
       await app.rooms.flush();
       await app.shadows.close();
+      await pdb.close();
+      await platform.close();
+    }
+  });
+
+  test('wakeTimer 早于 next_run_at 触发时，PG claimBatch 自动续订剩余唤醒并完成重试（#64）', async () => {
+    const platform = await createTestDb('webhooks_pg_wake');
+    const pdb = await openPlatformDb(platform.url);
+    const rx = await startReceiver();
+    rx.replies.push((res) => {
+      res.writeHead(500);
+      res.end('retry once');
+    });
+    await seedRetryEnv(pdb, `${rx.base}/pg-early-wake`);
+
+    const whNoPoll = new Webhooks(pdb, {
+      retryBaseMs: 80,
+      pollIntervalMs: 60_000,
+      timeoutMs: 2000,
+    });
+    const armedDelays = installEarlyFirstWake(whNoPoll);
+
+    try {
+      whNoPoll.emit('g-64', event());
+      await waitReceived(rx, 2);
+      expect(rx.received).toHaveLength(2);
+      expect(armedDelays.length).toBeGreaterThanOrEqual(2);
+      expect(armedDelays[1]).toBeGreaterThan(0);
+      await whNoPoll.flush();
+      expect(await pdb.query('select id from webhook_jobs')).toEqual([]);
+    } finally {
+      await whNoPoll.close();
       await pdb.close();
       await platform.close();
     }
