@@ -1,40 +1,40 @@
 [project]
-site_name = "Dowel 文档"
-site_description = "开源、可自托管、支持多人实时协作的数据库 schema 建模与迁移平台"
+site_name = "Dowel Docs"
+site_description = "Open-source, self-hosted, real-time collaborative database schema modeling and migration platform"
 site_url = "https://eimsound.github.io/dowel/"
 repo_url = "https://github.com/eimsound/dowel"
 repo_name = "eimsound/dowel"
-edit_uri = "edit/main/docs/"
-docs_dir = "docs"
+edit_uri = "edit/main/docs/en/"
+docs_dir = "en"
 site_dir = "site"
 
 nav = [
-  { "首页" = "index.md" },
-  { "快速开始" = [
-    { "上手指南" = "getting-started.md" },
-    { "部署与配置" = "deployment.md" },
-    { "账户、OIDC 与权限" = "accounts-and-access.md" },
+  { "Home" = "index.md" },
+  { "Get started" = [
+    { "Getting started" = "getting-started.md" },
+    { "Deployment and configuration" = "deployment.md" },
+    { "Accounts, OIDC, and access" = "accounts-and-access.md" },
   ] },
-  { "建模与版本" = [
-    { "建模、版本与画布历史" = "modeling.md" },
-    { "多方言与版本支持" = "dialects.md" },
-    { "接手现有项目与灾难恢复" = "takeover.md" },
+  { "Modeling and versions" = [
+    { "Modeling, versions, and canvas history" = "modeling.md" },
+    { "Dialects and version support" = "dialects.md" },
+    { "Takeover and disaster recovery" = "takeover.md" },
   ] },
-  { "执行与治理" = [
-    { "执行迁移、回滚与漂移" = "execution.md" },
-    { "执行策略与执行者" = "execution-policy.md" },
-    { "执行申请与审批" = "approvals.md" },
-    { "组级 Webhook" = "webhooks.md" },
+  { "Execution and governance" = [
+    { "Execution, rollback, and drift" = "execution.md" },
+    { "Execution policy and executors" = "execution-policy.md" },
+    { "Execution requests and approvals" = "approvals.md" },
+    { "Group webhooks" = "webhooks.md" },
   ] },
-  { "CI 与参考" = [
+  { "CI and reference" = [
     { "CI HTTP API" = "api.md" },
-    { "CI 流水线集成" = "ci-action.md" },
-    { "术语表" = "glossary.md" },
+    { "CI pipeline integration" = "ci-action.md" },
+    { "Glossary" = "glossary.md" },
   ] },
 ]
 
 [project.theme]
-language = "zh"
+language = "en"
 features = [
   "content.code.copy",
   "content.tabs.link",
@@ -52,19 +52,29 @@ features = [
 [[project.theme.palette]]
 media = "(prefers-color-scheme)"
 toggle.icon = "lucide/sun-moon"
-toggle.name = "切换明暗主题"
+toggle.name = "Switch to light mode"
 
 [[project.theme.palette]]
 media = "(prefers-color-scheme: light)"
 scheme = "default"
 toggle.icon = "lucide/sun"
-toggle.name = "切换为深色模式"
+toggle.name = "Switch to dark mode"
 
 [[project.theme.palette]]
 media = "(prefers-color-scheme: dark)"
 scheme = "slate"
 toggle.icon = "lucide/moon"
-toggle.name = "跟随系统主题"
+toggle.name = "Switch to system preference"
+
+[[project.extra.alternate]]
+name = "English"
+link = "/dowel/"
+lang = "en"
+
+[[project.extra.alternate]]
+name = "简体中文"
+link = "/dowel/zh/"
+lang = "zh"
 
 [project.markdown_extensions]
 admonition = {}

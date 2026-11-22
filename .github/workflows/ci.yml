@@ -65,7 +65,7 @@ jobs:
               count=$((count + 1))
               case "$file" in
                 # 仅文档 / 元信息白名单：命中则跳过，不置任何 true
-                *.md | docs/* | .agents/* | zensical.toml | LICENSE | .github/workflows/docs.yml | .github/dependabot.yml | .dockerignore | .gitignore)
+                *.md | docs/* | .agents/* | LICENSE | .github/workflows/docs.yml | .github/dependabot.yml | .dockerignore | .gitignore)
                   ;;
                 # 纯前端 / E2E
                 apps/web/* | e2e/* | playwright.config.ts)
