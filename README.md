@@ -66,7 +66,7 @@ pnpm docs:build   # 严格构建文档站点到 site/（检查死链与锚点）
 
 - **目标库方言**：已支持 PostgreSQL（15–19）、SQLite、MySQL（8.4 / 9.7）与 SQL Server（2019 / 2022 / 2025）。
 - **无命令行工具**：Dowel 不提供独立的命令行工具，CI 流水线直接调用 HTTP API 或仓库内置的 [actions/execute](actions/execute/README.md)。
-- **未实现功能**：模型分支与变更评审、Flyway / Prisma / Atlas 目录导出、浏览器离线 IndexedDB 模式、MCP 服务以及邮件通知均尚未实现。
+- **未实现功能**：模型分支与变更评审、浏览器离线 IndexedDB 模式、MCP 服务以及邮件通知均尚未实现。
 
 ## 协议
 
