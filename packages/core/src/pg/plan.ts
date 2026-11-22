@@ -945,6 +945,33 @@ const planWithIndexes = (
       cmpStr(a.id, b.id)
     );
   };
+  const conTakenSim = (
+    m: Model,
+    idx: ReturnType<typeof buildModelIndex>,
+    tableId: string,
+    name: string,
+  ): boolean => {
+    for (const kind of ['primaryKey', 'unique', 'check', 'foreignKey'] as const) {
+      for (const o of idx.childrenRef(tableId, kind)) {
+        if (o.name === name) return true;
+      }
+    }
+    if (cap.namedNotNull) {
+      for (const c of idx.childrenRef(tableId, 'column')) {
+        if (c.notNull && c.notNullName === name) return true;
+      }
+    }
+    for (const anc of partitionAncestors(m, tableId)) {
+      for (const k of idx.childrenRef(anc.id, 'check')) if (k.name === name) return true;
+      for (const k of idx.childrenRef(anc.id, 'foreignKey')) if (k.name === name) return true;
+      if (cap.namedNotNull) {
+        for (const c of idx.childrenRef(anc.id, 'column')) {
+          if (c.notNull && c.notNullName === name) return true;
+        }
+      }
+    }
+    return false;
+  };
   const simulateImplicitNames = (m: Model, idx: ReturnType<typeof buildModelIndex>): Map<string, string> => {
     const out = new Map<string, string>();
     if (!idx.allRef('table').some((t) => t.partitionOf !== null)) return out;
@@ -973,7 +1000,7 @@ const planWithIndexes = (
             (n) =>
               idx.isPgRelTaken(desc.parent, n, '') ||
               takenRel.has(`${desc.parent}:${n}`) ||
-              (isCon && (idx.isPgConTaken(desc.id, n, '') || takenCon.has(`${desc.id}:${n}`))),
+              (isCon && (conTakenSim(m, idx, desc.id, n) || takenCon.has(`${desc.id}:${n}`))),
           );
           takenRel.add(`${desc.parent}:${name}`);
           if (isCon) takenCon.add(`${desc.id}:${name}`);
@@ -1046,7 +1073,8 @@ const planWithIndexes = (
     }
 
     // 2. 把该子分区（及其后代）原有本地约束/索引的列引用映射到新物化的列 ID
-    const subTree = new Set([tId, ...partitionDescendants(cur, tId).map((d) => d.id)]);
+    const subDescendants = partitionDescendants(cur, tId);
+    const subTree = new Set([tId, ...subDescendants.map((d) => d.id)]);
     const mapCol = (c: string) => rootToCurCol.get(c) ?? c;
     for (const o of Object.values(cur.objects)) {
       if (o.kind === 'table' && subTree.has(o.id) && o.partitionBy && typeof o.partitionBy !== 'string') {
@@ -1174,6 +1202,11 @@ const planWithIndexes = (
             : !childRenamed &&
               !colRenamedInKey &&
               detObj.name === toImplicitNames.get(`${tId}#imp#${ancObj.id}`) &&
+              subDescendants.every(
+                (d) =>
+                  fromImplicitNames.get(`${d.id}#imp#${detachedOrigin.get(ancObj.id) ?? ancObj.id}`) ===
+                  toImplicitNames.get(`${d.id}#imp#${ancObj.id}`),
+              ) &&
               (ancObj.kind === 'primaryKey' || !hasDupAncDef(ancObj));
       if (sameParentRebind && inTo(ancObj.id) && !rebuild.has(ancObj.id) && keepImplicitName) {
         retainedForReattach.add(synId);
@@ -1980,6 +2013,280 @@ const planWithIndexes = (
       }
     }
   }
+  const collectPendingNames = (mode: 'preP11' | 'p15') => {
+    const pendingRelNames = new Set<string>();
+    const pendingConNames = new Set<string>();
+    const triggerConNames = new Set<string>();
+    for (const kind of ['primaryKey', 'unique', 'check', 'foreignKey', 'index'] as const) {
+      for (const o of toIdx.allRef(kind)) {
+        if (!(o.id in cur.objects)) {
+          if (kind !== 'index') {
+            pendingConNames.add(`${o.parent}:${o.name}`);
+            if ((kind === 'check' || kind === 'foreignKey') && toIdx.partitionsRef(o.parent).length > 0) {
+              for (const desc of toIdx.partitionDescendants(o.parent)) {
+                pendingConNames.add(`${desc.id}:${o.name}`);
+              }
+            }
+          }
+          if (kind === 'primaryKey' || kind === 'unique' || kind === 'index') {
+            pendingRelNames.add(`${get(to, o.parent, 'table').parent}:${o.name}`);
+          }
+        } else if (
+          mode === 'preP11' &&
+          (kind === 'check' || kind === 'foreignKey') &&
+          toIdx.partitionsRef(o.parent).length > 0
+        ) {
+          for (const desc of toIdx.partitionDescendants(o.parent)) {
+            const attachedInCur =
+              desc.id in cur.objects && ancestorsCur(desc.id).some((a) => a.id === o.parent);
+            if (!attachedInCur) {
+              pendingConNames.add(`${desc.id}:${o.name}`);
+              triggerConNames.add(`${desc.id}:${o.name}`);
+            }
+          }
+        }
+      }
+    }
+    if (mode === 'preP11') {
+      for (const o of toIdx.allRef('column')) {
+        const curCol = cur.objects[o.id];
+        if (o.identity && (curCol?.kind !== 'column' || !curCol.identity)) {
+          pendingRelNames.add(`${get(to, o.parent, 'table').parent}:${o.identity.sequenceName}`);
+        }
+        if (cap.namedNotNull && o.notNull && o.notNullName) {
+          const colPending =
+            curCol?.kind !== 'column' || !curCol.notNull || curCol.notNullName !== o.notNullName;
+          if (colPending) {
+            pendingConNames.add(`${o.parent}:${o.notNullName}`);
+            triggerConNames.add(`${o.parent}:${o.notNullName}`);
+          }
+          if (toIdx.partitionsRef(o.parent).length > 0) {
+            for (const desc of toIdx.partitionDescendants(o.parent)) {
+              const attachedInCur =
+                desc.id in cur.objects && ancestorsCur(desc.id).some((a) => a.id === o.parent);
+              if (colPending || !attachedInCur) {
+                pendingConNames.add(`${desc.id}:${o.notNullName}`);
+                triggerConNames.add(`${desc.id}:${o.notNullName}`);
+              }
+            }
+          }
+        }
+      }
+    }
+    return { pendingRelNames, pendingConNames, triggerConNames };
+  };
+  const prepareExistingImplicits = (mode: 'preP11' | 'p15') => {
+    const { pendingRelNames, pendingConNames, triggerConNames } = collectPendingNames(mode);
+    const implicitRels = new Set<string>();
+    const implicitCons = new Set<string>();
+    const noopRecord: (o: Obj) => void = () => {};
+    const emptyPartDescs: (parentId: string) => Table[] = () => [];
+    const unusedImplicitNameOf: (
+      o: PrimaryKey | Unique | Index,
+      desc: Table,
+      skipPending: boolean,
+    ) => string = () => '';
+
+    if (
+      (mode === 'p15' && pendingRelNames.size === 0 && pendingConNames.size === 0) ||
+      (mode === 'preP11' && triggerConNames.size === 0 && addedTables.length === 0 && willDetach.size === 0)
+    ) {
+      return {
+        hasCurPartitions: false,
+        pendingRelNames,
+        pendingConNames,
+        implicitRels,
+        implicitCons,
+        implicitNameOf: unusedImplicitNameOf,
+        partDescs: emptyPartDescs,
+        recordCurAdded: noopRecord,
+      };
+    }
+
+    const partChildren = new Map<string, Table[]>();
+    const existingParentKeys: Record<'primaryKey' | 'unique' | 'index', (PrimaryKey | Unique | Index)[]> = {
+      primaryKey: [],
+      unique: [],
+      index: [],
+    };
+    let hasCurPartitions = false;
+    for (const id in cur.objects) {
+      const o = cur.objects[id]!;
+      if (o.kind === 'table') {
+        if (o.partitionBy !== null) hasCurPartitions = true;
+        if (o.partitionOf !== null) {
+          hasCurPartitions = true;
+          let list = partChildren.get(o.partitionOf.parent);
+          if (!list) partChildren.set(o.partitionOf.parent, (list = []));
+          list.push(o);
+        }
+      } else if (o.kind === 'primaryKey' || o.kind === 'unique' || o.kind === 'index') {
+        if (get(cur, o.parent, 'table').partitionBy !== null) {
+          existingParentKeys[o.kind].push(o);
+        }
+      }
+    }
+    if (!hasCurPartitions) {
+      return {
+        hasCurPartitions: false,
+        pendingRelNames,
+        pendingConNames,
+        implicitRels,
+        implicitCons,
+        implicitNameOf: unusedImplicitNameOf,
+        partDescs: emptyPartDescs,
+        recordCurAdded: noopRecord,
+      };
+    }
+
+    const partDescs = (parentId: string): Table[] => {
+      if (!partChildren.has(parentId)) return [];
+      const out: Table[] = [];
+      const seen = new Set<string>([parentId]);
+      const queue = [parentId];
+      for (let head = 0; head < queue.length; head++) {
+        const kids = partChildren.get(queue[head]!);
+        if (!kids) continue;
+        for (const child of kids) {
+          if (seen.has(child.id)) continue;
+          seen.add(child.id);
+          out.push(child);
+          queue.push(child.id);
+        }
+      }
+      return out;
+    };
+
+    let nsReady = false;
+    const relOwners = new Map<string, Set<string>>();
+    const conLocal = new Map<string, Set<string>>();
+    const conProp = new Map<string, Set<string>>();
+    const addName = (map: Map<string, Set<string>>, k: string, name: string) => {
+      let s = map.get(k);
+      if (!s) map.set(k, (s = new Set()));
+      s.add(name);
+    };
+    const recordObj = (o: Obj) => {
+      if (o.kind === 'table' || o.kind === 'sequence') {
+        addName(relOwners, o.parent, o.name);
+      } else if (o.kind === 'index' || o.kind === 'primaryKey' || o.kind === 'unique') {
+        addName(relOwners, get(cur, o.parent, 'table').parent, o.name);
+        if (o.kind !== 'index') addName(conLocal, o.parent, o.name);
+      } else if (o.kind === 'check' || o.kind === 'foreignKey') {
+        addName(conLocal, o.parent, o.name);
+        addName(conProp, o.parent, o.name);
+      } else if (o.kind === 'column') {
+        if (o.identity) {
+          addName(relOwners, get(cur, o.parent, 'table').parent, o.identity.sequenceName);
+        }
+        if (cap.namedNotNull && o.notNull && o.notNullName) {
+          addName(conLocal, o.parent, o.notNullName);
+          addName(conProp, o.parent, o.notNullName);
+        }
+      }
+    };
+    const ensureNamespaces = () => {
+      if (nsReady) return;
+      nsReady = true;
+      for (const id in cur.objects) recordObj(cur.objects[id]!);
+    };
+    const relTaken = (schema: string, name: string) => relOwners.get(schema)?.has(name) ?? false;
+    const conTaken = (tableId: string, name: string): boolean => {
+      if (conLocal.get(tableId)?.has(name)) return true;
+      for (const anc of ancestorsCur(tableId)) {
+        if (anc.id !== tableId && conProp.get(anc.id)?.has(name)) return true;
+      }
+      return false;
+    };
+    const implicitNameOf = (o: PrimaryKey | Unique | Index, desc: Table, skipPending: boolean): string => {
+      ensureNamespaces();
+      const colPart =
+        o.kind === 'primaryKey'
+          ? null
+          : o.kind === 'unique'
+            ? joinNames(o.columns.map((c) => get(cur, c, 'column').name))
+            : joinNames(indexElementNames(cur, o));
+      const label = o.kind === 'primaryKey' ? 'pkey' : o.kind === 'unique' ? 'key' : 'idx';
+      const isCon = o.kind !== 'index';
+      return chooseName(
+        desc.name,
+        colPart,
+        label,
+        (n) =>
+          relTaken(desc.parent, n) ||
+          implicitRels.has(`${desc.parent}:${n}`) ||
+          (skipPending && pendingRelNames.has(`${desc.parent}:${n}`)) ||
+          (isCon &&
+            (conTaken(desc.id, n) ||
+              implicitCons.has(`${desc.id}:${n}`) ||
+              (skipPending && pendingConNames.has(`${desc.id}:${n}`)))),
+      );
+    };
+
+    const existingImplicits: {
+      o: PrimaryKey | Unique | Index;
+      desc: Table;
+      name: string;
+      isCon: boolean;
+    }[] = [];
+    for (const kind of ['primaryKey', 'unique', 'index'] as const) {
+      const isCon = kind !== 'index';
+      const existingParents = existingParentKeys[kind].sort((a, b) => cmpKeyIn(cur, a, b));
+      for (const o of existingParents) {
+        const tbl = get(cur, o.parent, 'table');
+        for (const desc of partDescs(tbl.id).sort((a, b) => cmpTableIn(cur, a, b))) {
+          const impKey = `${desc.id}#imp#${o.id}`;
+          const imp = implicitState.get(impKey);
+          const name = imp ? imp.name : implicitNameOf(o, desc, false);
+          if (!imp) {
+            implicitState.set(impKey, {
+              name,
+              spaces: isCon ? [`rel:${desc.parent}`, `con:${desc.id}`] : [`rel:${desc.parent}`],
+            });
+          }
+          implicitRels.add(`${desc.parent}:${name}`);
+          if (isCon) implicitCons.add(`${desc.id}:${name}`);
+          existingImplicits.push({ o, desc, name, isCon });
+        }
+      }
+    }
+    for (const { o, desc, name, isCon } of existingImplicits) {
+      const shouldYield =
+        mode === 'preP11'
+          ? isCon && triggerConNames.has(`${desc.id}:${name}`)
+          : pendingRelNames.has(`${desc.parent}:${name}`) ||
+            (isCon && pendingConNames.has(`${desc.id}:${name}`));
+      if (shouldYield) {
+        const safeName = implicitNameOf(o, desc, true);
+        if (o.kind === 'index') {
+          emit('rename', `${o.id}#ci`, `ALTER INDEX ${relIn(desc.id, name)} RENAME TO ${ident(safeName)}`);
+        } else {
+          emit(
+            'rename',
+            `${o.id}#cc`,
+            `ALTER TABLE ${T(desc.id)} RENAME CONSTRAINT ${ident(name)} TO ${ident(safeName)}`,
+          );
+        }
+        const imp = implicitState.get(`${desc.id}#imp#${o.id}`);
+        if (imp) imp.name = safeName;
+        implicitRels.add(`${desc.parent}:${safeName}`);
+        if (isCon) implicitCons.add(`${desc.id}:${safeName}`);
+      }
+    }
+    return {
+      hasCurPartitions: true,
+      pendingRelNames,
+      pendingConNames,
+      implicitRels,
+      implicitCons,
+      implicitNameOf,
+      partDescs,
+      recordCurAdded: (o: Obj) => {
+        if (nsReady) recordObj(o);
+      },
+    };
+  };
+  prepareExistingImplicits('preP11');
   // ───── P11 加列（生成列在改完列之后再加，见 P12g） ─────
   const addColumn = (c: Column) => {
     const table = get(cur, c.parent, 'table');
@@ -2167,6 +2474,64 @@ const planWithIndexes = (
     const childToRootCol = new Map<string, string>();
     const nnTakenOnSubtree = (name: string) =>
       conTakenCur(tId, name) || partitionDescendants(cur, tId).some((d) => conTakenCur(d.id, name));
+    const targetAncsCur = ancestorsCur(targetParentId);
+    const ancConNames = new Set<string>();
+    for (const anc of targetAncsCur) {
+      for (const k of [...childrenOf(cur, anc.id, 'check'), ...childrenOf(cur, anc.id, 'foreignKey')]) {
+        ancConNames.add(k.name);
+      }
+    }
+    for (const anc of partitionAncestors(to, tId)) {
+      for (const k of [...childrenOf(to, anc.id, 'check'), ...childrenOf(to, anc.id, 'foreignKey')]) {
+        ancConNames.add(k.name);
+      }
+    }
+    const rootNnNames = new Set<string>();
+    if (cap.namedNotNull) {
+      for (const rc of rootCols) {
+        if (rc.notNull && rc.notNullName) rootNnNames.add(rc.notNullName);
+      }
+    }
+    // 1.5 先去掉多余 identity 与 NOT NULL（须先 DROP IDENTITY 再 DROP NOT NULL），
+    // 并把与目标祖先 CHECK/FK 或目标根列 NOT NULL 名冲突的现有 NOT NULL 约束改到临时名
+    for (const cc of curChildCols) {
+      const rc = rootCols.find((x) => x.name === cc.name);
+      if (!rc) continue;
+      const Ac = `ALTER TABLE ${T(tId)} ALTER COLUMN ${ident(cc.name)}`;
+      if (!cc.generated && cc.identity) {
+        emit('dropIdentity', cc.id, `${Ac} DROP IDENTITY`);
+        cc.identity = null;
+      }
+      if (cc.notNull && !rc.notNull) {
+        emit('dropNotNull', cc.id, `${Ac} DROP NOT NULL`);
+        cc.notNull = false;
+        cc.notNullName = null;
+      }
+    }
+    if (cap.namedNotNull) {
+      for (const cc of curChildCols) {
+        const rc = rootCols.find((x) => x.name === cc.name);
+        if (!rc || !cc.notNull || !cc.notNullName) continue;
+        if (
+          ancConNames.has(cc.notNullName) ||
+          (cc.notNullName !== rc.notNullName && rootNnNames.has(cc.notNullName))
+        ) {
+          const tmpNn = `_dowel_tmp_${++tmp}`;
+          emit(
+            'rename',
+            `${cc.id}#nn`,
+            `ALTER TABLE ${T(tId)} RENAME CONSTRAINT ${ident(cc.notNullName)} TO ${ident(tmpNn)}`,
+          );
+          cc.notNullName = tmpNn;
+        }
+      }
+    }
+    const chooseAttachNnName = (rc: Column): string | null => {
+      if (!cap.namedNotNull || !rc.notNull) return null;
+      if (rc.notNullName && !nnTakenOnSubtree(rc.notNullName)) return rc.notNullName;
+      const autoName = chooseName(childTable.name, rc.name, 'not_null', (n) => conTakenCur(tId, n));
+      return ancConNames.has(autoName) || nnTakenOnSubtree(autoName) ? `_dowel_tmp_${++tmp}` : null;
+    };
     // 2. 补齐缺失的非生成列，并对齐已存在的列（含生成列的 NOT NULL 与列注释）
     for (const rc of rootCols) {
       const cc = curChildCols.find((x) => x.name === rc.name);
@@ -2177,10 +2542,7 @@ const planWithIndexes = (
           id: `__dowel_att_col_${++synSeq}`,
           parent: tId,
           identity: null,
-          notNullName:
-            cap.namedNotNull && rc.notNull && rc.notNullName && !nnTakenOnSubtree(rc.notNullName)
-              ? rc.notNullName
-              : null,
+          notNullName: chooseAttachNnName(rc),
           comment: null,
         };
         emit('addColumn', tId, `ALTER TABLE ${T(tId)} ADD COLUMN ${columnDef(addedCol, childTable)}`);
@@ -2189,10 +2551,6 @@ const planWithIndexes = (
       childToRootCol.set(cc.id, rc.id);
       const Ac = `ALTER TABLE ${T(tId)} ALTER COLUMN ${ident(cc.name)}`;
       if (!cc.generated) {
-        if (cc.identity) {
-          emit('dropIdentity', cc.id, `${Ac} DROP IDENTITY`);
-          cc.identity = null;
-        }
         if (cc.default && !same(cc.default, rc.default)) {
           emitDefaultCascade(cc, 'dropDefault', 'DROP DEFAULT');
           cc.default = null;
@@ -2208,14 +2566,8 @@ const planWithIndexes = (
           Object.assign(cc, { type: rc.type, typeRef: rc.typeRef, collation: rc.collation });
         }
       }
-      if (cc.notNull && !rc.notNull) {
-        emit('dropNotNull', cc.id, `${Ac} DROP NOT NULL`);
-        cc.notNull = false;
-        cc.notNullName = null;
-      }
       if (!cc.notNull && rc.notNull) {
-        const nnName =
-          cap.namedNotNull && rc.notNullName && !nnTakenOnSubtree(rc.notNullName) ? rc.notNullName : null;
+        const nnName = chooseAttachNnName(rc);
         emit(
           'setNotNull',
           cc.id,
@@ -2259,17 +2611,14 @@ const planWithIndexes = (
         id: `__dowel_att_col_${++synSeq}`,
         parent: tId,
         identity: null,
-        notNullName:
-          cap.namedNotNull && rc.notNull && rc.notNullName && !nnTakenOnSubtree(rc.notNullName)
-            ? rc.notNullName
-            : null,
+        notNullName: chooseAttachNnName(rc),
         comment: null,
       };
       emit('addColumn', tId, `ALTER TABLE ${T(tId)} ADD COLUMN ${columnDef(addedCol, childTable)}`);
     }
 
     // 补齐目标父表/祖先表上已存在的 CHECK 约束（PG ATTACH PARTITION 要求子表先具备父表 CHECK）
-    for (const anc of ancestorsCur(targetParentId)) {
+    for (const anc of targetAncsCur) {
       for (const ancCk of childrenOf(cur, anc.id, 'check')) {
         const existing = childrenOf(cur, tId, 'check').find((x) => x.name === ancCk.name);
         if (existing) {
@@ -2277,19 +2626,6 @@ const planWithIndexes = (
             continue;
           emit('dropCheck', existing.id, `ALTER TABLE ${T(tId)} DROP CONSTRAINT ${ident(existing.name)}`);
           delete cur.objects[existing.id];
-        }
-        if (cap.namedNotNull) {
-          for (const cc of columnsOf(cur, tId)) {
-            if (cc.notNull && cc.notNullName === ancCk.name) {
-              const tmpNn = `_dowel_tmp_${++tmp}`;
-              emit(
-                'rename',
-                `${cc.id}#nn`,
-                `ALTER TABLE ${T(tId)} RENAME CONSTRAINT ${ident(cc.notNullName)} TO ${ident(tmpNn)}`,
-              );
-              cc.notNullName = tmpNn;
-            }
-          }
         }
         emit(
           'addCheck',
@@ -2370,48 +2706,17 @@ const planWithIndexes = (
   // ───── P15 加主键、唯一、CHECK，建索引 ─────
   // cur 里没有的就是新增的或前面删掉待重建的；子表本地对象先于父表创建，
   // 且当在已有子分区的父表上建 PK / UNIQUE / INDEX 时，若 PG 自动生成的子分区继承索引名抢占了待建对象的名字，立即改名为非冲突派生名
-  const pendingRelNames = new Set<string>();
-  const pendingConNames = new Set<string>();
-  for (const kind of ['primaryKey', 'unique', 'check', 'foreignKey', 'index'] as const) {
-    for (const o of toIdx.allRef(kind)) {
-      if (o.id in cur.objects) continue;
-      if (kind !== 'index') {
-        pendingConNames.add(`${o.parent}:${o.name}`);
-        if (kind === 'check' || kind === 'foreignKey') {
-          for (const desc of partitionDescendants(to, o.parent)) {
-            pendingConNames.add(`${desc.id}:${o.name}`);
-          }
-        }
-      }
-      if (kind === 'primaryKey' || kind === 'unique' || kind === 'index') {
-        pendingRelNames.add(`${get(to, o.parent, 'table').parent}:${o.name}`);
-      }
-    }
-  }
+  const {
+    hasCurPartitions,
+    pendingRelNames,
+    pendingConNames,
+    implicitRels,
+    implicitCons,
+    implicitNameOf,
+    partDescs,
+    recordCurAdded,
+  } = prepareExistingImplicits('p15');
   if (pendingRelNames.size > 0 || pendingConNames.size > 0) {
-    const p15PartChildren = new Map<string, Table[]>();
-    const existingParentKeys: Record<'primaryKey' | 'unique' | 'index', (PrimaryKey | Unique | Index)[]> = {
-      primaryKey: [],
-      unique: [],
-      index: [],
-    };
-    let hasCurPartitions = false;
-    for (const id in cur.objects) {
-      const o = cur.objects[id]!;
-      if (o.kind === 'table') {
-        if (o.partitionBy !== null) hasCurPartitions = true;
-        if (o.partitionOf !== null) {
-          hasCurPartitions = true;
-          let list = p15PartChildren.get(o.partitionOf.parent);
-          if (!list) p15PartChildren.set(o.partitionOf.parent, (list = []));
-          list.push(o);
-        }
-      } else if (o.kind === 'primaryKey' || o.kind === 'unique' || o.kind === 'index') {
-        if (get(cur, o.parent, 'table').partitionBy !== null) {
-          existingParentKeys[o.kind].push(o);
-        }
-      }
-    }
     if (!hasCurPartitions) {
       for (const kind of ['primaryKey', 'unique', 'check', 'index'] as const) {
         const todo = toIdx
@@ -2423,134 +2728,6 @@ const planWithIndexes = (
         }
       }
     } else {
-      const partDescsP15 = (parentId: string): Table[] => {
-        if (!p15PartChildren.has(parentId)) return [];
-        const out: Table[] = [];
-        const seen = new Set<string>([parentId]);
-        const queue = [parentId];
-        for (let head = 0; head < queue.length; head++) {
-          const kids = p15PartChildren.get(queue[head]!);
-          if (!kids) continue;
-          for (const child of kids) {
-            if (seen.has(child.id)) continue;
-            seen.add(child.id);
-            out.push(child);
-            queue.push(child.id);
-          }
-        }
-        return out;
-      };
-      let p15NsReady = false;
-      const relOwnersP15 = new Map<string, Set<string>>();
-      const conLocalP15 = new Map<string, Set<string>>();
-      const conPropP15 = new Map<string, Set<string>>();
-      const addName = (map: Map<string, Set<string>>, k: string, name: string) => {
-        let s = map.get(k);
-        if (!s) map.set(k, (s = new Set()));
-        s.add(name);
-      };
-      const recordP15Obj = (o: Obj) => {
-        if (o.kind === 'table' || o.kind === 'sequence') {
-          addName(relOwnersP15, o.parent, o.name);
-        } else if (o.kind === 'index' || o.kind === 'primaryKey' || o.kind === 'unique') {
-          addName(relOwnersP15, get(cur, o.parent, 'table').parent, o.name);
-          if (o.kind !== 'index') addName(conLocalP15, o.parent, o.name);
-        } else if (o.kind === 'check' || o.kind === 'foreignKey') {
-          addName(conLocalP15, o.parent, o.name);
-          addName(conPropP15, o.parent, o.name);
-        } else if (o.kind === 'column') {
-          if (o.identity) {
-            addName(relOwnersP15, get(cur, o.parent, 'table').parent, o.identity.sequenceName);
-          }
-          if (cap.namedNotNull && o.notNull && o.notNullName) {
-            addName(conLocalP15, o.parent, o.notNullName);
-            addName(conPropP15, o.parent, o.notNullName);
-          }
-        }
-      };
-      const ensureP15Namespaces = () => {
-        if (p15NsReady) return;
-        p15NsReady = true;
-        for (const id in cur.objects) recordP15Obj(cur.objects[id]!);
-      };
-
-      const relTakenP15 = (schema: string, name: string) => relOwnersP15.get(schema)?.has(name) ?? false;
-      const conTakenP15 = (tableId: string, name: string): boolean => {
-        if (conLocalP15.get(tableId)?.has(name)) return true;
-        for (const anc of ancestorsCur(tableId)) {
-          if (anc.id !== tableId && conPropP15.get(anc.id)?.has(name)) return true;
-        }
-        return false;
-      };
-      const implicitRels = new Set<string>();
-      const implicitCons = new Set<string>();
-      const implicitNameOf = (o: PrimaryKey | Unique | Index, desc: Table, skipPending: boolean): string => {
-        ensureP15Namespaces();
-        const colPart =
-          o.kind === 'primaryKey'
-            ? null
-            : o.kind === 'unique'
-              ? joinNames(o.columns.map((c) => get(cur, c, 'column').name))
-              : joinNames(indexElementNames(cur, o));
-        const label = o.kind === 'primaryKey' ? 'pkey' : o.kind === 'unique' ? 'key' : 'idx';
-        const isCon = o.kind !== 'index';
-        return chooseName(
-          desc.name,
-          colPart,
-          label,
-          (n) =>
-            relTakenP15(desc.parent, n) ||
-            implicitRels.has(`${desc.parent}:${n}`) ||
-            (skipPending && pendingRelNames.has(`${desc.parent}:${n}`)) ||
-            (isCon &&
-              (conTakenP15(desc.id, n) ||
-                implicitCons.has(`${desc.id}:${n}`) ||
-                (skipPending && pendingConNames.has(`${desc.id}:${n}`)))),
-        );
-      };
-      // 先登记 cur 中已存在的分区父表 PK / UNIQUE / INDEX 在其后代上已占用的隐式继承索引/约束名，
-      // 若其与后续待建的父表 CHECK / FK 或子表本地约束/索引冲突，立即改名让出目标名
-      const existingImplicits: {
-        o: PrimaryKey | Unique | Index;
-        desc: Table;
-        name: string;
-        isCon: boolean;
-      }[] = [];
-      for (const kind of ['primaryKey', 'unique', 'index'] as const) {
-        const isCon = kind !== 'index';
-        const existingParents = existingParentKeys[kind].sort((a, b) => cmpKeyIn(cur, a, b));
-        for (const o of existingParents) {
-          const tbl = get(cur, o.parent, 'table');
-          for (const desc of partDescsP15(tbl.id).sort((a, b) => cmpTableIn(cur, a, b))) {
-            const imp = implicitState.get(`${desc.id}#imp#${o.id}`);
-            const name = imp ? imp.name : implicitNameOf(o, desc, false);
-            implicitRels.add(`${desc.parent}:${name}`);
-            if (isCon) implicitCons.add(`${desc.id}:${name}`);
-            existingImplicits.push({ o, desc, name, isCon });
-          }
-        }
-      }
-      for (const { o, desc, name, isCon } of existingImplicits) {
-        if (
-          pendingRelNames.has(`${desc.parent}:${name}`) ||
-          (isCon && pendingConNames.has(`${desc.id}:${name}`))
-        ) {
-          const safeName = implicitNameOf(o, desc, true);
-          if (o.kind === 'index') {
-            emit('rename', `${o.id}#ci`, `ALTER INDEX ${relIn(desc.id, name)} RENAME TO ${ident(safeName)}`);
-          } else {
-            emit(
-              'rename',
-              `${o.id}#cc`,
-              `ALTER TABLE ${T(desc.id)} RENAME CONSTRAINT ${ident(name)} TO ${ident(safeName)}`,
-            );
-          }
-          const imp = implicitState.get(`${desc.id}#imp#${o.id}`);
-          if (imp) imp.name = safeName;
-          implicitRels.add(`${desc.parent}:${safeName}`);
-          if (isCon) implicitCons.add(`${desc.id}:${safeName}`);
-        }
-      }
       for (const kind of ['primaryKey', 'unique', 'check', 'index'] as const) {
         const todo = toIdx
           .allRef(kind)
@@ -2558,12 +2735,11 @@ const planWithIndexes = (
           .sort((a, b) => cmpKeyIn(to, a, b));
         for (const o of todo) {
           emitConstraintOrIndex(o);
-          const curAdded = cur.objects[o.id]!;
-          if (p15NsReady) recordP15Obj(curAdded);
+          recordCurAdded(cur.objects[o.id]!);
           if (o.kind !== 'index') {
             pendingConNames.delete(`${o.parent}:${o.name}`);
             if (o.kind === 'check') {
-              for (const desc of partDescsP15(o.parent)) {
+              for (const desc of partDescs(o.parent)) {
                 pendingConNames.delete(`${desc.id}:${o.name}`);
               }
             }
@@ -2573,7 +2749,7 @@ const planWithIndexes = (
           pendingRelNames.delete(`${tbl.parent}:${o.name}`);
           if (tbl.partitionBy === null) continue;
           const isCon = o.kind !== 'index';
-          for (const desc of partDescsP15(tbl.id).sort((a, b) => cmpTableIn(cur, a, b))) {
+          for (const desc of partDescs(tbl.id).sort((a, b) => cmpTableIn(cur, a, b))) {
             const pgName = implicitNameOf(o, desc, false);
             if (
               pendingRelNames.has(`${desc.parent}:${pgName}`) ||

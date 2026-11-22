@@ -47,6 +47,7 @@ import {
   setCheckExpr,
   setColumnType,
   setNotNull,
+  setPartitionBound,
   setPartitionBy,
   type Table,
   validate,
@@ -970,5 +971,256 @@ describe('edit mutators & plan Stage 0 review regression', () => {
     expect(childrenOf(mAttachOk, candOk, 'check')).toEqual([]);
     expect(childrenOf(mAttachOk, gchOk, 'check').map((c) => c.name)).toEqual(['g_local_ck']);
     expect(validate(mAttachOk)).toEqual([]);
+  });
+
+  test('Issue #71: PG 18+ explicit notNullName collisions in P12h (ancestor FK) and P11/P12d/P12g (child implicit PK/UNIQUE)', () => {
+    // 1. P12h ATTACH PARTITION vs ancestor FOREIGN KEY
+    const { m: fkFrom, s: fkS } = base();
+    const ref = createTable(fkFrom, fkS, 'ref', 'ref');
+    const refId = addColumn(fkFrom, ref, { id: 'refId', name: 'id', type: 'integer', notNull: true });
+    addPrimaryKey(fkFrom, ref, [refId], 'ref_pk');
+
+    const pFk = createTable(fkFrom, fkS, 'p', 'p');
+    const pId = addColumn(fkFrom, pFk, { id: 'pId', name: 'id', type: 'integer', notNull: true });
+    addColumn(fkFrom, pFk, { id: 'pVal', name: 'val', type: 'integer', notNull: true });
+    setPartitionBy(fkFrom, pFk, {
+      strategy: 'range',
+      keys: [{ column: pId, expr: null, opclass: null, collation: null }],
+    });
+    addPrimaryKey(fkFrom, pFk, [pId], 'p_pk');
+    const fkObj = addForeignKey(fkFrom, pFk, [pId], ref, [refId], {}, 'p_fk');
+    renameKey(fkFrom, fkObj, 'fk_p_ref');
+
+    const plain = createTable(fkFrom, fkS, 'plain', 'plain');
+    const plId = addColumn(fkFrom, plain, { id: 'plId', name: 'id', type: 'integer', notNull: true });
+    const plVal = addColumn(fkFrom, plain, { id: 'plVal', name: 'val', type: 'integer', notNull: true });
+    (fkFrom.objects[plId] as Column).notNullName = 'fk_p_ref';
+    (fkFrom.objects[plId] as Column).notNullNameMode = 'explicit';
+    (fkFrom.objects[plVal] as Column).notNullName = 'p_id_not_null';
+    (fkFrom.objects[plVal] as Column).notNullNameMode = 'explicit';
+
+    const fkTo = structuredClone(fkFrom);
+    attachPartition(fkTo, pFk, plain, 'FOR VALUES FROM (0) TO (100)');
+    expect(validate(fkFrom)).toEqual([]);
+    expect(validate(fkTo)).toEqual([]);
+
+    const fkUp = plan(fkFrom, fkTo, { pgMajor: 18 });
+    const fkDown = plan(fkTo, fkFrom, { pgMajor: 18 });
+    const attachIdx = fkUp.findIndex((st) => st.kind === 'attachPartition');
+    expect(attachIdx).toBeGreaterThanOrEqual(0);
+    const preAttach = fkUp.slice(0, attachIdx);
+    expect(
+      preAttach.some(
+        (st) =>
+          st.kind === 'rename' &&
+          /^ALTER TABLE public\.plain RENAME CONSTRAINT fk_p_ref TO _dowel_tmp_\d+$/.test(st.sql),
+      ),
+    ).toBe(true);
+    expect(preAttach.some((st) => st.kind === 'rename' && st.sql.includes('TO p_id_not_null'))).toBe(true);
+    expect(preAttach.some((st) => st.kind === 'rename' && st.sql.includes('TO p_val_not_null'))).toBe(true);
+    expect(fkDown.length).toBeGreaterThan(0);
+
+    // 1b. Manual IR where p.id has derived null notNullName (cannot directly rename to rc.notNullName)
+    const manualFrom = structuredClone(fkFrom);
+    (manualFrom.objects[pId] as Column).notNullName = null;
+    (manualFrom.objects[pId] as Column).notNullNameMode = 'derived';
+    (manualFrom.objects[plVal] as Column).notNullName = 'plain_val_not_null';
+    (manualFrom.objects[plVal] as Column).notNullNameMode = 'derived';
+    const manualTo = structuredClone(manualFrom);
+    attachPartition(manualTo, pFk, plain, 'FOR VALUES FROM (0) TO (100)');
+    expect(validate(manualFrom)).toEqual([]);
+    expect(validate(manualTo)).toEqual([]);
+    const manualUp = plan(manualFrom, manualTo, { pgMajor: 18 });
+    const manualAttachIdx = manualUp.findIndex((st) => st.kind === 'attachPartition');
+    expect(manualAttachIdx).toBeGreaterThanOrEqual(0);
+    expect(
+      manualUp
+        .slice(0, manualAttachIdx)
+        .some(
+          (st) =>
+            st.kind === 'rename' &&
+            /^ALTER TABLE public\.plain RENAME CONSTRAINT fk_p_ref TO _dowel_tmp_\d+$/.test(st.sql),
+        ),
+    ).toBe(true);
+
+    // 1c. PG < 18 sanity check: derived notNullNames emit no NOT NULL RENAME CONSTRAINT
+    const pg17From = structuredClone(fkFrom);
+    (pg17From.objects[plId] as Column).notNullName = 'plain_id_not_null';
+    (pg17From.objects[plId] as Column).notNullNameMode = 'derived';
+    (pg17From.objects[plVal] as Column).notNullName = 'plain_val_not_null';
+    (pg17From.objects[plVal] as Column).notNullNameMode = 'derived';
+    const pg17To = structuredClone(pg17From);
+    attachPartition(pg17To, pFk, plain, 'FOR VALUES FROM (0) TO (100)');
+    expect(plan(pg17From, pg17To, { pgMajor: 17 }).some((st) => st.sql.includes('RENAME CONSTRAINT'))).toBe(
+      false,
+    );
+
+    // 2A. P11 + P10 new partition vs implicit PK, and P12d + P10 new partition vs implicit UNIQUE
+    const { m: impFromA, s: impSA } = base();
+    const pA = createTable(impFromA, impSA, 'p', 'pA');
+    const aId = addColumn(impFromA, pA, { id: 'aId', name: 'id', type: 'integer', notNull: true });
+    const aTag = addColumn(impFromA, pA, { id: 'aTag', name: 'tag', type: 'integer', notNull: true });
+    const aVal = addColumn(impFromA, pA, { id: 'aVal', name: 'val', type: 'integer', notNull: false });
+    setPartitionBy(impFromA, pA, {
+      strategy: 'range',
+      keys: [{ column: aId, expr: null, opclass: null, collation: null }],
+    });
+    addPrimaryKey(impFromA, pA, [aId], 'a_pk');
+    addUnique(impFromA, pA, [aId, aTag], false, 'a_uq');
+
+    const impToA = structuredClone(impFromA);
+    createPartition(impToA, pA, 'ch', 'DEFAULT', 'ch');
+    const aExtra = addColumn(impToA, pA, { id: 'aExtra', name: 'extra', type: 'integer', notNull: true });
+    (impToA.objects[aExtra] as Column).notNullName = 'ch_pkey';
+    (impToA.objects[aExtra] as Column).notNullNameMode = 'explicit';
+    setNotNull(impToA, aVal, true);
+    (impToA.objects[aVal] as Column).notNullName = 'ch_id_tag_key';
+    (impToA.objects[aVal] as Column).notNullNameMode = 'explicit';
+    expect(validate(impFromA)).toEqual([]);
+    expect(validate(impToA)).toEqual([]);
+
+    const upA = plan(impFromA, impToA, { pgMajor: 18 });
+    const downA = plan(impToA, impFromA, { pgMajor: 18 });
+    const createChIdx = upA.findIndex(
+      (st) => st.kind === 'createTable' && st.sql.includes('CREATE TABLE public.ch PARTITION OF public.p'),
+    );
+    const renamePkIdx = upA.findIndex(
+      (st) =>
+        st.kind === 'rename' && st.sql === 'ALTER TABLE public.ch RENAME CONSTRAINT ch_pkey TO ch_pkey1',
+    );
+    const addExtraIdx = upA.findIndex(
+      (st) =>
+        st.kind === 'addColumn' && st.sql.includes('ADD COLUMN extra integer CONSTRAINT ch_pkey NOT NULL'),
+    );
+    const renameUqIdx = upA.findIndex(
+      (st) =>
+        st.kind === 'rename' &&
+        st.sql === 'ALTER TABLE public.ch RENAME CONSTRAINT ch_id_tag_key TO ch_id_tag_key1',
+    );
+    const setValNnIdx = upA.findIndex(
+      (st) =>
+        st.kind === 'setNotNull' &&
+        st.sql === 'ALTER TABLE public.p ADD CONSTRAINT ch_id_tag_key NOT NULL val',
+    );
+    expect(createChIdx).toBeGreaterThanOrEqual(0);
+    expect(renamePkIdx).toBeGreaterThan(createChIdx);
+    expect(addExtraIdx).toBeGreaterThan(renamePkIdx);
+    expect(renameUqIdx).toBeGreaterThan(createChIdx);
+    expect(setValNnIdx).toBeGreaterThan(renameUqIdx);
+    expect(downA.length).toBeGreaterThan(0);
+
+    // 2B. P12g generated column + P10 new partition vs implicit PK
+    const { m: impFromB, s: impSB } = base();
+    const pB = createTable(impFromB, impSB, 'p', 'pB');
+    const bId = addColumn(impFromB, pB, { id: 'bId', name: 'id', type: 'integer', notNull: true });
+    setPartitionBy(impFromB, pB, {
+      strategy: 'range',
+      keys: [{ column: bId, expr: null, opclass: null, collation: null }],
+    });
+    addPrimaryKey(impFromB, pB, [bId], 'b_pk');
+
+    const impToB = structuredClone(impFromB);
+    createPartition(impToB, pB, 'ch', 'DEFAULT', 'ch');
+    const bGen = addColumn(impToB, pB, {
+      id: 'bGen',
+      name: 'g',
+      type: 'integer',
+      notNull: true,
+      generated: { expr: '(id * 2)', stored: true },
+    });
+    (impToB.objects[bGen] as Column).notNullName = 'ch_pkey';
+    (impToB.objects[bGen] as Column).notNullNameMode = 'explicit';
+    expect(validate(impFromB)).toEqual([]);
+    expect(validate(impToB)).toEqual([]);
+
+    const upB = plan(impFromB, impToB, { pgMajor: 18 });
+    const renamePkB = upB.findIndex(
+      (st) =>
+        st.kind === 'rename' && st.sql === 'ALTER TABLE public.ch RENAME CONSTRAINT ch_pkey TO ch_pkey1',
+    );
+    const addGenB = upB.findIndex(
+      (st) =>
+        st.kind === 'addColumn' &&
+        st.sql.includes(
+          'ADD COLUMN g integer GENERATED ALWAYS AS ((id * 2)) STORED CONSTRAINT ch_pkey NOT NULL',
+        ),
+    );
+    expect(renamePkB).toBeGreaterThanOrEqual(0);
+    expect(addGenB).toBeGreaterThan(renamePkB);
+
+    // 2C. Existing attached child ch in from -> P11 ch_pkey + P12d ch_id_tag_key
+    const impFromC = structuredClone(impFromA);
+    createPartition(impFromC, pA, 'ch', 'DEFAULT', 'ch');
+    const impToC = structuredClone(impFromC);
+    const cExtra = addColumn(impToC, pA, { id: 'cExtra', name: 'extra', type: 'integer', notNull: true });
+    (impToC.objects[cExtra] as Column).notNullName = 'ch_pkey';
+    (impToC.objects[cExtra] as Column).notNullNameMode = 'explicit';
+    setNotNull(impToC, aVal, true);
+    (impToC.objects[aVal] as Column).notNullName = 'ch_id_tag_key';
+    (impToC.objects[aVal] as Column).notNullNameMode = 'explicit';
+    expect(validate(impFromC)).toEqual([]);
+    expect(validate(impToC)).toEqual([]);
+
+    const upC = plan(impFromC, impToC, { pgMajor: 18 });
+    const downC = plan(impToC, impFromC, { pgMajor: 18 });
+    const renamePkC = upC.findIndex(
+      (st) =>
+        st.kind === 'rename' && st.sql === 'ALTER TABLE public.ch RENAME CONSTRAINT ch_pkey TO ch_pkey1',
+    );
+    const addExtraC = upC.findIndex(
+      (st) =>
+        st.kind === 'addColumn' && st.sql.includes('ADD COLUMN extra integer CONSTRAINT ch_pkey NOT NULL'),
+    );
+    const renameUqC = upC.findIndex(
+      (st) =>
+        st.kind === 'rename' &&
+        st.sql === 'ALTER TABLE public.ch RENAME CONSTRAINT ch_id_tag_key TO ch_id_tag_key1',
+    );
+    const setValNnC = upC.findIndex(
+      (st) =>
+        st.kind === 'setNotNull' &&
+        st.sql === 'ALTER TABLE public.p ADD CONSTRAINT ch_id_tag_key NOT NULL val',
+    );
+    expect(renamePkC).toBeGreaterThanOrEqual(0);
+    expect(addExtraC).toBeGreaterThan(renamePkC);
+    expect(renameUqC).toBeGreaterThanOrEqual(0);
+    expect(setValNnC).toBeGreaterThan(renameUqC);
+    expect(downC.length).toBeGreaterThan(0);
+
+    // 2D. Multi-level gp -> sub -> leaf: rebind sub + P12d gp.val.notNullName = 'leaf_pkey'
+    const { m: mlFrom, s: mlS } = base();
+    const gpMl = createTable(mlFrom, mlS, 'gp', 'gpMl');
+    const gpId = addColumn(mlFrom, gpMl, { id: 'gpId', name: 'id', type: 'integer', notNull: true });
+    const gpReg = addColumn(mlFrom, gpMl, { id: 'gpReg', name: 'region', type: 'text', notNull: true });
+    const gpVal = addColumn(mlFrom, gpMl, { id: 'gpVal', name: 'val', type: 'integer', notNull: false });
+    setPartitionBy(mlFrom, gpMl, {
+      strategy: 'range',
+      keys: [{ column: gpId, expr: null, opclass: null, collation: null }],
+    });
+    addPrimaryKey(mlFrom, gpMl, [gpId, gpReg], 'gp_pk');
+    const subMl = createPartition(mlFrom, gpMl, 'sub', 'FOR VALUES FROM (0) TO (10)', 'subMl');
+    setPartitionBy(mlFrom, subMl, {
+      strategy: 'list',
+      keys: [{ column: gpReg, expr: null, opclass: null, collation: null }],
+    });
+    createPartition(mlFrom, subMl, 'leaf', "FOR VALUES IN ('us')", 'leafMl');
+
+    const mlTo = structuredClone(mlFrom);
+    setPartitionBound(mlTo, subMl, 'FOR VALUES FROM (0) TO (20)');
+    setNotNull(mlTo, gpVal, true);
+    (mlTo.objects[gpVal] as Column).notNullName = 'leaf_pkey';
+    (mlTo.objects[gpVal] as Column).notNullNameMode = 'explicit';
+    expect(validate(mlFrom)).toEqual([]);
+    expect(validate(mlTo)).toEqual([]);
+
+    const upD = plan(mlFrom, mlTo, { pgMajor: 18 });
+    const dropSubPkIdx = upD.findIndex(
+      (st) => st.kind === 'dropPrimaryKey' && st.sql === 'ALTER TABLE public.sub DROP CONSTRAINT sub_pkey',
+    );
+    const attachSubIdx = upD.findIndex(
+      (st) => st.kind === 'attachPartition' && st.sql.includes('ATTACH PARTITION public.sub'),
+    );
+    expect(dropSubPkIdx).toBeGreaterThanOrEqual(0);
+    expect(attachSubIdx).toBeGreaterThan(dropSubPkIdx);
   });
 });
