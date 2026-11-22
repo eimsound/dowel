@@ -1,11 +1,13 @@
 # 需要数据库的测试用 Testcontainers 启动对应镜像（默认 pgvector/pgvector:pg18，多版本矩阵按需拉起 PG / MySQL / SQL Server；GitHub 的 ubuntu 运行器自带 Docker）。
 # CI=true 时没有 Docker 会直接失败，不会悄悄跳过。
+# 数据库 Docker 镜像体积较大，在 GitHub runner 上直拉通常只需十几到二十几秒，因此不额外占用 10GB Actions cache 空间。
 name: CI
 
 on:
   push:
     branches: [main]
   pull_request:
+  workflow_dispatch:
 
 # 只读令牌：CI 不需要写仓库
 permissions:
@@ -13,23 +15,178 @@ permissions:
 
 concurrency:
   group: ci-${{ github.ref }}
-  cancel-in-progress: true
+  cancel-in-progress: ${{ github.ref != 'refs/heads/main' }}
 
 jobs:
+  changes:
+    name: 变更范围分析
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    outputs:
+      code: ${{ steps.filter.outputs.code }}
+      pg: ${{ steps.filter.outputs.pg }}
+      mysql: ${{ steps.filter.outputs.mysql }}
+      mssql: ${{ steps.filter.outputs.mssql }}
+      e2e: ${{ steps.filter.outputs.e2e }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+          fetch-depth: 0
+      - id: filter
+        name: 分析变更路径并输出作业开关
+        env:
+          EVENT_NAME: ${{ github.event_name }}
+          PR_BASE_SHA: ${{ github.event.pull_request.base.sha }}
+          PUSH_BEFORE: ${{ github.event.before }}
+          HEAD_SHA: ${{ github.sha }}
+        run: |
+          set -euo pipefail
+          shopt -s extglob
+
+          emit_outputs() {
+            local code="$1" pg="$2" mysql="$3" mssql="$4" e2e="$5"
+            {
+              echo "code=$code"
+              echo "pg=$pg"
+              echo "mysql=$mysql"
+              echo "mssql=$mssql"
+              echo "e2e=$e2e"
+            } >> "$GITHUB_OUTPUT"
+            echo "outputs: code=$code pg=$pg mysql=$mysql mssql=$mssql e2e=$e2e"
+          }
+
+          classify_files() {
+            local code=false pg=false mysql=false mssql=false e2e=false
+            local count=0
+            local file
+            while IFS= read -r file; do
+              [[ -z "$file" ]] && continue
+              count=$((count + 1))
+              case "$file" in
+                # 仅文档 / 元信息白名单：命中则跳过，不置任何 true
+                *.md | docs/* | .agents/* | zensical.toml | LICENSE | .github/workflows/docs.yml | .github/dependabot.yml | .dockerignore | .gitignore)
+                  ;;
+                # 纯前端 / E2E
+                apps/web/* | e2e/* | playwright.config.ts)
+                  code=true
+                  e2e=true
+                  ;;
+                # 纯 Action
+                actions/*)
+                  code=true
+                  ;;
+                # PG 单方言纯测试（不含跨方言源码导入）
+                packages/core/test/partition* | packages/core/test/pg-* | packages/engines/test/roundtrip* | packages/engines/test/pagila* | packages/engines/test/naming* | packages/verifier/test/random.test.ts | packages/verifier/test/gen.ts | packages/verifier/test/debug.test.ts | packages/verifier/test/partition.test.ts | packages/verifier/test/pg-matrix.test.ts | packages/verifier/test/analyze.test.ts | packages/verifier/test/stats.test.ts)
+                  code=true
+                  pg=true
+                  ;;
+                # MySQL 单方言纯测试 / 容器
+                packages/+([^/])/test/mysql* | apps/server/test/mysql* | test/mysql*)
+                  code=true
+                  mysql=true
+                  ;;
+                # MSSQL 单方言纯测试 / 容器
+                packages/+([^/])/test/mssql* | apps/server/test/mssql* | test/mssql*)
+                  code=true
+                  mssql=true
+                  ;;
+                # SQLite 单方言纯测试
+                packages/+([^/])/test/sqlite* | apps/server/test/sqlite*)
+                  code=true
+                  ;;
+                # 其余一切文件（跨方言源码、共享测试设施、根配置、CI 自身等）：保守全部跑
+                *)
+                  code=true
+                  pg=true
+                  mysql=true
+                  mssql=true
+                  e2e=true
+                  break
+                  ;;
+              esac
+            done
+
+            if [[ "$count" -eq 0 ]]; then
+              emit_outputs true true true true true
+              return
+            fi
+
+            emit_outputs "$code" "$pg" "$mysql" "$mssql" "$e2e"
+          }
+
+          # --- diff extraction ---
+          FILES=""
+          DIFF_OK=false
+          case "${EVENT_NAME:-}" in
+            pull_request)
+              if git rev-parse --verify --quiet HEAD^2 >/dev/null 2>&1; then
+                if FILES="$(git -c core.quotePath=false diff --name-only --no-renames HEAD^1 HEAD)"; then
+                  DIFF_OK=true
+                fi
+              elif [[ -n "${PR_BASE_SHA:-}" ]]; then
+                if FILES="$(git -c core.quotePath=false diff --name-only --no-renames "${PR_BASE_SHA}...HEAD")"; then
+                  DIFF_OK=true
+                fi
+              fi
+              ;;
+            push)
+              ZERO_SHA="0000000000000000000000000000000000000000"
+              BEFORE="${PUSH_BEFORE:-}"
+              if [[ -n "$BEFORE" && "$BEFORE" != "$ZERO_SHA" ]] && git cat-file -e "${BEFORE}^{commit}" 2>/dev/null; then
+                if FILES="$(git -c core.quotePath=false diff --name-only --no-renames "$BEFORE" "${HEAD_SHA:-HEAD}")"; then
+                  DIFF_OK=true
+                fi
+              fi
+              ;;
+            *)
+              echo "event=${EVENT_NAME:-unknown}, fail-open: run all jobs"
+              emit_outputs true true true true true
+              exit 0
+              ;;
+          esac
+
+          if [[ "$DIFF_OK" != "true" ]]; then
+            echo "diff extraction failed or unavailable, fail-open: run all jobs"
+            emit_outputs true true true true true
+            exit 0
+          fi
+
+          if [[ -z "${FILES//[[:space:]]/}" ]]; then
+            echo "empty changed files list, fail-open: run all jobs"
+            emit_outputs true true true true true
+            exit 0
+          fi
+
+          echo "changed files:"
+          printf '%s\n' "$FILES"
+          classify_files <<< "$FILES"
+
+  # 与 check 互斥，保证纯文档 PR 快速通过且 CI 门禁清晰
+  format:
+    name: 格式检查（仅文档变更）
+    needs: changes
+    if: needs.changes.outputs.code == 'false'
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: ./.github/actions/setup-node-pnpm
+      - run: pnpm exec oxfmt --check
+
   check:
     name: lint、类型检查、单元测试、构建与冒烟
+    needs: changes
+    if: needs.changes.outputs.code == 'true'
     runs-on: ubuntu-latest
     timeout-minutes: 20
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
-      - uses: pnpm/action-setup@73e46992e05b19abd31f2f3c20e0e7370d762115 # v6.1.1
-      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
-        with:
-          node-version-file: .tool-versions
-          cache: pnpm
-      - run: pnpm install --frozen-lockfile
+      - uses: ./.github/actions/setup-node-pnpm
       - run: pnpm lint
       - run: pnpm typecheck
       - run: pnpm test
@@ -69,6 +226,8 @@ jobs:
 
   pg-matrix:
     name: PG 多版本矩阵（PG ${{ matrix.pg }}）
+    needs: changes
+    if: needs.changes.outputs.pg == 'true'
     runs-on: ubuntu-latest
     timeout-minutes: 25
     strategy:
@@ -79,12 +238,7 @@ jobs:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
-      - uses: pnpm/action-setup@73e46992e05b19abd31f2f3c20e0e7370d762115 # v6.1.1
-      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
-        with:
-          node-version-file: .tool-versions
-          cache: pnpm
-      - run: pnpm install --frozen-lockfile
+      - uses: ./.github/actions/setup-node-pnpm
       - run: pnpm vitest run packages/engines/test/roundtrip.test.ts packages/engines/test/pagila.test.ts packages/verifier/test/pg-matrix.test.ts
         env:
           DOWEL_PG_IMAGE: pgvector/pgvector:pg${{ matrix.pg }}
@@ -93,6 +247,8 @@ jobs:
 
   mysql-matrix:
     name: MySQL 多版本矩阵（MySQL ${{ matrix.mysql }}）
+    needs: changes
+    if: needs.changes.outputs.mysql == 'true'
     runs-on: ubuntu-latest
     timeout-minutes: 25
     strategy:
@@ -103,12 +259,7 @@ jobs:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
-      - uses: pnpm/action-setup@73e46992e05b19abd31f2f3c20e0e7370d762115 # v6.1.1
-      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
-        with:
-          node-version-file: .tool-versions
-          cache: pnpm
-      - run: pnpm install --frozen-lockfile
+      - uses: ./.github/actions/setup-node-pnpm
       - run: pnpm vitest run packages/core/test/mysql.test.ts packages/executor/test/mysql-execute.test.ts apps/server/test/mysql-target.test.ts packages/verifier/test/mysql-random.test.ts
         env:
           MYSQL_VERSION: ${{ matrix.mysql }}
@@ -117,6 +268,8 @@ jobs:
 
   mssql-matrix:
     name: MSSQL 多版本矩阵（SQL Server ${{ matrix.mssql }}）
+    needs: changes
+    if: needs.changes.outputs.mssql == 'true'
     runs-on: ubuntu-latest
     timeout-minutes: 30
     strategy:
@@ -127,12 +280,7 @@ jobs:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
-      - uses: pnpm/action-setup@73e46992e05b19abd31f2f3c20e0e7370d762115 # v6.1.1
-      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
-        with:
-          node-version-file: .tool-versions
-          cache: pnpm
-      - run: pnpm install --frozen-lockfile
+      - uses: ./.github/actions/setup-node-pnpm
       - run: pnpm vitest run packages/core/test/mssql.test.ts packages/executor/test/mssql-execute.test.ts apps/server/test/mssql-target.test.ts packages/verifier/test/mssql-random.test.ts
         env:
           MSSQL_VERSION: ${{ matrix.mssql }}
@@ -141,18 +289,15 @@ jobs:
 
   heavy:
     name: 随机闭环测试（5000 例）
+    needs: changes
+    if: needs.changes.outputs.pg == 'true'
     runs-on: ubuntu-latest
     timeout-minutes: 60
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
-      - uses: pnpm/action-setup@73e46992e05b19abd31f2f3c20e0e7370d762115 # v6.1.1
-      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
-        with:
-          node-version-file: .tool-versions
-          cache: pnpm
-      - run: pnpm install --frozen-lockfile
+      - uses: ./.github/actions/setup-node-pnpm
       - run: pnpm vitest run packages/verifier/test/random.test.ts packages/engines/test/naming.test.ts
         env:
           RUNS: '5000'
@@ -161,19 +306,32 @@ jobs:
 
   e2e:
     name: 端到端测试
+    needs: changes
+    if: needs.changes.outputs.e2e == 'true'
     runs-on: ubuntu-latest
     timeout-minutes: 30
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
-      - uses: pnpm/action-setup@73e46992e05b19abd31f2f3c20e0e7370d762115 # v6.1.1
-      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
+      - uses: ./.github/actions/setup-node-pnpm
+      - name: 读取 Playwright 版本
+        id: playwright
+        run: |
+          VERSION="$(node -p "require('./node_modules/@playwright/test/package.json').version")"
+          echo "version=${VERSION}" >> "$GITHUB_OUTPUT"
+      - name: 缓存 Playwright Chromium
+        id: playwright-cache
+        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
         with:
-          node-version-file: .tool-versions
-          cache: pnpm
-      - run: pnpm install --frozen-lockfile
-      - run: pnpm exec playwright install --with-deps chromium
+          path: ~/.cache/ms-playwright
+          key: ${{ runner.os }}-playwright-chromium-${{ steps.playwright.outputs.version }}
+      - name: 安装 Playwright Chromium 与系统依赖
+        if: steps.playwright-cache.outputs.cache-hit != 'true'
+        run: pnpm exec playwright install --with-deps chromium
+      - name: 安装 Playwright 系统依赖（命中浏览器缓存）
+        if: steps.playwright-cache.outputs.cache-hit == 'true'
+        run: pnpm exec playwright install-deps chromium
       # 截图对比测试需要中文字体（与本地生成基准图时一致）
       - run: sudo apt-get install -y --no-install-recommends fonts-noto-cjk
       - run: pnpm e2e

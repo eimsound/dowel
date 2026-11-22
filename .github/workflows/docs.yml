@@ -31,6 +31,10 @@ jobs:
         with:
           persist-credentials: false
       - uses: astral-sh/setup-uv@1db35dd8eee11c5894872e0b383ae6c406cf738d # v10.4.0
+        with:
+          enable-cache: true
+          cache-dependency-glob: .github/workflows/docs.yml
+          cache-suffix: docs-zensical
       - name: 严格构建文档站点
         run: uvx zensical==0.1.3 build --clean --strict
       - uses: actions/configure-pages@45bfe0192ca1faeb007ade9deae92b16b8254a0d # v6.0.0
