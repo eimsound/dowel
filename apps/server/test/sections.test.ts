@@ -1282,4 +1282,380 @@ describe('画布板块在途落库与重载竞态回归', () => {
       await rooms.flush();
     }
   });
+
+  test('reloadLayoutFromDb 当 DB 持久化版本高于事件版本时以 effectiveIncoming 胜出并写回 layoutVersions（#63）', async () => {
+    const { branchId, fakeBus, rooms, peerB } = await setupRaceRoom();
+    const origQuery = db.query.bind(db);
+    const enteredSelect = deferred();
+    const releaseSelect = deferred();
+
+    const l5 = { tbl_1: { x: 500, y: 500 }, tbl_2: { x: 520, y: 520 } };
+    const l3 = { tbl_1: { x: 300, y: 300 } };
+
+    try {
+      await origQuery('update branches set layout = $2::text::jsonb, layout_ver = 5 where id = $1', [
+        branchId,
+        JSON.stringify(l5),
+      ]);
+
+      db.query = (async <T = Record<string, unknown>>(sql: string, params?: unknown[]) => {
+        const res = await origQuery<T>(sql, params);
+        if (sql.includes('select layout, layout_ver from branches')) {
+          enteredSelect.resolve();
+          await releaseSelect.promise;
+        }
+        return res;
+      }) as typeof db.query;
+
+      const reloadPromise = fakeBus.emit({
+        t: 'room.layout.reload',
+        origin: 'replica-a',
+        branchId,
+        ver: 2,
+      });
+      await enteredSelect.promise;
+
+      // 查库返回前收到 ver = 3 的并发事件，但 DB 持久化的是 ver = 5，effectiveIncoming 应以 ver = 5 胜出
+      await fakeBus.emit({
+        t: 'room.layout',
+        origin: 'replica-c',
+        branchId,
+        positions: l3,
+        ver: 3,
+      });
+      expect(peerB.sent.at(-1)).toEqual({ t: 'layout', positions: l3 });
+
+      releaseSelect.resolve();
+      await reloadPromise;
+
+      expect(peerB.sent.at(-1)).toEqual({ t: 'layout', positions: l5 });
+
+      // 后续迟到的 ver = 3 / ver = 4 room.layout 必须被已写回的 ver = 5 版本号拦截
+      const countAtVer5 = peerB.sent.length;
+      await fakeBus.emit({
+        t: 'room.layout',
+        origin: 'replica-c',
+        branchId,
+        positions: { tbl_1: { x: 333, y: 333 }, tbl_2: { x: 344, y: 344 } },
+        ver: 3,
+      });
+      await fakeBus.emit({
+        t: 'room.layout',
+        origin: 'replica-c',
+        branchId,
+        positions: { tbl_1: { x: 444, y: 444 }, tbl_2: { x: 455, y: 455 } },
+        ver: 4,
+      });
+      expect(peerB.sent).toHaveLength(countAtVer5);
+
+      const observer = makePeer(editorUser);
+      await rooms.join(branchId, observer.peer);
+      expect(observer.sent).toContainEqual({ t: 'layout', positions: l5 });
+      await rooms.leave(branchId, observer.peer);
+
+      // ver = 6 更新正常生效
+      const l6 = { tbl_1: { x: 600, y: 600 }, tbl_2: { x: 620, y: 620 } };
+      await fakeBus.emit({
+        t: 'room.layout',
+        origin: 'replica-c',
+        branchId,
+        positions: l6,
+        ver: 6,
+      });
+      expect(peerB.sent.at(-1)).toEqual({ t: 'layout', positions: l6 });
+    } finally {
+      db.query = origQuery;
+      rooms.close();
+      await rooms.flush();
+    }
+  });
+
+  test('reloadLayoutFromDb 查库挂起期间，rooms.flush() 与防抖定时器等待重载完成且不写入陈旧 ver = 1（#63）', async () => {
+    // 1. rooms.flush() 场景
+    const { branchId, fakeBus, rooms, peerB } = await setupRaceRoom();
+    const origQuery = db.query.bind(db);
+    const enteredSelect = deferred();
+    const releaseSelect = deferred();
+    const events: string[] = [];
+    let updateCount = 0;
+
+    const b1 = { tbl_1: { x: 111, y: 111 } };
+    const a2 = { tbl_1: { x: 222, y: 222 } };
+
+    try {
+      await rooms.message(branchId, peerB.peer, { t: 'layout', positions: b1 });
+      await origQuery('update branches set layout = $2::text::jsonb, layout_ver = 2 where id = $1', [
+        branchId,
+        JSON.stringify(a2),
+      ]);
+
+      db.query = (async <T = Record<string, unknown>>(sql: string, params?: unknown[]) => {
+        if (sql.includes('select layout, layout_ver from branches')) {
+          events.push('select:start');
+          enteredSelect.resolve();
+          await releaseSelect.promise;
+          const res = await origQuery<T>(sql, params);
+          events.push('select:end');
+          return res;
+        }
+        if (sql.includes('update branches set layout')) {
+          updateCount += 1;
+          events.push('update');
+        }
+        return origQuery<T>(sql, params);
+      }) as typeof db.query;
+
+      const reloadPromise = fakeBus.emit({
+        t: 'room.layout.reload',
+        origin: 'replica-a',
+        branchId,
+        ver: 2,
+      });
+      await enteredSelect.promise;
+
+      const flushPromise = rooms.flush();
+      await new Promise((r) => setTimeout(r, 20));
+      expect(updateCount).toBe(0);
+      expect(events).toEqual(['select:start']);
+
+      releaseSelect.resolve();
+      await Promise.all([reloadPromise, flushPromise]);
+
+      expect(events).toEqual(['select:start', 'select:end']);
+      expect(updateCount).toBe(0);
+      expect(peerB.sent.at(-1)).toEqual({ t: 'layout', positions: a2 });
+
+      const [row1] = await origQuery<{
+        layout: Record<string, { x: number; y: number }>;
+        layout_ver: number;
+      }>('select layout, layout_ver from branches where id = $1', [branchId]);
+      expect(row1?.layout).toEqual(a2);
+      expect(Number(row1?.layout_ver)).toBe(2);
+
+      db.query = origQuery;
+      const obs1 = makePeer(editorUser);
+      await rooms.join(branchId, obs1.peer);
+      expect(obs1.sent).toContainEqual({ t: 'layout', positions: a2 });
+    } finally {
+      db.query = origQuery;
+      rooms.close();
+      await rooms.flush();
+    }
+
+    // 2. 真实防抖定时器到期场景
+    branchCounter += 1;
+    const branchId2 = `sec-race-${branchCounter}-${newId()}`;
+    await origQuery('insert into branches (id, project_id, name) values ($1, $2, $3)', [
+      branchId2,
+      projectId,
+      `race-${branchCounter}`,
+    ]);
+    const fakeBus2 = makeFakeBus('replica-b');
+    const rooms2 = new Rooms(
+      db,
+      (u, pid, lookup) => effectiveProjectRole(db, u, pid, lookup),
+      fakeBus2.bus,
+      undefined,
+      { layoutDebounceMs: 40 },
+    );
+    await rooms2.init(branchId2, emptyModel());
+    const peerB2 = makePeer(editorUser);
+    await rooms2.join(branchId2, peerB2.peer);
+
+    const enteredSelect2 = deferred();
+    const releaseSelect2 = deferred();
+    let updateCount2 = 0;
+
+    try {
+      await origQuery('update branches set layout = $2::text::jsonb, layout_ver = 2 where id = $1', [
+        branchId2,
+        JSON.stringify(a2),
+      ]);
+
+      db.query = (async <T = Record<string, unknown>>(sql: string, params?: unknown[]) => {
+        if (sql.includes('select layout, layout_ver from branches')) {
+          enteredSelect2.resolve();
+          await releaseSelect2.promise;
+        }
+        if (sql.includes('update branches set layout')) {
+          updateCount2 += 1;
+        }
+        return origQuery<T>(sql, params);
+      }) as typeof db.query;
+
+      await rooms2.message(branchId2, peerB2.peer, { t: 'layout', positions: b1 });
+      const reloadPromise2 = fakeBus2.emit({
+        t: 'room.layout.reload',
+        origin: 'replica-a',
+        branchId: branchId2,
+        ver: 2,
+      });
+      await enteredSelect2.promise;
+
+      // 等待超过 40ms 防抖延迟，确认定时器触发时被 IO 锁阻塞等待而不会在 SELECT 期间写库
+      await new Promise((r) => setTimeout(r, 100));
+      expect(updateCount2).toBe(0);
+
+      releaseSelect2.resolve();
+      await reloadPromise2;
+      await rooms2.flush();
+
+      expect(updateCount2).toBe(0);
+      expect(peerB2.sent.at(-1)).toEqual({ t: 'layout', positions: a2 });
+      const [row2] = await origQuery<{
+        layout: Record<string, { x: number; y: number }>;
+        layout_ver: number;
+      }>('select layout, layout_ver from branches where id = $1', [branchId2]);
+      expect(row2?.layout).toEqual(a2);
+      expect(Number(row2?.layout_ver)).toBe(2);
+    } finally {
+      db.query = origQuery;
+      rooms2.close();
+      await rooms2.flush();
+    }
+  });
+
+  test('reloadSectionsFromDb 查库挂起期间，rooms.flush() 与防抖定时器等待重载完成且不写入陈旧 ver = 1（#63）', async () => {
+    // 1. rooms.flush() 场景
+    const { branchId, fakeBus, rooms, peerB } = await setupRaceRoom();
+    const origQuery = db.query.bind(db);
+    const enteredSelect = deferred();
+    const releaseSelect = deferred();
+    const events: string[] = [];
+    let updateCount = 0;
+
+    const s1: CanvasSection[] = [{ id: 'sec-b1', name: '本地旧板块', color: 'peer-1', tables: ['t1'] }];
+    const s2: CanvasSection[] = [{ id: 'sec-a2', name: '远端新板块', color: 'peer-2', tables: ['t2'] }];
+
+    try {
+      await rooms.message(branchId, peerB.peer, { t: 'sections', sections: s1 });
+      await origQuery('update branches set sections = $2::text::jsonb, sections_ver = 2 where id = $1', [
+        branchId,
+        JSON.stringify(s2),
+      ]);
+
+      db.query = (async <T = Record<string, unknown>>(sql: string, params?: unknown[]) => {
+        if (sql.includes('select sections, sections_ver from branches')) {
+          events.push('select:start');
+          enteredSelect.resolve();
+          await releaseSelect.promise;
+          const res = await origQuery<T>(sql, params);
+          events.push('select:end');
+          return res;
+        }
+        if (sql.includes('update branches set sections')) {
+          updateCount += 1;
+          events.push('update');
+        }
+        return origQuery<T>(sql, params);
+      }) as typeof db.query;
+
+      const reloadPromise = fakeBus.emit({
+        t: 'room.sections.reload',
+        origin: 'replica-a',
+        branchId,
+        ver: 2,
+      });
+      await enteredSelect.promise;
+
+      const flushPromise = rooms.flush();
+      await new Promise((r) => setTimeout(r, 20));
+      expect(updateCount).toBe(0);
+      expect(events).toEqual(['select:start']);
+
+      releaseSelect.resolve();
+      await Promise.all([reloadPromise, flushPromise]);
+
+      expect(events).toEqual(['select:start', 'select:end']);
+      expect(updateCount).toBe(0);
+      expect(peerB.sent.at(-1)).toEqual({ t: 'sections', sections: s2 });
+
+      const [row1] = await origQuery<{ sections: CanvasSection[]; sections_ver: number }>(
+        'select sections, sections_ver from branches where id = $1',
+        [branchId],
+      );
+      expect(row1?.sections).toEqual(s2);
+      expect(Number(row1?.sections_ver)).toBe(2);
+
+      db.query = origQuery;
+      const obs1 = makePeer(editorUser);
+      await rooms.join(branchId, obs1.peer);
+      expect(obs1.sent).toContainEqual({ t: 'sections', sections: s2 });
+    } finally {
+      db.query = origQuery;
+      rooms.close();
+      await rooms.flush();
+    }
+
+    // 2. 真实防抖定时器到期场景
+    branchCounter += 1;
+    const branchId2 = `sec-race-${branchCounter}-${newId()}`;
+    await origQuery('insert into branches (id, project_id, name) values ($1, $2, $3)', [
+      branchId2,
+      projectId,
+      `race-${branchCounter}`,
+    ]);
+    const fakeBus2 = makeFakeBus('replica-b');
+    const rooms2 = new Rooms(
+      db,
+      (u, pid, lookup) => effectiveProjectRole(db, u, pid, lookup),
+      fakeBus2.bus,
+      undefined,
+      { layoutDebounceMs: 40 },
+    );
+    await rooms2.init(branchId2, emptyModel());
+    const peerB2 = makePeer(editorUser);
+    await rooms2.join(branchId2, peerB2.peer);
+
+    const enteredSelect2 = deferred();
+    const releaseSelect2 = deferred();
+    let updateCount2 = 0;
+
+    try {
+      await origQuery('update branches set sections = $2::text::jsonb, sections_ver = 2 where id = $1', [
+        branchId2,
+        JSON.stringify(s2),
+      ]);
+
+      db.query = (async <T = Record<string, unknown>>(sql: string, params?: unknown[]) => {
+        if (sql.includes('select sections, sections_ver from branches')) {
+          enteredSelect2.resolve();
+          await releaseSelect2.promise;
+        }
+        if (sql.includes('update branches set sections')) {
+          updateCount2 += 1;
+        }
+        return origQuery<T>(sql, params);
+      }) as typeof db.query;
+
+      await rooms2.message(branchId2, peerB2.peer, { t: 'sections', sections: s1 });
+      const reloadPromise2 = fakeBus2.emit({
+        t: 'room.sections.reload',
+        origin: 'replica-a',
+        branchId: branchId2,
+        ver: 2,
+      });
+      await enteredSelect2.promise;
+
+      await new Promise((r) => setTimeout(r, 100));
+      expect(updateCount2).toBe(0);
+
+      releaseSelect2.resolve();
+      await reloadPromise2;
+      await rooms2.flush();
+
+      expect(updateCount2).toBe(0);
+      expect(peerB2.sent.at(-1)).toEqual({ t: 'sections', sections: s2 });
+      const [row2] = await origQuery<{ sections: CanvasSection[]; sections_ver: number }>(
+        'select sections, sections_ver from branches where id = $1',
+        [branchId2],
+      );
+      expect(row2?.sections).toEqual(s2);
+      expect(Number(row2?.sections_ver)).toBe(2);
+    } finally {
+      db.query = origQuery;
+      rooms2.close();
+      await rooms2.flush();
+    }
+  });
 });

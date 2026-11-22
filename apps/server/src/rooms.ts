@@ -187,6 +187,9 @@ interface LayoutVersion {
 const isNewerLayoutVersion = (incoming: LayoutVersion, existing: LayoutVersion | undefined): boolean => {
   if (!existing) return true;
   if (incoming.ver !== existing.ver) return incoming.ver > existing.ver;
+  // 由 DB 持久化时钟推导的匿名基线（origin === ''）在同版本下不视为比既有同版本更新，
+  // 避免已从 DB 载入 ver = N 的表被迟到的 ver < N 重载事件（提权为 { ver: N, origin: '' }）误覆写
+  if (incoming.origin === '') return false;
   return incoming.origin >= existing.origin;
 };
 
@@ -213,8 +216,10 @@ interface Loaded {
   /** 每张表最近一次生效的布局版本（用于忽略乱序/败诉的远端旧坐标） */
   layoutVersions: Map<string, LayoutVersion>;
   layoutTimer?: ReturnType<typeof setTimeout>;
-  /** 当前在途的布局落库任务（串行化落库并确保 flush() 等待 SQL 真正完成） */
-  layoutFlushing: Promise<void> | null;
+  /** 房间级布局 DB 读写串行链（互斥协调 flushLayout 与 reloadLayoutFromDb，避免重载查库期间穿插旧刷盘） */
+  layoutIo: Promise<void>;
+  /** 当前排队及在途的布局 DB IO 计数（用于空闲卸载保护、flush 排空与重连排空） */
+  layoutIoCount: number;
   /** 连续防抖落盘失败的重试次数（收到新本地布局或落盘成功后清零） */
   layoutRetries: number;
   /** 画布板块定义（纯布局层，绝不进入 IR） */
@@ -226,8 +231,10 @@ interface Loaded {
   /** 最近一次生效的板块版本 */
   sectionsVersion: LayoutVersion | null;
   sectionsTimer?: ReturnType<typeof setTimeout>;
-  /** 当前在途的板块落库任务 */
-  sectionsFlushing: Promise<void> | null;
+  /** 房间级板块 DB 读写串行链（互斥协调 flushSections 与 reloadSectionsFromDb，避免重载查库期间穿插旧刷盘） */
+  sectionsIo: Promise<void>;
+  /** 当前排队及在途的板块 DB IO 计数（用于空闲卸载保护、flush 排空与重连排空） */
+  sectionsIoCount: number;
   /** 连续防抖落盘失败的重试次数 */
   sectionsRetries: number;
   /** 本机单调递增的板块写代次，避免异步落库/重载期间覆盖更新的本地编辑 */
@@ -567,13 +574,15 @@ export class Rooms {
       pendingLayout: {},
       layoutClock,
       layoutVersions,
-      layoutFlushing: null,
+      layoutIo: Promise.resolve(),
+      layoutIoCount: 0,
       layoutRetries: 0,
       sections: sanitizeSections(b?.sections),
       sectionsPending: false,
       sectionsClock,
       sectionsVersion: sectionsClock > 0 ? { ver: sectionsClock, origin: '' } : null,
-      sectionsFlushing: null,
+      sectionsIo: Promise.resolve(),
+      sectionsIoCount: 0,
       sectionsRetries: 0,
       sectionsWriteSeq: 0,
       activeOps: 0,
@@ -600,13 +609,11 @@ export class Rooms {
   }
 
   private hasPendingLayout(r: Loaded): boolean {
-    return (
-      Object.keys(r.pendingLayout).length > 0 || r.layoutFlushing !== null || r.layoutTimer !== undefined
-    );
+    return Object.keys(r.pendingLayout).length > 0 || r.layoutIoCount > 0 || r.layoutTimer !== undefined;
   }
 
   private hasPendingSections(r: Loaded): boolean {
-    return r.sectionsPending || r.sectionsFlushing !== null || r.sectionsTimer !== undefined;
+    return r.sectionsPending || r.sectionsIoCount > 0 || r.sectionsTimer !== undefined;
   }
 
   private isIdle(r: Loaded): boolean {
@@ -682,6 +689,42 @@ export class Rooms {
     try {
       return await fn();
     } finally {
+      release();
+    }
+  }
+
+  /** 按分支串行化画布布局的 DB 读写（flushLayout / reloadLayoutFromDb），防止重载查库与旧刷盘交错 */
+  private async withLayoutIoLock<T>(r: Loaded, fn: () => Promise<T>): Promise<T> {
+    let release!: () => void;
+    const mine = new Promise<void>((resolve) => {
+      release = resolve;
+    });
+    const prev = r.layoutIo;
+    r.layoutIo = prev.then(() => mine);
+    r.layoutIoCount += 1;
+    await prev;
+    try {
+      return await fn();
+    } finally {
+      r.layoutIoCount -= 1;
+      release();
+    }
+  }
+
+  /** 按分支串行化画布板块的 DB 读写（flushSections / reloadSectionsFromDb），防止重载查库与旧刷盘交错 */
+  private async withSectionsIoLock<T>(r: Loaded, fn: () => Promise<T>): Promise<T> {
+    let release!: () => void;
+    const mine = new Promise<void>((resolve) => {
+      release = resolve;
+    });
+    const prev = r.sectionsIo;
+    r.sectionsIo = prev.then(() => mine);
+    r.sectionsIoCount += 1;
+    await prev;
+    try {
+      return await fn();
+    } finally {
+      r.sectionsIoCount -= 1;
       release();
     }
   }
@@ -989,36 +1032,48 @@ export class Rooms {
   }
 
   private async reloadLayoutFromDb(branchId: string, r: Loaded, incoming?: LayoutVersion) {
-    while (r.layoutFlushing) {
-      await r.layoutFlushing.catch(() => {});
-    }
-    if (!this.isCurrentEntry(branchId, r)) return;
-    const pendingBefore: Layout = { ...r.pendingLayout };
-    const [b] = await this.db.query<{ layout: Layout; layout_ver: number | string }>(
-      'select layout, layout_ver from branches where id = $1',
-      [branchId],
-    );
-    if (!b || !this.isCurrentEntry(branchId, r)) return;
-    const persistedVer = parseClock(b.layout_ver);
-    if (persistedVer > r.layoutClock) r.layoutClock = persistedVer;
-    if (incoming && incoming.ver > r.layoutClock) r.layoutClock = incoming.ver;
-    if (!b.layout) return;
-    const clearedKeys: string[] = [];
-    let updatedAny = false;
-    for (const [key, pos] of Object.entries(b.layout)) {
-      if (!pos || typeof pos.x !== 'number' || typeof pos.y !== 'number') continue;
-      const cur = r.pendingLayout[key];
-      // 查询期间新产生的本地拖动保留，不被此次重载覆盖
-      if (cur !== undefined && cur !== pendingBefore[key]) continue;
-      if (incoming && !isNewerLayoutVersion(incoming, r.layoutVersions.get(key))) continue;
-      if (cur !== undefined) clearedKeys.push(key);
-      if (incoming) r.layoutVersions.set(key, incoming);
-      r.layout[key] = { x: pos.x, y: pos.y };
-      updatedAny = true;
-    }
-    if (clearedKeys.length > 0) this.clearPendingLayoutKeys(branchId, r, clearedKeys);
-    if (updatedAny) {
-      for (const p of r.peers) this.safeSend(p, { t: 'layout', positions: r.layout });
+    try {
+      await this.withLayoutIoLock(r, async () => {
+        if (!this.isCurrentEntry(branchId, r)) return;
+        const pendingBefore: Layout = { ...r.pendingLayout };
+        const [b] = await this.db.query<{ layout: Layout; layout_ver: number | string }>(
+          'select layout, layout_ver from branches where id = $1',
+          [branchId],
+        );
+        if (!b || !this.isCurrentEntry(branchId, r)) return;
+        const persistedVer = parseClock(b.layout_ver);
+        if (persistedVer > r.layoutClock) r.layoutClock = persistedVer;
+        if (incoming && incoming.ver > r.layoutClock) r.layoutClock = incoming.ver;
+        if (!b.layout) return;
+        const effectiveIncoming: LayoutVersion | undefined = incoming
+          ? persistedVer > incoming.ver
+            ? { ver: persistedVer, origin: '' }
+            : incoming
+          : persistedVer > 0
+            ? { ver: persistedVer, origin: '' }
+            : undefined;
+        const clearedKeys: string[] = [];
+        let updatedAny = false;
+        for (const [key, pos] of Object.entries(b.layout)) {
+          if (!pos || typeof pos.x !== 'number' || typeof pos.y !== 'number') continue;
+          const cur = r.pendingLayout[key];
+          // 查询期间新产生的本地拖动保留，不被此次重载覆盖
+          if (cur !== undefined && cur !== pendingBefore[key]) continue;
+          if (effectiveIncoming && !isNewerLayoutVersion(effectiveIncoming, r.layoutVersions.get(key))) {
+            continue;
+          }
+          if (cur !== undefined) clearedKeys.push(key);
+          if (effectiveIncoming) r.layoutVersions.set(key, effectiveIncoming);
+          r.layout[key] = { x: pos.x, y: pos.y };
+          updatedAny = true;
+        }
+        if (clearedKeys.length > 0) this.clearPendingLayoutKeys(branchId, r, clearedKeys);
+        if (updatedAny) {
+          for (const p of r.peers) this.safeSend(p, { t: 'layout', positions: r.layout });
+        }
+      });
+    } finally {
+      this.scheduleIdleEvictIfNeeded(branchId, r);
     }
   }
 
@@ -1077,31 +1132,33 @@ export class Rooms {
 
   private async reloadSectionsFromDb(branchId: string, r: Loaded, incoming: LayoutVersion) {
     const writeSeqBefore = r.sectionsWriteSeq;
-    while (r.sectionsFlushing) {
-      await r.sectionsFlushing.catch(() => {});
+    try {
+      await this.withSectionsIoLock(r, async () => {
+        if (!this.isCurrentEntry(branchId, r)) return;
+        if (r.sectionsWriteSeq !== writeSeqBefore) return;
+        if (!isNewerLayoutVersion(incoming, r.sectionsVersion ?? undefined)) return;
+        const [b] = await this.db.query<{ sections: CanvasSection[]; sections_ver: number | string }>(
+          'select sections, sections_ver from branches where id = $1',
+          [branchId],
+        );
+        if (!b || !this.isCurrentEntry(branchId, r)) return;
+        const persistedVer = parseClock(b.sections_ver);
+        if (persistedVer > r.sectionsClock) r.sectionsClock = persistedVer;
+        if (r.sectionsWriteSeq !== writeSeqBefore) return;
+        const effectiveIncoming: LayoutVersion =
+          persistedVer > incoming.ver ? { ver: persistedVer, origin: '' } : incoming;
+        if (!isNewerLayoutVersion(effectiveIncoming, r.sectionsVersion ?? undefined)) return;
+        const sections = sanitizeSections(b.sections);
+        r.sections = sections;
+        r.sectionsVersion = effectiveIncoming;
+        r.sectionsPending = false;
+        r.sectionsRetries = 0;
+        this.clearSectionsTimer(r);
+        for (const p of r.peers) this.safeSend(p, { t: 'sections', sections });
+      });
+    } finally {
+      this.scheduleIdleEvictIfNeeded(branchId, r);
     }
-    if (!this.isCurrentEntry(branchId, r)) return;
-    if (r.sectionsWriteSeq !== writeSeqBefore) return;
-    if (!isNewerLayoutVersion(incoming, r.sectionsVersion ?? undefined)) return;
-    const [b] = await this.db.query<{ sections: CanvasSection[]; sections_ver: number | string }>(
-      'select sections, sections_ver from branches where id = $1',
-      [branchId],
-    );
-    if (!b || !this.isCurrentEntry(branchId, r)) return;
-    const persistedVer = parseClock(b.sections_ver);
-    if (persistedVer > r.sectionsClock) r.sectionsClock = persistedVer;
-    if (r.sectionsWriteSeq !== writeSeqBefore) return;
-    const effectiveIncoming: LayoutVersion =
-      persistedVer > incoming.ver ? { ver: persistedVer, origin: '' } : incoming;
-    if (!isNewerLayoutVersion(effectiveIncoming, r.sectionsVersion ?? undefined)) return;
-    const sections = sanitizeSections(b.sections);
-    r.sections = sections;
-    r.sectionsVersion = effectiveIncoming;
-    r.sectionsPending = false;
-    r.sectionsRetries = 0;
-    this.clearSectionsTimer(r);
-    this.scheduleIdleEvictIfNeeded(branchId, r);
-    for (const p of r.peers) this.safeSend(p, { t: 'sections', sections });
   }
 
   private async handleClusterEvent(event: ClusterEvent) {
@@ -1253,11 +1310,11 @@ export class Rooms {
         const pending = this.rooms.get(branchId);
         const r = pending ? await pending.catch(() => null) : null;
         if (r && this.isCurrentEntry(branchId, r)) {
-          while (r.layoutFlushing) {
-            await r.layoutFlushing.catch(() => {});
+          while (r.layoutIoCount > 0) {
+            await r.layoutIo;
           }
-          while (r.sectionsFlushing) {
-            await r.sectionsFlushing.catch(() => {});
+          while (r.sectionsIoCount > 0) {
+            await r.sectionsIo;
           }
           if (!this.isCurrentEntry(branchId, r)) continue;
           const pendingLayoutBefore: Layout = { ...r.pendingLayout };
@@ -1298,7 +1355,7 @@ export class Rooms {
             if (
               !sectionsPendingBefore &&
               !r.sectionsPending &&
-              !r.sectionsFlushing &&
+              r.sectionsIoCount === 0 &&
               r.sectionsWriteSeq === sectionsWriteSeqBefore &&
               r.sectionsVersion === sectionsVersionBefore
             ) {
@@ -1581,86 +1638,80 @@ export class Rooms {
     r: Loaded,
     onErrorSnapshot?: (snapshot: Layout) => void,
   ): Promise<void> {
-    while (r.layoutFlushing) {
-      await r.layoutFlushing.catch(() => {});
-    }
-    if (Object.keys(r.pendingLayout).length === 0) {
-      r.layoutRetries = 0;
-      this.clearLayoutTimer(r);
-      this.scheduleIdleEvictIfNeeded(branchId, r);
-      return;
-    }
     let currentSnapshot: Layout = {};
-    const task = (async () => {
-      while (Object.keys(r.pendingLayout).length > 0) {
-        const snapshot: Layout = { ...r.pendingLayout };
-        const fullLayout = this.db.dialect === 'pg' ? null : { ...r.layout };
-        const keys = Object.keys(snapshot);
-        if (keys.length === 0) break;
-        const versionsBefore = new Map<string, LayoutVersion | undefined>();
-        let maxVersion = r.layoutClock;
-        if (this.db.dialect === 'pg') {
-          for (const key of keys) {
-            const ver = r.layoutVersions.get(key);
-            versionsBefore.set(key, ver);
-            if (ver && ver.ver > maxVersion) maxVersion = ver.ver;
-          }
-        } else {
-          for (const [key, ver] of r.layoutVersions) {
-            versionsBefore.set(key, ver);
-            if (ver.ver > maxVersion) maxVersion = ver.ver;
-          }
+    try {
+      await this.withLayoutIoLock(r, async () => {
+        if (!this.isCurrentEntry(branchId, r)) return;
+        if (Object.keys(r.pendingLayout).length === 0) {
+          r.layoutRetries = 0;
+          this.clearLayoutTimer(r);
+          return;
         }
-        const layoutVer = Math.max(0, maxVersion);
-        currentSnapshot = snapshot;
-        const rows =
-          this.db.dialect === 'pg'
-            ? await this.db.query<{ layout_ver: number | string }>(
-                "update branches set layout = coalesce(layout, '{}'::jsonb) || $2::text::jsonb, layout_ver = greatest(layout_ver, $3::bigint) where id = $1 returning layout_ver",
-                [branchId, JSON.stringify(snapshot), layoutVer],
-              )
-            : await this.db.query<{ layout_ver: number | string }>(
-                'update branches set layout = $2::text::jsonb, layout_ver = max(layout_ver, $3) where id = $1 returning layout_ver',
-                [branchId, JSON.stringify(fullLayout), layoutVer],
-              );
-        const persistedVer = parseClock(rows[0]?.layout_ver);
-        if (persistedVer > r.layoutClock) r.layoutClock = persistedVer;
-        // SQL 落库成功后再清理快照中未被新坐标或更高版本替换的键；若落库期间远端更新胜出并清掉了 pendingLayout，则重新入队以自愈 DB
-        for (const key of keys) {
-          const versionChanged = r.layoutVersions.get(key) !== versionsBefore.get(key);
-          if (r.pendingLayout[key] === snapshot[key] && !versionChanged) {
-            delete r.pendingLayout[key];
-          } else if (!(key in r.pendingLayout) && versionChanged) {
-            const winningPos = r.layout[key];
-            if (winningPos) {
-              r.pendingLayout[key] = winningPos;
+        while (this.isCurrentEntry(branchId, r) && Object.keys(r.pendingLayout).length > 0) {
+          const snapshot: Layout = { ...r.pendingLayout };
+          const fullLayout = this.db.dialect === 'pg' ? null : { ...r.layout };
+          const keys = Object.keys(snapshot);
+          if (keys.length === 0) break;
+          const versionsBefore = new Map<string, LayoutVersion | undefined>();
+          let maxVersion = r.layoutClock;
+          if (this.db.dialect === 'pg') {
+            for (const key of keys) {
+              const ver = r.layoutVersions.get(key);
+              versionsBefore.set(key, ver);
+              if (ver && ver.ver > maxVersion) maxVersion = ver.ver;
+            }
+          } else {
+            for (const [key, ver] of r.layoutVersions) {
+              versionsBefore.set(key, ver);
+              if (ver.ver > maxVersion) maxVersion = ver.ver;
             }
           }
-        }
-        if (this.db.dialect !== 'pg') {
-          for (const [key, currentVer] of r.layoutVersions) {
-            if (currentVer !== versionsBefore.get(key) && !(key in r.pendingLayout)) {
+          const layoutVer = Math.max(0, maxVersion);
+          currentSnapshot = snapshot;
+          const rows =
+            this.db.dialect === 'pg'
+              ? await this.db.query<{ layout_ver: number | string }>(
+                  "update branches set layout = coalesce(layout, '{}'::jsonb) || $2::text::jsonb, layout_ver = greatest(layout_ver, $3::bigint) where id = $1 returning layout_ver",
+                  [branchId, JSON.stringify(snapshot), layoutVer],
+                )
+              : await this.db.query<{ layout_ver: number | string }>(
+                  'update branches set layout = $2::text::jsonb, layout_ver = max(layout_ver, $3) where id = $1 returning layout_ver',
+                  [branchId, JSON.stringify(fullLayout), layoutVer],
+                );
+          const persistedVer = parseClock(rows[0]?.layout_ver);
+          if (persistedVer > r.layoutClock) r.layoutClock = persistedVer;
+          // SQL 落库成功后再清理快照中未被新坐标或更高版本替换的键；若落库期间远端更新胜出并清掉了 pendingLayout，则重新入队以自愈 DB
+          for (const key of keys) {
+            const versionChanged = r.layoutVersions.get(key) !== versionsBefore.get(key);
+            if (r.pendingLayout[key] === snapshot[key] && !versionChanged) {
+              delete r.pendingLayout[key];
+            } else if (!(key in r.pendingLayout) && versionChanged) {
               const winningPos = r.layout[key];
               if (winningPos) {
                 r.pendingLayout[key] = winningPos;
               }
             }
           }
+          if (this.db.dialect !== 'pg') {
+            for (const [key, currentVer] of r.layoutVersions) {
+              if (currentVer !== versionsBefore.get(key) && !(key in r.pendingLayout)) {
+                const winningPos = r.layout[key];
+                if (winningPos) {
+                  r.pendingLayout[key] = winningPos;
+                }
+              }
+            }
+          }
+          if (Object.keys(r.pendingLayout).length === 0) {
+            this.clearLayoutTimer(r);
+          }
+          r.layoutRetries = 0;
         }
-        if (Object.keys(r.pendingLayout).length === 0) {
-          this.clearLayoutTimer(r);
-        }
-        r.layoutRetries = 0;
-      }
-    })();
-    r.layoutFlushing = task;
-    try {
-      await task;
+      });
     } catch (err) {
       onErrorSnapshot?.(currentSnapshot);
       throw err;
     } finally {
-      if (r.layoutFlushing === task) r.layoutFlushing = null;
       this.scheduleIdleEvictIfNeeded(branchId, r);
     }
   }
@@ -1670,54 +1721,49 @@ export class Rooms {
     r: Loaded,
     onErrorState?: (state: { writeSeq: number; version: LayoutVersion | null }) => void,
   ): Promise<void> {
-    while (r.sectionsFlushing) {
-      await r.sectionsFlushing.catch(() => {});
-    }
-    if (!r.sectionsPending) {
-      r.sectionsRetries = 0;
-      this.scheduleIdleEvictIfNeeded(branchId, r);
-      return;
-    }
     let currentWriteSeq = r.sectionsWriteSeq;
     let currentVersion = r.sectionsVersion;
-    const task = (async () => {
-      while (r.sectionsPending) {
-        const snapshot = r.sections;
-        const writeSeq = r.sectionsWriteSeq;
-        const versionBefore = r.sectionsVersion;
-        const sectionsVer = Math.max(0, r.sectionsClock, versionBefore?.ver ?? 0);
-        currentWriteSeq = writeSeq;
-        currentVersion = versionBefore;
-        const rows =
-          this.db.dialect === 'pg'
-            ? await this.db.query<{ sections_ver: number | string }>(
-                'update branches set sections = $2::text::jsonb, sections_ver = greatest(sections_ver, $3::bigint) where id = $1 returning sections_ver',
-                [branchId, JSON.stringify(snapshot), sectionsVer],
-              )
-            : await this.db.query<{ sections_ver: number | string }>(
-                'update branches set sections = $2::text::jsonb, sections_ver = max(sections_ver, $3) where id = $1 returning sections_ver',
-                [branchId, JSON.stringify(snapshot), sectionsVer],
-              );
-        const persistedVer = parseClock(rows[0]?.sections_ver);
-        if (persistedVer > r.sectionsClock) r.sectionsClock = persistedVer;
-        if (r.sectionsWriteSeq === writeSeq && r.sectionsVersion === versionBefore) {
-          r.sectionsPending = false;
+    try {
+      await this.withSectionsIoLock(r, async () => {
+        if (!this.isCurrentEntry(branchId, r)) return;
+        if (!r.sectionsPending) {
           r.sectionsRetries = 0;
           this.clearSectionsTimer(r);
-        } else {
-          // 落库期间有新本地写入或收到更高版本远端板块（旧快照可能已覆写 DB），保持待刷状态幂等写回当前获胜版本
-          r.sectionsPending = true;
+          return;
         }
-      }
-    })();
-    r.sectionsFlushing = task;
-    try {
-      await task;
+        while (this.isCurrentEntry(branchId, r) && r.sectionsPending) {
+          const snapshot = r.sections;
+          const writeSeq = r.sectionsWriteSeq;
+          const versionBefore = r.sectionsVersion;
+          const sectionsVer = Math.max(0, r.sectionsClock, versionBefore?.ver ?? 0);
+          currentWriteSeq = writeSeq;
+          currentVersion = versionBefore;
+          const rows =
+            this.db.dialect === 'pg'
+              ? await this.db.query<{ sections_ver: number | string }>(
+                  'update branches set sections = $2::text::jsonb, sections_ver = greatest(sections_ver, $3::bigint) where id = $1 returning sections_ver',
+                  [branchId, JSON.stringify(snapshot), sectionsVer],
+                )
+              : await this.db.query<{ sections_ver: number | string }>(
+                  'update branches set sections = $2::text::jsonb, sections_ver = max(sections_ver, $3) where id = $1 returning sections_ver',
+                  [branchId, JSON.stringify(snapshot), sectionsVer],
+                );
+          const persistedVer = parseClock(rows[0]?.sections_ver);
+          if (persistedVer > r.sectionsClock) r.sectionsClock = persistedVer;
+          if (r.sectionsWriteSeq === writeSeq && r.sectionsVersion === versionBefore) {
+            r.sectionsPending = false;
+            r.sectionsRetries = 0;
+            this.clearSectionsTimer(r);
+          } else {
+            // 落库期间有新本地写入或收到更高版本远端板块（旧快照可能已覆写 DB），保持待刷状态幂等写回当前获胜版本
+            r.sectionsPending = true;
+          }
+        }
+      });
     } catch (err) {
       onErrorState?.({ writeSeq: currentWriteSeq, version: currentVersion });
       throw err;
     } finally {
-      if (r.sectionsFlushing === task) r.sectionsFlushing = null;
       this.scheduleIdleEvictIfNeeded(branchId, r);
     }
   }
@@ -2599,10 +2645,10 @@ export class Rooms {
       await r.lock.catch(() => {});
       this.clearLayoutTimer(r);
       this.clearSectionsTimer(r);
-      if (r.layoutFlushing || Object.keys(r.pendingLayout).length > 0) {
+      if (r.layoutIoCount > 0 || Object.keys(r.pendingLayout).length > 0) {
         await this.flushLayout(branchId, r);
       }
-      if (r.sectionsFlushing || r.sectionsPending) {
+      if (r.sectionsIoCount > 0 || r.sectionsPending) {
         await this.flushSections(branchId, r);
       }
       this.scheduleIdleEvictIfNeeded(branchId, r);
