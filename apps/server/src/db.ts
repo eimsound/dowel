@@ -104,6 +104,7 @@ type ColumnKind = 'json' | 'bool';
 /** SQLite 读出时需要转换的列，键是“表.列”（不是全局列名） */
 const COLUMN_KINDS = new Map<string, ColumnKind>([
   ['branches.layout', 'json'],
+  ['branches.sections', 'json'],
   ['branches.baseline', 'json'],
   ['room_commits.op_args', 'json'],
   ['room_commits.changes', 'json'],
@@ -1139,6 +1140,22 @@ export const MIGRATIONS: MigrationStep[] = [
       }
       if (!cols.some((c) => c.name === 'engine_version_num')) {
         await tx.exec('alter table environments add column engine_version_num integer;');
+      }
+    },
+  },
+  // Q17 Phase 1：画布板块（Section）纯布局层持久化（绝不进入 IR / 版本快照）
+  {
+    run: async (tx, d) => {
+      const { json } = types(d);
+      if (d === 'pg') {
+        await tx.exec(
+          `alter table branches add column if not exists sections ${json} not null default '[]';`,
+        );
+        return;
+      }
+      const cols = await tx.query<{ name: string }>('pragma table_info(branches)');
+      if (!cols.some((c) => c.name === 'sections')) {
+        await tx.exec(`alter table branches add column sections ${json} not null default '[]';`);
       }
     },
   },

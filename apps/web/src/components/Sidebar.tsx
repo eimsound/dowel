@@ -1,23 +1,28 @@
-// 左侧对象树：搜索 + 表（分区父表支持展开查看子分区）、枚举、序列、其他（不透明）对象，可折叠（DESIGN.md：Layout）。
+// 左侧对象树：按 Schema / 按板块双视图、搜索、表（分区父表支持展开查看子分区）、枚举、序列、其他（不透明）对象，可折叠（DESIGN.md：Layout）。
+import { type CanvasSection, sectionColorCssVar } from '@dowel/api';
 import { all, type Model, partitionsOf, resolvePartitionBy, type Table } from '@dowel/core';
 import {
   ChevronDown,
   ChevronRight,
   Eye,
   FileCode,
+  Focus,
   Hash,
   Layers,
   List,
   Plus,
   Search,
+  Settings2,
+  Sparkles,
   SquareFunction,
   Table2,
   Zap,
 } from 'lucide-react';
-import { type ReactNode, useState } from 'react';
+import { type ReactNode, useId, useMemo, useState } from 'react';
 import { useTranslation } from 'react-i18next';
 
 import { defaultSchemaOf, dialectUiSpec } from '../dialects.ts';
+import type { SidebarGrouping } from '../sections.ts';
 import { cx, IconButton } from './ui.tsx';
 
 const OPAQUE_ICON: Record<string, typeof Eye> = {
@@ -58,11 +63,13 @@ const Item = ({
 
 const Group = ({
   title,
+  dotColor,
   count,
   action,
   children,
 }: {
   title: string;
+  dotColor?: string;
   count: number;
   action?: ReactNode;
   children: ReactNode;
@@ -82,7 +89,14 @@ const Group = ({
           ) : (
             <ChevronRight size={14} aria-hidden="true" />
           )}
-          {title}
+          {dotColor && (
+            <span
+              aria-hidden="true"
+              className="size-2 shrink-0 rounded-full"
+              style={{ background: dotColor }}
+            />
+          )}
+          <span className="min-w-0 truncate">{title}</span>
           <span className="count ml-auto">{count}</span>
         </button>
         {action}
@@ -97,15 +111,32 @@ export const Sidebar = ({
   selected,
   onSelect,
   onAddSequence,
+  sections = [],
+  grouping = 'schema',
+  onChangeGrouping,
+  readOnly = false,
+  onOpenSectionManager,
+  onFocusTable,
+  onExitFocus,
+  focusedTableId = null,
 }: {
   model: Model;
   selected: string | null;
   onSelect: (id: string) => void;
   onAddSequence?: () => void;
+  sections?: CanvasSection[];
+  grouping?: SidebarGrouping;
+  onChangeGrouping?: (g: SidebarGrouping) => void;
+  readOnly?: boolean;
+  onOpenSectionManager?: (mode: 'manage' | 'suggest') => void;
+  onFocusTable?: (tableId: string) => void;
+  onExitFocus?: () => void;
+  focusedTableId?: string | null;
 }) => {
   const { t } = useTranslation();
   const [q, setQ] = useState('');
   const [expanded, setExpanded] = useState<Record<string, boolean>>({});
+  const tabBase = useId();
   const defSchema = defaultSchemaOf(model);
   const uiSpec = dialectUiSpec(model.dialect);
   const schemaName = (id: string) => model.objects[id]?.name ?? '';
@@ -152,20 +183,67 @@ export const Sidebar = ({
       forceExpand: !!q && childHasSelfMatch,
     };
   };
-  const filteredTables = byName(all(model, 'table').filter((x) => !x.partitionOf))
+  const topLevelTables = useMemo(() => byName(all(model, 'table').filter((x) => !x.partitionOf)), [model]);
+  const filteredTables = topLevelTables
     .map((x) => buildTableNode(x, false, new Set()))
     .filter((x): x is TableNode => x !== null);
+
+  const sectionBuckets = useMemo(() => {
+    const nodeById = new Map(filteredTables.map((n) => [n.table.id, n]));
+    const assigned = new Set<string>();
+    const list = sections.map((sec) => {
+      const nodes: TableNode[] = [];
+      for (const tid of sec.tables) {
+        assigned.add(tid);
+        const node = nodeById.get(tid);
+        if (node) nodes.push(node);
+      }
+      nodes.sort((a, b) => a.label.localeCompare(b.label));
+      return { section: sec, nodes };
+    });
+    const unassignedNodes = filteredTables.filter((n) => !assigned.has(n.table.id));
+    return { list, unassignedNodes };
+  }, [filteredTables, sections]);
+
   const renderTableNode = (node: TableNode, depth: number): ReactNode => {
     const { table, label, strat, totalChildren, children, forceExpand } = node;
+    const isFocused = focusedTableId === table.id;
+    const labelId = `${tabBase}-tbl-${table.id}`;
+    const focusBtn =
+      depth === 0 && onFocusTable ? (
+        <IconButton
+          label={t('sec.focusRowAction')}
+          size="sm"
+          aria-pressed={isFocused}
+          aria-describedby={labelId}
+          className={cx(
+            'shrink-0',
+            isFocused
+              ? 'text-primary-text opacity-100'
+              : 'opacity-0 group-focus-within:opacity-100 group-hover:opacity-100 focus-visible:opacity-100',
+          )}
+          onClick={() => (isFocused ? onExitFocus?.() : onFocusTable(table.id))}
+        >
+          <Focus size={13} aria-hidden="true" />
+        </IconButton>
+      ) : null;
+
     if (depth === 0 && !strat && totalChildren === 0) {
       return (
-        <Item
-          key={table.id}
-          label={label}
-          icon={<Table2 size={16} aria-hidden="true" />}
-          active={table.id === selected}
-          onClick={() => onSelect(table.id)}
-        />
+        <li key={table.id} className="group flex h-[var(--row-h)] items-center pr-1">
+          <button
+            type="button"
+            onClick={() => onSelect(table.id)}
+            aria-current={table.id === selected ? 'true' : undefined}
+            className="flex h-full min-w-0 flex-1 items-center gap-2 rounded-sm pr-2 pl-[22px] text-left font-mono text-sm text-text-2 transition-colors hover:bg-surface-hover aria-[current]:bg-primary-soft aria-[current]:font-medium aria-[current]:text-primary-text [&>svg]:text-text-3 aria-[current]:[&>svg]:text-primary-text"
+          >
+            <Table2 size={16} aria-hidden="true" />
+            <span id={labelId} className="min-w-0 flex-1 truncate">
+              {label}
+            </span>
+          </button>
+          {focusBtn}
+        </li>
       );
     }
     const isOpen = expanded[table.id] ?? forceExpand;
@@ -175,7 +253,7 @@ export const Sidebar = ({
     return (
       <li key={table.id}>
         <div
-          className={isChild ? 'flex h-[26px] items-center' : 'flex h-[var(--row-h)] items-center'}
+          className={isChild ? 'flex h-[26px] items-center' : 'group flex h-[var(--row-h)] items-center pr-1'}
           style={indentPx ? { paddingLeft: `${indentPx}px` } : undefined}
         >
           {hasChildren ? (
@@ -210,13 +288,16 @@ export const Sidebar = ({
             ) : (
               <Table2 size={16} aria-hidden="true" />
             )}
-            <span className="min-w-0 flex-1 truncate">{label}</span>
+            <span id={depth === 0 ? labelId : undefined} className="min-w-0 flex-1 truncate">
+              {label}
+            </span>
             {strat && (
               <span className="shrink-0 font-mono text-[11px] text-text-3">
                 {strat} · {totalChildren}
               </span>
             )}
           </button>
+          {focusBtn}
         </div>
         {hasChildren && isOpen && (
           <ul className="list-none p-0">{children.map((ch) => renderTableNode(ch, depth + 1))}</ul>
@@ -269,9 +350,45 @@ export const Sidebar = ({
     },
   ].map((g) => ({ ...g, items: g.items.filter((i) => match(i.label)) }));
 
+  const hasSectionMatch =
+    sectionBuckets.list.some((b) => b.nodes.length > 0) || sectionBuckets.unassignedNodes.length > 0;
+  const activeTabId = `${tabBase}-${grouping}`;
+
   return (
     <nav aria-label={t('ws.objects')} className="flex h-full flex-col">
-      <label className="m-2.5 flex h-[var(--ctl-h)] items-center gap-1.5 rounded-sm border border-border-strong bg-surface px-2 text-text-3 focus-within:border-primary focus-within:shadow-[0_0_0_3px_var(--primary-ring)]">
+      {onChangeGrouping && (
+        <div className="px-2.5 pt-2">
+          <div
+            role="tablist"
+            {...({ focusgroup: 'tablist nomemory' } as object)}
+            aria-label={t('sec.sidebarView')}
+            className="seg grid w-full grid-cols-2"
+          >
+            {(['schema', 'section'] as const).map((g) => (
+              <button
+                key={g}
+                type="button"
+                role="tab"
+                id={`${tabBase}-${g}`}
+                aria-selected={grouping === g}
+                {...(grouping === g ? { focusgroupstart: '' } : {})}
+                onFocus={() => onChangeGrouping(g)}
+                onClick={() => onChangeGrouping(g)}
+                className="justify-center px-1.5 text-xs"
+              >
+                {t(g === 'schema' ? 'sec.bySchema' : 'sec.bySection')}
+              </button>
+            ))}
+          </div>
+        </div>
+      )}
+
+      <label
+        className={cx(
+          'mx-2.5 mb-2 flex h-[var(--ctl-h)] items-center gap-1.5 rounded-sm border border-border-strong bg-surface px-2 text-text-3 focus-within:border-primary focus-within:shadow-[0_0_0_3px_var(--primary-ring)]',
+          onChangeGrouping ? 'mt-2' : 'mt-2.5',
+        )}
+      >
         <Search size={14} aria-hidden="true" />
         <input
           type="search"
@@ -282,33 +399,104 @@ export const Sidebar = ({
           className="min-w-0 flex-1 border-0 bg-transparent text-base text-text outline-0"
         />
       </label>
-      <ul className="min-h-0 flex-1 list-none overflow-auto px-1.5 pb-3">
-        {filteredTables.length > 0 && (
-          <Group title={t('ws.tables')} count={filteredTables.length}>
-            {filteredTables.map((node) => renderTableNode(node, 0))}
-          </Group>
-        )}
-        {otherGroups.map(
-          (g) =>
-            (g.items.length > 0 || (g.showEmpty && !q)) && (
-              <Group key={g.title} title={g.title} count={g.items.length} action={g.action}>
-                {g.items.map((i) => (
-                  <Item
-                    key={i.id}
-                    label={i.label}
-                    icon={i.icon}
-                    hint={i.hint}
-                    active={i.id === selected}
-                    onClick={() => onSelect(i.id)}
-                  />
-                ))}
+
+      {grouping === 'section' && onOpenSectionManager && (
+        <div className="flex flex-wrap gap-1 px-2.5 pb-2">
+          <button
+            type="button"
+            className="btn sm px-2 text-xs"
+            disabled={readOnly}
+            onClick={() => onOpenSectionManager('manage')}
+          >
+            <Plus size={12} aria-hidden="true" />
+            {t('sec.newSection')}
+          </button>
+          <button
+            type="button"
+            className="btn sm px-2 text-xs"
+            disabled={readOnly}
+            onClick={() => onOpenSectionManager('suggest')}
+          >
+            <Sparkles size={12} aria-hidden="true" />
+            {t('sec.suggestShort')}
+          </button>
+          <button
+            type="button"
+            className="btn sm px-2 text-xs"
+            onClick={() => onOpenSectionManager('manage')}
+          >
+            <Settings2 size={12} aria-hidden="true" />
+            {t('sec.manage')}
+          </button>
+        </div>
+      )}
+
+      <div
+        role={onChangeGrouping ? 'tabpanel' : undefined}
+        aria-labelledby={onChangeGrouping ? activeTabId : undefined}
+        className="min-h-0 flex-1 overflow-auto"
+      >
+        <ul className="list-none px-1.5 pb-3">
+          {grouping === 'schema' ? (
+            filteredTables.length > 0 && (
+              <Group title={t('ws.tables')} count={filteredTables.length}>
+                {filteredTables.map((node) => renderTableNode(node, 0))}
               </Group>
-            ),
-        )}
-        {q && filteredTables.length === 0 && otherGroups.every((g) => !g.items.length) && (
-          <li className="px-2 py-4 text-center text-sm text-text-3">{t('ws.noMatch')}</li>
-        )}
-      </ul>
+            )
+          ) : (
+            <>
+              {sectionBuckets.list.map(
+                ({ section, nodes }) =>
+                  (!q || nodes.length > 0) && (
+                    <Group
+                      key={section.id}
+                      title={section.name}
+                      dotColor={sectionColorCssVar(section.color)}
+                      count={nodes.length}
+                    >
+                      {nodes.length > 0 ? (
+                        nodes.map((node) => renderTableNode(node, 0))
+                      ) : (
+                        <li className="px-5 py-1 text-xs text-text-3">{t('sec.emptySection')}</li>
+                      )}
+                    </Group>
+                  ),
+              )}
+              {sectionBuckets.unassignedNodes.length > 0 && (
+                <Group
+                  title={t('sec.unassigned')}
+                  dotColor="var(--border-strong)"
+                  count={sectionBuckets.unassignedNodes.length}
+                >
+                  {sectionBuckets.unassignedNodes.map((node) => renderTableNode(node, 0))}
+                </Group>
+              )}
+            </>
+          )}
+          {otherGroups.map(
+            (g) =>
+              (g.items.length > 0 || (g.showEmpty && !q)) && (
+                <Group key={g.title} title={g.title} count={g.items.length} action={g.action}>
+                  {g.items.map((i) => (
+                    <Item
+                      key={i.id}
+                      label={i.label}
+                      icon={i.icon}
+                      hint={i.hint}
+                      active={i.id === selected}
+                      onClick={() => onSelect(i.id)}
+                    />
+                  ))}
+                </Group>
+              ),
+          )}
+          {q &&
+            (grouping === 'schema' ? filteredTables.length === 0 : !hasSectionMatch) &&
+            otherGroups.every((g) => !g.items.length) && (
+              <li className="px-2 py-4 text-center text-sm text-text-3">{t('ws.noMatch')}</li>
+            )}
+        </ul>
+      </div>
     </nav>
   );
 };

@@ -1,7 +1,7 @@
 // 模型页：顶栏 + 画布 / SQL + 属性面板 + 状态栏（DESIGN.md：Layout）。
 // 对象树在应用外壳的侧面板里（由这里通过 useShellPanel 提供），属性面板默认按需出现、可固定。
-import type { EnvInfo, VersionInfo } from '@dowel/api';
-import { createAll, formatScript, newId } from '@dowel/core';
+import type { CanvasSection, EnvInfo, VersionInfo } from '@dowel/api';
+import { all, createAll, formatScript, newId } from '@dowel/core';
 import { useQuery, useQueryClient } from '@tanstack/react-query';
 import { Link } from '@tanstack/react-router';
 import {
@@ -28,6 +28,7 @@ import { Canvas } from '../components/Canvas.tsx';
 import { CanvasHistory } from '../components/CanvasHistory.tsx';
 import { ImportDialog, MigrationDialog, VersionDialog } from '../components/Dialogs.tsx';
 import { Inspector } from '../components/Inspector.tsx';
+import { SectionDialog } from '../components/SectionDialog.tsx';
 import { PageHeader, useNarrow, useShellPanel } from '../components/Shell.tsx';
 import { Sidebar } from '../components/Sidebar.tsx';
 import { SqlView } from '../components/SqlView.tsx';
@@ -37,9 +38,21 @@ import { Avatar, IconButton, peerColor } from '../components/ui.tsx';
 import { clearTables, SELECT_TABLE_EVENT, setCurrentTables } from '../current-tables.ts';
 import { dialectUiSpec } from '../dialects.ts';
 import { useProject } from '../project.tsx';
+import {
+  buildCanvasGroups,
+  type CanvasViewMode,
+  type CanvasViewPrefs,
+  collectNeighborhood,
+  effectiveCanvasMode,
+  type FocusState,
+  readCanvasViewPrefs,
+  resolveTopLevelTableId,
+  type SidebarGrouping,
+  writeCanvasViewPrefs,
+} from '../sections.ts';
 import { useWorkspace } from '../workspace.ts';
 
-type DialogKey = 'import' | 'publish' | 'migration' | 'history' | null;
+type DialogKey = 'import' | 'publish' | 'migration' | 'history' | 'sections' | null;
 
 /** 属性面板的固定状态存在 localStorage（DESIGN.md：Layout） */
 const PIN_KEY = 'dowel.inspector';
@@ -59,12 +72,29 @@ export const Model = () => {
     queryKey: ['versions', pid],
     queryFn: () => api<VersionInfo[]>('GET', `/api/projects/${pid}/versions`),
   });
-  const { ws, model, status, pending, layout, peers, role: liveRole } = useWorkspace(pid, toast);
+  const { ws, model, status, pending, layout, sections, peers, role: liveRole } = useWorkspace(pid, toast);
   const [selected, setSelected] = useState<string | null>(null);
   const [tab, setTab] = useState<'canvas' | 'sql'>('canvas');
   const [dialog, setDialog] = useState<DialogKey>(null);
+  const [sectionDialogMode, setSectionDialogMode] = useState<'manage' | 'suggest'>('manage');
   const [relayout, setRelayout] = useState(0);
   const [pinned, setPinned] = useState(readPinned);
+  const [viewPrefs, setViewPrefs] = useState<CanvasViewPrefs>(() => readCanvasViewPrefs(pid));
+  const [prevPid, setPrevPid] = useState(pid);
+  if (pid !== prevPid) {
+    setPrevPid(pid);
+    setViewPrefs(readCanvasViewPrefs(pid));
+  }
+  const updateViewPrefs = useCallback(
+    (updater: (prev: CanvasViewPrefs) => CanvasViewPrefs) => {
+      setViewPrefs((prev) => {
+        const next = updater(prev);
+        writeCanvasViewPrefs(pid, next);
+        return next;
+      });
+    },
+    [pid],
+  );
   const narrow = useNarrow();
   // WebSocket 推来的角色（成员 / 授权变动后即时生效）优先于页面加载时的角色
   const role = liveRole ?? project.role;
@@ -102,16 +132,131 @@ export const Model = () => {
     }
   }, [model.objects, readOnly, uiSpec.defaultSchema, uiSpec.sequences, ws]);
 
+  const openSectionManager = useCallback((mode: 'manage' | 'suggest' = 'manage') => {
+    setSectionDialogMode(mode);
+    setDialog('sections');
+  }, []);
+
+  const setSidebarGrouping = useCallback(
+    (sidebarGrouping: SidebarGrouping) => updateViewPrefs((prev) => ({ ...prev, sidebarGrouping })),
+    [updateViewPrefs],
+  );
+
+  const setCanvasViewMode = useCallback(
+    (viewMode: CanvasViewMode) => updateViewPrefs((prev) => ({ ...prev, viewMode })),
+    [updateViewPrefs],
+  );
+
+  const toggleExpandedGroup = useCallback(
+    (groupId: string) =>
+      updateViewPrefs((prev) => ({
+        ...prev,
+        expandedGroups: prev.expandedGroups.includes(groupId)
+          ? prev.expandedGroups.filter((g) => g !== groupId)
+          : [...prev.expandedGroups, groupId],
+      })),
+    [updateViewPrefs],
+  );
+
+  const collapseAllGroups = useCallback(
+    () => updateViewPrefs((prev) => ({ ...prev, expandedGroups: [] })),
+    [updateViewPrefs],
+  );
+
+  const setFocusState = useCallback(
+    (focus: FocusState | null) => updateViewPrefs((prev) => ({ ...prev, focus })),
+    [updateViewPrefs],
+  );
+
+  const exitFocus = useCallback(() => setFocusState(null), [setFocusState]);
+
+  const focusTable = useCallback(
+    (tableId: string) => {
+      const topId = resolveTopLevelTableId(model, tableId) ?? tableId;
+      setSelected(tableId);
+      updateViewPrefs((prev) => ({
+        ...prev,
+        focus: { tableId: topId, hops: prev.focus?.hops ?? 1 },
+      }));
+    },
+    [model, updateViewPrefs],
+  );
+
+  const topTableCount = useMemo(() => all(model, 'table').filter((tb) => !tb.partitionOf).length, [model]);
+
+  // 选中对象时若在汇总折叠视图下自动展开所属板块，若在聚焦模式外则切到以它为中心的邻域，确保画布可见
+  const handleSelectObject = useCallback(
+    (id: string | null) => {
+      setSelected(id);
+      if (!id) return;
+      const topId = resolveTopLevelTableId(model, id);
+      if (!topId) return;
+      if (viewPrefs.focus) {
+        const nbrs = collectNeighborhood(model, viewPrefs.focus.tableId, viewPrefs.focus.hops);
+        if (!nbrs.has(topId)) {
+          updateViewPrefs((prev) => ({
+            ...prev,
+            focus: { tableId: topId, hops: prev.focus?.hops ?? 1 },
+          }));
+        }
+        return;
+      }
+      if (effectiveCanvasMode(viewPrefs.viewMode, topTableCount) === 'sections') {
+        const { tableToGroup } = buildCanvasGroups(model, sections);
+        const gid = tableToGroup.get(topId);
+        if (gid && !viewPrefs.expandedGroups.includes(gid)) {
+          updateViewPrefs((prev) =>
+            prev.expandedGroups.includes(gid)
+              ? prev
+              : { ...prev, expandedGroups: [...prev.expandedGroups, gid] },
+          );
+        }
+      }
+    },
+    [
+      model,
+      sections,
+      topTableCount,
+      updateViewPrefs,
+      viewPrefs.expandedGroups,
+      viewPrefs.focus,
+      viewPrefs.viewMode,
+    ],
+  );
+
   // 对象树放在应用外壳的侧面板里；选中项变化时更新
   useShellPanel(
     t('ws.objects'),
     <Sidebar
       model={model}
       selected={selected}
-      onSelect={setSelected}
+      onSelect={handleSelectObject}
       onAddSequence={!readOnly && uiSpec.sequences ? newSequence : undefined}
+      sections={sections}
+      grouping={viewPrefs.sidebarGrouping}
+      onChangeGrouping={setSidebarGrouping}
+      readOnly={readOnly}
+      onOpenSectionManager={openSectionManager}
+      onFocusTable={focusTable}
+      onExitFocus={exitFocus}
+      focusedTableId={viewPrefs.focus?.tableId ?? null}
     />,
-    [model, selected, t, readOnly, uiSpec.sequences, newSequence],
+    [
+      model,
+      selected,
+      handleSelectObject,
+      t,
+      readOnly,
+      uiSpec.sequences,
+      newSequence,
+      sections,
+      viewPrefs.sidebarGrouping,
+      setSidebarGrouping,
+      openSectionManager,
+      focusTable,
+      exitFocus,
+      viewPrefs.focus?.tableId,
+    ],
   );
 
   // 命令面板要能搜到当前模型里的表：把表清单登记到一个模块级的小注册表（离开模型页时清空）
@@ -122,10 +267,10 @@ export const Model = () => {
 
   // 命令面板选中一张表：直接在当前画布上选中它
   useEffect(() => {
-    const onSelect = (e: Event) => setSelected((e as CustomEvent<string>).detail);
+    const onSelect = (e: Event) => handleSelectObject((e as CustomEvent<string>).detail);
     window.addEventListener(SELECT_TABLE_EVENT, onSelect);
     return () => window.removeEventListener(SELECT_TABLE_EVENT, onSelect);
-  }, []);
+  }, [handleSelectObject]);
 
   // Esc 取消选中：属性面板按需时随之消失。编辑中的输入框、对话框里的 Esc 留给它们自己。
   useEffect(() => {
@@ -160,6 +305,12 @@ export const Model = () => {
     }
   }, [model, tab, project.targetPgMajor]);
   const onMove = useCallback((l: Parameters<typeof ws.move>[0]) => !readOnly && ws.move(l), [ws, readOnly]);
+  const onSetSections = useCallback(
+    (next: CanvasSection[]) => {
+      if (!readOnly) ws.setSections(next);
+    },
+    [ws, readOnly],
+  );
   const close = () => setDialog(null);
   const people = useMemo(() => {
     const names = [...new Set(peers.map((p) => p.user))];
@@ -352,9 +503,18 @@ export const Model = () => {
                     model={model}
                     layout={layout}
                     selected={selected}
-                    onSelect={setSelected}
+                    onSelect={handleSelectObject}
                     onMove={onMove}
                     relayout={relayout}
+                    sections={sections}
+                    viewMode={viewPrefs.viewMode}
+                    expandedGroups={viewPrefs.expandedGroups}
+                    onToggleGroup={toggleExpandedGroup}
+                    onCollapseAllGroups={collapseAllGroups}
+                    focus={viewPrefs.focus}
+                    onChangeFocus={setFocusState}
+                    onChangeViewMode={setCanvasViewMode}
+                    readOnly={readOnly}
                   />
                 </div>
               ) : (
@@ -376,7 +536,19 @@ export const Model = () => {
                 : 'flex w-[var(--inspector-w)] shrink-0 flex-col border-l border-border bg-panel max-[1279px]:w-[300px]'
             }
           >
-            <Inspector selected={selected} ws={ws} model={model} readOnly={readOnly} onSelect={setSelected} />
+            <Inspector
+              selected={selected}
+              ws={ws}
+              model={model}
+              readOnly={readOnly}
+              onSelect={handleSelectObject}
+              sections={sections}
+              onSetSections={onSetSections}
+              onOpenSectionManager={() => openSectionManager('manage')}
+              focusedTableId={viewPrefs.focus?.tableId ?? null}
+              onFocusTable={focusTable}
+              onExitFocus={exitFocus}
+            />
           </aside>
         )}
       </main>
@@ -413,6 +585,15 @@ export const Model = () => {
         onClose={close}
         readOnly={readOnly}
         layout={layout}
+      />
+      <SectionDialog
+        open={dialog === 'sections'}
+        initialMode={sectionDialogMode}
+        onClose={close}
+        model={model}
+        sections={sections}
+        readOnly={readOnly}
+        onSaveSections={onSetSections}
       />
     </>
   );

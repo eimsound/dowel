@@ -13,6 +13,7 @@ import {
 
 export * from './policy.ts';
 export * from './requests.ts';
+export * from './sections.ts';
 export * from './tokens.ts';
 export * from './webhooks.ts';
 
