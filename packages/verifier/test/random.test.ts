@@ -17,6 +17,7 @@ import { expect, test } from 'vitest';
 
 import { PG_URL, useTestDb } from '../../../test/pg.ts';
 import { build, resetShadow, verify, verifyScripts } from '../src/index.ts';
+import { assertWithBoundedShrink } from './fc-helpers.ts';
 import { makeVersions, versions } from './gen.ts';
 
 const conn = useTestDb('random');
@@ -25,6 +26,8 @@ const target = useTestDb('random_target');
 const RUNS = Number(process.env.RUNS ?? 100);
 // 经由执行器的那条：默认最多 30 轮（每轮要建两个库），想深挖时用 EXEC_RUNS 单独调大
 const EXEC_RUNS = Number(process.env.EXEC_RUNS ?? Math.min(RUNS, 30));
+const TIME_LIMIT = Number(process.env.TIME_LIMIT ?? 180_000);
+const SHRINK_TIME_LIMIT = Number(process.env.SHRINK_TIME_LIMIT ?? 120_000);
 
 const queryPgMajor = async (db: Db): Promise<number> => {
   const [{ v }] = (await db.query<{ v: number }>(
@@ -38,7 +41,7 @@ test.skipIf(!PG_URL)(
   async () => {
     const db = conn();
     const pgMajor = await queryPgMajor(db);
-    await fc.assert(
+    await assertWithBoundedShrink(
       fc.asyncProperty(versions, async (vs) => {
         const { v1, v2 } = makeVersions(vs, { pgMajor });
         expect(validate(v1)).toEqual([]);
@@ -53,14 +56,13 @@ test.skipIf(!PG_URL)(
       {
         numRuns: RUNS,
         seed: process.env.SEED ? Number(process.env.SEED) : undefined,
-        // 整个属性测试（跑用例 + 缩小反例）的总时限，超时算失败；防止失败后的缩小过程卡住很久。
-        // CI 上 5000 例正常要 8～10 分钟，时限要留够余量（见 ci.yml）
-        interruptAfterTimeLimit: Number(process.env.TIME_LIMIT ?? 180_000),
-        markInterruptAsFailure: true,
+        // 仅用于常规模糊测试（遭遇首例失败即停），缩小反例另受 SHRINK_TIME_LIMIT 独立约束
+        timeLimitMs: TIME_LIMIT,
+        shrinkTimeLimitMs: SHRINK_TIME_LIMIT,
       },
     );
   },
-  60_000 + RUNS * 1_000,
+  Math.max(TIME_LIMIT, 60_000 + RUNS * 1_000) + SHRINK_TIME_LIMIT + 30_000,
 );
 
 // 发布时冻结的脚本：plan() 的输出经 toScriptSteps 冻结，之后执行的是这份文本而不是重新规划。
@@ -70,7 +72,7 @@ test.skipIf(!PG_URL)(
   async () => {
     const db = conn();
     const pgMajor = await queryPgMajor(db);
-    await fc.assert(
+    await assertWithBoundedShrink(
       fc.asyncProperty(versions, async (vs) => {
         const { v1, v2 } = makeVersions(vs, { pgMajor });
         const up = toScriptSteps(plan(v1, v2));
@@ -84,12 +86,12 @@ test.skipIf(!PG_URL)(
       {
         numRuns: Math.min(RUNS, 50),
         seed: process.env.SEED ? Number(process.env.SEED) : undefined,
-        interruptAfterTimeLimit: Math.min(Number(process.env.TIME_LIMIT ?? 180_000), 90_000),
-        markInterruptAsFailure: true,
+        timeLimitMs: Math.min(TIME_LIMIT, 90_000),
+        shrinkTimeLimitMs: Math.min(SHRINK_TIME_LIMIT, 60_000),
       },
     );
   },
-  60_000 + 50 * 1_000,
+  60_000 + 50 * 1_000 + Math.min(SHRINK_TIME_LIMIT, 60_000) + 30_000,
 );
 
 // 经由执行器 + 历史表（P4b）：发布时冻结的脚本放进版本链，在一个真正的“目标库”上由执行器逐个执行（v1 → v2）、
@@ -126,7 +128,7 @@ test.skipIf(!PG_URL)(
         scope: null,
       };
     };
-    await fc.assert(
+    await assertWithBoundedShrink(
       fc.asyncProperty(versions, async (vs) => {
         const { v1, v2 } = makeVersions(vs, { pgMajor });
         const models = [await canon(v1), await canon(v2)];
@@ -212,13 +214,10 @@ test.skipIf(!PG_URL)(
       {
         numRuns: EXEC_RUNS,
         seed: process.env.SEED ? Number(process.env.SEED) : undefined,
-        interruptAfterTimeLimit: Math.min(
-          Number(process.env.TIME_LIMIT ?? 180_000),
-          90_000 + EXEC_RUNS * 1_500,
-        ),
-        markInterruptAsFailure: true,
+        timeLimitMs: Math.min(TIME_LIMIT, 90_000 + EXEC_RUNS * 1_500),
+        shrinkTimeLimitMs: Math.min(SHRINK_TIME_LIMIT, 60_000),
       },
     );
   },
-  120_000 + EXEC_RUNS * 2_000,
+  120_000 + EXEC_RUNS * 2_000 + Math.min(SHRINK_TIME_LIMIT, 60_000) + 30_000,
 );
