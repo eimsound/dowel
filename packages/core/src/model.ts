@@ -76,6 +76,22 @@ export const partitionDescendants = (m: Model, parentId: string): Table[] => {
   return out;
 };
 
+/** 某分区子表的全部严格祖先分区表（按由近及远顺序，不含自身；带环保护） */
+export const partitionAncestors = (m: Model, tableId: string): Table[] => {
+  const out: Table[] = [];
+  const seen = new Set<string>([tableId]);
+  const self = m.objects[tableId];
+  let cur = self?.kind === 'table' && self.partitionOf ? self.partitionOf.parent : null;
+  while (cur && !seen.has(cur)) {
+    seen.add(cur);
+    const t = m.objects[cur];
+    if (t?.kind !== 'table') break;
+    out.push(t);
+    cur = t.partitionOf?.parent ?? null;
+  }
+  return out;
+};
+
 /** 表的分区深度：普通表和根分区父表为 0，一级子分区为 1，二级子分区为 2，以此类推 */
 export const partitionDepth = (m: Model, tableId: string): number => {
   const seen = new Set<string>();

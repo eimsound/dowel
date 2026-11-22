@@ -77,7 +77,7 @@ jobs:
                   code=true
                   ;;
                 # PG 单方言纯测试（不含跨方言源码导入）
-                packages/core/test/partition* | packages/core/test/pg-* | packages/engines/test/roundtrip* | packages/engines/test/pagila* | packages/engines/test/naming* | packages/verifier/test/random.test.ts | packages/verifier/test/gen.ts | packages/verifier/test/debug.test.ts | packages/verifier/test/partition.test.ts | packages/verifier/test/pg-matrix.test.ts | packages/verifier/test/analyze.test.ts | packages/verifier/test/stats.test.ts)
+                packages/core/test/partition* | packages/core/test/pg-* | packages/engines/test/roundtrip* | packages/engines/test/pagila* | packages/engines/test/naming* | packages/verifier/test/random.test.ts | packages/verifier/test/fc-helpers.ts | packages/verifier/test/bounded-shrink.test.ts | packages/verifier/test/gen.ts | packages/verifier/test/debug.test.ts | packages/verifier/test/partition.test.ts | packages/verifier/test/pg-matrix.test.ts | packages/verifier/test/analyze.test.ts | packages/verifier/test/stats.test.ts)
                   code=true
                   pg=true
                   ;;
@@ -301,8 +301,10 @@ jobs:
       - run: pnpm vitest run packages/verifier/test/random.test.ts packages/engines/test/naming.test.ts
         env:
           RUNS: '5000'
-          # 整个属性测试（含缩小反例）的总时限：5000 例正常 8～10 分钟，留到 30 分钟
+          # 主模糊测试阶段时限（遭遇首例失败即停）：5000 例正常 8～10 分钟，留到 30 分钟
           TIME_LIMIT: '1800000'
+          # 失败后独立缩小反例的时限：上限 2 分钟，避免单次失败后 shrink 耗尽剩余时间
+          SHRINK_TIME_LIMIT: '120000'
 
   e2e:
     name: 端到端测试
