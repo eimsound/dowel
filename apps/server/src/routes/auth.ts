@@ -53,21 +53,21 @@ export const registerAuth = (app: Hono<Env>, ctx: AppContext) => {
     if (!isEmailConfiguredAndEnabled(stored)) {
       throw new HTTPException(422, { message: '实例尚未启用邮件服务，请联系管理员重置密码' });
     }
+    const origin = expectedOrigin(c, ctx.security);
+    if (!origin) {
+      throw new HTTPException(422, { message: '无法确定对外访问地址，请设置 DOWEL_PUBLIC_URL' });
+    }
+    const smtpConfig = resolveSmtpConfig(stored);
     const ip = clientIp(c, ctx.security);
     const gate = ctx.forgotPasswordLimiter.attempt(ip, b.email);
     if (!gate.allowed) {
       c.header('Retry-After', String(gate.retryAfterSeconds));
       return c.json<ApiErrorBody>({ error: '密码重置请求过于频繁，请稍后再试' }, 429);
     }
-    const origin = expectedOrigin(c, ctx.security);
-    if (!origin) {
-      throw new HTTPException(422, { message: '无法确定对外访问地址，请设置 DOWEL_PUBLIC_URL' });
-    }
-    const smtpConfig = resolveSmtpConfig(stored);
 
-    // 防邮箱枚举：无论邮箱是否存在或用户是否停用，对外统一返回 { ok: true }
+    // 防邮箱枚举：无论邮箱是否存在、是否停用或为纯 OIDC 无密码账户，对外统一返回 { ok: true }
     const user = await userByEmail(db, b.email);
-    if (!user || user.status !== 'active') {
+    if (!user || user.status !== 'active' || !user.hasPassword) {
       return c.json<Ok>({ ok: true });
     }
 

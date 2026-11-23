@@ -102,8 +102,9 @@ const formatAddressHeader = (name: string, address: string): string => {
   const trimmedName = name.trim();
   if (!trimmedName) return `<${address}>`;
   assertHeaderSafe(trimmedName, '发件人名称');
-  if (/^[A-Za-z0-9 _.-]+$/.test(trimmedName)) {
-    return `"${trimmedName}" <${address}>`;
+  if (/^[\x20-\x7e]+$/.test(trimmedName)) {
+    const escaped = trimmedName.replaceAll('\\', '\\\\').replaceAll('"', '\\"');
+    return `"${escaped}" <${address}>`;
   }
   return `${encodeHeaderValue(trimmedName)} <${address}>`;
 };

@@ -386,14 +386,32 @@ describe.each([
         adminCookie,
       );
 
-      // 2. 防枚举：不存在的邮箱和停用用户均返回 200 且不发信
+      // 2. 防枚举：不存在的邮箱、停用用户与纯 OIDC 无密码用户均返回 200 且不发信、不生成重置令牌
+      expect(
+        (
+          await call(
+            'POST',
+            '/api/admin/users',
+            { username: 'oidc-only', name: 'OIDC Only', email: 'oidc@example.com' },
+            adminCookie,
+          )
+        ).status,
+      ).toBe(201);
       expect((await call('POST', '/api/auth/forgot-password', { email: 'nobody@example.com' })).status).toBe(
         200,
       );
       expect((await call('POST', '/api/auth/forgot-password', { email: 'blocked@example.com' })).status).toBe(
         200,
       );
+      expect((await call('POST', '/api/auth/forgot-password', { email: 'oidc@example.com' })).status).toBe(
+        200,
+      );
       expect(smtp.captured).toHaveLength(0);
+      expect(
+        await db.query<{ id: string }>(
+          "select id from invites where kind = 'reset' and used_at is null and revoked_at is null",
+        ),
+      ).toHaveLength(0);
 
       // 3. 活跃用户先有个老会话和老 reset 令牌
       const aliceSession = (await call('POST', '/api/auth/login', { username: 'alice', password: PASSWORD }))
@@ -441,10 +459,20 @@ describe.each([
       expect(failedAudit!.data.delivered).toBe(false);
       smtp.setFailOnData(null);
 
-      // 5. 限流测试（重启注入 limit=1）
+      // 5. 限流测试（共享 limit=1 限流器：先验证本地 422 不消耗限流配额，恢复有效 publicUrl 后首次 200、第二次 429）
+      const sharedLimiter = new LoginLimiter({ limit: 1, ipLimit: 10, windowMs: 60_000 });
       await stop();
       await boot({
-        forgotPasswordLimiter: new LoginLimiter({ limit: 1, ipLimit: 10, windowMs: 60_000 }),
+        forgotPasswordLimiter: sharedLimiter,
+        loginLimiter: new LoginLimiter({ limit: 10_000, ipLimit: 10_000 }),
+        security: { publicUrl: 'not-a-url' },
+      });
+      expect((await call('POST', '/api/auth/forgot-password', { email: 'alice@example.com' })).status).toBe(
+        422,
+      );
+      await stop();
+      await boot({
+        forgotPasswordLimiter: sharedLimiter,
         loginLimiter: new LoginLimiter({ limit: 10_000, ipLimit: 10_000 }),
         security: { publicUrl: 'https://dowel.example.com' },
       });

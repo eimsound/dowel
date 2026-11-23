@@ -570,5 +570,19 @@ describe('原生 SMTP 客户端', () => {
     );
     expect(mime).toContain('MIME-Version: 1.0');
     expect(mime).toContain('Content-Type: multipart/alternative; boundary="');
+
+    const specialAsciiMime = buildMimeMessage(
+      baseConfig(25, { fromName: 'Dowel, Ops "Prod" \\ Team (CN)' }),
+      { to: 'u@b.com', subject: 'hi', text: 't', html: '<p>t</p>' },
+      'localhost',
+    );
+    expect(specialAsciiMime).toContain('From: "Dowel, Ops \\"Prod\\" \\\\ Team (CN)" <noreply@example.com>');
+
+    const utf8NameMime = buildMimeMessage(
+      baseConfig(25, { fromName: 'Dowel 平台' }),
+      { to: 'u@b.com', subject: 'hi', text: 't', html: '<p>t</p>' },
+      'localhost',
+    );
+    expect(utf8NameMime).toMatch(/^From: =\?UTF-8\?B\?[^\r\n]+\?= <noreply@example\.com>/m);
   });
 });
