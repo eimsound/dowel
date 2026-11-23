@@ -239,6 +239,12 @@ export const Invite = () => {
     queryFn: () => api<InviteInfo>('GET', `/api/invites/${token}`),
   });
   const [form, setForm] = useState({ username: '', name: '', email: '', password: '' });
+  const emailTouched = useRef(false);
+  useEffect(() => {
+    if (info.data?.email && !emailTouched.current) {
+      setForm((prev) => ({ ...prev, email: info.data!.email! }));
+    }
+  }, [info.data?.email]);
   const run = useMutation({
     mutationFn: () => api<Me>('POST', `/api/invites/${token}/accept`, form),
     onSuccess: (me) => {
@@ -246,8 +252,10 @@ export const Invite = () => {
       void nav({ to: '/' });
     },
   });
-  const set = (k: keyof typeof form) => (e: React.ChangeEvent<HTMLInputElement>) =>
+  const set = (k: keyof typeof form) => (e: React.ChangeEvent<HTMLInputElement>) => {
+    if (k === 'email') emailTouched.current = true;
     setForm({ ...form, [k]: e.target.value });
+  };
   const name = info.data?.instanceName ?? t('app.name');
   const message = info.data ? stateMessage(info.data.state, t) : '';
 
@@ -301,9 +309,13 @@ export const Invite = () => {
               <input
                 className="input"
                 type="email"
+                name="email"
                 value={form.email}
                 onChange={set('email')}
                 autoComplete="email"
+                autoCapitalize="none"
+                autoCorrect="off"
+                spellCheck={false}
               />
             </label>
             <label className="field">
@@ -344,6 +356,92 @@ export const Invite = () => {
               ))}
             </div>
           )}
+        </>
+      )}
+    </AuthShell>
+  );
+};
+
+export const ForgotPassword = () => {
+  const { t } = useTranslation();
+  const nav = useNavigate();
+  const instance = useInstance();
+  const [email, setEmail] = useState('');
+  const run = useMutation({
+    mutationFn: () => api<Ok>('POST', '/api/auth/forgot-password', { email }),
+  });
+  const passwordDisabled = instance.data ? !instance.data.passwordLogin : false;
+  const emailDisabled = instance.data ? !instance.data.emailEnabled : false;
+  const name = instance.data?.name ?? t('app.name');
+
+  return (
+    <AuthShell name={name} tagline={t('app.tagline')} title={t('account.forgotTitle')}>
+      {passwordDisabled ? (
+        <>
+          <Banner kind="warn">{t('account.passwordLoginOff')}</Banner>
+          <button type="button" className="btn w-full" onClick={() => void nav({ to: '/login' })}>
+            {t('account.goLogin')}
+          </button>
+        </>
+      ) : emailDisabled ? (
+        <>
+          <Banner kind="warn">{t('account.forgotDisabled')}</Banner>
+          <button type="button" className="btn w-full" onClick={() => void nav({ to: '/login' })}>
+            {t('account.goLogin')}
+          </button>
+        </>
+      ) : run.isSuccess ? (
+        <>
+          <Banner kind="ok" role="status">
+            {t('account.forgotSent')}
+          </Banner>
+          <button type="button" className="btn primary w-full" onClick={() => void nav({ to: '/login' })}>
+            {t('account.goLogin')}
+          </button>
+        </>
+      ) : (
+        <>
+          <p className="text-sm text-text-2">{t('account.forgotHint')}</p>
+          <form
+            className="space-y-3.5"
+            aria-label={t('account.forgotTitle')}
+            onSubmit={(e) => {
+              e.preventDefault();
+              run.mutate();
+            }}
+          >
+            <label className="field">
+              <span className="label">{t('account.forgotEmail')}</span>
+              <input
+                className="input"
+                type="email"
+                name="email"
+                value={email}
+                onChange={(e) => setEmail(e.target.value)}
+                required
+                autoComplete="email"
+                autoCapitalize="none"
+                autoCorrect="off"
+                spellCheck={false}
+              />
+            </label>
+            {run.error && (
+              <Banner kind="danger" role="alert">
+                {run.error.message}
+              </Banner>
+            )}
+            <button
+              type="submit"
+              className="btn primary w-full"
+              disabled={run.isPending}
+              aria-busy={run.isPending}
+            >
+              {t('account.forgotSubmit')}
+            </button>
+          </form>
+          <button type="button" className="btn ghost w-full" onClick={() => void nav({ to: '/login' })}>
+            {t('account.goLogin')}
+          </button>
         </>
       )}
     </AuthShell>

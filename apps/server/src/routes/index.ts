@@ -51,6 +51,8 @@ export const registerRoutes = (app: Hono<Env>, ctx: AppContext) => {
   app.use('/api/admin/*', requireUser(ctx.db));
   for (const [path, action] of [
     ['/api/admin/settings', 'instance.manage_settings'],
+    ['/api/admin/email', 'instance.manage_settings'],
+    ['/api/admin/email/*', 'instance.manage_settings'],
     ['/api/admin/users', 'instance.manage_users'],
     ['/api/admin/users/*', 'instance.manage_users'],
     ['/api/admin/invites', 'instance.invite'],

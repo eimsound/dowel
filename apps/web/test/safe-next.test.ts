@@ -1,7 +1,7 @@
 // 登录后跳转校验的单元测试：用例与服务端 safeNext 相同（apps/server/test/oidc.test.ts）。
 import { expect, test } from 'vitest';
 
-import { safeNext } from '../src/safe-next.ts';
+import { AUTH_NEXT_EXCLUDES, safeNext, safeNextPath } from '../src/safe-next.ts';
 
 const ORIGIN = 'http://dowel.invalid';
 
@@ -19,4 +19,6 @@ test('next 规范化后校验，非法值回退到 /', () => {
   // 同 origin 的绝对地址规范化后仍指向站内，允许
   expect(safeNext(`${ORIGIN}/a/b`, ORIGIN)).toBe('/a/b');
   expect(safeNext(undefined)).toBeNull();
+  expect(safeNextPath('/forgot-password', AUTH_NEXT_EXCLUDES, ORIGIN)).toBe('/');
+  expect(safeNextPath('/login?next=/', AUTH_NEXT_EXCLUDES, ORIGIN)).toBe('/');
 });

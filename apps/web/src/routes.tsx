@@ -16,7 +16,7 @@ import { useTranslation } from 'react-i18next';
 
 import { ApiError, api } from './api.ts';
 import { AppShell } from './components/Shell.tsx';
-import { ChangePassword, Invite, OidcConfirm, Reset } from './pages/Account.tsx';
+import { ChangePassword, ForgotPassword, Invite, OidcConfirm, Reset } from './pages/Account.tsx';
 import {
   AccountIdentities,
   AccountLayout,
@@ -52,8 +52,8 @@ import { ProjectProvider } from './project.tsx';
 import { AUTH_NEXT_EXCLUDES, safeNextPath } from './safe-next.ts';
 import { fetchMe, useMe } from './session.ts';
 
-/** 不需要登录的页面（登录、邀请、重置、OIDC 首次开户确认） */
-const PUBLIC = ['/login', '/invite/', '/reset/', '/oidc/confirm'];
+/** 不需要登录的页面（登录、忘记密码、邀请、重置、OIDC 首次开户确认） */
+const PUBLIC = ['/login', '/forgot-password', '/invite/', '/reset/', '/oidc/confirm'];
 const isPublic = (path: string) => PUBLIC.some((p) => path === p || path.startsWith(p));
 
 const rootRoute = createRootRoute({
@@ -360,6 +360,7 @@ const adminRoute = createRoute({
 
 const routes = [
   loginRoute,
+  createRoute({ getParentRoute: () => rootRoute, path: '/forgot-password', component: ForgotPassword }),
   changePasswordRoute,
   createRoute({
     getParentRoute: () => rootRoute,

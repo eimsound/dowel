@@ -3,7 +3,7 @@
 // 没有注册入口：注册只能通过邀请（02-consensus.md 11.1）。
 import type { Me } from '@dowel/api';
 import { useMutation } from '@tanstack/react-query';
-import { useNavigate, useRouterState, useSearch } from '@tanstack/react-router';
+import { Link, useNavigate, useRouterState, useSearch } from '@tanstack/react-router';
 import { useState } from 'react';
 import { useTranslation } from 'react-i18next';
 
@@ -104,6 +104,11 @@ export const Login = () => {
           {t('auth.login')}
         </button>
       </form>
+      {instance.data?.passwordLogin && instance.data?.emailEnabled && (
+        <Link to="/forgot-password" className="btn ghost w-full">
+          {t('auth.forgotPassword')}
+        </Link>
+      )}
       {providers.length > 0 && (
         <div className="space-y-2 border-t border-border pt-3.5">
           {providers.map((p) => (

@@ -69,3 +69,19 @@ test('服务端 audit-coverage 覆盖的全部审计动作在 zh / en 词典中�
     }
   }
 });
+
+test('邮件服务与找回密码审计动作在中英文下正确渲染', async () => {
+  await i18n.changeLanguage('zh');
+  expect(actionText('email.settings_update', {})).toBe('修改了邮件服务（SMTP）配置');
+  expect(actionText('email.test', { to: 'ops@example.com' })).toBe('发送了测试邮件至 ops@example.com');
+  expect(actionText('auth.forgot_password_request', { username: 'alice' })).toBe(
+    '发起了找回密码请求（用户 alice）',
+  );
+
+  await i18n.changeLanguage('en');
+  expect(actionText('email.settings_update', {})).toBe('updated SMTP email settings');
+  expect(actionText('email.test', { to: 'ops@example.com' })).toBe('sent a test email to ops@example.com');
+  expect(actionText('auth.forgot_password_request', { username: 'alice' })).toBe(
+    'requested a password reset for alice',
+  );
+});

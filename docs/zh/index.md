@@ -17,7 +17,7 @@ flowchart LR
 ### 部署与初始化 {#entry-deploy}
 
 - [上手指南](getting-started.md)：Docker Compose 启动、初始化管理员、四步向导建项目与最小验证执行闭环。
-- [部署与配置](deployment.md)：22 项服务端环境变量、源码构建、外部 PostgreSQL 多副本高可用（无 Redis）、反向代理与连接白名单。
+- [部署与配置](deployment.md)：27 项服务端环境变量、源码构建、外部 PostgreSQL 多副本高可用（无 Redis）、反向代理与连接白名单。
 - [账户、OIDC 与权限](accounts-and-access.md)：用户与邀请、Google/GitLab/通用 OIDC、组与项目授权、审计日志与个人设置。
 
 ### 建模与多方言 {#entry-modeling}

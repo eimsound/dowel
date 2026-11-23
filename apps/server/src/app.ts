@@ -13,10 +13,13 @@ import { EventBus, type EventBusOptions } from './bus.ts';
 import type { PlatformDb } from './db.ts';
 import { OpaqueRefresher } from './derive.ts';
 import { DriftScheduler } from './drift-scheduler.ts';
+import { defaultMailer, type Mailer } from './email.ts';
 import { EnvLocks, type ExecContext } from './executions.ts';
 import { HaCoordinator, type HaCoordinatorOptions } from './ha.ts';
 import {
   connectionLimiterFromEnv,
+  emailTestLimiterFromEnv,
+  forgotPasswordLimiterFromEnv,
   type KeyedLimiter,
   type LoginLimiter,
   loginLimiterFromEnv,
@@ -58,6 +61,12 @@ export interface AppOptions {
   tokenFailLimiter?: KeyedLimiter;
   /** 每个 CI 令牌的请求限速；默认 DOWEL_TOKEN_RATE_LIMIT（120）次 / DOWEL_TOKEN_RATE_WINDOW_MS（60000ms） */
   tokenLimiter?: KeyedLimiter;
+  /** 忘记密码请求限速器（测试用） */
+  forgotPasswordLimiter?: LoginLimiter;
+  /** 测试邮件发送限速器（测试用） */
+  emailTestLimiter?: KeyedLimiter;
+  /** 自定义邮件发送器（测试用；默认使用原生 SMTP 客户端） */
+  mailer?: Mailer;
   /** 首次启动自动生成的初始管理员临时密码文件路径（首次改密/重置后删除；运维指定文件时为 null） */
   initialAdminPasswordFile?: string | null;
   /** 首次启动引导创建的管理员用户名（默认 'admin'） */
@@ -150,6 +159,9 @@ export const createApp = (db: PlatformDb, options: AppOptions = {}) => {
     tokenFailLimiter: options.tokenFailLimiter ?? tokenFailLimiterFromEnv(),
     activeTokens,
     tokenLimiter: options.tokenLimiter ?? tokenLimiterFromEnv(),
+    forgotPasswordLimiter: options.forgotPasswordLimiter ?? forgotPasswordLimiterFromEnv(),
+    emailTestLimiter: options.emailTestLimiter ?? emailTestLimiterFromEnv(),
+    mailer: options.mailer ?? defaultMailer,
     guard,
     exec,
     drift,

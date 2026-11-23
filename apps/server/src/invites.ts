@@ -6,6 +6,7 @@ import { newId } from '@dowel/core';
 import type { Db } from '@dowel/engines';
 
 import { hashToken, newToken } from './auth.ts';
+import { normalizeEmail } from './users.ts';
 
 export type InviteKind = 'invite' | 'reset';
 
@@ -15,6 +16,7 @@ export interface Invite {
   userId: string | null;
   createdBy: string | null;
   groupIds: string[];
+  email: string | null;
   createdAt: string;
   expiresAt: string;
   usedBy: string | null;
@@ -25,8 +27,8 @@ export interface Invite {
 export type InviteState = 'ok' | 'used' | 'revoked' | 'expired';
 
 const COLUMNS = `i.id, i.kind, i.user_id as "userId", i.created_by as "createdBy", i.group_ids as "groupIds",
-  i.created_at as "createdAt", i.expires_at as "expiresAt", i.used_by as "usedBy", i.used_at as "usedAt",
-  i.revoked_at as "revokedAt"`;
+  i.email, i.created_at as "createdAt", i.expires_at as "expiresAt", i.used_by as "usedBy",
+  i.used_at as "usedAt", i.revoked_at as "revokedAt"`;
 
 export const inviteState = (invite: Invite, now = new Date()): InviteState => {
   // 先判 used：用过的邀请即便后来又被处理（或过期）也还是“已使用”
@@ -40,7 +42,7 @@ export const invitePath = (kind: InviteKind, token: string) =>
   kind === 'reset' ? `/reset/${token}` : `/invite/${token}`;
 
 /**
- * 建一个一次性链接。邀请默认 7 天，重置密码 24 小时（由调用方传 expiresInMs）。
+ * 建一个一次性链接。邀请默认 7 天，重置密码 24 小时（由调用方传 expiresInMs，忘记密码为 1 小时）。
  */
 export const createInvite = async (
   db: Db,
@@ -50,14 +52,16 @@ export const createInvite = async (
     userId?: string | null;
     expiresInMs: number;
     groupIds?: string[];
+    email?: string | null;
   },
 ): Promise<{ invite: Invite; token: string; url: string }> => {
   const token = newToken();
   const id = newId();
   const expiresAt = new Date(Date.now() + input.expiresInMs).toISOString();
+  const email = normalizeEmail(input.email);
   await db.query(
-    `insert into invites (id, kind, token_hash, user_id, created_by, group_ids, expires_at)
-     values ($1, $2, $3, $4, $5, $6::text::jsonb, $7)`,
+    `insert into invites (id, kind, token_hash, user_id, created_by, group_ids, email, expires_at)
+     values ($1, $2, $3, $4, $5, $6::text::jsonb, $7, $8)`,
     [
       id,
       input.kind,
@@ -65,6 +69,7 @@ export const createInvite = async (
       input.userId ?? null,
       input.createdBy,
       JSON.stringify(input.groupIds ?? []),
+      email,
       expiresAt,
     ],
   );
@@ -98,7 +103,7 @@ export const claimInvite = async (
     `update invites set used_at = $3, used_by = $4
       where token_hash = $1 and kind = $2
         and used_at is null and revoked_at is null and expires_at > $3
-      returning id, kind, token_hash, user_id as "userId", created_by as "createdBy",
+      returning id, kind, token_hash, user_id as "userId", created_by as "createdBy", email,
                 created_at as "createdAt", expires_at as "expiresAt",
                 used_by as "usedBy", used_at as "usedAt", revoked_at as "revokedAt"`,
     [hashToken(input.token), input.kind, now, input.usedBy ?? null],
@@ -109,6 +114,11 @@ export const claimInvite = async (
 /** 接受邀请时先认领、再建用户，建完把使用人补上（仍在同一个事务里） */
 export const setInviteUsedBy = async (db: Db, id: string, userId: string) => {
   await db.query('update invites set used_by = $2 where id = $1', [id, userId]);
+};
+
+/** 发信失败回滚未使用的邀请，避免留下孤儿记录 */
+export const deleteUnusedInvite = async (db: Db, id: string) => {
+  await db.query('delete from invites where id = $1 and used_at is null', [id]);
 };
 
 /** 撤销：只撤销未使用的邀请；已使用的返回 false（调用方给 409） */
@@ -126,7 +136,7 @@ export const listInvites = async (db: Db): Promise<InviteListItem[]> => {
   const rows = await db.query<InviteListItem & { usedAt: string | null }>(
     `select i.id, i.created_at as "createdAt", i.expires_at as "expiresAt",
             cu.username as "createdBy", uu.username as "usedBy", i.used_at as "usedAt",
-            i.revoked_at as "revokedAt"
+            i.revoked_at as "revokedAt", i.email
        from invites i
        left join users cu on cu.id = i.created_by
        left join users uu on uu.id = i.used_by
@@ -134,12 +144,14 @@ export const listInvites = async (db: Db): Promise<InviteListItem[]> => {
   );
   return rows.map((r) => ({
     ...r,
+    email: r.email ?? null,
     state: inviteState({
       id: r.id,
       kind: 'invite',
       userId: null,
       createdBy: null,
       groupIds: [],
+      email: r.email ?? null,
       createdAt: r.createdAt,
       expiresAt: r.expiresAt,
       usedBy: null,
@@ -149,9 +161,16 @@ export const listInvites = async (db: Db): Promise<InviteListItem[]> => {
   }));
 };
 
-/** 公开接口返回的邀请信息：只说明有效性，不暴露是谁创建的 */
+/** 公开接口返回的邀请信息：只说明有效性，不暴露是谁创建的；仅有效状态带出受邀邮箱 */
 export const inviteInfo = (invite: Invite | null, instanceName: string): InviteInfo => {
-  if (invite?.kind !== 'invite') return { valid: false, state: 'missing', instanceName, expiresAt: null };
+  if (invite?.kind !== 'invite')
+    return { valid: false, state: 'missing', instanceName, expiresAt: null, email: null };
   const state = inviteState(invite);
-  return { valid: state === 'ok', state, instanceName, expiresAt: invite.expiresAt };
+  return {
+    valid: state === 'ok',
+    state,
+    instanceName,
+    expiresAt: invite.expiresAt,
+    email: state === 'ok' ? (invite.email ?? null) : null,
+  };
 };

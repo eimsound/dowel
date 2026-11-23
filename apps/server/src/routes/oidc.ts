@@ -28,7 +28,7 @@ import {
 
 import { audit } from '../audit.ts';
 import { currentUser, hashToken, markLogin, startSession } from '../auth.ts';
-import { isUniqueViolation, type PlatformDb } from '../db.ts';
+import { isEmailUniqueViolation, isUniqueViolation, type PlatformDb } from '../db.ts';
 import {
   callbackUrl,
   clearDiscoveryCache,
@@ -364,7 +364,11 @@ export const registerOidcAuth = (app: Hono<Env>, ctx: AppContext) => {
         return finishLogin(c, ctx, provider, user, { subject: profile.sub, race: true }, state.next ?? '/');
       }
       // 只有 users.username 冲突才转到确认页；其他唯一约束冲突照常抛出
-      if (isUniqueViolation(e) && (await usernameTaken(db, suggested.username))) {
+      if (
+        isUniqueViolation(e) &&
+        !isEmailUniqueViolation(e) &&
+        (await usernameTaken(db, suggested.username))
+      ) {
         const pending = await createOidcPending(db, {
           providerId: provider.id,
           subject: profile.sub,
@@ -444,7 +448,8 @@ export const registerOidcAuth = (app: Hono<Env>, ctx: AppContext) => {
         );
         return c.json<Me>(racedMe);
       }
-      if (isUniqueViolation(e)) throw new HTTPException(409, { message: '用户名已被使用' });
+      if (isUniqueViolation(e) && !isEmailUniqueViolation(e))
+        throw new HTTPException(409, { message: '用户名已被使用' });
       throw e;
     }
     await deletePending(db, token);

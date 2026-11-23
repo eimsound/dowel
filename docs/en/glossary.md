@@ -5,7 +5,7 @@ This glossary defines the core concepts and canonical terms used across Dowel do
 ## Accounts and ownership {#accounts-and-ownership}
 
 - **Instance.** A single Dowel deployment serving one company.
-- **User.** A person with a unique username inside an instance who signs in with a username and password or an external OIDC identity. Email is an optional profile field and is not a sign-in credential.
+- **User.** A person with a unique username inside an instance who signs in with a username and password or an external OIDC identity. Email is an optional profile field enforced case-insensitively unique when set, used for forgot-password resets and invite delivery, and never used as a sign-in username.
 - **Instance admin.** A user who manages the entire instance, has visibility across all groups, projects, and audit logs, and holds all privileges.
 - **Group.** A flat collection of users that owns projects. Groups and their member lists are visible to every signed-in user, while projects inside a group are visible only to authorized users. One user may belong to multiple groups.
 - **Group admin.** A group member who manages that group's membership, group execution policy, group webhooks, and default permission on projects in the group.

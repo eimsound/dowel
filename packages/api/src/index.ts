@@ -53,8 +53,48 @@ export const displayNameSchema = z.string().trim().min(1, '名字不能为空').
 
 export const passwordSchema = z.string().min(8, '密码至少 8 位').max(200, '密码最多 200 个字符');
 
-/** 邮箱选填、不唯一、不验证，只作为资料里的一个字段 */
-export const emailFieldSchema = z.string().trim().max(200, '邮箱最多 200 个字符').nullable();
+const hasLineBreakOrNull = (s: string) => /[\r\n\0]/.test(s);
+
+const isValidEmailAddress = (s: string): boolean => {
+  if (hasLineBreakOrNull(s) || s.length === 0 || s.length > 200) return false;
+  if (/\s/.test(s)) return false;
+  const at = s.indexOf('@');
+  if (at <= 0 || at !== s.lastIndexOf('@')) return false;
+  const local = s.slice(0, at);
+  const domain = s.slice(at + 1);
+  if (local.length > 64 || local.startsWith('.') || local.endsWith('.') || local.includes('..')) return false;
+  if (!/^[a-z0-9.!#$%&'*+/=?^_`{|}~-]+$/.test(local)) return false;
+  if (domain.length > 253 || domain.startsWith('.') || domain.endsWith('.') || domain.includes('..'))
+    return false;
+  const labels = domain.split('.');
+  if (labels.length < 2) return false;
+  return labels.every((label) => /^[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?$/.test(label));
+};
+
+const safeTrim = (v: unknown, lower = false) => {
+  if (typeof v !== 'string' || hasLineBreakOrNull(v)) return v;
+  const trimmed = v.trim();
+  return lower ? trimmed.toLowerCase() : trimmed;
+};
+
+/** 必填邮箱地址：先检查禁止换行/空字符，再规范化为去空白小写并校验格式与长度 */
+export const emailAddressSchema = z.preprocess(
+  (v) => safeTrim(v, true),
+  z
+    .string({ error: '请输入有效的邮箱地址' })
+    .min(1, '邮箱不能为空')
+    .max(200, '邮箱最多 200 个字符')
+    .refine((s) => !hasLineBreakOrNull(s), '邮箱不能包含换行或空字符')
+    .refine(isValidEmailAddress, '邮箱格式不正确'),
+);
+
+/** 个人邮箱（选填可空，非空时全实例大小写不敏感唯一；可用于找回密码） */
+export const emailFieldSchema = z.preprocess((v) => {
+  if (v === null) return null;
+  if (typeof v !== 'string' || hasLineBreakOrNull(v)) return v;
+  const trimmed = v.trim().toLowerCase();
+  return trimmed === '' ? null : trimmed;
+}, emailAddressSchema.nullable());
 
 export const instanceRoleSchema = z.enum(['admin', 'member']);
 export type InstanceRole = z.infer<typeof instanceRoleSchema>;
@@ -92,10 +132,70 @@ export const instanceInfoSchema = z.object({
   name: z.string(),
   /** 实际是否可用（设置关闭但设了 DOWEL_ALLOW_PASSWORD_LOGIN=1 时仍然是 true） */
   passwordLogin: z.boolean(),
+  /** 实例是否已配置并启用邮件服务（控制登录页“忘记密码”与邀请发信入口） */
+  emailEnabled: z.boolean(),
   /** 启用的 OIDC 提供方（登录页显示“使用 XX 登录”） */
   providers: z.array(z.object({ slug: z.string(), name: z.string() })),
 });
 export type InstanceInfo = z.infer<typeof instanceInfoSchema>;
+
+// ───── 邮件服务（SMTP）配置 ─────
+
+export const smtpSecuritySchema = z.enum(['starttls', 'tls', 'none']);
+export type SmtpSecurity = z.infer<typeof smtpSecuritySchema>;
+
+export const emailSettingsSchema = z.object({
+  enabled: z.boolean(),
+  host: z.string(),
+  port: z.number().int().min(1).max(65535),
+  security: smtpSecuritySchema,
+  username: z.string(),
+  /** 是否已保存 SMTP 密码；绝不返回明文或密文 */
+  hasPassword: z.boolean(),
+  fromAddress: z.string(),
+  fromName: z.string(),
+});
+export type EmailSettings = z.infer<typeof emailSettingsSchema>;
+
+const safeTextLine = (max: number, label: string) =>
+  z.preprocess(
+    (v) => safeTrim(v, false),
+    z
+      .string()
+      .max(max, `${label}最多 ${max} 个字符`)
+      .refine((s) => !hasLineBreakOrNull(s), `${label}不能包含换行或空字符`),
+  );
+
+export const emailSettingsPatchSchema = z.object({
+  enabled: z.boolean().optional(),
+  host: safeTextLine(255, 'SMTP 主机').optional(),
+  port: z
+    .number()
+    .int('端口必须是整数')
+    .min(1, '端口必须在 1–65535 之间')
+    .max(65535, '端口必须在 1–65535 之间')
+    .optional(),
+  security: smtpSecuritySchema.optional(),
+  username: safeTextLine(200, '用户名').optional(),
+  /** undefined 保留原密码；null 或空串清空密码；非空字符串加密保存 */
+  password: z
+    .string()
+    .max(1000, '密码最多 1000 个字符')
+    .refine((s) => !hasLineBreakOrNull(s), '密码不能包含换行或空字符')
+    .nullable()
+    .optional(),
+  fromAddress: z
+    .preprocess((v) => safeTrim(v, true), z.union([z.literal(''), emailAddressSchema]))
+    .optional(),
+  fromName: safeTextLine(100, '发件人名称').optional(),
+});
+export type EmailSettingsPatch = z.infer<typeof emailSettingsPatchSchema>;
+
+export const emailTestSchema = z.object({ to: emailAddressSchema });
+export type EmailTest = z.infer<typeof emailTestSchema>;
+
+export const forgotPasswordSchema = z.object({ email: emailAddressSchema });
+export type ForgotPassword = z.infer<typeof forgotPasswordSchema>;
 
 export const groupCreationSchema = z.enum(['all', 'admin']);
 export type GroupCreation = z.infer<typeof groupCreationSchema>;
@@ -154,6 +254,7 @@ export type AdminUserCreate = z.infer<typeof adminUserCreateSchema>;
 
 export const adminUserPatchSchema = z.object({
   name: displayNameSchema.optional(),
+  email: emailFieldSchema.optional(),
   role: instanceRoleSchema.optional(),
   status: userStatusSchema.optional(),
 });
@@ -164,6 +265,10 @@ export const inviteCreateSchema = z.object({
   expiresInDays: z.number().int().min(1).max(365).optional(),
   /** 接受邀请后加入的组（组已经被删掉时跳过） */
   groupIds: z.array(z.string()).max(100).optional(),
+  /** 受邀人邮箱（可选；勾选邮件发送时必填） */
+  email: emailFieldSchema.optional(),
+  /** 是否通过实例 SMTP 发送邀请邮件 */
+  sendEmail: z.boolean().optional(),
 });
 export type InviteCreate = z.infer<typeof inviteCreateSchema>;
 
@@ -172,6 +277,8 @@ export const inviteCreatedSchema = z.object({
   token: z.string(),
   url: z.string(),
   expiresAt: z.string(),
+  email: z.string().nullable(),
+  emailSent: z.boolean(),
 });
 export type InviteCreated = z.infer<typeof inviteCreatedSchema>;
 
@@ -183,6 +290,7 @@ export const inviteListItemSchema = z.object({
   usedBy: z.string().nullable(),
   usedAt: z.string().nullable(),
   revokedAt: z.string().nullable(),
+  email: z.string().nullable(),
   state: z.enum(['ok', 'used', 'revoked', 'expired']),
 });
 export type InviteListItem = z.infer<typeof inviteListItemSchema>;
@@ -192,6 +300,7 @@ export const inviteInfoSchema = z.object({
   state: z.enum(['ok', 'used', 'revoked', 'expired', 'missing']),
   instanceName: z.string(),
   expiresAt: z.string().nullable(),
+  email: z.string().nullable(),
 });
 export type InviteInfo = z.infer<typeof inviteInfoSchema>;
 

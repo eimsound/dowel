@@ -17,7 +17,7 @@ flowchart LR
 ### Deployment and setup {#entry-deploy}
 
 - [Getting started](getting-started.md). Start Dowel with Docker Compose, create the initial instance admin, create a project with the four-step wizard, verify migrations, and execute to a target database.
-- [Deployment and configuration](deployment.md). Review all 22 server environment variables, source build commands, high availability without Redis on external PostgreSQL, reverse proxy setup, and connection allowlists.
+- [Deployment and configuration](deployment.md). Review all 27 server environment variables, source build commands, high availability without Redis on external PostgreSQL, reverse proxy setup, and connection allowlists.
 - [Accounts, OIDC, and access](accounts-and-access.md). Manage users and invites, Google, GitLab, and generic OIDC sign-in, group and project grants, audit logs, and personal settings.
 
 ### Modeling and dialects {#entry-modeling}

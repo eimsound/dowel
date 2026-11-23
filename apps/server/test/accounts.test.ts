@@ -495,13 +495,34 @@ describe.each([
       (await call('POST', '/api/admin/users', { username: 'member', name: 'X' }, admin.cookie)).status,
     ).toBe(409);
 
-    // 邮箱选填、不唯一
+    // 邮箱选填可空，非空时全实例大小写不敏感唯一
+    const createdOne = await call(
+      'POST',
+      '/api/admin/users',
+      { username: 'one', name: '一号', email: '  Same@X.com  ' },
+      admin.cookie,
+    );
+    expect(createdOne.status).toBe(201);
+    expect(createdOne.data.email).toBe('same@x.com');
+    const dupEmail = await call(
+      'POST',
+      '/api/admin/users',
+      { username: 'two', name: '二号', email: 'SAME@x.com' },
+      admin.cookie,
+    );
+    expect(dupEmail.status).toBe(409);
+    expect(dupEmail.data.error).toBe('邮箱已被使用');
+    // 多个无邮箱用户允许共存，不同邮箱也允许
+    expect(
+      (await call('POST', '/api/admin/users', { username: 'no-mail-1', name: '无邮箱1' }, admin.cookie))
+        .status,
+    ).toBe(201);
     expect(
       (
         await call(
           'POST',
           '/api/admin/users',
-          { username: 'one', name: '一号', email: 'same@x.com' },
+          { username: 'no-mail-2', name: '无邮箱2', email: '' },
           admin.cookie,
         )
       ).status,
@@ -511,7 +532,7 @@ describe.each([
         await call(
           'POST',
           '/api/admin/users',
-          { username: 'two', name: '二号', email: 'same@x.com' },
+          { username: 'two', name: '二号', email: 'two@x.com' },
           admin.cookie,
         )
       ).status,
@@ -523,20 +544,30 @@ describe.each([
     const byName = await call('GET', '/api/admin/users?q=%E4%BA%8C%E5%8F%B7', undefined, admin.cookie);
     expect((byName.data as unknown as { username: string }[]).map((u) => u.username)).toEqual(['two']);
     const byEmail = await call('GET', '/api/admin/users?q=same@x.com', undefined, admin.cookie);
-    expect((byEmail.data as unknown as { username: string }[]).map((u) => u.username).sort()).toEqual([
-      'one',
-      'two',
-    ]);
+    expect((byEmail.data as unknown as { username: string }[]).map((u) => u.username)).toEqual(['one']);
 
-    // 改名、改角色
+    // 管理员改邮箱冲突返回 409 邮箱已被使用；改名、改角色、改邮箱
+    const adminDup = await call(
+      'PATCH',
+      `/api/admin/users/${memberId}`,
+      { email: 'SAME@x.com' },
+      admin.cookie,
+    );
+    expect(adminDup.status).toBe(409);
+    expect(adminDup.data.error).toBe('邮箱已被使用');
     const patched = await call(
       'PATCH',
       `/api/admin/users/${memberId}`,
-      { name: '会员', role: 'admin' },
+      { name: '会员', role: 'admin', email: 'Member@X.com' },
       admin.cookie,
     );
     expect(patched.status).toBe(200);
-    expect(patched.data).toMatchObject({ username: 'member', name: '会员', role: 'admin' });
+    expect(patched.data).toMatchObject({
+      username: 'member',
+      name: '会员',
+      role: 'admin',
+      email: 'member@x.com',
+    });
     const [updated] = await db.query<{ action: string; data: unknown }>(
       "select action, data from audit_events where action = 'user.update'",
     );
@@ -743,15 +774,23 @@ describe.each([
     const r = await call(
       'PATCH',
       '/api/me',
-      { username: 'renamed', name: '新名字', email: 'me@x.com' },
+      { username: 'renamed', name: '新名字', email: '  ME@X.COM ' },
       member,
     );
     expect(r.status).toBe(200);
     expect(r.data).toMatchObject({ username: 'renamed', name: '新名字', email: 'me@x.com' });
+    // 另一个用户改用已被占用的邮箱返回 409 邮箱已被使用
+    await createMember(admin.cookie, 'other');
+    const other = await login('other');
+    const meDup = await call('PATCH', '/api/me', { email: 'me@x.com' }, other);
+    expect(meDup.status).toBe(409);
+    expect(meDup.data.error).toBe('邮箱已被使用');
+
     expect((await call('PATCH', '/api/me', { username: 'admin' }, member)).status).toBe(409);
     expect((await call('PATCH', '/api/me', { username: 'Bad Name' }, member)).status).toBe(400);
-    // 邮箱可以清空
+    // 邮箱可以清空，清空后别人可以使用该邮箱
     expect((await call('PATCH', '/api/me', { email: '' }, member)).data).toMatchObject({ email: null });
+    expect((await call('PATCH', '/api/me', { email: 'me@x.com' }, other)).status).toBe(200);
 
     // 改了用户名之后用新用户名登录，旧的不行
     expect((await call('POST', '/api/auth/login', { username: 'member', password: PASSWORD })).status).toBe(

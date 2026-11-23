@@ -43,7 +43,10 @@ const call = async (method: string, path: string, json?: unknown, cookie = '') =
 
 beforeEach(async () => {
   db = await openPlatformDb(':memory:');
-  const created = createApp(db, { loginLimiter: new LoginLimiter({ limit: 10_000, ipLimit: 10_000 }) });
+  const created = createApp(db, {
+    loginLimiter: new LoginLimiter({ limit: 10_000, ipLimit: 10_000 }),
+    mailer: async () => {},
+  });
   app = created.app;
   rooms = created.rooms;
   stop = async () => {
@@ -461,13 +464,53 @@ test('每个应审计的动作都能在 audit_events 里找到', async () => {
         ).toBe(200);
       },
     },
-    // 实例设置
+    // 实例设置与邮件服务
     {
       action: 'instance.settings_update',
       run: async () =>
         expect((await call('PATCH', '/api/admin/settings', { name: '示例公司' }, adminCookie)).status).toBe(
           200,
         ),
+    },
+    {
+      action: 'email.settings_update',
+      run: async () =>
+        expect(
+          (
+            await call(
+              'PATCH',
+              '/api/admin/email',
+              {
+                enabled: true,
+                host: 'smtp.example.com',
+                port: 587,
+                security: 'starttls',
+                fromAddress: 'noreply@example.com',
+                fromName: 'Dowel',
+              },
+              adminCookie,
+            )
+          ).status,
+        ).toBe(200),
+    },
+    {
+      action: 'email.test',
+      run: async () =>
+        expect(
+          (await call('POST', '/api/admin/email/test', { to: 'ops@example.com' }, adminCookie)).status,
+        ).toBe(200),
+    },
+    {
+      action: 'auth.forgot_password_request',
+      run: async () => {
+        expect(
+          (await call('PATCH', `/api/admin/users/${memberId}`, { email: 'member@example.com' }, adminCookie))
+            .status,
+        ).toBe(200);
+        expect(
+          (await call('POST', '/api/auth/forgot-password', { email: 'member@example.com' })).status,
+        ).toBe(200);
+      },
     },
     // 需要真实 PG / 影子库的动作（路由级覆盖在 targets 测试里）
     { action: 'environment.create', run: () => directAudit('environment.create', 'environment', 'e1') },

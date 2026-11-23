@@ -7,6 +7,7 @@ import type {
   AuditEvent,
   AuditPage,
   Directory,
+  EmailSettings,
   GrantInfo,
   GrantRole,
   GrantSubjectKind,
@@ -16,6 +17,8 @@ import type {
   InviteListItem,
   OidcProviderInfo,
   OidcProviderPreset,
+  Ok,
+  SmtpSecurity,
   UserStatus,
 } from '@dowel/api';
 import { useInfiniteQuery, useMutation, useQuery, useQueryClient } from '@tanstack/react-query';
@@ -32,7 +35,7 @@ import {
   UserPlus,
   Users,
 } from 'lucide-react';
-import { useId, useRef, useState } from 'react';
+import { useEffect, useId, useRef, useState } from 'react';
 import { useTranslation } from 'react-i18next';
 
 import { actionText } from '../activity.ts';
@@ -46,6 +49,7 @@ import { useToast } from '../components/Toasts.tsx';
 import { TokenPolicyPanel } from '../components/TokenSettings.tsx';
 import { Avatar, Banner, Empty, IconButton } from '../components/ui.tsx';
 import { formatTime } from '../format.ts';
+import { useInstance } from '../instance.ts';
 import { useMe } from '../session.ts';
 
 const SECTIONS = [
@@ -594,9 +598,14 @@ export const AdminInvites = () => {
   const { t } = useTranslation();
   const qc = useQueryClient();
   const toast = useToast();
+  const instance = useInstance();
+  const emailEnabled = instance.data?.emailEnabled ?? false;
   const [days, setDays] = useState('7');
   const [groupIds, setGroupIds] = useState<string[]>([]);
+  const [email, setEmail] = useState('');
+  const [sendEmail, setSendEmail] = useState(false);
   const [created, setCreated] = useState<InviteCreated | null>(null);
+  const willSendEmail = emailEnabled && sendEmail;
   const invites = useQuery({
     queryKey: ['admin-invites'],
     queryFn: () => api<InviteListItem[]>('GET', '/api/admin/invites'),
@@ -610,10 +619,14 @@ export const AdminInvites = () => {
       api<InviteCreated>('POST', '/api/admin/invites', {
         expiresInDays: Number(days) || 7,
         groupIds,
+        ...(email.trim() ? { email: email.trim() } : {}),
+        ...(willSendEmail ? { sendEmail: true } : {}),
       }),
     onSuccess: (invite) => {
       setCreated(invite);
       setGroupIds([]);
+      setEmail('');
+      setSendEmail(false);
       void qc.invalidateQueries({ queryKey: ['admin-invites'] });
     },
   });
@@ -629,7 +642,8 @@ export const AdminInvites = () => {
     <>
       <Section title={t('adm.invite.create')}>
         <form
-          className="flex flex-wrap items-end gap-2 rounded-md border border-border bg-panel p-4"
+          className="flex flex-wrap items-end gap-3 rounded-md border border-border bg-panel p-4"
+          aria-label={t('adm.invite.create')}
           onSubmit={(e) => {
             e.preventDefault();
             create.mutate();
@@ -640,10 +654,26 @@ export const AdminInvites = () => {
             <input
               className="input"
               type="number"
+              name="expiresInDays"
               min={1}
               max={365}
               value={days}
               onChange={(e) => setDays(e.target.value)}
+            />
+          </label>
+          <label className="field w-64">
+            <span className="label">{t('adm.invite.email')}</span>
+            <input
+              className="input"
+              type="email"
+              name="inviteEmail"
+              value={email}
+              required={willSendEmail}
+              autoComplete="off"
+              autoCapitalize="none"
+              autoCorrect="off"
+              spellCheck={false}
+              onChange={(e) => setEmail(e.target.value)}
             />
           </label>
           <fieldset className="field w-64">
@@ -668,7 +698,31 @@ export const AdminInvites = () => {
             </div>
             <span className="hint">{t('adm.invite.noGroupsHint')}</span>
           </fieldset>
-          <button type="submit" className="btn primary" disabled={create.isPending}>
+          <div className="field w-full">
+            <label className="check">
+              <input
+                type="checkbox"
+                checked={willSendEmail}
+                disabled={!emailEnabled}
+                onChange={(e) => setSendEmail(e.target.checked)}
+              />
+              <span>{t('adm.invite.sendEmail')}</span>
+            </label>
+            {!emailEnabled && (
+              <span className="hint">
+                {t('adm.invite.emailDisabledHint')}{' '}
+                <Link to="/admin/settings" className="text-primary-text underline">
+                  {t('adm.invite.goEmailSettings')}
+                </Link>
+              </span>
+            )}
+          </div>
+          <button
+            type="submit"
+            className="btn primary"
+            disabled={create.isPending}
+            aria-busy={create.isPending}
+          >
             <MailPlus size={16} aria-hidden="true" />
             {t('adm.invite.create')}
           </button>
@@ -680,8 +734,12 @@ export const AdminInvites = () => {
         </form>
         {created && (
           <OneTimeLink
-            label={t('adm.invite.create')}
-            hint={t('adm.invite.linkHint')}
+            label={
+              created.emailSent && created.email
+                ? t('adm.invite.sentTitle', { email: created.email })
+                : t('adm.invite.create')
+            }
+            hint={created.emailSent ? t('adm.invite.sentLinkHint') : t('adm.invite.linkHint')}
             url={created.url}
             onDismiss={() => setCreated(null)}
           />
@@ -699,6 +757,7 @@ export const AdminInvites = () => {
             <thead>
               <tr>
                 <th scope="col">{t('adm.status')}</th>
+                <th scope="col">{t('adm.invite.emailCol')}</th>
                 <th scope="col">{t('adm.createdAt')}</th>
                 <th scope="col">{t('adm.invite.expiresAt')}</th>
                 <th scope="col">{t('adm.invite.createdBy')}</th>
@@ -712,6 +771,7 @@ export const AdminInvites = () => {
               {(invites.data ?? []).map((i) => (
                 <tr key={i.id}>
                   <td>{t(`adm.invite.state.${i.state}`)}</td>
+                  <td className="font-mono text-xs">{i.email ?? '—'}</td>
                   <td>
                     <time dateTime={i.createdAt} className="text-xs text-text-3">
                       {formatTime(i.createdAt)}
@@ -1124,6 +1184,361 @@ const ProviderRow = ({
   );
 };
 
+const SMTP_DEFAULT_PORTS: Record<SmtpSecurity, string> = {
+  starttls: '587',
+  tls: '465',
+  none: '25',
+};
+
+const AdminEmailSettings = () => {
+  const { t } = useTranslation();
+  const qc = useQueryClient();
+  const toast = useToast();
+  const me = useMe().data;
+  const emailQuery = useQuery({
+    queryKey: ['admin-email'],
+    queryFn: () => api<EmailSettings>('GET', '/api/admin/email'),
+  });
+
+  interface EmailFormState {
+    enabled: boolean;
+    host: string;
+    port: string;
+    security: SmtpSecurity;
+    username: string;
+    password: string;
+    clearPassword: boolean;
+    fromAddress: string;
+    fromName: string;
+  }
+
+  const [form, setForm] = useState<EmailFormState | null>(null);
+  const [portError, setPortError] = useState<string | null>(null);
+  const portRef = useRef<HTMLInputElement>(null);
+
+  const [testTo, setTestTo] = useState(me?.email ?? '');
+  const testToTouched = useRef(false);
+  useEffect(() => {
+    if (me?.email && !testToTouched.current) {
+      setTestTo(me.email);
+    }
+  }, [me?.email]);
+
+  const saved = emailQuery.data;
+  const base: EmailFormState | null = saved
+    ? {
+        enabled: saved.enabled,
+        host: saved.host,
+        port: String(saved.port),
+        security: saved.security,
+        username: saved.username,
+        password: '',
+        clearPassword: false,
+        fromAddress: saved.fromAddress,
+        fromName: saved.fromName,
+      }
+    : null;
+  const value = form ?? base;
+  const isDirty =
+    Boolean(form && base) &&
+    (form!.enabled !== base!.enabled ||
+      form!.host !== base!.host ||
+      form!.port !== base!.port ||
+      form!.security !== base!.security ||
+      form!.username !== base!.username ||
+      form!.password !== '' ||
+      form!.clearPassword ||
+      form!.fromAddress !== base!.fromAddress ||
+      form!.fromName !== base!.fromName);
+
+  const save = useMutation({
+    mutationFn: (body: EmailFormState) =>
+      api<EmailSettings>('PATCH', '/api/admin/email', {
+        enabled: body.enabled,
+        host: body.host,
+        port: Number(body.port),
+        security: body.security,
+        username: body.username,
+        ...(body.clearPassword ? { password: null } : body.password ? { password: body.password } : {}),
+        fromAddress: body.fromAddress,
+        fromName: body.fromName,
+      }),
+    onSuccess: (next) => {
+      qc.setQueryData(['admin-email'], next);
+      setForm(null);
+      setPortError(null);
+      toast(t('adm.smtp.saved'));
+      void qc.invalidateQueries({ queryKey: ['instance'] });
+    },
+  });
+
+  const [sentTo, setSentTo] = useState<string | null>(null);
+  const test = useMutation({
+    mutationFn: (to: string) => api<Ok>('POST', '/api/admin/email/test', { to }),
+    onSuccess: (_res, to) => {
+      setSentTo(to);
+    },
+  });
+
+  const isConfigured = Boolean(saved?.host.trim() && saved?.fromAddress.trim());
+  const canTest = !isDirty && isConfigured;
+
+  return (
+    <Section title={t('adm.smtp.title')}>
+      {value && (
+        <div className="space-y-4 rounded-md border border-border bg-panel p-4">
+          <form
+            className="space-y-3"
+            aria-label={t('adm.smtp.title')}
+            onSubmit={(e) => {
+              e.preventDefault();
+              const portNum = Number(value.port.trim());
+              if (!Number.isInteger(portNum) || portNum < 1 || portNum > 65535) {
+                setPortError(t('adm.smtp.portInvalid'));
+                portRef.current?.focus();
+                return;
+              }
+              setPortError(null);
+              test.reset();
+              setSentTo(null);
+              save.mutate(value);
+            }}
+          >
+            <label className="check">
+              <input
+                type="checkbox"
+                checked={value.enabled}
+                onChange={(e) => setForm({ ...value, enabled: e.target.checked })}
+              />
+              <span>{t('adm.smtp.enabled')}</span>
+            </label>
+            <div className="grid max-w-2xl grid-cols-1 gap-3 sm:grid-cols-2">
+              <label className="field">
+                <span className="label">{t('adm.smtp.host')}</span>
+                <input
+                  className="input font-mono"
+                  name="smtpHost"
+                  value={value.host}
+                  placeholder="smtp.example.com"
+                  autoComplete="off"
+                  autoCapitalize="none"
+                  autoCorrect="off"
+                  spellCheck={false}
+                  onChange={(e) => setForm({ ...value, host: e.target.value })}
+                />
+              </label>
+              <label className="field">
+                <span className="label">{t('adm.smtp.security')}</span>
+                <select
+                  className="select"
+                  name="smtpSecurity"
+                  value={value.security}
+                  onChange={(e) => {
+                    const nextSec = e.target.value as SmtpSecurity;
+                    const oldDefault = SMTP_DEFAULT_PORTS[value.security];
+                    const shouldSwitchPort = value.port.trim() === '' || value.port.trim() === oldDefault;
+                    setForm({
+                      ...value,
+                      security: nextSec,
+                      port: shouldSwitchPort ? SMTP_DEFAULT_PORTS[nextSec] : value.port,
+                    });
+                    setPortError(null);
+                  }}
+                >
+                  <option value="starttls">{t('adm.smtp.securityOption.starttls')}</option>
+                  <option value="tls">{t('adm.smtp.securityOption.tls')}</option>
+                  <option value="none">{t('adm.smtp.securityOption.none')}</option>
+                </select>
+              </label>
+              <label className="field">
+                <span className="label">{t('adm.smtp.port')}</span>
+                <input
+                  ref={portRef}
+                  className="input font-mono"
+                  type="text"
+                  inputMode="numeric"
+                  name="smtpPort"
+                  value={value.port}
+                  placeholder={SMTP_DEFAULT_PORTS[value.security]}
+                  aria-invalid={portError ? 'true' : 'false'}
+                  aria-describedby={portError ? 'smtp-port-err smtp-port-hint' : 'smtp-port-hint'}
+                  onChange={(e) => {
+                    setForm({ ...value, port: e.target.value });
+                    setPortError(null);
+                  }}
+                />
+                <span id="smtp-port-hint" className="hint">
+                  {t('adm.smtp.portHint')}
+                </span>
+                {portError && (
+                  <span id="smtp-port-err" className="hint error">
+                    {portError}
+                  </span>
+                )}
+              </label>
+              <label className="field">
+                <span className="label">{t('adm.smtp.username')}</span>
+                <input
+                  className="input font-mono"
+                  name="smtpUsername"
+                  value={value.username}
+                  autoComplete="off"
+                  autoCapitalize="none"
+                  autoCorrect="off"
+                  spellCheck={false}
+                  onChange={(e) => setForm({ ...value, username: e.target.value })}
+                />
+              </label>
+              <div className="field">
+                <label className="field">
+                  <span className="label">{t('adm.smtp.password')}</span>
+                  <input
+                    className="input"
+                    type="password"
+                    name="smtpPassword"
+                    value={value.password}
+                    placeholder={saved?.hasPassword && !value.clearPassword ? '••••••' : ''}
+                    autoComplete="new-password"
+                    aria-describedby="smtp-pw-hint"
+                    onChange={(e) =>
+                      setForm({
+                        ...value,
+                        password: e.target.value,
+                        clearPassword: e.target.value ? false : value.clearPassword,
+                      })
+                    }
+                  />
+                  <span id="smtp-pw-hint" className="hint">
+                    {t('adm.smtp.passwordHint')}
+                  </span>
+                </label>
+                {saved?.hasPassword && (
+                  <label className="check mt-1">
+                    <input
+                      type="checkbox"
+                      checked={value.clearPassword}
+                      onChange={(e) =>
+                        setForm({
+                          ...value,
+                          clearPassword: e.target.checked,
+                          password: e.target.checked ? '' : value.password,
+                        })
+                      }
+                    />
+                    <span>{t('adm.smtp.clearPassword')}</span>
+                  </label>
+                )}
+              </div>
+              <label className="field">
+                <span className="label">{t('adm.smtp.fromAddress')}</span>
+                <input
+                  className="input"
+                  type="email"
+                  name="smtpFromAddress"
+                  value={value.fromAddress}
+                  placeholder="noreply@example.com"
+                  autoComplete="off"
+                  autoCapitalize="none"
+                  autoCorrect="off"
+                  spellCheck={false}
+                  onChange={(e) => setForm({ ...value, fromAddress: e.target.value })}
+                />
+              </label>
+              <label className="field sm:col-span-2">
+                <span className="label">{t('adm.smtp.fromName')}</span>
+                <input
+                  className="input"
+                  name="smtpFromName"
+                  value={value.fromName}
+                  placeholder="Dowel"
+                  autoComplete="off"
+                  onChange={(e) => setForm({ ...value, fromName: e.target.value })}
+                />
+              </label>
+            </div>
+            <p className="hint">{t('adm.smtp.publicUrlHint')}</p>
+            {save.error && (
+              <Banner kind="danger" role="alert">
+                {save.error.message}
+              </Banner>
+            )}
+            <div className="flex justify-end">
+              <button
+                type="submit"
+                className="btn primary"
+                disabled={save.isPending}
+                aria-busy={save.isPending}
+              >
+                {t('adm.smtp.save')}
+              </button>
+            </div>
+          </form>
+
+          <hr className="border-border" />
+
+          <form
+            className="space-y-2.5"
+            aria-label={t('adm.smtp.testTitle')}
+            onSubmit={(e) => {
+              e.preventDefault();
+              if (!canTest) return;
+              setSentTo(null);
+              test.mutate(testTo.trim());
+            }}
+          >
+            <h3 className="text-sm font-medium text-text">{t('adm.smtp.testTitle')}</h3>
+            <div className="flex flex-wrap items-end gap-2">
+              <label className="field w-72">
+                <span className="label">{t('adm.smtp.testTo')}</span>
+                <input
+                  className="input"
+                  type="email"
+                  name="testRecipient"
+                  value={testTo}
+                  required
+                  autoComplete="email"
+                  autoCapitalize="none"
+                  autoCorrect="off"
+                  spellCheck={false}
+                  onChange={(e) => {
+                    testToTouched.current = true;
+                    setTestTo(e.target.value);
+                    if (test.error) test.reset();
+                    if (sentTo) setSentTo(null);
+                  }}
+                />
+              </label>
+              <button
+                type="submit"
+                className="btn"
+                disabled={test.isPending || !canTest || !testTo.trim()}
+                aria-busy={test.isPending}
+              >
+                {t('adm.smtp.sendTest')}
+              </button>
+            </div>
+            {isDirty ? (
+              <p className="hint">{t('adm.smtp.saveBeforeTestHint')}</p>
+            ) : !isConfigured ? (
+              <p className="hint">{t('adm.smtp.configureBeforeTestHint')}</p>
+            ) : null}
+            {sentTo && (
+              <Banner kind="ok" role="status">
+                {t('adm.smtp.testSent', { to: sentTo })}
+              </Banner>
+            )}
+            {test.error && (
+              <Banner kind="danger" role="alert">
+                {test.error.message}
+              </Banner>
+            )}
+          </form>
+        </div>
+      )}
+    </Section>
+  );
+};
+
 export const AdminSettings = () => {
   const { t } = useTranslation();
   const qc = useQueryClient();
@@ -1164,77 +1579,80 @@ export const AdminSettings = () => {
     },
   });
   return (
-    <Section title={t('adm.navSettings')}>
-      {value && (
-        <form
-          className="space-y-3 rounded-md border border-border bg-panel p-4"
-          onSubmit={(e) => {
-            e.preventDefault();
-            save.mutate(value);
-          }}
-        >
-          <label className="field max-w-md">
-            <span className="label">{t('adm.settings.name')}</span>
-            <input
-              className="input"
-              value={value.name}
-              onChange={(e) => setForm({ ...value, name: e.target.value })}
-              required
-            />
-          </label>
-          <label className="field max-w-md">
-            <span className="label">{t('adm.settings.groupCreation')}</span>
-            <select
-              className="select"
-              value={value.groupCreation}
-              onChange={(e) =>
-                setForm({ ...value, groupCreation: e.target.value === 'admin' ? 'admin' : 'all' })
-              }
-            >
-              <option value="all">{t('adm.settings.groupCreationAll')}</option>
-              <option value="admin">{t('adm.settings.groupCreationAdmin')}</option>
-            </select>
-          </label>
-          <label className="field max-w-md">
-            <span className="label">{t('adm.settings.allowlist')}</span>
-            <textarea
-              className="textarea h-28 font-mono"
-              value={value.allowlist}
-              spellCheck={false}
-              placeholder="10.0.0.0/8\ndb.internal"
-              onChange={(e) => setForm({ ...value, allowlist: e.target.value })}
-            />
-            <span className="hint">{t('adm.settings.allowlistHint')}</span>
-          </label>
-          <label className="field max-w-md">
-            <span className="label">{t('adm.settings.webhookAllowlist')}</span>
-            <textarea
-              className="textarea h-28 font-mono"
-              value={value.webhookAllowlist}
-              spellCheck={false}
-              placeholder="10.1.2.0/24\nhooks.internal"
-              onChange={(e) => setForm({ ...value, webhookAllowlist: e.target.value })}
-            />
-            <span className="hint">{t('adm.settings.webhookAllowlistHint')}</span>
-          </label>
-          <label className="field max-w-md">
-            <span className="label">{t('adm.settings.instanceId')}</span>
-            <input className="input font-mono" value={settings.data?.instanceId ?? ''} readOnly />
-            <span className="hint">{t('adm.settings.instanceIdHint')}</span>
-          </label>
-          {save.error && (
-            <Banner kind="danger" role="alert">
-              {save.error.message}
-            </Banner>
-          )}
-          <div className="flex justify-end">
-            <button type="submit" className="btn primary" disabled={save.isPending}>
-              {t('adm.settings.save')}
-            </button>
-          </div>
-        </form>
-      )}
-    </Section>
+    <>
+      <Section title={t('adm.navSettings')}>
+        {value && (
+          <form
+            className="space-y-3 rounded-md border border-border bg-panel p-4"
+            onSubmit={(e) => {
+              e.preventDefault();
+              save.mutate(value);
+            }}
+          >
+            <label className="field max-w-md">
+              <span className="label">{t('adm.settings.name')}</span>
+              <input
+                className="input"
+                value={value.name}
+                onChange={(e) => setForm({ ...value, name: e.target.value })}
+                required
+              />
+            </label>
+            <label className="field max-w-md">
+              <span className="label">{t('adm.settings.groupCreation')}</span>
+              <select
+                className="select"
+                value={value.groupCreation}
+                onChange={(e) =>
+                  setForm({ ...value, groupCreation: e.target.value === 'admin' ? 'admin' : 'all' })
+                }
+              >
+                <option value="all">{t('adm.settings.groupCreationAll')}</option>
+                <option value="admin">{t('adm.settings.groupCreationAdmin')}</option>
+              </select>
+            </label>
+            <label className="field max-w-md">
+              <span className="label">{t('adm.settings.allowlist')}</span>
+              <textarea
+                className="textarea h-28 font-mono"
+                value={value.allowlist}
+                spellCheck={false}
+                placeholder="10.0.0.0/8\ndb.internal"
+                onChange={(e) => setForm({ ...value, allowlist: e.target.value })}
+              />
+              <span className="hint">{t('adm.settings.allowlistHint')}</span>
+            </label>
+            <label className="field max-w-md">
+              <span className="label">{t('adm.settings.webhookAllowlist')}</span>
+              <textarea
+                className="textarea h-28 font-mono"
+                value={value.webhookAllowlist}
+                spellCheck={false}
+                placeholder="10.1.2.0/24\nhooks.internal"
+                onChange={(e) => setForm({ ...value, webhookAllowlist: e.target.value })}
+              />
+              <span className="hint">{t('adm.settings.webhookAllowlistHint')}</span>
+            </label>
+            <label className="field max-w-md">
+              <span className="label">{t('adm.settings.instanceId')}</span>
+              <input className="input font-mono" value={settings.data?.instanceId ?? ''} readOnly />
+              <span className="hint">{t('adm.settings.instanceIdHint')}</span>
+            </label>
+            {save.error && (
+              <Banner kind="danger" role="alert">
+                {save.error.message}
+              </Banner>
+            )}
+            <div className="flex justify-end">
+              <button type="submit" className="btn primary" disabled={save.isPending}>
+                {t('adm.settings.save')}
+              </button>
+            </div>
+          </form>
+        )}
+      </Section>
+      <AdminEmailSettings />
+    </>
   );
 };
 

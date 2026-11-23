@@ -9,11 +9,17 @@ import { DatabaseSync } from 'node:sqlite';
 import { BASELINE_VERSION_NAME } from '@dowel/api';
 import { addColumn, createSchema, createTable, emptyModel, type Model } from '@dowel/core';
 import { type ScriptStep, stepsChecksum } from '@dowel/engines';
-import { afterAll, describe, expect, test } from 'vitest';
+import { afterAll, describe, expect, test, vi } from 'vitest';
 
 import { createTestDb, PG_URL } from '../../../test/pg.ts';
 import { hashPassword } from '../src/auth.ts';
-import { isUniqueViolation, MIGRATIONS, openPlatformDb, type PlatformDb } from '../src/db.ts';
+import {
+  isEmailUniqueViolation,
+  isUniqueViolation,
+  MIGRATIONS,
+  openPlatformDb,
+  type PlatformDb,
+} from '../src/db.ts';
 import { effectiveRole, loadRoleContext, type ProjectRoleInput } from '../src/roles.ts';
 import { readSettings } from '../src/settings.ts';
 
@@ -90,8 +96,12 @@ const check = async (db: PlatformDb) => {
   expect(users.map((u) => ({ id: u.id, username: u.username, role: u.role }))).toEqual(EXPECTED);
   expect(users.every((u) => u.status === 'active')).toBe(true);
 
-  // 邮箱不再唯一、密码可为空
-  await db.query("update users set password_hash = null, email = 'same@x.com' where id in ('u1', 'u2')");
+  // 密码可为空，多个 null 邮箱允许，但非空邮箱大小写不敏感全实例唯一
+  await db.query("update users set password_hash = null, email = null where id in ('u1', 'u2')");
+  await db.query("update users set email = 'Unique@X.com' where id = 'u1'");
+  await expect(db.query("update users set email = 'unique@x.com' where id = 'u2'")).rejects.toSatisfy(
+    isEmailUniqueViolation,
+  );
 
   // 组：每个创建者一个组（用他的用户名），默认权限是 none；没有创建者的项目归 default 组，
   // default 组的管理员只取启用的实例管理员。创建者只有在自己名下所有项目都是 owner 时才是组管理员。
@@ -815,8 +825,8 @@ describe('从 v27 升级迁移 28：must_change_password 与清理历史 setup_t
             : 'insert into instance_settings (key, value) values ($1, $2)',
           ['setup_token', JSON.stringify({ plain: 'stale-token' })],
         );
-        // 模拟停在 v27：删掉 v28 迁移记录并移回旧列，以真实测试迁移 28（含重复运行幂等）
-        await db.query('delete from dowel_migrations where version >= $1', [MIGRATIONS.length]);
+        // 模拟停在 v27：删掉 v28+ 迁移记录并移回旧列，以真实测试迁移 28（含重复运行幂等）
+        await db.query('delete from dowel_migrations where version >= $1', [28]);
       } finally {
         await db.close();
       }
@@ -835,8 +845,8 @@ describe('从 v27 升级迁移 28：must_change_password 与清理历史 setup_t
         );
         expect(Boolean(u!.mustChangePassword)).toBe(false);
 
-        // SQLite 也验证删掉列后再跑或直接删 migration version 幂等重跑
-        await upgraded.query('delete from dowel_migrations where version >= $1', [MIGRATIONS.length]);
+        // 幂等重跑迁移 28+
+        await upgraded.query('delete from dowel_migrations where version >= $1', [28]);
       } finally {
         await upgraded.close();
       }
@@ -852,6 +862,147 @@ describe('从 v27 升级迁移 28：must_change_password 与清理历史 setup_t
         expect(Boolean(u!.mustChangePassword)).toBe(false);
       } finally {
         await rerun.close();
+      }
+    },
+  );
+});
+
+describe('从 v28 升级迁移 29：邮箱规范化、安全去重、大小写不敏感部分唯一索引与 invites.email', () => {
+  const cleanups: (() => Promise<void>)[] = [];
+  afterAll(async () => {
+    for (const c of cleanups) await c();
+  });
+
+  test.each([
+    { platform: 'sqlite' as const, skip: false },
+    { platform: 'pg' as const, skip: !PG_URL },
+  ])(
+    '历史重复邮箱安全去重（活跃管理员优先/最早优先）、告警不泄邮箱、索引拦截重邮箱并允许多个 null（$platform）',
+    async ({ platform, skip }) => {
+      if (skip) return;
+      let url = '';
+      if (platform === 'pg') {
+        const pg = await createTestDb('mig29');
+        cleanups.push(pg.close);
+        url = pg.url;
+      } else {
+        const dir = mkdtempSync(join(tmpdir(), 'dowel-mig29-'));
+        cleanups.push(async () => rmSync(dir, { recursive: true, force: true }));
+        url = join(dir, 'dowel.db');
+      }
+
+      const base = await openPlatformDb(url);
+      try {
+        await base.exec('drop index if exists users_email_unique');
+        await base.exec('alter table invites drop column email');
+        await base.query('delete from dowel_migrations where version >= $1', [29]);
+
+        // 组1：重复邮箱，含一个较早的普通成员、一个停用管理员、一个活跃管理员 → 保留活跃管理员
+        await base.query(
+          `insert into users (id, username, name, email, role, status, created_at)
+           values ($1, $2, $3, $4, $5, $6, $7)`,
+          ['u-m', 'member1', '成员', '  Dup@Example.com \n', 'member', 'active', '2026-01-01T00:00:00.000Z'],
+        );
+        await base.query(
+          `insert into users (id, username, name, email, role, status, created_at)
+           values ($1, $2, $3, $4, $5, $6, $7)`,
+          ['u-da', 'disadmin', '停用管', 'DUP@example.com', 'admin', 'disabled', '2026-01-01T00:00:00.000Z'],
+        );
+        await base.query(
+          `insert into users (id, username, name, email, role, status, created_at)
+           values ($1, $2, $3, $4, $5, $6, $7)`,
+          ['u-aa', 'actadmin', '活跃管', 'dup@example.com', 'admin', 'active', '2026-01-02T00:00:00.000Z'],
+        );
+
+        // 组2：均非活跃管理员，按 created_at asc, id asc 保留最早一位
+        await base.query(
+          `insert into users (id, username, name, email, role, status, created_at)
+           values ($1, $2, $3, $4, $5, $6, $7)`,
+          ['u-e1', 'early', '早', '  Same@Y.com ', 'member', 'active', '2026-01-01T00:00:00.000Z'],
+        );
+        await base.query(
+          `insert into users (id, username, name, email, role, status, created_at)
+           values ($1, $2, $3, $4, $5, $6, $7)`,
+          ['u-e2', 'late', '晚', 'same@y.com', 'member', 'active', '2026-01-03T00:00:00.000Z'],
+        );
+
+        // 空串与纯空白规范化为 null，且允许多个 null
+        await base.query(
+          `insert into users (id, username, name, email, role, status, created_at)
+           values ($1, $2, $3, $4, $5, $6, $7)`,
+          ['u-b1', 'blank1', '空1', ' \t\n ', 'member', 'active', '2026-01-04T00:00:00.000Z'],
+        );
+        await base.query(
+          `insert into users (id, username, name, email, role, status, created_at)
+           values ($1, $2, $3, $4, $5, $6, $7)`,
+          ['u-b2', 'blank2', '空2', null, 'member', 'active', '2026-01-05T00:00:00.000Z'],
+        );
+      } finally {
+        await base.close();
+      }
+
+      const warnSpy = vi.spyOn(console, 'warn').mockImplementation(() => {});
+      let upgraded: PlatformDb;
+      try {
+        upgraded = await openPlatformDb(url);
+      } finally {
+        const logs = warnSpy.mock.calls.map((c) => c.join(' ')).join('\n');
+        warnSpy.mockRestore();
+        expect(logs).toContain('u-m(member1)');
+        expect(logs).toContain('u-da(disadmin)');
+        expect(logs).toContain('u-e2(late)');
+        // 告警日志不泄露邮箱地址
+        expect(logs.toLowerCase()).not.toContain('dup@example.com');
+        expect(logs.toLowerCase()).not.toContain('same@y.com');
+      }
+
+      try {
+        const [ver] = await upgraded.query<{ v: number }>('select max(version) as v from dowel_migrations');
+        expect(ver!.v).toBe(MIGRATIONS.length);
+
+        const rows = await upgraded.query<{ id: string; email: string | null }>(
+          'select id, email from users order by id',
+        );
+        const byId = new Map(rows.map((r) => [r.id, r.email]));
+        expect(byId.get('u-aa')).toBe('dup@example.com');
+        expect(byId.get('u-m')).toBeNull();
+        expect(byId.get('u-da')).toBeNull();
+        expect(byId.get('u-e1')).toBe('same@y.com');
+        expect(byId.get('u-e2')).toBeNull();
+        expect(byId.get('u-b1')).toBeNull();
+        expect(byId.get('u-b2')).toBeNull();
+
+        // 唯一索引大小写不敏感拦截重邮箱，同时允许多条 null
+        await expect(
+          upgraded.query(
+            "insert into users (id, username, name, email) values ('u-dup', 'dupnew', 'Dup', 'DUP@EXAMPLE.COM')",
+          ),
+        ).rejects.toSatisfy(isEmailUniqueViolation);
+        await upgraded.query(
+          "insert into users (id, username, name, email) values ('u-null2', 'null2', 'Null2', null)",
+        );
+
+        // invites.email 可写入与查询
+        await upgraded.query(
+          "insert into invites (id, kind, token_hash, email, expires_at) values ('inv1', 'invite', 'th1', 'inv@x.com', '2099-01-01T00:00:00.000Z')",
+        );
+        const [inv] = await upgraded.query<{ email: string | null }>(
+          "select email from invites where id = 'inv1'",
+        );
+        expect(inv!.email).toBe('inv@x.com');
+
+        // 幂等重跑迁移 29
+        await upgraded.query('delete from dowel_migrations where version >= $1', [29]);
+        await upgraded.close();
+        const rerun = await openPlatformDb(url);
+        try {
+          const [ver2] = await rerun.query<{ v: number }>('select max(version) as v from dowel_migrations');
+          expect(ver2!.v).toBe(MIGRATIONS.length);
+        } finally {
+          await rerun.close();
+        }
+      } finally {
+        await upgraded.close().catch(() => {});
       }
     },
   );
