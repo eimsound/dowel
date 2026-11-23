@@ -57,7 +57,7 @@ When you add an environment to an existing Dowel project (such as restoring a pr
 
 When the platform database is lost without a backup or reinstalling Dowel changes `instance_id`, recover using any surviving target databases:
 
-1. Deploy and initialize a fresh Dowel instance with `DOWEL_SECRET` and create the first instance admin through `/setup` or unattended environment variables.
+1. Deploy and start a fresh Dowel instance with `DOWEL_SECRET`, and sign in as the bootstrap instance admin using `initial-admin-password` or a preset password via `DOWEL_ADMIN_PASSWORD_FILE` or `DOWEL_ADMIN_PASSWORD`.
 2. As an instance admin, open the [New project wizard](#takeover-wizard), pick the dialect, choose Take over an existing project, enter the connection strings (and shadow database settings) for all known environments, and select the detected project.
 3. Confirm the claim. Because the fresh instance has a new `instance_id`, Dowel prompts for instance admin claim confirmation. Once confirmed, Dowel verifies the entire chain in the shadow database, rebuilds the platform project, and locks out the old instance from executing against those targets.
 4. Verify the restored version chain, current environment versions, and post-takeover drift checks before resuming normal modeling and execution.

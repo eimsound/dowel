@@ -6,7 +6,7 @@ import { resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
 
 import { newId } from '@dowel/core';
-import { autoSetup, openPlatformDb } from '@dowel/server';
+import { bootstrapAdmin, openPlatformDb } from '@dowel/server';
 import { chromium, type Page } from '@playwright/test';
 
 import { type GeneratedSchema, generateLargeSchema } from './generator.ts';
@@ -103,11 +103,13 @@ const seedPlatformDb = async (
 ): Promise<{ pid100: string; pid1000: string; pid1000Focus1: string; pid1000Focus2: string }> => {
   const db = await openPlatformDb(dbPath);
   try {
-    const admin = await autoSetup(db, {
-      DOWEL_ADMIN_USERNAME: ADMIN_USER,
-      DOWEL_ADMIN_PASSWORD: ADMIN_PASS,
+    const { created: admin } = await bootstrapAdmin(db, {
+      env: {
+        DOWEL_ADMIN_USERNAME: ADMIN_USER,
+        DOWEL_ADMIN_PASSWORD: ADMIN_PASS,
+      },
     });
-    if (!admin) throw new Error('autoSetup 未创建管理员');
+    if (!admin) throw new Error('bootstrapAdmin 未创建管理员');
 
     const groupId = newId();
     await db.query(

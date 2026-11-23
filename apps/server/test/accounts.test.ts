@@ -1,26 +1,35 @@
 // 账户集成测试：初始化、实例设置、密码登录开关、邀请、重置密码、用户管理、个人设置。
 // 用 app.request 直接打 HTTP（不需要真实端口）；SQLite 用内存库，PostgreSQL 用测试实例（没有 Docker 时跳过）。
 
-import { spawnSync } from 'node:child_process';
+import { spawn, spawnSync } from 'node:child_process';
+import { existsSync, mkdtempSync, readFileSync, rmSync, statSync, writeFileSync } from 'node:fs';
+import { tmpdir } from 'node:os';
+import { join } from 'node:path';
 
 import type { InstanceInfo, Me, SessionInfo } from '@dowel/api';
 import { afterEach, beforeEach, describe, expect, test } from 'vitest';
 
 import { createTestDb, PG_URL } from '../../../test/pg.ts';
+import type { AppOptions } from '../src/app.ts';
 import { hashToken } from '../src/auth.ts';
-import { autoSetup, createApp, openPlatformDb, type PlatformDb, writeSettings } from '../src/index.ts';
+import { bootstrapAdmin, createApp, openPlatformDb, type PlatformDb, writeSettings } from '../src/index.ts';
 import { makeUser, PASSWORD } from './support.ts';
 
 let db: PlatformDb;
 let app: ReturnType<typeof createApp>['app'];
-let setupToken: string;
 let stop: () => Promise<void>;
 let pg: Awaited<ReturnType<typeof createTestDb>> | undefined;
+const tempDirs: string[] = [];
 
-const boot = async (options: { allowPasswordLogin?: boolean } = {}) => {
+const makeTempDir = () => {
+  const dir = mkdtempSync(join(tmpdir(), 'dowel-acc-test-'));
+  tempDirs.push(dir);
+  return dir;
+};
+
+const boot = async (options: AppOptions = {}) => {
   const created = createApp(db, options);
   app = created.app;
-  setupToken = created.setupToken!;
   stop = async () => {
     await created.rooms.flush();
     await created.shadows.close();
@@ -44,6 +53,7 @@ describe.each([
     await db.close();
     await pg?.close();
     pg = undefined;
+    while (tempDirs.length > 0) rmSync(tempDirs.pop()!, { recursive: true, force: true });
   });
 
   const call = async (method: string, path: string, json?: unknown, cookie = '') => {
@@ -67,22 +77,19 @@ describe.each([
     };
   };
 
-  /** 用初始化令牌创建第一个实例管理员，返回它的会话 cookie 和用户 ID */
+  /** 直接写库建一个无需改密的实例管理员，返回它的会话 cookie 和用户 ID */
   const setupAdmin = async (username = 'admin') => {
-    const r = await call('POST', '/api/setup', {
-      token: setupToken,
-      username,
-      name: '管理员',
-      password: PASSWORD,
-    });
-    expect(r.status).toBe(200);
-    return { cookie: r.cookie, id: r.data.id as string };
+    const u = await makeUser(db, username, { name: '管理员', role: 'admin' });
+    const cookie = await login(username);
+    return { cookie, id: u.id };
   };
 
-  /** 管理员建一个普通用户；返回新用户 ID */
+  /** 管理员建一个普通用户（带初始密码时会置 mustChangePassword），并在辅助里清理标志以便既有流程直接用 */
   const createMember = async (admin: string, username: string, password = PASSWORD) => {
     const r = await call('POST', '/api/admin/users', { username, name: username, password }, admin);
     expect(r.status).toBe(201);
+    expect(r.data.mustChangePassword).toBe(true);
+    await db.query('update users set must_change_password = $2 where id = $1', [r.data.id, false]);
     return r.data.id as string;
   };
 
@@ -92,66 +99,183 @@ describe.each([
     return r.cookie;
   };
 
+  test.skipIf(skip)('废除 /setup：首次启动写 0600 临时密码，登录后强制改密并清理初始文件', async () => {
+    expect((await call('GET', '/api/setup')).status).toBe(404);
+    expect(
+      (await call('POST', '/api/setup', { token: 'x', username: 'a', name: 'A', password: PASSWORD })).status,
+    ).toBe(404);
+
+    const inst = await call('GET', '/api/instance');
+    expect(inst.status).toBe(200);
+    expect(inst.data).toMatchObject({ name: 'Dowel', passwordLogin: true, providers: [] });
+    expect('needsSetup' in inst.data).toBe(false);
+
+    const dir = makeTempDir();
+    const pwFile = join(dir, 'initial-admin-password');
+    const bootRes = await bootstrapAdmin(db, { env: { DOWEL_INITIAL_PASSWORD_FILE: pwFile } });
+    expect(bootRes.source).toBe('generated');
+    expect(bootRes.bootstrapUsername).toBe('admin');
+    expect(bootRes.initialAdminPasswordFile).toBe(pwFile);
+    expect(bootRes.created).toMatchObject({ username: 'admin', role: 'admin', mustChangePassword: true });
+    expect(statSync(pwFile).mode & 0o777).toBe(0o600);
+    const tempPw = readFileSync(pwFile, 'utf8').trim();
+    expect(tempPw).toHaveLength(24);
+
+    // 再次执行幂等不覆盖
+    const second = await bootstrapAdmin(db, { env: { DOWEL_INITIAL_PASSWORD_FILE: pwFile } });
+    expect(second.created).toBeNull();
+    expect(readFileSync(pwFile, 'utf8').trim()).toBe(tempPw);
+
+    await stop();
+    await boot({
+      initialAdminPasswordFile: bootRes.initialAdminPasswordFile,
+      bootstrapUsername: bootRes.bootstrapUsername,
+    });
+
+    const firstLogin = await call('POST', '/api/auth/login', { username: 'admin', password: tempPw });
+    expect(firstLogin.status).toBe(200);
+    expect(firstLogin.data).toMatchObject({ username: 'admin', role: 'admin', mustChangePassword: true });
+    const otherLogin = await call('POST', '/api/auth/login', { username: 'admin', password: tempPw });
+    expect(otherLogin.status).toBe(200);
+
+    // 允许 GET /api/auth/me，但其它已认证端点与 SSE / OIDC link 一律 403 password_change_required
+    expect((await call('GET', '/api/auth/me', undefined, firstLogin.cookie)).data).toMatchObject({
+      mustChangePassword: true,
+    });
+    for (const [m, p, b] of [
+      ['GET', '/api/projects'],
+      ['PATCH', '/api/me', { name: '新名' }],
+      ['GET', '/api/me/sessions'],
+      ['GET', '/api/me/inbox/stream'],
+      ['GET', '/api/admin/users'],
+      ['POST', '/api/groups', { slug: 'g', name: 'G' }],
+      ['GET', '/api/directory'],
+    ] as const) {
+      const blocked = await call(m, p, b, firstLogin.cookie);
+      expect(blocked.status, `${m} ${p}`).toBe(403);
+      expect(blocked.data).toMatchObject({ code: 'password_change_required' });
+    }
+    await db.query(
+      `insert into oidc_providers (id, slug, name, issuer, client_id, client_secret_enc, enabled, auto_provision)
+       values ('acc-oidc-id', 'acc-oidc', 'Acc OIDC', 'https://idp.example', 'cid', 'enc', true, false)`,
+    );
+    try {
+      const oidcLinkBlocked = await call(
+        'GET',
+        '/api/auth/oidc/acc-oidc/start?mode=link',
+        undefined,
+        firstLogin.cookie,
+      );
+      expect(oidcLinkBlocked.status).toBe(403);
+      expect(oidcLinkBlocked.data).toMatchObject({ code: 'password_change_required' });
+    } finally {
+      await db.query("delete from oidc_providers where id = 'acc-oidc-id'");
+    }
+
+    // 强制改密不允许新密码与临时密码相同
+    expect(
+      (
+        await call(
+          'POST',
+          '/api/me/password',
+          { oldPassword: tempPw, newPassword: tempPw },
+          firstLogin.cookie,
+        )
+      ).status,
+    ).toBe(400);
+
+    // 强制改密期间也允许退出
+    expect((await call('POST', '/api/auth/logout', undefined, otherLogin.cookie)).status).toBe(200);
+    const thirdLogin = await call('POST', '/api/auth/login', { username: 'admin', password: tempPw });
+
+    // 完成改密：清除标志、删除自动生成的密码文件、吊销其他会话并保留当前会话
+    const changed = await call(
+      'POST',
+      '/api/me/password',
+      { oldPassword: tempPw, newPassword: PASSWORD },
+      firstLogin.cookie,
+    );
+    expect(changed.status).toBe(200);
+    expect(existsSync(pwFile)).toBe(false);
+    expect((await call('GET', '/api/auth/me', undefined, firstLogin.cookie)).data).toMatchObject({
+      mustChangePassword: false,
+    });
+    expect((await call('GET', '/api/auth/me', undefined, thirdLogin.cookie)).status).toBe(401);
+    expect((await call('GET', '/api/projects', undefined, firstLogin.cookie)).status).toBe(200);
+    expect(await login('admin', PASSWORD)).toBeTruthy();
+  });
+
   test.skipIf(skip)(
-    '初始化：需要初始化时返回 needsSetup，令牌正确才能建管理员，之后 setup 一律 409',
+    '运维预设密码（DOWEL_ADMIN_PASSWORD_FILE / DOWEL_ADMIN_PASSWORD）：无需强制改密、绝不删文件且互斥报错',
     async () => {
-      expect((await call('GET', '/api/setup')).data).toEqual({ needsSetup: true });
-      expect((await call('GET', '/api/instance')).data).toMatchObject({ needsSetup: true, name: 'Dowel' });
+      const dir = makeTempDir();
+      const opFile = join(dir, 'op-secret');
+      writeFileSync(opFile, `\n  ${PASSWORD}-op-file \n`, { mode: 0o600 });
 
-      const bad = await call('POST', '/api/setup', {
-        token: 'not-the-token',
-        username: 'admin',
-        name: '管理员',
-        password: PASSWORD,
-      });
-      expect(bad.status).toBe(403);
+      await expect(
+        bootstrapAdmin(db, { env: { DOWEL_ADMIN_PASSWORD_FILE: opFile, DOWEL_ADMIN_PASSWORD: PASSWORD } }),
+      ).rejects.toThrow(/DOWEL_ADMIN_PASSWORD_FILE/);
 
-      const ok = await call('POST', '/api/setup', {
-        token: setupToken,
-        username: 'admin',
-        name: '管理员',
-        password: PASSWORD,
+      const emptyFile = join(dir, 'empty');
+      writeFileSync(emptyFile, '   \n');
+      await expect(bootstrapAdmin(db, { env: { DOWEL_ADMIN_PASSWORD_FILE: emptyFile } })).rejects.toThrow(
+        /不能为空/,
+      );
+
+      const shortFile = join(dir, 'short');
+      writeFileSync(shortFile, '1234567\n');
+      await expect(bootstrapAdmin(db, { env: { DOWEL_ADMIN_PASSWORD_FILE: shortFile } })).rejects.toThrow(
+        /不合法/,
+      );
+
+      await expect(
+        bootstrapAdmin(db, { env: { DOWEL_ADMIN_PASSWORD_FILE: join(dir, 'missing') } }),
+      ).rejects.toThrow(/无法读取/);
+
+      const bootRes = await bootstrapAdmin(db, {
+        env: { DOWEL_ADMIN_USERNAME: 'OpsRoot', DOWEL_ADMIN_PASSWORD_FILE: opFile },
       });
-      expect(ok.status).toBe(200);
-      expect(ok.data).toMatchObject({ username: 'admin', role: 'admin', status: 'active' });
-      // 建完即登录
-      expect((await call('GET', '/api/auth/me', undefined, ok.cookie)).data).toMatchObject({
-        username: 'admin',
+      expect(bootRes.source).toBe('file');
+      expect(bootRes.initialAdminPasswordFile).toBeNull();
+      expect(bootRes.bootstrapUsername).toBe('opsroot');
+      expect(bootRes.created).toMatchObject({
+        username: 'opsroot',
+        name: 'opsroot',
         role: 'admin',
+        mustChangePassword: false,
       });
 
-      expect((await call('GET', '/api/setup')).data).toEqual({ needsSetup: false });
-      expect((await call('GET', '/api/instance')).data).toMatchObject({ needsSetup: false });
-
-      // 已经有用户：不管令牌对不对都是 409（令牌也已经用掉了）
+      const cookie = await login('opsroot', `${PASSWORD}-op-file`);
+      expect((await call('GET', '/api/projects', undefined, cookie)).status).toBe(200);
       expect(
         (
-          await call('POST', '/api/setup', {
-            token: setupToken,
-            username: 'admin2',
-            name: '管理员二',
-            password: PASSWORD,
-          })
+          await call(
+            'POST',
+            '/api/me/password',
+            { oldPassword: `${PASSWORD}-op-file`, newPassword: 'new-op-password' },
+            cookie,
+          )
         ).status,
-      ).toBe(409);
+      ).toBe(200);
+      // 运维提供的新密码文件绝不会被删除或覆盖
+      expect(readFileSync(opFile, 'utf8')).toBe(`\n  ${PASSWORD}-op-file \n`);
+
+      // 清库后测 DOWEL_ADMIN_PASSWORD
+      await db.query('delete from sessions');
+      await db.query('delete from users');
+      const envRes = await bootstrapAdmin(db, {
+        env: { DOWEL_ADMIN_USERNAME: 'root', DOWEL_ADMIN_PASSWORD: PASSWORD },
+      });
+      expect(envRes.source).toBe('env');
+      expect(envRes.initialAdminPasswordFile).toBeNull();
+      expect(envRes.created).toMatchObject({
+        username: 'root',
+        role: 'admin',
+        mustChangePassword: false,
+      });
+      expect(await login('root', PASSWORD)).toBeTruthy();
     },
   );
-
-  test.skipIf(skip)('无人值守初始化：DOWEL_ADMIN_* 直接建管理员，已有用户时不再执行', async () => {
-    const env = { DOWEL_ADMIN_USERNAME: 'root', DOWEL_ADMIN_PASSWORD: PASSWORD };
-    const created = await autoSetup(db, env);
-    expect(created).toMatchObject({ username: 'root', role: 'admin' });
-    expect((await call('GET', '/api/setup')).data).toEqual({ needsSetup: false });
-    expect(await login('root')).toBeTruthy();
-
-    // 第二次不会再建（幂等）
-    expect(await autoSetup(db, env)).toBeNull();
-    expect(await db.query('select username from users')).toEqual([{ username: 'root' }]);
-    // 只设置一半时什么都不做
-    await db.query('delete from users');
-    expect(await autoSetup(db, { DOWEL_ADMIN_USERNAME: 'root' })).toBeNull();
-    expect((await call('GET', '/api/setup')).data).toEqual({ needsSetup: true });
-  });
 
   test.skipIf(skip)('实例设置：只有实例管理员能读写，公开接口返回登录页需要的信息', async () => {
     const admin = await setupAdmin();
@@ -467,6 +591,16 @@ describe.each([
     // 现在唯一的管理员是 admin2：不能再降级它
     const admin2 = await login('admin2');
     expect(
+      (
+        await call(
+          'POST',
+          '/api/me/password',
+          { oldPassword: PASSWORD, newPassword: 'admin2-new-password' },
+          admin2,
+        )
+      ).status,
+    ).toBe(200);
+    expect(
       (await call('PATCH', `/api/admin/users/${second.data.id as string}`, { role: 'member' }, admin2))
         .status,
     ).toBe(422);
@@ -737,6 +871,16 @@ describe.each([
     );
     expect(second.status).toBe(201);
     const admin2 = await login('admin2');
+    expect(
+      (
+        await call(
+          'POST',
+          '/api/me/password',
+          { oldPassword: PASSWORD, newPassword: 'admin2-new-password' },
+          admin2,
+        )
+      ).status,
+    ).toBe(200);
 
     const [a, b] = await Promise.all([
       call('PATCH', `/api/admin/users/${second.data.id as string}`, { role: 'member' }, admin.cookie),
@@ -749,73 +893,158 @@ describe.each([
     ).toHaveLength(1);
   });
 
-  test.skipIf(skip)('初始化并发：同一个令牌只会建出一个管理员', async () => {
-    const bodies = [
-      { token: setupToken, username: 'first', name: '第一个', password: PASSWORD },
-      { token: setupToken, username: 'second', name: '第二个', password: PASSWORD },
-    ];
-    const results = await Promise.all(bodies.map((json) => call('POST', '/api/setup', json)));
-    expect(results.filter((r) => r.status === 200)).toHaveLength(1);
-    // 另一个要么令牌已被认领（403），要么实例已经初始化（409）
-    expect(results.filter((r) => r.status === 403 || r.status === 409)).toHaveLength(1);
-    expect(await db.query('select id from users')).toHaveLength(1);
-    expect(await db.query<{ role: string }>("select role from users where role = 'admin'")).toHaveLength(1);
-  });
-
-  test.skipIf(skip)('初始化：令牌不对时不会被用掉，失败后会还回来', async () => {
-    expect(
-      (
-        await call('POST', '/api/setup', {
-          token: 'wrong-token',
-          username: 'someone',
-          name: '某人',
-          password: PASSWORD,
-        })
-      ).status,
-    ).toBe(403);
-    // 令牌没被消费，正确的令牌还能用
-    expect(
-      (
-        await call('POST', '/api/setup', {
-          token: setupToken,
-          username: 'admin',
-          name: '管理员',
-          password: PASSWORD,
-        })
-      ).status,
-    ).toBe(200);
-  });
-
-  test.skipIf(skip)('初始化失败后令牌会还回来，可以重试', async () => {
-    // 用 SQLite 触发器造一个插入失败（令牌恢复的逻辑与方言无关）
-    if (platform !== 'sqlite') return;
-    await db.exec(`create trigger fail_setup before insert on users
-                   when new.username = 'boom'
+  test.skipIf(skip)(
+    'bootstrapAdmin 插入失败回滚并清理刚写入的临时密码文件，重试可成功（SQLite）',
+    async () => {
+      if (platform !== 'sqlite') return;
+      const dir = makeTempDir();
+      const pwFile = join(dir, 'initial-admin-password');
+      await db.exec(`create trigger fail_setup before insert on users
+                   when new.username = 'admin'
                    begin select raise(abort, 'boom'); end;`);
-    expect(
-      (
-        await call('POST', '/api/setup', {
-          token: setupToken,
-          username: 'boom',
-          name: '炸',
-          password: PASSWORD,
-        })
-      ).status,
-    ).toBe(500);
-    expect(await db.query('select id from users')).toHaveLength(0);
+      await expect(bootstrapAdmin(db, { env: { DOWEL_INITIAL_PASSWORD_FILE: pwFile } })).rejects.toThrow(
+        /boom/,
+      );
+      expect(await db.query('select id from users')).toHaveLength(0);
+      expect(existsSync(pwFile)).toBe(false);
 
-    // 令牌被还回来了，同一个令牌还能继续初始化
-    expect(
-      (
-        await call('POST', '/api/setup', {
-          token: setupToken,
-          username: 'admin',
-          name: '管理员',
-          password: PASSWORD,
-        })
-      ).status,
-    ).toBe(200);
-  });
+      await db.exec('drop trigger fail_setup');
+      const ok = await bootstrapAdmin(db, { env: { DOWEL_INITIAL_PASSWORD_FILE: pwFile } });
+      expect(ok.created).toMatchObject({ username: 'admin', role: 'admin', mustChangePassword: true });
+      expect(existsSync(pwFile)).toBe(true);
+    },
+  );
+
+  test.skipIf(skip)(
+    '管理员创建与重置临时密码：手动/随机生成、禁止自重置、吊销会话、不泄露明文审计，且 /api/reset/:token 清除须改密',
+    async () => {
+      const admin = await setupAdmin();
+      // 创建不带密码的纯 OIDC 用户：mustChangePassword=false
+      const oidcCreated = await call(
+        'POST',
+        '/api/admin/users',
+        { username: 'oidc-only-u', name: 'OIDC用户' },
+        admin.cookie,
+      );
+      expect(oidcCreated.status).toBe(201);
+      expect(oidcCreated.data.mustChangePassword).toBe(false);
+
+      // 创建带密码的用户：mustChangePassword=true，列表中返回布尔值
+      const tempCreated = await call(
+        'POST',
+        '/api/admin/users',
+        { username: 'tempuser', name: '临时用户', password: PASSWORD },
+        admin.cookie,
+      );
+      expect(tempCreated.status).toBe(201);
+      expect(tempCreated.data.mustChangePassword).toBe(true);
+      const userList = (await call('GET', '/api/admin/users?q=tempuser', undefined, admin.cookie))
+        .data as unknown as { id: string; mustChangePassword: boolean }[];
+      expect(userList[0]!.mustChangePassword).toBe(true);
+
+      const tempUserId = tempCreated.data.id as string;
+      const tempSession = await login('tempuser');
+      expect((await call('GET', '/api/projects', undefined, tempSession)).status).toBe(403);
+
+      // 1. 禁止在用户管理接口重置自己，也不允许操作不存在用户或过短密码
+      expect(
+        (await call('POST', `/api/admin/users/${admin.id}/reset-password`, {}, admin.cookie)).status,
+      ).toBe(422);
+      expect(
+        (await call('POST', '/api/admin/users/no-such-user/reset-password', {}, admin.cookie)).status,
+      ).toBe(404);
+      expect(
+        (
+          await call(
+            'POST',
+            `/api/admin/users/${tempUserId}/reset-password`,
+            { password: 'short' },
+            admin.cookie,
+          )
+        ).status,
+      ).toBe(400);
+
+      // 2. 自动生成临时密码：吊销原有会话、审计不含明文
+      const genRes = await call('POST', `/api/admin/users/${tempUserId}/reset-password`, {}, admin.cookie);
+      expect(genRes.status).toBe(200);
+      expect(genRes.data.mustChangePassword).toBe(true);
+      const generatedPw = genRes.data.password as string;
+      expect(generatedPw).toHaveLength(24);
+      expect((await call('GET', '/api/auth/me', undefined, tempSession)).status).toBe(401);
+
+      const [resetAudit] = await db.query<{
+        data: { username: string; generated: boolean; mustChangePassword: boolean };
+      }>("select data from audit_events where action = 'user.password_reset_temp' order by at desc limit 1");
+      expect(resetAudit!.data).toEqual({
+        username: 'tempuser',
+        generated: true,
+        mustChangePassword: true,
+      });
+      expect(JSON.stringify(resetAudit!.data)).not.toContain(generatedPw);
+
+      // 用生成的新临时密码登录 → 被 403 拦截 → 改密恢复
+      const tempSession2 = await login('tempuser', generatedPw);
+      expect((await call('GET', '/api/projects', undefined, tempSession2)).data).toMatchObject({
+        code: 'password_change_required',
+      });
+      expect(
+        (
+          await call(
+            'POST',
+            '/api/me/password',
+            { oldPassword: generatedPw, newPassword: 'tempuser-new-pw' },
+            tempSession2,
+          )
+        ).status,
+      ).toBe(200);
+      expect((await call('GET', '/api/projects', undefined, tempSession2)).status).toBe(200);
+
+      // 3. 管理员手动指定临时密码
+      const manualRes = await call(
+        'POST',
+        `/api/admin/users/${tempUserId}/reset-password`,
+        { password: 'manual-temp-pw' },
+        admin.cookie,
+      );
+      expect(manualRes.status).toBe(200);
+      expect(manualRes.data).toEqual({ password: 'manual-temp-pw', mustChangePassword: true });
+      const tempSession3 = await login('tempuser', 'manual-temp-pw');
+      expect((await call('GET', '/api/auth/me', undefined, tempSession3)).data).toMatchObject({
+        mustChangePassword: true,
+      });
+
+      // 4. 用户通过 /api/reset/:token 完成自助重置时同样清除 mustChangePassword，若为 bootstrap 管理员也清理文件
+      const resetLink = await call('POST', `/api/admin/users/${tempUserId}/reset-link`, {}, admin.cookie);
+      expect(resetLink.status).toBe(200);
+      expect(
+        (
+          await call('POST', `/api/reset/${resetLink.data.token as string}`, {
+            password: 'self-reset-pw',
+          })
+        ).status,
+      ).toBe(200);
+      const afterReset = await login('tempuser', 'self-reset-pw');
+      expect((await call('GET', '/api/auth/me', undefined, afterReset)).data).toMatchObject({
+        mustChangePassword: false,
+      });
+      expect((await call('GET', '/api/projects', undefined, afterReset)).status).toBe(200);
+
+      // 5. bootstrapUsername 在被重置密码或 /api/reset/:token 时同样清理 initialAdminPasswordFile
+      const dir = makeTempDir();
+      const orphanFile = join(dir, 'initial-admin-password');
+      writeFileSync(orphanFile, 'leftover\n', { mode: 0o600 });
+      await stop();
+      await boot({ initialAdminPasswordFile: orphanFile, bootstrapUsername: 'tempuser' });
+      const admin2 = await login('admin');
+      await call('POST', `/api/admin/users/${tempUserId}/reset-password`, {}, admin2);
+      expect(existsSync(orphanFile)).toBe(false);
+
+      writeFileSync(orphanFile, 'leftover2\n', { mode: 0o600 });
+      const adminLink = await call('POST', `/api/admin/users/${tempUserId}/reset-link`, {}, admin2);
+      await call('POST', `/api/reset/${adminLink.data.token as string}`, { password: 'self-reset-pw-2' });
+      expect(existsSync(orphanFile)).toBe(false);
+    },
+  );
 
   test.skipIf(skip)('登录耗时不泄露用户名是否存在（不存在时也跑 scrypt）', async () => {
     await createMember((await setupAdmin()).cookie, 'member');
@@ -878,7 +1107,20 @@ describe.each([
     expect(created.status).toBe(201);
     expect(created.data.username).toBe('mixedcase');
 
-    const member = await login('MixedCase');
+    const memberLogin = await call('POST', '/api/auth/login', { username: 'MixedCase', password: PASSWORD });
+    expect(memberLogin.status).toBe(200);
+    expect(memberLogin.data.mustChangePassword).toBe(true);
+    const member = memberLogin.cookie;
+    expect(
+      (
+        await call(
+          'POST',
+          '/api/me/password',
+          { oldPassword: PASSWORD, newPassword: 'mixed-new-password' },
+          member,
+        )
+      ).status,
+    ).toBe(200);
     const renamed = await call('PATCH', '/api/me', { username: 'NewName' }, member);
     expect(renamed.status).toBe(200);
     expect(renamed.data.username).toBe('newname');
@@ -900,21 +1142,23 @@ describe.each([
     expect(accepted.data.username).toBe('inviteduser');
   });
 
-  test.skipIf(skip)('无人值守初始化的环境变量要走和接口一样的校验', async () => {
+  test.skipIf(skip)('bootstrapAdmin 的环境变量要走和接口一样的校验', async () => {
     await expect(
-      autoSetup(db, { DOWEL_ADMIN_USERNAME: 'Bad Name', DOWEL_ADMIN_PASSWORD: PASSWORD }),
+      bootstrapAdmin(db, { env: { DOWEL_ADMIN_USERNAME: 'Bad Name', DOWEL_ADMIN_PASSWORD: PASSWORD } }),
     ).rejects.toThrow(/DOWEL_ADMIN_USERNAME/);
     await expect(
-      autoSetup(db, { DOWEL_ADMIN_USERNAME: '-bad-', DOWEL_ADMIN_PASSWORD: PASSWORD }),
+      bootstrapAdmin(db, { env: { DOWEL_ADMIN_USERNAME: '-bad-', DOWEL_ADMIN_PASSWORD: PASSWORD } }),
     ).rejects.toThrow(/DOWEL_ADMIN_USERNAME/);
     await expect(
-      autoSetup(db, { DOWEL_ADMIN_USERNAME: 'root', DOWEL_ADMIN_PASSWORD: 'short' }),
+      bootstrapAdmin(db, { env: { DOWEL_ADMIN_USERNAME: 'root', DOWEL_ADMIN_PASSWORD: 'short' } }),
     ).rejects.toThrow(/DOWEL_ADMIN_PASSWORD/);
 
     // 合法值（大小写会被统一成小写）照常建管理员
     expect(await db.query('select id from users')).toHaveLength(0);
-    const created = await autoSetup(db, { DOWEL_ADMIN_USERNAME: 'Root', DOWEL_ADMIN_PASSWORD: PASSWORD });
-    expect(created).toMatchObject({ username: 'root', role: 'admin' });
+    const res = await bootstrapAdmin(db, {
+      env: { DOWEL_ADMIN_USERNAME: 'Root', DOWEL_ADMIN_PASSWORD: PASSWORD },
+    });
+    expect(res.created).toMatchObject({ username: 'root', role: 'admin', mustChangePassword: false });
   });
 
   test.skipIf(skip)('撤销邀请：已使用返回 409，已撤销返回 404', async () => {
@@ -1045,11 +1289,11 @@ describe.each([
   });
 });
 
-test('DOWEL_ADMIN_* 不合法时服务启动失败并打印原因', () => {
+test('DOWEL_ADMIN_* 启动校验与首次启动 0600 临时密码文件日志契约', async () => {
   const run = (env: Record<string, string>) =>
     spawnSync(process.execPath, ['--conditions=@dowel/source', 'apps/server/src/main.ts'], {
       cwd: process.cwd(),
-      env: { ...process.env, DOWEL_DB: ':memory:', PORT: '0', ...env },
+      env: { ...process.env, DOWEL_DB: ':memory:', PORT: '0', DOWEL_DRIFT_INTERVAL_MINUTES: '0', ...env },
       encoding: 'utf8',
       timeout: 60_000,
     });
@@ -1061,4 +1305,71 @@ test('DOWEL_ADMIN_* 不合法时服务启动失败并打印原因', () => {
   const badPassword = run({ DOWEL_ADMIN_USERNAME: 'root', DOWEL_ADMIN_PASSWORD: 'short' });
   expect(badPassword.status).toBe(1);
   expect(badPassword.stderr).toContain('DOWEL_ADMIN_PASSWORD');
+
+  const dir = mkdtempSync(join(tmpdir(), 'dowel-main-boot-'));
+  try {
+    const opFile = join(dir, 'op-pw');
+    writeFileSync(opFile, 'operator-pw-123\n', { mode: 0o600 });
+
+    const conflict = run({
+      DOWEL_ADMIN_PASSWORD_FILE: opFile,
+      DOWEL_ADMIN_PASSWORD: 'password1',
+    });
+    expect(conflict.status).toBe(1);
+    expect(conflict.stderr).toContain('DOWEL_ADMIN_PASSWORD_FILE');
+
+    const missingFile = run({ DOWEL_ADMIN_PASSWORD_FILE: join(dir, 'nonexistent-pw') });
+    expect(missingFile.status).toBe(1);
+    expect(missingFile.stderr).toContain('DOWEL_ADMIN_PASSWORD_FILE');
+
+    // 未配置 DOWEL_ADMIN_PASSWORD* 且首次使用本地 SQLite 文件时，写入同目录 0600 initial-admin-password，且日志只打路径不打明文
+    const sqlitePath = join(dir, 'dowel.db');
+    const pwFile = join(dir, 'initial-admin-password');
+    const child = spawn(process.execPath, ['--conditions=@dowel/source', 'apps/server/src/main.ts'], {
+      cwd: process.cwd(),
+      env: {
+        ...process.env,
+        DOWEL_DB: sqlitePath,
+        PORT: '0',
+        DOWEL_DRIFT_INTERVAL_MINUTES: '0',
+        DOWEL_ADMIN_USERNAME: '',
+        DOWEL_ADMIN_PASSWORD: '',
+        DOWEL_ADMIN_PASSWORD_FILE: '',
+        DOWEL_INITIAL_PASSWORD_FILE: '',
+      },
+      stdio: ['ignore', 'pipe', 'pipe'],
+    });
+    let stdout = '';
+    let stderr = '';
+    child.stdout.on('data', (d) => {
+      stdout += String(d);
+    });
+    child.stderr.on('data', (d) => {
+      stderr += String(d);
+    });
+    try {
+      const deadline = Date.now() + 60_000;
+      while (Date.now() < deadline && (!stdout.includes('Dowel 已启动') || !existsSync(pwFile))) {
+        if (child.exitCode !== null) {
+          throw new Error(`子进程提前退出（${child.exitCode}）：${stderr}\n${stdout}`);
+        }
+        await new Promise((r) => setTimeout(r, 50));
+      }
+      expect(existsSync(pwFile), `stdout=${stdout}\nstderr=${stderr}`).toBe(true);
+      expect(statSync(pwFile).mode & 0o777).toBe(0o600);
+      const pw = readFileSync(pwFile, 'utf8').trim();
+      expect(pw).toHaveLength(24);
+      expect(stdout).toContain(pwFile);
+      expect(stdout).not.toContain(pw);
+      expect(stderr).not.toContain(pw);
+    } finally {
+      child.kill('SIGTERM');
+      await new Promise((r) => {
+        if (child.exitCode !== null) return r(undefined);
+        child.once('exit', r);
+      });
+    }
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
 });

@@ -31,16 +31,23 @@ export interface User {
   lastLoginAt: string | null;
   /** 是否设置了密码；密码哈希本身绝不出现在响应里 */
   hasPassword: boolean;
+  /** 是否需要在登录后强制修改密码 */
+  mustChangePassword: boolean;
 }
 
 /** 查询用户时统一用这组列，保证 HTTP 响应和 WebSocket 里的形状一致 */
 export const USER_COLUMNS = `u.id, u.username, u.email, u.name, u.role, u.status,
-  u.created_at as "createdAt", u.last_login_at as "lastLoginAt"`;
+  u.created_at as "createdAt", u.last_login_at as "lastLoginAt", u.must_change_password as "mustChangePassword"`;
 
-/** 把查询里的 password_hash 换成 hasPassword：哈希值不能离开这一层 */
-export const toUser = (row: User & { password_hash: string | null }): User => {
-  const { password_hash, ...u } = row;
-  return { ...u, hasPassword: !!password_hash };
+export type RawUserRow = Omit<User, 'hasPassword' | 'mustChangePassword'> & {
+  password_hash: string | null;
+  mustChangePassword: boolean | number;
+};
+
+/** 把查询里的 password_hash 换成 hasPassword、规范化 mustChangePassword：哈希值不能离开这一层 */
+export const toUser = (row: RawUserRow): User => {
+  const { password_hash, mustChangePassword, ...u } = row;
+  return { ...u, hasPassword: !!password_hash, mustChangePassword: Boolean(mustChangePassword) };
 };
 
 export const hashPassword = async (pw: string): Promise<string> => {
@@ -84,7 +91,7 @@ export const markLogin = async (db: PlatformDb, userId: string) => {
  * 登录成功时更新 last_login_at。
  */
 export const login = async (db: PlatformDb, username: string, password: string): Promise<LoginResult> => {
-  const [u] = await db.query<User & { password_hash: string | null }>(
+  const [u] = await db.query<RawUserRow>(
     `select ${USER_COLUMNS}, u.password_hash from users u where u.username = $1`,
     [normalizeUsername(username)],
   );
@@ -152,7 +159,7 @@ export const revokeSessions = async (db: PlatformDb, userId: string, except?: st
  */
 export const userOfToken = async (db: PlatformDb, token: string | undefined): Promise<User | null> => {
   if (!token) return null;
-  const [u] = await db.query<User & { password_hash: string | null; lastSeen: string | null }>(
+  const [u] = await db.query<RawUserRow & { lastSeen: string | null }>(
     `select ${USER_COLUMNS}, u.password_hash, s.last_seen_at as "lastSeen" from sessions s join users u on u.id = s.user_id
       where s.token_hash = $1 and s.expires_at > $2 and u.status = 'active'`,
     [hashToken(token), new Date()],

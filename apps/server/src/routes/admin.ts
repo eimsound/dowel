@@ -1,5 +1,7 @@
 // 实例管理：实例设置、用户管理、邀请链接。整个 /api/admin/* 先经过 requireUser + requireInstanceAdmin。
 import {
+  adminResetPasswordSchema,
+  type AdminResetPasswordResult,
   type AdminUser,
   adminUserCreateSchema,
   adminUserPatchSchema,
@@ -18,11 +20,12 @@ import { HTTPException } from 'hono/http-exception';
 
 import { parseAllowlist, validAllowlistEntry } from '../allowlist.ts';
 import { audit } from '../audit.ts';
-import { revokeSessions } from '../auth.ts';
+import { hashPassword, revokeSessions } from '../auth.ts';
 import { isUniqueViolation } from '../db.ts';
 import { deleteGrant, grantById, insertGrant, listGrants, subjectExists } from '../grants.ts';
 import { createInvite, inviteById, listInvites, revokeInvite } from '../invites.ts';
 import { hasOidcProvider, readSettings, writeSettings } from '../settings.ts';
+import { generateTempPassword, removeInitialAdminPasswordFile } from '../setup.ts';
 import { userById, usernameTaken } from '../users.ts';
 import { type AppContext, body, createUserOrConflict, type Env } from './context.ts';
 
@@ -91,13 +94,18 @@ export const registerAdmin = (app: Hono<Env>, ctx: AppContext) => {
     // 两种方言都有 lower()；LIKE 在 SQLite 里对 ASCII 已经不区分大小写，统一小写更稳。
     // 搜索条件按 q 是否为空拼，避免 PG 推断不出 `$1 is null` 的参数类型。
     const where = q ? 'where lower(username) like $1 or lower(name) like $1 or lower(email) like $1' : '';
-    const rows = await db.query<AdminUser>(
+    const rows = await db.query<
+      Omit<AdminUser, 'mustChangePassword'> & { mustChangePassword: boolean | number }
+    >(
       `select id, username, name, email, role, status,
-              created_at as "createdAt", last_login_at as "lastLoginAt"
+              created_at as "createdAt", last_login_at as "lastLoginAt",
+              must_change_password as "mustChangePassword"
          from users ${where} order by created_at, username`,
       q ? [`%${q}%`] : [],
     );
-    return c.json<AdminUser[]>(rows);
+    return c.json<AdminUser[]>(
+      rows.map((r) => ({ ...r, mustChangePassword: Boolean(r.mustChangePassword) })),
+    );
   });
 
   app.post('/api/admin/users', async (c) => {
@@ -109,6 +117,7 @@ export const registerAdmin = (app: Hono<Env>, ctx: AppContext) => {
       email: b.email,
       password: b.password,
       role: b.role ?? 'member',
+      mustChangePassword: Boolean(b.password),
     });
     await audit(
       db,
@@ -202,6 +211,52 @@ export const registerAdmin = (app: Hono<Env>, ctx: AppContext) => {
       ctx.security,
     );
     return c.json<ResetLink>({ url, token, expiresAt: invite.expiresAt });
+  });
+
+  /** 管理员直接为用户设置或生成临时密码：立即吊销所有会话与协作连接，下次登录强制改密 */
+  app.post('/api/admin/users/:id/reset-password', async (c) => {
+    const id = c.req.param('id');
+    const b = await body(c, adminResetPasswordSchema);
+    if (id === actorId(c)) {
+      throw new HTTPException(422, { message: '不能在此重置自己的密码，请前往个人设置修改' });
+    }
+    const pre = await userById(db, id);
+    if (!pre) throw new HTTPException(404, { message: '用户不存在' });
+
+    const generated = !b.password;
+    const password = b.password ?? generateTempPassword();
+    const hash = await hashPassword(password);
+
+    const target = await db.transaction(async (tx) => {
+      const current = await userById(tx, id);
+      if (!current) throw new HTTPException(404, { message: '用户不存在' });
+      await tx.query('update users set password_hash = $2, must_change_password = $3 where id = $1', [
+        id,
+        hash,
+        true,
+      ]);
+      await tx.query('delete from sessions where user_id = $1', [id]);
+      return current;
+    });
+
+    await ctx.rooms.kickUser(id, '密码已重置，请重新登录并修改密码');
+    if (target.username === ctx.bootstrapUsername) {
+      await removeInitialAdminPasswordFile(ctx.initialAdminPasswordFile);
+    }
+    await audit(
+      db,
+      c,
+      {
+        action: 'user.password_reset_temp',
+        actorKind: 'user',
+        actorId: actorId(c),
+        targetKind: 'user',
+        targetId: id,
+        data: { username: target.username, generated, mustChangePassword: true },
+      },
+      ctx.security,
+    );
+    return c.json<AdminResetPasswordResult>({ password, mustChangePassword: true });
   });
 
   // ───── 实例级授权（scope=instance，只有实例管理员能管） ─────

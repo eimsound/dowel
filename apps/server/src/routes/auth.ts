@@ -1,10 +1,11 @@
-// 认证：登录、退出、当前用户。注册只通过邀请（见 account.ts），不再有公开的注册接口。
-import { type ApiErrorBody, loginSchema, type Me, type Ok } from '@dowel/api';
+// 认证：登录、退出、当前用户与公开实例信息。注册只通过邀请（见 account.ts），不再有公开的注册接口。
+import { type ApiErrorBody, type InstanceInfo, loginSchema, type Me, type Ok } from '@dowel/api';
 import type { Hono } from 'hono';
 import { HTTPException } from 'hono/http-exception';
 
 import { audit } from '../audit.ts';
 import { currentUser, endSession, login, startSession } from '../auth.ts';
+import { publicProviders } from '../oidc.ts';
 import { clientIp } from '../security.ts';
 import { readSettings } from '../settings.ts';
 import { normalizeUsername } from '../users.ts';
@@ -12,6 +13,16 @@ import { type AppContext, body, type Env } from './context.ts';
 
 export const registerAuth = (app: Hono<Env>, ctx: AppContext) => {
   const { db } = ctx;
+
+  app.get('/api/instance', async (c) => {
+    const settings = await readSettings(db);
+    return c.json<InstanceInfo>({
+      name: settings.name,
+      // 应急变量打开时，即使设置里关了也算可用（登录接口也是这么判断的）
+      passwordLogin: settings.passwordLogin || ctx.allowPasswordLogin,
+      providers: await publicProviders(db),
+    });
+  });
 
   app.post('/api/auth/login', async (c) => {
     const b = await body(c, loginSchema);

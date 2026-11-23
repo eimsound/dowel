@@ -16,9 +16,11 @@ docker compose up -d
 
 ## 2. 初始化与建组 {#setup-and-group}
 
-1. 打开 <http://localhost:4600>。首次启动且实例尚无用户时，页面会自动跳转到 `/setup`。
-2. 从服务端启动日志中复制一次性初始化令牌，填写用户名与密码创建首个实例管理员（也可通过 `DOWEL_ADMIN_USERNAME` 与 `DOWEL_ADMIN_PASSWORD` 环境变量自动初始化）。
-3. 登录后前往“管理后台”或项目首页新建一个组。所有项目都归属于某个组，访问路径为 `/project/<组标识>/<项目标识>`。
+1. 首次启动且实例尚无用户时，服务端会自动创建初始实例管理员（用户名默认为 `admin`，可通过 `DOWEL_ADMIN_USERNAME` 修改）：
+   - 未配置预设密码时，服务端会生成随机临时密码，并以 `0600` 权限写入数据目录的 `initial-admin-password` 文件（Docker Compose 下位于 `dowel-data` 卷的 `/data/initial-admin-password`，日志仅打印文件路径，不输出明文密码）；
+   - 从该文件读取临时密码，打开 <http://localhost:4600> 登录 `admin`，系统会引导进入修改密码页面，设置新密码并自动清理 `initial-admin-password` 文件；
+   - 如需在启动前直接指定正式密码，可通过 `DOWEL_ADMIN_PASSWORD_FILE` 或 `DOWEL_ADMIN_PASSWORD` 配置（二者互斥）。
+2. 登录后前往“管理后台”或项目首页新建一个组。所有项目都归属于某个组，访问路径为 `/project/<组标识>/<项目标识>`。
 
 用户邀请、OIDC 外部登录和权限模型见 [账户、OIDC 与权限](accounts-and-access.md)。
 

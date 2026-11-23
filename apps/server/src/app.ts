@@ -26,7 +26,7 @@ import {
 import { Requests } from './requests.ts';
 import { effectiveProjectRole } from './roles.ts';
 import { Rooms, type RoomsOptions } from './rooms.ts';
-import type { AppContext, Env } from './routes/context.ts';
+import { type AppContext, CodedHTTPException, type Env } from './routes/context.ts';
 import { registerRoutes } from './routes/index.ts';
 import { SecretError, scrubSecrets } from './secrets.ts';
 import {
@@ -36,7 +36,7 @@ import {
   securityHeaders,
 } from './security.ts';
 import { passwordLoginForced, readSettings } from './settings.ts';
-import { newSetupToken } from './setup.ts';
+import { DEFAULT_ADMIN_USERNAME } from './setup.ts';
 import { ShadowError } from './shadow.ts';
 import { Shadows } from './shadows.ts';
 import type { ConnectionGuard } from './targets.ts';
@@ -58,10 +58,10 @@ export interface AppOptions {
   tokenFailLimiter?: KeyedLimiter;
   /** 每个 CI 令牌的请求限速；默认 DOWEL_TOKEN_RATE_LIMIT（120）次 / DOWEL_TOKEN_RATE_WINDOW_MS（60000ms） */
   tokenLimiter?: KeyedLimiter;
-  /** 自定义一次性初始化令牌（测试用，优先于平台库中持久化的共享令牌） */
-  setupToken?: string;
-  /** 多副本冷启动经 ensureSetupToken 持久化并共享的初始化令牌（由 main.ts 传入；传 null 表示实例已初始化） */
-  sharedSetupToken?: string | null;
+  /** 首次启动自动生成的初始管理员临时密码文件路径（首次改密/重置后删除；运维指定文件时为 null） */
+  initialAdminPasswordFile?: string | null;
+  /** 首次启动引导创建的管理员用户名（默认 'admin'） */
+  bootstrapUsername?: string;
   /** 跨副本事件总线配置（测试可注入自定义 replicaId / channel） */
   bus?: EventBusOptions;
   /** 副本租约与分布式任务协调器配置 */
@@ -137,15 +137,6 @@ export const createApp = (db: PlatformDb, options: AppOptions = {}) => {
   });
   bus.onReconnect(() => activeTokens.markStale());
 
-  const setupTokenMode: AppContext['setupTokenMode'] =
-    options.setupToken !== undefined ? 'custom' : options.sharedSetupToken !== undefined ? 'shared' : 'local';
-  const setupToken =
-    options.setupToken !== undefined
-      ? options.setupToken
-      : options.sharedSetupToken !== undefined
-        ? options.sharedSetupToken
-        : newSetupToken();
-
   const ctx: AppContext = {
     db,
     bus,
@@ -165,9 +156,8 @@ export const createApp = (db: PlatformDb, options: AppOptions = {}) => {
     requests,
     webhooks,
     security,
-    // 一次性初始化令牌：生产冷启动由 main.ts 经 ensureSetupToken 获取后同步传入 sharedSetupToken；单测可直接用内存令牌
-    setupToken,
-    setupTokenMode,
+    initialAdminPasswordFile: options.initialAdminPasswordFile ?? null,
+    bootstrapUsername: options.bootstrapUsername ?? DEFAULT_ADMIN_USERNAME,
     allowPasswordLogin: options.allowPasswordLogin ?? passwordLoginForced(),
     replace,
     upgradeWebSocket,
@@ -176,8 +166,9 @@ export const createApp = (db: PlatformDb, options: AppOptions = {}) => {
   // 所有错误响应的出口：每个分支的文本统一过 scrubSecrets（连接串里的密码不能出现在响应里）。
   // 往下游抛错的地方不用各自脱敏；已经落库的文本（验证报告、历史）才在写入前脱敏
   app.onError((err, c) => {
-    const fail = (message: string, status: 422 | 500 | HTTPException['status']) =>
-      c.json<ApiErrorBody>({ error: scrubSecrets(message) }, status);
+    const fail = (message: string, status: 422 | 500 | HTTPException['status'], code?: string) =>
+      c.json<ApiErrorBody>({ error: scrubSecrets(message), ...(code ? { code } : {}) }, status);
+    if (err instanceof CodedHTTPException) return fail(err.message, err.status, err.code);
     if (err instanceof HTTPException) return fail(err.message, err.status);
     if (
       err instanceof PlanError ||
@@ -216,6 +207,5 @@ export const createApp = (db: PlatformDb, options: AppOptions = {}) => {
     exec,
     requests,
     webhooks,
-    setupToken: ctx.setupToken,
   };
 };

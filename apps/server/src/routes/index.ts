@@ -22,7 +22,6 @@ import { registerOidcAdmin, registerOidcAuth, registerOidcMe } from './oidc.ts';
 import { registerPolicy } from './policy.ts';
 import { registerProjects } from './projects.ts';
 import { registerInbox, registerRequests } from './requests.ts';
-import { registerSetup } from './setup.ts';
 import { registerSync } from './sync.ts';
 import { registerTakeover } from './takeover.ts';
 import { registerTokens } from './tokens.ts';
@@ -35,10 +34,9 @@ export const registerRoutes = (app: Hono<Env>, ctx: AppContext) => {
   app.use('/api/*', rejectTokens);
   registerCi(app, ctx);
 
-  // 公开接口：登录 / 退出、初始化与实例信息、接受邀请、重置密码
+  // 公开接口：登录 / 退出、实例信息、接受邀请、重置密码
   registerAuth(app, ctx);
   registerOidcAuth(app, ctx);
-  registerSetup(app, ctx);
   registerInvites(app, ctx);
 
   // 个人设置

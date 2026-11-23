@@ -779,10 +779,11 @@ export const registerInbox = (app: Hono<Env>, ctx: AppContext) => {
             };
           });
           if (ping && !closed) {
-            const [u] = await db.query<{ status: string }>('select status from users where id = $1', [
-              user.id,
-            ]);
-            if (closed || u?.status !== 'active') break;
+            const [u] = await db.query<{ status: string; mustChangePassword: boolean | number }>(
+              'select status, must_change_password as "mustChangePassword" from users where id = $1',
+              [user.id],
+            );
+            if (closed || u?.status !== 'active' || Boolean(u.mustChangePassword)) break;
             await s.write(': ping\n\n').catch(() => {
               closed = true;
             });

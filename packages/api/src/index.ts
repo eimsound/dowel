@@ -80,28 +80,18 @@ export const meSchema = z.object({
   lastLoginAt: z.string().nullable(),
   /** 是否已经有密码：纯 OIDC 用户第一次设置密码时不需要旧密码 */
   hasPassword: z.boolean(),
+  /** 是否必须在登录后修改密码（首次随机密码 / 管理员创建或重置的临时密码） */
+  mustChangePassword: z.boolean(),
 });
 export type Me = z.infer<typeof meSchema>;
 
-// ───── 初始化与实例设置 ─────
-
-export const setupStatusSchema = z.object({ needsSetup: z.boolean() });
-export type SetupStatus = z.infer<typeof setupStatusSchema>;
-
-export const setupSchema = z.object({
-  token: z.string().min(1, '请输入初始化令牌'),
-  username: usernameSchema,
-  name: displayNameSchema,
-  password: passwordSchema,
-});
-export type Setup = z.infer<typeof setupSchema>;
+// ───── 实例信息与设置 ─────
 
 /** 登录页需要的信息；不需要登录就能读 */
 export const instanceInfoSchema = z.object({
   name: z.string(),
   /** 实际是否可用（设置关闭但设了 DOWEL_ALLOW_PASSWORD_LOGIN=1 时仍然是 true） */
   passwordLogin: z.boolean(),
-  needsSetup: z.boolean(),
   /** 启用的 OIDC 提供方（登录页显示“使用 XX 登录”） */
   providers: z.array(z.object({ slug: z.string(), name: z.string() })),
 });
@@ -149,6 +139,7 @@ export const adminUserSchema = z.object({
   status: userStatusSchema,
   createdAt: z.string(),
   lastLoginAt: z.string().nullable(),
+  mustChangePassword: z.boolean(),
 });
 export type AdminUser = z.infer<typeof adminUserSchema>;
 
@@ -217,6 +208,17 @@ export type ResetLink = z.infer<typeof resetLinkSchema>;
 
 export const resetPasswordSchema = z.object({ password: passwordSchema });
 export type ResetPassword = z.infer<typeof resetPasswordSchema>;
+
+export const adminResetPasswordSchema = z.object({
+  password: z.preprocess((v) => (v === '' ? undefined : v), passwordSchema.optional()),
+});
+export type AdminResetPassword = z.infer<typeof adminResetPasswordSchema>;
+
+export const adminResetPasswordResultSchema = z.object({
+  password: z.string(),
+  mustChangePassword: z.literal(true),
+});
+export type AdminResetPasswordResult = z.infer<typeof adminResetPasswordResultSchema>;
 
 // ───── 个人设置 ─────
 
@@ -1523,7 +1525,7 @@ export type AuditPage = z.infer<typeof auditPageSchema>;
 export const okSchema = z.object({ ok: z.literal(true) });
 export type Ok = z.infer<typeof okSchema>;
 
-export const apiErrorSchema = z.object({ error: z.string() });
+export const apiErrorSchema = z.object({ error: z.string(), code: z.string().optional() });
 export type ApiErrorBody = z.infer<typeof apiErrorSchema>;
 
 export * from './canvas-history.ts';

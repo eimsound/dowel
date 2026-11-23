@@ -636,6 +636,13 @@ P3 审查后的修正（2026-11-19）：
 - 将全量用户文档与 Zensical 配置统一收拢至 `docs/`：删除根目录 `zensical.toml`，原 14 篇中文文档移入 `docs/zh/`，新增英文主文档 `docs/en/`（14 篇，术语对齐 `GLOSSARY.md` 并保留一致 `{#anchor-id}` 锚点），配置 `docs/zensical.toml`（英文主站，输出 `docs/site/`，对应 `/dowel/`）与 `docs/zensical.zh.toml`（简体中文站，输出 `docs/site/zh/`，对应 `/dowel/zh/`），页眉启用 `English` / `简体中文` 语言切换器（`alternate`）。
 - 更新 `package.json`（`docs:dev`、`docs:dev:zh`、`docs:build`）、`.gitignore` / `.oxfmtrc.jsonc` / `.oxlintrc.json`（忽略 `docs/site/` 与 `docs/.cache/`）、`.dockerignore`、`README.md` 与 `.github/workflows/ci.yml`（移除根目录 `zensical.toml`）；`.github/workflows/docs.yml` 改为在 `docs/` 下双构建严格校验并随 `push` 至 `main` 与 `workflow_dispatch` 自动发布到 GitHub Pages。
 
+### 4.19 首次启动管理员引导与强制修改临时密码（2026-11-23）
+
+- **废除 `/setup` 与 `setup_token`**：新增迁移 28 为 `users` 增加 `must_change_password` 并清理历史 `instance_settings('setup_token')`；移除 `GET/POST /api/setup` 与 `InstanceInfo.needsSetup`（`GET /api/instance` 并入 `routes/auth.ts`）。`apps/server/src/setup.ts` 实现幂等 `bootstrapAdmin(db)`（PG 通过事务级 `pg_advisory_xact_lock(hashtext('dowel:setup'))` 串行多副本冷启动）：支持 `DOWEL_ADMIN_PASSWORD_FILE`（trimmed、永不修改或删除）与 `DOWEL_ADMIN_PASSWORD`（二者互斥，均置 `mustChangePassword = false`），未配置时生成 24 位随机密码以 `0600` 原子写入 `DOWEL_INITIAL_PASSWORD_FILE`（默认 `<dataDir>/initial-admin-password`）并置 `mustChangePassword = true`，启动日志只打印路径、不打印明文。
+- **全链路强制改密门槛（fail-closed）**：`requireUser` 对 `mustChangePassword === true` 除 `POST /api/me/password` 外一律返回 `403 { error, code: 'password_change_required' }`（同时仅放行公开端点、`GET /api/auth/me`、`POST /api/auth/logout` 与 `/api/ci/*`）；OIDC `mode=link`、`GET /api/me/inbox/stream` SSE 心跳与 `/api/projects/:pid/sync` WS 升级/`Rooms` 均同步校验并在触发时断开（`4403`）。
+- **改密、管理员重置与文件清理**：`POST /api/me/password` 强制改密时禁止新密码等于临时密码、完成后清 `must_change_password = false` 并吊销其他会话；`POST /api/admin/users/:id/reset-password` 支持手动输入或自动生成 24 位临时密码（禁止自重置 `422`、同事务吊销所有会话并 `rooms.kickUser` 立即 `4403` 断开 WS、写入不含明文的 `user.password_reset_temp` 审计）；`POST /api/admin/users` 设密时置 `mustChangePassword: true`；`POST /api/reset/:token` 同步清 `must_change_password = false`（与 `/reset/:token` 页面保留供后续自助流程复用）；当目标为初始管理员且已完成改密/重置时尽力清理自动生成的 `initial-admin-password` 文件。
+- **前端路由与后台简化**：`/setup` 重定向到 `/login`；`Login.tsx` 与 `rootRoute.beforeLoad` 将 `mustChangePassword` 用户引导至独立的 `/change-password` 页（失焦/提交后即时校验、`aria-invalid`/`aria-describedby` 与退出逃生入口）；`AdminUsers` 每行仅保留单一「重置密码」弹窗按钮与「须改密」徽标。
+
 ## 5. 下一步
 
 M3：模型分支、语义冲突检测与合并、变更评审流程、本地离线浏览与 MCP 服务。

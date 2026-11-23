@@ -140,6 +140,7 @@ const COLUMN_KINDS = new Map<string, ColumnKind>([
   ['webhook_deliveries.test', 'bool'],
   ['webhook_jobs.payload', 'json'],
   ['token_policies.rule', 'json'],
+  ['users.must_change_password', 'bool'],
 ]);
 
 /** 登记新增表 / 列的转换规则（测试里也用这个造同名列不同表） */
@@ -1176,6 +1177,23 @@ export const MIGRATIONS: MigrationStep[] = [
       if (!cols.some((c) => c.name === 'sections_ver')) {
         await tx.exec('alter table branches add column sections_ver integer not null default 0;');
       }
+    },
+  },
+  // 废除 /setup + setup_token：新增 users.must_change_password（首次启动临时密码或管理员创建/重置密码后强制改密），
+  // 并清理历史遗留的 instance_settings('setup_token')。
+  {
+    run: async (tx, d) => {
+      if (d === 'pg') {
+        await tx.exec(
+          'alter table users add column if not exists must_change_password boolean not null default false;',
+        );
+      } else {
+        const cols = await tx.query<{ name: string }>('pragma table_info(users)');
+        if (!cols.some((c) => c.name === 'must_change_password')) {
+          await tx.exec('alter table users add column must_change_password integer not null default 0;');
+        }
+      }
+      await tx.query('delete from instance_settings where key = $1', ['setup_token']);
     },
   },
 ];

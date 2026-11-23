@@ -1,5 +1,5 @@
-// 路由：根布局（登录 / 初始化检查）→ 登录前页面 / 已登录外壳 → 组页面、项目布局 → 项目子页面。
-// 未登录跳登录页并带 next；需要初始化跳 /setup。
+// 路由：根布局（登录 / 强制改密检查）→ 登录前页面 / 已登录外壳 → 组页面、项目布局 → 项目子页面。
+// 未登录跳登录页并带 next；临时密码登录强制跳 /change-password。
 import type { ProjectInfo, ResolvedProject } from '@dowel/api';
 import { useQuery } from '@tanstack/react-query';
 import {
@@ -16,8 +16,7 @@ import { useTranslation } from 'react-i18next';
 
 import { ApiError, api } from './api.ts';
 import { AppShell } from './components/Shell.tsx';
-import { instanceQuery } from './instance.ts';
-import { Invite, OidcConfirm, Reset, Setup } from './pages/Account.tsx';
+import { ChangePassword, Invite, OidcConfirm, Reset } from './pages/Account.tsx';
 import {
   AccountIdentities,
   AccountLayout,
@@ -50,19 +49,36 @@ import { RequestDetail } from './pages/Request.tsx';
 import { VersionDetail, Versions } from './pages/Versions.tsx';
 import { Model } from './pages/Workspace.tsx';
 import { ProjectProvider } from './project.tsx';
-import { safeNext } from './safe-next.ts';
-import { fetchMe, queryClient, useMe } from './session.ts';
+import { AUTH_NEXT_EXCLUDES, safeNextPath } from './safe-next.ts';
+import { fetchMe, useMe } from './session.ts';
 
-/** 不需要登录的页面（登录、初始化、邀请、重置、OIDC 首次开户确认） */
-const PUBLIC = ['/login', '/setup', '/invite/', '/reset/', '/oidc/confirm'];
+/** 不需要登录的页面（登录、邀请、重置、OIDC 首次开户确认） */
+const PUBLIC = ['/login', '/invite/', '/reset/', '/oidc/confirm'];
 const isPublic = (path: string) => PUBLIC.some((p) => path === p || path.startsWith(p));
 
 const rootRoute = createRootRoute({
   beforeLoad: async ({ location }) => {
-    const [me, instance] = await Promise.all([fetchMe(), queryClient.ensureQueryData(instanceQuery)]);
-    if (instance.needsSetup && location.pathname !== '/setup') throw redirect({ to: '/setup' });
+    if (location.pathname === '/setup') throw redirect({ to: '/login', replace: true });
+    const me = await fetchMe();
     if (!me && !isPublic(location.pathname))
-      throw redirect({ to: '/login', search: { next: safeNext(location.href) ?? '/' } });
+      throw redirect({
+        to: '/login',
+        search: { next: safeNextPath(location.href, AUTH_NEXT_EXCLUDES) ?? '/' },
+      });
+    if (me?.mustChangePassword && location.pathname !== '/change-password') {
+      const next = safeNextPath(location.href, AUTH_NEXT_EXCLUDES);
+      throw redirect({
+        to: '/change-password',
+        search: next && next !== '/' ? { next } : {},
+        replace: true,
+      });
+    }
+    if (me && !me.mustChangePassword && location.pathname === '/change-password') {
+      const rawNext = new URLSearchParams(location.searchStr ?? '').get('next') ?? undefined;
+      const target = safeNextPath(rawNext, AUTH_NEXT_EXCLUDES) ?? '/';
+      if (target === '/') throw redirect({ to: '/', replace: true });
+      throw redirect({ href: target, replace: true });
+    }
     return { me };
   },
   component: () => <Outlet />,
@@ -75,6 +91,15 @@ const loginRoute = createRoute({
     next: typeof search.next === 'string' ? search.next : undefined,
   }),
   component: Login,
+});
+
+const changePasswordRoute = createRoute({
+  getParentRoute: () => rootRoute,
+  path: '/change-password',
+  validateSearch: (search: Record<string, unknown>): { next?: string } => ({
+    next: typeof search.next === 'string' ? search.next : undefined,
+  }),
+  component: ChangePassword,
 });
 
 /** 项目不存在或看不到（G4：没有权限时一律当作不存在） */
@@ -335,7 +360,14 @@ const adminRoute = createRoute({
 
 const routes = [
   loginRoute,
-  createRoute({ getParentRoute: () => rootRoute, path: '/setup', component: Setup }),
+  changePasswordRoute,
+  createRoute({
+    getParentRoute: () => rootRoute,
+    path: '/setup',
+    beforeLoad: () => {
+      throw redirect({ to: '/login', replace: true });
+    },
+  }),
   createRoute({ getParentRoute: () => rootRoute, path: '/invite/$token', component: Invite }),
   createRoute({ getParentRoute: () => rootRoute, path: '/reset/$token', component: Reset }),
   createRoute({ getParentRoute: () => rootRoute, path: '/oidc/confirm', component: OidcConfirm }),

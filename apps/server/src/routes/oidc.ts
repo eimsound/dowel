@@ -65,7 +65,7 @@ import { expectedOrigin } from '../security.ts';
 import { readSettings } from '../settings.ts';
 import { normalizeUsername } from '../usernames.ts';
 import { userById, usernameTaken } from '../users.ts';
-import { type AppContext, body, type Env } from './context.ts';
+import { type AppContext, body, type Env, passwordChangeRequired } from './context.ts';
 
 const STATE_COOKIE = 'dowel_oidc_state';
 const PENDING_COOKIE = 'dowel_oidc_pending';
@@ -152,6 +152,7 @@ export const registerOidcAuth = (app: Hono<Env>, ctx: AppContext) => {
     if (mode === 'link') {
       const u = await currentUser(db, c);
       if (!u) throw new HTTPException(401, { message: '关联账户需要先登录' });
+      if (u.mustChangePassword) throw passwordChangeRequired();
       userId = u.id;
     }
     if (inviteToken) {
@@ -255,10 +256,10 @@ export const registerOidcAuth = (app: Hono<Env>, ctx: AppContext) => {
     }
     const profile = token.access_token ? await mergeUserInfo(config, token.access_token, base) : base;
 
-    /** link 模式必须由发起关联的同一个用户完成；切换会话或未登录都拒绝 */
+    /** link 模式必须由发起关联的同一个用户完成；切换会话、未登录或仍需强制改密都拒绝 */
     const linkUser = async () => {
       const current = await currentUser(db, c);
-      if (!current || !state.userId || current.id !== state.userId) return null;
+      if (!current || current.mustChangePassword || !state.userId || current.id !== state.userId) return null;
       return current;
     };
 

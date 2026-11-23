@@ -132,6 +132,10 @@ describe.each([
     expect((await li.call('POST', '/api/auth/login', { username: 'li', password: 'password2' })).status).toBe(
       200,
     );
+    expect(
+      (await li.call('POST', '/api/me/password', { oldPassword: 'password2', newPassword: 'password2-new' }))
+        .status,
+    ).toBe(200);
     // 建组 → 建项目（项目必须属于一个组）；李四先不是组成员，看不到项目
     const group = await zhang.call('POST', '/api/groups', { slug: 'shop', name: '商城组' });
     expect(group.status).toBe(201);
@@ -280,6 +284,14 @@ describe.each([
     expect(
       (await wang.call('POST', '/api/auth/login', { username: 'wang', password: 'password3' })).status,
     ).toBe(200);
+    expect(
+      (
+        await wang.call('POST', '/api/me/password', {
+          oldPassword: 'password3',
+          newPassword: 'password3-new',
+        })
+      ).status,
+    ).toBe(200);
     // 组外的人用项目级授权给查看者
     const [wangUser] = await db.query<{ id: string }>("select id from users where username = 'wang'");
     expect(
@@ -313,6 +325,14 @@ describe.each([
     expect(
       (await li2.call('POST', '/api/auth/login', { username: 'li2', password: 'password4' })).status,
     ).toBe(200);
+    expect(
+      (
+        await li2.call('POST', '/api/me/password', {
+          oldPassword: 'password4',
+          newPassword: 'password4-new',
+        })
+      ).status,
+    ).toBe(200);
     await zhang.call('POST', `/api/projects/${pid}/grants`, {
       subjectKind: 'user',
       subjectId: id,
@@ -328,7 +348,84 @@ describe.each([
     expect(await closed).toBe(4403);
     expect((await li2.call('GET', '/api/projects')).status).toBe(401);
     expect(
-      (await li2.call('POST', '/api/auth/login', { username: 'li2', password: 'password4' })).status,
+      (await li2.call('POST', '/api/auth/login', { username: 'li2', password: 'password4-new' })).status,
     ).toBe(403);
+  });
+
+  test.skipIf(skip)('临时密码 / 管理员重置密码：WS 升级返回 403 且在线连接立即被 4403 踢出', async () => {
+    const zhao = agent();
+    const created = await zhang.call('POST', '/api/admin/users', {
+      username: 'zhao',
+      name: '赵六',
+      password: 'temp-password-6',
+    });
+    expect(created.status).toBe(201);
+    const id = created.data.id as string;
+    expect(
+      (await zhang.call('POST', '/api/groups/shop/members', { username: 'zhao', role: 'member' })).status,
+    ).toBe(200);
+
+    const firstLogin = await zhao.call('POST', '/api/auth/login', {
+      username: 'zhao',
+      password: 'temp-password-6',
+    });
+    expect(firstLogin.status).toBe(200);
+    expect(firstLogin.data.mustChangePassword).toBe(true);
+
+    const wsUrl = `${base.replace('http', 'ws')}/api/projects/${pid}/sync`;
+    const blockedStatus = await new Promise<number>((resolve) => {
+      const ws = new WebSocket(wsUrl, { headers: { cookie: zhao.cookie() } });
+      ws.on('unexpected-response', (_req, res) => {
+        resolve(res.statusCode ?? 0);
+        res.resume();
+      });
+      ws.on('error', () => resolve(-1));
+    });
+    expect(blockedStatus).toBe(403);
+
+    expect(
+      (
+        await zhao.call('POST', '/api/me/password', {
+          oldPassword: 'temp-password-6',
+          newPassword: 'zhao-active-pw',
+        })
+      ).status,
+    ).toBe(200);
+
+    const w = await connect(zhao, pid, 'tab-zhao');
+    await until(() => w.client.ready && all(w.client.view, 'table').length > 0);
+    const closed = new Promise<number>((resolve) => w.ws.once('close', (code) => resolve(code)));
+
+    const reset = await zhang.call('POST', `/api/admin/users/${id}/reset-password`, {});
+    expect(reset.status).toBe(200);
+    expect(reset.data.mustChangePassword).toBe(true);
+    const tempPw = reset.data.password as string;
+    expect(await closed).toBe(4403);
+    expect((await zhao.call('GET', '/api/projects')).status).toBe(401);
+
+    const relogin = await zhao.call('POST', '/api/auth/login', { username: 'zhao', password: tempPw });
+    expect(relogin.status).toBe(200);
+    expect(relogin.data.mustChangePassword).toBe(true);
+    const blockedAgain = await new Promise<number>((resolve) => {
+      const ws = new WebSocket(wsUrl, { headers: { cookie: zhao.cookie() } });
+      ws.on('unexpected-response', (_req, res) => {
+        resolve(res.statusCode ?? 0);
+        res.resume();
+      });
+      ws.on('error', () => resolve(-1));
+    });
+    expect(blockedAgain).toBe(403);
+
+    expect(
+      (
+        await zhao.call('POST', '/api/me/password', {
+          oldPassword: tempPw,
+          newPassword: 'zhao-recovered-pw',
+        })
+      ).status,
+    ).toBe(200);
+    const recovered = await connect(zhao, pid, 'tab-zhao-2');
+    await until(() => recovered.client.ready && all(recovered.client.view, 'table').length > 0);
+    recovered.ws.close();
   });
 });

@@ -11,7 +11,7 @@ import { api } from '../api.ts';
 import { AuthShell, useSetMe } from '../components/AuthShell.tsx';
 import { Banner } from '../components/ui.tsx';
 import { useInstance } from '../instance.ts';
-import { safeNext } from '../safe-next.ts';
+import { AUTH_NEXT_EXCLUDES, safeNextPath } from '../safe-next.ts';
 
 export const Login = () => {
   const { t } = useTranslation();
@@ -19,12 +19,20 @@ export const Login = () => {
   const instance = useInstance();
   const setMe = useSetMe();
   const { next: rawNext } = useSearch({ from: '/login' });
-  const next = safeNext(rawNext);
+  const next = safeNextPath(rawNext, AUTH_NEXT_EXCLUDES);
   const [form, setForm] = useState({ username: '', password: '' });
   const run = useMutation({
     mutationFn: () => api<Me>('POST', '/api/auth/login', form),
     onSuccess: (me) => {
       setMe(me);
+      if (me.mustChangePassword) {
+        void nav({
+          to: '/change-password',
+          search: next && next !== '/' ? { next } : {},
+          replace: true,
+        });
+        return;
+      }
       // 未登录时被重定向过来的，登录后回到原地址（只接受站内路径）
       if (next && next !== '/') window.location.assign(next);
       else void nav({ to: '/' });

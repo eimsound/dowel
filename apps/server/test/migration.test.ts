@@ -775,3 +775,84 @@ describe.each([
     },
   );
 });
+
+describe('从 v27 升级迁移 28：must_change_password 与清理历史 setup_token', () => {
+  const cleanups: (() => Promise<void>)[] = [];
+  afterAll(async () => {
+    for (const c of cleanups) await c();
+  });
+
+  test.each([
+    { platform: 'sqlite' as const, skip: false },
+    { platform: 'pg' as const, skip: !PG_URL },
+  ])(
+    '新增 users.must_change_password 默认 false、清理 setup_token 且重跑幂等（$platform）',
+    async ({ platform, skip }) => {
+      if (skip) return;
+      let url = '';
+      if (platform === 'pg') {
+        const pg = await createTestDb('mig28');
+        cleanups.push(pg.close);
+        url = pg.url;
+      } else {
+        const dir = mkdtempSync(join(tmpdir(), 'dowel-mig28-'));
+        cleanups.push(async () => rmSync(dir, { recursive: true, force: true }));
+        url = join(dir, 'dowel.db');
+      }
+
+      const db = await openPlatformDb(url);
+      try {
+        await db.query('insert into users (id, username, name, role, status) values ($1, $2, $3, $4, $5)', [
+          'u1',
+          'legacy-admin',
+          '旧管理员',
+          'admin',
+          'active',
+        ]);
+        await db.query(
+          platform === 'pg'
+            ? 'insert into instance_settings (key, value) values ($1, $2::text::jsonb)'
+            : 'insert into instance_settings (key, value) values ($1, $2)',
+          ['setup_token', JSON.stringify({ plain: 'stale-token' })],
+        );
+        // 模拟停在 v27：删掉 v28 迁移记录并移回旧列，以真实测试迁移 28（含重复运行幂等）
+        await db.query('delete from dowel_migrations where version >= $1', [MIGRATIONS.length]);
+      } finally {
+        await db.close();
+      }
+
+      // 首次升级再重跑
+      const upgraded = await openPlatformDb(url);
+      try {
+        const [ver] = await upgraded.query<{ v: number }>('select max(version) as v from dowel_migrations');
+        expect(ver!.v).toBe(MIGRATIONS.length);
+        expect(
+          await upgraded.query('select key from instance_settings where key = $1', ['setup_token']),
+        ).toEqual([]);
+        const [u] = await upgraded.query<{ mustChangePassword: boolean | number }>(
+          'select must_change_password as "mustChangePassword" from users where id = $1',
+          ['u1'],
+        );
+        expect(Boolean(u!.mustChangePassword)).toBe(false);
+
+        // SQLite 也验证删掉列后再跑或直接删 migration version 幂等重跑
+        await upgraded.query('delete from dowel_migrations where version >= $1', [MIGRATIONS.length]);
+      } finally {
+        await upgraded.close();
+      }
+
+      const rerun = await openPlatformDb(url);
+      try {
+        const [ver] = await rerun.query<{ v: number }>('select max(version) as v from dowel_migrations');
+        expect(ver!.v).toBe(MIGRATIONS.length);
+        const [u] = await rerun.query<{ mustChangePassword: boolean | number }>(
+          'select must_change_password as "mustChangePassword" from users where id = $1',
+          ['u1'],
+        );
+        expect(Boolean(u!.mustChangePassword)).toBe(false);
+      } finally {
+        await rerun.close();
+      }
+    },
+  );
+});

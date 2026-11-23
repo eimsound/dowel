@@ -3,11 +3,17 @@ import type { ApiErrorBody } from '@dowel/api';
 
 export class ApiError extends Error {
   status: number;
+  /** 服务端返回的错误码（例如 password_change_required） */
+  code?: string;
   /** 服务端返回的完整响应体（发布被拒绝时带着验证报告） */
   body: unknown;
   constructor(status: number, message: string, body?: unknown) {
     super(message);
     this.status = status;
+    this.code =
+      body && typeof body === 'object' && typeof (body as ApiErrorBody).code === 'string'
+        ? (body as ApiErrorBody).code
+        : undefined;
     this.body = body;
   }
 }
