@@ -199,6 +199,10 @@ const matrix: Record<string, Spec> = {
     path: () => '/api/reset/no-such-token',
     body: () => ({}),
   },
+  'POST /api/auth/forgot-password': {
+    access: { kind: 'public', statuses: [400, 422] },
+    body: () => ({}),
+  },
   // 个人设置：所有登录用户都能访问自己的资料
   'PATCH /api/me': { access: { kind: 'authed', statuses: [200] }, body: () => ({}) },
   'POST /api/me/password': { access: { kind: 'authed', statuses: [400] }, body: () => ({}) },
@@ -216,6 +220,15 @@ const matrix: Record<string, Spec> = {
   'GET /api/admin/settings': { access: { kind: 'instance', statuses: [200] } },
   'PATCH /api/admin/settings': {
     access: { kind: 'instance', statuses: [200] },
+    body: () => ({}),
+  },
+  'GET /api/admin/email': { access: { kind: 'instance', statuses: [200] } },
+  'PATCH /api/admin/email': {
+    access: { kind: 'instance', statuses: [200] },
+    body: () => ({}),
+  },
+  'POST /api/admin/email/test': {
+    access: { kind: 'instance', statuses: [400] },
     body: () => ({}),
   },
   'GET /api/admin/users': { access: { kind: 'instance', statuses: [200] } },
@@ -885,6 +898,9 @@ beforeAll(async () => {
     connectionLimiter: new KeyedLimiter({ limit: 10_000, windowMs: 60_000 }),
     tokenFailLimiter: new KeyedLimiter({ limit: 10_000, windowMs: 60_000 }),
     tokenLimiter: new KeyedLimiter({ limit: 10_000, windowMs: 60_000 }),
+    forgotPasswordLimiter: new LoginLimiter({ limit: 10_000, ipLimit: 10_000 }),
+    emailTestLimiter: new KeyedLimiter({ limit: 10_000, windowMs: 60_000 }),
+    mailer: async () => {},
   });
   app = created.app;
   injectWebSocket = created.injectWebSocket;

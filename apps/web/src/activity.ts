@@ -17,5 +17,6 @@ export const actionText = (action: string, data: unknown) => {
     role: typeof d.role === 'string' ? i18n.t(`projects.role.${d.role}`) : '',
     username: typeof d.username === 'string' ? d.username : '',
     provider: typeof d.provider === 'string' ? d.provider : '',
+    to: typeof d.to === 'string' ? d.to : '',
   });
 };

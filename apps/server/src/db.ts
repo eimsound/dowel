@@ -164,6 +164,34 @@ export const isUniqueViolation = (err: unknown): boolean => {
   return e.cause === undefined ? false : isUniqueViolation(e.cause);
 };
 
+/** 专门识别 users.email 大小写不敏感部分唯一索引（users_email_unique）的唯一冲突 */
+export const isEmailUniqueViolation = (err: unknown): boolean => {
+  if (!err || typeof err !== 'object') return false;
+  const e = err as {
+    code?: unknown;
+    constraint_name?: unknown;
+    constraint?: unknown;
+    message?: unknown;
+    cause?: unknown;
+  };
+  const msg = typeof e.message === 'string' ? e.message : '';
+  if (
+    e.code === '23505' &&
+    (e.constraint_name === 'users_email_unique' ||
+      e.constraint === 'users_email_unique' ||
+      msg.includes('users_email_unique'))
+  ) {
+    return true;
+  }
+  if (
+    msg.includes('UNIQUE constraint failed') &&
+    (msg.includes('users_email_unique') || msg.includes('users.email') || msg.includes('lower(email)'))
+  ) {
+    return true;
+  }
+  return e.cause === undefined ? false : isEmailUniqueViolation(e.cause);
+};
+
 /** 外键冲突（PG 23503；SQLite errcode 787 / “FOREIGN KEY constraint failed”）：删除被引用的行时转成 409 */
 export const isForeignKeyViolation = (err: unknown): boolean => {
   if (!err || typeof err !== 'object') return false;
@@ -1194,6 +1222,52 @@ export const MIGRATIONS: MigrationStep[] = [
         }
       }
       await tx.query('delete from instance_settings where key = $1', ['setup_token']);
+    },
+  },
+  // 邮件服务接入（SMTP）：规范化现有 users.email、对历史大小写重复邮箱做安全去重、创建大小写不敏感部分唯一索引，
+  // 并给 invites 表增加可选收件人邮箱列 email。
+  {
+    run: async (tx, d) => {
+      if (d === 'pg') {
+        await tx.exec("update users set email = lower(btrim(email, E' \\t\\r\\n')) where email is not null;");
+      } else {
+        await tx.exec(
+          "update users set email = lower(trim(email, ' ' || char(9) || char(10) || char(13))) where email is not null;",
+        );
+      }
+      await tx.exec("update users set email = null where email = '';");
+
+      const dups = await tx.query<{ email: string }>(
+        'select lower(email) as email from users where email is not null group by lower(email) having count(*) > 1 order by lower(email)',
+      );
+      for (const dup of dups) {
+        const rows = await tx.query<{ id: string; username: string }>(
+          `select id, username from users
+            where lower(email) = $1
+            order by case when role = 'admin' and status = 'active' then 0 else 1 end, created_at asc, id asc`,
+          [dup.email],
+        );
+        const cleared = rows.slice(1);
+        if (!cleared.length) continue;
+        const clearedIds = cleared.map((r) => r.id);
+        await tx.query(`update users set email = null where id in (${inList(clearedIds)})`, clearedIds);
+        console.warn(
+          `迁移检测到历史重复邮箱，已保留首位用户邮箱并清空 ${cleared.length} 条冲突邮箱（受影响用户：${cleared.map((r) => `${r.id}(${r.username})`).join(', ')}）`,
+        );
+      }
+
+      await tx.exec(
+        'create unique index if not exists users_email_unique on users (lower(email)) where email is not null;',
+      );
+
+      if (d === 'pg') {
+        await tx.exec('alter table invites add column if not exists email text;');
+      } else {
+        const cols = await tx.query<{ name: string }>('pragma table_info(invites)');
+        if (!cols.some((c) => c.name === 'email')) {
+          await tx.exec('alter table invites add column email text;');
+        }
+      }
     },
   },
 ];

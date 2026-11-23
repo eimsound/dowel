@@ -1,10 +1,14 @@
-// 实例管理：实例设置、用户管理、邀请链接。整个 /api/admin/* 先经过 requireUser + requireInstanceAdmin。
+// 实例管理：实例设置、邮件设置、用户管理、邀请链接。整个 /api/admin/* 先经过 requireUser + requireInstanceAdmin。
 import {
   adminResetPasswordSchema,
   type AdminResetPasswordResult,
   type AdminUser,
   adminUserCreateSchema,
   adminUserPatchSchema,
+  type ApiErrorBody,
+  type EmailSettings,
+  emailSettingsPatchSchema,
+  emailTestSchema,
   type GrantInfo,
   grantCreateSchema,
   type InstanceSettings,
@@ -21,12 +25,23 @@ import { HTTPException } from 'hono/http-exception';
 import { parseAllowlist, validAllowlistEntry } from '../allowlist.ts';
 import { audit } from '../audit.ts';
 import { hashPassword, revokeSessions } from '../auth.ts';
-import { isUniqueViolation } from '../db.ts';
+import { isEmailUniqueViolation, isUniqueViolation } from '../db.ts';
+import {
+  inviteEmailTemplate,
+  isEmailConfiguredAndEnabled,
+  readEmailSettings,
+  readStoredEmailSettings,
+  resolveSmtpConfig,
+  testEmailTemplate,
+  writeEmailSettings,
+} from '../email.ts';
 import { deleteGrant, grantById, insertGrant, listGrants, subjectExists } from '../grants.ts';
-import { createInvite, inviteById, listInvites, revokeInvite } from '../invites.ts';
+import { createInvite, deleteUnusedInvite, inviteById, listInvites, revokeInvite } from '../invites.ts';
+import { scrubSecrets, SecretError } from '../secrets.ts';
+import { expectedOrigin } from '../security.ts';
 import { hasOidcProvider, readSettings, writeSettings } from '../settings.ts';
 import { generateTempPassword, removeInitialAdminPasswordFile } from '../setup.ts';
-import { userById, usernameTaken } from '../users.ts';
+import { emailTaken, normalizeEmail, userById, usernameTaken } from '../users.ts';
 import { type AppContext, body, createUserOrConflict, type Env } from './context.ts';
 
 /** 邀请默认 7 天，重置密码链接 24 小时 */
@@ -87,6 +102,66 @@ export const registerAdmin = (app: Hono<Env>, ctx: AppContext) => {
     return c.json<InstanceSettings>(next);
   });
 
+  // ───── 邮件服务（SMTP） ─────
+
+  app.get('/api/admin/email', async (c) => c.json<EmailSettings>(await readEmailSettings(db)));
+
+  app.patch('/api/admin/email', async (c) => {
+    const b = await body(c, emailSettingsPatchSchema);
+    const { settings, audit: auditData } = await writeEmailSettings(db, b);
+    await audit(
+      db,
+      c,
+      {
+        action: 'email.settings_update',
+        actorKind: 'user',
+        actorId: actorId(c),
+        targetKind: 'instance',
+        targetId: null,
+        data: auditData,
+      },
+      ctx.security,
+    );
+    return c.json<EmailSettings>(settings);
+  });
+
+  app.post('/api/admin/email/test', async (c) => {
+    const b = await body(c, emailTestSchema);
+    const stored = await readStoredEmailSettings(db);
+    const config = resolveSmtpConfig(stored);
+    const gate = ctx.emailTestLimiter.attempt(actorId(c));
+    if (!gate.allowed) {
+      c.header('Retry-After', String(gate.retryAfterSeconds));
+      return c.json<ApiErrorBody>(
+        { error: `发送测试邮件太频繁了，请 ${gate.retryAfterSeconds} 秒后再试` },
+        429,
+      );
+    }
+    const { name } = await readSettings(db);
+    const tpl = testEmailTemplate(name);
+    try {
+      await ctx.mailer(config, { to: b.to, ...tpl });
+    } catch (e) {
+      if (e instanceof SecretError || e instanceof HTTPException) throw e;
+      const reason = scrubSecrets(e instanceof Error ? e.message : String(e));
+      throw new HTTPException(502, { message: `测试邮件发送失败：${reason}` });
+    }
+    await audit(
+      db,
+      c,
+      {
+        action: 'email.test',
+        actorKind: 'user',
+        actorId: actorId(c),
+        targetKind: 'instance',
+        targetId: null,
+        data: { to: b.to },
+      },
+      ctx.security,
+    );
+    return c.json<Ok>({ ok: true });
+  });
+
   // ───── 用户管理 ─────
 
   app.get('/api/admin/users', async (c) => {
@@ -111,6 +186,7 @@ export const registerAdmin = (app: Hono<Env>, ctx: AppContext) => {
   app.post('/api/admin/users', async (c) => {
     const b = await body(c, adminUserCreateSchema);
     if (await usernameTaken(db, b.username)) throw new HTTPException(409, { message: '用户名已被使用' });
+    if (b.email && (await emailTaken(db, b.email))) throw new HTTPException(409, { message: '邮箱已被使用' });
     const user = await createUserOrConflict(db, {
       username: b.username,
       name: b.name,
@@ -142,27 +218,37 @@ export const registerAdmin = (app: Hono<Env>, ctx: AppContext) => {
     // 计数和更新必须在同一个事务里，否则两个管理员同时互相降级时会都以为自己不是最后一个。
     // PG 用 `for update` 锁住所有 active 管理员行（等锁的语句会重新判断行是否还符合条件）；
     // SQLite 不支持 for update，但适配器只有一个连接、事务串行，效果一样（见 db.ts 的注释）。
-    const target = await db.transaction(async (tx) => {
-      const current = await userById(tx, id);
-      if (!current) throw new HTTPException(404, { message: '用户不存在' });
-      // 不能把最后一个 active 的实例管理员停用或降级，否则没人能管理实例
-      const demote = b.role === 'member' && current.role === 'admin';
-      const disable = b.status === 'disabled' && current.status === 'active';
-      if ((demote || disable) && current.role === 'admin' && current.status === 'active') {
-        const admins = await tx.query<{ id: string }>(
-          `select id from users where role = 'admin' and status = 'active' order by id${db.dialect === 'pg' ? ' for update' : ''}`,
+    let target: AdminUser;
+    try {
+      target = await db.transaction(async (tx) => {
+        const current = await userById(tx, id);
+        if (!current) throw new HTTPException(404, { message: '用户不存在' });
+        // 不能把最后一个 active 的实例管理员停用或降级，否则没人能管理实例
+        const demote = b.role === 'member' && current.role === 'admin';
+        const disable = b.status === 'disabled' && current.status === 'active';
+        if ((demote || disable) && current.role === 'admin' && current.status === 'active') {
+          const admins = await tx.query<{ id: string }>(
+            `select id from users where role = 'admin' and status = 'active' order by id${db.dialect === 'pg' ? ' for update' : ''}`,
+          );
+          if (admins.length <= 1)
+            throw new HTTPException(422, {
+              message: demote ? '不能降级最后一个实例管理员' : '不能停用最后一个实例管理员',
+            });
+        }
+        const nextEmail = b.email === undefined ? current.email : normalizeEmail(b.email);
+        if (b.email !== undefined && nextEmail && (await emailTaken(tx, nextEmail, id))) {
+          throw new HTTPException(409, { message: '邮箱已被使用' });
+        }
+        await tx.query(
+          'update users set name = coalesce($2, name), role = coalesce($3, role), status = coalesce($4, status), email = $5 where id = $1',
+          [id, b.name ?? null, b.role ?? null, b.status ?? null, nextEmail],
         );
-        if (admins.length <= 1)
-          throw new HTTPException(422, {
-            message: demote ? '不能降级最后一个实例管理员' : '不能停用最后一个实例管理员',
-          });
-      }
-      await tx.query(
-        'update users set name = coalesce($2, name), role = coalesce($3, role), status = coalesce($4, status) where id = $1',
-        [id, b.name ?? null, b.role ?? null, b.status ?? null],
-      );
-      return current;
-    });
+        return current;
+      });
+    } catch (e) {
+      if (isEmailUniqueViolation(e)) throw new HTTPException(409, { message: '邮箱已被使用' });
+      throw e;
+    }
 
     const disable = b.status === 'disabled' && target.status === 'active';
 
@@ -334,12 +420,52 @@ export const registerAdmin = (app: Hono<Env>, ctx: AppContext) => {
 
   app.post('/api/admin/invites', async (c) => {
     const b = await body(c, inviteCreateSchema);
+    const email = normalizeEmail(b.email);
+    const sendEmail = b.sendEmail === true;
+    if (email && (await emailTaken(db, email))) {
+      throw new HTTPException(409, { message: '邮箱已被使用' });
+    }
+    let smtpConfig: ReturnType<typeof resolveSmtpConfig> | null = null;
+    let origin = '';
+    let instanceName = '';
+    if (sendEmail) {
+      if (!email) {
+        throw new HTTPException(400, { message: '发送邀请邮件需要填写受邀人邮箱' });
+      }
+      const stored = await readStoredEmailSettings(db);
+      if (!isEmailConfiguredAndEnabled(stored)) {
+        throw new HTTPException(422, { message: '实例尚未启用邮件服务，请先在实例设置中配置并启用 SMTP' });
+      }
+      smtpConfig = resolveSmtpConfig(stored);
+      const resolvedOrigin = expectedOrigin(c, ctx.security);
+      if (!resolvedOrigin) {
+        throw new HTTPException(422, { message: '无法确定对外访问地址，请设置 DOWEL_PUBLIC_URL' });
+      }
+      origin = resolvedOrigin;
+      instanceName = (await readSettings(db)).name;
+    }
+
+    const expiresInDays = b.expiresInDays ?? INVITE_DAYS;
     const { invite, token, url } = await createInvite(db, {
       kind: 'invite',
       createdBy: actorId(c),
-      expiresInMs: (b.expiresInDays ?? INVITE_DAYS) * DAY_MS,
+      expiresInMs: expiresInDays * DAY_MS,
       groupIds: b.groupIds,
+      email,
     });
+
+    if (sendEmail && smtpConfig && email) {
+      const inviteUrl = `${origin}${url}`;
+      const tpl = inviteEmailTemplate({ instanceName, inviteUrl, expiresInDays });
+      try {
+        await ctx.mailer(smtpConfig, { to: email, ...tpl });
+      } catch (e) {
+        await deleteUnusedInvite(db, invite.id).catch(() => {});
+        const reason = scrubSecrets(e instanceof Error ? e.message : String(e));
+        throw new HTTPException(502, { message: `邀请邮件发送失败：${reason}` });
+      }
+    }
+
     await audit(
       db,
       c,
@@ -349,11 +475,21 @@ export const registerAdmin = (app: Hono<Env>, ctx: AppContext) => {
         actorId: actorId(c),
         targetKind: 'invite',
         targetId: invite.id,
-        data: { expiresAt: invite.expiresAt, groupIds: b.groupIds ?? [] },
+        data: { expiresAt: invite.expiresAt, groupIds: b.groupIds ?? [], emailSent: sendEmail },
       },
       ctx.security,
     );
-    return c.json<InviteCreated>({ id: invite.id, token, url, expiresAt: invite.expiresAt }, 201);
+    return c.json<InviteCreated>(
+      {
+        id: invite.id,
+        token,
+        url,
+        expiresAt: invite.expiresAt,
+        email: invite.email,
+        emailSent: sendEmail,
+      },
+      201,
+    );
   });
 
   app.get('/api/admin/invites', async (c) => c.json<InviteListItem[]>(await listInvites(db)));

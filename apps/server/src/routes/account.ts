@@ -25,7 +25,7 @@ import {
   startSession,
   verifyPassword,
 } from '../auth.ts';
-import { isUniqueViolation } from '../db.ts';
+import { isEmailUniqueViolation, isUniqueViolation } from '../db.ts';
 import {
   claimInvite,
   type InviteState,
@@ -36,7 +36,7 @@ import {
 } from '../invites.ts';
 import { readSettings } from '../settings.ts';
 import { removeInitialAdminPasswordFile } from '../setup.ts';
-import { userById, usernameTaken } from '../users.ts';
+import { emailTaken, normalizeEmail, userById, usernameTaken } from '../users.ts';
 import { type AppContext, body, createUserOrConflict, type Env } from './context.ts';
 
 /** 首次设置密码只允许最近 10 分钟内登录的会话（见 /api/me/password） */
@@ -76,6 +76,9 @@ export const registerMe = (app: Hono<Env>, ctx: AppContext) => {
     const b = await body(c, mePatchSchema);
     if (b.username && (await usernameTaken(db, b.username, me.id)))
       throw new HTTPException(409, { message: '用户名已被使用' });
+    const nextEmail = b.email === undefined ? me.email : normalizeEmail(b.email);
+    if (b.email !== undefined && nextEmail && (await emailTaken(db, nextEmail, me.id)))
+      throw new HTTPException(409, { message: '邮箱已被使用' });
     try {
       await db.query(
         'update users set username = coalesce($2, username), name = coalesce($3, name), email = $4 where id = $1',
@@ -84,11 +87,12 @@ export const registerMe = (app: Hono<Env>, ctx: AppContext) => {
           b.username ?? null,
           b.name ?? null,
           // email 不传表示不改，传空字符串表示清空
-          b.email === undefined ? me.email : b.email?.trim() || null,
+          nextEmail,
         ],
       );
     } catch (e) {
-      // 并发改用户名时 usernameTaken() 可能都没查到，唯一约束兜底
+      // 并发改用户名/邮箱时预检可能都没查到，唯一约束兜底
+      if (isEmailUniqueViolation(e)) throw new HTTPException(409, { message: '邮箱已被使用' });
       if (isUniqueViolation(e)) throw new HTTPException(409, { message: '用户名已被使用' });
       throw e;
     }
@@ -249,6 +253,7 @@ export const registerInvites = (app: Hono<Env>, ctx: AppContext) => {
     const state = inviteState(invite);
     if (state !== 'ok') throw inviteUnusable(state);
     if (await usernameTaken(db, b.username)) throw new HTTPException(409, { message: '用户名已被使用' });
+    if (b.email && (await emailTaken(db, b.email))) throw new HTTPException(409, { message: '邮箱已被使用' });
 
     const user = await db.transaction(async (tx) => {
       // 认领和建用户在同一个事务里：并发接受同一个邀请时只有一个能认领到；

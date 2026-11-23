@@ -302,3 +302,27 @@ export const tokenLimiterFromEnv = (env: NodeJS.ProcessEnv = process.env) =>
     limit: envPositiveInt(env.DOWEL_TOKEN_RATE_LIMIT) ?? 120,
     windowMs: envPositiveInt(env.DOWEL_TOKEN_RATE_WINDOW_MS) ?? 60_000,
   });
+
+/**
+ * 忘记密码请求限速（单副本进程内计数）：
+ * - DOWEL_FORGOT_PASSWORD_LIMIT：同一 IP + 邮箱在窗口内允许的请求次数（默认 3）；
+ * - DOWEL_FORGOT_PASSWORD_IP_LIMIT：同一 IP 在窗口内允许的总请求次数（默认 10）；
+ * - DOWEL_FORGOT_PASSWORD_WINDOW_MS：窗口长度（毫秒，默认 900000 = 15 分钟）。
+ */
+export const forgotPasswordLimiterFromEnv = (env: NodeJS.ProcessEnv = process.env) =>
+  new LoginLimiter({
+    limit: envPositiveInt(env.DOWEL_FORGOT_PASSWORD_LIMIT) ?? 3,
+    ipLimit: envPositiveInt(env.DOWEL_FORGOT_PASSWORD_IP_LIMIT) ?? 10,
+    windowMs: envPositiveInt(env.DOWEL_FORGOT_PASSWORD_WINDOW_MS) ?? 15 * 60_000,
+  });
+
+/**
+ * 后台测试邮件发送限速（按管理员用户 ID；单副本进程内计数）：
+ * - DOWEL_EMAIL_TEST_LIMIT：单个管理员在窗口内允许的测试发信次数（默认 5）；
+ * - DOWEL_EMAIL_TEST_WINDOW_MS：窗口长度（毫秒，默认 60000 = 1 分钟）。
+ */
+export const emailTestLimiterFromEnv = (env: NodeJS.ProcessEnv = process.env) =>
+  new KeyedLimiter({
+    limit: envPositiveInt(env.DOWEL_EMAIL_TEST_LIMIT) ?? 5,
+    windowMs: envPositiveInt(env.DOWEL_EMAIL_TEST_WINDOW_MS) ?? 60_000,
+  });

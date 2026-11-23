@@ -22,6 +22,12 @@ export interface NewUser {
 /** 用户名在库里只存小写；比较前统一规范化 */
 export { normalizeUsername };
 
+/** 邮箱在库里只存去首尾空白后的小写形式；空串归为 null */
+export const normalizeEmail = (email: string | null | undefined): string | null => {
+  const trimmed = email?.trim().toLowerCase() ?? '';
+  return trimmed === '' ? null : trimmed;
+};
+
 export const usernameTaken = async (db: Db, username: string, exceptId?: string) => {
   // 分开写：PG 里 `$1 is null` 这种用法无法推断参数类型
   const [row] = exceptId
@@ -30,6 +36,15 @@ export const usernameTaken = async (db: Db, username: string, exceptId?: string)
         exceptId,
       ])
     : await db.query('select 1 from users where username = $1', [normalizeUsername(username)]);
+  return !!row;
+};
+
+export const emailTaken = async (db: Db, email: string, exceptId?: string): Promise<boolean> => {
+  const normalized = normalizeEmail(email);
+  if (!normalized) return false;
+  const [row] = exceptId
+    ? await db.query('select 1 from users where lower(email) = $1 and id <> $2', [normalized, exceptId])
+    : await db.query('select 1 from users where lower(email) = $1', [normalized]);
   return !!row;
 };
 
@@ -49,9 +64,19 @@ export const userByUsername = async (db: Db, username: string): Promise<User | n
   return u ? toUser(u) : null;
 };
 
+export const userByEmail = async (db: Db, email: string): Promise<User | null> => {
+  const normalized = normalizeEmail(email);
+  if (!normalized) return null;
+  const [u] = await db.query<RawUserRow>(
+    `select ${USER_COLUMNS}, u.password_hash from users u where lower(u.email) = $1`,
+    [normalized],
+  );
+  return u ? toUser(u) : null;
+};
+
 export const createUser = async (db: Db, input: NewUser): Promise<User> => {
   const id = newId();
-  const email = input.email?.trim() || null;
+  const email = normalizeEmail(input.email);
   await db.query(
     `insert into users (id, username, name, email, password_hash, role, status, must_change_password)
      values ($1, $2, $3, $4, $5, $6, 'active', $7)`,

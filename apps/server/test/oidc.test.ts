@@ -4,7 +4,13 @@ import { Events, OAuth2Server } from 'oauth2-mock-server';
 import { afterAll, afterEach, beforeAll, beforeEach, describe, expect, test } from 'vitest';
 
 import { createApp, openPlatformDb, type PlatformDb } from '../src/index.ts';
-import { clearDiscoveryCache, countEnabledProviders, hasOtherLoginMethod, safeNext } from '../src/oidc.ts';
+import {
+  clearDiscoveryCache,
+  countEnabledProviders,
+  hasOtherLoginMethod,
+  provisionFromIdentity,
+  safeNext,
+} from '../src/oidc.ts';
 import { LoginLimiter } from '../src/rate-limit.ts';
 import { hasOidcProvider } from '../src/settings.ts';
 import { makeUser, PASSWORD } from './support.ts';
@@ -559,5 +565,61 @@ describe('OIDC 登录', () => {
     expect(await hasOtherLoginMethod(db, user.id, 'none', false)).toBe(true);
     await call('PATCH', `/api/admin/oidc/${created.id as string}`, { enabled: false }, admin.cookie);
     expect(await hasOtherLoginMethod(db, user.id, 'none', false)).toBe(false);
+  });
+
+  test('已有同邮箱用户时 OIDC autoProvision 绝不自动关联且邮箱降级为 null（含并发）', async () => {
+    const provider = await createProvider({ autoProvision: true });
+    const providerId = provider.id as string;
+    const existing = await makeUser(db, 'someone', { email: 'Alice@Example.com' });
+
+    // 即使外部 IdP 返回相同的邮箱（大小写不同），也不关联到 existing，且不抛 500
+    claims = {
+      sub: 'subject-new-alice',
+      preferred_username: 'new-alice',
+      name: 'New Alice',
+      email: 'alice@example.com',
+    };
+    const { result } = await loginWithOidc();
+    expect(result.status).toBe(302);
+    expect(result.location).toBe('/projects');
+    const session = cookieFrom(result, 'dowel_session');
+    const me = await call('GET', '/api/auth/me', undefined, session);
+    expect(me.status).toBe(200);
+    expect(me.data.id).not.toBe(existing.id);
+    expect(me.data.username).toBe('new-alice');
+    expect(me.data.email).toBeNull();
+
+    // existing 账号未关联该外部身份
+    const [existingId] = await db.query('select 1 from user_identities where user_id = $1', [existing.id]);
+    expect(existingId).toBeUndefined();
+
+    // 两个新用户携同一尚未被占用的外部邮箱并发开户：先到者占邮箱，后到者降级 email=null 且均成功登录
+    const [u1, u2] = await Promise.all([
+      provisionFromIdentity(db, {
+        providerId,
+        subject: 'subject-race-1',
+        username: 'race-1',
+        name: 'Race 1',
+        email: 'shared-race@example.com',
+        inviteToken: null,
+      }),
+      provisionFromIdentity(db, {
+        providerId,
+        subject: 'subject-race-2',
+        username: 'race-2',
+        name: 'Race 2',
+        email: 'SHARED-RACE@example.com',
+        inviteToken: null,
+      }),
+    ]);
+    expect(u1.id).not.toBe(u2.id);
+    const identities = await db.query<{ userId: string }>(
+      'select user_id as "userId" from user_identities where provider_id = $1 and user_id in ($2, $3)',
+      [providerId, u1.id, u2.id],
+    );
+    expect(identities).toHaveLength(2);
+    const emails = [u1.email, u2.email].sort((a, b) => String(a).localeCompare(String(b)));
+    expect(emails).toContain('shared-race@example.com');
+    expect(emails).toContain(null);
   });
 });

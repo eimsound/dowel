@@ -16,9 +16,10 @@ import {
   userActor,
 } from '../authz.ts';
 import type { EventBus } from '../bus.ts';
-import { isUniqueViolation, type PlatformDb } from '../db.ts';
+import { isEmailUniqueViolation, isUniqueViolation, type PlatformDb } from '../db.ts';
 import type { OpaqueRefresher } from '../derive.ts';
 import type { DriftScheduler } from '../drift-scheduler.ts';
+import type { Mailer } from '../email.ts';
 import { type EnvRow, envResource, loadEnv } from '../envs.ts';
 import type { ExecContext } from '../executions.ts';
 import { groupById, groupBySlug, groupRoleOf } from '../groups.ts';
@@ -65,6 +66,12 @@ export interface AppContext {
   activeTokens: ActiveTokenCache;
   /** 每个 CI 令牌的请求限速（P6） */
   tokenLimiter: KeyedLimiter;
+  /** 忘记密码邮件请求限速（按 IP + 邮箱与 IP 总量） */
+  forgotPasswordLimiter: LoginLimiter;
+  /** 管理后台发送测试邮件限速（按管理员） */
+  emailTestLimiter: KeyedLimiter;
+  /** 邮件发送器（默认原生 SMTP 客户端，测试可替换） */
+  mailer: Mailer;
   /** 连接目标库 / 影子库之前统一跑的检查（SSRF 白名单） */
   guard: ConnectionGuard;
   /** 执行 / 漂移检查共用的上下文（平台库、白名单、环境锁） */
@@ -146,6 +153,7 @@ export const createUserOrConflict = async (db: Db, input: NewUser): Promise<User
   try {
     return await createUser(db, input);
   } catch (e) {
+    if (isEmailUniqueViolation(e)) throw new HTTPException(409, { message: '邮箱已被使用' });
     if (isUniqueViolation(e)) throw new HTTPException(409, { message: '用户名已被使用' });
     throw e;
   }

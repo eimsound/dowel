@@ -23,7 +23,7 @@ export const safeNext = (next: string | undefined, origin = FALLBACK_ORIGIN): st
 };
 
 /** 重定向回跳禁止落地的认证页面路径前缀 */
-export const AUTH_NEXT_EXCLUDES = ['/login', '/change-password', '/setup'] as const;
+export const AUTH_NEXT_EXCLUDES = ['/login', '/change-password', '/setup', '/forgot-password'] as const;
 
 /** 额外过滤禁止落点的站内路径前缀（如 /login、/change-password、/setup） */
 export const safeNextPath = (

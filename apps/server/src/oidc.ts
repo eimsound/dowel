@@ -10,12 +10,12 @@ import { HTTPException } from 'hono/http-exception';
 import { allowInsecureRequests, type Configuration, discovery, fetchUserInfo } from 'openid-client';
 
 import { hashToken, type User } from './auth.ts';
-import type { PlatformDb } from './db.ts';
+import { isEmailUniqueViolation, type PlatformDb } from './db.ts';
 import { claimInvite, inviteByToken, inviteState, setInviteUsedBy } from './invites.ts';
 import { decrypt } from './secrets.ts';
 import { expectedOrigin, type SecurityConfig } from './security.ts';
 import { cleanSlug, normalizeUsername } from './usernames.ts';
-import { createUser } from './users.ts';
+import { createUser, emailTaken, normalizeEmail } from './users.ts';
 
 /** 短时状态（state / nonce / PKCE verifier / 邀请令牌）的有效期 */
 export const OIDC_TTL_MS = 10 * 60_000;
@@ -497,13 +497,43 @@ export const provisionFromIdentity = async (
       groupIds = full?.groupIds ?? [];
     }
 
-    const user = await createUser(tx, {
-      username: input.username,
-      name: input.name,
-      email: input.email,
-      password: null,
-      role: 'member',
-    });
+    // 绝不按邮箱自动关联已有账号；若外部邮箱已被占用，新建用户的邮箱置为 null 避免阻塞 OIDC 开户
+    let email = normalizeEmail(input.email);
+    if (email && (await emailTaken(tx, email))) email = null;
+
+    let user: User;
+    if (email !== null) {
+      await tx.exec('savepoint oidc_create_user');
+      try {
+        user = await createUser(tx, {
+          username: input.username,
+          name: input.name,
+          email,
+          password: null,
+          role: 'member',
+        });
+        await tx.exec('release savepoint oidc_create_user');
+      } catch (e) {
+        await tx.exec('rollback to savepoint oidc_create_user');
+        await tx.exec('release savepoint oidc_create_user');
+        if (!isEmailUniqueViolation(e)) throw e;
+        user = await createUser(tx, {
+          username: input.username,
+          name: input.name,
+          email: null,
+          password: null,
+          role: 'member',
+        });
+      }
+    } else {
+      user = await createUser(tx, {
+        username: input.username,
+        name: input.name,
+        email: null,
+        password: null,
+        role: 'member',
+      });
+    }
 
     if (inviteId) {
       await setInviteUsedBy(tx, inviteId, user.id);
