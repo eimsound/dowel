@@ -11,8 +11,8 @@ import type {
   VersionInfo,
   WizardEvent,
 } from '@dowel/api';
-import { addColumn, all, type Model, renameColumn } from '@dowel/core';
-import { type Db, ensureHistory, recordVersion, stepsChecksum } from '@dowel/engines';
+import { addColumn, all, type Model, newId, plan, renameColumn } from '@dowel/core';
+import { type Db, ensureHistory, recordVersion, stepsChecksum, toScriptSteps } from '@dowel/engines';
 import { afterAll, beforeAll, describe, expect, test, vi } from 'vitest';
 
 import { connect, createTestDb, PG_URL } from '../../../test/pg.ts';
@@ -843,7 +843,7 @@ describe.skipIf(!PG_URL)('接手与认领（P4c）', () => {
       claimed: false,
       currentVersion: null,
     });
-    // 同一个项目 ID 的历史，但版本不在平台的链上（来自另一份项目副本）：422
+    // 同一个项目 ID 的历史，但版本不在平台的链上且占用同一编号（来自另一份项目副本）：409 history_fork
     await ensureHistory(other.db);
     await plant(other, pid, {
       id: 'alien-v1',
@@ -853,8 +853,8 @@ describe.skipIf(!PG_URL)('接手与认领（P4c）', () => {
       model: await versionModel(A, chain[0]!.id),
     });
     const foreign = await attach({ name: 'other', url: other.url });
-    expect(foreign.status).toBe(422);
-    expect(foreign.data.error).toMatch(/不在平台库的版本链上|不一致/);
+    expect(foreign.status).toBe(409);
+    expect(foreign.data.code).toBe('history_fork');
     // 由 A 认领的 prod：不确认 → 409 claim_required；项目管理员（不是实例管理员）→ 403；确认 → 201，当前版本 v2
     const need = await attach({ name: 'prod', url: prod.url, production: true });
     expect(need.status).toBe(409);
@@ -1691,6 +1691,148 @@ describe.skipIf(!PG_URL)('接手与认领（P4c）', () => {
     expect(rExhausted.last.error).not.toContain('服务器内部错误');
     expect(await shadowExists(shadow6)).toBe(false);
   });
+
+  test('ADR 0013 版本树接手与接入：作废岔路与活跃主链共存，自动写 retired_at 并保护活跃头', async () => {
+    const dev = await newTarget('tree_dev');
+    const prod = await newTarget('tree_prod');
+    const ext = await newTarget('tree_ext');
+    const pid = await project(A, '树接手');
+    const eDev = await addEnv(A, pid, 'dev', dev.url);
+    const eProd = await addEnv(A, pid, 'prod', prod.url);
+    const eExt = await addEnv(A, pid, 'ext', ext.url);
+
+    // 1. 先在源实例发布 v1 -> v2 -> v3，dev 停在 v3（即将成为作废岔路），ext 也走到 v3
+    const [_v1, v2, v3] = await publishN(A, pid, 3);
+    expect((await exec(A, pid, eDev, 'execute', v3!.id)).last.stage).toBe('done');
+    expect((await exec(A, pid, eProd, 'execute', v2!.id)).last.stage).toBe('done');
+
+    // 在源实例 A 构造延自 v2 的新活跃版本 v4（parent = v2），再把 v3 标成作废
+    const [bRow] = await A.db.query<{ id: string }>('select id from branches where project_id = $1', [pid]);
+    const m2 = await versionModel(A, v2!.id);
+    const m4 = structuredClone(m2);
+    addColumn(m4, all(m4, 'table').find((t) => t.name === 'orders')!.id, { name: 'c4', type: 'text' });
+    const up4 = toScriptSteps(plan(m2, m4), 'pg');
+    const down4 = toScriptSteps(plan(m4, m2), 'pg');
+    const v4Id = newId();
+    await A.db.query(
+      `insert into versions (id, project_id, branch_id, seq, name, model, created_by, number, parent_id,
+                             up_steps, down_steps, checksum, verified_at)
+       values ($1, $2, $3, 3, 'v4', $4::text::jsonb, null, 4, $5, $6::text::jsonb, $7::text::jsonb, $8, $9)`,
+      [
+        v4Id,
+        pid,
+        bRow!.id,
+        JSON.stringify(m4),
+        v2!.id,
+        JSON.stringify(up4),
+        JSON.stringify(down4),
+        stepsChecksum(up4, down4),
+        new Date().toISOString(),
+      ],
+    );
+    await A.db.query('update versions set retired_at = $2 where id = $1', [v3!.id, new Date().toISOString()]);
+    expect((await exec(A, pid, eProd, 'execute', v4Id)).last.stage).toBe('done');
+
+    // 在 ext 上继续沿着已被作废的 v3 发布并执行 v5（模拟陈旧实例试图复活作废分支）
+    const m3 = await versionModel(A, v3!.id);
+    const m5 = structuredClone(m3);
+    addColumn(m5, all(m5, 'table').find((t) => t.name === 'orders')!.id, { name: 'c5', type: 'text' });
+    const up5 = toScriptSteps(plan(m3, m5), 'pg');
+    const down5 = toScriptSteps(plan(m5, m3), 'pg');
+    const v5Id = newId();
+    // 暂时取消 retired_at，在 ext 上按 v1->v2->v3->v5 执行后再恢复
+    await A.db.query('update versions set retired_at = null where id = $1', [v3!.id]);
+    await A.db.query(
+      `insert into versions (id, project_id, branch_id, seq, name, model, created_by, number, parent_id,
+                             up_steps, down_steps, checksum, verified_at)
+       values ($1, $2, $3, 4, 'v5', $4::text::jsonb, null, 5, $5, $6::text::jsonb, $7::text::jsonb, $8, $9)`,
+      [
+        v5Id,
+        pid,
+        bRow!.id,
+        JSON.stringify(m5),
+        v3!.id,
+        JSON.stringify(up5),
+        JSON.stringify(down5),
+        stepsChecksum(up5, down5),
+        new Date().toISOString(),
+      ],
+    );
+    expect((await exec(A, pid, eExt, 'execute', v5Id)).last.stage).toBe('done');
+    await A.db.query('update versions set retired_at = $2 where id = $1', [v3!.id, new Date().toISOString()]);
+
+    // 2. 新实例 B 从 [dev(停在 v3), prod(停在 v4)] 接手整个项目
+    const B = await newInstance('TreeTakeover');
+    const resB = await takeover(
+      B,
+      pid,
+      [
+        { name: 'dev', url: dev.url },
+        { name: 'prod', url: prod.url },
+      ],
+      { claim: true },
+    );
+    expect(resB.last, JSON.stringify(resB.events)).toMatchObject({
+      stage: 'done',
+      retiredVersions: [{ id: v3!.id, number: 3 }],
+    });
+    const bVers = await B.db.query<{
+      id: string;
+      number: number;
+      parentId: string | null;
+      retiredAt: unknown;
+      retiredBy: string | null;
+    }>(
+      'select id, number, parent_id as "parentId", retired_at as "retiredAt", retired_by as "retiredBy" from versions where project_id = $1 order by number',
+      [pid],
+    );
+    expect(bVers.find((v) => v.id === v3!.id)?.retiredAt).not.toBeNull();
+    expect(bVers.find((v) => v.id === v3!.id)?.retiredBy).toBeNull();
+    expect(bVers.find((v) => v.id === v4Id)?.retiredAt).toBeNull();
+    expect(bVers.find((v) => v.id === v4Id)?.parentId).toBe(v2!.id);
+    // 工作副本停在活跃头 v4 的模型（不含 v3 的 c3）
+    const bModel = await modelOf(B, pid);
+    const bCols = all(bModel, 'column').map((c) => c.name);
+    expect(bCols).toContain('c4');
+    expect(bCols).not.toContain('c3');
+
+    // 3. 新实例 C 先只接手 prod（链上是 v1->v2->v4），再 attach dev（带着作废岔路 v3）：
+    //    应补齐 v3 且自动标成作废，返回 retiredVersions=[v3]，C 的工作副本保持 v4 不被覆盖
+    const C = await newInstance('TreeAttach');
+    const resC = await takeover(C, pid, [{ name: 'prod', url: prod.url }], { claim: true });
+    expect(resC.last.stage).toBe('done');
+    const attDev = await C.call('POST', `/api/projects/${pid}/environments/attach`, {
+      name: 'dev',
+      url: dev.url,
+      production: false,
+      allowSameInstance: true,
+      claim: true,
+    });
+    expect(attDev.status, JSON.stringify(attDev.data)).toBe(201);
+    expect(attDev.data as unknown as AttachResult).toMatchObject({
+      claimed: true,
+      aheadVersions: [{ id: v3!.id, number: 3 }],
+      retiredVersions: [{ id: v3!.id, number: 3 }],
+    });
+    const [cV3] = await C.db.query<{ retiredAt: unknown; retiredBy: string | null }>(
+      'select retired_at as "retiredAt", retired_by as "retiredBy" from versions where id = $1',
+      [v3!.id],
+    );
+    expect(cV3!.retiredAt).not.toBeNull();
+    expect(cV3!.retiredBy).toBeNull();
+    expect(all(await modelOf(C, pid), 'column').map((c) => c.name)).toContain('c4');
+
+    // 试图把沿着已作废 v3 继续延伸出 v5 的 ext 接入 C → 409 history_fork（绝不复活作废版本）
+    const attExt = await C.call('POST', `/api/projects/${pid}/environments/attach`, {
+      name: 'ext',
+      url: ext.url,
+      production: false,
+      allowSameInstance: true,
+      claim: true,
+    });
+    expect(attExt.status).toBe(409);
+    expect(attExt.data.code).toBe('history_fork');
+  }, 120_000);
 });
 
 describe.skipIf(!PG_URL)('只预演不执行（dry run）', () => {

@@ -84,7 +84,7 @@ Every execution or rollback passes through six sequential checks. Failure at any
 
 ### Rollback and permanent script locking {#rollback-and-lock}
 
-- Rollback runs each version's `down` script along the chain using the same validation rules as upgrades. The `v0 · Baseline` or root version has no rollback script, so you cannot roll back past it.
+- Rollback runs each version's `down` script along the chain using the same validation rules as upgrades. The `v0 · Baseline` or root version has no rollback script, so you cannot roll back past it. Rollbacks follow the `parent` links back, and you can only roll back to an ancestor of the current version.
 - **Permanent execution lock.** Once a version leaves a write on any target database (either a committed transaction or the first non-transactional or MySQL step begins), the platform records `executed_at` permanently. Script editing remains blocked even if you later roll back, delete the environment, change its connection string, or wipe the target database.
 - **Configuration lock during execution.** While an environment holds its execution lock, editing the connection string, changing shadow settings, deleting the environment, or unmarking production returns HTTP `409`. If an earlier crashed process left stale `running` claims with no active execution, editing the environment conservatively marks those versions executed and clears the stale claims.
 
@@ -149,7 +149,47 @@ Mark as applied writes a `direction = 'mark'` history entry aligning the environ
 - When marking forward, the confirmation dialog previews the live check, lists every skipped version and script, explains that script data steps will not run, requires explicit checkbox confirmation, re-verifies the live fingerprint under the project lock, and marks skipped versions with `executed_at`. Marking backward or at the current version preserves script editability for unexecuted versions.
 - Mark as applied is a privileged operation gated by the environment's "Who can execute" policy. Production environments require typing the environment name. CI tokens cannot invoke mark operations.
 
+- **Cross-branch mark**: when an environment is on a [retired](#retire) version and the live structure already matches a version on the active chain, you can mark the environment as applied to that active version. Only the versions after the common ancestor up to the target are recorded as applied; unrelated retired versions are never included. The same confirmation is required. You cannot mark an environment as applied to a retired version.
+
 ### Known drift limits {#drift-limits}
 
 - **Drifted environment behind the chain head.** If `prod` sits at `v5` with an out-of-band hotfix while the chain head is `v7`, revert `prod` back to `v5` with the repair script before upgrading, or merge the hotfix into `v8` and mark `prod` as applied.
 - Three-way automatic merges during import are not supported.
+
+## Retiring tail versions {#retire}
+
+If a version was published by mistake, or you want to drop the last few versions and redesign, you can **retire** one or more consecutive versions at the end of the active chain from the version detail page (the first version cannot be retired). Retiring happens on the platform only:
+
+- **No target database is touched**; the original versions, their frozen migrations and the history in target databases are kept;
+- **Version numbers are never reused**: after retiring `v5`, the next version published from `v4` is `v6`, with parent `v4`;
+- By default the working copy is **reverted** to the model of the retired range's parent (as a new commit in canvas history that you can restore anytime); you can choose to keep the current working copy instead;
+- Open execution requests that reference these versions are invalidated (the requester is notified and a `request.invalidated` webhook is sent);
+- Retiring is rejected (409) while an environment is executing one of these versions; retry after it finishes;
+- **Tiered permission**: project editors can retire a range in which no version has ever run in any environment; if any version in the range has run, a project admin is required;
+- Every retire is written to the audit log (`version.retire`).
+
+You cannot execute (upgrade) to a retired version, mark an environment as applied to it, or edit its scripts. The version list can be filtered by Active / Retired.
+
+### Unretire {#unretire}
+
+As long as **no newer version has been published from the parent** (the retired range attaches directly to the current active chain head and reaches the highest version number), you can **unretire** the whole range in one click from a retired version's detail page. The same tiered permission applies; previously invalidated requests stay invalid; you can optionally restore the working copy to the restored head's model.
+
+Once a newer version has been published from the parent, the superseded branch can **never be unretired**. Use Apply to canvas below if you need its structure.
+
+### Apply to canvas {#apply-to-canvas}
+
+Every version, including retired ones, has **Apply to canvas** on its detail page: Dowel shows the differences from the working copy to that version, then replaces the working copy with the version's model as a new commit in canvas history (restorable from canvas history). If the working copy changes while you review, you are asked to confirm again.
+
+### Environments on a retired version: switching back to the active chain {#switch}
+
+After you retire a version that has already run, the environments that ran it stay on the retired version (for example on `v5` while the active chain is `… → v4 → v6`). Such an environment has three options:
+
+1. **Switch**: the environment page's execute button becomes "Switch to v6". The route goes through the common ancestor: it runs the rollback script of `v5` back to `v4`, then the upgrade script of `v6`. The dry run and execution requests list the **rollback segment** and the **upgrade segment** separately, with a prominent "Rollback" tag on every rolled-back version. Rollback scripts may drop columns, tables and their data, so you must tick the confirmation that the rollback segment may cause data loss before confirming. Switching is subject to both execute and rollback permission; approvals and typing the environment name for production work the same as for execution; execution requests bind the checksums of both segments.
+2. **Roll back to an ancestor**: roll back to `v4` or an earlier version.
+3. **Mark as applied across branches**: if the live structure already matches a version on the active chain and a rollback's data loss is unacceptable, align the history with no SQL using [Mark as applied](#mark-as-applied).
+
+Each migration of a switch commits separately and is read back and verified: if the rollback segment succeeds and the upgrade segment fails, the environment stays on the common ancestor (for example `v4`); run it again to reach `v6`.
+
+**CI tokens never roll back automatically**: when reaching the target requires a rollback first, the CI API returns `switch_requires_web` (409) and the switch must be confirmed in the Dowel web UI; a retired target version returns `version_retired` (409).
+
+The structure and format version of the `dowel` history tables in target databases do not change: retired branches are simply the versions that are not on the path from the root to the highest number, and takeover classifies them automatically (see [Takeover](takeover.md#multi-env-merge)).

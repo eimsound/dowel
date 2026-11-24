@@ -1186,3 +1186,173 @@ describe('M3-C 迁移：mcp_tokens 表结构、JSON 往返、外键与幂等性'
     },
   );
 });
+
+describe('从上一个迁移升级到最新：versions.retired_at 与 retired_by（ADR 0013）', () => {
+  const cleanups: (() => Promise<void>)[] = [];
+  afterAll(async () => {
+    for (const c of cleanups) await c();
+  });
+
+  test.each([
+    { platform: 'sqlite' as const, skip: false },
+    { platform: 'pg' as const, skip: !PG_URL },
+  ])(
+    '存量版本 retired_at/retired_by 默认为 null、外键 on delete set null 生效且重跑幂等（$platform）',
+    async ({ platform, skip }) => {
+      if (skip) return;
+      let url = '';
+      if (platform === 'pg') {
+        const pg = await createTestDb('mig31');
+        cleanups.push(pg.close);
+        url = pg.url;
+      } else {
+        const dir = mkdtempSync(join(tmpdir(), 'dowel-mig31-'));
+        cleanups.push(async () => rmSync(dir, { recursive: true, force: true }));
+        url = join(dir, 'dowel.db');
+      }
+
+      const targetMigration = MIGRATIONS.length;
+      const base = await openPlatformDb(url);
+      try {
+        await base.query('insert into users (id, username, name, role, status) values ($1, $2, $3, $4, $5)', [
+          'u1',
+          'retirer1',
+          '作废人1',
+          'admin',
+          'active',
+        ]);
+        await base.query('insert into users (id, username, name, role, status) values ($1, $2, $3, $4, $5)', [
+          'u2',
+          'retirer2',
+          '作废人2',
+          'member',
+          'active',
+        ]);
+        await base.query("insert into groups (id, slug, name) values ('g1', 'g1', '组')");
+        await base.query("insert into projects (id, name, group_id, slug) values ('p1', 'p1', 'g1', 'p1')");
+        await base.query("insert into branches (id, project_id, name) values ('b1', 'p1', 'main')");
+
+        if (platform === 'pg') {
+          await base.exec('alter table versions drop column if exists retired_at');
+          await base.exec('alter table versions drop column if exists retired_by');
+          await base.query('delete from dowel_migrations where version >= $1', [targetMigration]);
+        } else {
+          await base.query('delete from dowel_migrations where version >= $1', [targetMigration]);
+        }
+      } finally {
+        await base.close();
+      }
+
+      if (platform === 'sqlite') {
+        const conn = new DatabaseSync(url);
+        try {
+          conn.exec('pragma foreign_keys = off; pragma legacy_alter_table = on;');
+          conn.exec(`create table versions_pre_retire (
+            id text primary key,
+            project_id text not null references projects on delete cascade,
+            branch_id text not null references branches on delete cascade,
+            seq bigint not null,
+            name text not null,
+            model text not null,
+            created_by text references users on delete set null,
+            created_at text not null default (strftime('%Y-%m-%dT%H:%M:%fZ', 'now')),
+            number int,
+            parent_id text,
+            up_steps text,
+            down_steps text,
+            checksum text,
+            verified_at text,
+            verify_report text,
+            edited integer not null default 0,
+            scope text,
+            executed_at text,
+            restored_at text
+          )`);
+          conn.exec('drop table versions');
+          conn.exec('alter table versions_pre_retire rename to versions');
+          conn.exec('create unique index versions_project_number on versions (project_id, number)');
+          expect(conn.prepare('pragma foreign_key_check').all()).toEqual([]);
+        } finally {
+          conn.close();
+        }
+      }
+
+      // 在“升级前（无 retired_at / retired_by 列）”的库里写入存量版本行
+      if (platform === 'sqlite') {
+        const conn = new DatabaseSync(url);
+        try {
+          conn
+            .prepare(
+              `insert into versions (id, project_id, branch_id, seq, name, model, number, parent_id, up_steps, down_steps, checksum)
+               values ('v1', 'p1', 'b1', 1, 'v1', ?, 1, null, '[]', '[]', ?)`,
+            )
+            .run(JSON.stringify(emptyModel()), stepsChecksum([], []));
+        } finally {
+          conn.close();
+        }
+      } else {
+        const { connect } = await import('../../../test/pg.ts');
+        const c = connect(url);
+        try {
+          await c.db.query(
+            `insert into versions (id, project_id, branch_id, seq, name, model, number, parent_id, up_steps, down_steps, checksum)
+             values ('v1', 'p1', 'b1', 1, 'v1', $1::text::jsonb, 1, null, '[]'::text::jsonb, '[]'::text::jsonb, $2)`,
+            [JSON.stringify(emptyModel()), stepsChecksum([], [])],
+          );
+        } finally {
+          await c.close();
+        }
+      }
+
+      const upgraded = await openPlatformDb(url);
+      try {
+        const [ver] = await upgraded.query<{ v: number }>('select max(version) as v from dowel_migrations');
+        expect(ver!.v).toBe(MIGRATIONS.length);
+
+        const [v1] = await upgraded.query<{ retiredAt: unknown; retiredBy: string | null }>(
+          'select retired_at as "retiredAt", retired_by as "retiredBy" from versions where id = $1',
+          ['v1'],
+        );
+        expect(v1).toEqual({ retiredAt: null, retiredBy: null });
+
+        // 写入 retired_at / retired_by 并验证 users 删除时 on delete set null 生效
+        const retiredIso = '2026-11-24T12:00:00.000Z';
+        await upgraded.query(
+          `insert into versions (id, project_id, branch_id, seq, name, model, number, parent_id, up_steps, down_steps, checksum, retired_at, retired_by)
+           values ('v2', 'p1', 'b1', 2, 'v2', $1::text::jsonb, 2, 'v1', '[]'::text::jsonb, '[]'::text::jsonb, $2, $3, 'u1'),
+                  ('v3', 'p1', 'b1', 3, 'v3', $1::text::jsonb, 3, 'v2', '[]'::text::jsonb, '[]'::text::jsonb, $2, $3, 'u2')`,
+          [JSON.stringify(emptyModel()), stepsChecksum([], []), retiredIso],
+        );
+        await upgraded.query("delete from users where id = 'u2'");
+        const rows = await upgraded.query<{ id: string; retiredAt: unknown; retiredBy: string | null }>(
+          'select id, retired_at as "retiredAt", retired_by as "retiredBy" from versions order by number asc',
+        );
+        expect(rows[1]!.retiredBy).toBe('u1');
+        expect(rows[1]!.retiredAt).toBeTruthy();
+        expect(rows[2]!.retiredBy).toBeNull();
+        if (platform === 'sqlite') expect(await upgraded.query('pragma foreign_key_check')).toEqual([]);
+
+        // 幂等重跑迁移：保留存量与既有作废标记
+        await upgraded.query('delete from dowel_migrations where version >= $1', [targetMigration]);
+        await upgraded.close();
+        const rerun = await openPlatformDb(url);
+        try {
+          const [ver2] = await rerun.query<{ v: number }>('select max(version) as v from dowel_migrations');
+          expect(ver2!.v).toBe(MIGRATIONS.length);
+          const afterRerun = await rerun.query<{ id: string; retiredBy: string | null }>(
+            'select id, retired_by as "retiredBy" from versions order by number asc',
+          );
+          expect(afterRerun).toEqual([
+            { id: 'v1', retiredBy: null },
+            { id: 'v2', retiredBy: 'u1' },
+            { id: 'v3', retiredBy: null },
+          ]);
+        } finally {
+          await rerun.close();
+        }
+      } finally {
+        await upgraded.close().catch(() => {});
+      }
+    },
+  );
+});

@@ -40,7 +40,9 @@ Takeover stops before writing anything to the platform or target databases if an
 
 ## Merging multiple environments {#multi-env-merge}
 
-When taking over multiple environments at once, Dowel merges their histories by version ID into one linear chain. No forks are permitted and matching version IDs must agree completely, while environments may sit at different positions along the chain. For example, if `dev` is at `v3` and `prod` is at `v2`, the restored chain spans `v0` through `v3`, `dev` records current version `v3`, `prod` records current version `v2`, and `v3` appears as pending for `prod`.
+When taking over multiple environments at once, Dowel merges their histories by version ID into one version tree. Matching version IDs must agree completely; version numbers must be unique and increasing with a single root, otherwise the histories are treated as a fork (`history_fork`) and takeover is rejected. The unique path from the root to the **highest number** is the active chain, and every other branch is automatically classified as [retired](execution.md#retire) (for example, if one environment is on a retired `v5` and another has reached `v6` with parent `v4`, `v5` is restored as retired and the active chain is `… → v4 → v6`). Environments may sit at different positions along the chain. For example, if `dev` is at `v3` and `prod` is at `v2`, the restored chain spans `v0` through `v3`, `dev` records current version `v3`, `prod` records current version `v2`, and `v3` appears as pending for `prod`.
+
+> **Retire and takeover**: "the path from the root to the highest number is the active chain" holds only after a newer version has been written to at least one target database taking part in the takeover. If you retire an executed `v5` and the platform database is lost before `v6` reaches any target database, takeover restores `v5` as the active chain head; retire it again after the takeover.
 
 ## Attach an existing environment to an existing project {#attach-existing}
 

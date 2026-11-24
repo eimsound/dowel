@@ -24,6 +24,7 @@ import {
   type PendingRequest,
   type RequestActions,
   type RequestApprovers,
+  type RequestKind,
   type RequestMigration,
   type RequestStageView,
   type RequestStatus,
@@ -41,7 +42,7 @@ import { HTTPException } from 'hono/http-exception';
 import { auditIn } from './audit.ts';
 import { can, userActor } from './authz.ts';
 import type { EventBus } from './bus.ts';
-import { inList, type PlatformDb } from './db.ts';
+import { inList, type PlatformDb, readDbNow } from './db.ts';
 import { type EnvRow, iso } from './envs.ts';
 import type { ExecContext } from './executions.ts';
 import type { HaCoordinator } from './ha.ts';
@@ -247,15 +248,40 @@ export const loadAudience = async (
   return loadRoleContexts(db, [...new Set([...rows, ...extra].map((r) => r.id))]);
 };
 
+/** 从存储的 direction（'up'|'down'）与绑定的迁移快照推导 API 申请类型（ADR 0013） */
+export const requestKindOf = (req: Pick<RequestRow, 'direction' | 'migrations'>): RequestKind =>
+  req.direction === 'down'
+    ? 'rollback'
+    : req.migrations.some((m) => m.direction === 'down')
+      ? 'switch'
+      : 'execute';
+
+/** 从申请推导传给执行器的路线方向 */
+export const execDirectionOf = (
+  req: Pick<RequestRow, 'direction' | 'migrations'>,
+): 'up' | 'down' | 'switch' => {
+  const kind = requestKindOf(req);
+  return kind === 'rollback' ? 'down' : kind === 'switch' ? 'switch' : 'up';
+};
+
+const actionLabel = (kind: RequestKind, toNum: number | null, lcaNum: number | null): string => {
+  if (kind === 'switch') {
+    const toText = toNum !== null ? ` v${toNum}` : '';
+    const lcaText = lcaNum !== null ? `（先回滚到 v${lcaNum}）` : '';
+    return `切换到${toText}${lcaText}`;
+  }
+  return `${kind === 'rollback' ? '回滚' : '执行'}${toNum !== null ? `到 v${toNum}` : ''}`;
+};
+
 /** 判断资格需要的环境信息：项目、环境、当前生效策略、方向 */
 export interface StageScope {
   project: ProjectRow;
   env: { id: string; production: boolean };
   resolved: ResolvedPolicy;
-  direction: 'up' | 'down';
+  direction: 'up' | 'down' | 'switch';
 }
 
-/** 这个人现在能不能在这个环境上执行（回滚）：满足生效的“谁能执行”，或是执行者（审批不给执行权） */
+/** 这个人现在能不能在这个环境上执行（回滚 / 切换）：满足生效的“谁能执行”，或是执行者（审批不给执行权） */
 export const hasExecRight = (rc: RoleContext, s: StageScope): boolean => {
   const role = effectiveRole(rc, s.project);
   if (!role) return false;
@@ -264,17 +290,18 @@ export const hasExecRight = (rc: RoleContext, s: StageScope): boolean => {
     { groupId: s.project.groupId, projectId: s.project.id, envId: s.env.id },
     s.env.production && s.resolved.whoCanExecute.value === 'executor',
   );
-  return can(
-    userActor({ id: rc.userId, role: rc.instanceAdmin ? 'admin' : 'member' }),
-    s.direction === 'down' ? 'environment.rollback' : 'environment.execute',
-    {
-      kind: 'environment',
-      role,
-      production: s.env.production,
-      execPolicy: s.resolved.whoCanExecute.value,
-      isExecutor: exec,
-    },
-  );
+  const actor = userActor({ id: rc.userId, role: rc.instanceAdmin ? 'admin' : 'member' });
+  const resource = {
+    kind: 'environment' as const,
+    role,
+    production: s.env.production,
+    execPolicy: s.resolved.whoCanExecute.value,
+    isExecutor: exec,
+  };
+  if (s.direction === 'down') return can(actor, 'environment.rollback', resource);
+  if (s.direction === 'switch')
+    return can(actor, 'environment.execute', resource) && can(actor, 'environment.rollback', resource);
+  return can(actor, 'environment.execute', resource);
 };
 
 /**
@@ -348,7 +375,7 @@ const vlabel = (v: { number: number } | null | undefined) =>
  */
 export interface BindingCache {
   envs: Map<string, EnvRow | null>;
-  versions: Map<string, Map<string, { id: string; number: number; checksum: string }>>;
+  versions: Map<string, Map<string, { id: string; number: number; checksum: string; retiredAt: unknown }>>;
   projects: Map<string, ProjectRow | null>;
   stores: Map<string, PolicyStore>;
 }
@@ -392,8 +419,8 @@ export const bindingProblem = async (
     async () =>
       new Map(
         (
-          await db.query<{ id: string; number: number; checksum: string }>(
-            'select id, number, checksum from versions where project_id = $1',
+          await db.query<{ id: string; number: number; checksum: string; retiredAt: unknown }>(
+            'select id, number, checksum, retired_at as "retiredAt" from versions where project_id = $1',
             [req.project_id],
           )
         ).map((v) => [v.id, v]),
@@ -406,11 +433,24 @@ export const bindingProblem = async (
   if (env.drift_status === 'drifted') return invalid('检测到漂移：目标库的结构和环境当前版本不一致');
   if (env.production !== req.production) return invalid('环境的“生产”标记变了');
   if (connHash(env) !== req.conn_hash) return invalid('环境的连接设置变了');
-  if (!versions.has(req.to_version_id)) return invalid('目标版本已经不存在');
+  const toVer = versions.get(req.to_version_id);
+  if (!toVer) return invalid('目标版本已经不存在');
+  // (a) 非回滚申请（执行 / 切换）：目标版本已作废 → 失效
+  if (req.direction !== 'down' && iso(toVer.retiredAt) !== null)
+    return invalid(`目标版本 v${toVer.number} 已作废`);
+  const reqCreatedMs = new Date(iso(req.created_at)!).getTime();
   for (const m of req.migrations) {
     const v = versions.get(m.versionId);
     if (!v) return invalid(`版本 v${m.number} 已经不存在`);
     if (v.checksum !== m.checksum) return invalid(`版本 v${m.number} 的脚本在提交之后被修改过`);
+    const retiredAtIso = iso(v.retiredAt);
+    if (retiredAtIso !== null) {
+      // (b) 绑定的升级迁移对应版本已作废 → 失效
+      if (m.direction === 'up') return invalid(`版本 v${m.number} 已作废`);
+      // (c) 绑定的回滚迁移对应版本在提交申请之后才被作废 → 失效；提交前已作废的（作废后发起的切换 / 回滚申请）保持有效
+      if (new Date(retiredAtIso).getTime() > reqCreatedMs)
+        return invalid(`版本 v${m.number} 在提交申请后被作废`);
+    }
   }
   const project = await cached(cache.projects, req.project_id, () => projectRow(db, req.project_id));
   if (!project) return invalid('项目已经不存在');
@@ -423,6 +463,23 @@ export const bindingProblem = async (
     )
   )
     return invalid('环境的审批流程变严了：请按新的审批流程重新提交');
+  return null;
+};
+
+/** 计算某条开放申请因版本作废而失效的原因（与 bindingProblem 规则与文案保持一致）；不受该作废段影响时返回 null */
+export const retireInvalidReason = (
+  req: Pick<RequestRow, 'direction' | 'to_version_id' | 'migrations'>,
+  retiredSpan: ReadonlyMap<string, { number: number }>,
+): string | null => {
+  if (req.direction !== 'down') {
+    const toVer = retiredSpan.get(req.to_version_id);
+    if (toVer) return `目标版本 v${toVer.number} 已作废`;
+  }
+  for (const m of req.migrations) {
+    if (!retiredSpan.has(m.versionId)) continue;
+    if (m.direction === 'up') return `版本 v${m.number} 已作废`;
+    return `版本 v${m.number} 在提交申请后被作废`;
+  }
   return null;
 };
 
@@ -460,7 +517,7 @@ export const isInterrupted = (req: Pick<RequestRow, 'status' | 'result'>): boole
  *   并保留原节点心跳抖动恢复后由 finish() 覆盖真实结果的能力，同样不再被巡检/重检改写为失效 / 过期（#18）。
  */
 const SWEEP_WHERE = "status in ('pending', 'approved', 'failed') and not emergency";
-const sweepWhere = (dialect: PlatformDb['dialect']): string => {
+export const sweepWhere = (dialect: PlatformDb['dialect']): string => {
   const codeExpr = dialect === 'pg' ? "result->>'code'" : "json_extract(result, '$.code')";
   return `${SWEEP_WHERE} and (status <> 'failed' or coalesce(${codeExpr}, '') <> '${INTERRUPTED}')`;
 };
@@ -965,7 +1022,7 @@ export class Requests {
     );
     const stale: string[] = [];
     const cache = newBindingCache();
-    const now = new Date();
+    const now = await readDbNow(this.db, this.db.dialect);
     for (const r of rows) {
       if (isInterrupted(r)) continue;
       if (await bindingProblem(this.db, r, now, cache)) stale.push(r.id);
@@ -980,7 +1037,7 @@ export class Requests {
     const fx = await withPolicyLock(this.db, async (tx) => {
       const fx = Object.assign(new Effects(), { n: 0 });
       const cache = newBindingCache();
-      const now = new Date();
+      const now = await readDbNow(tx, this.db.dialect);
       for (const id of ids) {
         const [r] = await tx.query<RequestRow>(`select * from exec_requests where id = $1 and ${where}`, [
           id,
@@ -1152,12 +1209,12 @@ export class Requests {
     return { project, env, store, resolved: resolveEnv(store, env) };
   }
 
-  stageScope(s: RequestScope, req: Pick<RequestRow, 'direction'>): StageScope {
+  stageScope(s: RequestScope, req: Pick<RequestRow, 'direction' | 'migrations'>): StageScope {
     return {
       project: s.project,
       env: { id: s.env.id, production: s.env.production },
       resolved: s.resolved,
-      direction: req.direction,
+      direction: execDirectionOf(req),
     };
   }
 
@@ -1231,23 +1288,46 @@ export class Requests {
     }
   }
 
-  private async versionRefs(db: Db, req: RequestRow) {
-    const ids = [req.to_version_id, ...(req.from_version_id ? [req.from_version_id] : [])];
-    const rows = await db.query<RequestVersionRef>(
-      `select id, number, name from versions where id in (${inList(ids)})`,
-      ids,
+  private async versionRefs(
+    db: Db,
+    req: Pick<RequestRow, 'direction' | 'from_version_id' | 'to_version_id' | 'migrations'>,
+  ) {
+    const lastDown = [...req.migrations].reverse().find((m) => m.direction === 'down');
+    const uniqueIds = [
+      ...new Set(
+        [
+          req.to_version_id,
+          ...(req.from_version_id ? [req.from_version_id] : []),
+          ...(lastDown ? [lastDown.versionId] : []),
+        ].filter(Boolean),
+      ),
+    ];
+    const rows = await db.query<RequestVersionRef & { parentId: string | null }>(
+      `select id, number, name, parent_id as "parentId" from versions where id in (${inList(uniqueIds)})`,
+      uniqueIds,
     );
     const m = new Map(rows.map((r) => [r.id, r]));
+    const lcaId = lastDown ? (m.get(lastDown.versionId)?.parentId ?? null) : null;
+    let lca: RequestVersionRef | null = lcaId ? (m.get(lcaId) ?? null) : null;
+    if (lcaId && !lca) {
+      const [row] = await db.query<RequestVersionRef>('select id, number, name from versions where id = $1', [
+        lcaId,
+      ]);
+      lca = row ?? null;
+    }
+    const strip = (r: RequestVersionRef | null): RequestVersionRef | null =>
+      r ? { id: r.id, number: r.number, name: r.name } : null;
     return {
-      from: req.from_version_id ? (m.get(req.from_version_id) ?? null) : null,
-      to: m.get(req.to_version_id) ?? { id: req.to_version_id, number: -1, name: '' },
+      from: req.from_version_id ? strip(m.get(req.from_version_id) ?? null) : null,
+      to: strip(m.get(req.to_version_id) ?? null) ?? { id: req.to_version_id, number: -1, name: '' },
+      lca: requestKindOf(req) === 'switch' ? strip(lca) : null,
     };
   }
 
   private noticeData(
     req: RequestRow,
     s: RequestScope,
-    refs: { from: RequestVersionRef | null; to: RequestVersionRef },
+    refs: { from: RequestVersionRef | null; to: RequestVersionRef; lca: RequestVersionRef | null },
     n: {
       event: string;
       status?: RequestStatus;
@@ -1258,7 +1338,9 @@ export class Requests {
     },
   ): NoticeData {
     const where = `${s.project.name} / ${s.env.name}`;
-    const what = `${req.direction === 'down' ? '回滚' : '执行'}到 v${refs.to.number}`;
+    const kind = requestKindOf(req);
+    const execDir = execDirectionOf(req);
+    const what = actionLabel(kind, refs.to.number >= 0 ? refs.to.number : null, refs.lca?.number ?? null);
     const titles: Record<string, string> = {
       approve: `待你审批：${where} ${what}`,
       execute: `待你执行：${where} ${what}（已全部通过）`,
@@ -1290,9 +1372,10 @@ export class Requests {
       params: {
         project: s.project.name,
         env: s.env.name,
-        direction: req.direction,
+        direction: execDir,
         to: refs.to.number,
         from: refs.from?.number ?? null,
+        lca: refs.lca?.number ?? null,
         reason: n.reason ?? null,
         stage: n.stage !== undefined ? n.stage + 1 : null,
       },
@@ -1321,9 +1404,10 @@ export class Requests {
       error?: string | null;
     } = {},
   ): Promise<number> {
-    const to = req.migrations.at(-1);
-    const toNum = to ? (req.direction === 'down' ? to.number - 1 : to.number) : null;
-    const what = `${req.direction === 'down' ? '回滚' : '执行'}${toNum !== null ? `到 v${toNum}` : ''}`;
+    const kind = requestKindOf(req);
+    const execDir = execDirectionOf(req);
+    const refs = await this.versionRefs(tx, req);
+    const what = actionLabel(kind, refs.to.number >= 0 ? refs.to.number : null, refs.lca?.number ?? null);
     const titles: Record<WebhookEventType, string> = {
       'request.created': '新的执行申请',
       'request.approved': '执行申请已全部通过',
@@ -1364,9 +1448,11 @@ export class Requests {
           group: s.project.groupSlug,
         },
         environment: { id: s.env.id, name: s.env.name, production: s.env.production },
-        direction: req.direction,
+        kind,
+        direction: execDir,
         fromVersionId: req.from_version_id,
         toVersionId: req.to_version_id,
+        ...(refs.lca ? { lca: refs.lca } : {}),
         migrations: req.migrations.map((m) => ({ number: m.number, name: m.name, direction: m.direction })),
         actor: extra.actor ?? null,
         reason: extra.reason ?? null,
@@ -1448,11 +1534,12 @@ export class Requests {
   afterDirectRun(
     user: { id: string; name: string },
     a: { pid: string; env: EnvRow },
-    run: { mode: 'migrate' | 'baseline'; to?: string; direction?: 'up' | 'down' },
+    run: { mode: 'migrate' | 'baseline'; to?: string; direction?: 'up' | 'down' | 'switch' },
     r: {
       ok: boolean;
       current: RequestVersionRef | null;
       ran: number;
+      lca?: RequestVersionRef | null;
       error: { error: string; code?: string } | null;
     },
   ): Promise<void> {
@@ -1470,7 +1557,9 @@ export class Requests {
               ])
             )[0]
           : undefined;
-        const what = `${run.direction === 'down' ? '回滚' : '执行'}${toRef ? `到 v${toRef.number}` : ''}`;
+        const kind: RequestKind =
+          run.direction === 'down' ? 'rollback' : run.direction === 'switch' ? 'switch' : 'execute';
+        const what = actionLabel(kind, toRef?.number ?? null, r.lca?.number ?? null);
         const hookEvent: WebhookEventInput = {
           type: 'execution.finished',
           title: `${r.ok ? '执行完成' : '执行失败'}：${s.project.name} / ${s.env.name}`,
@@ -1492,6 +1581,7 @@ export class Requests {
             },
             environment: { id: s.env.id, name: s.env.name, production: s.env.production },
             direction: run.direction ?? 'up',
+            ...(r.lca ? { lca: r.lca } : {}),
             toVersionId: run.to ?? null,
             actor: user.name,
             ok: r.ok,
@@ -1804,7 +1894,7 @@ export class Requests {
         id: r.id,
         project: p ?? { id: r.project_id, name: '', slug: '', groupSlug: '' },
         environment: e ?? { id: r.environment_id, name: '', production: r.production },
-        kind: r.direction === 'down' ? 'rollback' : 'execute',
+        kind: requestKindOf(r),
         from: r.from_version_id ? (versions.get(r.from_version_id) ?? null) : null,
         to: versions.get(r.to_version_id) ?? { id: r.to_version_id, number: -1, name: '' },
         status: r.status,
@@ -2120,7 +2210,12 @@ export class Requests {
       `select * from exec_requests where id = $1 and ${sweepWhere(this.db.dialect)}`,
       [rid],
     );
-    if (r && !isInterrupted(r) && (await bindingProblem(this.db, r))) await this.closeStale([rid]);
+    if (
+      r &&
+      !isInterrupted(r) &&
+      (await bindingProblem(this.db, r, await readDbNow(this.db, this.db.dialect)))
+    )
+      await this.closeStale([rid]);
   }
 
   /** 申请的有效期（小时 → 到期时间） */

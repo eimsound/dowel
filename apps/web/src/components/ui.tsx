@@ -256,16 +256,19 @@ export const Banner = ({
   children,
   action,
   role,
+  id,
 }: {
   kind: keyof typeof BANNER_ICON;
   title?: string;
   children?: ReactNode;
   action?: ReactNode;
   role?: 'status' | 'alert';
+  /** 供确认勾选框 / 按钮的 aria-describedby 引用 */
+  id?: string;
 }) => {
   const Icon = BANNER_ICON[kind];
   return (
-    <div className={cx('banner', kind)} role={role}>
+    <div className={cx('banner', kind)} role={role} id={id}>
       <Icon size={16} aria-hidden="true" />
       <div className="body">
         {title && <strong>{title}</strong>}

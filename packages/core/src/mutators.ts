@@ -315,7 +315,8 @@ export const runMutator = (m: Model, name: string, args: unknown) => {
     runPaste(m, parsed.data);
     return;
   }
-  const mu = (mutators as Record<string, { args: z.ZodType; run: (m: Model, a: unknown) => unknown }>)[name];
+  const registry = mutators as Record<string, { args: z.ZodType; run: (m: Model, a: unknown) => unknown }>;
+  const mu = Object.hasOwn(registry, name) ? registry[name] : undefined;
   if (!mu) throw new E.EditError(`未知的操作：${name}`);
   const parsed = mu.args.safeParse(args);
   if (!parsed.success) throw new E.EditError(`参数不合法：${parsed.error.issues[0]?.message ?? ''}`);

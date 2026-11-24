@@ -52,6 +52,8 @@ beforeEach(async () => {
   app = created.app;
   rooms = created.rooms;
   stop = async () => {
+    created.requests.stop();
+    await created.webhooks.close();
     await created.rooms.flush();
     await created.shadows.close();
   };
@@ -396,6 +398,48 @@ test('每个应审计的动作都能在 audit_events 里找到', async () => {
     // 重新验证需要真实 PG 影子库：路由级覆盖在 versions.test.ts，这里直接写审计保证动作名不漂移
     { action: 'version.verify', run: () => directAudit('version.verify', 'version', 'v1') },
     {
+      action: 'version.retire',
+      run: async () => {
+        const p = (await call('GET', '/api/projects', undefined, adminCookie)).data as unknown as {
+          id: string;
+        }[];
+        await addTable(rooms, db, p[0]!.id, 'orders_v2');
+        const v2 = await call('POST', `/api/projects/${p[0]!.id}/versions`, { name: 'v2' }, adminCookie);
+        expect(v2.status).toBe(201);
+        expect(
+          (
+            await call(
+              'POST',
+              `/api/projects/${p[0]!.id}/versions/${v2.data.id as string}/retire`,
+              { head: v2.data.id as string },
+              adminCookie,
+            )
+          ).status,
+        ).toBe(200);
+      },
+    },
+    {
+      action: 'version.unretire',
+      run: async () => {
+        const p = (await call('GET', '/api/projects', undefined, adminCookie)).data as unknown as {
+          id: string;
+        }[];
+        const vs = (await call('GET', `/api/projects/${p[0]!.id}/versions`, undefined, adminCookie))
+          .data as unknown as { id: string; unretirable: boolean }[];
+        const target = vs.find((v) => v.unretirable)!;
+        expect(
+          (
+            await call(
+              'POST',
+              `/api/projects/${p[0]!.id}/versions/${target.id}/unretire`,
+              { syncWorkingCopy: false },
+              adminCookie,
+            )
+          ).status,
+        ).toBe(200);
+      },
+    },
+    {
       action: 'grant.create',
       run: async () => {
         const p = (await call('GET', '/api/projects', undefined, adminCookie)).data as unknown as {
@@ -522,6 +566,7 @@ test('每个应审计的动作都能在 audit_events 里找到', async () => {
     { action: 'environment.update', run: () => directAudit('environment.update', 'environment', 'e1') },
     { action: 'environment.execute', run: () => directAudit('environment.execute', 'environment', 'e1') },
     { action: 'environment.rollback', run: () => directAudit('environment.rollback', 'environment', 'e1') },
+    { action: 'environment.switch', run: () => directAudit('environment.switch', 'environment', 'e1') },
     { action: 'environment.baseline', run: () => directAudit('environment.baseline', 'environment', 'e1') },
     // P4c：接手、认领、接入已有历史（路由级覆盖在 takeover.test.ts）
     { action: 'project.takeover', run: () => directAudit('project.takeover', 'project', 'p1') },
@@ -587,6 +632,34 @@ test('每个应审计的动作都能在 audit_events 里找到', async () => {
               'POST',
               `/api/projects/${p[0]!.id}/history/0/restore`,
               { workingSeq: hist.currentSeq },
+              adminCookie,
+            )
+          ).status,
+        ).toBe(200);
+      },
+    },
+    {
+      action: 'model.apply_version',
+      run: async () => {
+        const p = (await call('GET', '/api/projects', undefined, adminCookie)).data as unknown as {
+          id: string;
+        }[];
+        const vs = (await call('GET', `/api/projects/${p[0]!.id}/versions`, undefined, adminCookie))
+          .data as unknown as { id: string }[];
+        const diff = (
+          await call(
+            'GET',
+            `/api/projects/${p[0]!.id}/versions/${vs[0]!.id}/canvas-diff`,
+            undefined,
+            adminCookie,
+          )
+        ).data as unknown as { currentSeq: number };
+        expect(
+          (
+            await call(
+              'POST',
+              `/api/projects/${p[0]!.id}/versions/${vs[0]!.id}/apply`,
+              { workingSeq: diff.currentSeq },
               adminCookie,
             )
           ).status,

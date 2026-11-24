@@ -2,7 +2,7 @@
 import type { AttachResult } from '@dowel/api';
 import { afterEach, expect, test } from 'vitest';
 
-import { attachSuccessMessage } from '../src/envs.ts';
+import { attachRetiredMessage, attachSuccessMessage } from '../src/envs.ts';
 import i18n from '../src/i18n.ts';
 
 type AttachSummary = Pick<AttachResult, 'attached' | 'claimed' | 'currentVersion' | 'aheadVersions'>;
@@ -100,5 +100,31 @@ test('tk.attached* 词条在 zh 与 en 100% 对齐，且旧后缀键已移除', 
       expect(i18n.exists(key, { lng }), `${lng}: 缺少 ${key}`).toBe(true);
     }
     expect(i18n.exists('tk.attachedClaimed', { lng }), `${lng}: 不应保留旧后缀键`).toBe(false);
+  }
+});
+
+test('attachRetiredMessage 与版本作废/接手新增 i18n 词条在中英文下完整对齐', async () => {
+  const t = i18n.t.bind(i18n);
+  expect(attachRetiredMessage(t, undefined)).toBeNull();
+  expect(attachRetiredMessage(t, [])).toBeNull();
+
+  await i18n.changeLanguage('zh');
+  expect(attachRetiredMessage(t, [v(3)])).toBe('以下补齐的岔路版本已自动标记为已作废：v3。');
+  expect(attachRetiredMessage(t, [v(3), v(4)])).toBe('以下补齐的岔路版本已自动标记为已作废：v3、v4。');
+
+  await i18n.changeLanguage('en');
+  expect(attachRetiredMessage(t, [v(3)])).toBe('Off-path versions marked as retired: v3.');
+  expect(attachRetiredMessage(t, [v(3), v(4)])).toBe('Off-path versions marked as retired: v3, v4.');
+
+  for (const lng of ['zh', 'en'] as const) {
+    for (const key of [
+      'tk.retiredTitle',
+      'tk.retiredBody',
+      'tk.attachedRetired',
+      'vl.workingFailedRetire',
+      'vl.workingFailedUnretire',
+    ]) {
+      expect(i18n.exists(key, { lng }), `${lng}: 缺少 ${key}`).toBe(true);
+    }
   }
 });

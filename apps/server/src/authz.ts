@@ -24,6 +24,12 @@ export type ProjectAction =
   | 'version.publish'
   | 'version.edit'
   | 'version.verify'
+  /**
+   * 作废 / 取消作废链尾版本（ADR 0013）：涉及的整段都没在任何环境执行过时，项目编辑者即可；
+   * 任一版本执行过（versions.executed_at）还要 version.retire_executed（项目管理员）
+   */
+  | 'version.retire'
+  | 'version.retire_executed'
   | 'migration.read'
   | 'ddl.read'
   | 'model.verify'
@@ -229,6 +235,8 @@ export const ACTION_MIN_ROLE: Record<ProjectAction, Role> = {
   // 编辑冻结脚本、重新验证：沿用发布的权限（编辑者）
   'version.edit': 'editor',
   'version.verify': 'editor',
+  'version.retire': 'editor',
+  'version.retire_executed': 'admin',
   'migration.read': 'viewer',
   'ddl.read': 'viewer',
   'model.verify': 'viewer',

@@ -1189,4 +1189,40 @@ describe.each([
       expect(auditsAfterRetry).toHaveLength(1);
     },
   );
+
+  // #90：mutator 名恰好是 Object.prototype 上的属性名时按未知 mutator 处理
+  test.skipIf(skip)('list_mutators / apply_changes 把原型属性名当作未知 mutator', async () => {
+    const f = await setupEnv();
+    const tokAlice = await f.issueToken(f.alice.id, ['read', 'write']);
+    const protoNames = ['toString', 'constructor', 'valueOf', 'hasOwnProperty', '__proto__'];
+
+    const lm = await f.callTool(tokAlice.token, 'list_mutators', { names: [...protoNames, 'createTable'] });
+    expect(lm.isError).toBeFalsy();
+    expect((lm.structuredContent!.mutators as { name: string }[]).map((m) => m.name)).toEqual([
+      'createTable',
+    ]);
+    expect(lm.structuredContent!.unknown).toEqual(protoNames);
+
+    const publicSchemaId = all((await f.created.rooms.model(f.branch1)).model, 'schema')[0]!.id;
+    for (const name of protoNames) {
+      const res = await f.callTool(tokAlice.token, 'apply_changes', {
+        project: f.p1Id,
+        baseSeq: 0,
+        ops: [
+          { name: 'createTable', args: { id: '$ref:t', schema: publicSchemaId, name: 'should_rollback' } },
+          { name, args: {} },
+        ],
+      });
+      expect(res.isError).toBe(true);
+      expect(res.structuredContent).toMatchObject({
+        code: 'invalid',
+        message: `未知的操作：${name}`,
+        index: 1,
+        currentSeq: 0,
+      });
+    }
+    const state = await f.created.rooms.model(f.branch1);
+    expect(state.seq).toBe(0);
+    expect(all(state.model, 'table').map((t) => t.name)).not.toContain('should_rollback');
+  });
 });

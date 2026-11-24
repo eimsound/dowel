@@ -513,6 +513,26 @@ const matrix: Record<string, Spec> = {
     access: { kind: 'project', min: 'editor', statuses: [422] },
     path: (ctx) => `${P()}/versions/${ctx.versionId}/verify`,
   },
+  // 链尾版本作废 / 取消作废（基础角色 version.retire 为 editor；含已执行版本时升级为 version.retire_executed 需 admin）
+  'POST /api/projects/:pid/versions/:vid/retire': {
+    access: { kind: 'project', min: 'editor', statuses: [400] },
+    path: (ctx) => `${P()}/versions/${ctx.versionId}/retire`,
+    body: () => ({}),
+  },
+  'POST /api/projects/:pid/versions/:vid/unretire': {
+    access: { kind: 'project', min: 'editor', statuses: [400] },
+    path: (ctx) => `${P()}/versions/${ctx.versionId}/unretire`,
+    body: () => ({ syncWorkingCopy: 'bad' }),
+  },
+  'GET /api/projects/:pid/versions/:vid/canvas-diff': {
+    access: { kind: 'project', min: 'viewer', statuses: [200] },
+    path: (ctx) => `${P()}/versions/${ctx.versionId}/canvas-diff`,
+  },
+  'POST /api/projects/:pid/versions/:vid/apply': {
+    access: { kind: 'project', min: 'editor', statuses: [400] },
+    path: (ctx) => `${P()}/versions/${ctx.versionId}/apply`,
+    body: () => ({ workingSeq: -1 }),
+  },
   'GET /api/projects/:pid/activity': {
     access: { kind: 'project', min: 'viewer', statuses: [200] },
     path: () => `${P()}/activity`,
@@ -638,6 +658,16 @@ const matrix: Record<string, Spec> = {
   'POST /api/projects/:pid/environments/:eid/rollback': {
     access: { kind: 'project', min: 'editor', statuses: [400] },
     path: (ctx) => `${P()}/environments/${ctx.envId}/rollback`,
+    body: () => ({}),
+    prepare: async (ctx) => {
+      const e = await freshEnv(ctx.pid, ++unique);
+      ctx.envId = e.id;
+      ctx.envName = e.name;
+    },
+  },
+  'POST /api/projects/:pid/environments/:eid/switch': {
+    access: { kind: 'project', min: 'editor', statuses: [400] },
+    path: (ctx) => `${P()}/environments/${ctx.envId}/switch`,
     body: () => ({}),
     prepare: async (ctx) => {
       const e = await freshEnv(ctx.pid, ++unique);
@@ -1391,4 +1421,96 @@ test('mustChangePassword：强制改密期间仅放行 me/password/logout 与公
 
   // 允许退出登录
   expect((await call('POST', '/api/auth/logout', undefined, forcedCookie)).status).toBe(200);
+});
+
+test('version.retire / version.retire_executed 权限分级：未执行版本 editor 可做，已执行版本仅 admin 可做', async () => {
+  const admin = byName.get('admin')!;
+  const p = await call(
+    'POST',
+    '/api/projects',
+    { name: 'Retire Matrix', groupId: currentCtx.groupId },
+    admin.cookie,
+  );
+  expect(p.status).toBe(201);
+  const pid = p.data.id as string;
+  const [b] = await db.query<{ id: string }>('select id from branches where project_id = $1', [pid]);
+  // 给测试项目复刻与矩阵相同的成员授权
+  for (const [uname, role] of [
+    ['pv', 'viewer'],
+    ['pe', 'editor'],
+    ['pa', 'admin'],
+  ] as const) {
+    const u = byName.get(uname)!;
+    await ensureGrant(`retire-m-${uname}`, u.userId, role, 'project', pid);
+  }
+  const [h] = await db.query<{ id: string }>("select id from groups where slug = 'matrix-h'");
+  await db.query(
+    `insert into grants (id, subject_kind, subject_id, role, scope_kind, scope_id)
+     values ('retire-m-h', 'group', $1, 'editor', 'project', $2)`,
+    [h!.id, pid],
+  );
+
+  const insertVer = async (id: string, number: number, parentId: string | null, executed: boolean) => {
+    await db.query(
+      `insert into versions (id, project_id, branch_id, seq, name, model, number, parent_id, up_steps, down_steps, checksum, executed_at)
+       values ($1, $2, $3, $4, $5, $6::text::jsonb, $4, $7, '[]'::text::jsonb, '[]'::text::jsonb, $8, $9)`,
+      [
+        id,
+        pid,
+        b!.id,
+        number,
+        `v${number}`,
+        JSON.stringify(emptyModel()),
+        parentId,
+        stepsChecksum([], []),
+        executed ? new Date().toISOString() : null,
+      ],
+    );
+  };
+  await insertVer('rm-v1', 1, null, true);
+
+  for (const executed of [false, true]) {
+    const vid = executed ? 'rm-v2-exec' : 'rm-v2-unexec';
+    const minAllowed: Role = executed ? 'admin' : 'editor';
+    await insertVer(vid, executed ? 3 : 2, 'rm-v1', executed);
+
+    // 1. retire：按所有身份依次验证
+    for (const identity of identities) {
+      // 重置为活跃状态以便逐个身份测试
+      await db.query('update versions set retired_at = null, retired_by = null where id = $1', [vid]);
+      const res = await call(
+        'POST',
+        `/api/projects/${pid}/versions/${vid}/retire`,
+        { head: vid, keepWorkingCopy: true },
+        identity.cookie,
+      );
+      const want = expectedStatus({ kind: 'project', min: minAllowed, statuses: [200] }, identity);
+      const allowed = Array.isArray(want) ? want : [want];
+      expect(allowed, `retire(executed=${executed}) / ${identity.name} 返回 ${res.status}`).toContain(
+        res.status,
+      );
+    }
+
+    // 2. unretire：先把目标版本设为已作废，再按所有身份依次验证
+    for (const identity of identities) {
+      await db.query('update versions set retired_at = $2, retired_by = $3 where id = $1', [
+        vid,
+        new Date().toISOString(),
+        admin.userId,
+      ]);
+      const res = await call(
+        'POST',
+        `/api/projects/${pid}/versions/${vid}/unretire`,
+        { syncWorkingCopy: false },
+        identity.cookie,
+      );
+      const want = expectedStatus({ kind: 'project', min: minAllowed, statuses: [200] }, identity);
+      const allowed = Array.isArray(want) ? want : [want];
+      expect(allowed, `unretire(executed=${executed}) / ${identity.name} 返回 ${res.status}`).toContain(
+        res.status,
+      );
+    }
+    // 清理测试版本，保持单一尾链继续下一轮
+    await db.query('delete from versions where id = $1', [vid]);
+  }
 });

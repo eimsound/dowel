@@ -32,11 +32,18 @@ const RequestRow = ({ r, extra }: { r: ExecRequestSummary; extra?: string }) => 
     <li className="flex flex-wrap items-center gap-x-3 gap-y-1 px-3 py-2 text-sm not-first:border-t not-first:border-border">
       <StatusBadge status={r.status} />
       <RequestLink r={r}>
-        {t(r.kind === 'rollback' ? 'req.rowRollback' : 'req.rowExecute', {
-          project: r.project.name,
-          env: r.environment.name,
-          to: r.to.number,
-        })}
+        {t(
+          r.kind === 'rollback'
+            ? 'req.rowRollback'
+            : r.kind === 'switch'
+              ? 'req.rowSwitch'
+              : 'req.rowExecute',
+          {
+            project: r.project.name,
+            env: r.environment.name,
+            to: r.to.number,
+          },
+        )}
       </RequestLink>
       {extra && <span className="badge warn">{extra}</span>}
       <span className="flex-1" />

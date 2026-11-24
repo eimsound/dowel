@@ -179,6 +179,13 @@ export const CI_ERROR_STATUS = {
   version_not_found: 422,
   /** 目标版本早于环境的当前版本：令牌不能回滚 */
   rollback_not_allowed: 409,
+  /**
+   * ADR 0013：环境停在已作废的岔路上，到目标版本要先回滚到最近公共祖先再升级。令牌不自动回滚：
+   * 要在 Web 端人工确认切换（details.current 是环境当前版本）
+   */
+  switch_requires_web: 409,
+  /** ADR 0013：目标版本已作废，不能执行到它 */
+  version_retired: 409,
   /** 目标库的历史和平台的版本链对不上（当前版本不在链上、校验和不同、链被篡改……），details.reason 是具体原因 */
   version_mismatch: 409,
   /** 要执行的迁移还没有通过影子库验证 */
@@ -228,8 +235,9 @@ export interface CiErrorBody {
     /** 失败时目标库已被部分改动（含非事务步骤的迁移停在中途） */
     partial?: boolean;
     timeout?: { kind: 'lock' | 'statement'; ms: number };
-    /** 回滚被拒绝时：环境的当前版本 */
+    /** 回滚被拒绝 / 需要切换时：环境的当前版本与最近公共祖先 */
     current?: CiVersionRef | null;
+    lca?: CiVersionRef | null;
     problems?: string[];
   };
   /** 执行失败时：环境停在的版本（最后一个成功的版本）；其他错误没有这一项 */
@@ -318,7 +326,7 @@ export interface CiVersion extends CiVersionRef {
 }
 
 export const ciEnvironmentVersionSchema = ciVersionRefSchema.extend({
-  state: z.enum(['applied', 'current', 'pending']),
+  state: z.enum(['applied', 'current', 'pending', 'retired']),
   verified: z.boolean(),
 });
 export type CiEnvironmentVersion = z.infer<typeof ciEnvironmentVersionSchema>;

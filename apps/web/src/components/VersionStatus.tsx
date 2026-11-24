@@ -3,10 +3,11 @@
 import type { StoredVerifyReport, VerifyResponse, VersionInfo } from '@dowel/api';
 import { BASELINE_VERSION_NAME } from '@dowel/api';
 import type { Dialect } from '@dowel/core';
-import { CircleCheck, CircleHelp, DatabaseBackup, Pencil } from 'lucide-react';
+import { Archive, CircleCheck, CircleHelp, DatabaseBackup, Pencil } from 'lucide-react';
 import { useTranslation } from 'react-i18next';
 
 import { dialectUiSpec } from '../dialects.ts';
+import { formatTime } from '../format.ts';
 import { Banner } from './ui.tsx';
 
 /** 版本在界面上的名字：v0 基线的名字本身已经带着 v0，这里换成“基线”，避免和 v0 标记重复 */
@@ -21,15 +22,58 @@ export const VersionNumber = ({ number }: { number: number }) => (
   <span className="chip shrink-0 font-mono">v{number}</span>
 );
 
-/** 已验证 / 未验证 / 人工编辑：脚本被人工改过时两个标记都显示（改过的脚本可能已重新验证） */
+/**
+ * 已作废（ADR 0013）的标记：文字 + 图标，不只靠颜色。title 说明谁什么时候作废的（接手时自动识别的没有作废人）
+ */
+export const RetiredBadge = ({
+  v,
+  id,
+}: {
+  v: { retiredAt: string | null; retiredBy?: string | null; restoredAt?: string | null };
+  id?: string;
+}) => {
+  const { t } = useTranslation();
+  if (!v.retiredAt) return null;
+  // 归属说明对读屏可见（不只放在 title 里）：有作废人 / 接手时自动识别 / 作废人已删除
+  const who = v.retiredBy
+    ? t('vl.retiredBy', { name: v.retiredBy, time: formatTime(v.retiredAt) })
+    : v.restoredAt
+      ? t('vl.retiredAuto')
+      : t('vl.retiredAt', { time: formatTime(v.retiredAt) });
+  return (
+    <span id={id} className="risk medium inline-flex items-center gap-1" title={who}>
+      <Archive size={12} aria-hidden="true" />
+      {t('vl.retiredBadge')}
+      <span className="sr-only"> ({who})</span>
+    </span>
+  );
+};
+
+/** 已验证 / 未验证 / 人工编辑：脚本被人工改过时两个标记都显示（改过的脚本可能已重新验证）；链头 / 已作废 / 执行过（ADR 0013） */
 export const VersionBadges = ({
   v,
+  retiredId,
 }: {
-  v: Pick<VersionInfo, 'verifiedAt' | 'edited'> & { restoredAt?: string | null };
+  /** 已作废标记的 id：版本链接用 aria-describedby 引用它 */
+  retiredId?: string;
+  v: Pick<VersionInfo, 'verifiedAt' | 'edited'> & {
+    restoredAt?: string | null;
+    latest?: boolean;
+    retiredAt?: string | null;
+    retiredBy?: string | null;
+    executed?: boolean;
+  };
 }) => {
   const { t } = useTranslation();
   return (
     <span className="inline-flex shrink-0 flex-wrap items-center gap-1.5">
+      {v.latest && <span className="chip">{t('vl.head')}</span>}
+      {v.retiredAt && (
+        <RetiredBadge
+          id={retiredId}
+          v={{ retiredAt: v.retiredAt, retiredBy: v.retiredBy ?? null, restoredAt: v.restoredAt ?? null }}
+        />
+      )}
       {v.verifiedAt ? (
         <span className="risk low inline-flex items-center gap-1">
           <CircleCheck size={12} aria-hidden="true" />
@@ -45,6 +89,12 @@ export const VersionBadges = ({
         <span className="risk low inline-flex items-center gap-1">
           <Pencil size={12} aria-hidden="true" />
           {t('versions.edited')}
+        </span>
+      )}
+      {v.executed && (
+        <span className="chip" title={t('vl.executedHint')}>
+          {t('vl.executed')}
+          <span className="sr-only"> ({t('vl.executedHint')})</span>
         </span>
       )}
       {v.restoredAt && (

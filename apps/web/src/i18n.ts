@@ -103,6 +103,76 @@ const zh = {
     verifyFailed: '验证没有通过，见下方报告',
     verifyMissingTarget: '未完成最低目标版本验证，见下方详情',
   },
+  vl: {
+    head: '链头',
+    executed: '已执行过',
+    executedHint: '曾在环境中执行过；作废或取消作废需要项目管理员。',
+    retiredBadge: '已作废',
+    retiredBy: '{{time}} 由 {{name}} 作废',
+    retiredAuto: '接手时识别为已作废',
+    retiredAt: '{{time}} 已作废',
+    filter: '按状态筛选版本',
+    filter_all: '全部',
+    filter_active: '活跃',
+    filter_retired: '已作废',
+    apply: '应用到画布',
+    retire: '作废',
+    unretire: '取消作废',
+    needsAdminRetire: '作废范围包含已在环境执行过的版本，需要项目管理员。',
+    needsAdminUnretire: '恢复范围包含已在环境执行过的版本，需要项目管理员。',
+    retiredTitle: '这个版本已作废',
+    retiredBody:
+      '它已不在活跃主链上：不能再执行到它，也不能标记为已执行到它。停在它上面的环境可以回滚到祖先版本、切换回活跃主链，或在线上结构一致时使用“标记为已执行”跨岔路对齐。',
+    notUnretirable:
+      '已经基于父版本发布了更新的版本，这一段不能再取消作废。需要它的结构时可以使用“应用到画布”。',
+    notEditableRetired: '已作废的版本不能编辑脚本。',
+    range: 'v{{from}}～v{{to}}',
+    spanLabel: '涉及的版本',
+    retireTitle: '作废 {{range}}',
+    retireTitleStale: '作废版本',
+    retireStale: '作废范围已经变化（可能有人刚作废了这些版本），请关闭后刷新再试。',
+    retireConfirm: '作废 {{count}} 个版本',
+    retireConfirmOne: '作废 v{{number}}',
+    retireKeeps:
+      '作废不会删除原版本和迁移记录，版本号也不会重用：下次发布将是 v{{next}}（父版本 v{{parent}}）。作废不连接任何目标库。',
+    retireExecutedTitle: '有版本已在环境执行过',
+    retireExecuted:
+      '范围中有版本已在环境执行过（{{list}}）。作废后停在这些版本上的环境不会变动；之后切回活跃主链会先执行回滚脚本（可能导致数据丢失），也可在线上结构一致时用“标记为已执行”跨岔路对齐，不执行 SQL。只有项目管理员可以作废已执行过的版本。',
+    retireExecutedOne:
+      'v{{number}} 已在环境执行过。作废后停在它上面的环境不会变动；之后切回活跃主链会先执行回滚脚本（可能导致数据丢失），也可在线上结构一致时用“标记为已执行”跨岔路对齐，不执行 SQL。只有项目管理员可以作废已执行过的版本。',
+    retireRequests: '引用这些版本的待处理执行申请会自动失效。',
+    listSep: '、',
+    workingCopy: '工作副本',
+    revertTo: '回退到 v{{parent}} 的模型（作为一条新的修改记录记入画布修改历史，随时可恢复之前的状态）',
+    keepWorking: '保留当前工作副本',
+    headChanged: '活跃链头刚刚发生了变化，请重新确认作废范围。',
+    retired: '已作废 {{range}}，链头现在是 v{{head}}',
+    retiredWithRequests: '已作废 {{range}}，链头现在是 v{{head}}，{{count}} 个执行申请已失效',
+    retireDoneTitle: '已作废',
+    workingChangedRetire:
+      '版本已作废，但工作副本在确认期间被修改，没有回退。需要时可以在版本页对父版本使用“应用到画布”。',
+    workingFailedRetire:
+      '版本已作废，但回退工作副本时发生异常，工作副本未改动。需要时可以在版本页对父版本使用“应用到画布”。',
+    unretireTitle: '取消作废 {{range}}',
+    unretireTitleStale: '取消作废',
+    unretireConfirm: '取消作废',
+    unretireHint: '尚未基于父版本发布更新的版本，可以把这一段恢复回活跃主链。此前已失效的执行申请不会恢复。',
+    restoreWorking: '将工作副本恢复到 v{{head}} 的模型（作为一条新的修改记录记入画布修改历史）',
+    unretired: '已取消作废 {{range}}，链头现在是 v{{head}}',
+    unretireDoneTitle: '已取消作废',
+    workingChangedUnretire: '版本已恢复为活跃主链，但工作副本在确认期间被修改，没有恢复到链头的模型。',
+    workingFailedUnretire:
+      '版本已恢复为活跃主链，但同步工作副本时发生异常，工作副本未改动。需要时可以在版本页对链头使用“应用到画布”。',
+    applyTitle: '将 v{{number}} 应用到画布',
+    applyConfirm: '应用到画布',
+    applyLoading: '正在比较工作副本和这个版本…',
+    applySame: '当前工作副本已经和 v{{number}} 一致。',
+    applyWarn:
+      '将用 v{{number}} 的模型整体替换当前工作副本，并作为一条新的修改记录记入画布修改历史；之后随时可在画布修改历史中恢复。',
+    applyDiff: '工作副本 → v{{number}} 的变化',
+    applyRaced: '工作副本在你查看期间已被修改，下面是最新的差异，请重新确认。',
+    applied: '已将 v{{number}} 应用到画布',
+  },
   envp: {
     title: '环境',
     detail: '环境详情',
@@ -156,7 +226,7 @@ const zh = {
       'MySQL DDL 会隐式提交：这个迁移不是原子的，每步都会直接生效并记录检查点，失败后需要修复或从断点续跑。',
     nonTxGeneric: '含非事务步骤：这个迁移不是原子的，失败后目标库会停在中途，需要从断点续跑。',
     nonTxShort: '含非事务步骤',
-    state: { applied: '已执行', current: '当前', pending: '待执行' },
+    state: { applied: '已执行', current: '当前', pending: '待执行', retired: '已作废' },
     dir: { baseline: '写入基线', up: '升级', down: '回滚', mark: '标记' },
     run: {
       time: '时间',
@@ -233,15 +303,31 @@ const zh = {
       rollToLabel: '回滚到版本',
       titleExecute: '执行到 v{{number}}（{{name}}）',
       titleRollback: '回滚到 v{{number}}（{{name}}）',
+      titleSwitch: '切换到 v{{number}}（{{name}}）',
       titleBaseline: '写入基线（{{name}}）',
       confirmExecute: '确认执行',
       confirmRollback: '确认回滚',
+      confirmSwitch: '确认切换',
       confirmBaseline: '确认写入基线',
       executeIntro: '将依次执行下面 {{count}} 个迁移，每个迁移在目标库里一个事务，执行完都会读回结构并校验。',
       executeIntroNonTx:
         '将依次执行下面 {{count}} 个迁移。{{dialect}} 的 DDL 会隐式提交：每条语句会按顺序在目标库直接生效并记录检查点；如果中途失败，之前已执行的步骤不会自动回滚，后续可在环境页从失败步修复或继续，执行完都会读回结构并校验。',
       rollbackIntro: '将依次回滚下面 {{count}} 个版本（执行它们的回滚脚本）。',
       rollbackNoRisk: '回滚脚本没有做过锁和重写分析，请自行评估对线上的影响。',
+      switchButton: '切换到 v{{number}}',
+      switchBanner: '这个环境停在已作废的版本 v{{number}} 上。',
+      switchBannerBody:
+        '可以经最近公共祖先切换回活跃主链（先执行回滚脚本，可能导致数据丢失），也可以在线上结构一致时用“标记为已执行”跨岔路对齐，不执行 SQL。',
+      switchIntro:
+        '先回滚 {{down}} 个版本到最近公共祖先，再升级 {{up}} 个版本。每个迁移都在目标库里单独提交并读回校验。',
+      switchRouteAria: '先从 v{{from}} 回滚到 v{{lca}}，再升级到 v{{to}}',
+      segDown: '回滚段（执行回滚脚本）',
+      segUp: '升级段',
+      rollbackChip: '回滚',
+      switchWarnTitle: '回滚段可能导致数据丢失',
+      switchWarn:
+        '回滚段会执行已作废版本的回滚脚本，可能删除列、表和其中的数据。如果不能接受数据丢失，请先手工让线上结构与目标版本一致，再用“标记为已执行”跨岔路对齐，不执行 SQL。',
+      switchAck: '我已了解回滚段会执行已作废版本的回滚脚本，可能导致数据丢失',
       baselineHint: '库的结构已经等于基线，只在目标库里写入 Dowel 的历史，不执行任何 SQL。',
       migrations: '要执行的迁移',
       steps: '{{count}} 步',
@@ -323,6 +409,12 @@ const zh = {
       tipBackward:
         '不执行任何 SQL，只在迁移历史里把这个环境记为已到达 v{{number}}。Dowel 会先核对线上结构，和 v{{number}} 的模型完全一致才允许标记。适用于线上已经手工改成这个版本的情况，比如热修、手工补完失败的迁移。',
       stay: '标记为停在 v{{number}}（放弃未完成的迁移）',
+      cross: '跨岔路标记为已执行到 v{{number}}',
+      tipCross:
+        '不执行任何 SQL，把停在已作废岔路上的环境记为已到达活跃主链上的 v{{number}}。Dowel 会先核对线上结构，和 v{{number}} 的模型完全一致才允许标记。适用于不能接受回滚丢数据、线上结构已经和 v{{number}} 一致的环境。',
+      crossTitle: '跨岔路标记',
+      crossBody:
+        '环境从已作废的 v{{from}} 记为已到达活跃主链上的 v{{number}}，不执行任何 SQL。下面是从最近公共祖先到 v{{number}} 的版本，不包括无关的已作废版本。',
       tipStay:
         '不执行任何 SQL，只在迁移历史里记下：这个环境停在 v{{number}}，上一次没有结束的迁移作废。适用于你已经手工把半途的库改回了 v{{number}} 的样子。Dowel 会先核对线上结构，和 v{{number}} 的模型完全一致才允许标记；之后执行会从头重跑那个迁移。',
       planChanged: '目标库在核对之后变了，已经刷新了核对结果，请重新确认。',
@@ -399,6 +491,9 @@ const zh = {
     claimDone: '已认领：之后由本实例执行。',
     claimNoop: '本来就是本实例认领的，什么都没改。',
     warnTitle: '项目已经建好，但有没做完的事',
+    retiredTitle: '已自动识别为已作废的版本',
+    retiredBody:
+      '以下版本不在合并后的活跃主链（根到最大编号）上，接手后已标记为已作废；如需调整可在版本页查看或处理：',
     openProject: '进入项目',
     // 环境页：认领
     claimBannerTitle: '这个库里的项目由另一个实例认领',
@@ -426,6 +521,7 @@ const zh = {
     attachedAheadNoVersion: '已接入 {{name}}：补齐 {{count}} 个领先版本。',
     attachedAheadNoVersionClaimed: '已接入 {{name}}：补齐 {{count}} 个领先版本，并已认领。',
     attachedNone: '已添加 {{name}}（这个库里还没有这个项目的历史）。',
+    attachedRetired: '以下补齐的岔路版本已自动标记为已作废：{{list}}。',
     attachedWarn: '环境已添加，但有没做完的事：{{msg}}',
     attachAheadTitle: '确认覆盖工作副本并接入领先环境',
     attachAheadIntro:
@@ -439,6 +535,7 @@ const zh = {
       title: '预演',
       running: '正在预演：做完全部执行前检查，不写任何东西…',
       readonly: '只是预演：没有写目标库，也没有登记任何东西。',
+      switchVia: '经最近公共祖先 v{{lca}} 切换：先回滚，再升级。',
       okTitle: '预演通过',
       okBody: '现在执行的话，会做下面这些事：',
       failTitle: '预演没有通过',
@@ -705,6 +802,8 @@ const zh = {
       publish: '发布了版本 {{name}}',
       edit_steps: '修改了冻结的迁移脚本',
       verify: '重新验证了迁移',
+      retire: '作废了版本 {{range}}',
+      unretire: '取消作废了版本 {{range}}',
     },
     environment: {
       create: '添加了环境 {{name}}',
@@ -715,12 +814,14 @@ const zh = {
       rollback: '回滚了环境 {{name}}',
       baseline: '为环境 {{name}} 写入了基线',
       mark: '标记了环境 {{name}} 的当前版本',
+      switch: '切换了环境 {{name}} 的版本（先回滚再升级）',
       attach_history: '接入了环境 {{name}} 的已有历史',
       emergency: '紧急执行了环境 {{name}}',
     },
     model: {
       import: '导入了 SQL（{{count}} 个对象）',
       restore: '从修改历史恢复了工作副本',
+      apply_version: '将版本 {{range}} 应用到了画布',
       mutate: '修改了工作副本（{{count}} 处操作）',
       verify: '在影子库验证了迁移',
     },
@@ -1025,6 +1126,7 @@ const zh = {
     to: '到',
     empty: '空库',
     head: '工作副本',
+    retiredSuffix: '（已作废）',
     up: '升级脚本',
     down: '回滚脚本',
     upShort: '升级',
@@ -1490,6 +1592,9 @@ const zh = {
     emergencyBadge: '紧急执行',
     headExecute: '{{env}}：{{from}} → {{to}}（执行）',
     headRollback: '{{env}}：{{from}} → {{to}}（回滚）',
+    headSwitch: '{{env}}：{{from}} → {{to}}（切换）',
+    switchNote:
+      '这个申请会先回滚 {{down}} 个版本到 v{{lca}}（执行回滚脚本，可能导致数据丢失），再升级 {{up}} 个版本。',
     none: '（还没有执行过）',
     requestedBy: '申请人',
     executedByEmergency: '执行人',
@@ -1501,8 +1606,10 @@ const zh = {
     stageOf: '第 {{n}}/{{total}} 个环节',
     rowExecute: '{{project}} / {{env}}：执行到 v{{to}}',
     rowRollback: '{{project}} / {{env}}：回滚到 v{{to}}',
+    rowSwitch: '{{project}} / {{env}}：切换到 v{{to}}',
     envRowExecute: '执行到 v{{to}}',
     envRowRollback: '回滚到 v{{to}}',
+    envRowSwitch: '切换到 v{{to}}',
     envPending: '待处理的执行申请',
     envPendingEmpty: '没有待处理的执行申请。',
     envApprovalRequired:
@@ -1511,6 +1618,7 @@ const zh = {
     envButton: {
       execute: '提交执行申请',
       rollback: '申请回滚',
+      switch: '申请切换',
       emergency: '紧急执行',
       emergencyRollback: '紧急回滚',
     },
@@ -1528,6 +1636,7 @@ const zh = {
     dialog: {
       titleExecute: '提交执行申请：{{name}} 执行到 v{{number}}',
       titleRollback: '提交回滚申请：{{name}} 回滚到 v{{number}}',
+      titleSwitch: '提交切换申请：{{name}} 切换到 v{{number}}',
       submit: '提交执行申请',
       intro:
         '申请绑定当前的起始版本和这些迁移的校验和：环境状态一变（有人先执行了、检测到漂移、脚本被修改）申请就失效；过了有效期也会失效。',
@@ -1548,6 +1657,7 @@ const zh = {
       titleApprove: '通过并执行：{{name}} 到 v{{number}}',
       introExecute: '将执行 {{count}} 个迁移：',
       introRollback: '将回滚 {{count}} 个迁移：',
+      introSwitch: '将先回滚 {{down}} 个版本，再升级 {{up}} 个版本：',
     },
     actions: {
       title: '处理',
@@ -2081,6 +2191,9 @@ const zh = {
       pullSchema: '从环境导入结构',
       attachAhead: '接入领先环境',
       restoreHistory: '恢复历史状态',
+      retireVersions: '作废版本后回退工作副本',
+      unretireVersions: '取消作废后同步工作副本',
+      applyVersion: '应用版本到画布',
       replaceModel: '替换模型',
       derive: '刷新派生定义',
     },
@@ -2320,6 +2433,82 @@ const en: typeof zh = {
     verifyFailed: 'Verification failed; see the report below',
     verifyMissingTarget: 'Lowest target version not verified; see details below',
   },
+  vl: {
+    head: 'Chain head',
+    executed: 'Executed',
+    executedHint: 'Has run in an environment; retiring or unretiring requires a project admin.',
+    retiredBadge: 'Retired',
+    retiredBy: 'Retired {{time}} by {{name}}',
+    retiredAuto: 'Classified as retired on takeover',
+    retiredAt: 'Retired {{time}}',
+    filter: 'Filter versions by status',
+    filter_all: 'All',
+    filter_active: 'Active',
+    filter_retired: 'Retired',
+    apply: 'Apply to canvas',
+    retire: 'Retire',
+    unretire: 'Unretire',
+    needsAdminRetire: 'Retiring versions that have run in an environment requires a project admin.',
+    needsAdminUnretire: 'Unretiring versions that have run in an environment requires a project admin.',
+    retiredTitle: 'This version is retired',
+    retiredBody:
+      'It is no longer on the active chain: environments cannot execute up to it or mark it as applied. Environments on it can roll back to an ancestor, switch back to the active chain, or use "Mark as applied" across branches when the live structure matches.',
+    notUnretirable:
+      'A newer version has been published from the parent, so this range cannot be unretired. Use "Apply to canvas" if you need its structure.',
+    notEditableRetired: 'Scripts of retired versions cannot be edited.',
+    range: 'v{{from}}–v{{to}}',
+    spanLabel: 'Versions in range',
+    retireTitle: 'Retire {{range}}',
+    retireTitleStale: 'Retire versions',
+    retireStale:
+      'The range has changed (someone may have just retired these versions). Close this dialog, refresh and try again.',
+    retireConfirm: 'Retire {{count}} versions',
+    retireConfirmOne: 'Retire v{{number}}',
+    retireKeeps:
+      'Retiring keeps the original versions and migration history, and version numbers are never reused: the next published version will be v{{next}} (parent v{{parent}}). No target database is touched.',
+    retireExecutedTitle: 'Some versions have run in environments',
+    retireExecuted:
+      'Some versions in this range have run in environments ({{list}}). Environments on them stay unchanged; switching them back to the active chain runs rollback scripts first (possible data loss), or you can use "Mark as applied" across branches without running SQL when the live structure matches. Only project admins can retire executed versions.',
+    retireExecutedOne:
+      'v{{number}} has run in environments. Environments on it stay unchanged; switching them back to the active chain runs rollback scripts first (possible data loss), or you can use "Mark as applied" across branches without running SQL when the live structure matches. Only project admins can retire executed versions.',
+    retireRequests: 'Any open execution requests referencing these versions will be invalidated.',
+    listSep: ', ',
+    workingCopy: 'Working copy',
+    revertTo:
+      "Revert to v{{parent}}'s model (recorded as a new commit in canvas history; you can restore the previous working copy anytime)",
+    keepWorking: 'Keep the current working copy',
+    headChanged: 'The active chain head just changed. Review the range and confirm again.',
+    retired: 'Retired {{range}}; chain head is now v{{head}}',
+    retiredWithRequests:
+      'Retired {{range}}; chain head is now v{{head}}; {{count}} execution request(s) invalidated',
+    retireDoneTitle: 'Retired',
+    workingChangedRetire:
+      'The versions were retired, but the working copy changed before confirmation and was not reverted. Use "Apply to canvas" on the parent version if needed.',
+    workingFailedRetire:
+      'The versions were retired, but reverting the working copy failed so the working copy was left unchanged. Use "Apply to canvas" on the parent version if needed.',
+    unretireTitle: 'Unretire {{range}}',
+    unretireTitleStale: 'Unretire',
+    unretireConfirm: 'Unretire',
+    unretireHint:
+      'No newer version has been published from the parent, so this range can return to the active chain. Previously invalidated execution requests stay invalid.',
+    restoreWorking: "Restore the working copy to v{{head}}'s model (as a new commit in canvas history)",
+    unretired: 'Unretired {{range}}; chain head is now v{{head}}',
+    unretireDoneTitle: 'Unretired',
+    workingChangedUnretire:
+      "The versions are back on the active chain, but the working copy changed before confirmation and was not restored to the head's model.",
+    workingFailedUnretire:
+      'The versions are back on the active chain, but restoring the working copy failed so it was left unchanged. Use "Apply to canvas" on the chain head if needed.',
+    applyTitle: 'Apply v{{number}} to canvas',
+    applyConfirm: 'Apply to canvas',
+    applyLoading: 'Comparing the working copy with this version…',
+    applySame: 'The working copy already matches v{{number}}.',
+    applyWarn:
+      "Replaces the working copy with v{{number}}'s model as a new commit in canvas history; you can restore the previous state from canvas history.",
+    applyDiff: 'Changes from the working copy to v{{number}}',
+    applyRaced:
+      'The working copy changed while you were reviewing; the latest differences are shown below, please confirm again.',
+    applied: 'Applied v{{number}} to the canvas',
+  },
   envp: {
     title: 'Environments',
     detail: 'Environment details',
@@ -2374,7 +2563,7 @@ const en: typeof zh = {
     nonTxGeneric:
       'Contains non-transactional steps: this migration is not atomic. If it fails the database stops midway and must be resumed from the checkpoint.',
     nonTxShort: 'non-transactional',
-    state: { applied: 'Applied', current: 'Current', pending: 'Pending' },
+    state: { applied: 'Applied', current: 'Current', pending: 'Pending', retired: 'Retired' },
     dir: { baseline: 'Baseline', up: 'Upgrade', down: 'Rollback', mark: 'Mark' },
     run: {
       time: 'Time',
@@ -2453,9 +2642,11 @@ const en: typeof zh = {
       rollToLabel: 'Roll back to',
       titleExecute: 'Execute up to v{{number}} ({{name}})',
       titleRollback: 'Roll back to v{{number}} ({{name}})',
+      titleSwitch: 'Switch to v{{number}} ({{name}})',
       titleBaseline: 'Write baseline ({{name}})',
       confirmExecute: 'Confirm execution',
       confirmRollback: 'Confirm rollback',
+      confirmSwitch: 'Confirm switch',
       confirmBaseline: 'Confirm baseline',
       executeIntro:
         'These {{count}} migrations will run in order, each in one transaction in the target database; the structure is read back and verified after each.',
@@ -2464,6 +2655,21 @@ const en: typeof zh = {
       rollbackIntro: 'These {{count}} versions will be rolled back in order (their rollback scripts run).',
       rollbackNoRisk:
         'Rollback scripts have no lock or rewrite analysis; assess the impact on production yourself.',
+      switchButton: 'Switch to v{{number}}',
+      switchBanner: 'This environment is on retired version v{{number}}.',
+      switchBannerBody:
+        'You can switch back to the active chain through the common ancestor (rollback scripts run first and may cause data loss), or use "Mark as applied" across branches without running SQL when the live structure matches.',
+      switchIntro:
+        'Roll back {{down}} version(s) to the common ancestor, then upgrade {{up}} version(s). Each migration commits separately on the target and is read back and verified.',
+      switchRouteAria: 'Roll back from v{{from}} to v{{lca}}, then upgrade to v{{to}}',
+      segDown: 'Rollback segment (runs rollback scripts)',
+      segUp: 'Upgrade segment',
+      rollbackChip: 'Rollback',
+      switchWarnTitle: 'The rollback segment may lose data',
+      switchWarn:
+        'The rollback segment runs rollback scripts of retired versions and may drop columns, tables, and their data. If data loss is not acceptable, align the schema manually and use "Mark as applied" across branches without running SQL.',
+      switchAck:
+        'I understand the rollback segment runs rollback scripts of retired versions and may cause data loss',
       baselineHint:
         'The database structure already equals the baseline. Only Dowel history is written to the target database; no SQL runs.',
       migrations: 'Migrations to run',
@@ -2553,6 +2759,12 @@ const en: typeof zh = {
       toLabel: 'Mark up to version',
       forward: 'Mark as applied to v{{number}}',
       backward: 'Mark as rolled back to v{{number}}',
+      cross: 'Mark across branches as applied to v{{number}}',
+      tipCross:
+        'Runs no SQL; it records an environment that is on a retired branch as having reached v{{number}} on the active chain. Dowel first checks the live structure and only allows the mark if it matches the model of v{{number}} exactly. For environments that cannot afford the data loss of a rollback and whose live structure already matches v{{number}}.',
+      crossTitle: 'Cross-branch mark',
+      crossBody:
+        'The environment moves from retired v{{from}} to v{{number}} on the active chain without running SQL. Below are the versions from the common ancestor up to v{{number}}; unrelated retired versions are not included.',
       tip: 'Runs no SQL; it only records in the migration history that this environment has reached v{{number}}. Dowel first checks the live structure and only allows the mark if it matches the model of v{{number}} exactly. For when the database was already changed by hand to that version, e.g. a hotfix or finishing a failed migration manually. After marking, the scripts of v{{number}} can no longer be edited.',
       tipBackward:
         'Runs no SQL; it only records in the migration history that this environment has reached v{{number}}. Dowel first checks the live structure and only allows the mark if it matches the model of v{{number}} exactly. For when the database was already changed by hand to that version, e.g. a hotfix or finishing a failed migration manually.',
@@ -2643,6 +2855,9 @@ const en: typeof zh = {
     claimDone: 'Claimed: this instance executes from now on.',
     claimNoop: 'Already claimed by this instance; nothing changed.',
     warnTitle: 'The project was created, but something is unfinished',
+    retiredTitle: 'Versions classified as retired',
+    retiredBody:
+      'The following versions are off the merged active chain (root to highest number) and were marked as retired on takeover. You can review or manage them on the Versions page:',
     openProject: 'Open project',
     claimBannerTitle: 'The project in this database is claimed by another instance',
     claimBannerBody:
@@ -2669,6 +2884,7 @@ const en: typeof zh = {
     attachedAheadNoVersion: 'Attached {{name}}: added {{count}} ahead version(s).',
     attachedAheadNoVersionClaimed: 'Attached and claimed {{name}}: added {{count}} ahead version(s).',
     attachedNone: 'Added {{name}} (no history of this project in that database yet).',
+    attachedRetired: 'Off-path versions marked as retired: {{list}}.',
     attachedWarn: 'The environment was added, but something is unfinished: {{msg}}',
     attachAheadTitle: 'Confirm overwriting working copy to attach ahead environment',
     attachAheadIntro:
@@ -2682,6 +2898,7 @@ const en: typeof zh = {
       title: 'Dry run',
       running: 'Dry run: doing all pre-execution checks, writing nothing…',
       readonly: 'Dry run only: nothing was written to the target database or registered on the platform.',
+      switchVia: 'Switching through the common ancestor v{{lca}}: roll back first, then upgrade.',
       okTitle: 'Dry run passed',
       okBody: 'If you execute now, this is what will happen:',
       failTitle: 'Dry run did not pass',
@@ -2957,6 +3174,8 @@ const en: typeof zh = {
       publish: 'published version {{name}}',
       edit_steps: 'edited a frozen migration',
       verify: 're-verified a migration',
+      retire: 'retired versions {{range}}',
+      unretire: 'unretired versions {{range}}',
     },
     environment: {
       create: 'added environment {{name}}',
@@ -2967,12 +3186,14 @@ const en: typeof zh = {
       rollback: 'rolled back {{name}}',
       baseline: 'wrote the baseline on {{name}}',
       mark: 'marked the current version on {{name}}',
+      switch: 'switched {{name}} (rolled back, then upgraded)',
       attach_history: 'attached existing history on {{name}}',
       emergency: 'ran an emergency execution on {{name}}',
     },
     model: {
       import: 'imported SQL ({{count}} objects)',
       restore: 'restored the working copy from canvas history',
+      apply_version: 'applied version {{range}} to the canvas',
       mutate: 'edited the working copy ({{count}} operations)',
       verify: 'verified the migration in the shadow database',
     },
@@ -3297,6 +3518,7 @@ const en: typeof zh = {
     to: 'To',
     empty: 'Empty database',
     head: 'Working copy',
+    retiredSuffix: ' (retired)',
     up: 'Upgrade script',
     down: 'Rollback script',
     upShort: 'Upgrade',
@@ -3779,6 +4001,9 @@ const en: typeof zh = {
     emergencyBadge: 'Emergency',
     headExecute: '{{env}}: {{from}} → {{to}} (execute)',
     headRollback: '{{env}}: {{from}} → {{to}} (roll back)',
+    headSwitch: '{{env}}: {{from}} → {{to}} (switch)',
+    switchNote:
+      'This request rolls back {{down}} version(s) to v{{lca}} (rollback scripts run; data may be lost), then upgrades {{up}} version(s).',
     none: '(nothing executed yet)',
     requestedBy: 'Requested by',
     executedByEmergency: 'Executed by',
@@ -3790,8 +4015,10 @@ const en: typeof zh = {
     stageOf: 'Stage {{n}}/{{total}}',
     rowExecute: '{{project}} / {{env}}: execute to v{{to}}',
     rowRollback: '{{project}} / {{env}}: roll back to v{{to}}',
+    rowSwitch: '{{project}} / {{env}}: switch to v{{to}}',
     envRowExecute: 'Execute to v{{to}}',
     envRowRollback: 'Roll back to v{{to}}',
+    envRowSwitch: 'Switch to v{{to}}',
     envPending: 'Open execution requests',
     envPendingEmpty: 'No open execution requests.',
     envApprovalRequired:
@@ -3801,6 +4028,7 @@ const en: typeof zh = {
     envButton: {
       execute: 'Submit execution request',
       rollback: 'Request rollback',
+      switch: 'Request switch',
       emergency: 'Emergency execute',
       emergencyRollback: 'Emergency roll back',
     },
@@ -3818,6 +4046,7 @@ const en: typeof zh = {
     dialog: {
       titleExecute: 'Request execution: {{name}} to v{{number}}',
       titleRollback: 'Request rollback: {{name}} to v{{number}}',
+      titleSwitch: 'Request switch: {{name}} to v{{number}}',
       submit: 'Submit execution request',
       intro:
         'The request is bound to the current starting version and the checksums of these migrations: it becomes invalid as soon as the environment changes (someone executed first, drift was found, a script was edited) or when it expires.',
@@ -3838,6 +4067,7 @@ const en: typeof zh = {
       titleApprove: 'Approve and execute: {{name}} to v{{number}}',
       introExecute: '{{count}} migration(s) will be executed:',
       introRollback: '{{count}} migration(s) will be rolled back:',
+      introSwitch: '{{down}} version(s) will be rolled back and then {{up}} version(s) upgraded:',
     },
     actions: {
       title: 'Actions',
@@ -4402,6 +4632,9 @@ const en: typeof zh = {
       pullSchema: 'Import from environment',
       attachAhead: 'Attach ahead environment',
       restoreHistory: 'Restore from history',
+      retireVersions: 'Revert working copy after retiring versions',
+      unretireVersions: 'Sync working copy after unretiring versions',
+      applyVersion: 'Apply version to canvas',
       replaceModel: 'Replace model',
       derive: 'Refresh derived DDL',
     },

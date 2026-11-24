@@ -6,8 +6,8 @@
 // - 不确定步骤（如 DML / MODIFY COLUMN）崩溃恢复保守拒绝不误跳过
 import * as E from '@dowel/core';
 import { emptyBase, emptyModel, plan } from '@dowel/core';
-import { getEngine, HistoryError, stepsChecksum, toScriptSteps } from '@dowel/engines';
-import { type ChainVersion, execute, ExecutorError } from '@dowel/executor';
+import { getEngine, HistoryError, stepsChecksum, toScriptSteps, verifyChain } from '@dowel/engines';
+import { type ChainVersion, checkDrift, execute, ExecutorError, markApplied } from '@dowel/executor';
 import { describe, expect, it } from 'vitest';
 
 import { createMysqlTestDb, useMysqlTestDb } from '../../../test/mysql.ts';
@@ -265,6 +265,213 @@ describe('MySQL executor: history guards, crash recovery & resume', () => {
       const state = await engine.history.readHistory(tdb.db, 'proj-fail');
       expect(state.history[0]?.status).toBe('failed');
       expect(state.history[0]?.stepIndex).toBe(0);
+    } finally {
+      await tdb.close();
+    }
+  });
+
+  it('supports ADR 0013 version-tree switch, retired_target guards, and cross-branch markApplied', async () => {
+    const tdb = await createMysqlTestDb('exec_tree');
+    if (!tdb) return;
+
+    try {
+      const m1 = emptyModel('mysql');
+      const s1 = E.createSchema(m1, 'default');
+      const t1 = E.createTable(m1, s1, 'items');
+      const id1 = E.addColumn(m1, t1, { name: 'id', type: 'int', notNull: true });
+      E.addPrimaryKey(m1, t1, [id1]);
+
+      const m2 = structuredClone(m1);
+      E.addColumn(m2, t1, { name: 'legacy_col', type: 'varchar(64)' });
+
+      const m3 = structuredClone(m1);
+      E.addColumn(m3, t1, { name: 'main_col', type: 'varchar(64)' });
+
+      // 为测试跨岔路零 SQL 标记：v4 与 v2 结构完全相同（都有 legacy_col）
+      const m4 = structuredClone(m2);
+
+      const mk = (
+        id: string,
+        number: number,
+        parentId: string | null,
+        fromM: E.Model,
+        toM: E.Model,
+        retired = false,
+      ): ChainVersion => {
+        const up = toScriptSteps(plan(fromM, toM), 'mysql');
+        const down = toScriptSteps(plan(toM, fromM), 'mysql');
+        return {
+          id,
+          number,
+          parentId,
+          name: `MySQL v${number}`,
+          model: toM,
+          upSteps: up,
+          downSteps: down,
+          checksum: stepsChecksum(up, down),
+          verified: true,
+          retired,
+          publishedAt: new Date().toISOString(),
+          publishedBy: null,
+          scope: null,
+        };
+      };
+
+      const v1 = mk('mv-1', 1, null, emptyBase(m1, null), m1);
+      const v2Live = mk('mv-2', 2, 'mv-1', m1, m2);
+      const v2Retired: ChainVersion = { ...v2Live, retired: true };
+      const v3 = mk('mv-3', 3, 'mv-1', m1, m3);
+      const v4SameAsV2 = mk('mv-4', 4, 'mv-1', m1, m4);
+
+      const engine = getEngine('mysql');
+
+      // 1. 走到 mv-2 后作废 mv-2，新增 mv-3(parent mv-1)
+      await execute({
+        db: tdb.db,
+        dialect: 'mysql',
+        projectId: 'proj-tree',
+        projectName: 'Tree App',
+        instanceId: 'inst-1',
+        chain: [v1, v2Live],
+        to: 'mv-2',
+        executedBy: 'u1',
+      });
+
+      const tree: ChainVersion[] = [v1, v2Retired, v3];
+
+      // up 去 mv-3 → switch_required（带 LCA mv-1）
+      await expect(
+        execute({
+          db: tdb.db,
+          dialect: 'mysql',
+          projectId: 'proj-tree',
+          projectName: 'Tree App',
+          instanceId: 'inst-1',
+          chain: tree,
+          to: 'mv-3',
+          direction: 'up',
+          executedBy: 'u1',
+        }),
+      ).rejects.toMatchObject({ code: 'switch_required', details: { lca: { id: 'mv-1', number: 1 } } });
+
+      // switch 预演与真实执行
+      const dry = await execute({
+        db: tdb.db,
+        dialect: 'mysql',
+        projectId: 'proj-tree',
+        projectName: 'Tree App',
+        instanceId: 'inst-1',
+        chain: tree,
+        to: 'mv-3',
+        direction: 'switch',
+        dryRun: true,
+        executedBy: 'u1',
+      });
+      expect(dry.lca?.id).toBe('mv-1');
+      expect(dry.dryRun?.migrations.map((m) => [m.versionId, m.direction])).toEqual([
+        ['mv-2', 'down'],
+        ['mv-3', 'up'],
+      ]);
+
+      const sw = await execute({
+        db: tdb.db,
+        dialect: 'mysql',
+        projectId: 'proj-tree',
+        projectName: 'Tree App',
+        instanceId: 'inst-1',
+        chain: tree,
+        to: 'mv-3',
+        direction: 'switch',
+        executedBy: 'u1',
+      });
+      expect(sw.direction).toBe('switch');
+      expect(sw.current).toBe('mv-3');
+      expect(sw.lca?.id).toBe('mv-1');
+      const hAfterSwitch = await engine.history.readHistory(tdb.db, 'proj-tree');
+      expect(hAfterSwitch.currentVersion).toBe('mv-3');
+      expect(verifyChain(hAfterSwitch.versions)).toEqual([]);
+      expect(
+        await checkDrift({ db: tdb.db, dialect: 'mysql', projectId: 'proj-tree', chain: tree }),
+      ).toMatchObject({
+        status: 'ok',
+        version: 'mv-3',
+      });
+
+      // 回滚到 mv-1 后试图再 up mv-2 → retired_target
+      await execute({
+        db: tdb.db,
+        dialect: 'mysql',
+        projectId: 'proj-tree',
+        projectName: 'Tree App',
+        instanceId: 'inst-1',
+        chain: tree,
+        to: 'mv-1',
+        direction: 'down',
+        executedBy: 'u1',
+      });
+      await expect(
+        execute({
+          db: tdb.db,
+          dialect: 'mysql',
+          projectId: 'proj-tree',
+          projectName: 'Tree App',
+          instanceId: 'inst-1',
+          chain: tree,
+          to: 'mv-2',
+          direction: 'up',
+          executedBy: 'u1',
+        }),
+      ).rejects.toMatchObject({ code: 'retired_target' });
+
+      // 2. 跨岔路 markApplied（另一个独立 project）：在 mv-2 上标到结构相同的 mv-4
+      await execute({
+        db: tdb.db,
+        dialect: 'mysql',
+        projectId: 'proj-cross',
+        projectName: 'Cross App',
+        instanceId: 'inst-1',
+        chain: [v1, v2Live],
+        to: 'mv-2',
+        executedBy: 'u1',
+      });
+      const crossChain: ChainVersion[] = [v1, v2Retired, v4SameAsV2];
+      const markDry = await markApplied({
+        db: tdb.db,
+        dialect: 'mysql',
+        projectId: 'proj-cross',
+        projectName: 'Cross App',
+        instanceId: 'inst-1',
+        chain: crossChain,
+        to: 'mv-4',
+        executedBy: 'u1',
+        dryRun: true,
+      });
+      expect(markDry.plan.direction).toBe('cross');
+      expect(markDry.plan.skipped.map((v) => v.id)).toEqual(['mv-4']);
+
+      await markApplied({
+        db: tdb.db,
+        dialect: 'mysql',
+        projectId: 'proj-cross',
+        projectName: 'Cross App',
+        instanceId: 'inst-1',
+        chain: crossChain,
+        to: 'mv-4',
+        executedBy: 'u1',
+        acknowledge: true,
+        expect: {
+          from: markDry.plan.from?.id ?? null,
+          to: markDry.plan.to.id,
+          skipped: markDry.plan.skipped.map((v) => v.id),
+          fingerprint: markDry.plan.fingerprint,
+        },
+      });
+      expect(
+        await checkDrift({ db: tdb.db, dialect: 'mysql', projectId: 'proj-cross', chain: crossChain }),
+      ).toMatchObject({
+        status: 'ok',
+        version: 'mv-4',
+      });
     } finally {
       await tdb.close();
     }

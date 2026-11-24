@@ -28,11 +28,16 @@ Any underlying state change before execution begins marks the request invalid au
 - Drift was detected on the target database.
 - A script on the path was edited, or the target version state changed.
 - The environment's connection string or production flag changed.
+- A version referenced by the request was [retired](execution.md#retire). Requests that upgrade to or through a retired version become invalid; a request that rolls back a retired version becomes invalid only if the version was retired after the request was submitted, so switch requests submitted after a retire stay valid.
 - The approval flow tightened (stages added, stricter pools, or higher approval counts). If the policy loosened, open requests continue under the stricter snapshot captured at submission.
 
 Requests also expire automatically after the policy TTL (default `24` hours, configurable from `1` to `720` hours across layers).
 
 The server runs periodic distributed sweeps across open requests and triggers immediate re-checks after executions, drift scans, script edits, and policy saves. Before executing an approved request, the executor re-verifies the live current version and migration checksums inside the target database project lock so stale cached state can never execute.
+
+### Switch requests {#switch-requests}
+
+When an environment is on a [retired version](execution.md#switch) and needs to return to the active chain, you submit a **switch request**: it rolls back to the common ancestor, then upgrades to the target version. The request detail lists the rollback segment and the upgrade segment separately (rolled-back versions are tagged "Rollback") and binds the checksums of both segments; submitting requires confirming that the rollback segment may cause data loss. Whoever executes a switch request must hold both execute and rollback permission; the approval flow is the same as for execution requests, and production still requires typing the environment name.
 
 ## Approval and execution handover {#approval-and-handover}
 

@@ -1463,4 +1463,55 @@ describe('原型属性名不被当作对象依赖', () => {
     expect(res.model.objects.c2).toMatchObject({ name: 'valueOf' });
     expect(res.model.objects.e1).toMatchObject({ values: ['hasOwnProperty'] });
   });
+
+  // #90：mutator 名恰好是 Object.prototype 上的属性名时，应按未知操作干净拒绝
+  test.each([...PROTO_KEYS])('Room.handle：mutator 名 %s 被拒绝为 invalid 并推进 processed', async (name) => {
+    const rejects: [string, Rejection][] = [];
+    const store = memoryStore();
+    store.reject = async (client, r) => {
+      rejects.push([client, r]);
+    };
+    const room = new Room(emptyRoomState(emptyModel()), store);
+    const seq = room.seq;
+    const outs = await room.handle('c2', 'bob', {
+      t: 'op',
+      op: { client: 'c2', n: 1, name, args: {}, reads: [] },
+    });
+    const r: Rejection = { n: 1, code: 'invalid', message: `未知的操作：${name}` };
+    expect(outs).toEqual([{ to: 'c2', msg: { t: 'reject', ...r } }]);
+    expect(rejects).toEqual([['c2', r]]);
+    expect(room.processedOf('c2')).toBe(1);
+    expect(room.seq).toBe(seq);
+    expect(store.commits).toEqual([]);
+
+    // 同一客户端后续操作继续正常提交
+    const next = await room.handle('c2', 'bob', {
+      t: 'op',
+      op: {
+        client: 'c2',
+        n: 2,
+        name: 'createSchema',
+        args: { id: 's1', name: 'public' },
+        reads: [['s1', null]],
+      },
+    });
+    expect(next.map((o) => o.msg.t)).toEqual(['commit']);
+    expect(room.processedOf('c2')).toBe(2);
+  });
+
+  test.each([...PROTO_KEYS])('Room.simulate：mutator 名 %s 返回 invalid', async (name) => {
+    const { room } = await jsonWire();
+    const res = room.simulate('mcp:t1', [
+      {
+        client: 'mcp:t1',
+        n: 1,
+        name: 'setComment',
+        args: { id: 't1', comment: 'x' },
+        reads: [['t1', room.versions.t1!]],
+      },
+      { client: 'mcp:t1', n: 2, name, args: {}, reads: [] },
+    ]);
+    expect(res).toEqual({ ok: false, failedIndex: 1, code: 'invalid', message: `未知的操作：${name}` });
+    expect(room.processedOf('mcp:t1')).toBe(0);
+  });
 });

@@ -18,11 +18,13 @@ export const MARK_TITLE = {
   forward: 'dr.mark.forward',
   backward: 'dr.mark.backward',
   current: 'dr.mark.stay',
+  cross: 'dr.mark.cross',
 } as const;
 export const MARK_TIP = {
   forward: 'dr.mark.tip',
   backward: 'dr.mark.tipBackward',
   current: 'dr.mark.tipStay',
+  cross: 'dr.mark.tipCross',
 } as const;
 
 type Check =
@@ -32,13 +34,30 @@ type Check =
 
 /**
  * 按平台缓存估计的标记方向（只用来先显示按钮 / 标题；**真正的方向、跳过哪些版本、要不要确认，全以服务端预演返回的 plan 为准**）：
- * 目标就是当前版本是 current（只有上一次执行没结束时才会列出来），比当前版本旧是 backward，否则 forward。
+ * 目标就是当前版本是 current（只有上一次执行没结束时才会列出来）；有版本树（parentId）时按祖先关系判断：
+ * 目标是当前版本的祖先 = backward，当前版本是目标的祖先 = forward，否则跨岔路 = cross（ADR 0013）；
+ * 没有树信息时退回按编号比较。
  */
 export const markDirection = (
   current: { id: string; number: number } | null,
   to: { id: string; number: number },
-): 'forward' | 'backward' | 'current' =>
-  current?.id === to.id ? 'current' : current && to.number < current.number ? 'backward' : 'forward';
+  tree?: { id: string; parentId: string | null }[],
+): 'forward' | 'backward' | 'current' | 'cross' => {
+  if (current?.id === to.id) return 'current';
+  if (!current) return 'forward';
+  if (tree) {
+    const parent = new Map(tree.map((v) => [v.id, v.parentId]));
+    const ancestors = (id: string) => {
+      const out = new Set<string>();
+      for (let x: string | null | undefined = id; x; x = parent.get(x)) out.add(x);
+      return out;
+    };
+    if (ancestors(current.id).has(to.id)) return 'backward';
+    if (ancestors(to.id).has(current.id)) return 'forward';
+    return 'cross';
+  }
+  return to.number < current.number ? 'backward' : 'forward';
+};
 
 export const MarkDialog = ({
   pid,
@@ -47,6 +66,7 @@ export const MarkDialog = ({
   production,
   current,
   to,
+  tree,
   onClose,
 }: {
   pid: string;
@@ -56,6 +76,8 @@ export const MarkDialog = ({
   /** 当前版本（有未完成的运行时是目标库实际读到的，否则是平台缓存）：只用来在预演回来之前先显示 */
   current: { id: string; number: number } | null;
   to: EnvVersion;
+  /** 版本树（环境状态里的全部版本）：用来在预演回来之前估计方向（含跨岔路） */
+  tree?: { id: string; parentId: string | null }[];
   onClose: () => void;
 }) => {
   const { t } = useTranslation();
@@ -109,7 +131,7 @@ export const MarkDialog = ({
   const plan = check.state === 'done' && check.res.ok ? check.res.plan : undefined;
   const skipped = plan?.skipped ?? [];
   // 方向和要不要确认都以预演返回的 plan 为准；预演回来之前先按缓存显示
-  const direction = plan?.direction ?? markDirection(current, to);
+  const direction = plan?.direction ?? markDirection(current, to, tree);
   const needAck = skipped.length > 0;
   const canConfirm = !!plan && (!needAck || ack) && (!production || typed.trim() === envName);
 
@@ -229,6 +251,11 @@ export const MarkDialog = ({
             </Banner>
             {needAck ? (
               <>
+                {direction === 'cross' && plan.from && (
+                  <Banner kind="warn" title={t('dr.mark.crossTitle')}>
+                    {t('dr.mark.crossBody', { from: plan.from.number, number: to.number })}
+                  </Banner>
+                )}
                 <h3 className="section-title">{t('dr.mark.skippedTitle')}</h3>
                 <p className="hint m-0">{t('dr.mark.skippedHint')}</p>
                 <ul className="m-0 list-none space-y-1 p-0">
