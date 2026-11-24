@@ -2,8 +2,9 @@
 import type { ProjectActivityEvent } from '@dowel/api';
 import { useTranslation } from 'react-i18next';
 
-import { actionText } from '../activity.ts';
+import { actionText, viaMcp } from '../activity.ts';
 import { formatTime } from '../format.ts';
+import { McpBadge } from './McpTokens.tsx';
 import { Avatar } from './ui.tsx';
 
 export const ActivityList = ({ events }: { events: ProjectActivityEvent[] }) => {
@@ -23,6 +24,7 @@ export const ActivityList = ({ events }: { events: ProjectActivityEvent[] }) => 
             <p className="min-w-0 flex-1 truncate text-sm">
               <span className="font-medium">{actor}</span> {label}
             </p>
+            {viaMcp(e.data) && <McpBadge />}
             <time dateTime={e.at} className="shrink-0 text-xs text-text-3">
               {formatTime(e.at)}
             </time>

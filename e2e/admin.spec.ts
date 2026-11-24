@@ -56,6 +56,10 @@ test('用户：建用户、改角色（最后一个管理员 422 显示在界面
   // 停用：会话立刻失效，登录时给出明确原因
   await admin.getByLabel('搜索用户名、名字或邮箱…').fill(username);
   await row.getByRole('button', { name: '停用' }).click();
+  // 停用前确认：会同时吊销会话与全部 MCP 令牌（M3-C）
+  const disableDialog = admin.getByRole('dialog', { name: `停用用户 ${username}？` });
+  await expect(disableDialog.getByText('全部 MCP 令牌')).toBeVisible();
+  await disableDialog.getByRole('button', { name: '停用用户' }).click();
   await expect(admin.getByText('已更新用户').first()).toBeVisible();
   await expect(row.getByText('已停用')).toBeVisible();
 

@@ -1,10 +1,10 @@
-// 个人设置（/account）：资料、密码、登录方式、会话、偏好。
+// 个人设置（/account）：资料、密码、登录方式、会话、MCP 访问（M3-C，见 components/McpTokens.tsx）、偏好。
 // 导航方式是外壳的侧面板（和后台一致，见 DESIGN.md 的 Layout）：每节是独立的嵌套路由，地址可以直接分享。
 // P1c 里 OIDC 关联成功后的回调就落在 /account（本页的资料一节）。
 import type { Me, MeIdentity, SessionInfo } from '@dowel/api';
 import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query';
 import { Link, Outlet, useRouterState } from '@tanstack/react-router';
-import { KeyRound, Link2, MonitorSmartphone, Palette, Trash2, UserRound } from 'lucide-react';
+import { Bot, KeyRound, Link2, MonitorSmartphone, Palette, Trash2, UserRound } from 'lucide-react';
 import { useState } from 'react';
 import { useTranslation } from 'react-i18next';
 
@@ -24,6 +24,7 @@ const SECTIONS = [
   { to: '/account/password', label: 'acc.password', icon: KeyRound },
   { to: '/account/identities', label: 'acc.identities', icon: Link2 },
   { to: '/account/sessions', label: 'acc.sessions', icon: MonitorSmartphone },
+  { to: '/account/mcp', label: 'mcp.title', icon: Bot },
   { to: '/account/preferences', label: 'acc.preferences', icon: Palette },
 ] as const;
 
