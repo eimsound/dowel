@@ -151,6 +151,8 @@ const zh = {
     retireDoneTitle: '已作废',
     workingChangedRetire:
       '版本已作废，但工作副本在确认期间被修改，没有回退。需要时可以在版本页对父版本使用“应用到画布”。',
+    workingFailedRetire:
+      '版本已作废，但回退工作副本时发生异常，工作副本未改动。需要时可以在版本页对父版本使用“应用到画布”。',
     unretireTitle: '取消作废 {{range}}',
     unretireTitleStale: '取消作废',
     unretireConfirm: '取消作废',
@@ -159,6 +161,8 @@ const zh = {
     unretired: '已取消作废 {{range}}，链头现在是 v{{head}}',
     unretireDoneTitle: '已取消作废',
     workingChangedUnretire: '版本已恢复为活跃主链，但工作副本在确认期间被修改，没有恢复到链头的模型。',
+    workingFailedUnretire:
+      '版本已恢复为活跃主链，但同步工作副本时发生异常，工作副本未改动。需要时可以在版本页对链头使用“应用到画布”。',
     applyTitle: '将 v{{number}} 应用到画布',
     applyConfirm: '应用到画布',
     applyLoading: '正在比较工作副本和这个版本…',
@@ -487,6 +491,9 @@ const zh = {
     claimDone: '已认领：之后由本实例执行。',
     claimNoop: '本来就是本实例认领的，什么都没改。',
     warnTitle: '项目已经建好，但有没做完的事',
+    retiredTitle: '已自动识别为已作废的版本',
+    retiredBody:
+      '以下版本不在合并后的活跃主链（根到最大编号）上，接手后已标记为已作废；如需调整可在版本页查看或处理：',
     openProject: '进入项目',
     // 环境页：认领
     claimBannerTitle: '这个库里的项目由另一个实例认领',
@@ -514,6 +521,7 @@ const zh = {
     attachedAheadNoVersion: '已接入 {{name}}：补齐 {{count}} 个领先版本。',
     attachedAheadNoVersionClaimed: '已接入 {{name}}：补齐 {{count}} 个领先版本，并已认领。',
     attachedNone: '已添加 {{name}}（这个库里还没有这个项目的历史）。',
+    attachedRetired: '以下补齐的岔路版本已自动标记为已作废：{{list}}。',
     attachedWarn: '环境已添加，但有没做完的事：{{msg}}',
     attachAheadTitle: '确认覆盖工作副本并接入领先环境',
     attachAheadIntro:
@@ -2257,6 +2265,8 @@ const en: typeof zh = {
     retireDoneTitle: 'Retired',
     workingChangedRetire:
       'The versions were retired, but the working copy changed before confirmation and was not reverted. Use "Apply to canvas" on the parent version if needed.',
+    workingFailedRetire:
+      'The versions were retired, but reverting the working copy failed so the working copy was left unchanged. Use "Apply to canvas" on the parent version if needed.',
     unretireTitle: 'Unretire {{range}}',
     unretireTitleStale: 'Unretire',
     unretireConfirm: 'Unretire',
@@ -2267,6 +2277,8 @@ const en: typeof zh = {
     unretireDoneTitle: 'Unretired',
     workingChangedUnretire:
       "The versions are back on the active chain, but the working copy changed before confirmation and was not restored to the head's model.",
+    workingFailedUnretire:
+      'The versions are back on the active chain, but restoring the working copy failed so it was left unchanged. Use "Apply to canvas" on the chain head if needed.',
     applyTitle: 'Apply v{{number}} to canvas',
     applyConfirm: 'Apply to canvas',
     applyLoading: 'Comparing the working copy with this version…',
@@ -2624,6 +2636,9 @@ const en: typeof zh = {
     claimDone: 'Claimed: this instance executes from now on.',
     claimNoop: 'Already claimed by this instance; nothing changed.',
     warnTitle: 'The project was created, but something is unfinished',
+    retiredTitle: 'Versions classified as retired',
+    retiredBody:
+      'The following versions are off the merged active chain (root to highest number) and were marked as retired on takeover. You can review or manage them on the Versions page:',
     openProject: 'Open project',
     claimBannerTitle: 'The project in this database is claimed by another instance',
     claimBannerBody:
@@ -2650,6 +2665,7 @@ const en: typeof zh = {
     attachedAheadNoVersion: 'Attached {{name}}: added {{count}} ahead version(s).',
     attachedAheadNoVersionClaimed: 'Attached and claimed {{name}}: added {{count}} ahead version(s).',
     attachedNone: 'Added {{name}} (no history of this project in that database yet).',
+    attachedRetired: 'Off-path versions marked as retired: {{list}}.',
     attachedWarn: 'The environment was added, but something is unfinished: {{msg}}',
     attachAheadTitle: 'Confirm overwriting working copy to attach ahead environment',
     attachAheadIntro:

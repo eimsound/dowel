@@ -35,6 +35,21 @@ export type Dialect = 'sqlite' | 'pg';
 export const inList = (ids: readonly unknown[], startIndex = 1): string =>
   ids.map((_, i) => `$${startIndex + i}`).join(', ');
 
+/**
+ * 平台库当前时间 SQL 表达式（单调以平台库时钟为准，消除 HA 多副本墙钟偏差）。
+ * PG 用 clock_timestamp() 而非 now()（transaction_timestamp）：确保在拿到事务级锁（如 withPolicyLock）之后取时，
+ * 不因事务在等锁前启动导致时间戳顺序与加锁顺序倒挂。
+ */
+export const dbNowSql = (dialect: Dialect): string =>
+  dialect === 'pg' ? 'clock_timestamp()' : "(strftime('%Y-%m-%dT%H:%M:%fZ', 'now'))";
+
+/** 读取平台库当前时间（优先于副本墙钟 new Date()，用于申请创建时间、作废时间与过期判定） */
+export const readDbNow = async (db: Db, dialect: Dialect): Promise<Date> => {
+  const [row] = await db.query<{ now: Date | string }>(`select ${dbNowSql(dialect)} as now`);
+  const raw = row?.now;
+  return raw instanceof Date ? raw : new Date(String(raw));
+};
+
 export interface AdvisoryLockOptions {
   /** 等待拿锁的超时时间（毫秒）；默认 0（不等待，等同 tryOnly） */
   timeoutMs?: number;

@@ -7,7 +7,6 @@ import {
   type ModelUpdate,
   type PublishedTables,
   type PublishRejected,
-  type RequestMigration,
   type StoredVerifyReport,
   stepsPatchSchema,
   type VerifyReport,
@@ -63,9 +62,18 @@ import {
   instanceLevelProblem,
   versionExecutedAnywhere,
 } from '../chain.ts';
-import { inList, isUniqueViolation } from '../db.ts';
+import { dbNowSql, inList, isUniqueViolation, readDbNow } from '../db.ts';
 import { iso, projectPlanOptions } from '../envs.ts';
-import { sweepWhere } from '../requests.ts';
+import { withPolicyLock } from '../policy.ts';
+import {
+  bindingProblem,
+  Effects,
+  isInterrupted,
+  newBindingCache,
+  type RequestRow,
+  retireInvalidReason,
+  sweepWhere,
+} from '../requests.ts';
 import { WorkingChangedError } from '../rooms.ts';
 import { scrubSecrets } from '../secrets.ts';
 import { ShadowError, storedReport } from '../shadow.ts';
@@ -522,17 +530,21 @@ export const registerVersions = (app: Hono<Env>, ctx: AppContext) => {
     opName: string,
     requestedSeq: number | undefined,
   ): Promise<WorkingCopyOutcome> => {
-    await refresher.flush(branch);
-    const { model: currentModel, seq: currentSeq } = await rooms.model(branch);
-    if (requestedSeq !== undefined && requestedSeq !== currentSeq) return 'changed';
-    const expectedSeq = requestedSeq ?? currentSeq;
-    if (deepEqual(currentModel, targetModel)) return 'unchanged';
     try {
+      await refresher.flush(branch);
+      const { model: currentModel, seq: currentSeq } = await rooms.model(branch);
+      if (requestedSeq !== undefined && requestedSeq !== currentSeq) return 'changed';
+      const expectedSeq = requestedSeq ?? currentSeq;
+      if (deepEqual(currentModel, targetModel)) return 'unchanged';
       await ctx.replace(branch, userName, targetModel, opName, expectedSeq);
       return 'reverted';
     } catch (e) {
       if (e instanceof WorkingChangedError) return 'changed';
-      throw e;
+      console.error(
+        `同步工作副本失败（${opName}，版本状态已提交）`,
+        e instanceof Error ? scrubSecrets(e.message) : e,
+      );
+      return 'failed';
     }
   };
 
@@ -919,7 +931,7 @@ export const registerVersions = (app: Hono<Env>, ctx: AppContext) => {
   /**
    * 作废活跃主链最末尾的连续一段版本（ADR 0013）：软作废（写 retired_at / retired_by），
    * 永远不允许作废首个版本；存在执行中登记（claimed）时拒绝；含已执行版本需项目管理员权限；
-   * 事务提交后踢一轮申请巡检并按需把工作副本回退到该段父版本。
+   * 事务内同步将受影响执行申请置为失效（防未巡检即 unretire 复活），提交后推送通知与 Webhook 并按需回退工作副本。
    */
   app.post('/api/projects/:pid/versions/:vid/retire', async (c) => {
     const a = await access(c, ctx, 'version.retire');
@@ -936,7 +948,8 @@ export const registerVersions = (app: Hono<Env>, ctx: AppContext) => {
       executedAt: unknown;
     }
 
-    const done = await db.transaction(async (tx) => {
+    const fx = new Effects();
+    const done = await withPolicyLock(db, async (tx) => {
       await lockChain(tx, a.pid);
       const rows = await tx.query<SpanRow>(
         `select id, number, name, parent_id as "parentId", retired_at as "retiredAt", executed_at as "executedAt"
@@ -1001,38 +1014,26 @@ export const registerVersions = (app: Hono<Env>, ctx: AppContext) => {
         throw new HTTPException(403, { message: '作废已在环境执行过的版本需要项目管理员权限' });
       }
 
-      const openReqs = await tx.query<{
-        id: string;
-        direction: 'up' | 'down';
-        to_version_id: string;
-        migrations: RequestMigration[];
-        created_at: unknown;
-      }>(
-        `select id, direction, to_version_id, migrations, created_at
-           from exec_requests
-          where project_id = $1 and ${sweepWhere(db.dialect)}`,
+      await tx.query(
+        `update versions set retired_at = ${dbNowSql(db.dialect)}, retired_by = $1 where id in (${inList(spanIds, 2)})`,
+        [user.id, ...spanIds],
+      );
+
+      // 事务内同步失效所有受影响开放申请（写入审计、收件箱与 webhook_jobs），消除 retire → 立即 unretire 的复活窗口
+      const openReqs = await tx.query<RequestRow>(
+        `select * from exec_requests where project_id = $1 and ${sweepWhere(db.dialect)} order by created_at asc, id asc`,
         [a.pid],
       );
-      const spanSet = new Set(spanIds);
-      const affected = openReqs.filter(
-        (r) =>
-          (r.direction !== 'down' && spanSet.has(r.to_version_id)) ||
-          (Array.isArray(r.migrations) && r.migrations.some((m) => spanSet.has(m.versionId))),
-      );
-
-      const nowMs = Date.now();
-      let maxReqCreatedMs = 0;
-      for (const r of affected) {
-        const ms = new Date(iso(r.created_at) ?? 0).getTime();
-        if (ms > maxReqCreatedMs) maxReqCreatedMs = ms;
+      const spanById = new Map(span.map((v) => [v.id, v]));
+      let invalidatedRequests = 0;
+      for (const r of openReqs) {
+        if (isInterrupted(r)) continue;
+        const reason = retireInvalidReason(r, spanById);
+        if (!reason) continue;
+        if (await ctx.requests.setStatus(tx, null, r, 'invalid', reason, null, fx, { onlyIf: r.status })) {
+          invalidatedRequests++;
+        }
       }
-      // 保证同毫秒内先创建申请、再作废时严格满足 retired_at > created_at（触发回滚绑定失效判定）
-      const retiredAtMs = maxReqCreatedMs >= nowMs ? maxReqCreatedMs + 1 : nowMs;
-
-      await tx.query(
-        `update versions set retired_at = $1, retired_by = $2 where id in (${inList(spanIds, 3)})`,
-        [new Date(retiredAtMs).toISOString(), user.id, ...spanIds],
-      );
 
       let parentModel: Model | null = null;
       if (!b.keepWorkingCopy) {
@@ -1047,16 +1048,12 @@ export const registerVersions = (app: Hono<Env>, ctx: AppContext) => {
         head,
         newHead,
         anyExecuted,
-        invalidatedRequests: affected.length,
-        retiredAtMs,
+        invalidatedRequests,
         parentModel,
       };
     });
 
-    const lagMs = done.retiredAtMs - Date.now();
-    if (lagMs >= 0) await new Promise((r) => setTimeout(r, lagMs + 1));
-
-    ctx.requests.kick({ projectIds: [a.pid] });
+    await ctx.requests.flushEffects(fx);
 
     const workingCopy: WorkingCopyOutcome = b.keepWorkingCopy
       ? 'kept'
@@ -1117,7 +1114,8 @@ export const registerVersions = (app: Hono<Env>, ctx: AppContext) => {
       executedAt: unknown;
     }
 
-    const done = await db.transaction(async (tx) => {
+    const fx = new Effects();
+    const done = await withPolicyLock(db, async (tx) => {
       await lockChain(tx, a.pid);
       const raw = await tx.query<{
         id: string;
@@ -1184,6 +1182,28 @@ export const registerVersions = (app: Hono<Env>, ctx: AppContext) => {
         throw new HTTPException(403, { message: '取消作废已在环境执行过的版本需要项目管理员权限' });
       }
 
+      // 清空 retired_at 前防御性兜底：若存在尚未落库失效的历史/直改库残留开放申请，按当前绑定先原子置为失效再恢复
+      const openReqs = await tx.query<RequestRow>(
+        `select * from exec_requests where project_id = $1 and ${sweepWhere(db.dialect)} order by created_at asc, id asc`,
+        [a.pid],
+      );
+      if (openReqs.length) {
+        const spanSet = new Set(spanIds);
+        const dbNow = await readDbNow(tx, db.dialect);
+        const cache = newBindingCache();
+        for (const r of openReqs) {
+          if (isInterrupted(r)) continue;
+          const touchesSpan =
+            (r.direction !== 'down' && spanSet.has(r.to_version_id)) ||
+            (Array.isArray(r.migrations) && r.migrations.some((m) => spanSet.has(m.versionId)));
+          if (!touchesSpan) continue;
+          const p = await bindingProblem(tx, r, dbNow, cache);
+          if (p) {
+            await ctx.requests.setStatus(tx, null, r, p.status, p.reason, null, fx, { onlyIf: r.status });
+          }
+        }
+      }
+
       await tx.query(
         `update versions set retired_at = null, retired_by = null where id in (${inList(spanIds)})`,
         spanIds,
@@ -1199,6 +1219,8 @@ export const registerVersions = (app: Hono<Env>, ctx: AppContext) => {
 
       return { span, headBefore, newHead, anyExecuted, headModel };
     });
+
+    await ctx.requests.flushEffects(fx);
 
     const workingCopy: WorkingCopyOutcome = b.syncWorkingCopy
       ? await syncWorkingCopy(a.branch, user.name, done.headModel!, 'unretireVersions', b.workingSeq)

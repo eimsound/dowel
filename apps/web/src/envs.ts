@@ -68,6 +68,17 @@ export const attachSuccessMessage = (
   return t(result.claimed ? 'tk.attachedNoVersionClaimed' : 'tk.attachedNoVersion', { name });
 };
 
+/** 接入领先环境时若识别并自动作废了不在活跃主链上的岔路版本，生成补充提示文案 */
+export const attachRetiredMessage = (
+  t: TFunction,
+  retiredVersions: Pick<AttachResult, 'retiredVersions'>['retiredVersions'] | undefined,
+): string | null => {
+  if (!retiredVersions?.length) return null;
+  return t('tk.attachedRetired', {
+    list: retiredVersions.map((v) => `v${v.number}`).join(t('vl.listSep')),
+  });
+};
+
 /**
  * 读执行 / 回滚 / 写基线的 SSE：每条消息 `data: {ExecEvent JSON}`（解析见 sse.ts）。
  * 请求本身被拒绝（403 / 422 / 404，还没开始流）抛 ApiError；流里出错是最后一条带 error 的事件，由调用方处理。

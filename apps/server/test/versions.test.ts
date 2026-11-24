@@ -26,7 +26,7 @@ import {
 } from '@dowel/core';
 import { type Db, type ScriptStep, stepsChecksum } from '@dowel/engines';
 import { HTTPException } from 'hono/http-exception';
-import { afterAll, beforeAll, describe, expect, test } from 'vitest';
+import { afterAll, beforeAll, describe, expect, test, vi } from 'vitest';
 
 import { connect, createTestDb, PG_URL } from '../../../test/pg.ts';
 import { createApp, openPlatformDb, type PlatformDb } from '../src/index.ts';
@@ -1702,7 +1702,6 @@ describe.each([
       expect(ret.status).toBe(200);
       expect((ret.data as unknown as VersionRetireResult).invalidatedRequests).toBe(3);
 
-      await created.requests.sweep({ projectIds: [pid] });
       const statusMap = async () =>
         new Map(
           (
@@ -1712,6 +1711,27 @@ describe.each([
             )
           ).map((r) => [r.id, r]),
         );
+      // 事务提交瞬间（无需先跑 sweep），受影响开放申请已持久化为 invalid，且写好收件箱通知与失效审计
+      const immediateAfterRetire = await statusMap();
+      expect(immediateAfterRetire.get('r-up-pending')!.status).toBe('invalid');
+      expect(immediateAfterRetire.get('r-up-failed')!.status).toBe('invalid');
+      expect(immediateAfterRetire.get('r-down-pre')!.status).toBe('invalid');
+      expect(immediateAfterRetire.get('r-down-pre')!.status_reason).toContain('作废');
+      expect(immediateAfterRetire.get('r-up-int')!.status).toBe('failed');
+      expect(immediateAfterRetire.get('r-up-exec')!.status).toBe('executing');
+      expect(immediateAfterRetire.get('r-safe')!.status).toBe('pending');
+      const invInbox = await db.query<{ request_id: string }>(
+        "select request_id from inbox_items where project_id = $1 and kind = 'request_result' and user_id = $2",
+        [pid, editorId],
+      );
+      expect(invInbox.map((r) => r.request_id).sort()).toEqual(['r-down-pre', 'r-up-failed', 'r-up-pending']);
+      const invAudits = await db.query<{ target_id: string }>(
+        "select target_id from audit_events where project_id = $1 and action = 'exec_request.invalidate'",
+        [pid],
+      );
+      expect(invAudits).toHaveLength(3);
+
+      expect(await created.requests.sweep({ projectIds: [pid] })).toBe(0);
       const afterRetire = await statusMap();
       expect(afterRetire.get('r-up-pending')!.status).toBe('invalid');
       expect(afterRetire.get('r-up-failed')!.status).toBe('invalid');
@@ -1749,15 +1769,246 @@ describe.each([
       await created.requests.sweep({ projectIds: [pid] });
       expect((await statusMap()).get('r-switch-post')!.status).toBe('pending');
 
-      // 作废 v4 后 switch 申请失效；之后再 unretire v4，已失效申请不会复活
+      // 作废 v4 后 switch 申请立即失效；之后再 unretire v4，已失效申请不会复活
       expect((await retire(pid, v4.id, { head: v4.id })).status).toBe(200);
-      await created.requests.sweep({ projectIds: [pid] });
       expect((await statusMap()).get('r-switch-post')!.status).toBe('invalid');
 
       expect((await unretire(pid, v4.id)).status).toBe(200);
       const finalMap = await statusMap();
       expect(finalMap.get('r-switch-post')!.status).toBe('invalid');
       expect(finalMap.get('r-up-pending')!.status).toBe('invalid');
+    },
+  );
+
+  test.skipIf(skip)(
+    'retire 后不先 sweep 立即 unretire：作废前开放申请永久保持失效且不可审批或执行，直接写库后 unretire 也能防御性失效',
+    async () => {
+      const pid = await newProject('adr13-no-sweep-unretire');
+      await addTable(created.rooms, db, pid);
+      const v1 = (await publish(pid, 'v1')).data as unknown as VersionCreated;
+      await editModel(created.rooms, db, pid, (m) => void addNote(m, 'c2'));
+      const v2 = (await publish(pid, 'v2')).data as unknown as VersionCreated;
+      const d2 = await detail(pid, v2.id);
+
+      const urlEnc = encrypt('postgres://u:p@127.0.0.1:5432/nosweep');
+      const hash = connHash({ url_enc: urlEnc });
+      await db.query(
+        `insert into environments (id, project_id, name, url_enc, production, current_version_id)
+         values ('env-ns-up', $1, 'env-ns-up', $2, true, $3),
+                ('env-ns-down', $1, 'env-ns-down', $2, true, $4)`,
+        [pid, urlEnc, v1.id, v2.id],
+      );
+      const flow = JSON.stringify({ implicit: true, stages: [] });
+      const future = new Date(Date.now() + 3600_000).toISOString();
+      const createdBefore = new Date(Date.now() - 10_000).toISOString();
+      const insertReq = (opts: {
+        id: string;
+        envId: string;
+        direction: 'up' | 'down';
+        fromId: string;
+        toId: string;
+        migrations: unknown[];
+        status: string;
+      }) =>
+        db.query(
+          `insert into exec_requests
+             (id, project_id, environment_id, requested_by, direction, from_version_id, to_version_id,
+              migrations, dry_run, reason, flow, conn_hash, production, status, stage, expires_at, created_at, updated_at)
+           values ($1, $2, $3, $4, $5, $6, $7, $8::text::jsonb, null, '竞态回归', $9::text::jsonb, $10, true, $11, 0, $12, $13, $13)`,
+          [
+            opts.id,
+            pid,
+            opts.envId,
+            editorId,
+            opts.direction,
+            opts.fromId,
+            opts.toId,
+            JSON.stringify(opts.migrations),
+            flow,
+            hash,
+            opts.status,
+            future,
+            createdBefore,
+          ],
+        );
+
+      const reqUpId = newId();
+      const reqDownId = newId();
+      await insertReq({
+        id: reqUpId,
+        envId: 'env-ns-up',
+        direction: 'up',
+        fromId: v1.id,
+        toId: v2.id,
+        migrations: [
+          {
+            versionId: v2.id,
+            number: 2,
+            name: 'v2',
+            direction: 'up',
+            checksum: d2.checksum,
+            steps: 1,
+            nonTransactional: 0,
+          },
+        ],
+        status: 'pending',
+      });
+      await insertReq({
+        id: reqDownId,
+        envId: 'env-ns-down',
+        direction: 'down',
+        fromId: v2.id,
+        toId: v1.id,
+        migrations: [
+          {
+            versionId: v2.id,
+            number: 2,
+            name: 'v2',
+            direction: 'down',
+            checksum: d2.checksum,
+            steps: 1,
+            nonTransactional: 0,
+          },
+        ],
+        status: 'approved',
+      });
+
+      // 作废后完全不调用 sweep()，立刻 unretire
+      const ret = await retire(pid, v2.id, { head: v2.id, keepWorkingCopy: true }, editor);
+      expect(ret.status).toBe(200);
+      expect((ret.data as unknown as VersionRetireResult).invalidatedRequests).toBe(2);
+
+      const unret = await unretire(pid, v2.id, { syncWorkingCopy: false }, editor);
+      expect(unret.status).toBe(200);
+
+      for (const rid of [reqUpId, reqDownId]) {
+        const [row] = await db.query<{ status: string }>('select status from exec_requests where id = $1', [
+          rid,
+        ]);
+        expect(row!.status).toBe('invalid');
+      }
+      expect(
+        (
+          await call(
+            'POST',
+            `/api/projects/${pid}/requests/${reqUpId}/approve`,
+            { stage: 0, comment: 'try' },
+            admin,
+          )
+        ).status,
+      ).toBe(409);
+      expect(
+        (
+          await call(
+            'POST',
+            `/api/projects/${pid}/requests/${reqDownId}/execute`,
+            { confirm: 'env-ns-down' },
+            admin,
+          )
+        ).status,
+      ).toBe(409);
+
+      // 防御性路径：绕过 retire 路由直接改库置 retired_at 后，不跑 sweep 直接 unretire，仍会在清空前原子失效残留开放申请
+      const reqDirectId = newId();
+      await insertReq({
+        id: reqDirectId,
+        envId: 'env-ns-up',
+        direction: 'up',
+        fromId: v1.id,
+        toId: v2.id,
+        migrations: [
+          {
+            versionId: v2.id,
+            number: 2,
+            name: 'v2',
+            direction: 'up',
+            checksum: d2.checksum,
+            steps: 1,
+            nonTransactional: 0,
+          },
+        ],
+        status: 'pending',
+      });
+      await db.query('update versions set retired_at = $2 where id = $1', [v2.id, new Date().toISOString()]);
+
+      const unretDef = await unretire(pid, v2.id, { syncWorkingCopy: false }, editor);
+      expect(unretDef.status).toBe(200);
+      const [directRow] = await db.query<{ status: string }>(
+        'select status from exec_requests where id = $1',
+        [reqDirectId],
+      );
+      expect(directRow!.status).toBe('invalid');
+      expect(
+        (
+          await call(
+            'POST',
+            `/api/projects/${pid}/requests/${reqDirectId}/approve`,
+            { stage: 0, comment: 'try' },
+            admin,
+          )
+        ).status,
+      ).toBe(409);
+    },
+  );
+
+  test.skipIf(skip)(
+    'syncWorkingCopy 抛出非 WorkingChangedError 异常时：retire 与 unretire 均返回 200 (workingCopy=failed) 且正常写入审计',
+    async () => {
+      const pid = await newProject('adr13-sync-wc-failed');
+      await addTable(created.rooms, db, pid);
+      const v1 = (await publish(pid, 'v1')).data as unknown as VersionCreated;
+      await editModel(created.rooms, db, pid, (m) => void addNote(m, 'c2'));
+      const v2 = (await publish(pid, 'v2')).data as unknown as VersionCreated;
+
+      const origReplace = created.rooms.replace.bind(created.rooms);
+      const errSpy = vi.spyOn(console, 'error').mockImplementation(() => {});
+      try {
+        created.rooms.replace = (async () => {
+          throw new Error('模拟房间替换故障');
+        }) as typeof created.rooms.replace;
+
+        const ret = await retire(pid, v2.id, { head: v2.id, keepWorkingCopy: false }, editor);
+        expect(ret.status).toBe(200);
+        expect(ret.data as unknown as VersionRetireResult).toMatchObject({
+          retired: [{ id: v2.id, number: 2, name: 'v2' }],
+          head: { id: v1.id, number: 1, name: 'v1' },
+          workingCopy: 'failed',
+        });
+
+        // 因上次同步失败工作副本仍停在 v2，先还原 replace 在画布做一次编辑使工作副本偏离 v2，再测 unretire 同步失败分支
+        created.rooms.replace = origReplace;
+        await editModel(created.rooms, db, pid, (m) => void addNote(m, 'dirty_before_unretire'));
+        created.rooms.replace = (async () => {
+          throw new Error('模拟房间替换故障');
+        }) as typeof created.rooms.replace;
+
+        const unret = await unretire(pid, v2.id, { syncWorkingCopy: true }, editor);
+        expect(unret.status).toBe(200);
+        expect(unret.data as unknown as VersionUnretireResult).toMatchObject({
+          restored: [{ id: v2.id, number: 2, name: 'v2' }],
+          head: { id: v2.id, number: 2, name: 'v2' },
+          workingCopy: 'failed',
+        });
+      } finally {
+        created.rooms.replace = origReplace;
+        errSpy.mockRestore();
+      }
+
+      const [v2Row] = await db.query<{ retired_at: unknown }>(
+        'select retired_at from versions where id = $1',
+        [v2.id],
+      );
+      expect(v2Row!.retired_at).toBeNull();
+
+      const audits = await db.query<{ action: string; data: { workingCopy?: string } }>(
+        "select action, data from audit_events where project_id = $1 and action in ('version.retire', 'version.unretire') order by at asc",
+        [pid],
+      );
+      expect(audits).toHaveLength(2);
+      expect(audits.map((a) => ({ action: a.action, workingCopy: a.data.workingCopy }))).toEqual([
+        { action: 'version.retire', workingCopy: 'failed' },
+        { action: 'version.unretire', workingCopy: 'failed' },
+      ]);
     },
   );
 });

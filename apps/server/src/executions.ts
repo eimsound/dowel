@@ -403,6 +403,53 @@ export interface RunInput {
    交给之后在目标库项目锁里运行的同步，按目标库历史来决定；
  * - null：已经 confirmed，保持不动，也不进任何集合。
  */
+const lockProjectChain = async (tx: Db, dialect: PlatformDb['dialect'], pid: string) => {
+  if (dialect === 'pg') await tx.query('select id from projects where id = $1 for update', [pid]);
+};
+
+const claimIn = async (
+  tx: Db,
+  pid: string,
+  envId: string,
+  v: ChainVersion,
+  direction: 'up' | 'down' | 'baseline' | 'mark',
+): Promise<'new' | 'adopted' | null> => {
+  const [row] = await tx.query<{ checksum: string; verified_at: unknown; retired_at: unknown }>(
+    'select checksum, verified_at, retired_at from versions where id = $1 and project_id = $2',
+    [v.id, pid],
+  );
+  if (!row || row.checksum !== v.checksum)
+    throw new HTTPException(409, { message: `版本 v${v.number} 的脚本在执行前被修改了，请刷新后重试` });
+  // ADR 0013：锁内复核未作废——拒绝并发作废后的升级（up）或标记（mark），允许回滚（down）已作废版本
+  if ((direction === 'up' || direction === 'mark') && row.retired_at !== null && row.retired_at !== undefined)
+    throw new ExecutorError(
+      'retired_target',
+      `版本 v${v.number}「${v.name}」已被作废，不能${direction === 'mark' ? '标记为已执行' : '升级到它'}`,
+      {
+        versionId: v.id,
+        number: v.number,
+        ...(direction === 'up' ? { direction: 'up' } : {}),
+      },
+    );
+  if (
+    direction !== 'baseline' &&
+    direction !== 'mark' &&
+    (row.verified_at === null || row.verified_at === undefined)
+  )
+    throw new HTTPException(409, { message: `版本 v${v.number} 在执行前被标为未验证，请重新验证后再执行` });
+  const inserted = await tx.query<{ version_id: string }>(
+    `insert into environment_versions (environment_id, version_id, state) values ($1, $2, 'claimed')
+     on conflict do nothing returning version_id`,
+    [envId, v.id],
+  );
+  if (inserted.length > 0) return 'new';
+  const [existing] = await tx.query<{ state: string }>(
+    'select state from environment_versions where environment_id = $1 and version_id = $2',
+    [envId, v.id],
+  );
+  return existing?.state === 'claimed' ? 'adopted' : null;
+};
+
 const claim = async (
   db: PlatformDb,
   pid: string,
@@ -411,45 +458,8 @@ const claim = async (
   direction: 'up' | 'down' | 'baseline' | 'mark',
 ): Promise<'new' | 'adopted' | null> =>
   db.transaction(async (tx) => {
-    if (db.dialect === 'pg') await tx.query('select id from projects where id = $1 for update', [pid]);
-    const [row] = await tx.query<{ checksum: string; verified_at: unknown; retired_at: unknown }>(
-      'select checksum, verified_at, retired_at from versions where id = $1 and project_id = $2',
-      [v.id, pid],
-    );
-    if (!row || row.checksum !== v.checksum)
-      throw new HTTPException(409, { message: `版本 v${v.number} 的脚本在执行前被修改了，请刷新后重试` });
-    // ADR 0013：锁内复核未作废——拒绝并发作废后的升级（up）或标记（mark），允许回滚（down）已作废版本
-    if (
-      (direction === 'up' || direction === 'mark') &&
-      row.retired_at !== null &&
-      row.retired_at !== undefined
-    )
-      throw new ExecutorError(
-        'retired_target',
-        `版本 v${v.number}「${v.name}」已被作废，不能${direction === 'mark' ? '标记为已执行' : '升级到它'}`,
-        {
-          versionId: v.id,
-          number: v.number,
-          ...(direction === 'up' ? { direction: 'up' } : {}),
-        },
-      );
-    if (
-      direction !== 'baseline' &&
-      direction !== 'mark' &&
-      (row.verified_at === null || row.verified_at === undefined)
-    )
-      throw new HTTPException(409, { message: `版本 v${v.number} 在执行前被标为未验证，请重新验证后再执行` });
-    const inserted = await tx.query<{ version_id: string }>(
-      `insert into environment_versions (environment_id, version_id, state) values ($1, $2, 'claimed')
-       on conflict do nothing returning version_id`,
-      [envId, v.id],
-    );
-    if (inserted.length > 0) return 'new';
-    const [existing] = await tx.query<{ state: string }>(
-      'select state from environment_versions where environment_id = $1 and version_id = $2',
-      [envId, v.id],
-    );
-    return existing?.state === 'claimed' ? 'adopted' : null;
+    await lockProjectChain(tx, db.dialect, pid);
+    return claimIn(tx, pid, envId, v, direction);
   });
 
 const MANUAL_MESSAGE = '这些差异是上一次执行留下的，需要手工修正'; // 短句；详细说明只在界面文案和文档里留一份
@@ -1040,27 +1050,35 @@ export const runMark = async (x: ExecContext, input: MarkInput): Promise<MarkRes
       acknowledge: input.acknowledge,
       expect: input.expect,
       beforeMark: async (p: MarkPlan) => {
-        // 即使向后/当前标记（skipped 为空）也要复核目标版本未作废
-        const [targetRow] = await db.query<{ retired_at: unknown }>(
-          'select retired_at from versions where id = $1 and project_id = $2',
-          [p.to.id, pid],
-        );
-        if (!targetRow) throw new ExecutorError('unknown_version', `目标版本不存在：${p.to.id}`);
-        if (targetRow.retired_at !== null && targetRow.retired_at !== undefined)
-          throw new ExecutorError(
-            'retired_target',
-            `版本 v${p.to.number}「${p.to.name}」已被作废，不能标记为已执行`,
-            {
-              versionId: p.to.id,
-              number: p.to.number,
-            },
+        const { added, adoptedIds } = await db.transaction(async (tx) => {
+          await lockProjectChain(tx, db.dialect, pid);
+          // 即使向后/当前标记（skipped 为空）也要在 projects 行锁内复核目标版本未作废，关闭与并发 retire 的 TOCTOU 窗口
+          const [targetRow] = await tx.query<{ retired_at: unknown }>(
+            'select retired_at from versions where id = $1 and project_id = $2',
+            [p.to.id, pid],
           );
-        for (const v of p.skipped) {
-          // direction = 'mark'：不要求已验证（标记不执行脚本），但拒绝已作废版本
-          const k = await claim(db, pid, env.id, v, 'mark');
-          if (k === 'new') claimed.add(v.id);
-          else if (k === 'adopted') adopted.add(v.id);
-        }
+          if (!targetRow) throw new ExecutorError('unknown_version', `目标版本不存在：${p.to.id}`);
+          if (targetRow.retired_at !== null && targetRow.retired_at !== undefined)
+            throw new ExecutorError(
+              'retired_target',
+              `版本 v${p.to.number}「${p.to.name}」已被作废，不能标记为已执行`,
+              {
+                versionId: p.to.id,
+                number: p.to.number,
+              },
+            );
+          const added: string[] = [];
+          const adoptedIds: string[] = [];
+          for (const v of p.skipped) {
+            // direction = 'mark'：不要求已验证（标记不执行脚本），但拒绝已作废版本
+            const k = await claimIn(tx, pid, env.id, v, 'mark');
+            if (k === 'new') added.push(v.id);
+            else if (k === 'adopted') adoptedIds.push(v.id);
+          }
+          return { added, adoptedIds };
+        });
+        for (const id of added) claimed.add(id);
+        for (const id of adoptedIds) adopted.add(id);
       },
       onTouch: (p) => {
         for (const v of p.skipped) touched.add(v.id);

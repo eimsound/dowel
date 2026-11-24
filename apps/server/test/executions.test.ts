@@ -24,7 +24,7 @@ import { afterAll, beforeAll, describe, expect, test, vi } from 'vitest';
 import { connect, createTestDb, PG_URL } from '../../../test/pg.ts';
 import { versionExecutedAnywhere } from '../src/chain.ts';
 import { type EnvRow, syncEnvCache } from '../src/envs.ts';
-import { checkEnvDrift, runExecution } from '../src/executions.ts';
+import { checkEnvDrift, runExecution, runMark } from '../src/executions.ts';
 import { createApp, openPlatformDb, type PlatformDb } from '../src/index.ts';
 import { KeyedLimiter, LoginLimiter } from '../src/rate-limit.ts';
 import { encrypt } from '../src/secrets.ts';
@@ -1537,6 +1537,44 @@ describe.each([
       });
       expect(markGo.status).toBe(200);
       expect((markGo.data as unknown as MarkResult).current.id).toBe(mv3Id);
+
+      // 8. 向后标记（skipped 为空）锁内复核竞态：在 loadChain 与 beforeMark 之间并发作废目标版本 → retired_target
+      const backProj = await newProject('adr13-back-mark-race');
+      const [bv1, bv2, bv3] = await publishChain(backProj.pid, 3);
+      expect(last((await exec(backProj.pid, backProj.eid, 'execute', bv3!.id)).events).stage).toBe('done');
+      // 把目标库结构还原到 v2（去掉 c3 列），构造向后标记 v3 → v2（skipped 为空）
+      await backProj.target.db.exec('alter table orders drop column c3');
+      const [backEnvRow] = await db.query<EnvRow>('select * from environments where id = $1', [backProj.eid]);
+      const origQuery = db.query.bind(db);
+      let retiredDuringMark = false;
+      const querySpy = vi.spyOn(db, 'query').mockImplementation((async (sql: string, params?: unknown[]) => {
+        const res = await origQuery(sql, params);
+        // loadChain 之后、markApplied -> beforeMark 之前（读取 instance_settings 时）并发作废 bv2
+        if (!retiredDuringMark && sql.includes('from instance_settings')) {
+          retiredDuringMark = true;
+          await origQuery('update versions set retired_at = $2 where id = $1', [
+            bv2!.id,
+            new Date().toISOString(),
+          ]);
+        }
+        return res;
+      }) as typeof db.query);
+      try {
+        await expect(
+          runMark(created.exec, {
+            pid: backProj.pid,
+            projectName: 'adr13-back-mark-race',
+            env: backEnvRow!,
+            to: bv2!.id,
+            userId: 'admin',
+          }),
+        ).rejects.toMatchObject({ code: 'retired_target' });
+      } finally {
+        querySpy.mockRestore();
+      }
+      expect(retiredDuringMark).toBe(true);
+      expect((await status(backProj.pid, backProj.eid)).currentVersion?.id).toBe(bv3!.id);
+      expect(bv1!.number).toBe(1);
     },
   );
 });

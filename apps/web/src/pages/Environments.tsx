@@ -44,7 +44,7 @@ import { useToast } from '../components/Toasts.tsx';
 import { Banner, IconButton } from '../components/ui.tsx';
 import { useVersionName, VersionBadges, VersionNumber } from '../components/VersionStatus.tsx';
 import { dialectUiSpec, formatEngineVersion } from '../dialects.ts';
-import { attachSuccessMessage, useEnvHistory, useEnvStatus, useEnvs } from '../envs.ts';
+import { attachRetiredMessage, attachSuccessMessage, useEnvHistory, useEnvStatus, useEnvs } from '../envs.ts';
 import { formatTime } from '../format.ts';
 import { invalidatePolicyDependents } from '../policy-cache.ts';
 import { useProject } from '../project.tsx';
@@ -176,6 +176,8 @@ const EnvForm = ({ pid }: { pid: string }) => {
       if (attach) {
         const a = r as AttachResult;
         toast(attachSuccessMessage(t, form.name, a));
+        const retiredMsg = attachRetiredMessage(t, a.retiredVersions);
+        if (retiredMsg) toast(retiredMsg);
         // 环境已经添加，但认领失败 / 同步失败：如实告诉用户（可以在环境页重试）
         for (const w of a.warnings ?? []) toast(t('tk.attachedWarn', { msg: w }), 'error');
       }

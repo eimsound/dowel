@@ -156,8 +156,8 @@ export const RetireDialog = ({
       invalidateAfter(qc, pid);
       const args = { range: rangeLabel(r.retired), head: r.head.number, count: r.invalidatedRequests };
       toast(t(r.invalidatedRequests ? 'vl.retiredWithRequests' : 'vl.retired', args));
-      // 工作副本在确认期间被别人改过：作废已经完成，但没有回退；留在对话框里说明
-      if (r.workingCopy === 'changed') setChanged(r);
+      // 工作副本在确认期间被别人改过或同步失败：作废已经完成，但没有回退；留在对话框里说明
+      if (r.workingCopy === 'changed' || r.workingCopy === 'failed') setChanged(r);
       else onClose();
     },
     onError: (e) => {
@@ -207,7 +207,7 @@ export const RetireDialog = ({
       <div className="space-y-3">
         {changed ? (
           <Banner kind="warn" role="status" title={t('vl.retireDoneTitle')}>
-            {t('vl.workingChangedRetire')}
+            {changed.workingCopy === 'failed' ? t('vl.workingFailedRetire') : t('vl.workingChangedRetire')}
           </Banner>
         ) : stale || !parent ? (
           <Banner kind="info" role="status">
@@ -302,7 +302,7 @@ export const UnretireDialog = ({
     onSuccess: (r) => {
       invalidateAfter(qc, pid);
       toast(t('vl.unretired', { range: rangeLabel(r.restored), head: r.head.number }));
-      if (r.workingCopy === 'changed') setChanged(r);
+      if (r.workingCopy === 'changed' || r.workingCopy === 'failed') setChanged(r);
       else onClose();
     },
     onError: (e) => {
@@ -348,7 +348,9 @@ export const UnretireDialog = ({
       <div className="space-y-3">
         {changed ? (
           <Banner kind="warn" role="status" title={t('vl.unretireDoneTitle')}>
-            {t('vl.workingChangedUnretire')}
+            {changed.workingCopy === 'failed'
+              ? t('vl.workingFailedUnretire')
+              : t('vl.workingChangedUnretire')}
           </Banner>
         ) : stale || !last ? (
           <Banner kind="info" role="status">

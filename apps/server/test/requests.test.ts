@@ -868,6 +868,98 @@ describe.skipIf(!PG_URL)('执行申请：表驱动场景（目标库 PG）', () 
       created.webhooks.enqueueIn = enqueueIn;
     }
   });
+
+  test('ADR 0013：墙钟偏差下，retire 后不先 sweep 立即 unretire 不复活回滚申请，作废后提交的 switch 保持有效并可执行', async () => {
+    const pid = await newProject('req-retire-unretire-clock');
+    const prod = await realEnv(pid, 'prod', true);
+    const [v1, v2] = await publishChain(pid, 2);
+
+    expect(
+      last(
+        (
+          await call('POST', `/api/projects/${pid}/environments/${prod.eid}/execute`, {
+            to: v2!.id,
+            confirm: 'prod',
+          })
+        ).events,
+      ).stage,
+    ).toBe('done');
+
+    // 1. 作废前通过真实 HTTP 接口提交回滚申请
+    const rbPre = await call(
+      'POST',
+      `/api/projects/${pid}/environments/${prod.eid}/requests`,
+      { kind: 'rollback', to: v1!.id, reason: '作废前提交的回滚' },
+      'dev',
+    );
+    expect(rbPre.status, JSON.stringify(rbPre.data)).toBe(201);
+    const rbPreId = rbPre.data.id as string;
+
+    // 2. 作废 v2 后不先跑 sweep，立刻取消作废 v2 → 申请仍然不可复活、不可审批或执行
+    const ret1 = await call(
+      'POST',
+      `/api/projects/${pid}/versions/${v2!.id}/retire`,
+      { head: v2!.id, keepWorkingCopy: false },
+      'pa',
+    );
+    expect(ret1.status).toBe(200);
+    expect(ret1.data.invalidatedRequests).toBe(1);
+
+    const unret1 = await call(
+      'POST',
+      `/api/projects/${pid}/versions/${v2!.id}/unretire`,
+      { syncWorkingCopy: false },
+      'pa',
+    );
+    expect(unret1.status).toBe(200);
+
+    expect((await detail(pid, rbPreId)).status).toBe('invalid');
+    expect((await approve(pid, rbPreId, 0, 'pa')).status).toBe(409);
+    expect((await executeReq(pid, rbPreId, 'pa')).status).toBe(409);
+
+    // 3. 再次作废 v2，并在 v1 下发布 v3；模拟另一副本墙钟落后 60s 时提交 switch 申请
+    const ret2 = await call(
+      'POST',
+      `/api/projects/${pid}/versions/${v2!.id}/retire`,
+      { head: v2!.id, keepWorkingCopy: false },
+      'pa',
+    );
+    expect(ret2.status).toBe(200);
+
+    await editModel(
+      created.rooms,
+      db,
+      pid,
+      (m) => void addColumn(m, tableOf(m), { name: 'c3_sw', type: 'text' }),
+    );
+    const v3Res = await call('POST', `/api/projects/${pid}/versions`, { name: 'v3' });
+    expect(v3Res.status, JSON.stringify(v3Res.data)).toBe(201);
+    const v3Id = v3Res.data.id as string;
+
+    const realNow = Date.now();
+    const nowSpy = vi.spyOn(Date, 'now').mockImplementation(() => realNow - 60_000);
+    let swId = '';
+    try {
+      const swRes = await call(
+        'POST',
+        `/api/projects/${pid}/environments/${prod.eid}/requests`,
+        { kind: 'switch', to: v3Id, acknowledgeRollback: true, reason: '墙钟落后副本提交切换' },
+        'dev',
+      );
+      expect(swRes.status, JSON.stringify(swRes.data)).toBe(201);
+      swId = swRes.data.id as string;
+    } finally {
+      nowSpy.mockRestore();
+    }
+
+    // 使用平台库时间：sweep 和 detail (recheck) 均不会误判失效，且可正常审批执行
+    expect(await created.requests.sweep({ projectIds: [pid] })).toBe(0);
+    expect((await detail(pid, swId)).status).toBe('pending');
+
+    const runSw = await approveAndExecute(pid, swId, 0, 'pa');
+    expect(runSw.status).toBe(200);
+    expect(last(runSw.events)).toMatchObject({ stage: 'done', current: { id: v3Id, number: 3 } });
+  });
 });
 
 // ───── 第一轮审查的修复 ─────

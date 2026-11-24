@@ -25,7 +25,8 @@ import { z } from 'zod';
 import { auditIn } from '../audit.ts';
 import type { User } from '../auth.ts';
 import { can, userActor } from '../authz.ts';
-import { envResource, loadEnv } from '../envs.ts';
+import { dbNowSql, inList, readDbNow } from '../db.ts';
+import { envResource, iso, loadEnv } from '../envs.ts';
 import { accessIn, envAuthOf, loadPolicies, withPolicyLock } from '../policy.ts';
 import {
   bindingProblem,
@@ -117,7 +118,7 @@ const decideIn = async (
   if (req.status !== 'pending' && req.status !== 'approved' && req.status !== 'failed')
     throw conflict(`申请${statusLabel(req.status)}${req.status_reason ? `：${req.status_reason}` : ''}`);
   // 绑定检查：环境状态变了 / 过期 / 流程变严 → 转成终态（提交），返回 409
-  const problem = await bindingProblem(tx, req);
+  const problem = await bindingProblem(tx, req, await readDbNow(tx, requests.db.dialect));
   if (problem) {
     await requests.setStatus(tx, c, req, problem.status, problem.reason, null, fx);
     return { req, stale: problem };
@@ -444,36 +445,61 @@ export const registerRequests = (app: Hono<Env>, ctx: AppContext) => {
       const migrations = await snapshotOf(tx, a.pid, plan, b.kind, b.to);
       const flow = flowOf(auth.resolved);
       const id = newId();
-      const now = new Date();
-      await tx.query(
-        `insert into exec_requests (id, project_id, environment_id, requested_by, direction, from_version_id, to_version_id,
-            migrations, dry_run, reason, flow, conn_hash, production, status, stage, expires_at, created_at, updated_at)
-         values ($1, $2, $3, $4, $5, $6, $7, $8::text::jsonb, $9::text::jsonb, $10, $11::text::jsonb, $12, $13, 'pending', 0, $14, $15, $15)`,
-        [
-          id,
-          a.pid,
-          env.id,
-          user.id,
-          storedDir,
-          env.current_version_id,
-          b.to,
-          JSON.stringify(migrations),
-          JSON.stringify({
-            firstRun: plan.firstRun,
-            createsHistory: plan.createsHistory,
-            resume: plan.resume
-              ? { versionId: plan.resume.versionId, afterStep: plan.resume.afterStep }
-              : null,
-            checks: plan.checks,
-          }),
-          b.reason,
-          JSON.stringify(flow),
-          connHash(env),
-          env.production,
-          Requests.expiry(auth.resolved, now),
-          now.toISOString(),
-        ],
-      );
+      const dbNow = await readDbNow(tx, db.dialect);
+      const expiresAt = Requests.expiry(auth.resolved, dbNow);
+      const downIds = migrations.filter((m) => m.direction === 'down').map((m) => m.versionId);
+      const dryRunJson = JSON.stringify({
+        firstRun: plan.firstRun,
+        createsHistory: plan.createsHistory,
+        resume: plan.resume ? { versionId: plan.resume.versionId, afterStep: plan.resume.afterStep } : null,
+        checks: plan.checks,
+      });
+      const baseParams = [
+        id,
+        a.pid,
+        env.id,
+        user.id,
+        storedDir,
+        env.current_version_id,
+        b.to,
+        JSON.stringify(migrations),
+        dryRunJson,
+        b.reason,
+        JSON.stringify(flow),
+        connHash(env),
+        env.production,
+        expiresAt,
+      ];
+      if (db.dialect === 'pg') {
+        const createdExpr = downIds.length
+          ? `greatest(clock_timestamp(), coalesce((select max(retired_at) from versions where project_id = $2 and id in (${inList(downIds, 15)})), '-infinity'::timestamptz))`
+          : 'clock_timestamp()';
+        await tx.query(
+          `insert into exec_requests (id, project_id, environment_id, requested_by, direction, from_version_id, to_version_id,
+              migrations, dry_run, reason, flow, conn_hash, production, status, stage, expires_at, created_at, updated_at)
+           values ($1, $2, $3, $4, $5, $6, $7, $8::text::jsonb, $9::text::jsonb, $10, $11::text::jsonb, $12, $13, 'pending', 0, $14, ${createdExpr}, clock_timestamp())`,
+          downIds.length ? [...baseParams, ...downIds] : baseParams,
+        );
+      } else {
+        const nowIso = dbNow.toISOString();
+        let createdAt = nowIso;
+        if (downIds.length) {
+          const [maxRow] = await tx.query<{ m: unknown }>(
+            `select max(retired_at) as m from versions where project_id = $1 and retired_at is not null and id in (${inList(downIds, 2)})`,
+            [a.pid, ...downIds],
+          );
+          const maxIso = iso(maxRow?.m);
+          if (maxIso && new Date(maxIso).getTime() > dbNow.getTime()) {
+            createdAt = new Date(maxIso).toISOString();
+          }
+        }
+        await tx.query(
+          `insert into exec_requests (id, project_id, environment_id, requested_by, direction, from_version_id, to_version_id,
+              migrations, dry_run, reason, flow, conn_hash, production, status, stage, expires_at, created_at, updated_at)
+           values ($1, $2, $3, $4, $5, $6, $7, $8::text::jsonb, $9::text::jsonb, $10, $11::text::jsonb, $12, $13, 'pending', 0, $14, $15, $16)`,
+          [...baseParams, createdAt, nowIso],
+        );
+      }
       await auditIn(
         tx,
         c,
@@ -657,12 +683,13 @@ export const registerRequests = (app: Hono<Env>, ctx: AppContext) => {
       const migrations = await snapshotOf(tx, a.pid, plan, b.kind, b.to);
       const flow = flowOf(auth.resolved);
       const id = newId();
-      const now = new Date();
+      const dbNow = await readDbNow(tx, db.dialect);
+      const nowSql = dbNowSql(db.dialect);
       await tx.query(
         `insert into exec_requests (id, project_id, environment_id, requested_by, direction, from_version_id, to_version_id,
             migrations, dry_run, reason, flow, conn_hash, production, status, stage, expires_at, created_at, updated_at,
             executed_by, emergency, worker_id)
-         values ($1, $2, $3, $4, $5, $6, $7, $8::text::jsonb, null, $9, $10::text::jsonb, $11, $12, 'executing', $13, $14, $15, $15, $4, $16, $17)`,
+         values ($1, $2, $3, $4, $5, $6, $7, $8::text::jsonb, null, $9, $10::text::jsonb, $11, $12, 'executing', $13, $14, ${nowSql}, ${nowSql}, $4, $15, $16)`,
         [
           id,
           a.pid,
@@ -677,8 +704,7 @@ export const registerRequests = (app: Hono<Env>, ctx: AppContext) => {
           connHash(env),
           env.production,
           stagesOf(flow).length,
-          Requests.expiry(auth.resolved, now),
-          now.toISOString(),
+          Requests.expiry(auth.resolved, dbNow),
           true,
           requests.workerId,
         ],

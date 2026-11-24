@@ -42,7 +42,7 @@ import { HTTPException } from 'hono/http-exception';
 import { auditIn } from './audit.ts';
 import { can, userActor } from './authz.ts';
 import type { EventBus } from './bus.ts';
-import { inList, type PlatformDb } from './db.ts';
+import { inList, type PlatformDb, readDbNow } from './db.ts';
 import { type EnvRow, iso } from './envs.ts';
 import type { ExecContext } from './executions.ts';
 import type { HaCoordinator } from './ha.ts';
@@ -463,6 +463,23 @@ export const bindingProblem = async (
     )
   )
     return invalid('环境的审批流程变严了：请按新的审批流程重新提交');
+  return null;
+};
+
+/** 计算某条开放申请因版本作废而失效的原因（与 bindingProblem 规则与文案保持一致）；不受该作废段影响时返回 null */
+export const retireInvalidReason = (
+  req: Pick<RequestRow, 'direction' | 'to_version_id' | 'migrations'>,
+  retiredSpan: ReadonlyMap<string, { number: number }>,
+): string | null => {
+  if (req.direction !== 'down') {
+    const toVer = retiredSpan.get(req.to_version_id);
+    if (toVer) return `目标版本 v${toVer.number} 已作废`;
+  }
+  for (const m of req.migrations) {
+    if (!retiredSpan.has(m.versionId)) continue;
+    if (m.direction === 'up') return `版本 v${m.number} 已作废`;
+    return `版本 v${m.number} 在提交申请后被作废`;
+  }
   return null;
 };
 
@@ -1005,7 +1022,7 @@ export class Requests {
     );
     const stale: string[] = [];
     const cache = newBindingCache();
-    const now = new Date();
+    const now = await readDbNow(this.db, this.db.dialect);
     for (const r of rows) {
       if (isInterrupted(r)) continue;
       if (await bindingProblem(this.db, r, now, cache)) stale.push(r.id);
@@ -1020,7 +1037,7 @@ export class Requests {
     const fx = await withPolicyLock(this.db, async (tx) => {
       const fx = Object.assign(new Effects(), { n: 0 });
       const cache = newBindingCache();
-      const now = new Date();
+      const now = await readDbNow(tx, this.db.dialect);
       for (const id of ids) {
         const [r] = await tx.query<RequestRow>(`select * from exec_requests where id = $1 and ${where}`, [
           id,
@@ -2193,7 +2210,12 @@ export class Requests {
       `select * from exec_requests where id = $1 and ${sweepWhere(this.db.dialect)}`,
       [rid],
     );
-    if (r && !isInterrupted(r) && (await bindingProblem(this.db, r))) await this.closeStale([rid]);
+    if (
+      r &&
+      !isInterrupted(r) &&
+      (await bindingProblem(this.db, r, await readDbNow(this.db, this.db.dialect)))
+    )
+      await this.closeStale([rid]);
   }
 
   /** 申请的有效期（小时 → 到期时间） */

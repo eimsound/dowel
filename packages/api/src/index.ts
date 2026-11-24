@@ -698,9 +698,10 @@ export type VersionRef = z.infer<typeof versionRefSchema>;
 
 /**
  * 工作副本的处理结果：reverted = 已回退到父版本 / 已同步到恢复后的链头；kept = 按要求保留；
- * unchanged = 工作副本本来就和那个模型一致；changed = 工作副本在确认期间被别人改过，没有动（作废 / 取消作废本身已完成）
+ * unchanged = 工作副本本来就和那个模型一致；changed = 工作副本在确认期间被别人改过，没有动；
+ * failed = 同步工作副本时遇到意外异常，没有改动工作副本（作废 / 取消作废本身已完成并记入审计）
  */
-export const workingCopyOutcomeSchema = z.enum(['reverted', 'kept', 'unchanged', 'changed']);
+export const workingCopyOutcomeSchema = z.enum(['reverted', 'kept', 'unchanged', 'changed', 'failed']);
 export type WorkingCopyOutcome = z.infer<typeof workingCopyOutcomeSchema>;
 
 export const versionRetireResultSchema = z.object({
