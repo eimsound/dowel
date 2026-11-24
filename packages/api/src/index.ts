@@ -1187,6 +1187,8 @@ export const execErrorDetailsSchema = z.object({
   needsManual: needsManualSchema.optional(),
   /** plan_changed：锁里重新算出的标记计划（预演之后目标库变了） */
   plan: markPlanSchema.optional(),
+  /** switch_required：需要先回滚到的最近公共祖先（ADR 0013） */
+  lca: envVersionRefSchema.optional(),
   /**
    * step_timeout：某一步因为执行策略的超时被取消。lock = 等锁超过 lock_timeout（表被别的会话占着），
    * statement = 语句执行超过 statement_timeout。ms 是当时的设置
@@ -1494,6 +1496,8 @@ export const attachResultSchema = environmentCreatedSchema.extend({
   claimed: z.boolean(),
   /** 目标库领先于平台链时本次补齐并验证通过的版本列表 */
   aheadVersions: z.array(envVersionRefSchema).default([]),
+  /** 本次补齐的领先版本中，不在合并后活跃主链上、自动标记为已作废的岔路版本（ADR 0013） */
+  retiredVersions: z.array(envVersionRefSchema).default([]),
   /** 环境已经建好，但有没做完的事（认领失败、同步目标库状态失败）：可以在环境页重试认领 / 读历史 */
   warnings: z.array(z.string()).default([]),
 });
@@ -1614,6 +1618,8 @@ export const wizardEventSchema = z.object({
   project: projectCreatedSchema.optional(),
   /** 接手成功但有没做完的事（例如某个库认领失败：项目已经建好，可以在环境页重试认领） */
   warnings: z.array(z.string()).optional(),
+  /** 接手时自动识别为已作废的岔路版本（ADR 0013） */
+  retiredVersions: z.array(envVersionRefSchema).optional(),
 });
 export type WizardEvent = z.infer<typeof wizardEventSchema>;
 
