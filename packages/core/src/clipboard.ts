@@ -16,6 +16,7 @@ import {
   ForeignKey,
   Index,
   type IndexElement,
+  isValidIndexElement,
   type Model,
   type Obj,
   Opaque,
@@ -885,9 +886,7 @@ export const parseClipboard = (text: string): ClipboardPayload | null => {
           throw new ClipboardError('invalid_payload');
         }
         for (const el of item.elements) {
-          const hasCol = el.column !== null;
-          const hasExpr = el.expr !== null && el.expr.length > 0;
-          if (hasCol === hasExpr) {
+          if (!isValidIndexElement(el)) {
             throw new ClipboardError('invalid_payload');
           }
           if (el.column !== null && !hasColumnOfTable(item.parent, el.column)) {
@@ -2422,7 +2421,7 @@ const planTablesPaste = (ctx: PasteContext, payload: ClipboardPayload): PastePla
       const mappedElements: IndexElement[] = [];
       for (const e of ix.elements) {
         let mappedCol: string | null = null;
-        if (e.column !== null) {
+        if (e.column) {
           const nextId = tableColIdMap.get(e.column);
           if (!nextId) {
             const obj = ctx.frag[e.column];
@@ -2431,16 +2430,15 @@ const planTablesPaste = (ctx: PasteContext, payload: ClipboardPayload): PastePla
             mappedCol = nextId;
           }
         }
-        const mappedExpr = e.expr
-          ? renameQualifiedManyInExpr(
-              ctx.target.dialect,
-              renameManyInExpr(ctx.target.dialect, e.expr, colRenameMap),
-              ctx.qualifiedEnumRenames,
-            )
-          : null;
-        const hasCol = e.column !== null;
-        const hasExpr = mappedExpr !== null && mappedExpr.length > 0;
-        if (hasCol === hasExpr) {
+        const mappedExpr =
+          e.expr !== null
+            ? renameQualifiedManyInExpr(
+                ctx.target.dialect,
+                renameManyInExpr(ctx.target.dialect, e.expr, colRenameMap),
+                ctx.qualifiedEnumRenames,
+              )
+            : null;
+        if (!isValidIndexElement({ column: e.column, expr: mappedExpr })) {
           invalidElement = true;
         }
         mappedElements.push({
@@ -3453,9 +3451,7 @@ const planItemsPaste = (ctx: PasteContext, payload: ClipboardPayload, tgtTbl: Ta
             ctx.qualifiedEnumRenames,
           );
         }
-        const hasCol = el.column !== null;
-        const hasExpr = mappedElExpr !== null && mappedElExpr.length > 0;
-        if (hasCol === hasExpr) invalidElement = true;
+        if (!isValidIndexElement({ column: el.column, expr: mappedElExpr })) invalidElement = true;
         mappedElements.push({
           column: mappedCol,
           expr: mappedElExpr,

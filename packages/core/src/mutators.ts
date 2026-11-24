@@ -278,7 +278,8 @@ const runPaste = (m: Model, a: z.infer<typeof pasteArgs>) => {
   const created = new Set<string>();
   const fresh = (newId: unknown) => {
     if (typeof newId !== 'string') return;
-    if (newId in m.objects || created.has(newId)) throw new E.EditError(`对象 ID ${newId} 已存在`);
+    if (Object.hasOwn(m.objects, newId) || created.has(newId))
+      throw new E.EditError(`对象 ID ${newId} 已存在`);
     created.add(newId);
   };
   for (const op of a.ops) {

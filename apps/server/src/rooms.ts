@@ -269,6 +269,9 @@ export class WorkingChangedError extends Error {
   }
 }
 
+/** MCP `apply_changes` 禁止调用的 mutator（如 `paste` 单 op 可包裹多达 20,000 子操作，避免绕过 MCP 100 op 批量上限） */
+export const MCP_DISALLOWED_MUTATORS: ReadonlySet<string> = new Set(['paste']);
+
 export interface ApplyMcpOpInput {
   name: string;
   args: unknown;
@@ -2383,6 +2386,18 @@ export class Rooms {
 
       for (let i = 0; i < opts.ops.length; i++) {
         const input = opts.ops[i]!;
+        if (MCP_DISALLOWED_MUTATORS.has(input.name)) {
+          return {
+            kind: 'err',
+            res: {
+              ok: false,
+              index: i,
+              currentSeq,
+              code: 'invalid',
+              message: `MCP apply_changes 不允许使用操作：${input.name}`,
+            },
+          };
+        }
         const n = startN + i;
         const expandedArgs = expandMcpRefs(input.args, refs);
         let execRes: ReturnType<typeof execute>;

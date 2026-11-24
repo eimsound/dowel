@@ -628,4 +628,93 @@ describe('copyTables / copyItems 提取规则与 planPaste 错误边界', () => 
     expect(CLIPBOARD_VERSION).toBe(1);
     expect(MAX_PASTE_OPS).toBe(20_000);
   });
+
+  test('空白索引表达式与 isValidIndexElement 对齐：parseClipboard 拒绝且 planPaste 逐项跳过', () => {
+    const m = emptyModel('pg');
+    const pub = createSchema(m, 'public');
+    const t = createTable(m, pub, 'users');
+    const cEmail = addColumn(m, t, { name: 'email', type: 'text' });
+    const cName = addColumn(m, t, { name: 'name', type: 'text' });
+    const ixWs = addIndex(m, t, [{ column: cEmail }], {}, 'ix_ws');
+    const ixOk = addIndex(m, t, [{ column: cName }], {}, 'ix_ok');
+    expect(validate(m)).toEqual([]);
+
+    // 1. parseClipboard 拒绝空白表达式或列与空表达式并存
+    const baseTables = copyTables(m, [t], { source: SRC });
+    for (const badEl of [
+      { column: null, expr: '   ' },
+      { column: cEmail, expr: '' },
+    ]) {
+      const badPayload = clonePlain(baseTables);
+      const badIx = badPayload.fragment[ixWs] as Extract<
+        (typeof badPayload.fragment)[string],
+        { kind: 'index' }
+      >;
+      badIx.elements = [{ ...badIx.elements[0]!, ...badEl }];
+      let err: ClipboardError | null = null;
+      try {
+        parseClipboard(serializeClipboard(badPayload));
+      } catch (e) {
+        err = e as ClipboardError;
+      }
+      expect(err).toBeInstanceOf(ClipboardError);
+      expect(err?.code).toBe('invalid_payload');
+    }
+
+    // 2. planPaste（tables 模式）跳过空白表达式索引，保留表与其余合法索引，整批 paste 可执行
+    const tablesWithWs = clonePlain(baseTables);
+    const wsIxObj = tablesWithWs.fragment[ixWs] as Extract<
+      (typeof tablesWithWs.fragment)[string],
+      { kind: 'index' }
+    >;
+    wsIxObj.elements = [{ ...wsIxObj.elements[0]!, column: null, expr: '   ' }];
+
+    const target1 = emptyModel('pg');
+    createSchema(target1, 'public');
+    const tblPlan = planPaste(target1, tablesWithWs);
+    expect(tblPlan.report.skipped).toContainEqual({
+      kind: 'index',
+      name: 'users_email_idx',
+      table: 'users',
+      reason: 'unsupported',
+      detail: null,
+    });
+    runMutator(target1, 'paste', { ops: tblPlan.ops });
+    expect(validate(target1)).toEqual([]);
+    expect(
+      Object.values(target1.objects)
+        .filter((o) => o.kind === 'index')
+        .map((o) => o.name),
+    ).toEqual(['users_name_idx']);
+
+    // 3. planPaste（items 模式）跳过空白表达式索引，合法索引正常贴入目标表
+    const baseItems = copyItems(m, t, [ixWs, ixOk], { source: SRC });
+    const itemsWithWs = clonePlain(baseItems);
+    const wsItemObj = itemsWithWs.fragment[ixWs] as Extract<
+      (typeof itemsWithWs.fragment)[string],
+      { kind: 'index' }
+    >;
+    wsItemObj.elements = [{ ...wsItemObj.elements[0]!, column: null, expr: '   ' }];
+
+    const target2 = emptyModel('pg');
+    const pub2 = createSchema(target2, 'public');
+    const tgtTbl = createTable(target2, pub2, 'users_target');
+    addColumn(target2, tgtTbl, { name: 'email', type: 'text' });
+    addColumn(target2, tgtTbl, { name: 'name', type: 'text' });
+    const itemPlan = planPaste(target2, itemsWithWs, { targetTable: tgtTbl });
+    expect(itemPlan.report.skipped).toContainEqual({
+      kind: 'index',
+      name: 'users_email_idx',
+      table: 'users_target',
+      reason: 'unsupported',
+      detail: null,
+    });
+    runMutator(target2, 'paste', { ops: itemPlan.ops });
+    expect(validate(target2)).toEqual([]);
+    expect(
+      Object.values(target2.objects)
+        .filter((o) => o.kind === 'index')
+        .map((o) => o.name),
+    ).toEqual(['users_target_name_idx']);
+  });
 });

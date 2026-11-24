@@ -133,4 +133,22 @@ describe('原型属性名作为 mutator 名或依赖 ID', () => {
     }
     expect(E.validate(m)).toEqual(PROTO_KEYS.map((k) => `view v_${k}：parent 不存在`));
   });
+
+  test('runPaste 对原型属性名 ID 走保留名报错而非误报已存在', () => {
+    const m = setup();
+    for (const k of PROTO_KEYS) {
+      let err: unknown;
+      try {
+        E.runMutator(m, 'paste', {
+          ops: [{ name: 'createTable', args: { id: k, schema: 's1', name: `p_${k}` } }],
+        });
+      } catch (e) {
+        err = e;
+      }
+      expect(err).toBeInstanceOf(E.EditError);
+      expect((err as Error).message).toContain('保留名');
+      expect((err as Error).message).not.toContain('已存在');
+    }
+    expect(Object.keys(m.objects).sort()).toEqual(['c1', 's1', 't1']);
+  });
 });
