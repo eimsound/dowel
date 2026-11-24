@@ -383,7 +383,13 @@ export const registerEnvironments = (app: Hono<Env>, ctx: AppContext) => {
     /** 预览：差异 + 指纹 + 三种只警告不拦截的情况 */
     const previewOf = async (w = working, sq = workingSeq): Promise<PullPreview> => {
       const metas = await loadVersionMetas(db, a.pid);
-      const head = metas.at(-1);
+      let head: (typeof metas)[number] | undefined;
+      for (let i = metas.length - 1; i >= 0; i--) {
+        if (!metas[i]!.retired) {
+          head = metas[i];
+          break;
+        }
+      }
       const cur = metas.find((m) => m.id === env.current_version_id);
       const [headModel] = head
         ? await db.query<{ model: Model }>('select model from versions where id = $1', [head.id])
@@ -396,9 +402,9 @@ export const registerEnvironments = (app: Hono<Env>, ctx: AppContext) => {
         fingerprint: live.fingerprint,
         workingSeq: sq,
         warnings: {
-          // 环境落后于链头；从来没有执行过（没有当前版本）但链上已经有版本也算——覆盖同样不会带上任何中间版本
+          // 环境未到达当前活跃链头（落后或停在已作废岔路）；从来没有执行过但链上已经有活跃版本也算
           behindHead:
-            head && (!cur || cur.number < head.number)
+            head && (!cur || cur.id !== head.id)
               ? { current: cur ? versionRef(cur) : null, head: versionRef(head) }
               : null,
           unfinished: live.state?.unfinished != null,
