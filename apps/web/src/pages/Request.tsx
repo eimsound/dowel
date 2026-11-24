@@ -1,8 +1,8 @@
 // 执行申请详情（P5b，E9）：起止版本、绑定的迁移与校验和、预演摘要、审批环节与时间线、当前状态和失效原因；
 // 按钮：通过 / 驳回（带意见）/ 通过并执行 / 执行 / 撤回。按钮是否可用由服务端给出（actions），不在界面上自己推。
 // “通过并执行”和“执行”打开确认对话框：生产环境要输入环境名，确认后用 SSE 读进度。
-import type { ExecEvent, ExecRequestDetail, RequestStageView } from '@dowel/api';
-import { useMutation, useQueryClient } from '@tanstack/react-query';
+import type { ExecEvent, ExecRequestDetail, RequestStageView, VersionInfo } from '@dowel/api';
+import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query';
 import { Link, useParams } from '@tanstack/react-router';
 import { Check, CircleDashed, LoaderCircle, X } from 'lucide-react';
 import { useId, useRef, useState } from 'react';
@@ -108,7 +108,7 @@ const RunDialog = ({
           {(phase === 'confirm' || phase === 'running') && (
             <button
               type="button"
-              className={r.kind === 'rollback' ? 'btn danger solid' : 'btn primary'}
+              className={r.kind === 'execute' ? 'btn primary' : 'btn danger solid'}
               aria-disabled={!canConfirm || phase === 'running' || undefined}
               aria-busy={phase === 'running' || undefined}
               onClick={() => void start()}
@@ -121,9 +121,18 @@ const RunDialog = ({
     >
       <div className="space-y-3">
         <p className="text-sm text-text-2">
-          {t(r.kind === 'rollback' ? 'req.run.introRollback' : 'req.run.introExecute', {
-            count: r.migrations.length,
-          })}
+          {t(
+            r.kind === 'rollback'
+              ? 'req.run.introRollback'
+              : r.kind === 'switch'
+                ? 'req.run.introSwitch'
+                : 'req.run.introExecute',
+            {
+              count: r.migrations.length,
+              down: r.migrations.filter((m) => m.direction === 'down').length,
+              up: r.migrations.filter((m) => m.direction === 'up').length,
+            },
+          )}
         </p>
         <ol className="m-0 list-none overflow-hidden rounded-md border border-border p-0">
           {r.migrations.map((m) => (
@@ -247,6 +256,12 @@ const RequestView = ({ rid }: { rid: string }) => {
   const qc = useQueryClient();
   const toast = useToast();
   const q = useRequest(pid, rid);
+  // 切换申请（ADR 0013）：回滚段的终点（最近公共祖先）= 最后一个回滚的版本的 parent
+  const versions = useQuery({
+    queryKey: ['versions', pid],
+    queryFn: () => api<VersionInfo[]>('GET', `/api/projects/${pid}/versions`),
+    enabled: q.data?.kind === 'switch',
+  });
   const commentId = useId();
   const [comment, setComment] = useState('');
   const [run, setRun] = useState<{ approve: number | null } | null>(null);
@@ -310,11 +325,18 @@ const RequestView = ({ rid }: { rid: string }) => {
               <StatusBadge status={r.status} />
               {r.emergency && <span className="badge danger">{t('req.emergencyBadge')}</span>}
               <h2 className="text-[length:var(--fs-headline)] font-semibold">
-                {t(r.kind === 'rollback' ? 'req.headRollback' : 'req.headExecute', {
-                  env: r.environment.name,
-                  from: r.from ? `v${r.from.number}` : t('req.none'),
-                  to: `v${r.to.number}`,
-                })}
+                {t(
+                  r.kind === 'rollback'
+                    ? 'req.headRollback'
+                    : r.kind === 'switch'
+                      ? 'req.headSwitch'
+                      : 'req.headExecute',
+                  {
+                    env: r.environment.name,
+                    from: r.from ? `v${r.from.number}` : t('req.none'),
+                    to: `v${r.to.number}`,
+                  },
+                )}
               </h2>
               {r.environment.production && <span className="badge danger">{t('envp.production')}</span>}
             </div>
@@ -466,6 +488,23 @@ const RequestView = ({ rid }: { rid: string }) => {
           </Section>
 
           <Section title={t('req.migrations')} count={r.migrations.length}>
+            {r.kind === 'switch' &&
+              (() => {
+                const downs = r.migrations.filter((m) => m.direction === 'down');
+                const lastDown = downs.at(-1);
+                const lca = versions.data?.find(
+                  (v) => v.id === versions.data?.find((x) => x.id === lastDown?.versionId)?.parentId,
+                );
+                return (
+                  <Banner kind="warn">
+                    {t('req.switchNote', {
+                      down: downs.length,
+                      up: r.migrations.length - downs.length,
+                      lca: lca?.number ?? '?',
+                    })}
+                  </Banner>
+                );
+              })()}
             <table className="data-table">
               <thead>
                 <tr>
@@ -488,7 +527,13 @@ const RequestView = ({ rid }: { rid: string }) => {
                         <span className="font-mono">{m.name}</span>
                       </Link>
                     </td>
-                    <td>{t(m.direction === 'down' ? 'req.down' : 'req.up')}</td>
+                    <td>
+                      {r.kind === 'switch' && m.direction === 'down' ? (
+                        <span className="risk high">{t('req.down')}</span>
+                      ) : (
+                        t(m.direction === 'down' ? 'req.down' : 'req.up')
+                      )}
+                    </td>
                     <td>
                       {m.steps}
                       {m.nonTransactional > 0 && (

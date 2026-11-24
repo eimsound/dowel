@@ -70,6 +70,7 @@ export const Modal = ({
   icon,
   size = 'md',
   footer,
+  pending = false,
 }: {
   open: boolean;
   onClose: () => void;
@@ -80,7 +81,17 @@ export const Modal = ({
   size?: 'sm' | 'md' | 'lg';
   /** 底部操作区：左侧辅助操作，右侧取消 / 主按钮 */
   footer?: ReactNode;
+  /**
+   * 操作进行中：不能用 Esc、点外部或右上角关闭（closedby="none" 只是渐进增强，cancel 事件里同样拦下，
+   * 不支持 closedby 的浏览器也不会关掉）
+   */
+  pending?: boolean;
 }) => {
+  const { t } = useTranslation();
+  const pendingRef = useRef(pending);
+  useEffect(() => {
+    pendingRef.current = pending;
+  }, [pending]);
   const ref = useRef<HTMLDialogElement>(null);
   const titleId = useId();
   useEffect(() => {
@@ -97,7 +108,7 @@ export const Modal = ({
       pressedOutside = outside(e, d);
     };
     const up = (e: PointerEvent) => {
-      if (pressedOutside && outside(e, d)) d.close();
+      if (pressedOutside && outside(e, d) && !pendingRef.current) d.close();
     };
     d.addEventListener('pointerdown', down);
     d.addEventListener('pointerup', up);
@@ -111,7 +122,10 @@ export const Modal = ({
       ref={ref}
       aria-labelledby={titleId}
       onClose={onClose}
-      {...({ closedby: 'any' } as object)}
+      onCancel={(e) => {
+        if (pendingRef.current) e.preventDefault();
+      }}
+      {...({ closedby: pending ? 'none' : 'any' } as object)}
       className={`m-auto max-h-[88vh] flex-col overflow-hidden rounded-lg border border-border bg-panel p-0 text-text shadow-[var(--shadow-lg)] open:flex ${
         size === 'lg' ? 'w-[min(900px,94vw)]' : size === 'sm' ? 'w-[min(440px,94vw)]' : 'w-[min(600px,94vw)]'
       }`}
@@ -121,7 +135,11 @@ export const Modal = ({
         <h2 id={titleId} className="flex-1 text-[length:var(--fs-lg)] font-semibold">
           {title}
         </h2>
-        <IconButton label="关闭" onClick={() => ref.current!.close()}>
+        <IconButton
+          label={t('dlg.close')}
+          aria-disabled={pending || undefined}
+          onClick={() => !pendingRef.current && ref.current!.close()}
+        >
           <X size={16} aria-hidden="true" />
         </IconButton>
       </header>

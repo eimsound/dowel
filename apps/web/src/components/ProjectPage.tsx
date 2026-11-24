@@ -68,8 +68,10 @@ export const Rows = ({ children }: { children: ReactNode }) => (
   <ul className="m-0 list-none overflow-hidden rounded-md border border-border bg-panel p-0">{children}</ul>
 );
 
-export const Row = ({ children }: { children: ReactNode }) => (
-  <li className="flex items-center gap-2.5 px-3 py-2.5 not-first:border-t not-first:border-border">
+export const Row = ({ children, className }: { children: ReactNode; className?: string }) => (
+  <li
+    className={`flex items-center gap-2.5 px-3 py-2.5 not-first:border-t not-first:border-border${className ? ` ${className}` : ''}`}
+  >
     {children}
   </li>
 );

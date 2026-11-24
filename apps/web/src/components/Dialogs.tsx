@@ -391,7 +391,8 @@ export const MigrationDialog = ({ pid, open, onClose }: Base) => {
   });
   const [env, setEnv] = useState('');
   const [copied, setCopied] = useState(false);
-  const effFrom = from ?? versions.data?.[0]?.id ?? 'empty';
+  // 默认和活跃链头比较（ADR 0013：编号最大的版本可能已作废）
+  const effFrom = from ?? versions.data?.find((v) => v.latest)?.id ?? 'empty';
   const mig = useQuery({
     queryKey: ['migration', pid, effFrom, to],
     queryFn: () => api<MigrationResult>('GET', `/api/projects/${pid}/migration?from=${effFrom}&to=${to}`),

@@ -32,7 +32,7 @@ import { useTranslation } from 'react-i18next';
 import { ApiError, api } from '../api.ts';
 import { ClaimDialog } from '../components/ClaimDialog.tsx';
 import { DriftBadge, driftLabel, useDeniedHint } from '../components/EnvBits.tsx';
-import { DiffList, ExecDialog, type ExecKind, type ExecMode } from '../components/ExecDialog.tsx';
+import { DiffList, ExecDialog, type ExecKind, type ExecMode, routeFor } from '../components/ExecDialog.tsx';
 import { ImportDialog } from '../components/ImportDialog.tsx';
 import { MARK_TIP, MARK_TITLE, MarkDialog, markDirection } from '../components/MarkDialog.tsx';
 import { Confirm, Modal } from '../components/Modal.tsx';
@@ -476,9 +476,10 @@ const VERSION_STATE_KEY = {
   applied: 'envx.state.applied',
   current: 'envx.state.current',
   pending: 'envx.state.pending',
+  retired: 'envx.state.retired',
 } as const;
 
-/** 版本链：每个版本相对这个环境的当前版本是已执行 / 当前 / 待执行 */
+/** 版本链：每个版本相对这个环境的当前版本是已执行 / 当前 / 待执行 / 已作废（不在当前版本的祖先路径上） */
 const VersionChain = ({
   status,
   params,
@@ -496,7 +497,7 @@ const VersionChain = ({
   return (
     <Rows>
       {[...status.versions].reverse().map((v) => (
-        <Row key={v.id}>
+        <Row key={v.id} className={v.retired ? 'row-retired' : undefined}>
           <VersionNumber number={v.number} />
           <Link
             to="/project/$owner/$project/versions/$vid"
@@ -505,7 +506,14 @@ const VersionChain = ({
           >
             {versionName(v)}
           </Link>
-          <VersionBadges v={{ verifiedAt: v.verified ? 'x' : null, edited: v.edited }} />
+          <VersionBadges
+            v={{
+              verifiedAt: v.verified ? 'x' : null,
+              edited: v.edited,
+              // 状态 chip 已经写着“已作废”时不重复
+              retiredAt: v.retired && v.state !== 'retired' ? 'x' : null,
+            }}
+          />
           {v.nonTransactional && (
             <span className="risk medium" title={nonTxHint}>
               {t('envx.nonTxShort')}
@@ -780,10 +788,17 @@ const EnvironmentDetailView = ({ eid }: { eid: string }) => {
   const canConfigure = env.permissions.configure;
   const canUnmarkProduction = env.permissions.unmarkProduction;
   const canExec = status?.permissions.execute ?? env.permissions.execute;
+  // 版本树（ADR 0013）：待执行 = 活跃主链上还没到的版本；回滚目标 = 当前版本的祖先（已执行）；
+  // 环境停在已作废岔路上时，到待执行版本要先回滚到最近公共祖先再升级（切换）
   const pending = status?.versions.filter((v) => v.state === 'pending') ?? [];
   const current = status?.currentVersion ?? null;
-  const rollbackTargets = current ? (status?.versions ?? []).filter((v) => v.number < current.number) : [];
+  const currentRetired = !!current && !!status?.versions.find((v) => v.id === current.id)?.retired;
+  const rollbackTargets = current ? (status?.versions ?? []).filter((v) => v.state === 'applied') : [];
   const execTarget = pending.find((v) => v.id === execTo) ?? pending.at(-1);
+  const execKind: ExecKind =
+    status && execTarget && routeFor(status, execTarget).items.some((m) => m.direction === 'down')
+      ? 'switch'
+      : 'execute';
   const rollTarget = rollbackTargets.find((v) => v.id === rollTo) ?? rollbackTargets.at(-1);
   const showBaseline =
     !!status && !!history && !history.initialized && !current && status.versions[0]?.number === 0;
@@ -793,9 +808,12 @@ const EnvironmentDetailView = ({ eid }: { eid: string }) => {
   // 未完成的运行同样用执行器给的 unfinished / readbackFailure，不从 runs 里推
   const openRun = !!history?.unfinished || history?.readbackFailure === true;
   const markCurrent = openRun ? (history?.currentVersion ?? current) : current;
-  const markTargets = (status?.versions ?? []).filter((v) => openRun || v.id !== markCurrent?.id);
+  // 不能标记到已作废的版本（ADR 0013）；有未完成的运行时当前版本仍可作为目标
+  const markTargets = (status?.versions ?? []).filter(
+    (v) => (openRun || v.id !== markCurrent?.id) && (!v.retired || (openRun && v.id === markCurrent?.id)),
+  );
   const markTarget = markTargets.find((v) => v.id === markTo) ?? markTargets.at(-1);
-  const markDir = markTarget ? markDirection(markCurrent, markTarget) : 'forward';
+  const markDir = markTarget ? markDirection(markCurrent, markTarget, status?.versions) : 'forward';
   // P5b：环境要求审批（配置了审批环节）或者自己没有执行权限时，执行 / 回滚变成“提交执行申请”
   const perm = status?.permissions ?? env.permissions;
   const direct = perm.execute && !perm.approvalRequired;
@@ -900,6 +918,12 @@ const EnvironmentDetailView = ({ eid }: { eid: string }) => {
               </div>
             </Banner>
           )}
+          {/* ADR 0013：环境停在已作废的版本上：引导切换回活跃主链，或跨岔路零 SQL 标记 */}
+          {current && currentRetired && (
+            <Banner kind="warn" title={t('envx.exec.switchBanner', { number: current.number })} role="status">
+              <p className="m-0">{t('envx.exec.switchBannerBody')}</p>
+            </Banner>
+          )}
           {history?.unfinished && (
             <Banner kind="danger" title={t('envx.unfinished.title')} role="alert">
               {t('envx.unfinished.body', {
@@ -964,16 +988,22 @@ const EnvironmentDetailView = ({ eid }: { eid: string }) => {
                       className="btn primary"
                       aria-disabled={!canRun || !execTarget || undefined}
                       title={runTitle}
-                      onClick={() => execTarget && run('execute', execTarget)}
+                      onClick={() => execTarget && run(execKind, execTarget)}
                     >
                       <Play size={16} aria-hidden="true" />
-                      {direct || !viaRequest ? t('envx.exec.button') : t('req.envButton.execute')}
+                      {execKind === 'switch'
+                        ? direct || !viaRequest
+                          ? t('envx.exec.switchButton', { number: execTarget?.number })
+                          : t('req.envButton.switch')
+                        : direct || !viaRequest
+                          ? t('envx.exec.button')
+                          : t('req.envButton.execute')}
                     </button>
                     {perm.emergency && execTarget && (
                       <button
                         type="button"
                         className="btn danger"
-                        onClick={() => setDlg({ kind: 'execute', to: execTarget, mode: 'emergency' })}
+                        onClick={() => setDlg({ kind: execKind, to: execTarget, mode: 'emergency' })}
                       >
                         <Siren size={16} aria-hidden="true" />
                         {t('req.envButton.emergency')}
@@ -1145,9 +1175,16 @@ const EnvironmentDetailView = ({ eid }: { eid: string }) => {
                   >
                     <StatusBadge status={rq.status} />
                     <Link to="/project/$owner/$project/requests/$rid" params={{ ...params, rid: rq.id }}>
-                      {t(rq.kind === 'rollback' ? 'req.envRowRollback' : 'req.envRowExecute', {
-                        to: rq.to.number,
-                      })}
+                      {t(
+                        rq.kind === 'rollback'
+                          ? 'req.envRowRollback'
+                          : rq.kind === 'switch'
+                            ? 'req.envRowSwitch'
+                            : 'req.envRowExecute',
+                        {
+                          to: rq.to.number,
+                        },
+                      )}
                     </Link>
                     {rq.status === 'pending' && (
                       <span className="text-xs text-text-2">
@@ -1331,6 +1368,7 @@ const EnvironmentDetailView = ({ eid }: { eid: string }) => {
           production={env.production}
           current={markCurrent}
           to={markDlg}
+          tree={status?.versions}
           onClose={() => setMarkDlg(null)}
         />
       )}

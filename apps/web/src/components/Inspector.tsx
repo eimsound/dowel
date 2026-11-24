@@ -671,7 +671,7 @@ const TableInspector = ({
     refetchOnMount: false,
   });
   const versionCount = versions.data?.length ?? 0;
-  const latestId = versions.data?.[0]?.id;
+  const latestId = versions.data?.find((v) => v.latest)?.id;
   const publishedTables = useQuery({
     queryKey: ['published-tables', pid, latestId, versionCount],
     queryFn: async () => {

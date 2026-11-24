@@ -25,17 +25,57 @@ import { PolicySummary } from './PolicyEditor.tsx';
 import { Banner, Sql } from './ui.tsx';
 import { useVersionName, VersionNumber } from './VersionStatus.tsx';
 
-export type ExecKind = 'execute' | 'rollback' | 'baseline';
+/** switch（ADR 0013）：环境停在已作废岔路上，经最近公共祖先先回滚再升级到活跃主链上的版本 */
+export type ExecKind = 'execute' | 'rollback' | 'switch' | 'baseline';
 /** direct：直接执行；request：提交执行申请；emergency：紧急执行（实例管理员，绕过审批） */
 export type ExecMode = 'direct' | 'request' | 'emergency';
 
-/** 这次要执行 / 回滚的版本（按执行顺序）：执行是从当前版本之后到目标；回滚是从当前版本往回到目标之后 */
-export const migrationsFor = (status: EnvStatus, kind: ExecKind, to?: EnvVersion): EnvVersion[] => {
-  if (kind === 'baseline' || !to) return [];
-  const cur = status.currentVersion?.number ?? -1;
-  if (kind === 'execute') return status.versions.filter((v) => v.number > cur && v.number <= to.number);
-  return status.versions.filter((v) => v.number > to.number && v.number <= cur).reverse();
+/** 路线上的一个迁移：回滚段执行这个版本的回滚脚本，升级段执行它的升级脚本 */
+export interface RouteItem {
+  v: EnvVersion;
+  direction: 'up' | 'down';
+}
+
+/** 从根到 id 的路径（含两端，根在前）；版本树断了返回空 */
+const pathFromRoot = (byId: Map<string, EnvVersion>, id: string): EnvVersion[] => {
+  const out: EnvVersion[] = [];
+  for (let v = byId.get(id); v; v = v.parentId ? byId.get(v.parentId) : undefined) {
+    out.push(v);
+    if (out.length > byId.size) return [];
+  }
+  return out.reverse();
 };
+
+/**
+ * 当前版本到目标的路线（按执行顺序，沿 parent 经最近公共祖先）：先回滚段（当前版本往回到公共祖先之后），
+ * 再升级段（公共祖先之后到目标）。界面先按平台缓存显示；真正要做的事以服务端预演为准。
+ */
+export const routeFor = (
+  status: EnvStatus,
+  to?: EnvVersion,
+): { items: RouteItem[]; lca: EnvVersion | null } => {
+  if (!to) return { items: [], lca: null };
+  const byId = new Map(status.versions.map((v) => [v.id, v]));
+  const toPath = pathFromRoot(byId, to.id);
+  const cur = status.currentVersion?.id ?? null;
+  if (!cur) return { items: toPath.map((v) => ({ v, direction: 'up' })), lca: null };
+  const curPath = pathFromRoot(byId, cur);
+  let i = 0;
+  while (i < curPath.length && i < toPath.length && curPath[i]!.id === toPath[i]!.id) i++;
+  const down = curPath.slice(i).reverse();
+  const up = toPath.slice(i);
+  return {
+    items: [
+      ...down.map((v) => ({ v, direction: 'down' as const })),
+      ...up.map((v) => ({ v, direction: 'up' as const })),
+    ],
+    lca: down.length && up.length ? (curPath[i - 1] ?? null) : null,
+  };
+};
+
+/** 这次要执行 / 回滚的版本（按执行顺序） */
+export const migrationsFor = (status: EnvStatus, kind: ExecKind, to?: EnvVersion): RouteItem[] =>
+  kind === 'baseline' ? [] : routeFor(status, to).items;
 
 interface Progress {
   status: 'start' | 'step' | 'done';
@@ -148,6 +188,9 @@ const DryRunPanel = ({
       <Banner kind="ok" title={t('tk.dry.okTitle')}>
         {plan.migrations.length === 0 && !plan.baseline ? t('tk.dry.nothing') : t('tk.dry.okBody')}
       </Banner>
+      {plan.direction === 'switch' && plan.lca && (
+        <p className="hint m-0">{t('tk.dry.switchVia', { lca: plan.lca.number })}</p>
+      )}
       {plan.firstRun === 'empty' && <p className="hint m-0">{t('tk.dry.firstRunEmpty')}</p>}
       {plan.firstRun === 'baseline' && <p className="hint m-0">{t('tk.dry.firstRunBaseline')}</p>}
       {plan.createsHistory && (
@@ -173,6 +216,9 @@ const DryRunPanel = ({
               <VersionNumber number={m.number} />
               <span className="font-mono">{versionName(m)}</span>
               <span className="text-text-3">{t('tk.dry.steps', { count: m.steps.length })}</span>
+              {plan.direction === 'switch' && m.direction === 'down' && (
+                <span className="risk high">{t('envx.exec.rollbackChip')}</span>
+              )}
               {m.nonTransactional > 0 && (
                 <span className="risk medium">{t('tk.dry.nonTx', { count: m.nonTransactional })}</span>
               )}
@@ -245,6 +291,13 @@ export const ExecDialog = ({
   const versionName = useVersionName();
   const inputId = useId();
   const migrations = migrationsFor(status, kind, to);
+  const route = kind === 'switch' ? routeFor(status, to) : null;
+  const isSwitch = kind === 'switch';
+  const downs = migrations.filter((m) => m.direction === 'down');
+  const ups = migrations.filter((m) => m.direction === 'up');
+  const rollbackAckId = useId();
+  const rollbackWarnId = useId();
+  const [rollbackAck, setRollbackAck] = useState(false);
   const [typed, setTyped] = useState('');
   const [phase, setPhase] = useState<'confirm' | 'running' | 'done' | 'failed'>('confirm');
   const [stage, setStage] = useState<ExecEvent['stage'] | null>(null);
@@ -265,6 +318,12 @@ export const ExecDialog = ({
   const dryKey = `${pid}\0${eid}\0${kind}\0${to?.id ?? ''}\0${dryTick}\0${isRequest ? '1' : '0'}`;
   const [dryState, setDryState] = useState<{ key: string; val: DryState } | null>(null);
   const dry: DryState = dryState?.key === dryKey ? dryState.val : { state: 'loading' };
+  // 每次重新预演都清掉回滚确认：确认只对应它看到的那一份计划
+  const [ackKey, setAckKey] = useState(dryKey);
+  if (ackKey !== dryKey) {
+    setAckKey(dryKey);
+    setRollbackAck(false);
+  }
   // 申请不执行任何东西，不用输入环境名（执行时再输入）；直接执行和紧急执行在生产环境要输入
   const mustType = production && !isRequest;
   const dryOk = dry.state === 'done' && dry.res.ok;
@@ -273,13 +332,16 @@ export const ExecDialog = ({
     // 申请：预演不通过不能提交（服务端同样会拒绝）
     (!isRequest || dryOk) &&
     // 紧急执行：必填原因 + 勾选确认（二次确认）
-    (!isEmergency || (reason.trim() !== '' && ack));
+    (!isEmergency || (reason.trim() !== '' && ack)) &&
+    // 切换：必须确认回滚段可能丢数据（服务端同样要求 acknowledgeRollback）
+    (!isSwitch || rollbackAck);
 
   // 对话框打开（或点“重新预演”）时先预演：只读，不写目标库，也不写平台库的登记；
   // 预演没通过不挡着确认按钮——真正的执行会被同样的原因拒绝，原因照样显示
   useEffect(() => {
     let live = true;
     const body = kind === 'baseline' ? { dryRun: true } : { to: to?.id, dryRun: true };
+    // switch 的预演走 …/switch（直接执行）或申请接口（kind = switch）
     // 申请：没有直接执行权限的人也能预演（提交申请的接口带 dryRun）
     const req = isRequest
       ? api<DryRunResponse>('POST', `/api/projects/${pid}/environments/${eid}/requests`, {
@@ -320,6 +382,7 @@ export const ExecDialog = ({
         kind,
         to: to!.id,
         reason: reason.trim(),
+        ...(isSwitch ? { acknowledgeRollback: true } : {}),
       });
       void qc.invalidateQueries({ queryKey: ['requests', pid] });
       onRequested?.(r);
@@ -336,11 +399,12 @@ export const ExecDialog = ({
     running.current = true;
     setPhase('running');
     const base = `/api/projects/${pid}/environments/${eid}`;
+    const ackBody = isSwitch ? { acknowledgeRollback: true } : {};
     const body = isEmergency
-      ? { kind, to: to!.id, reason: reason.trim(), confirm: typed }
+      ? { kind, to: to!.id, reason: reason.trim(), confirm: typed, ...ackBody }
       : kind === 'baseline'
         ? { confirm: typed }
-        : { to: to!.id, confirm: typed };
+        : { to: to!.id, confirm: typed, ...ackBody };
     let last: ExecEvent | null = null;
     try {
       await streamExec(`${base}/${isEmergency ? 'emergency' : kind}`, body, (e) => {
@@ -371,17 +435,26 @@ export const ExecDialog = ({
   };
 
   const title = isRequest
-    ? t(kind === 'rollback' ? 'req.dialog.titleRollback' : 'req.dialog.titleExecute', {
-        name: envName,
-        number: to?.number,
-      })
+    ? t(
+        kind === 'rollback'
+          ? 'req.dialog.titleRollback'
+          : isSwitch
+            ? 'req.dialog.titleSwitch'
+            : 'req.dialog.titleExecute',
+        {
+          name: envName,
+          number: to?.number,
+        },
+      )
     : isEmergency
       ? t('req.emergency.title', { name: envName, number: to?.number })
       : kind === 'baseline'
         ? t('envx.exec.titleBaseline', { name: envName })
         : kind === 'execute'
           ? t('envx.exec.titleExecute', { name: envName, number: to?.number })
-          : t('envx.exec.titleRollback', { name: envName, number: to?.number });
+          : isSwitch
+            ? t('envx.exec.titleSwitch', { name: envName, number: to?.number })
+            : t('envx.exec.titleRollback', { name: envName, number: to?.number });
   const details = error?.event?.details;
   const rows = plan?.migrations ?? [];
   const closeLabel = phase === 'confirm' ? t('dlg.cancel') : t('dlg.close');
@@ -401,9 +474,13 @@ export const ExecDialog = ({
           {phase !== 'done' && phase !== 'failed' && (
             <button
               type="button"
-              className={kind === 'rollback' || isEmergency ? 'btn danger solid' : 'btn primary'}
+              className={kind === 'rollback' || isSwitch || isEmergency ? 'btn danger solid' : 'btn primary'}
               aria-disabled={!canConfirm || phase === 'running' || undefined}
-              aria-describedby={mustType && !canConfirm ? `${inputId}-hint` : undefined}
+              aria-describedby={
+                [isSwitch ? rollbackWarnId : '', mustType && !canConfirm ? `${inputId}-hint` : '']
+                  .filter(Boolean)
+                  .join(' ') || undefined
+              }
               aria-busy={phase === 'running' || undefined}
               onClick={() => void start()}
             >
@@ -415,7 +492,9 @@ export const ExecDialog = ({
                     ? t('envx.exec.confirmBaseline')
                     : kind === 'execute'
                       ? t('envx.exec.confirmExecute')
-                      : t('envx.exec.confirmRollback')}
+                      : isSwitch
+                        ? t('envx.exec.confirmSwitch')
+                        : t('envx.exec.confirmRollback')}
             </button>
           )}
         </>
@@ -432,61 +511,117 @@ export const ExecDialog = ({
           <p className="text-sm text-text-2">{t('envx.exec.baselineHint')}</p>
         ) : (
           <>
+            {isSwitch && route?.lca && status.currentVersion && to && (
+              <p className="m-0 font-mono text-sm" data-testid="switch-route">
+                <span className="sr-only">
+                  {t('envx.exec.switchRouteAria', {
+                    from: status.currentVersion.number,
+                    lca: route.lca.number,
+                    to: to.number,
+                  })}
+                </span>
+                <span aria-hidden="true" className="inline-flex flex-wrap items-center gap-1.5">
+                  <span>v{status.currentVersion.number}</span>
+                  <span className="text-text-3">→</span>
+                  <span>v{route.lca.number}</span>
+                  <span className="text-text-3">→</span>
+                  <span>v{to.number}</span>
+                </span>
+              </p>
+            )}
             <p className="text-sm text-text-2">
-              {kind === 'execute'
-                ? uiSpec.transactionalDdl
-                  ? t('envx.exec.executeIntro', { count: migrations.length })
-                  : t('envx.exec.executeIntroNonTx', {
-                      count: migrations.length,
-                      dialect: uiSpec.name,
-                    })
-                : t('envx.exec.rollbackIntro', { count: migrations.length })}
+              {isSwitch
+                ? t('envx.exec.switchIntro', { down: downs.length, up: ups.length })
+                : kind === 'execute'
+                  ? uiSpec.transactionalDdl
+                    ? t('envx.exec.executeIntro', { count: migrations.length })
+                    : t('envx.exec.executeIntroNonTx', {
+                        count: migrations.length,
+                        dialect: uiSpec.name,
+                      })
+                  : t('envx.exec.rollbackIntro', { count: migrations.length })}
             </p>
-            <ol
-              className="m-0 list-none overflow-hidden rounded-md border border-border p-0"
-              aria-label={t('envx.exec.migrations')}
-            >
-              {migrations.map((v, i) => {
-                const p = progress[v.id];
-                return (
-                  <li
-                    key={v.id}
-                    className="flex flex-wrap items-center gap-2 px-3 py-2 text-sm not-first:border-t not-first:border-border"
-                  >
-                    <span className="w-5 shrink-0 text-xs text-text-3">{i + 1}</span>
-                    <VersionNumber number={v.number} />
-                    <span className="min-w-0 flex-1 truncate font-mono">{versionName(v)}</span>
-                    <span className="text-xs text-text-3">
-                      {t('envx.exec.steps', { count: kind === 'execute' ? v.upSteps : v.downSteps })}
-                    </span>
-                    {kind === 'execute' && v.nonTransactional && (
-                      <span className="risk medium" title={nonTxHint}>
-                        {t('envx.nonTxShort')}
-                      </span>
-                    )}
-                    {kind === 'execute' && <RiskChip v={v} />}
-                    {p && (
-                      <span className="inline-flex items-center gap-1 text-xs text-text-2">
-                        {p.status === 'done' ? (
-                          <CircleCheck size={12} aria-hidden="true" />
-                        ) : (
-                          <LoaderCircle size={12} aria-hidden="true" className="animate-spin" />
+            {[
+              ...(isSwitch
+                ? [
+                    { key: 'down', label: t('envx.exec.segDown'), items: downs, offset: 0 },
+                    { key: 'up', label: t('envx.exec.segUp'), items: ups, offset: downs.length },
+                  ]
+                : [{ key: 'all', label: t('envx.exec.migrations'), items: migrations, offset: 0 }]),
+            ].map((seg) => (
+              <section key={seg.key} className="space-y-1" aria-label={seg.label}>
+                {isSwitch && <h3 className="section-title m-0">{seg.label}</h3>}
+                <ol
+                  className="m-0 list-none overflow-hidden rounded-md border border-border p-0"
+                  aria-label={seg.label}
+                >
+                  {seg.items.map(({ v, direction }, j) => {
+                    const i = seg.offset + j;
+                    const p = progress[v.id];
+                    const isUp = direction === 'up';
+                    return (
+                      <li
+                        key={`${v.id}-${direction}`}
+                        className="flex flex-wrap items-center gap-2 px-3 py-2 text-sm not-first:border-t not-first:border-border"
+                      >
+                        <span className="w-5 shrink-0 text-xs text-text-3">{i + 1}</span>
+                        <VersionNumber number={v.number} />
+                        <span className="min-w-0 flex-1 truncate font-mono">{versionName(v)}</span>
+                        <span className="text-xs text-text-3">
+                          {t('envx.exec.steps', { count: isUp ? v.upSteps : v.downSteps })}
+                        </span>
+                        {isSwitch && !isUp && (
+                          <span className="risk high">{t('envx.exec.rollbackChip')}</span>
                         )}
-                        {p.status === 'done'
-                          ? t('envx.exec.migDone')
-                          : t('envx.exec.migRunning', { step: p.step, steps: p.steps })}
-                      </span>
-                    )}
-                    {!p && phase === 'running' && (
-                      <CircleDashed size={12} aria-hidden="true" className="text-text-3" />
-                    )}
-                  </li>
-                );
-              })}
-            </ol>
+                        {isUp && v.nonTransactional && (
+                          <span className="risk medium" title={nonTxHint}>
+                            {t('envx.nonTxShort')}
+                          </span>
+                        )}
+                        {isUp && <RiskChip v={v} />}
+                        {p && (
+                          <span className="inline-flex items-center gap-1 text-xs text-text-2">
+                            {p.status === 'done' ? (
+                              <CircleCheck size={12} aria-hidden="true" />
+                            ) : (
+                              <LoaderCircle size={12} aria-hidden="true" className="animate-spin" />
+                            )}
+                            {p.status === 'done'
+                              ? t('envx.exec.migDone')
+                              : t('envx.exec.migRunning', { step: p.step, steps: p.steps })}
+                          </span>
+                        )}
+                        {!p && phase === 'running' && (
+                          <CircleDashed size={12} aria-hidden="true" className="text-text-3" />
+                        )}
+                      </li>
+                    );
+                  })}
+                </ol>
+              </section>
+            ))}
             {kind === 'rollback' && <p className="hint">{t('envx.exec.rollbackNoRisk')}</p>}
-            {kind === 'execute' && migrations.some((v) => v.nonTransactional) && (
+            {(kind === 'execute' || isSwitch) && ups.some(({ v }) => v.nonTransactional) && (
               <p className="hint">{nonTxHint}</p>
+            )}
+            {isSwitch && phase === 'confirm' && (
+              <div className="space-y-2">
+                <div id={rollbackWarnId}>
+                  <Banner kind="danger" title={t('envx.exec.switchWarnTitle')}>
+                    {t('envx.exec.switchWarn')}
+                  </Banner>
+                </div>
+                <label htmlFor={rollbackAckId} className="flex items-start gap-2 text-sm">
+                  <input
+                    id={rollbackAckId}
+                    type="checkbox"
+                    checked={rollbackAck}
+                    aria-describedby={rollbackWarnId}
+                    onChange={(e) => setRollbackAck(e.target.checked)}
+                  />
+                  {t('envx.exec.switchAck')}
+                </label>
+              </div>
             )}
           </>
         )}
