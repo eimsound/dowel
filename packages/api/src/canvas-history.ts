@@ -35,6 +35,8 @@ export const canvasHistoryEntrySchema = z.object({
   summary: z.array(z.string()),
   isCurrent: z.boolean(),
   version: canvasHistoryVersionRefSchema.nullable(),
+  via: z.literal('mcp').optional(),
+  mcpTokenPrefix: z.string().optional(),
 });
 export type CanvasHistoryEntry = z.infer<typeof canvasHistoryEntrySchema>;
 
