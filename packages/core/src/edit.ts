@@ -521,7 +521,7 @@ export const normalizeAllPartitionFamilies = (m: Model): Model => {
       break;
     }
     if (o.kind === 'column') {
-      const p = m.objects[o.parent];
+      const p = find(m, o.parent);
       if (p?.kind === 'table' && p.partitionOf !== null) {
         needsWork = true;
         break;
@@ -668,7 +668,7 @@ const ancestorsOf = (m: Model, tableId: string): Table[] => {
   let cur: string | null = tableId;
   while (cur && !seen.has(cur)) {
     seen.add(cur);
-    const t: Obj | undefined = m.objects[cur];
+    const t: Obj | undefined = find(m, cur);
     if (t?.kind !== 'table') break;
     out.push(t);
     cur = t.partitionOf?.parent ?? null;

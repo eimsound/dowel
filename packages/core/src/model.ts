@@ -107,7 +107,7 @@ export const rootTableId = (m: Model, tableId: string): string => {
   let cur = tableId;
   while (!seen.has(cur)) {
     seen.add(cur);
-    const t = m.objects[cur];
+    const t = find(m, cur);
     if (t?.kind !== 'table' || !t.partitionOf) return cur;
     if (!Object.hasOwn(m.objects, t.partitionOf.parent)) return cur;
     cur = t.partitionOf.parent;
@@ -145,11 +145,11 @@ export const partitionDescendants = (m: Model, parentId: string): Table[] => {
 export const partitionAncestors = (m: Model, tableId: string): Table[] => {
   const out: Table[] = [];
   const seen = new Set<string>([tableId]);
-  const self = m.objects[tableId];
+  const self = find(m, tableId);
   let cur = self?.kind === 'table' && self.partitionOf ? self.partitionOf.parent : null;
   while (cur && !seen.has(cur)) {
     seen.add(cur);
-    const t = m.objects[cur];
+    const t = find(m, cur);
     if (t?.kind !== 'table') break;
     out.push(t);
     cur = t.partitionOf?.parent ?? null;
@@ -164,7 +164,7 @@ export const partitionDepth = (m: Model, tableId: string): number => {
   let depth = 0;
   while (!seen.has(cur)) {
     seen.add(cur);
-    const t = m.objects[cur];
+    const t = find(m, cur);
     if (t?.kind !== 'table' || !t.partitionOf) return depth;
     if (!Object.hasOwn(m.objects, t.partitionOf.parent)) return depth;
     cur = t.partitionOf.parent;
@@ -260,13 +260,13 @@ export const validate = (m: Model): string[] =>
     const errs: string[] = [];
     const need = (o: Obj, ref: string | null | undefined, kind: Kind, what: string) => {
       if (!ref) return;
-      const t = m.objects[ref];
+      const t = find(m, ref);
       if (!t || t.kind !== kind) errs.push(`${o.kind} ${o.name}：${what} 指向不存在的 ${kind} ${ref}`);
     };
     const colOfTable = (o: Obj, table: string, cols: string[], what: string) => {
       const root = rootTableId(m, table);
       for (const c of cols) {
-        const col = m.objects[c];
+        const col = find(m, c);
         if (col?.kind !== 'column' || (col.parent !== table && col.parent !== root))
           errs.push(`${o.kind} ${o.name}：${what} 引用的列 ${c} 不在表 ${table} 中`);
       }
@@ -281,11 +281,11 @@ export const validate = (m: Model): string[] =>
           need(o, o.parent, 'schema', 'parent');
           break;
         case 'opaque': {
-          const p = m.objects[o.parent];
+          const p = find(m, o.parent);
           if (!p || (p.kind !== 'schema' && p.kind !== 'table'))
             errs.push(`${o.objType} ${o.name}：parent 不存在`);
           for (const d of o.deps)
-            if (!m.objects[d]) errs.push(`${o.objType} ${o.name}：依赖的对象 ${d} 不存在`);
+            if (!find(m, d)) errs.push(`${o.objType} ${o.name}：依赖的对象 ${d} 不存在`);
           break;
         }
         case 'enum':
@@ -335,7 +335,7 @@ export const validate = (m: Model): string[] =>
           }
           if (o.kind === 'primaryKey') {
             for (const c of o.columns) {
-              const col = m.objects[c];
+              const col = find(m, c);
               if (col?.kind === 'column' && !col.notNull)
                 errs.push(`主键 ${o.name}：列 ${col.name} 必须 NOT NULL`);
             }
