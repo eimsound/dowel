@@ -1,26 +1,31 @@
-// MCP 服务（M3-C，ADR 0014）：`POST /api/mcp`，无状态 Streamable HTTP（不建会话、不开 SSE，多副本无需粘性路由）。
-// - 只认 `Authorization: Bearer dwm_…`（个人 MCP 令牌）；会话 cookie 一律不读，CI 令牌在更前面的 rejectTokens 里就 403。
-// - 认证失败限速与 CI 令牌同一套防误杀做法（pitfalls #8 #9）：缺头 / 格式不对直接在内存里 401，不查库、不扣失败桶；
-//   格式合法的令牌按来源 IP 同步预占失败计数，认证成功、主体问题（停用 / 需改密码）或数据库异常时退回；
-//   IP 触限时先查活跃 MCP 令牌哈希快照，命中的合法令牌仍然进库强校验，未命中的直接 429。
-// - 认证通过后检查实例开关“允许 MCP 访问”，再按令牌 ID 限速，最后把主体挂到 c.get('mcp')。
 import {
   MCP_HTTP_ERROR_STATUS,
   MCP_TOKEN_PATTERN,
   type McpHttpErrorBody,
   type McpHttpErrorCode,
 } from '@dowel/api';
+// MCP 服务（M3-C，ADR 0014）：`POST /api/mcp`，无状态 Streamable HTTP（不建会话、不开 SSE，多副本无需粘性路由）。
+// - 只认 `Authorization: Bearer dwm_…`（个人 MCP 令牌）；会话 cookie 一律不读，CI 令牌在更前面的 rejectTokens 里就 403。
+// - 认证失败限速与 CI 令牌同一套防误杀做法（pitfalls #8 #9）：缺头 / 格式不对直接在内存里 401，不查库、不扣失败桶；
+//   格式合法的令牌按来源 IP 同步预占失败计数，认证成功、主体问题（停用 / 需改密码）或数据库异常时退回；
+//   IP 触限时先查活跃 MCP 令牌哈希快照，命中的合法令牌仍然进库强校验，未命中的直接 429。
+// - 认证通过后检查实例开关“允许 MCP 访问”，再按令牌 ID 限速，最后把主体挂到 c.get('mcp')。
+import { createMcpHandler, isJsonContentType } from '@modelcontextprotocol/server';
 import type { Context, Hono, MiddlewareHandler } from 'hono';
 import type { ContentfulStatusCode } from 'hono/utils/http-status';
 
 import { hashToken } from '../auth.ts';
-import { authenticateMcpToken } from '../mcp-tokens.ts';
+import { createMcpServer } from '../mcp-server.ts';
+import { authenticateMcpToken, type McpPrincipal } from '../mcp-tokens.ts';
+import { scrubSecrets } from '../secrets.ts';
 import { clientIp } from '../security.ts';
 import { readSettings } from '../settings.ts';
 import type { AppContext, Env } from './context.ts';
 
 /** MCP 服务的挂载路径 */
 export const MCP_PATH = '/api/mcp';
+
+const MAX_MCP_BODY_BYTES = 1024 * 1024;
 
 const MESSAGES: Record<McpHttpErrorCode, string> = {
   token_missing: '缺少 MCP 令牌：请求头需要 Authorization: Bearer dwm_…',
@@ -104,12 +109,73 @@ export const mcpAuth =
   };
 
 /**
- * 注册 MCP 服务。认证中间件之后的 JSON-RPC 处理（initialize / tools/list / tools/call / resources/*）
- * 由 @modelcontextprotocol/server 的无状态 handler 负责（M3-C 后端模块 B 实现）；这里先占位。
+ * 注册 MCP 服务。认证中间件之后由 @modelcontextprotocol/server 的无状态 handler 负责
+ * （支持 2026-07-28 与 2025-era 无会话请求：initialize / tools/* / resources/* / ping）。
  */
 export const registerMcp = (app: Hono<Env>, ctx: AppContext) => {
-  app.use(MCP_PATH, mcpAuth(ctx));
-  app.all(MCP_PATH, (c) =>
-    c.json({ jsonrpc: '2.0', id: null, error: { code: -32601, message: 'MCP 服务尚未实现' } }, 501),
+  const handler = createMcpHandler(
+    (reqCtx) => {
+      const extra = reqCtx.authInfo?.extra as { principal: McpPrincipal; honoCtx: Context<Env> } | undefined;
+      if (!extra) throw new Error('缺少 MCP 认证上下文');
+      return createMcpServer(ctx, extra.principal, extra.honoCtx);
+    },
+    {
+      legacy: 'stateless',
+      maxRequestBodySize: MAX_MCP_BODY_BYTES,
+      onerror: (err) => {
+        console.error('MCP 处理错误：', scrubSecrets(err.message));
+      },
+    },
   );
+
+  app.use(MCP_PATH, mcpAuth(ctx));
+  app.all(MCP_PATH, async (c) => {
+    if (c.req.method !== 'POST') {
+      return c.json(
+        { jsonrpc: '2.0', id: null, error: { code: -32000, message: 'Method not allowed.' } },
+        405,
+        { Allow: 'POST' },
+      );
+    }
+    if (!isJsonContentType(c.req.header('content-type'))) {
+      return c.json(
+        {
+          jsonrpc: '2.0',
+          id: null,
+          error: { code: -32000, message: 'Unsupported Media Type: Content-Type must be application/json' },
+        },
+        415,
+      );
+    }
+    const contentLength = Number(c.req.header('content-length'));
+    if (Number.isFinite(contentLength) && contentLength > MAX_MCP_BODY_BYTES) {
+      return c.json(
+        {
+          jsonrpc: '2.0',
+          id: null,
+          error: { code: -32000, message: 'Payload Too Large: request body exceeds 1 MiB limit' },
+        },
+        413,
+      );
+    }
+    const principal = c.get('mcp');
+    const response = await handler.fetch(c.req.raw, {
+      authInfo: {
+        token: principal.tokenId,
+        clientId: principal.user.id,
+        scopes: [...principal.scopes],
+        extra: { principal, honoCtx: c },
+      },
+    });
+    if (response.headers.has('mcp-session-id')) {
+      const headers = new Headers(response.headers);
+      headers.delete('mcp-session-id');
+      return new Response(response.body, {
+        status: response.status,
+        statusText: response.statusText,
+        headers,
+      });
+    }
+    return response;
+  });
 };

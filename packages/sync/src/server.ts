@@ -30,6 +30,28 @@ export interface RoomState {
 
 export type Out = { to: '*' | (string & {}); msg: ToClient };
 
+export interface SimulateCommit {
+  n: number;
+  seq: number;
+  name: string;
+  changes: Commit['changes'];
+}
+
+export type SimulateResult =
+  | {
+      ok: true;
+      baseSeq: number;
+      headSeq: number;
+      model: Model;
+      commits: SimulateCommit[];
+    }
+  | {
+      ok: false;
+      failedIndex: number;
+      code: Rejection['code'];
+      message: string;
+    };
+
 class Reject extends Error {
   code: Rejection['code'];
   constructor(code: Rejection['code'], message: string) {
@@ -166,6 +188,71 @@ export class Room {
   get versions(): Versions {
     return this.s.versions;
   }
+  processedOf(client: string): number {
+    return this.s.processed[client] ?? 0;
+  }
+
+  /**
+   * 在不修改房间内存状态与持久化存储的前提下，按顺序预演一批操作，用于干跑校验或原子批处理预检。
+   * 复用与 handle 一致的 reads 冲突检查及 execute 语义。
+   */
+  simulate(client: string, ops: Op[]): SimulateResult {
+    if (!client || client.toLowerCase() === SYSTEM_CLIENT) {
+      throw new Error('无效的客户端标识');
+    }
+    const baseSeq = this.s.seq;
+    if (ops.length === 0) {
+      return { ok: true, baseSeq, headSeq: baseSeq, model: clonePlain(this.s.model), commits: [] };
+    }
+    let simModel = clonePlain(this.s.model);
+    const simVersions: Versions = { ...this.s.versions };
+    let simSeq = baseSeq;
+    const simOutcome = new Map(this.outcome);
+    const simIndex = new MutableModelIndex(simModel);
+    const commits: SimulateCommit[] = [];
+    let done = this.s.processed[client] ?? 0;
+
+    for (let i = 0; i < ops.length; i++) {
+      const op = ops[i]!;
+      if (op.client !== client) {
+        throw new Error('模拟操作客户端不匹配');
+      }
+      if (op.n !== done + 1) {
+        throw new Error(`修改乱序：期望 ${done + 1}，收到 ${op.n}`);
+      }
+      try {
+        this.checkReadsAgainst(op, simModel, simVersions, simOutcome, false);
+        let result: ReturnType<typeof execute>;
+        try {
+          result = execute(simModel, op.name, op.args, simIndex);
+        } catch (e) {
+          if (e instanceof EditError) throw new Reject('invalid', e.message);
+          throw e;
+        }
+        const batch = result.changes.map((c) => ({
+          id: c.id,
+          prev: simModel.objects[c.id],
+          next: c.obj ? result.next.objects[c.id] : undefined,
+        }));
+        simIndex.applyBatch(result.next, batch);
+        simModel = result.next;
+        simSeq += 1;
+        for (const c of result.changes) {
+          if (c.obj) simVersions[c.id] = simSeq;
+          else delete simVersions[c.id];
+        }
+        simOutcome.set(`${client}:${op.n}`, simSeq);
+        done = op.n;
+        commits.push({ n: op.n, seq: simSeq, name: op.name, changes: result.changes });
+      } catch (e) {
+        if (!(e instanceof Reject)) throw e;
+        return { ok: false, failedIndex: i, code: e.code, message: e.message };
+      }
+    }
+
+    return { ok: true, baseSeq, headSeq: simSeq, model: simModel, commits };
+  }
+
   get stats(): RoomMemoryStats {
     return {
       log: this.s.log.length,
@@ -543,7 +630,16 @@ export class Room {
 
   /** 修改依据的对象如果之后被别人改过，就拒绝（先到先得） */
   private checkReads(op: Op) {
-    const s = this.s;
+    this.checkReadsAgainst(op, this.s.model, this.s.versions, this.outcome, true);
+  }
+
+  private checkReadsAgainst(
+    op: Op,
+    model: Model,
+    versions: Versions,
+    outcome: Map<string, number | 'rejected'>,
+    touchOutcome: boolean,
+  ) {
     const ownPendingPrefix = `p:${op.client}:`;
     for (const [id, seen] of op.reads) {
       let expected = seen;
@@ -552,16 +648,18 @@ export class Room {
           throw new Reject('dependency', '依赖的修改不存在');
         }
         const outcomeKey = seen.slice(2);
-        const o = this.outcome.get(outcomeKey);
+        const o = outcome.get(outcomeKey);
         if (o === undefined) throw new Reject('dependency', '依赖的修改不存在');
-        // 命中后刷新到最近位置，保护同一客户端流水线未确认操作对前序结果的持续引用
-        this.outcome.delete(outcomeKey);
-        this.outcome.set(outcomeKey, o);
+        if (touchOutcome) {
+          // 命中后刷新到最近位置，保护同一客户端流水线未确认操作对前序结果的持续引用
+          outcome.delete(outcomeKey);
+          outcome.set(outcomeKey, o);
+        }
         if (o === 'rejected') throw new Reject('dependency', '依赖的上一个修改已被拒绝');
         expected = o;
       }
-      const cur = s.model.objects[id];
-      const now = cur ? (s.versions[id] ?? 0) : null;
+      const cur = model.objects[id];
+      const now = cur ? (versions[id] ?? 0) : null;
       const ok = expected === null ? now === null : now !== null && (now as number) <= (expected as number);
       if (!ok) {
         const who = this.lastWriter.get(id) ?? '其他人';
