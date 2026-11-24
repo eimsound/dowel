@@ -149,7 +149,7 @@ export const registerMcpTokens = (app: Hono<Env>, ctx: AppContext) => {
       if ((await countActiveMcpTokens(tx, me.id, nowIso)) >= MCP_TOKEN_MAX_ACTIVE_PER_USER) {
         throw new CodedHTTPException(
           422,
-          `每个账号最多同时持有 ${MCP_TOKEN_MAX_ACTIVE_PER_USER} 个有效 MCP 令牌，请先吊销不再使用的令牌`,
+          `每个用户最多同时持有 ${MCP_TOKEN_MAX_ACTIVE_PER_USER} 个有效 MCP 令牌，请先吊销不再使用的令牌`,
           'mcp_token_limit',
         );
       }
