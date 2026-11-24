@@ -47,6 +47,8 @@ export const ClipboardPayload = z.object({
   external: z.array(id).default([]),
   layout: z.record(z.string(), point).default({}),
   sections: z.record(z.string(), z.string()).default({}),
+  /** 复制时没有带上的不透明对象（视图、触发器等）个数，粘贴时提示 */
+  skippedOpaque: z.number().int().min(0).default(0),
 });
 export type ClipboardPayload = z.infer<typeof ClipboardPayload>;
 
