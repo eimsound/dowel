@@ -122,4 +122,6 @@ Authentication errors are returned as JSON `{ "error": "…", "code": "…" }` b
 | 403    | `password_change_required`, `mcp_disabled`, `forbidden`                             |
 | 429    | `rate_limited` (with `Retry-After`)                                                 |
 
+Browser-based clients sending a cross-origin `Origin` header are rejected before authentication by the origin guard with HTTP `403` and a generic `{ "error": "…" }` JSON body (without a `code` field, rather than `McpHttpErrorBody`).
+
 Tool failures are returned inside MCP as `isError: true` with a `code` such as `project_not_found`, `forbidden`, `scope_required`, `conflict`, `invalid`, `base_seq_ahead`, or `shadow_unavailable`.

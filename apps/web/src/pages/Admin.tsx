@@ -367,6 +367,14 @@ export const AdminUsers = () => {
       refresh();
     },
   });
+  const disable = useMutation({
+    mutationFn: (id: string) => api<AdminUser>('PATCH', `/api/admin/users/${id}`, { status: 'disabled' }),
+    onSuccess: () => {
+      setDisableTarget(null);
+      toast(t('adm.updated'));
+      refresh();
+    },
+  });
   const add = useMutation({
     mutationFn: () =>
       api<AdminUser>('POST', '/api/admin/users', {
@@ -383,6 +391,7 @@ export const AdminUsers = () => {
     },
   });
   const error = patch.error ?? add.error;
+  const userActionPending = patch.isPending || disable.isPending;
 
   return (
     <>
@@ -447,7 +456,7 @@ export const AdminUsers = () => {
                         className="select w-32"
                         aria-label={`${t('adm.role')} · ${u.username}`}
                         value={u.role}
-                        disabled={patch.isPending}
+                        disabled={userActionPending}
                         onChange={(e) =>
                           patch.mutate({ id: u.id, body: { role: e.target.value as InstanceRole } })
                         }
@@ -474,13 +483,16 @@ export const AdminUsers = () => {
                         <button
                           type="button"
                           className="btn sm"
-                          disabled={patch.isPending}
-                          onClick={() =>
+                          disabled={userActionPending}
+                          onClick={() => {
                             // 停用会吊销会话与全部 MCP 令牌，先确认；启用直接生效
-                            u.status === 'active'
-                              ? setDisableTarget(u)
-                              : patch.mutate({ id: u.id, body: { status: 'active' } })
-                          }
+                            if (u.status === 'active') {
+                              disable.reset();
+                              setDisableTarget(u);
+                            } else {
+                              patch.mutate({ id: u.id, body: { status: 'active' } });
+                            }
+                          }}
                         >
                           {t(u.status === 'active' ? 'adm.disable' : 'adm.enable')}
                         </button>
@@ -495,7 +507,7 @@ export const AdminUsers = () => {
                       <button
                         type="button"
                         className="btn sm"
-                        disabled={patch.isPending || u.id === me?.id}
+                        disabled={userActionPending || u.id === me?.id}
                         onClick={() => setResetTarget(u)}
                       >
                         {t('adm.resetPassword')}
@@ -607,19 +619,13 @@ export const AdminUsers = () => {
         open={!!disableTarget}
         onClose={() => {
           setDisableTarget(null);
-          patch.reset();
+          disable.reset();
         }}
         title={t('adm.disableTitle', { username: disableTarget?.username ?? '' })}
         confirmLabel={t('adm.disableConfirm')}
-        pending={patch.isPending}
-        error={patch.error?.message}
-        onConfirm={() =>
-          disableTarget &&
-          patch.mutate(
-            { id: disableTarget.id, body: { status: 'disabled' } },
-            { onSuccess: () => setDisableTarget(null) },
-          )
-        }
+        pending={disable.isPending}
+        error={disable.error?.message}
+        onConfirm={() => disableTarget && disable.mutate(disableTarget.id)}
       >
         {t('adm.disableBody')}
       </Confirm>

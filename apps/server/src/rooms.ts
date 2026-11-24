@@ -46,7 +46,7 @@ import { atOf } from './time.ts';
 
 export type { Role } from '@dowel/api';
 
-const SNAPSHOT_EVERY = 200;
+export const SNAPSHOT_EVERY = 200;
 const HISTORY_SUMMARY_LIMIT = 5;
 /** join 复查权限时因并发刷新触发重查的最大尝试次数 */
 const MAX_JOIN_VERIFY_ATTEMPTS = 8;
@@ -280,6 +280,14 @@ export interface ApplyMcpOpsOptions {
   baseSeq?: number;
   dryRun?: boolean;
   ops: ApplyMcpOpInput[];
+  /**
+   * 写事务提交前的回调（仅非 dryRun 且至少有 1 条提交时在同一个 DB 事务 `tx` 内调用）。
+   * 适合写入必须与本次提交同生共死的记录（例如 `auditIn(tx, ...)`）；回调抛错会回滚整批提交并恢复内存房间，不广播也不触发派生刷新。
+   */
+  onBeforeCommit?: (
+    tx: Db,
+    info: { seqFrom: number; seqTo: number; committed: { index: number; seq: number }[] },
+  ) => Promise<void>;
 }
 
 export interface ApplyMcpChangedItem {
@@ -2474,15 +2482,24 @@ export class Rooms {
             const allOuts: Out[] = [];
             for (const op of builtOps) {
               const outs = await r.room.handle(client, opts.user, { t: 'op', op }, { store });
+              let opCommitted = false;
               for (const o of outs) {
                 if (o.msg.t === 'reject') {
                   throw new Error(`预期预检通过的操作被拒绝：${o.msg.message}`);
                 }
+                if (o.msg.t === 'commit') opCommitted = true;
                 allOuts.push(o);
               }
+              if (opCommitted) await this.maybeSnapshot(tx, branchId, r.room);
             }
-            const committedOuts = allOuts.some((o) => o.msg.t === 'commit');
-            if (committedOuts) await this.maybeSnapshot(tx, branchId, r.room);
+            const committed = sim.commits.map((c, idx) => ({ index: idx, seq: c.seq }));
+            if (committed.length > 0 && opts.onBeforeCommit) {
+              await opts.onBeforeCommit(tx, {
+                seqFrom: committed[0]!.seq,
+                seqTo: committed.at(-1)!.seq,
+                committed,
+              });
+            }
             const changed = summarizeBatchChanges(beforeModel, r.room.model, sim.commits);
             return {
               kind: 'ok',
@@ -2491,7 +2508,7 @@ export class Rooms {
                 dryRun: false,
                 baseSeq: opts.baseSeq ?? sim.baseSeq,
                 seq: r.room.seq,
-                committed: sim.commits.map((c, idx) => ({ index: idx, seq: c.seq })),
+                committed,
                 refs: Object.fromEntries(refs),
                 changed,
                 model: structuredClone(r.room.model),

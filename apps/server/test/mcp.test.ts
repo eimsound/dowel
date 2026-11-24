@@ -20,6 +20,7 @@ import { newMcpToken } from '../src/mcp-tokens.ts';
 import { KeyedLimiter, LoginLimiter } from '../src/rate-limit.ts';
 import type { Extra, Peer } from '../src/rooms.ts';
 import { encrypt } from '../src/secrets.ts';
+import { type Shadow, ShadowUnavailableError } from '../src/shadow.ts';
 import { addTable, editModel, makeUser, PASSWORD } from './support.ts';
 
 process.env.DOWEL_SECRET ??= 'mcp-test-secret-key-0123456789abcdef';
@@ -973,40 +974,219 @@ describe.each([
   );
 
   test.skipIf(platform !== 'sqlite')(
-    'verify_migration 按用户（跨令牌）扣减 connectionLimiter 限流配额',
+    'verify_migration 对 SQLite 与前置配置类 ShadowError 不消耗配额，外部验证与界面共用用户限流桶',
     async () => {
-      const f = await setupEnv({ connectionLimiter: new KeyedLimiter({ limit: 2, windowMs: 60_000 }) });
-      const tok1 = await f.issueToken(f.alice.id, ['read', 'verify'], null, 'tok-1');
-      const tok2 = await f.issueToken(f.alice.id, ['read', 'verify'], null, 'tok-2');
+      // 1. SQLite（内存影子库）与未配置环境 / 生产禁止同实例等 preConnect ShadowError 不消耗连接配额
+      const limiter = new KeyedLimiter({ limit: 2, windowMs: 60_000 });
+      const f = await setupEnv({ connectionLimiter: limiter });
+      const tok = await f.issueToken(f.admin.id, ['read', 'verify'], null, 'tok-pre');
       await editModel(f.created.rooms, f.db, f.p2Id, (m) => {
         const sid = all(m, 'schema')[0]?.id ?? createSchema(m, 'main');
-        const tid = createTable(m, sid, 'rate_tbl');
+        const tid = createTable(m, sid, 'rate_sqlite_tbl');
         addColumn(m, tid, { name: 'id', type: 'integer', notNull: true });
       });
+      await addTable(f.created.rooms, f.db, f.p1Id, 'rate_pg_tbl');
 
-      const r1 = await f.callTool(tok1.token, 'verify_migration', {
-        project: f.p2Id,
+      for (let i = 0; i < 4; i++) {
+        const res = await f.callTool(tok.token, 'verify_migration', {
+          project: f.p2Id,
+          from: 'empty',
+          to: 'head',
+        });
+        expect(res.isError).toBeFalsy();
+      }
+      expect(limiter.keyCount).toBe(0);
+
+      for (let i = 0; i < 4; i++) {
+        const res = await f.callTool(tok.token, 'verify_migration', {
+          project: f.p1Id,
+          from: 'empty',
+          to: 'head',
+        });
+        expect(res.isError).toBe(true);
+        expect(res.structuredContent?.code).toBe('shadow_unavailable');
+      }
+      expect(limiter.keyCount).toBe(0);
+
+      await f.db.query(
+        `insert into environments (id, project_id, name, url_enc, production, allow_same_instance)
+         values ($1, $2, $3, $4, $5, $6)`,
+        [newId(), f.p1Id, 'prod-no-same', encrypt('postgres://u:p@127.0.0.1:5432/prod'), true, false],
+      );
+      for (let i = 0; i < 4; i++) {
+        const res = await f.callTool(tok.token, 'verify_migration', {
+          project: f.p1Id,
+          from: 'empty',
+          to: 'head',
+        });
+        expect(res.isError).toBe(true);
+        expect(res.structuredContent?.code).toBe('shadow_unavailable');
+      }
+      expect(limiter.keyCount).toBe(0);
+
+      // 2. 外部影子库验证按同一用户（跨 MCP 令牌 + 与界面 connectionLimit 共用桶）扣减配额
+      const sharedLimiter = new KeyedLimiter({ limit: 2, windowMs: 60_000 });
+      const fShared = await setupEnv({ connectionLimiter: sharedLimiter });
+      const tok1 = await fShared.issueToken(fShared.admin.id, ['read', 'verify'], null, 'tok-1');
+      const tok2 = await fShared.issueToken(fShared.admin.id, ['read', 'verify'], null, 'tok-2');
+      await addTable(fShared.created.rooms, fShared.db, fShared.p1Id, 'shared_rate_tbl');
+
+      const fakeShadow: Shadow = {
+        importSql: async () => {
+          throw new Error('not used');
+        },
+        verify: async () => ({
+          ok: true,
+          up: [],
+          down: [],
+          upDiff: [],
+          downDiff: [],
+          risks: [],
+          error: null,
+        }),
+        verifyScripts: async () => {
+          throw new Error('not used');
+        },
+        canonicalize: async () => [],
+        close: async () => {},
+      };
+      fShared.created.shadows.forProject = async () => ({ shadow: fakeShadow, label: 'pg-shadow' });
+
+      const r1 = await fShared.callTool(tok1.token, 'verify_migration', {
+        project: fShared.p1Id,
         from: 'empty',
         to: 'head',
       });
       expect(r1.isError).toBeFalsy();
 
-      // 使用同一个用户的第二个令牌同样共享用户额度
-      const r2 = await f.callTool(tok2.token, 'verify_migration', {
-        project: f.p2Id,
+      const r2 = await fShared.callTool(tok2.token, 'verify_migration', {
+        project: fShared.p1Id,
         from: 'empty',
         to: 'head',
       });
       expect(r2.isError).toBeFalsy();
 
-      // 第 3 次触发按用户限流
-      const r3 = await f.callTool(tok1.token, 'verify_migration', {
-        project: f.p2Id,
+      const r3 = await fShared.callTool(tok1.token, 'verify_migration', {
+        project: fShared.p1Id,
         from: 'empty',
         to: 'head',
       });
       expect(r3.isError).toBe(true);
       expect(r3.structuredContent?.code).toBe('rate_limited');
+
+      const uiCheck = await fShared.callHttp(
+        'POST',
+        '/api/connection-check',
+        { groupId: fShared.groupId, dialect: 'pg', url: 'postgres://u:p@127.0.0.1:1/db' },
+        fShared.adminCookie,
+      );
+      expect(uiCheck.status).toBe(429);
+
+      // 3. 真实连库类的 ShadowUnavailableError（非 preConnect）仍消耗配额
+      const errLimiter = new KeyedLimiter({ limit: 1, windowMs: 60_000 });
+      const fErr = await setupEnv({ connectionLimiter: errLimiter });
+      const tokErr = await fErr.issueToken(fErr.admin.id, ['read', 'verify'], null, 'tok-err');
+      await addTable(fErr.created.rooms, fErr.db, fErr.p1Id, 'err_rate_tbl');
+      fErr.created.shadows.forProject = async () => {
+        throw new ShadowUnavailableError('连接被拒绝');
+      };
+
+      const e1 = await fErr.callTool(tokErr.token, 'verify_migration', {
+        project: fErr.p1Id,
+        from: 'empty',
+        to: 'head',
+      });
+      expect(e1.isError).toBe(true);
+      expect(e1.structuredContent?.code).toBe('shadow_unavailable');
+
+      const e2 = await fErr.callTool(tokErr.token, 'verify_migration', {
+        project: fErr.p1Id,
+        from: 'empty',
+        to: 'head',
+      });
+      expect(e2.isError).toBe(true);
+      expect(e2.structuredContent?.code).toBe('rate_limited');
+    },
+  );
+
+  test.skipIf(platform !== 'sqlite')(
+    'apply_changes 审计写入失败时与提交原子回滚，不广播且重试不会重复创建对象',
+    async () => {
+      const f = await setupEnv();
+      const tokAlice = await f.issueToken(f.alice.id, ['read', 'write']);
+      const { peer, sent } = makePeer(f.alice);
+      await f.created.rooms.join(f.branch1, peer);
+
+      const publicSchemaId = all((await f.created.rooms.model(f.branch1)).model, 'schema')[0]!.id;
+      const ops = [
+        {
+          name: 'createTable',
+          args: { id: '$ref:t1', schema: publicSchemaId, name: 'audit_rollback_tbl' },
+        },
+      ];
+
+      await f.db.exec(`
+        create trigger fail_mcp_mutate_audit
+        before insert on audit_events
+        when new.action = 'model.mutate'
+        begin
+          select raise(abort, 'simulated audit failure');
+        end
+      `);
+      try {
+        const failRes = await f.callTool(tokAlice.token, 'apply_changes', {
+          project: f.p1Id,
+          baseSeq: 0,
+          ops,
+        });
+        expect(failRes.isError).toBe(true);
+        expect(failRes.structuredContent?.code).toBe('internal');
+
+        const commitsAfterFail = await f.db.query<{ seq: number }>(
+          'select seq from room_commits where branch_id = $1',
+          [f.branch1],
+        );
+        expect(commitsAfterFail).toHaveLength(0);
+
+        const stateAfterFail = await f.created.rooms.model(f.branch1);
+        expect(stateAfterFail.seq).toBe(0);
+        expect(all(stateAfterFail.model, 'table').map((t) => t.name)).not.toContain('audit_rollback_tbl');
+
+        expect(sent.filter((m) => m.t === 'commit')).toHaveLength(0);
+
+        const auditsAfterFail = await f.db.query<{ id: string }>(
+          "select id from audit_events where action = 'model.mutate'",
+        );
+        expect(auditsAfterFail).toHaveLength(0);
+      } finally {
+        await f.db.exec('drop trigger if exists fail_mcp_mutate_audit');
+      }
+
+      // 审计恢复后重试同批操作：仅提交一次、仅生成一张表、审计写入一条
+      const okRes = await f.callTool(tokAlice.token, 'apply_changes', {
+        project: f.p1Id,
+        baseSeq: 0,
+        ops,
+      });
+      expect(okRes.isError).toBeFalsy();
+      expect(okRes.structuredContent?.seq).toBe(1);
+
+      const stateAfterRetry = await f.created.rooms.model(f.branch1);
+      expect(stateAfterRetry.seq).toBe(1);
+      expect(all(stateAfterRetry.model, 'table').filter((t) => t.name === 'audit_rollback_tbl')).toHaveLength(
+        1,
+      );
+
+      const commitsAfterRetry = await f.db.query<{ seq: number }>(
+        'select seq from room_commits where branch_id = $1',
+        [f.branch1],
+      );
+      expect(commitsAfterRetry).toHaveLength(1);
+
+      const auditsAfterRetry = await f.db.query<{ id: string }>(
+        "select id from audit_events where action = 'model.mutate'",
+      );
+      expect(auditsAfterRetry).toHaveLength(1);
     },
   );
 });

@@ -6,6 +6,7 @@ import {
   type Column,
   columnsOf,
   type ForeignKey,
+  getDialect,
   type Index,
   mutators,
   type Obj,
@@ -35,7 +36,7 @@ import type { Context } from 'hono';
 import { z } from 'zod';
 
 import pkg from '../package.json' with { type: 'json' };
-import { audit } from './audit.ts';
+import { audit, auditIn } from './audit.ts';
 import { type Action, can, userActor } from './authz.ts';
 import { inList } from './db.ts';
 import { iso, loadVersionRefs, projectPlanOptions, sanitizeSummary, versionRef } from './envs.ts';
@@ -831,8 +832,9 @@ export const createMcpServer = (
         resolvedEnvName = envRow.name;
       }
 
-      const gate = ctx.connectionLimiter.attempt(`user:${principal.user.id}`);
-      if (!gate.allowed) {
+      const needsExternalShadow = getDialect(toRef.model.dialect).capabilities.requiresExternalShadow;
+      const gate = needsExternalShadow ? ctx.connectionLimiter.attempt(principal.user.id) : null;
+      if (gate && !gate.allowed) {
         return toolError('rate_limited', `影子库验证请求太频繁，请在 ${gate.retryAfterSeconds} 秒后重试`);
       }
 
@@ -842,6 +844,7 @@ export const createMcpServer = (
         shadowHandle = await ctx.shadows.forProject(row.id, resolvedEnvId);
       } catch (e) {
         if (e instanceof ShadowError) {
+          if (e.preConnect && gate?.allowed) gate.refund();
           await audit(
             ctx.db,
             honoCtx,
@@ -965,6 +968,30 @@ export const createMcpServer = (
         baseSeq: args.baseSeq,
         dryRun: args.dryRun,
         ops: args.ops,
+        onBeforeCommit: async (tx, info) => {
+          await auditIn(
+            tx,
+            honoCtx,
+            {
+              action: 'model.mutate',
+              actorKind: 'user',
+              actorId: principal.user.id,
+              targetKind: 'project',
+              targetId: row.id,
+              projectId: row.id,
+              data: {
+                via: 'mcp',
+                mcpToken: { id: principal.tokenId, name: principal.tokenName, prefix: principal.prefix },
+                projectId: row.id,
+                opCount: args.ops.length,
+                ops: args.ops.map((o) => o.name),
+                seqFrom: info.seqFrom,
+                seqTo: info.seqTo,
+              },
+            },
+            ctx.security,
+          );
+        },
       });
 
       if (!res.ok) {
@@ -972,31 +999,6 @@ export const createMcpServer = (
           ...(res.index !== undefined ? { index: res.index } : {}),
           currentSeq: res.currentSeq,
         });
-      }
-
-      if (!res.dryRun && res.committed.length > 0) {
-        await audit(
-          ctx.db,
-          honoCtx,
-          {
-            action: 'model.mutate',
-            actorKind: 'user',
-            actorId: principal.user.id,
-            targetKind: 'project',
-            targetId: row.id,
-            projectId: row.id,
-            data: {
-              via: 'mcp',
-              mcpToken: { id: principal.tokenId, name: principal.tokenName, prefix: principal.prefix },
-              projectId: row.id,
-              opCount: args.ops.length,
-              ops: args.ops.map((o) => o.name),
-              seqFrom: res.committed[0]!.seq,
-              seqTo: res.committed.at(-1)!.seq,
-            },
-          },
-          ctx.security,
-        );
       }
 
       return toolOk({

@@ -122,4 +122,6 @@ claude mcp add --transport http --scope user dowel https://dowel.example.com/api
 | 403    | `password_change_required`、`mcp_disabled`、`forbidden`                             |
 | 429    | `rate_limited`（带 `Retry-After`）                                                  |
 
+浏览器内客户端如果携带跨源 `Origin` 请求头，会在认证之前被来源校验拦截，返回 HTTP `403` 与通用的 `{ "error": "…" }` JSON（不含 `code` 字段，而不是 `McpHttpErrorBody`）。
+
 工具执行失败在 MCP 消息里以 `isError: true` 返回，`code` 如 `project_not_found`、`forbidden`、`scope_required`、`conflict`、`invalid`、`base_seq_ahead`、`shadow_unavailable`。
