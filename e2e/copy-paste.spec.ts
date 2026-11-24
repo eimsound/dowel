@@ -125,8 +125,8 @@ test('从画布修改历史复制表并粘贴到当前画布', async ({ browser 
 
   // 删除 products，再从历史快照里把它找回来
   await selectTable(page, 'products');
-  await inspector(page).getByRole('button', { name: '更多' }).click();
-  await page.getByRole('menuitem', { name: '删除表' }).click();
+  await inspector(page).getByRole('button', { name: '更多操作' }).click();
+  await page.getByText('删除表', { exact: true }).click();
   await page.getByRole('dialog').getByRole('button', { name: '删除表' }).click();
   await expect(tree(page).getByRole('button', { name: 'products', exact: true })).toHaveCount(0);
   await synced(page);

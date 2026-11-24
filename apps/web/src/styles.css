@@ -501,22 +501,23 @@ dialog::backdrop {
     font-weight: 500;
     color: var(--text-3);
   }
+  /* 10px 小字：颜色向正文色靠拢，保证在浅色底上对比度 ≥ 4.5:1（亮 / 暗两种配色） */
   .flag {
     padding: 0 4px;
     border-radius: var(--r-xs);
     background: var(--surface-active);
-    color: var(--text-3);
+    color: var(--text-2);
     font-family: var(--font-code);
     font-size: 10px;
     font-weight: 600;
     line-height: 16px;
   }
   .flag.pk {
-    color: var(--pk);
+    color: color-mix(in oklab, var(--pk) 75%, var(--text));
     background: color-mix(in oklab, var(--pk) 14%, transparent);
   }
   .flag.fk {
-    color: var(--fk);
+    color: color-mix(in oklab, var(--fk) 75%, var(--text));
     background: color-mix(in oklab, var(--fk) 14%, transparent);
   }
   .risk {
