@@ -28,6 +28,7 @@ nav = [
   ] },
   { "CI 与参考" = [
     { "CI HTTP API" = "api.md" },
+    { "AI 编程助手（MCP）" = "mcp.md" },
     { "CI 流水线集成" = "ci-action.md" },
     { "术语表" = "glossary.md" },
   ] },

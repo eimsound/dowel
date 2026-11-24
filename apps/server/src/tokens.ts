@@ -36,10 +36,16 @@ export interface ActiveTokenCacheOptions {
   maxEntries?: number;
   /** 时钟（测试可注入） */
   now?: () => number;
+  /**
+   * 哪张令牌表：ci_tokens（默认，归属列 project_id）或 mcp_tokens（M3-C，归属列 user_id）。
+   * 缓存条目里的 projectId 字段对 MCP 令牌存的是用户 ID（forgetProject 对应“按归属清理”）。
+   */
+  table?: 'ci_tokens' | 'mcp_tokens';
 }
 
 interface CachedTokenEntry {
   id: string;
+  /** 归属：CI 令牌是项目 ID，MCP 令牌是用户 ID */
   projectId: string;
   expiresAtMs: number;
 }
@@ -56,6 +62,7 @@ export class ActiveTokenCache {
   readonly maxEntries: number;
   private readonly db: Db;
   private readonly now: () => number;
+  private readonly table: 'ci_tokens' | 'mcp_tokens';
   private entries: Map<string, CachedTokenEntry> | null = null;
   private lastLoadedAt = Number.NEGATIVE_INFINITY;
   private dirty = false;
@@ -66,6 +73,7 @@ export class ActiveTokenCache {
     this.ttlMs = options.ttlMs ?? 15_000;
     this.maxEntries = options.maxEntries ?? 10_000;
     this.now = options.now ?? Date.now;
+    this.table = options.table ?? 'ci_tokens';
   }
 
   /** 是否在活跃令牌快照中且未过期（仅在来源 IP 已超失败限流上限时调用） */
@@ -143,8 +151,9 @@ export class ActiveTokenCache {
         projectId: string;
         expiresAt: unknown;
       }>(
-        `select token_hash as "tokenHash", id, project_id as "projectId", expires_at as "expiresAt"
-           from ci_tokens
+        `select token_hash as "tokenHash", id, ${this.table === 'mcp_tokens' ? 'user_id' : 'project_id'} as "projectId",
+                expires_at as "expiresAt"
+           from ${this.table}
           where revoked_at is null and expires_at > $1
           order by coalesce(last_used_at, created_at) desc
           limit $2`,

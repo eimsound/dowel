@@ -15,6 +15,7 @@ import { useEffect, useMemo } from 'react';
 import { useTranslation } from 'react-i18next';
 
 import { ApiError, api } from './api.ts';
+import { AccountMcp } from './components/McpTokens.tsx';
 import { AppShell } from './components/Shell.tsx';
 import { ChangePassword, ForgotPassword, Invite, OidcConfirm, Reset } from './pages/Account.tsx';
 import {
@@ -344,7 +345,7 @@ const newProjectRoute = createRoute({
   component: NewProject,
 });
 
-/** 个人设置（/account）：布局在 AccountLayout，五个分区是嵌套路由 */
+/** 个人设置（/account）：布局在 AccountLayout，六个分区是嵌套路由（含 M3-C 的 MCP 访问） */
 const accountRoute = createRoute({
   getParentRoute: () => rootRoute,
   path: '/account',
@@ -387,6 +388,7 @@ const routes = [
       component: AccountIdentities,
     }),
     createRoute({ getParentRoute: () => accountRoute, path: 'sessions', component: AccountSessions }),
+    createRoute({ getParentRoute: () => accountRoute, path: 'mcp', component: AccountMcp }),
     createRoute({
       getParentRoute: () => accountRoute,
       path: 'preferences',

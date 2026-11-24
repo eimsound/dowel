@@ -6,14 +6,16 @@ import {
   type CanvasHistoryList,
   type CanvasHistoryVersionRef,
   type CanvasSection,
+  MCP_REF_PATTERN,
   type Role,
   sanitizeSections,
 } from '@dowel/api';
-import type { Model, Obj } from '@dowel/core';
+import { EditError, type Model, MutableModelIndex, newId, type Obj, readsOf } from '@dowel/core';
 import type { Db } from '@dowel/engines';
 import {
   type Commit,
   emptyRoomState,
+  execute,
   isValidClientId,
   type Op,
   type Out,
@@ -21,6 +23,7 @@ import {
   Room,
   type RoomState,
   type RoomStore,
+  type SimulateCommit,
   SYSTEM_CLIENT,
   type ToClient,
   type ToServer,
@@ -43,7 +46,7 @@ import { atOf } from './time.ts';
 
 export type { Role } from '@dowel/api';
 
-const SNAPSHOT_EVERY = 200;
+export const SNAPSHOT_EVERY = 200;
 const HISTORY_SUMMARY_LIMIT = 5;
 /** join 复查权限时因并发刷新触发重查的最大尝试次数 */
 const MAX_JOIN_VERIFY_ATTEMPTS = 8;
@@ -264,6 +267,120 @@ export class WorkingChangedError extends Error {
     this.currentModel = currentModel;
   }
 }
+
+export interface ApplyMcpOpInput {
+  name: string;
+  args: unknown;
+}
+
+export interface ApplyMcpOpsOptions {
+  userId: string;
+  tokenId: string;
+  user: string;
+  baseSeq?: number;
+  dryRun?: boolean;
+  ops: ApplyMcpOpInput[];
+  /**
+   * 写事务提交前的回调（仅非 dryRun 且至少有 1 条提交时在同一个 DB 事务 `tx` 内调用）。
+   * 适合写入必须与本次提交同生共死的记录（例如 `auditIn(tx, ...)`）；回调抛错会回滚整批提交并恢复内存房间，不广播也不触发派生刷新。
+   */
+  onBeforeCommit?: (
+    tx: Db,
+    info: { seqFrom: number; seqTo: number; committed: { index: number; seq: number }[] },
+  ) => Promise<void>;
+}
+
+export interface ApplyMcpChangedItem {
+  id: string;
+  kind: Obj['kind'];
+  name: string;
+  deleted: boolean;
+}
+
+export type ApplyMcpOpsResult =
+  | {
+      ok: true;
+      dryRun: boolean;
+      baseSeq: number;
+      seq: number;
+      committed: { index: number; seq: number }[];
+      refs: Record<string, string>;
+      changed: ApplyMcpChangedItem[];
+      model: Model;
+    }
+  | {
+      ok: false;
+      index?: number;
+      currentSeq: number;
+      code: 'base_seq_ahead' | 'conflict' | 'invalid' | 'dependency';
+      message: string;
+    };
+
+/** 递归把参数里的 `$ref:<alias>` 占位符替换成整批共享的 UUIDv7（同 alias 同 ID，refs 键为去掉 `$ref:` 前缀的 alias） */
+const expandMcpRefs = (value: unknown, refs: Map<string, string>): unknown => {
+  if (typeof value === 'string') {
+    if (!MCP_REF_PATTERN.test(value)) return value;
+    const alias = value.slice(5);
+    let id = refs.get(alias);
+    if (!id) {
+      id = newId();
+      refs.set(alias, id);
+    }
+    return id;
+  }
+  if (Array.isArray(value)) {
+    return value.map((v) => expandMcpRefs(v, refs));
+  }
+  if (value && typeof value === 'object') {
+    const out: Record<string, unknown> = {};
+    for (const [k, v] of Object.entries(value)) {
+      out[k] = expandMcpRefs(v, refs);
+    }
+    return out;
+  }
+  return value;
+};
+
+const mcpTokenIdFromClient = (client: string): string | null => {
+  if (!client.startsWith('mcp:')) return null;
+  const parts = client.split(':');
+  // 支持 `mcp:${userId}:${tokenId}`（也兼容 `mcp:${tokenId}`）
+  return parts.length >= 3 ? parts[2] || null : parts[1] || null;
+};
+
+const summarizeBatchChanges = (
+  before: Model,
+  after: Model,
+  commits: SimulateCommit[],
+): ApplyMcpChangedItem[] => {
+  const firstCreated = new Map<string, Obj>();
+  const touchedOrder: string[] = [];
+  const seen = new Set<string>();
+  for (const c of commits) {
+    for (const ch of c.changes) {
+      if (!seen.has(ch.id)) {
+        seen.add(ch.id);
+        touchedOrder.push(ch.id);
+      }
+      if (ch.obj && !firstCreated.has(ch.id)) {
+        firstCreated.set(ch.id, ch.obj);
+      }
+    }
+  }
+  const items: ApplyMcpChangedItem[] = [];
+  for (const id of touchedOrder) {
+    const fin = after.objects[id];
+    if (fin) {
+      items.push({ id, kind: fin.kind, name: fin.name, deleted: false });
+      continue;
+    }
+    const prev = before.objects[id] ?? firstCreated.get(id);
+    if (prev) {
+      items.push({ id, kind: prev.kind, name: prev.name, deleted: true });
+    }
+  }
+  return items;
+};
 
 export class Rooms {
   private rooms = new Map<string, Promise<Loaded>>();
@@ -2168,6 +2285,266 @@ export class Rooms {
     }));
   }
 
+  /** 按快照与增量提交重建任意历史 seq 的模型（调用方需已验证 seq <= 当前最新 seq） */
+  private async loadModelFromSnapshot(db: Db, branchId: string, seq: number): Promise<Model | null> {
+    const [snapRow] = await db.query<{ seq: string | number; model: Model }>(
+      'select seq, model from room_snapshots where branch_id = $1 and seq <= $2 order by seq desc limit 1',
+      [branchId, seq],
+    );
+    if (!snapRow) return null;
+    const model = structuredClone(snapRow.model);
+    const snapSeq = Number(snapRow.seq);
+    if (snapSeq < seq) {
+      const commits = await db.query<{ seq: string | number; changes: Commit['changes'] }>(
+        'select seq, changes from room_commits where branch_id = $1 and seq > $2 and seq <= $3 order by seq',
+        [branchId, snapSeq, seq],
+      );
+      for (const c of commits) {
+        for (const ch of c.changes) {
+          if (ch.obj) model.objects[ch.id] = structuredClone(ch.obj);
+          else delete model.objects[ch.id];
+        }
+      }
+    }
+    return model;
+  }
+
+  /**
+   * 代表 MCP 令牌向工作副本应用一批原子操作（支持 baseSeq 冲突检测、`$ref:<alias>` 占位符与 `dryRun`）。
+   * 锁顺序与 WS 提交一致：withActiveRoomLock → DB 事务（PG `branches FOR UPDATE` + catchUpFrom）→ 释放锁后广播与触发派生刷新。
+   */
+  async applyMcpOps(branchId: string, opts: ApplyMcpOpsOptions): Promise<ApplyMcpOpsResult> {
+    const client = `mcp:${opts.userId}:${opts.tokenId}`;
+    const dryRun = !!opts.dryRun;
+    let loadedRef: Loaded | null = null;
+    let caughtUp: Commit[] = [];
+
+    type LockValue =
+      | { kind: 'err'; res: Extract<ApplyMcpOpsResult, { ok: false }> }
+      | { kind: 'dry'; res: Extract<ApplyMcpOpsResult, { ok: true }> }
+      | { kind: 'ok'; res: Extract<ApplyMcpOpsResult, { ok: true }>; outs: Out[] };
+
+    const planAndSimulate = async (
+      db: Db,
+      r: Loaded,
+    ): Promise<
+      | LockValue
+      | {
+          builtOps: Op[];
+          refs: Map<string, string>;
+          sim: Extract<ReturnType<Room['simulate']>, { ok: true }>;
+        }
+    > => {
+      const currentSeq = r.room.seq;
+      const effectiveBaseSeq = opts.baseSeq ?? currentSeq;
+      if (!Number.isInteger(effectiveBaseSeq) || effectiveBaseSeq < 0) {
+        return {
+          kind: 'err',
+          res: { ok: false, currentSeq, code: 'invalid', message: `无效的 baseSeq：${opts.baseSeq}` },
+        };
+      }
+      if (effectiveBaseSeq > currentSeq) {
+        return {
+          kind: 'err',
+          res: {
+            ok: false,
+            currentSeq,
+            code: 'base_seq_ahead',
+            message: `baseSeq (${effectiveBaseSeq}) 超过了当前最新版本号 (${currentSeq})`,
+          },
+        };
+      }
+
+      const baseModel =
+        effectiveBaseSeq === currentSeq
+          ? structuredClone(r.room.model)
+          : await this.loadModelFromSnapshot(db, branchId, effectiveBaseSeq);
+      if (!baseModel) {
+        return {
+          kind: 'err',
+          res: {
+            ok: false,
+            currentSeq,
+            code: 'conflict',
+            message: `历史版本 #${effectiveBaseSeq} 的快照已不可用，请基于最新 seq=${currentSeq} 重新读取后重试`,
+          },
+        };
+      }
+
+      const startN = r.room.processedOf(client) + 1;
+      const refs = new Map<string, string>();
+      const builtOps: Op[] = [];
+      let batchModel = structuredClone(baseModel);
+      const batchIndex = new MutableModelIndex(batchModel);
+      const pendingOpNById = new Map<string, number>();
+
+      for (let i = 0; i < opts.ops.length; i++) {
+        const input = opts.ops[i]!;
+        const n = startN + i;
+        const expandedArgs = expandMcpRefs(input.args, refs);
+        let execRes: ReturnType<typeof execute>;
+        try {
+          execRes = execute(batchModel, input.name, expandedArgs, batchIndex);
+        } catch (e) {
+          if (e instanceof EditError) {
+            return {
+              kind: 'err',
+              res: { ok: false, index: i, currentSeq, code: 'invalid', message: e.message },
+            };
+          }
+          throw e;
+        }
+        const readIds = new Set([
+          ...readsOf(baseModel, expandedArgs),
+          ...readsOf(batchModel, expandedArgs),
+          ...execRes.changes.map((c) => c.id),
+        ]);
+        const reads: Op['reads'] = [...readIds].sort().map((id) => {
+          const prevN = pendingOpNById.get(id);
+          if (prevN !== undefined) return [id, `p:${client}:${prevN}`];
+          if (id in baseModel.objects) return [id, effectiveBaseSeq];
+          return [id, null];
+        });
+        builtOps.push({ client, n, name: input.name, args: expandedArgs, reads });
+
+        const batch = execRes.changes.map((c) => ({
+          id: c.id,
+          prev: batchModel.objects[c.id],
+          next: c.obj ? execRes.next.objects[c.id] : undefined,
+        }));
+        batchIndex.applyBatch(execRes.next, batch);
+        batchModel = execRes.next;
+        for (const c of execRes.changes) pendingOpNById.set(c.id, n);
+      }
+
+      const sim = r.room.simulate(client, builtOps);
+      if (!sim.ok) {
+        return {
+          kind: 'err',
+          res: {
+            ok: false,
+            index: sim.failedIndex,
+            currentSeq,
+            code: sim.code,
+            message: sim.message,
+          },
+        };
+      }
+      return { builtOps, refs, sim };
+    };
+
+    let lockedValue: LockValue;
+    try {
+      const locked = await this.withActiveRoomLock(branchId, async (r): Promise<LockValue> => {
+        loadedRef = r;
+        caughtUp = [];
+        if (dryRun) {
+          const missed = r.dirty ? await this.reloadAndMissedLocked(branchId, r) : [];
+          const fresh = this.db.dialect === 'pg' ? await this.catchUpReadOnly(branchId, r) : [];
+          caughtUp = missed.length > 0 ? [...missed, ...fresh] : fresh;
+          const prepared = await planAndSimulate(this.db, r);
+          if ('kind' in prepared) return prepared;
+          const { refs, sim } = prepared;
+          const changed = summarizeBatchChanges(r.room.model, sim.model, sim.commits);
+          return {
+            kind: 'dry',
+            res: {
+              ok: true,
+              dryRun: true,
+              baseSeq: opts.baseSeq ?? r.room.seq,
+              seq: sim.headSeq,
+              committed: sim.commits.map((c, idx) => ({ index: idx, seq: c.seq })),
+              refs: Object.fromEntries(refs),
+              changed,
+              model: sim.model,
+            },
+          };
+        }
+
+        if (r.dirty) await this.reloadLocked(branchId, r);
+        let mutated = false;
+        try {
+          return await this.db.transaction(async (tx): Promise<LockValue> => {
+            if (this.db.dialect === 'pg') {
+              const [branch] = await tx.query<{ id: string }>(
+                'select id from branches where id = $1 for update',
+                [branchId],
+              );
+              if (!branch) throw new Error(`分支 ${branchId} 不存在`);
+              caughtUp = await this.catchUpFrom(tx, branchId, r);
+            }
+            const prepared = await planAndSimulate(tx, r);
+            if ('kind' in prepared) return prepared;
+            const { builtOps, refs, sim } = prepared;
+            const beforeModel = r.room.model;
+            const store = this.makeStore(tx, branchId);
+            mutated = true;
+            const allOuts: Out[] = [];
+            for (const op of builtOps) {
+              const outs = await r.room.handle(client, opts.user, { t: 'op', op }, { store });
+              let opCommitted = false;
+              for (const o of outs) {
+                if (o.msg.t === 'reject') {
+                  throw new Error(`预期预检通过的操作被拒绝：${o.msg.message}`);
+                }
+                if (o.msg.t === 'commit') opCommitted = true;
+                allOuts.push(o);
+              }
+              if (opCommitted) await this.maybeSnapshot(tx, branchId, r.room);
+            }
+            const committed = sim.commits.map((c, idx) => ({ index: idx, seq: c.seq }));
+            if (committed.length > 0 && opts.onBeforeCommit) {
+              await opts.onBeforeCommit(tx, {
+                seqFrom: committed[0]!.seq,
+                seqTo: committed.at(-1)!.seq,
+                committed,
+              });
+            }
+            const changed = summarizeBatchChanges(beforeModel, r.room.model, sim.commits);
+            return {
+              kind: 'ok',
+              res: {
+                ok: true,
+                dryRun: false,
+                baseSeq: opts.baseSeq ?? sim.baseSeq,
+                seq: r.room.seq,
+                committed,
+                refs: Object.fromEntries(refs),
+                changed,
+                model: structuredClone(r.room.model),
+              },
+              outs: allOuts,
+            };
+          });
+        } catch (err) {
+          if (mutated) {
+            r.dirty = true;
+            await this.reloadLocked(branchId, r).catch(() => {});
+          }
+          throw err;
+        }
+      });
+      loadedRef = locked.r;
+      lockedValue = locked.value;
+    } catch (err) {
+      if (loadedRef && caughtUp.length) this.broadcastCommits(loadedRef, caughtUp);
+      throw err;
+    }
+
+    if (loadedRef && caughtUp.length) this.broadcastCommits(loadedRef, caughtUp);
+    if (lockedValue.kind !== 'ok') return lockedValue.res;
+    for (const o of lockedValue.outs) {
+      if (o.msg.t === 'commit') {
+        for (const p of loadedRef.peers) this.safeSend(p, this.forPeer(p, o.msg));
+      }
+    }
+    if (lockedValue.outs.some((o) => o.msg.t === 'commit')) {
+      this.onCommit(branchId);
+      await this.publish({ t: 'room.commit', branchId, seq: lockedValue.res.seq });
+    }
+    return lockedValue.res;
+  }
+
   /**
    * 重建任意 seq（含 0）的完整模型：从不大于 seq 的最新快照出发，按序重放后续提交。
    * seq < 0 或超过当前最新 seq 时抛 404。
@@ -2180,25 +2557,8 @@ export class Rooms {
     if (!Number.isInteger(seq) || seq < 0 || seq > snap.currentSeq)
       throw new HTTPException(404, { message: `修改记录 #${seq} 不存在` });
     if (snap.currentModel) return snap.currentModel;
-    const [snapRow] = await this.db.query<{ seq: string | number; model: Model }>(
-      'select seq, model from room_snapshots where branch_id = $1 and seq <= $2 order by seq desc limit 1',
-      [branchId, seq],
-    );
-    if (!snapRow) throw new HTTPException(404, { message: `修改记录 #${seq} 缺少可用快照` });
-    const model = structuredClone(snapRow.model);
-    const snapSeq = Number(snapRow.seq);
-    if (snapSeq < seq) {
-      const commits = await this.db.query<{ seq: string | number; changes: Commit['changes'] }>(
-        'select seq, changes from room_commits where branch_id = $1 and seq > $2 and seq <= $3 order by seq',
-        [branchId, snapSeq, seq],
-      );
-      for (const c of commits) {
-        for (const ch of c.changes) {
-          if (ch.obj) model.objects[ch.id] = structuredClone(ch.obj);
-          else delete model.objects[ch.id];
-        }
-      }
-    }
+    const model = await this.loadModelFromSnapshot(this.db, branchId, seq);
+    if (!model) throw new HTTPException(404, { message: `修改记录 #${seq} 缺少可用快照` });
     return model;
   }
 
@@ -2253,6 +2613,34 @@ export class Rooms {
     };
   }
 
+  private async mcpPrefixesFor(clients: string[]): Promise<Map<string, string>> {
+    const tokenIds = [
+      ...new Set(clients.map(mcpTokenIdFromClient).filter((id): id is string => id !== null)),
+    ];
+    const prefixes = new Map<string, string>();
+    if (tokenIds.length > 0) {
+      const rows = await this.db.query<{ id: string; prefix: string }>(
+        `select id, prefix from mcp_tokens where id in (${inList(tokenIds)})`,
+        tokenIds,
+      );
+      for (const t of rows) prefixes.set(t.id, t.prefix);
+    }
+    return prefixes;
+  }
+
+  private mcpHistoryMeta(
+    client: string,
+    prefixes: Map<string, string>,
+  ): Pick<CanvasHistoryEntry, 'via' | 'mcpTokenPrefix'> {
+    if (!client.startsWith('mcp:')) return {};
+    const tokenId = mcpTokenIdFromClient(client);
+    const prefix = tokenId ? prefixes.get(tokenId) : undefined;
+    return {
+      via: 'mcp',
+      ...(prefix ? { mcpTokenPrefix: prefix } : {}),
+    };
+  }
+
   /** 分页倒序查询画布修改历史；翻到末尾时附带 seq = 0 初始状态，并匹配已发布版本标记 */
   async listHistory(
     branchId: string,
@@ -2271,6 +2659,7 @@ export class Rooms {
 
     type CommitRow = {
       seq: string | number;
+      client: string;
       user_name: string;
       op_name: string | null;
       changes: Commit['changes'];
@@ -2279,7 +2668,7 @@ export class Rooms {
     const rows =
       beforeSeq !== undefined
         ? await this.db.query<CommitRow>(
-            `select seq, user_name, op_name, changes, created_at
+            `select seq, client, user_name, op_name, changes, created_at
                from room_commits
               where branch_id = $1 and seq < $2
               order by seq desc
@@ -2287,7 +2676,7 @@ export class Rooms {
             [branchId, beforeSeq, limit],
           )
         : await this.db.query<CommitRow>(
-            `select seq, user_name, op_name, changes, created_at
+            `select seq, client, user_name, op_name, changes, created_at
                from room_commits
               where branch_id = $1
               order by seq desc
@@ -2298,9 +2687,12 @@ export class Rooms {
     const includeInit = rows.length < limit;
     const seqs = rows.map((row) => Number(row.seq));
     if (includeInit) seqs.push(0);
-    const versions = seqs.length
-      ? await this.versionsInRange(branchId, Math.min(...seqs), Math.max(...seqs))
-      : new Map<number, CanvasHistoryVersionRef>();
+    const [versions, mcpPrefixes] = await Promise.all([
+      seqs.length
+        ? this.versionsInRange(branchId, Math.min(...seqs), Math.max(...seqs))
+        : Promise.resolve(new Map<number, CanvasHistoryVersionRef>()),
+      this.mcpPrefixesFor(rows.map((r) => r.client)),
+    ]);
 
     // 从当前模型与本页提交收集对象名，便于为删除操作解析对象名称
     const knownObjects: Record<string, Obj> = { ...(currentObjects ?? {}) };
@@ -2319,6 +2711,7 @@ export class Rooms {
         summary: summarizeChanges(row.changes, knownNames, knownObjects),
         isCurrent: seq === currentSeq,
         version: versions.get(seq) ?? null,
+        ...this.mcpHistoryMeta(row.client, mcpPrefixes),
       };
     });
 
@@ -2349,15 +2742,17 @@ export class Rooms {
     }
     const [row] = await this.db.query<{
       seq: string | number;
+      client: string;
       user_name: string;
       op_name: string | null;
       changes: Commit['changes'];
       created_at: unknown;
     }>(
-      'select seq, user_name, op_name, changes, created_at from room_commits where branch_id = $1 and seq = $2',
+      'select seq, client, user_name, op_name, changes, created_at from room_commits where branch_id = $1 and seq = $2',
       [branchId, seq],
     );
     if (!row) throw new HTTPException(404, { message: `修改记录 #${seq} 不存在` });
+    const mcpPrefixes = await this.mcpPrefixesFor([row.client]);
 
     const knownObjects: Record<string, Obj> = {
       ...(context?.prevModel?.objects ?? {}),
@@ -2374,6 +2769,7 @@ export class Rooms {
       summary: summarizeChanges(row.changes, knownNames, knownObjects),
       isCurrent: seq === currentSeq,
       version: versions.get(seq) ?? null,
+      ...this.mcpHistoryMeta(row.client, mcpPrefixes),
     };
   }
 

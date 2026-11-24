@@ -16,7 +16,7 @@ import {
 } from '../src/bus.ts';
 import { createApp, openPlatformDb, type PlatformDb } from '../src/index.ts';
 import { effectiveProjectRole } from '../src/roles.ts';
-import { type Peer, Rooms } from '../src/rooms.ts';
+import { type Peer, Rooms, SNAPSHOT_EVERY } from '../src/rooms.ts';
 import { makeUser, PASSWORD } from './support.ts';
 
 let db: PlatformDb;
@@ -1753,4 +1753,81 @@ test('远端 room.layout 不重置本地空闲倒计时；join 异步核验抛�
     testRooms.close();
     await testRooms.flush();
   }
+});
+
+test('applyMcpOps 批量跨越 SNAPSHOT_EVERY 时写入该点位快照', async () => {
+  const branchSnap = `${branchId}-mcp-snapshot`;
+  await db.query("insert into branches (id, project_id, name) values ($1, $2, 'mcp-snapshot')", [
+    branchSnap,
+    pid,
+  ]);
+  await rooms.init(branchSnap, model);
+
+  let currentSeq = 0;
+  let nextIdx = 1;
+  const targetBeforeCross = SNAPSHOT_EVERY - 5;
+  while (currentSeq < targetBeforeCross) {
+    const count = Math.min(100, targetBeforeCross - currentSeq);
+    const ops = Array.from({ length: count }, () => {
+      const idx = nextIdx++;
+      return {
+        name: 'createTable',
+        args: { id: `$ref:t_${idx}`, schema: schemaId, name: `snap_t_${idx}` },
+      };
+    });
+    const r = await rooms.applyMcpOps(branchSnap, {
+      userId: member.id,
+      tokenId: 'tok-snap',
+      user: member.name,
+      baseSeq: currentSeq,
+      ops,
+    });
+    expect(r.ok).toBe(true);
+    if (r.ok) currentSeq = r.seq;
+  }
+
+  expect(currentSeq).toBe(SNAPSHOT_EVERY - 5);
+  const snapsBefore = await db.query<{ seq: string | number }>(
+    'select seq from room_snapshots where branch_id = $1 order by seq',
+    [branchSnap],
+  );
+  expect(snapsBefore.map((s) => Number(s.seq))).toEqual([0]);
+
+  const crossOps = Array.from({ length: 10 }, () => {
+    const idx = nextIdx++;
+    return {
+      name: 'createTable',
+      args: { id: `$ref:t_${idx}`, schema: schemaId, name: `snap_t_${idx}` },
+    };
+  });
+  const crossRes = await rooms.applyMcpOps(branchSnap, {
+    userId: member.id,
+    tokenId: 'tok-snap',
+    user: member.name,
+    baseSeq: currentSeq,
+    ops: crossOps,
+  });
+  expect(crossRes.ok).toBe(true);
+  if (crossRes.ok) expect(crossRes.seq).toBe(SNAPSHOT_EVERY + 5);
+
+  const snapsAfter = await db.query<{ seq: string | number; model: Model }>(
+    'select seq, model from room_snapshots where branch_id = $1 order by seq',
+    [branchSnap],
+  );
+  expect(snapsAfter.map((s) => Number(s.seq))).toEqual([0, SNAPSHOT_EVERY]);
+  const snapAtEvery = snapsAfter.find((s) => Number(s.seq) === SNAPSHOT_EVERY)!;
+  const snapTableNames = new Set(all(snapAtEvery.model, 'table').map((t) => t.name));
+  expect(snapTableNames.has(`snap_t_${SNAPSHOT_EVERY}`)).toBe(true);
+  expect(snapTableNames.has(`snap_t_${SNAPSHOT_EVERY + 1}`)).toBe(false);
+  expect(snapTableNames.has(`snap_t_${SNAPSHOT_EVERY + 5}`)).toBe(false);
+
+  const atEvery = await rooms.modelAt(branchSnap, SNAPSHOT_EVERY);
+  const atEveryNames = new Set(all(atEvery, 'table').map((t) => t.name));
+  expect(atEveryNames.has(`snap_t_${SNAPSHOT_EVERY}`)).toBe(true);
+  expect(atEveryNames.has(`snap_t_${SNAPSHOT_EVERY + 1}`)).toBe(false);
+
+  const atMid = await rooms.modelAt(branchSnap, SNAPSHOT_EVERY + 3);
+  const atMidNames = new Set(all(atMid, 'table').map((t) => t.name));
+  expect(atMidNames.has(`snap_t_${SNAPSHOT_EVERY + 3}`)).toBe(true);
+  expect(atMidNames.has(`snap_t_${SNAPSHOT_EVERY + 4}`)).toBe(false);
 });

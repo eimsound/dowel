@@ -45,6 +45,7 @@ import { useProject } from '../project.tsx';
 import type { Layout } from '../workspace.ts';
 import { Canvas, shortType, typeLabel } from './Canvas.tsx';
 import { DiffList } from './ExecDialog.tsx';
+import { McpBadge } from './McpTokens.tsx';
 import { Modal } from './Modal.tsx';
 import { SqlView } from './SqlView.tsx';
 import { useToast } from './Toasts.tsx';
@@ -801,6 +802,7 @@ export const CanvasHistory = ({
                               )}
                             >
                               <span className="truncate">{actor}</span>
+                              {entry.via === 'mcp' && <McpBadge />}
                               <time dateTime={entry.at} className="shrink-0">
                                 {formatTime(entry.at)}
                               </time>
@@ -892,6 +894,14 @@ export const CanvasHistory = ({
                           <span className="font-medium text-text">{opText(detail.entry.opName)}</span>
                           <span>·</span>
                           <span>{detail.entry.user || t('hist.initialUser')}</span>
+                          {detail.entry.via === 'mcp' && (
+                            <>
+                              <McpBadge />
+                              {detail.entry.mcpTokenPrefix && (
+                                <span className="font-mono">{detail.entry.mcpTokenPrefix}…</span>
+                              )}
+                            </>
+                          )}
                           <span>·</span>
                           <time dateTime={detail.entry.at}>{formatTime(detail.entry.at)}</time>
                           {detail.entry.seq > 0 && (
