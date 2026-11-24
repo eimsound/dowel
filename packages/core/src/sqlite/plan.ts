@@ -342,8 +342,8 @@ export const sqlitePlan = (from: Model, to: Model): Step[] => {
           transactional === undefined ? { kind, target, sql } : { kind, target, sql, transactional },
         );
 
-      const inFrom = (id: string) => id in from.objects;
-      const inTo = (id: string) => id in to.objects;
+      const inFrom = (id: string) => Object.hasOwn(from.objects, id);
+      const inTo = (id: string) => Object.hasOwn(to.objects, id);
 
       // 维护当前真实表名与已占用名，保证临时名永不冲突
       const usedNamesLower = new Set<string>();

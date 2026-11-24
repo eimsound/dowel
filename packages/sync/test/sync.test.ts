@@ -19,6 +19,7 @@ import {
   isValidClientId,
   memoryStore,
   type Op,
+  opReads,
   type Rejection,
   Room,
   SyncClient,
@@ -1346,5 +1347,120 @@ describe('Room.processedOf 与 Room.simulate', () => {
     expect(Object.keys(room.model.objects).sort()).toEqual(['s1', 't1']);
     expect(room.processedOf('mcp:t1')).toBe(0);
     expect(store.commits).toHaveLength(2);
+  });
+});
+
+// #87：参数文本恰好是 Object.prototype 上的名字时，不能被当作对象依赖，也不能导致冲突误判
+describe('原型属性名不被当作对象依赖', () => {
+  const PROTO_OPS: [string, string, Record<string, unknown>][] = [
+    ['注释 toString', 'setComment', { id: 't1', comment: 'toString' }],
+    ['表名 constructor', 'renameTable', { id: 't1', name: 'constructor' }],
+    ['列名 valueOf', 'addColumn', { table: 't1', column: { id: 'c2', name: 'valueOf', type: 'text' } }],
+    [
+      '枚举值 hasOwnProperty',
+      'createEnum',
+      { id: 'e1', schema: 's1', name: 'status', values: ['hasOwnProperty'] },
+    ],
+  ];
+  const PROTO_KEYS = new Set(['constructor', 'toString', 'valueOf', 'hasOwnProperty', '__proto__']);
+  const json = <T>(x: T): T => JSON.parse(JSON.stringify(x)) as T;
+
+  /** 客户端与房间之间只用 JSON 传消息（与 WebSocket 一致） */
+  const jsonWire = async () => {
+    const room = new Room(emptyRoomState(emptyModel()), memoryStore());
+    const c = new SyncClient('c1', emptyModel());
+    const outbox: ToServer[] = [];
+    const sent: Op[] = [];
+    c.send = (msg) => outbox.push(json(msg));
+    const flush = async () => {
+      while (outbox.length) {
+        const msg = outbox.shift()!;
+        if (msg.t === 'op') sent.push(msg.op);
+        for (const o of await room.handle('c1', 'alice', msg))
+          if (o.to === '*' || o.to === 'c1') c.receive(json(o.msg));
+      }
+    };
+    c.connect();
+    await flush();
+    c.mutate('createSchema', { id: 's1', name: 'public' });
+    c.mutate('createTable', { id: 't1', schema: 's1', name: 'users' });
+    c.mutate('addColumn', { table: 't1', column: { id: 'c1', name: 'email', type: 'text' } });
+    await flush();
+    sent.length = 0;
+    return { room, c, flush, sent };
+  };
+
+  test.each(PROTO_OPS)('opReads 不包含原型属性名：%s', async (_, name, args) => {
+    const { room } = await jsonWire();
+    const { changes } = execute(room.model, name, args);
+    const reads = opReads(room.model, room.versions, args, changes);
+    for (const [id, v] of reads) {
+      expect(PROTO_KEYS.has(id)).toBe(false);
+      expect(typeof v === 'function').toBe(false);
+    }
+    expect(json(reads)).toEqual(reads);
+  });
+
+  test.each(PROTO_OPS)('SyncClient → JSON → Room.handle 正常提交：%s', async (_, name, args) => {
+    const { room, c, flush, sent } = await jsonWire();
+    const seq = room.seq;
+    c.mutate(name, args);
+    await flush();
+    expect(c.notices).toEqual([]);
+    expect(room.seq).toBe(seq + 1);
+    expect(sent).toHaveLength(1);
+    for (const [id] of sent[0]!.reads) expect(PROTO_KEYS.has(id)).toBe(false);
+    expect(same(c.view, room.model)).toBe(true);
+  });
+
+  test('basisOf 不为原型属性名生成版本', async () => {
+    const { c } = await jsonWire();
+    expect(c.basisOf(['t1', ...PROTO_KEYS])).toEqual({ t1: c.viewVersions.t1 });
+    // 草稿 basis 里带原型属性名也不会被当作依据
+    c.mutate('setComment', { id: 't1', comment: 'toString' }, json({ t1: c.viewVersions.t1! }));
+    expect(c.pending.at(-1)!.reads.map(([id]) => id)).toEqual(['t1']);
+  });
+
+  test('Room.handle：旧客户端经 JSON 发来的 [toString, null] 依据不会误判冲突', async () => {
+    const { room } = await jsonWire();
+    const outs = await room.handle('c2', 'bob', {
+      t: 'op',
+      op: {
+        client: 'c2',
+        n: 1,
+        name: 'setComment',
+        args: { id: 't1', comment: 'toString' },
+        reads: [
+          ['t1', room.versions.t1!],
+          ['toString', null],
+          ['constructor', null],
+        ],
+      },
+    });
+    expect(outs.map((o) => o.msg.t)).toEqual(['commit']);
+    expect(room.model.objects.t1!.comment).toBe('toString');
+  });
+
+  test('Room.simulate：原型属性名作为参数文本时不误报冲突', async () => {
+    const { room } = await jsonWire();
+    // 与 MCP 批量路径一致：批内前序操作写过的对象依赖 p:<client>:<n>，其余依赖房间版本
+    let model = room.model;
+    const versions: Versions = { ...room.versions };
+    const ops: Op[] = PROTO_OPS.map(([, name, args], i) => {
+      const n = i + 1;
+      const { next, changes } = execute(model, name, args);
+      const reads = json(opReads(model, versions, args, changes));
+      model = next;
+      for (const c of changes) versions[c.id] = `p:mcp:t1:${n}`;
+      return { client: 'mcp:t1', n, name, args, reads };
+    });
+    for (const op of ops) for (const [id] of op.reads) expect(PROTO_KEYS.has(id)).toBe(false);
+    const res = room.simulate('mcp:t1', ops);
+    expect(res).toMatchObject({ ok: true });
+    if (!res.ok) return;
+    expect(res.commits).toHaveLength(PROTO_OPS.length);
+    expect(res.model.objects.t1).toMatchObject({ name: 'constructor', comment: 'toString' });
+    expect(res.model.objects.c2).toMatchObject({ name: 'valueOf' });
+    expect(res.model.objects.e1).toMatchObject({ values: ['hasOwnProperty'] });
   });
 });

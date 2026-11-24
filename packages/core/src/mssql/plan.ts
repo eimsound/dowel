@@ -218,8 +218,8 @@ export const mssqlPlan = (from: Model, to: Model, opts?: MssqlPlanOptions): Step
       const steps: Step[] = [];
       const emit = (kind: string, target: string, sql: string) => steps.push({ kind, target, sql });
 
-      const inFrom = (id: string) => id in from.objects;
-      const inTo = (id: string) => id in to.objects;
+      const inFrom = (id: string) => Object.hasOwn(from.objects, id);
+      const inTo = (id: string) => Object.hasOwn(to.objects, id);
       const removed = Object.values(from.objects).filter((o) => !inTo(o.id));
       const added = Object.values(to.objects).filter((o) => !inFrom(o.id));
       const common = Object.values(to.objects).filter((o) => inFrom(o.id));
@@ -742,7 +742,7 @@ export const mssqlPlan = (from: Model, to: Model, opts?: MssqlPlanOptions): Step
 
       // ───── P4 删表 ─────
       for (const o of removed) {
-        if (o.kind !== 'table' || !(o.id in cur.objects)) continue;
+        if (o.kind !== 'table' || !Object.hasOwn(cur.objects, o.id)) continue;
         emit('dropTable', o.id, `DROP TABLE ${T(o.id)}`);
         for (const k of Object.values(cur.objects)) {
           if ('parent' in k && k.parent === o.id) delete cur.objects[k.id];
@@ -752,7 +752,7 @@ export const mssqlPlan = (from: Model, to: Model, opts?: MssqlPlanOptions): Step
 
       // ───── P5 删列（计算列先删，普通列后删） ─────
       const colsToDrop = removed
-        .filter((o): o is Column => o.kind === 'column' && o.id in cur.objects)
+        .filter((o): o is Column => o.kind === 'column' && Object.hasOwn(cur.objects, o.id))
         .sort((x, y) => (x.generated ? 0 : 1) - (y.generated ? 0 : 1));
       for (const o of colsToDrop) {
         const c = get(cur, o.id, 'column');
@@ -763,18 +763,18 @@ export const mssqlPlan = (from: Model, to: Model, opts?: MssqlPlanOptions): Step
 
       // ───── P5c 删除早期不透明对象（已移除或变更的）、需重建的序列及已移除序列（必须在 P6b schema 改名与 P10 建表前完成） ─────
       const earlyDrops = all(from, 'opaque').filter(
-        (o) => !isLate(o) && (isRemoved(o.id) || opaqueChanged.has(o.id)) && o.id in cur.objects,
+        (o) => !isLate(o) && (isRemoved(o.id) || opaqueChanged.has(o.id)) && Object.hasOwn(cur.objects, o.id),
       );
       for (const o of topo(earlyDrops).reverse()) dropOpaque(get(cur, o.id, 'opaque'));
 
       for (const id of seqRebuild) {
-        if (!(id in cur.objects)) continue;
+        if (!Object.hasOwn(cur.objects, id)) continue;
         get(cur, id, 'sequence');
         emit('dropSequence', id, `DROP SEQUENCE ${S(id)}`);
         delete cur.objects[id];
       }
       for (const o of removed) {
-        if (o.kind !== 'sequence' || !(o.id in cur.objects)) continue;
+        if (o.kind !== 'sequence' || !Object.hasOwn(cur.objects, o.id)) continue;
         emit('dropSequence', o.id, `DROP SEQUENCE ${S(o.id)}`);
         delete cur.objects[o.id];
       }
@@ -838,7 +838,7 @@ export const mssqlPlan = (from: Model, to: Model, opts?: MssqlPlanOptions): Step
 
       // 阶段 1：疏散所有与待新建或待改名目标名冲突的待删非 dbo schema
       for (const o of removed) {
-        if (o.kind !== 'schema' || !(o.id in cur.objects)) continue;
+        if (o.kind !== 'schema' || !Object.hasOwn(cur.objects, o.id)) continue;
         const c = get(cur, o.id, 'schema');
         const low = c.name.toLowerCase();
         if (low === 'dbo' || !neededTargets.has(low)) continue;
@@ -1093,14 +1093,14 @@ export const mssqlPlan = (from: Model, to: Model, opts?: MssqlPlanOptions): Step
         (o) => !isLate(o) && (!inFrom(o.id) || opaqueChanged.has(o.id)),
       );
       for (const o of topo(earlyCreates)) {
-        if (inFrom(o.id) && o.id in cur.objects) dropOpaque(get(cur, o.id, 'opaque'));
+        if (inFrom(o.id) && Object.hasOwn(cur.objects, o.id)) dropOpaque(get(cur, o.id, 'opaque'));
         createOpaque(o);
       }
 
       // ───── P9 建序列、改序列选项 ─────
       for (const o of [...added, ...common]) {
         if (o.kind !== 'sequence') continue;
-        if (!(o.id in cur.objects)) {
+        if (!Object.hasOwn(cur.objects, o.id)) {
           cur.objects[o.id] = fresh(o);
           emit('createSequence', o.id, `CREATE SEQUENCE ${S(o.id)} ${seqOptionsSql(o.options, 'create')}`);
         } else {
@@ -1154,7 +1154,7 @@ export const mssqlPlan = (from: Model, to: Model, opts?: MssqlPlanOptions): Step
       };
 
       for (const c of added) {
-        if (c.kind !== 'column' || c.id in cur.objects || c.generated) continue;
+        if (c.kind !== 'column' || Object.hasOwn(cur.objects, c.id) || c.generated) continue;
         emitAddColumn(c);
       }
 
@@ -1218,13 +1218,13 @@ export const mssqlPlan = (from: Model, to: Model, opts?: MssqlPlanOptions): Step
 
       // P12g 添加新增或需重建的计算列
       for (const c of [...added, ...[...regen].map((id) => to.objects[id]!)]) {
-        if (c.kind !== 'column' || c.id in cur.objects) continue;
+        if (c.kind !== 'column' || Object.hasOwn(cur.objects, c.id)) continue;
         emitAddColumn(c);
       }
 
       // ───── P14 删已移除用户 schema（其内部表/序列/早期不透明对象已在 P4/P5c 清理或 P6c 迁出） ─────
       for (const o of removed) {
-        if (o.kind !== 'schema' || !(o.id in cur.objects)) continue;
+        if (o.kind !== 'schema' || !Object.hasOwn(cur.objects, o.id)) continue;
         const c = get(cur, o.id, 'schema');
         dropSchemaIfNonDbo(c.name, o.id);
         delete cur.objects[o.id];
@@ -1233,7 +1233,7 @@ export const mssqlPlan = (from: Model, to: Model, opts?: MssqlPlanOptions): Step
       // ───── P15 加主键、唯一约束、CHECK 与索引（每表 CLUSTERED 优先于 NONCLUSTERED） ─────
       const pendingKeys: (PrimaryKey | Unique | Check | Index)[] = [];
       for (const o of Object.values(to.objects)) {
-        if (isKey(o) && !(o.id in cur.objects)) pendingKeys.push(o);
+        if (isKey(o) && !Object.hasOwn(cur.objects, o.id)) pendingKeys.push(o);
       }
       const keyOrder = (o: PrimaryKey | Unique | Check | Index): number => {
         const cl = o.kind !== 'check' && isKeyOrIndexClustered(to, o) ? 0 : 10;
@@ -1257,7 +1257,7 @@ export const mssqlPlan = (from: Model, to: Model, opts?: MssqlPlanOptions): Step
 
       // ───── P16 加外键 ─────
       for (const o of Object.values(to.objects)) {
-        if (o.kind !== 'foreignKey' || o.id in cur.objects) continue;
+        if (o.kind !== 'foreignKey' || Object.hasOwn(cur.objects, o.id)) continue;
         cur.objects[o.id] = fresh(o);
         emit(
           'addForeignKey',
@@ -1267,7 +1267,7 @@ export const mssqlPlan = (from: Model, to: Model, opts?: MssqlPlanOptions): Step
       }
 
       // ───── P16b 建晚期不透明对象（视图、触发器等） ─────
-      const lateCreates = all(to, 'opaque').filter((o) => isLate(o) && !(o.id in cur.objects));
+      const lateCreates = all(to, 'opaque').filter((o) => isLate(o) && !Object.hasOwn(cur.objects, o.id));
       for (const o of topo(lateCreates)) createOpaque(o);
 
       // ───── P17 对象注释（MS_Description 扩展属性）与终态自检 ─────

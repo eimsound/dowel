@@ -4,29 +4,30 @@ import { generateKeyBetween } from 'fractional-indexing';
 
 import type { IdentKind } from './dialect.ts';
 import { EditError } from './errors.ts';
-import { newId } from './ids.ts';
-import type {
-  Check,
-  Column,
-  ColumnDefault,
-  ColumnExt,
-  Enum,
-  ForeignKey,
-  Index,
-  IndexElement,
-  IndexExt,
-  Model,
-  Obj,
-  PartitionSpec,
-  PrimaryKey,
-  PrimaryKeyExt,
-  Schema,
-  Sequence,
-  SequenceOptions,
-  Table,
-  TableExt,
-  Unique,
-  UniqueExt,
+import { isReservedId, newId } from './ids.ts';
+import {
+  type Check,
+  type Column,
+  type ColumnDefault,
+  type ColumnExt,
+  type Enum,
+  type ForeignKey,
+  type Index,
+  type IndexElement,
+  type IndexExt,
+  isValidIndexElement,
+  type Model,
+  type Obj,
+  type PartitionSpec,
+  type PrimaryKey,
+  type PrimaryKeyExt,
+  type Schema,
+  type Sequence,
+  type SequenceOptions,
+  type Table,
+  type TableExt,
+  type Unique,
+  type UniqueExt,
 } from './ir.ts';
 import { clonePlain, deepEqual } from './json.ts';
 import {
@@ -297,7 +298,8 @@ export const createTable = (
 ): string => {
   get(m, schema, 'schema');
   assertIdent(m, name, 'table');
-  if (id in m.objects) throw new EditError(`对象 ID ${id} 已存在`);
+  if (isReservedId(id)) throw new EditError(`对象 ID ${id} 是保留名`);
+  if (Object.hasOwn(m.objects, id)) throw new EditError(`对象 ID ${id} 已存在`);
   if (relTaken(m, schema, name, '') || typeTaken(m, schema, name, ''))
     throw new EditError(`名字 ${name} 已被占用`);
   if (m.dialect === 'mysql' && ext?.mysql) {
@@ -562,7 +564,7 @@ const assertPartitionConstraintCompat = (
 const nextDetId = (m: Model, seed: string): string => {
   for (let i = 0; ; i++) {
     const candidate = derivedUuid(i === 0 ? seed : `${seed}#${i}`);
-    if (!(candidate in m.objects)) return candidate;
+    if (!Object.hasOwn(m.objects, candidate)) return candidate;
   }
 };
 
@@ -606,7 +608,8 @@ export const createPartition = (
   if (!getDialect(m.dialect).capabilities.partitioning) throw new EditError('当前方言不支持分区表');
   const parent = get(m, parentId, 'table');
   normalizePartitionFamily(m, parentId);
-  if (id in m.objects) throw new EditError(`对象 ID ${id} 已存在`);
+  if (isReservedId(id)) throw new EditError(`对象 ID ${id} 是保留名`);
+  if (Object.hasOwn(m.objects, id)) throw new EditError(`对象 ID ${id} 已存在`);
   if (!parent.partitionBy) throw new EditError(`表 ${parent.name} 不是分区父表`);
   const spec = resolvePartitionBy(m, parent);
   if (!spec) throw new EditError(`无法解析表 ${parent.name} 的分区定义`);
@@ -1594,6 +1597,8 @@ export const addIndex = (
   if (opts.nullsNotDistinct && !getDialect(m.dialect).capabilities.nullsNotDistinct) {
     throw new EditError('当前方言不支持 NULLS NOT DISTINCT');
   }
+  if (elements.length === 0) throw new EditError('索引至少需要一个元素');
+  if (!elements.every(isValidIndexElement)) throw new EditError('索引元素必须是列或非空表达式之一');
   const t = get(m, table, 'table');
   normalizePartitionFamily(m, table);
   const fullElements: IndexElement[] = elements.map((e) => ({

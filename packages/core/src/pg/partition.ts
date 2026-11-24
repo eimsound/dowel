@@ -276,7 +276,7 @@ const findRootTableId = (m: Model, tableId: string): string => {
     seen.add(cur);
     const t = m.objects[cur];
     if (t?.kind !== 'table' || !t.partitionOf) return cur;
-    if (!(t.partitionOf.parent in m.objects)) return cur;
+    if (!Object.hasOwn(m.objects, t.partitionOf.parent)) return cur;
     cur = t.partitionOf.parent;
   }
   return cur;
