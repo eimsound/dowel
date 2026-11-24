@@ -1,6 +1,11 @@
 /* 设计 token 与组件样式。数值以仓库根目录的 DESIGN.md 为准（YAML 部分），
    参考实现见 .agents/docs/ui/mockups/（theme.css、base.css），三处保持一致。 */
 @import 'tailwindcss';
+/* React Flow v13 的样式包在 @layer xyflow 里。必须紧跟 tailwindcss 之后导入，
+   层序才会是 theme < base < components < utilities < xyflow：Tailwind preflight（如 * { margin: 0 }）
+   盖不掉 xyflow 的面板外边距等规则，而下方未分层的画布覆盖样式仍然优先。
+   若改回在组件里 import，打包后 xyflow 层会排到最前、优先级最低。 */
+@import '@xyflow/react/dist/style.css';
 
 /* ---------- token ---------- */
 :root {
@@ -999,6 +1004,9 @@ dialog::backdrop {
 
 /* ---------- 画布（React Flow） ---------- */
 .react-flow {
+  /* React Flow v13 默认在 .react-flow 上设 color-scheme: light dark（跟随系统），
+     会把 theme.ts 写在 <html> 上的手动主题挡在画布外；改为继承，画布内的 light-dark() token 与全局一致 */
+  color-scheme: inherit;
   --xy-background-color: var(--canvas);
   --xy-edge-stroke: var(--edge);
   --xy-edge-stroke-selected: var(--primary);

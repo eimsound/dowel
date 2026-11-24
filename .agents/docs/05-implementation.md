@@ -129,7 +129,7 @@ M1b 中发现并修正的问题：
 | -------- | ---------------------------------- | -------------------------------------------------------------------------------------------------------------------------------------------------- |
 | 应用     | `apps/web`                         | React 19 + Vite 8 + Tailwind 4；TanStack Router / Query；中英文（i18next）                                                                         |
 | 工作区   | `src/workspace.ts`                 | WebSocket 连接同步房间（断线指数退避重连；只处理当前连接的事件）、`SyncClient`、布局、在线成员；`useSyncExternalStore`                             |
-| 画布     | `components/Canvas.tsx`            | @xyflow/react 12 + elkjs 自动布局；分区子表折叠到父表；拖动后同步位置                                                                              |
+| 画布     | `components/Canvas.tsx`            | @xyflow/react 13 + elkjs 自动布局；分区子表折叠到父表；拖动后同步位置                                                                              |
 | 属性面板 | `components/Inspector.tsx`         | 表 / 列 / 约束 / 索引 / 枚举 / 序列编辑；输入框是“草稿”：获得焦点时记下依据的版本，保存时一并提交                                                  |
 | 对话框   | `components/Dialogs.tsx`           | 导入 SQL、保存版本、迁移（升级 / 回滚脚本、影子库验证、逐步风险）、成员                                                                            |
 | 通用组件 | `Modal` / `Toasts` / `Tabs`        | 按 modern-web-guidance：原生 `<dialog>` + `showModal()`；`popover="manual"` 的通知区；`focusgroup` 选项卡；popover 和 focusgroup 按需加载 polyfill |

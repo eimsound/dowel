@@ -9,14 +9,13 @@ import {
   type Table,
 } from '@dowel/core';
 import {
-  applyNodeChanges,
   Background,
   BackgroundVariant,
   type Edge,
   Handle,
   MiniMap,
   type Node,
-  type NodeChange,
+  type NodeChangeset,
   type NodeProps,
   Panel,
   Position,
@@ -25,8 +24,6 @@ import {
   useReactFlow,
   useViewport,
 } from '@xyflow/react';
-
-import '@xyflow/react/dist/style.css';
 import { Focus, Maximize, Table2, ZoomIn, ZoomOut } from 'lucide-react';
 import { memo, useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState } from 'react';
 import { useTranslation } from 'react-i18next';
@@ -888,17 +885,16 @@ export const Canvas = memo(
       return anyActive ? next : baseEdges;
     }, [baseEdges, selected]);
 
-    const onNodesChange = useCallback((changes: NodeChange<CanvasNode>[]) => {
-      const filtered: NodeChange<CanvasNode>[] = [];
-      for (const ch of changes) {
-        if (ch.type === 'select') continue;
-        if (ch.type === 'position') {
-          if (ch.dragging === true) draggingIdsRef.current.add(ch.id);
-          else if (ch.dragging === false) draggingIdsRef.current.delete(ch.id);
-        }
-        filtered.push(ch);
+    // 选中态完全由 selected 受控（renderedNodes 派生），丢弃 React Flow 内部的 select 变更，
+    // 避免点击/框选额外触发一次 rfNodes 更新；其余变更（位置、尺寸）照常应用。
+    // v13 每次派发都会新建 NodeChangeset，可以就地裁剪后在 updater 里 applyTo。
+    const onNodesChange = useCallback((changes: NodeChangeset<CanvasNode>) => {
+      for (const ch of changes.getByType('select')) changes.remove(ch);
+      for (const ch of changes.getByType('position')) {
+        if (ch.dragging === true) draggingIdsRef.current.add(ch.id);
+        else if (ch.dragging === false) draggingIdsRef.current.delete(ch.id);
       }
-      if (filtered.length > 0) setRfNodes((nds) => applyNodeChanges(filtered, nds));
+      if (!changes.isEmpty()) setRfNodes((nds) => changes.applyTo(nds));
     }, []);
 
     const showViewBar =
