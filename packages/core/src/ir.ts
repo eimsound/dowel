@@ -389,3 +389,15 @@ export const emptyModel = (dialect: Dialect = 'pg'): Model => ({ format: FORMAT,
 
 export const isConstraint = (o: Obj): o is Constraint =>
   o.kind === 'primaryKey' || o.kind === 'unique' || o.kind === 'foreignKey' || o.kind === 'check';
+
+/**
+ * 索引元素必须恰好是列或表达式之一：column 为非空字符串且 expr 为空，
+ * 或 expr 为非空（去掉首尾空白后）字符串且 column 为空。model.validate() 与 addIndex 共用此规则。
+ */
+export const isValidIndexElement = (e: { column?: string | null; expr?: string | null }): boolean => {
+  const hasColumn = e.column != null && e.column !== '';
+  const hasExpr = e.expr != null && e.expr.trim() !== '';
+  if (hasColumn) return e.expr == null;
+  if (hasExpr) return e.column == null;
+  return false;
+};

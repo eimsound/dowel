@@ -28,6 +28,7 @@ import {
   type ToClient,
   type ToServer,
   type Versions,
+  verOf,
 } from '@dowel/sync';
 import { HTTPException } from 'hono/http-exception';
 
@@ -2239,7 +2240,9 @@ export class Rooms {
               caughtUp = await this.catchUpFrom(tx, branchId, r);
             }
             const rejected = objects.some(
-              (o) => !(o.id in r.room.model.objects) || (r.room.versions[o.id] ?? 0) !== (expect[o.id] ?? 0),
+              (o) =>
+                !Object.hasOwn(r.room.model.objects, o.id) ||
+                verOf(r.room.versions, o.id) !== verOf(expect, o.id),
             );
             const store = this.makeStore(tx, branchId);
             mutated = true;
@@ -2402,7 +2405,7 @@ export class Rooms {
         const reads: Op['reads'] = [...readIds].sort().map((id) => {
           const prevN = pendingOpNById.get(id);
           if (prevN !== undefined) return [id, `p:${client}:${prevN}`];
-          if (id in baseModel.objects) return [id, effectiveBaseSeq];
+          if (Object.hasOwn(baseModel.objects, id)) return [id, effectiveBaseSeq];
           return [id, null];
         });
         builtOps.push({ client, n, name: input.name, args: expandedArgs, reads });

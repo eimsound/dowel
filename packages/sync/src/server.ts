@@ -5,11 +5,13 @@ import {
   type Commit,
   execute,
   type Op,
+  ownObj,
   type Rejection,
   SYSTEM_CLIENT,
   type ToClient,
   type ToServer,
   type Versions,
+  verOf,
 } from './protocol.ts';
 
 /** 持久化接口：先写操作日志再广播（04-ir-design.md 2.5） */
@@ -142,7 +144,7 @@ export class Room {
       }
       for (const ch of c.changes) {
         if (ch.obj) {
-          if (ch.id in state.model.objects) this.recordLastWriter(ch.id, c.user);
+          if (Object.hasOwn(state.model.objects, ch.id)) this.recordLastWriter(ch.id, c.user);
         } else {
           this.lastWriter.delete(ch.id);
         }
@@ -290,7 +292,7 @@ export class Room {
       for (const [id, o] of Object.entries(next.objects))
         if (!deepEqual(s.model.objects[id], o)) changes.push({ id, obj: clonePlain(o) });
       for (const id of Object.keys(s.model.objects))
-        if (!(id in next.objects)) changes.push({ id, obj: null });
+        if (!Object.hasOwn(next.objects, id)) changes.push({ id, obj: null });
       const n = (s.processed[SYSTEM_CLIENT] ?? 0) + 1;
       const commit: Commit = { t: 'commit', seq: s.seq + 1, client: SYSTEM_CLIENT, n, user, changes };
       await targetStore.append(commit, { client: SYSTEM_CLIENT, n, name: opName, args: null, reads: [] });
@@ -316,7 +318,9 @@ export class Room {
       const s = this.s;
       const targetStore = store ?? this.store;
       const changes = objects
-        .filter((o) => o.id in s.model.objects && (s.versions[o.id] ?? 0) === (expect[o.id] ?? 0))
+        .filter(
+          (o) => Object.hasOwn(s.model.objects, o.id) && verOf(s.versions, o.id) === verOf(expect, o.id),
+        )
         .filter((o) => !deepEqual(s.model.objects[o.id], o))
         .map((o) => ({ id: o.id, obj: clonePlain(o) }));
       if (!changes.length) return [];
@@ -658,8 +662,8 @@ export class Room {
         if (o === 'rejected') throw new Reject('dependency', '依赖的上一个修改已被拒绝');
         expected = o;
       }
-      const cur = model.objects[id];
-      const now = cur ? (versions[id] ?? 0) : null;
+      const cur = ownObj(model, id);
+      const now = cur ? verOf(versions, id) : null;
       const ok = expected === null ? now === null : now !== null && (now as number) <= (expected as number);
       if (!ok) {
         const who = this.lastWriter.get(id) ?? '其他人';
