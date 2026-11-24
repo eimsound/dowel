@@ -310,20 +310,20 @@ const zh = {
         '将依次执行下面 {{count}} 个迁移。{{dialect}} 的 DDL 会隐式提交：每条语句会按顺序在目标库直接生效并记录检查点；如果中途失败，之前已执行的步骤不会自动回滚，后续可在环境页从失败步修复或继续，执行完都会读回结构并校验。',
       rollbackIntro: '将依次回滚下面 {{count}} 个版本（执行它们的回滚脚本）。',
       rollbackNoRisk: '回滚脚本没有做过锁和重写分析，请自行评估对线上的影响。',
-      switchButton: '切换到 v{{number}}…',
+      switchButton: '切换到 v{{number}}',
       switchBanner: '这个环境停在已作废的版本 v{{number}} 上。',
       switchBannerBody:
-        '可以经最近公共祖先切换回活跃主链（先执行回滚脚本，可能丢数据），也可以在线上结构已经一致时用“标记为已执行”跨岔路零 SQL 切换。',
+        '可以经最近公共祖先切换回活跃主链（先执行回滚脚本，可能导致数据丢失），也可以在线上结构一致时用“标记为已执行”跨岔路对齐，不执行 SQL。',
       switchIntro:
         '先回滚 {{down}} 个版本到最近公共祖先，再升级 {{up}} 个版本。每个迁移都在目标库里单独提交并读回校验。',
       switchRouteAria: '先从 v{{from}} 回滚到 v{{lca}}，再升级到 v{{to}}',
       segDown: '回滚段（执行回滚脚本）',
       segUp: '升级段',
       rollbackChip: '回滚',
-      switchWarnTitle: '回滚段可能丢数据',
+      switchWarnTitle: '回滚段可能导致数据丢失',
       switchWarn:
-        '回滚段会执行已作废版本的回滚脚本，可能删除列、表和其中的数据。如果不能接受丢数据，请改用“标记为已执行”跨岔路零 SQL 切换。',
-      switchAck: '我已确认回滚段可能丢数据',
+        '回滚段会执行已作废版本的回滚脚本，可能删除列、表和其中的数据。如果不能接受数据丢失，请先手工让线上结构与目标版本一致，再用“标记为已执行”跨岔路对齐，不执行 SQL。',
+      switchAck: '我已了解回滚段会执行已作废版本的回滚脚本，可能导致数据丢失',
       baselineHint: '库的结构已经等于基线，只在目标库里写入 Dowel 的历史，不执行任何 SQL。',
       migrations: '要执行的迁移',
       steps: '{{count}} 步',
@@ -1111,6 +1111,7 @@ const zh = {
     to: '到',
     empty: '空库',
     head: '工作副本',
+    retiredSuffix: '（已作废）',
     up: '升级脚本',
     down: '回滚脚本',
     upShort: '升级',
@@ -2423,10 +2424,10 @@ const en: typeof zh = {
       rollbackIntro: 'These {{count}} versions will be rolled back in order (their rollback scripts run).',
       rollbackNoRisk:
         'Rollback scripts have no lock or rewrite analysis; assess the impact on production yourself.',
-      switchButton: 'Switch to v{{number}}…',
+      switchButton: 'Switch to v{{number}}',
       switchBanner: 'This environment is on retired version v{{number}}.',
       switchBannerBody:
-        'You can switch back to the active chain through the common ancestor (rollback scripts run first; data may be lost), or, if the live structure already matches, use "Mark as applied" to switch across branches without SQL.',
+        'You can switch back to the active chain through the common ancestor (rollback scripts run first and may cause data loss), or use "Mark as applied" across branches without running SQL when the live structure matches.',
       switchIntro:
         'Roll back {{down}} version(s) to the common ancestor, then upgrade {{up}} version(s). Each migration commits separately on the target and is read back and verified.',
       switchRouteAria: 'Roll back from v{{from}} to v{{lca}}, then upgrade to v{{to}}',
@@ -2435,8 +2436,9 @@ const en: typeof zh = {
       rollbackChip: 'Rollback',
       switchWarnTitle: 'The rollback segment may lose data',
       switchWarn:
-        'The rollback segment runs rollback scripts of retired versions and may drop columns, tables and their data. If data loss is unacceptable, use "Mark as applied" to switch across branches without SQL.',
-      switchAck: 'I understand the rollback segment may lose data',
+        'The rollback segment runs rollback scripts of retired versions and may drop columns, tables, and their data. If data loss is not acceptable, align the schema manually and use "Mark as applied" across branches without running SQL.',
+      switchAck:
+        'I understand the rollback segment runs rollback scripts of retired versions and may cause data loss',
       baselineHint:
         'The database structure already equals the baseline. Only Dowel history is written to the target database; no SQL runs.',
       migrations: 'Migrations to run',
@@ -2526,7 +2528,7 @@ const en: typeof zh = {
       toLabel: 'Mark up to version',
       forward: 'Mark as applied to v{{number}}',
       backward: 'Mark as rolled back to v{{number}}',
-      cross: 'Mark as applied to v{{number}} across branches',
+      cross: 'Mark across branches as applied to v{{number}}',
       tipCross:
         'Runs no SQL; it records an environment that is on a retired branch as having reached v{{number}} on the active chain. Dowel first checks the live structure and only allows the mark if it matches the model of v{{number}} exactly. For environments that cannot afford the data loss of a rollback and whose live structure already matches v{{number}}.',
       crossTitle: 'Cross-branch mark',
@@ -3273,6 +3275,7 @@ const en: typeof zh = {
     to: 'To',
     empty: 'Empty database',
     head: 'Working copy',
+    retiredSuffix: ' (retired)',
     up: 'Upgrade script',
     down: 'Rollback script',
     upShort: 'Upgrade',

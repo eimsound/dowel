@@ -416,6 +416,7 @@ export const MigrationDialog = ({ pid, open, onClose }: Base) => {
       {versions.data?.map((v) => (
         <option key={v.id} value={v.id}>
           v{v.number} {versionName(v)}
+          {v.retiredAt ? t('dlg.retiredSuffix') : ''}
         </option>
       ))}
     </>

@@ -549,7 +549,7 @@ export const ExecDialog = ({
                   ]
                 : [{ key: 'all', label: t('envx.exec.migrations'), items: migrations, offset: 0 }]),
             ].map((seg) => (
-              <section key={seg.key} className="space-y-1" aria-label={seg.label}>
+              <section key={seg.key} className="space-y-1">
                 {isSwitch && <h3 className="section-title m-0">{seg.label}</h3>}
                 <ol
                   className="m-0 list-none overflow-hidden rounded-md border border-border p-0"
