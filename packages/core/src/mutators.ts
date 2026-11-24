@@ -96,7 +96,10 @@ export const mutators = {
         typeRef: id.nullable().optional(),
         notNull: z.boolean().optional(),
         default: ColumnDefault.nullable().optional(),
-        identity: z.object({ always: z.boolean() }).nullable().optional(),
+        identity: z
+          .object({ always: z.boolean(), options: SequenceOptions.partial().optional() })
+          .nullable()
+          .optional(),
         generated: z
           .object({ expr: z.string().min(1), stored: z.boolean() })
           .nullable()
@@ -141,8 +144,9 @@ export const mutators = {
     }),
     (m, a) => E.addUnique(m, a.table, a.columns, a.nullsNotDistinct ?? false, a.id, a.ext),
   ),
-  addCheck: def(z.object({ id, table: id, expr: z.string().min(1) }), (m, a) =>
-    E.addCheck(m, a.table, a.expr, a.id),
+  addCheck: def(
+    z.object({ id, table: id, expr: z.string().min(1), noInherit: z.boolean().optional() }),
+    (m, a) => E.addCheck(m, a.table, a.expr, a.id, a.noInherit ?? false),
   ),
   setCheckExpr: def(z.object({ id, expr: z.string().min(1) }), (m, a) => setCheckExpr(m, a.id, a.expr)),
   addForeignKey: def(
@@ -199,11 +203,80 @@ export const mutators = {
   ),
 };
 
+/**
+ * 粘贴（ADR 0013 第 2 节）允许组合的普通 mutator：只有新建类操作和命名 / 注释，不能删除或改动既有对象，
+ * 也不能嵌套 paste。整批在同一份草稿上依次执行，任何一步不合法整批作废（原子）。
+ */
+export const PASTE_MUTATORS = [
+  'createEnum',
+  'createSequence',
+  'createTable',
+  'setTableExt',
+  'setPartitionBy',
+  'createPartition',
+  'addColumn',
+  'setColumnExt',
+  'addPrimaryKey',
+  'addUnique',
+  'addCheck',
+  'addForeignKey',
+  'addIndex',
+  'renameKey',
+  'setComment',
+] as const satisfies readonly (keyof typeof mutators)[];
+
+/** 单次粘贴最多展开的子操作数（与 clipboard.ts 的 MAX_PASTE_OPS 一致） */
+const PASTE_OPS_LIMIT = 20_000;
+
+const pasteArgs = z.object({
+  ops: z
+    .array(z.object({ name: z.enum(PASTE_MUTATORS), args: z.unknown() }))
+    .min(1)
+    .max(PASTE_OPS_LIMIT),
+});
+
+/** 新建对象类操作在 paste 里的参数必须给出新 ID：只能建新对象，绝不复用模型里已有的 ID */
+const PASTE_NEW_ID_OPS: ReadonlySet<string> = new Set([
+  'createEnum',
+  'createSequence',
+  'createTable',
+  'createPartition',
+  'addPrimaryKey',
+  'addUnique',
+  'addCheck',
+  'addForeignKey',
+  'addIndex',
+]);
+
+const runPaste = (m: Model, a: z.infer<typeof pasteArgs>) => {
+  const created = new Set<string>();
+  const fresh = (newId: unknown) => {
+    if (typeof newId !== 'string') return;
+    if (newId in m.objects || created.has(newId)) throw new E.EditError(`对象 ID ${newId} 已存在`);
+    created.add(newId);
+  };
+  for (const op of a.ops) {
+    const args = op.args as Record<string, unknown> | null;
+    if (args && typeof args === 'object') {
+      if (PASTE_NEW_ID_OPS.has(op.name)) fresh(args.id);
+      if (op.name === 'addColumn') fresh((args.column as Record<string, unknown> | undefined)?.id);
+    }
+    runMutator(m, op.name, op.args);
+  }
+};
+
 export type MutatorName = keyof typeof mutators;
+export type PasteArgs = z.infer<typeof pasteArgs>;
 export type MutatorArgs<K extends MutatorName> = z.infer<(typeof mutators)[K]['args']>;
 
 /** 执行一个修改：校验参数后在模型上执行（直接修改传入的模型）。参数不合法或操作不合法抛 EditError */
 export const runMutator = (m: Model, name: string, args: unknown) => {
+  if (name === 'paste') {
+    const parsed = pasteArgs.safeParse(args);
+    if (!parsed.success) throw new E.EditError(`参数不合法：${parsed.error.issues[0]?.message ?? ''}`);
+    runPaste(m, parsed.data);
+    return;
+  }
   const mu = (mutators as Record<string, { args: z.ZodType; run: (m: Model, a: unknown) => unknown }>)[name];
   if (!mu) throw new E.EditError(`未知的操作：${name}`);
   const parsed = mu.args.safeParse(args);

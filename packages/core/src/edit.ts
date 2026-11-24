@@ -1052,7 +1052,8 @@ export interface ColumnSpec {
   typeRef?: string | null;
   notNull?: boolean;
   default?: ColumnDefault | null;
-  identity?: { always: boolean } | null;
+  /** options：粘贴时带上来源列的序列参数（缺省项取默认值，type 缺省按列类型推导） */
+  identity?: { always: boolean; options?: Partial<SequenceOptions> } | null;
   generated?: { expr: string; stored: boolean } | null;
   collation?: string | null;
   /** 放在这一列之前；不传则放在最后 */
@@ -1131,7 +1132,15 @@ export const addColumn = (m: Model, table: string, spec: ColumnSpec): string => 
     comment: null,
     ...(cleanedExt ? { ext: cleanedExt as ColumnExt } : {}),
   };
-  if (c.identity) c.identity.options.type = identityType(c.type);
+  if (c.identity) {
+    c.identity.options.type = identityType(c.type);
+    const opts = spec.identity?.options;
+    if (opts) {
+      for (const [k, v] of Object.entries(opts)) {
+        if (v !== undefined) (c.identity.options as Record<string, unknown>)[k] = v;
+      }
+    }
+  }
   m.objects[c.id] = c;
   refreshDerivedNames(m, t.id);
   return c.id;
