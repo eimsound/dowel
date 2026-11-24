@@ -285,6 +285,17 @@ export const dropSequence = (m: Model, id: string) => {
   for (const tid of affectedTables) refreshDerivedNames(m, tid);
 };
 
+export const setSequenceOwnedBy = (m: Model, id: string, column: string | null) => {
+  if (!getDialect(m.dialect).capabilities.sequences) throw new EditError('当前方言不支持独立序列');
+  const s = get(m, id, 'sequence');
+  if (column !== null) {
+    const c = get(m, column, 'column');
+    const t = get(m, c.parent, 'table');
+    if (t.parent !== s.parent) throw new EditError('序列与归属列必须在同一个 schema 中');
+  }
+  s.ownedBy = column;
+};
+
 // ───── 表 ─────
 
 export const createTable = (

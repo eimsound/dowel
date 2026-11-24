@@ -3,7 +3,7 @@ import {
   clonePlain,
   deepEqual,
   type Model,
-  type MutableModelIndex,
+  MutableModelIndex,
   type Obj,
   OverlayModelIndex,
   readsOf,
@@ -222,6 +222,9 @@ export const execute = (
   });
 
   const draft: Model = { ...m, objects: objectsProxy };
+  // 粘贴一次展开成上千个子操作，每个都要做重名判定：没有现成索引时（例如还有待确认修改）临时建一个，
+  // 一次 O(n) 建索引远比每个子操作 O(n) 枚举写时复制代理便宜
+  if (!baseIndex && name === 'paste') baseIndex = new MutableModelIndex(m);
   if (baseIndex) {
     const overlayIndex = new OverlayModelIndex(baseIndex, overlay, draft, wrapRoot);
     withModelIndex(draft, () => runMutator(draft, name, args), overlayIndex);

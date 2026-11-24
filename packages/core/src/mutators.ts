@@ -56,6 +56,9 @@ export const mutators = {
   ),
   renameSequence: def(z.object({ id, name }), (m, a) => E.renameSequence(m, a.id, a.name)),
   dropSequence: def(z.object({ id }), (m, a) => E.dropSequence(m, a.id)),
+  setSequenceOwnedBy: def(z.object({ id, column: id.nullable() }), (m, a) =>
+    E.setSequenceOwnedBy(m, a.id, a.column),
+  ),
 
   createTable: def(
     z.object({
@@ -210,6 +213,7 @@ export const mutators = {
 export const PASTE_MUTATORS = [
   'createEnum',
   'createSequence',
+  'setSequenceOwnedBy',
   'createTable',
   'setTableExt',
   'setPartitionBy',
@@ -248,6 +252,16 @@ const PASTE_NEW_ID_OPS: ReadonlySet<string> = new Set([
   'addIndex',
 ]);
 
+/** 只能修改本次 paste 新建对象的操作（防止通过 paste 篡改模型中既有对象） */
+const PASTE_CREATED_ONLY_OPS: ReadonlySet<string> = new Set([
+  'setSequenceOwnedBy',
+  'setTableExt',
+  'setPartitionBy',
+  'setColumnExt',
+  'renameKey',
+  'setComment',
+]);
+
 const runPaste = (m: Model, a: z.infer<typeof pasteArgs>) => {
   const created = new Set<string>();
   const fresh = (newId: unknown) => {
@@ -260,6 +274,18 @@ const runPaste = (m: Model, a: z.infer<typeof pasteArgs>) => {
     if (args && typeof args === 'object') {
       if (PASTE_NEW_ID_OPS.has(op.name)) fresh(args.id);
       if (op.name === 'addColumn') fresh((args.column as Record<string, unknown> | undefined)?.id);
+      if (PASTE_CREATED_ONLY_OPS.has(op.name)) {
+        if (typeof args.id !== 'string' || !created.has(args.id)) {
+          throw new E.EditError(`操作 ${op.name} 只能作用于本次粘贴新建的对象`);
+        }
+        if (
+          op.name === 'setSequenceOwnedBy' &&
+          typeof args.column === 'string' &&
+          !created.has(args.column)
+        ) {
+          throw new E.EditError('序列归属列必须是本次粘贴新建的列');
+        }
+      }
     }
     runMutator(m, op.name, op.args);
   }

@@ -595,7 +595,9 @@ export const Model = () => {
           );
           return;
         }
-        throw e;
+        // 载荷来自剪贴板（可能被其他程序改过）：任何意外错误都只提示，不让事件处理抛出
+        toast(t('clip.failed', { reason: e instanceof Error ? e.message : String(e) }), 'error');
+        return;
       }
       const targetName = plan.targetTable ? (model.objects[plan.targetTable]?.name ?? null) : null;
       const count = payload.kind === 'tables' ? plan.newTables.length : plan.newItems.length;

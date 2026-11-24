@@ -1,7 +1,16 @@
 // MySQL 方言规格实现（注册到 @dowel/core registry）。
 import type { DialectCapabilities, DialectSpec, IdentKind } from '../dialect.ts';
 import { emptyModel, type Model, type Obj } from '../ir.ts';
-import { all, allChildrenOf, childrenOf, columnsOf, get, indexElementNames } from '../model.ts';
+import {
+  all,
+  allChildrenOf,
+  childrenOf,
+  childrenOfKinds,
+  columnsOf,
+  get,
+  indexElementNames,
+  objectsOfKinds,
+} from '../model.ts';
 import {
   MAX_MYSQL_IDENT,
   MYSQL_SAFE_IDENT_RE,
@@ -50,7 +59,7 @@ export const MYSQL_CAPABILITIES: DialectCapabilities = {
 
 const isMysqlTableOrViewTaken = (m: Model, name: string, selfId: string): boolean => {
   const low = name.toLowerCase();
-  return Object.values(m.objects).some((o) => {
+  return objectsOfKinds(m, ['table', 'opaque']).some((o) => {
     if (o.id === selfId) return false;
     if (o.kind === 'table') return o.name.toLowerCase() === low;
     if (o.kind === 'opaque' && o.objType === 'view') return o.name.toLowerCase() === low;
@@ -61,7 +70,7 @@ const isMysqlTableOrViewTaken = (m: Model, name: string, selfId: string): boolea
 const isMysqlTableIndexTaken = (m: Model, tableId: string, name: string, selfId: string): boolean => {
   const low = name.toLowerCase();
   if (low === 'primary') return true;
-  return Object.values(m.objects).some((o) => {
+  return childrenOfKinds(m, tableId, ['unique', 'index', 'foreignKey']).some((o) => {
     if (o.id === selfId) return false;
     if ((o.kind === 'unique' || o.kind === 'index' || o.kind === 'foreignKey') && o.parent === tableId) {
       return o.name.toLowerCase() === low;
@@ -72,7 +81,7 @@ const isMysqlTableIndexTaken = (m: Model, tableId: string, name: string, selfId:
 
 const isMysqlSchemaConstraintTaken = (m: Model, name: string, selfId: string): boolean => {
   const low = name.toLowerCase();
-  return Object.values(m.objects).some((o) => {
+  return objectsOfKinds(m, ['foreignKey', 'check']).some((o) => {
     if (o.id === selfId) return false;
     if (o.kind === 'foreignKey' || o.kind === 'check') {
       return o.name.toLowerCase() === low;
@@ -92,7 +101,7 @@ const isMysqlConTaken = (m: Model, tableId: string, name: string, selfId: string
   if (self?.kind === 'check') {
     return isMysqlSchemaConstraintTaken(m, name, selfId);
   }
-  return Object.values(m.objects).some((o) => {
+  return objectsOfKinds(m, ['foreignKey', 'check', 'unique', 'index']).some((o) => {
     if (o.id === selfId) return false;
     if (o.kind === 'foreignKey' || o.kind === 'check') return o.name.toLowerCase() === low;
     if ((o.kind === 'unique' || o.kind === 'index') && o.parent === tableId)
