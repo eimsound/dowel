@@ -1,6 +1,18 @@
 // 在扁平模型上查询对象的工具函数，以及模型的一致性校验。
 import { EditError } from './errors.ts';
-import type { Column, Enum, Index, Kind, Model, Obj, ObjOf, PartitionSpec, Sequence, Table } from './ir.ts';
+import {
+  type Column,
+  type Enum,
+  type Index,
+  isValidIndexElement,
+  type Kind,
+  type Model,
+  type Obj,
+  type ObjOf,
+  type PartitionSpec,
+  type Sequence,
+  type Table,
+} from './ir.ts';
 import { buildModelIndex, type ModelIndex } from './model-index.ts';
 import { resolvePartitionBy } from './pg/partition.ts';
 import { ident } from './pg/quote.ts';
@@ -36,14 +48,14 @@ export const withModelIndex = <T>(m: Model, fn: (idx: ModelIndex) => T, existing
 };
 
 export const get = <K extends Kind>(m: Model, id: string, kind?: K): ObjOf<K> => {
-  const o = m.objects[id];
+  const o = Object.hasOwn(m.objects, id) ? m.objects[id] : undefined;
   if (!o) throw new EditError(`对象不存在：${id}`);
   if (kind && o.kind !== kind) throw new EditError(`对象 ${id} 是 ${o.kind}，不是 ${kind}`);
   return o as ObjOf<K>;
 };
 
 export const find = (m: Model, id: string | null | undefined): Obj | undefined =>
-  id ? m.objects[id] : undefined;
+  id && Object.hasOwn(m.objects, id) ? m.objects[id] : undefined;
 
 export const all = <K extends Kind>(m: Model, kind: K): ObjOf<K>[] => {
   const idx = getActiveModelIndex(m);
@@ -116,7 +128,7 @@ export const rootTableId = (m: Model, tableId: string): string => {
     seen.add(cur);
     const t = m.objects[cur];
     if (t?.kind !== 'table' || !t.partitionOf) return cur;
-    if (!(t.partitionOf.parent in m.objects)) return cur;
+    if (!Object.hasOwn(m.objects, t.partitionOf.parent)) return cur;
     cur = t.partitionOf.parent;
   }
   return cur;
@@ -173,7 +185,7 @@ export const partitionDepth = (m: Model, tableId: string): number => {
     seen.add(cur);
     const t = m.objects[cur];
     if (t?.kind !== 'table' || !t.partitionOf) return depth;
-    if (!(t.partitionOf.parent in m.objects)) return depth;
+    if (!Object.hasOwn(m.objects, t.partitionOf.parent)) return depth;
     cur = t.partitionOf.parent;
     depth++;
   }
@@ -338,7 +350,7 @@ export const validate = (m: Model): string[] =>
           }
           if (o.kind === 'index') {
             for (const e of o.elements)
-              if (!!e.column === !!e.expr) errs.push(`索引 ${o.name}：元素必须是列或表达式之一`);
+              if (!isValidIndexElement(e)) errs.push(`索引 ${o.name}：元素必须是列或表达式之一`);
           }
           if (o.kind === 'primaryKey') {
             for (const c of o.columns) {

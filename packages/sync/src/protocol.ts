@@ -36,6 +36,14 @@ export const isValidClientId = (client: unknown): client is string =>
 export type Ver = number | string;
 export type Versions = Record<string, Ver>;
 
+/** 只取自有属性：ID 可能是 constructor、toString 等 Object.prototype 上的名字 */
+export const ownObj = (m: Model, id: string): Obj | undefined =>
+  Object.hasOwn(m.objects, id) ? m.objects[id] : undefined;
+
+/** 对象的已知版本；没有记录（含 Object.prototype 上的名字）时为 0 */
+export const verOf = (versions: Versions, id: string): Ver =>
+  Object.hasOwn(versions, id) ? (versions[id] ?? 0) : 0;
+
 export interface Op {
   client: string;
   /** 该客户端的第 n 个修改，从 1 开始严格递增 */
@@ -181,13 +189,13 @@ export const execute = (
         const v = overlay.get(prop);
         return v ? wrapRoot(v) : undefined;
       }
-      const orig = m.objects[prop];
+      const orig = ownObj(m, prop);
       return orig ? wrapRoot(orig) : undefined;
     },
     has(_t, prop) {
       if (typeof prop !== 'string') return false;
       if (overlay.has(prop)) return overlay.get(prop) !== undefined;
-      return prop in m.objects;
+      return Object.hasOwn(m.objects, prop);
     },
     set(_t, prop, value) {
       if (typeof prop !== 'string') return false;
@@ -196,7 +204,7 @@ export const execute = (
     },
     deleteProperty(_t, prop) {
       if (typeof prop !== 'string') return true;
-      if (prop in m.objects || overlay.has(prop)) {
+      if (Object.hasOwn(m.objects, prop) || overlay.has(prop)) {
         overlay.set(prop, undefined);
       }
       return true;
@@ -207,7 +215,7 @@ export const execute = (
         if (!overlay.has(id) || overlay.get(id) !== undefined) keys.push(id);
       }
       for (const [id, val] of overlay) {
-        if (val !== undefined && !(id in m.objects)) keys.push(id);
+        if (val !== undefined && !Object.hasOwn(m.objects, id)) keys.push(id);
       }
       return keys;
     },
@@ -215,7 +223,7 @@ export const execute = (
       if (typeof prop !== 'string') return undefined;
       let val: Obj | undefined;
       if (overlay.has(prop)) val = overlay.get(prop);
-      else if (prop in m.objects) val = m.objects[prop];
+      else if (Object.hasOwn(m.objects, prop)) val = m.objects[prop];
       if (!val) return undefined;
       return { configurable: true, enumerable: true, writable: true, value: wrapRoot(val) };
     },
@@ -234,7 +242,7 @@ export const execute = (
 
   const changes: Change[] = [];
   for (const [id, o] of overlay) {
-    const before = m.objects[id];
+    const before = ownObj(m, id);
     if (o === undefined) {
       if (before) changes.push({ id, obj: null });
     } else if (!before || !deepEqual(before, o)) {
@@ -273,5 +281,5 @@ export const opReads = (
   changes: Change[],
 ): [string, Ver | null][] => {
   const ids = new Set([...readsOf(m, args), ...changes.map((c) => c.id)]);
-  return [...ids].sort().map((id) => [id, id in m.objects ? (versions[id] ?? 0) : null]);
+  return [...ids].sort().map((id) => [id, Object.hasOwn(m.objects, id) ? verOf(versions, id) : null]);
 };

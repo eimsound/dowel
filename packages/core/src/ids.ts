@@ -8,3 +8,9 @@ export const newId = (): string => {
   const h = [...b].map((x) => x.toString(16).padStart(2, '0')).join('');
   return `${h.slice(0, 8)}-${h.slice(8, 12)}-${h.slice(12, 16)}-${h.slice(16, 20)}-${h.slice(20)}`;
 };
+
+/**
+ * Object.prototype 上的属性名（constructor、toString、__proto__ 等）不能当对象 ID：
+ * 模型对象表是普通对象，这些名字会和继承属性混淆，__proto__ 还会改写原型。
+ */
+export const isReservedId = (id: string): boolean => id in Object.prototype;

@@ -277,8 +277,8 @@ const planWithIndexes = (
   const steps: Step[] = [];
   const emit = (kind: string, target: string, sql: string) => steps.push({ kind, target, sql });
 
-  const inFrom = (id: string) => id in from.objects;
-  const inTo = (id: string) => id in to.objects;
+  const inFrom = (id: string) => Object.hasOwn(from.objects, id);
+  const inTo = (id: string) => Object.hasOwn(to.objects, id);
   const removed: Obj[] = [];
   for (const id in from.objects) {
     if (!inTo(id)) removed.push(from.objects[id]!);
@@ -1126,14 +1126,15 @@ const planWithIndexes = (
             (x) =>
               x.kind === detObj.kind &&
               !matchedToObjs.has(x.id) &&
-              !(x.id in cur.objects) &&
+              !Object.hasOwn(cur.objects, x.id) &&
               x.name === detObj.name &&
               sameDef(x, migrated(detObj)),
           );
         }
         if (!toMatch) {
           toMatch = toOnT.find((x) => {
-            if (x.kind !== detObj.kind || matchedToObjs.has(x.id) || x.id in cur.objects) return false;
+            if (x.kind !== detObj.kind || matchedToObjs.has(x.id) || Object.hasOwn(cur.objects, x.id))
+              return false;
             if (x.kind === 'primaryKey') return true;
             if (x.kind === 'check' && detObj.kind === 'check')
               return x.name === detObj.name || x.expr === migrateExpr(detObj.expr, tId);
@@ -1429,7 +1430,7 @@ const planWithIndexes = (
     .filter((o): o is Table => o.kind === 'table')
     .sort((x, y) => partitionDepth(from, y.id) - partitionDepth(from, x.id));
   for (const o of removedTables) {
-    if (!(o.id in cur.objects)) continue;
+    if (!Object.hasOwn(cur.objects, o.id)) continue;
     const curT = get(cur, o.id, 'table');
     // 若父表或祖先表仍被外键引用，PG 禁止直接 DROP 子分区，需先 DETACH 再 DROP
     if (curT.partitionOf && hasReferencingFkOnAncestor(o.id)) {
@@ -1453,7 +1454,7 @@ const planWithIndexes = (
     ),
   ].sort((x, y) => (x.generated ? 0 : 1) - (y.generated ? 0 : 1));
   for (const o of colsToDrop) {
-    if (!(o.id in cur.objects)) continue;
+    if (!Object.hasOwn(cur.objects, o.id)) continue;
     if (attachKeptCols.has(o.id)) continue; // 将在 P12h 随 ATTACH 吸收
     emit('dropColumn', o.id, `ALTER TABLE ${T(o.parent)} DROP COLUMN ${C(o.id)}`);
     dropWithColumn(o.id);
@@ -1977,10 +1978,11 @@ const planWithIndexes = (
       );
   };
   const allColRefsInCur = (o: PrimaryKey | Unique | Index): boolean => {
-    if (o.kind === 'primaryKey' || o.kind === 'unique') return o.columns.every((c) => c in cur.objects);
+    if (o.kind === 'primaryKey' || o.kind === 'unique')
+      return o.columns.every((c) => Object.hasOwn(cur.objects, c));
     return (
-      o.elements.every((e) => !e.column || e.column in cur.objects) &&
-      o.include.every((c) => c in cur.objects)
+      o.elements.every((e) => !e.column || Object.hasOwn(cur.objects, e.column)) &&
+      o.include.every((c) => Object.hasOwn(cur.objects, c))
     );
   };
   for (const o of addedTables) {
@@ -2007,7 +2009,7 @@ const planWithIndexes = (
     if (o.partitionBy !== null && !o.partitionOf) {
       for (const kind of ['primaryKey', 'unique', 'index'] as const) {
         for (const k of childrenOf(to, o.id, kind).sort((a, b) => cmpKeyIn(to, a, b))) {
-          if (k.id in cur.objects || !allColRefsInCur(k)) continue;
+          if (Object.hasOwn(cur.objects, k.id) || !allColRefsInCur(k)) continue;
           emitConstraintOrIndex(k);
         }
       }
@@ -2019,7 +2021,7 @@ const planWithIndexes = (
     const triggerConNames = new Set<string>();
     for (const kind of ['primaryKey', 'unique', 'check', 'foreignKey', 'index'] as const) {
       for (const o of toIdx.allRef(kind)) {
-        if (!(o.id in cur.objects)) {
+        if (!Object.hasOwn(cur.objects, o.id)) {
           if (kind !== 'index') {
             pendingConNames.add(`${o.parent}:${o.name}`);
             if ((kind === 'check' || kind === 'foreignKey') && toIdx.partitionsRef(o.parent).length > 0) {
@@ -2038,7 +2040,7 @@ const planWithIndexes = (
         ) {
           for (const desc of toIdx.partitionDescendants(o.parent)) {
             const attachedInCur =
-              desc.id in cur.objects && ancestorsCur(desc.id).some((a) => a.id === o.parent);
+              Object.hasOwn(cur.objects, desc.id) && ancestorsCur(desc.id).some((a) => a.id === o.parent);
             if (!attachedInCur) {
               pendingConNames.add(`${desc.id}:${o.name}`);
               triggerConNames.add(`${desc.id}:${o.name}`);
@@ -2063,7 +2065,7 @@ const planWithIndexes = (
           if (toIdx.partitionsRef(o.parent).length > 0) {
             for (const desc of toIdx.partitionDescendants(o.parent)) {
               const attachedInCur =
-                desc.id in cur.objects && ancestorsCur(desc.id).some((a) => a.id === o.parent);
+                Object.hasOwn(cur.objects, desc.id) && ancestorsCur(desc.id).some((a) => a.id === o.parent);
               if (colPending || !attachedInCur) {
                 pendingConNames.add(`${desc.id}:${o.notNullName}`);
                 triggerConNames.add(`${desc.id}:${o.notNullName}`);
@@ -2294,12 +2296,12 @@ const planWithIndexes = (
     emit('addColumn', c.id, `ALTER TABLE ${T(c.parent)} ADD COLUMN ${columnDef(c, table)}`);
   };
   for (const c of added) {
-    if (c.kind !== 'column' || c.id in cur.objects || c.generated) continue;
+    if (c.kind !== 'column' || Object.hasOwn(cur.objects, c.id) || c.generated) continue;
     addColumn(c);
   }
   const lateGenerated = () => {
     for (const c of [...added, ...[...regen].map((id) => to.objects[id]!)]) {
-      if (c.kind !== 'column' || c.id in cur.objects) continue;
+      if (c.kind !== 'column' || Object.hasOwn(cur.objects, c.id)) continue;
       addColumn(c);
     }
   };
@@ -2682,16 +2684,18 @@ const planWithIndexes = (
     c.ownedBy = o.ownedBy;
   }
   // ───── P14 删早期不透明对象、序列、枚举、扩展、schema ─────
-  const earlyDrops = all(from, 'opaque').filter((o) => !isLate(o) && isRemoved(o.id) && o.id in cur.objects);
+  const earlyDrops = all(from, 'opaque').filter(
+    (o) => !isLate(o) && isRemoved(o.id) && Object.hasOwn(cur.objects, o.id),
+  );
   for (const o of topo(earlyDrops).reverse()) dropOpaque(get(cur, o.id, 'opaque'));
   for (const o of removed) {
-    if (o.kind !== 'extension' || !(o.id in cur.objects)) continue;
+    if (o.kind !== 'extension' || !Object.hasOwn(cur.objects, o.id)) continue;
     emit('dropExtension', o.id, `DROP EXTENSION ${ident(o.name)}`);
     delete cur.objects[o.id];
   }
   for (const kind of ['sequence', 'enum', 'schema'] as const) {
     for (const o of removed) {
-      if (o.kind !== kind || !(o.id in cur.objects)) continue;
+      if (o.kind !== kind || !Object.hasOwn(cur.objects, o.id)) continue;
       const c = cur.objects[o.id] as Sequence | Enum | Schema;
       const sql =
         c.kind === 'sequence'
@@ -2721,7 +2725,7 @@ const planWithIndexes = (
       for (const kind of ['primaryKey', 'unique', 'check', 'index'] as const) {
         const todo = toIdx
           .allRef(kind)
-          .filter((o) => !(o.id in cur.objects))
+          .filter((o) => !Object.hasOwn(cur.objects, o.id))
           .sort((a, b) => cmpKeyIn(to, a, b));
         for (const o of todo) {
           emitConstraintOrIndex(o);
@@ -2731,7 +2735,7 @@ const planWithIndexes = (
       for (const kind of ['primaryKey', 'unique', 'check', 'index'] as const) {
         const todo = toIdx
           .allRef(kind)
-          .filter((o) => !(o.id in cur.objects))
+          .filter((o) => !Object.hasOwn(cur.objects, o.id))
           .sort((a, b) => cmpKeyIn(to, a, b));
         for (const o of todo) {
           emitConstraintOrIndex(o);
@@ -2782,7 +2786,7 @@ const planWithIndexes = (
   }
   // ───── P16 加外键 ─────
   for (const o of toIdx.allRef('foreignKey')) {
-    if (o.id in cur.objects) continue;
+    if (Object.hasOwn(cur.objects, o.id)) continue;
     cur.objects[o.id] = fresh(o);
     emit(
       'addForeignKey',
@@ -2791,7 +2795,7 @@ const planWithIndexes = (
     );
   }
   // ───── P16b 建晚期不透明对象（视图、触发器、策略、排他约束） ─────
-  const lateCreates = all(to, 'opaque').filter((o) => isLate(o) && !(o.id in cur.objects));
+  const lateCreates = all(to, 'opaque').filter((o) => isLate(o) && !Object.hasOwn(cur.objects, o.id));
   for (const o of topo(lateCreates)) createOpaque(o);
   // ───── P17 注释，以及不产生 SQL 的属性（nameMode 等）。不透明对象的注释已包含在它的 DDL 里 ─────
   const commentTarget = (o: Obj): string => {

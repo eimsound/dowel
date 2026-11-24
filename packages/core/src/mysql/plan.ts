@@ -539,8 +539,8 @@ export const mysqlPlan = (from: Model, to: Model, opts?: MysqlPlanOptions): Step
       const emit = (kind: string, target: string, sql: string) =>
         steps.push({ kind, target, sql, transactional: false });
 
-      const inFrom = (id: string) => id in from.objects;
-      const inTo = (id: string) => id in to.objects;
+      const inFrom = (id: string) => Object.hasOwn(from.objects, id);
+      const inTo = (id: string) => Object.hasOwn(to.objects, id);
 
       // 收集所有已占用名用于生成永不冲突的临时名
       const usedLower = new Set<string>();

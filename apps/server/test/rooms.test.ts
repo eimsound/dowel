@@ -1851,6 +1851,59 @@ test('applyMcpOps 批量跨越 SNAPSHOT_EVERY 时写入该点位快照', async (
   expect(atMidNames.has(`snap_t_${SNAPSHOT_EVERY + 4}`)).toBe(false);
 });
 
+test('applyMcpOps / Room.simulate：表名 constructor、列名 valueOf、注释 toString、枚举值 hasOwnProperty 不误报冲突（#87）', async () => {
+  const branchProto = `${branchId}-mcp-proto`;
+  await db.query("insert into branches (id, project_id, name) values ($1, $2, 'mcp-proto')", [
+    branchProto,
+    pid,
+  ]);
+  await rooms.init(branchProto, model);
+
+  const first = await rooms.applyMcpOps(branchProto, {
+    userId: member.id,
+    tokenId: 'tok-proto',
+    user: member.name,
+    ops: [{ name: 'createTable', args: { id: '$ref:t', schema: schemaId, name: 'users' } }],
+  });
+  expect(first.ok).toBe(true);
+  if (!first.ok) return;
+  const tableId = first.refs.t!;
+
+  const ops = [
+    { name: 'renameTable', args: { id: tableId, name: 'constructor' } },
+    { name: 'setComment', args: { id: tableId, comment: 'toString' } },
+    { name: 'addColumn', args: { table: tableId, column: { id: '$ref:c', name: 'valueOf', type: 'text' } } },
+    {
+      name: 'createEnum',
+      args: { id: '$ref:e', schema: schemaId, name: 'status', values: ['hasOwnProperty'] },
+    },
+  ];
+  // 先 dry-run（只走 Room.simulate），再真正提交；两次都基于同一个 baseSeq
+  const dry = await rooms.applyMcpOps(branchProto, {
+    userId: member.id,
+    tokenId: 'tok-proto',
+    user: member.name,
+    baseSeq: first.seq,
+    dryRun: true,
+    ops,
+  });
+  expect(dry).toMatchObject({ ok: true, dryRun: true });
+
+  const res = await rooms.applyMcpOps(branchProto, {
+    userId: member.id,
+    tokenId: 'tok-proto',
+    user: member.name,
+    baseSeq: first.seq,
+    ops,
+  });
+  expect(res).toMatchObject({ ok: true, dryRun: false, seq: first.seq + ops.length });
+  if (!res.ok) return;
+  const t = res.model.objects[tableId];
+  expect(t).toMatchObject({ kind: 'table', name: 'constructor', comment: 'toString' });
+  expect(res.model.objects[res.refs.c!]).toMatchObject({ kind: 'column', name: 'valueOf' });
+  expect(res.model.objects[res.refs.e!]).toMatchObject({ kind: 'enum', values: ['hasOwnProperty'] });
+});
+
 const PASTE_SRC = { projectId: 'proj-room', projectName: '房间项目', origin: 'canvas' as const, seq: null };
 
 test('paste 房间级防护：viewer 发送 paste 被拒绝且不推进 processed、不写 room_rejections，editor 同序号粘贴正常生效', async () => {

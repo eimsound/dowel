@@ -11,6 +11,7 @@ import {
   type ToServer,
   type Ver,
   type Versions,
+  verOf,
 } from './protocol.ts';
 
 export interface PendingOp extends Op {
@@ -63,7 +64,7 @@ export class SyncClient {
     const baseIdx = this.pending.length === 0 ? this.getConfirmedIndex() : undefined;
     const { next, changes } = execute(this.view, name, args, baseIdx);
     let reads = opReads(this.view, this.viewVersions, args, changes);
-    if (basis) reads = reads.map(([id, v]) => [id, id in basis ? basis[id]! : v]);
+    if (basis) reads = reads.map(([id, v]) => [id, Object.hasOwn(basis, id) ? basis[id]! : v]);
     const rawOp: Op = { client: this.id, n: this.nextN++, name, args, reads };
     const op: PendingOp = { ...rawOp, stale: false };
     this.pending.push(op);
@@ -82,7 +83,7 @@ export class SyncClient {
   /** 当前看到的这些对象的版本（打开编辑框时调用，保存时作为 basis 传入） */
   basisOf(ids: string[]): Versions {
     const out: Versions = {};
-    for (const id of ids) if (id in this.view.objects) out[id] = this.viewVersions[id] ?? 0;
+    for (const id of ids) if (Object.hasOwn(this.view.objects, id)) out[id] = verOf(this.viewVersions, id);
     return out;
   }
 

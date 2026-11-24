@@ -3,12 +3,14 @@
 import { z } from 'zod';
 
 import * as E from './edit.ts';
+import { isReservedId } from './ids.ts';
 import {
   ColumnDefault,
   ColumnExt,
   FkAction,
   IndexElement,
   IndexExt,
+  isValidIndexElement,
   type Model,
   type Obj,
   PartitionSpec,
@@ -20,7 +22,11 @@ import {
 import { columnsOf, effectiveColumnsOf, rootTableId } from './model.ts';
 import { getDialect } from './registry.ts';
 
-const id = z.string().min(1).max(64);
+const id = z
+  .string()
+  .min(1)
+  .max(64)
+  .refine((s) => !isReservedId(s), { message: '对象 ID 不能是保留名' });
 const name = z.string().min(1).max(128);
 
 /** 修改一个 CHECK 约束的表达式（推导名会随引用的列变化） */
@@ -180,7 +186,13 @@ export const mutators = {
     z.object({
       id,
       table: id,
-      elements: z.array(IndexElement.partial()).min(1),
+      elements: z
+        .array(
+          IndexElement.partial().refine(isValidIndexElement, {
+            message: '索引元素必须是列或非空表达式之一',
+          }),
+        )
+        .min(1, { message: '索引至少需要一个元素' }),
       unique: z.boolean().optional(),
       method: z.string().optional(),
       include: z.array(id).optional(),
@@ -320,7 +332,7 @@ export const readsOf = (m: Model, args: unknown): string[] => {
   const exprs: string[] = [];
   const walk = (x: unknown, k?: string) => {
     if (typeof x === 'string') {
-      if (x in m.objects) out.add(x);
+      if (Object.hasOwn(m.objects, x)) out.add(x);
       if (k === 'expr' || k === 'where') exprs.push(x);
     } else if (Array.isArray(x)) for (const v of x) walk(v, k);
     else if (x && typeof x === 'object') for (const [kk, v] of Object.entries(x)) walk(v, kk);
