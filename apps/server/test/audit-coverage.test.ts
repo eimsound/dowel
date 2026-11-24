@@ -520,6 +520,7 @@ test('每个应审计的动作都能在 audit_events 里找到', async () => {
     { action: 'environment.update', run: () => directAudit('environment.update', 'environment', 'e1') },
     { action: 'environment.execute', run: () => directAudit('environment.execute', 'environment', 'e1') },
     { action: 'environment.rollback', run: () => directAudit('environment.rollback', 'environment', 'e1') },
+    { action: 'environment.switch', run: () => directAudit('environment.switch', 'environment', 'e1') },
     { action: 'environment.baseline', run: () => directAudit('environment.baseline', 'environment', 'e1') },
     // P4c：接手、认领、接入已有历史（路由级覆盖在 takeover.test.ts）
     { action: 'project.takeover', run: () => directAudit('project.takeover', 'project', 'p1') },

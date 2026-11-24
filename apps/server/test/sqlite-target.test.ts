@@ -12,6 +12,8 @@ import type {
   CiExecuteResult,
   DriftCheckResponse,
   ExecEvent,
+  MarkDryRunResponse,
+  MarkResult,
   ProjectCreated,
   ProjectInfo,
   TakeoverInspectResult,
@@ -20,8 +22,8 @@ import type {
   VersionDetail,
   WizardEvent,
 } from '@dowel/api';
-import { addColumn, all, createTable, setColumnType, setDefault } from '@dowel/core';
-import { openSqliteDb } from '@dowel/engines';
+import { addColumn, all, createTable, type Model, newId, plan, setColumnType, setDefault } from '@dowel/core';
+import { getEngine, openSqliteDb, stepsChecksum, toScriptSteps, verifyChain } from '@dowel/engines';
 import { afterAll, beforeAll, describe, expect, test } from 'vitest';
 
 import { createApp, openPlatformDb, type PlatformDb } from '../src/index.ts';
@@ -538,5 +540,162 @@ describe('SQLite 目标库全栈', () => {
     expect(maskUrl('sqlserver://sa:p@ss@10.0.0.1\\INST1:1433/app')).toBe(
       'sqlserver://sa:***@10.0.0.1\\INST1:1433/app',
     );
+  });
+
+  test('ADR 0013 SQLite 目标全栈切换（switch）与跨岔路标记（cross mark）', async () => {
+    const mkFile = async (name: string) => {
+      const f = path.join(allowedDir, name);
+      const seed = openSqliteDb(f);
+      await seed.db.exec(`
+        CREATE TABLE users (
+          id INTEGER PRIMARY KEY AUTOINCREMENT,
+          email TEXT NOT NULL
+        ) STRICT;
+      `);
+      seed.close();
+      return { file: f, url: `sqlite://${f}` };
+    };
+    const tSw = await mkFile('tree-switch.sqlite');
+    const tMk = await mkFile('tree-mark.sqlite');
+
+    const wizRes = await req('POST', '/api/projects/wizard', {
+      groupId,
+      name: 'SQLite Tree App',
+      dialect: 'sqlite',
+      environments: [{ name: 'local-sw', url: tSw.url, production: false }],
+      content: { kind: 'database', env: 'local-sw' },
+    });
+    expect(wizRes.status).toBe(200);
+    const pid = parseSse<WizardEvent>(await wizRes.text()).find((e) => e.stage === 'done')!.project!.id;
+    const envsList = (await (await req('GET', `/api/projects/${pid}/environments`)).json()) as {
+      id: string;
+    }[];
+    const eidSw = envsList[0]!.id;
+
+    // 创建第二个同样库结构（仅 users(id, email)）的 SQLite 环境用于测试 cross mark
+    const envMkRes = await req('POST', `/api/projects/${pid}/environments`, {
+      name: 'local-mk',
+      url: tMk.url,
+      production: false,
+    });
+    expect(envMkRes.status).toBe(201);
+    const eidMk = ((await envMkRes.json()) as { id: string }).id;
+
+    // 写基线 v0，然后发布 v1（添加 legacy_tag 列）并执行两个环境到 v1
+    const baseRes = await req('POST', `/api/projects/${pid}/environments/${eidSw}/baseline`, {});
+    expect(parseSse<ExecEvent>(await baseRes.text()).some((e) => e.stage === 'done')).toBe(true);
+    const [v0] = (await (await req('GET', `/api/projects/${pid}/versions`)).json()) as {
+      id: string;
+      number: number;
+    }[];
+
+    await editModel(rooms, pdb, pid, (m) => {
+      const users = all(m, 'table').find((t) => t.name === 'users')!;
+      addColumn(m, users.id, { name: 'legacy_tag', type: 'TEXT', notNull: false });
+    });
+    const v1 = (await (
+      await req('POST', `/api/projects/${pid}/versions`, { name: 'v1-legacy' })
+    ).json()) as VersionCreated;
+
+    for (const eid of [eidSw, eidMk]) {
+      const r = await req('POST', `/api/projects/${pid}/environments/${eid}/execute`, { to: v1.id });
+      expect(parseSse<ExecEvent>(await r.text()).some((e) => e.stage === 'done')).toBe(true);
+    }
+
+    // 在 v0 之下新增：v2(active, 加 main_tag 列) 与 v3(active, 与 v1 结构完全等价：有 legacy_tag 列)
+    const [bRow] = await pdb.query<{ id: string }>('select id from branches where project_id = $1', [pid]);
+    const [v0Row] = await pdb.query<{ model: Model }>('select model from versions where id = $1', [v0!.id]);
+    const [v1Row] = await pdb.query<{ model: Model }>('select model from versions where id = $1', [v1.id]);
+    const m0 = v0Row!.model;
+    const m2 = structuredClone(m0);
+    const m2Users = all(m2, 'table').find((t) => t.name === 'users')!;
+    addColumn(m2, m2Users.id, { name: 'main_tag', type: 'TEXT', notNull: false });
+    const up2 = toScriptSteps(plan(m0, m2), 'sqlite');
+    const down2 = toScriptSteps(plan(m2, m0), 'sqlite');
+    const v2Id = newId();
+    await pdb.query(
+      `insert into versions (id, project_id, branch_id, seq, name, model, created_by, number, parent_id,
+                             up_steps, down_steps, checksum, verified_at)
+       values ($1, $2, $3, 2, 'v2-main', $4::text::jsonb, null, 2, $5, $6::text::jsonb, $7::text::jsonb, $8, $9)`,
+      [
+        v2Id,
+        pid,
+        bRow!.id,
+        JSON.stringify(m2),
+        v0!.id,
+        JSON.stringify(up2),
+        JSON.stringify(down2),
+        stepsChecksum(up2, down2),
+        new Date().toISOString(),
+      ],
+    );
+    await pdb.query('update versions set retired_at = $2 where id = $1', [v1.id, new Date().toISOString()]);
+
+    // 1. tSw 通过 /switch 切换到 v2（先 down v1 删 legacy_tag，再 up v2 加 main_tag）
+    const swRes = await req('POST', `/api/projects/${pid}/environments/${eidSw}/switch`, {
+      to: v2Id,
+      acknowledgeRollback: true,
+    });
+    expect(swRes.status).toBe(200);
+    const swEvents = parseSse<ExecEvent>(await swRes.text());
+    expect(swEvents.at(-1)).toMatchObject({ stage: 'done', current: { id: v2Id } });
+
+    const eng = getEngine('sqlite');
+    const chkSw = openSqliteDb(tSw.file, { readOnly: true });
+    try {
+      const h = await eng.history.readHistory(chkSw.db, pid);
+      expect(h.currentVersion).toBe(v2Id);
+      expect(verifyChain(h.versions)).toEqual([]);
+    } finally {
+      chkSw.close();
+    }
+    const swDrift = (await (
+      await req('POST', `/api/projects/${pid}/environments/${eidSw}/drift-check`, {})
+    ).json()) as DriftCheckResponse;
+    expect(swDrift.status).toBe('ok');
+
+    // 2. 用与 v1 等价的模型在 v0 下新增 v3，在停在 v1 的 tMk 上执行跨岔路 zero-SQL mark → v3
+    const up3 = toScriptSteps(plan(m0, v1Row!.model), 'sqlite');
+    const down3 = toScriptSteps(plan(v1Row!.model, m0), 'sqlite');
+    const v3Id = newId();
+    await pdb.query(
+      `insert into versions (id, project_id, branch_id, seq, name, model, created_by, number, parent_id,
+                             up_steps, down_steps, checksum, verified_at)
+       values ($1, $2, $3, 3, 'v3-cross', $4::text::jsonb, null, 3, $5, $6::text::jsonb, $7::text::jsonb, $8, $9)`,
+      [
+        v3Id,
+        pid,
+        bRow!.id,
+        JSON.stringify(v1Row!.model),
+        v0!.id,
+        JSON.stringify(up3),
+        JSON.stringify(down3),
+        stepsChecksum(up3, down3),
+        new Date().toISOString(),
+      ],
+    );
+    const mkDry = (await (
+      await req('POST', `/api/projects/${pid}/environments/${eidMk}/mark`, { to: v3Id, dryRun: true })
+    ).json()) as MarkDryRunResponse;
+    expect(mkDry.ok).toBe(true);
+    expect(mkDry.plan!.direction).toBe('cross');
+    expect(mkDry.plan!.skipped.map((v) => v.id)).toEqual([v3Id]);
+
+    const mkGoRes = await req('POST', `/api/projects/${pid}/environments/${eidMk}/mark`, {
+      to: v3Id,
+      acknowledge: true,
+      expect: {
+        from: mkDry.plan!.from?.id ?? null,
+        to: mkDry.plan!.to.id,
+        skipped: mkDry.plan!.skipped.map((v) => v.id),
+        fingerprint: mkDry.plan!.fingerprint,
+      },
+    });
+    expect(mkGoRes.status).toBe(200);
+    expect(((await mkGoRes.json()) as MarkResult).current.id).toBe(v3Id);
+    const mkDrift = (await (
+      await req('POST', `/api/projects/${pid}/environments/${eidMk}/drift-check`, {})
+    ).json()) as DriftCheckResponse;
+    expect(mkDrift.status).toBe('ok');
   });
 });

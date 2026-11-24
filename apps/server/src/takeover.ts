@@ -123,25 +123,31 @@ const formatVerifyFailure = (v: Pick<HistoryVersionRow, 'number' | 'name'>, repo
 };
 
 /**
- * 按顺序在影子库中闭环验证一条版本链（ADR 0012）：
- * - 接手整条链时 baseModel 为 null（首版本按其 scope 建空库模型起跑）；
- * - 接入领先环境时 baseModel 为原平台链头模型；
- * - 任意一个版本失败或影子库中途不可用立即拒绝并指明版本号和原因。
+ * 按 parentId 追溯父模型并在影子库中闭环验证版本树（ADR 0012 / 0013）：
+ * - 接手整棵版本树时 existingModels 为空（首版本按其 scope 建空库模型起跑）；
+ * - 接入领先环境时 existingModels 传入原平台全部已有版本的模型映射（支持按 parentId 追溯分叉）；
+ * - 按编号升序验证，确保父版本先于子版本进入 modelById；任意一个版本失败或影子库不可用立即拒绝。
  */
 export const verifyVersionChain = async (o: {
   shadow: Shadow;
   shadowLabel: string;
   versions: HistoryVersionRow[];
-  baseModel: Model | null;
+  existingModels?: ReadonlyMap<string, Model>;
   onVersion?: (v: HistoryVersionRow, index: number, total: number) => Promise<void> | void;
 }): Promise<Map<string, StoredVerifyReport>> => {
   const reports = new Map<string, StoredVerifyReport>();
-  let prevModel = o.baseModel;
-  for (let i = 0; i < o.versions.length; i++) {
-    const v = o.versions[i]!;
-    await o.onVersion?.(v, i, o.versions.length);
-    const parent = prevModel ? { model: prevModel } : null;
-    const from = chainFrom(parent, v.model, v.scope);
+  const modelById = new Map<string, Model>(o.existingModels ?? []);
+  const ordered = [...o.versions].sort((a, b) => a.number - b.number);
+  for (let i = 0; i < ordered.length; i++) {
+    const v = ordered[i]!;
+    await o.onVersion?.(v, i, ordered.length);
+    const parentModel = v.parentId ? modelById.get(v.parentId) : undefined;
+    if (v.parentId && !parentModel)
+      throw new TakeoverRejected(
+        'verify_failed',
+        `版本 v${v.number}「${v.name}」的父版本 ${v.parentId} 模型缺失，无法在影子库验证`,
+      );
+    const from = chainFrom(parentModel ? { model: parentModel } : null, v.model, v.scope);
     const checkDown = !(v.number === 0 && v.downSteps.length === 0);
     let report: VerifyReport;
     try {
@@ -156,7 +162,7 @@ export const verifyVersionChain = async (o: {
     }
     if (!report.ok) throw new TakeoverRejected('verify_failed', formatVerifyFailure(v, report));
     reports.set(v.versionId, storedReport(report, o.shadowLabel));
-    prevModel = v.model;
+    modelById.set(v.versionId, v.model);
   }
   return reports;
 };
@@ -164,7 +170,7 @@ export const verifyVersionChain = async (o: {
 /** 恢复版本并非由当前画布提交序列发布，seq 统一写哨兵值 -1（正常画布提交 seq >= 0） */
 const RESTORED_VERSION_SEQ = -1;
 
-/** 写入从目标库恢复并已验证通过的版本行（接手整条链与接入领先版本共用） */
+/** 写入从目标库恢复并已验证通过的版本行（接手整棵版本树与接入领先版本共用） */
 export const insertRestoredVersions = async (
   tx: Db,
   o: {
@@ -172,6 +178,7 @@ export const insertRestoredVersions = async (
     branch: string;
     versions: HistoryVersionRow[];
     verifiedReports: Map<string, StoredVerifyReport>;
+    retiredIds?: ReadonlySet<string>;
     restoredAt?: string;
   },
 ) => {
@@ -179,11 +186,13 @@ export const insertRestoredVersions = async (
   for (const v of o.versions) {
     const report = o.verifiedReports.get(v.versionId) ?? null;
     const verifiedAt = report?.ok ? report.at : null;
+    const retiredAt = o.retiredIds?.has(v.versionId) ? restoredAt : null;
     await tx.query(
       `insert into versions (id, project_id, branch_id, seq, name, model, created_by, created_at, number, parent_id,
-                             up_steps, down_steps, checksum, verified_at, verify_report, scope, restored_at)
+                             up_steps, down_steps, checksum, verified_at, verify_report, scope, restored_at,
+                             retired_at, retired_by)
        values ($1, $2, $3, $4, $5, $6::text::jsonb, null, $7, $8, $9, $10::text::jsonb, $11::text::jsonb, $12,
-               $13, $14::text::jsonb, $15::text::jsonb, $16)`,
+               $13, $14::text::jsonb, $15::text::jsonb, $16, $17, null)`,
       [
         v.versionId,
         o.pid,
@@ -201,6 +210,7 @@ export const insertRestoredVersions = async (
         report ? JSON.stringify(report) : null,
         v.scope?.length ? JSON.stringify(v.scope) : null,
         restoredAt,
+        retiredAt,
       ],
     );
   }
@@ -237,7 +247,9 @@ export const restoreChain = async (
     restoredAt?: string;
   },
 ) => {
-  const head = o.merged.versions.at(-1)!;
+  const headId = o.merged.active.at(-1);
+  const head =
+    (headId ? o.merged.versions.find((v) => v.versionId === headId) : undefined) ?? o.merged.versions.at(-1)!;
   await tx.query(
     "insert into branches (id, project_id, name, baseline) values ($1, $2, 'main', $3::text::jsonb)",
     [o.branch, o.pid, JSON.stringify(head.model)],
@@ -251,6 +263,7 @@ export const restoreChain = async (
     branch: o.branch,
     versions: o.merged.versions,
     verifiedReports: o.verifiedReports,
+    retiredIds: new Set(o.merged.retired),
     restoredAt: o.restoredAt,
   });
   for (const e of o.envs) {

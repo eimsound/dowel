@@ -17,18 +17,19 @@ import {
   type RepairScript,
 } from '@dowel/api';
 import type { Dialect } from '@dowel/core';
-import { type Db, getEngine } from '@dowel/engines';
+import { type Db, getEngine, indexTree, maxNumberNode, routeBetween } from '@dowel/engines';
 import { claimOf, type ExecuteExpect, ExecutorError, type MarkPlan, repairRisks } from '@dowel/executor';
 import type { Context, Hono } from 'hono';
 import { HTTPException } from 'hono/http-exception';
 import { streamSSE } from 'hono/streaming';
 
 import { audit } from '../audit.ts';
-import { type EnvAction, userActor } from '../authz.ts';
+import { can, type EnvAction, userActor } from '../authz.ts';
 import { inList } from '../db.ts';
 import {
   driftInfo,
   type EnvRow,
+  envResource,
   loadVersionMetas,
   permissionsOf,
   toEnvVersion,
@@ -44,6 +45,7 @@ import {
   runInfoOf,
   runMark,
 } from '../executions.ts';
+import { deniedMessage } from '../policy.ts';
 import { scrubSecrets } from '../secrets.ts';
 import { readSettings } from '../settings.ts';
 import { sseSender } from '../sse.ts';
@@ -67,6 +69,7 @@ export interface StreamOutcome {
   ok: boolean;
   current: EnvVersionRef | null;
   ran: number;
+  lca?: EnvVersionRef | null;
   error: { error: string; code?: string; details?: ExecEvent['details'] } | null;
 }
 
@@ -86,8 +89,10 @@ export const execStream = (
   c: Context<Env>,
   ctx: AppContext,
   a: RunAccess,
-  action: Extract<EnvAction, 'environment.execute' | 'environment.rollback' | 'environment.baseline'>,
-  run: { mode: 'migrate' | 'baseline'; to?: string; direction?: 'up' | 'down' },
+  action:
+    | Extract<EnvAction, 'environment.execute' | 'environment.rollback' | 'environment.baseline'>
+    | 'environment.switch',
+  run: { mode: 'migrate' | 'baseline'; to?: string; direction?: 'up' | 'down' | 'switch' },
   opts: StreamOptions = {},
 ) => {
   const { db } = ctx;
@@ -135,7 +140,7 @@ export const execStream = (
         },
       });
       ranList = result.ran.map((r) => ({ number: r.number, direction: r.direction }));
-      outcome = { ok: true, current, ran: result.ran.length, error: null };
+      outcome = { ok: true, current, ran: result.ran.length, lca: result.lca ?? null, error: null };
     } catch (e) {
       ev = errorEvent(e);
       outcome = { ok: false, current: null, ran: 0, error: ev };
@@ -157,7 +162,15 @@ export const execStream = (
             name: env.name,
             production: env.production,
             from: fromId,
+            ...(run.mode === 'migrate' ? { direction: run.direction } : {}),
             ...(outcome.ok ? { to: outcome.current?.id ?? null, ran: ranList } : { to: run.to ?? null }),
+            ...(action === 'environment.switch'
+              ? {
+                  lca: outcome.lca ?? null,
+                  rolledBack: ranList.filter((r) => r.direction === 'down').map((r) => r.number),
+                  upgraded: ranList.filter((r) => r.direction === 'up').map((r) => r.number),
+                }
+              : {}),
             ...policyAudit,
             ok: outcome.ok,
             ...(ev ? { code: ev.code, error: ev.error } : {}),
@@ -183,7 +196,7 @@ export const dryRunFor = async (
   ctx: AppContext,
   a: Pick<EnvAccess, 'pid' | 'name' | 'env'> & { dialect?: Dialect },
   userId: string,
-  run: { mode: 'migrate' | 'baseline'; to?: string; direction?: 'up' | 'down' },
+  run: { mode: 'migrate' | 'baseline'; to?: string; direction?: 'up' | 'down' | 'switch' },
 ): Promise<DryRunResponse> => {
   const { db } = ctx;
   try {
@@ -205,6 +218,7 @@ export const dryRunFor = async (
       plan: {
         mode: result.mode,
         direction: result.direction,
+        lca: ref(plan.lca),
         firstRun: plan.firstRun,
         baseline: plan.baseline,
         from: ref(plan.from),
@@ -252,11 +266,12 @@ export const APPROVAL_REQUIRED = {
 
 /** 目标版本要在这个项目的链上（404） */
 export const assertVersion = async (db: Db, pid: string, to: string) => {
-  const [v] = await db.query<{ id: string }>('select id from versions where id = $1 and project_id = $2', [
-    to,
-    pid,
-  ]);
+  const [v] = await db.query<{ id: string; number: number; name: string; retired_at: unknown }>(
+    'select id, number, name, retired_at from versions where id = $1 and project_id = $2',
+    [to, pid],
+  );
   if (!v) throw new HTTPException(404, { message: '版本不存在' });
+  return v;
 };
 
 /** 生产环境的执行 / 回滚 / 写基线必须在请求里带上环境名（服务端校验，不只是界面上的确认框） */
@@ -285,6 +300,10 @@ export const registerExecutions = (app: Hono<Env>, ctx: AppContext) => {
     );
     const cur = metas.find((m) => m.id === env.current_version_id);
     const versions = metas.map((m) => toEnvVersion(m, cur, executed, dialect));
+    const activeHead = maxNumberNode(metas.filter((m) => m.retiredAt === null || m.retiredAt === undefined));
+    const pending = activeHead
+      ? (routeBetween(indexTree(metas), cur?.id ?? null, activeHead.id)?.up.map((v) => v.id) ?? [])
+      : [];
     return c.json<EnvStatus>({
       id: env.id,
       name: env.name,
@@ -294,7 +313,7 @@ export const registerExecutions = (app: Hono<Env>, ctx: AppContext) => {
       policy: auth.resolved,
       currentVersion: cur ? versionRef(cur) : null,
       versions,
-      pending: versions.filter((v) => v.state === 'pending').map((v) => v.id),
+      pending,
       drift: driftInfo(env),
       permissions: permissionsOf(userActor(c.get('user')), env, role, auth),
     });
@@ -366,9 +385,14 @@ export const registerExecutions = (app: Hono<Env>, ctx: AppContext) => {
   app.post('/api/projects/:pid/environments/:eid/execute', async (c) => {
     const a = await envAccess(c, ctx, 'environment.execute');
     const b = await body(c, executeRequestSchema);
-    await assertVersion(db, a.pid, b.to);
+    const target = await assertVersion(db, a.pid, b.to);
     const run = { mode: 'migrate', to: b.to, direction: 'up' } as const;
     if (b.dryRun) return c.json(await dryRunFor(ctx, a, c.get('user').id, run));
+    if (target.retired_at !== null && target.retired_at !== undefined)
+      return c.json(
+        { error: `版本 v${target.number}「${target.name}」已作废，不能升级到它`, code: 'retired_target' },
+        409,
+      );
     // 配置了审批环节：谁都不能直接执行（实例管理员也走审批，另有紧急执行），要提交执行申请（P5b）
     if (approvalRequired(a)) return c.json(APPROVAL_REQUIRED, 403);
     confirmed(a.env, b.confirm);
@@ -384,6 +408,30 @@ export const registerExecutions = (app: Hono<Env>, ctx: AppContext) => {
     if (approvalRequired(a)) return c.json(APPROVAL_REQUIRED, 403);
     confirmed(a.env, b.confirm);
     return execStream(c, ctx, a, 'environment.rollback', run);
+  });
+
+  /** 切换（ADR 0013）：环境停在已作废岔路上时，先回滚到最近公共祖先再升级到活跃目标；同时要求执行和回滚权限 */
+  app.post('/api/projects/:pid/environments/:eid/switch', async (c) => {
+    const a = await envAccess(c, ctx, 'environment.execute');
+    if (!can(userActor(c.get('user')), 'environment.rollback', envResource(a.env, a.role, a.auth)))
+      throw new HTTPException(403, { message: deniedMessage('environment.rollback', a.auth) });
+    const b = await body(c, executeRequestSchema);
+    const target = await assertVersion(db, a.pid, b.to);
+    const run = { mode: 'migrate', to: b.to, direction: 'switch' } as const;
+    if (b.dryRun) return c.json(await dryRunFor(ctx, a, c.get('user').id, run));
+    if (target.retired_at !== null && target.retired_at !== undefined)
+      return c.json(
+        { error: `版本 v${target.number}「${target.name}」已作废，不能切换到它`, code: 'retired_target' },
+        409,
+      );
+    if (approvalRequired(a)) return c.json(APPROVAL_REQUIRED, 403);
+    if (b.acknowledgeRollback !== true)
+      return c.json(
+        { error: '切换版本需要确认回滚段会执行回滚脚本、可能造成数据丢失', code: 'rollback_ack_required' },
+        422,
+      );
+    confirmed(a.env, b.confirm);
+    return execStream(c, ctx, a, 'environment.switch', run);
   });
 
   // ───── 标记为已执行（ADR 0004） ─────

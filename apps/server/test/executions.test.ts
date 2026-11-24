@@ -3,24 +3,28 @@
 // 目标库 / 影子库用测试 PG（Testcontainers 或 DOWEL_TEST_PG），没有 Docker 时跳过。
 import type {
   DriftCheckResponse,
+  DryRunResponse,
   EnvHistory,
   EnvInfo,
   EnvStatus,
   ExecEvent,
+  MarkDryRunResponse,
+  MarkResult,
+  ProjectActivity,
   ProjectCreated,
   VersionDetail,
   VersionInfo,
   WizardEvent,
 } from '@dowel/api';
-import { addColumn, addIndex, addUnique, all, type Model } from '@dowel/core';
-import { stepsChecksum } from '@dowel/engines';
+import { addColumn, addIndex, addUnique, all, type Model, newId, plan } from '@dowel/core';
+import { stepsChecksum, toScriptSteps } from '@dowel/engines';
 import type { TargetState } from '@dowel/executor';
 import { afterAll, beforeAll, describe, expect, test, vi } from 'vitest';
 
 import { connect, createTestDb, PG_URL } from '../../../test/pg.ts';
 import { versionExecutedAnywhere } from '../src/chain.ts';
 import { type EnvRow, syncEnvCache } from '../src/envs.ts';
-import { checkEnvDrift } from '../src/executions.ts';
+import { checkEnvDrift, runExecution } from '../src/executions.ts';
 import { createApp, openPlatformDb, type PlatformDb } from '../src/index.ts';
 import { KeyedLimiter, LoginLimiter } from '../src/rate-limit.ts';
 import { encrypt } from '../src/secrets.ts';
@@ -613,6 +617,34 @@ describe.each([
     await syncEnvCache(db, 'sc-env', run({ unfinished: down, runs: [down] }));
     expect(await rows()).toEqual(['sc-v1:confirmed']);
     expect(String(await executedAt('sc-v1'))).toBe(String(at)); // 只写一次，不改
+
+    // status=running 且 stepIndex=null 的非 mark 迁移同样算碰过（保护运行中版本不被作废）
+    await db.query(
+      "update environment_versions set state = 'claimed' where environment_id = 'sc-env' and version_id = 'sc-v2'",
+    );
+    await syncEnvCache(
+      db,
+      'sc-env',
+      run({
+        unfinished: null,
+        runs: [down, { ...unfinished!, status: 'running', stepIndex: null, direction: 'up' }],
+      }),
+    );
+    expect(await rows()).toEqual(['sc-v1:confirmed', 'sc-v2:confirmed']);
+
+    // 而 status=running 且 stepIndex=null 的 mark 记录不算碰过，同步会清理残留 claimed
+    await db.query(
+      "update environment_versions set state = 'claimed' where environment_id = 'sc-env' and version_id = 'sc-v2'",
+    );
+    await syncEnvCache(
+      db,
+      'sc-env',
+      run({
+        unfinished: null,
+        runs: [down, { ...unfinished!, status: 'running', stepIndex: null, direction: 'mark' }],
+      }),
+    );
+    expect(await rows()).toEqual(['sc-v1:confirmed']);
 
     // 换了连接串 / 目标库被清空：镜像清空，缓存的当前版本回到空；版本仍然不能编辑
     await db.query("update environments set current_version_id = 'sc-v2' where id = 'sc-env'");
@@ -1283,6 +1315,228 @@ describe.each([
       } finally {
         await release();
       }
+    },
+  );
+
+  test.skipIf(skip || !PG_URL)(
+    'ADR 0013 switch / retired_target / status.pending 树计算 / claim 并发复核 / 跨岔路 mark',
+    async () => {
+      const { pid, eid, target } = await newProject('adr13-switch');
+      const [v1, v2] = await publishChain(pid, 2);
+      // 先在 dev 环境走到 v2
+      expect(last((await exec(pid, eid, 'execute', v2!.id)).events).stage).toBe('done');
+
+      // 在 v1 下构造分叉活跃版本 v3（添加 main_c3），再把 v2 标为作废
+      const [bRow] = await db.query<{ id: string }>('select id from branches where project_id = $1', [pid]);
+      const [v1Row] = await db.query<{ model: Model }>('select model from versions where id = $1', [v1!.id]);
+      const m1 = v1Row!.model;
+      const m3 = structuredClone(m1);
+      addNote(m3, 'main_c3');
+      const up3 = toScriptSteps(plan(m1, m3), 'pg');
+      const down3 = toScriptSteps(plan(m3, m1), 'pg');
+      const v3Id = newId();
+      await db.query(
+        `insert into versions (id, project_id, branch_id, seq, name, model, created_by, number, parent_id,
+                               up_steps, down_steps, checksum, verified_at)
+         values ($1, $2, $3, 2, 'v3', $4::text::jsonb, null, 3, $5, $6::text::jsonb, $7::text::jsonb, $8, $9)`,
+        [
+          v3Id,
+          pid,
+          bRow!.id,
+          JSON.stringify(m3),
+          v1!.id,
+          JSON.stringify(up3),
+          JSON.stringify(down3),
+          stepsChecksum(up3, down3),
+          new Date().toISOString(),
+        ],
+      );
+      await db.query('update versions set retired_at = $2 where id = $1', [v2!.id, new Date().toISOString()]);
+
+      // 1. 直接 execute 到已作废版本 v2 → 409 retired_target；去 v3 → SSE switch_required
+      const execRet = await call('POST', `/api/projects/${pid}/environments/${eid}/execute`, { to: v2!.id });
+      expect(execRet.status).toBe(409);
+      expect(execRet.data.code).toBe('retired_target');
+      const execWrong = await exec(pid, eid, 'execute', v3Id);
+      expect(last(execWrong.events)).toMatchObject({
+        code: 'switch_required',
+        details: { lca: { id: v1!.id } },
+      });
+
+      // 2. status.pending 沿着版本树计算到活跃头 v3（停在 v2 时 pending=[v3]）
+      expect((await status(pid, eid)).pending).toEqual([v3Id]);
+
+      // 3. /switch：缺 rollback 权限（viewer / 生产未授权 editor）403；预演返回 direction=switch + lca；真实无 ack → 422
+      expect(
+        (await call('POST', `/api/projects/${pid}/environments/${eid}/switch`, { to: v3Id }, viewer)).status,
+      ).toBe(403);
+      const dry = await call('POST', `/api/projects/${pid}/environments/${eid}/switch`, {
+        to: v3Id,
+        dryRun: true,
+      });
+      expect(dry.status).toBe(200);
+      expect((dry.data as unknown as DryRunResponse).plan).toMatchObject({
+        direction: 'switch',
+        lca: { id: v1!.id, number: 1 },
+      });
+
+      const noAck = await call('POST', `/api/projects/${pid}/environments/${eid}/switch`, { to: v3Id });
+      expect(noAck.status).toBe(422);
+      expect(noAck.data.code).toBe('rollback_ack_required');
+
+      // 4. 真实 switch 执行成功，审计记录 environment.switch 写入动态
+      const sw = await call('POST', `/api/projects/${pid}/environments/${eid}/switch`, {
+        to: v3Id,
+        acknowledgeRollback: true,
+      });
+      expect(sw.status).toBe(200);
+      expect(last(sw.events)).toMatchObject({ stage: 'done', current: { id: v3Id } });
+      expect(await columnsOf(target)).toEqual(['id', 'main_c3']);
+      expect((await status(pid, eid)).pending).toEqual([]);
+
+      const act = (await call('GET', `/api/projects/${pid}/activity`)).data as unknown as ProjectActivity;
+      const swAudit = act.events.find((e) => e.action === 'environment.switch');
+      expect(swAudit).toBeDefined();
+      expect(swAudit!.data).toMatchObject({
+        direction: 'switch',
+        lca: { id: v1!.id, number: 1 },
+        rolledBack: [2],
+        upgraded: [3],
+        ok: true,
+      });
+
+      // 5. 生产环境 switch 还受 approvalRequired (403) 与 confirm (422) 约束
+      const prodTgt = await createTestDb('exec_prod_sw');
+      targets.push(prodTgt);
+      const prodRes = await call('POST', `/api/projects/${pid}/environments`, {
+        name: 'prod-sw',
+        url: prodTgt.url,
+        production: true,
+        allowSameInstance: true,
+      });
+      const prodEid = prodRes.data.id as string;
+      const noConf = await call('POST', `/api/projects/${pid}/environments/${prodEid}/switch`, {
+        to: v3Id,
+        acknowledgeRollback: true,
+      });
+      expect(noConf.status).toBe(422);
+      expect(
+        (
+          await call('PUT', `/api/projects/${pid}/environments/${prodEid}/exec-policy`, {
+            settings: { approval: [{ approvers: { kind: 'project_admins' }, count: 1 }] },
+          })
+        ).status,
+      ).toBe(200);
+      const needApp = await call('POST', `/api/projects/${pid}/environments/${prodEid}/switch`, {
+        to: v3Id,
+        acknowledgeRollback: true,
+        confirm: 'prod-sw',
+      });
+      expect(needApp.status).toBe(403);
+      expect(needApp.data.code).toBe('approval_required');
+
+      // 6. claim 并发复核竞态：先停在 v1，在执行 v3 的 plan 事件发出后瞬间把 v3 标为已作废 → claim 拦成 retired_target
+      expect(last((await exec(pid, eid, 'rollback', v1!.id)).events).stage).toBe('done');
+      const [envRow] = await db.query<EnvRow>('select * from environments where id = $1', [eid]);
+      await expect(
+        runExecution(created.exec, {
+          pid,
+          projectName: 'adr13-switch',
+          env: envRow!,
+          mode: 'migrate',
+          to: v3Id,
+          direction: 'up',
+          userId: 'admin',
+          timeouts: { statementMs: 0, lockMs: 0 },
+          onEvent: async (e) => {
+            if (e.stage === 'plan') {
+              await db.query('update versions set retired_at = $2 where id = $1', [
+                v3Id,
+                new Date().toISOString(),
+              ]);
+            }
+          },
+        }),
+      ).rejects.toMatchObject({ code: 'retired_target' });
+      await db.query('update versions set retired_at = null where id = $1', [v3Id]);
+
+      // 7. 跨岔路 mark（另一个等价模型的项目）与禁止 mark 到已作废版本
+      const markProj = await newProject('adr13-mark');
+      const [mv1, mv2] = await publishChain(markProj.pid, 2);
+      expect(last((await exec(markProj.pid, markProj.eid, 'execute', mv2!.id)).events).stage).toBe('done');
+      const [mbRow] = await db.query<{ id: string }>('select id from branches where project_id = $1', [
+        markProj.pid,
+      ]);
+      const [mv2Row] = await db.query<{ model: Model }>('select model from versions where id = $1', [
+        mv2!.id,
+      ]);
+      const [mv1Row] = await db.query<{ model: Model }>('select model from versions where id = $1', [
+        mv1!.id,
+      ]);
+      const mSame = mv2Row!.model;
+      const upSame = toScriptSteps(plan(mv1Row!.model, mSame), 'pg');
+      const downSame = toScriptSteps(plan(mSame, mv1Row!.model), 'pg');
+      const mv3Id = newId();
+      await db.query(
+        `insert into versions (id, project_id, branch_id, seq, name, model, created_by, number, parent_id,
+                               up_steps, down_steps, checksum, verified_at)
+         values ($1, $2, $3, 2, 'v3-same', $4::text::jsonb, null, 3, $5, $6::text::jsonb, $7::text::jsonb, $8, $9)`,
+        [
+          mv3Id,
+          markProj.pid,
+          mbRow!.id,
+          JSON.stringify(mSame),
+          mv1!.id,
+          JSON.stringify(upSame),
+          JSON.stringify(downSame),
+          stepsChecksum(upSame, downSame),
+          new Date().toISOString(),
+        ],
+      );
+      await db.query('update versions set retired_at = $2 where id = $1', [
+        mv2!.id,
+        new Date().toISOString(),
+      ]);
+
+      const markRetDry = await call(
+        'POST',
+        `/api/projects/${markProj.pid}/environments/${markProj.eid}/mark`,
+        {
+          to: mv2!.id,
+          dryRun: true,
+        },
+      );
+      expect(markRetDry.status).toBe(200);
+      expect(markRetDry.data).toMatchObject({ ok: false, code: 'retired_target' });
+
+      const markRet = await call('POST', `/api/projects/${markProj.pid}/environments/${markProj.eid}/mark`, {
+        to: mv2!.id,
+      });
+      expect(markRet.status).toBe(422);
+      expect(markRet.data.code).toBe('retired_target');
+
+      const markDry = await call('POST', `/api/projects/${markProj.pid}/environments/${markProj.eid}/mark`, {
+        to: mv3Id,
+        dryRun: true,
+      });
+      expect(markDry.status).toBe(200);
+      const dryRes = markDry.data as unknown as MarkDryRunResponse;
+      expect(dryRes.ok).toBe(true);
+      expect(dryRes.plan!.direction).toBe('cross');
+      expect(dryRes.plan!.skipped.map((v) => v.id)).toEqual([mv3Id]);
+
+      const markGo = await call('POST', `/api/projects/${markProj.pid}/environments/${markProj.eid}/mark`, {
+        to: mv3Id,
+        acknowledge: true,
+        expect: {
+          from: dryRes.plan!.from?.id ?? null,
+          to: dryRes.plan!.to.id,
+          skipped: dryRes.plan!.skipped.map((v) => v.id),
+          fingerprint: dryRes.plan!.fingerprint,
+        },
+      });
+      expect(markGo.status).toBe(200);
+      expect((markGo.data as unknown as MarkResult).current.id).toBe(mv3Id);
     },
   );
 });

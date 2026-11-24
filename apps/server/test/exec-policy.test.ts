@@ -313,4 +313,23 @@ describe('接口：档位存在环境上，默认值、修改、特权操作', (
       emergency: false,
     });
   });
+
+  test('switch 接口同步受环境执行档位约束（含默认生产、放宽与仅限执行者）', async () => {
+    expect(await tryExecute('dev', 'viewer', 'switch')).toBe(403);
+    expect(await tryExecute('dev', 'editor', 'switch')).toBe(404);
+    expect(await tryExecute('prod', 'editor', 'switch')).toBe(403);
+    expect(await tryExecute('prod', 'pa', 'switch')).toBe(404);
+
+    // 生产环境放宽到 editor 后，editor 可通过 switch 鉴权；收紧回默认后再次 403
+    expect((await call('PATCH', env('prod'), { execPolicy: 'editor' }, 'pa')).status).toBe(200);
+    expect(await tryExecute('prod', 'editor', 'switch')).toBe(404);
+    expect((await call('PATCH', env('prod'), { execPolicy: null }, 'pa')).status).toBe(200);
+    expect(await tryExecute('prod', 'editor', 'switch')).toBe(403);
+
+    // 仅限执行者环境：项目管理员也 403，只有实例管理员通过 switch 鉴权
+    const swExec = await addEnv('sw-exec', false, 'executor');
+    expect(await tryExecute(swExec, 'editor', 'switch')).toBe(403);
+    expect(await tryExecute(swExec, 'pa', 'switch')).toBe(403);
+    expect(await tryExecute(swExec, 'admin', 'switch')).toBe(404);
+  });
 });

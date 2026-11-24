@@ -117,6 +117,11 @@ const toInfo = (v: InfoRow, latestId: string | null): VersionInfo => ({
   verifiedAt: v.verifiedAt,
   edited: v.edited,
   latest: v.id === latestId,
+  // TODO(Task B): 作废字段与取消作废判定由 Task B 完整实现，此处仅作最小编译占位
+  retiredAt: null,
+  retiredBy: null,
+  executed: false,
+  unretirable: false,
   restoredAt: v.restoredAt ? new Date(v.restoredAt).toISOString() : null,
 });
 

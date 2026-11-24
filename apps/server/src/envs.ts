@@ -167,8 +167,10 @@ export const loadEnv = async (db: Db, pid: string, eid: string): Promise<EnvRow>
 export interface VersionMeta {
   id: string;
   number: number;
+  parentId: string | null;
   name: string;
   verifiedAt: unknown;
+  retiredAt: unknown;
   edited: boolean;
   upSteps: ScriptStep[];
   downSteps: ScriptStep[];
@@ -177,8 +179,8 @@ export interface VersionMeta {
 
 export const loadVersionMetas = async (db: Db, pid: string): Promise<VersionMeta[]> =>
   db.query<VersionMeta>(
-    `select id, number, name, verified_at as "verifiedAt", edited, up_steps as "upSteps",
-            down_steps as "downSteps", verify_report as "verifyReport"
+    `select id, number, parent_id as "parentId", name, verified_at as "verifiedAt", retired_at as "retiredAt",
+            edited, up_steps as "upSteps", down_steps as "downSteps", verify_report as "verifyReport"
        from versions where project_id = $1 order by number`,
     [pid],
   );
@@ -195,12 +197,14 @@ export const loadChain = async (db: Db, pid: string): Promise<ChainVersion[]> =>
     downSteps: ScriptStep[];
     checksum: string;
     verifiedAt: unknown;
+    retiredAt: unknown;
     createdAt: unknown;
     createdBy: string | null;
     scope: string[] | null;
   }>(
     `select id, number, parent_id as "parentId", name, model, up_steps as "upSteps", down_steps as "downSteps",
-            checksum, verified_at as "verifiedAt", created_at as "createdAt", created_by as "createdBy", scope
+            checksum, verified_at as "verifiedAt", retired_at as "retiredAt", created_at as "createdAt",
+            created_by as "createdBy", scope
        from versions where project_id = $1 order by number`,
     [pid],
   );
@@ -214,6 +218,7 @@ export const loadChain = async (db: Db, pid: string): Promise<ChainVersion[]> =>
     downSteps: r.downSteps,
     checksum: r.checksum,
     verified: r.verifiedAt !== null && r.verifiedAt !== undefined,
+    retired: r.retiredAt !== null && r.retiredAt !== undefined,
     publishedAt: iso(r.createdAt) ?? new Date(0).toISOString(),
     publishedBy: r.createdBy,
     scope: r.scope?.length ? r.scope : null,
@@ -435,6 +440,9 @@ export const toEnvVersion = (
     number: m.number,
     name: m.name,
     state,
+    // TODO(Task B): 完整版本树 state（retired / applied / current / pending）计算由 Task B 重写
+    parentId: m.parentId,
+    retired: m.retiredAt !== null && m.retiredAt !== undefined,
     verified: m.verifiedAt !== null && m.verifiedAt !== undefined,
     edited: m.edited,
     upSteps: m.upSteps.length,
