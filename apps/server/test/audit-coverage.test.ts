@@ -637,6 +637,42 @@ test('每个应审计的动作都能在 audit_events 里找到', async () => {
         ).toBe(200);
       },
     },
+    // M3-C：MCP 令牌创建、吊销与账号停用批量吊销
+    {
+      action: 'mcp_token.create',
+      run: async () => {
+        expect((await call('POST', '/api/me/mcp-tokens', { name: 'mcp-audit' }, adminCookie)).status).toBe(
+          201,
+        );
+      },
+    },
+    {
+      action: 'mcp_token.revoke',
+      run: async () => {
+        const list = (await call('GET', '/api/me/mcp-tokens', undefined, adminCookie)).data as unknown as {
+          tokens: { id: string }[];
+        };
+        expect(
+          (await call('POST', `/api/me/mcp-tokens/${list.tokens[0]!.id}/revoke`, {}, adminCookie)).status,
+        ).toBe(200);
+      },
+    },
+    {
+      action: 'mcp_token.revoke_all',
+      run: async () => {
+        const freshMember = await call('POST', '/api/auth/login', {
+          username: 'member',
+          password: 'password3',
+        });
+        expect(freshMember.status).toBe(200);
+        expect(
+          (await call('POST', '/api/me/mcp-tokens', { name: 'member-mcp' }, freshMember.cookie)).status,
+        ).toBe(201);
+        expect(
+          (await call('PATCH', `/api/admin/users/${memberId}`, { status: 'disabled' }, adminCookie)).status,
+        ).toBe(200);
+      },
+    },
     // OIDC 动作（路由级覆盖在 oidc.test.ts 里）
     { action: 'oidc.provider_create', run: () => directAudit('oidc.provider_create', 'oidc_provider', 'o1') },
     { action: 'oidc.provider_update', run: () => directAudit('oidc.provider_update', 'oidc_provider', 'o1') },
