@@ -41,6 +41,7 @@ import {
   runExecution,
 } from '../executions.ts';
 import { groupBySlug } from '../groups.ts';
+import { bearerMcpToken } from '../mcp-tokens.ts';
 import { loadPolicies, resolveEnv } from '../policy.ts';
 import { type ProjectRow, projectRow, projectRows } from '../roles.ts';
 import { SecretError, scrubSecrets } from '../secrets.ts';
@@ -55,6 +56,7 @@ import {
   tokenActor,
 } from '../tokens.ts';
 import type { AppContext, Env } from './context.ts';
+import { MCP_PATH, mcpHttpError } from './mcp.ts';
 
 /** CI 接口的预期错误：带机器可读的 code，HTTP 状态码由 code 决定 */
 export class CiError extends Error {
@@ -89,13 +91,21 @@ export const ciJson = (c: Context, e: CiError) => {
   );
 };
 
-/** 令牌访问 /api/ci 之外的接口：403 forbidden（不回落到 cookie 会话，令牌不能管理令牌、不能编辑、不能发布……） */
+/**
+ * 令牌越界：403 forbidden（不回落到 cookie 会话）。
+ * - CI 令牌（Bearer dwl_…）访问 /api/ci 之外的接口（含 /api/mcp）：令牌不能管理令牌、不能编辑、不能发布……
+ * - MCP 令牌（Bearer dwm_…，M3-C）访问 /api/mcp 之外的接口（含 /api/ci/…、/api/me/mcp-tokens、WebSocket）。
+ */
 export const rejectTokens: MiddlewareHandler<Env> = async (c, next) => {
-  if (!c.req.path.startsWith('/api/ci/') && bearerToken(c.req.header('authorization')) !== null)
+  const path = c.req.path;
+  const header = c.req.header('authorization');
+  if (!path.startsWith('/api/ci/') && bearerToken(header) !== null)
     return ciJson(
       c,
       new CiError('forbidden', 'CI 令牌不能访问这个接口：令牌只能读取项目状态和执行迁移（/api/ci/…）'),
     );
+  if (path !== MCP_PATH && bearerMcpToken(header) !== null)
+    return mcpHttpError(c, 'forbidden', 'MCP 令牌不能访问这个接口：MCP 令牌只能访问 /api/mcp');
   await next();
 };
 

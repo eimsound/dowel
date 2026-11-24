@@ -23,6 +23,8 @@ import {
   type KeyedLimiter,
   type LoginLimiter,
   loginLimiterFromEnv,
+  mcpFailLimiterFromEnv,
+  mcpLimiterFromEnv,
   tokenFailLimiterFromEnv,
   tokenLimiterFromEnv,
 } from './rate-limit.ts';
@@ -61,6 +63,10 @@ export interface AppOptions {
   tokenFailLimiter?: KeyedLimiter;
   /** 每个 CI 令牌的请求限速；默认 DOWEL_TOKEN_RATE_LIMIT（120）次 / DOWEL_TOKEN_RATE_WINDOW_MS（60000ms） */
   tokenLimiter?: KeyedLimiter;
+  /** MCP 令牌认证失败的限速（按来源 IP）；默认 DOWEL_MCP_FAIL_LIMIT（20）次 / DOWEL_MCP_FAIL_WINDOW_MS（600000ms） */
+  mcpFailLimiter?: KeyedLimiter;
+  /** 每个 MCP 令牌的请求限速；默认 DOWEL_MCP_RATE_LIMIT（120）次 / DOWEL_MCP_RATE_WINDOW_MS（60000ms） */
+  mcpLimiter?: KeyedLimiter;
   /** 忘记密码请求限速器（测试用） */
   forgotPasswordLimiter?: LoginLimiter;
   /** 测试邮件发送限速器（测试用） */
@@ -141,10 +147,15 @@ export const createApp = (db: PlatformDb, options: AppOptions = {}) => {
   const requests = new Requests(db, exec, webhooks, security, { bus, ha });
   drift.afterSweep = () => requests.kick({ all: true });
   const activeTokens = new ActiveTokenCache(db);
+  const activeMcpTokens = new ActiveTokenCache(db, { table: 'mcp_tokens' });
   bus.onEvent((event) => {
     if (event.t === 'ci_tokens.changed' && event.origin !== bus.replicaId) activeTokens.markStale();
+    if (event.t === 'mcp_tokens.changed' && event.origin !== bus.replicaId) activeMcpTokens.markStale();
   });
-  bus.onReconnect(() => activeTokens.markStale());
+  bus.onReconnect(() => {
+    activeTokens.markStale();
+    activeMcpTokens.markStale();
+  });
 
   const ctx: AppContext = {
     db,
@@ -159,6 +170,9 @@ export const createApp = (db: PlatformDb, options: AppOptions = {}) => {
     tokenFailLimiter: options.tokenFailLimiter ?? tokenFailLimiterFromEnv(),
     activeTokens,
     tokenLimiter: options.tokenLimiter ?? tokenLimiterFromEnv(),
+    mcpFailLimiter: options.mcpFailLimiter ?? mcpFailLimiterFromEnv(),
+    activeMcpTokens,
+    mcpLimiter: options.mcpLimiter ?? mcpLimiterFromEnv(),
     forgotPasswordLimiter: options.forgotPasswordLimiter ?? forgotPasswordLimiterFromEnv(),
     emailTestLimiter: options.emailTestLimiter ?? emailTestLimiterFromEnv(),
     mailer: options.mailer ?? defaultMailer,

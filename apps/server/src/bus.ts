@@ -88,6 +88,8 @@ export type ClusterEvent =
   | { t: 'inbox.changed'; origin: string; userIds: string[] }
   | { t: 'webhooks.wake'; origin: string }
   | { t: 'ci_tokens.changed'; origin: string }
+  /** MCP 令牌创建 / 吊销 / 批量吊销（M3-C）：其他副本清空活跃 MCP 令牌哈希缓存 */
+  | { t: 'mcp_tokens.changed'; origin: string }
   | {
       t: 'shadows.forget';
       origin: string;

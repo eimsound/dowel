@@ -24,6 +24,7 @@ import { type EnvRow, envResource, loadEnv } from '../envs.ts';
 import type { ExecContext } from '../executions.ts';
 import { groupById, groupBySlug, groupRoleOf } from '../groups.ts';
 import type { HaCoordinator } from '../ha.ts';
+import type { McpPrincipal } from '../mcp-tokens.ts';
 import {
   accessIn,
   deniedMessage,
@@ -43,8 +44,8 @@ import type { ActiveTokenCache, CiTokenAuth } from '../tokens.ts';
 import { createUser, type NewUser } from '../users.ts';
 import type { Webhooks } from '../webhooks.ts';
 
-/** 请求上挂的身份：登录用户（会话 cookie），或者 CI 令牌（只在 /api/ci/… 上，见 routes/ci.ts） */
-export type Env = { Variables: { user: User; token: CiTokenAuth } };
+/** 请求上挂的身份：登录用户（会话 cookie）、CI 令牌（只在 /api/ci/… 上，见 routes/ci.ts）或 MCP 令牌的主体（只在 /api/mcp 上，见 routes/mcp.ts） */
+export type Env = { Variables: { user: User; token: CiTokenAuth; mcp: McpPrincipal } };
 
 export interface AppContext {
   db: PlatformDb;
@@ -66,6 +67,12 @@ export interface AppContext {
   activeTokens: ActiveTokenCache;
   /** 每个 CI 令牌的请求限速（P6） */
   tokenLimiter: KeyedLimiter;
+  /** MCP 令牌认证失败的限速（按来源 IP；M3-C），规则同 tokenFailLimiter */
+  mcpFailLimiter: KeyedLimiter;
+  /** 活跃 MCP 令牌哈希缓存（M3-C）：仅在来源 IP 触发失败限流时放行有效令牌做数据库强校验 */
+  activeMcpTokens: ActiveTokenCache;
+  /** 每个 MCP 令牌的请求限速（M3-C） */
+  mcpLimiter: KeyedLimiter;
   /** 忘记密码邮件请求限速（按 IP + 邮箱与 IP 总量） */
   forgotPasswordLimiter: LoginLimiter;
   /** 管理后台发送测试邮件限速（按管理员） */

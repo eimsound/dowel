@@ -18,6 +18,7 @@ import { registerEnvironments } from './environments.ts';
 import { registerExecutions } from './executions.ts';
 import { registerGrants } from './grants.ts';
 import { registerGroups } from './groups.ts';
+import { registerMcp } from './mcp.ts';
 import { registerOidcAdmin, registerOidcAuth, registerOidcMe } from './oidc.ts';
 import { registerPolicy } from './policy.ts';
 import { registerProjects } from './projects.ts';
@@ -30,9 +31,12 @@ import { registerWebhooks } from './webhooks.ts';
 import { registerWizard } from './wizard.ts';
 
 export const registerRoutes = (app: Hono<Env>, ctx: AppContext) => {
-  // CI 令牌（P6）：只允许访问 /api/ci/…；带 Bearer dwl_… 访问其余任何接口一律 403，不回落到 cookie
+  // 令牌隔离（P6 / M3-C）：CI 令牌（Bearer dwl_…）只能访问 /api/ci/…，MCP 令牌（Bearer dwm_…）只能访问 /api/mcp；
+  // 越界一律 403，不回落到 cookie
   app.use('/api/*', rejectTokens);
   registerCi(app, ctx);
+  // MCP 服务（M3-C）：只认 Bearer dwm_…，不读 cookie
+  registerMcp(app, ctx);
 
   // 公开接口：登录 / 退出、实例信息、接受邀请、重置密码
   registerAuth(app, ctx);
