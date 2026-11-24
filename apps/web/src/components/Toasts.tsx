@@ -1,12 +1,13 @@
 // 通知：一个 popover="manual" 的容器（不会被点击外部关闭）放在顶层右下角，里面堆叠多条消息。
-// 错误（如冲突）一直保留到用户关闭；成功提示 4 秒后消失，焦点在通知里时暂停（DESIGN.md：反馈）。
+// 错误（如冲突）一直保留到用户关闭；成功提示与中性说明（notice：没做成但不是错误，如“剪贴板里没有可粘贴的内容”）
+// 4 秒后消失，焦点在通知里时暂停（DESIGN.md：反馈）。
 // 对话框里的结果和错误显示在对话框内，不用通知（模态框打开时通知会被遮住）。
-import { CircleAlert, CircleCheck, X } from 'lucide-react';
+import { CircleAlert, CircleCheck, Info, X } from 'lucide-react';
 import { createContext, type ReactNode, useCallback, useContext, useEffect, useRef, useState } from 'react';
 
 import { IconButton } from './ui.tsx';
 
-type Toast = { id: number; text: string; kind: 'error' | 'info' };
+type Toast = { id: number; text: string; kind: 'error' | 'info' | 'notice' };
 const Ctx = createContext<(text: string, kind?: Toast['kind']) => void>(() => {});
 export const useToast = () => useContext(Ctx);
 
@@ -40,6 +41,7 @@ export const ToastProvider = ({ children }: { children: ReactNode }) => {
       <section
         ref={region}
         popover="manual"
+        data-toasts=""
         aria-label="通知"
         className="fixed inset-auto right-4 bottom-10 w-[min(340px,90vw)] space-y-2 overflow-visible bg-transparent p-0"
       >
@@ -60,7 +62,7 @@ const ToastItem = ({ toast, onClose }: { toast: Toast; onClose: () => void }) =>
     }, 4000);
     return () => clearInterval(timer);
   }, [toast.kind, onClose]);
-  const Icon = toast.kind === 'error' ? CircleAlert : CircleCheck;
+  const Icon = toast.kind === 'error' ? CircleAlert : toast.kind === 'notice' ? Info : CircleCheck;
   return (
     <div
       ref={ref}
@@ -69,7 +71,7 @@ const ToastItem = ({ toast, onClose }: { toast: Toast; onClose: () => void }) =>
       <Icon
         size={16}
         aria-hidden="true"
-        className={`mt-px ${toast.kind === 'error' ? 'text-danger' : 'text-ok'}`}
+        className={`mt-px ${toast.kind === 'error' ? 'text-danger' : toast.kind === 'notice' ? 'text-text-2' : 'text-ok'}`}
       />
       <p className="flex-1 break-words">{toast.text}</p>
       <IconButton label="关闭通知" size="sm" onClick={onClose}>

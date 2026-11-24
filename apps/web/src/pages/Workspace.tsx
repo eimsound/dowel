@@ -1,12 +1,25 @@
 // 模型页：顶栏 + 画布 / SQL + 属性面板 + 状态栏（DESIGN.md：Layout）。
 // 对象树在应用外壳的侧面板里（由这里通过 useShellPanel 提供），属性面板默认按需出现、可固定。
 import type { CanvasSection, EnvInfo, VersionInfo } from '@dowel/api';
-import { buildModelIndex, createAll, formatScript, newId } from '@dowel/core';
+import {
+  buildModelIndex,
+  ClipboardError,
+  type ClipboardPayload,
+  copyItems,
+  copyTables,
+  createAll,
+  formatScript,
+  newId,
+  PasteError,
+  planPaste,
+} from '@dowel/core';
 import { useQuery, useQueryClient } from '@tanstack/react-query';
 import { Link } from '@tanstack/react-router';
 import {
   BookmarkPlus,
+  ClipboardPaste,
   CloudCheck,
+  Copy,
   Database,
   FileCode,
   FileInput,
@@ -20,14 +33,29 @@ import {
   Users,
   Workflow,
 } from 'lucide-react';
-import { useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState } from 'react';
+import { useCallback, useEffect, useId, useLayoutEffect, useMemo, useRef, useState } from 'react';
 import { useTranslation } from 'react-i18next';
 
 import { api } from '../api.ts';
-import { Canvas } from '../components/Canvas.tsx';
+import {
+  readClipboard,
+  readClipboardEvent,
+  type ReadResult,
+  shouldIgnoreClipboardKey,
+  writeClipboard,
+  writeClipboardEvent,
+} from '../clipboard.ts';
+import { Canvas, type CanvasApi } from '../components/Canvas.tsx';
 import { CanvasHistory } from '../components/CanvasHistory.tsx';
 import { ImportDialog, MigrationDialog, VersionDialog } from '../components/Dialogs.tsx';
 import { Inspector } from '../components/Inspector.tsx';
+import {
+  hasDetails,
+  type PasteSummary,
+  PasteReportPanel,
+  summaryText,
+  summaryTitle,
+} from '../components/PasteReport.tsx';
 import { SectionDialog } from '../components/SectionDialog.tsx';
 import { PageHeader, useNarrow, useShellPanel } from '../components/Shell.tsx';
 import { type SelectedStore, Sidebar } from '../components/Sidebar.tsx';
@@ -35,6 +63,7 @@ import { SqlView } from '../components/SqlView.tsx';
 import { Tabs } from '../components/Tabs.tsx';
 import { useToast } from '../components/Toasts.tsx';
 import { Avatar, IconButton, peerColor } from '../components/ui.tsx';
+import { nudgeAway, placePastedTables, sectionIndex, sectionsAfterPaste } from '../copy-paste.ts';
 import { clearTables, SELECT_TABLE_EVENT, setCurrentTables } from '../current-tables.ts';
 import { dialectUiSpec } from '../dialects.ts';
 import { useProject } from '../project.tsx';
@@ -87,7 +116,15 @@ export const Model = () => {
     }),
     [],
   );
+  /** 多选的表（复制用）；为空时只看 selected */
+  const [multi, setMulti] = useState<string[]>([]);
   const updateSelected = useCallback((id: string | null) => {
+    selectedRef.current = id;
+    for (const fn of selectedListenersRef.current) fn();
+    setSelected(id);
+    setMulti([]);
+  }, []);
+  const setPrimary = useCallback((id: string | null) => {
     selectedRef.current = id;
     for (const fn of selectedListenersRef.current) fn();
     setSelected(id);
@@ -274,6 +311,11 @@ export const Model = () => {
     ],
   );
 
+  const handleSelectObjectRef = useRef(handleSelectObject);
+  useLayoutEffect(() => {
+    handleSelectObjectRef.current = handleSelectObject;
+  });
+
   // 对象树放在应用外壳的侧面板里；通过 selectedStore 在叶行局部更新选中态，避免点击节点重渲染整棵树
   useShellPanel(
     t('ws.objects'),
@@ -325,12 +367,42 @@ export const Model = () => {
     return () => window.removeEventListener(SELECT_TABLE_EVENT, onSelect);
   }, [handleSelectObject]);
 
+  /** 画布全选（⌘A）用：选择逻辑在后面定义，键盘监听先挂上 */
+  const selectManyRef = useRef<(ids: string[]) => void>(() => {});
+  const canvasApi = useRef<CanvasApi | null>(null);
   // Esc 取消选中：属性面板按需时随之消失。编辑中的输入框、对话框里的 Esc 留给它们自己。
   useEffect(() => {
     const onKey = (e: KeyboardEvent) => {
-      if (e.key !== 'Escape') return;
       const el = e.target as HTMLElement | null;
-      if (el?.closest('input, textarea, select, [contenteditable="true"], dialog, [popover]')) return;
+      // ⌘A / Ctrl+A：焦点在画布上（或页面本身）时选中画布上显示的全部表
+      if (
+        e.key.toLowerCase() === 'a' &&
+        (e.ctrlKey || e.metaKey) &&
+        !e.altKey &&
+        !e.shiftKey &&
+        (el?.closest('.react-flow') || el === document.body) &&
+        !document.querySelector('dialog[open]')
+      ) {
+        if (el.closest('input, textarea, select, [contenteditable="true"], dialog, [popover]')) return;
+        const ids = canvasApi.current?.visibleTableIds() ?? [];
+        if (!ids.length) return;
+        e.preventDefault();
+        selectManyRef.current(ids);
+        return;
+      }
+      if (e.key !== 'Escape') return;
+      // 焦点在粘贴结果面板里：Esc 关掉面板（不动画布选择）
+      const report = el?.closest('[data-testid="paste-report"]');
+      if (report) {
+        report.querySelector<HTMLButtonElement>('[data-dismiss]')?.click();
+        return;
+      }
+      if (
+        el?.closest(
+          'input, textarea, select, [contenteditable="true"], dialog, [popover], [data-testid="paste-report"]',
+        )
+      )
+        return;
       updateSelected(null);
     };
     window.addEventListener('keydown', onKey);
@@ -365,6 +437,258 @@ export const Model = () => {
     [ws, readOnly],
   );
   const close = useCallback(() => setDialog(null), []);
+
+  // ───── 复制粘贴（ADR 0013 第 2 节） ─────
+  const copyHintId = useId();
+  const [pasteSummary, setPasteSummary] = useState<PasteSummary | null>(null);
+  const [prevPastePid, setPrevPastePid] = useState(pid);
+  if (pid !== prevPastePid) {
+    setPrevPastePid(pid);
+    setPasteSummary(null);
+  }
+  const isTable = useCallback((id: string | null) => !!id && model.objects[id]?.kind === 'table', [model]);
+  /** 多选里仍然存在的表（协作者可能刚删掉其中几张） */
+  const liveMulti = useMemo(() => {
+    const ids = multi.filter((id) => model.objects[id]?.kind === 'table');
+    return ids.length === multi.length ? multi : ids;
+  }, [multi, model]);
+  /** 当前要复制的表：多选优先，否则是选中的那张表 */
+  const copyTargets = useMemo(() => {
+    if (liveMulti.length) return liveMulti;
+    return selected && model.objects[selected]?.kind === 'table' ? [selected] : [];
+  }, [liveMulti, selected, model]);
+
+  const toggleSelect = useCallback(
+    (id: string) => {
+      const base = liveMulti.length ? liveMulti : selected && isTable(selected) ? [selected] : [];
+      const next = base.includes(id) ? base.filter((x) => x !== id) : [...base, id];
+      setMulti(next.length > 1 ? next : []);
+      setPrimary(next.includes(id) ? id : (next.at(-1) ?? null));
+    },
+    [liveMulti, selected, isTable, setPrimary],
+  );
+  const selectMany = useCallback(
+    (ids: string[]) => {
+      const tables = ids.filter((id) => model.objects[id]?.kind === 'table');
+      setMulti(tables.length > 1 ? tables : []);
+      setPrimary(tables[0] ?? null);
+    },
+    [model, setPrimary],
+  );
+  useLayoutEffect(() => {
+    selectManyRef.current = selectMany;
+  });
+
+  const source = useCallback(
+    () => ({ projectId: pid, projectName: project.name, origin: 'canvas' as const, seq: null }),
+    [pid, project.name],
+  );
+  const buildTablesPayload = useCallback(
+    (ids: string[]) =>
+      copyTables(model, ids, { source: source(), layout, sections: sectionIndex(sections, ids) }),
+    [model, layout, sections, source],
+  );
+  const copyFeedback = useCallback(
+    (p: ClipboardPayload) => {
+      if (p.kind === 'tables') toast(t('clip.copiedTables', { count: p.tables.length }));
+      else toast(t('clip.copiedItems', { count: p.items.length }));
+    },
+    [t, toast],
+  );
+  const copyError = useCallback(
+    (e: unknown) => {
+      if (e instanceof ClipboardError && e.code === 'too_large') toast(t('clip.tooLarge'), 'error');
+      else toast(t('clip.copyFailed', { reason: e instanceof Error ? e.message : String(e) }), 'error');
+    },
+    [t, toast],
+  );
+  /** 按钮触发的复制（表） */
+  const copyTableIds = useCallback(
+    (ids: string[]) => {
+      if (!ids.length) return;
+      try {
+        const p = buildTablesPayload(ids);
+        void writeClipboard(p).then(() => copyFeedback(p));
+      } catch (e) {
+        copyError(e);
+      }
+    },
+    [buildTablesPayload, copyFeedback, copyError],
+  );
+  /** 按钮触发的复制（表内列 / 约束 / 索引） */
+  const copyTableItems = useCallback(
+    (tableId: string, itemIds: string[]) => {
+      if (!itemIds.length) return;
+      try {
+        const p = copyItems(model, tableId, itemIds, { source: source() });
+        void writeClipboard(p).then(() => copyFeedback(p));
+      } catch (e) {
+        copyError(e);
+      }
+    },
+    [model, source, copyFeedback, copyError],
+  );
+
+  /** 粘贴后要选中的新表：等模型里出现它们再选（此刻的 model 还是粘贴前的） */
+  const pendingSelect = useRef<string[] | null>(null);
+  useEffect(() => {
+    const ids = pendingSelect.current;
+    if (!ids || !ids.every((id) => model.objects[id])) return;
+    pendingSelect.current = null;
+    handleSelectObject(ids[0]!);
+    if (ids.length > 1) setMulti(ids);
+  }, [model, handleSelectObject]);
+  const pasteButtonRef = useRef<HTMLButtonElement>(null);
+  const [announce, setAnnounce] = useState('');
+  const lastAnnounce = useRef('');
+  const speak = useCallback((text: string) => {
+    // 读屏对与上次完全相同的消息不再播报：重复时补一个不换行空格
+    const next = text === lastAnnounce.current ? `${text}\u00A0` : text;
+    lastAnnounce.current = next;
+    setAnnounce(next);
+  }, []);
+
+  const pasteResult = useCallback(
+    (r: ReadResult, mode: 'any' | 'items' = 'any') => {
+      if (!r.ok) {
+        if (r.reason === 'unsupported_version') toast(t('clip.unsupportedVersion'), 'error');
+        else toast(t('clip.nothingToPaste'), 'notice');
+        return;
+      }
+      const payload = r.payload;
+      if (readOnly) {
+        toast(t('clip.readOnly'), 'notice');
+        return;
+      }
+      if (payload.dialect !== model.dialect) {
+        toast(
+          t('clip.dialectMismatch', {
+            from: dialectUiSpec(payload.dialect).name,
+            to: dialectUiSpec(model.dialect).name,
+          }),
+          'error',
+        );
+        return;
+      }
+      if (mode === 'items' && payload.kind === 'tables') {
+        toast(t('clip.pasteIntoTables'), 'notice');
+        return;
+      }
+      // 表内粘贴只往唯一选中的那张表里贴；多选时不猜目标
+      const targetTable =
+        payload.kind === 'items' && liveMulti.length <= 1 && isTable(selected) ? selected : null;
+      if (payload.kind === 'items' && !targetTable) {
+        toast(t('clip.needTarget'), 'error');
+        return;
+      }
+      let plan;
+      try {
+        plan = planPaste(model, payload, { targetTable });
+      } catch (e) {
+        if (e instanceof PasteError) {
+          toast(
+            t(`clip.pasteError.${e.code}`, {
+              ...e.params,
+              defaultValue: t('clip.failed', { reason: e.message }),
+            }),
+            'error',
+          );
+          return;
+        }
+        throw e;
+      }
+      const targetName = plan.targetTable ? (model.objects[plan.targetTable]?.name ?? null) : null;
+      const count = payload.kind === 'tables' ? plan.newTables.length : plan.newItems.length;
+      const summary: PasteSummary = { kind: payload.kind, count, table: targetName, report: plan.report };
+      if (plan.ops.length === 0) {
+        if (hasDetails(plan.report)) {
+          setPasteSummary(summary);
+          speak(summaryText(t, summary));
+        } else {
+          setPasteSummary(null);
+          toast(t('clip.nothingPasted'), 'notice');
+        }
+        return;
+      }
+      if (!ws.act('paste', { ops: plan.ops })) return;
+      if (payload.kind === 'tables') {
+        const positions = nudgeAway(
+          placePastedTables(payload, plan, canvasApi.current?.viewportCenter() ?? null),
+          layout,
+        );
+        if (Object.keys(positions).length) ws.move(positions);
+        const nextSections = sectionsAfterPaste(sections, payload, plan, pid);
+        if (nextSections) ws.setSections(nextSections);
+        pendingSelect.current = plan.newTables.length ? plan.newTables : null;
+      }
+      if (hasDetails(plan.report)) {
+        setPasteSummary(summary);
+        speak(summaryText(t, summary));
+      } else {
+        setPasteSummary(null);
+        toast(summaryTitle(t, summary));
+      }
+    },
+    [readOnly, model, selected, liveMulti.length, isTable, ws, layout, sections, pid, toast, t, speak],
+  );
+  const pasteFromButton = useCallback(() => {
+    void readClipboard().then((r) => pasteResult(r));
+  }, [pasteResult]);
+  const pasteIntoTable = useCallback(() => {
+    void readClipboard().then((r) => pasteResult(r, 'items'));
+  }, [pasteResult]);
+  const closePasteReport = useCallback(() => {
+    setPasteSummary(null);
+    // 关闭按钮随面板卸载：焦点回到顶栏的“粘贴”，没有就交给画布
+    const target = pasteButtonRef.current ?? document.querySelector<HTMLElement>('.react-flow');
+    target?.focus();
+  }, []);
+  const clipCtx = useMemo(
+    () => ({
+      copyTables: copyTableIds,
+      copyItems: copyTableItems,
+      pasteInto: readOnly ? undefined : pasteIntoTable,
+    }),
+    [copyTableIds, copyTableItems, readOnly, pasteIntoTable],
+  );
+  const clearSelection = useCallback(() => updateSelected(null), [updateSelected]);
+
+  // 键盘 ⌘C / ⌘V：走 copy / paste 事件（同步、无权限弹窗）；输入框、编辑器、对话框里交给浏览器
+  const clipRef = useRef({ copyTargets, buildTablesPayload, copyFeedback, copyError, pasteResult });
+  useLayoutEffect(() => {
+    clipRef.current = { copyTargets, buildTablesPayload, copyFeedback, copyError, pasteResult };
+  });
+  const tabRef = useRef(tab);
+  useLayoutEffect(() => {
+    tabRef.current = tab;
+  });
+  useEffect(() => {
+    const onCopy = (e: ClipboardEvent) => {
+      // SQL 视图里复制的是 DDL 文本，交给浏览器
+      if (tabRef.current !== 'canvas' || shouldIgnoreClipboardKey(e, 'copy')) return;
+      const c = clipRef.current;
+      if (!c.copyTargets.length) return;
+      try {
+        const p = c.buildTablesPayload(c.copyTargets);
+        writeClipboardEvent(e, p);
+        e.preventDefault();
+        c.copyFeedback(p);
+      } catch (err) {
+        c.copyError(err);
+      }
+    };
+    const onPaste = (e: ClipboardEvent) => {
+      if (tabRef.current !== 'canvas' || shouldIgnoreClipboardKey(e, 'paste')) return;
+      e.preventDefault();
+      clipRef.current.pasteResult(readClipboardEvent(e));
+    };
+    document.addEventListener('copy', onCopy);
+    document.addEventListener('paste', onPaste);
+    return () => {
+      document.removeEventListener('copy', onCopy);
+      document.removeEventListener('paste', onPaste);
+    };
+  }, []);
   const people = useMemo(() => {
     const names = [...new Set(peers.map((p) => p.user))];
     return [me.name, ...names.filter((n) => n !== me.name)];
@@ -402,7 +726,7 @@ export const Model = () => {
 
   const env = envs.data?.[0];
   const latest = versions.data?.[0];
-  const showInspector = pinned || selected !== null;
+  const showInspector = pinned || selected !== null || liveMulti.length > 1;
   const dialectLabel =
     model.dialect === 'pg'
       ? project.targetPgMajor !== null
@@ -431,9 +755,9 @@ export const Model = () => {
         ]}
         center={
           <>
-            {!readOnly && (
-              <>
-                <div className="flex gap-1.5">
+            <div className="flex gap-1.5">
+              {!readOnly && (
+                <>
                   <button type="button" className="btn" onClick={newTable}>
                     <Plus size={16} aria-hidden="true" />
                     {t('ws.newTable')}
@@ -445,18 +769,58 @@ export const Model = () => {
                   >
                     <Network size={16} aria-hidden="true" />
                   </IconButton>
-                </div>
-                <span className="h-5 w-px bg-border" aria-hidden="true" />
-              </>
-            )}
+                </>
+              )}
+              <IconButton
+                label={
+                  copyTargets.length
+                    ? t('clip.copySelected', { count: copyTargets.length })
+                    : t('clip.copySelectedNone')
+                }
+                variant="secondary"
+                aria-disabled={copyTargets.length === 0 || undefined}
+                aria-describedby={copyTargets.length === 0 ? copyHintId : undefined}
+                onClick={() => {
+                  if (copyTargets.length) copyTableIds(copyTargets);
+                }}
+              >
+                <Copy size={16} aria-hidden="true" />
+              </IconButton>
+              <span id={copyHintId} className="sr-only">
+                {t('clip.selectFirst')}
+              </span>
+              {!readOnly && (
+                <IconButton
+                  ref={pasteButtonRef}
+                  label={t('clip.pasteButton')}
+                  variant="secondary"
+                  onClick={pasteFromButton}
+                >
+                  <ClipboardPaste size={16} aria-hidden="true" />
+                </IconButton>
+              )}
+            </div>
+            <span className="h-5 w-px bg-border" aria-hidden="true" />
             <div className="flex gap-1.5">
               {!readOnly && (
-                <button type="button" className="btn" onClick={() => setDialog('import')}>
+                <button
+                  type="button"
+                  className="btn"
+                  aria-label={t('ws.import')}
+                  title={t('ws.import')}
+                  onClick={() => setDialog('import')}
+                >
                   <FileInput size={16} aria-hidden="true" />
                   <span className="max-[1080px]:hidden">{t('ws.import')}</span>
                 </button>
               )}
-              <Link to="/project/$owner/$project/environments" params={params} className="btn">
+              <Link
+                to="/project/$owner/$project/environments"
+                params={params}
+                className="btn"
+                aria-label={t('nav.environments')}
+                title={t('nav.environments')}
+              >
                 <Database size={16} aria-hidden="true" />
                 <span className="max-[1080px]:hidden">{t('nav.environments')}</span>
               </Link>
@@ -474,7 +838,13 @@ export const Model = () => {
                 <span className="max-[1080px]:hidden">{t('hist.open')}</span>
               </button>
               {!readOnly && (
-                <button type="button" className="btn" onClick={() => setDialog('publish')}>
+                <button
+                  type="button"
+                  className="btn"
+                  aria-label={t('ws.saveVersion')}
+                  title={t('ws.saveVersion')}
+                  onClick={() => setDialog('publish')}
+                >
                   <BookmarkPlus size={16} aria-hidden="true" />
                   <span className="max-[1080px]:hidden">{t('ws.saveVersion')}</span>
                 </button>
@@ -551,7 +921,7 @@ export const Model = () => {
           >
             {(k) =>
               k === 'canvas' ? (
-                <div className="h-full">
+                <div className="relative h-full">
                   <Canvas
                     model={model}
                     modelIndex={modelIndex}
@@ -569,7 +939,24 @@ export const Model = () => {
                     onChangeFocus={setFocusState}
                     onChangeViewMode={setCanvasViewMode}
                     readOnly={readOnly}
+                    multi={liveMulti}
+                    onToggleSelect={toggleSelect}
+                    onSelectMany={selectMany}
+                    onCopyGroup={copyTableIds}
+                    apiRef={canvasApi}
                   />
+                  <div aria-live="polite" className="sr-only">
+                    {announce}
+                  </div>
+                  {pasteSummary && (
+                    <div className="pointer-events-none absolute inset-x-3 bottom-14 z-10 flex">
+                      <PasteReportPanel
+                        summary={pasteSummary}
+                        onClose={closePasteReport}
+                        onOpenHistory={() => setDialog('history')}
+                      />
+                    </div>
+                  )}
                 </div>
               ) : (
                 <div className="h-full pt-12">
@@ -603,6 +990,9 @@ export const Model = () => {
               focusedTableId={viewPrefs.focus?.tableId ?? null}
               onFocusTable={focusTable}
               onExitFocus={exitFocus}
+              multi={liveMulti}
+              clip={clipCtx}
+              onClearMulti={clearSelection}
             />
           </aside>
         )}

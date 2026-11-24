@@ -7,6 +7,7 @@ import {
   type Column,
   childrenOf,
   columnsOf,
+  rootTableId,
   deepEqual,
   effectiveColumnsOf,
   type FkAction,
@@ -43,6 +44,8 @@ import {
   Check,
   ChevronDown,
   ChevronRight,
+  ClipboardPaste,
+  Copy,
   Ellipsis,
   Eye,
   FileCode,
@@ -71,9 +74,17 @@ import { resolveTopLevelTableId } from '../sections.ts';
 import type { Workspace } from '../workspace.ts';
 import { shortType, typeLabel } from './Canvas.tsx';
 import { Modal } from './Modal.tsx';
-import { Banner, cx, Empty, IconButton, Menu, Sql } from './ui.tsx';
+import { Banner, cx, Empty, IconButton, Menu, type MenuItem, Sql } from './ui.tsx';
 
-type Ctx = { ws: Workspace; model: Model; readOnly: boolean; modelIndex?: ModelIndex };
+/** 复制粘贴入口（ADR 0013 第 2 节）：由模型页提供；不传则不显示复制粘贴按钮 */
+export interface ClipCtx {
+  copyTables: (ids: string[]) => void;
+  copyItems: (tableId: string, itemIds: string[]) => void;
+  /** 把剪贴板里的列 / 约束 / 索引粘贴进当前表（只读成员不传） */
+  pasteInto?: () => void;
+}
+
+type Ctx = { ws: Workspace; model: Model; readOnly: boolean; modelIndex?: ModelIndex; clip?: ClipCtx };
 
 /** 失焦或回车时提交，Esc 放弃；传入 validate 时仅在失焦/提交时校验并在输入时清除错误 */
 const Field = ({
@@ -220,24 +231,40 @@ const Row = ({
   children,
   onDelete,
   deleteLabel,
+  onCopy,
+  copyLabel,
 }: {
   icon: ReactNode;
   name: string;
   children: ReactNode;
   onDelete?: () => void;
   deleteLabel: string;
+  onCopy?: () => void;
+  copyLabel?: string;
 }) => (
-  <li className="group grid grid-cols-[16px_minmax(0,1fr)_auto] items-start gap-x-2 rounded-sm px-1.5 py-1 hover:bg-surface-hover">
+  <li className="group grid grid-cols-[16px_minmax(0,1fr)_auto_auto] items-start gap-x-1 rounded-sm px-1.5 py-1 hover:bg-surface-hover">
     <span className="mt-0.5 text-text-3">{icon}</span>
     <div className="min-w-0">
       <div className="truncate font-mono text-sm">{name}</div>
       <div className="font-mono text-xs text-text-3">{children}</div>
     </div>
+    {onCopy ? (
+      <IconButton
+        label={copyLabel ?? name}
+        size="sm"
+        className="opacity-0 group-focus-within:opacity-100 group-hover:opacity-100 focus-visible:opacity-100 [@media(hover:none)]:opacity-100"
+        onClick={onCopy}
+      >
+        <Copy size={14} aria-hidden="true" />
+      </IconButton>
+    ) : (
+      <span />
+    )}
     {onDelete && (
       <IconButton
         label={deleteLabel}
         size="sm"
-        className="opacity-0 group-focus-within:opacity-100 group-hover:opacity-100 focus-visible:opacity-100"
+        className="opacity-0 group-focus-within:opacity-100 group-hover:opacity-100 focus-visible:opacity-100 [@media(hover:none)]:opacity-100"
         onClick={onDelete}
       >
         <Trash2 size={14} aria-hidden="true" />
@@ -651,6 +678,7 @@ const TableInspector = ({
   model,
   modelIndex,
   readOnly,
+  clip,
   onSelect,
   sections,
   onSetSections,
@@ -1157,12 +1185,13 @@ const TableInspector = ({
         title={t('insp.columns')}
         count={cols.length}
         action={
-          !locked &&
-          !isChild && (
-            <IconButton label={t('insp.addColumn')} size="sm" onClick={addColumn}>
-              <Plus size={14} aria-hidden="true" />
-            </IconButton>
-          )
+          <>
+            {!locked && !isChild && (
+              <IconButton label={t('insp.addColumn')} size="sm" onClick={addColumn}>
+                <Plus size={14} aria-hidden="true" />
+              </IconButton>
+            )}
+          </>
         }
       >
         {!isChild && (
@@ -1441,6 +1470,15 @@ const TableInspector = ({
                       >
                         <ArrowDown size={14} aria-hidden="true" />
                       </IconButton>
+                      {clip && !locked && (
+                        <IconButton
+                          label={t('clip.copyColumn', { name: c.name })}
+                          size="sm"
+                          onClick={() => clip.copyItems(table.id, [c.id])}
+                        >
+                          <Copy size={14} aria-hidden="true" />
+                        </IconButton>
+                      )}
                       <IconButton
                         label={
                           isPartKey
@@ -1746,18 +1784,20 @@ const TableInspector = ({
         title={t('insp.constraints')}
         count={(pk ? 1 : 0) + fks.length + uniques.length + checks.length}
         action={
-          !locked && (
-            <Menu
-              label={t('insp.addConstraint')}
-              trigger={<Plus size={14} aria-hidden="true" />}
-              triggerClassName="btn icon ghost sm"
-              items={[
-                { label: t('insp.check'), onSelect: () => startAdding('check') },
-                { label: t('insp.uniqueConstraint'), onSelect: () => startAdding('unique') },
-                { label: t('insp.fk'), onSelect: () => startAdding('fk') },
-              ]}
-            />
-          )
+          <>
+            {!locked && (
+              <Menu
+                label={t('insp.addConstraint')}
+                trigger={<Plus size={14} aria-hidden="true" />}
+                triggerClassName="btn icon ghost sm"
+                items={[
+                  { label: t('insp.check'), onSelect: () => startAdding('check') },
+                  { label: t('insp.uniqueConstraint'), onSelect: () => startAdding('unique') },
+                  { label: t('insp.fk'), onSelect: () => startAdding('fk') },
+                ]}
+              />
+            )}
+          </>
         }
       >
         <ul className="list-none space-y-0.5 p-0">
@@ -1767,6 +1807,8 @@ const TableInspector = ({
               name={pk.name}
               deleteLabel={`${t('insp.delete')} ${pk.name}`}
               onDelete={locked ? undefined : () => ws.act('dropKey', { id: pk.id })}
+              onCopy={clip && !isChild && !locked ? () => clip.copyItems(table.id, [pk.id]) : undefined}
+              copyLabel={t('clip.copyItem', { name: pk.name })}
             >
               <div>
                 {model.dialect === 'mssql' &&
@@ -1805,6 +1847,8 @@ const TableInspector = ({
               name={f.name}
               deleteLabel={`${t('insp.delete')} ${f.name}`}
               onDelete={locked ? undefined : () => ws.act('dropKey', { id: f.id })}
+              onCopy={clip && !isChild && !locked ? () => clip.copyItems(table.id, [f.id]) : undefined}
+              copyLabel={t('clip.copyItem', { name: f.name })}
             >
               {f.columns.map(name).join(', ')} → {name(f.refTable)}.{f.refColumns.map(name).join(', ')}
               {f.onDelete !== 'noAction' && ` · ON DELETE ${f.onDelete}`}
@@ -1817,6 +1861,8 @@ const TableInspector = ({
               name={u.name}
               deleteLabel={`${t('insp.delete')} ${u.name}`}
               onDelete={locked ? undefined : () => ws.act('dropKey', { id: u.id })}
+              onCopy={clip && !isChild && !locked ? () => clip.copyItems(table.id, [u.id]) : undefined}
+              copyLabel={t('clip.copyItem', { name: u.name })}
             >
               UNIQUE{' '}
               {model.dialect === 'mssql' ? `${u.ext?.mssql?.clustered ? 'CLUSTERED' : 'NONCLUSTERED'} ` : ''}(
@@ -1830,6 +1876,8 @@ const TableInspector = ({
               name={k.name}
               deleteLabel={`${t('insp.delete')} ${k.name}`}
               onDelete={locked ? undefined : () => ws.act('dropKey', { id: k.id })}
+              onCopy={clip && !isChild && !locked ? () => clip.copyItems(table.id, [k.id]) : undefined}
+              copyLabel={t('clip.copyItem', { name: k.name })}
             >
               <Field
                 ws={ws}
@@ -2002,11 +2050,13 @@ const TableInspector = ({
         title={t('insp.indexes')}
         count={indexes.length}
         action={
-          !locked && (
-            <IconButton label={t('insp.addIndex')} size="sm" onClick={() => startAdding('index')}>
-              <Plus size={14} aria-hidden="true" />
-            </IconButton>
-          )
+          <>
+            {!locked && (
+              <IconButton label={t('insp.addIndex')} size="sm" onClick={() => startAdding('index')}>
+                <Plus size={14} aria-hidden="true" />
+              </IconButton>
+            )}
+          </>
         }
       >
         <ul className="list-none space-y-0.5 p-0">
@@ -2029,6 +2079,8 @@ const TableInspector = ({
                 name={x.name}
                 deleteLabel={`${t('insp.delete')} ${x.name}`}
                 onDelete={locked ? undefined : () => ws.act('dropKey', { id: x.id })}
+                onCopy={clip && !isChild && !locked ? () => clip.copyItems(table.id, [x.id]) : undefined}
+                copyLabel={t('clip.copyItem', { name: x.name })}
               >
                 {x.unique && 'UNIQUE '}
                 {label}
@@ -2662,6 +2714,123 @@ const TableInspector = ({
 
 const KIND_ICON = { table: Table2, enum: List, sequence: Hash } as const;
 
+/**
+ * 表的复制菜单（放在面板标题栏、表单之外，查看者也能用）：复制整张表，或它的全部列 / 约束 / 索引。
+ * 单个列、约束、索引的复制按钮在各自的行上（只对编辑者显示，查看者的表单整体禁用）。
+ */
+const CopyMenu = ({ table, model, clip }: { table: Table; model: Model; clip: ClipCtx }) => {
+  const { t } = useTranslation();
+  const root = rootTableId(model, table.id);
+  const cols = columnsOf(model, root);
+  const keys = [
+    ...childrenOf(model, table.id, 'primaryKey'),
+    ...childrenOf(model, table.id, 'unique'),
+    ...childrenOf(model, table.id, 'check'),
+    ...childrenOf(model, table.id, 'foreignKey'),
+  ];
+  const indexes = childrenOf(model, table.id, 'index');
+  const child = table.partitionOf !== null;
+  const items: MenuItem[] = [
+    {
+      label: t('clip.copyTable', { name: table.name }),
+      icon: <Table2 size={16} aria-hidden="true" />,
+      onSelect: () => clip.copyTables([table.id]),
+    },
+  ];
+  if (!child && cols.length)
+    items.push({
+      label: t('clip.copyAllColumns', { count: cols.length }),
+      onSelect: () =>
+        clip.copyItems(
+          table.id,
+          cols.map((c) => c.id),
+        ),
+      separatorBefore: true,
+    });
+  if (!child && keys.length)
+    items.push({
+      label: t('clip.copyAllConstraints', { count: keys.length }),
+      onSelect: () =>
+        clip.copyItems(
+          table.id,
+          keys.map((k) => k.id),
+        ),
+      separatorBefore: !cols.length,
+    });
+  if (!child && indexes.length)
+    items.push({
+      label: t('clip.copyAllIndexes', { count: indexes.length }),
+      onSelect: () =>
+        clip.copyItems(
+          table.id,
+          indexes.map((x) => x.id),
+        ),
+      separatorBefore: !cols.length && !keys.length,
+    });
+  return (
+    <Menu
+      label={t('clip.copyMenu', { name: table.name })}
+      trigger={<Copy size={16} aria-hidden="true" />}
+      items={items}
+    />
+  );
+};
+
+/** 画布上多选了几张表：列出表名，提供“复制这些表”和“取消选择” */
+const MultiSelection = ({
+  ids,
+  model,
+  clip,
+  onClear,
+}: {
+  ids: readonly string[];
+  model: Model;
+  clip?: ClipCtx;
+  onClear?: () => void;
+}) => {
+  const { t } = useTranslation();
+  const tables = ids.flatMap((id) => {
+    const o = model.objects[id];
+    return o?.kind === 'table' ? [o] : [];
+  });
+  return (
+    <>
+      <div className="flex h-[46px] shrink-0 items-center gap-2 border-b border-border pr-2.5 pl-3.5">
+        <Table2 size={16} aria-hidden="true" className="text-text-3" />
+        <h2 className="min-w-0 flex-1 truncate text-[length:var(--fs-lg)] font-semibold">
+          {t('clip.selectedTables', { count: tables.length })}
+        </h2>
+      </div>
+      <div className="min-h-0 flex-1 space-y-3 overflow-auto px-3.5 pt-3 pb-5">
+        <div className="flex flex-wrap gap-1.5">
+          {clip && (
+            <button type="button" className="btn" onClick={() => clip.copyTables(tables.map((x) => x.id))}>
+              <Copy size={16} aria-hidden="true" />
+              {t('clip.copyTables', { count: tables.length })}
+            </button>
+          )}
+          {onClear && (
+            <button type="button" className="btn ghost" onClick={onClear}>
+              {t('clip.clearSelection')}
+            </button>
+          )}
+        </div>
+        <ul className="m-0 list-none space-y-0.5 p-0">
+          {tables.map((tb) => (
+            <li key={tb.id} className="truncate rounded-sm px-1.5 py-1 font-mono text-sm">
+              {model.objects[tb.parent]?.name && getDialect(model.dialect).capabilities.schemas && (
+                <span className="text-text-3">{model.objects[tb.parent]!.name}.</span>
+              )}
+              {tb.name}
+            </li>
+          ))}
+        </ul>
+        <p className="hint">{t('clip.multiHint')}</p>
+      </div>
+    </>
+  );
+};
+
 const InspectorContent = ({
   o,
   onSelect,
@@ -2712,6 +2881,12 @@ const InspectorContent = ({
           {o.name}
         </h2>
         {o.kind === 'opaque' && <span className="badge">{o.objType}</span>}
+        {o.kind === 'table' && ctx.clip && <CopyMenu table={o} model={model} clip={ctx.clip} />}
+        {o.kind === 'table' && !o.partitionOf && !readOnly && ctx.clip?.pasteInto && (
+          <IconButton label={t('clip.pasteInto', { name: o.name })} onClick={ctx.clip.pasteInto}>
+            <ClipboardPaste size={16} aria-hidden="true" />
+          </IconButton>
+        )}
         {o.kind === 'table' && focusTargetId && (onFocusTable || onExitFocus) && (
           <IconButton
             label={t('sec.focusAction')}
@@ -2891,8 +3066,13 @@ export const Inspector = memo(
     focusedTableId,
     onFocusTable,
     onExitFocus,
+    multi,
+    onClearMulti,
     ...ctx
   }: Ctx & {
+    /** 画布上多选的表（≥ 2 时显示多选面板） */
+    multi?: readonly string[];
+    onClearMulti?: () => void;
     selected: string | null;
     onSelect: (id: string | null) => void;
     sections?: CanvasSection[];
@@ -2905,6 +3085,9 @@ export const Inspector = memo(
     const { t } = useTranslation();
     const { readOnly, model } = ctx;
     const effectiveIndex = useMemo(() => ctx.modelIndex ?? buildModelIndex(model), [model, ctx.modelIndex]);
+
+    if (multi && multi.length > 1)
+      return <MultiSelection ids={multi} model={model} clip={ctx.clip} onClear={onClearMulti} />;
 
     const o = selected ? model.objects[selected] : undefined;
     if (!o || !['table', 'enum', 'sequence', 'opaque'].includes(o.kind))
