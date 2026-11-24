@@ -195,6 +195,8 @@ export interface ExecuteResult {
   mode: 'migrate' | 'baseline';
   /** switch = 先回滚到最近公共祖先再升级（ADR 0013） */
   direction: 'up' | 'down' | 'switch' | 'none';
+  /** switch 路线经过的最近公共祖先；其他情况为 null / undefined */
+  lca?: { id: string; number: number; name: string } | null;
   /** 本次是否写入了基线 */
   baseline: boolean;
   /** 本次真正执行（或写入基线）的迁移，按顺序 */

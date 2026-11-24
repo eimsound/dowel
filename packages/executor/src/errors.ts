@@ -93,6 +93,8 @@ export interface ExecutorErrorDetails {
   markPlan?: MarkPlan;
   /** 出错时环境停在哪个版本（目标库历史里最后一条成功的记录） */
   reached?: string | null;
+  /** switch_required：需要经过的最近公共祖先（ADR 0013） */
+  lca?: { id: string; number: number; name: string };
   /** step_timeout：lock = 等锁超过 lock_timeout，statement = 语句超过 statement_timeout；ms 是当时的设置 */
   timeout?: { kind: 'lock' | 'statement'; ms: number };
 }

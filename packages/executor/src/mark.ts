@@ -1,6 +1,6 @@
 // 标记为已执行（ADR 0004）：不执行任何 SQL，只在目标库的迁移历史里把环境记为“已经到达版本 X”。
 import { type Dialect, scrubSecrets } from '@dowel/core';
-import { type Db, getEngine, HistoryError } from '@dowel/engines';
+import { type Db, getEngine, HistoryError, indexTree, routeBetween } from '@dowel/engines';
 
 import { diffAgainst } from './compare.ts';
 import { ExecutorError } from './errors.ts';
@@ -103,18 +103,22 @@ const markLocked = async (o: MarkOptions, seen: (current: string | null) => void
       const state = await readState(conn, o.projectId, dialect);
       seen(state.current);
       assertTargetHistory(state, o.chain, o.instanceId);
-      const idx = new Map(o.chain.map((v, i) => [v.id, i]));
-      const to = o.chain[idx.get(o.to) ?? -1];
+      const byId = indexTree(o.chain);
+      const to = byId.get(o.to);
       if (!to) throw new ExecutorError('unknown_version', `目标版本不存在：${o.to}`);
-      const curIdx = state.current === null ? -1 : (idx.get(state.current) ?? -1);
-      if (state.current !== null && curIdx < 0)
+      if (to.retired)
+        throw new ExecutorError('retired_target', `版本 ${label(to)} 已作废，不能标记为已执行`, {
+          versionId: to.id,
+          number: to.number,
+        });
+      const cur = state.current === null ? null : (byId.get(state.current) ?? null);
+      if (state.current !== null && !cur)
         throw new ExecutorError(
           'history_mismatch',
           `目标库历史里的当前版本 ${state.current} 不在平台库的版本链上`,
         );
-      const tgtIdx = idx.get(to.id)!;
       const open = state.unfinished !== null || state.readbackFailure !== null;
-      if (tgtIdx === curIdx && !open)
+      if (cur?.id === to.id && !open)
         throw new ExecutorError(
           'mark_noop',
           `环境已经记在 ${label(to)}，不需要标记。如果线上结构和它对不上，那是漂移，请先处理漂移`,
@@ -127,12 +131,21 @@ const markLocked = async (o: MarkOptions, seen: (current: string | null) => void
           `线上结构和 ${label(to)} 的模型不一致（${diff.total} 处差异），不能标记。标记只记录“已经到达这个版本”，不改库：请先把库改成这个版本的样子`,
           { diff: diff.items, diffTotal: diff.total, versionId: to.id, number: to.number },
         );
-      const forward = tgtIdx > curIdx;
+      const route = routeBetween(byId, cur?.id ?? null, to.id);
+      if (!route) throw new ExecutorError('chain_broken', '平台库里的版本树断裂，无法计算标记路线');
+      const direction: MarkPlan['direction'] =
+        cur?.id === to.id
+          ? 'current'
+          : route.down.length === 0
+            ? 'forward'
+            : route.up.length === 0
+              ? 'backward'
+              : 'cross';
       const plan: MarkPlan = {
-        direction: tgtIdx === curIdx ? 'current' : forward ? 'forward' : 'backward',
-        from: curIdx >= 0 ? o.chain[curIdx]! : null,
+        direction,
+        from: cur,
         to,
-        skipped: forward ? o.chain.slice(curIdx + 1, tgtIdx + 1) : [],
+        skipped: direction === 'forward' || direction === 'cross' ? route.up : [],
         fingerprint: engine.fingerprint(snapshot),
       };
       if (o.dryRun) {
@@ -145,12 +158,12 @@ const markLocked = async (o: MarkOptions, seen: (current: string | null) => void
         if (!o.acknowledge)
           throw new ExecutorError(
             'ack_required',
-            '向前标记要确认：被跳过的版本里的脚本效果已经手工完成，或者不需要',
+            `${direction === 'cross' ? '跨岔路' : '向前'}标记要确认：被跳过的版本里的脚本效果已经手工完成，或者不需要`,
           );
         if (!o.expect)
           throw new ExecutorError(
             'expect_required',
-            '向前标记要带着预演拿到的计划确认（expect）：确认必须绑定到预演结果，请先预演',
+            `${direction === 'cross' ? '跨岔路' : '向前'}标记要带着预演拿到的计划确认（expect）：确认必须绑定到预演结果，请先预演`,
           );
       }
       if (o.expect) {

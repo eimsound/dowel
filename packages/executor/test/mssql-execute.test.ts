@@ -15,8 +15,8 @@ import {
   type Model,
   plan,
 } from '@dowel/core';
-import { getEngine, type ScriptStep, stepsChecksum, toScriptSteps } from '@dowel/engines';
-import { type ChainVersion, checkDrift, execute, ExecutorError } from '@dowel/executor';
+import { getEngine, type ScriptStep, stepsChecksum, toScriptSteps, verifyChain } from '@dowel/engines';
+import { type ChainVersion, checkDrift, execute, ExecutorError, markApplied } from '@dowel/executor';
 import { beforeAll, describe, expect, it } from 'vitest';
 
 import { connectTestMssql, createTestMssqlDb, getMssqlAdminUrl, MSSQL_VERSION } from '../../../test/mssql.ts';
@@ -297,6 +297,201 @@ describe(`MSSQL (${MSSQL_VERSION}) executor integration`, () => {
       } finally {
         await other.close();
       }
+    } finally {
+      await t.close();
+    }
+  }, 120_000);
+
+  it('supports ADR 0013 version-tree switch, retired_target guards, and cross-branch markApplied', async () => {
+    if (!adminUrl) return;
+    const t = await createTestMssqlDb('mssql_tree');
+    try {
+      const m1 = buildUsersV1();
+      const m2 = buildUsersV2(m1); // 加 role 列（将被作废）
+      const m3 = structuredClone(m1);
+      addColumn(m3, 't-users', { id: 'c-main', name: 'main_tag', type: 'nvarchar(64)' });
+      // 与 m2 结构完全等价的模型，用来测跨岔路零 SQL 标记
+      const m4 = structuredClone(m2);
+
+      const mk = (
+        id: string,
+        number: number,
+        parentId: string | null,
+        fromM: Model,
+        toM: Model,
+        retired = false,
+      ): ChainVersion => {
+        const up = toScriptSteps(plan(fromM, toM), 'mssql');
+        const down = toScriptSteps(plan(toM, fromM), 'mssql');
+        return {
+          id,
+          number,
+          parentId,
+          name: `MSSQL v${number}`,
+          model: toM,
+          upSteps: up,
+          downSteps: down,
+          checksum: stepsChecksum(up, down),
+          verified: true,
+          retired,
+          publishedAt: new Date().toISOString(),
+          publishedBy: null,
+          scope: null,
+        };
+      };
+
+      const v1 = mk('sv-1', 1, null, emptyBase(m1, null), m1);
+      const v2Live = mk('sv-2', 2, 'sv-1', m1, m2);
+      const v2Retired: ChainVersion = { ...v2Live, retired: true };
+      const v3 = mk('sv-3', 3, 'sv-1', m1, m3);
+      const v4SameAsV2 = mk('sv-4', 4, 'sv-1', m1, m4);
+
+      // 1. 走到 sv-2 后作废，切向 sv-3
+      await execute({
+        db: t.db,
+        dialect: 'mssql',
+        projectId: 'p-tree',
+        projectName: 'Tree App',
+        instanceId: 'inst-A',
+        chain: [v1, v2Live],
+        to: 'sv-2',
+        executedBy: 'u1',
+      });
+      const tree: ChainVersion[] = [v1, v2Retired, v3];
+
+      const err = await fails(
+        execute({
+          db: t.db,
+          dialect: 'mssql',
+          projectId: 'p-tree',
+          projectName: 'Tree App',
+          instanceId: 'inst-A',
+          chain: tree,
+          to: 'sv-3',
+          direction: 'up',
+          executedBy: 'u1',
+        }),
+      );
+      expect(err.code).toBe('switch_required');
+      expect(err.details.lca?.id).toBe('sv-1');
+
+      const dry = await execute({
+        db: t.db,
+        dialect: 'mssql',
+        projectId: 'p-tree',
+        projectName: 'Tree App',
+        instanceId: 'inst-A',
+        chain: tree,
+        to: 'sv-3',
+        direction: 'switch',
+        dryRun: true,
+        executedBy: 'u1',
+      });
+      expect(dry.lca?.id).toBe('sv-1');
+      expect(dry.dryRun?.migrations.map((m) => [m.versionId, m.direction])).toEqual([
+        ['sv-2', 'down'],
+        ['sv-3', 'up'],
+      ]);
+
+      const sw = await execute({
+        db: t.db,
+        dialect: 'mssql',
+        projectId: 'p-tree',
+        projectName: 'Tree App',
+        instanceId: 'inst-A',
+        chain: tree,
+        to: 'sv-3',
+        direction: 'switch',
+        executedBy: 'u1',
+      });
+      expect(sw.direction).toBe('switch');
+      expect(sw.current).toBe('sv-3');
+      const hAfterSwitch = await engine.history.readHistory(t.db, 'p-tree');
+      expect(hAfterSwitch.currentVersion).toBe('sv-3');
+      expect(verifyChain(hAfterSwitch.versions)).toEqual([]);
+      expect(
+        await checkDrift({ db: t.db, dialect: 'mssql', projectId: 'p-tree', chain: tree }),
+      ).toMatchObject({
+        status: 'ok',
+        version: 'sv-3',
+      });
+
+      // 回滚到 sv-1 后再试图 up 到已作废 sv-2 → retired_target
+      await execute({
+        db: t.db,
+        dialect: 'mssql',
+        projectId: 'p-tree',
+        projectName: 'Tree App',
+        instanceId: 'inst-A',
+        chain: tree,
+        to: 'sv-1',
+        direction: 'down',
+        executedBy: 'u1',
+      });
+      const retErr = await fails(
+        execute({
+          db: t.db,
+          dialect: 'mssql',
+          projectId: 'p-tree',
+          projectName: 'Tree App',
+          instanceId: 'inst-A',
+          chain: tree,
+          to: 'sv-2',
+          direction: 'up',
+          executedBy: 'u1',
+        }),
+      );
+      expect(retErr.code).toBe('retired_target');
+
+      // 2. 跨岔路 markApplied（另一个独立 project）：在 sv-2 上标到结构相同的 sv-4
+      await execute({
+        db: t.db,
+        dialect: 'mssql',
+        projectId: 'p-cross',
+        projectName: 'Cross App',
+        instanceId: 'inst-A',
+        chain: [v1, v2Live],
+        to: 'sv-2',
+        executedBy: 'u1',
+      });
+      const crossChain: ChainVersion[] = [v1, v2Retired, v4SameAsV2];
+      const markDry = await markApplied({
+        db: t.db,
+        dialect: 'mssql',
+        projectId: 'p-cross',
+        projectName: 'Cross App',
+        instanceId: 'inst-A',
+        chain: crossChain,
+        to: 'sv-4',
+        executedBy: 'u1',
+        dryRun: true,
+      });
+      expect(markDry.plan.direction).toBe('cross');
+      expect(markDry.plan.skipped.map((v) => v.id)).toEqual(['sv-4']);
+
+      await markApplied({
+        db: t.db,
+        dialect: 'mssql',
+        projectId: 'p-cross',
+        projectName: 'Cross App',
+        instanceId: 'inst-A',
+        chain: crossChain,
+        to: 'sv-4',
+        executedBy: 'u1',
+        acknowledge: true,
+        expect: {
+          from: markDry.plan.from?.id ?? null,
+          to: markDry.plan.to.id,
+          skipped: markDry.plan.skipped.map((v) => v.id),
+          fingerprint: markDry.plan.fingerprint,
+        },
+      });
+      expect(
+        await checkDrift({ db: t.db, dialect: 'mssql', projectId: 'p-cross', chain: crossChain }),
+      ).toMatchObject({
+        status: 'ok',
+        version: 'sv-4',
+      });
     } finally {
       await t.close();
     }
