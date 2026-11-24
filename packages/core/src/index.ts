@@ -1,3 +1,4 @@
+export * from './clipboard.ts';
 export * from './dialect.ts';
 export * from './edit.ts';
 export * from './empty.ts';

@@ -48,7 +48,8 @@ test('hist.op.edit 在中英文下均有对应文案', async () => {
 test('所有 core mutators 在 zh / en 的 hist.op 词典中均有文案', async () => {
   for (const lng of ['zh', 'en'] as const) {
     await i18n.changeLanguage(lng);
-    for (const op of Object.keys(mutators)) {
+    // paste 不在普通 mutator 表里（由 runMutator 单独分派），一并检查
+    for (const op of [...Object.keys(mutators), 'paste']) {
       expect(i18n.exists(`hist.op.${op}`, { lng }), `${lng}: 缺少 hist.op.${op}`).toBe(true);
     }
   }

@@ -1,7 +1,16 @@
 // SQLite 方言规格实现（注册到 @dowel/core registry）。
 import type { DialectCapabilities, DialectSpec, IdentKind } from '../dialect.ts';
 import { emptyModel, type Model, type Obj } from '../ir.ts';
-import { all, allChildrenOf, childrenOf, columnsOf, get, indexElementNames } from '../model.ts';
+import {
+  all,
+  allChildrenOf,
+  childrenOf,
+  childrenOfKinds,
+  columnsOf,
+  get,
+  indexElementNames,
+  objectsOfKinds,
+} from '../model.ts';
 import { sqliteChooseName, sqliteJoinNames } from './naming.ts';
 import {
   SQLITE_INSTANCE_LEVEL_DESCRIPTION,
@@ -45,7 +54,7 @@ export const SQLITE_CAPABILITIES: DialectCapabilities = {
 
 const isSqliteRelTaken = (m: Model, name: string, selfId: string): boolean => {
   const low = name.toLowerCase();
-  return Object.values(m.objects).some((o) => {
+  return objectsOfKinds(m, ['table', 'index', 'opaque']).some((o) => {
     if (o.id === selfId) return false;
     if (o.kind === 'table' || o.kind === 'index' || o.kind === 'opaque') {
       return o.name.toLowerCase() === low;
@@ -56,7 +65,7 @@ const isSqliteRelTaken = (m: Model, name: string, selfId: string): boolean => {
 
 const isSqliteConTaken = (m: Model, tableId: string, name: string, selfId: string): boolean => {
   const low = name.toLowerCase();
-  return Object.values(m.objects).some((o) => {
+  return childrenOfKinds(m, tableId, ['primaryKey', 'unique', 'check', 'foreignKey']).some((o) => {
     if (o.id === selfId) return false;
     if (
       (o.kind === 'primaryKey' || o.kind === 'unique' || o.kind === 'check' || o.kind === 'foreignKey') &&

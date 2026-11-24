@@ -71,6 +71,25 @@ export const childrenOf = <K extends Kind>(m: Model, parent: string, kind: K): O
   );
 };
 
+/**
+ * 指定几种 kind 的全部对象：有活动索引时直接取索引里的分桶（不经过写时复制代理逐个枚举整个模型），
+ * 否则退回单趟扫描。用于方言的重名判定等热点路径，语义与过滤 Object.values(m.objects) 完全一致。
+ */
+export const objectsOfKinds = (m: Model, kinds: readonly Kind[]): readonly Obj[] => {
+  const idx = getActiveModelIndex(m);
+  if (idx) return kinds.length === 1 ? idx.allRef(kinds[0]!) : kinds.flatMap((k) => idx.allRef(k));
+  const want = new Set<string>(kinds);
+  return Object.values(m.objects).filter((o) => want.has(o.kind));
+};
+
+/** 某父对象下指定几种 kind 的直接子对象（有活动索引时走索引） */
+export const childrenOfKinds = (m: Model, parent: string, kinds: readonly Kind[]): readonly Obj[] => {
+  const idx = getActiveModelIndex(m);
+  if (idx) return kinds.flatMap((k) => idx.childrenRef(parent, k));
+  const want = new Set<string>(kinds);
+  return Object.values(m.objects).filter((o) => want.has(o.kind) && 'parent' in o && o.parent === parent);
+};
+
 /** 某父对象下的全部直接子对象（不限 kind） */
 export const allChildrenOf = (m: Model, parent: string): Obj[] => {
   const idx = getActiveModelIndex(m);

@@ -50,6 +50,7 @@ import {
   projectRows,
   visibleProjects,
 } from './roles.ts';
+import { MCP_DISALLOWED_MUTATORS } from './rooms.ts';
 import type { AppContext, Env } from './routes/context.ts';
 import { scrubSecrets } from './secrets.ts';
 import { ShadowError } from './shadow.ts';
@@ -470,11 +471,14 @@ const readCachedEnvironments = async (ctx: AppContext, pid: string) => {
 
 const listMutatorCatalog = (names?: string[]) => {
   const registry = mutators as Record<string, { args: z.ZodType }>;
-  const targetNames = names?.length ? names : Object.keys(registry);
+  const targetNames = names?.length
+    ? names
+    : Object.keys(registry).filter((n) => !MCP_DISALLOWED_MUTATORS.has(n));
   const items: { name: string; argsSchema: Record<string, unknown> }[] = [];
   const unknown: string[] = [];
   for (const name of targetNames) {
-    const entry = Object.hasOwn(registry, name) ? registry[name] : undefined;
+    const entry =
+      !MCP_DISALLOWED_MUTATORS.has(name) && Object.hasOwn(registry, name) ? registry[name] : undefined;
     if (!entry) {
       unknown.push(name);
       continue;

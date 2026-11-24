@@ -24,7 +24,7 @@ import {
   useReactFlow,
   useViewport,
 } from '@xyflow/react';
-import { Focus, Maximize, Table2, ZoomIn, ZoomOut } from 'lucide-react';
+import { Copy, Focus, Maximize, Table2, ZoomIn, ZoomOut } from 'lucide-react';
 import { memo, useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState } from 'react';
 import { useTranslation } from 'react-i18next';
 
@@ -69,6 +69,8 @@ type SummaryData = {
   group: CanvasGroup;
   hasSections: boolean;
   onExpand: (groupId: string) => void;
+  /** 复制该板块 / schema 下的全部表（不传则不显示复制按钮） */
+  onCopy?: (tableIds: string[], label: string) => void;
 };
 type SummaryNode = Node<SummaryData, 'sectionSummary'>;
 type CanvasNode = TableNode | SummaryNode;
@@ -162,7 +164,7 @@ const TableNodeView = memo(({ data, selected }: NodeProps<TableNode>) => {
 
 const SummaryNodeView = memo(({ data }: NodeProps<SummaryNode>) => {
   const { t } = useTranslation();
-  const { group, hasSections, onExpand } = data;
+  const { group, hasSections, onExpand, onCopy } = data;
   const displayName = group.kind === 'unassigned' ? t('sec.unassigned') : group.name;
   const dotColor = group.color ? sectionColorCssVar(group.color) : 'var(--border-strong)';
   const fkLabel = t(hasSections ? 'sec.crossSectionFk' : 'sec.crossSchemaFk', {
@@ -197,7 +199,20 @@ const SummaryNodeView = memo(({ data }: NodeProps<SummaryNode>) => {
           <span className="font-mono">{t('sec.tableCount', { count: group.tableIds.length })}</span>
           <span className="truncate font-mono text-text-3">{fkLabel}</span>
         </div>
-        <div className="flex justify-end">
+        <div className="flex justify-end gap-1.5">
+          {onCopy && group.tableIds.length > 0 && (
+            <IconButton
+              label={t('clip.copyGroup', { name: displayName, count: group.tableIds.length })}
+              size="sm"
+              className="nodrag nopan"
+              onClick={(e) => {
+                e.stopPropagation();
+                onCopy(group.tableIds, displayName);
+              }}
+            >
+              <Copy size={14} aria-hidden="true" />
+            </IconButton>
+          )}
           <button
             type="button"
             className="btn sm nodrag nopan"
@@ -330,6 +345,15 @@ const ZoomPanel = () => {
 const EMPTY_SECTIONS: CanvasSection[] = [];
 const EMPTY_EXPANDED: string[] = [];
 const miniMapNodeClass = (n: CanvasNode) => (n.selected ? 'selected' : '');
+const EMPTY_MULTI: readonly string[] = [];
+
+/** 画布对外暴露的少量命令（粘贴时取可见区域中心） */
+export interface CanvasApi {
+  /** 当前可见区域中心的画布坐标；画布还没初始化时为 null */
+  viewportCenter: () => { x: number; y: number } | null;
+  /** 当前视图里渲染的表（全选用） */
+  visibleTableIds: () => string[];
+}
 
 export const Canvas = memo(
   ({
@@ -349,6 +373,11 @@ export const Canvas = memo(
     onChangeFocus,
     onChangeViewMode,
     readOnly = false,
+    multi = EMPTY_MULTI,
+    onToggleSelect,
+    onSelectMany,
+    onCopyGroup,
+    apiRef,
   }: {
     model: Model;
     modelIndex?: ModelIndex;
@@ -367,6 +396,14 @@ export const Canvas = memo(
     onChangeFocus?: (next: FocusState | null) => void;
     onChangeViewMode?: (mode: CanvasViewMode) => void;
     readOnly?: boolean;
+    /** 多选的表（复制用）；selected 是其中的主选中项 */
+    multi?: readonly string[];
+    /** Ctrl / ⌘ / Shift 点击：切换一张表的多选状态 */
+    onToggleSelect?: (id: string) => void;
+    /** 框选（Shift 拖动）结束：选中框内的表 */
+    onSelectMany?: (ids: string[]) => void;
+    onCopyGroup?: (tableIds: string[], label: string) => void;
+    apiRef?: { current: CanvasApi | null };
   }) => {
     const { t } = useTranslation();
     const draggingIdsRef = useRef(new Set<string>());
@@ -651,6 +688,7 @@ export const Canvas = memo(
               group: g,
               hasSections,
               onExpand: toggleGroup,
+              onCopy: onCopyGroup,
             },
           });
         }
@@ -669,7 +707,16 @@ export const Canvas = memo(
         });
       }
       return out;
-    }, [collapsedGroups, sections.length, savedGroupPos, toggleGroup, visibleTables, savedPos, tableDataMap]);
+    }, [
+      collapsedGroups,
+      sections.length,
+      savedGroupPos,
+      toggleGroup,
+      onCopyGroup,
+      visibleTables,
+      savedPos,
+      tableDataMap,
+    ]);
 
     const [rfNodes, setRfNodes] = useState<CanvasNode[]>(desiredNodes);
     useLayoutEffect(() => {
@@ -698,18 +745,23 @@ export const Canvas = memo(
       });
     }, [desiredNodes]);
 
+    const multiSet = useMemo(() => new Set(multi), [multi]);
+    // 框选（Shift 拖动）进行中的临时选择：渲染时以它为准，React Flow 据此算出增量 select 变更，结束时一次提交
+    const [boxDraft, setBoxDraft] = useState<ReadonlySet<string> | null>(null);
+    const boxRef = useRef<ReadonlySet<string> | null>(null);
     const renderedNodes = useMemo(() => {
       let next: CanvasNode[] | null = null;
       for (let i = 0; i < rfNodes.length; i++) {
         const n = rfNodes[i]!;
-        const want = n.type === 'table' && n.id === selected;
+        const want =
+          n.type === 'table' && (boxDraft ? boxDraft.has(n.id) : n.id === selected || multiSet.has(n.id));
         if (Boolean(n.selected) !== want) {
           next ??= rfNodes.slice();
           next[i] = { ...n, selected: want } as CanvasNode;
         }
       }
       return next ?? rfNodes;
-    }, [rfNodes, selected]);
+    }, [rfNodes, selected, multiSet, boxDraft]);
 
     // 当前视图中所有可见表（及汇总卡片）就位之后适配一次视图
     useEffect(() => {
@@ -872,24 +924,38 @@ export const Canvas = memo(
     ]);
 
     const edges: Edge[] = useMemo(() => {
-      if (!selected) return baseEdges;
+      if (!selected && !multiSet.size) return baseEdges;
+      const active = (id: string) => id === selected || multiSet.has(id);
       let anyActive = false;
       const next = baseEdges.map((e) => {
         if (e.id.startsWith('sum-edge:') || e.id.startsWith('cross:')) return e;
-        if (e.source === selected || e.target === selected) {
+        if (active(e.source) || active(e.target)) {
           anyActive = true;
           return { ...e, style: ACTIVE_FK_STYLE, zIndex: 1 };
         }
         return e;
       });
       return anyActive ? next : baseEdges;
-    }, [baseEdges, selected]);
+    }, [baseEdges, selected, multiSet]);
 
-    // 选中态完全由 selected 受控（renderedNodes 派生），丢弃 React Flow 内部的 select 变更，
-    // 避免点击/框选额外触发一次 rfNodes 更新；其余变更（位置、尺寸）照常应用。
+    // 选中态完全由 selected / multi 受控（renderedNodes 派生），丢弃 React Flow 内部的 select 变更，
+    // 避免点击额外触发一次 rfNodes 更新；框选进行中把 select 变更累积到 boxDraft；
+    // 删除变更一律丢弃（画布上不能用键盘删表）；其余变更（位置、尺寸）照常应用。
     // v13 每次派发都会新建 NodeChangeset，可以就地裁剪后在 updater 里 applyTo。
     const onNodesChange = useCallback((changes: NodeChangeset<CanvasNode>) => {
-      for (const ch of changes.getByType('select')) changes.remove(ch);
+      const selects = changes.getByType('select');
+      if (boxRef.current && selects.length) {
+        const next = new Set(boxRef.current);
+        for (const ch of selects) {
+          if (ch.id.startsWith(SUMMARY_NODE_PREFIX)) continue;
+          if (ch.selected) next.add(ch.id);
+          else next.delete(ch.id);
+        }
+        boxRef.current = next;
+        setBoxDraft(next);
+      }
+      for (const ch of selects) changes.remove(ch);
+      for (const ch of changes.getByType('remove')) changes.remove(ch);
       for (const ch of changes.getByType('position')) {
         if (ch.dragging === true) draggingIdsRef.current.add(ch.id);
         else if (ch.dragging === false) draggingIdsRef.current.delete(ch.id);
@@ -912,37 +978,103 @@ export const Canvas = memo(
         : focusTableObj.name;
     }, [focusTableObj, model]);
 
-    const handleNodeDragStop = useCallback(
-      (_: unknown, node: CanvasNode) => {
-        draggingIdsRef.current.delete(node.id);
-        if (node.type === 'sectionSummary') {
-          setSummaryPositions((prev) => ({ ...prev, [node.id]: node.position }));
-        } else {
-          onMove({ [node.id]: node.position });
+    const commitDraggedNodes = useCallback(
+      (dragged: CanvasNode[]) => {
+        const tableMoves: Layout = {};
+        let summaryPatch: Record<string, { x: number; y: number }> | null = null;
+        for (const n of dragged) {
+          draggingIdsRef.current.delete(n.id);
+          if (n.type === 'sectionSummary') {
+            summaryPatch ??= {};
+            summaryPatch[n.id] = n.position;
+          } else {
+            tableMoves[n.id] = n.position;
+          }
+        }
+        if (summaryPatch) {
+          const patch = summaryPatch;
+          setSummaryPositions((prev) => ({ ...prev, ...patch }));
+        }
+        if (Object.keys(tableMoves).length > 0) {
+          onMove(tableMoves);
         }
       },
       [onMove],
     );
 
-    const handleNodeClick = useCallback(
-      (_: unknown, n: CanvasNode) => {
-        if (n.type === 'table') onSelect(n.id);
+    const handleNodeDragStop = useCallback(
+      (_: unknown, node: CanvasNode, nodes: CanvasNode[]) => {
+        const dragged = nodes.some((n) => n.id === node.id) ? nodes : [node, ...nodes];
+        commitDraggedNodes(dragged);
       },
-      [onSelect],
+      [commitDraggedNodes],
     );
+
+    const handleSelectionDragStop = useCallback(
+      (_: unknown, nodes: CanvasNode[]) => {
+        commitDraggedNodes(nodes);
+      },
+      [commitDraggedNodes],
+    );
+
+    const handleNodeClick = useCallback(
+      (e: { ctrlKey: boolean; metaKey: boolean; shiftKey: boolean }, n: CanvasNode) => {
+        if (n.type !== 'table') return;
+        if ((e.ctrlKey || e.metaKey || e.shiftKey) && onToggleSelect) onToggleSelect(n.id);
+        else onSelect(n.id);
+      },
+      [onSelect, onToggleSelect],
+    );
+    const handleSelectionStart = useCallback(() => {
+      if (!onSelectMany) return;
+      boxRef.current = new Set();
+      setBoxDraft(boxRef.current);
+    }, [onSelectMany]);
+    const handleSelectionEnd = useCallback(() => {
+      const ids = boxRef.current;
+      boxRef.current = null;
+      setBoxDraft(null);
+      if (ids && ids.size && onSelectMany) onSelectMany([...ids]);
+    }, [onSelectMany]);
+
+    const wrapRef = useRef<HTMLDivElement>(null);
+    const visibleIdsRef = useRef(visibleTableIds);
+    useLayoutEffect(() => {
+      visibleIdsRef.current = visibleTableIds;
+    });
+    useLayoutEffect(() => {
+      if (!apiRef) return;
+      apiRef.current = {
+        viewportCenter: () => {
+          if (!flow) return null;
+          const r = wrapRef.current?.getBoundingClientRect();
+          if (!r) return null;
+          return flow.screenToFlowPosition({ x: r.left + r.width / 2, y: r.top + r.height / 2 });
+        },
+        visibleTableIds: () => [...visibleIdsRef.current],
+      };
+      return () => {
+        apiRef.current = null;
+      };
+    }, [apiRef, flow]);
 
     const handlePaneClick = useCallback(() => onSelect(null), [onSelect]);
 
     return (
       <ReactFlow<CanvasNode>
+        ref={wrapRef}
         nodes={renderedNodes}
         edges={edges}
         nodeTypes={nodeTypes}
         onlyRenderVisibleElements
         onNodesChange={onNodesChange}
         onNodeDragStop={handleNodeDragStop}
+        onSelectionDragStop={handleSelectionDragStop}
         onNodeClick={handleNodeClick}
         onPaneClick={handlePaneClick}
+        onSelectionStart={handleSelectionStart}
+        onSelectionEnd={handleSelectionEnd}
+        deleteKeyCode={null}
         onInit={setFlow}
         minZoom={0.05}
         maxZoom={2}

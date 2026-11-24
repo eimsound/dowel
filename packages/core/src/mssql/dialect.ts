@@ -1,7 +1,16 @@
 // MSSQL（SQL Server 2019 / 2022 / 2025）方言规格实现（注册到 @dowel/core registry）。
 import type { DialectCapabilities, DialectSpec, IdentKind } from '../dialect.ts';
 import { emptyModel, type Model } from '../ir.ts';
-import { all, allChildrenOf, childrenOf, columnsOf, get, indexElementNames } from '../model.ts';
+import {
+  all,
+  allChildrenOf,
+  childrenOf,
+  childrenOfKinds,
+  columnsOf,
+  get,
+  indexElementNames,
+  objectsOfKinds,
+} from '../model.ts';
 import { formatMssqlScript } from './batch.ts';
 import { isReservedMssqlSchema, MAX_MSSQL_IDENT, mssqlChooseName, mssqlJoinNames } from './naming.ts';
 import {
@@ -48,7 +57,16 @@ const schemaOfTable = (m: Model, tableId: string): string => get(m, tableId, 'ta
 /** 判断对象名在 schema 级 `sys.objects` 命名空间是否已被占用（大小写不敏感） */
 const isMssqlObjTaken = (m: Model, schemaId: string, name: string, selfId: string): boolean => {
   const low = name.toLowerCase();
-  return Object.values(m.objects).some((o) => {
+  return objectsOfKinds(m, [
+    'table',
+    'sequence',
+    'primaryKey',
+    'unique',
+    'foreignKey',
+    'check',
+    'column',
+    'opaque',
+  ]).some((o) => {
     if (o.id === selfId) return false;
     if ((o.kind === 'table' || o.kind === 'sequence') && o.parent === schemaId) {
       return o.name.toLowerCase() === low;
@@ -81,7 +99,7 @@ const isMssqlObjTaken = (m: Model, schemaId: string, name: string, selfId: strin
 /** 判断索引/约束名在表级 `sys.indexes` 命名空间是否已被占用（大小写不敏感） */
 const isMssqlIdxTaken = (m: Model, tableId: string, name: string, selfId: string): boolean => {
   const low = name.toLowerCase();
-  return Object.values(m.objects).some((o) => {
+  return childrenOfKinds(m, tableId, ['index', 'primaryKey', 'unique']).some((o) => {
     if (o.id === selfId) return false;
     if ((o.kind === 'index' || o.kind === 'primaryKey' || o.kind === 'unique') && o.parent === tableId) {
       return o.name.toLowerCase() === low;

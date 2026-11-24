@@ -8,9 +8,21 @@ import type {
   CanvasHistoryList,
   ModelUpdate,
 } from '@dowel/api';
-import { all, columnsOf, createAll, formatScript, type Model } from '@dowel/core';
+import {
+  all,
+  ClipboardError,
+  type ClipboardPayload,
+  childrenOf,
+  columnsOf,
+  copyItems,
+  copyTables,
+  createAll,
+  formatScript,
+  type Model,
+} from '@dowel/core';
 import { useInfiniteQuery, useMutation, useQuery, useQueryClient } from '@tanstack/react-query';
 import {
+  Copy,
   FileCode,
   GitCompareArrows,
   History,
@@ -26,8 +38,10 @@ import { useCallback, useEffect, useId, useLayoutEffect, useMemo, useRef, useSta
 import { useTranslation } from 'react-i18next';
 
 import { ApiError, api } from '../api.ts';
+import { writeClipboard } from '../clipboard.ts';
 import { defaultSchemaOf } from '../dialects.ts';
 import { formatTime } from '../format.ts';
+import { useProject } from '../project.tsx';
 import type { Layout } from '../workspace.ts';
 import { Canvas, shortType, typeLabel } from './Canvas.tsx';
 import { DiffList } from './ExecDialog.tsx';
@@ -38,6 +52,12 @@ import { useToast } from './Toasts.tsx';
 import { Banner, cx, Empty, IconButton } from './ui.tsx';
 
 type PreviewTab = 'opDiff' | 'state' | 'diffToCurrent';
+
+/** 从历史快照复制：表 / 表内项（结果显示在对话框内，不弹通知） */
+interface HistoryCopy {
+  tables: (ids: string[]) => void;
+  items: (tableId: string, itemIds: string[]) => void;
+}
 type StateView = 'canvas' | 'schema' | 'sql';
 
 const outside = (e: PointerEvent, d: HTMLDialogElement) => {
@@ -60,10 +80,37 @@ const parseWorkingChangedConflict = (e: unknown): CanvasHistoryConflict | null =
 };
 
 /** 历史画布只读预览：使用独立本地布局，不改动工作区协作布局 */
-const HistoryCanvasPreview = ({ model, seedLayout }: { model: Model; seedLayout: Layout }) => {
+const HistoryCanvasPreview = ({
+  model,
+  seedLayout,
+  copy,
+}: {
+  model: Model;
+  seedLayout: Layout;
+  copy?: HistoryCopy;
+}) => {
   const { t } = useTranslation();
   const [localLayout, setLocalLayout] = useState<Layout>(() => ({ ...seedLayout }));
   const [selected, setSelected] = useState<string | null>(null);
+  const [multi, setMulti] = useState<string[]>([]);
+  const select = useCallback((id: string | null) => {
+    setSelected(id);
+    setMulti([]);
+  }, []);
+  const toggle = useCallback(
+    (id: string) => {
+      const base = multi.length ? multi : selected ? [selected] : [];
+      const next = base.includes(id) ? base.filter((x) => x !== id) : [...base, id];
+      setMulti(next.length > 1 ? next : []);
+      setSelected(next.includes(id) ? id : (next.at(-1) ?? null));
+    },
+    [multi, selected],
+  );
+  const selectMany = useCallback((ids: string[]) => {
+    setMulti(ids.length > 1 ? ids : []);
+    setSelected(ids[0] ?? null);
+  }, []);
+  const picked = multi.length ? multi : selected ? [selected] : [];
   const tables = useMemo(() => all(model, 'table').filter((tb) => !tb.partitionOf), [model]);
   const onMove = useCallback((patch: Layout) => {
     setLocalLayout((prev) => ({ ...prev, ...patch }));
@@ -79,22 +126,42 @@ const HistoryCanvasPreview = ({ model, seedLayout }: { model: Model; seedLayout:
     );
   }
   return (
-    <div className="h-full min-h-[320px] w-full bg-[var(--canvas)]">
+    <div className="relative h-full min-h-[320px] w-full bg-[var(--canvas)]">
       <Canvas
         model={model}
         layout={localLayout}
         selected={selected}
-        onSelect={setSelected}
+        onSelect={select}
         onMove={onMove}
         relayout={0}
+        multi={multi}
+        onToggleSelect={toggle}
+        onSelectMany={selectMany}
       />
+      {copy && (
+        <div className="absolute top-2 left-2 z-10 flex items-center gap-2 rounded-sm border border-border bg-surface px-2 py-1 text-xs text-text-2 shadow-[var(--shadow-sm)]">
+          <span>
+            {picked.length ? t('clip.selectedTables', { count: picked.length }) : t('hist.copyHint')}
+          </span>
+          <button
+            type="button"
+            className="btn sm"
+            disabled={!picked.length}
+            onClick={() => copy.tables(picked)}
+          >
+            <Copy size={14} aria-hidden="true" />
+            {t('clip.copySelectedTables')}
+          </button>
+        </div>
+      )}
     </div>
   );
 };
 
 /** 当时状态的只读表结构总览（兼顾键盘与屏幕阅读器快速浏览） */
-const HistorySchemaSummary = ({ model }: { model: Model }) => {
+const HistorySchemaSummary = ({ model, copy }: { model: Model; copy?: HistoryCopy }) => {
   const { t } = useTranslation();
+  const [picked, setPicked] = useState<string[]>([]);
   const tables = useMemo(
     () =>
       all(model, 'table')
@@ -137,6 +204,17 @@ const HistorySchemaSummary = ({ model }: { model: Model }) => {
     return s && s !== defSchema ? `${s}.` : '';
   };
 
+  const keyLabel = (o: { kind: string }) =>
+    o.kind === 'primaryKey'
+      ? 'PK'
+      : o.kind === 'unique'
+        ? 'UQ'
+        : o.kind === 'check'
+          ? 'CK'
+          : o.kind === 'foreignKey'
+            ? 'FK'
+            : 'IX';
+
   return (
     <div className="space-y-4 p-4">
       {tables.length > 0 && (
@@ -146,20 +224,79 @@ const HistorySchemaSummary = ({ model }: { model: Model }) => {
             {t('ws.tables')}
             <span className="count">{tables.length}</span>
           </h3>
+          {copy && (
+            <div className="flex flex-wrap items-center gap-1.5 text-xs text-text-2">
+              {picked.length > 0 && <span>{t('clip.selectedTables', { count: picked.length })}</span>}
+              <button
+                type="button"
+                className="btn sm"
+                disabled={!picked.length}
+                onClick={() => copy.tables(picked)}
+              >
+                <Copy size={14} aria-hidden="true" />
+                {t('clip.copySelectedTables')}
+              </button>
+              {picked.length > 0 && (
+                <button type="button" className="btn ghost sm" onClick={() => setPicked([])}>
+                  {t('clip.clearSelection')}
+                </button>
+              )}
+            </div>
+          )}
           <div className="grid grid-cols-[repeat(auto-fill,minmax(260px,1fr))] gap-3">
             {tables.map((tb) => {
               const cols = columnsOf(model, tb.id);
+              const keys = [
+                ...childrenOf(model, tb.id, 'primaryKey'),
+                ...childrenOf(model, tb.id, 'unique'),
+                ...childrenOf(model, tb.id, 'check'),
+                ...childrenOf(model, tb.id, 'foreignKey'),
+                ...childrenOf(model, tb.id, 'index'),
+              ];
+              const fullName = `${schemaPrefix(tb.parent)}${tb.name}`;
               return (
                 <div key={tb.id} className="overflow-hidden rounded-md border border-border bg-panel">
                   <div className="flex items-center gap-1.5 border-b border-border bg-surface-2 px-3 py-2 font-mono text-sm font-semibold">
-                    <Table2 size={14} aria-hidden="true" className="text-text-3" />
-                    <span className="min-w-0 flex-1 truncate">
-                      {schemaPrefix(tb.parent) && (
-                        <span className="font-normal text-text-3">{schemaPrefix(tb.parent)}</span>
-                      )}
-                      {tb.name}
-                    </span>
+                    {copy ? (
+                      <label className="flex min-w-0 flex-1 cursor-pointer items-center gap-1.5">
+                        <input
+                          type="checkbox"
+                          aria-label={t('clip.selectTable', { name: fullName })}
+                          checked={picked.includes(tb.id)}
+                          onChange={(e) =>
+                            setPicked((p) =>
+                              e.target.checked ? [...p, tb.id] : p.filter((x) => x !== tb.id),
+                            )
+                          }
+                        />
+                        <span className="min-w-0 flex-1 truncate">
+                          {schemaPrefix(tb.parent) && (
+                            <span className="font-normal text-text-3">{schemaPrefix(tb.parent)}</span>
+                          )}
+                          {tb.name}
+                        </span>
+                      </label>
+                    ) : (
+                      <>
+                        <Table2 size={14} aria-hidden="true" className="text-text-3" />
+                        <span className="min-w-0 flex-1 truncate">
+                          {schemaPrefix(tb.parent) && (
+                            <span className="font-normal text-text-3">{schemaPrefix(tb.parent)}</span>
+                          )}
+                          {tb.name}
+                        </span>
+                      </>
+                    )}
                     <span className="count font-sans">{cols.length}</span>
+                    {copy && (
+                      <IconButton
+                        label={t('clip.copyTable', { name: fullName })}
+                        size="sm"
+                        onClick={() => copy.tables([tb.id])}
+                      >
+                        <Copy size={14} aria-hidden="true" />
+                      </IconButton>
+                    )}
                   </div>
                   <ul className="m-0 list-none divide-y divide-border p-0">
                     {cols.map((c) => {
@@ -172,7 +309,10 @@ const HistorySchemaSummary = ({ model }: { model: Model }) => {
                             : '';
                       const nn = c.notNull || pkCols.has(c.id);
                       return (
-                        <li key={c.id} className="flex items-center gap-2 px-3 py-1.5 font-mono text-xs">
+                        <li
+                          key={c.id}
+                          className="group flex items-center gap-2 px-3 py-1.5 font-mono text-xs"
+                        >
                           <span
                             className={cx(
                               'w-5 shrink-0 text-[10px] font-semibold',
@@ -188,6 +328,16 @@ const HistorySchemaSummary = ({ model }: { model: Model }) => {
                           <span className={cx('shrink-0', c.typeRef ? 'text-enum' : 'text-text-3')}>
                             {shortType(typeLabel(model, c))}
                           </span>
+                          {copy && (
+                            <IconButton
+                              label={t('clip.copyColumn', { name: `${fullName}.${c.name}` })}
+                              size="sm"
+                              className="opacity-0 group-focus-within:opacity-100 group-hover:opacity-100 focus-visible:opacity-100 [@media(hover:none)]:opacity-100"
+                              onClick={() => copy.items(tb.id, [c.id])}
+                            >
+                              <Copy size={13} aria-hidden="true" />
+                            </IconButton>
+                          )}
                         </li>
                       );
                     })}
@@ -195,6 +345,35 @@ const HistorySchemaSummary = ({ model }: { model: Model }) => {
                       <li className="px-3 py-2 text-xs text-text-3">{t('hist.noColumns')}</li>
                     )}
                   </ul>
+                  {copy && keys.length > 0 && (
+                    <details className="border-t border-border">
+                      <summary className="cursor-pointer px-3 py-1.5 text-xs text-text-2">
+                        {t('hist.keysAndIndexes', { count: keys.length })}
+                        <span className="sr-only">{t('hist.keysAndIndexesOf', { name: fullName })}</span>
+                      </summary>
+                      <ul className="m-0 list-none divide-y divide-border p-0">
+                        {keys.map((k) => (
+                          <li
+                            key={k.id}
+                            className="group flex items-center gap-2 px-3 py-1.5 font-mono text-xs"
+                          >
+                            <span className="w-5 shrink-0 text-[10px] font-semibold text-text-3">
+                              {keyLabel(k)}
+                            </span>
+                            <span className="min-w-0 flex-1 truncate">{k.name}</span>
+                            <IconButton
+                              label={t('clip.copyItem', { name: `${fullName}.${k.name}` })}
+                              size="sm"
+                              className="opacity-0 group-focus-within:opacity-100 group-hover:opacity-100 focus-visible:opacity-100 [@media(hover:none)]:opacity-100"
+                              onClick={() => copy.items(tb.id, [k.id])}
+                            >
+                              <Copy size={13} aria-hidden="true" />
+                            </IconButton>
+                          </li>
+                        ))}
+                      </ul>
+                    </details>
+                  )}
                 </div>
               );
             })}
@@ -272,6 +451,8 @@ export const CanvasHistory = ({
   const [confirmOpen, setConfirmOpen] = useState(false);
   const [conflict, setConflict] = useState<CanvasHistoryConflict | null>(null);
   const [restoreError, setRestoreError] = useState<string | null>(null);
+  const { project } = useProject();
+  const [copyStatus, setCopyStatus] = useState<{ text: string; error: boolean } | null>(null);
 
   const confirmOpenRef = useRef(confirmOpen);
   useLayoutEffect(() => {
@@ -397,6 +578,52 @@ export const CanvasHistory = ({
   const { reset: resetRestore } = restore;
 
   const opText = (opName: string) => t(`hist.op.${opName}`, { defaultValue: opName });
+
+  // 复制结果写在对话框内的状态行（对话框打开时不弹通知，DESIGN.md：反馈）
+  const lastCopyText = useRef('');
+  const reportCopy = useCallback(
+    (build: () => ClipboardPayload) => {
+      let text: string;
+      let error = false;
+      try {
+        const p = build();
+        void writeClipboard(p);
+        text =
+          p.kind === 'tables'
+            ? t('clip.copiedInDialogTables', { count: p.tables.length })
+            : t('clip.copiedInDialogItems', { count: p.items.length });
+      } catch (e) {
+        error = true;
+        text =
+          e instanceof ClipboardError && e.code === 'too_large'
+            ? t('clip.tooLarge')
+            : t('clip.copyFailed', { reason: e instanceof Error ? e.message : String(e) });
+      }
+      // 读屏对与上次完全相同的消息不再播报：重复时补一个不换行空格
+      if (text === lastCopyText.current) text += '\u00A0';
+      lastCopyText.current = text;
+      setCopyStatus({ text, error });
+    },
+    [t],
+  );
+  const historyCopy = useMemo<HistoryCopy | undefined>(() => {
+    if (!detail) return undefined;
+    const source = {
+      projectId: pid,
+      projectName: project.name,
+      origin: 'history' as const,
+      seq: detail.entry.seq,
+    };
+    return {
+      tables: (ids) => reportCopy(() => copyTables(detail.model, ids, { source, layout })),
+      items: (tableId, ids) => reportCopy(() => copyItems(detail.model, tableId, ids, { source })),
+    };
+  }, [detail, pid, project.name, layout, reportCopy]);
+  const [prevCopyKey, setPrevCopyKey] = useState(`${open}:${activeSeq}`);
+  if (prevCopyKey !== `${open}:${activeSeq}`) {
+    setPrevCopyKey(`${open}:${activeSeq}`);
+    setCopyStatus(null);
+  }
 
   const openConfirm = () => {
     if (readOnly) return;
@@ -709,7 +936,7 @@ export const CanvasHistory = ({
                     {tab === 'state' && (
                       <>
                         <div className="flex shrink-0 items-center justify-between gap-2 border-b border-border bg-panel px-4 py-2">
-                          <span className="text-xs text-text-2">
+                          <span className="min-w-0 flex-1 text-xs text-text-2">
                             {t('hist.stateSummary', {
                               seq: detail.entry.seq,
                               tables: tableCount,
@@ -736,6 +963,23 @@ export const CanvasHistory = ({
                             ))}
                           </fieldset>
                         </div>
+                        {/* 复制结果：常驻的状态 / 错误区（对话框里不弹通知），文字可换行不截断 */}
+                        <div
+                          role="status"
+                          className={cx(
+                            'shrink-0 border-b border-border bg-panel px-4 py-1.5 text-xs text-text-2 empty:border-0 empty:p-0',
+                          )}
+                        >
+                          {copyStatus && !copyStatus.error ? copyStatus.text : null}
+                        </div>
+                        <div
+                          role="alert"
+                          className={cx(
+                            'shrink-0 border-b border-border bg-panel px-4 py-1.5 text-xs text-danger empty:border-0 empty:p-0',
+                          )}
+                        >
+                          {copyStatus?.error ? copyStatus.text : null}
+                        </div>
 
                         <div className="min-h-0 flex-1 overflow-auto">
                           {stateView === 'canvas' ? (
@@ -743,9 +987,14 @@ export const CanvasHistory = ({
                               key={detail.entry.seq}
                               model={detail.model}
                               seedLayout={layout}
+                              copy={historyCopy}
                             />
                           ) : stateView === 'schema' ? (
-                            <HistorySchemaSummary model={detail.model} />
+                            <HistorySchemaSummary
+                              key={detail.entry.seq}
+                              model={detail.model}
+                              copy={historyCopy}
+                            />
                           ) : (
                             <div className="h-full">
                               <SqlView text={ddl} label="DDL" dialect={detail.model.dialect} />

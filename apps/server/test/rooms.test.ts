@@ -1,9 +1,26 @@
 // 房间的“踢人”语义：角色 / 状态在 join 之后变了（refreshLoaded）或被停用时，
 // 遗留连接上的消息一律丢弃；join 时也要再确认一次账号状态和生效角色。
-import { all, emptyModel, type Model, readsOf } from '@dowel/core';
+import {
+  addCheck,
+  addColumn,
+  addForeignKey,
+  addPrimaryKey,
+  all,
+  copyTables,
+  createSchema,
+  createTable,
+  emptyModel,
+  type Model,
+  newId,
+  type Obj,
+  planPaste,
+  readsOf,
+  validate,
+} from '@dowel/core';
 import { type Commit, SyncClient, type ToClient } from '@dowel/sync';
-import { afterAll, beforeAll, expect, test } from 'vitest';
+import { afterAll, beforeAll, describe, expect, test } from 'vitest';
 
+import { createTestDb, PG_URL } from '../../../test/pg.ts';
 import type { User } from '../src/auth.ts';
 import {
   type ClusterEvent,
@@ -14,9 +31,11 @@ import {
   type ReconnectHandler,
   truncateRoomPeersForEvent,
 } from '../src/bus.ts';
+import { OpaqueRefresher } from '../src/derive.ts';
 import { createApp, openPlatformDb, type PlatformDb } from '../src/index.ts';
 import { effectiveProjectRole } from '../src/roles.ts';
 import { type Peer, Rooms, SNAPSHOT_EVERY } from '../src/rooms.ts';
+import type { Shadow } from '../src/shadow.ts';
 import { makeUser, PASSWORD } from './support.ts';
 
 let db: PlatformDb;
@@ -1883,4 +1902,343 @@ test('applyMcpOps / Room.simulate：表名 constructor、列名 valueOf、注释
   expect(t).toMatchObject({ kind: 'table', name: 'constructor', comment: 'toString' });
   expect(res.model.objects[res.refs.c!]).toMatchObject({ kind: 'column', name: 'valueOf' });
   expect(res.model.objects[res.refs.e!]).toMatchObject({ kind: 'enum', values: ['hasOwnProperty'] });
+});
+
+const PASTE_SRC = { projectId: 'proj-room', projectName: '房间项目', origin: 'canvas' as const, seq: null };
+
+test('paste 房间级防护：viewer 发送 paste 被拒绝且不推进 processed、不写 room_rejections，editor 同序号粘贴正常生效', async () => {
+  const editorUser = await makeUser(db, 'paste-sec-editor', { name: '粘贴编辑者' });
+  const viewerUser = await makeUser(db, 'paste-sec-viewer', { name: '粘贴只读者' });
+  await db.query(
+    "insert into grants (id, scope_kind, scope_id, subject_kind, subject_id, role) values ($1, 'project', $2, 'user', $3, 'editor')",
+    ['g-paste-sec-editor', pid, editorUser.id],
+  );
+  await db.query(
+    "insert into grants (id, scope_kind, scope_id, subject_kind, subject_id, role) values ($1, 'project', $2, 'user', $3, 'viewer')",
+    ['g-paste-sec-viewer', pid, viewerUser.id],
+  );
+
+  const branchPasteViewer = `${branchId}-paste-viewer`;
+  await db.query("insert into branches (id, project_id, name) values ($1, $2, 'paste-viewer')", [
+    branchPasteViewer,
+    pid,
+  ]);
+  const initModel = emptyModel('pg');
+  const pub = createSchema(initModel, 'public');
+  const srcTbl = createTable(initModel, pub, 'src_t');
+  const srcId = addColumn(initModel, srcTbl, { name: 'id', type: 'bigint', notNull: true });
+  addPrimaryKey(initModel, srcTbl, [srcId]);
+  await rooms.init(branchPasteViewer, initModel);
+
+  const editor = peerOf(editorUser);
+  const viewer = peerOf(viewerUser);
+  await rooms.join(branchPasteViewer, editor.peer);
+  await rooms.join(branchPasteViewer, viewer.peer);
+  expect(viewer.peer.role).toBe('viewer');
+
+  const clientId = 'tab-paste-victim';
+  await rooms.message(branchPasteViewer, editor.peer, { t: 'hello', client: clientId, lastSeq: 0 });
+  await rooms.message(branchPasteViewer, viewer.peer, { t: 'hello', client: clientId, lastSeq: 0 });
+
+  const cur = await rooms.state(branchPasteViewer);
+  const payload = copyTables(cur.model, [srcTbl], { source: PASTE_SRC });
+  const plan = planPaste(cur.model, payload);
+  const pasteArgs = { ops: plan.ops };
+  const pasteReads = readsOf(cur.model, pasteArgs).map(
+    (id) => [id, cur.versions[id] ?? 0] as [string, number],
+  );
+
+  // viewer 冒用同 client 发送 paste（n=1）：必须被拒绝，不推进 processed，不写 room_rejections
+  await rooms.message(branchPasteViewer, viewer.peer, {
+    t: 'op',
+    op: { client: clientId, n: 1, name: 'paste', args: pasteArgs, reads: pasteReads },
+  });
+  expect(
+    viewer.sent.some((m) => {
+      const msg = m as { t: string; n?: number; code?: string };
+      return msg.t === 'reject' && msg.n === 1 && msg.code === 'invalid';
+    }),
+  ).toBe(true);
+  const rejRows = await db.query<{ id: number }>('select id from room_rejections where branch_id = $1', [
+    branchPasteViewer,
+  ]);
+  expect(rejRows).toHaveLength(0);
+  expect(all((await rooms.model(branchPasteViewer)).model, 'table').map((t) => t.name)).toEqual(['src_t']);
+
+  // editor 随后以同一序号 n=1 提交 paste：不能被 viewer 污染或静默吞掉
+  await rooms.message(branchPasteViewer, editor.peer, {
+    t: 'op',
+    op: { client: clientId, n: 1, name: 'paste', args: pasteArgs, reads: pasteReads },
+  });
+  const after = (await rooms.model(branchPasteViewer)).model;
+  expect(
+    all(after, 'table')
+      .map((t) => t.name)
+      .sort(),
+  ).toEqual(['src_t', 'src_t_copy']);
+  expect(validate(after)).toEqual([]);
+});
+
+test('paste 房间级并发冲突：并发删表后过期 paste 整批原子拒绝（first-writer-wins），不留半成品对象', async () => {
+  const editorA = await makeUser(db, 'paste-conf-a', { name: '粘贴并发A' });
+  const editorB = await makeUser(db, 'paste-conf-b', { name: '粘贴并发B' });
+  await db.query(
+    "insert into grants (id, scope_kind, scope_id, subject_kind, subject_id, role) values ($1, 'project', $2, 'user', $3, 'editor')",
+    ['g-paste-conf-a', pid, editorA.id],
+  );
+  await db.query(
+    "insert into grants (id, scope_kind, scope_id, subject_kind, subject_id, role) values ($1, 'project', $2, 'user', $3, 'editor')",
+    ['g-paste-conf-b', pid, editorB.id],
+  );
+
+  const branchConflict = `${branchId}-paste-conflict`;
+  await db.query("insert into branches (id, project_id, name) values ($1, $2, 'paste-conflict')", [
+    branchConflict,
+    pid,
+  ]);
+  const initModel = emptyModel('pg');
+  const pub = createSchema(initModel, 'public');
+  const usersId = createTable(initModel, pub, 'users');
+  const usersPkCol = addColumn(initModel, usersId, { name: 'id', type: 'bigint', notNull: true });
+  addPrimaryKey(initModel, usersId, [usersPkCol]);
+  await rooms.init(branchConflict, initModel);
+
+  const peerA = peerOf(editorA);
+  const peerB = peerOf(editorB);
+  await rooms.join(branchConflict, peerA.peer);
+  await rooms.join(branchConflict, peerB.peer);
+  await rooms.message(branchConflict, peerA.peer, { t: 'hello', client: 'c-paste-a', lastSeq: 0 });
+  await rooms.message(branchConflict, peerB.peer, { t: 'hello', client: 'c-paste-b', lastSeq: 0 });
+
+  // 构造来源模型：一次粘贴两张表（products + 引用外部表 users 的 orders）
+  const srcModel = emptyModel('pg');
+  const srcPub = createSchema(srcModel, 'public');
+  const srcUsers = createTable(srcModel, srcPub, 'users');
+  const srcUsersId = addColumn(srcModel, srcUsers, { name: 'id', type: 'bigint', notNull: true });
+  addPrimaryKey(srcModel, srcUsers, [srcUsersId]);
+  const srcProducts = createTable(srcModel, srcPub, 'products');
+  const srcProdId = addColumn(srcModel, srcProducts, { name: 'id', type: 'bigint', notNull: true });
+  addPrimaryKey(srcModel, srcProducts, [srcProdId]);
+  const srcOrders = createTable(srcModel, srcPub, 'orders');
+  const srcOrdId = addColumn(srcModel, srcOrders, { name: 'id', type: 'bigint', notNull: true });
+  const srcOrdUid = addColumn(srcModel, srcOrders, { name: 'user_id', type: 'bigint', notNull: true });
+  addPrimaryKey(srcModel, srcOrders, [srcOrdId]);
+  addForeignKey(srcModel, srcOrders, [srcOrdUid], srcUsers, [srcUsersId]);
+
+  const snap = await rooms.state(branchConflict);
+  const payload = copyTables(srcModel, [srcProducts, srcOrders], { source: PASTE_SRC });
+  const plan = planPaste(snap.model, payload);
+  const pasteArgs = { ops: plan.ops };
+  const pasteReadIds = readsOf(snap.model, pasteArgs);
+  expect(pasteReadIds).toContain(usersId);
+  const staleReads = pasteReadIds.map((id) => [id, snap.versions[id] ?? 0] as [string, number]);
+
+  // 并发写入方 B 先删掉 users
+  const dropReads = readsOf(snap.model, { id: usersId }).map(
+    (id) => [id, snap.versions[id] ?? 0] as [string, number],
+  );
+  await rooms.message(branchConflict, peerB.peer, {
+    t: 'op',
+    op: { client: 'c-paste-b', n: 1, name: 'dropTable', args: { id: usersId }, reads: dropReads },
+  });
+  expect(all((await rooms.model(branchConflict)).model, 'table')).toHaveLength(0);
+
+  // 写入方 A 提交过期 paste：整批因读集冲突拒绝，products 与 orders 均不得部分落库
+  await rooms.message(branchConflict, peerA.peer, {
+    t: 'op',
+    op: { client: 'c-paste-a', n: 1, name: 'paste', args: pasteArgs, reads: staleReads },
+  });
+  expect(
+    peerA.sent.some((m) => {
+      const msg = m as { t: string; n?: number; code?: string };
+      return msg.t === 'reject' && msg.n === 1 && msg.code === 'conflict';
+    }),
+  ).toBe(true);
+
+  const after = (await rooms.model(branchConflict)).model;
+  expect(all(after, 'table')).toHaveLength(0);
+  expect(all(after, 'column')).toHaveLength(0);
+  expect(all(after, 'foreignKey')).toHaveLength(0);
+  expect(validate(after)).toEqual([]);
+
+  const rejRows = await db.query<{ code: string }>('select code from room_rejections where branch_id = $1', [
+    branchConflict,
+  ]);
+  expect(rejRows).toEqual([{ code: 'conflict' }]);
+});
+
+describe.skipIf(!PG_URL)('paste PG HA 跨副本广播与 OpaqueRefresher.flush', () => {
+  test('副本 A 提交含 CHECK 约束的 paste：副本 B 实时收到广播，且副本 B 执行 OpaqueRefresher.flush 规范化并跨副本收敛', async () => {
+    const pg = await createTestDb('rooms_paste_ha');
+    const dbA = await openPlatformDb(pg.url);
+    const dbB = await openPlatformDb(pg.url);
+    const suffix = newId()
+      .replace(/[^a-z0-9]/gi, '')
+      .slice(0, 8)
+      .toLowerCase();
+    const channel = `dowel_paste_ha_${suffix}`;
+    const appA = createApp(dbA, { bus: { replicaId: `paste-a-${suffix}`, channel } });
+    const appB = createApp(dbB, { bus: { replicaId: `paste-b-${suffix}`, channel } });
+    let refresherB: OpaqueRefresher | null = null;
+
+    try {
+      await appA.bus.start();
+      await appB.bus.start();
+
+      const admin = await makeUser(dbA, 'paste-ha-admin', { name: '管理员', role: 'admin' });
+      const alice = await makeUser(dbA, 'paste-ha-alice', { name: '张三' });
+      const bob = await makeUser(dbA, 'paste-ha-bob', { name: '李四' });
+
+      const login = await appA.app.request('/api/auth/login', {
+        method: 'POST',
+        headers: { 'content-type': 'application/json' },
+        body: JSON.stringify({ username: admin.username, password: PASSWORD }),
+      });
+      const cookie = login.headers.get('set-cookie')!.split(';')[0]!;
+      const grpRes = await appA.app.request('/api/groups', {
+        method: 'POST',
+        headers: { cookie, 'content-type': 'application/json' },
+        body: JSON.stringify({ slug: `paste-ha-${suffix}`, name: '粘贴HA组', defaultRole: 'none' }),
+      });
+      const grp = (await grpRes.json()) as { id: string };
+      const projRes = await appA.app.request('/api/projects', {
+        method: 'POST',
+        headers: { cookie, 'content-type': 'application/json' },
+        body: JSON.stringify({ name: '粘贴HA项目', groupId: grp.id }),
+      });
+      const proj = (await projRes.json()) as { id: string };
+
+      for (const u of [alice, bob]) {
+        await appA.app.request(`/api/projects/${proj.id}/grants`, {
+          method: 'POST',
+          headers: { cookie, 'content-type': 'application/json' },
+          body: JSON.stringify({ subjectKind: 'user', subjectId: u.id, role: 'editor' }),
+        });
+      }
+
+      const [br] = await dbA.query<{ id: string }>(
+        "select id from branches where project_id = $1 and name = 'main'",
+        [proj.id],
+      );
+      const haBranch = br!.id;
+      const initState = await appA.rooms.state(haBranch);
+      await appA.refresher.reset(haBranch, initState.model);
+
+      const peerA = peerOf(alice);
+      const peerB = peerOf(bob);
+      await appA.rooms.join(haBranch, peerA.peer);
+      await appB.rooms.join(haBranch, peerB.peer);
+      await appA.rooms.message(haBranch, peerA.peer, { t: 'hello', client: 'c-ha-a', lastSeq: 0 });
+      await appB.rooms.message(haBranch, peerB.peer, { t: 'hello', client: 'c-ha-b', lastSeq: 0 });
+
+      // 构造包含未规范化 CHECK 约束的来源表并提交 paste 到副本 A
+      const src = emptyModel('pg');
+      const srcPub = createSchema(src, 'public');
+      const srcInv = createTable(src, srcPub, 'invoices');
+      const srcInvId = addColumn(src, srcInv, { name: 'id', type: 'bigint', notNull: true });
+      addColumn(src, srcInv, { name: 'amount', type: 'integer', notNull: true });
+      addPrimaryKey(src, srcInv, [srcInvId]);
+      addCheck(src, srcInv, 'amount > 0');
+
+      const plan = planPaste(initState.model, copyTables(src, [srcInv], { source: PASTE_SRC }));
+      const pasteArgs = { ops: plan.ops };
+      const pasteReads = readsOf(initState.model, pasteArgs).map(
+        (id) => [id, initState.versions[id] ?? 0] as [string, number],
+      );
+
+      await appA.rooms.message(haBranch, peerA.peer, {
+        t: 'op',
+        op: { client: 'c-ha-a', n: 1, name: 'paste', args: pasteArgs, reads: pasteReads },
+      });
+
+      // 副本 B 的 peer 必须实时收到 paste commit 广播
+      await waitForCond(() =>
+        peerB.sent.some((m) => {
+          const msg = m as Commit;
+          return (
+            msg.t === 'commit' &&
+            msg.changes.some((ch) => ch.obj?.kind === 'table' && ch.obj.name === 'invoices')
+          );
+        }),
+      );
+
+      const modelA1 = (await appA.rooms.model(haBranch)).model;
+      const modelB1 = (await appB.rooms.model(haBranch)).model;
+      expect(all(modelA1, 'table').map((t) => t.name)).toEqual(['invoices']);
+      expect(all(modelB1, 'table').map((t) => t.name)).toEqual(['invoices']);
+      expect(all(modelB1, 'check').map((c) => c.expr)).toEqual(['amount > 0']);
+      expect(validate(modelA1)).toEqual([]);
+      expect(validate(modelB1)).toEqual([]);
+
+      // 在副本 B 上经 PG branches.baseline 与分布式 derive 锁执行 OpaqueRefresher.flush，验证规范化写回与跨副本同步
+      const canonicalShadow = {
+        canonicalize: async (_prev: Model, next: Model) =>
+          Object.values(next.objects)
+            .filter((o) => o.kind === 'check' && !o.expr.startsWith('('))
+            .map((o) => ({ ...o, expr: `(${(o as { expr: string }).expr})` }) as Obj),
+      } as unknown as Shadow;
+
+      refresherB = new OpaqueRefresher(
+        appB.rooms,
+        async () => canonicalShadow,
+        {
+          load: async (bId) =>
+            (
+              await dbB.query<{ baseline: Model | null }>('select baseline from branches where id = $1', [
+                bId,
+              ])
+            )[0]?.baseline ?? null,
+          save: async (bId, m) => {
+            await dbB.query('update branches set baseline = $2::text::jsonb where id = $1', [
+              bId,
+              JSON.stringify(m),
+            ]);
+          },
+        },
+        appB.ha,
+      );
+
+      await refresherB.flush(haBranch);
+
+      // 规范化 patch 必须跨副本同步回副本 A
+      await waitForCond(() =>
+        peerA.sent.some((m) => {
+          const msg = m as Commit;
+          return (
+            msg.t === 'commit' &&
+            msg.changes.some((ch) => ch.obj?.kind === 'check' && ch.obj.expr === '(amount > 0)')
+          );
+        }),
+      );
+
+      const modelA2 = (await appA.rooms.model(haBranch)).model;
+      const modelB2 = (await appB.rooms.model(haBranch)).model;
+      expect(all(modelA2, 'check').map((c) => c.expr)).toEqual(['(amount > 0)']);
+      expect(all(modelB2, 'check').map((c) => c.expr)).toEqual(['(amount > 0)']);
+
+      const [baseRow] = await dbA.query<{ baseline: Model | null }>(
+        'select baseline from branches where id = $1',
+        [haBranch],
+      );
+      expect(all(baseRow!.baseline!, 'check').map((c) => c.expr)).toEqual(['(amount > 0)']);
+    } finally {
+      refresherB?.stop();
+      if (refresherB) await refresherB.drain();
+      appA.refresher.stop();
+      appB.refresher.stop();
+      await appA.refresher.drain();
+      await appB.refresher.drain();
+      appA.rooms.close();
+      appB.rooms.close();
+      await appA.rooms.flush();
+      await appB.rooms.flush();
+      await appA.shadows.close();
+      await appB.shadows.close();
+      await appA.bus.close();
+      await appB.bus.close();
+      await dbA.close();
+      await dbB.close();
+      await pg.close();
+    }
+  });
 });

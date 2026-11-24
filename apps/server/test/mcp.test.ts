@@ -1225,4 +1225,73 @@ describe.each([
     expect(state.seq).toBe(0);
     expect(all(state.model, 'table').map((t) => t.name)).not.toContain('should_rollback');
   });
+
+  test.skipIf(skip)('list_mutators 排除 paste 且 apply_changes 拒绝 paste 以防止绕过批量上限', async () => {
+    const f = await setupEnv();
+    const tokAlice = await f.issueToken(f.alice.id, ['read', 'write']);
+
+    const lmAll = await f.callTool(tokAlice.token, 'list_mutators', {});
+    expect(lmAll.isError).toBeFalsy();
+    expect((lmAll.structuredContent!.mutators as { name: string }[]).map((m) => m.name)).not.toContain(
+      'paste',
+    );
+
+    const lmFilter = await f.callTool(tokAlice.token, 'list_mutators', {
+      names: ['paste', 'createTable'],
+    });
+    expect(lmFilter.isError).toBeFalsy();
+    expect((lmFilter.structuredContent!.mutators as { name: string }[]).map((m) => m.name)).toEqual([
+      'createTable',
+    ]);
+    expect(lmFilter.structuredContent!.unknown).toEqual(['paste']);
+
+    const resList = await parseRpc(
+      await f.mcpPost(tokAlice.token, {
+        jsonrpc: '2.0',
+        id: 90,
+        method: 'resources/read',
+        params: { uri: 'dowel://mutators' },
+      }),
+    );
+    const catalog = JSON.parse(((resList.result?.contents as { text: string }[]) ?? [])[0]!.text) as {
+      mutators: { name: string }[];
+    };
+    expect(catalog.mutators.map((m) => m.name)).not.toContain('paste');
+
+    const publicSchemaId = all((await f.created.rooms.model(f.branch1)).model, 'schema')[0]!.id;
+    for (const dryRun of [true, false]) {
+      const res = await f.callTool(tokAlice.token, 'apply_changes', {
+        project: f.p1Id,
+        baseSeq: 0,
+        dryRun,
+        ops: [
+          { name: 'createTable', args: { id: '$ref:t', schema: publicSchemaId, name: 'should_rollback' } },
+          {
+            name: 'paste',
+            args: {
+              ops: [
+                {
+                  name: 'createTable',
+                  args: { id: '$ref:p_tbl', schema: publicSchemaId, name: 'via_paste' },
+                },
+              ],
+            },
+          },
+        ],
+      });
+      expect(res.isError).toBe(true);
+      expect(res.structuredContent).toMatchObject({
+        code: 'invalid',
+        index: 1,
+        currentSeq: 0,
+      });
+      expect(res.structuredContent?.message).toContain('paste');
+    }
+
+    const state = await f.created.rooms.model(f.branch1);
+    expect(state.seq).toBe(0);
+    expect(all(state.model, 'table').map((t) => t.name)).toEqual([]);
+    expect(await f.db.query('select * from room_rejections where branch_id = $1', [f.branch1])).toEqual([]);
+    expect(await f.db.query("select id from audit_events where action = 'model.mutate'")).toEqual([]);
+  });
 });
