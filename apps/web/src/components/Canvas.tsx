@@ -978,16 +978,43 @@ export const Canvas = memo(
         : focusTableObj.name;
     }, [focusTableObj, model]);
 
-    const handleNodeDragStop = useCallback(
-      (_: unknown, node: CanvasNode) => {
-        draggingIdsRef.current.delete(node.id);
-        if (node.type === 'sectionSummary') {
-          setSummaryPositions((prev) => ({ ...prev, [node.id]: node.position }));
-        } else {
-          onMove({ [node.id]: node.position });
+    const commitDraggedNodes = useCallback(
+      (dragged: CanvasNode[]) => {
+        const tableMoves: Layout = {};
+        let summaryPatch: Record<string, { x: number; y: number }> | null = null;
+        for (const n of dragged) {
+          draggingIdsRef.current.delete(n.id);
+          if (n.type === 'sectionSummary') {
+            summaryPatch ??= {};
+            summaryPatch[n.id] = n.position;
+          } else {
+            tableMoves[n.id] = n.position;
+          }
+        }
+        if (summaryPatch) {
+          const patch = summaryPatch;
+          setSummaryPositions((prev) => ({ ...prev, ...patch }));
+        }
+        if (Object.keys(tableMoves).length > 0) {
+          onMove(tableMoves);
         }
       },
       [onMove],
+    );
+
+    const handleNodeDragStop = useCallback(
+      (_: unknown, node: CanvasNode, nodes: CanvasNode[]) => {
+        const dragged = nodes.some((n) => n.id === node.id) ? nodes : [node, ...nodes];
+        commitDraggedNodes(dragged);
+      },
+      [commitDraggedNodes],
+    );
+
+    const handleSelectionDragStop = useCallback(
+      (_: unknown, nodes: CanvasNode[]) => {
+        commitDraggedNodes(nodes);
+      },
+      [commitDraggedNodes],
     );
 
     const handleNodeClick = useCallback(
@@ -1042,6 +1069,7 @@ export const Canvas = memo(
         onlyRenderVisibleElements
         onNodesChange={onNodesChange}
         onNodeDragStop={handleNodeDragStop}
+        onSelectionDragStop={handleSelectionDragStop}
         onNodeClick={handleNodeClick}
         onPaneClick={handlePaneClick}
         onSelectionStart={handleSelectionStart}

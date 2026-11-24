@@ -1,4 +1,4 @@
-import { describe, expect, test } from 'vitest';
+import { describe, expect, test, vi } from 'vitest';
 
 import {
   addCheck,
@@ -126,6 +126,175 @@ describe('剪贴板序列化、校验与表达式改写', () => {
     const badItemsRef = clonePlain(itemPayload);
     badItemsRef.items = [t];
     expect(() => parseClipboard(JSON.stringify(badItemsRef))).toThrowError(ClipboardError);
+
+    // tables / items / external 含重复 ID 必须被 parseClipboard 拒绝
+    const dupTables = clonePlain(base);
+    dupTables.tables = [t, t];
+    try {
+      parseClipboard(JSON.stringify(dupTables));
+      expect.unreachable();
+    } catch (e) {
+      expect(e).toBeInstanceOf(ClipboardError);
+      expect((e as ClipboardError).code).toBe('invalid_payload');
+    }
+
+    const dupItems = clonePlain(itemPayload);
+    dupItems.items = [c, c];
+    try {
+      parseClipboard(JSON.stringify(dupItems));
+      expect.unreachable();
+    } catch (e) {
+      expect(e).toBeInstanceOf(ClipboardError);
+      expect((e as ClipboardError).code).toBe('invalid_payload');
+    }
+  });
+
+  test('parseClipboard 在调用 JSON.parse 之前拦截超过 MAX_CLIPBOARD_BYTES 的输入', () => {
+    const parseSpy = vi.spyOn(JSON, 'parse');
+    try {
+      // 超长 ASCII（即使不是合法 JSON 也必须在 JSON.parse 前直接抛 too_large）
+      const hugeAscii = 'x'.repeat(MAX_CLIPBOARD_BYTES + 1);
+      let err1: ClipboardError | null = null;
+      try {
+        parseClipboard(hugeAscii);
+      } catch (e) {
+        err1 = e as ClipboardError;
+      }
+      expect(err1).toBeInstanceOf(ClipboardError);
+      expect(err1?.code).toBe('too_large');
+      expect(parseSpy).not.toHaveBeenCalled();
+
+      // 字符数 <= MAX_CLIPBOARD_BYTES，但 UTF-8 字节数 > MAX_CLIPBOARD_BYTES 的多字节文本
+      const hugeUtf8 = `{"format":"${CLIPBOARD_FORMAT}","v":1,"pad":"${'甲'.repeat(Math.ceil(MAX_CLIPBOARD_BYTES / 3))}"}`;
+      expect(hugeUtf8.length).toBeLessThan(MAX_CLIPBOARD_BYTES);
+      expect(new TextEncoder().encode(hugeUtf8).byteLength).toBeGreaterThan(MAX_CLIPBOARD_BYTES);
+      let err2: ClipboardError | null = null;
+      try {
+        parseClipboard(hugeUtf8);
+      } catch (e) {
+        err2 = e as ClipboardError;
+      }
+      expect(err2).toBeInstanceOf(ClipboardError);
+      expect(err2?.code).toBe('too_large');
+      expect(parseSpy).not.toHaveBeenCalled();
+    } finally {
+      parseSpy.mockRestore();
+    }
+  });
+
+  test('篡改载荷中索引/约束引用缺失列或跨表列：parseClipboard 拒绝且直接调用 planPaste 防御性跳过并保证 validate 通过', () => {
+    const m = emptyModel('pg');
+    const pub = createSchema(m, 'public');
+    const tA = createTable(m, pub, 'a');
+    const aId = addColumn(m, tA, { name: 'id', type: 'bigint', notNull: true });
+    const aCode = addColumn(m, tA, { name: 'code', type: 'text', notNull: true });
+    const aExtra = addColumn(m, tA, { name: 'extra', type: 'text' });
+    const pkId = addPrimaryKey(m, tA, [aId]);
+    const uqId = addUnique(m, tA, [aCode]);
+    const ixId = addIndex(m, tA, [{ column: aCode }], { include: [aExtra] });
+
+    const tB = createTable(m, pub, 'b');
+    const bId = addColumn(m, tB, { name: 'id', type: 'bigint', notNull: true });
+    const bAId = addColumn(m, tB, { name: 'a_id', type: 'bigint' });
+    const fkId = addForeignKey(m, tB, [bAId], tA, [aId]);
+    expect(validate(m)).toEqual([]);
+
+    const base = copyTables(m, [tA, tB], { source: SRC });
+
+    const assertInvalidAndSafePlan = (
+      mutator: (p: ReturnType<typeof copyTables>) => void,
+      expectedSkipKind: string,
+    ) => {
+      const crafted = clonePlain(base);
+      mutator(crafted);
+
+      let parseErr: ClipboardError | null = null;
+      try {
+        parseClipboard(JSON.stringify(crafted));
+      } catch (e) {
+        parseErr = e as ClipboardError;
+      }
+      expect(parseErr).toBeInstanceOf(ClipboardError);
+      expect(parseErr?.code).toBe('invalid_payload');
+
+      // 即使绕过 parseClipboard 直接调用 planPaste，也不能产生非法模型
+      const target = emptyModel('pg');
+      createSchema(target, 'public');
+      const plan = planPaste(target, crafted);
+      expect(plan.report.skipped.some((s) => s.kind === expectedSkipKind)).toBe(true);
+      runMutator(target, 'paste', { ops: plan.ops });
+      expect(validate(target)).toEqual([]);
+    };
+
+    // 1. 索引 element 引用缺失列
+    assertInvalidAndSafePlan((p) => {
+      const ix = p.fragment[ixId];
+      if (ix?.kind === 'index') ix.elements[0]!.column = 'missing_col';
+    }, 'index');
+
+    // 2. 索引 include 引用缺失列
+    assertInvalidAndSafePlan((p) => {
+      const ix = p.fragment[ixId];
+      if (ix?.kind === 'index') ix.include = ['missing_inc_col'];
+    }, 'index');
+
+    // 3. 索引 element 跨表引用另一张表的列
+    assertInvalidAndSafePlan((p) => {
+      const ix = p.fragment[ixId];
+      if (ix?.kind === 'index') ix.elements[0]!.column = bId;
+    }, 'index');
+
+    // 4. 主键引用缺失列
+    assertInvalidAndSafePlan((p) => {
+      const pk = p.fragment[pkId];
+      if (pk?.kind === 'primaryKey') pk.columns = ['missing_pk_col'];
+    }, 'primaryKey');
+
+    // 5. UNIQUE 引用缺失列
+    assertInvalidAndSafePlan((p) => {
+      const uq = p.fragment[uqId];
+      if (uq?.kind === 'unique') uq.columns = ['missing_uq_col'];
+    }, 'unique');
+
+    // 6. FK 本地列缺失
+    assertInvalidAndSafePlan((p) => {
+      const fk = p.fragment[fkId];
+      if (fk?.kind === 'foreignKey') fk.columns = ['missing_fk_local'];
+    }, 'foreignKey');
+
+    // 7. FK 内部 refColumns 缺失
+    assertInvalidAndSafePlan((p) => {
+      const fk = p.fragment[fkId];
+      if (fk?.kind === 'foreignKey') fk.refColumns = ['missing_fk_ref'];
+    }, 'foreignKey');
+  });
+
+  test('直接调用 planPaste 时对重复 tables / items ID 去重，不产生重复副本', () => {
+    const m = emptyModel('pg');
+    const pub = createSchema(m, 'public');
+    const t = createTable(m, pub, 'users');
+    const c = addColumn(m, t, { name: 'id', type: 'bigint', notNull: true });
+
+    const dupTablesPayload = clonePlain(copyTables(m, [t], { source: SRC }));
+    dupTablesPayload.tables = [t, t];
+    const target1 = emptyModel('pg');
+    createSchema(target1, 'public');
+    const plan1 = planPaste(target1, dupTablesPayload);
+    expect(plan1.newTables).toHaveLength(1);
+    runMutator(target1, 'paste', { ops: plan1.ops });
+    expect(validate(target1)).toEqual([]);
+    expect(Object.values(target1.objects).filter((o) => o.kind === 'table')).toHaveLength(1);
+
+    const dupItemsPayload = clonePlain(copyItems(m, t, [c], { source: SRC }));
+    dupItemsPayload.items = [c, c];
+    const target2 = emptyModel('pg');
+    const pub2 = createSchema(target2, 'public');
+    const t2 = createTable(target2, pub2, 'dest');
+    const plan2 = planPaste(target2, dupItemsPayload, { targetTable: t2 });
+    expect(plan2.newItems).toHaveLength(1);
+    runMutator(target2, 'paste', { ops: plan2.ops });
+    expect(validate(target2)).toEqual([]);
+    expect(Object.values(target2.objects).filter((o) => o.kind === 'column')).toHaveLength(1);
   });
 
   test('serializeClipboard 超过 MAX_CLIPBOARD_BYTES 抛 too_large', () => {

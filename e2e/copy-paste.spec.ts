@@ -240,3 +240,105 @@ test('属性面板：复制列和索引并粘贴进另一张表；查看者不�
   await expect(viewer.page.getByText('你在这个项目里是查看者，不能粘贴。')).toBeVisible();
   await expect(tree(viewer.page).getByRole('button', { name: 'orders_copy', exact: true })).toHaveCount(0);
 });
+
+const tableNode = (page: Page, name: string) =>
+  page.locator('.react-flow__node').filter({
+    has: page.locator('div.font-semibold', { hasText: new RegExp(`^${name}$`) }),
+  });
+
+const nodeFlowPos = async (page: Page, name: string) =>
+  tableNode(page, name).evaluate((el) => {
+    const tf = (el as { style?: { transform?: string } }).style?.transform ?? '';
+    const match = /translate(?:3d)?\(\s*(-?[\d.]+)px,\s*(-?[\d.]+)px/.exec(tf);
+    if (!match) throw new Error(`无法解析节点坐标 transform=${tf}`);
+    return { x: Number(match[1]), y: Number(match[2]) };
+  });
+
+test('多选两张表并整体拖动：两张表都保存新位置且刷新后不回弹', async ({ browser }) => {
+  const { page } = await newUser(browser, '多选拖动');
+  const group = await createGroup(page);
+  await createSqliteProject(page, group.name, '多选拖动', SHOP_SQL);
+
+  const usersNode = tableNode(page, 'users');
+  const productsNode = tableNode(page, 'products');
+  const ordersNode = tableNode(page, 'orders');
+  await expect(usersNode).toBeVisible();
+  await expect(productsNode).toBeVisible();
+  await expect(ordersNode).toBeVisible();
+  await synced(page);
+
+  const beforeUsers = await nodeFlowPos(page, 'users');
+  const beforeProducts = await nodeFlowPos(page, 'products');
+  const beforeOrders = await nodeFlowPos(page, 'orders');
+
+  // 选中 users，再 Shift+点击 products 形成多选
+  await usersNode.locator('div.font-semibold').click();
+  await productsNode.locator('div.font-semibold').click({ modifiers: ['Shift'] });
+  await expect(page.getByRole('button', { name: /^复制选中的 2 张表/ })).toBeVisible();
+
+  // 拖动其中一张选中的表（整体拖动两张表）
+  const box = await usersNode.locator('div.font-semibold').boundingBox();
+  expect(box).not.toBeNull();
+  const startX = box!.x + box!.width / 2;
+  const startY = box!.y + box!.height / 2;
+  await page.mouse.move(startX, startY);
+  await page.mouse.down();
+  await page.mouse.move(startX + 140, startY + 90, { steps: 12 });
+  await page.mouse.up();
+
+  // 两张选中的表都移动了相近位移，且未回弹；未选中的 orders 保持原地
+  await expect
+    .poll(async () => {
+      const u = await nodeFlowPos(page, 'users');
+      const p = await nodeFlowPos(page, 'products');
+      return {
+        dux: u.x - beforeUsers.x,
+        duy: u.y - beforeUsers.y,
+        dpx: p.x - beforeProducts.x,
+        dpy: p.y - beforeProducts.y,
+      };
+    })
+    .toMatchObject({
+      dux: expect.any(Number),
+      duy: expect.any(Number),
+      dpx: expect.any(Number),
+      dpy: expect.any(Number),
+    });
+
+  const afterDragUsers = await nodeFlowPos(page, 'users');
+  const afterDragProducts = await nodeFlowPos(page, 'products');
+  const afterDragOrders = await nodeFlowPos(page, 'orders');
+
+  const dux = afterDragUsers.x - beforeUsers.x;
+  const duy = afterDragUsers.y - beforeUsers.y;
+  const dpx = afterDragProducts.x - beforeProducts.x;
+  const dpy = afterDragProducts.y - beforeProducts.y;
+
+  expect(dux).toBeGreaterThan(40);
+  expect(duy).toBeGreaterThan(20);
+  expect(dpx).toBeGreaterThan(40);
+  expect(dpy).toBeGreaterThan(20);
+  expect(Math.abs(dux - dpx)).toBeLessThan(5);
+  expect(Math.abs(duy - dpy)).toBeLessThan(5);
+  expect(Math.abs(afterDragOrders.x - beforeOrders.x)).toBeLessThan(2);
+  expect(Math.abs(afterDragOrders.y - beforeOrders.y)).toBeLessThan(2);
+
+  // 等待服务端防抖落库（默认 500ms），刷新页面后确认两张表的新位置均被持久化
+  await page.waitForTimeout(1000);
+  await page.reload();
+  await expect(tableNode(page, 'users')).toBeVisible();
+  await expect(tableNode(page, 'products')).toBeVisible();
+  await expect(tableNode(page, 'orders')).toBeVisible();
+  await synced(page);
+
+  const afterReloadUsers = await nodeFlowPos(page, 'users');
+  const afterReloadProducts = await nodeFlowPos(page, 'products');
+  const afterReloadOrders = await nodeFlowPos(page, 'orders');
+
+  expect(Math.abs(afterReloadUsers.x - afterDragUsers.x)).toBeLessThan(2);
+  expect(Math.abs(afterReloadUsers.y - afterDragUsers.y)).toBeLessThan(2);
+  expect(Math.abs(afterReloadProducts.x - afterDragProducts.x)).toBeLessThan(2);
+  expect(Math.abs(afterReloadProducts.y - afterDragProducts.y)).toBeLessThan(2);
+  expect(Math.abs(afterReloadOrders.x - beforeOrders.x)).toBeLessThan(2);
+  expect(Math.abs(afterReloadOrders.y - beforeOrders.y)).toBeLessThan(2);
+});

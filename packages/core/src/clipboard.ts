@@ -716,10 +716,17 @@ const VALID_ITEM_KINDS: ReadonlySet<string> = new Set([
 
 /**
  * 解析剪贴板文本：不是 Dowel 载荷（非 JSON、format 不符）返回 null；
- * format 相符但版本不认识抛 ClipboardError('unsupported_version')，结构不合法抛 ClipboardError('invalid_payload')。
+ * 超过 MAX_CLIPBOARD_BYTES 在 JSON.parse 前抛 ClipboardError('too_large')；
+ * format 相符但版本不认识抛 ClipboardError('unsupported_version')，结构或内部引用不合法抛 ClipboardError('invalid_payload')。
  */
 export const parseClipboard = (text: string): ClipboardPayload | null => {
   if (typeof text !== 'string') return null;
+  if (
+    text.length > MAX_CLIPBOARD_BYTES ||
+    (text.length * 3 > MAX_CLIPBOARD_BYTES && utf8ByteLen(text) > MAX_CLIPBOARD_BYTES)
+  ) {
+    throw new ClipboardError('too_large');
+  }
   let raw: unknown;
   try {
     raw = JSON.parse(text);
@@ -750,14 +757,45 @@ export const parseClipboard = (text: string): ClipboardPayload | null => {
     }
   }
 
+  const fragRootOf = (tableId: string): string => {
+    let cur = tableId;
+    const seen = new Set<string>();
+    while (!seen.has(cur)) {
+      seen.add(cur);
+      const curObj = frag[cur];
+      if (!curObj || curObj.kind !== 'table' || !curObj.partitionOf) break;
+      const parentObj = frag[curObj.partitionOf.parent];
+      if (!parentObj || parentObj.kind !== 'table') break;
+      cur = parentObj.id;
+    }
+    return cur;
+  };
+
+  const hasColumnOfTable = (tableId: string, colId: string): boolean => {
+    const col = frag[colId];
+    if (!col || col.kind !== 'column') return false;
+    return col.parent === tableId || col.parent === fragRootOf(tableId);
+  };
+
+  const copiedTables = new Set<string>();
   if (data.kind === 'tables') {
     if (data.table !== null || data.items.length > 0) {
       throw new ClipboardError('invalid_payload');
     }
     for (const tid of data.tables) {
+      if (copiedTables.has(tid)) {
+        throw new ClipboardError('invalid_payload');
+      }
       const t = frag[tid];
       if (!t || t.kind !== 'table') {
         throw new ClipboardError('invalid_payload');
+      }
+      copiedTables.add(tid);
+    }
+    // 补充纳入被复制表的分区子表，以便校验内部外键与列归属
+    for (const item of Object.values(frag)) {
+      if (item.kind === 'table' && item.partitionOf && copiedTables.has(fragRootOf(item.id))) {
+        copiedTables.add(item.id);
       }
     }
   } else {
@@ -768,18 +806,123 @@ export const parseClipboard = (text: string): ClipboardPayload | null => {
     if (!tbl || tbl.kind !== 'table') {
       throw new ClipboardError('invalid_payload');
     }
+    const srcRoot = fragRootOf(data.table);
+    const seenItems = new Set<string>();
     for (const iid of data.items) {
+      if (seenItems.has(iid)) {
+        throw new ClipboardError('invalid_payload');
+      }
+      seenItems.add(iid);
       const it = frag[iid];
       if (!it || !VALID_ITEM_KINDS.has(it.kind)) {
+        throw new ClipboardError('invalid_payload');
+      }
+      if (it.kind === 'column') {
+        if (it.parent !== data.table && it.parent !== srcRoot) {
+          throw new ClipboardError('invalid_payload');
+        }
+      } else if ('parent' in it && it.parent !== data.table) {
         throw new ClipboardError('invalid_payload');
       }
     }
   }
 
+  const seenExternal = new Set<string>();
   for (const eid of data.external) {
+    if (seenExternal.has(eid)) {
+      throw new ClipboardError('invalid_payload');
+    }
+    seenExternal.add(eid);
     const extTbl = frag[eid];
     if (!extTbl || extTbl.kind !== 'table') {
       throw new ClipboardError('invalid_payload');
+    }
+  }
+
+  // 校验 fragment 内部列与父表引用完整性，防止篡改载荷生成缺列索引/约束导致非法模型
+  for (const item of Object.values(frag)) {
+    switch (item.kind) {
+      case 'column': {
+        const parentTbl = frag[item.parent];
+        if (!parentTbl || parentTbl.kind !== 'table') {
+          throw new ClipboardError('invalid_payload');
+        }
+        break;
+      }
+      case 'table': {
+        if (copiedTables.has(item.id) && item.partitionBy !== null && typeof item.partitionBy === 'object') {
+          for (const k of item.partitionBy.keys) {
+            if (k.column !== null && !hasColumnOfTable(item.id, k.column)) {
+              throw new ClipboardError('invalid_payload');
+            }
+          }
+        }
+        break;
+      }
+      case 'primaryKey':
+      case 'unique': {
+        const parentTbl = frag[item.parent];
+        if (!parentTbl || parentTbl.kind !== 'table') {
+          throw new ClipboardError('invalid_payload');
+        }
+        for (const cid of item.columns) {
+          if (!hasColumnOfTable(item.parent, cid)) {
+            throw new ClipboardError('invalid_payload');
+          }
+        }
+        break;
+      }
+      case 'check': {
+        const parentTbl = frag[item.parent];
+        if (!parentTbl || parentTbl.kind !== 'table') {
+          throw new ClipboardError('invalid_payload');
+        }
+        break;
+      }
+      case 'index': {
+        const parentTbl = frag[item.parent];
+        if (!parentTbl || parentTbl.kind !== 'table') {
+          throw new ClipboardError('invalid_payload');
+        }
+        for (const el of item.elements) {
+          const hasCol = el.column !== null;
+          const hasExpr = el.expr !== null && el.expr.length > 0;
+          if (hasCol === hasExpr) {
+            throw new ClipboardError('invalid_payload');
+          }
+          if (el.column !== null && !hasColumnOfTable(item.parent, el.column)) {
+            throw new ClipboardError('invalid_payload');
+          }
+        }
+        for (const cid of item.include) {
+          if (!hasColumnOfTable(item.parent, cid)) {
+            throw new ClipboardError('invalid_payload');
+          }
+        }
+        break;
+      }
+      case 'foreignKey': {
+        const parentTbl = frag[item.parent];
+        if (!parentTbl || parentTbl.kind !== 'table') {
+          throw new ClipboardError('invalid_payload');
+        }
+        if (item.columns.length !== item.refColumns.length) {
+          throw new ClipboardError('invalid_payload');
+        }
+        for (const cid of item.columns) {
+          if (!hasColumnOfTable(item.parent, cid)) {
+            throw new ClipboardError('invalid_payload');
+          }
+        }
+        if (copiedTables.has(item.refTable)) {
+          for (const rc of item.refColumns) {
+            if (!hasColumnOfTable(item.refTable, rc)) {
+              throw new ClipboardError('invalid_payload');
+            }
+          }
+        }
+        break;
+      }
     }
   }
 
@@ -1783,7 +1926,7 @@ const planTablesPaste = (ctx: PasteContext, payload: ClipboardPayload): PastePla
     return fallback.id;
   };
 
-  const colIdMap = new Map<string, string>();
+  const colIdsByTable = new Map<string, Map<string, string>>();
   const newColNameById = new Map<string, string>();
   const deferredFks: {
     fk: ForeignKey;
@@ -1792,10 +1935,32 @@ const planTablesPaste = (ctx: PasteContext, payload: ClipboardPayload): PastePla
     newSchemaId: string;
     srcTableName: string;
     colRenameMap: Map<string, string>;
+    tableColIdMap: Map<string, string>;
   }[] = [];
   let partitionObjectsSkipped = 0;
 
+  const mapCols = (
+    colIds: readonly string[],
+    colMap: Map<string, string>,
+  ): { mapped: string[]; missing: string[] } => {
+    const mapped: string[] = [];
+    const missing: string[] = [];
+    for (const cid of colIds) {
+      const nextId = colMap.get(cid);
+      if (!nextId) {
+        const obj = ctx.frag[cid];
+        missing.push(obj?.kind === 'column' ? obj.name : cid);
+      } else {
+        mapped.push(nextId);
+      }
+    }
+    return { mapped, missing };
+  };
+
+  const seenTables = new Set<string>();
   for (const srcRootId of payload.tables) {
+    if (seenTables.has(srcRootId)) continue;
+    seenTables.add(srcRootId);
     const srcTbl = ctx.frag[srcRootId];
     if (srcTbl?.kind !== 'table') continue;
 
@@ -1810,6 +1975,8 @@ const planTablesPaste = (ctx: PasteContext, payload: ClipboardPayload): PastePla
     }
     tableMap[srcRootId] = newTableId;
     newTables.push(newTableId);
+    const tableColIdMap = new Map<string, string>();
+    colIdsByTable.set(srcRootId, tableColIdMap);
 
     // SQLite WITHOUT ROWID 需要等主键创建后通过 setTableExt 设置
     const hasSqliteWithoutRowid = Boolean(srcTbl.ext?.sqlite?.withoutRowid);
@@ -1854,7 +2021,7 @@ const planTablesPaste = (ctx: PasteContext, payload: ClipboardPayload): PastePla
         });
         colRenameMap.set(srcCol.name, newColName);
       }
-      colIdMap.set(srcCol.id, newColId);
+      tableColIdMap.set(srcCol.id, newColId);
       newColNameById.set(newColId, newColName);
       exprColNames.push(newColName);
 
@@ -2007,9 +2174,20 @@ const planTablesPaste = (ctx: PasteContext, payload: ClipboardPayload): PastePla
     }
 
     // 主键
+    let createdPk = false;
     for (const pk of ctx.fragIdx.childrenRef(srcRootId, 'primaryKey')) {
+      const { mapped: mappedCols, missing } = mapCols(pk.columns, tableColIdMap);
+      if (missing.length > 0 || mappedCols.length === 0) {
+        ctx.report.skipped.push({
+          kind: 'primaryKey',
+          name: pk.name,
+          table: newTableName,
+          reason: 'missingColumns',
+          detail: missing.length > 0 ? [...new Set(missing)].join(', ') : null,
+        });
+        continue;
+      }
       const newPkId = ctx.allocId();
-      const mappedCols = pk.columns.map((c) => colIdMap.get(c)!);
       ctx.ops.push({
         name: 'addPrimaryKey',
         args: {
@@ -2019,6 +2197,7 @@ const planTablesPaste = (ctx: PasteContext, payload: ClipboardPayload): PastePla
           ...(pk.ext ? { ext: clonePlain(pk.ext) } : {}),
         },
       });
+      createdPk = true;
       if (pk.nameMode === 'explicit' && ctx.target.dialect !== 'mysql') {
         const newName = ctx.ns.allocateName(pk.name, 'constraint', (n) =>
           ctx.ns.isKeyTaken(newSchemaId, newTableId, 'primaryKey', n),
@@ -2051,7 +2230,7 @@ const planTablesPaste = (ctx: PasteContext, payload: ClipboardPayload): PastePla
     }
 
     // SQLite 延迟的 WITHOUT ROWID 与 AUTOINCREMENT 扩展
-    if (hasSqliteWithoutRowid && srcTbl.ext) {
+    if (hasSqliteWithoutRowid && createdPk && srcTbl.ext) {
       ctx.ops.push({
         name: 'setTableExt',
         args: { id: newTableId, ext: clonePlain(srcTbl.ext) },
@@ -2065,76 +2244,89 @@ const planTablesPaste = (ctx: PasteContext, payload: ClipboardPayload): PastePla
     }
 
     // PG 分区设置与全部后代子分区（BFS 顺序）
-    const mapPartitionSpec = (spec: PartitionSpec): PartitionSpec => ({
-      strategy: spec.strategy,
-      keys: spec.keys.map((k): PartitionKey => {
+    const mapPartitionSpec = (spec: PartitionSpec): PartitionSpec | null => {
+      const keys: PartitionKey[] = [];
+      for (const k of spec.keys) {
+        let mappedCol: string | null = null;
+        if (k.column !== null) {
+          const nextId = tableColIdMap.get(k.column);
+          if (!nextId) return null;
+          mappedCol = nextId;
+        }
         let expr = k.expr;
         if (expr) {
           expr = renameManyInExpr(ctx.target.dialect, expr, colRenameMap);
           expr = renameQualifiedManyInExpr(ctx.target.dialect, expr, ctx.qualifiedEnumRenames);
         }
-        return {
-          column: k.column ? colIdMap.get(k.column)! : null,
+        if ((mappedCol !== null) === (expr !== null && expr.length > 0)) return null;
+        keys.push({
+          column: mappedCol,
           expr,
           opclass: k.opclass,
           collation: k.collation,
-        };
-      }),
-    });
+        });
+      }
+      return keys.length > 0 ? { strategy: spec.strategy, keys } : null;
+    };
 
     if (d.capabilities.partitioning && srcTbl.partitionBy !== null) {
       const rootSpec = resolvePartitionBy(ctx.fragModel, srcTbl);
-      if (rootSpec) {
+      const mappedRootSpec = rootSpec ? mapPartitionSpec(rootSpec) : null;
+      if (mappedRootSpec) {
         ctx.ops.push({
           name: 'setPartitionBy',
-          args: { id: newTableId, partitionBy: mapPartitionSpec(rootSpec) },
+          args: { id: newTableId, partitionBy: mappedRootSpec },
         });
-      }
-      for (const srcDesc of ctx.fragIdx.partitionDescendants(srcRootId)) {
-        const newDescId = ctx.allocId();
-        const descParentNewId = tableMap[srcDesc.partitionOf!.parent]!;
-        const descSchemaId = mapSchema(srcDesc.parent, srcDesc.parent !== srcTbl.parent);
-        const newDescName = ctx.ns.allocateName(srcDesc.name, 'table', (n) =>
-          ctx.ns.isTableTaken(descSchemaId, n),
-        );
-        ctx.ns.addTable(descSchemaId, newDescName);
-        if (newDescName !== srcDesc.name) {
-          ctx.report.renamed.push({ kind: 'table', table: null, from: srcDesc.name, to: newDescName });
-        }
-        tableMap[srcDesc.id] = newDescId;
-
-        ctx.ops.push({
-          name: 'createPartition',
-          args: {
-            id: newDescId,
-            parent: descParentNewId,
-            name: newDescName,
-            bound: srcDesc.partitionOf!.bound,
-            schema: descSchemaId,
-          },
-        });
-        if (srcDesc.partitionBy !== null) {
-          const descSpec = resolvePartitionBy(ctx.fragModel, srcDesc);
-          if (descSpec) {
-            ctx.ops.push({
-              name: 'setPartitionBy',
-              args: { id: newDescId, partitionBy: mapPartitionSpec(descSpec) },
-            });
+        for (const srcDesc of ctx.fragIdx.partitionDescendants(srcRootId)) {
+          const partOf = srcDesc.partitionOf;
+          const descParentNewId =
+            partOf && Object.hasOwn(tableMap, partOf.parent) ? tableMap[partOf.parent] : undefined;
+          if (!partOf || !descParentNewId) continue;
+          const newDescId = ctx.allocId();
+          const descSchemaId = mapSchema(srcDesc.parent, srcDesc.parent !== srcTbl.parent);
+          const newDescName = ctx.ns.allocateName(srcDesc.name, 'table', (n) =>
+            ctx.ns.isTableTaken(descSchemaId, n),
+          );
+          ctx.ns.addTable(descSchemaId, newDescName);
+          if (newDescName !== srcDesc.name) {
+            ctx.report.renamed.push({ kind: 'table', table: null, from: srcDesc.name, to: newDescName });
           }
-        }
-        if (srcDesc.comment !== null) {
-          ctx.commentQueue.push({ id: newDescId, comment: srcDesc.comment });
-        }
+          tableMap[srcDesc.id] = newDescId;
 
-        for (const ch of ctx.fragIdx.allChildrenOf(srcDesc.id)) {
-          if (
-            ch.kind === 'primaryKey' ||
-            ch.kind === 'unique' ||
-            ch.kind === 'check' ||
-            ch.kind === 'foreignKey' ||
-            ch.kind === 'index'
-          ) {
-            partitionObjectsSkipped++;
+          ctx.ops.push({
+            name: 'createPartition',
+            args: {
+              id: newDescId,
+              parent: descParentNewId,
+              name: newDescName,
+              bound: partOf.bound,
+              schema: descSchemaId,
+            },
+          });
+          if (srcDesc.partitionBy !== null) {
+            const descSpec = resolvePartitionBy(ctx.fragModel, srcDesc);
+            const mappedDescSpec = descSpec ? mapPartitionSpec(descSpec) : null;
+            if (mappedDescSpec) {
+              ctx.ops.push({
+                name: 'setPartitionBy',
+                args: { id: newDescId, partitionBy: mappedDescSpec },
+              });
+            }
+          }
+          if (srcDesc.comment !== null) {
+            ctx.commentQueue.push({ id: newDescId, comment: srcDesc.comment });
+          }
+
+          for (const ch of ctx.fragIdx.allChildrenOf(srcDesc.id)) {
+            if (
+              ch.kind === 'primaryKey' ||
+              ch.kind === 'unique' ||
+              ch.kind === 'check' ||
+              ch.kind === 'foreignKey' ||
+              ch.kind === 'index'
+            ) {
+              partitionObjectsSkipped++;
+            }
           }
         }
       }
@@ -2142,8 +2334,18 @@ const planTablesPaste = (ctx: PasteContext, payload: ClipboardPayload): PastePla
 
     // UNIQUE / CHECK / INDEX
     for (const u of ctx.fragIdx.childrenRef(srcRootId, 'unique')) {
+      const { mapped: mappedCols, missing } = mapCols(u.columns, tableColIdMap);
+      if (missing.length > 0 || mappedCols.length === 0) {
+        ctx.report.skipped.push({
+          kind: 'unique',
+          name: u.name,
+          table: newTableName,
+          reason: 'missingColumns',
+          detail: missing.length > 0 ? [...new Set(missing)].join(', ') : null,
+        });
+        continue;
+      }
       const newUid = ctx.allocId();
-      const mappedCols = u.columns.map((c) => colIdMap.get(c)!);
       ctx.ops.push({
         name: 'addUnique',
         args: {
@@ -2215,22 +2417,65 @@ const planTablesPaste = (ctx: PasteContext, payload: ClipboardPayload): PastePla
     }
 
     for (const ix of ctx.fragIdx.childrenRef(srcRootId, 'index')) {
-      const newIxId = ctx.allocId();
-      const mappedElements = ix.elements.map((e) => ({
-        column: e.column ? colIdMap.get(e.column)! : null,
-        expr: e.expr
+      const missingCols: string[] = [];
+      let invalidElement = false;
+      const mappedElements: IndexElement[] = [];
+      for (const e of ix.elements) {
+        let mappedCol: string | null = null;
+        if (e.column !== null) {
+          const nextId = tableColIdMap.get(e.column);
+          if (!nextId) {
+            const obj = ctx.frag[e.column];
+            missingCols.push(obj?.kind === 'column' ? obj.name : e.column);
+          } else {
+            mappedCol = nextId;
+          }
+        }
+        const mappedExpr = e.expr
           ? renameQualifiedManyInExpr(
               ctx.target.dialect,
               renameManyInExpr(ctx.target.dialect, e.expr, colRenameMap),
               ctx.qualifiedEnumRenames,
             )
-          : null,
-        desc: e.desc,
-        nullsFirst: e.nullsFirst,
-        opclass: e.opclass,
-        collation: e.collation,
-      }));
-      const mappedInclude = ix.include.map((c) => colIdMap.get(c)!);
+          : null;
+        const hasCol = e.column !== null;
+        const hasExpr = mappedExpr !== null && mappedExpr.length > 0;
+        if (hasCol === hasExpr) {
+          invalidElement = true;
+        }
+        mappedElements.push({
+          column: mappedCol,
+          expr: mappedExpr,
+          desc: e.desc,
+          nullsFirst: e.nullsFirst,
+          opclass: e.opclass,
+          collation: e.collation,
+        });
+      }
+      const incRes = mapCols(ix.include, tableColIdMap);
+      if (incRes.missing.length > 0) missingCols.push(...incRes.missing);
+      if (missingCols.length > 0) {
+        ctx.report.skipped.push({
+          kind: 'index',
+          name: ix.name,
+          table: newTableName,
+          reason: 'missingColumns',
+          detail: [...new Set(missingCols)].join(', '),
+        });
+        continue;
+      }
+      if (invalidElement || mappedElements.length === 0) {
+        ctx.report.skipped.push({
+          kind: 'index',
+          name: ix.name,
+          table: newTableName,
+          reason: 'unsupported',
+          detail: null,
+        });
+        continue;
+      }
+      const mappedInclude = incRes.mapped;
+      const newIxId = ctx.allocId();
       const mappedWhere = ix.where
         ? renameQualifiedManyInExpr(
             ctx.target.dialect,
@@ -2286,23 +2531,66 @@ const planTablesPaste = (ctx: PasteContext, payload: ClipboardPayload): PastePla
         newSchemaId,
         srcTableName: srcTbl.name,
         colRenameMap,
+        tableColIdMap,
       });
     }
   }
 
   // 所有表建完后再处理全部外键（内部重连 + 外部按 schema.table.col 重连）
   for (const item of deferredFks) {
-    const { fk, newTableId, newTableName, newSchemaId, srcTableName } = item;
-    const mappedCols = fk.columns.map((c) => colIdMap.get(c)!);
+    const { fk, newTableId, newTableName, newSchemaId, srcTableName, tableColIdMap } = item;
+    const localRes = mapCols(fk.columns, tableColIdMap);
+    if (localRes.missing.length > 0 || localRes.mapped.length === 0) {
+      ctx.report.skipped.push({
+        kind: 'foreignKey',
+        name: fk.name,
+        table: newTableName,
+        reason: 'missingColumns',
+        detail: localRes.missing.length > 0 ? [...new Set(localRes.missing)].join(', ') : null,
+      });
+      continue;
+    }
+    const mappedCols = localRes.mapped;
     let refTable: string;
     let refColumns: string[];
 
-    if (fk.refTable in tableMap) {
-      refTable = tableMap[fk.refTable]!;
-      refColumns = fk.refColumns.map((c) => colIdMap.get(c)!);
+    if (Object.hasOwn(tableMap, fk.refTable)) {
+      const mappedRefTable = tableMap[fk.refTable];
+      const refRootId = rootTableId(ctx.fragModel, fk.refTable);
+      const refColMap = colIdsByTable.get(refRootId);
+      const refRes = refColMap
+        ? mapCols(fk.refColumns, refColMap)
+        : { mapped: [], missing: [...fk.refColumns] };
+      if (
+        !mappedRefTable ||
+        refRes.missing.length > 0 ||
+        refRes.mapped.length === 0 ||
+        refRes.mapped.length !== mappedCols.length
+      ) {
+        ctx.report.skipped.push({
+          kind: 'foreignKey',
+          name: fk.name,
+          table: newTableName,
+          reason: 'missingRefColumns',
+          detail: refRes.missing.length > 0 ? [...new Set(refRes.missing)].join(', ') : null,
+        });
+        continue;
+      }
+      refTable = mappedRefTable;
+      refColumns = refRes.mapped;
     } else {
       const reconnected = reconnectExternalFk(ctx, fk, srcTableName);
       if (!reconnected) continue;
+      if (reconnected.refColumns.length !== mappedCols.length) {
+        ctx.report.skipped.push({
+          kind: 'foreignKey',
+          name: fk.name,
+          table: newTableName,
+          reason: 'missingRefColumns',
+          detail: null,
+        });
+        continue;
+      }
       refTable = reconnected.refTable;
       refColumns = reconnected.refColumns;
     }
@@ -2397,7 +2685,11 @@ const normExprText = (s: string | null): string | null => (s === null ? null : s
 const planItemsPaste = (ctx: PasteContext, payload: ClipboardPayload, tgtTbl: Table): PastePlan => {
   const d = getDialect(ctx.target.dialect);
   const tgtSchemaId = tgtTbl.parent;
-  const srcTbl = ctx.frag[payload.table!] as Table;
+  const rawSrcTbl = payload.table ? ctx.frag[payload.table] : undefined;
+  if (!rawSrcTbl || rawSrcTbl.kind !== 'table') {
+    throw new PasteError('nothing_to_paste');
+  }
+  const srcTbl = rawSrcTbl;
   const srcRootId = rootTableId(ctx.fragModel, srcTbl.id);
 
   ctx.ns.initTableColumns(tgtTbl.id);
@@ -2451,7 +2743,14 @@ const planItemsPaste = (ctx: PasteContext, payload: ClipboardPayload, tgtTbl: Ta
     }
   };
 
-  const itemObjs = payload.items.map((iid) => ctx.frag[iid]).filter((o): o is Obj => Boolean(o));
+  const seenItems = new Set<string>();
+  const itemObjs: Obj[] = [];
+  for (const iid of payload.items) {
+    if (seenItems.has(iid)) continue;
+    seenItems.add(iid);
+    const o = ctx.frag[iid];
+    if (o) itemObjs.push(o);
+  }
   const srcColItems = itemObjs.filter((o): o is Column => o.kind === 'column');
   const srcKeyItems = itemObjs.filter((o) => o.kind !== 'column');
 
@@ -3136,6 +3435,7 @@ const planItemsPaste = (ctx: PasteContext, payload: ClipboardPayload, tgtTbl: Ta
 
     if (item.kind === 'index') {
       const missingCols: string[] = [];
+      let invalidElement = false;
       const mappedElements: IndexElement[] = [];
       for (const el of item.elements) {
         let mappedCol: string | null = null;
@@ -3153,6 +3453,9 @@ const planItemsPaste = (ctx: PasteContext, payload: ClipboardPayload, tgtTbl: Ta
             ctx.qualifiedEnumRenames,
           );
         }
+        const hasCol = el.column !== null;
+        const hasExpr = mappedElExpr !== null && mappedElExpr.length > 0;
+        if (hasCol === hasExpr) invalidElement = true;
         mappedElements.push({
           column: mappedCol,
           expr: mappedElExpr,
@@ -3171,6 +3474,16 @@ const planItemsPaste = (ctx: PasteContext, payload: ClipboardPayload, tgtTbl: Ta
           table: tgtTbl.name,
           reason: 'missingColumns',
           detail: [...new Set(missingCols)].join(', '),
+        });
+        continue;
+      }
+      if (invalidElement || mappedElements.length === 0) {
+        ctx.report.skipped.push({
+          kind: 'index',
+          name: item.name,
+          table: tgtTbl.name,
+          reason: 'unsupported',
+          detail: null,
         });
         continue;
       }
