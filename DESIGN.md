@@ -664,7 +664,7 @@ Dowel 是给后端工程师和 DBA 用的工具：在画布上多人实时编辑
 ## Implementation
 
 - 主题 token 写在 `apps/web/src/styles.css` 的 `:root`，用 `light-dark()` 定义（`color-scheme: light dark`；HTML 里有 `<meta name="color-scheme" content="light dark">`），并映射到 Tailwind 4 的 `@theme`。数值与本文件 YAML 一致；`@.agents/docs/ui/mockups/theme.css` 是同一套 token 的参考实现。
-- 用户可在设置里覆盖配色（跟随系统 / 亮 / 暗）：设置 `<html style="color-scheme: …">`，`light-dark()` 随之切换。语言和配色存在 `localStorage`（`dowel.lang` / `dowel.scheme`），个人设置的“偏好”一节和账户菜单都能改。
+- 用户可在设置里覆盖配色（跟随系统 / 亮 / 暗）：设置 `<html style="color-scheme: …">`，`light-dark()` 随之切换。这依赖产物里保留原生 `light-dark()`：`apps/web/vite.config.ts` 用 `css.lightningcss.exclude: Features.LightDark` 禁止生产 CSS 压缩把它降级成只跟 `prefers-color-scheme` 走的开关（`e2e/scheme.spec.ts` 覆盖）。语言和配色存在 `localStorage`（`dowel.lang` / `dowel.scheme`），个人设置的“偏好”一节和账户菜单都能改。
 - 命令面板在 `apps/web/src/components/CommandPalette.tsx`；当前模型里的表通过 `apps/web/src/current-tables.ts` 的可订阅 store（`useSyncExternalStore`）交给它（模型页挂载时登记、离开时清空，新建 / 删除表时通知面板），选中表时派发一个 `window` 事件让模型页选中，不新增路由参数。“新建项目 / 新建组”通过 `/?new=project|group` 交给“我的项目”页，页面打开对话框 / 聚焦输入框后用 `replace` 把参数清掉。
 - 登录限速默认“同一 IP 10 次 / 10 分钟、同一 IP + 账号 30 次 / 10 分钟”，可用 `DOWEL_LOGIN_LIMIT`、`DOWEL_LOGIN_IP_LIMIT`、`DOWEL_LOGIN_WINDOW_MS` 调整（反向代理 / NAT 后面很多人共用一个 IP 时要调大；e2e 在一个 IP 上反复登录，配置里已调大）。
 - 组件：通用组件在 `apps/web/src/components/ui.tsx`（`IconButton`、`Menu`、`Banner`、`Empty`、`Avatar`、`Sql` 高亮），组件样式在 `styles.css` 的 `@layer components`（`.btn`、`.input`、`.select`、`.seg`、`.flag`、`.risk`、`.banner`、`.menu` …），类名与静态稿一致；布局用 Tailwind 工具类。图标 `lucide-react`；字体 `@fontsource-variable/inter`、`@fontsource-variable/jetbrains-mono`。
