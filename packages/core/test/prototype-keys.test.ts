@@ -76,3 +76,61 @@ describe('原型属性名作为文本参数时 mutator 正常执行', () => {
     expect(Object.keys(m.objects).sort()).toEqual(['c1', 's1', 't1']);
   });
 });
+
+// #90：mutator 注册表与 validate() 的依赖检查同样不能命中 Object.prototype 上的属性
+describe('原型属性名作为 mutator 名或依赖 ID', () => {
+  test('runMutator 对原型属性名抛 EditError（而不是 TypeError）', () => {
+    const m = setup();
+    for (const k of PROTO_KEYS) {
+      let err: unknown;
+      try {
+        E.runMutator(m, k, {});
+      } catch (e) {
+        err = e;
+      }
+      expect(err).toBeInstanceOf(E.EditError);
+      expect((err as Error).message).toBe(`未知的操作：${k}`);
+    }
+    expect(Object.keys(m.objects).sort()).toEqual(['c1', 's1', 't1']);
+  });
+
+  test('validate() 把 opaque.deps 中的原型属性名报告为不存在的依赖', () => {
+    const m = setup();
+    const view: E.Opaque = {
+      id: 'o1',
+      kind: 'opaque',
+      objType: 'view',
+      parent: 's1',
+      name: 'v_proto_deps',
+      ddl: ['CREATE VIEW public.v_proto_deps AS SELECT 1'],
+      drop: 'DROP VIEW public.v_proto_deps',
+      deps: ['t1', 'nonexistent_id', ...PROTO_KEYS],
+      order: 1,
+      comment: null,
+    };
+    m.objects[view.id] = view;
+    expect(E.validate(m)).toEqual(
+      ['nonexistent_id', ...PROTO_KEYS].map((d) => `view v_proto_deps：依赖的对象 ${d} 不存在`),
+    );
+  });
+
+  test('validate() 把指向原型属性名的引用报告为不存在', () => {
+    const m = setup();
+    for (const k of PROTO_KEYS) {
+      const view: E.Opaque = {
+        id: `o_${k}`,
+        kind: 'opaque',
+        objType: 'view',
+        parent: k,
+        name: `v_${k}`,
+        ddl: [],
+        drop: '',
+        deps: [],
+        order: 1,
+        comment: null,
+      };
+      m.objects[view.id] = view;
+    }
+    expect(E.validate(m)).toEqual(PROTO_KEYS.map((k) => `view v_${k}：parent 不存在`));
+  });
+});

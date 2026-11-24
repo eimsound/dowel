@@ -474,7 +474,7 @@ const listMutatorCatalog = (names?: string[]) => {
   const items: { name: string; argsSchema: Record<string, unknown> }[] = [];
   const unknown: string[] = [];
   for (const name of targetNames) {
-    const entry = registry[name];
+    const entry = Object.hasOwn(registry, name) ? registry[name] : undefined;
     if (!entry) {
       unknown.push(name);
       continue;

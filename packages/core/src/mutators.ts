@@ -216,7 +216,8 @@ export type MutatorArgs<K extends MutatorName> = z.infer<(typeof mutators)[K]['a
 
 /** 执行一个修改：校验参数后在模型上执行（直接修改传入的模型）。参数不合法或操作不合法抛 EditError */
 export const runMutator = (m: Model, name: string, args: unknown) => {
-  const mu = (mutators as Record<string, { args: z.ZodType; run: (m: Model, a: unknown) => unknown }>)[name];
+  const registry = mutators as Record<string, { args: z.ZodType; run: (m: Model, a: unknown) => unknown }>;
+  const mu = Object.hasOwn(registry, name) ? registry[name] : undefined;
   if (!mu) throw new E.EditError(`未知的操作：${name}`);
   const parsed = mu.args.safeParse(args);
   if (!parsed.success) throw new E.EditError(`参数不合法：${parsed.error.issues[0]?.message ?? ''}`);
