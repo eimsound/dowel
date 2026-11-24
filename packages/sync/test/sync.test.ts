@@ -18,6 +18,7 @@ import {
   execute,
   isValidClientId,
   memoryStore,
+  type Op,
   type Rejection,
   Room,
   SyncClient,
@@ -1181,5 +1182,169 @@ describe('写时复制 execute 与单次执行优化一致性', () => {
 
     expect(a.view.objects.pk2).toMatchObject({ name: 'orders_pkey' });
     expect(a.view.objects.idx2).toMatchObject({ name: 'orders_id_idx' });
+  });
+});
+
+describe('Room.processedOf 与 Room.simulate', () => {
+  test('processedOf 返回客户端已处理序号，未出现过则返回 0', async () => {
+    const base = emptyModel('pg');
+    const store = memoryStore();
+    const room = new Room(emptyRoomState(base), store);
+    expect(room.processedOf('mcp:t1')).toBe(0);
+
+    await room.handle('mcp:t1', 'alice', {
+      t: 'op',
+      op: {
+        client: 'mcp:t1',
+        n: 1,
+        name: 'createSchema',
+        args: { id: 's1', name: 'public' },
+        reads: [['s1', null]],
+      },
+    });
+    expect(room.processedOf('mcp:t1')).toBe(1);
+    expect(room.processedOf('mcp:t2')).toBe(0);
+  });
+
+  test('simulate 支持 p:<client>:<n> 批内依赖且不修改房间状态或 store', async () => {
+    const base = emptyModel('pg');
+    const store = memoryStore();
+    const room = new Room(emptyRoomState(base), store);
+
+    const ops: Op[] = [
+      {
+        client: 'mcp:t1',
+        n: 1,
+        name: 'createSchema',
+        args: { id: 's1', name: 'public' },
+        reads: [['s1', null]],
+      },
+      {
+        client: 'mcp:t1',
+        n: 2,
+        name: 'createTable',
+        args: { id: 't1', schema: 's1', name: 'users' },
+        reads: [
+          ['s1', 'p:mcp:t1:1'],
+          ['t1', null],
+        ],
+      },
+      {
+        client: 'mcp:t1',
+        n: 3,
+        name: 'addColumn',
+        args: { table: 't1', column: { id: 'c1', name: 'id', type: 'bigint', notNull: true } },
+        reads: [['t1', 'p:mcp:t1:2']],
+      },
+    ];
+
+    const res = room.simulate('mcp:t1', ops);
+    expect(res.ok).toBe(true);
+    if (!res.ok) return;
+    expect(res.baseSeq).toBe(0);
+    expect(res.headSeq).toBe(3);
+    expect(res.commits.map((c) => [c.n, c.seq, c.name])).toEqual([
+      [1, 1, 'createSchema'],
+      [2, 2, 'createTable'],
+      [3, 3, 'addColumn'],
+    ]);
+    expect(Object.keys(res.model.objects).sort()).toEqual(['c1', 's1', 't1']);
+
+    // 零副作用：房间 seq、model、processed 与 store 都未发生变化
+    expect(room.seq).toBe(0);
+    expect(room.model.objects).toEqual({});
+    expect(room.processedOf('mcp:t1')).toBe(0);
+    expect(store.commits).toEqual([]);
+  });
+
+  test('simulate 遇到冲突或非法操作时返回精确 failedIndex 并保持零副作用', async () => {
+    const base = emptyModel('pg');
+    const store = memoryStore();
+    const room = new Room(emptyRoomState(base), store);
+
+    await room.handle('ws:u1', 'bob', {
+      t: 'op',
+      op: {
+        client: 'ws:u1',
+        n: 1,
+        name: 'createSchema',
+        args: { id: 's1', name: 'public' },
+        reads: [['s1', null]],
+      },
+    });
+    await room.handle('ws:u1', 'bob', {
+      t: 'op',
+      op: {
+        client: 'ws:u1',
+        n: 2,
+        name: 'createTable',
+        args: { id: 't1', schema: 's1', name: 'users' },
+        reads: [
+          ['s1', 1],
+          ['t1', null],
+        ],
+      },
+    });
+
+    // 冲突：reads 看到 t1=1，实际 t1=2
+    const conflictRes = room.simulate('mcp:t1', [
+      {
+        client: 'mcp:t1',
+        n: 1,
+        name: 'createTable',
+        args: { id: 't2', schema: 's1', name: 'orders' },
+        reads: [
+          ['s1', 1],
+          ['t2', null],
+        ],
+      },
+      {
+        client: 'mcp:t1',
+        n: 2,
+        name: 'addColumn',
+        args: { table: 't1', column: { id: 'c1', name: 'id', type: 'bigint' } },
+        reads: [['t1', 1]],
+      },
+    ]);
+    expect(conflictRes).toEqual({
+      ok: false,
+      failedIndex: 1,
+      code: 'conflict',
+      message: expect.stringContaining('已被 bob 修改'),
+    });
+
+    // 非法：重复表名触发 EditError -> code: 'invalid'，且第 1 步创建在模拟结束后未残留
+    const invalidRes = room.simulate('mcp:t1', [
+      {
+        client: 'mcp:t1',
+        n: 1,
+        name: 'createTable',
+        args: { id: 't2', schema: 's1', name: 'orders' },
+        reads: [
+          ['s1', 1],
+          ['t2', null],
+        ],
+      },
+      {
+        client: 'mcp:t1',
+        n: 2,
+        name: 'createTable',
+        args: { id: 't3', schema: 's1', name: 'orders' },
+        reads: [
+          ['s1', 1],
+          ['t3', null],
+        ],
+      },
+    ]);
+    expect(invalidRes.ok).toBe(false);
+    if (!invalidRes.ok) {
+      expect(invalidRes.failedIndex).toBe(1);
+      expect(invalidRes.code).toBe('invalid');
+    }
+
+    expect(room.seq).toBe(2);
+    expect(Object.keys(room.model.objects).sort()).toEqual(['s1', 't1']);
+    expect(room.processedOf('mcp:t1')).toBe(0);
+    expect(store.commits).toHaveLength(2);
   });
 });

@@ -1007,3 +1007,182 @@ describe('从 v28 升级迁移 29：邮箱规范化、安全去重、大小写�
     },
   );
 });
+
+const MCP_MIGRATION = MIGRATIONS.findIndex(
+  (m) => typeof m === 'function' && m('sqlite').includes('create table if not exists mcp_tokens'),
+);
+
+describe('M3-C 迁移：mcp_tokens 表结构、JSON 往返、外键与幂等性', () => {
+  const cleanups: (() => Promise<void>)[] = [];
+  afterAll(async () => {
+    for (const c of cleanups) await c();
+  });
+
+  test.each([
+    { platform: 'sqlite' as const, skip: false },
+    { platform: 'pg' as const, skip: !PG_URL },
+  ])(
+    'mcp_tokens 列齐全、索引生效、scopes/project_ids JSON 往返、级联/置空与幂等重跑（$platform）',
+    async ({ platform, skip }) => {
+      if (skip) return;
+      expect(MCP_MIGRATION).toBeGreaterThan(0);
+      const mcpVersion = MCP_MIGRATION + 1;
+
+      let url = '';
+      if (platform === 'pg') {
+        const pg = await createTestDb('mig_mcp');
+        cleanups.push(pg.close);
+        url = pg.url;
+      } else {
+        const dir = mkdtempSync(join(tmpdir(), 'dowel-mig-mcp-'));
+        cleanups.push(async () => rmSync(dir, { recursive: true, force: true }));
+        url = join(dir, 'dowel.db');
+      }
+
+      const db = await openPlatformDb(url);
+      try {
+        const [ver] = await db.query<{ v: number }>('select max(version) as v from dowel_migrations');
+        expect(ver!.v).toBe(MIGRATIONS.length);
+
+        const expectedCols = [
+          'id',
+          'user_id',
+          'kind',
+          'name',
+          'prefix',
+          'token_hash',
+          'scopes',
+          'project_ids',
+          'created_at',
+          'expires_at',
+          'revoked_at',
+          'revoked_by',
+          'revoked_reason',
+          'last_used_at',
+          'last_used_ip',
+        ];
+        if (platform === 'pg') {
+          const cols = await db.query<{ name: string }>(
+            "select column_name as name from information_schema.columns where table_schema = current_schema() and table_name = 'mcp_tokens'",
+          );
+          expect(cols.map((c) => c.name).sort()).toEqual([...expectedCols].sort());
+          const idx = await db.query<{ indexname: string }>(
+            "select indexname from pg_indexes where tablename = 'mcp_tokens' and indexname = 'mcp_tokens_user'",
+          );
+          expect(idx).toHaveLength(1);
+        } else {
+          const cols = await db.query<{ name: string }>('pragma table_info(mcp_tokens)');
+          expect(cols.map((c) => c.name).sort()).toEqual([...expectedCols].sort());
+          const idx = await db.query<{ name: string }>(
+            "select name from sqlite_master where type = 'index' and name = 'mcp_tokens_user'",
+          );
+          expect(idx).toHaveLength(1);
+        }
+
+        await db.query(
+          "insert into users (id, username, name) values ('u1', 'u1', '用户1'), ('u2', 'u2', '管理员')",
+        );
+        await db.query(
+          `insert into mcp_tokens
+             (id, user_id, name, prefix, token_hash, scopes, project_ids, expires_at, revoked_at, revoked_by, revoked_reason)
+           values ($1, $2, $3, $4, $5, $6::text::jsonb, $7::text::jsonb, $8, $9, $10, $11)`,
+          [
+            't1',
+            'u1',
+            '工作区令牌',
+            'dwm_12345678',
+            'hash-1',
+            JSON.stringify(['read', 'verify']),
+            JSON.stringify(['p1', 'p2']),
+            '2099-01-01T00:00:00.000Z',
+            '2026-06-01T00:00:00.000Z',
+            'u2',
+            'admin',
+          ],
+        );
+        await db.query(
+          `insert into mcp_tokens
+             (id, user_id, name, prefix, token_hash, scopes, project_ids, expires_at)
+           values ($1, $2, $3, $4, $5, $6::text::jsonb, $7::text::jsonb, $8)`,
+          [
+            't2',
+            'u1',
+            '全项目令牌',
+            'dwm_abcdefgh',
+            'hash-2',
+            JSON.stringify(['read']),
+            null,
+            '2099-01-01T00:00:00.000Z',
+          ],
+        );
+
+        const rows = await db.query<{
+          id: string;
+          kind: string;
+          scopes: unknown;
+          project_ids: unknown;
+          revoked_by: string | null;
+        }>('select id, kind, scopes, project_ids, revoked_by from mcp_tokens order by id');
+        expect(rows).toEqual([
+          {
+            id: 't1',
+            kind: 'personal',
+            scopes: ['read', 'verify'],
+            project_ids: ['p1', 'p2'],
+            revoked_by: 'u2',
+          },
+          {
+            id: 't2',
+            kind: 'personal',
+            scopes: ['read'],
+            project_ids: null,
+            revoked_by: null,
+          },
+        ]);
+
+        // token_hash 唯一约束生效
+        const dup = await db
+          .query(
+            `insert into mcp_tokens (id, user_id, name, prefix, token_hash, scopes, expires_at)
+             values ('t-dup', 'u1', '重复', 'dwm_00000000', 'hash-1', $1::text::jsonb, '2099-01-01T00:00:00.000Z')`,
+            [JSON.stringify(['read'])],
+          )
+          .catch((e: unknown) => e);
+        expect(isUniqueViolation(dup)).toBe(true);
+
+        // revoked_by 删除置空（on delete set null），user_id 级联删除（on delete cascade）
+        await db.query("delete from users where id = 'u2'");
+        const [afterRevokerDelete] = await db.query<{ revoked_by: string | null }>(
+          "select revoked_by from mcp_tokens where id = 't1'",
+        );
+        expect(afterRevokerDelete!.revoked_by).toBeNull();
+
+        await db.query("delete from users where id = 'u1'");
+        expect(await db.query('select id from mcp_tokens')).toEqual([]);
+
+        // 幂等重跑该条迁移，已有数据保持完好
+        await db.query("insert into users (id, username, name) values ('u3', 'u3', '用户3')");
+        await db.query(
+          `insert into mcp_tokens (id, user_id, name, prefix, token_hash, scopes, project_ids, expires_at)
+           values ('t3', 'u3', '保留令牌', 'dwm_keep1234', 'hash-3', $1::text::jsonb, $2::text::jsonb, '2099-01-01T00:00:00.000Z')`,
+          [JSON.stringify(['read', 'write']), JSON.stringify(['p9'])],
+        );
+        await db.query('delete from dowel_migrations where version >= $1', [mcpVersion]);
+      } finally {
+        await db.close();
+      }
+
+      const rerun = await openPlatformDb(url);
+      try {
+        const [ver2] = await rerun.query<{ v: number }>('select max(version) as v from dowel_migrations');
+        expect(ver2!.v).toBe(MIGRATIONS.length);
+        const rows = await rerun.query<{ id: string; scopes: unknown; project_ids: unknown }>(
+          "select id, scopes, project_ids from mcp_tokens where id = 't3'",
+        );
+        expect(rows).toEqual([{ id: 't3', scopes: ['read', 'write'], project_ids: ['p9'] }]);
+      } finally {
+        await rerun.close();
+      }
+    },
+  );
+});

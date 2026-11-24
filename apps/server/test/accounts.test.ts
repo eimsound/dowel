@@ -297,6 +297,8 @@ describe.each([
       connectionAllowlist: [],
       // P5b：Webhook 出站额外放行的地址（默认只允许公网）
       webhookAllowlist: [],
+      // M3-C：允许 MCP 访问总开关（默认开）
+      allowMcpAccess: true,
       // P4a：实例唯一标识，首次启动时生成，只读
       instanceId: expect.stringMatching(/^[0-9a-f-]{36}$/),
     });

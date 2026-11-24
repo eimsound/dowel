@@ -756,6 +756,7 @@ export const prepareMssqlShadow = async (
   if (!env) {
     throw new ShadowError(
       '项目还没有配置环境。导入 SQL、验证迁移都需要一个真实的 SQL Server 实例作影子库，请先在“环境”里添加项目要部署到的数据库',
+      { preConnect: true },
     );
   }
   let url = env.shadowUrl ?? null;
@@ -764,6 +765,7 @@ export const prepareMssqlShadow = async (
     if (env.production && !env.allowSameInstance) {
       throw new ShadowError(
         `环境“${env.name}”是生产环境，默认不在同一实例上建影子库（检查会占用生产实例的资源）。请为它配置单独的影子库实例，或明确允许使用同一实例`,
+        { preConnect: true },
       );
     }
     const prepared = await ensureSameInstanceMssqlShadow(env.url, guard).catch((e: unknown) => {

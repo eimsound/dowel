@@ -34,10 +34,12 @@ import {
   inviteState,
   setInviteUsedBy,
 } from '../invites.ts';
+import { revokeAllMcpTokens } from '../mcp-tokens.ts';
 import { readSettings } from '../settings.ts';
 import { removeInitialAdminPasswordFile } from '../setup.ts';
 import { emailTaken, normalizeEmail, userById, usernameTaken } from '../users.ts';
 import { type AppContext, body, createUserOrConflict, type Env } from './context.ts';
+import { afterRevokeAllMcpTokens } from './mcp-tokens.ts';
 
 /** 首次设置密码只允许最近 10 分钟内登录的会话（见 /api/me/password） */
 const FIRST_PASSWORD_WINDOW_MS = 10 * 60_000;
@@ -316,6 +318,7 @@ export const registerInvites = (app: Hono<Env>, ctx: AppContext) => {
     if (state !== 'ok') throw resetUnusable(state);
     // 先把哈希算好，让事务尽量短
     const hash = await hashPassword(b.password);
+    let revokedMcpTokens = 0;
     const user = await db.transaction(async (tx) => {
       // 认领不到就不改密码（并发时只有一个请求能拿到令牌）
       const claimed = await claimInvite(tx, { token, kind: 'reset' });
@@ -330,8 +333,9 @@ export const registerInvites = (app: Hono<Env>, ctx: AppContext) => {
         hash,
         false,
       ]);
-      // 设完新密码，这个用户的所有会话都失效
+      // 设完新密码，这个用户的所有会话和 MCP 令牌都失效
       await tx.query('delete from sessions where user_id = $1', [target.id]);
+      revokedMcpTokens = await revokeAllMcpTokens(tx, target.id, 'password_reset', null);
       return target;
     });
     await ctx.rooms.kickUser(user.id, '密码已重置，请重新登录');
@@ -351,6 +355,13 @@ export const registerInvites = (app: Hono<Env>, ctx: AppContext) => {
       },
       ctx.security,
     );
+    await afterRevokeAllMcpTokens(c, ctx, {
+      userId: user.id,
+      username: user.username,
+      actorId: invite.createdBy ?? user.id,
+      reason: 'password_reset',
+      count: revokedMcpTokens,
+    });
     return c.json<Ok>({ ok: true });
   });
 };

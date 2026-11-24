@@ -70,6 +70,7 @@ export const Modal = ({
   icon,
   size = 'md',
   footer,
+  dismissible = true,
 }: {
   open: boolean;
   onClose: () => void;
@@ -80,7 +81,12 @@ export const Modal = ({
   size?: 'sm' | 'md' | 'lg';
   /** 底部操作区：左侧辅助操作，右侧取消 / 主按钮 */
   footer?: ReactNode;
+  /**
+   * false：不能用 Esc、点外部或右上角关闭，只能用底部按钮关闭（一次性展示的令牌明文，误关就再也看不到）。
+   */
+  dismissible?: boolean;
 }) => {
+  const { t } = useTranslation();
   const ref = useRef<HTMLDialogElement>(null);
   const titleId = useId();
   useEffect(() => {
@@ -91,7 +97,7 @@ export const Modal = ({
   // closedby="any" 不支持时（Safari）补上点击外部关闭：按下和松开都在外部才关闭
   useEffect(() => {
     const d = ref.current!;
-    if ('closedBy' in HTMLDialogElement.prototype) return;
+    if (!dismissible || 'closedBy' in HTMLDialogElement.prototype) return;
     let pressedOutside = false;
     const down = (e: PointerEvent) => {
       pressedOutside = outside(e, d);
@@ -105,13 +111,15 @@ export const Modal = ({
       d.removeEventListener('pointerdown', down);
       d.removeEventListener('pointerup', up);
     };
-  }, []);
+  }, [dismissible]);
   return (
     <dialog
       ref={ref}
       aria-labelledby={titleId}
       onClose={onClose}
-      {...({ closedby: 'any' } as object)}
+      // 不支持 closedby 的浏览器里 Esc 触发 cancel：不可关闭时拦下
+      onCancel={dismissible ? undefined : (e) => e.preventDefault()}
+      {...({ closedby: dismissible ? 'any' : 'none' } as object)}
       className={`m-auto max-h-[88vh] flex-col overflow-hidden rounded-lg border border-border bg-panel p-0 text-text shadow-[var(--shadow-lg)] open:flex ${
         size === 'lg' ? 'w-[min(900px,94vw)]' : size === 'sm' ? 'w-[min(440px,94vw)]' : 'w-[min(600px,94vw)]'
       }`}
@@ -121,9 +129,11 @@ export const Modal = ({
         <h2 id={titleId} className="flex-1 text-[length:var(--fs-lg)] font-semibold">
           {title}
         </h2>
-        <IconButton label="关闭" onClick={() => ref.current!.close()}>
-          <X size={16} aria-hidden="true" />
-        </IconButton>
+        {dismissible && (
+          <IconButton label={t('dlg.close')} onClick={() => ref.current!.close()}>
+            <X size={16} aria-hidden="true" />
+          </IconButton>
+        )}
       </header>
       {open && (
         <>

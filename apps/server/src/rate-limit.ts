@@ -304,6 +304,28 @@ export const tokenLimiterFromEnv = (env: NodeJS.ProcessEnv = process.env) =>
   });
 
 /**
+ * MCP 令牌认证失败限速（按来源 IP；M3-C，ADR 0014，与 CI 令牌同一套防误杀做法，单副本进程内计数）：
+ * - DOWEL_MCP_FAIL_LIMIT：同一 IP 在窗口内允许的格式合法但校验失败的次数（默认 20）；
+ * - DOWEL_MCP_FAIL_WINDOW_MS：窗口长度（毫秒，默认 600000 = 10 分钟）。
+ */
+export const mcpFailLimiterFromEnv = (env: NodeJS.ProcessEnv = process.env) =>
+  new KeyedLimiter({
+    limit: envPositiveInt(env.DOWEL_MCP_FAIL_LIMIT) ?? 20,
+    windowMs: envPositiveInt(env.DOWEL_MCP_FAIL_WINDOW_MS) ?? 10 * 60_000,
+  });
+
+/**
+ * MCP 请求速率限速（按令牌；单副本进程内计数，HA 多副本部署下实际总配额约为设定值 × 副本数）：
+ * - DOWEL_MCP_RATE_LIMIT：单个 MCP 令牌在窗口内允许的请求次数（默认 120）；
+ * - DOWEL_MCP_RATE_WINDOW_MS：窗口长度（毫秒，默认 60000 = 1 分钟）。
+ */
+export const mcpLimiterFromEnv = (env: NodeJS.ProcessEnv = process.env) =>
+  new KeyedLimiter({
+    limit: envPositiveInt(env.DOWEL_MCP_RATE_LIMIT) ?? 120,
+    windowMs: envPositiveInt(env.DOWEL_MCP_RATE_WINDOW_MS) ?? 60_000,
+  });
+
+/**
  * 忘记密码请求限速（单副本进程内计数）：
  * - DOWEL_FORGOT_PASSWORD_LIMIT：同一 IP + 邮箱在窗口内允许的请求次数（默认 3）；
  * - DOWEL_FORGOT_PASSWORD_IP_LIMIT：同一 IP 在窗口内允许的总请求次数（默认 10）；

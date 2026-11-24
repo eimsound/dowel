@@ -28,6 +28,7 @@ nav = [
   ] },
   { "CI and reference" = [
     { "CI HTTP API" = "api.md" },
+    { "AI assistants (MCP)" = "mcp.md" },
     { "CI pipeline integration" = "ci-action.md" },
     { "Glossary" = "glossary.md" },
   ] },

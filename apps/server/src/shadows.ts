@@ -207,6 +207,7 @@ export class Shadows {
         if (!first)
           throw new ShadowError(
             '项目还没有配置环境。导入 SQL、验证迁移都需要一个真实的数据库实例作影子库，请先在“环境”里添加项目要部署到的数据库',
+            { preConnect: true },
           );
         id = first.id;
       }
@@ -326,6 +327,7 @@ export class Shadows {
     if (!rows.length) {
       throw new ShadowError(
         '项目还没有配置环境。导入 SQL、验证迁移都需要一个真实的数据库实例作影子库，请先在“环境”里添加项目要部署到的数据库',
+        { preConnect: true },
       );
     }
 

@@ -38,8 +38,9 @@ import {
 import { useEffect, useId, useRef, useState } from 'react';
 import { useTranslation } from 'react-i18next';
 
-import { actionText } from '../activity.ts';
+import { actionText, viaMcp } from '../activity.ts';
 import { api } from '../api.ts';
+import { AdminUserMcpTokens, McpBadge } from '../components/McpTokens.tsx';
 import { Confirm, Modal } from '../components/Modal.tsx';
 import { PolicyLayerPanel } from '../components/PolicyEditor.tsx';
 import { Row, Rows, Section } from '../components/ProjectPage.tsx';
@@ -292,6 +293,7 @@ const ResetPasswordModal = ({
     >
       <form id={formId} className="space-y-3" noValidate onSubmit={onSubmit}>
         <p className="text-sm text-text-2">{t('adm.resetPasswordBody')}</p>
+        <p className="text-sm text-text-2">{t('mcp.adminRevokeAllNote')}</p>
         <label className="field">
           <span className="label">{t('adm.resetPasswordField')}</span>
           <input
@@ -342,6 +344,8 @@ export const AdminUsers = () => {
   const [q, setQ] = useState('');
   const [tempPassword, setTempPassword] = useState<{ username: string; password: string } | null>(null);
   const [resetTarget, setResetTarget] = useState<AdminUser | null>(null);
+  const [mcpTarget, setMcpTarget] = useState<AdminUser | null>(null);
+  const [disableTarget, setDisableTarget] = useState<AdminUser | null>(null);
   const [create, setCreate] = useState({
     username: '',
     name: '',
@@ -363,6 +367,14 @@ export const AdminUsers = () => {
       refresh();
     },
   });
+  const disable = useMutation({
+    mutationFn: (id: string) => api<AdminUser>('PATCH', `/api/admin/users/${id}`, { status: 'disabled' }),
+    onSuccess: () => {
+      setDisableTarget(null);
+      toast(t('adm.updated'));
+      refresh();
+    },
+  });
   const add = useMutation({
     mutationFn: () =>
       api<AdminUser>('POST', '/api/admin/users', {
@@ -379,6 +391,7 @@ export const AdminUsers = () => {
     },
   });
   const error = patch.error ?? add.error;
+  const userActionPending = patch.isPending || disable.isPending;
 
   return (
     <>
@@ -443,7 +456,7 @@ export const AdminUsers = () => {
                         className="select w-32"
                         aria-label={`${t('adm.role')} · ${u.username}`}
                         value={u.role}
-                        disabled={patch.isPending}
+                        disabled={userActionPending}
                         onChange={(e) =>
                           patch.mutate({ id: u.id, body: { role: e.target.value as InstanceRole } })
                         }
@@ -470,13 +483,16 @@ export const AdminUsers = () => {
                         <button
                           type="button"
                           className="btn sm"
-                          disabled={patch.isPending}
-                          onClick={() =>
-                            patch.mutate({
-                              id: u.id,
-                              body: { status: u.status === 'active' ? 'disabled' : 'active' },
-                            })
-                          }
+                          disabled={userActionPending}
+                          onClick={() => {
+                            // 停用会吊销会话与全部 MCP 令牌，先确认；启用直接生效
+                            if (u.status === 'active') {
+                              disable.reset();
+                              setDisableTarget(u);
+                            } else {
+                              patch.mutate({ id: u.id, body: { status: 'active' } });
+                            }
+                          }}
                         >
                           {t(u.status === 'active' ? 'adm.disable' : 'adm.enable')}
                         </button>
@@ -491,10 +507,18 @@ export const AdminUsers = () => {
                       <button
                         type="button"
                         className="btn sm"
-                        disabled={patch.isPending || u.id === me?.id}
+                        disabled={userActionPending || u.id === me?.id}
                         onClick={() => setResetTarget(u)}
                       >
                         {t('adm.resetPassword')}
+                      </button>
+                      <button
+                        type="button"
+                        className="btn sm ml-1.5"
+                        aria-label={t('mcp.adminOpen', { username: u.username })}
+                        onClick={() => setMcpTarget(u)}
+                      >
+                        {t('mcp.adminButton')}
                       </button>
                     </td>
                   </tr>
@@ -590,6 +614,21 @@ export const AdminUsers = () => {
           refresh();
         }}
       />
+      <AdminUserMcpTokens user={mcpTarget} onClose={() => setMcpTarget(null)} />
+      <Confirm
+        open={!!disableTarget}
+        onClose={() => {
+          setDisableTarget(null);
+          disable.reset();
+        }}
+        title={t('adm.disableTitle', { username: disableTarget?.username ?? '' })}
+        confirmLabel={t('adm.disableConfirm')}
+        pending={disable.isPending}
+        error={disable.error?.message}
+        onConfirm={() => disableTarget && disable.mutate(disableTarget.id)}
+      >
+        {t('adm.disableBody')}
+      </Confirm>
     </>
   );
 };
@@ -1547,7 +1586,13 @@ export const AdminSettings = () => {
     queryKey: ['admin-settings'],
     queryFn: () => api<InstanceSettings>('GET', '/api/admin/settings'),
   });
-  type Form = { name: string; groupCreation: 'all' | 'admin'; allowlist: string; webhookAllowlist: string };
+  type Form = {
+    name: string;
+    groupCreation: 'all' | 'admin';
+    allowlist: string;
+    webhookAllowlist: string;
+    allowMcpAccess: boolean;
+  };
   const [form, setForm] = useState<Form | null>(null);
   const value: Form | null =
     form ??
@@ -1557,6 +1602,7 @@ export const AdminSettings = () => {
           groupCreation: settings.data.groupCreation,
           allowlist: settings.data.connectionAllowlist.join('\n'),
           webhookAllowlist: settings.data.webhookAllowlist.join('\n'),
+          allowMcpAccess: settings.data.allowMcpAccess,
         }
       : null);
   const save = useMutation({
@@ -1568,6 +1614,8 @@ export const AdminSettings = () => {
         connectionAllowlist: body.allowlist.split(/[\s,]+/).filter(Boolean),
         // Webhook 出站额外放行的地址（默认只允许公网）
         webhookAllowlist: body.webhookAllowlist.split(/[\s,]+/).filter(Boolean),
+        // MCP 访问总开关（M3-C，ADR 0014）
+        allowMcpAccess: body.allowMcpAccess,
       }),
     onSuccess: (next) => {
       qc.setQueryData(['admin-settings'], next);
@@ -1576,6 +1624,8 @@ export const AdminSettings = () => {
       void qc.invalidateQueries({ queryKey: ['instance'] });
       // 顶栏 / 登录页用的实例信息也要刷新
       void qc.invalidateQueries({ queryKey: ['groups'] });
+      // “允许 MCP 访问”改了之后个人设置里的令牌列表（allowed）也要刷新
+      void qc.invalidateQueries({ queryKey: ['mcp-tokens'] });
     },
   });
   return (
@@ -1633,6 +1683,20 @@ export const AdminSettings = () => {
               />
               <span className="hint">{t('adm.settings.webhookAllowlistHint')}</span>
             </label>
+            <div className="field max-w-md">
+              <label className="flex items-center gap-2">
+                <input
+                  type="checkbox"
+                  checked={value.allowMcpAccess}
+                  aria-describedby="adm-settings-mcp-hint"
+                  onChange={(e) => setForm({ ...value, allowMcpAccess: e.target.checked })}
+                />
+                <span>{t('adm.settings.allowMcpAccess')}</span>
+              </label>
+              <span id="adm-settings-mcp-hint" className="hint">
+                {t('adm.settings.allowMcpAccessHint')}
+              </span>
+            </div>
             <label className="field max-w-md">
               <span className="label">{t('adm.settings.instanceId')}</span>
               <input className="input font-mono" value={settings.data?.instanceId ?? ''} readOnly />
@@ -1825,6 +1889,7 @@ const TARGET_KINDS = [
   'exec_request',
   'webhook',
   'ci_token',
+  'mcp_token',
   'invite',
   'session',
   'oidc_provider',
@@ -2003,6 +2068,12 @@ const AuditRow = ({ event, open, onToggle }: { event: AuditEvent; open: boolean;
         <td className="font-mono text-xs">{actor}</td>
         <td>
           {actionText(event.action, event.data)}
+          {viaMcp(event.data) && (
+            <>
+              {' '}
+              <McpBadge />
+            </>
+          )}
           <span className="block font-mono text-xs text-text-3">{event.action}</span>
         </td>
         <td className="font-mono text-xs">{target}</td>

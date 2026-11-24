@@ -72,7 +72,18 @@ export interface Shadow {
   close(): Promise<void>;
 }
 
-export class ShadowError extends Error {}
+export interface ShadowErrorOptions {
+  /** 为 true 表示在建立任何外部数据库连接之前就因配置前置条件失败（如未配置环境、生产环境未允许同实例影子库），不计入连库限速 */
+  preConnect?: boolean;
+}
+
+export class ShadowError extends Error {
+  readonly preConnect: boolean;
+  constructor(message: string, options?: ShadowErrorOptions) {
+    super(message);
+    this.preConnect = Boolean(options?.preConnect);
+  }
+}
 
 /**
  * 影子库的基础设施故障（连不上、被占用、超时、连接断开……）：消息统一带“影子库不可用：”前缀，**只在这里加一次**。
