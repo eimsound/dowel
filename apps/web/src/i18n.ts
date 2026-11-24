@@ -165,7 +165,7 @@ const zh = {
       status: '状态',
       by: '执行者',
       running: '进行中',
-      done: '完成',
+      done: '我已保存，关闭',
       failed: '失败',
       checkpoint: '断点：已完成第 {{step}} 步',
       readbackFailure: '读回不一致，需要人工修正',
@@ -721,8 +721,8 @@ const zh = {
     model: {
       import: '导入了 SQL（{{count}} 个对象）',
       restore: '从修改历史恢复了工作副本',
-      mutate: '通过 MCP 修改了工作副本（{{count}} 处操作）',
-      verify: '通过 MCP 在影子库验证了迁移',
+      mutate: '修改了工作副本（{{count}} 处操作）',
+      verify: '在影子库验证了迁移',
     },
     grant: {
       create: '添加了授权（{{role}}）',
@@ -776,7 +776,7 @@ const zh = {
     inviteRevoked: '这个邀请链接已被撤销。',
     inviteExpired: '这个邀请链接已过期。',
     resetTitle: '重置密码',
-    resetHint: '设置新密码。完成后这个用户的所有会话都会失效。',
+    resetHint: '设置新密码。完成后这个用户的所有会话都会失效，全部 MCP 令牌也会被吊销。',
     resetSubmit: '设置新密码',
     resetDone: '密码已更新，请用新密码登录。',
     forgotTitle: '忘记密码',
@@ -1630,7 +1630,7 @@ const zh = {
   mcp: {
     title: 'MCP 访问',
     intro:
-      'MCP 令牌让 AI 编程助手（如 Claude Code、Cursor）以你的身份访问 Dowel：只能读取模型、在影子库验证、修改工作副本，权限不会超过你自己的。AI 不能发布版本、不能执行迁移，也不会连接环境的目标库。',
+      'MCP 令牌让 AI 编程助手（如 Claude Code、Cursor）以你的身份访问 Dowel：按你勾选的权限和项目范围读取模型、在影子库验证或修改工作副本，权限不会超过你当前的项目角色。AI 不能发布版本、不能执行迁移，也不会连接环境的目标库。',
     disabledBanner: '实例管理员已关闭 MCP 访问。已有令牌暂时不能使用，也不能新建令牌。',
     create: '新建 MCP 令牌',
     emptyTitle: '还没有 MCP 令牌',
@@ -1654,7 +1654,7 @@ const zh = {
       read: '读取项目、模型、DDL、版本和迁移预览，以及环境的缓存状态。始终包含。',
       verify: '在影子库里执行迁移并比对结果。不连接目标库。',
       write:
-        '和你在画布上编辑一样：走冲突检测，实时同步给其他成员，可以在修改历史里恢复。需要项目编辑者以上。',
+        '和你在画布上编辑一样：走冲突检测，实时同步给其他成员，可以在修改历史里恢复。需要项目编辑者及以上角色。',
     },
     projects: '项目范围',
     projectsAll: '我能访问的全部项目',
@@ -1666,7 +1666,7 @@ const zh = {
     expiry: '有效期',
     expiryDays: '{{count}} 天',
     expiryYear: '1 年',
-    expiryHint: '令牌必须过期，到期后需要新建。',
+    expiryHint: '令牌必须设置有效期，到期后需要新建。',
     createSubmit: '新建令牌',
     cancel: '取消',
     done: '完成',
@@ -1675,14 +1675,19 @@ const zh = {
     tokenLabel: 'MCP 令牌',
     copyToken: '复制令牌',
     copyConfig: '复制配置',
+    copyNamed: '复制{{name}}',
+    other: { url: '地址', transport: '传输方式', header: '请求头' },
+    expiresOn: '到期',
+    activeCount: '有效令牌 {{count}} / {{max}} 个',
     copied: '已复制',
     copyFailed: '复制失败，请手动选中复制',
     clientsTitle: '配置到客户端',
     clientOther: '其他客户端',
     clientHint: {
-      claude: '在终端运行这条命令。',
-      cursor: '写入项目的 .cursor/mcp.json 或全局的 ~/.cursor/mcp.json。',
-      vscode: '写入工作区的 .vscode/mcp.json。',
+      claude: '在终端运行这条命令（--scope user 表示对这台电脑上的所有项目生效）。',
+      cursor: '写入用户级配置 ~/.cursor/mcp.json。不要把含令牌的配置提交到仓库里的 .cursor/mcp.json。',
+      vscode:
+        '用命令“MCP: Open User Configuration”打开用户级 mcp.json 后写入。不要把含令牌的配置提交到仓库里的 .vscode/mcp.json。',
       other: '任何支持 Streamable HTTP 传输的 MCP 客户端都可以使用这些参数。',
     },
     col: {
@@ -1701,7 +1706,7 @@ const zh = {
     reason: {
       self: '本人吊销',
       admin: '管理员吊销',
-      user_disabled: '账号停用时吊销',
+      user_disabled: '用户停用时吊销',
       password_reset: '重置密码时吊销',
     },
     revoke: '吊销',
@@ -2275,7 +2280,7 @@ const en: typeof zh = {
       status: 'Status',
       by: 'Executed by',
       running: 'Running',
-      done: 'Done',
+      done: 'I saved it',
       failed: 'Failed',
       checkpoint: 'checkpoint: {{step}} steps done',
       readbackFailure: 'read-back mismatch, needs manual fix',
@@ -2865,8 +2870,8 @@ const en: typeof zh = {
     model: {
       import: 'imported SQL ({{count}} objects)',
       restore: 'restored the working copy from canvas history',
-      mutate: 'edited the working copy via MCP ({{count}} operations)',
-      verify: 'verified the migration in the shadow database via MCP',
+      mutate: 'edited the working copy ({{count}} operations)',
+      verify: 'verified the migration in the shadow database',
     },
     grant: {
       create: 'added a grant ({{role}})',
@@ -2922,7 +2927,8 @@ const en: typeof zh = {
     inviteRevoked: 'This invitation link has been revoked.',
     inviteExpired: 'This invitation link has expired.',
     resetTitle: 'Reset password',
-    resetHint: 'Choose a new password. All sessions of this user are signed out afterwards.',
+    resetHint:
+      "Choose a new password. All sessions of this user are signed out afterwards, and all of the user's MCP tokens are revoked.",
     resetSubmit: 'Set new password',
     resetDone: 'Password updated. Log in with the new password.',
     forgotTitle: 'Forgot password',
@@ -3817,7 +3823,7 @@ const en: typeof zh = {
   mcp: {
     title: 'MCP access',
     intro:
-      "MCP tokens let AI coding assistants (such as Claude Code or Cursor) act as you in Dowel. They can read models, verify in the shadow database, and edit the working copy, never with more permissions than your own. AI can't publish versions or run migrations, and never connects to an environment's target database.",
+      "MCP tokens let AI coding assistants (such as Claude Code or Cursor) act as you in Dowel. Within the permissions and projects you grant, they can read models, verify in the shadow database, or edit the working copy, never exceeding your current project role. AI can't publish versions or run migrations, and never connects to an environment's target database.",
     disabledBanner:
       "Your instance admin has turned off MCP access. Existing tokens can't be used and new tokens can't be created.",
     create: 'New MCP token',
@@ -3843,7 +3849,7 @@ const en: typeof zh = {
       verify:
         'Run migrations in the shadow database and compare the result. Never connects to the target database.',
       write:
-        'Same as editing on the canvas: conflict-checked, synced live to other members, and recoverable from canvas history. Requires editor or above.',
+        'Same as editing on the canvas: conflict-checked, synced live to other members, and recoverable from canvas history. Requires project editor role or above.',
     },
     projects: 'Projects',
     projectsAll: 'All projects I can access',
@@ -3855,7 +3861,7 @@ const en: typeof zh = {
     expiry: 'Expires in',
     expiryDays: '{{count}} days',
     expiryYear: '1 year',
-    expiryHint: 'Tokens always expire; create a new one when it does.',
+    expiryHint: 'Every token must expire. Create a new one after it expires.',
     createSubmit: 'Create token',
     cancel: 'Cancel',
     done: 'Done',
@@ -3865,14 +3871,21 @@ const en: typeof zh = {
     tokenLabel: 'MCP token',
     copyToken: 'Copy token',
     copyConfig: 'Copy config',
+    copyNamed: 'Copy {{name}}',
+    other: { url: 'URL', transport: 'Transport', header: 'Header' },
+    expiresOn: 'Expires',
+    activeCount: '{{count}} of {{max}} active tokens',
     copied: 'Copied',
     copyFailed: 'Copy failed; select and copy it manually',
     clientsTitle: 'Add to a client',
     clientOther: 'Other clients',
     clientHint: {
-      claude: 'Run this command in a terminal.',
-      cursor: 'Add to .cursor/mcp.json in the project or ~/.cursor/mcp.json globally.',
-      vscode: 'Add to .vscode/mcp.json in the workspace.',
+      claude:
+        'Run this command in a terminal (--scope user makes it available in all projects on this computer).',
+      cursor:
+        "Add to your user-level ~/.cursor/mcp.json. Don't commit a config containing the token to a repository's .cursor/mcp.json.",
+      vscode:
+        "Run “MCP: Open User Configuration” and add it to your user-level mcp.json. Don't commit a config containing the token to a repository's .vscode/mcp.json.",
       other: 'Any MCP client that supports the Streamable HTTP transport can use these settings.',
     },
     col: {
@@ -3891,7 +3904,7 @@ const en: typeof zh = {
     reason: {
       self: 'Revoked by you',
       admin: 'Revoked by an admin',
-      user_disabled: 'Revoked when the account was disabled',
+      user_disabled: 'Revoked when the user was disabled',
       password_reset: 'Revoked when the password was reset',
     },
     revoke: 'Revoke',
@@ -3902,7 +3915,7 @@ const en: typeof zh = {
     revokedToast: 'MCP token revoked',
     adminButton: 'MCP tokens',
     adminOpen: 'MCP tokens ({{username}})',
-    adminTitle: 'MCP tokens of {{name}}',
+    adminTitle: 'MCP tokens · {{name}}',
     adminEmpty: 'This user has no MCP tokens.',
     adminRevokeBody: "This user's AI coding assistants lose access immediately. This can't be undone.",
     adminRevokeAllNote: "This also revokes all of this user's MCP tokens.",

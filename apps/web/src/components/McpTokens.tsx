@@ -6,6 +6,7 @@ import {
   type AdminMcpTokenList,
   type AdminUser,
   MCP_TOKEN_DEFAULT_DAYS,
+  MCP_TOKEN_MAX_ACTIVE_PER_USER,
   MCP_TOKEN_MAX_PROJECTS,
   type McpExtraScope,
   type McpTokenCreated,
@@ -184,15 +185,20 @@ export const McpTokenTable = ({
   tokens,
   caption,
   onRevoke,
+  tableRef,
 }: {
   tokens: McpTokenInfo[];
   caption: string;
   onRevoke?: (tok: McpTokenInfo) => void;
+  /** 吊销后用来接住焦点（tabIndex=-1，只能由脚本聚焦） */
+  tableRef?: React.Ref<HTMLDivElement>;
 }) => {
   const { t } = useTranslation();
   const captionId = useId();
   return (
     <div
+      ref={tableRef}
+      tabIndex={-1}
       className="overflow-x-auto rounded-md border border-border bg-panel"
       role="region"
       aria-labelledby={captionId}
@@ -204,10 +210,8 @@ export const McpTokenTable = ({
         <thead>
           <tr>
             <th scope="col">{t('mcp.col.name')}</th>
-            <th scope="col">{t('mcp.col.scopes')}</th>
             <th scope="col">{t('mcp.col.projects')}</th>
             <th scope="col">{t('mcp.col.lastUsed')}</th>
-            <th scope="col">{t('mcp.col.expiresAt')}</th>
             <th scope="col">{t('mcp.col.status')}</th>
             {onRevoke && (
               <th scope="col">
@@ -222,10 +226,10 @@ export const McpTokenTable = ({
               <th scope="row" className="text-left font-normal">
                 <span className="block font-medium text-text">{tok.name}</span>
                 <span className="block font-mono text-xs text-text-2">{tok.prefix}…</span>
+                <span className="mt-1 block">
+                  <ScopeMarks tok={tok} />
+                </span>
               </th>
-              <td>
-                <ScopeMarks tok={tok} />
-              </td>
               <td>
                 <ProjectsCell tok={tok} />
               </td>
@@ -242,12 +246,10 @@ export const McpTokenTable = ({
                 )}
               </td>
               <td>
-                <time dateTime={tok.expiresAt} className="text-xs whitespace-nowrap">
-                  {formatTime(tok.expiresAt)}
-                </time>
-              </td>
-              <td>
                 <TokenStatus tok={tok} />
+                <span className="block text-xs whitespace-nowrap">
+                  {t('mcp.expiresOn')} <time dateTime={tok.expiresAt}>{formatTime(tok.expiresAt)}</time>
+                </span>
               </td>
               {onRevoke && (
                 <td>
@@ -283,7 +285,8 @@ const mcpUrl = () => `${location.origin}/api/mcp`;
 
 /** 客户端配置片段（令牌嵌在片段里；只在一次性展示时出现） */
 export const clientSnippets = (token: string, url = mcpUrl()) => ({
-  claude: `claude mcp add --transport http dowel ${url} --header "Authorization: Bearer ${token}"`,
+  // --scope user：对这台机器上的所有项目生效（默认 local 只对当前目录生效）
+  claude: `claude mcp add --transport http --scope user dowel ${url} --header "Authorization: Bearer ${token}"`,
   cursor: JSON.stringify(
     { mcpServers: { dowel: { url, headers: { Authorization: `Bearer ${token}` } } } },
     null,
@@ -294,10 +297,9 @@ export const clientSnippets = (token: string, url = mcpUrl()) => ({
     null,
     2,
   ),
-  other: `URL: ${url}\nTransport: Streamable HTTP\nAuthorization: Bearer ${token}`,
 });
 
-type ClientKey = keyof ReturnType<typeof clientSnippets>;
+type ClientKey = keyof ReturnType<typeof clientSnippets> | 'other';
 
 const Snippet = ({ text, label, hint }: { text: string; label: string; hint?: string }) => (
   <div className="space-y-1.5 pt-2">
@@ -308,6 +310,34 @@ const Snippet = ({ text, label, hint }: { text: string; label: string; hint?: st
     <CopyButton text={text} label={label} />
   </div>
 );
+
+/** 其他客户端：地址、传输、请求头分别复制 */
+const OtherClient = ({ token }: { token: string }) => {
+  const { t } = useTranslation();
+  const rows = [
+    { key: 'url', label: t('mcp.other.url'), value: mcpUrl() },
+    { key: 'transport', label: t('mcp.other.transport'), value: 'Streamable HTTP' },
+    { key: 'header', label: t('mcp.other.header'), value: `Authorization: Bearer ${token}` },
+  ];
+  return (
+    <div className="space-y-2 pt-2">
+      <p className="hint m-0">{t('mcp.clientHint.other')}</p>
+      <dl className="m-0 space-y-2">
+        {rows.map((r) => (
+          <div key={r.key} className="space-y-1">
+            <dt className="label">{r.label}</dt>
+            <dd className="m-0 flex items-center gap-2">
+              <code className="min-w-0 flex-1 truncate rounded-md border border-border bg-bg px-2 py-1 font-mono text-xs">
+                {r.value}
+              </code>
+              <CopyButton text={r.value} label={t('mcp.copyNamed', { name: r.label })} iconOnly />
+            </dd>
+          </div>
+        ))}
+      </dl>
+    </div>
+  );
+};
 
 /** 一次性展示：令牌明文 + 客户端配置 */
 const Reveal = ({ created }: { created: McpTokenCreated }) => {
@@ -321,7 +351,9 @@ const Reveal = ({ created }: { created: McpTokenCreated }) => {
   }, []);
   return (
     <div className="space-y-3" data-testid="mcp-token-reveal">
-      <Banner kind="warn">{t('mcp.onceWarn')}</Banner>
+      <div id="mcp-token-once-warn">
+        <Banner kind="warn">{t('mcp.onceWarn')}</Banner>
+      </div>
       <div className="field">
         <label className="label" htmlFor="mcp-token-plain">
           {t('mcp.tokenLabel')}
@@ -332,6 +364,8 @@ const Reveal = ({ created }: { created: McpTokenCreated }) => {
             ref={inputRef}
             className="input flex-1 font-mono"
             readOnly
+            aria-describedby="mcp-token-once-warn"
+            onFocus={(e) => e.currentTarget.select()}
             value={created.token}
             spellCheck={false}
             autoComplete="off"
@@ -354,7 +388,13 @@ const Reveal = ({ created }: { created: McpTokenCreated }) => {
             { key: 'other', title: t('mcp.clientOther') },
           ]}
         >
-          {(k) => <Snippet text={snippets[k]} label={t('mcp.copyConfig')} hint={t(`mcp.clientHint.${k}`)} />}
+          {(k) =>
+            k === 'other' ? (
+              <OtherClient token={created.token} />
+            ) : (
+              <Snippet text={snippets[k]} label={t('mcp.copyConfig')} hint={t(`mcp.clientHint.${k}`)} />
+            )
+          }
         </Tabs>
       </section>
     </div>
@@ -431,6 +471,8 @@ const CreateDialog = ({ open, onClose }: { open: boolean; onClose: () => void })
       size="md"
       icon={<KeyRound size={16} aria-hidden="true" />}
       title={created ? t('mcp.createdTitle') : t('mcp.createTitle')}
+      // 一次性展示态：只能用底部“我已保存，关闭”关闭，防止误点外部丢失明文
+      dismissible={!created}
       footer={
         created ? (
           <span className="ml-auto">
@@ -645,6 +687,8 @@ export const AccountMcp = () => {
   const [creating, setCreating] = useState(false);
   const [revoking, setRevoking] = useState<McpTokenInfo | null>(null);
   const disabledId = useId();
+  // 吊销后那一行的吊销按钮会消失，确认框关闭时焦点无处可回：移到本节标题
+  const headingRef = useRef<HTMLHeadingElement>(null);
 
   const list = useQuery({
     queryKey: ['mcp-tokens'],
@@ -656,18 +700,23 @@ export const AccountMcp = () => {
       setRevoking(null);
       toast(t('mcp.revokedToast'));
       void qc.invalidateQueries({ queryKey: ['mcp-tokens'] });
+      requestAnimationFrame(() => headingRef.current?.focus());
     },
   });
 
   const allowed = list.data?.allowed ?? true;
   const tokens = sortTokens(list.data?.tokens ?? []);
+  const activeCount = tokens.filter((x) => x.status === 'active').length;
+  const atLimit = activeCount >= MCP_TOKEN_MAX_ACTIVE_PER_USER;
+  const blocked = !allowed || atLimit;
+  // 不能新建时用 aria-disabled（仍在 Tab 顺序里，原因经 aria-describedby 读出），不用原生 disabled
   const createButton = (
     <button
       type="button"
       className="btn primary"
-      disabled={!allowed}
-      aria-describedby={allowed ? undefined : disabledId}
-      onClick={() => setCreating(true)}
+      aria-disabled={blocked || undefined}
+      aria-describedby={blocked ? disabledId : undefined}
+      onClick={() => !blocked && setCreating(true)}
     >
       <KeyRound size={16} aria-hidden="true" />
       {t('mcp.create')}
@@ -678,15 +727,22 @@ export const AccountMcp = () => {
     <section className="space-y-3" data-testid="account-mcp">
       <div className="flex flex-wrap items-start justify-between gap-3">
         <div className="min-w-0 flex-1 space-y-1">
-          <h2 className="section-title">{t('mcp.title')}</h2>
+          <h2 ref={headingRef} tabIndex={-1} className="section-title">
+            {t('mcp.title')}
+          </h2>
           <p className="hint">{t('mcp.intro')}</p>
         </div>
         {tokens.length > 0 && createButton}
       </div>
-      {!allowed && (
+      {blocked && (
         <div id={disabledId}>
-          <Banner kind="warn">{t('mcp.disabledBanner')}</Banner>
+          <Banner kind="warn">{!allowed ? t('mcp.disabledBanner') : t('mcp.err.limit')}</Banner>
         </div>
+      )}
+      {tokens.length > 0 && (
+        <p className="hint m-0">
+          {t('mcp.activeCount', { count: activeCount, max: MCP_TOKEN_MAX_ACTIVE_PER_USER })}
+        </p>
       )}
       {list.error && (
         <Banner kind="danger" role="alert">
@@ -731,6 +787,8 @@ export const AdminUserMcpTokens = ({ user, onClose }: { user: AdminUser | null; 
   const qc = useQueryClient();
   const toast = useToast();
   const [revoking, setRevoking] = useState<McpTokenInfo | null>(null);
+  // 吊销后行内按钮消失：焦点移到表格区域，不掉回 <body>
+  const tableRef = useRef<HTMLDivElement>(null);
   const list = useQuery({
     queryKey: ['admin-mcp-tokens', user?.id],
     queryFn: () => api<AdminMcpTokenList>('GET', `/api/admin/users/${user!.id}/mcp-tokens`),
@@ -743,13 +801,14 @@ export const AdminUserMcpTokens = ({ user, onClose }: { user: AdminUser | null; 
       setRevoking(null);
       toast(t('mcp.revokedToast'));
       void qc.invalidateQueries({ queryKey: ['admin-mcp-tokens', user?.id] });
+      requestAnimationFrame(() => tableRef.current?.focus());
     },
   });
   const tokens = sortTokens(list.data?.tokens ?? []);
   return (
     <>
       <Modal
-        open={!!user && !revoking}
+        open={!!user}
         onClose={onClose}
         size="lg"
         icon={<Bot size={16} aria-hidden="true" />}
@@ -770,6 +829,7 @@ export const AdminUserMcpTokens = ({ user, onClose }: { user: AdminUser | null; 
         {list.data &&
           (tokens.length ? (
             <McpTokenTable
+              tableRef={tableRef}
               tokens={tokens}
               caption={t('mcp.adminTitle', { name: user?.name ?? '' })}
               onRevoke={setRevoking}

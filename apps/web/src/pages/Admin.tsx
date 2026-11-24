@@ -1618,6 +1618,8 @@ export const AdminSettings = () => {
       void qc.invalidateQueries({ queryKey: ['instance'] });
       // 顶栏 / 登录页用的实例信息也要刷新
       void qc.invalidateQueries({ queryKey: ['groups'] });
+      // “允许 MCP 访问”改了之后个人设置里的令牌列表（allowed）也要刷新
+      void qc.invalidateQueries({ queryKey: ['mcp-tokens'] });
     },
   });
   return (
