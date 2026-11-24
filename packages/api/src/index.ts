@@ -636,8 +636,25 @@ export const versionInfoSchema = z.object({
   verifiedAt: z.string().nullable(),
   /** 冻结的脚本被人工改过 */
   edited: z.boolean(),
-  /** 链上最新的版本：只有它的脚本可以编辑 */
+  /** 活跃主链的链头（未作废、编号最大的版本）：只有它的脚本可以编辑，新版本以它为 parent */
   latest: z.boolean(),
+  /**
+   * 作废时间（ADR 0013 软作废）；null = 在活跃主链上。已作废的版本不能再升级（up）到或标记到，
+   * 停在它上面的环境只能回滚到祖先、经最近公共祖先切回活跃主链，或跨岔路零 SQL 标记到结构一致的活跃版本
+   */
+  retiredAt: z.string().nullable(),
+  /** 作废人的显示名（接手时自动识别为作废的岔路、或作废人已删除时为 null） */
+  retiredBy: z.string().nullable(),
+  /**
+   * 这个版本在任何环境执行过（versions.executed_at 非空，或有执行中的登记）。作废 / 取消作废的权限分级看它：
+   * 涉及的整段都没执行过 = 项目编辑者；任一版本执行过 = 项目管理员
+   */
+  executed: z.boolean(),
+  /**
+   * 可以一键取消作废：它已作废、它的 parent 是当前活跃链头、从它到全局最大编号的整段都是已作废的连续链尾
+   * （还没有基于父版本发布更新的版本）。取消作废会恢复整段
+   */
+  unretirable: z.boolean(),
   /**
    * 接手时从目标库的 dowel 历史恢复出来的时间（不是在本实例发布的）；null 表示本实例发布的。
    * 恢复的版本一律是“未验证”（见 05-implementation.md P4c）：要执行或回滚它需要先在影子库里重新验证。
@@ -645,6 +662,82 @@ export const versionInfoSchema = z.object({
   restoredAt: z.string().nullable(),
 });
 export type VersionInfo = z.infer<typeof versionInfoSchema>;
+
+// ───── 链尾版本作废 / 取消作废 / 应用到画布（ADR 0013） ─────
+
+/**
+ * 作废从这个版本到活跃链头的整段（POST /api/projects/:pid/versions/:vid/retire）。
+ * vid 必须在活跃主链上且不是第一个版本。head 是界面看到的活跃链头（乐观并发：链头变了 409，要重新确认作废范围）。
+ * keepWorkingCopy = false（默认）：工作副本回退到这一段的父版本的模型（作为画布历史里的新提交）；true = 保留当前工作副本。
+ * workingSeq：回退工作副本时的乐观并发（界面打开对话框时的工作副本 seq）；工作副本变了不回退，结果里 workingCopy = 'changed'
+ */
+export const versionRetireSchema = z
+  .object({
+    head: z.string().min(1),
+    keepWorkingCopy: z.boolean().default(false),
+    workingSeq: z.number().int().min(0).optional(),
+  })
+  .strict();
+export type VersionRetire = z.infer<typeof versionRetireSchema>;
+
+/**
+ * 取消作废（POST /api/projects/:pid/versions/:vid/unretire）：恢复从 vid 到全局最大编号的整段已作废链尾。
+ * syncWorkingCopy = true：工作副本同步切回恢复后的链头的模型（默认不动）。workingSeq 同上
+ */
+export const versionUnretireSchema = z
+  .object({
+    syncWorkingCopy: z.boolean().default(false),
+    workingSeq: z.number().int().min(0).optional(),
+  })
+  .strict();
+export type VersionUnretire = z.infer<typeof versionUnretireSchema>;
+
+export const versionRefSchema = z.object({ id: z.string(), number: z.number(), name: z.string() });
+export type VersionRef = z.infer<typeof versionRefSchema>;
+
+/**
+ * 工作副本的处理结果：reverted = 已回退到父版本 / 已同步到恢复后的链头；kept = 按要求保留；
+ * unchanged = 工作副本本来就和那个模型一致；changed = 工作副本在确认期间被别人改过，没有动（作废 / 取消作废本身已完成）
+ */
+export const workingCopyOutcomeSchema = z.enum(['reverted', 'kept', 'unchanged', 'changed']);
+export type WorkingCopyOutcome = z.infer<typeof workingCopyOutcomeSchema>;
+
+export const versionRetireResultSchema = z.object({
+  /** 作废的版本（编号升序） */
+  retired: z.array(versionRefSchema),
+  /** 新的活跃链头（被作废段的父版本） */
+  head: versionRefSchema,
+  /** 因此失效的执行申请数 */
+  invalidatedRequests: z.number().int().min(0),
+  workingCopy: workingCopyOutcomeSchema,
+});
+export type VersionRetireResult = z.infer<typeof versionRetireResultSchema>;
+
+export const versionUnretireResultSchema = z.object({
+  /** 恢复的版本（编号升序） */
+  restored: z.array(versionRefSchema),
+  /** 新的活跃链头（全局最大编号的版本） */
+  head: versionRefSchema,
+  workingCopy: workingCopyOutcomeSchema,
+});
+export type VersionUnretireResult = z.infer<typeof versionUnretireResultSchema>;
+
+/** 应用到画布前的预览（GET /api/projects/:pid/versions/:vid/canvas-diff）：当前工作副本 → 这个版本的模型的差异 */
+export const versionCanvasDiffSchema = z.object({
+  diffToCurrent: z.object({
+    total: z.number().int().min(0),
+    items: z.array(z.object({ kind: z.string(), target: z.string(), sql: z.string() })),
+  }),
+  currentSeq: z.number().int().min(0),
+});
+export type VersionCanvasDiff = z.infer<typeof versionCanvasDiffSchema>;
+
+/**
+ * 应用到画布（POST /api/projects/:pid/versions/:vid/apply）：把工作副本整体替换成这个版本（含已作废版本）的模型，
+ * 作为画布历史里的新提交。workingSeq 是预览时的工作副本 seq；变了返回 409（CanvasHistoryConflict，code = working_changed）
+ */
+export const versionApplySchema = z.object({ workingSeq: z.number().int().min(0) }).strict();
+export type VersionApply = z.infer<typeof versionApplySchema>;
 
 /** 项目所有已发布版本中出现过的表 ID 集合（用于锁定已发布表的不可变分区策略） */
 export const publishedTablesSchema = z.object({
@@ -958,7 +1051,15 @@ export const envVersionSchema = z.object({
   id: z.string(),
   number: z.number(),
   name: z.string(),
-  state: z.enum(['applied', 'current', 'pending']),
+  /**
+   * 相对这个环境的当前版本：applied = 当前版本的祖先（已执行）；current；pending = 活跃主链上、还没到的版本；
+   * retired = 已作废、且不在当前版本的祖先路径上（不能升级到它）
+   */
+  state: z.enum(['applied', 'current', 'pending', 'retired']),
+  /** 版本树里的 parent（第一个版本为 null） */
+  parentId: z.string().nullable(),
+  /** 已作废（ADR 0013） */
+  retired: z.boolean(),
   verified: z.boolean(),
   edited: z.boolean(),
   /** 升级 / 回滚脚本的步数 */
@@ -983,9 +1084,9 @@ export const envStatusSchema = z.object({
   effectiveExecPolicy: execPolicySchema,
   policy: z.custom<ResolvedPolicy>(),
   currentVersion: envVersionRefSchema.nullable(),
-  /** 链上全部版本（升序） */
+  /** 全部版本（编号升序，含已作废的版本） */
   versions: z.array(envVersionSchema),
-  /** 待执行的版本 ID（升序）：执行到最新版本需要依次执行它们 */
+  /** 待执行的版本 ID（升序）：执行到活跃链头需要依次升级它们（环境停在已作废岔路上时，不含要先回滚的那一段） */
   pending: z.array(z.string()),
   drift: driftInfoSchema,
   permissions: envPermissionsSchema,
@@ -996,6 +1097,10 @@ export type EnvStatus = z.infer<typeof envStatusSchema>;
 export const executeRequestSchema = z.object({
   to: z.string().min(1),
   confirm: z.string().optional(),
+  /**
+   * 切换（ADR 0013，POST …/switch）：确认回滚段会执行回滚脚本、可能丢数据。切换的真执行必须为 true（预演不需要）
+   */
+  acknowledgeRollback: z.boolean().optional(),
   /** 只预演（见 DryRunResponse）：生产环境也不需要 confirm，因为什么都不会写 */
   dryRun: z.boolean().optional(),
 });
@@ -1055,11 +1160,14 @@ export const markVersionSchema = envVersionRefSchema.extend({
 export type MarkVersion = z.infer<typeof markVersionSchema>;
 
 export const markPlanSchema = z.object({
-  /** current：目标就是当前版本（上一次执行没有结束、手工改回当前版本之后放弃那次未完成的运行） */
-  direction: z.enum(['forward', 'backward', 'current']),
+  /**
+   * current：目标就是当前版本（上一次执行没有结束、手工改回当前版本之后放弃那次未完成的运行）；
+   * cross（ADR 0013）：从已作废岔路跨到活跃主链上结构一致的版本，skipped 是最近公共祖先之后到 to 的一段
+   */
+  direction: z.enum(['forward', 'backward', 'current', 'cross']),
   from: envVersionRefSchema.nullable(),
   to: envVersionRefSchema,
-  /** 向前：被记为已执行、但脚本没有执行的版本（from 之后到 to，含 to）；向后为空 */
+  /** 向前：被记为已执行、但脚本没有执行的版本（from 之后到 to，含 to）；跨岔路：最近公共祖先之后到 to；向后为空 */
   skipped: z.array(markVersionSchema),
   /** 读到的线上结构指纹 */
   fingerprint: z.string(),
@@ -1286,7 +1394,10 @@ export type DryRunMigration = z.infer<typeof dryRunMigrationSchema>;
 
 export const dryRunPlanSchema = z.object({
   mode: z.enum(['migrate', 'baseline']),
-  direction: z.enum(['up', 'down', 'none']),
+  /** switch：先回滚到最近公共祖先（lca）再升级到目标（ADR 0013） */
+  direction: z.enum(['up', 'down', 'switch', 'none']),
+  /** 切换路线经过的最近公共祖先（回滚段的终点）；其他情况为 null */
+  lca: envVersionRefSchema.nullable(),
   /** 目标库还没有历史：baseline 只写基线，empty 在空库上建库；已有历史为 null */
   firstRun: z.enum(['baseline', 'empty']).nullable(),
   baseline: z.boolean(),

@@ -174,6 +174,13 @@ export const CI_ERROR_STATUS = {
   version_not_found: 422,
   /** 目标版本早于环境的当前版本：令牌不能回滚 */
   rollback_not_allowed: 409,
+  /**
+   * ADR 0013：环境停在已作废的岔路上，到目标版本要先回滚到最近公共祖先再升级。令牌不自动回滚：
+   * 要在 Web 端人工确认切换（details.current 是环境当前版本）
+   */
+  switch_requires_web: 409,
+  /** ADR 0013：目标版本已作废，不能执行到它 */
+  version_retired: 409,
   /** 目标库的历史和平台的版本链对不上（当前版本不在链上、校验和不同、链被篡改……），details.reason 是具体原因 */
   version_mismatch: 409,
   /** 要执行的迁移还没有通过影子库验证 */

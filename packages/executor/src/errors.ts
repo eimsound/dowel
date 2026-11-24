@@ -27,6 +27,13 @@ export type ExecutorErrorCode =
   | 'first_run_drift'
   /** 要求的方向与实际要走的方向相反（例如用“执行”去回滚） */
   | 'wrong_direction'
+  /**
+   * ADR 0013：要求只升级（up），但环境停在已作废的岔路上，到目标要先回滚到最近公共祖先再升级（switch）。
+   * Web 端要走“切换”并显式确认回滚段；CI 令牌一律拒绝（不自动回滚）
+   */
+  | 'switch_required'
+  /** ADR 0013：不能升级（up）到、也不能标记到已作废的版本 */
+  | 'retired_target'
   /** 要写基线，但条件不满足 */
   | 'baseline_not_applicable'
   /** 要执行的迁移还没有通过影子库验证 */

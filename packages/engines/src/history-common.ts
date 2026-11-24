@@ -12,7 +12,14 @@ export const readSteps = (value: unknown): ScriptStep[] => {
   return canonicalSteps(value as ScriptStep[]);
 };
 
-export type ChainProblemCode = 'number_gap' | 'parent_broken' | 'checksum_mismatch';
+export type ChainProblemCode =
+  /** 同一个编号出现了两次（不同的 version_id） */
+  | 'number_duplicate'
+  /** 不止一个根（parent 为空的版本），或根不是编号最小的版本 */
+  | 'root_multiple'
+  /** parent 指向不存在的版本、或指向编号不小于自己的版本 */
+  | 'parent_broken'
+  | 'checksum_mismatch';
 
 export interface ChainProblem {
   code: ChainProblemCode;
@@ -22,30 +29,49 @@ export interface ChainProblem {
 }
 
 /**
- * 校验版本链：number 连续、parent 指向上一个版本（第一个版本为空）、
- * 每行重新算的 checksum 与存储值一致。返回问题列表（空数组表示链是完整的）。
+ * 校验版本树（ADR 0013）：版本号唯一、只有一个根且根编号最小、每个非根版本的 parent 存在且编号更小
+ * （即“版本号唯一递增 + 合法父链树”）、每行重新算的 checksum 与存储值一致。
+ * 编号可以有空缺（作废的版本可能从没写进这个目标库），同一个 parent 下可以有多个子版本（已作废的岔路）；
+ * 根到最大编号的路径即活跃主链（见 version-tree.ts）。返回问题列表（空数组表示完整）。
  */
 export const verifyChain = (rows: HistoryVersionRow[]): ChainProblem[] => {
   const sorted = [...rows].sort((a, b) => a.number - b.number);
   const out: ChainProblem[] = [];
-  const start = sorted[0]?.number === 1 ? 1 : 0;
+  const byId = new Map(sorted.map((r) => [r.versionId, r]));
+  const byNumber = new Map<number, HistoryVersionRow>();
+  let root: HistoryVersionRow | null = null;
   for (const [i, r] of sorted.entries()) {
-    if (r.number !== start + i)
+    const dup = byNumber.get(r.number);
+    if (dup && dup.versionId !== r.versionId)
       out.push({
-        code: 'number_gap',
+        code: 'number_duplicate',
         versionId: r.versionId,
-        message: `版本 ${r.name} 的 number 是 ${r.number}，链上这个位置应该是 ${start + i}`,
+        message: `版本 ${r.name} 的 number ${r.number} 和版本 ${dup.name} 重复`,
       });
-    const expectedParent = i === 0 ? null : sorted[i - 1]!.versionId;
-    if (r.parentId !== expectedParent)
-      out.push({
-        code: 'parent_broken',
-        versionId: r.versionId,
-        message:
-          i === 0
-            ? `链上第一个版本 ${r.name} 不应该有 parent（现在是 ${r.parentId ?? '空'}）`
-            : `版本 ${r.name} 的 parent 是 ${r.parentId ?? '空'}，应该指向上一个版本 ${expectedParent}`,
-      });
+    else byNumber.set(r.number, r);
+    if (r.parentId === null) {
+      if (root || i !== 0)
+        out.push({
+          code: 'root_multiple',
+          versionId: r.versionId,
+          message: root
+            ? `版本 ${r.name} 和 ${root.name} 都没有 parent：历史有不止一个起点`
+            : `版本 ${r.name} 没有 parent，但它不是编号最小的版本`,
+        });
+      root ??= r;
+    } else {
+      const parent = byId.get(r.parentId);
+      if (!parent || parent.number >= r.number)
+        out.push({
+          code: 'parent_broken',
+          versionId: r.versionId,
+          message: parent
+            ? `版本 ${r.name} 的 parent ${parent.name} 的编号（${parent.number}）不比它小（${r.number}）`
+            : i === 0
+              ? `链上第一个版本 ${r.name} 不应该有 parent（现在是 ${r.parentId}）`
+              : `版本 ${r.name} 的 parent ${r.parentId} 不在历史里`,
+        });
+    }
     const checksum = stepsChecksum(r.upSteps, r.downSteps);
     if (checksum !== r.checksum)
       out.push({

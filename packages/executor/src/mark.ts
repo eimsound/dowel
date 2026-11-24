@@ -9,9 +9,14 @@ import { assertPlatformChain, assertTargetHistory, readState } from './state.ts'
 import type { ChainVersion } from './types.ts';
 
 export interface MarkPlan {
-  direction: 'forward' | 'backward' | 'current';
+  /**
+   * forward：to 是当前版本的后代；backward：to 是当前版本的祖先；current：同一个版本（只在收尾中途 / 读回失败的记录）；
+   * cross（ADR 0013）：从已作废的岔路跨到活跃主链上结构一致的版本，skipped 是最近公共祖先之后到 to 的那一段
+   */
+  direction: 'forward' | 'backward' | 'current' | 'cross';
   from: ChainVersion | null;
   to: ChainVersion;
+  /** 要记为已到达、但没有执行脚本的版本（forward：当前之后到 to；cross：最近公共祖先之后到 to；都含 to） */
   skipped: ChainVersion[];
   fingerprint: string;
 }

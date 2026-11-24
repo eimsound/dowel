@@ -29,11 +29,20 @@ export const OPEN_REQUEST_STATUSES: readonly RequestStatus[] = ['pending', 'appr
 const reasonText = z.string().trim().max(2000, '最多 2000 个字');
 
 /** 提交执行申请：执行（向前）或回滚到 to；起始版本取提交时环境的当前版本，服务端先跑一次预演，不通过不能提交 */
+/**
+ * 申请的种类：execute = 升级；rollback = 回滚；switch = 经最近公共祖先先回滚再升级（ADR 0013，环境停在已作废岔路上时
+ * 切回活跃主链），要同时满足执行和回滚的权限，提交时必须确认回滚段（acknowledgeRollback）
+ */
+export const requestKindSchema = z.enum(['execute', 'rollback', 'switch']);
+export type RequestKind = z.infer<typeof requestKindSchema>;
+
 export const requestCreateSchema = z
   .object({
-    kind: z.enum(['execute', 'rollback']),
+    kind: requestKindSchema,
     to: z.string().min(1),
     reason: reasonText.default(''),
+    /** switch 必须为 true：确认回滚段会执行回滚脚本、可能丢数据 */
+    acknowledgeRollback: z.boolean().optional(),
   })
   .strict();
 export type RequestCreate = z.infer<typeof requestCreateSchema>;
@@ -62,10 +71,12 @@ export type RequestExecute = z.infer<typeof requestExecuteSchema>;
 /** 紧急执行（只有实例管理员）：绕过审批，不绕过漂移、完整性等检查；必须写原因 */
 export const emergencyExecuteSchema = z
   .object({
-    kind: z.enum(['execute', 'rollback']),
+    kind: requestKindSchema,
     to: z.string().min(1),
     reason: reasonText.min(1, '紧急执行必须填写原因'),
     confirm: z.string().optional(),
+    /** switch 必须为 true */
+    acknowledgeRollback: z.boolean().optional(),
   })
   .strict();
 export type EmergencyExecute = z.infer<typeof emergencyExecuteSchema>;
@@ -118,7 +129,7 @@ export interface ExecRequestSummary {
   id: string;
   project: { id: string; name: string; slug: string; groupSlug: string };
   environment: { id: string; name: string; production: boolean };
-  kind: 'execute' | 'rollback';
+  kind: RequestKind;
   from: RequestVersionRef | null;
   to: RequestVersionRef;
   status: RequestStatus;

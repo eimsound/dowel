@@ -1270,6 +1270,22 @@ export const MIGRATIONS: MigrationStep[] = [
       }
     },
   },
+  // ADR 0013 链尾版本作废：平台库软作废（retired_at / retired_by），版本号只增不重用；目标库表结构不变
+  {
+    run: async (tx, d) => {
+      const { ts } = types(d);
+      if (d === 'pg') {
+        await tx.exec(`alter table versions add column if not exists retired_at ${ts};
+   alter table versions add column if not exists retired_by text references users on delete set null;`);
+        return;
+      }
+      const cols = await tx.query<{ name: string }>('pragma table_info(versions)');
+      if (!cols.some((c) => c.name === 'retired_at'))
+        await tx.exec(`alter table versions add column retired_at ${ts};`);
+      if (!cols.some((c) => c.name === 'retired_by'))
+        await tx.exec('alter table versions add column retired_by text references users on delete set null;');
+    },
+  },
 ];
 
 /** PG 启动迁移使用的跨副本 advisory lock 键 */
