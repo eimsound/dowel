@@ -28,3 +28,4 @@ export * from './sqlite/import.ts';
 export * from './sqlite/snapshot.ts';
 export * from './steps.ts';
 export * from './types.ts';
+export * from './version-tree.ts';

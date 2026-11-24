@@ -17,8 +17,15 @@ import {
   type TargetInfo,
 } from '@dowel/api';
 import { type Dialect, getDialect, type Model, newId } from '@dowel/core';
-import { type Db, getEngine, HistoryError } from '@dowel/engines';
-import { claimInstance, inspectAttach, planDiff, readState, type TargetState } from '@dowel/executor';
+import { type Db, getEngine, HistoryError, maxNumberNode } from '@dowel/engines';
+import {
+  claimInstance,
+  ExecutorError,
+  inspectAttach,
+  planDiff,
+  readState,
+  type TargetState,
+} from '@dowel/executor';
 import type { Context, Hono } from 'hono';
 import { HTTPException } from 'hono/http-exception';
 
@@ -49,7 +56,7 @@ import {
   dropSameInstanceShadow,
   inspectTargetOn,
 } from '../targets.ts';
-import { type AppContext, access, body, connectionLimit, type Env } from './context.ts';
+import { type AppContext, access, body, CodedHTTPException, connectionLimit, type Env } from './context.ts';
 
 /** 在已有目标库连接上读取历史并同步到平台库缓存（在目标库项目锁里做，拿不到锁就只读不同步） */
 const syncTargetOn = async (
@@ -169,6 +176,8 @@ export const registerClaims = (app: Hono<Env>, ctx: AppContext) => {
       try {
         ins = await inspectAttach(probe.db, a.pid, chain, settings.instanceId, a.dialect);
       } catch (e) {
+        if (e instanceof ExecutorError && e.code === 'history_fork')
+          throw new CodedHTTPException(409, e.message, 'history_fork');
         throw toTargetError(e, b.url, a.dialect);
       }
     } finally {
@@ -178,6 +187,13 @@ export const registerClaims = (app: Hono<Env>, ctx: AppContext) => {
     if (b.shadowUrl) await claimShadow(b.shadowUrl, ctx.guard, a.dialect);
     const hasHistory = ins.hasHistory;
     const aheadVersions = ins.hasHistory ? ins.aheadVersions : [];
+    const retiredAheadIds = ins.hasHistory ? ins.retiredAheadIds : [];
+    const retiredAheadSet = new Set(retiredAheadIds);
+    const newActiveHead = ins.hasHistory ? ins.newActiveHead : null;
+    const retiredAheadRefs = aheadVersions
+      .filter((v) => retiredAheadSet.has(v.versionId))
+      .map((v) => ({ id: v.versionId, number: v.number, name: v.name }));
+    const platActiveHead = maxNumberNode(chain.filter((v) => !v.retired));
     const needClaim = ins.hasHistory && !ins.claim.mine;
     if (needClaim) {
       if (!can(actor, 'instance.claim_project', { kind: 'instance' }))
@@ -196,15 +212,14 @@ export const registerClaims = (app: Hono<Env>, ctx: AppContext) => {
         );
     }
 
-    // ② 目标库严格领先于平台链（ADR 0012）：
-    //    1) 先按顺序用影子库对全部领先版本做闭环验证（基线模型为原链头模型）；缺影子库或任一版本失败 → 422 拒绝
-    //    2) 检查当前工作副本是否有未发布修改；有且未确认 → 409 working_dirty_confirm，已确认但 seq 变了 → 409 working_changed
+    // ② 目标库存在平台缺失的版本（ADR 0012 / 0013）：
+    //    1) 按 parentId 追溯父模型用影子库对全部缺失版本做闭环验证；缺影子库或任一版本失败 → 422 拒绝
+    //    2) 若产生了新的活跃链头，检查当前工作副本是否有未发布修改；有且未确认 → 409 working_dirty_confirm，已确认但 seq 变了 → 409 working_changed
     let verifiedReports = new Map<string, StoredVerifyReport>();
     let shadow: Shadow | null = null;
     let createdShadow: { targetUrl: string; name: string } | null = null;
     let committed = false;
     let expectedWorkingSeq: number | undefined;
-    const newHead = aheadVersions.at(-1) ?? null;
 
     const closeShadow = async () => {
       const s = shadow;
@@ -222,7 +237,7 @@ export const registerClaims = (app: Hono<Env>, ctx: AppContext) => {
     };
 
     try {
-      if (aheadVersions.length && newHead) {
+      if (aheadVersions.length) {
         const existingEnvs = await db.query<
           Pick<EnvRow, 'name' | 'url_enc' | 'production' | 'allow_same_instance' | 'shadow_url_enc'>
         >(
@@ -254,7 +269,7 @@ export const registerClaims = (app: Hono<Env>, ctx: AppContext) => {
             shadow,
             shadowLabel: prepared.label,
             versions: aheadVersions,
-            baseModel: chain.at(-1)?.model ?? null,
+            existingModels: new Map(chain.map((v) => [v.id, v.model])),
           });
         } catch (e) {
           if (e instanceof TakeoverRejected) {
@@ -266,33 +281,45 @@ export const registerClaims = (app: Hono<Env>, ctx: AppContext) => {
           await closeShadow();
         }
 
-        // 检查工作副本是否相对原链头有未发布的修改（与 pull 相同的并发保护）
-        await refresher.flush(a.branch);
-        const { model: working, seq: workingSeq } = await rooms.model(a.branch);
-        const baseHeadModel = chain.at(-1)?.model ?? emptyBase(working, a.schemas);
-        const isDirty = (w: Model) => planDiff(baseHeadModel, w).total > 0;
-        const previewOf = (w: Model, sq: number): AttachOverwritePreview => {
-          const diff = planDiff(w, newHead.model);
-          return {
-            aheadVersions: aheadVersions.map((v) => ({ id: v.versionId, number: v.number, name: v.name })),
-            items: diff.items,
-            total: diff.total,
-            workingSeq: sq,
+        if (newActiveHead) {
+          // 检查工作副本是否相对原活跃链头有未发布的修改（与 pull 相同的并发保护）
+          await refresher.flush(a.branch);
+          const { model: working, seq: workingSeq } = await rooms.model(a.branch);
+          const baseHeadModel = platActiveHead?.model ?? emptyBase(working, a.schemas);
+          const isDirty = (w: Model) => planDiff(baseHeadModel, w).total > 0;
+          const previewOf = (w: Model, sq: number): AttachOverwritePreview => {
+            const diff = planDiff(w, newActiveHead.model);
+            return {
+              aheadVersions: aheadVersions.map((v) => ({ id: v.versionId, number: v.number, name: v.name })),
+              items: diff.items,
+              total: diff.total,
+              workingSeq: sq,
+            };
           };
-        };
-        if (isDirty(working)) {
-          if (!b.confirmOverwrite) {
-            await cleanupShadow();
-            return c.json(
-              {
-                error: '工作副本有未发布的修改，接入领先环境会将其覆盖到新链头，请先查看差异并确认',
-                code: 'working_dirty_confirm',
-                ...previewOf(working, workingSeq),
-              },
-              409,
-            );
-          }
-          if (b.workingSeq !== undefined && b.workingSeq !== workingSeq) {
+          if (isDirty(working)) {
+            if (!b.confirmOverwrite) {
+              await cleanupShadow();
+              return c.json(
+                {
+                  error: '工作副本有未发布的修改，接入领先环境会将其覆盖到新链头，请先查看差异并确认',
+                  code: 'working_dirty_confirm',
+                  ...previewOf(working, workingSeq),
+                },
+                409,
+              );
+            }
+            if (b.workingSeq !== undefined && b.workingSeq !== workingSeq) {
+              await cleanupShadow();
+              return c.json(
+                {
+                  error: '工作副本在预览之后被改过，请重新确认差异',
+                  code: 'working_changed',
+                  ...previewOf(working, workingSeq),
+                },
+                409,
+              );
+            }
+          } else if (b.confirmOverwrite && b.workingSeq !== undefined && b.workingSeq !== workingSeq) {
             await cleanupShadow();
             return c.json(
               {
@@ -303,36 +330,32 @@ export const registerClaims = (app: Hono<Env>, ctx: AppContext) => {
               409,
             );
           }
-        } else if (b.confirmOverwrite && b.workingSeq !== undefined && b.workingSeq !== workingSeq) {
-          await cleanupShadow();
-          return c.json(
-            {
-              error: '工作副本在预览之后被改过，请重新确认差异',
-              code: 'working_changed',
-              ...previewOf(working, workingSeq),
-            },
-            409,
-          );
+          expectedWorkingSeq = b.confirmOverwrite ? b.workingSeq : workingSeq;
         }
-        expectedWorkingSeq = b.confirmOverwrite ? b.workingSeq : workingSeq;
       }
 
       // 若目标库有历史，提交后还需建立 1 条短连接复用完成认领（若需）与状态同步；必须在写平台库之前扣减限速配额
       if (hasHistory) connectionLimit(c, ctx, 1);
 
-      // ③ 平台事务：领先版本（若有）+ 环境行 + 审计（重名与链头并发在事务里检查）。提交之前目标库一概不动
+      // ③ 平台事务：缺失版本（若有）+ 环境行 + 审计（重名与版本树并发在事务里检查）。提交之前目标库一概不动
       const id = newId();
       try {
         await db.transaction(async (tx) => {
           if (aheadVersions.length) {
             if (db.dialect === 'pg')
               await tx.query('select id from projects where id = $1 for update', [a.pid]);
-            const [headNow] = await tx.query<{ id: string }>(
-              'select id from versions where project_id = $1 order by number desc limit 1',
+            const curRows = await tx.query<{ id: string; number: number; retired_at: unknown }>(
+              'select id, number, retired_at from versions where project_id = $1 order by number',
               [a.pid],
             );
-            if ((headNow?.id ?? null) !== (chain.at(-1)?.id ?? null))
-              throw new HTTPException(409, { message: '版本链刚刚发生了变化，请刷新后重试' });
+            const treeChanged =
+              curRows.length !== chain.length ||
+              curRows.some(
+                (r, i) =>
+                  r.id !== chain[i]!.id ||
+                  (r.retired_at !== null && r.retired_at !== undefined) !== Boolean(chain[i]!.retired),
+              );
+            if (treeChanged) throw new HTTPException(409, { message: '版本链刚刚发生了变化，请刷新后重试' });
             const aheadIds = aheadVersions.map((v) => v.versionId);
             const clash = await tx.query<{ id: string }>(
               `select id from versions where id in (${inList(aheadIds)})`,
@@ -347,6 +370,7 @@ export const registerClaims = (app: Hono<Env>, ctx: AppContext) => {
               branch: a.branch,
               versions: aheadVersions,
               verifiedReports,
+              retiredIds: retiredAheadSet,
             });
           }
           const [dup] = await tx.query<{ id: string }>(
@@ -385,6 +409,9 @@ export const registerClaims = (app: Hono<Env>, ctx: AppContext) => {
                 name: b.name,
                 claimRequested: needClaim,
                 ...(aheadVersions.length ? { aheadVersions: aheadVersions.map((v) => v.number) } : {}),
+                ...(retiredAheadRefs.length
+                  ? { retiredVersions: retiredAheadRefs.map((v) => v.number) }
+                  : {}),
               },
             },
             ctx.security,
@@ -396,26 +423,28 @@ export const registerClaims = (app: Hono<Env>, ctx: AppContext) => {
       }
       committed = true;
 
-      // 提交之后：若有领先版本，尝试按期望 seq 覆盖工作副本到新链头（记入 room_commits 操作历史）并重新加载合并后的完整链。
+      // 提交之后：若产生了新的活跃链头，尝试按期望 seq 覆盖工作副本到新链头（记入 room_commits 操作历史）并重新加载合并后的完整链。
       // 事务已提交，此处若发生并发编辑冲突或异常不能返回 500（否则环境与版本已入库且跳过认领），记作 warning 提示用户在模型页处理。
       const warnings: string[] = [];
       let mergedChain = chain;
-      if (aheadVersions.length && newHead) {
-        try {
-          await ctx.replace(a.branch, user.name, newHead.model, 'attachAhead', expectedWorkingSeq);
-        } catch (e) {
-          if (e instanceof WorkingChangedError) {
-            warnings.push(
-              `环境“${b.name}”与领先版本已接入，但接入期间工作副本被他人修改，未自动覆盖工作副本；请在模型页核对并在需要时通过修改历史或从环境导入同步`,
-            );
-          } else {
-            console.error(
-              '接入：同步工作副本失败（环境与领先版本已入库）',
-              e instanceof Error ? scrubSecrets(e.message) : e,
-            );
-            warnings.push(
-              `环境“${b.name}”与领先版本已接入，但自动同步工作副本失败；请在模型页手动核对或从环境导入`,
-            );
+      if (aheadVersions.length) {
+        if (newActiveHead) {
+          try {
+            await ctx.replace(a.branch, user.name, newActiveHead.model, 'attachAhead', expectedWorkingSeq);
+          } catch (e) {
+            if (e instanceof WorkingChangedError) {
+              warnings.push(
+                `环境“${b.name}”与领先版本已接入，但接入期间工作副本被他人修改，未自动覆盖工作副本；请在模型页核对并在需要时通过修改历史或从环境导入同步`,
+              );
+            } else {
+              console.error(
+                '接入：同步工作副本失败（环境与领先版本已入库）',
+                e instanceof Error ? scrubSecrets(e.message) : e,
+              );
+              warnings.push(
+                `环境“${b.name}”与领先版本已接入，但自动同步工作副本失败；请在模型页手动核对或从环境导入`,
+              );
+            }
           }
         }
         try {
@@ -503,6 +532,7 @@ export const registerClaims = (app: Hono<Env>, ctx: AppContext) => {
           currentVersion: current,
           claimed,
           aheadVersions: aheadVersions.map((v) => ({ id: v.versionId, number: v.number, name: v.name })),
+          retiredVersions: retiredAheadRefs,
           warnings,
         },
         201,
@@ -548,6 +578,8 @@ export const registerClaims = (app: Hono<Env>, ctx: AppContext) => {
             chain,
           });
         } catch (e) {
+          if (e instanceof ExecutorError && e.code === 'history_fork')
+            throw new CodedHTTPException(409, e.message, 'history_fork');
           throw toTargetError(e, url, a.dialect);
         }
         // 认领之后复用同一连接同步一次（当前版本、执行过哪些版本）：失败只记日志，不影响认领结果

@@ -4,6 +4,7 @@
 // 布局按 DESIGN.md 的“向导”：用外壳的内容区（没有侧面板），步骤指示在顶部，上一步 / 下一步在底部右侧。
 import type {
   Dialect,
+  EnvVersionRef,
   GroupList,
   ProjectCreated,
   TakeoverInspectResult,
@@ -110,6 +111,12 @@ export const NewProject = () => {
   const setWarnings = (w: string[]) => {
     warningsRef.current = w;
     setWarningsState(w);
+  };
+  const [retiredVersions, setRetiredVersionsState] = useState<EnvVersionRef[]>([]);
+  const retiredRef = useRef<EnvVersionRef[]>([]);
+  const setRetiredVersions = (v: EnvVersionRef[]) => {
+    retiredRef.current = v;
+    setRetiredVersionsState(v);
   };
   const [created, setCreated] = useState<ProjectCreated | null>(null);
   /** 接手：每个环境（按本地 key）读到的项目、选中的项目、认领确认对话框 */
@@ -326,6 +333,7 @@ export const NewProject = () => {
     setBusy(true);
     setError('');
     setWarnings([]);
+    setRetiredVersions([]);
     setStage(null);
     setStageDetail(null);
     const body = {
@@ -380,6 +388,7 @@ export const NewProject = () => {
         }
         if (event.project) project = event.project;
         if (event.warnings?.length) setWarnings(event.warnings);
+        if (event.retiredVersions?.length) setRetiredVersions(event.retiredVersions);
       });
     } catch (e) {
       setError(e instanceof Error ? e.message : String(e));
@@ -390,8 +399,8 @@ export const NewProject = () => {
       qc.invalidateQueries({ queryKey: ['projects'] }),
       qc.invalidateQueries({ queryKey: ['groups'] }),
     ]);
-    // 项目建好了但有没做完的事（例如某个库认领失败）：先让用户看到，再进项目
-    if (warningsRef.current.length) {
+    // 项目建好了但有没做完的事（例如某个库认领失败）或识别出已作废岔路版本：先让用户看到，再进项目
+    if (warningsRef.current.length || retiredRef.current.length) {
       setCreated(project);
       return;
     }
@@ -1074,21 +1083,36 @@ export const NewProject = () => {
                       <li key={w}>{w}</li>
                     ))}
                   </ul>
-                  <div className="mt-2">
-                    <button
-                      type="button"
-                      className="btn primary"
-                      onClick={() =>
-                        void nav({
-                          to: '/project/$owner/$project',
-                          params: { owner: created.group.slug, project: created.slug },
-                        })
-                      }
-                    >
-                      {t('tk.openProject')}
-                    </button>
-                  </div>
                 </Banner>
+              )}
+              {created && retiredVersions.length > 0 && (
+                <Banner kind="info" title={t('tk.retiredTitle')} role="status">
+                  <p className="m-0">{t('tk.retiredBody')}</p>
+                  <ul className="m-0 mt-1.5 list-disc space-y-0.5 pl-5">
+                    {retiredVersions.map((v) => (
+                      <li key={v.id}>
+                        <span className="font-mono">v{v.number}</span>
+                        {v.name ? ` · ${v.name}` : ''}
+                      </li>
+                    ))}
+                  </ul>
+                </Banner>
+              )}
+              {created && (warnings.length > 0 || retiredVersions.length > 0) && (
+                <div>
+                  <button
+                    type="button"
+                    className="btn primary"
+                    onClick={() =>
+                      void nav({
+                        to: '/project/$owner/$project',
+                        params: { owner: created.group.slug, project: created.slug },
+                      })
+                    }
+                  >
+                    {t('tk.openProject')}
+                  </button>
+                </div>
               )}
               {error && (
                 <Banner kind="danger" role="alert" title={t('wiz.failed')}>

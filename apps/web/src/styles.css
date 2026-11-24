@@ -484,7 +484,8 @@ dialog::backdrop {
     cursor: pointer;
   }
   .seg > button[aria-selected='true'],
-  .seg > button[aria-pressed='true'] {
+  .seg > button[aria-pressed='true'],
+  .seg > button[aria-checked='true'] {
     background: var(--surface-active);
     color: var(--text);
     font-weight: 500;
@@ -492,6 +493,15 @@ dialog::backdrop {
   .seg.floating {
     background: var(--surface);
     box-shadow: var(--shadow-sm);
+  }
+  /* 强制颜色模式会去掉背景：选中项另加系统色轮廓，不只靠背景区分 */
+  @media (forced-colors: active) {
+    .seg > button[aria-selected='true'],
+    .seg > button[aria-pressed='true'],
+    .seg > button[aria-checked='true'] {
+      outline: 2px solid Highlight;
+      outline-offset: -2px;
+    }
   }
 
   /* 标记 */
@@ -538,6 +548,10 @@ dialog::backdrop {
   .risk.high {
     color: var(--danger);
     background: var(--danger-soft);
+  }
+  /* 已作废的版本行（ADR 0013）：左侧警示色边只是装饰，行里总有“已作废”文字标记 */
+  .row-retired {
+    box-shadow: inset 3px 0 0 var(--warn);
   }
   .chip {
     display: inline-flex;

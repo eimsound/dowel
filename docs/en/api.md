@@ -247,6 +247,7 @@ Waits synchronously until checks and migration execution complete, then returns 
 
 - **Policy gate.** Checks only the effective "Allow CI token execution" flag (tightened across layers; enabled by default for non-production, disabled for production). It bypasses "Who can execute" (`whoCanExecute`, including "Executors only") and approval flows. Any user allowed to create CI tokens can issue a token that applies forward migrations on environments where this toggle is enabled.
 - **No rollbacks.** Targeting a version earlier than the environment's current version returns `409 rollback_not_allowed`. Rollbacks run through the web UI under approval policy rules.
+- **No automatic switches.** When the environment is on a [retired version](execution.md#switch) and reaching the target requires a rollback first, the API returns `409 switch_requires_web` (`details.current` is the current version); confirm the switch in the web UI. A retired target version returns `409 version_retired`. `latest` means the active chain head (the highest-numbered version that is not retired).
 - **Full safety pipeline.** Drift checks, version chain and checksum validation, target instance claim checks, shadow verification requirements, and policy lock and statement timeouts all apply. The server re-checks token status and policy flags after acquiring the environment lock.
 - **Locking and request invalidation.** Shares environment and target project locks with UI executions and execution requests. Completing a token run invalidates any affected open execution requests on that environment.
 - **Auditing and notifications.** Non-dry-run requests passing the policy check write audit logs naming the token name, prefix, and creator. Completed runs (success or failure) emit the `token.executed` group webhook event, and runs on production notify project admins and environment approvers (or authorized executors when no stages exist) in the in-app inbox. Two boundaries apply:
@@ -334,30 +335,32 @@ All errors use a unified JSON envelope:
 
 > On partial failures, `reached` identifies the last completed version. `details` appears only when extra context such as `diff`, `timeout`, `current`, or `partial` exists.
 
-| Error code (`code`)        | HTTP status | Meaning and common causes                                                                                   |
-| -------------------------- | ----------- | ----------------------------------------------------------------------------------------------------------- |
-| `invalid_request`          | `400`       | Invalid JSON body or out-of-range `to`, `dryRun`, or `lockTimeoutSeconds`                                   |
-| `token_missing`            | `401`       | Missing `Authorization` header                                                                              |
-| `token_invalid`            | `401`       | Malformed token, missing `dwl_` prefix, or unknown token                                                    |
-| `token_expired`            | `401`       | Token passed its expiration timestamp                                                                       |
-| `token_revoked`            | `401`       | Token was revoked                                                                                           |
-| `forbidden`                | `403`       | CI token called an endpoint outside `/api/ci/...`                                                           |
-| `token_execution_disabled` | `403`       | Effective execution policy disables CI token execution (default on production)                              |
-| `project_not_found`        | `404`       | Project does not exist or belongs to another project                                                        |
-| `environment_not_found`    | `404`       | Environment does not exist                                                                                  |
-| `rollback_not_allowed`     | `409`       | Target version is older than current version (tokens cannot roll back; see `details.current`)               |
-| `version_mismatch`         | `409`       | Target history conflicts with platform chain, checksum mismatch, or newer format (see `details.reason`)     |
-| `unverified`               | `409`       | Pending migration has not passed shadow database verification                                               |
-| `drift`                    | `409`       | Target schema drifted from current version, or first run is neither baseline nor empty (`details.firstRun`) |
-| `unfinished_run`           | `409`       | Previous non-transactional or auto-commit migration stopped partway; resolve in the UI first                |
-| `foreign_instance`         | `409`       | Project in target database is claimed by another Dowel instance                                             |
-| `rejected`                 | `409`       | Pre-execution check rejected the run, such as instance-level SQL or invalid scope (`details.reason`)        |
-| `version_not_found`        | `422`       | Target version is missing from the chain, or the project has no published versions                          |
-| `execution_failed`         | `422`       | SQL step error, policy timeout, or read-back mismatch; environment stops at `reached`                       |
-| `lock_timeout`             | `423`       | Timed out waiting for environment lock or target project lock (another run is active)                       |
-| `rate_limited`             | `429`       | Exceeded auth-failure limit or token request limit (check `Retry-After` header)                             |
-| `target_unreachable`       | `502`       | Failed to connect to target database, or missing privileges such as creating the `dowel` schema             |
-| `internal`                 | `500`       | Unexpected server error                                                                                     |
+| Error code (`code`)        | HTTP status | Meaning and common causes                                                                                                  |
+| -------------------------- | ----------- | -------------------------------------------------------------------------------------------------------------------------- |
+| `invalid_request`          | `400`       | Invalid JSON body or out-of-range `to`, `dryRun`, or `lockTimeoutSeconds`                                                  |
+| `token_missing`            | `401`       | Missing `Authorization` header                                                                                             |
+| `token_invalid`            | `401`       | Malformed token, missing `dwl_` prefix, or unknown token                                                                   |
+| `token_expired`            | `401`       | Token passed its expiration timestamp                                                                                      |
+| `token_revoked`            | `401`       | Token was revoked                                                                                                          |
+| `forbidden`                | `403`       | CI token called an endpoint outside `/api/ci/...`                                                                          |
+| `token_execution_disabled` | `403`       | Effective execution policy disables CI token execution (default on production)                                             |
+| `project_not_found`        | `404`       | Project does not exist or belongs to another project                                                                       |
+| `environment_not_found`    | `404`       | Environment does not exist                                                                                                 |
+| `rollback_not_allowed`     | `409`       | Target version is older than current version (tokens cannot roll back; see `details.current`)                              |
+| `switch_requires_web`      | `409`       | Environment is on a retired version and reaching the target needs a rollback; tokens never roll back, switch in the web UI |
+| `version_retired`          | `409`       | Target version is retired and cannot be executed                                                                           |
+| `version_mismatch`         | `409`       | Target history conflicts with platform chain, checksum mismatch, or newer format (see `details.reason`)                    |
+| `unverified`               | `409`       | Pending migration has not passed shadow database verification                                                              |
+| `drift`                    | `409`       | Target schema drifted from current version, or first run is neither baseline nor empty (`details.firstRun`)                |
+| `unfinished_run`           | `409`       | Previous non-transactional or auto-commit migration stopped partway; resolve in the UI first                               |
+| `foreign_instance`         | `409`       | Project in target database is claimed by another Dowel instance                                                            |
+| `rejected`                 | `409`       | Pre-execution check rejected the run, such as instance-level SQL or invalid scope (`details.reason`)                       |
+| `version_not_found`        | `422`       | Target version is missing from the chain, or the project has no published versions                                         |
+| `execution_failed`         | `422`       | SQL step error, policy timeout, or read-back mismatch; environment stops at `reached`                                      |
+| `lock_timeout`             | `423`       | Timed out waiting for environment lock or target project lock (another run is active)                                      |
+| `rate_limited`             | `429`       | Exceeded auth-failure limit or token request limit (check `Retry-After` header)                                            |
+| `target_unreachable`       | `502`       | Failed to connect to target database, or missing privileges such as creating the `dowel` schema                            |
+| `internal`                 | `500`       | Unexpected server error                                                                                                    |
 
 ---
 

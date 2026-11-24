@@ -10,7 +10,18 @@ import type {
 import { type Dialect, isNontransactionalSql } from '@dowel/core';
 import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query';
 import { Link, useParams } from '@tanstack/react-router';
-import { ArrowRight, BookmarkPlus, Download, Pencil, Plus, ShieldCheck, Trash2 } from 'lucide-react';
+import {
+  Archive,
+  ArchiveRestore,
+  ArrowRight,
+  BookmarkPlus,
+  ClipboardPaste,
+  Download,
+  Pencil,
+  Plus,
+  ShieldCheck,
+  Trash2,
+} from 'lucide-react';
 import { useId, useRef, useState } from 'react';
 import { useTranslation } from 'react-i18next';
 
@@ -20,6 +31,13 @@ import { EmptyHint, ProjectPage, Row, Rows, Section } from '../components/Projec
 import { SqlView } from '../components/SqlView.tsx';
 import { useToast } from '../components/Toasts.tsx';
 import { Banner, IconButton, Sql } from '../components/ui.tsx';
+import {
+  ApplyToCanvasDialog,
+  RetireDialog,
+  retireSpan,
+  UnretireDialog,
+  unretireSpan,
+} from '../components/VersionLifecycle.tsx';
 import {
   RiskNote,
   useVersionName,
@@ -43,7 +61,15 @@ export const Versions = () => {
   const versions = useVersions(pid);
   const versionName = useVersionName();
   const [publish, setPublish] = useState(false);
+  const [filter, setFilter] = useState<'all' | 'active' | 'retired'>('all');
   const canPublish = project.role !== 'viewer';
+  const hasRetired = versions.data?.some((v) => v.retiredAt !== null) ?? false;
+  // 已作废的版本都恢复了（筛选栏隐藏）时回到“全部”，不留下空列表
+  const effective = hasRetired ? filter : 'all';
+  const shown = (versions.data ?? []).filter((v) =>
+    effective === 'all' ? true : effective === 'retired' ? v.retiredAt !== null : v.retiredAt === null,
+  );
+  const badgeId = (id: string) => `retired-badge-${id}`;
 
   return (
     <ProjectPage
@@ -58,23 +84,52 @@ export const Versions = () => {
       }
     >
       <div className="space-y-3">
+        {hasRetired && (
+          // focusgroup polyfill 提供方向键移动（不另外写键盘监听，pitfalls #31）；选中跟随焦点
+          <div
+            className="seg"
+            role="radiogroup"
+            {...({ focusgroup: 'radiogroup nomemory' } as object)}
+            aria-label={t('vl.filter')}
+          >
+            {(['all', 'active', 'retired'] as const).map((f) => (
+              <button
+                key={f}
+                type="button"
+                role="radio"
+                aria-checked={effective === f}
+                {...(effective === f ? { focusgroupstart: '' } : {})}
+                onFocus={() => setFilter(f)}
+                onClick={() => setFilter(f)}
+              >
+                {t(`vl.filter_${f}`)}
+              </button>
+            ))}
+          </div>
+        )}
         {versions.data && versions.data.length === 0 ? (
           <EmptyHint>{t('versions.empty')}</EmptyHint>
         ) : (
           <Rows>
-            {(versions.data ?? []).map((v) => (
-              <Row key={v.id}>
+            {shown.map((v) => (
+              <Row key={v.id} className={v.retiredAt ? 'row-retired' : undefined}>
                 <VersionNumber number={v.number} />
                 <Link
                   to="/project/$owner/$project/versions/$vid"
                   params={{ ...params, vid: v.id }}
                   className="min-w-0 flex-1 truncate font-mono font-medium no-underline"
+                  aria-describedby={v.retiredAt ? badgeId(v.id) : undefined}
                 >
                   {versionName(v)}
                 </Link>
-                <VersionBadges v={v} />
-                <span className="w-32 shrink-0 text-right text-xs text-text-2">{v.createdBy ?? '—'}</span>
-                <time dateTime={v.createdAt} className="w-40 shrink-0 text-right text-xs text-text-3">
+                <VersionBadges v={v} retiredId={badgeId(v.id)} />
+                <span className="w-32 shrink-0 text-right text-xs text-text-2 max-[900px]:hidden">
+                  {v.createdBy ?? '—'}
+                </span>
+                <time
+                  dateTime={v.createdAt}
+                  className="w-40 shrink-0 text-right text-xs text-text-3 max-[900px]:hidden"
+                >
                   {formatTime(v.createdAt)}
                 </time>
               </Row>
@@ -261,6 +316,7 @@ const VersionDetailView = ({ vid }: { vid: string }) => {
   const versions = useVersions(pid);
   const [dir, setDir] = useState<'up' | 'down'>('up');
   const [editing, setEditing] = useState(false);
+  const [dialog, setDialog] = useState<'retire' | 'unretire' | 'apply' | null>(null);
   const detailKey = ['version', pid, vid];
   const detail = useQuery({
     queryKey: detailKey,
@@ -304,6 +360,11 @@ const VersionDetailView = ({ vid }: { vid: string }) => {
 
   const prev = versions.data?.find((v) => v.id === version.parentId);
   const canEdit = project.role !== 'viewer';
+  const role = project.role as 'viewer' | 'editor' | 'admin';
+  const all = versions.data ?? [];
+  const self = all.find((v) => v.id === version.id);
+  const span = self && !self.retiredAt ? retireSpan(all, self) : [];
+  const restoreSpan = self?.unretirable ? unretireSpan(all) : [];
   const steps = dir === 'up' ? version.upSteps : version.downSteps;
   const report = version.verifyReport;
   const isBaseline = version.number === 0;
@@ -332,7 +393,7 @@ const VersionDetailView = ({ vid }: { vid: string }) => {
           <h2 className="m-0 font-mono text-[length:var(--fs-headline)] font-semibold">
             {versionName(version)}
           </h2>
-          <VersionBadges v={version} />
+          <VersionBadges v={{ ...version, executed: self?.executed ?? false }} />
           <span className="text-xs text-text-3">
             {t('versions.publishedAt', {
               time: formatTime(version.createdAt),
@@ -342,7 +403,40 @@ const VersionDetailView = ({ vid }: { vid: string }) => {
           <span className="font-mono text-xs text-text-3" title={version.checksum}>
             {t('versions.checksum', { sum: version.checksum.slice(0, 12) })}
           </span>
+          {/* 版本自身的动作放在标题行（可换行），不挤进固定高度的顶栏；权限不够的原因在对话框里说明 */}
+          {canEdit && (
+            <span className="ml-auto flex flex-wrap items-center gap-2">
+              <button type="button" className="btn" onClick={() => setDialog('apply')}>
+                <ClipboardPaste size={16} aria-hidden="true" />
+                {t('vl.apply')}
+              </button>
+              {span.length > 0 && (
+                <button type="button" className="btn" onClick={() => setDialog('retire')}>
+                  <Archive size={16} aria-hidden="true" />
+                  {t('vl.retire')}
+                </button>
+              )}
+            </span>
+          )}
         </div>
+
+        {version.retiredAt && (
+          <Banner
+            kind="warn"
+            title={t('vl.retiredTitle')}
+            action={
+              canEdit && restoreSpan.length > 0 ? (
+                <button type="button" className="btn" onClick={() => setDialog('unretire')}>
+                  <ArchiveRestore size={16} aria-hidden="true" />
+                  {t('vl.unretire')}
+                </button>
+              ) : undefined
+            }
+          >
+            <p className="m-0">{t('vl.retiredBody')}</p>
+            {!version.unretirable && <p className="mt-1.5 mb-0">{t('vl.notUnretirable')}</p>}
+          </Banner>
+        )}
 
         <Section
           title={t('versions.migration')}
@@ -393,14 +487,23 @@ const VersionDetailView = ({ vid }: { vid: string }) => {
         >
           {prev ? (
             <p className="hint">
-              {t('versions.prev')} <span className="font-mono">v{prev.number}</span>
+              {t('versions.prev')}{' '}
+              <Link
+                to="/project/$owner/$project/versions/$vid"
+                params={{ ...params, vid: prev.id }}
+                className="font-mono"
+              >
+                v{prev.number}
+              </Link>
               <ArrowRight size={12} aria-hidden="true" />
               <span className="font-mono">v{version.number}</span>
             </p>
           ) : (
             <Banner kind="info">{isBaseline ? t('versions.baselineHint') : t('versions.noPrev')}</Banner>
           )}
-          {!version.latest && canEdit && <p className="hint">{t('versions.notLatest')}</p>}
+          {!version.latest && canEdit && (
+            <p className="hint">{version.retiredAt ? t('vl.notEditableRetired') : t('versions.notLatest')}</p>
+          )}
           {verify.error && (
             <Banner kind="danger" role="alert">
               {verify.error.message}
@@ -431,6 +534,16 @@ const VersionDetailView = ({ vid }: { vid: string }) => {
             </EmptyHint>
           )}
         </Section>
+
+        {dialog === 'apply' && (
+          <ApplyToCanvasDialog pid={pid} version={version} onClose={() => setDialog(null)} />
+        )}
+        {dialog === 'retire' && self && (
+          <RetireDialog pid={pid} versions={all} from={self} role={role} onClose={() => setDialog(null)} />
+        )}
+        {dialog === 'unretire' && self && (
+          <UnretireDialog pid={pid} versions={all} role={role} onClose={() => setDialog(null)} />
+        )}
 
         <Section title={t('versions.ddl')}>
           {ddl.error ? (

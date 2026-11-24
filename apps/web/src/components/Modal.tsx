@@ -70,6 +70,7 @@ export const Modal = ({
   icon,
   size = 'md',
   footer,
+  pending = false,
   dismissible = true,
 }: {
   open: boolean;
@@ -82,11 +83,21 @@ export const Modal = ({
   /** 底部操作区：左侧辅助操作，右侧取消 / 主按钮 */
   footer?: ReactNode;
   /**
+   * 操作进行中：不能用 Esc、点外部或右上角关闭（closedby="none" 只是渐进增强，cancel 事件里同样拦下，
+   * 不支持 closedby 的浏览器也不会关掉）
+   */
+  pending?: boolean;
+  /**
    * false：不能用 Esc、点外部或右上角关闭，只能用底部按钮关闭（一次性展示的令牌明文，误关就再也看不到）。
    */
   dismissible?: boolean;
 }) => {
   const { t } = useTranslation();
+  const locked = !dismissible || pending;
+  const lockedRef = useRef(locked);
+  useEffect(() => {
+    lockedRef.current = locked;
+  }, [locked]);
   const ref = useRef<HTMLDialogElement>(null);
   const titleId = useId();
   useEffect(() => {
@@ -103,7 +114,7 @@ export const Modal = ({
       pressedOutside = outside(e, d);
     };
     const up = (e: PointerEvent) => {
-      if (pressedOutside && outside(e, d)) d.close();
+      if (pressedOutside && outside(e, d) && !lockedRef.current) d.close();
     };
     d.addEventListener('pointerdown', down);
     d.addEventListener('pointerup', up);
@@ -117,9 +128,11 @@ export const Modal = ({
       ref={ref}
       aria-labelledby={titleId}
       onClose={onClose}
-      // 不支持 closedby 的浏览器里 Esc 触发 cancel：不可关闭时拦下
-      onCancel={dismissible ? undefined : (e) => e.preventDefault()}
-      {...({ closedby: dismissible ? 'any' : 'none' } as object)}
+      // 不支持 closedby 的浏览器里 Esc 触发 cancel：不可关闭或操作进行中时拦下
+      onCancel={(e) => {
+        if (lockedRef.current) e.preventDefault();
+      }}
+      {...({ closedby: locked ? 'none' : 'any' } as object)}
       className={`m-auto max-h-[88vh] flex-col overflow-hidden rounded-lg border border-border bg-panel p-0 text-text shadow-[var(--shadow-lg)] open:flex ${
         size === 'lg' ? 'w-[min(900px,94vw)]' : size === 'sm' ? 'w-[min(440px,94vw)]' : 'w-[min(600px,94vw)]'
       }`}
@@ -130,7 +143,11 @@ export const Modal = ({
           {title}
         </h2>
         {dismissible && (
-          <IconButton label={t('dlg.close')} onClick={() => ref.current!.close()}>
+          <IconButton
+            label={t('dlg.close')}
+            aria-disabled={pending || undefined}
+            onClick={() => !lockedRef.current && ref.current!.close()}
+          >
             <X size={16} aria-hidden="true" />
           </IconButton>
         )}

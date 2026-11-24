@@ -311,4 +311,44 @@ describe('actions/execute/run.sh 超时保护与参数校验（#16）', () => {
       rmSync(shimTmp, { recursive: true, force: true });
     }
   });
+
+  test('CI 返回 409 switch_requires_web / version_retired 时结构化报错且不泄露令牌', async () => {
+    let status = 409;
+    let payload: Record<string, unknown> = {};
+    const ciMock = createServer((_req: IncomingMessage, res: ServerResponse) => {
+      res.writeHead(status, { 'content-type': 'application/json' }).end(JSON.stringify(payload));
+    });
+    await new Promise<void>((r) => ciMock.listen(0, '127.0.0.1', r));
+    const port = (ciMock.address() as AddressInfo).port;
+    const mockUrl = `http://127.0.0.1:${port}`;
+    try {
+      payload = {
+        ok: false,
+        code: 'switch_requires_web',
+        error: '环境当前停在已作废岔路 v2 上，需要先回滚到 v1，请在 Web 端确认切换',
+        details: {
+          current: { id: 'v2-id', number: 2, name: 'old' },
+          lca: { id: 'v1-id', number: 1, name: 'init' },
+        },
+      };
+      const sw = await runAction({ DOWEL_URL: mockUrl, GITHUB_ACTIONS: 'true' });
+      expect(sw.code).toBe(1);
+      expect(sw.outputs).toMatchObject({ ok: 'false', code: 'switch_requires_web', noop: 'false' });
+      expect(sw.stdout).toContain('::error::[switch_requires_web]');
+      expect(sw.stdout + sw.stderr).not.toContain(SAMPLE_TOKEN);
+
+      payload = {
+        ok: false,
+        code: 'version_retired',
+        error: '目标版本 v2 已被作废，不能通过 CI 执行',
+      };
+      const ret = await runAction({ DOWEL_URL: mockUrl, DOWEL_TO: 'v2', GITHUB_ACTIONS: 'true' });
+      expect(ret.code).toBe(1);
+      expect(ret.outputs).toMatchObject({ ok: 'false', code: 'version_retired', noop: 'false' });
+      expect(ret.stdout).toContain('::error::[version_retired]');
+      expect(ret.stdout + ret.stderr).not.toContain(SAMPLE_TOKEN);
+    } finally {
+      await new Promise<void>((r) => ciMock.close(() => r()));
+    }
+  });
 });

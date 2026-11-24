@@ -56,11 +56,10 @@ import { ShadowError } from './shadow.ts';
 import {
   buildDdlSql,
   buildMigrationPreview,
-  chainHead,
   findVersion,
   listProjectVersions,
   resolveModelRef,
-  toVersionDetail,
+  versionDetailOf,
 } from './versions.ts';
 
 const MAX_FULL_MODEL_TABLES_WITHOUT_SCHEMA = 200;
@@ -209,6 +208,7 @@ const listVisibleAllowlistedProjects = async (
       `select project_id as "projectId", id, number, name
          from versions
         where project_id in (${inList(pids)})
+          and retired_at is null
         order by number desc`,
       pids,
     );
@@ -688,8 +688,7 @@ export const createMcpServer = (
       const { row } = resolved.project;
       const v = await findVersion(ctx.db, row.id, args.version);
       if (!v) return toolError('version_not_found', `版本不存在：${args.version}`);
-      const head = await chainHead(ctx.db, row.id);
-      return toolOk({ version: toVersionDetail(v, head?.id ?? null) });
+      return toolOk({ version: await versionDetailOf(ctx.db, row.id, v) });
     },
   });
 

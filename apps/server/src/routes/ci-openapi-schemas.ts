@@ -75,7 +75,11 @@ export const ciErrorDetailsOpenApiSchema = z
     current: ciVersionRefOpenApiSchema
       .nullable()
       .optional()
-      .openapi({ description: '回滚被拒时环境当前的版本' }),
+      .openapi({ description: '回滚被拒或需要切换时环境当前的版本' }),
+    lca: ciVersionRefOpenApiSchema
+      .nullable()
+      .optional()
+      .openapi({ description: '环境停在已作废分支需要切换时的最近公共祖先版本' }),
     problems: z.array(z.string()).optional().openapi({ description: '预检拒绝的具体问题列表' }),
   })
   .openapi('CiErrorDetails');
@@ -140,7 +144,7 @@ export const ciVersionListOpenApiSchema = z.array(ciVersionOpenApiSchema).openap
 
 export const ciEnvironmentVersionOpenApiSchema = ciVersionRefOpenApiSchema
   .extend({
-    state: z.enum(['applied', 'current', 'pending']),
+    state: z.enum(['applied', 'current', 'pending', 'retired']),
     verified: z.boolean(),
   })
   .openapi('CiEnvironmentVersion');

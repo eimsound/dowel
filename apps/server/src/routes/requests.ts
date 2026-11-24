@@ -12,6 +12,7 @@ import {
   requestApproveSchema,
   requestCreateSchema,
   requestExecuteSchema,
+  type RequestKind,
   requestRejectSchema,
 } from '@dowel/api';
 import { newId } from '@dowel/core';
@@ -24,13 +25,15 @@ import { z } from 'zod';
 import { auditIn } from '../audit.ts';
 import type { User } from '../auth.ts';
 import { can, userActor } from '../authz.ts';
-import { envResource, loadEnv } from '../envs.ts';
+import { dbNowSql, inList, readDbNow } from '../db.ts';
+import { envResource, iso, loadEnv } from '../envs.ts';
 import { accessIn, envAuthOf, loadPolicies, withPolicyLock } from '../policy.ts';
 import {
   bindingProblem,
   connHash,
   Effects,
   eligibleFor,
+  execDirectionOf,
   flowOf,
   hasExecRight,
   isInterrupted,
@@ -44,7 +47,15 @@ import {
 } from '../requests.ts';
 import { effectiveRole, loadRoleContext } from '../roles.ts';
 import { sseSender } from '../sse.ts';
-import { type AppContext, access, body, connectionLimit, type Env, envAccess } from './context.ts';
+import {
+  type AppContext,
+  access,
+  body,
+  CodedHTTPException,
+  connectionLimit,
+  type Env,
+  envAccess,
+} from './context.ts';
 import { assertVersion, confirmed, dryRunFor, execStream, type RunAccess } from './executions.ts';
 
 /** 申请里的操作（都在执行策略锁里做） */
@@ -107,7 +118,7 @@ const decideIn = async (
   if (req.status !== 'pending' && req.status !== 'approved' && req.status !== 'failed')
     throw conflict(`申请${statusLabel(req.status)}${req.status_reason ? `：${req.status_reason}` : ''}`);
   // 绑定检查：环境状态变了 / 过期 / 流程变严 → 转成终态（提交），返回 409
-  const problem = await bindingProblem(tx, req);
+  const problem = await bindingProblem(tx, req, await readDbNow(tx, requests.db.dialect));
   if (problem) {
     await requests.setStatus(tx, c, req, problem.status, problem.reason, null, fx);
     return { req, stale: problem };
@@ -275,12 +286,15 @@ const decideIn = async (
 const runRequest = (c: Context<Env>, ctx: AppContext, req: RequestRow, { a }: RunPlan) => {
   const user = c.get('user');
   const me = { id: user.id, name: user.name };
+  const dir = execDirectionOf(req);
+  const action =
+    dir === 'down' ? 'environment.rollback' : dir === 'switch' ? 'environment.switch' : 'environment.execute';
   return execStream(
     c,
     ctx,
     a,
-    req.direction === 'down' ? 'environment.rollback' : 'environment.execute',
-    { mode: 'migrate', to: req.to_version_id, direction: req.direction },
+    action,
+    { mode: 'migrate', to: req.to_version_id, direction: dir },
     {
       auditExtra: { requestId: req.id, ...(req.emergency ? { emergency: true, reason: req.reason } : {}) },
       expect: {
@@ -305,27 +319,50 @@ const listQuery = z.object({
 /**
  * 预演 → 申请绑定的迁移快照。绑定的是**预演用的那一份**校验和（第一轮审查：之前在锁内重新读平台库，预演之后脚本被改，
  * 就会绑定一个没预演过的版本）：锁内读到的校验和和预演时的不一样 → 409，让用户重新预演。
+ * ADR 0013：非回滚申请禁止目标或任何升级段版本已作废（允许回滚段里的已作废版本）。
  */
-export const snapshotOf = async (db: Db, pid: string, plan: NonNullable<DryRunResponse['plan']>) => {
-  const sums = new Map(
-    (
-      await db.query<{ id: string; checksum: string }>(
-        'select id, checksum from versions where project_id = $1',
-        [pid],
-      )
-    ).map((v) => [v.id, v.checksum]),
-  );
+export const snapshotOf = async (
+  db: Db,
+  pid: string,
+  plan: NonNullable<DryRunResponse['plan']>,
+  kind: RequestKind,
+  toVersionId: string,
+) => {
+  const rows = await db.query<{
+    id: string;
+    number: number;
+    name: string;
+    checksum: string;
+    retired_at: unknown;
+  }>('select id, number, name, checksum, retired_at from versions where project_id = $1', [pid]);
+  const byId = new Map(rows.map((v) => [v.id, v]));
+  if (kind !== 'rollback') {
+    const target = byId.get(toVersionId);
+    if (!target) throw conflict('目标版本在预演之后不存在了，请重新预演');
+    if (target.retired_at !== null && target.retired_at !== undefined)
+      throw new CodedHTTPException(
+        409,
+        `版本 v${target.number}「${target.name}」已作废，不能${kind === 'switch' ? '切换到它' : '升级到它'}`,
+        'retired_target',
+      );
+  }
   return plan.migrations.map((m) => {
-    const checksum = sums.get(m.versionId);
-    if (!checksum) throw conflict(`版本 v${m.number} 在预演之后不存在了，请重新预演`);
-    if (checksum !== m.checksum)
+    const v = byId.get(m.versionId);
+    if (!v) throw conflict(`版本 v${m.number} 在预演之后不存在了，请重新预演`);
+    if (v.checksum !== m.checksum)
       throw conflict(`版本 v${m.number} 的脚本在预演之后被修改了，请重新预演后再提交`);
+    if (m.direction === 'up' && v.retired_at !== null && v.retired_at !== undefined)
+      throw new CodedHTTPException(
+        409,
+        `版本 v${m.number}「${v.name}」在预演之后已被作废，不能升级到它`,
+        'retired_target',
+      );
     return {
       versionId: m.versionId,
       number: m.number,
       name: m.name,
       direction: m.direction as 'up' | 'down',
-      checksum,
+      checksum: v.checksum,
       steps: m.steps.length,
       nonTransactional: m.nonTransactional,
     };
@@ -362,10 +399,24 @@ export const registerRequests = (app: Hono<Env>, ctx: AppContext) => {
     const a = await envAccess(c, ctx, 'environment.request');
     const b = await body(c, requestCreateSchema.extend({ dryRun: z.boolean().optional() }));
     const user = c.get('user');
-    await assertVersion(db, a.pid, b.to);
-    const direction = b.kind === 'rollback' ? 'down' : 'up';
+    const target = await assertVersion(db, a.pid, b.to);
+    const execDir = b.kind === 'rollback' ? 'down' : b.kind === 'switch' ? 'switch' : 'up';
+    // exec_requests.direction 列约束仍为 ('up', 'down')：switch 存为 'up'，API 返回的 kind 由 migrations 推导
+    const storedDir = b.kind === 'rollback' ? 'down' : 'up';
+    if (!b.dryRun) {
+      if (b.kind !== 'rollback' && target.retired_at !== null && target.retired_at !== undefined)
+        return c.json(
+          { error: `版本 v${target.number}「${target.name}」已作废，不能提交该申请`, code: 'retired_target' },
+          409,
+        );
+      if (b.kind === 'switch' && b.acknowledgeRollback !== true)
+        return c.json(
+          { error: '切换申请必须确认回滚段会执行回滚脚本、可能造成数据丢失', code: 'rollback_ack_required' },
+          422,
+        );
+    }
     connectionLimit(c, ctx);
-    const dry = await dryRunFor(ctx, a, user.id, { mode: 'migrate', to: b.to, direction });
+    const dry = await dryRunFor(ctx, a, user.id, { mode: 'migrate', to: b.to, direction: execDir });
     if (b.dryRun) return c.json(dry);
     if (!dry.ok || !dry.plan)
       return c.json(
@@ -391,39 +442,64 @@ export const registerRequests = (app: Hono<Env>, ctx: AppContext) => {
           '环境的当前版本和预演读到的不一致（平台库的缓存可能落后于目标库）：请在环境页刷新执行历史后重新提交',
         );
       if (env.drift_status === 'drifted') throw conflict('环境检测到漂移，不能提交申请');
-      const migrations = await snapshotOf(tx, a.pid, plan);
+      const migrations = await snapshotOf(tx, a.pid, plan, b.kind, b.to);
       const flow = flowOf(auth.resolved);
       const id = newId();
-      const now = new Date();
-      await tx.query(
-        `insert into exec_requests (id, project_id, environment_id, requested_by, direction, from_version_id, to_version_id,
-            migrations, dry_run, reason, flow, conn_hash, production, status, stage, expires_at, created_at, updated_at)
-         values ($1, $2, $3, $4, $5, $6, $7, $8::text::jsonb, $9::text::jsonb, $10, $11::text::jsonb, $12, $13, 'pending', 0, $14, $15, $15)`,
-        [
-          id,
-          a.pid,
-          env.id,
-          user.id,
-          direction,
-          env.current_version_id,
-          b.to,
-          JSON.stringify(migrations),
-          JSON.stringify({
-            firstRun: plan.firstRun,
-            createsHistory: plan.createsHistory,
-            resume: plan.resume
-              ? { versionId: plan.resume.versionId, afterStep: plan.resume.afterStep }
-              : null,
-            checks: plan.checks,
-          }),
-          b.reason,
-          JSON.stringify(flow),
-          connHash(env),
-          env.production,
-          Requests.expiry(auth.resolved, now),
-          now.toISOString(),
-        ],
-      );
+      const dbNow = await readDbNow(tx, db.dialect);
+      const expiresAt = Requests.expiry(auth.resolved, dbNow);
+      const downIds = migrations.filter((m) => m.direction === 'down').map((m) => m.versionId);
+      const dryRunJson = JSON.stringify({
+        firstRun: plan.firstRun,
+        createsHistory: plan.createsHistory,
+        resume: plan.resume ? { versionId: plan.resume.versionId, afterStep: plan.resume.afterStep } : null,
+        checks: plan.checks,
+      });
+      const baseParams = [
+        id,
+        a.pid,
+        env.id,
+        user.id,
+        storedDir,
+        env.current_version_id,
+        b.to,
+        JSON.stringify(migrations),
+        dryRunJson,
+        b.reason,
+        JSON.stringify(flow),
+        connHash(env),
+        env.production,
+        expiresAt,
+      ];
+      if (db.dialect === 'pg') {
+        const createdExpr = downIds.length
+          ? `greatest(clock_timestamp(), coalesce((select max(retired_at) from versions where project_id = $2 and id in (${inList(downIds, 15)})), '-infinity'::timestamptz))`
+          : 'clock_timestamp()';
+        await tx.query(
+          `insert into exec_requests (id, project_id, environment_id, requested_by, direction, from_version_id, to_version_id,
+              migrations, dry_run, reason, flow, conn_hash, production, status, stage, expires_at, created_at, updated_at)
+           values ($1, $2, $3, $4, $5, $6, $7, $8::text::jsonb, $9::text::jsonb, $10, $11::text::jsonb, $12, $13, 'pending', 0, $14, ${createdExpr}, clock_timestamp())`,
+          downIds.length ? [...baseParams, ...downIds] : baseParams,
+        );
+      } else {
+        const nowIso = dbNow.toISOString();
+        let createdAt = nowIso;
+        if (downIds.length) {
+          const [maxRow] = await tx.query<{ m: unknown }>(
+            `select max(retired_at) as m from versions where project_id = $1 and retired_at is not null and id in (${inList(downIds, 2)})`,
+            [a.pid, ...downIds],
+          );
+          const maxIso = iso(maxRow?.m);
+          if (maxIso && new Date(maxIso).getTime() > dbNow.getTime()) {
+            createdAt = new Date(maxIso).toISOString();
+          }
+        }
+        await tx.query(
+          `insert into exec_requests (id, project_id, environment_id, requested_by, direction, from_version_id, to_version_id,
+              migrations, dry_run, reason, flow, conn_hash, production, status, stage, expires_at, created_at, updated_at)
+           values ($1, $2, $3, $4, $5, $6, $7, $8::text::jsonb, $9::text::jsonb, $10, $11::text::jsonb, $12, $13, 'pending', 0, $14, $15, $16)`,
+          [...baseParams, createdAt, nowIso],
+        );
+      }
       await auditIn(
         tx,
         c,
@@ -438,9 +514,11 @@ export const registerRequests = (app: Hono<Env>, ctx: AppContext) => {
             environmentId: env.id,
             name: env.name,
             production: env.production,
-            direction,
+            kind: b.kind,
+            direction: execDir,
             from: env.current_version_id,
             to: b.to,
+            ...(plan.lca ? { lca: plan.lca } : {}),
             migrations: migrations.map((m) => ({
               number: m.number,
               direction: m.direction,
@@ -567,11 +645,22 @@ export const registerRequests = (app: Hono<Env>, ctx: AppContext) => {
     if (!can(userActor(user), 'instance.emergency_execute', { kind: 'instance' }))
       throw forbidden('只有实例管理员能紧急执行');
     const b = await body(c, emergencyExecuteSchema);
-    await assertVersion(db, a.pid, b.to);
-    const direction = b.kind === 'rollback' ? 'down' : 'up';
+    const target = await assertVersion(db, a.pid, b.to);
+    const execDir = b.kind === 'rollback' ? 'down' : b.kind === 'switch' ? 'switch' : 'up';
+    const storedDir = b.kind === 'rollback' ? 'down' : 'up';
+    if (b.kind !== 'rollback' && target.retired_at !== null && target.retired_at !== undefined)
+      return c.json(
+        { error: `版本 v${target.number}「${target.name}」已作废，不能紧急执行到它`, code: 'retired_target' },
+        409,
+      );
+    if (b.kind === 'switch' && b.acknowledgeRollback !== true)
+      return c.json(
+        { error: '紧急切换必须确认回滚段会执行回滚脚本、可能造成数据丢失', code: 'rollback_ack_required' },
+        422,
+      );
     confirmed(a.env, b.confirm);
     connectionLimit(c, ctx);
-    const dry = await dryRunFor(ctx, a, user.id, { mode: 'migrate', to: b.to, direction });
+    const dry = await dryRunFor(ctx, a, user.id, { mode: 'migrate', to: b.to, direction: execDir });
     if (!dry.ok || !dry.plan)
       return c.json(
         {
@@ -591,21 +680,22 @@ export const registerRequests = (app: Hono<Env>, ctx: AppContext) => {
         throw conflict('环境的当前版本在检查之后变了，请重试');
       confirmed(env, b.confirm);
       const auth = envAuthOf(await loadPolicies(tx, project), rc, project, env);
-      const migrations = await snapshotOf(tx, a.pid, plan);
+      const migrations = await snapshotOf(tx, a.pid, plan, b.kind, b.to);
       const flow = flowOf(auth.resolved);
       const id = newId();
-      const now = new Date();
+      const dbNow = await readDbNow(tx, db.dialect);
+      const nowSql = dbNowSql(db.dialect);
       await tx.query(
         `insert into exec_requests (id, project_id, environment_id, requested_by, direction, from_version_id, to_version_id,
             migrations, dry_run, reason, flow, conn_hash, production, status, stage, expires_at, created_at, updated_at,
             executed_by, emergency, worker_id)
-         values ($1, $2, $3, $4, $5, $6, $7, $8::text::jsonb, null, $9, $10::text::jsonb, $11, $12, 'executing', $13, $14, $15, $15, $4, $16, $17)`,
+         values ($1, $2, $3, $4, $5, $6, $7, $8::text::jsonb, null, $9, $10::text::jsonb, $11, $12, 'executing', $13, $14, ${nowSql}, ${nowSql}, $4, $15, $16)`,
         [
           id,
           a.pid,
           env.id,
           user.id,
-          direction,
+          storedDir,
           env.current_version_id,
           b.to,
           JSON.stringify(migrations),
@@ -614,8 +704,7 @@ export const registerRequests = (app: Hono<Env>, ctx: AppContext) => {
           connHash(env),
           env.production,
           stagesOf(flow).length,
-          Requests.expiry(auth.resolved, now),
-          now.toISOString(),
+          Requests.expiry(auth.resolved, dbNow),
           true,
           requests.workerId,
         ],
@@ -634,9 +723,11 @@ export const registerRequests = (app: Hono<Env>, ctx: AppContext) => {
             environmentId: env.id,
             name: env.name,
             production: env.production,
-            direction,
+            kind: b.kind,
+            direction: execDir,
             from: env.current_version_id,
             to: b.to,
+            ...(plan.lca ? { lca: plan.lca } : {}),
             reason: b.reason,
             migrations: migrations.map((m) => m.number),
           },

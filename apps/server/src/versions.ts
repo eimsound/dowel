@@ -17,12 +17,19 @@ import {
   type Step,
   validate,
 } from '@dowel/core';
-import { type Db, getEngine, isNontransactionalSql, type ScriptStep } from '@dowel/engines';
+import {
+  type Db,
+  getEngine,
+  indexTree,
+  isNontransactionalSql,
+  maxNumberNode,
+  type ScriptStep,
+} from '@dowel/engines';
 import { HTTPException } from 'hono/http-exception';
 
-import { emptyBase } from './chain.ts';
+import { emptyBase, versionExecutedAnywhere } from './chain.ts';
 import type { OpaqueRefresher } from './derive.ts';
-import { projectPlanOptions } from './envs.ts';
+import { iso, projectPlanOptions } from './envs.ts';
 import type { Rooms } from './rooms.ts';
 import { scrubSecrets } from './secrets.ts';
 import { ShadowError, storedReport } from './shadow.ts';
@@ -39,7 +46,10 @@ export interface InfoRow {
   edited: boolean;
   createdAt: string;
   createdBy: string | null;
-  restoredAt: string | null;
+  retiredAt: unknown;
+  retiredBy: string | null;
+  executedAt: unknown;
+  restoredAt: unknown;
 }
 
 /** 详情字段：模型、冻结脚本和验证报告 */
@@ -57,14 +67,18 @@ export type VersionRow = InfoRow & Detail;
 
 /** 列表只要概要：不读模型和冻结脚本（模型可能很大，版本又多） */
 export const INFO_COLUMNS = `v.id, v.name, v.seq, v.number, v.parent_id as "parentId", v.verified_at as "verifiedAt", v.edited,
-  v.created_at as "createdAt", u.name as "createdBy", v.restored_at as "restoredAt"`;
+  v.created_at as "createdAt", u.name as "createdBy", v.retired_at as "retiredAt", ru.name as "retiredBy",
+  v.executed_at as "executedAt", v.restored_at as "restoredAt"`;
 export const ROW_COLUMNS = `${INFO_COLUMNS}, v.model, v.up_steps as "upSteps", v.down_steps as "downSteps", v.checksum,
   v.verify_report as "verifyReport", v.scope`;
 
 /** 取项目里的一个版本（带冻结脚本和验证报告）；不存在抛 404 */
 export const loadVersion = async (db: Db, pid: string, vid: string): Promise<VersionRow> => {
   const [v] = await db.query<VersionRow>(
-    `select ${ROW_COLUMNS} from versions v left join users u on u.id = v.created_by
+    `select ${ROW_COLUMNS}
+       from versions v
+       left join users u on u.id = v.created_by
+       left join users ru on ru.id = v.retired_by
       where v.id = $1 and v.project_id = $2`,
     [vid, pid],
   );
@@ -72,14 +86,18 @@ export const loadVersion = async (db: Db, pid: string, vid: string): Promise<Ver
   return v;
 };
 
-/** 按版本号、'latest' 或 ID 查找版本；不存在返回 null */
+/** 按版本号、'latest'（活跃链头）或 ID 查找版本；不存在返回 null */
 export const findVersion = async (db: Db, pid: string, ref: string): Promise<VersionRow | null> => {
   if (ref === 'latest') {
     return (
       (
         await db.query<VersionRow>(
-          `select ${ROW_COLUMNS} from versions v left join users u on u.id = v.created_by
-            where v.project_id = $1 order by v.number desc limit 1`,
+          `select ${ROW_COLUMNS}
+             from versions v
+             left join users u on u.id = v.created_by
+             left join users ru on ru.id = v.retired_by
+            where v.project_id = $1 and v.retired_at is null
+            order by v.number desc limit 1`,
           [pid],
         )
       )[0] ?? null
@@ -92,7 +110,10 @@ export const findVersion = async (db: Db, pid: string, ref: string): Promise<Ver
     return (
       (
         await db.query<VersionRow>(
-          `select ${ROW_COLUMNS} from versions v left join users u on u.id = v.created_by
+          `select ${ROW_COLUMNS}
+             from versions v
+             left join users u on u.id = v.created_by
+             left join users ru on ru.id = v.retired_by
             where v.project_id = $1 and v.number = $2`,
           [pid, num],
         )
@@ -102,7 +123,10 @@ export const findVersion = async (db: Db, pid: string, ref: string): Promise<Ver
   return (
     (
       await db.query<VersionRow>(
-        `select ${ROW_COLUMNS} from versions v left join users u on u.id = v.created_by
+        `select ${ROW_COLUMNS}
+           from versions v
+           left join users u on u.id = v.created_by
+           left join users ru on ru.id = v.retired_by
           where v.id = $1 and v.project_id = $2`,
         [ref, pid],
       )
@@ -110,25 +134,119 @@ export const findVersion = async (db: Db, pid: string, ref: string): Promise<Ver
   );
 };
 
-/** 链头概要：链上最新的版本（number 最大）的 id 和 number。检查并发、判断“是不是最新”只需要它，不读模型 */
-export const chainHead = async (db: Db, pid: string) =>
+/** 活跃链头概要：未作废且 number 最大的版本。检查并发、判断“是不是活跃最新”只需要它，不读模型 */
+export const activeHead = async (db: Db, pid: string) =>
   (
     await db.query<{ id: string; number: number }>(
-      'select id, number from versions where project_id = $1 order by number desc limit 1',
+      'select id, number from versions where project_id = $1 and retired_at is null order by number desc limit 1',
       [pid],
     )
   )[0] ?? null;
 
-/** 链头连同模型：只有发布时算 parent / from 才需要 */
-export const chainHeadWithModel = async (db: Db, pid: string) =>
+/** 活跃链头连同模型：只有发布时算 parent / from 才需要 */
+export const activeHeadWithModel = async (db: Db, pid: string) =>
   (
     await db.query<{ id: string; number: number; model: Model }>(
-      'select id, number, model from versions where project_id = $1 order by number desc limit 1',
+      'select id, number, model from versions where project_id = $1 and retired_at is null order by number desc limit 1',
       [pid],
     )
   )[0] ?? null;
 
-export const toVersionInfo = (v: InfoRow, latestId: string | null): VersionInfo => ({
+/** 全局最大版本号（包含已作废的版本，ADR 0013 版本号只增不重用） */
+export const globalMaxNumber = async (db: Db, pid: string): Promise<number | null> => {
+  const [row] = await db.query<{ max: number | string | null }>(
+    'select max(number) as max from versions where project_id = $1',
+    [pid],
+  );
+  return row?.max == null ? null : Number(row.max);
+};
+
+/** 项目内存在进行中执行（state = 'claimed'）的版本 ID 集合（集合查询，避免列表 N+1） */
+export const claimedVersionIds = async (db: Db, pid: string): Promise<Set<string>> =>
+  new Set(
+    (
+      await db.query<{ versionId: string }>(
+        `select distinct ev.version_id as "versionId"
+           from environment_versions ev
+           join environments e on e.id = ev.environment_id
+          where e.project_id = $1 and ev.state = 'claimed'`,
+        [pid],
+      )
+    ).map((r) => r.versionId),
+  );
+
+export interface VersionTreeNode {
+  id: string;
+  number: number;
+  parentId: string | null;
+  retired: boolean;
+}
+
+export interface UnretireAnalysis<T extends VersionTreeNode> {
+  globalMax: T | null;
+  activeHead: T | null;
+  /** (activeHead, globalMax] 沿 parent_id 的整条待恢复路径（编号升序）；不可恢复时为空 */
+  path: T[];
+  /** path 上所有版本的 id 集合 */
+  ids: Set<string>;
+}
+
+/**
+ * 计算当前项目唯一允许一键取消作废的路径 (activeHead, globalMax]（ADR 0013）：
+ * 仅当全局最大编号版本已作废，且从它沿 parent_id 回溯能连续穿过已作废节点到达当前活跃链头时才成立。
+ * 列表 / 详情的 `unretirable` 标记与 `POST .../unretire` 共用同一判定函数。
+ */
+export const analyzeUnretire = <T extends VersionTreeNode>(nodes: readonly T[]): UnretireAnalysis<T> => {
+  const globalMax = maxNumberNode(nodes);
+  let head: T | null = null;
+  for (const n of nodes) if (!n.retired && (!head || n.number > head.number)) head = n;
+  if (!globalMax || !head || !globalMax.retired) {
+    return { globalMax, activeHead: head, path: [], ids: new Set() };
+  }
+  const byId = indexTree(nodes);
+  const reversed: T[] = [];
+  const seen = new Set<string>();
+  let cur: T | undefined = globalMax;
+  let reachedHead = false;
+  while (cur) {
+    if (cur.id === head.id) {
+      reachedHead = true;
+      break;
+    }
+    if (seen.has(cur.id) || !cur.retired) break;
+    seen.add(cur.id);
+    reversed.push(cur);
+    cur = cur.parentId ? byId.get(cur.parentId) : undefined;
+  }
+  const path = reachedHead ? reversed.reverse() : [];
+  return { globalMax, activeHead: head, path, ids: new Set(path.map((n) => n.id)) };
+};
+
+export const loadVersionTree = async (db: Db, pid: string): Promise<VersionTreeNode[]> => {
+  const rows = await db.query<{
+    id: string;
+    number: number;
+    parentId: string | null;
+    retiredAt: unknown;
+  }>(
+    'select id, number, parent_id as "parentId", retired_at as "retiredAt" from versions where project_id = $1',
+    [pid],
+  );
+  return rows.map((r) => ({
+    id: r.id,
+    number: r.number,
+    parentId: r.parentId,
+    retired: r.retiredAt !== null && r.retiredAt !== undefined,
+  }));
+};
+
+export interface InfoFlags {
+  latest: boolean;
+  executed: boolean;
+  unretirable: boolean;
+}
+
+export const toVersionInfo = (v: InfoRow, flags: InfoFlags): VersionInfo => ({
   id: v.id,
   name: v.name,
   seq: v.seq,
@@ -138,34 +256,74 @@ export const toVersionInfo = (v: InfoRow, latestId: string | null): VersionInfo 
   createdBy: v.createdBy,
   verifiedAt: v.verifiedAt,
   edited: v.edited,
-  latest: v.id === latestId,
-  restoredAt: v.restoredAt ? new Date(v.restoredAt).toISOString() : null,
+  latest: flags.latest,
+  retiredAt: iso(v.retiredAt),
+  retiredBy: v.retiredBy ?? null,
+  executed: flags.executed,
+  unretirable: flags.unretirable,
+  restoredAt: iso(v.restoredAt),
 });
 
-export const toVersionDetail = (v: VersionRow, latestId: string | null): VersionDetail => ({
-  ...toVersionInfo(v, latestId),
+export const toVersionDetail = (v: VersionRow, flags: InfoFlags): VersionDetail => ({
+  ...toVersionInfo(v, flags),
   upSteps: v.upSteps,
   downSteps: v.downSteps,
   checksum: v.checksum,
   verifyReport: v.verifyReport,
 });
 
+export const versionDetailOf = async (db: Db, pid: string, v: VersionRow): Promise<VersionDetail> => {
+  const analysis = analyzeUnretire(await loadVersionTree(db, pid));
+  const executed =
+    (v.executedAt !== null && v.executedAt !== undefined) || (await versionExecutedAnywhere(db, v.id));
+  return toVersionDetail(v, {
+    latest: v.id === (analysis.activeHead?.id ?? null),
+    executed,
+    unretirable: analysis.ids.has(v.id),
+  });
+};
+
 /** 列出项目的版本列表（按 number 倒序），可限制条数 */
 export const listProjectVersions = async (db: Db, pid: string, limit?: number): Promise<VersionInfo[]> => {
   const rows =
     limit !== undefined
       ? await db.query<InfoRow>(
-          `select ${INFO_COLUMNS} from versions v left join users u on u.id = v.created_by
-            where v.project_id = $1 order by v.number desc limit $2`,
+          `select ${INFO_COLUMNS}
+             from versions v
+             left join users u on u.id = v.created_by
+             left join users ru on ru.id = v.retired_by
+            where v.project_id = $1
+            order by v.number desc limit $2`,
           [pid, limit],
         )
       : await db.query<InfoRow>(
-          `select ${INFO_COLUMNS} from versions v left join users u on u.id = v.created_by
-            where v.project_id = $1 order by v.number desc`,
+          `select ${INFO_COLUMNS}
+             from versions v
+             left join users u on u.id = v.created_by
+             left join users ru on ru.id = v.retired_by
+            where v.project_id = $1
+            order by v.number desc`,
           [pid],
         );
-  const latestId = rows[0]?.id ?? null;
-  return rows.map((v) => toVersionInfo(v, latestId));
+  const claimedIds = await claimedVersionIds(db, pid);
+  const tree =
+    limit === undefined
+      ? rows.map((r) => ({
+          id: r.id,
+          number: r.number,
+          parentId: r.parentId,
+          retired: r.retiredAt !== null && r.retiredAt !== undefined,
+        }))
+      : await loadVersionTree(db, pid);
+  const analysis = analyzeUnretire(tree);
+  const activeHeadId = analysis.activeHead?.id ?? null;
+  return rows.map((v) =>
+    toVersionInfo(v, {
+      latest: v.id === activeHeadId,
+      executed: (v.executedAt !== null && v.executedAt !== undefined) || claimedIds.has(v.id),
+      unretirable: analysis.ids.has(v.id),
+    }),
+  );
 };
 
 export type MultiVersionVerifyOutcome =

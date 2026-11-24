@@ -12,7 +12,7 @@ import type {
 } from '@dowel/api';
 import { needsManualSchema } from '@dowel/api';
 import { deriveTargetPgMajor, type Dialect, type Model, pgMajorOf, type PlanOptions } from '@dowel/core';
-import type { Db, ScriptStep } from '@dowel/engines';
+import { type Db, indexTree, pathFromRoot, type ScriptStep } from '@dowel/engines';
 import { type ChainVersion, isNonTx, runTouched, runVersionId, type TargetState } from '@dowel/executor';
 import { HTTPException } from 'hono/http-exception';
 
@@ -167,6 +167,8 @@ export const loadEnv = async (db: Db, pid: string, eid: string): Promise<EnvRow>
 export interface VersionMeta {
   id: string;
   number: number;
+  parentId: string | null;
+  retired: boolean;
   name: string;
   verifiedAt: unknown;
   edited: boolean;
@@ -175,13 +177,19 @@ export interface VersionMeta {
   verifyReport: { risks?: { level: 'low' | 'medium' | 'high'; note?: string }[]; riskError?: string } | null;
 }
 
-export const loadVersionMetas = async (db: Db, pid: string): Promise<VersionMeta[]> =>
-  db.query<VersionMeta>(
-    `select id, number, name, verified_at as "verifiedAt", edited, up_steps as "upSteps",
+export const loadVersionMetas = async (db: Db, pid: string): Promise<VersionMeta[]> => {
+  const rows = await db.query<Omit<VersionMeta, 'retired'> & { retiredAt: unknown }>(
+    `select id, number, parent_id as "parentId", retired_at as "retiredAt", name,
+            verified_at as "verifiedAt", edited, up_steps as "upSteps",
             down_steps as "downSteps", verify_report as "verifyReport"
        from versions where project_id = $1 order by number`,
     [pid],
   );
+  return rows.map(({ retiredAt, ...rest }) => ({
+    ...rest,
+    retired: retiredAt !== null && retiredAt !== undefined,
+  }));
+};
 
 /** 完整的版本链（含模型和冻结脚本，执行器 / 漂移检测用） */
 export const loadChain = async (db: Db, pid: string): Promise<ChainVersion[]> => {
@@ -189,6 +197,7 @@ export const loadChain = async (db: Db, pid: string): Promise<ChainVersion[]> =>
     id: string;
     number: number;
     parentId: string | null;
+    retiredAt: unknown;
     name: string;
     model: Model;
     upSteps: ScriptStep[];
@@ -199,8 +208,9 @@ export const loadChain = async (db: Db, pid: string): Promise<ChainVersion[]> =>
     createdBy: string | null;
     scope: string[] | null;
   }>(
-    `select id, number, parent_id as "parentId", name, model, up_steps as "upSteps", down_steps as "downSteps",
-            checksum, verified_at as "verifiedAt", created_at as "createdAt", created_by as "createdBy", scope
+    `select id, number, parent_id as "parentId", retired_at as "retiredAt", name, model,
+            up_steps as "upSteps", down_steps as "downSteps", checksum,
+            verified_at as "verifiedAt", created_at as "createdAt", created_by as "createdBy", scope
        from versions where project_id = $1 order by number`,
     [pid],
   );
@@ -214,6 +224,7 @@ export const loadChain = async (db: Db, pid: string): Promise<ChainVersion[]> =>
     downSteps: r.downSteps,
     checksum: r.checksum,
     verified: r.verifiedAt !== null && r.verifiedAt !== undefined,
+    retired: r.retiredAt !== null && r.retiredAt !== undefined,
     publishedAt: iso(r.createdAt) ?? new Date(0).toISOString(),
     publishedBy: r.createdBy,
     scope: r.scope?.length ? r.scope : null,
@@ -419,15 +430,56 @@ export const toEnvInfo = (
 
 const LEVELS = { low: 0, medium: 1, high: 2 } as const;
 
-/** 环境状态里的一个版本：相对环境当前版本是已执行 / 当前 / 待执行 */
+export type EnvVersionState = EnvVersion['state'];
+
+/**
+ * 按版本树计算各版本相对环境当前版本的状态（ADR 0013）：
+ * - current：就是当前版本；
+ * - applied：当前版本的严格祖先（沿 parent_id 到根，哪怕该祖先已作废）；
+ * - retired：已作废且不是当前版本或其祖先；
+ * - pending：活跃主链上（未作废）且不在当前版本祖先路径上的版本。
+ */
+export const versionStates = (
+  versions: readonly { id: string; number: number; parentId: string | null; retired: boolean }[],
+  currentId: string | null,
+): Map<string, EnvVersionState> => {
+  const out = new Map<string, EnvVersionState>();
+  const byId = indexTree(versions);
+  const ancestors = new Set<string>();
+  if (currentId !== null) {
+    const path = pathFromRoot(byId, currentId);
+    if (path) {
+      for (const n of path) if (n.id !== currentId) ancestors.add(n.id);
+    }
+  }
+  for (const v of versions) {
+    if (currentId !== null && v.id === currentId) out.set(v.id, 'current');
+    else if (ancestors.has(v.id)) out.set(v.id, 'applied');
+    else if (v.retired) out.set(v.id, 'retired');
+    else out.set(v.id, 'pending');
+  }
+  return out;
+};
+
+/** 环境状态里的一个版本：相对环境当前版本是已执行 / 当前 / 待执行 / 已作废 */
 export const toEnvVersion = (
   m: VersionMeta,
   current: VersionMeta | undefined,
   executed: Set<string>,
   dialect: Dialect = 'pg',
+  states?: ReadonlyMap<string, EnvVersionState>,
 ): EnvVersion => {
-  const state =
-    !current || m.number > current.number ? 'pending' : m.id === current.id ? 'current' : 'applied';
+  const state: EnvVersionState =
+    states?.get(m.id) ??
+    (current
+      ? m.id === current.id
+        ? 'current'
+        : m.retired
+          ? 'retired'
+          : m.number < current.number
+            ? 'applied'
+            : 'pending'
+      : versionStates([m], null).get(m.id)!);
   const risks = m.verifyReport?.risks ?? [];
   const analysed = risks.filter((r) => !r.note);
   return {
@@ -435,6 +487,8 @@ export const toEnvVersion = (
     number: m.number,
     name: m.name,
     state,
+    parentId: m.parentId,
+    retired: m.retired,
     verified: m.verifiedAt !== null && m.verifiedAt !== undefined,
     edited: m.edited,
     upSteps: m.upSteps.length,

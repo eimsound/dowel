@@ -2,20 +2,36 @@
 // 人工编辑冻结脚本、重新验证（执行的是冻结脚本而不是重新 plan）。
 // 平台库在 SQLite 和 PostgreSQL 上各跑一遍；影子库验证需要测试 PG（没有 Docker 时跳过）。
 import type {
+  CanvasHistoryConflict,
+  CanvasHistoryList,
+  ModelUpdate,
   PublishedTables,
   StoredVerifyReport,
+  VersionCanvasDiff,
   VersionCreated,
   VersionDetail,
   VersionInfo,
+  VersionRetireResult,
+  VersionUnretireResult,
 } from '@dowel/api';
-import { addColumn, all, createSchema, createTable, dropTable, emptyModel, type Model } from '@dowel/core';
+import {
+  addColumn,
+  all,
+  createSchema,
+  createTable,
+  dropTable,
+  emptyModel,
+  type Model,
+  newId,
+} from '@dowel/core';
 import { type Db, type ScriptStep, stepsChecksum } from '@dowel/engines';
 import { HTTPException } from 'hono/http-exception';
-import { afterAll, beforeAll, describe, expect, test } from 'vitest';
+import { afterAll, beforeAll, describe, expect, test, vi } from 'vitest';
 
 import { connect, createTestDb, PG_URL } from '../../../test/pg.ts';
 import { createApp, openPlatformDb, type PlatformDb } from '../src/index.ts';
 import { LoginLimiter } from '../src/rate-limit.ts';
+import { connHash } from '../src/requests.ts';
 import { encrypt, SecretError } from '../src/secrets.ts';
 import { type Shadow, ShadowError, shadowOps } from '../src/shadow.ts';
 import { shadowSetupError } from '../src/targets.ts';
@@ -113,6 +129,22 @@ describe.each([
     call('PATCH', `/api/projects/${pid}/versions/${vid}/steps`, { up, down }, cookie);
   const reverify = (pid: string, vid: string, cookie = admin) =>
     call('POST', `/api/projects/${pid}/versions/${vid}/verify`, undefined, cookie);
+  const retire = (
+    pid: string,
+    vid: string,
+    body: { head: string; keepWorkingCopy?: boolean; workingSeq?: number },
+    cookie = editor,
+  ) => call('POST', `/api/projects/${pid}/versions/${vid}/retire`, body, cookie);
+  const unretire = (
+    pid: string,
+    vid: string,
+    body: { syncWorkingCopy?: boolean; workingSeq?: number } = {},
+    cookie = editor,
+  ) => call('POST', `/api/projects/${pid}/versions/${vid}/unretire`, body, cookie);
+  const canvasDiff = (pid: string, vid: string, cookie = viewer) =>
+    call('GET', `/api/projects/${pid}/versions/${vid}/canvas-diff`, undefined, cookie);
+  const applyVersion = (pid: string, vid: string, workingSeq: number, cookie = editor) =>
+    call('POST', `/api/projects/${pid}/versions/${vid}/apply`, { workingSeq }, cookie);
 
   beforeAll(async () => {
     if (skip) return;
@@ -133,6 +165,8 @@ describe.each([
 
   afterAll(async () => {
     if (skip) return;
+    created.requests.stop();
+    await created.webhooks.close();
     await created.rooms.flush();
     await created.shadows.close();
     await db.close();
@@ -1098,6 +1132,883 @@ describe.each([
       const ids = (r2.data as unknown as PublishedTables).tableIds;
       expect(ids).toContain(t1Id);
       expect(ids).toContain(t2Id);
+    },
+  );
+
+  // ───── ADR 0013：链尾版本作废 / 取消作废 / 应用到画布 ─────
+
+  test.skipIf(skip)(
+    '作废后发布编号只增不重用，latest/列表字段正确，已作废版本禁编辑但可按 parent_id 重新验证',
+    async () => {
+      const pid = await newProject('adr13-numbering');
+      await addTable(created.rooms, db, pid);
+      const v1 = (await publish(pid, 'v1')).data as unknown as VersionCreated;
+      await editModel(created.rooms, db, pid, (m) => void addNote(m, 'c2'));
+      const v2 = (await publish(pid, 'v2')).data as unknown as VersionCreated;
+      await editModel(created.rooms, db, pid, (m) => void addNote(m, 'c3'));
+      const v3 = (await publish(pid, 'v3')).data as unknown as VersionCreated;
+
+      // 作废 v3（默认回退工作副本到 v2）
+      const ret3 = await retire(pid, v3.id, { head: v3.id }, editor);
+      expect(ret3.status).toBe(200);
+      const ret3Data = ret3.data as unknown as VersionRetireResult;
+      expect(ret3Data).toMatchObject({
+        retired: [{ id: v3.id, number: 3, name: 'v3' }],
+        head: { id: v2.id, number: 2, name: 'v2' },
+        invalidatedRequests: 0,
+        workingCopy: 'reverted',
+      });
+
+      // 工作副本已回到 v2，直接点发布应报“与当前活跃版本（v2）没有变更”
+      const noChange = await publish(pid, 'dup');
+      expect(noChange.status).toBe(422);
+      expect(String(noChange.data.error)).toContain('v2');
+
+      // 修改工作副本并发布：编号必须是全局 max + 1 = 4，parent 是活跃链头 v2
+      await editModel(created.rooms, db, pid, (m) => void addNote(m, 'c4'));
+      const v4 = (await publish(pid, 'v4')).data as unknown as VersionCreated;
+      expect(v4.number).toBe(4);
+
+      // 再次作废 v4 并发布，编号跳到 5，parent 仍为 v2
+      expect((await retire(pid, v4.id, { head: v4.id })).status).toBe(200);
+      await editModel(created.rooms, db, pid, (m) => void addNote(m, 'c5'));
+      const v5 = (await publish(pid, 'v5')).data as unknown as VersionCreated;
+      expect(v5.number).toBe(5);
+
+      const items = await list(pid);
+      expect(
+        items.map((x) => ({
+          n: x.number,
+          parentId: x.parentId,
+          latest: x.latest,
+          retired: x.retiredAt !== null,
+          retiredBy: x.retiredBy,
+          executed: x.executed,
+          unretirable: x.unretirable,
+        })),
+      ).toEqual([
+        {
+          n: 5,
+          parentId: v2.id,
+          latest: true,
+          retired: false,
+          retiredBy: null,
+          executed: false,
+          unretirable: false,
+        },
+        {
+          n: 4,
+          parentId: v2.id,
+          latest: false,
+          retired: true,
+          retiredBy: '编辑者',
+          executed: false,
+          unretirable: false,
+        },
+        {
+          n: 3,
+          parentId: v2.id,
+          latest: false,
+          retired: true,
+          retiredBy: '编辑者',
+          executed: false,
+          unretirable: false,
+        },
+        {
+          n: 2,
+          parentId: v1.id,
+          latest: false,
+          retired: false,
+          retiredBy: null,
+          executed: false,
+          unretirable: false,
+        },
+        {
+          n: 1,
+          parentId: null,
+          latest: false,
+          retired: false,
+          retiredBy: null,
+          executed: false,
+          unretirable: false,
+        },
+      ]);
+
+      // 详情也携带一致的新字段
+      const d3 = await detail(pid, v3.id);
+      expect(d3.latest).toBe(false);
+      expect(d3.retiredAt).toMatch(/^\d{4}-\d\d-\d\dT/);
+      expect(d3.retiredBy).toBe('编辑者');
+      expect(d3.executed).toBe(false);
+      expect(d3.unretirable).toBe(false);
+
+      // 已作废版本禁止编辑脚本（409），新活跃链头 v5 允许编辑脚本
+      expect((await patchSteps(pid, v3.id, d3.upSteps, d3.downSteps)).status).toBe(409);
+      const d5 = await detail(pid, v5.id);
+      expect((await patchSteps(pid, v5.id, [...d5.upSteps, step('SELECT 1')], d5.downSteps)).status).toBe(
+        200,
+      );
+
+      // 重新验证：已作废版本 v4 和跳号版本 v5 都必须按 parent_id (v2) 而非 number - 1 作为 from
+      const d2 = await detail(pid, v2.id);
+      const seenFromCols: string[][] = [];
+      const restore = stubShadows(async () => ({
+        label: 'stub：shadow',
+        shadow: {
+          verifyScripts: async (from) => {
+            seenFromCols.push(all(from, 'column').map((c) => c.name));
+            return okReport;
+          },
+        },
+      }));
+      try {
+        expect((await reverify(pid, v4.id)).status).toBe(200);
+        expect((await reverify(pid, v5.id)).status).toBe(200);
+        expect(seenFromCols).toEqual([
+          ['id', 'c2'],
+          ['id', 'c2'],
+        ]);
+        expect(d2.number).toBe(2);
+      } finally {
+        restore();
+      }
+    },
+  );
+
+  test.skipIf(skip)(
+    'GET /published-tables 排除已作废且从未执行过的版本，但保留已作废且已执行过的版本',
+    async () => {
+      const pid = await newProject('adr13-pub-tables');
+      let tKeep = '';
+      let tRetiredExec = '';
+      let tRetiredUnexec = '';
+      await editModel(created.rooms, db, pid, (m) => {
+        const pub = all(m, 'schema').find((s) => s.name === 'public')!;
+        tKeep = createTable(m, pub.id, 't_keep');
+        addColumn(m, tKeep, { name: 'id', type: 'integer', notNull: true });
+      });
+      const v1 = (await publish(pid, 'v1')).data as unknown as VersionCreated;
+
+      await editModel(created.rooms, db, pid, (m) => {
+        const pub = all(m, 'schema').find((s) => s.name === 'public')!;
+        tRetiredExec = createTable(m, pub.id, 't_retired_exec');
+        addColumn(m, tRetiredExec, { name: 'id', type: 'integer', notNull: true });
+      });
+      const v2 = (await publish(pid, 'v2')).data as unknown as VersionCreated;
+      await db.query('update versions set executed_at = $2 where id = $1', [v2.id, new Date().toISOString()]);
+
+      await editModel(created.rooms, db, pid, (m) => {
+        const pub = all(m, 'schema').find((s) => s.name === 'public')!;
+        tRetiredUnexec = createTable(m, pub.id, 't_retired_unexec');
+        addColumn(m, tRetiredUnexec, { name: 'id', type: 'integer', notNull: true });
+      });
+      const v3 = (await publish(pid, 'v3')).data as unknown as VersionCreated;
+
+      // 作废 v2 与 v3（含已执行的 v2，需 admin）
+      expect((await retire(pid, v2.id, { head: v3.id }, admin)).status).toBe(200);
+
+      const res = await call('GET', `/api/projects/${pid}/published-tables`, undefined, viewer);
+      expect(res.status).toBe(200);
+      const ids = (res.data as unknown as PublishedTables).tableIds;
+      expect(ids).toContain(tKeep);
+      expect(ids).toContain(tRetiredExec);
+      expect(ids).not.toContain(tRetiredUnexec);
+      expect(v1.number).toBe(1);
+    },
+  );
+
+  test.skipIf(skip)(
+    'retire 校验与权限分级：首版本422 / 已作废422 / head过期409 / claimed 409 / 已执行需admin / 工作副本四种结果',
+    async () => {
+      const pid = await newProject('adr13-retire-rules');
+      await addTable(created.rooms, db, pid);
+      const v1 = (await publish(pid, 'v1')).data as unknown as VersionCreated;
+      await editModel(created.rooms, db, pid, (m) => void addNote(m, 'c2'));
+      const v2 = (await publish(pid, 'v2')).data as unknown as VersionCreated;
+      await editModel(created.rooms, db, pid, (m) => void addNote(m, 'c3'));
+      const v3 = (await publish(pid, 'v3')).data as unknown as VersionCreated;
+      await editModel(created.rooms, db, pid, (m) => void addNote(m, 'c4'));
+      const v4 = (await publish(pid, 'v4')).data as unknown as VersionCreated;
+
+      // 1. 不存在 404，首版本 422，head 不匹配 409 head_changed，viewer 403
+      expect((await retire(pid, 'nope', { head: v4.id })).status).toBe(404);
+      expect((await retire(pid, v4.id, { head: v4.id }, viewer)).status).toBe(403);
+      expect((await retire(pid, v1.id, { head: v4.id })).status).toBe(422);
+      const badHead = await retire(pid, v3.id, { head: v3.id });
+      expect(badHead.status).toBe(409);
+      expect(badHead.data.code).toBe('head_changed');
+
+      // 2. 存在 claimed 进行中执行 → 409 execution_in_progress，且列表 executed=true
+      const envId = newId();
+      await db.query(
+        `insert into environments (id, project_id, name, url_enc, production)
+         values ($1, $2, 'staging', $3, false)`,
+        [envId, pid, encrypt('postgres://127.0.0.1:1/stg')],
+      );
+      await db.query(
+        `insert into environment_versions (environment_id, version_id, state)
+         values ($1, $2, 'claimed')`,
+        [envId, v4.id],
+      );
+      expect((await list(pid)).find((x) => x.id === v4.id)!.executed).toBe(true);
+      const claimedRes = await retire(pid, v3.id, { head: v4.id }, admin);
+      expect(claimedRes.status).toBe(409);
+      expect(claimedRes.data.code).toBe('execution_in_progress');
+      expect(String(claimedRes.data.error)).toContain('v4');
+      expect(String(claimedRes.data.error)).toContain('staging');
+      await db.query('delete from environment_versions where environment_id = $1', [envId]);
+
+      // 3. 含 executed_at：editor 403，admin 200；同时测试 keepWorkingCopy = true（outcome = 'kept'）
+      await db.query('update versions set executed_at = $2 where id = $1', [v3.id, new Date().toISOString()]);
+      expect((await retire(pid, v3.id, { head: v4.id, keepWorkingCopy: true }, editor)).status).toBe(403);
+      const ret34 = await retire(pid, v3.id, { head: v4.id, keepWorkingCopy: true }, admin);
+      expect(ret34.status).toBe(200);
+      expect(ret34.data as unknown as VersionRetireResult).toMatchObject({
+        retired: [
+          { id: v3.id, number: 3, name: 'v3' },
+          { id: v4.id, number: 4, name: 'v4' },
+        ],
+        head: { id: v2.id, number: 2, name: 'v2' },
+        workingCopy: 'kept',
+      });
+
+      // 已作废版本再次 retire → 422
+      const alreadyRetired = await retire(pid, v4.id, { head: v2.id }, admin);
+      expect(alreadyRetired.status).toBe(422);
+
+      // 4. 取消作废 [v3, v4] 权限分级：editor 403（因 v3 executed_at 非空），admin 200（顺便测 syncWorkingCopy: true）
+      expect((await unretire(pid, v4.id, { syncWorkingCopy: false }, editor)).status).toBe(403);
+      const unret = await unretire(pid, v3.id, { syncWorkingCopy: true }, admin);
+      expect(unret.status).toBe(200);
+      expect(unret.data as unknown as VersionUnretireResult).toMatchObject({
+        restored: [
+          { id: v3.id, number: 3, name: 'v3' },
+          { id: v4.id, number: 4, name: 'v4' },
+        ],
+        head: { id: v4.id, number: 4, name: 'v4' },
+        // 工作副本之前保留了 v4 的模型，因此本来就一致
+        workingCopy: 'unchanged',
+      });
+
+      // 5. 工作副本回退 outcome = 'reverted' 与画布历史 opName='retireVersions'，以及 workingSeq 过时 → 'changed'
+      const ret4Reverted = await retire(pid, v4.id, { head: v4.id, keepWorkingCopy: false }, editor);
+      expect(ret4Reverted.status).toBe(200);
+      expect((ret4Reverted.data as unknown as VersionRetireResult).workingCopy).toBe('reverted');
+      const histAfterRetire = (await call('GET', `/api/projects/${pid}/history`))
+        .data as unknown as CanvasHistoryList;
+      expect(histAfterRetire.entries[0]!.opName).toBe('retireVersions');
+
+      // 同步回 v4（带着正确 workingSeq）→ reverted，并记为 unretireVersions
+      const unretSync = await unretire(
+        pid,
+        v4.id,
+        { syncWorkingCopy: true, workingSeq: histAfterRetire.currentSeq },
+        editor,
+      );
+      expect(unretSync.status).toBe(200);
+      expect((unretSync.data as unknown as VersionUnretireResult).workingCopy).toBe('reverted');
+      const histAfterUnretire = (await call('GET', `/api/projects/${pid}/history`))
+        .data as unknown as CanvasHistoryList;
+      expect(histAfterUnretire.entries[0]!.opName).toBe('unretireVersions');
+
+      // 过时 workingSeq：作废仍然成功，workingCopy = 'changed' 且工作副本 seq 不变
+      const retChanged = await retire(pid, v4.id, { head: v4.id, workingSeq: 0 }, editor);
+      expect(retChanged.status).toBe(200);
+      expect((retChanged.data as unknown as VersionRetireResult).workingCopy).toBe('changed');
+      const histNoChange = (await call('GET', `/api/projects/${pid}/history`))
+        .data as unknown as CanvasHistoryList;
+      expect(histNoChange.currentSeq).toBe(histAfterUnretire.currentSeq);
+    },
+  );
+
+  test.skipIf(skip)(
+    'unretire 严格路径语义：复杂分叉仅恢复 (activeHead, globalMax]，旧岔路永久作废；对活跃版本返 409',
+    async () => {
+      const pid = await newProject('adr13-unretire-tree');
+      await addTable(created.rooms, db, pid);
+      const v1 = (await publish(pid, 'v1')).data as unknown as VersionCreated;
+      for (let i = 2; i <= 5; i++) {
+        await editModel(created.rooms, db, pid, (m) => void addNote(m, `c${i}`));
+        const v = (await publish(pid, `v${i}`)).data as unknown as VersionCreated;
+        expect(v.number).toBe(i);
+      }
+      const initialList = await list(pid);
+      const idOf = (n: number) => initialList.find((x) => x.number === n)!.id;
+
+      // 对活跃版本调 unretire → 409 not_unretirable
+      const activeUnretire = await unretire(pid, idOf(5));
+      expect(activeUnretire.status).toBe(409);
+      expect(activeUnretire.data.code).toBe('not_unretirable');
+
+      // 复现 ADR 0013 示例：retire v5 → publish v6(parent v4) → retire v6 → retire v4
+      expect((await retire(pid, idOf(5), { head: idOf(5) })).status).toBe(200);
+      // 此时 v5.unretirable = true
+      expect((await list(pid)).find((x) => x.number === 5)!.unretirable).toBe(true);
+
+      await editModel(created.rooms, db, pid, (m) => void addNote(m, 'c6'));
+      const v6 = (await publish(pid, 'v6')).data as unknown as VersionCreated;
+      expect(v6.number).toBe(6);
+
+      // 一旦基于 v4 发布 v6，v5 永久不可取消作废（unretirable = false）
+      expect((await list(pid)).find((x) => x.number === 5)!.unretirable).toBe(false);
+      const denyV5 = await unretire(pid, idOf(5));
+      expect(denyV5.status).toBe(409);
+      expect(denyV5.data.code).toBe('not_unretirable');
+      expect(String(denyV5.data.error)).toContain('v4');
+      expect(String(denyV5.data.error)).toContain('v6');
+
+      // 再依次 retire v6 和 v4：此时 activeHead = v3，globalMax = v6，路径 (v3, v6] = [v4, v6]
+      expect((await retire(pid, v6.id, { head: v6.id })).status).toBe(200);
+      expect((await retire(pid, idOf(4), { head: idOf(4) })).status).toBe(200);
+
+      const beforeRestore = await list(pid);
+      expect(beforeRestore.map((x) => ({ n: x.number, unretirable: x.unretirable }))).toEqual([
+        { n: 6, unretirable: true },
+        { n: 5, unretirable: false },
+        { n: 4, unretirable: true },
+        { n: 3, unretirable: false },
+        { n: 2, unretirable: false },
+        { n: 1, unretirable: false },
+      ]);
+
+      // v5 仍然 409
+      expect((await unretire(pid, idOf(5))).status).toBe(409);
+
+      // 从 v4（或 v6）取消作废：只恢复 [v4, v6]，v5 永久保持作废
+      const restored = await unretire(pid, idOf(4), { syncWorkingCopy: false });
+      expect(restored.status).toBe(200);
+      expect(restored.data as unknown as VersionUnretireResult).toMatchObject({
+        restored: [
+          { id: idOf(4), number: 4, name: 'v4' },
+          { id: v6.id, number: 6, name: 'v6' },
+        ],
+        head: { id: v6.id, number: 6, name: 'v6' },
+        workingCopy: 'kept',
+      });
+      const afterRestore = await list(pid);
+      expect(afterRestore.find((x) => x.number === 5)!.retiredAt).not.toBeNull();
+      expect(afterRestore.find((x) => x.number === 4)!.retiredAt).toBeNull();
+      expect(afterRestore.find((x) => x.number === 6)!.retiredAt).toBeNull();
+      expect(afterRestore.find((x) => x.number === 6)!.latest).toBe(true);
+      expect(v1.number).toBe(1);
+    },
+  );
+
+  test.skipIf(skip)(
+    '应用到画布（canvas-diff / apply）：含已作废版本、working_changed 409、no-op、applyVersion 历史与审计',
+    async () => {
+      const pid = await newProject('adr13-apply-canvas');
+      await addTable(created.rooms, db, pid);
+      const v1 = (await publish(pid, 'v1')).data as unknown as VersionCreated;
+      await editModel(created.rooms, db, pid, (m) => void addNote(m, 'extra_col'));
+      const v2 = (await publish(pid, 'v2')).data as unknown as VersionCreated;
+
+      // 作废 v2 后工作副本回到 v1
+      expect((await retire(pid, v2.id, { head: v2.id })).status).toBe(200);
+
+      // 预览应用已作废版本 v2 的差异
+      const diffRes = await canvasDiff(pid, v2.id, viewer);
+      expect(diffRes.status).toBe(200);
+      const diff = diffRes.data as unknown as VersionCanvasDiff;
+      expect(diff.diffToCurrent.total).toBeGreaterThan(0);
+      expect(diff.diffToCurrent.items.some((i) => i.sql.includes('extra_col'))).toBe(true);
+
+      // 权限：viewer 不能 apply
+      expect((await applyVersion(pid, v2.id, diff.currentSeq, viewer)).status).toBe(403);
+
+      // workingSeq 不匹配 → 409 CanvasHistoryConflict (working_changed)
+      const conflictRes = await applyVersion(pid, v2.id, diff.currentSeq + 1, editor);
+      expect(conflictRes.status).toBe(409);
+      const conflict = conflictRes.data as unknown as CanvasHistoryConflict;
+      expect(conflict.code).toBe('working_changed');
+      expect(conflict.currentSeq).toBe(diff.currentSeq);
+      expect(conflict.diffToCurrent.total).toBe(diff.diffToCurrent.total);
+
+      // 正确 seq 应用已作废的 v2 → 200，生成新画布提交 opName='applyVersion' 及审计 model.apply_version
+      const applied = await applyVersion(pid, v2.id, diff.currentSeq, editor);
+      expect(applied.status).toBe(200);
+      const updated = applied.data as unknown as ModelUpdate;
+      expect(updated.seq).toBe(diff.currentSeq + 1);
+
+      const hist = (await call('GET', `/api/projects/${pid}/history`)).data as unknown as CanvasHistoryList;
+      expect(hist.entries[0]!.opName).toBe('applyVersion');
+      const [auditRow] = await db.query<{ data: { versionId: string; number: number } }>(
+        "select data from audit_events where project_id = $1 and action = 'model.apply_version'",
+        [pid],
+      );
+      expect(auditRow!.data).toMatchObject({ versionId: v2.id, number: 2 });
+
+      // 再次应用同一版本（工作副本已与 v2 一致）→ 200 no-op，不增加历史 seq
+      const noop = await applyVersion(pid, v2.id, updated.seq, editor);
+      expect(noop.status).toBe(200);
+      expect((noop.data as unknown as ModelUpdate).seq).toBe(updated.seq);
+      expect(v1.number).toBe(1);
+    },
+  );
+
+  test.skipIf(skip)(
+    '作废使关联开放执行申请按方向规则失效（排除 interrupted/executing），且 unretire 不复活已失效申请',
+    async () => {
+      const pid = await newProject('adr13-req-invalidation');
+      await addTable(created.rooms, db, pid);
+      const v1 = (await publish(pid, 'v1')).data as unknown as VersionCreated;
+      await editModel(created.rooms, db, pid, (m) => void addNote(m, 'c2'));
+      const v2 = (await publish(pid, 'v2')).data as unknown as VersionCreated;
+      await editModel(created.rooms, db, pid, (m) => void addNote(m, 'c3'));
+      const v3 = (await publish(pid, 'v3')).data as unknown as VersionCreated;
+
+      const d2 = await detail(pid, v2.id);
+      const d3 = await detail(pid, v3.id);
+
+      const urlEnc = encrypt('postgres://u:p@127.0.0.1:5432/reqinv');
+      const hash = connHash({ url_enc: urlEnc });
+      await db.query(
+        `insert into environments (id, project_id, name, url_enc, production, current_version_id)
+         values ('env-up', $1, 'env-up', $2, true, $3),
+                ('env-down', $1, 'env-down', $2, true, $4),
+                ('env-safe', $1, 'env-safe', $2, true, $5)`,
+        [pid, urlEnc, v2.id, v3.id, v1.id],
+      );
+      const flow = JSON.stringify({ implicit: true, stages: [] });
+      const future = new Date(Date.now() + 3600_000).toISOString();
+      const createdBefore = new Date().toISOString();
+      const insertReq = (opts: {
+        id: string;
+        envId: string;
+        direction: 'up' | 'down';
+        fromId: string | null;
+        toId: string;
+        migrations: unknown[];
+        status: string;
+        result?: unknown;
+        createdAt?: string;
+      }) =>
+        db.query(
+          `insert into exec_requests
+             (id, project_id, environment_id, requested_by, direction, from_version_id, to_version_id,
+              migrations, dry_run, reason, flow, conn_hash, production, status, stage, expires_at, created_at, updated_at, result)
+           values ($1, $2, $3, $4, $5, $6, $7, $8::text::jsonb, null, '测试', $9::text::jsonb, $10, true, $11, 0, $12, $13, $13, $14::text::jsonb)`,
+          [
+            opts.id,
+            pid,
+            opts.envId,
+            editorId,
+            opts.direction,
+            opts.fromId,
+            opts.toId,
+            JSON.stringify(opts.migrations),
+            flow,
+            hash,
+            opts.status,
+            future,
+            opts.createdAt ?? createdBefore,
+            opts.result ? JSON.stringify(opts.result) : null,
+          ],
+        );
+
+      const migV3Up = [
+        {
+          versionId: v3.id,
+          number: 3,
+          name: 'v3',
+          direction: 'up',
+          checksum: d3.checksum,
+          steps: 1,
+          nonTransactional: 0,
+        },
+      ];
+      const migV3Down = [
+        {
+          versionId: v3.id,
+          number: 3,
+          name: 'v3',
+          direction: 'down',
+          checksum: d3.checksum,
+          steps: 1,
+          nonTransactional: 0,
+        },
+      ];
+      const migV2Up = [
+        {
+          versionId: v2.id,
+          number: 2,
+          name: 'v2',
+          direction: 'up',
+          checksum: d2.checksum,
+          steps: 1,
+          nonTransactional: 0,
+        },
+      ];
+
+      await insertReq({
+        id: 'r-up-pending',
+        envId: 'env-up',
+        direction: 'up',
+        fromId: v2.id,
+        toId: v3.id,
+        migrations: migV3Up,
+        status: 'pending',
+      });
+      await insertReq({
+        id: 'r-up-failed',
+        envId: 'env-up',
+        direction: 'up',
+        fromId: v2.id,
+        toId: v3.id,
+        migrations: migV3Up,
+        status: 'failed',
+      });
+      await insertReq({
+        id: 'r-up-int',
+        envId: 'env-up',
+        direction: 'up',
+        fromId: v2.id,
+        toId: v3.id,
+        migrations: migV3Up,
+        status: 'failed',
+        result: { ok: false, code: 'interrupted', error: '断线', current: null },
+      });
+      await insertReq({
+        id: 'r-up-exec',
+        envId: 'env-up',
+        direction: 'up',
+        fromId: v2.id,
+        toId: v3.id,
+        migrations: migV3Up,
+        status: 'executing',
+      });
+      // 作废前提交的普通回滚（v3 → v2）必须在作废后失效
+      await insertReq({
+        id: 'r-down-pre',
+        envId: 'env-down',
+        direction: 'down',
+        fromId: v3.id,
+        toId: v2.id,
+        migrations: migV3Down,
+        status: 'approved',
+      });
+      // 未涉及 v3 的申请不受影响
+      await insertReq({
+        id: 'r-safe',
+        envId: 'env-safe',
+        direction: 'up',
+        fromId: v1.id,
+        toId: v2.id,
+        migrations: migV2Up,
+        status: 'pending',
+      });
+
+      const ret = await retire(pid, v3.id, { head: v3.id });
+      expect(ret.status).toBe(200);
+      expect((ret.data as unknown as VersionRetireResult).invalidatedRequests).toBe(3);
+
+      const statusMap = async () =>
+        new Map(
+          (
+            await db.query<{ id: string; status: string; status_reason: string | null }>(
+              'select id, status, status_reason from exec_requests where project_id = $1',
+              [pid],
+            )
+          ).map((r) => [r.id, r]),
+        );
+      // 事务提交瞬间（无需先跑 sweep），受影响开放申请已持久化为 invalid，且写好收件箱通知与失效审计
+      const immediateAfterRetire = await statusMap();
+      expect(immediateAfterRetire.get('r-up-pending')!.status).toBe('invalid');
+      expect(immediateAfterRetire.get('r-up-failed')!.status).toBe('invalid');
+      expect(immediateAfterRetire.get('r-down-pre')!.status).toBe('invalid');
+      expect(immediateAfterRetire.get('r-down-pre')!.status_reason).toContain('作废');
+      expect(immediateAfterRetire.get('r-up-int')!.status).toBe('failed');
+      expect(immediateAfterRetire.get('r-up-exec')!.status).toBe('executing');
+      expect(immediateAfterRetire.get('r-safe')!.status).toBe('pending');
+      const invInbox = await db.query<{ request_id: string }>(
+        "select request_id from inbox_items where project_id = $1 and kind = 'request_result' and user_id = $2",
+        [pid, editorId],
+      );
+      expect(invInbox.map((r) => r.request_id).sort()).toEqual(['r-down-pre', 'r-up-failed', 'r-up-pending']);
+      const invAudits = await db.query<{ target_id: string }>(
+        "select target_id from audit_events where project_id = $1 and action = 'exec_request.invalidate'",
+        [pid],
+      );
+      expect(invAudits).toHaveLength(3);
+
+      expect(await created.requests.sweep({ projectIds: [pid] })).toBe(0);
+      const afterRetire = await statusMap();
+      expect(afterRetire.get('r-up-pending')!.status).toBe('invalid');
+      expect(afterRetire.get('r-up-failed')!.status).toBe('invalid');
+      expect(afterRetire.get('r-down-pre')!.status).toBe('invalid');
+      expect(afterRetire.get('r-down-pre')!.status_reason).toContain('作废');
+      expect(afterRetire.get('r-up-int')!.status).toBe('failed');
+      expect(afterRetire.get('r-up-exec')!.status).toBe('executing');
+      expect(afterRetire.get('r-safe')!.status).toBe('pending');
+
+      // 作废之后新建的 switch（先 down v3 再 up v4）在 sweep 后保持有效；再作废 v4 才失效
+      await editModel(created.rooms, db, pid, (m) => void addNote(m, 'c4'));
+      const v4 = (await publish(pid, 'v4')).data as unknown as VersionCreated;
+      const d4 = await detail(pid, v4.id);
+      await insertReq({
+        id: 'r-switch-post',
+        envId: 'env-down',
+        direction: 'up',
+        fromId: v3.id,
+        toId: v4.id,
+        migrations: [
+          ...migV3Down,
+          {
+            versionId: v4.id,
+            number: 4,
+            name: 'v4',
+            direction: 'up',
+            checksum: d4.checksum,
+            steps: 1,
+            nonTransactional: 0,
+          },
+        ],
+        status: 'pending',
+        createdAt: new Date().toISOString(),
+      });
+      await created.requests.sweep({ projectIds: [pid] });
+      expect((await statusMap()).get('r-switch-post')!.status).toBe('pending');
+
+      // 作废 v4 后 switch 申请立即失效；之后再 unretire v4，已失效申请不会复活
+      expect((await retire(pid, v4.id, { head: v4.id })).status).toBe(200);
+      expect((await statusMap()).get('r-switch-post')!.status).toBe('invalid');
+
+      expect((await unretire(pid, v4.id)).status).toBe(200);
+      const finalMap = await statusMap();
+      expect(finalMap.get('r-switch-post')!.status).toBe('invalid');
+      expect(finalMap.get('r-up-pending')!.status).toBe('invalid');
+    },
+  );
+
+  test.skipIf(skip)(
+    'retire 后不先 sweep 立即 unretire：作废前开放申请永久保持失效且不可审批或执行，直接写库后 unretire 也能防御性失效',
+    async () => {
+      const pid = await newProject('adr13-no-sweep-unretire');
+      await addTable(created.rooms, db, pid);
+      const v1 = (await publish(pid, 'v1')).data as unknown as VersionCreated;
+      await editModel(created.rooms, db, pid, (m) => void addNote(m, 'c2'));
+      const v2 = (await publish(pid, 'v2')).data as unknown as VersionCreated;
+      const d2 = await detail(pid, v2.id);
+
+      const urlEnc = encrypt('postgres://u:p@127.0.0.1:5432/nosweep');
+      const hash = connHash({ url_enc: urlEnc });
+      await db.query(
+        `insert into environments (id, project_id, name, url_enc, production, current_version_id)
+         values ('env-ns-up', $1, 'env-ns-up', $2, true, $3),
+                ('env-ns-down', $1, 'env-ns-down', $2, true, $4)`,
+        [pid, urlEnc, v1.id, v2.id],
+      );
+      const flow = JSON.stringify({ implicit: true, stages: [] });
+      const future = new Date(Date.now() + 3600_000).toISOString();
+      const createdBefore = new Date(Date.now() - 10_000).toISOString();
+      const insertReq = (opts: {
+        id: string;
+        envId: string;
+        direction: 'up' | 'down';
+        fromId: string;
+        toId: string;
+        migrations: unknown[];
+        status: string;
+      }) =>
+        db.query(
+          `insert into exec_requests
+             (id, project_id, environment_id, requested_by, direction, from_version_id, to_version_id,
+              migrations, dry_run, reason, flow, conn_hash, production, status, stage, expires_at, created_at, updated_at)
+           values ($1, $2, $3, $4, $5, $6, $7, $8::text::jsonb, null, '竞态回归', $9::text::jsonb, $10, true, $11, 0, $12, $13, $13)`,
+          [
+            opts.id,
+            pid,
+            opts.envId,
+            editorId,
+            opts.direction,
+            opts.fromId,
+            opts.toId,
+            JSON.stringify(opts.migrations),
+            flow,
+            hash,
+            opts.status,
+            future,
+            createdBefore,
+          ],
+        );
+
+      const reqUpId = newId();
+      const reqDownId = newId();
+      await insertReq({
+        id: reqUpId,
+        envId: 'env-ns-up',
+        direction: 'up',
+        fromId: v1.id,
+        toId: v2.id,
+        migrations: [
+          {
+            versionId: v2.id,
+            number: 2,
+            name: 'v2',
+            direction: 'up',
+            checksum: d2.checksum,
+            steps: 1,
+            nonTransactional: 0,
+          },
+        ],
+        status: 'pending',
+      });
+      await insertReq({
+        id: reqDownId,
+        envId: 'env-ns-down',
+        direction: 'down',
+        fromId: v2.id,
+        toId: v1.id,
+        migrations: [
+          {
+            versionId: v2.id,
+            number: 2,
+            name: 'v2',
+            direction: 'down',
+            checksum: d2.checksum,
+            steps: 1,
+            nonTransactional: 0,
+          },
+        ],
+        status: 'approved',
+      });
+
+      // 作废后完全不调用 sweep()，立刻 unretire
+      const ret = await retire(pid, v2.id, { head: v2.id, keepWorkingCopy: true }, editor);
+      expect(ret.status).toBe(200);
+      expect((ret.data as unknown as VersionRetireResult).invalidatedRequests).toBe(2);
+
+      const unret = await unretire(pid, v2.id, { syncWorkingCopy: false }, editor);
+      expect(unret.status).toBe(200);
+
+      for (const rid of [reqUpId, reqDownId]) {
+        const [row] = await db.query<{ status: string }>('select status from exec_requests where id = $1', [
+          rid,
+        ]);
+        expect(row!.status).toBe('invalid');
+      }
+      expect(
+        (
+          await call(
+            'POST',
+            `/api/projects/${pid}/requests/${reqUpId}/approve`,
+            { stage: 0, comment: 'try' },
+            admin,
+          )
+        ).status,
+      ).toBe(409);
+      expect(
+        (
+          await call(
+            'POST',
+            `/api/projects/${pid}/requests/${reqDownId}/execute`,
+            { confirm: 'env-ns-down' },
+            admin,
+          )
+        ).status,
+      ).toBe(409);
+
+      // 防御性路径：绕过 retire 路由直接改库置 retired_at 后，不跑 sweep 直接 unretire，仍会在清空前原子失效残留开放申请
+      const reqDirectId = newId();
+      await insertReq({
+        id: reqDirectId,
+        envId: 'env-ns-up',
+        direction: 'up',
+        fromId: v1.id,
+        toId: v2.id,
+        migrations: [
+          {
+            versionId: v2.id,
+            number: 2,
+            name: 'v2',
+            direction: 'up',
+            checksum: d2.checksum,
+            steps: 1,
+            nonTransactional: 0,
+          },
+        ],
+        status: 'pending',
+      });
+      await db.query('update versions set retired_at = $2 where id = $1', [v2.id, new Date().toISOString()]);
+
+      const unretDef = await unretire(pid, v2.id, { syncWorkingCopy: false }, editor);
+      expect(unretDef.status).toBe(200);
+      const [directRow] = await db.query<{ status: string }>(
+        'select status from exec_requests where id = $1',
+        [reqDirectId],
+      );
+      expect(directRow!.status).toBe('invalid');
+      expect(
+        (
+          await call(
+            'POST',
+            `/api/projects/${pid}/requests/${reqDirectId}/approve`,
+            { stage: 0, comment: 'try' },
+            admin,
+          )
+        ).status,
+      ).toBe(409);
+    },
+  );
+
+  test.skipIf(skip)(
+    'syncWorkingCopy 抛出非 WorkingChangedError 异常时：retire 与 unretire 均返回 200 (workingCopy=failed) 且正常写入审计',
+    async () => {
+      const pid = await newProject('adr13-sync-wc-failed');
+      await addTable(created.rooms, db, pid);
+      const v1 = (await publish(pid, 'v1')).data as unknown as VersionCreated;
+      await editModel(created.rooms, db, pid, (m) => void addNote(m, 'c2'));
+      const v2 = (await publish(pid, 'v2')).data as unknown as VersionCreated;
+
+      const origReplace = created.rooms.replace.bind(created.rooms);
+      const errSpy = vi.spyOn(console, 'error').mockImplementation(() => {});
+      try {
+        created.rooms.replace = (async () => {
+          throw new Error('模拟房间替换故障');
+        }) as typeof created.rooms.replace;
+
+        const ret = await retire(pid, v2.id, { head: v2.id, keepWorkingCopy: false }, editor);
+        expect(ret.status).toBe(200);
+        expect(ret.data as unknown as VersionRetireResult).toMatchObject({
+          retired: [{ id: v2.id, number: 2, name: 'v2' }],
+          head: { id: v1.id, number: 1, name: 'v1' },
+          workingCopy: 'failed',
+        });
+
+        // 因上次同步失败工作副本仍停在 v2，先还原 replace 在画布做一次编辑使工作副本偏离 v2，再测 unretire 同步失败分支
+        created.rooms.replace = origReplace;
+        await editModel(created.rooms, db, pid, (m) => void addNote(m, 'dirty_before_unretire'));
+        created.rooms.replace = (async () => {
+          throw new Error('模拟房间替换故障');
+        }) as typeof created.rooms.replace;
+
+        const unret = await unretire(pid, v2.id, { syncWorkingCopy: true }, editor);
+        expect(unret.status).toBe(200);
+        expect(unret.data as unknown as VersionUnretireResult).toMatchObject({
+          restored: [{ id: v2.id, number: 2, name: 'v2' }],
+          head: { id: v2.id, number: 2, name: 'v2' },
+          workingCopy: 'failed',
+        });
+      } finally {
+        created.rooms.replace = origReplace;
+        errSpy.mockRestore();
+      }
+
+      const [v2Row] = await db.query<{ retired_at: unknown }>(
+        'select retired_at from versions where id = $1',
+        [v2.id],
+      );
+      expect(v2Row!.retired_at).toBeNull();
+
+      const audits = await db.query<{ action: string; data: { workingCopy?: string } }>(
+        "select action, data from audit_events where project_id = $1 and action in ('version.retire', 'version.unretire') order by at asc",
+        [pid],
+      );
+      expect(audits).toHaveLength(2);
+      expect(audits.map((a) => ({ action: a.action, workingCopy: a.data.workingCopy }))).toEqual([
+        { action: 'version.retire', workingCopy: 'failed' },
+        { action: 'version.unretire', workingCopy: 'failed' },
+      ]);
     },
   );
 });

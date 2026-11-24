@@ -27,6 +27,11 @@ export interface ChainVersion {
    * 不用项目当前的范围——范围之后改了，旧版本的比较结果也不能变。
    */
   scope: string[] | null;
+  /**
+   * 平台库里已作废（ADR 0013，retired_at 非空）。执行器拒绝任何升级（up）到已作废版本的迁移、拒绝标记到已作废版本；
+   * 回滚已作废版本（down）和经最近公共祖先切回活跃主链不受影响。不给 = 未作废。
+   */
+  retired?: boolean;
 }
 
 /** 差异列表里的一项：由 plan(线上结构, 版本模型) 的一步转成，表示“要让线上结构回到这个版本，需要做什么” */
@@ -88,7 +93,10 @@ export interface ExecuteOptions {
   projectName: string | null;
   /** 本 Dowel 实例的唯一标识，写进历史 */
   instanceId: string;
-  /** 平台库里完整的版本链（按 number 升序） */
+  /**
+   * 平台库里完整的版本树（按 number 升序，含已作废的版本）：父子关系看 parentId，
+   * 路线沿 parent_id 经最近公共祖先规划（先 down 再 up，见 version-tree.ts 的 routeBetween）
+   */
   chain: ChainVersion[];
   /**
    * migrate：执行 / 回滚到 `to`；
@@ -97,8 +105,13 @@ export interface ExecuteOptions {
   mode?: 'migrate' | 'baseline';
   /** 目标版本 ID（mode = migrate 时必填） */
   to?: string;
-  /** 期望的方向：给了而实际路线是反方向就拒绝（“执行”接口不能顺手回滚，“回滚”接口不能顺手前进）；空操作不受影响 */
-  direction?: 'up' | 'down';
+  /**
+   * 期望的路线形状：给了而实际路线不一样就拒绝（空操作不受影响）——
+   * up = 只升级（“执行”接口、CI 令牌），实际要先回滚再升级时报 switch_required，实际是回滚时报 wrong_direction；
+   * down = 只回滚（“回滚”接口），否则 wrong_direction；
+   * switch = 先回滚到最近公共祖先再升级（ADR 0013 混合切换，Web 端显式确认），否则 wrong_direction。
+   */
+  direction?: 'up' | 'down' | 'switch';
   executedBy: string | null;
   via?: 'web' | 'ci';
   /** 等项目锁的时间，默认 30 秒 */
@@ -167,6 +180,8 @@ export interface DryRunPlan {
   /** 执行前 / 执行后的版本 */
   from: { id: string; number: number; name: string } | null;
   to: { id: string; number: number; name: string } | null;
+  /** 路线经过的最近公共祖先：switch（先回滚再升级）时是回滚段的终点、升级段的起点；其他情况为 null */
+  lca: { id: string; number: number; name: string } | null;
   migrations: DryRunMigration[];
   /** 上一次停在中途：会从哪个迁移的哪一步之后接着跑 */
   resume: { versionId: string; direction: MigrationDirection; afterStep: number } | null;
@@ -178,7 +193,10 @@ export interface DryRunPlan {
 
 export interface ExecuteResult {
   mode: 'migrate' | 'baseline';
-  direction: 'up' | 'down' | 'none';
+  /** switch = 先回滚到最近公共祖先再升级（ADR 0013） */
+  direction: 'up' | 'down' | 'switch' | 'none';
+  /** switch 路线经过的最近公共祖先；其他情况为 null / undefined */
+  lca?: { id: string; number: number; name: string } | null;
   /** 本次是否写入了基线 */
   baseline: boolean;
   /** 本次真正执行（或写入基线）的迁移，按顺序 */

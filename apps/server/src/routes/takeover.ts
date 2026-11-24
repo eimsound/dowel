@@ -265,9 +265,15 @@ export const runTakeover = (c: Context<Env>, ctx: AppContext, b: ProjectWizard, 
           );
       }
 
-      // 强制全链影子库闭环验证（ADR 0012）：写入平台库事务之前，按版本顺序（v0 → v1 → … → vN）逐个验证。
+      // 强制全链影子库闭环验证（ADR 0012 / 0013）：写入平台库事务之前，按编号升序沿 parentId 逐个验证。
       // 找不到可用影子库或任一版本验证失败，直接拒绝接手（不写平台库，也不认领目标库）。
-      const head = merged.versions.at(-1)!;
+      const headId = merged.active.at(-1);
+      const head =
+        (headId ? merged.versions.find((v) => v.versionId === headId) : undefined) ?? merged.versions.at(-1)!;
+      const retiredSet = new Set(merged.retired);
+      const retiredRefs = merged.versions
+        .filter((v) => retiredSet.has(v.versionId))
+        .map((v) => ({ id: v.versionId, number: v.number, name: v.name }));
       stage = 'verify';
       await send({ stage });
       const prepared = await pickShadow(environments, unionScopes(merged.versions), ctx.guard, dialect);
@@ -277,7 +283,6 @@ export const runTakeover = (c: Context<Env>, ctx: AppContext, b: ProjectWizard, 
         shadow,
         shadowLabel: prepared.label,
         versions: merged.versions,
-        baseModel: null,
         onVersion: async (v, i, total) => {
           await send({ stage: 'verify', detail: `v${v.number} (${i + 1}/${total})` });
         },
@@ -384,6 +389,7 @@ export const runTakeover = (c: Context<Env>, ctx: AppContext, b: ProjectWizard, 
               environments: envRows.map((e) => e.name),
               versions: merged.versions.length,
               head: head.number,
+              ...(retiredRefs.length ? { retiredVersions: retiredRefs.map((v) => v.number) } : {}),
               claimed: foreign.map((s) => s.name),
             },
           },
@@ -490,7 +496,12 @@ export const runTakeover = (c: Context<Env>, ctx: AppContext, b: ProjectWizard, 
         } catch (x) {
           console.error('接手：初始漂移检查失败（忽略）', x instanceof Error ? x.message : x);
         }
-      await send({ stage: 'done', project, ...(warnings.length ? { warnings } : {}) });
+      await send({
+        stage: 'done',
+        project,
+        ...(warnings.length ? { warnings } : {}),
+        ...(retiredRefs.length ? { retiredVersions: retiredRefs } : {}),
+      });
     } catch (e) {
       if (committed) {
         console.error('接手：提交之后的步骤失败', e);

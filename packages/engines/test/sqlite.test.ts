@@ -30,6 +30,7 @@ import {
   sqliteHistory,
   stepsChecksum,
   toScriptSteps,
+  verifyChain,
 } from '../src/index.ts';
 
 describe('@dowel/engines SQLite adapter', () => {
@@ -390,6 +391,61 @@ describe('@dowel/engines SQLite adapter', () => {
       await sqliteEngine.execStepSql(h.db, 'PRAGMA main.foreign_keys = 0');
       const [fkState] = await h.db.query<{ foreign_keys: number }>('PRAGMA foreign_keys');
       expect(fkState?.foreign_keys).toBe(1);
+    } finally {
+      h.close();
+    }
+  });
+
+  it('ADR 0013: sqliteHistory supports forked version trees and down -> up currentVersion', async () => {
+    const h = openSqliteDb(':memory:');
+    try {
+      await sqliteHistory.ensureHistory(h.db);
+      const m = emptyModel('sqlite');
+      const s = createSchema(m, 'main');
+      const t = createTable(m, s, 'items');
+      const id = addColumn(m, t, { name: 'id', type: 'INTEGER', notNull: true });
+      addPrimaryKey(m, t, [id]);
+      const up = [{ sql: 'SELECT 1', transactional: true }];
+      const down = [{ sql: 'SELECT 1', transactional: true }];
+      const checksum = stepsChecksum(up, down);
+      const now = new Date().toISOString();
+      const mkRow = (versionId: string, number: number, parentId: string | null) => ({
+        projectId: 'p-fork',
+        versionId,
+        number,
+        parentId,
+        name: `v${number}`,
+        scope: null,
+        upSteps: up,
+        downSteps: down,
+        checksum,
+        model: m,
+        fingerprint: 'fp',
+        publishedAt: now,
+        publishedBy: 'u1',
+      });
+      await sqliteHistory.writeProject(h.db, {
+        projectId: 'p-fork',
+        name: 'Fork',
+        instanceId: 'inst-1',
+        claimedAt: now,
+        claimedBy: 'u1',
+      });
+      for (const r of [mkRow('v1', 1, null), mkRow('v2', 2, 'v1'), mkRow('v3', 3, 'v1')]) {
+        await sqliteHistory.recordVersion(h.db, r);
+      }
+      const base = { projectId: 'p-fork', executedBy: 'u1', via: 'web' as const, instanceId: 'inst-1' };
+      for (const step of [
+        { fromVersion: null, toVersion: 'v2', direction: 'up' as const },
+        { fromVersion: 'v2', toVersion: 'v1', direction: 'down' as const },
+        { fromVersion: 'v1', toVersion: 'v3', direction: 'up' as const },
+      ]) {
+        const rid = await sqliteHistory.startRun(h.db, { ...base, ...step });
+        await sqliteHistory.finishRun(h.db, rid, 'done');
+      }
+      const state = await sqliteHistory.readHistory(h.db, 'p-fork');
+      expect(state.currentVersion).toBe('v3');
+      expect(verifyChain(state.versions)).toEqual([]);
     } finally {
       h.close();
     }

@@ -114,31 +114,80 @@ const chain = (from: number, count: number): HistoryVersionRow[] => {
   return out;
 };
 
-describe('verifyChain', () => {
-  test('完整的链没有问题（从 v0 或 v1 开始都可以）', () => {
+describe('verifyChain（版本树校验）', () => {
+  test('完整的线性链与分叉树没有问题（从 v0 / v1 / 任意起号都可以，且允许跳号）', () => {
     expect(verifyChain(chain(0, 4))).toEqual([]);
     expect(verifyChain(chain(1, 3))).toEqual([]);
     expect(verifyChain([])).toEqual([]);
     // 顺序不影响
     expect(verifyChain([...chain(0, 3)].reverse())).toEqual([]);
+    // 跳号允许（例如跳过作废且未落地的 v1，或从 v3 开始）
+    const gapped = [
+      row(0, null, 'CREATE TABLE t0 (a int)', 'DROP TABLE t0'),
+      row(2, 'p1-v0', 'CREATE TABLE t2 (a int)', 'DROP TABLE t2'),
+    ];
+    expect(verifyChain(gapped)).toEqual([]);
+    expect(verifyChain(chain(3, 2))).toEqual([]);
+    // 合法分叉树：同一 parent 下有作废岔路 v5 和新版本 v6
+    const base = chain(1, 4);
+    const v5 = row(5, 'p1-v4', 'CREATE TABLE t5 (a int)', 'DROP TABLE t5');
+    const v6 = row(6, 'p1-v4', 'CREATE TABLE t6 (a int)', 'DROP TABLE t6');
+    expect(verifyChain([...base, v5, v6])).toEqual([]);
+    // 多层分叉且无序输入
+    const v3b = row(4, 'p1-v2', 'CREATE TABLE t3b (a int)', 'DROP TABLE t3b');
+    const multiFork = [
+      row(1, null, 'CREATE TABLE t1 (a int)', 'DROP TABLE t1'),
+      row(2, 'p1-v1', 'CREATE TABLE t2 (a int)', 'DROP TABLE t2'),
+      row(3, 'p1-v2', 'CREATE TABLE t3 (a int)', 'DROP TABLE t3'),
+      v3b,
+      row(5, 'p1-v3', 'CREATE TABLE t5 (a int)', 'DROP TABLE t5'),
+      row(6, 'p1-v3', 'CREATE TABLE t6 (a int)', 'DROP TABLE t6'),
+    ];
+    expect(verifyChain([...multiFork].reverse())).toEqual([]);
   });
 
-  test('断链：parent 指错', () => {
-    const rows = chain(0, 4);
-    rows[2] = { ...rows[2]!, parentId: rows[0]!.versionId };
-    const problems = verifyChain(rows);
-    expect(problems.map((p) => [p.code, p.versionId])).toEqual([['parent_broken', 'p1-v2']]);
+  test('分叉异常：重复编号（不同 versionId）、多个根或非最小编号的根', () => {
+    const base = chain(1, 3);
+    const dupNum = {
+      ...row(2, 'p1-v1', 'CREATE TABLE t2b (a int)', 'DROP TABLE t2b'),
+      versionId: 'p1-v2-dup',
+    };
+    expect(verifyChain([...base, dupNum]).map((p) => [p.code, p.versionId])).toEqual([
+      ['number_duplicate', 'p1-v2-dup'],
+    ]);
+
+    const twoRoots = [
+      row(1, null, 'CREATE TABLE t1 (a int)', 'DROP TABLE t1'),
+      row(2, null, 'CREATE TABLE t2 (a int)', 'DROP TABLE t2'),
+    ];
+    expect(verifyChain(twoRoots).map((p) => [p.code, p.versionId])).toEqual([['root_multiple', 'p1-v2']]);
+
+    // 最小编号有 parent，而更大的节点没有 parent
+    const badRootOrder = [
+      row(1, 'p1-v2', 'CREATE TABLE t1 (a int)', 'DROP TABLE t1'),
+      row(2, null, 'CREATE TABLE t2 (a int)', 'DROP TABLE t2'),
+    ];
+    expect(verifyChain(badRootOrder).map((p) => p.code)).toEqual(['parent_broken', 'root_multiple']);
   });
 
-  test('断链：缺了中间一个版本；第一个版本不应有 parent', () => {
-    const rows = chain(0, 4);
-    const missing = rows.filter((r) => r.number !== 1);
-    expect(verifyChain(missing).map((p) => p.code)).toEqual(['number_gap', 'parent_broken', 'number_gap']);
+  test('断链：parent 缺失、第一个版本有 parent、或 parent 编号不小于自己', () => {
+    const missingParent = chain(0, 4).filter((r) => r.number !== 1);
+    expect(verifyChain(missingParent).map((p) => [p.code, p.versionId])).toEqual([
+      ['parent_broken', 'p1-v2'],
+    ]);
+
     const headless = chain(0, 2);
     headless[0] = { ...headless[0]!, parentId: 'ghost' };
-    expect(verifyChain(headless).map((p) => p.code)).toEqual(['parent_broken']);
-    // 起点只能是 0 或 1
-    expect(verifyChain(chain(3, 2)).map((p) => p.code)).toContain('number_gap');
+    expect(verifyChain(headless).map((p) => [p.code, p.versionId])).toEqual([['parent_broken', 'p1-v0']]);
+
+    // parent 编号大于自身
+    const rows = chain(1, 3);
+    rows[1] = { ...rows[1]!, parentId: rows[2]!.versionId };
+    expect(verifyChain(rows).map((p) => [p.code, p.versionId])).toEqual([['parent_broken', 'p1-v2']]);
+
+    // 自引用（parent 编号等于自身）
+    const selfRef = [row(1, 'p1-v1', 'CREATE TABLE t1 (a int)', 'DROP TABLE t1')];
+    expect(verifyChain(selfRef).map((p) => [p.code, p.versionId])).toEqual([['parent_broken', 'p1-v1']]);
   });
 
   test('篡改：脚本被改了但 checksum 没变', () => {
@@ -382,6 +431,39 @@ describe.skipIf(!PG_URL)('版本行与执行记录', () => {
     expect(h.history[4]!.finishedAt).toMatch(/^\d{4}-\d\d-\d\dT/);
     // 别的项目互不影响
     expect((await readHistory(db, 'cur-other')).currentVersion).toBeNull();
+  });
+
+  test('跨分叉执行（down 回滚到公共祖先后再 up 到新分叉）：currentVersion 与版本树 verifyChain 均正确', async () => {
+    const db = await ready();
+    const p = 'cur-fork';
+    const v1 = row(1, null, 'CREATE TABLE t1 (a int)', 'DROP TABLE t1', p);
+    const v2 = row(2, v1.versionId, 'CREATE TABLE t2 (a int)', 'DROP TABLE t2', p);
+    const v3 = row(3, v2.versionId, 'CREATE TABLE t3 (a int)', 'DROP TABLE t3', p);
+    const v4 = row(4, v3.versionId, 'CREATE TABLE t4 (a int)', 'DROP TABLE t4', p);
+    const v5 = row(5, v4.versionId, 'CREATE TABLE t5 (a int)', 'DROP TABLE t5', p);
+    const v6 = row(6, v4.versionId, 'CREATE TABLE t6 (a int)', 'DROP TABLE t6', p);
+    for (const v of [v1, v2, v3, v4, v5, v6]) await recordVersion(db, v);
+    await writeProject(db, {
+      projectId: p,
+      name: '分叉历史',
+      instanceId: 'inst-1',
+      claimedAt: null,
+      claimedBy: null,
+    });
+    const base = { projectId: p, executedBy: 'u1', via: 'web' as const, instanceId: 'inst-1' };
+    for (const step of [
+      { fromVersion: null, toVersion: v5.versionId, direction: 'up' as const },
+      { fromVersion: v5.versionId, toVersion: v4.versionId, direction: 'down' as const },
+      { fromVersion: v4.versionId, toVersion: v6.versionId, direction: 'up' as const },
+    ]) {
+      const id = await startRun(db, { ...base, ...step });
+      await finishRun(db, id, 'done');
+    }
+    const h = await readHistory(db, p);
+    expect(h.currentVersion).toBe(v6.versionId);
+    expect(verifyChain(h.versions)).toEqual([]);
+    const summary = (await listHistoryProjects(db)).find((x) => x.projectId === p)!;
+    expect(summary).toMatchObject({ versions: 6, headNumber: 6, currentNumber: 6 });
   });
 
   test('history 只追加：结束的记录不能再改，也不能删；标识字段不能改', async () => {

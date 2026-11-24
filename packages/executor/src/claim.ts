@@ -1,10 +1,18 @@
 // 认领与接入已有历史：全面按 dialect 派发至 EngineAdapter。
 import { type Dialect, stableJson } from '@dowel/core';
-import { type ClaimInput, type Db, getEngine, type HistoryVersionRow, verifyChain } from '@dowel/engines';
+import {
+  activePath,
+  type ClaimInput,
+  type Db,
+  getEngine,
+  type HistoryVersionRow,
+  maxNumberNode,
+  verifyChain,
+} from '@dowel/engines';
 
 import { ExecutorError } from './errors.ts';
 import { ensureHistoryMapped } from './execute.ts';
-import { assertTargetHistory, claimOf, readState, type TargetState } from './state.ts';
+import { asRows, assertTargetHistory, claimOf, readState, type TargetState } from './state.ts';
 import type { ChainVersion } from './types.ts';
 
 export interface ClaimOptions extends Omit<ClaimInput, 'name'> {
@@ -48,7 +56,7 @@ const assertMatchesChain = (state: TargetState, chain: ChainVersion[], instanceI
   for (const r of state.versions) assertVersionSame(r, byId.get(r.versionId)!);
 };
 
-const rowToChainVersion = (r: HistoryVersionRow): ChainVersion => ({
+const rowToChainVersion = (r: HistoryVersionRow, retired = false): ChainVersion => ({
   id: r.versionId,
   number: r.number,
   parentId: r.parentId,
@@ -61,6 +69,7 @@ const rowToChainVersion = (r: HistoryVersionRow): ChainVersion => ({
   publishedAt: r.publishedAt,
   publishedBy: r.publishedBy,
   scope: normScope(r.scope),
+  retired,
 });
 
 export const claimInstance = async (
@@ -113,6 +122,10 @@ export type AttachInspection =
       state: TargetState;
       current: ChainVersion | null;
       aheadVersions: HistoryVersionRow[];
+      /** aheadVersions 中不在合并后活跃主链上、接入后应记为已作废的版本 ID */
+      retiredAheadIds: string[];
+      /** 合并后产生了新的活跃链头时对应的版本行；仅补齐已作废岔路时为 null */
+      newActiveHead: HistoryVersionRow | null;
       claim: ReturnType<typeof claimOf>;
     };
 
@@ -140,51 +153,89 @@ export const inspectAttach = async (
       `目标库历史里的当前版本 ${state.current} 不在它自己的版本记录里`,
     );
 
-  let aheadVersions: HistoryVersionRow[] = [];
-  if (state.versions.length <= chain.length) {
-    assertMatchesChain(state, chain, instanceId);
-  } else {
-    const sorted = [...state.versions].sort((a, b) => a.number - b.number);
-    const prefix = sorted.slice(0, chain.length);
-    for (let i = 0; i < chain.length; i++) {
-      const v = chain[i]!;
-      const r = prefix[i]!;
-      if (r.versionId !== v.id) {
-        if (r.parentId === v.parentId)
-          throw new ExecutorError(
-            'history_conflict',
-            `目标库历史与平台库的版本链分叉：目标库在 v${r.number} 处是「${r.name}」（${r.versionId}），平台库是「${v.name}」（${v.id}）`,
-          );
+  // 集合/树并集校验（ADR 0013）：
+  // 1) 平台已有的版本（按 versionId）必须完全一致；
+  // 2) 不在平台里的目标库版本，如果编号已存在于平台 → history_fork；其余为“平台缺失的版本”；
+  // 3) 并集必须通过版本树 verifyChain，所有执行记录引用必须在并集内。
+  const platById = new Map(chain.map((v) => [v.id, v]));
+  const platByNumber = new Map(chain.map((v) => [v.number, v]));
+  const missing: HistoryVersionRow[] = [];
+  for (const r of state.versions) {
+    const pv = platById.get(r.versionId);
+    if (pv) {
+      assertVersionSame(r, pv);
+      continue;
+    }
+    const clash = platByNumber.get(r.number);
+    if (clash)
+      throw new ExecutorError(
+        'history_fork',
+        `目标库历史与平台库的版本链分叉：v${r.number} 在目标库是「${r.name}」（${r.versionId}），平台库是「${clash.name}」（${clash.id}）`,
+      );
+    missing.push(r);
+  }
+  missing.sort((a, b) => a.number - b.number);
+
+  const unionRows = [...asRows(chain, projectId), ...missing].sort((a, b) => a.number - b.number);
+  const unionProblems = verifyChain(unionRows);
+  if (unionProblems.length) {
+    const forkProblem = unionProblems.find(
+      (p) => p.code === 'root_multiple' || p.code === 'number_duplicate',
+    );
+    if (forkProblem)
+      throw new ExecutorError('history_fork', `目标库历史与平台库的版本链分叉：${forkProblem.message}`, {
+        problems: unionProblems.map((p) => p.message),
+      });
+    throw new ExecutorError(
+      'history_broken',
+      `目标库与平台库合并后的版本树不完整：${unionProblems[0]!.message}`,
+      { problems: unionProblems.map((p) => p.message) },
+    );
+  }
+  const unionIds = new Set(unionRows.map((v) => v.versionId));
+  for (const run of state.runs)
+    for (const id of [run.fromVersion, run.toVersion])
+      if (id && !unionIds.has(id))
         throw new ExecutorError(
           'history_mismatch',
-          `目标库历史与平台库的版本链对不上：目标库历史里的版本 ${r.name}（${r.versionId}）不在平台库的版本链上`,
+          `目标库历史与平台库的版本链对不上：执行记录 #${run.id} 引用了未知版本 ${id}`,
         );
-      }
-      assertVersionSame(r, v);
-    }
-    const ahead = sorted.slice(chain.length);
-    if (chain.length > 0) {
-      const head = chain.at(-1)!;
-      const firstAhead = ahead[0]!;
-      if (firstAhead.parentId !== head.id || firstAhead.number !== head.number + 1)
+
+  let retiredAheadIds: string[] = [];
+  let newActiveHead: HistoryVersionRow | null = null;
+  if (missing.length > 0) {
+    const platActiveHead = maxNumberNode(chain.filter((v) => !v.retired));
+    const unionNodes = unionRows.map((v) => ({ id: v.versionId, number: v.number, parentId: v.parentId }));
+    const unionActive = activePath(unionNodes);
+    const unionActiveSet = new Set(unionActive.map((n) => n.id));
+    if (platActiveHead && !unionActiveSet.has(platActiveHead.id))
+      throw new ExecutorError(
+        'history_fork',
+        `目标库历史与平台库活跃主链分叉：平台当前活跃链头 v${platActiveHead.number}「${platActiveHead.name}」不在合并后的活跃主链上`,
+      );
+    for (const v of chain) {
+      if (v.retired && unionActiveSet.has(v.id))
         throw new ExecutorError(
-          'history_conflict',
-          `目标库历史与平台库的版本链分叉：v${firstAhead.number}「${firstAhead.name}」的父版本不是平台链头 v${head.number}「${head.name}」`,
+          'history_fork',
+          `目标库历史与平台库冲突：平台已作废的版本 v${v.number}「${v.name}」落在了合并后的活跃主链上，不能静默复活已作废版本`,
         );
     }
-    const allIds = new Set([...chain.map((v) => v.id), ...ahead.map((v) => v.versionId)]);
-    for (const run of state.runs)
-      for (const id of [run.fromVersion, run.toVersion])
-        if (id && !allIds.has(id))
-          throw new ExecutorError(
-            'history_mismatch',
-            `目标库历史与平台库的版本链对不上：执行记录 #${run.id} 引用了未知版本 ${id}`,
-          );
-    aheadVersions = ahead;
+    retiredAheadIds = missing.filter((v) => !unionActiveSet.has(v.versionId)).map((v) => v.versionId);
+    const unionHeadId = unionActive.at(-1)?.id ?? null;
+    newActiveHead = missing.find((v) => v.versionId === unionHeadId) ?? null;
   }
 
+  const retiredSet = new Set(retiredAheadIds);
   const byId = new Map<string, ChainVersion>(chain.map((v) => [v.id, v]));
-  for (const r of aheadVersions) byId.set(r.versionId, rowToChainVersion(r));
+  for (const r of missing) byId.set(r.versionId, rowToChainVersion(r, retiredSet.has(r.versionId)));
   const current = state.current ? (byId.get(state.current) ?? null) : null;
-  return { hasHistory: true, state, current, aheadVersions, claim: claimOf(state, instanceId) };
+  return {
+    hasHistory: true,
+    state,
+    current,
+    aheadVersions: missing,
+    retiredAheadIds,
+    newActiveHead,
+    claim: claimOf(state, instanceId),
+  };
 };
