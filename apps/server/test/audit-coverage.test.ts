@@ -2,12 +2,14 @@
 // 最后断言表里每个动作都真的写进了 audit_events，且没有表外的动作。
 // environment.* / model.import / OIDC 相关动作需要真实 PG、影子库或 OIDC 提供方，
 // 它们的路由级覆盖在 targets / oidc 集成测试里；这里用 audit() 直接写入，保证动作名不漂移。
+import { newId } from '@dowel/core';
 import type { Context } from 'hono';
 import { afterEach, beforeEach, expect, test } from 'vitest';
 
 import { audit } from '../src/audit.ts';
 import { hashToken } from '../src/auth.ts';
 import { createApp, openPlatformDb, type PlatformDb } from '../src/index.ts';
+import { newMcpToken } from '../src/mcp-tokens.ts';
 import { LoginLimiter } from '../src/rate-limit.ts';
 import type { SecurityConfig } from '../src/security.ts';
 import { addTable, makeUser, PASSWORD } from './support.ts';
@@ -664,6 +666,94 @@ test('每个应审计的动作都能在 audit_events 里找到', async () => {
         ).toBe(200);
       },
     },
+    {
+      action: 'model.mutate',
+      run: async () => {
+        const p = (await call('GET', '/api/projects', undefined, adminCookie)).data as unknown as {
+          id: string;
+        }[];
+        const [adminRow] = await db.query<{ id: string }>("select id from users where username = 'admin'");
+        const tok = newMcpToken();
+        await db.query(
+          `insert into mcp_tokens (id, user_id, kind, name, prefix, token_hash, scopes, project_ids, expires_at)
+           values ($1, $2, 'personal', $3, $4, $5, $6::text::jsonb, null, $7)`,
+          [
+            'mcp-audit-tok-1',
+            adminRow!.id,
+            'audit-mcp',
+            tok.prefix,
+            tok.hash,
+            JSON.stringify(['read', 'verify', 'write']),
+            new Date(Date.now() + 86_400_000).toISOString(),
+          ],
+        );
+        const hist = (await call('GET', `/api/projects/${p[0]!.id}/history`, undefined, adminCookie))
+          .data as unknown as { currentSeq: number };
+        const res = await app.request('/api/mcp', {
+          method: 'POST',
+          headers: {
+            authorization: `Bearer ${tok.token}`,
+            'content-type': 'application/json',
+            accept: 'application/json, text/event-stream',
+          },
+          body: JSON.stringify({
+            jsonrpc: '2.0',
+            id: 1,
+            method: 'tools/call',
+            params: {
+              name: 'apply_changes',
+              arguments: {
+                project: p[0]!.id,
+                baseSeq: hist.currentSeq,
+                ops: [{ name: 'createSchema', args: { id: newId(), name: 'mcp_audit_schema' } }],
+              },
+            },
+          }),
+        });
+        expect(res.status).toBe(200);
+      },
+    },
+    {
+      action: 'model.verify',
+      run: async () => {
+        const p = (await call('GET', '/api/projects', undefined, adminCookie)).data as unknown as {
+          id: string;
+        }[];
+        const [adminRow] = await db.query<{ id: string }>("select id from users where username = 'admin'");
+        const tok = newMcpToken();
+        await db.query(
+          `insert into mcp_tokens (id, user_id, kind, name, prefix, token_hash, scopes, project_ids, expires_at)
+           values ($1, $2, 'personal', $3, $4, $5, $6::text::jsonb, null, $7)`,
+          [
+            'mcp-audit-tok-2',
+            adminRow!.id,
+            'audit-mcp-verify',
+            tok.prefix,
+            tok.hash,
+            JSON.stringify(['read', 'verify']),
+            new Date(Date.now() + 86_400_000).toISOString(),
+          ],
+        );
+        const res = await app.request('/api/mcp', {
+          method: 'POST',
+          headers: {
+            authorization: `Bearer ${tok.token}`,
+            'content-type': 'application/json',
+            accept: 'application/json, text/event-stream',
+          },
+          body: JSON.stringify({
+            jsonrpc: '2.0',
+            id: 2,
+            method: 'tools/call',
+            params: {
+              name: 'verify_migration',
+              arguments: { project: p[0]!.id, from: 'empty', to: 'head' },
+            },
+          }),
+        });
+        expect(res.status).toBe(200);
+      },
+    },
     // P6：CI 令牌创建 / 吊销、谁能创建令牌规则
     {
       action: 'token_policy.update',
@@ -707,6 +797,42 @@ test('每个应审计的动作都能在 audit_events 里找到', async () => {
               adminCookie,
             )
           ).status,
+        ).toBe(200);
+      },
+    },
+    // M3-C：MCP 令牌创建、吊销与账号停用批量吊销
+    {
+      action: 'mcp_token.create',
+      run: async () => {
+        expect((await call('POST', '/api/me/mcp-tokens', { name: 'mcp-audit' }, adminCookie)).status).toBe(
+          201,
+        );
+      },
+    },
+    {
+      action: 'mcp_token.revoke',
+      run: async () => {
+        const list = (await call('GET', '/api/me/mcp-tokens', undefined, adminCookie)).data as unknown as {
+          tokens: { id: string }[];
+        };
+        expect(
+          (await call('POST', `/api/me/mcp-tokens/${list.tokens[0]!.id}/revoke`, {}, adminCookie)).status,
+        ).toBe(200);
+      },
+    },
+    {
+      action: 'mcp_token.revoke_all',
+      run: async () => {
+        const freshMember = await call('POST', '/api/auth/login', {
+          username: 'member',
+          password: 'password3',
+        });
+        expect(freshMember.status).toBe(200);
+        expect(
+          (await call('POST', '/api/me/mcp-tokens', { name: 'member-mcp' }, freshMember.cookie)).status,
+        ).toBe(201);
+        expect(
+          (await call('PATCH', `/api/admin/users/${memberId}`, { status: 'disabled' }, adminCookie)).status,
         ).toBe(200);
       },
     },

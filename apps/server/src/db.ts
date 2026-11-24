@@ -135,6 +135,8 @@ const COLUMN_KINDS = new Map<string, ColumnKind>([
   ['environments.allow_same_instance', 'bool'],
   ['environments.drift_summary', 'json'],
   ['audit_events.data', 'json'],
+  ['mcp_tokens.scopes', 'json'],
+  ['mcp_tokens.project_ids', 'json'],
   ['invites.group_ids', 'json'],
   ['instance_settings.value', 'json'],
   ['oidc_providers.enabled', 'bool'],
@@ -1284,6 +1286,33 @@ export const MIGRATIONS: MigrationStep[] = [
         }
       }
     },
+  },
+  // M3-C：个人 MCP 令牌（ADR 0014）。
+  // - 属于用户（不是项目），用户删除时级联删除；只存明文的 SHA-256（token_hash 唯一），prefix 是明文前 12 个字符（dwm_ + 8 位）；
+  // - kind 预留给以后的 OAuth 2.1 访问令牌（目前只有 'personal'，不加 CHECK，免得以后 SQLite 重建表）；
+  // - scopes 是 JSON 数组（总是含 'read'），project_ids 是 JSON 数组或 null（null = 用户能看到的全部项目）；
+  // - 吊销写 revoked_at / revoked_by / revoked_reason（行保留，列表和审计看得到）；last_used_at / last_used_ip 最多 60 秒写一次；
+  // - 用 if not exists：升级测试会回退 dowel_migrations 版本号后重跑，后续迁移须幂等。
+  (d) => {
+    const { ts, now, json } = types(d);
+    return `create table if not exists mcp_tokens (
+     id text primary key,
+     user_id text not null references users on delete cascade,
+     kind text not null default 'personal',
+     name text not null,
+     prefix text not null,
+     token_hash text not null unique,
+     scopes ${json} not null,
+     project_ids ${json},
+     created_at ${ts} not null default ${now},
+     expires_at ${ts} not null,
+     revoked_at ${ts},
+     revoked_by text references users on delete set null,
+     revoked_reason text,
+     last_used_at ${ts},
+     last_used_ip text
+   );
+   create index if not exists mcp_tokens_user on mcp_tokens (user_id);`;
   },
   // ADR 0013 链尾版本作废：平台库软作废（retired_at / retired_by），版本号只增不重用；目标库表结构不变
   {

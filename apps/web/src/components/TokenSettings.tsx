@@ -1,6 +1,7 @@
 // CI 令牌（P6）：项目设置里的令牌管理（T1）和实例 / 组 / 项目三层“谁能创建令牌”的配置（T2）。
 // 令牌明文只在创建结果里出现一次；复制按钮遵循独立的 role="status" 实时区、失败提示与防重复定时器叠加。
 import {
+  CI_DOCS_PATH,
   type CiTokenCreated,
   type CiTokenInfo,
   type CiTokenList,
@@ -509,7 +510,12 @@ export const ProjectTokensPanel = ({ pid }: { pid: string }) => {
 
   return (
     <div className="space-y-4" data-testid="ci-tokens-panel">
-      <p className="hint mt-0">{t('tok.intro')}</p>
+      <p className="hint mt-0">
+        {t('tok.intro')} {/* CI API 交互文档（M3-C）：服务端页面，登录会话即可查看，不走 SPA 路由 */}
+        <a className="text-primary-text underline" href={CI_DOCS_PATH}>
+          {t('tok.apiDocs')}
+        </a>
+      </p>
 
       {created && <OneTimeToken created={created} onDismiss={() => setCreated(null)} />}
 

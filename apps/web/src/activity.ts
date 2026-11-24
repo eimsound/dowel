@@ -31,7 +31,7 @@ export const actionText = (action: string, data: unknown) => {
     name,
     environment,
     ...(environment ? { context: 'env' } : {}),
-    count: typeof d.objects === 'number' ? d.objects : 0,
+    count: typeof d.objects === 'number' ? d.objects : typeof d.opCount === 'number' ? d.opCount : 0,
     role: typeof d.role === 'string' ? i18n.t(`projects.role.${d.role}`) : '',
     username: typeof d.username === 'string' ? d.username : '',
     provider: typeof d.provider === 'string' ? d.provider : '',
@@ -39,3 +39,7 @@ export const actionText = (action: string, data: unknown) => {
     range: rangeOf(d),
   });
 };
+
+/** 通过 MCP 令牌发生的操作（M3-C）：审计 data.via = 'mcp'，界面加“MCP”标记 */
+export const viaMcp = (data: unknown): boolean =>
+  !!data && typeof data === 'object' && (data as Record<string, unknown>).via === 'mcp';

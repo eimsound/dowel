@@ -16,7 +16,7 @@
 Authorization: Bearer dwl_<43 位随机字符>
 ```
 
-- **不走 Cookie 会话，不校验 `Origin`**，适合直接用 `curl` 或各类 CI 运行器调用。
+- **不走 Cookie 会话，不校验 `Origin`**，适合直接用 `curl` 或各类 CI 运行器调用。（仅 OpenAPI 规范 `/api/ci/openapi.json` 与交互式文档 `/api/ci/docs` 额外允许已登录用户的会话 Cookie；详见 [OpenAPI 规范与交互式文档](#openapi-docs)。）
 - **能力范围固定为“只读 + 执行”**：令牌只能访问 `/api/ci/…` 且只能操作它所属的单个项目。携带 `Bearer dwl_…` 访问任何 `/api/ci/…` 之外的接口（包括编辑模型、发布版本、改策略、改连接串、标记为已执行、写基线、认领、接手、令牌管理本身）一律返回 `403 forbidden`，不会回落到 Cookie 会话。
 - **项目归属**：令牌属于项目，创建者离职或被停用不影响令牌继续工作。
 - **必须过期**：创建时必须指定有效天数（默认 90 天，最长 365 天）。过期和吊销均立即生效。
@@ -360,3 +360,37 @@ curl -fsS \
 | `rate_limited`             | `429`       | 超过认证失败限速或令牌请求限速（响应头带 `Retry-After`）                           |
 | `target_unreachable`       | `502`       | 无法连接目标库，或目标库拒绝操作（例如缺少建 schema 权限）                         |
 | `internal`                 | `500`       | 服务器内部错误                                                                     |
+
+---
+
+## 6. OpenAPI 规范与交互式文档 {#openapi-docs}
+
+Dowel 为上述 7 个外部 CI 接口提供 OpenAPI 3.1 规范与完全自托管的 Scalar 交互式文档：
+
+- **`GET /api/ci/openapi.json`** — 生成自服务端路由契约的 OpenAPI `3.1.0` JSON 文档，包含全部 7 个 `/api/ci/…` 接口的路径参数、请求体、成功响应与错误响应结构（`CiErrorBody`）。
+- **`GET /api/ci/docs`** — 自托管的 Scalar 交互式 API 参考页面（脚本与资源全部由同源服务提供，严格遵守 `script-src 'self'` CSP，不加载外部 CDN、外部字体或遥测服务）。
+
+### 访问认证规则 {#openapi-docs-auth}
+
+7 个 CI 业务接口始终**只接受 `Authorization: Bearer dwl_…` 令牌**（绝不接受会话 Cookie）。文档接口（`/api/ci/openapi.json`、`/api/ci/docs`、`/api/ci/docs/init.js`）则支持**以下任一方式**访问：
+
+1. **已登录用户的会话 Cookie** — 在浏览器登录 Dowel 后直接打开 `${DOWEL_URL}/api/ci/docs`。处于首次强制改密期间的账号返回 `403 password_change_required`；未登录或已停用账号返回 `401 unauthorized`。
+2. **有效的项目 CI 令牌（`Authorization: Bearer dwl_…`）** — 与业务接口共用同一套令牌校验、按 IP 失败限流、活跃令牌缓存与按令牌请求限速；无效、过期或已吊销的 `dwl_…` 令牌返回 `401`（`token_invalid` / `token_expired` / `token_revoked`），绝不回落到 Cookie 会话。
+
+携带 MCP 令牌（`Bearer dwm_…`）访问会返回 `403 forbidden`。
+
+### 使用 CI 令牌获取 OpenAPI 3.1 文档 {#openapi-curl}
+
+```bash
+curl -fsS \
+  -H "Authorization: Bearer ${DOWEL_TOKEN}" \
+  "${DOWEL_URL}/api/ci/openapi.json"
+```
+
+### 在浏览器查看交互式文档 {#openapi-browser}
+
+在浏览器登录 Dowel 后，直接访问以下地址即可浏览接口说明并在线调试：
+
+```text
+${DOWEL_URL}/api/ci/docs
+```

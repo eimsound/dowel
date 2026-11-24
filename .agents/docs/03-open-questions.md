@@ -297,6 +297,8 @@
 
 ✅ **已确定（2026-11-17）**：M3 提供 MCP 服务，与 CLI 共用同一套 API；AI 的修改走同样的冲突规则和评审流程。
 
+> **已落地（2026-11-24，M3-C，[ADR 0014](adr/0014-mcp-tokens-and-boundaries.md)）**：不做 CLI（11.4），MCP 服务直接复用服务端内部函数；个人 MCP 令牌（`dwm_`，scope `read` / `verify` / `write`，可选项目白名单，必须过期）；`apply_changes` 经 `Rooms` 走与人相同的同步层冲突规则；只读平台缓存、绝不连目标库；不能发布或执行，发布与执行仍由人走评审与审批。CI 的 7 个对外接口另生成 OpenAPI 与 Scalar 文档。
+
 - 调研结论是“AI / MCP 不算差异化，只是基本配置”（[01-research.md](01-research.md) 1.3），但路线图里没有安排。
 - **倾向**：提供 MCP 服务，暴露读取 IR、调用 mutator、生成并验证迁移的能力。AI 的修改和人一样走同步层的冲突规则和评审流程，不开后门。放在 M3，和 CLI 代理共用一套 API。
 

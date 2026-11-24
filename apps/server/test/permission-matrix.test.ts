@@ -56,6 +56,8 @@ type Access =
   | { kind: 'project-instance-admin'; statuses?: number[] }
   /** CI 令牌端点（/api/ci/*）：无令牌的用户一律 401，持有效令牌返回 tokenStatuses */
   | { kind: 'ci'; tokenStatuses: number[] }
+  /** CI 文档端点（/api/ci/openapi.json、/api/ci/docs*）：已登录用户或有效 CI 令牌均可访问 */
+  | { kind: 'ci-docs'; statuses?: number[]; tokenStatuses: number[] }
   | { kind: 'ws' };
 
 interface Ctx {
@@ -90,6 +92,7 @@ let injectWebSocket: ReturnType<typeof createApp>['injectWebSocket'];
 const P = () => `/api/projects/${currentCtx.pid}`;
 let currentCtx: Ctx;
 let ciToken = '';
+let mcpToken = '';
 let adminUserId = '';
 let unique = 0;
 
@@ -216,6 +219,14 @@ const matrix: Record<string, Spec> = {
     access: { kind: 'authed', statuses: [404] },
     path: () => '/api/me/identities/no-such-identity',
   },
+  // 个人 MCP 令牌（M3-C）
+  'GET /api/me/mcp-tokens': { access: { kind: 'authed', statuses: [200] } },
+  'POST /api/me/mcp-tokens': { access: { kind: 'authed', statuses: [400] }, body: () => ({}) },
+  'POST /api/me/mcp-tokens/:id/revoke': {
+    access: { kind: 'authed', statuses: [404] },
+    path: () => '/api/me/mcp-tokens/no-such-mcp-token/revoke',
+    body: () => ({}),
+  },
   // 实例管理
   'GET /api/admin/settings': { access: { kind: 'instance', statuses: [200] } },
   'PATCH /api/admin/settings': {
@@ -246,6 +257,15 @@ const matrix: Record<string, Spec> = {
   'POST /api/admin/users/:id/reset-password': {
     access: { kind: 'instance', statuses: [200] },
     path: (ctx) => `/api/admin/users/${ctx.resetTargetId}/reset-password`,
+    body: () => ({}),
+  },
+  'GET /api/admin/users/:id/mcp-tokens': {
+    access: { kind: 'instance', statuses: [200] },
+    path: (ctx) => `/api/admin/users/${ctx.outsiderId}/mcp-tokens`,
+  },
+  'POST /api/admin/users/:id/mcp-tokens/:tid/revoke': {
+    access: { kind: 'instance', statuses: [404] },
+    path: (ctx) => `/api/admin/users/${ctx.outsiderId}/mcp-tokens/no-such-mcp-token/revoke`,
     body: () => ({}),
   },
   'GET /api/admin/grants': { access: { kind: 'instance', statuses: [200] } },
@@ -843,6 +863,10 @@ const matrix: Record<string, Spec> = {
       ctx.tokenId = await freshToken(ctx.pid, ++unique, adminUserId);
     },
   },
+  // CI 文档与 OpenAPI 规范（/api/ci/openapi.json、/api/ci/docs*）：已登录用户或有效 CI 令牌均可访问
+  'GET /api/ci/openapi.json': { access: { kind: 'ci-docs', statuses: [200], tokenStatuses: [200] } },
+  'GET /api/ci/docs': { access: { kind: 'ci-docs', statuses: [200], tokenStatuses: [200] } },
+  'GET /api/ci/docs/init.js': { access: { kind: 'ci-docs', statuses: [200], tokenStatuses: [200] } },
   // CI 令牌专用端点（/api/ci/*）
   'GET /api/ci/token': { access: { kind: 'ci', tokenStatuses: [200] } },
   'GET /api/ci/projects/:owner/:project': {
@@ -900,6 +924,8 @@ const expectedStatus = (access: Access, identity: Identity): number | number[] =
   switch (access.kind) {
     case 'authed':
       return access.statuses ?? [200];
+    case 'ci-docs':
+      return access.statuses ?? [200];
     case 'instance':
       return identity.instanceAdmin ? (access.statuses ?? [200]) : 403;
     case 'group-read':
@@ -928,6 +954,8 @@ beforeAll(async () => {
     connectionLimiter: new KeyedLimiter({ limit: 10_000, windowMs: 60_000 }),
     tokenFailLimiter: new KeyedLimiter({ limit: 10_000, windowMs: 60_000 }),
     tokenLimiter: new KeyedLimiter({ limit: 10_000, windowMs: 60_000 }),
+    mcpFailLimiter: new KeyedLimiter({ limit: 10_000, windowMs: 60_000 }),
+    mcpLimiter: new KeyedLimiter({ limit: 10_000, windowMs: 60_000 }),
     forgotPasswordLimiter: new LoginLimiter({ limit: 10_000, ipLimit: 10_000 }),
     emailTestLimiter: new KeyedLimiter({ limit: 10_000, windowMs: 60_000 }),
     mailer: async () => {},
@@ -1049,6 +1077,10 @@ beforeAll(async () => {
   const tok = await call('POST', `/api/projects/${pid}/tokens`, { name: 'matrix-ci' }, adminCookie);
   expect(tok.status).toBe(201);
   ciToken = tok.data.token as string;
+
+  const mcpTok = await call('POST', '/api/me/mcp-tokens', { name: 'matrix-mcp' }, adminCookie);
+  expect(mcpTok.status).toBe(201);
+  mcpToken = mcpTok.data.token as string;
 
   currentCtx = {
     pid,
@@ -1252,13 +1284,20 @@ test('CI 令牌：访问所有非 /api/ci 端点一律 403 forbidden（不回落
     const res = await call(route.method, path, spec.body?.(ctx), admin.cookie, {
       authorization: `Bearer ${ciToken}`,
     });
-    if (spec.access.kind === 'ci') {
+    if (spec.access.kind === 'ci' || spec.access.kind === 'ci-docs') {
       expect(spec.access.tokenStatuses, `${key} / ciToken 返回 ${res.status}`).toContain(res.status);
     } else {
       expect(res.status, `CI 令牌访问非允许端点 ${key} 应为 403`).toBe(403);
       expect(res.data, key).toMatchObject({ ok: false, code: 'forbidden' });
     }
   }
+  // /api/mcp 仅注册了 ALL，单独核对 CI 令牌访问它也被 403 拒绝
+  const ciOnMcp = await call('POST', '/api/mcp', {}, admin.cookie, {
+    authorization: `Bearer ${ciToken}`,
+  });
+  expect(ciOnMcp.status, 'CI 令牌访问 /api/mcp 应为 403').toBe(403);
+  expect(ciOnMcp.data).toMatchObject({ ok: false, code: 'forbidden' });
+
   // WebSocket 同步接口带 CI 令牌同样被 403 拒绝
   const wsUrl = `${base.replace('http', 'ws')}/api/projects/${currentCtx.pid}/sync`;
   const wsStatus = await new Promise<number>((resolve) => {
@@ -1272,6 +1311,46 @@ test('CI 令牌：访问所有非 /api/ci 端点一律 403 forbidden（不回落
     ws.on('error', () => resolve(-1));
   });
   expect(wsStatus).toBe(403);
+});
+
+test('MCP 令牌：访问所有非 /api/mcp 端点一律 403 forbidden（不回落到 cookie），只允许访问 /api/mcp', async () => {
+  const admin = byName.get('admin')!;
+  for (const route of app.routes.filter((r) => r.method !== 'ALL')) {
+    const key = `${route.method} ${route.path}`;
+    const spec = matrix[key]!;
+    if (spec.access.kind === 'ws') continue;
+    const ctx: Ctx = { ...currentCtx };
+    await spec.prepare?.(ctx, admin);
+    const path = spec.path?.(ctx) ?? route.path;
+    const res = await call(route.method, path, spec.body?.(ctx), admin.cookie, {
+      authorization: `Bearer ${mcpToken}`,
+    });
+    expect(res.status, `MCP 令牌访问非允许端点 ${key} 应为 403`).toBe(403);
+    expect(res.data, key).toMatchObject({ code: 'forbidden' });
+  }
+  // WebSocket 同步接口带 MCP 令牌同样被 403 拒绝
+  const wsUrl = `${base.replace('http', 'ws')}/api/projects/${currentCtx.pid}/sync`;
+  const wsStatus = await new Promise<number>((resolve) => {
+    const ws = new WebSocket(wsUrl, {
+      headers: { authorization: `Bearer ${mcpToken}`, cookie: admin.cookie },
+    });
+    ws.on('unexpected-response', (_req, res) => {
+      resolve(res.statusCode ?? 0);
+      res.resume();
+    });
+    ws.on('error', () => resolve(-1));
+  });
+  expect(wsStatus).toBe(403);
+
+  // /api/mcp 仅带会话 cookie 拒绝（401 token_missing），带 MCP 令牌可以通过认证
+  const cookieOnly = await call('POST', '/api/mcp', {}, admin.cookie);
+  expect(cookieOnly.status).toBe(401);
+  expect(cookieOnly.data).toMatchObject({ code: 'token_missing' });
+
+  const authedMcp = await call('POST', '/api/mcp', {}, '', {
+    authorization: `Bearer ${mcpToken}`,
+  });
+  expect([401, 403, 429]).not.toContain(authedMcp.status);
 });
 
 test('mustChangePassword：强制改密期间仅放行 me/password/logout 与公开端点，其余全部 403 password_change_required', async () => {

@@ -71,6 +71,7 @@ export const Modal = ({
   size = 'md',
   footer,
   pending = false,
+  dismissible = true,
 }: {
   open: boolean;
   onClose: () => void;
@@ -86,12 +87,17 @@ export const Modal = ({
    * 不支持 closedby 的浏览器也不会关掉）
    */
   pending?: boolean;
+  /**
+   * false：不能用 Esc、点外部或右上角关闭，只能用底部按钮关闭（一次性展示的令牌明文，误关就再也看不到）。
+   */
+  dismissible?: boolean;
 }) => {
   const { t } = useTranslation();
-  const pendingRef = useRef(pending);
+  const locked = !dismissible || pending;
+  const lockedRef = useRef(locked);
   useEffect(() => {
-    pendingRef.current = pending;
-  }, [pending]);
+    lockedRef.current = locked;
+  }, [locked]);
   const ref = useRef<HTMLDialogElement>(null);
   const titleId = useId();
   useEffect(() => {
@@ -102,13 +108,13 @@ export const Modal = ({
   // closedby="any" 不支持时（Safari）补上点击外部关闭：按下和松开都在外部才关闭
   useEffect(() => {
     const d = ref.current!;
-    if ('closedBy' in HTMLDialogElement.prototype) return;
+    if (!dismissible || 'closedBy' in HTMLDialogElement.prototype) return;
     let pressedOutside = false;
     const down = (e: PointerEvent) => {
       pressedOutside = outside(e, d);
     };
     const up = (e: PointerEvent) => {
-      if (pressedOutside && outside(e, d) && !pendingRef.current) d.close();
+      if (pressedOutside && outside(e, d) && !lockedRef.current) d.close();
     };
     d.addEventListener('pointerdown', down);
     d.addEventListener('pointerup', up);
@@ -116,16 +122,17 @@ export const Modal = ({
       d.removeEventListener('pointerdown', down);
       d.removeEventListener('pointerup', up);
     };
-  }, []);
+  }, [dismissible]);
   return (
     <dialog
       ref={ref}
       aria-labelledby={titleId}
       onClose={onClose}
+      // 不支持 closedby 的浏览器里 Esc 触发 cancel：不可关闭或操作进行中时拦下
       onCancel={(e) => {
-        if (pendingRef.current) e.preventDefault();
+        if (lockedRef.current) e.preventDefault();
       }}
-      {...({ closedby: pending ? 'none' : 'any' } as object)}
+      {...({ closedby: locked ? 'none' : 'any' } as object)}
       className={`m-auto max-h-[88vh] flex-col overflow-hidden rounded-lg border border-border bg-panel p-0 text-text shadow-[var(--shadow-lg)] open:flex ${
         size === 'lg' ? 'w-[min(900px,94vw)]' : size === 'sm' ? 'w-[min(440px,94vw)]' : 'w-[min(600px,94vw)]'
       }`}
@@ -135,13 +142,15 @@ export const Modal = ({
         <h2 id={titleId} className="flex-1 text-[length:var(--fs-lg)] font-semibold">
           {title}
         </h2>
-        <IconButton
-          label={t('dlg.close')}
-          aria-disabled={pending || undefined}
-          onClick={() => !pendingRef.current && ref.current!.close()}
-        >
-          <X size={16} aria-hidden="true" />
-        </IconButton>
+        {dismissible && (
+          <IconButton
+            label={t('dlg.close')}
+            aria-disabled={pending || undefined}
+            onClick={() => !lockedRef.current && ref.current!.close()}
+          >
+            <X size={16} aria-hidden="true" />
+          </IconButton>
+        )}
       </header>
       {open && (
         <>

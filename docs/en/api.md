@@ -16,7 +16,7 @@ Authenticate every `/api/ci/...` request with a project CI token:
 Authorization: Bearer dwl_<43 random characters>
 ```
 
-- **No cookie sessions or `Origin` checks.** Suitable for `curl` and headless CI runners.
+- **No cookie sessions or `Origin` checks.** Suitable for `curl` and headless CI runners. (The OpenAPI specification `/api/ci/openapi.json` and interactive docs `/api/ci/docs` additionally accept a logged-in browser session cookie; see [OpenAPI specification and interactive reference](#openapi-docs).)
 - **Read-only plus forward apply scope.** A CI token only works under `/api/ci/...` for its single owning project. Passing `Bearer dwl_...` to any other endpoint (including model editing, version publishing, policy edits, connection edits, mark as applied, write baseline, claiming, takeover, or token management) returns `403 forbidden` without falling back to cookie authentication.
 - **Project ownership.** Tokens belong to the project rather than a user account, so disabling or removing the creator never breaks pipelines.
 - **Mandatory expiration.** Every token expires after a configured lifetime (default 90 days, maximum 365 days). Expiration and revocation take effect immediately.
@@ -361,3 +361,37 @@ All errors use a unified JSON envelope:
 | `rate_limited`             | `429`       | Exceeded auth-failure limit or token request limit (check `Retry-After` header)                                            |
 | `target_unreachable`       | `502`       | Failed to connect to target database, or missing privileges such as creating the `dowel` schema                            |
 | `internal`                 | `500`       | Unexpected server error                                                                                                    |
+
+---
+
+## 6. OpenAPI specification and interactive reference {#openapi-docs}
+
+Dowel exposes an OpenAPI 3.1 schema and a self-hosted Scalar API reference page covering the 7 CI endpoints:
+
+- **`GET /api/ci/openapi.json`** — OpenAPI `3.1.0` JSON document describing all 7 `/api/ci/...` endpoints, request parameters/bodies, 200 responses, and CI error responses (`CiErrorBody`).
+- **`GET /api/ci/docs`** — Self-hosted Scalar interactive API reference UI (all assets served from the same origin with strict CSP compatibility; no external CDN, fonts, or telemetry requests).
+
+### Access and authentication rules {#openapi-docs-auth}
+
+Unlike the 7 operational CI endpoints (which strictly require `Authorization: Bearer dwl_...` and never accept cookies), the documentation endpoints (`/api/ci/openapi.json`, `/api/ci/docs`, and `/api/ci/docs/init.js`) accept **either**:
+
+1. **A logged-in user session cookie** — Open `${DOWEL_URL}/api/ci/docs` directly in your browser after signing in. Users required to change a temporary password receive `403 password_change_required`; unauthenticated or disabled sessions receive `401 unauthorized`.
+2. **A valid project CI token (`Authorization: Bearer dwl_...`)** — Subject to the same token validation, per-IP failure rate limit, and per-token rate limit as operational CI endpoints. Invalid, expired, or revoked `dwl_...` tokens return `401` (`token_invalid`, `token_expired`, `token_revoked`) without falling back to cookies.
+
+Passing an MCP token (`Bearer dwm_...`) returns `403 forbidden`.
+
+### Fetch the OpenAPI 3.1 specification with a CI token {#openapi-curl}
+
+```bash
+curl -fsS \
+  -H "Authorization: Bearer ${DOWEL_TOKEN}" \
+  "${DOWEL_URL}/api/ci/openapi.json"
+```
+
+### Open interactive documentation in a browser {#openapi-browser}
+
+Sign in to Dowel in your browser and navigate to:
+
+```text
+${DOWEL_URL}/api/ci/docs
+```

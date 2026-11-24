@@ -11,6 +11,7 @@ import {
   type ResolvedPolicy,
 } from './policy.ts';
 
+export * from './mcp.ts';
 export * from './policy.ts';
 export * from './requests.ts';
 export * from './sections.ts';
@@ -214,6 +215,8 @@ export const instanceSettingsSchema = z.object({
    * Webhook 默认只能发往公网地址（拒绝回环、私有、链路本地等），这里列出的内网地址额外放行。
    */
   webhookAllowlist: z.array(z.string()),
+  /** 允许 MCP 访问（M3-C，ADR 0014）：关闭后不能新建 MCP 令牌，已有令牌访问 /api/mcp 一律 403 mcp_disabled；默认开 */
+  allowMcpAccess: z.boolean(),
   /** 实例的唯一标识：首次启动时生成，之后不变，只读（写进目标库的历史里，用来识别由哪个实例执行） */
   instanceId: z.string(),
 });
@@ -225,6 +228,7 @@ export const instanceSettingsPatchSchema = z.object({
   passwordLogin: z.boolean().optional(),
   connectionAllowlist: z.array(z.string().trim().max(200)).max(200).optional(),
   webhookAllowlist: z.array(z.string().trim().max(200)).max(200).optional(),
+  allowMcpAccess: z.boolean().optional(),
 });
 export type InstanceSettingsPatch = z.infer<typeof instanceSettingsPatchSchema>;
 

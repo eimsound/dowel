@@ -96,7 +96,7 @@ for (const scheme of ['light', 'dark'] as const) {
     await expect(save).toHaveAccessibleDescription(/有空的步骤.*升级脚本第 \d+ 步/);
     await scan(page, '版本详情（编辑脚本，有空步骤）');
 
-    for (const section of ['', '/password', '/identities', '/sessions', '/preferences']) {
+    for (const section of ['', '/password', '/identities', '/sessions', '/mcp', '/preferences']) {
       await page.goto(`/account${section}`);
       await expect(page.getByRole('heading', { name: '个人设置', exact: true })).toBeVisible();
       await scan(page, `个人设置${section}`);

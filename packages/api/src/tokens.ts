@@ -151,6 +151,11 @@ export interface TokenPolicyView {
 
 // ───── 面向 CI 的 HTTP API（/api/ci/…）：令牌认证，结构化的 JSON 错误 ─────
 
+/** CI OpenAPI 3.1 文档 JSON 路径（支持会话 Cookie 或 CI 令牌访问） */
+export const CI_OPENAPI_PATH = '/api/ci/openapi.json';
+/** CI 交互式 API 参考文档页面路径（Scalar，支持会话 Cookie 或 CI 令牌访问） */
+export const CI_DOCS_PATH = '/api/ci/docs';
+
 /**
  * 错误码 → HTTP 状态码（每个 code 固定对应一个状态码；一个状态码可以对应多个 code）。docs/en/api.md 与 docs/zh/api.md 有完整的表。
  */
