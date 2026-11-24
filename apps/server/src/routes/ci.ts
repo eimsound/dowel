@@ -22,7 +22,7 @@ import {
   TOKEN_PATTERN,
 } from '@dowel/api';
 import type { Db } from '@dowel/engines';
-import { HistoryError, indexTree, maxNumberNode, pathFromRoot, ScopeError } from '@dowel/engines';
+import { HistoryError, maxNumberNode, ScopeError } from '@dowel/engines';
 import { ExecutorError, type ExecutorErrorCode } from '@dowel/executor';
 import type { Context, Hono, MiddlewareHandler } from 'hono';
 import { HTTPException } from 'hono/http-exception';
