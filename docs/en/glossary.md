@@ -23,6 +23,7 @@ This glossary defines the core concepts and canonical terms used across Dowel do
 - **Approval flow.** An ordered sequence of approval stages defined in an execution policy. The default flow contains a single stage.
 - **Approval stage.** One step in an approval flow specifying eligible approvers and the required approval count.
 - **CI token.** A project-scoped credential with a required expiration (maximum 365 days) for automated pipelines. It can query state and apply forward migrations on environments where CI token execution is enabled, and cannot edit models, publish versions, or roll back.
+- **MCP token.** A user-scoped credential that lets an AI coding assistant access Dowel as that user through the MCP server. Its permission is the intersection of the user's current project role and the token's permissions (read / verify in shadow database / edit working copy), optionally limited to selected projects, and it always expires. It can't publish or execute and never connects to target databases.
 
 ## Projects and environments {#projects-and-environments}
 
