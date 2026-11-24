@@ -651,8 +651,8 @@ export const versionInfoSchema = z.object({
    */
   executed: z.boolean(),
   /**
-   * 可以一键取消作废：它已作废、它的 parent 是当前活跃链头、从它到全局最大编号的整段都是已作废的连续链尾
-   * （还没有基于父版本发布更新的版本）。取消作废会恢复整段
+   * 可以一键取消作废：全局最大编号的版本已作废、从它沿 parent 回溯能到达当前活跃链头，且这个版本在这条路径
+   * (活跃链头, 全局最大编号] 上（还没有基于父版本发布更新的版本）。取消作废恢复整条路径；路径之外的旧岔路保持作废
    */
   unretirable: z.boolean(),
   /**
@@ -681,7 +681,8 @@ export const versionRetireSchema = z
 export type VersionRetire = z.infer<typeof versionRetireSchema>;
 
 /**
- * 取消作废（POST /api/projects/:pid/versions/:vid/unretire）：恢复从 vid 到全局最大编号的整段已作废链尾。
+ * 取消作废（POST /api/projects/:pid/versions/:vid/unretire）：vid 必须在 (活跃链头, 全局最大编号] 这条已作废路径上，
+ * 恢复整条路径（不是按编号批量恢复：路径之外被替代的旧岔路保持作废）。
  * syncWorkingCopy = true：工作副本同步切回恢复后的链头的模型（默认不动）。workingSeq 同上
  */
 export const versionUnretireSchema = z
