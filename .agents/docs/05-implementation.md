@@ -656,4 +656,4 @@ P3 审查后的修正（2026-11-19）：
 
 ## 5. 下一步
 
-M3：模型分支、语义冲突检测与合并、变更评审流程与 MCP 服务（本地离线模式已于 2026-11-22 明确不做，见 [03-open-questions.md](03-open-questions.md) Q18）。
+M3：链尾版本作废与公共祖先切换（[ADR 0013](adr/0013-retire-tail-version-instead-of-branches.md)）、同方言画布 / 画布历史 / 跨画布复制粘贴、版本模型应用到画布与 MCP 服务（模型分支与语义合并引擎已于 2026-11-24 明确不做，见 [ADR 0013](adr/0013-retire-tail-version-instead-of-branches.md)；本地离线模式已于 2026-11-22 明确不做，见 [03-open-questions.md](03-open-questions.md) Q18）。
