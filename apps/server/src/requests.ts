@@ -348,7 +348,7 @@ const vlabel = (v: { number: number } | null | undefined) =>
  */
 export interface BindingCache {
   envs: Map<string, EnvRow | null>;
-  versions: Map<string, Map<string, { id: string; number: number; checksum: string }>>;
+  versions: Map<string, Map<string, { id: string; number: number; checksum: string; retiredAt: unknown }>>;
   projects: Map<string, ProjectRow | null>;
   stores: Map<string, PolicyStore>;
 }
@@ -392,8 +392,8 @@ export const bindingProblem = async (
     async () =>
       new Map(
         (
-          await db.query<{ id: string; number: number; checksum: string }>(
-            'select id, number, checksum from versions where project_id = $1',
+          await db.query<{ id: string; number: number; checksum: string; retiredAt: unknown }>(
+            'select id, number, checksum, retired_at as "retiredAt" from versions where project_id = $1',
             [req.project_id],
           )
         ).map((v) => [v.id, v]),
@@ -406,11 +406,24 @@ export const bindingProblem = async (
   if (env.drift_status === 'drifted') return invalid('检测到漂移：目标库的结构和环境当前版本不一致');
   if (env.production !== req.production) return invalid('环境的“生产”标记变了');
   if (connHash(env) !== req.conn_hash) return invalid('环境的连接设置变了');
-  if (!versions.has(req.to_version_id)) return invalid('目标版本已经不存在');
+  const toVer = versions.get(req.to_version_id);
+  if (!toVer) return invalid('目标版本已经不存在');
+  // (a) 非回滚申请（执行 / 切换）：目标版本已作废 → 失效
+  if (req.direction !== 'down' && iso(toVer.retiredAt) !== null)
+    return invalid(`目标版本 v${toVer.number} 已作废`);
+  const reqCreatedMs = new Date(iso(req.created_at)!).getTime();
   for (const m of req.migrations) {
     const v = versions.get(m.versionId);
     if (!v) return invalid(`版本 v${m.number} 已经不存在`);
     if (v.checksum !== m.checksum) return invalid(`版本 v${m.number} 的脚本在提交之后被修改过`);
+    const retiredAtIso = iso(v.retiredAt);
+    if (retiredAtIso !== null) {
+      // (b) 绑定的升级迁移对应版本已作废 → 失效
+      if (m.direction === 'up') return invalid(`版本 v${m.number} 已作废`);
+      // (c) 绑定的回滚迁移对应版本在提交申请之后才被作废 → 失效；提交前已作废的（作废后发起的切换 / 回滚申请）保持有效
+      if (new Date(retiredAtIso).getTime() > reqCreatedMs)
+        return invalid(`版本 v${m.number} 在提交申请后被作废`);
+    }
   }
   const project = await cached(cache.projects, req.project_id, () => projectRow(db, req.project_id));
   if (!project) return invalid('项目已经不存在');
@@ -460,7 +473,7 @@ export const isInterrupted = (req: Pick<RequestRow, 'status' | 'result'>): boole
  *   并保留原节点心跳抖动恢复后由 finish() 覆盖真实结果的能力，同样不再被巡检/重检改写为失效 / 过期（#18）。
  */
 const SWEEP_WHERE = "status in ('pending', 'approved', 'failed') and not emergency";
-const sweepWhere = (dialect: PlatformDb['dialect']): string => {
+export const sweepWhere = (dialect: PlatformDb['dialect']): string => {
   const codeExpr = dialect === 'pg' ? "result->>'code'" : "json_extract(result, '$.code')";
   return `${SWEEP_WHERE} and (status <> 'failed' or coalesce(${codeExpr}, '') <> '${INTERRUPTED}')`;
 };
