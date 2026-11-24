@@ -10,13 +10,20 @@ import {
   MCP_TOKEN_PATTERN,
   MCP_TOKEN_PREFIX,
   type McpRevokeReason,
+  mcpRevokeReasonSchema,
   type McpScope,
+  type McpTokenInfo,
+  mcpTokenKindSchema,
+  type McpTokenProjectRef,
+  type McpTokenStatus,
   normalizeMcpScopes,
 } from '@dowel/api';
 import type { Db } from '@dowel/engines';
 
 import { hashToken, type User } from './auth.ts';
+import { inList } from './db.ts';
 import { iso } from './envs.ts';
+import { effectiveRole, loadRoleContext, type ProjectRoleInput } from './roles.ts';
 import { userById } from './users.ts';
 
 /** 认证后挂在 /api/mcp 请求上的主体 */
@@ -151,4 +158,165 @@ export const revokeAllMcpTokens = async (
     [userId, new Date().toISOString(), by, reason],
   );
   return rows.length;
+};
+
+interface McpTokenRow {
+  id: string;
+  kind: string;
+  name: string;
+  prefix: string;
+  scopes: unknown;
+  projectIds: unknown;
+  createdAt: unknown;
+  expiresAt: unknown;
+  lastUsedAt: unknown;
+  lastUsedIp: string | null;
+  revokedAt: unknown;
+  revokedBy: string | null;
+  revokedByName: string | null;
+  revokedReason: string | null;
+}
+
+const MCP_TOKEN_SELECT = `select t.id, t.kind, t.name, t.prefix, t.scopes, t.project_ids as "projectIds",
+    t.created_at as "createdAt", t.expires_at as "expiresAt", t.last_used_at as "lastUsedAt",
+    t.last_used_ip as "lastUsedIp", t.revoked_at as "revokedAt", t.revoked_by as "revokedBy",
+    ru.name as "revokedByName", t.revoked_reason as "revokedReason"
+  from mcp_tokens t
+  left join users ru on ru.id = t.revoked_by`;
+
+/** 令牌状态：吊销优先于过期（与 CI 令牌一致） */
+export const mcpTokenStatus = (
+  r: { revokedAt: unknown; expiresAt: unknown },
+  now = Date.now(),
+): McpTokenStatus =>
+  r.revokedAt !== null && r.revokedAt !== undefined
+    ? 'revoked'
+    : Date.parse(iso(r.expiresAt)!) <= now
+      ? 'expired'
+      : 'active';
+
+interface VisibleProjectRow extends ProjectRoleInput {
+  name: string;
+  slug: string;
+  groupSlug: string;
+}
+
+/**
+ * 解析一组项目 ID 中调用者当前可见的项目（已删除或无权查看的不会出现在返回 Map 里）。
+ * 用于创建令牌时校验白名单，以及在列表/详情里把 projectIds 解析成 { id, path, name }。
+ */
+export const resolveVisibleMcpProjects = async (
+  db: Db,
+  projectIds: readonly string[],
+  viewer: { id: string; role: string },
+): Promise<Map<string, { path: string; name: string }>> => {
+  const ids = [...new Set(projectIds)];
+  const out = new Map<string, { path: string; name: string }>();
+  if (!ids.length) return out;
+  const rows = await db.query<VisibleProjectRow>(
+    `select p.id, p.name, p.slug, p.group_id as "groupId", g.slug as "groupSlug",
+            cast(g.default_role as text) as "groupDefaultRole",
+            cast(p.default_role as text) as "projectDefaultRole"
+       from projects p
+       join groups g on g.id = p.group_id
+      where p.id in (${inList(ids)})`,
+    ids,
+  );
+  if (!rows.length) return out;
+  if (viewer.role === 'admin') {
+    for (const p of rows) out.set(p.id, { path: `${p.groupSlug}/${p.slug}`, name: p.name });
+    return out;
+  }
+  const rc = await loadRoleContext(db, viewer);
+  for (const p of rows) {
+    if (effectiveRole(rc, p) !== null) out.set(p.id, { path: `${p.groupSlug}/${p.slug}`, name: p.name });
+  }
+  return out;
+};
+
+const toMcpTokenInfo = (
+  r: McpTokenRow,
+  visible: ReadonlyMap<string, { path: string; name: string }>,
+  now: number,
+): McpTokenInfo => {
+  const parsedKind = mcpTokenKindSchema.safeParse(r.kind);
+  const parsedReason = mcpRevokeReasonSchema.safeParse(r.revokedReason);
+  const pids = parseProjectIds(r.projectIds);
+  const projects: McpTokenProjectRef[] | null =
+    pids === null
+      ? null
+      : pids.map((id) => {
+          const p = visible.get(id);
+          return { id, path: p?.path ?? null, name: p?.name ?? null };
+        });
+  return {
+    id: r.id,
+    kind: parsedKind.success ? parsedKind.data : 'personal',
+    name: r.name,
+    prefix: r.prefix,
+    scopes: parseScopes(r.scopes),
+    projects,
+    createdAt: iso(r.createdAt)!,
+    expiresAt: iso(r.expiresAt)!,
+    lastUsedAt: iso(r.lastUsedAt),
+    lastUsedIp: r.lastUsedIp,
+    revokedAt: iso(r.revokedAt),
+    revokedBy: r.revokedBy ? { id: r.revokedBy, name: r.revokedByName ?? r.revokedBy } : null,
+    revokedReason: parsedReason.success ? parsedReason.data : null,
+    status: mcpTokenStatus(r, now),
+  };
+};
+
+/** 列出指定用户的全部 MCP 令牌：有效令牌在前，再按创建时间新到旧排序 */
+export const listMcpTokens = async (
+  db: Db,
+  userId: string,
+  viewer: { id: string; role: string },
+): Promise<McpTokenInfo[]> => {
+  const rows = await db.query<McpTokenRow>(
+    `${MCP_TOKEN_SELECT} where t.user_id = $1 order by t.created_at desc, t.id desc`,
+    [userId],
+  );
+  if (!rows.length) return [];
+  const allProjectIds = rows.flatMap((r) => parseProjectIds(r.projectIds) ?? []);
+  const visible = await resolveVisibleMcpProjects(db, allProjectIds, viewer);
+  const now = Date.now();
+  const items = rows.map((r) => toMcpTokenInfo(r, visible, now));
+  items.sort(
+    (a, b) =>
+      (a.status === 'active' ? 0 : 1) - (b.status === 'active' ? 0 : 1) ||
+      Date.parse(b.createdAt) - Date.parse(a.createdAt) ||
+      b.id.localeCompare(a.id),
+  );
+  return items;
+};
+
+/** 加载指定用户的单个 MCP 令牌详情；不存在返回 null */
+export const loadMcpToken = async (
+  db: Db,
+  userId: string,
+  tokenId: string,
+  viewer: { id: string; role: string },
+): Promise<McpTokenInfo | null> => {
+  const [row] = await db.query<McpTokenRow>(`${MCP_TOKEN_SELECT} where t.user_id = $1 and t.id = $2`, [
+    userId,
+    tokenId,
+  ]);
+  if (!row) return null;
+  const pids = parseProjectIds(row.projectIds);
+  const visible = pids ? await resolveVisibleMcpProjects(db, pids, viewer) : new Map();
+  return toMcpTokenInfo(row, visible, Date.now());
+};
+
+/** 统计指定用户当前未吊销且未过期的 MCP 令牌数量 */
+export const countActiveMcpTokens = async (
+  db: Db,
+  userId: string,
+  nowIso = new Date().toISOString(),
+): Promise<number> => {
+  const [row] = await db.query<{ n: number }>(
+    'select count(*) as n from mcp_tokens where user_id = $1 and revoked_at is null and expires_at > $2',
+    [userId, nowIso],
+  );
+  return Number(row?.n ?? 0);
 };

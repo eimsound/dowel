@@ -37,12 +37,14 @@ import {
 } from '../email.ts';
 import { deleteGrant, grantById, insertGrant, listGrants, subjectExists } from '../grants.ts';
 import { createInvite, deleteUnusedInvite, inviteById, listInvites, revokeInvite } from '../invites.ts';
+import { revokeAllMcpTokens } from '../mcp-tokens.ts';
 import { scrubSecrets, SecretError } from '../secrets.ts';
 import { expectedOrigin } from '../security.ts';
 import { hasOidcProvider, readSettings, writeSettings } from '../settings.ts';
 import { generateTempPassword, removeInitialAdminPasswordFile } from '../setup.ts';
 import { emailTaken, normalizeEmail, userById, usernameTaken } from '../users.ts';
 import { type AppContext, body, createUserOrConflict, type Env } from './context.ts';
+import { afterRevokeAllMcpTokens } from './mcp-tokens.ts';
 
 /** 邀请默认 7 天，重置密码链接 24 小时 */
 const INVITE_DAYS = 7;
@@ -219,6 +221,7 @@ export const registerAdmin = (app: Hono<Env>, ctx: AppContext) => {
     // PG 用 `for update` 锁住所有 active 管理员行（等锁的语句会重新判断行是否还符合条件）；
     // SQLite 不支持 for update，但适配器只有一个连接、事务串行，效果一样（见 db.ts 的注释）。
     let target: AdminUser;
+    let revokedMcpTokens = 0;
     try {
       target = await db.transaction(async (tx) => {
         const current = await userById(tx, id);
@@ -243,6 +246,9 @@ export const registerAdmin = (app: Hono<Env>, ctx: AppContext) => {
           'update users set name = coalesce($2, name), role = coalesce($3, role), status = coalesce($4, status), email = $5 where id = $1',
           [id, b.name ?? null, b.role ?? null, b.status ?? null, nextEmail],
         );
+        if (disable) {
+          revokedMcpTokens = await revokeAllMcpTokens(tx, id, 'user_disabled', actorId(c));
+        }
         return current;
       });
     } catch (e) {
@@ -252,8 +258,10 @@ export const registerAdmin = (app: Hono<Env>, ctx: AppContext) => {
 
     const disable = b.status === 'disabled' && target.status === 'active';
 
-    // 停用：立即删掉他的会话
-    if (disable) await revokeSessions(db, id);
+    // 停用：立即删掉他的会话并吊销全部 MCP 令牌
+    if (disable) {
+      await revokeSessions(db, id);
+    }
     // 停用、降级 / 升级实例管理员都会改变生效角色：刷新所有已加载房间
     await ctx.rooms.refreshLoaded();
     await audit(
@@ -269,6 +277,15 @@ export const registerAdmin = (app: Hono<Env>, ctx: AppContext) => {
       },
       ctx.security,
     );
+    if (disable) {
+      await afterRevokeAllMcpTokens(c, ctx, {
+        userId: id,
+        username: target.username,
+        actorId: actorId(c),
+        reason: 'user_disabled',
+        count: revokedMcpTokens,
+      });
+    }
     return c.json<AdminUser>((await userById(db, id))!);
   });
 
@@ -313,6 +330,7 @@ export const registerAdmin = (app: Hono<Env>, ctx: AppContext) => {
     const password = b.password ?? generateTempPassword();
     const hash = await hashPassword(password);
 
+    let revokedMcpTokens = 0;
     const target = await db.transaction(async (tx) => {
       const current = await userById(tx, id);
       if (!current) throw new HTTPException(404, { message: '用户不存在' });
@@ -322,6 +340,7 @@ export const registerAdmin = (app: Hono<Env>, ctx: AppContext) => {
         true,
       ]);
       await tx.query('delete from sessions where user_id = $1', [id]);
+      revokedMcpTokens = await revokeAllMcpTokens(tx, id, 'password_reset', actorId(c));
       return current;
     });
 
@@ -342,6 +361,13 @@ export const registerAdmin = (app: Hono<Env>, ctx: AppContext) => {
       },
       ctx.security,
     );
+    await afterRevokeAllMcpTokens(c, ctx, {
+      userId: id,
+      username: target.username,
+      actorId: actorId(c),
+      reason: 'password_reset',
+      count: revokedMcpTokens,
+    });
     return c.json<AdminResetPasswordResult>({ password, mustChangePassword: true });
   });
 

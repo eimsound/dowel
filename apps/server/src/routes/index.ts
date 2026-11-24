@@ -18,6 +18,7 @@ import { registerEnvironments } from './environments.ts';
 import { registerExecutions } from './executions.ts';
 import { registerGrants } from './grants.ts';
 import { registerGroups } from './groups.ts';
+import { registerMcpTokens } from './mcp-tokens.ts';
 import { registerMcp } from './mcp.ts';
 import { registerOidcAdmin, registerOidcAuth, registerOidcMe } from './oidc.ts';
 import { registerPolicy } from './policy.ts';
@@ -71,6 +72,7 @@ export const registerRoutes = (app: Hono<Env>, ctx: AppContext) => {
   ] as const)
     app.use(path, requireInstanceAdmin(action));
   registerAdmin(app, ctx);
+  registerMcpTokens(app, ctx);
   registerOidcAdmin(app, ctx);
   registerAudit(app, ctx);
 
