@@ -301,12 +301,35 @@ export const clientSnippets = (token: string, url = mcpUrl()) => ({
 
 type ClientKey = keyof ReturnType<typeof clientSnippets> | 'other';
 
-const Snippet = ({ text, label, hint }: { text: string; label: string; hint?: string }) => (
+const CLIENT_TITLES: Record<Exclude<ClientKey, 'other'>, string> = {
+  claude: 'Claude Code',
+  cursor: 'Cursor',
+  vscode: 'VS Code',
+};
+
+const Snippet = ({
+  text,
+  label,
+  hint,
+  name,
+}: {
+  text: string;
+  label: string;
+  hint?: string;
+  name: string;
+}) => (
   <div className="space-y-1.5 pt-2">
     {hint && <p className="hint m-0">{hint}</p>}
-    <pre className="m-0 overflow-x-auto rounded-md border border-border bg-bg p-3 font-mono text-xs whitespace-pre">
-      <code>{text}</code>
-    </pre>
+    <section
+      aria-label={name}
+      // oxlint-disable-next-line jsx-a11y/no-noninteractive-tabindex -- 可滚动的代码区需要能用键盘滚动
+      tabIndex={0}
+      className="overflow-x-auto rounded-md border border-border bg-bg p-3"
+    >
+      <pre className="m-0 font-mono text-xs whitespace-pre">
+        <code>{text}</code>
+      </pre>
+    </section>
     <CopyButton text={text} label={label} />
   </div>
 );
@@ -392,7 +415,12 @@ const Reveal = ({ created }: { created: McpTokenCreated }) => {
             k === 'other' ? (
               <OtherClient token={created.token} />
             ) : (
-              <Snippet text={snippets[k]} label={t('mcp.copyConfig')} hint={t(`mcp.clientHint.${k}`)} />
+              <Snippet
+                text={snippets[k]}
+                name={t('mcp.snippetName', { client: CLIENT_TITLES[k] })}
+                label={t('mcp.copyConfig')}
+                hint={t(`mcp.clientHint.${k}`)}
+              />
             )
           }
         </Tabs>
