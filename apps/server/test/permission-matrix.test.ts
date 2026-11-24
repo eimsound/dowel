@@ -56,6 +56,8 @@ type Access =
   | { kind: 'project-instance-admin'; statuses?: number[] }
   /** CI 令牌端点（/api/ci/*）：无令牌的用户一律 401，持有效令牌返回 tokenStatuses */
   | { kind: 'ci'; tokenStatuses: number[] }
+  /** CI 文档端点（/api/ci/openapi.json、/api/ci/docs*）：已登录用户或有效 CI 令牌均可访问 */
+  | { kind: 'ci-docs'; statuses?: number[]; tokenStatuses: number[] }
   | { kind: 'ws' };
 
 interface Ctx {
@@ -813,6 +815,10 @@ const matrix: Record<string, Spec> = {
       ctx.tokenId = await freshToken(ctx.pid, ++unique, adminUserId);
     },
   },
+  // CI 文档与 OpenAPI 规范（/api/ci/openapi.json、/api/ci/docs*）：已登录用户或有效 CI 令牌均可访问
+  'GET /api/ci/openapi.json': { access: { kind: 'ci-docs', statuses: [200], tokenStatuses: [200] } },
+  'GET /api/ci/docs': { access: { kind: 'ci-docs', statuses: [200], tokenStatuses: [200] } },
+  'GET /api/ci/docs/init.js': { access: { kind: 'ci-docs', statuses: [200], tokenStatuses: [200] } },
   // CI 令牌专用端点（/api/ci/*）
   'GET /api/ci/token': { access: { kind: 'ci', tokenStatuses: [200] } },
   'GET /api/ci/projects/:owner/:project': {
@@ -869,6 +875,8 @@ const expectedStatus = (access: Access, identity: Identity): number | number[] =
   if (!identity.active) return 401;
   switch (access.kind) {
     case 'authed':
+      return access.statuses ?? [200];
+    case 'ci-docs':
       return access.statuses ?? [200];
     case 'instance':
       return identity.instanceAdmin ? (access.statuses ?? [200]) : 403;
@@ -1222,7 +1230,7 @@ test('CI 令牌：访问所有非 /api/ci 端点一律 403 forbidden（不回落
     const res = await call(route.method, path, spec.body?.(ctx), admin.cookie, {
       authorization: `Bearer ${ciToken}`,
     });
-    if (spec.access.kind === 'ci') {
+    if (spec.access.kind === 'ci' || spec.access.kind === 'ci-docs') {
       expect(spec.access.tokenStatuses, `${key} / ciToken 返回 ${res.status}`).toContain(res.status);
     } else {
       expect(res.status, `CI 令牌访问非允许端点 ${key} 应为 403`).toBe(403);

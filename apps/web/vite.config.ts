@@ -1,10 +1,53 @@
+import { copyFileSync, createReadStream, mkdirSync } from 'node:fs';
+import { createRequire } from 'node:module';
+import { dirname, resolve } from 'node:path';
+
 import tailwindcss from '@tailwindcss/vite';
 import react from '@vitejs/plugin-react';
 import { Features } from 'lightningcss';
-import { defaultClientConditions, defineConfig } from 'vite';
+import { defaultClientConditions, defineConfig, type Plugin } from 'vite';
+
+const require = createRequire(import.meta.url);
+const SCALAR_VENDOR_PATH = '/vendor/scalar/standalone.js';
+
+/** 自托管 @scalar/api-reference 浏览器独立包，满足 strict CSP（script-src 'self'，零外链 CDN） */
+const scalarStandalonePlugin = (): Plugin => {
+  // @scalar/api-reference 的 exports 未暴露 ./package.json，经主入口 dist/index.js 定位 dist/browser/standalone.js
+  const scalarDistDir = dirname(require.resolve('@scalar/api-reference'));
+  const standaloneFile = resolve(scalarDistDir, 'browser/standalone.js');
+  let outDir = 'dist';
+
+  return {
+    name: 'dowel-scalar-standalone',
+    configResolved(config) {
+      outDir = resolve(config.root, config.build.outDir);
+    },
+    configureServer(server) {
+      server.middlewares.use((req, res, next) => {
+        const pathname = req.url?.split('?')[0];
+        if ((req.method === 'GET' || req.method === 'HEAD') && pathname === SCALAR_VENDOR_PATH) {
+          res.setHeader('Content-Type', 'text/javascript; charset=utf-8');
+          res.setHeader('Cache-Control', 'no-store');
+          if (req.method === 'HEAD') {
+            res.end();
+            return;
+          }
+          createReadStream(standaloneFile).pipe(res);
+          return;
+        }
+        next();
+      });
+    },
+    writeBundle(options) {
+      const targetDir = resolve(options.dir ?? outDir, 'vendor/scalar');
+      mkdirSync(targetDir, { recursive: true });
+      copyFileSync(standaloneFile, resolve(targetDir, 'standalone.js'));
+    },
+  };
+};
 
 export default defineConfig({
-  plugins: [react(), tailwindcss()],
+  plugins: [react(), tailwindcss(), scalarStandalonePlugin()],
   resolve: {
     conditions: ['@dowel/source', ...defaultClientConditions],
   },
