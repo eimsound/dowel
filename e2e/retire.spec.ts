@@ -24,7 +24,7 @@ const scan = async (page: Page, label: string) => {
 };
 
 const versionRow = (page: Page, n: number) =>
-  page.getByRole('listitem').filter({ hasText: new RegExp(`^v${n}\\b`) });
+  page.getByRole('listitem').filter({ has: page.getByRole('link', { name: `v${n}`, exact: true }) });
 
 const openVersion = async (page: Page, n: number) => {
   await gotoPage(page, '版本');
@@ -67,7 +67,7 @@ for (const scheme of ['light', 'dark'] as const) {
       await dlg.getByRole('button', { name: '作废 v2' }).click();
       await expect(dlg).toBeHidden();
       await expect(page.getByText('已作废 v2，链头现在是 v1')).toBeVisible();
-      await expect(page.getByRole('heading', { name: '这个版本已作废' })).toBeVisible();
+      await expect(page.getByText('这个版本已作废', { exact: true })).toBeVisible();
       // 还没发布更新版本：可以取消作废
       await expect(page.getByRole('button', { name: '取消作废' })).toBeVisible();
 
@@ -136,7 +136,7 @@ for (const scheme of ['light', 'dark'] as const) {
       await dlg.getByRole('button', { name: '取消作废' }).click();
       await expect(dlg).toBeHidden();
       await expect(page.getByText('已取消作废 v3，链头现在是 v3')).toBeVisible();
-      await expect(page.getByRole('heading', { name: '这个版本已作废' })).toHaveCount(0);
+      await expect(page.getByText('这个版本已作废', { exact: true })).toHaveCount(0);
       await scan(page, '版本详情');
     } finally {
       await db.drop();
