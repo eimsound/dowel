@@ -1729,6 +1729,7 @@ const zh = {
     },
   },
   tok: {
+    apiDocs: '查看 CI API 文档（OpenAPI）',
     title: 'CI 令牌',
     intro:
       '令牌属于项目，创建者离职或停用不影响使用。只能通过 /api/ci/… 读取项目状态和向前执行迁移：仅受环境“允许 CI 令牌执行”开关约束（非生产环境默认开启、生产环境默认关闭），不受“谁能执行”策略与审批流程限制。',
@@ -3927,6 +3928,7 @@ const en: typeof zh = {
     },
   },
   tok: {
+    apiDocs: 'API reference (OpenAPI)',
     title: 'CI tokens',
     intro:
       'Tokens belong to the project, so disabling or removing their creator does not break pipelines. They can only read project state and execute forward migrations via /api/ci/…: gated solely by each environment’s “Allow CI token execution” setting (on by default for non-production, off for production), bypassing “Who can execute” and approval workflows.',
