@@ -22,7 +22,7 @@ import {
   TOKEN_PATTERN,
 } from '@dowel/api';
 import type { Db } from '@dowel/engines';
-import { HistoryError, ScopeError } from '@dowel/engines';
+import { HistoryError, indexTree, maxNumberNode, pathFromRoot, ScopeError } from '@dowel/engines';
 import { ExecutorError, type ExecutorErrorCode } from '@dowel/executor';
 import type { Context, Hono, MiddlewareHandler } from 'hono';
 import { HTTPException } from 'hono/http-exception';
@@ -31,7 +31,7 @@ import type { ContentfulStatusCode } from 'hono/utils/http-status';
 import { audit } from '../audit.ts';
 import { hashToken } from '../auth.ts';
 import { can } from '../authz.ts';
-import { type EnvRow, iso } from '../envs.ts';
+import { type EnvRow, iso, versionStates } from '../envs.ts';
 import {
   checkEnvDriftDetailed,
   classifyError,
@@ -106,6 +106,8 @@ const EXECUTOR_CODES: Partial<Record<ExecutorErrorCode, CiErrorCode>> = {
   foreign_instance: 'foreign_instance',
   unverified: 'unverified',
   wrong_direction: 'rollback_not_allowed',
+  switch_required: 'switch_requires_web',
+  retired_target: 'version_retired',
   unknown_version: 'version_not_found',
   chain_broken: 'version_mismatch',
   history_broken: 'version_mismatch',
@@ -153,7 +155,10 @@ export const toCiError = (
         reason: e.code,
         ...(d.diff ? { diff: d.diff, diffTotal: d.diffTotal ?? d.diff.length } : {}),
         ...(e.code === 'first_run_drift' ? { firstRun: true } : {}),
-        ...(e.code === 'wrong_direction' && 'reached' in d ? { current: refOf(d.reached) } : {}),
+        ...((e.code === 'wrong_direction' || e.code === 'switch_required') && 'reached' in d
+          ? { current: refOf(d.reached) }
+          : {}),
+        ...(e.code === 'switch_required' && d.lca ? { lca: refOf(d.lca.id) ?? d.lca } : {}),
         ...(version !== undefined ? { version } : {}),
         ...(d.step !== undefined ? { step: d.step } : {}),
         ...(d.partial !== undefined ? { partial: d.partial } : {}),
@@ -209,17 +214,33 @@ const wrap =
 interface VersionLite {
   id: string;
   number: number;
+  parentId: string | null;
   name: string;
   verifiedAt: unknown;
+  retiredAt: unknown;
   checksum: string;
   createdAt: unknown;
 }
 
 const loadVersions = (db: Db, pid: string) =>
   db.query<VersionLite>(
-    `select id, number, name, verified_at as "verifiedAt", checksum, created_at as "createdAt"
+    `select id, number, parent_id as "parentId", name, verified_at as "verifiedAt",
+            retired_at as "retiredAt", checksum, created_at as "createdAt"
        from versions where project_id = $1 order by number`,
     [pid],
+  );
+
+const isRetired = (v: Pick<VersionLite, 'retiredAt'>): boolean =>
+  v.retiredAt !== null && v.retiredAt !== undefined;
+
+const activeHeadOf = (versions: VersionLite[]): VersionLite | undefined =>
+  maxNumberNode(versions.filter((v) => !isRetired(v))) ?? undefined;
+
+/** 与环境状态页同一套版本树状态（envs.ts versionStates） */
+const ciVersionStates = (versions: VersionLite[], cur: VersionLite | undefined) =>
+  versionStates(
+    versions.map((v) => ({ id: v.id, number: v.number, parentId: v.parentId, retired: isRetired(v) })),
+    cur?.id ?? null,
   );
 
 const ref = (v: { id: string; number: number; name: string }): CiVersionRef => ({
@@ -380,7 +401,7 @@ export const registerCi = (app: Hono<Env>, ctx: AppContext) => {
       const envs = await db.query<EnvRow>('select * from environments where project_id = $1 order by name', [
         p.id,
       ]);
-      const head = versions.at(-1);
+      const head = activeHeadOf(versions);
       return c.json<CiProject>({
         id: p.id,
         name: p.name,
@@ -427,12 +448,10 @@ export const registerCi = (app: Hono<Env>, ctx: AppContext) => {
           { reason: 'history_mismatch' },
         );
       const store = await loadPolicies(db, p);
+      const states = ciVersionStates(versions, cur);
       const list = versions.map((v) => ({
         ...ref(v),
-        state: (!cur || v.number > cur.number ? 'pending' : v.id === cur.id ? 'current' : 'applied') as
-          | 'pending'
-          | 'current'
-          | 'applied',
+        state: states.get(v.id)!,
         verified: v.verifiedAt !== null && v.verifiedAt !== undefined,
       }));
       return c.json<CiEnvironmentStatus>({
@@ -579,15 +598,24 @@ export const registerCi = (app: Hono<Env>, ctx: AppContext) => {
         const v = id ? byId.get(id) : undefined;
         return v ? ref(v) : null;
       };
+      const head = activeHeadOf(versions);
       const raw = String(b.to).trim().toLowerCase();
       const target =
-        raw === 'latest' ? versions.at(-1) : versions.find((v) => v.number === Number(raw.replace(/^v/, '')));
+        raw === 'latest' ? head : versions.find((v) => v.number === Number(raw.replace(/^v/, '')));
       if (!target)
         throw new CiError(
           'version_not_found',
-          versions.length
-            ? `目标版本 ${b.to} 不在版本链上（最新是 v${versions.at(-1)!.number}）`
-            : '项目还没有发布任何版本',
+          head
+            ? `目标版本 ${b.to} 不在版本链上（最新活跃版本是 v${head.number}）`
+            : versions.length
+              ? '项目没有可用的活跃版本'
+              : '项目还没有发布任何版本',
+        );
+      if (isRetired(target))
+        throw new CiError(
+          'version_retired',
+          `目标版本 v${target.number}「${target.name}」已作废，不能执行到它`,
+          { version: ref(target) },
         );
 
       let curProject = p;
@@ -683,13 +711,20 @@ export const registerCi = (app: Hono<Env>, ctx: AppContext) => {
                     },
                   ]
                 : []),
-              ...plan.migrations.map((m): CiMigration => ({
-                number: m.number,
-                name: m.name,
-                direction: m.direction === 'down' ? 'up' : (m.direction as 'up' | 'baseline'),
-                steps: m.steps.length,
-                nonTransactional: m.nonTransactional,
-              })),
+              ...plan.migrations.map((m): CiMigration => {
+                if (m.direction === 'down')
+                  throw new CiError(
+                    'switch_requires_web',
+                    'CI 令牌不允许执行回滚操作，请在 Web 端人工确认切换',
+                  );
+                return {
+                  number: m.number,
+                  name: m.name,
+                  direction: m.direction,
+                  steps: m.steps.length,
+                  nonTransactional: m.nonTransactional,
+                };
+              }),
             ],
             noop: plan.migrations.length === 0 && !plan.baseline,
             durationMs: Date.now() - started,
@@ -723,7 +758,8 @@ export const registerCi = (app: Hono<Env>, ctx: AppContext) => {
           lockWaitMs: b.lockTimeoutSeconds * 1000,
           timeouts: curTimeouts,
           onCommitted: (m) => {
-            committed.push({ number: m.number, direction: m.direction === 'baseline' ? 'baseline' : 'up' });
+            if (m.direction === 'down') throw new Error('CI 令牌执行中出现了非法的回滚迁移');
+            committed.push({ number: m.number, direction: m.direction });
             lastReachedId = m.toId;
           },
           // 锁内重新检查：等锁期间令牌可能被吊销 / 过期，策略可能关闭了允许令牌执行
@@ -771,11 +807,15 @@ export const registerCi = (app: Hono<Env>, ctx: AppContext) => {
           from,
           to: ref(target),
           reached: current ? { id: current.id, number: current.number, name: current.name } : null,
-          migrations: ran.map((m) => ({
-            number: m.number,
-            name: byNumber.get(m.number)?.name ?? '',
-            direction: m.direction === 'baseline' ? 'baseline' : 'up',
-          })),
+          migrations: ran.map((m) => {
+            if (m.direction === 'down')
+              throw new CiError('switch_requires_web', 'CI 令牌不允许执行回滚操作，请在 Web 端人工确认切换');
+            return {
+              number: m.number,
+              name: byNumber.get(m.number)?.name ?? '',
+              direction: m.direction,
+            };
+          }),
           noop: ran.length === 0,
           durationMs: Date.now() - started,
         };

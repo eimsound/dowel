@@ -12,7 +12,8 @@ import type {
   PendingRequest,
   PolicySettings,
 } from '@dowel/api';
-import { addColumn, all, emptyModel, type Model } from '@dowel/core';
+import { addColumn, all, emptyModel, type Model, newId, plan } from '@dowel/core';
+import { stepsChecksum, toScriptSteps } from '@dowel/engines';
 import { afterAll, beforeAll, describe, expect, test, vi } from 'vitest';
 
 import { connect, createTestDb, PG_URL } from '../../../test/pg.ts';
@@ -674,6 +675,198 @@ describe.skipIf(!PG_URL)('执行申请：表驱动场景（目标库 PG）', () 
     expect(a.data.code).toBe('request_invalid');
     expect((await detail(pid, r1.id)).statusReason).toContain('审批流程变严');
     await call('PUT', '/api/groups/req/exec-policy', { production: {}, nonProduction: {} }, 'ga');
+  });
+
+  test('ADR 0013 切换申请（kind=switch）：提交、审批、双分段执行、Webhook 标题与紧急切换', async () => {
+    const pid = await newProject('req-switch');
+    const prod = await realEnv(pid, 'prod', true);
+    const [v1, v2] = await publishChain(pid, 2);
+    // 先由管理员直接执行到 v2
+    expect(
+      last(
+        (
+          await call('POST', `/api/projects/${pid}/environments/${prod.eid}/execute`, {
+            to: v2!.id,
+            confirm: 'prod',
+          })
+        ).events,
+      ).stage,
+    ).toBe('done');
+
+    // 在 v1 下创建新分支活跃版本 v3（添加 main_c3），并将 v2 标为作废
+    const [bRow] = await db.query<{ id: string }>('select id from branches where project_id = $1', [pid]);
+    const [v1Row] = await db.query<{ model: Model }>('select model from versions where id = $1', [v1!.id]);
+    const m1 = v1Row!.model;
+    const m3 = structuredClone(m1);
+    addColumn(m3, tableOf(m3), { name: 'main_c3', type: 'text' });
+    const up3 = toScriptSteps(plan(m1, m3), 'pg');
+    const down3 = toScriptSteps(plan(m3, m1), 'pg');
+    const v3Id = newId();
+    await db.query(
+      `insert into versions (id, project_id, branch_id, seq, name, model, created_by, number, parent_id,
+                             up_steps, down_steps, checksum, verified_at)
+       values ($1, $2, $3, 2, 'v3', $4::text::jsonb, null, 3, $5, $6::text::jsonb, $7::text::jsonb, $8, $9)`,
+      [
+        v3Id,
+        pid,
+        bRow!.id,
+        JSON.stringify(m3),
+        v1!.id,
+        JSON.stringify(up3),
+        JSON.stringify(down3),
+        stepsChecksum(up3, down3),
+        new Date().toISOString(),
+      ],
+    );
+    await db.query('update versions set retired_at = $2 where id = $1', [v2!.id, new Date().toISOString()]);
+
+    // 1. 提交校验：针对已作废版本 v2 提交非 rollback 申请 → 409 retired_target；switch 缺 ack → 422
+    const retSub = await call(
+      'POST',
+      `/api/projects/${pid}/environments/${prod.eid}/requests`,
+      { kind: 'switch', to: v2!.id, acknowledgeRollback: true },
+      'dev',
+    );
+    expect(retSub.status).toBe(409);
+    expect(retSub.data.code).toBe('retired_target');
+
+    const noAckSub = await call(
+      'POST',
+      `/api/projects/${pid}/environments/${prod.eid}/requests`,
+      { kind: 'switch', to: v3Id },
+      'dev',
+    );
+    expect(noAckSub.status).toBe(422);
+    expect(noAckSub.data.code).toBe('rollback_ack_required');
+
+    // dryRun 无需 acknowledgeRollback 也能返回完整 switch + lca 计划
+    const drySub = await call(
+      'POST',
+      `/api/projects/${pid}/environments/${prod.eid}/requests`,
+      { kind: 'switch', to: v3Id, dryRun: true },
+      'dev',
+    );
+    expect(drySub.status).toBe(200);
+    expect((drySub.data as unknown as DryRunResponse).plan).toMatchObject({
+      direction: 'switch',
+      lca: { id: v1!.id, number: 1 },
+    });
+
+    const hookEvents: { type: string; lines: string[]; data: Record<string, unknown> }[] = [];
+    const enqueueIn = created.webhooks.enqueueIn.bind(created.webhooks);
+    created.webhooks.enqueueIn = async (tx, gid, event) => {
+      hookEvents.push({
+        type: event.type,
+        lines: event.lines,
+        data: event.data as Record<string, unknown>,
+      });
+      return enqueueIn(tx, gid, event);
+    };
+    try {
+      // 2. 真实提交 switch 申请：DB 存 direction='up'，API 派生 kind='switch'
+      const subRes = await call(
+        'POST',
+        `/api/projects/${pid}/environments/${prod.eid}/requests`,
+        { kind: 'switch', to: v3Id, acknowledgeRollback: true, reason: '切换到新活跃主链' },
+        'dev',
+      );
+      expect(subRes.status, JSON.stringify(subRes.data)).toBe(201);
+      const rid = subRes.data.id as string;
+      const [dbRow] = await db.query<{ direction: string }>(
+        'select direction from exec_requests where id = $1',
+        [rid],
+      );
+      expect(dbRow!.direction).toBe('up');
+      expect((await detail(pid, rid)).kind).toBe('switch');
+      const reqList = (await call('GET', `/api/projects/${pid}/requests`))
+        .data as unknown as ExecRequestSummary[];
+      expect(reqList.find((r) => r.id === rid)?.kind).toBe('switch');
+
+      // 通知与 Webhook 文案含 LCA 提示 “切换到 v3（先回滚到 v1）”
+      const paInbox = await inbox('pa');
+      const notice = paInbox.items.find((n) => n.requestId === rid);
+      expect(notice?.data.title).toContain('切换到 v3（先回滚到 v1）');
+      expect(
+        hookEvents.some(
+          (h) => h.type === 'request.created' && h.lines.join('\n').includes('切换到 v3（先回滚到 v1）'),
+        ),
+      ).toBe(true);
+
+      // 3. 审批通过并执行：执行器完成 [down v2, up v3] 两段迁移，目标库停在 v3
+      const runRes = await approveAndExecute(pid, rid, 0, 'pa');
+      expect(runRes.status).toBe(200);
+      expect(last(runRes.events)).toMatchObject({ stage: 'done', current: { id: v3Id, number: 3 } });
+      expect((await detail(pid, rid)).status).toBe('executed');
+      const cols = await prod.target.db.query<{ c: string }>(
+        "select column_name::text as c from information_schema.columns where table_schema='public' and table_name='orders' order by ordinal_position",
+      );
+      expect(cols.map((c) => c.c)).toEqual(['id', 'main_c3']);
+      expect(
+        hookEvents.some(
+          (h) => h.type === 'request.executed' && h.lines.join('\n').includes('切换到 v3（先回滚到 v1）'),
+        ),
+      ).toBe(true);
+
+      // 4. 在版本树上从 v3 回滚到 v1：Webhook 文案必须用真实的 v1（不能退化为 3 - 1 = v2）
+      const rbSub = await call(
+        'POST',
+        `/api/projects/${pid}/environments/${prod.eid}/requests`,
+        { kind: 'rollback', to: v1!.id },
+        'dev',
+      );
+      expect(rbSub.status, JSON.stringify(rbSub.data)).toBe(201);
+      const rbId = rbSub.data.id as string;
+      const rbHook = hookEvents.find((h) => h.type === 'request.created' && h.data.requestId === rbId);
+      expect(rbHook?.lines.join('\n')).toContain('回滚到 v1');
+      expect(rbHook?.lines.join('\n')).not.toContain('回滚到 v2');
+      expect(last((await approveAndExecute(pid, rbId, 0, 'pa')).events).stage).toBe('done');
+
+      // 5. 紧急切换（emergency kind=switch）：把测试库重置回作废前路径走到 v2 再作废 v2
+      await db.query('update versions set retired_at = null where id = $1', [v2!.id]);
+      expect(
+        last(
+          (
+            await call('POST', `/api/projects/${pid}/environments/${prod.eid}/execute`, {
+              to: v2!.id,
+              confirm: 'prod',
+            })
+          ).events,
+        ).stage,
+      ).toBe('done');
+      await db.query('update versions set retired_at = $2 where id = $1', [v2!.id, new Date().toISOString()]);
+
+      const emPath = `/api/projects/${pid}/environments/${prod.eid}/emergency`;
+      const emNoAck = await call('POST', emPath, {
+        kind: 'switch',
+        to: v3Id,
+        reason: '紧急回切',
+        confirm: 'prod',
+      });
+      expect(emNoAck.status).toBe(422);
+      expect(emNoAck.data.code).toBe('rollback_ack_required');
+
+      const emRet = await call('POST', emPath, {
+        kind: 'switch',
+        to: v2!.id,
+        acknowledgeRollback: true,
+        reason: '已作废',
+        confirm: 'prod',
+      });
+      expect(emRet.status).toBe(409);
+      expect(emRet.data.code).toBe('retired_target');
+
+      const emOk = await call('POST', emPath, {
+        kind: 'switch',
+        to: v3Id,
+        acknowledgeRollback: true,
+        reason: '紧急切换活跃主链',
+        confirm: 'prod',
+      });
+      expect(emOk.status).toBe(200);
+      expect(last(emOk.events)).toMatchObject({ stage: 'done', current: { id: v3Id, number: 3 } });
+    } finally {
+      created.webhooks.enqueueIn = enqueueIn;
+    }
   });
 });
 

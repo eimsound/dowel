@@ -25,7 +25,10 @@ export const stripReadbackMark = (error: string): string =>
   error.startsWith(READBACK_MARK) ? error.slice(READBACK_MARK.length) : error;
 
 export const runTouched = (r: RunRow): boolean =>
-  (r.status === 'done' && r.direction !== 'mark') || r.stepIndex !== null || isReadbackFailure(r.error);
+  (r.status === 'running' && r.direction !== 'mark') ||
+  (r.status === 'done' && r.direction !== 'mark') ||
+  r.stepIndex !== null ||
+  isReadbackFailure(r.error);
 
 export const runVersionId = (r: RunRow): string | null =>
   r.direction === 'down' ? r.fromVersion : r.toVersion;

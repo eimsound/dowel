@@ -224,10 +224,10 @@ export const loadChain = async (db: Db, pid: string): Promise<ChainVersion[]> =>
     downSteps: r.downSteps,
     checksum: r.checksum,
     verified: r.verifiedAt !== null && r.verifiedAt !== undefined,
+    retired: r.retiredAt !== null && r.retiredAt !== undefined,
     publishedAt: iso(r.createdAt) ?? new Date(0).toISOString(),
     publishedBy: r.createdBy,
     scope: r.scope?.length ? r.scope : null,
-    retired: r.retiredAt !== null && r.retiredAt !== undefined,
   }));
 };
 

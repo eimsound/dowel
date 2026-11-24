@@ -24,6 +24,7 @@ import {
   stepsChecksum,
   toScriptSteps,
 } from '@dowel/engines';
+import { verifyChain } from '@dowel/engines';
 import { expect, test } from 'vitest';
 
 import { connect, createTestDb, PG_URL, useTestDb } from '../../../test/pg.ts';
@@ -1337,6 +1338,251 @@ test.skipIf(!PG_URL)(
       // 一致：照常执行
       const ok = await run(t.db, chain, 3, { expect: bind(idOf(chain, 2), [3]) });
       expect(ok).toMatchObject({ direction: 'up', current: idOf(chain, 3) });
+    });
+  },
+);
+
+test.skipIf(!PG_URL)(
+  'ADR 0013 版本树路由：switch 先降到 LCA 再升到目标；方向错误报 switch_required/wrong_direction；作废版本拒升只许降',
+  async () => {
+    const m1 = await canon(m0());
+    const m2 = await canon(withEmail(m0()));
+    const m3Ret = await canon(
+      (() => {
+        const m = structuredClone(m2);
+        const pub = Object.values(m.objects).find((o) => o.kind === 'schema' && o.name === 'public')!.id;
+        const t = createTable(m, pub, 'legacy_logs', 't-legacy');
+        addColumn(m, t, { name: 'id', type: 'bigint', notNull: true, id: 'c-lid' });
+        addPrimaryKey(m, t, ['c-lid'], 'pk-legacy');
+        return m;
+      })(),
+    );
+    const m4 = await canon(withOrders(m2));
+    const m5 = await canon(
+      (() => {
+        const m = structuredClone(m4);
+        addColumn(m, 't-orders', { name: 'note', type: 'text', id: 'c-onote' });
+        return m;
+      })(),
+    );
+
+    const mk = (
+      id: string,
+      number: number,
+      parentId: string | null,
+      fromM: Model,
+      toM: Model,
+      retired = false,
+    ): ChainVersion => {
+      const up = toScriptSteps(plan(fromM, toM), 'pg');
+      const down = toScriptSteps(plan(toM, fromM), 'pg');
+      return {
+        id,
+        number,
+        parentId,
+        name: `版本 ${number}`,
+        model: toM,
+        upSteps: up,
+        downSteps: down,
+        checksum: stepsChecksum(up, down),
+        verified: true,
+        retired,
+        publishedAt: new Date().toISOString(),
+        publishedBy: null,
+        scope: null,
+      };
+    };
+
+    const v1 = mk('v-1', 1, null, emptyBase(m1, null), m1);
+    const v2 = mk('v-2', 2, 'v-1', m1, m2);
+    const v3Live = mk('v-3', 3, 'v-2', m2, m3Ret);
+    const v3Retired: ChainVersion = { ...v3Live, retired: true };
+    const v4 = mk('v-4', 4, 'v-2', m2, m4);
+    const v5 = mk('v-5', 5, 'v-4', m4, m5);
+    const tree: ChainVersion[] = [v1, v2, v3Retired, v4, v5];
+
+    await withTarget(async (t) => {
+      const call = (over: Partial<Parameters<typeof execute>[0]> & { chain: ChainVersion[]; to: string }) =>
+        execute({
+          db: t.db,
+          projectId: 'p1',
+          projectName: '演示',
+          instanceId: 'inst-A',
+          executedBy: 'u1',
+          ...over,
+        });
+
+      // 先在作废前的链路走到 v-3
+      await call({ chain: [v1, v2, v3Live], to: 'v-3', direction: 'up' });
+
+      // 已停在作废 v-3：不能方向 'up' 再空操作
+      await expect(call({ chain: tree, to: 'v-3', direction: 'up' })).rejects.toMatchObject({
+        code: 'retired_target',
+      });
+      // 用 direction: 'up' 或 'down' 试图去另一岔路 v-5 → switch_required / wrong_direction
+      const reqSwitch = await fails(call({ chain: tree, to: 'v-5', direction: 'up' }));
+      expect(reqSwitch).toMatchObject({
+        code: 'switch_required',
+        details: {
+          reached: 'v-3',
+          versionId: 'v-5',
+          lca: { id: 'v-2', number: 2, name: '版本 2' },
+        },
+      });
+      await expect(call({ chain: tree, to: 'v-5', direction: 'down' })).rejects.toMatchObject({
+        code: 'wrong_direction',
+      });
+
+      // switch 预演：只算计划 [v-3 down, v-4 up, v-5 up] 与 lca，不写历史表
+      const dry = await call({ chain: tree, to: 'v-5', direction: 'switch', dryRun: true });
+      expect(dry).toMatchObject({
+        direction: 'switch',
+        lca: { id: 'v-2', number: 2, name: '版本 2' },
+        dryRun: {
+          lca: { id: 'v-2', number: 2, name: '版本 2' },
+          migrations: [
+            { versionId: 'v-3', direction: 'down' },
+            { versionId: 'v-4', direction: 'up' },
+            { versionId: 'v-5', direction: 'up' },
+          ],
+        },
+      });
+      expect((await readState(t.db, 'p1')).current).toBe('v-3');
+
+      // 绑定预演的 expect 被改坏（例如删掉 down 或改错 lca 后面的路径）→ request_stale
+      await expect(
+        call({
+          chain: tree,
+          to: 'v-5',
+          direction: 'switch',
+          expect: {
+            from: 'v-3',
+            migrations: [
+              { versionId: 'v-4', direction: 'up', checksum: v4.checksum },
+              { versionId: 'v-5', direction: 'up', checksum: v5.checksum },
+            ],
+          },
+        }),
+      ).rejects.toMatchObject({ code: 'request_stale' });
+
+      // 真实 switch 执行：先 down v-3 再 up v-4、v-5
+      const switched = await call({ chain: tree, to: 'v-5', direction: 'switch' });
+      expect(switched).toMatchObject({
+        direction: 'switch',
+        current: 'v-5',
+        lca: { id: 'v-2', number: 2, name: '版本 2' },
+      });
+      expect(switched.ran.map((x) => [x.versionId, x.direction])).toEqual([
+        ['v-3', 'down'],
+        ['v-4', 'up'],
+        ['v-5', 'up'],
+      ]);
+      expect((await readState(t.db, 'p1')).current).toBe('v-5');
+      await structureIs(t.db, m5);
+      const hist = await readHistory(t.db, 'p1');
+      expect(verifyChain(hist.versions)).toEqual([]);
+      expect(await checkDrift({ db: t.db, projectId: 'p1', chain: tree })).toMatchObject({
+        status: 'ok',
+        version: 'v-5',
+      });
+
+      // 已经在活跃链上的回滚不能假装 switch
+      await expect(call({ chain: tree, to: 'v-4', direction: 'switch' })).rejects.toMatchObject({
+        code: 'wrong_direction',
+      });
+      // 回滚到 v-2 再升级到 v-3（已作废）→ retired_target
+      await call({ chain: tree, to: 'v-2', direction: 'down' });
+      await expect(call({ chain: tree, to: 'v-3', direction: 'up' })).rejects.toMatchObject({
+        code: 'retired_target',
+      });
+    });
+
+    // 在独立的库里停在已作废 v-3：允许沿 down 回滚到 v-2
+    await withTarget(async (t) => {
+      await execute({
+        db: t.db,
+        projectId: 'p1',
+        projectName: '演示',
+        instanceId: 'inst-A',
+        executedBy: 'u1',
+        chain: [v1, v2, v3Live],
+        to: 'v-3',
+        direction: 'up',
+      });
+      const rolled = await execute({
+        db: t.db,
+        projectId: 'p1',
+        projectName: '演示',
+        instanceId: 'inst-A',
+        executedBy: 'u1',
+        chain: tree,
+        to: 'v-2',
+        direction: 'down',
+      });
+      expect(rolled).toMatchObject({ direction: 'down', current: 'v-2' });
+    });
+
+    // 非事务 up 中途失败且该版本随后被作废：再次 up 必须拒绝对已作废版本的断点续跑并给出清晰提示
+    await withTarget(async (t) => {
+      const m3Bad = structuredClone(m2);
+      const badUp: ScriptStep[] = [
+        { sql: 'CREATE TABLE public.tmp_nontx (id int)', transactional: false },
+        {
+          sql: 'CREATE TABLE public.bad_ref (id int references public.missing_tbl(id))',
+          transactional: false,
+        },
+      ];
+      const badDown: ScriptStep[] = [{ sql: 'DROP TABLE IF EXISTS public.tmp_nontx', transactional: false }];
+      const v3Bad: ChainVersion = {
+        id: 'v-3',
+        number: 3,
+        parentId: 'v-2',
+        name: '失败岔路',
+        model: m3Bad,
+        upSteps: badUp,
+        downSteps: badDown,
+        checksum: stepsChecksum(badUp, badDown),
+        verified: true,
+        publishedAt: new Date().toISOString(),
+        publishedBy: null,
+        scope: null,
+      };
+      await execute({
+        db: t.db,
+        projectId: 'p1',
+        projectName: '演示',
+        instanceId: 'inst-A',
+        executedBy: 'u1',
+        chain: [v1, v2],
+        to: 'v-2',
+      });
+      const failErr = await fails(
+        execute({
+          db: t.db,
+          projectId: 'p1',
+          projectName: '演示',
+          instanceId: 'inst-A',
+          executedBy: 'u1',
+          chain: [v1, v2, v3Bad],
+          to: 'v-3',
+          direction: 'up',
+        }),
+      );
+      expect(failErr.details.partial).toBe(true);
+      const retiredErr = await fails(
+        execute({
+          db: t.db,
+          projectId: 'p1',
+          projectName: '演示',
+          instanceId: 'inst-A',
+          executedBy: 'u1',
+          chain: [v1, v2, { ...v3Bad, retired: true }, v4],
+          to: 'v-3',
+          direction: 'up',
+        }),
+      );
+      expect(retiredErr.code).toBe('retired_target');
+      expect(retiredErr.message).toMatch(/已被作废/);
     });
   },
 );

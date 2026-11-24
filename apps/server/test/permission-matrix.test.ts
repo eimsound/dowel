@@ -645,6 +645,16 @@ const matrix: Record<string, Spec> = {
       ctx.envName = e.name;
     },
   },
+  'POST /api/projects/:pid/environments/:eid/switch': {
+    access: { kind: 'project', min: 'editor', statuses: [400] },
+    path: (ctx) => `${P()}/environments/${ctx.envId}/switch`,
+    body: () => ({}),
+    prepare: async (ctx) => {
+      const e = await freshEnv(ctx.pid, ++unique);
+      ctx.envId = e.id;
+      ctx.envName = e.name;
+    },
+  },
   // 接入已有历史（P4c）：配置类特权操作，至少项目管理员（freshEnv 之外的新环境：请求体不合法 → 400）
   'POST /api/projects/:pid/environments/attach': {
     access: { kind: 'project', min: 'admin', statuses: [400] },

@@ -49,15 +49,16 @@ test('runVersionId：回滚取 fromVersion，升级 / 基线取 toVersion；对�
   expect(runVersionId(run({ direction: 'up', fromVersion: 'a', toVersion: null }))).toBeNull();
 });
 
-test('runTouched：完成、做了一部分（含 -1）、读回失败都算碰过；干净的失败、没开始的 running 不算', () => {
+test('runTouched：完成、做了一部分（含 -1）、读回失败、进行中的迁移都算碰过；干净的失败与未完成的 mark 不算', () => {
   const run = (over: Record<string, unknown>) =>
     ({ id: 1, status: 'failed', stepIndex: null, error: null, direction: 'up', ...over }) as never;
   expect(runTouched(run({ status: 'done' }))).toBe(true);
   expect(runTouched(run({ stepIndex: 0 }))).toBe(true);
   expect(runTouched(run({ stepIndex: -1 }))).toBe(true);
   expect(runTouched(run({ error: '[readback_mismatch] x' }))).toBe(true);
+  expect(runTouched(run({ status: 'running' }))).toBe(true);
+  expect(runTouched(run({ status: 'running', direction: 'mark' }))).toBe(false);
   expect(runTouched(run({}))).toBe(false);
-  expect(runTouched(run({ status: 'running' }))).toBe(false);
 });
 
 const meta = (id: string, number: number, parentId: string | null, retired = false): VersionMeta => ({

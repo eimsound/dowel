@@ -12,6 +12,7 @@ import {
   type TargetInfo,
 } from '@dowel/api';
 import { type Model, newId } from '@dowel/core';
+import { maxNumberNode } from '@dowel/engines';
 import { planDiff } from '@dowel/executor';
 import type { Hono } from 'hono';
 import { HTTPException } from 'hono/http-exception';

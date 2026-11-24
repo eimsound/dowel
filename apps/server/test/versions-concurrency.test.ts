@@ -61,8 +61,8 @@ describe.skipIf(!PG_URL)('版本发布 / 作废 / 取消作废并发串行化（
    */
   const withProjectRowLock = async <T>(
     pid: string,
-    fn: (holder: ReturnType<typeof connect>, holderPid: number) => Promise<Promise<T>[]>,
-  ): Promise<T[]> => {
+    fn: (holder: ReturnType<typeof connect>, holderPid: number) => Promise<[Promise<T>, Promise<T>]>,
+  ): Promise<[T, T]> => {
     const holder = connect(platform.url);
     try {
       await holder.db.exec('begin');
@@ -72,7 +72,7 @@ describe.skipIf(!PG_URL)('版本发布 / 作废 / 取消作废并发串行化（
         await holder.db.query('select id from projects where id = $1 for update', [pid]);
         const pending = await fn(holder, holderPid);
         await holder.db.exec('commit');
-        return await Promise.all(pending);
+        return [await pending[0], await pending[1]];
       } catch (e) {
         await holder.db.exec('rollback').catch(() => {});
         throw e;
@@ -184,7 +184,7 @@ describe.skipIf(!PG_URL)('版本发布 / 作废 / 取消作废并发串行化（
         'e2',
       );
       await waitProjectLockWaiters(holder, holderPid, 2);
-      return [p1, p2];
+      return [p1, p2] as [typeof p1, typeof p2];
     });
     const ok = [r1, r2].filter((r) => r.status === 200);
     const conflict = [r1, r2].filter((r) => r.status === 409);
@@ -211,7 +211,7 @@ describe.skipIf(!PG_URL)('版本发布 / 作废 / 取消作废并发串行化（
       );
       const p2 = call('POST', `/api/projects/${pid}/versions`, { name: 'v3' }, 'e2');
       await waitProjectLockWaiters(holder, holderPid, 2);
-      return [p1, p2];
+      return [p1, p2] as [typeof p1, typeof p2];
     });
     const statuses = [retireRes.status, pubRes.status];
     expect(statuses.includes(409)).toBe(true);
@@ -248,7 +248,7 @@ describe.skipIf(!PG_URL)('版本发布 / 作废 / 取消作废并发串行化（
         'e2',
       );
       await waitProjectLockWaiters(holder, holderPid, 2);
-      return [p1, p2];
+      return [p1, p2] as [typeof p1, typeof p2];
     });
     const ok = [r1, r2].filter((r) => r.status === 200);
     const conflict = [r1, r2].filter((r) => r.status === 409);
@@ -286,7 +286,7 @@ describe.skipIf(!PG_URL)('版本发布 / 作废 / 取消作废并发串行化（
       );
       const p2 = call('POST', `/api/projects/${pid}/versions`, { name: 'v3' }, 'e2');
       await waitProjectLockWaiters(holder, holderPid, 2);
-      return [p1, p2];
+      return [p1, p2] as [typeof p1, typeof p2];
     });
     expect([unretireRes.status, pubRes.status].includes(409)).toBe(true);
     expect(unretireRes.status === 200 || pubRes.status === 201).toBe(true);

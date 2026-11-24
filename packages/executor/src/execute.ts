@@ -14,9 +14,13 @@ import {
   type EngineAdapter,
   getEngine,
   HistoryError,
+  indexTree,
   NO_TIMEOUTS,
   parsePgCreateIndexConcurrently,
   parsePgDetachConcurrently,
+  routeBetween,
+  routeShape,
+  type RouteShape,
   type ScriptStep,
   type TxHooks,
 } from '@dowel/engines';
@@ -69,20 +73,28 @@ class StepFailure extends Error {
   }
 }
 
-const upMigration = (chain: ChainVersion[], i: number): Migration => ({
-  version: chain[i]!,
+const upMigration = (byId: ReadonlyMap<string, ChainVersion>, v: ChainVersion): Migration => ({
+  version: v,
   direction: 'up',
-  from: chain[i - 1] ?? null,
-  to: chain[i]!,
-  steps: chain[i]!.upSteps,
+  from: v.parentId ? (byId.get(v.parentId) ?? null) : null,
+  to: v,
+  steps: v.upSteps,
 });
-const downMigration = (chain: ChainVersion[], i: number): Migration => ({
-  version: chain[i]!,
-  direction: 'down',
-  from: chain[i]!,
-  to: chain[i - 1]!,
-  steps: chain[i]!.downSteps,
-});
+const downMigration = (byId: ReadonlyMap<string, ChainVersion>, v: ChainVersion): Migration => {
+  const parent = v.parentId ? byId.get(v.parentId) : undefined;
+  if (!parent)
+    throw new ExecutorError('chain_broken', `版本 ${label(v)} 缺少父版本，无法回滚`, {
+      versionId: v.id,
+      number: v.number,
+    });
+  return {
+    version: v,
+    direction: 'down',
+    from: v,
+    to: parent,
+    steps: v.downSteps,
+  };
+};
 const baselineMigration = (v: ChainVersion): Migration => ({
   version: v,
   direction: 'baseline',
@@ -393,11 +405,24 @@ const runMigration = async (
   return runId;
 };
 
-const route = (chain: ChainVersion[], curIdx: number, tgtIdx: number): Migration[] => {
-  const out: Migration[] = [];
-  if (tgtIdx > curIdx) for (let i = curIdx + 1; i <= tgtIdx; i++) out.push(upMigration(chain, i));
-  else for (let i = curIdx; i > tgtIdx; i--) out.push(downMigration(chain, i));
-  return out;
+interface PlannedRoute {
+  lca: ChainVersion | null;
+  shape: RouteShape;
+  migrations: Migration[];
+}
+
+const buildRoute = (
+  byId: ReadonlyMap<string, ChainVersion>,
+  fromId: string | null,
+  toId: string,
+): PlannedRoute => {
+  const r = routeBetween(byId, fromId, toId);
+  if (!r) throw new ExecutorError('chain_broken', '平台库里的版本树断裂，无法规划执行路线');
+  return {
+    lca: r.lca,
+    shape: routeShape(r),
+    migrations: [...r.down.map((v) => downMigration(byId, v)), ...r.up.map((v) => upMigration(byId, v))],
+  };
 };
 
 const preflight = (migrations: Migration[], dialect: Dialect) => {
@@ -472,19 +497,21 @@ const locked = async (conn: Db, c: Ctx): Promise<ExecuteResult> => {
   const state: TargetState = await readState(conn, o.projectId, dialect);
   assertTargetHistory(state, chain, o.instanceId);
 
-  const first = chain[0];
+  const byId = indexTree(chain);
+  const first = chain.find((v) => v.parentId === null) ?? chain[0];
   if (!first) throw new ExecutorError('unknown_version', '项目还没有发布任何版本');
-  const idx = new Map(chain.map((v, i) => [v.id, i]));
-  const target = mode === 'baseline' ? first : chain.find((v) => v.id === o.to);
+  const target = mode === 'baseline' ? first : byId.get(o.to ?? '');
   if (!target) throw new ExecutorError('unknown_version', `目标版本不存在：${o.to ?? '（未指定）'}`);
-  const tgtIdx = idx.get(target.id)!;
-  const curIdx = state.current === null ? -1 : (idx.get(state.current) ?? -1);
-  if (state.current !== null && curIdx < 0)
+  const cur = state.current === null ? null : (byId.get(state.current) ?? null);
+  if (state.current !== null && !cur)
     throw new ExecutorError(
       'history_mismatch',
       `目标库历史里的当前版本 ${state.current} 不在平台库的版本链上`,
     );
+  const refOf = (v: ChainVersion | null | undefined) =>
+    v ? { id: v.id, number: v.number, name: v.name } : null;
 
+  let planned: PlannedRoute = { lca: null, shape: 'none', migrations: [] };
   let migrations: Migration[] = [];
   let baseline: Migration | null = null;
   let resumeAfter: number | null = null;
@@ -495,14 +522,29 @@ const locked = async (conn: Db, c: Ctx): Promise<ExecuteResult> => {
     const p = state.unfinished;
     if (mode === 'baseline')
       throw new ExecutorError('baseline_not_applicable', '上一次执行停在中途，必须先继续执行它，不能写基线');
-    migrations = route(chain, curIdx, tgtIdx);
-    const m0 = migrations[0];
     const want = runVersionId(p);
+    const openVer = want ? byId.get(want) : undefined;
+    // 上一次升级停在中途的版本已被作废：给出可操作的错误码 retired_target，而不是令人困惑的 unfinished_run
+    if (p.direction === 'up' && openVer?.retired)
+      throw new ExecutorError(
+        'retired_target',
+        `版本 ${label(openVer)} 在上一次升级停在中途后已被作废，不能继续升级到它。` +
+          '如果尚未发布更新版本，可以先取消作废后再继续；否则请先手工恢复目标库结构到祖先或活跃版本，再使用“标记为已执行”',
+        {
+          versionId: openVer.id,
+          number: openVer.number,
+          direction: 'up',
+          partial: true,
+          reached: state.current,
+        },
+      );
+    planned = buildRoute(byId, state.current, target.id);
+    migrations = planned.migrations;
+    const m0 = migrations[0];
     if (!m0 || m0.direction !== p.direction || m0.version.id !== want) {
-      const v = chain[idx.get(want ?? '') ?? -1];
       throw new ExecutorError(
         'unfinished_run',
-        `上一次${p.direction === 'down' ? '回滚' : '执行'}${v ? ` ${label(v)}` : ''}${p.status === 'running' ? '被中断了' : '失败了'}，停在第 ${(p.stepIndex ?? -1) + 2} 步之前，目标库处于半途状态。` +
+        `上一次${p.direction === 'down' ? '回滚' : '执行'}${openVer ? ` ${label(openVer)}` : ''}${p.status === 'running' ? '被中断了' : '失败了'}，停在第 ${(p.stepIndex ?? -1) + 2} 步之前，目标库处于半途状态。` +
           `必须先继续执行它（把目标版本设为${p.direction === 'down' ? '它的回滚目标或更早的版本' : ' 它或更靠后的版本'}），不能改做别的`,
         {
           versionId: want ?? undefined,
@@ -543,22 +585,34 @@ const locked = async (conn: Db, c: Ctx): Promise<ExecuteResult> => {
     if (cls.kind === 'baseline') {
       baseline = baselineMigration(first);
       snapshotFp = engine.fingerprint(snapshot);
-      migrations = mode === 'baseline' ? [] : route(chain, 0, tgtIdx);
-    } else migrations = route(chain, -1, tgtIdx);
+      planned =
+        mode === 'baseline'
+          ? { lca: null, shape: 'none', migrations: [] }
+          : buildRoute(byId, first.id, target.id);
+    } else planned = buildRoute(byId, null, target.id);
+    migrations = planned.migrations;
   } else {
     if (mode === 'baseline')
       throw new ExecutorError(
         'baseline_not_applicable',
         '这个库里已经有这个项目的 Dowel 历史，不需要再写基线',
       );
-    migrations = route(chain, curIdx, tgtIdx);
+    planned = buildRoute(byId, state.current, target.id);
+    migrations = planned.migrations;
     if (!migrations.length) {
+      if (target.retired && o.direction !== 'down')
+        throw new ExecutorError('retired_target', `版本 ${label(target)} 已作废，不能升级到它`, {
+          versionId: target.id,
+          number: target.number,
+          direction: 'up',
+          reached: state.current,
+        });
       if (o.expect) assertExpected(o.expect, state.current, migrations);
-      const cur = chain[curIdx];
-      const ref = cur ? { id: cur.id, number: cur.number, name: cur.name } : null;
+      const ref = refOf(cur);
       return {
         mode,
         direction: 'none',
+        lca: null,
         baseline: false,
         ran: [],
         current: state.current,
@@ -569,6 +623,7 @@ const locked = async (conn: Db, c: Ctx): Promise<ExecuteResult> => {
                 baseline: false,
                 from: ref,
                 to: ref,
+                lca: null,
                 migrations: [],
                 resume: null,
                 createsHistory: false,
@@ -579,45 +634,82 @@ const locked = async (conn: Db, c: Ctx): Promise<ExecuteResult> => {
       };
     }
     await c.emit({ type: 'phase', phase: 'drift' });
-    const cur = chain[curIdx]!;
-    const snapshot = await engine.readSnapshot(conn, cur.scope);
-    const recorded = state.versions.find((v) => v.versionId === cur.id)?.fingerprint;
+    const snapshot = await engine.readSnapshot(conn, cur!.scope);
+    const recorded = state.versions.find((v) => v.versionId === cur!.id)?.fingerprint;
     if (!recorded || recorded !== engine.fingerprint(snapshot)) {
-      const diff = diffAgainst(snapshot, cur.model);
+      const diff = diffAgainst(snapshot, cur!.model);
       if (diff.total)
         throw new ExecutorError(
           'drift',
-          `目标库的结构与环境当前版本 ${label(cur)} 不一致（${diff.total} 处差异），可能有人绕过 Dowel 直接改过库。已拒绝执行${manualNote(state)}`,
+          `目标库的结构与环境当前版本 ${label(cur!)} 不一致（${diff.total} 处差异），可能有人绕过 Dowel 直接改过库。已拒绝执行${manualNote(state)}`,
           {
             diff: diff.items,
             diffTotal: diff.total,
-            versionId: cur.id,
-            number: cur.number,
+            versionId: cur!.id,
+            number: cur!.number,
             ...manualOf(state),
           },
         );
     }
   }
 
-  const routeDir = migrations[0]?.direction === 'down' ? 'down' : migrations.length ? 'up' : null;
-  if (o.direction && routeDir && routeDir !== o.direction)
-    throw new ExecutorError(
-      'wrong_direction',
-      routeDir === 'down'
-        ? `目标版本 ${label(target)} 比环境当前版本更早，这是回滚，不是执行`
-        : `目标版本 ${label(target)} 比环境当前版本更新，这是执行，不是回滚`,
-      { versionId: target.id, reached: state.current },
-    );
+  // ADR 0013：不允许升级（up）到任何已作废版本（回滚 down 允许，switch 的回滚段也允许）
+  for (const m of migrations) {
+    if (m.direction === 'up' && m.version.retired)
+      throw new ExecutorError('retired_target', `版本 ${label(m.version)} 已作废，不能升级到它`, {
+        versionId: m.version.id,
+        number: m.version.number,
+        direction: 'up',
+        reached: state.current,
+      });
+  }
+
+  if (o.direction && planned.shape !== 'none') {
+    if (o.direction === 'up') {
+      if (planned.shape === 'switch')
+        throw new ExecutorError(
+          'switch_required',
+          `环境当前停在已作废岔路 ${cur ? label(cur) : ''} 上，到 ${label(target)} 需要先回滚到公共祖先 ${label(planned.lca!)} 再升级：请改用“切换”并确认回滚段`,
+          {
+            versionId: target.id,
+            number: target.number,
+            reached: state.current,
+            lca: refOf(planned.lca)!,
+          },
+        );
+      if (planned.shape === 'down')
+        throw new ExecutorError(
+          'wrong_direction',
+          `目标版本 ${label(target)} 比环境当前版本更早，这是回滚，不是执行`,
+          { versionId: target.id, reached: state.current },
+        );
+    } else if (o.direction === 'down' && planned.shape !== 'down') {
+      throw new ExecutorError(
+        'wrong_direction',
+        planned.shape === 'switch'
+          ? `目标版本 ${label(target)} 不在当前版本的祖先路径上，需要先回滚到 ${label(planned.lca!)} 再升级，请改用“切换”`
+          : `目标版本 ${label(target)} 比环境当前版本更新，这是执行，不是回滚`,
+        { versionId: target.id, reached: state.current },
+      );
+    } else if (o.direction === 'switch' && planned.shape !== 'switch') {
+      throw new ExecutorError(
+        'wrong_direction',
+        `从当前版本到 ${label(target)} 不需要跨岔路切换，请改用${planned.shape === 'down' ? '“回滚”' : '“执行”'}`,
+        { versionId: target.id, reached: state.current },
+      );
+    }
+  }
   preflight(migrations, dialect);
   if (o.expect) assertExpected(o.expect, state.current, migrations);
-  const direction = migrations[0]?.direction === 'down' ? 'down' : migrations.length ? 'up' : 'none';
+  const direction: ExecuteResult['direction'] = planned.shape;
+  const lcaRef = planned.shape === 'switch' ? refOf(planned.lca) : null;
   if (o.dryRun) {
-    const ref = (v: ChainVersion | undefined) => (v ? { id: v.id, number: v.number, name: v.name } : null);
-    const lastTo = migrations.at(-1)?.to ?? (baseline ? first : (chain[curIdx] ?? null));
+    const lastTo = migrations.at(-1)?.to ?? (baseline ? first : cur);
     const stepNonTx = (s: ScriptStep) => isNonTx(s, dialect);
     return {
       mode,
-      direction: direction as ExecuteResult['direction'],
+      direction,
+      lca: lcaRef,
       baseline: baseline !== null,
       ran: [],
       from: state.current,
@@ -625,8 +717,9 @@ const locked = async (conn: Db, c: Ctx): Promise<ExecuteResult> => {
       dryRun: {
         firstRun: state.current === null && !state.unfinished ? (baseline ? 'baseline' : 'empty') : null,
         baseline: baseline !== null,
-        from: ref(chain[curIdx]),
-        to: ref(lastTo ?? undefined),
+        from: refOf(cur),
+        to: refOf(lastTo),
+        lca: lcaRef,
         migrations: migrations.map((m) => ({
           versionId: m.version.id,
           number: m.version.number,
@@ -738,7 +831,8 @@ const locked = async (conn: Db, c: Ctx): Promise<ExecuteResult> => {
   }
   return {
     mode,
-    direction: direction as ExecuteResult['direction'],
+    direction,
+    lca: lcaRef,
     baseline: baseline !== null,
     ran,
     from: state.current,

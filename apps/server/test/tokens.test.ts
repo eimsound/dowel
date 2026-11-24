@@ -37,7 +37,8 @@ import {
   tokenCreatorAllows,
   type VersionDetail,
 } from '@dowel/api';
-import { addColumn, all, type Model } from '@dowel/core';
+import { addColumn, all, type Model, newId, plan } from '@dowel/core';
+import { stepsChecksum, toScriptSteps } from '@dowel/engines';
 import { serve } from '@hono/node-server';
 import { afterAll, beforeAll, describe, expect, test } from 'vitest';
 
@@ -1565,6 +1566,130 @@ describe.skipIf(!PG_URL)('CI 执行接口、错误码、审计通知与 GitHub A
     } finally {
       rmSync(dir, { recursive: true, force: true });
     }
+  }, 120_000);
+
+  test('ADR 0013 CI 版本树：latest 解析到活跃头、状态四分类、version_retired 与 switch_requires_web（409）', async () => {
+    const p = await newProject('ci-tree');
+    const stg = await addRealEnv(p.pid, 'staging', false);
+    const dev = await addRealEnv(p.pid, 'dev', false);
+    const [v1, v2] = await publishChain(p.pid, 2);
+
+    // stg 走到 v1，dev 走到 v2
+    expect(
+      (
+        await ciCall(
+          p.token,
+          'POST',
+          `/api/ci/projects/${groupSlug}/${p.slug}/environments/staging/execute`,
+          {
+            to: 'v1',
+          },
+        )
+      ).status,
+    ).toBe(200);
+    expect(
+      (
+        await ciCall(p.token, 'POST', `/api/ci/projects/${groupSlug}/${p.slug}/environments/dev/execute`, {
+          to: 'v2',
+        })
+      ).status,
+    ).toBe(200);
+
+    // 在 v1 下构造分叉活跃版本 v3（添加 main_c3），将 v2 标为已作废
+    const [bRow] = await db.query<{ id: string }>('select id from branches where project_id = $1', [p.pid]);
+    const [v1Row] = await db.query<{ model: Model }>('select model from versions where id = $1', [v1!.id]);
+    const m1 = v1Row!.model;
+    const m3 = structuredClone(m1);
+    addColumn(m3, tableOf(m3), { name: 'main_c3', type: 'text' });
+    const up3 = toScriptSteps(plan(m1, m3), 'pg');
+    const down3 = toScriptSteps(plan(m3, m1), 'pg');
+    const v3Id = newId();
+    await db.query(
+      `insert into versions (id, project_id, branch_id, seq, name, model, created_by, number, parent_id,
+                             up_steps, down_steps, checksum, verified_at)
+       values ($1, $2, $3, 2, 'v3', $4::text::jsonb, null, 3, $5, $6::text::jsonb, $7::text::jsonb, $8, $9)`,
+      [
+        v3Id,
+        p.pid,
+        bRow!.id,
+        JSON.stringify(m3),
+        v1!.id,
+        JSON.stringify(up3),
+        JSON.stringify(down3),
+        stepsChecksum(up3, down3),
+        new Date().toISOString(),
+      ],
+    );
+    await db.query('update versions set retired_at = $2 where id = $1', [v2!.id, new Date().toISOString()]);
+
+    // 1. GET /api/ci/projects/:o/:p 中的 latest 为活跃头 v3
+    const projRes = await ciCall(p.token, 'GET', `/api/ci/projects/${groupSlug}/${p.slug}`);
+    expect(projRes.status).toBe(200);
+    expect((projRes.data as unknown as CiProject).latest).toMatchObject({ id: v3Id, number: 3 });
+
+    // 2. stg 状态四分类与 pending：v1=current, v2=retired, v3=pending；dev：v1=applied, v2=current, v3=pending
+    const stgStatus = ciEnvironmentStatusSchema.parse(
+      (await ciCall(p.token, 'GET', `/api/ci/projects/${groupSlug}/${p.slug}/environments/staging`)).data,
+    );
+    expect(stgStatus.versions.map((v) => [v.number, v.state])).toEqual([
+      [1, 'current'],
+      [2, 'retired'],
+      [3, 'pending'],
+    ]);
+    expect(stgStatus.pending).toEqual([3]);
+
+    const devStatus = ciEnvironmentStatusSchema.parse(
+      (await ciCall(p.token, 'GET', `/api/ci/projects/${groupSlug}/${p.slug}/environments/dev`)).data,
+    );
+    expect(devStatus.versions.map((v) => [v.number, v.state])).toEqual([
+      [1, 'applied'],
+      [2, 'current'],
+      [3, 'pending'],
+    ]);
+    expect(devStatus.pending).toEqual([3]);
+
+    // 3. 显式传入已作废的 v2 → 409 version_retired
+    const retiredRes = await ciCall(
+      p.token,
+      'POST',
+      `/api/ci/projects/${groupSlug}/${p.slug}/environments/staging/execute`,
+      { to: 'v2' },
+    );
+    expect(retiredRes.status).toBe(409);
+    expect(retiredRes.data).toMatchObject({ ok: false, code: 'version_retired' });
+
+    // 4. dev 停在已作废 v2，尝试执行 latest（解析为 v3）→ 409 switch_requires_web，且返回 current 与 lca
+    const switchRes = await ciCall(
+      p.token,
+      'POST',
+      `/api/ci/projects/${groupSlug}/${p.slug}/environments/dev/execute`,
+      { to: 'latest' },
+    );
+    expect(switchRes.status).toBe(409);
+    expect(switchRes.data as unknown as CiErrorBody).toMatchObject({
+      ok: false,
+      code: 'switch_requires_web',
+      details: {
+        current: { id: v2!.id, number: 2 },
+        lca: { id: v1!.id, number: 1 },
+      },
+    });
+
+    // stg 正常用 latest 执行到活跃头 v3（不经由 v2）
+    const stgUp = await ciCall(
+      p.token,
+      'POST',
+      `/api/ci/projects/${groupSlug}/${p.slug}/environments/staging/execute`,
+      { to: 'latest' },
+    );
+    expect(stgUp.status, JSON.stringify(stgUp.data)).toBe(200);
+    expect(stgUp.data as unknown as CiExecuteResult).toMatchObject({
+      ok: true,
+      reached: { id: v3Id, number: 3 },
+      migrations: [{ number: 3, direction: 'up' }],
+    });
+    expect(stg.target).toBeDefined();
+    expect(dev.target).toBeDefined();
   }, 120_000);
 });
 

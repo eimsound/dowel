@@ -145,9 +145,11 @@ describe('多环境合并（mergeHistories，纯函数）', () => {
       { name: 'prod', state: stateOf(chain.slice(0, 2), 'v-2') },
     ]);
     expect(m.versions.map((v) => v.number)).toEqual([1, 2, 3]);
+    expect(m.active).toEqual(['v-1', 'v-2', 'v-3']);
+    expect(m.retired).toEqual([]);
     expect(m.envs).toEqual([
-      { name: 'dev', current: 'v-3', behind: 0 },
-      { name: 'prod', current: 'v-2', behind: 1 },
+      { name: 'dev', current: 'v-3', behind: 0, onRetired: false },
+      { name: 'prod', current: 'v-2', behind: 1, onRetired: false },
     ]);
   });
 
@@ -158,14 +160,12 @@ describe('多环境合并（mergeHistories，纯函数）', () => {
     ]);
     expect(a.versions.map((v) => v.versionId)).toEqual(['v-1', 'v-2', 'v-3']);
     const one = mergeHistories([{ name: 'x', state: stateOf(chain.slice(0, 1), null) }]);
-    expect(one.envs).toEqual([{ name: 'x', current: null, behind: 1 }]);
+    expect(one.envs).toEqual([{ name: 'x', current: null, behind: 1, onRetired: false }]);
   });
 
-  test('分叉：两个环境在同一个父版本下有不同的子版本 → history_fork，说明在哪个版本之后分叉', () => {
+  test('编号相同但版本 ID 不同（同父分叉且占了同一个编号）→ history_fork，说明在哪个版本之后分叉', () => {
     const alt = withNote(models[0]!);
-    const altChain = chainOf([models[0]!, withEmail(models[0]!), alt]);
     const forked = [chain[0]!, chain[1]!, { ...version([...models.slice(0, 2), alt], 2), id: 'v-3-alt' }];
-    expect(altChain).toHaveLength(3);
     const e = fails(() =>
       mergeHistories([
         { name: 'dev', state: stateOf(chain, 'v-3') },
@@ -176,6 +176,64 @@ describe('多环境合并（mergeHistories，纯函数）', () => {
     expect(e.message).toContain('分叉');
     expect(e.message).toContain('dev');
     expect(e.message).toContain('prod');
+  });
+
+  test('ADR 0013 树分叉合并：作废岔路 v-3-alt 与活跃主链 v-4（同挂在 v-2 下）可合并，分类 active/retired 与 onRetired', () => {
+    const pubId = Object.values(models[1]!.objects).find(
+      (o) => o.kind === 'schema' && o.name === 'public',
+    )!.id;
+    const m3Alt = structuredClone(models[1]!);
+    createTable(m3Alt, pubId, 'alt_tbl', 't-alt');
+    addColumn(m3Alt, 't-alt', { name: 'id', type: 'bigint', id: 'c-aid' });
+    const m4Active = structuredClone(models[1]!);
+    createTable(m4Active, pubId, 'main_tbl', 't-main');
+    addColumn(m4Active, 't-main', { name: 'id', type: 'bigint', id: 'c-mid' });
+
+    const v1 = chain[0]!;
+    const v2 = chain[1]!;
+    const v3AltSteps = toScriptSteps(plan(v2.model, m3Alt), 'pg');
+    const v3AltDown = toScriptSteps(plan(m3Alt, v2.model), 'pg');
+    const v3Alt: ChainVersion = {
+      id: 'v-3-alt',
+      number: 3,
+      parentId: 'v-2',
+      name: '岔路 3',
+      model: m3Alt,
+      upSteps: v3AltSteps,
+      downSteps: v3AltDown,
+      checksum: stepsChecksum(v3AltSteps, v3AltDown),
+      verified: true,
+      publishedAt: new Date().toISOString(),
+      publishedBy: null,
+      scope: null,
+    };
+    const v4Steps = toScriptSteps(plan(v2.model, m4Active), 'pg');
+    const v4Down = toScriptSteps(plan(m4Active, v2.model), 'pg');
+    const v4: ChainVersion = {
+      id: 'v-4',
+      number: 4,
+      parentId: 'v-2',
+      name: '活跃 4',
+      model: m4Active,
+      upSteps: v4Steps,
+      downSteps: v4Down,
+      checksum: stepsChecksum(v4Steps, v4Down),
+      verified: true,
+      publishedAt: new Date().toISOString(),
+      publishedBy: null,
+      scope: null,
+    };
+
+    const merged = mergeHistories([
+      { name: 'dev', state: stateOf([v1, v2, v3Alt], 'v-3-alt') },
+      { name: 'prod', state: stateOf([v1, v2, v4], 'v-4') },
+    ]);
+    expect(merged.active).toEqual(['v-1', 'v-2', 'v-4']);
+    expect(merged.retired).toEqual(['v-3-alt']);
+    expect(merged.envs).toEqual([
+      { name: 'dev', current: 'v-3-alt', behind: 1, onRetired: true },
+      { name: 'prod', current: 'v-4', behind: 0, onRetired: false },
+    ]);
   });
 
   test('不同的起点 → history_fork', () => {
@@ -534,12 +592,12 @@ describe.skipIf(!PG_URL)('认领（claimInstance）与接入检查（inspectAtta
         claim: { mine: false, instanceId: 'inst-A' },
       });
       if (ahead.hasHistory) expect(ahead.aheadVersions.map((v) => v.versionId)).toEqual(['v-2', 'v-3']);
-      // 分叉：平台链在 v1 之后是另一个 v2-fork，而目标库是 v1 -> v2 -> v3 → history_conflict
+      // 编号冲突分叉（v-2 vs v-2-fork 同占 number=2）→ history_fork
       const forked = [longChain[0]!, { ...longChain[1]!, id: 'v-2-fork' }];
       await expect(inspectAttach(t.db, 'p1', forked, 'inst-B')).rejects.toMatchObject({
-        code: 'history_conflict',
+        code: 'history_fork',
       });
-      // 平台链较长但目标库最后版本不同（分叉，长度 <= 平台链）→ history_mismatch
+      // 平台链较长但编号 2 对不上（同编号不同 ID）→ history_fork
       const longerFork = [...longChain, { ...longChain[2]!, id: 'v-4', number: 4, parentId: 'v-3' }];
       const mismatched = [
         longerFork[0]!,
@@ -548,8 +606,98 @@ describe.skipIf(!PG_URL)('认领（claimInstance）与接入检查（inspectAtta
         longerFork[3]!,
       ];
       await expect(inspectAttach(t.db, 'p1', mismatched, 'inst-B')).rejects.toMatchObject({
-        code: 'history_mismatch',
+        code: 'history_fork',
       });
+    });
+  });
+
+  test('inspectAttach 版本树：目标库带作废岔路、替换活跃头，或试图复活已作废路径时报错', async () => {
+    const m1 = m0();
+    const pubId = Object.values(m1.objects).find((o) => o.kind === 'schema' && o.name === 'public')!.id;
+    const m2 = withEmail(m1);
+    const m3 = withNote(m2);
+    const m4 = structuredClone(m2);
+    createTable(m4, pubId, 'audit_log', 't-audit');
+    addColumn(m4, 't-audit', { name: 'id', type: 'bigint', id: 'c-auid' });
+    const m5 = structuredClone(m3);
+    createTable(m5, pubId, 'ext_fork', 't-ext');
+    addColumn(m5, 't-ext', { name: 'id', type: 'bigint', id: 'c-exid' });
+
+    const baseTree = chainOf([m1, m2, m3]);
+    const mkNode = (
+      id: string,
+      number: number,
+      parentId: string,
+      fromM: Model,
+      toM: Model,
+      retired = false,
+    ): ChainVersion => {
+      const up = toScriptSteps(plan(fromM, toM), 'pg');
+      const down = toScriptSteps(plan(toM, fromM), 'pg');
+      return {
+        id,
+        number,
+        parentId,
+        name: `版本 ${number}`,
+        model: toM,
+        upSteps: up,
+        downSteps: down,
+        checksum: stepsChecksum(up, down),
+        verified: true,
+        retired,
+        publishedAt: new Date().toISOString(),
+        publishedBy: null,
+        scope: null,
+      };
+    };
+    const v4 = mkNode('v-4', 4, 'v-2', m2, m4);
+    const v5OnRetired = mkNode('v-5', 5, 'v-3', m3, m5);
+
+    // 情况 1：目标库只走到被作废的 v-3，平台已经有替换主链 v-4 → 补齐 v-3 并自动标为作废，newActiveHead 为 null
+    await withTarget(async (t) => {
+      await run(t.db, baseTree, 3);
+      const r = await inspectAttach(t.db, 'p1', [baseTree[0]!, baseTree[1]!, v4], 'inst-B');
+      expect(r.hasHistory).toBe(true);
+      if (r.hasHistory) {
+        expect(r.aheadVersions.map((v) => v.versionId)).toEqual(['v-3']);
+        expect(r.retiredAheadIds).toEqual(['v-3']);
+        expect(r.newActiveHead).toBeNull();
+      }
+    });
+
+    // 情况 2：目标库从 v-3 switch 到了 v-4，平台只有 [v-1, v-2] → 补齐 v-3（retired）和 v-4（active），newActiveHead 为 v-4
+    await withTarget(async (t) => {
+      await run(t.db, baseTree, 3);
+      await execute({
+        db: t.db,
+        projectId: 'p1',
+        projectName: '演示',
+        instanceId: 'inst-A',
+        chain: [baseTree[0]!, baseTree[1]!, { ...baseTree[2]!, retired: true }, v4],
+        to: 'v-4',
+        direction: 'switch',
+        executedBy: 'u1',
+      });
+      const r = await inspectAttach(t.db, 'p1', baseTree.slice(0, 2), 'inst-B');
+      expect(r.hasHistory).toBe(true);
+      if (r.hasHistory) {
+        expect(r.aheadVersions.map((v) => v.versionId)).toEqual(['v-3', 'v-4']);
+        expect(r.retiredAheadIds).toEqual(['v-3']);
+        expect(r.newActiveHead?.versionId).toBe('v-4');
+      }
+    });
+
+    // 情况 3：目标库沿着平台已作废的 v-3 继续生出 v-5（会复活 v-3 或顶掉平台活跃头 v-4）→ history_fork
+    await withTarget(async (t) => {
+      await run(t.db, [...baseTree, v5OnRetired], 5);
+      await expect(
+        inspectAttach(
+          t.db,
+          'p1',
+          [baseTree[0]!, baseTree[1]!, { ...baseTree[2]!, retired: true }, v4],
+          'inst-B',
+        ),
+      ).rejects.toMatchObject({ code: 'history_fork' });
     });
   });
 });
@@ -932,6 +1080,98 @@ describe.skipIf(!PG_URL)('标记为已执行（markApplied）', () => {
       await t.db.exec("update dowel.meta set value = '9'::jsonb where key = 'format_version'");
       const f = await mark(t.db, 2).catch((x: unknown) => x);
       expect(f).toMatchObject({ code: 'format_too_new' });
+    });
+  });
+
+  test('跨岔路零 SQL 标记（direction: cross）：作废岔路 → 结构相同的活跃分支只跳过 LCA→目标、已作废目标拒标、多跳跨岔路只列活跃段', async () => {
+    const m1 = m0();
+    const m2 = withEmail(m1);
+    const m3Ret = withNote(m2); // 岔路 v3：加 note 列
+    // 活跃主链分两跳从 v2 到与 v3 等价的模型：v4 加 tag 列（不影响比较或下面用两步拆出 note），
+    // 为保证结构严格一致：v3 加 note 列；v4 加 tag 列，v5 加 note 列且 v3 也已有 tag 列（v2 先有 tag、或 v3 = mNoteWithTag）
+    const m3Full = structuredClone(m3Ret);
+    addColumn(m3Full, 't-users', { name: 'tag', type: 'text', id: 'c-tag-ret' });
+    const m4 = structuredClone(m2);
+    addColumn(m4, 't-users', { name: 'tag', type: 'text', id: 'c-tag' });
+    const m5 = withNote(m4);
+
+    const mk = (
+      id: string,
+      number: number,
+      parentId: string | null,
+      fromM: Model | null,
+      toM: Model,
+      retired = false,
+    ): ChainVersion => {
+      const up = toScriptSteps(plan(fromM ?? emptyBase(toM, null), toM), 'pg');
+      const down = toScriptSteps(plan(toM, fromM ?? emptyBase(toM, null)), 'pg');
+      return {
+        id,
+        number,
+        parentId,
+        name: `v${number}`,
+        model: toM,
+        upSteps: up,
+        downSteps: down,
+        checksum: stepsChecksum(up, down),
+        verified: true,
+        retired,
+        publishedAt: new Date().toISOString(),
+        publishedBy: null,
+        scope: null,
+      };
+    };
+    const v1 = mk('v-1', 1, null, null, m1);
+    const v2 = mk('v-2', 2, 'v-1', m1, m2);
+    const v3 = mk('v-3', 3, 'v-2', m2, m3Full);
+    const v4 = mk('v-4', 4, 'v-2', m2, m4);
+    const v5 = mk('v-5', 5, 'v-4', m4, m5);
+
+    await withTarget(async (t) => {
+      await run(t.db, [v1, v2, v3], 3);
+      const tree: ChainVersion[] = [v1, v2, { ...v3, retired: true }, v4, v5];
+
+      // 目标本身已作废：不能标记过去（即使线上当前不是它）
+      await run(t.db, [v1, v2, v3], 2);
+      await expect(
+        markApplied({ ...base, chain: tree, db: t.db, to: 'v-3', dryRun: true }),
+      ).rejects.toMatchObject({
+        code: 'retired_target',
+      });
+
+      // 回到 v-3（已在作废岔路上），结构与 v-5 一致：多跳跨岔路标记 skipped 只含 [v-4, v-5]（不含 v-3、不回退 v-2）
+      await run(t.db, [v1, v2, v3], 3);
+      const dry = await markApplied({ ...base, chain: tree, db: t.db, to: 'v-5', dryRun: true });
+      expect(dry.plan.direction).toBe('cross');
+      expect(dry.plan.from?.id).toBe('v-3');
+      expect(dry.plan.to.id).toBe('v-5');
+      expect(dry.plan.skipped.map((v) => v.id)).toEqual(['v-4', 'v-5']);
+
+      // 确认校验：缺 ack → ack_required；有 ack 缺 expect → expect_required；expect.skipped 被篡改 → plan_changed
+      await expect(markApplied({ ...base, chain: tree, db: t.db, to: 'v-5' })).rejects.toMatchObject({
+        code: 'ack_required',
+      });
+      await expect(
+        markApplied({ ...base, chain: tree, db: t.db, to: 'v-5', acknowledge: true }),
+      ).rejects.toMatchObject({ code: 'expect_required' });
+      const badExp = { ...expectOf(dry.plan), skipped: ['v-5'] };
+      await expect(
+        markApplied({ ...base, chain: tree, db: t.db, to: 'v-5', acknowledge: true, expect: badExp }),
+      ).rejects.toMatchObject({ code: 'plan_changed' });
+
+      // 带着正确确认提交：不执行 SQL，写入 mark 记录与 v-5，之后 checkDrift 通过
+      const res = await markApplied({
+        ...base,
+        chain: tree,
+        db: t.db,
+        to: 'v-5',
+        acknowledge: true,
+        expect: expectOf(dry.plan),
+      });
+      expect(res.plan.direction).toBe('cross');
+      const h = await readHistory(t.db, 'p1');
+      expect(h.currentVersion).toBe('v-5');
+      expect((await checkDrift({ db: t.db, projectId: 'p1', chain: tree })).status).toBe('ok');
     });
   });
 });
