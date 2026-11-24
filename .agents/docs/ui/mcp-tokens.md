@@ -81,3 +81,14 @@
 - 复选框、单选组用 `<fieldset>` / `<legend>`；说明文字 `aria-describedby`；错误 `role="alert"`，复制提示 `role="status"`。
 - 表格在 < 1024 宽时横向滚动容器（`overflow-x: auto`，`tabindex="0"` + `aria-label`）。
 - 亮 / 暗两种配色都跑 axe（Playwright E2E）。
+
+## 6. UX 审阅后的修订（2026-11-24）
+
+独立 UX / 文案审阅后已落实到实现（以代码与 `i18n.ts` 为准）：
+
+- 一次性展示态不可误关：`Modal dismissible={false}`（`closedby="none"`、不响应 Esc 与点外部、不显示右上角关闭），只能用「我已保存，关闭」关闭；令牌输入框聚焦即全选，并用 `aria-describedby` 关联警告。
+- 「新建 MCP 令牌」在实例关闭或已有 20 个有效令牌时用 `aria-disabled`（仍可聚焦），原因由 `aria-describedby` 读出；页面显示“有效令牌 n / 20 个”。
+- 表格合并为 5 列（名称 + 前缀 + 权限标记 / 项目 / 最后使用 / 状态 + 到期 / 操作），适配个人设置 760px 内容宽度；项目列直接列出 `owner/project`，不用 `interestfor`。
+- 吊销后焦点移到本节标题（个人设置）或表格区域（管理后台），吊销确认框叠在列表对话框之上而不是关闭它。
+- 客户端配置：Claude Code 加 `--scope user`；Cursor 与 VS Code 分成两个选项卡，提示写入用户级配置、不要把含令牌的文件提交到仓库；“其他客户端”的地址、传输方式、请求头分别复制。
+- 文案：避免“账号”，改“用户”；“需要项目编辑者及以上角色”；页头说明按勾选的权限和项目范围、不超过当前项目角色；停用用户新增确认对话框；重置密码与重置链接说明会吊销 MCP 令牌；`model.mutate` / `model.verify` 的动态文案不重复“通过 MCP”，由 `MCP` 标记表达。
