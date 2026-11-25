@@ -1,33 +1,17 @@
 // CI 令牌（P6）：令牌管理界面（创建只显示一次、列表、吊销）、三层“谁能创建令牌”的配置（上级锁定 + 组条件自动只读可见）、
-// 用 Playwright request 上下文拿令牌调 /api/ci 执行接口打到测试 PG（生产默认拒、开开关后通过并在收件箱显示通知），
-// 以及亮 / 暗配色下的 axe 无障碍扫描。
-import AxeBuilder from '@axe-core/playwright';
-import { expect, type Page, test } from '@playwright/test';
+// 用 Playwright request 上下文拿令牌调 /api/ci 执行接口打到测试 PG（生产默认拒、开开关后通过并在收件箱显示通知，亮 / 暗配色）。
+import { expect, test } from '@playwright/test';
 
 import { addEnv, newTargetDb, openEnv, publishTable } from './exec-helpers.ts';
 import { createGroup, createProjectIn, gotoPage, holdRequest, instanceAdmin, newUser } from './helpers.ts';
 
-const scan = async (page: Page, label: string) => {
-  const results = await new AxeBuilder({ page }).analyze();
-  const bad = results.violations.filter((v) => v.impact === 'serious' || v.impact === 'critical');
-  expect(
-    bad,
-    `${label} 有 serious / critical 级别的无障碍问题：\n${bad
-      .map(
-        (v) => `- ${v.id} (${v.impact}) ${v.help}\n  ${v.nodes.map((n) => n.target.join(' ')).join('\n  ')}`,
-      )
-      .join('\n')}`,
-  ).toEqual([]);
-};
-
 for (const scheme of ['light', 'dark'] as const) {
-  test(`令牌管理与三层创建规则界面、自动只读可见性、无障碍扫描（${scheme}）`, async ({ browser }) => {
+  test(`令牌管理与三层创建规则界面、自动只读可见性（${scheme}）`, async ({ browser }) => {
     // 管理后台 /admin/policy 包含“谁能创建 CI 令牌”配置
     const admin = await instanceAdmin(browser, scheme);
     await admin.goto('/admin/policy');
     await expect(admin.getByRole('heading', { name: '谁能创建 CI 令牌' })).toBeVisible();
     await expect(admin.getByTestId('token-policy-panel')).toContainText('不受“谁能执行”策略与审批流程限制');
-    await scan(admin, `/admin/policy (${scheme})`);
 
     // 建业务组、流水线组（另一位用户加入流水线组）和项目
     const { page: ga } = await newUser(browser, '令牌组管', { colorScheme: scheme });
@@ -51,7 +35,6 @@ for (const scheme of ['light', 'dark'] as const) {
     await groupTokPanel.getByLabel('组', { exact: true }).selectOption({ label: pipeGroup.name });
     await groupTokPanel.getByRole('button', { name: '保存创建规则' }).click();
     await expect(ga.getByText('已保存令牌创建规则')).toBeVisible();
-    await scan(ga, `组页 · 令牌规则 (${scheme})`);
 
     // 项目层：看到“由组锁定”提示；创建令牌只显示一次明文；关闭后列表不显示明文；吊销生效
     await ga.goto(projectUrl);
@@ -65,7 +48,6 @@ for (const scheme of ['light', 'dark'] as const) {
     await tokPanel.getByRole('button', { name: '创建令牌' }).click();
     const tokenValue = (await tokPanel.getByTestId('created-token-value').textContent())?.trim() ?? '';
     expect(tokenValue).toMatch(/^dwl_[A-Za-z0-9_-]{43}$/);
-    await scan(ga, `项目设置 · 创建令牌后 (${scheme})`);
     await tokPanel.getByRole('button', { name: '我已保存' }).click();
     await expect(tokPanel.getByTestId('created-token-value')).toHaveCount(0);
     // 列表里只显示前缀，不显示明文
@@ -181,11 +163,10 @@ test.describe('CI 令牌真实执行（需要目标库 PG）', () => {
         expect(await prodOk.json()).toMatchObject({ ok: true, reached: { number: 1 }, noop: false });
       });
 
-      await test.step('收件箱显示通知并通过 axe 扫描', async () => {
+      await test.step('收件箱显示通知', async () => {
         await page.goto('/inbox');
         await page.getByRole('tab', { name: /^通知/ }).click();
         await expect(page.getByText(/CI 令牌执行了生产环境/)).toBeVisible({ timeout: 15_000 });
-        await scan(page, '收件箱 · CI 令牌执行通知');
       });
     } finally {
       await stgDb.drop();

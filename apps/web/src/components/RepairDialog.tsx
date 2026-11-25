@@ -102,7 +102,6 @@ export const RepairDialog = ({
             {r.script ? (
               <section
                 aria-label={t('dr.repairTitle')}
-                // oxlint-disable-next-line jsx-a11y/no-noninteractive-tabindex -- 可滚动的代码区需要能用键盘滚动
                 tabIndex={0}
                 className="bg-code-bg max-h-80 overflow-auto rounded-sm border border-border p-2"
               >

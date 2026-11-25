@@ -1,22 +1,8 @@
 // MCP 令牌（M3-C，ADR 0014）：个人设置「MCP 访问」新建 → 一次性展示（不可误关）与客户端配置 → 用令牌调 /api/mcp
-// → 列表与吊销；管理后台查看并吊销某个用户的令牌；实例开关“允许 MCP 访问”；亮 / 暗配色下的 axe 无障碍扫描。
-import AxeBuilder from '@axe-core/playwright';
-import { expect, type Page, test } from '@playwright/test';
+// → 列表与吊销；管理后台查看并吊销某个用户的令牌；实例开关“允许 MCP 访问”（亮 / 暗配色）。
+import { expect, test } from '@playwright/test';
 
 import { createProject, instanceAdmin, newUser } from './helpers.ts';
-
-const scan = async (page: Page, label: string) => {
-  const results = await new AxeBuilder({ page }).analyze();
-  const bad = results.violations.filter((v) => v.impact === 'serious' || v.impact === 'critical');
-  expect(
-    bad,
-    `${label} 有 serious / critical 级别的无障碍问题：\n${bad
-      .map(
-        (v) => `- ${v.id} (${v.impact}) ${v.help}\n  ${v.nodes.map((n) => n.target.join(' ')).join('\n  ')}`,
-      )
-      .join('\n')}`,
-  ).toEqual([]);
-};
 
 const initialize = (token: string) => ({
   headers: {
@@ -47,7 +33,6 @@ for (const scheme of ['light', 'dark'] as const) {
     const section = page.getByTestId('account-mcp');
     await expect(section.getByRole('heading', { name: 'MCP 访问' })).toBeVisible();
     await expect(section.getByText('还没有 MCP 令牌')).toBeVisible();
-    await scan(page, `/account/mcp 空状态 (${scheme})`);
 
     // 新建：名称必填、只允许指定项目时至少选一个
     await section.getByRole('button', { name: '新建 MCP 令牌' }).click();
@@ -62,7 +47,6 @@ for (const scheme of ['light', 'dark'] as const) {
     await dlg.getByRole('button', { name: '新建令牌' }).click();
     await expect(dlg.getByText('至少选择一个项目')).toBeVisible();
     await dlg.getByRole('checkbox', { name: new RegExp(`MCP 项目 ${scheme}`) }).check();
-    await scan(page, `新建 MCP 令牌对话框 (${scheme})`);
     await dlg.getByRole('button', { name: '新建令牌' }).click();
 
     // 一次性展示：Esc 不能关闭；复制按钮的结果通过 role="status" 播报；配置片段里带令牌
@@ -78,7 +62,6 @@ for (const scheme of ['light', 'dark'] as const) {
     await expect(reveal.locator('code').first()).toContainText(token);
     await reveal.getByRole('tab', { name: 'VS Code' }).click();
     await expect(reveal.locator('code').first()).toContainText('"type": "http"');
-    await scan(page, `MCP 令牌一次性展示 (${scheme})`);
     await reveal.getByRole('button', { name: '我已保存，关闭' }).click();
     await expect(reveal).toBeHidden();
 
@@ -88,7 +71,6 @@ for (const scheme of ['light', 'dark'] as const) {
     await expect(table).toContainText(token.slice(0, 12));
     await expect(table).not.toContainText(token);
     await expect(table).toContainText('修改');
-    await scan(page, `/account/mcp 列表 (${scheme})`);
 
     // 令牌能用：/api/mcp initialize 成功（令牌请求不带 cookie）
     const ok = await page.request.post('/api/mcp', initialize(token));
@@ -119,7 +101,6 @@ for (const scheme of ['light', 'dark'] as const) {
     await admin.getByRole('button', { name: `MCP 令牌（${username}）` }).click();
     const adminDlg = admin.getByRole('dialog', { name: new RegExp(`MCP 用户 ${scheme} 的 MCP 令牌`) });
     await expect(adminDlg.getByTestId('mcp-token-table')).toContainText('笔记本上的 Claude Code');
-    await scan(admin, `管理后台 · 用户的 MCP 令牌 (${scheme})`);
     await adminDlg.getByRole('button', { name: '吊销 MCP 令牌 笔记本上的 Claude Code' }).click();
     const confirm = admin.getByRole('dialog', { name: '吊销 MCP 令牌 笔记本上的 Claude Code？' });
     await confirm.getByRole('button', { name: '吊销令牌' }).click();

@@ -1,28 +1,14 @@
 // 组级 Webhook（P5b，E8）：组管理员在组首页新建通用 JSON Webhook（带签名密钥）→ 发送测试 → 界面显示成功、
-// 投递记录里有一条 → 本地接收端收到的请求签名正确；编辑时 URL 和密钥不回显；亮 / 暗各做一次 axe 扫描。
+// 投递记录里有一条 → 本地接收端收到的请求签名正确；编辑时 URL 和密钥不回显（亮 / 暗）。
 // 接收端是测试进程里的 HTTP 服务器（127.0.0.1）：默认的出站限制会拒绝回环地址，所以先把 127.0.0.0/8 加进
 // 实例设置的 webhookAllowlist，结束后恢复原值。
 import { createHmac } from 'node:crypto';
 import { createServer, type IncomingHttpHeaders, type Server } from 'node:http';
 import type { AddressInfo } from 'node:net';
 
-import AxeBuilder from '@axe-core/playwright';
 import { expect, type Page, test } from '@playwright/test';
 
 import { adminPage, createGroup, newUser } from './helpers.ts';
-
-const scan = async (page: Page, label: string) => {
-  const results = await new AxeBuilder({ page }).analyze();
-  const bad = results.violations.filter((v) => v.impact === 'serious' || v.impact === 'critical');
-  expect(
-    bad,
-    `${label} 有 serious / critical 级别的无障碍问题：\n${bad
-      .map(
-        (v) => `- ${v.id} (${v.impact}) ${v.help}\n  ${v.nodes.map((n) => n.target.join(' ')).join('\n  ')}`,
-      )
-      .join('\n')}`,
-  ).toEqual([]);
-};
 
 /** SHOOT_APP=1 时把截图写到 .agents/docs/ui/shots/（和 visual.spec.ts 同一个约定） */
 const shoot = async (page: Page, name: string) => {
@@ -100,7 +86,6 @@ for (const scheme of ['light', 'dark'] as const) {
     await dlg.getByLabel('Webhook 地址').fill(`${base}/hooks/${token}`);
     await dlg.getByLabel(/^签名密钥/).fill(secret);
     await dlg.getByLabel('申请已通过').check();
-    await scan(page, `新建 Webhook 对话框（${scheme}）`);
     await dlg.getByRole('button', { name: '新建 Webhook' }).click();
     await expect(dlg).toBeHidden();
     await expect(page.getByText(`已新建 Webhook ${name}`)).toBeVisible();
@@ -128,7 +113,6 @@ for (const scheme of ['light', 'dark'] as const) {
     const body = JSON.parse(got.body) as { type: string; title: string; text: string };
     expect(body).toMatchObject({ type: 'test', title: 'Dowel Webhook 测试' });
     expect(body.text).toContain(group.name);
-    await scan(page, `组首页 · Webhook（${scheme}）`);
     await shoot(page, `webhooks-group-${scheme}`);
 
     // 投递记录：一条测试投递
@@ -139,7 +123,6 @@ for (const scheme of ['light', 'dark'] as const) {
     await expect(rows.nth(1)).toContainText('测试');
     await expect(rows.nth(1)).toContainText('200');
     await expect(rows.nth(1)).toContainText('成功');
-    await scan(page, `投递记录（${scheme}）`);
     await logs.getByRole('button', { name: '关闭' }).click();
     await expect(logs).toBeHidden();
 
@@ -156,7 +139,6 @@ for (const scheme of ['light', 'dark'] as const) {
     const html = await page.content();
     expect(html).not.toContain(token);
     expect(html).not.toContain(secret);
-    await scan(page, `编辑 Webhook 对话框（${scheme}）`);
     // 只改名字：保存后 URL 和密钥保留，再发一次测试仍然签名正确
     await edit.getByLabel('名称').fill(`${name}-改`);
     await edit.getByRole('button', { name: '保存 Webhook' }).click();

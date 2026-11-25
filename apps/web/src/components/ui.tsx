@@ -184,7 +184,6 @@ export const Menu = ({
       >
         {trigger}
       </button>
-      {/* oxlint-disable-next-line jsx-a11y/no-static-element-interactions -- 键盘事件从菜单项冒泡上来，菜单本身不可聚焦 */}
       <div
         ref={pop}
         popover="auto"

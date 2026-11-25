@@ -22,7 +22,6 @@
     "bench:all": "pnpm bench:core && pnpm bench:ui && pnpm bench:shadow"
   },
   "devDependencies": {
-    "@axe-core/playwright": "^4.14.0",
     "@dowel/api": "workspace:*",
     "@dowel/core": "workspace:*",
     "@dowel/engines": "workspace:*",

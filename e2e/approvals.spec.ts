@@ -1,24 +1,10 @@
 // 执行申请与审批（P5b 验收）：开发提交申请 → 组管理员审批 → DBA“通过并执行”；收件箱未读数实时变化；
-// 实例管理员的紧急执行（原因必填、二次确认）；申请详情、收件箱、确认对话框（申请模式）的 axe 扫描（亮 / 暗）。
+// 实例管理员的紧急执行（原因必填、二次确认）。
 // 需要 PG 作目标库（Testcontainers 或 DOWEL_TEST_PG），没有 Docker 时跳过。
-import AxeBuilder from '@axe-core/playwright';
 import { expect, type Page, test } from '@playwright/test';
 
 import { addEnv, execDialog, newTargetDb, openEnv, publishTable } from './exec-helpers.ts';
 import { createGroup, createProjectIn, instanceAdmin, newUser } from './helpers.ts';
-
-const scan = async (page: Page, label: string) => {
-  const results = await new AxeBuilder({ page }).analyze();
-  const bad = results.violations.filter((v) => v.impact === 'serious' || v.impact === 'critical');
-  expect(
-    bad,
-    `${label} 有 serious / critical 级别的无障碍问题：\n${bad
-      .map(
-        (v) => `- ${v.id} (${v.impact}) ${v.help}\n  ${v.nodes.map((n) => n.target.join(' ')).join('\n  ')}`,
-      )
-      .join('\n')}`,
-  ).toEqual([]);
-};
 
 const shoot = async (page: Page, name: string) => {
   if (process.env.SHOOT_APP === '1')
@@ -95,17 +81,14 @@ test.describe('需要目标库', () => {
         const dlg = execDialog(dev);
         await expect(dlg.getByTestId('dry-run')).toBeVisible({ timeout: 30_000 });
         await dlg.getByLabel('申请说明（选填）').fill('上线订单表');
-        await scan(dev, '确认对话框 · 提交执行申请');
         await dlg.getByRole('button', { name: '提交执行申请' }).click();
         await expect(dev.getByTestId('request-status')).toHaveText('待审批');
         await expect(dev.getByTestId('stage-0')).toContainText('项目所属组的组管理员');
-        await scan(dev, '申请详情 · 待审批');
 
         // 组管理员：图标栏未读数出现（SSE 推送，不刷新页面），收件箱里“待我处理”有这条
         await expect(unread(ga)).toHaveText('1', { timeout: 15_000 });
         await ga.getByRole('link', { name: '收件箱' }).click();
         await expect(ga.getByRole('tab', { name: /待我处理（1）/ })).toBeVisible();
-        await scan(ga, '收件箱');
         await shoot(ga, `inbox-${scheme}`);
         await ga.getByRole('link', { name: /审批项目 \/ prod：执行到 v1/ }).click();
         await ga.getByLabel('意见（选填）').fill('可以上线');
@@ -119,7 +102,6 @@ test.describe('需要目标库', () => {
         await dba.getByRole('link', { name: /审批项目 \/ prod：执行到 v1/ }).click();
         await expect(dba.getByTestId('stage-1')).toContainText('当前环节');
         await expect(dba.getByTestId('stage-1')).toContainText('执行者');
-        await scan(dba, '申请详情 · 第二个环节');
         await shoot(dba, `request-${scheme}`);
         await dba.getByRole('button', { name: '通过并执行' }).click();
         const run = dba.getByRole('dialog');
@@ -159,7 +141,6 @@ test.describe('需要目标库', () => {
         await em.getByLabel('紧急执行的原因').fill('线上故障，需要立即加表');
         await expect(confirm).toHaveAttribute('aria-disabled', 'true');
         await em.getByLabel('我确认这是紧急情况，要绕过审批直接执行').check();
-        await scan(admin, '确认对话框 · 紧急执行');
         await confirm.click();
         await expect(em.getByText('执行完成')).toBeVisible({ timeout: 60_000 });
         // 组管理员之前那条“待你审批”还没读，加上紧急执行的开始和结果两条：3 条未读

@@ -33,11 +33,7 @@ export const ProjectPage = ({
         center={center}
         actions={actions}
       />
-      <main
-        // oxlint-disable-next-line jsx-a11y/no-noninteractive-tabindex -- 只读视图内所有控件可能被禁用，可滚动主区域需要能用键盘滚动
-        tabIndex={0}
-        className="min-h-0 flex-1 overflow-auto focus-visible:outline-offset-[-2px]"
-      >
+      <main tabIndex={0} className="min-h-0 flex-1 overflow-auto focus-visible:outline-offset-[-2px]">
         <div className={`mx-auto px-6 py-6 ${wide ? 'max-w-[1200px]' : 'max-w-[960px]'}`}>{children}</div>
       </main>
     </>

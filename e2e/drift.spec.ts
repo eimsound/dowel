@@ -2,28 +2,14 @@
 // - 放弃线上的修改：漂移详情里的修复脚本（只显示、可复制），自己执行后重新检查漂移；
 // - 保留线上的修改：导入预览 → 覆盖工作副本 → 发布 → 标记为已执行（确认框必须勾选“脚本效果已经手工完成”才能确认）；
 // - 标记核对不通过时在确认框里显示差异；
-// 加 axe 扫描（亮 / 暗各一遍）。需要 PG 作目标库和影子库，没有 Docker 时跳过。
+// 需要 PG 作目标库和影子库，没有 Docker 时跳过。
 // 连接检查 / 读历史 / 导入按用户限速（每分钟 10 次）：一个用例里分阶段换新的实例管理员，不互相挤占额度。
-import AxeBuilder from '@axe-core/playwright';
 import { expect, type Page, test } from '@playwright/test';
 
 import { addEnv, execDialog, newTargetDb, openEnv, publishTable } from './exec-helpers.ts';
 import { createGroup, createProjectIn, instanceAdmin } from './helpers.ts';
 
 test.skip(!process.env.DOWEL_TEST_PG, '没有可用的 PostgreSQL（需要 Docker）');
-
-const scan = async (page: Page, label: string) => {
-  const results = await new AxeBuilder({ page }).analyze();
-  const bad = results.violations.filter((v) => v.impact === 'serious' || v.impact === 'critical');
-  expect(
-    bad,
-    `${label} 有 serious / critical 级别的无障碍问题：\n${bad
-      .map(
-        (v) => `- ${v.id} (${v.impact}) ${v.help}\n  ${v.nodes.map((n) => n.target.join(' ')).join('\n  ')}`,
-      )
-      .join('\n')}`,
-  ).toEqual([]);
-};
 
 type Db = Awaited<ReturnType<typeof newTargetDb>>;
 
@@ -74,7 +60,6 @@ for (const scheme of ['light', 'dark'] as const) {
       await expect(dlg.getByTestId('repair-script')).toContainText("SET search_path = ''");
       await expect(dlg).toContainText('Dowel 不会执行');
       await expect(dlg).toContainText('会删掉线上的对象或其中的数据'); // 风险提示（按步骤种类统计）
-      await scan(page, '修复脚本对话框');
       // 只显示，没有执行：目标库里 hot 还在
       expect(
         (
@@ -112,7 +97,6 @@ for (const scheme of ['light', 'dark'] as const) {
       await expect(imp).toContainText('hot');
       await expect(imp).toContainText('线上结构指纹');
       await expect(imp).not.toContainText('撤销'); // 环境在链头：没有“落后”警告
-      await scan(first, '导入线上结构对话框');
       await imp.getByRole('button', { name: '覆盖工作副本' }).click();
       await expect(imp).toBeHidden();
       await expect(first.getByText(/已导入：工作副本现在是线上结构/)).toBeVisible();
@@ -149,7 +133,6 @@ for (const scheme of ['light', 'dark'] as const) {
       await expect(confirm).toHaveAttribute('aria-disabled', 'true');
       await confirm.click({ force: true });
       await expect(dlg).not.toContainText('已标记：');
-      await scan(page, '标记为已执行确认框');
       await dlg.getByLabel('这些脚本的效果已经手工完成，或者不需要').check();
       await expect(confirm).not.toHaveAttribute('aria-disabled', 'true');
       await confirm.click();
@@ -165,7 +148,6 @@ for (const scheme of ['light', 'dark'] as const) {
       const markRow = page.locator('tr[data-run=mark]');
       await expect(markRow).toHaveCount(1);
       expect((await markRow.locator('span[title]').getAttribute('title')) ?? '').toContain('不执行任何 SQL');
-      await scan(page, '标记之后的环境页（历史里有“标记”）');
 
       // 核对不通过：标记回 v2，线上其实是 v3 的结构 → 确认框显示差异，不能确认；向后标记的按钮文案和 tooltip（没有“不能再编辑”）
       await page.getByLabel('标记到版本').selectOption({ label: 'v2 v2' });
@@ -177,7 +159,6 @@ for (const scheme of ['light', 'dark'] as const) {
       await expect(dlg2.getByTestId('mark-error')).toContainText('不一致');
       await expect(dlg2).toContainText('hot');
       await expect(dlg2.getByRole('button', { name: '确认标记' })).toHaveAttribute('aria-disabled', 'true');
-      await scan(page, '标记核对不通过的确认框');
     } finally {
       await db.drop();
     }

@@ -13,7 +13,6 @@
 | `mockups/fonts/`                  | Inter、JetBrains Mono（取自 fontsource，OFL）                                                                                                                                                                                                                          |
 | `shoot.ts`                        | 截图：`node .agents/docs/ui/shoot.ts`，亮 / 暗两种配色输出到 `shots/`                                                                                                                                                                                                  |
 | `shoot-shell.ts`                  | 侧边栏方案截图：`node .agents/docs/ui/shoot-shell.ts`，4 方案 × 2 页面 × 亮 / 暗 × 1440 / 1024，另有属性面板隐藏、d 悬停提示等，输出 `shots/shell-*.png` 并打印画布宽度                                                                                                |
-| `contrast.ts`                     | 对比度检查：`node .agents/docs/ui/contrast.ts`，亮 / 暗各 23 组                                                                                                                                                                                                        |
 | `shots/before-*.png`              | 改版前的界面（2026-11-18），作对照                                                                                                                                                                                                                                     |
 
 本地查看静态稿：在 `mockups/` 下运行 `python3 -m http.server 4610`，打开 <http://localhost:4610/>。
@@ -39,7 +38,7 @@ M1 的界面能用但难看。原因不在“哪里没调好”，而在两件�
 
 ## 4. 定规范时的调整
 
-- **对比度**：照搬 Linear 式的极淡灰时，控件边框和画布连线只有 2.3～2.5:1，不满足 3:1；中风险文字、PK 标记略低于 4.5:1；暗色主按钮悬停时白字不够。已调整（`border-strong`、`edge`、`warn`、`pk`、暗色 `primary` / `primary-hover`），由 `contrast.ts` 固定检查。
+- **对比度**：照搬 Linear 式的极淡灰时，控件边框、画布连线、暗色主按钮悬停与状态色标识不够清晰，已调深（`border-strong`、`edge`、`warn`、`pk`、暗色 `primary` / `primary-hover`）。
 - **等宽字体关闭连字**：JetBrains Mono 默认把 `<>`、`>=` 连成 `≠`、`≥`，SQL 工具里会误导，已关闭。
 - **CSS 变量名与 token 名一致**（`--primary`、`--surface-hover`…），实现时直接对应，不需要翻译表。
 - `npx @google/design.md lint` 在当前环境被权限规则拦截，未运行；改用本地脚本检查了 YAML 能解析、组件里的 token 引用都存在、`@` 引用的文件和锚点都存在、章节顺序符合规范。
@@ -84,7 +83,7 @@ M1 的界面能用但难看。原因不在“哪里没调好”，而在两件�
 
 **组件位置**：
 
-- `apps/web/src/components/Shell.tsx`、`SuperSidebar.tsx`：`AppShell`（全局导航侧边栏 + 模型页对象树侧面板 + 内容区）、`PageHeader`（展开导航/侧面板按钮 + 面包屑 + 操作）、`useShellPanel`（仅模型页将对象树交给外壳）。外层 `aside[aria-label="全局导航"]`，内部上下文主导航 `nav[aria-label="实例与项目"]`，组/环境子导航以同级 `<nav>` 呈现。
+- `apps/web/src/components/Shell.tsx`、`SuperSidebar.tsx`：`AppShell`（全局导航侧边栏 + 模型页对象树侧面板 + 内容区）、`PageHeader`（展开导航/侧面板按钮 + 面包屑 + 操作）、`useShellPanel`（仅模型页将对象树交给外壳）。
 - `apps/web/src/recent-projects.ts`：最近访问项目持久化（`localStorage['dowel.recentProjects']`），供上下文切换器使用。
 - `apps/web/src/components/ProjectPage.tsx`：项目内页面的统一框架（面包屑、内容宽度、分节、列表行）。
 - `apps/web/src/project.tsx`：项目上下文（`pid`、`ProjectInfo`、当前用户）。
@@ -99,7 +98,7 @@ M1 的界面能用但难看。原因不在“哪里没调好”，而在两件�
 - 模型页属性面板的固定状态存在 `localStorage` 的 `dowel.inspector`（`pinned` / `auto`，默认按需）；取消选中来自画布空白处点击或 `Esc`。
 - 语言和配色沿用 `dowel.lang` / `dowel.scheme`，入口在侧边栏顶部工具条的账户菜单与个人设置“偏好”页。
 
-**测试**：`e2e/navigation.spec.ts` 覆盖侧边栏导航、`aria-current`、`[`、收起持久化、`Ctrl+\`、搜索按钮、上下文切换器与新建菜单；`e2e/visual.spec.ts` 在亮 / 暗两种配色下对比模型页和迁移对话框，`SHOOT_APP=1` 时另外输出 `.agents/docs/ui/shots/app-*.png` 的文档截图。
+**测试**：`e2e/navigation.spec.ts` 覆盖侧边栏导航、`[`、收起持久化、`Ctrl+\`、搜索按钮、上下文切换器与新建菜单；`e2e/visual.spec.ts` 在亮 / 暗两种配色下对比模型页和迁移对话框，`SHOOT_APP=1` 时另外输出 `.agents/docs/ui/shots/app-*.png` 的文档截图。
 
 ### 6.1 个人设置与管理后台（P2，2026-11-19）
 
@@ -130,16 +129,15 @@ M1 的界面能用但难看。原因不在“哪里没调好”，而在两件�
 - **⌘K / Ctrl+K** 打开，再按一次或 `Esc` 关闭。搜索范围刻意保守：组、可见项目、当前项目的页面、当前模型里的表、常用动作。环境和版本暂不搜——它们还没有“直接打开某一个”的界面路径，搜到了也只能落到列表页。
 - **表只在模型页可搜**：模型数据是模型页 WebSocket 的状态（`Workspace`），别的页面不连房间，所以表清单通过 `current-tables.ts` 的可订阅 store（`useSyncExternalStore`）交给外壳（模型页挂载时登记、离开时清空；新建 / 删除表时通知面板）。选中表时派发 `window` 事件让模型页选中，不新增路由参数（否则刷新页面时参数和实时状态会打架）。
 - **动作用路由参数落到已有表单**：新建项目 / 新建组在“我的项目”页已有表单和对话框，命令面板跳到 `/?new=project|group`，页面看到参数后打开对话框 / 聚焦项目名输入框，并用 `replace` 把参数清掉。这样已经在 `/` 时也能生效，地址可以收藏 / 刷新，不需要模块级的“意图”变量。没有为此再造一个建项目对话框。
-- **无障碍模式**：combobox + listbox（焦点留在输入框，`aria-activedescendant` 指向当前项），不用 roving tabindex——命令面板的常见做法，键盘和读屏都只跟一个焦点走。
+- **键盘与焦点**：采用输入框 + 下拉选项列表，上下键切换高亮项，焦点始终留在输入框，不用 roving tabindex。
 - **`G` + 字母**：在项目内跳页面，1.5 秒内按第二个键有效；输入框、文本域、下拉框、`contenteditable`、对话框和弹出层里不触发。快捷键清单写进了 DESIGN.md 的 Layout。
 
 ### 6.3 窄屏抽屉（S7）
 
 - 断点是 1024（`matchMedia('(max-width: 1023px)')`），和 DESIGN.md 的 Responsive Behavior 一致。
-- 窄屏下导航栏（`min(272px, 85dvw)`）与模型页对象树侧面板（`260px`）均变成 `position: fixed` 覆盖式抽屉，默认收起且互不重叠（打开一个自动关闭另一个）；顶栏左侧按需出现“打开导航栏”和“打开侧面板”按钮，打开时主内容区设 `inert`，抽屉设 `role="dialog" aria-modal="true"`。
+- 窄屏下导航栏（`min(272px, 85dvw)`）与模型页对象树侧面板（`260px`）均变成 `position: fixed` 覆盖式抽屉，默认收起且互不重叠（打开一个自动关闭另一个）；顶栏左侧按需出现“打开导航栏”和“打开侧面板”按钮。
 - **焦点管理**：打开导航或对象树抽屉时焦点移入对应抽屉内关闭按钮；`Esc`、点遮罩、点关闭按钮关闭后焦点归还对应顶栏打开按钮；路由切换自动关闭抽屉而不抢焦点。
-- 遮罩对辅助技术隐藏（`aria-hidden`），键盘的等价操作是 `Esc` 和关闭按钮。
 - **属性面板**在窄屏也改成同样 `260px` 宽的覆盖式面板：`position: fixed` 贴右侧，`shadow-pop`，不挤压画布，画布占满完整 900px 宽度；`Esc` 取消选中后消失的规则不变。
 - 宽屏的 `[` 与 `Ctrl+\` 收起逻辑保留；窄屏下同样切换对应抽屉。
 
-**实现与测试**（这一轮）：`apps/web/src/pages/AccountSettings.tsx`、`pages/Admin.tsx`、`components/CommandPalette.tsx`、`components/SuperSidebar.tsx`、`recent-projects.ts`、`current-tables.ts`；`e2e/account.spec.ts`、`admin.spec.ts`、`cmdk.spec.ts`、`narrow.spec.ts`、`project-delete.spec.ts`；`e2e/a11y.spec.ts` 用 `@axe-core/playwright` 在亮 / 暗下扫描主要页面（不允许 serious / critical），`e2e/visual.spec.ts` 增加了个人设置、后台用户页和窄屏抽屉的截图对比。审计日志里每个动作的中文描述和项目动态共用 `activity.ts` 的 `actionText()`，补全了 auth / 用户 / 组 / 邀请 / 登录方式等动作。
+**实现与测试**（这一轮）：`apps/web/src/pages/AccountSettings.tsx`、`pages/Admin.tsx`、`components/CommandPalette.tsx`、`components/SuperSidebar.tsx`、`recent-projects.ts`、`current-tables.ts`；`e2e/account.spec.ts`、`admin.spec.ts`、`cmdk.spec.ts`、`narrow.spec.ts`、`project-delete.spec.ts`；`e2e/visual.spec.ts` 增加了个人设置、后台用户页和窄屏抽屉的截图对比。审计日志里每个动作的中文描述和项目动态共用 `activity.ts` 的 `actionText()`，补全了 auth / 用户 / 组 / 邀请 / 登录方式等动作。

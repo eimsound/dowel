@@ -1,27 +1,13 @@
 // 链尾版本作废（ADR 0013）：执行到 v2 → 作废 v2（工作副本回退到 v1）→ 基于 v1 发布 v3 →
 // 停在已作废 v2 上的环境经最近公共祖先切换（v2 → v1 → v3）→ 把已作废的 v2 应用到画布 →
-// 作废 v3 后在还没发布更新版本前取消作废。亮 / 暗两种配色各扫一遍无障碍（版本列表、详情、三个对话框、切换对话框）。
+// 作废 v3 后在还没发布更新版本前取消作废（亮 / 暗两种配色）。
 // 需要 PG 作目标库和影子库（Testcontainers 或 DOWEL_TEST_PG，见 e2e/global-setup.ts），没有 Docker 时跳过。
-import AxeBuilder from '@axe-core/playwright';
 import { expect, type Page, test } from '@playwright/test';
 
 import { addEnv, execDialog, newTargetDb, openEnv, publishTable } from './exec-helpers.ts';
 import { createProject, gotoPage, newUser } from './helpers.ts';
 
 test.skip(!process.env.DOWEL_TEST_PG, '没有可用的 PostgreSQL（需要 Docker）');
-
-const scan = async (page: Page, label: string) => {
-  const results = await new AxeBuilder({ page }).analyze();
-  const bad = results.violations.filter((v) => v.impact === 'serious' || v.impact === 'critical');
-  expect(
-    bad,
-    `${label} 有 serious / critical 级别的无障碍问题：\n${bad
-      .map(
-        (v) => `- ${v.id} (${v.impact}) ${v.help}\n  ${v.nodes.map((n) => n.target.join(' ')).join('\n  ')}`,
-      )
-      .join('\n')}`,
-  ).toEqual([]);
-};
 
 const versionRow = (page: Page, n: number) =>
   page.getByRole('listitem').filter({ has: page.getByRole('link', { name: `v${n}`, exact: true }) });
@@ -63,7 +49,6 @@ for (const scheme of ['light', 'dark'] as const) {
       await expect(dlg).toContainText('下次发布将是 v3（父版本 v1）');
       await expect(dlg).toContainText('v2 已在环境执行过');
       await expect(dlg.getByRole('radio', { name: /回退到 v1 的模型/ })).toBeChecked();
-      await scan(page, '作废对话框');
       await dlg.getByRole('button', { name: '作废 v2' }).click();
       await expect(dlg).toBeHidden();
       await expect(page.getByText('已作废 v2，链头现在是 v1')).toBeVisible();
@@ -78,7 +63,6 @@ for (const scheme of ['light', 'dark'] as const) {
       await page.getByRole('radio', { name: '已作废' }).click();
       await expect(page.getByRole('link', { name: 'v1', exact: true })).toHaveCount(0);
       await page.getByRole('radio', { name: '全部' }).click();
-      await scan(page, '版本列表（含已作废）');
 
       // 工作副本已回退到 v1（customers 不在了）：基于 v1 发布 v3（items）
       await publishTable(page, 'items', 'v3', 3);
@@ -99,7 +83,6 @@ for (const scheme of ['light', 'dark'] as const) {
       await expect(dlg.getByRole('list', { name: '回滚段（执行回滚脚本）' })).toContainText('v2');
       await expect(dlg.getByRole('list', { name: '升级段' })).toContainText('v3');
       await expect(dlg.getByTestId('dry-run')).toContainText('经最近公共祖先 v1 切换', { timeout: 60_000 });
-      await scan(page, '切换对话框');
       // 没勾选回滚确认不能执行
       const confirm = dlg.getByRole('button', { name: '确认切换' });
       await expect(confirm).toHaveAttribute('aria-disabled', 'true');
@@ -117,7 +100,6 @@ for (const scheme of ['light', 'dark'] as const) {
       dlg = page.getByRole('dialog');
       await expect(dlg.getByRole('heading', { name: '将 v2 应用到画布' })).toBeVisible();
       await expect(dlg.getByRole('heading', { name: /工作副本 → v2 的变化/ })).toBeVisible();
-      await scan(page, '应用到画布对话框');
       await dlg.getByRole('button', { name: '应用到画布' }).click();
       await expect(dlg).toBeHidden();
       await expect(page.getByText('已将 v2 应用到画布')).toBeVisible();
@@ -132,12 +114,10 @@ for (const scheme of ['light', 'dark'] as const) {
       await page.getByRole('button', { name: '取消作废' }).click();
       dlg = page.getByRole('dialog');
       await expect(dlg.getByRole('heading', { name: '取消作废 v3' })).toBeVisible();
-      await scan(page, '取消作废对话框');
       await dlg.getByRole('button', { name: '取消作废' }).click();
       await expect(dlg).toBeHidden();
       await expect(page.getByText('已取消作废 v3，链头现在是 v3')).toBeVisible();
       await expect(page.getByText('这个版本已作废', { exact: true })).toHaveCount(0);
-      await scan(page, '版本详情');
     } finally {
       await db.drop();
     }
