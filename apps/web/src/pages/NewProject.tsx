@@ -868,35 +868,37 @@ export const NewProject = () => {
                             {filledEnvs.map((env) => (
                               <fieldset
                                 key={env.key}
-                                className="m-0 space-y-2 rounded-sm border border-border bg-bg p-3"
+                                className="m-0 min-w-0 overflow-hidden rounded-sm border border-border bg-bg p-0"
                               >
-                                <legend className="px-1 font-mono text-xs font-medium">
+                                <legend className="float-left flex w-full items-center gap-2 border-b border-border bg-panel px-3 py-2 font-mono text-xs font-medium text-text">
                                   {env.name}
                                   {env.production ? ` · ${t('wiz.envProduction')}` : ''}
                                 </legend>
-                                <label className="field">
-                                  <span className="label">{t('wiz.envShadowUrl')}</span>
-                                  <input
-                                    className="input font-mono"
-                                    value={env.shadowUrl}
-                                    placeholder={uiSpec.shadowPlaceholder}
-                                    autoCapitalize="none"
-                                    autoCorrect="off"
-                                    spellCheck={false}
-                                    onChange={(e) => patchEnv(env.key, { shadowUrl: e.target.value })}
-                                  />
-                                </label>
-                                <div className="checks">
-                                  <label>
+                                <div className="clear-both space-y-2 p-3">
+                                  <label className="field">
+                                    <span className="label">{t('wiz.envShadowUrl')}</span>
                                     <input
-                                      type="checkbox"
-                                      checked={env.allowSameInstance}
-                                      onChange={(e) =>
-                                        patchEnv(env.key, { allowSameInstance: e.target.checked })
-                                      }
+                                      className="input font-mono"
+                                      value={env.shadowUrl}
+                                      placeholder={uiSpec.shadowPlaceholder}
+                                      autoCapitalize="none"
+                                      autoCorrect="off"
+                                      spellCheck={false}
+                                      onChange={(e) => patchEnv(env.key, { shadowUrl: e.target.value })}
                                     />
-                                    {t('wiz.envAllowSame')}
                                   </label>
+                                  <div className="checks">
+                                    <label>
+                                      <input
+                                        type="checkbox"
+                                        checked={env.allowSameInstance}
+                                        onChange={(e) =>
+                                          patchEnv(env.key, { allowSameInstance: e.target.checked })
+                                        }
+                                      />
+                                      {t('wiz.envAllowSame')}
+                                    </label>
+                                  </div>
                                 </div>
                               </fieldset>
                             ))}

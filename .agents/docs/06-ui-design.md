@@ -56,9 +56,9 @@ M1 的界面能用但难看。原因不在“哪里没调好”，而在两件�
 1. **风险分析把前面步骤的全表扫描算到每一步**：`pg_stat_xact_user_tables` 在 PG 15+ 是本连接尚未刷新的累计值，不只是当前事务。迁移对话框开始显示风险原因后，每一步都显示“全表扫描 orders, customers”，改名也被标成高风险。改为每步前后各读一次取增量（`packages/verifier/test/analyze.test.ts`）。
 2. **表达式规范化在并发编辑时卡住**：添加环境后的第一次规范化要从零建库，耗时较长；期间用户的修改会让写回被版本检查拒绝，而之后基线被设成了“最新模型”，于是没写回的原文被当成已规范化，再也不会重试。改为基线 = 本次规范化的那份模型 + 规范形式，写回被拒绝时自动重试（最多 3 次，`apps/server/test/derive.test.ts`）。新界面操作更快，e2e 稳定复现了这个问题。
 
-## 6. 应用外壳实现（P2，2026-11-19）
+## 6. 应用外壳实现（P2，2026-11-19；2026-11-23 重构为 Super Sidebar）
 
-采用共识 11.6 的方案 d：图标栏 + 随页面变化的侧面板。规范写在 DESIGN.md 的 `## Layout`。
+将原 48px 图标栏 + 双层导航面板重构为 **GitLab Super Sidebar 风格的单层上下文侧边栏**（`SuperSidebar`），取消组、环境、个人设置、管理后台的冗余二级侧面板，仅保留模型页的对象树为按需/可折叠工作区侧面板（`SidePanel`）。规范同步写在 DESIGN.md 的 `## Layout`。
 
 **路由**（`apps/web/src/routes.tsx`，TanStack Router 的嵌套布局）：
 
@@ -77,14 +77,15 @@ M1 的界面能用但难看。原因不在“哪里没调好”，而在两件�
 │   ├─ /members                                                   成员与授权
 │   └─ /settings                                                  项目设置
 ├─ /p/:pid                                                        旧地址，跳到项目概览
-├─ /account、/account/password|identities|sessions|preferences      个人设置（分区在侧面板）
+├─ /account、/account/password|identities|sessions|mcp|preferences  个人设置（分区在全局侧边栏）
 ```
 
 旧路径跳转仍然有效：`/p/:pid` 和 `resolve` 返回的 `redirected` 都替换到 `/project/:owner/:project`。
 
 **组件位置**：
 
-- `apps/web/src/components/Shell.tsx`：`AppShell`（图标栏 + 侧面板 + 内容区）、`PageHeader`（面包屑 + 操作）、`useShellPanel`（页面把侧面板内容交给外壳）、账户菜单。图标栏是 `nav[aria-label="实例与项目"]`，侧面板内容由各页面提供自己的 `nav`。
+- `apps/web/src/components/Shell.tsx`、`SuperSidebar.tsx`：`AppShell`（全局导航侧边栏 + 模型页对象树侧面板 + 内容区）、`PageHeader`（展开导航/侧面板按钮 + 面包屑 + 操作）、`useShellPanel`（仅模型页将对象树交给外壳）。外层 `aside[aria-label="全局导航"]`，内部上下文主导航 `nav[aria-label="实例与项目"]`，组/环境子导航以同级 `<nav>` 呈现。
+- `apps/web/src/recent-projects.ts`：最近访问项目持久化（`localStorage['dowel.recentProjects']`），供上下文切换器使用。
 - `apps/web/src/components/ProjectPage.tsx`：项目内页面的统一框架（面包屑、内容宽度、分节、列表行）。
 - `apps/web/src/project.tsx`：项目上下文（`pid`、`ProjectInfo`、当前用户）。
 - `apps/web/src/pages/`：`Projects`（我的项目）、`Group`、`Workspace`（模型页）、`Overview`、`Versions`、`Environments`、`Activity`、`Members`、`ProjectSettings`、`AccountSettings`（个人设置）、`Admin`（管理后台）。
@@ -94,22 +95,23 @@ M1 的界面能用但难看。原因不在“哪里没调好”，而在两件�
 
 - 当前用户、实例信息、项目、版本、环境、动态都在 TanStack Query 的缓存里（`session.ts` 里的 `queryClient`）；路由 `beforeLoad` 用 `ensureQueryData` 读同一份缓存。
 - 模型页的实时模型、在线成员、同步状态在 `workspace.ts` 的 `Workspace` 里（WebSocket）；其它页面不连接房间。
-- 侧面板的收起状态是外壳的组件状态（`[` 切换，不持久化）；当前页面由路径决定。
+- 全局导航侧边栏的收起状态存 `localStorage['dowel.sidebar']`（`Ctrl+\` 切换，无对象树页面 `[` 也切换它）；模型页对象树侧面板的收起状态为外壳组件状态（`[` 切换）。当前页面与上下文由路径决定。
 - 模型页属性面板的固定状态存在 `localStorage` 的 `dowel.inspector`（`pinned` / `auto`，默认按需）；取消选中来自画布空白处点击或 `Esc`。
-- 语言和配色沿用 `dowel.lang` / `dowel.scheme`，入口从工作区顶栏移到了图标栏底部的账户菜单。
+- 语言和配色沿用 `dowel.lang` / `dowel.scheme`，入口在侧边栏顶部工具条的账户菜单与个人设置“偏好”页。
 
-**测试**：`e2e/navigation.spec.ts` 覆盖图标栏、`aria-current`、组页往返和 `[`；`e2e/visual.spec.ts` 在亮 / 暗两种配色下对比模型页和迁移对话框，`SHOOT_APP=1` 时另外输出 `.agents/docs/ui/shots/app-*.png` 的文档截图。
+**测试**：`e2e/navigation.spec.ts` 覆盖侧边栏导航、`aria-current`、`[`、收起持久化、`Ctrl+\`、搜索按钮、上下文切换器与新建菜单；`e2e/visual.spec.ts` 在亮 / 暗两种配色下对比模型页和迁移对话框，`SHOOT_APP=1` 时另外输出 `.agents/docs/ui/shots/app-*.png` 的文档截图。
 
 ### 6.1 个人设置与管理后台（P2，2026-11-19）
 
-两者用**同一套导航方式**：侧面板里是分区导航，每节是独立的嵌套路由。理由是它们和项目页面一样“内容区在右侧、上下文在左侧”，再用页内 tab 会多一层控件，而且侧面板可以随窄屏一起变成抽屉（S7），不用为设置页单独再写一套响应式逻辑。
+两者通过 `SuperSidebar` 的上下文切换直接渲染各自全部分区导航（不再占双层侧面板），每节仍为独立的嵌套路由，窄屏随导航抽屉统一收起。
 
 ```
 /account                 资料            /admin                   用户
 /account/password        密码            /admin/invites           邀请
 /account/identities      登录方式        /admin/sign-in           登录方式
 /account/sessions        会话            /admin/settings          实例设置
-/account/preferences     偏好            /admin/grants            授权
+/account/mcp             MCP 访问        /admin/grants            授权
+/account/preferences     偏好            /admin/policy            策略
                                           /admin/audit             审计日志
 ```
 
@@ -133,11 +135,11 @@ M1 的界面能用但难看。原因不在“哪里没调好”，而在两件�
 
 ### 6.3 窄屏抽屉（S7）
 
-- 断点是 1024（`matchMedia('(max-width: 1023px)')`），和 DESIGN.md 的 Responsive Behavior 一致；图标栏保持 48px。
-- 窄屏下侧面板是 `position: fixed`、宽 260px 的抽屉，默认收起；顶栏左侧出现“打开侧面板”按钮。打开时内容上盖一层遮罩（`--backdrop`，从图标栏右边开始，图标栏仍然可用）。
-- **焦点管理**：打开时焦点移到抽屉里第一个可聚焦元素（关闭按钮）；`Esc`、点遮罩、点抽屉里的关闭按钮都会关闭，关闭后的 effect 里把焦点还给“打开侧面板”——那个按钮只在收起时渲染，所以不能在关闭的那一刻同步聚焦。
-- 掩体对辅助技术隐藏（`aria-hidden`），键盘的等价操作是 `Esc` 和关闭按钮。
-- **属性面板**在窄屏也改成覆盖式：`position: fixed` 贴右侧，`shadow-pop`，不挤压画布；`Esc` 取消选中后消失的规则不变。
-- 宽屏的 `[` 收起逻辑保留；窄屏下 `[` 打开 / 关闭抽屉。
+- 断点是 1024（`matchMedia('(max-width: 1023px)')`），和 DESIGN.md 的 Responsive Behavior 一致。
+- 窄屏下导航栏（`min(272px, 85dvw)`）与模型页对象树侧面板（`260px`）均变成 `position: fixed` 覆盖式抽屉，默认收起且互不重叠（打开一个自动关闭另一个）；顶栏左侧按需出现“打开导航栏”和“打开侧面板”按钮，打开时主内容区设 `inert`，抽屉设 `role="dialog" aria-modal="true"`。
+- **焦点管理**：打开导航或对象树抽屉时焦点移入对应抽屉内关闭按钮；`Esc`、点遮罩、点关闭按钮关闭后焦点归还对应顶栏打开按钮；路由切换自动关闭抽屉而不抢焦点。
+- 遮罩对辅助技术隐藏（`aria-hidden`），键盘的等价操作是 `Esc` 和关闭按钮。
+- **属性面板**在窄屏也改成同样 `260px` 宽的覆盖式面板：`position: fixed` 贴右侧，`shadow-pop`，不挤压画布，画布占满完整 900px 宽度；`Esc` 取消选中后消失的规则不变。
+- 宽屏的 `[` 与 `Ctrl+\` 收起逻辑保留；窄屏下同样切换对应抽屉。
 
-**实现与测试**（这一轮）：`apps/web/src/pages/AccountSettings.tsx`、`pages/Admin.tsx`、`components/CommandPalette.tsx`、`components/SettingsNav.tsx`、`current-tables.ts`；`e2e/account.spec.ts`、`admin.spec.ts`、`cmdk.spec.ts`、`narrow.spec.ts`、`project-delete.spec.ts`；`e2e/a11y.spec.ts` 用 `@axe-core/playwright` 在亮 / 暗下扫描主要页面（不允许 serious / critical），`e2e/visual.spec.ts` 增加了个人设置、后台用户页和窄屏抽屉的截图对比。审计日志里每个动作的中文描述和项目动态共用 `activity.ts` 的 `actionText()`，补全了 auth / 用户 / 组 / 邀请 / 登录方式等动作。
+**实现与测试**（这一轮）：`apps/web/src/pages/AccountSettings.tsx`、`pages/Admin.tsx`、`components/CommandPalette.tsx`、`components/SuperSidebar.tsx`、`recent-projects.ts`、`current-tables.ts`；`e2e/account.spec.ts`、`admin.spec.ts`、`cmdk.spec.ts`、`narrow.spec.ts`、`project-delete.spec.ts`；`e2e/a11y.spec.ts` 用 `@axe-core/playwright` 在亮 / 暗下扫描主要页面（不允许 serious / critical），`e2e/visual.spec.ts` 增加了个人设置、后台用户页和窄屏抽屉的截图对比。审计日志里每个动作的中文描述和项目动态共用 `activity.ts` 的 `actionText()`，补全了 auth / 用户 / 组 / 邀请 / 登录方式等动作。

@@ -302,8 +302,18 @@ export const Empty = ({
 /** 协作者颜色：按出现顺序分配 peer-1 … peer-8，自己用 me */
 export const peerColor = (i: number) => `var(--peer-${(i % 8) + 1})`;
 
-export const Avatar = ({ name, color, title }: { name: string; color: string; title?: string }) => (
-  <span className="avatar" style={{ background: color }} title={title ?? name}>
+export const Avatar = ({
+  name,
+  color,
+  title,
+  className,
+}: {
+  name: string;
+  color: string;
+  title?: string;
+  className?: string;
+}) => (
+  <span className={cx('avatar', className)} style={{ background: color }} title={title ?? name}>
     {name.slice(0, 1)}
   </span>
 );

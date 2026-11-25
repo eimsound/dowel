@@ -66,10 +66,10 @@ test('切换组时未保存的表单不会带到另一个组', async ({ browser 
   const rail = page.getByRole('navigation', { name: '实例与项目' });
 
   // 两个组的头像首字不同，背景色也不同（不是一律显示“组”）
-  const initials = await rail.locator('.rail-org-av').allTextContents();
+  const initials = await rail.locator('.sb-org-av').allTextContents();
   expect(initials).toEqual(expect.arrayContaining(['A', 'B']));
   const style = (name: string) =>
-    rail.getByRole('link', { name, exact: true }).locator('.rail-org-av').getAttribute('style');
+    rail.getByRole('link', { name, exact: true }).locator('.sb-org-av').getAttribute('style');
   expect(await style(a.name)).toContain('--peer-');
   expect(await style(b.name)).toContain('--peer-');
 
@@ -118,13 +118,13 @@ test('图标栏只显示我的组；正在看的组不是我的组时临时显�
     .click();
   await expect(page.getByRole('heading', { name: other.name, exact: true })).toBeVisible();
 
-  // 正在看别人的组：图标栏临时显示它，并标明不是我的组（虚线边框 + tooltip）
+  // 正在看别人的组：侧边栏临时显示它，并标明不是我的组（虚线边框 + tooltip）
   const temp = rail.getByRole('link', { name: other.name, exact: true });
   await expect(temp).toBeVisible();
   await expect(temp).toHaveAttribute('data-temp', '');
-  await expect(temp.locator('.rail-org-av')).toHaveCSS('border-style', 'dashed');
+  await expect(temp.locator('.sb-org-av')).toHaveCSS('border-style', 'dashed');
 
-  // 组很多时组区域单独滚动，底部的收件箱始终可见
-  await expect(rail.locator('.rail-orgs')).toHaveCSS('overflow-y', 'auto');
-  await expect(rail.getByRole('link', { name: '收件箱', exact: true })).toBeVisible();
+  // 组很多时导航区单独滚动，顶部工具条里的收件箱始终可见
+  await expect(page.locator('.sb-scroll')).toHaveCSS('overflow-y', 'auto');
+  await expect(page.getByRole('link', { name: '收件箱', exact: true })).toBeVisible();
 });

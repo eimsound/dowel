@@ -187,6 +187,7 @@ const ProjectLayout = () => {
             owner: projectInfoData.group.slug,
             slug: projectInfoData.slug,
             name: projectInfoData.name,
+            groupName: projectInfoData.group.name,
             pid: projectInfoData.id,
           }
         : undefined,

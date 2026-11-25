@@ -1,17 +1,17 @@
-// 组首页：侧面板是组内项目列表；主区域是组信息、成员、组设置（组管理员）。
+// 组首页：主区域是组信息、成员、组设置（组管理员）；组内项目列表在全局侧边栏中展示。
 // 组对所有人可见；成员和组管理员名单对所有人可见，修改需要组管理员（规则在服务端 authz.ts）。
-import type { GroupInfo, GroupMember, ProjectListItem } from '@dowel/api';
+import type { GroupInfo, GroupMember } from '@dowel/api';
 import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query';
-import { Link, useNavigate, useParams } from '@tanstack/react-router';
+import { useNavigate, useParams } from '@tanstack/react-router';
 import { FolderTree, Plus, Trash2, Users } from 'lucide-react';
-import { useMemo, useState } from 'react';
+import { useState } from 'react';
 import { useTranslation } from 'react-i18next';
 
 import { api } from '../api.ts';
 import { Confirm } from '../components/Modal.tsx';
 import { PolicyLayerPanel } from '../components/PolicyEditor.tsx';
 import { Row, Rows, Section } from '../components/ProjectPage.tsx';
-import { PageHeader, useShellPanel } from '../components/Shell.tsx';
+import { PageHeader } from '../components/Shell.tsx';
 import { useToast } from '../components/Toasts.tsx';
 import { TokenPolicyPanel } from '../components/TokenSettings.tsx';
 import { Avatar, Banner, IconButton } from '../components/ui.tsx';
@@ -33,46 +33,8 @@ export const GroupPage = () => {
     queryKey: ['group', slug, 'members'],
     queryFn: () => api<GroupMember[]>('GET', `/api/groups/${slug}/members`),
   });
-  const projects = useQuery({
-    queryKey: ['group', slug, 'projects'],
-    queryFn: () => api<ProjectListItem[]>('GET', `/api/groups/${slug}/projects`),
-  });
   const isAdmin = me?.role === 'admin' || group.data?.role === 'admin';
   const [confirm, setConfirm] = useState(false);
-
-  const panel = useMemo(() => {
-    const list = projects.data ?? [];
-    return (
-      <nav aria-label={t('gp.projects')} className="flex h-full min-h-0 flex-col">
-        <div className="flex items-center gap-2 px-3.5 pt-3 pb-1">
-          <span className="section-title flex-1">
-            {t('gp.projects')}
-            <span className="count">{list.length}</span>
-          </span>
-        </div>
-        {list.length === 0 ? (
-          <p className="hint px-3.5 py-2">{t('gp.noProjects')}</p>
-        ) : (
-          <ul className="m-0 min-h-0 flex-1 list-none overflow-auto p-1.5">
-            {list.map((p) => (
-              <li key={p.id}>
-                <Link
-                  to="/project/$owner/$project"
-                  params={{ owner: slug, project: p.slug }}
-                  className="flex h-[var(--row-h)] items-center gap-2 rounded-sm px-2 text-sm text-text-2 no-underline hover:bg-surface-hover"
-                >
-                  <FolderTree size={16} aria-hidden="true" className="shrink-0 text-text-3" />
-                  <span className="min-w-0 flex-1 truncate">{p.name}</span>
-                  <span className="chip">{t(`projects.role.${p.role}`)}</span>
-                </Link>
-              </li>
-            ))}
-          </ul>
-        )}
-      </nav>
-    );
-  }, [projects.data, slug, t]);
-  useShellPanel(t('gp.projects'), panel, [panel]);
 
   const refresh = () => {
     void qc.invalidateQueries({ queryKey: ['group', slug] });

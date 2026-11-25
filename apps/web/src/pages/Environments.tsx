@@ -1,4 +1,4 @@
-// 环境：侧面板是环境列表，主区域是列表 + 新建（管理员）或单个环境的详情。
+// 环境：主区域是列表 + 新建（管理员）或单个环境的详情；环境列表由全局侧边栏显示。
 // 详情里可以测试连接、从目标库导入结构、删除环境；连接状态只在这里主动检查。
 import type {
   AttachOverwritePreview,
@@ -14,24 +14,13 @@ import type {
 import type { Dialect } from '@dowel/core';
 import { useMutation, useQueryClient } from '@tanstack/react-query';
 import { Link, useNavigate, useParams } from '@tanstack/react-router';
-import {
-  ArrowDownToLine,
-  Database,
-  FileInput,
-  Play,
-  PlugZap,
-  Plus,
-  RotateCcw,
-  ShieldAlert,
-  Siren,
-  Trash2,
-} from 'lucide-react';
+import { ArrowDownToLine, Database, FileInput, Play, PlugZap, RotateCcw, Siren, Trash2 } from 'lucide-react';
 import { useId, useState } from 'react';
 import { useTranslation } from 'react-i18next';
 
 import { ApiError, api } from '../api.ts';
 import { ClaimDialog } from '../components/ClaimDialog.tsx';
-import { DriftBadge, driftLabel, useDeniedHint } from '../components/EnvBits.tsx';
+import { DriftBadge, useDeniedHint } from '../components/EnvBits.tsx';
 import { DiffList, ExecDialog, type ExecKind, type ExecMode, routeFor } from '../components/ExecDialog.tsx';
 import { ImportDialog } from '../components/ImportDialog.tsx';
 import { MARK_TIP, MARK_TITLE, MarkDialog, markDirection } from '../components/MarkDialog.tsx';
@@ -39,7 +28,7 @@ import { Confirm, Modal } from '../components/Modal.tsx';
 import { EnvPolicyPanel } from '../components/PolicyEditor.tsx';
 import { EmptyHint, ProjectPage, Row, Rows, Section } from '../components/ProjectPage.tsx';
 import { RepairDialog } from '../components/RepairDialog.tsx';
-import { PageHeader, useShellPanel } from '../components/Shell.tsx';
+import { PageHeader } from '../components/Shell.tsx';
 import { useToast } from '../components/Toasts.tsx';
 import { Banner, IconButton } from '../components/ui.tsx';
 import { useVersionName, VersionBadges, VersionNumber } from '../components/VersionStatus.tsx';
@@ -51,88 +40,6 @@ import { useProject } from '../project.tsx';
 import { invalidateRequests, useEnvRequests } from '../requests.ts';
 import { useMe } from '../session.ts';
 import { StatusBadge } from './Request.tsx';
-
-/**
- * 侧面板里的一个环境。漂移警告的说明不放进链接里（链接的名字要保持就是环境名），
- * 用 aria-describedby 指向旁边的 sr-only 文字，图标本身 aria-hidden。
- */
-const EnvPanelLink = ({
-  e,
-  params,
-  active,
-}: {
-  e: EnvInfo;
-  params: { owner: string; project: string };
-  active: boolean;
-}) => {
-  const { t } = useTranslation();
-  const descId = useId();
-  const warn = driftLabel(t, e.drift);
-  return (
-    <>
-      <Link
-        to="/project/$owner/$project/environments/$eid"
-        params={{ ...params, eid: e.id }}
-        aria-current={active ? 'page' : undefined}
-        aria-describedby={warn ? descId : undefined}
-        className="flex h-[var(--row-h)] items-center gap-2 rounded-sm px-2 font-mono text-sm text-text-2 no-underline hover:bg-surface-hover aria-[current=page]:bg-primary-soft aria-[current=page]:text-primary-text"
-      >
-        <Database size={16} aria-hidden="true" className="shrink-0 text-text-3" />
-        <span className="min-w-0 flex-1 truncate">{e.name}</span>
-        {warn && (
-          <ShieldAlert
-            size={14}
-            aria-hidden="true"
-            className={e.drift.status === 'drifted' ? 'shrink-0 text-danger' : 'shrink-0 text-warn'}
-          />
-        )}
-        {e.production && <span className="badge danger font-sans">{t('envp.production')}</span>}
-      </Link>
-      {warn && (
-        <span id={descId} className="sr-only">
-          {warn}
-        </span>
-      )}
-    </>
-  );
-};
-
-/** 项目页的侧面板：环境列表（DESIGN.md：Layout） */
-const EnvPanel = ({ pid, activeId }: { pid: string; activeId?: string }) => {
-  const { t } = useTranslation();
-  const { project } = useProject();
-  const envs = useEnvs(pid);
-  const params = { owner: project.group.slug, project: project.slug };
-  useShellPanel(
-    t('envp.list'),
-    <nav aria-label={t('envp.list')} className="flex h-full min-h-0 flex-col">
-      <div className="flex items-center gap-2 px-3.5 pt-3 pb-1">
-        <span className="section-title flex-1">
-          {t('nav.environments')}
-          <span className="count">{envs.data?.length ?? 0}</span>
-        </span>
-        <Link
-          to="/project/$owner/$project/environments"
-          params={params}
-          className="btn icon ghost"
-          aria-label={t('envp.add')}
-          title={t('envp.add')}
-        >
-          <Plus size={16} aria-hidden="true" />
-        </Link>
-      </div>
-      <ul className="m-0 min-h-0 flex-1 list-none overflow-auto p-1.5">
-        {(envs.data ?? []).map((e) => (
-          <li key={e.id}>
-            <EnvPanelLink e={e} params={params} active={e.id === activeId} />
-          </li>
-        ))}
-      </ul>
-    </nav>,
-    [envs.data, activeId, params.owner, params.project, project.role, t],
-  );
-  return null;
-};
 
 const EnvForm = ({ pid }: { pid: string }) => {
   const { t } = useTranslation();
@@ -431,48 +338,45 @@ export const Environments = () => {
   const envs = useEnvs(pid);
   const canManage = project.role === 'admin';
   return (
-    <>
-      <EnvPanel pid={pid} />
-      <ProjectPage title={t('envp.title')}>
-        <div className="space-y-6">
-          <p className="text-sm text-text-2">
-            {uiSpec.requiresExternalShadow ? t('envp.addHint') : t('envp.addHintSqlite')}
-          </p>
-          {envs.data && envs.data.length === 0 ? (
-            <EmptyHint>{t('envp.empty')}</EmptyHint>
-          ) : (
-            <Rows>
-              {(envs.data ?? []).map((e) => {
-                const verLabel = formatEngineVersion(project.dialect, e.engineVersion, e.engineMajor);
-                return (
-                  <Row key={e.id}>
-                    <Database size={16} aria-hidden="true" className="shrink-0 text-text-3" />
-                    <Link
-                      to="/project/$owner/$project/environments/$eid"
-                      params={{ ...params, eid: e.id }}
-                      className="min-w-0 flex-1 truncate font-mono font-medium no-underline"
-                    >
-                      {e.name}
-                    </Link>
-                    {verLabel && <span className="chip shrink-0 font-mono">{verLabel}</span>}
-                    {e.production ? (
-                      <span className="badge danger">{t('envp.production')}</span>
-                    ) : (
-                      <span className="badge">{t('envp.notProduction')}</span>
-                    )}
-                    {(e.drift.status === 'drifted' || e.drift.status === 'error') && (
-                      <DriftBadge drift={e.drift} />
-                    )}
-                    <code className="w-72 truncate text-xs text-text-3 max-[900px]:hidden">{e.url}</code>
-                  </Row>
-                );
-              })}
-            </Rows>
-          )}
-          {canManage ? <EnvForm pid={pid} /> : <Banner kind="info">{t('envp.manageHint')}</Banner>}
-        </div>
-      </ProjectPage>
-    </>
+    <ProjectPage title={t('envp.title')}>
+      <div className="space-y-6">
+        <p className="text-sm text-text-2">
+          {uiSpec.requiresExternalShadow ? t('envp.addHint') : t('envp.addHintSqlite')}
+        </p>
+        {envs.data && envs.data.length === 0 ? (
+          <EmptyHint>{t('envp.empty')}</EmptyHint>
+        ) : (
+          <Rows>
+            {(envs.data ?? []).map((e) => {
+              const verLabel = formatEngineVersion(project.dialect, e.engineVersion, e.engineMajor);
+              return (
+                <Row key={e.id}>
+                  <Database size={16} aria-hidden="true" className="shrink-0 text-text-3" />
+                  <Link
+                    to="/project/$owner/$project/environments/$eid"
+                    params={{ ...params, eid: e.id }}
+                    className="min-w-0 flex-1 truncate font-mono font-medium no-underline"
+                  >
+                    {e.name}
+                  </Link>
+                  {verLabel && <span className="chip shrink-0 font-mono">{verLabel}</span>}
+                  {e.production ? (
+                    <span className="badge danger">{t('envp.production')}</span>
+                  ) : (
+                    <span className="badge">{t('envp.notProduction')}</span>
+                  )}
+                  {(e.drift.status === 'drifted' || e.drift.status === 'error') && (
+                    <DriftBadge drift={e.drift} />
+                  )}
+                  <code className="w-72 truncate text-xs text-text-3 max-[900px]:hidden">{e.url}</code>
+                </Row>
+              );
+            })}
+          </Rows>
+        )}
+        {canManage ? <EnvForm pid={pid} /> : <Banner kind="info">{t('envp.manageHint')}</Banner>}
+      </div>
+    </ProjectPage>
   );
 };
 
@@ -781,21 +685,17 @@ const EnvironmentDetailView = ({ eid }: { eid: string }) => {
       ? manualRaw
       : undefined;
 
-  // 详情页也显示环境列表（同一个侧面板）
   if (!env)
     return (
-      <>
-        <EnvPanel pid={pid} activeId={eid} />
-        <ProjectPage title={t('envp.detail')}>
-          {envs.isLoading ? null : envs.error ? (
-            <Banner kind="danger" role="alert">
-              {envs.error.message}
-            </Banner>
-          ) : (
-            <Banner kind="danger">{t('envp.notFound')}</Banner>
-          )}
-        </ProjectPage>
-      </>
+      <ProjectPage title={t('envp.detail')}>
+        {envs.isLoading ? null : envs.error ? (
+          <Banner kind="danger" role="alert">
+            {envs.error.message}
+          </Banner>
+        ) : (
+          <Banner kind="danger">{t('envp.notFound')}</Banner>
+        )}
+      </ProjectPage>
     );
 
   const canConfigure = env.permissions.configure;
@@ -845,7 +745,6 @@ const EnvironmentDetailView = ({ eid }: { eid: string }) => {
 
   return (
     <>
-      <EnvPanel pid={pid} activeId={eid} />
       <PageHeader
         crumbs={[
           { label: project.group.name, to: '/group/$slug', params: { slug: project.group.slug } },

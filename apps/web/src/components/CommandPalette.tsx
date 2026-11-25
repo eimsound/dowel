@@ -20,7 +20,17 @@ import {
   Users,
   Workflow,
 } from 'lucide-react';
-import { type ReactNode, useEffect, useId, useLayoutEffect, useMemo, useRef, useState } from 'react';
+import {
+  type ReactNode,
+  type RefObject,
+  useCallback,
+  useEffect,
+  useId,
+  useLayoutEffect,
+  useMemo,
+  useRef,
+  useState,
+} from 'react';
 import { useTranslation } from 'react-i18next';
 
 import { api } from '../api.ts';
@@ -61,10 +71,12 @@ export const CommandPalette = ({
   me,
   project,
   pages,
+  openRef,
 }: {
   me: Me;
   project?: ShellProject;
   pages: PalettePage[];
+  openRef?: RefObject<(() => void) | null>;
 }) => {
   const { t } = useTranslation();
   const nav = useNavigate();
@@ -93,12 +105,20 @@ export const CommandPalette = ({
   const close = () => setOpen(false);
   // 打开时记住焦点所在元素，关闭后还回去（对话框被移出 DOM 时浏览器会把焦点丢给 body）
   const restoreFocus = useRef<HTMLElement | null>(null);
-  const show = () => {
+  const show = useCallback(() => {
     restoreFocus.current = document.activeElement instanceof HTMLElement ? document.activeElement : null;
     setQuery('');
     setActive(0);
     setOpen(true);
-  };
+  }, []);
+
+  useLayoutEffect(() => {
+    if (!openRef) return;
+    openRef.current = show;
+    return () => {
+      openRef.current = null;
+    };
+  }, [openRef, show]);
 
   // ⌘K / Ctrl+K 打开（再按一次关闭）
   useEffect(() => {

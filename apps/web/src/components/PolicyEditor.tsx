@@ -426,199 +426,213 @@ export const PolicySetEditor = ({
     for (let j = i + 1; j < all.length; j++)
       if (approversOverlap(all[i]!.approvers, all[j]!.approvers)) overlaps.push([i + 1, j + 1]);
   return (
-    <fieldset className="space-y-4 rounded-md border border-border bg-panel px-4 py-3">
-      {title && <legend className="px-1 text-sm font-medium">{title}</legend>}
-      <div className="grid gap-4 sm:grid-cols-2">
-        <div className="space-y-1">
-          <label className="field" htmlFor={`${id}-who`}>
-            <span className="label">{t('pol.who.label')}</span>
-            <select
-              id={`${id}-who`}
-              className="select"
-              value={value.whoCanExecute ?? ''}
-              disabled={disabled}
-              onChange={(e) => set('whoCanExecute', (e.target.value || undefined) as ExecPolicy | undefined)}
-            >
-              <option value="">{t('pol.inherit')}</option>
-              {WHO.map((w) => (
-                <option key={w} value={w} disabled={tooLoose('whoCanExecute', w)}>
-                  {label('whoCanExecute', w)}
-                  {tooLoose('whoCanExecute', w) ? ` ${t('pol.tooLoose')}` : ''}
+    <fieldset className="m-0 min-w-0 overflow-hidden rounded-md border border-border bg-panel p-0">
+      {title && (
+        <legend className="float-left flex w-full items-center gap-2 border-b border-border bg-[var(--node-head)] px-4 py-2.5 text-sm font-semibold text-text">
+          <span
+            aria-hidden="true"
+            className={`size-2 shrink-0 rounded-full ${production ? 'bg-warn' : 'bg-border-strong'}`}
+          />
+          {title}
+        </legend>
+      )}
+      <div className="clear-both space-y-4 p-4">
+        <div className="grid gap-4 sm:grid-cols-2">
+          <div className="space-y-1">
+            <label className="field" htmlFor={`${id}-who`}>
+              <span className="label">{t('pol.who.label')}</span>
+              <select
+                id={`${id}-who`}
+                className="select"
+                value={value.whoCanExecute ?? ''}
+                disabled={disabled}
+                onChange={(e) =>
+                  set('whoCanExecute', (e.target.value || undefined) as ExecPolicy | undefined)
+                }
+              >
+                <option value="">{t('pol.inherit')}</option>
+                {WHO.map((w) => (
+                  <option key={w} value={w} disabled={tooLoose('whoCanExecute', w)}>
+                    {label('whoCanExecute', w)}
+                    {tooLoose('whoCanExecute', w) ? ` ${t('pol.tooLoose')}` : ''}
+                  </option>
+                ))}
+              </select>
+            </label>
+            <Effective field="whoCanExecute" r={live.whoCanExecute} />
+          </div>
+          <div className="space-y-1">
+            <label className="field" htmlFor={`${id}-tok`}>
+              <span className="label">{t('pol.tokens.label')}</span>
+              <select
+                ref={tokRef}
+                id={`${id}-tok`}
+                className="select"
+                value={value.allowTokens === undefined ? '' : String(value.allowTokens)}
+                disabled={disabled}
+                aria-describedby={`${id}-tok-hint`}
+                onChange={(e) =>
+                  set('allowTokens', e.target.value === '' ? undefined : e.target.value === 'true')
+                }
+              >
+                <option value="">{t('pol.inherit')}</option>
+                <option value="true" disabled={tooLoose('allowTokens', true)}>
+                  {t('pol.tokens.yes')}
+                  {tooLoose('allowTokens', true) ? ` ${t('pol.tooLoose')}` : ''}
                 </option>
-              ))}
-            </select>
-          </label>
-          <Effective field="whoCanExecute" r={live.whoCanExecute} />
+                <option value="false">{t('pol.tokens.no')}</option>
+              </select>
+            </label>
+            <span id={`${id}-tok-hint`} className="block">
+              <Effective field="allowTokens" r={live.allowTokens} />
+            </span>
+          </div>
+          {timeout('lockTimeoutMs', 'pol.lockTimeout')}
+          {timeout('statementTimeoutMs', 'pol.statementTimeout')}
+          <div className="space-y-1">
+            <label className="field" htmlFor={`${id}-ttl`}>
+              <span className="label">{t('pol.ttl')}</span>
+              <input
+                id={`${id}-ttl`}
+                className="input w-40"
+                type="number"
+                min={1}
+                max={720}
+                step={1}
+                inputMode="numeric"
+                placeholder={t('pol.inheritShort')}
+                value={value.requestTtlHours ?? ''}
+                disabled={disabled}
+                aria-describedby={`${id}-ttl-hint`}
+                onChange={(e) => {
+                  const raw = e.target.value.trim();
+                  const n = Number(raw);
+                  set(
+                    'requestTtlHours',
+                    raw === '' || !Number.isInteger(n) || n < 1 ? undefined : Math.min(720, n),
+                  );
+                }}
+              />
+            </label>
+            <span id={`${id}-ttl-hint`} className="block">
+              <Effective field="requestTtlHours" r={live.requestTtlHours} />
+            </span>
+          </div>
         </div>
         <div className="space-y-1">
-          <label className="field" htmlFor={`${id}-tok`}>
-            <span className="label">{t('pol.tokens.label')}</span>
-            <select
-              ref={tokRef}
-              id={`${id}-tok`}
-              className="select"
-              value={value.allowTokens === undefined ? '' : String(value.allowTokens)}
-              disabled={disabled}
-              aria-describedby={`${id}-tok-hint`}
-              onChange={(e) =>
-                set('allowTokens', e.target.value === '' ? undefined : e.target.value === 'true')
-              }
-            >
-              <option value="">{t('pol.inherit')}</option>
-              <option value="true" disabled={tooLoose('allowTokens', true)}>
-                {t('pol.tokens.yes')}
-                {tooLoose('allowTokens', true) ? ` ${t('pol.tooLoose')}` : ''}
-              </option>
-              <option value="false">{t('pol.tokens.no')}</option>
-            </select>
-          </label>
-          <span id={`${id}-tok-hint`} className="block">
-            <Effective field="allowTokens" r={live.allowTokens} />
-          </span>
+          <p className="hint m-0">{t('pol.timeoutHint')}</p>
+          <p className="hint m-0">{t('pol.ttlHint')}</p>
         </div>
-        {timeout('lockTimeoutMs', 'pol.lockTimeout')}
-        {timeout('statementTimeoutMs', 'pol.statementTimeout')}
-        <div className="space-y-1">
-          <label className="field" htmlFor={`${id}-ttl`}>
-            <span className="label">{t('pol.ttl')}</span>
-            <input
-              id={`${id}-ttl`}
-              className="input w-40"
-              type="number"
-              min={1}
-              max={720}
-              step={1}
-              inputMode="numeric"
-              placeholder={t('pol.inheritShort')}
-              value={value.requestTtlHours ?? ''}
-              disabled={disabled}
-              aria-describedby={`${id}-ttl-hint`}
-              onChange={(e) => {
-                const raw = e.target.value.trim();
-                const n = Number(raw);
-                set(
-                  'requestTtlHours',
-                  raw === '' || !Number.isInteger(n) || n < 1 ? undefined : Math.min(720, n),
-                );
-              }}
-            />
-          </label>
-          <span id={`${id}-ttl-hint`} className="block">
-            <Effective field="requestTtlHours" r={live.requestTtlHours} />
-          </span>
-        </div>
-      </div>
-      <p className="hint">{t('pol.timeoutHint')}</p>
-      <p className="hint">{t('pol.ttlHint')}</p>
 
-      <div className="space-y-2">
-        <h3 className="text-sm font-medium">{t('pol.approval.label')}</h3>
-        <p className="hint">{t('pol.approval.note')}</p>
-        {locked.length === 0 && own.length === 0 && (
-          <p className="text-sm text-text-2">{t('pol.approval.default')}</p>
-        )}
-        <ol className="list-none space-y-1.5 p-0">
-          {locked.map((s, i) => (
-            <li
-              key={`l${i}`}
-              className="flex flex-wrap items-center gap-2 rounded-md border border-border bg-surface-2 px-3 py-2 text-sm text-text-2"
-            >
-              <Lock size={12} aria-hidden="true" />
-              <span>{t('pol.approval.stage', { n: i + 1 })}</span>
-              <span>{approverText(t, s.stage.approvers, names)}</span>
-              <span>· {t('pol.approval.countN', { n: s.stage.count })}</span>
-              <span className="chip">{t('pol.approval.lockedStage', { layer: layer(s.source) })}</span>
-            </li>
-          ))}
-        </ol>
-        <ol className="list-none space-y-1.5 p-0">
-          {own.map((s, i) => (
-            <StageEditor
-              key={i}
-              stage={s}
-              index={locked.length + i}
-              last={i === own.length - 1}
-              disabled={disabled}
-              dir={dir.data}
-              names={names}
-              onChange={(n) =>
-                set(
-                  'approval',
-                  own.map((x, j) => (j === i ? n : x)),
-                )
+        <div className="space-y-2 border-t border-border pt-4">
+          <h3 className="text-sm font-medium">{t('pol.approval.label')}</h3>
+          <p className="hint">{t('pol.approval.note')}</p>
+          {locked.length === 0 && own.length === 0 && (
+            <p className="text-sm text-text-2">{t('pol.approval.default')}</p>
+          )}
+          <ol className="list-none space-y-1.5 p-0">
+            {locked.map((s, i) => (
+              <li
+                key={`l${i}`}
+                className="flex flex-wrap items-center gap-2 rounded-md border border-border bg-surface-2 px-3 py-2 text-sm text-text-2"
+              >
+                <Lock size={12} aria-hidden="true" />
+                <span>{t('pol.approval.stage', { n: i + 1 })}</span>
+                <span>{approverText(t, s.stage.approvers, names)}</span>
+                <span>· {t('pol.approval.countN', { n: s.stage.count })}</span>
+                <span className="chip">{t('pol.approval.lockedStage', { layer: layer(s.source) })}</span>
+              </li>
+            ))}
+          </ol>
+          <ol className="list-none space-y-1.5 p-0">
+            {own.map((s, i) => (
+              <StageEditor
+                key={i}
+                stage={s}
+                index={locked.length + i}
+                last={i === own.length - 1}
+                disabled={disabled}
+                dir={dir.data}
+                names={names}
+                onChange={(n) =>
+                  set(
+                    'approval',
+                    own.map((x, j) => (j === i ? n : x)),
+                  )
+                }
+                onRemove={() => {
+                  const rest = own.filter((_, j) => j !== i);
+                  set(
+                    'approval',
+                    rest.length
+                      ? rest.map((x, j) => (j < rest.length - 1 ? { ...x, lastApproverExecutes: false } : x))
+                      : undefined,
+                  );
+                }}
+              />
+            ))}
+          </ol>
+          {overlaps.length > 0 && (
+            <p className="hint" role="note" data-testid="approval-overlap">
+              {t('pol.approval.overlap', { pairs: overlaps.map(([x, y]) => `${x} / ${y}`).join('、') })}
+            </p>
+          )}
+          {!disabled && (
+            <button
+              type="button"
+              className="btn sm"
+              onClick={() =>
+                set('approval', [
+                  ...own.map((x) => ({ ...x, lastApproverExecutes: false })),
+                  { approvers: { kind: 'project_admins' }, count: 1, lastApproverExecutes: false },
+                ])
               }
-              onRemove={() => {
-                const rest = own.filter((_, j) => j !== i);
-                set(
-                  'approval',
-                  rest.length
-                    ? rest.map((x, j) => (j < rest.length - 1 ? { ...x, lastApproverExecutes: false } : x))
-                    : undefined,
-                );
-              }}
-            />
-          ))}
-        </ol>
-        {overlaps.length > 0 && (
-          <p className="hint" role="note" data-testid="approval-overlap">
-            {t('pol.approval.overlap', { pairs: overlaps.map(([x, y]) => `${x} / ${y}`).join('、') })}
-          </p>
-        )}
-        {!disabled && (
-          <button
-            type="button"
-            className="btn sm"
-            onClick={() =>
-              set('approval', [
-                ...own.map((x) => ({ ...x, lastApproverExecutes: false })),
-                { approvers: { kind: 'project_admins' }, count: 1, lastApproverExecutes: false },
-              ])
+            >
+              <Plus size={14} aria-hidden="true" />
+              {t('pol.approval.add')}
+            </button>
+          )}
+        </div>
+        {bypass && (
+          // 提示条本身不是 live region（里面有按钮，放进 live region 会被压平成纯文本）；出现 / 一键关闭的播报走下面单独的区域。
+          // 一键关闭只改草稿（整层替换保存，不能顺带提交其他未完成的修改），保存后才生效
+          <Banner
+            kind="warn"
+            action={
+              canEdit && (
+                <button
+                  type="button"
+                  className="btn sm shrink-0"
+                  disabled={disabled}
+                  aria-describedby={`${id}-tokwarn`}
+                  onClick={() => {
+                    // 先同步提交草稿再移焦点：提示条随之消失，焦点落到本套的“允许 CI 令牌执行”时读屏读到的是新值
+                    flushSync(() => set('allowTokens', false));
+                    tokRef.current?.focus();
+                    // 稍后再播报“保存后生效”，不和聚焦时的朗读重叠
+                    window.setTimeout(() => setAnnounce(t('pol.tokenGuard.pending')), 400);
+                  }}
+                >
+                  {t('pol.tokenGuard.action')}
+                </button>
+              )
             }
           >
-            <Plus size={14} aria-hidden="true" />
-            {t('pol.approval.add')}
-          </button>
+            <span id={`${id}-tokwarn`} data-testid="token-bypass-warn">
+              <strong className="block">{t('pol.tokenGuard.title')}</strong>
+              {t(at === 'environment' ? 'pol.tokenGuard.bodyEnv' : 'pol.tokenGuard.bodyLayer')}
+            </span>
+          </Banner>
+        )}
+        <div className="sr-only" aria-live="polite" aria-atomic="true">
+          {announce}
+        </div>
+        {problems.length > 0 && (
+          <Banner kind="warn" role="status">
+            {problems.map((p) => p.message).join('；')}
+          </Banner>
         )}
       </div>
-      {bypass && (
-        // 提示条本身不是 live region（里面有按钮，放进 live region 会被压平成纯文本）；出现 / 一键关闭的播报走下面单独的区域。
-        // 一键关闭只改草稿（整层替换保存，不能顺带提交其他未完成的修改），保存后才生效
-        <Banner
-          kind="warn"
-          action={
-            canEdit && (
-              <button
-                type="button"
-                className="btn sm shrink-0"
-                disabled={disabled}
-                aria-describedby={`${id}-tokwarn`}
-                onClick={() => {
-                  // 先同步提交草稿再移焦点：提示条随之消失，焦点落到本套的“允许 CI 令牌执行”时读屏读到的是新值
-                  flushSync(() => set('allowTokens', false));
-                  tokRef.current?.focus();
-                  // 稍后再播报“保存后生效”，不和聚焦时的朗读重叠
-                  window.setTimeout(() => setAnnounce(t('pol.tokenGuard.pending')), 400);
-                }}
-              >
-                {t('pol.tokenGuard.action')}
-              </button>
-            )
-          }
-        >
-          <span id={`${id}-tokwarn`} data-testid="token-bypass-warn">
-            <strong className="block">{t('pol.tokenGuard.title')}</strong>
-            {t(at === 'environment' ? 'pol.tokenGuard.bodyEnv' : 'pol.tokenGuard.bodyLayer')}
-          </span>
-        </Banner>
-      )}
-      <div className="sr-only" aria-live="polite" aria-atomic="true">
-        {announce}
-      </div>
-      {problems.length > 0 && (
-        <Banner kind="warn" role="status">
-          {problems.map((p) => p.message).join('；')}
-        </Banner>
-      )}
     </fieldset>
   );
 };

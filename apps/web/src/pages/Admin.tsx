@@ -1,5 +1,5 @@
 // 管理后台（/admin）：只有实例管理员能进；其他人看到普通的 404 页，不暴露后台存在。
-// 导航和“个人设置”一样放在外壳的侧面板里（useShellPanel）；每节是独立的嵌套路由。
+// 导航放在全局侧边栏里；每节是独立的嵌套路由。
 // 涉及“最后一个管理员”“关闭密码登录”这类保护时，服务端返回 422，界面原样显示它的说明。
 import type {
   AdminResetPasswordResult,
@@ -22,19 +22,8 @@ import type {
   UserStatus,
 } from '@dowel/api';
 import { useInfiniteQuery, useMutation, useQuery, useQueryClient } from '@tanstack/react-query';
-import { Link, Outlet, useRouterState } from '@tanstack/react-router';
-import {
-  Copy,
-  Gauge,
-  KeyRound,
-  MailPlus,
-  ScrollText,
-  Settings as SettingsIcon,
-  ShieldCheck,
-  Trash2,
-  UserPlus,
-  Users,
-} from 'lucide-react';
+import { Link, Outlet } from '@tanstack/react-router';
+import { Copy, KeyRound, MailPlus, Trash2, UserPlus } from 'lucide-react';
 import { useEffect, useId, useRef, useState } from 'react';
 import { useTranslation } from 'react-i18next';
 
@@ -44,24 +33,13 @@ import { AdminUserMcpTokens, McpBadge } from '../components/McpTokens.tsx';
 import { Confirm, Modal } from '../components/Modal.tsx';
 import { PolicyLayerPanel } from '../components/PolicyEditor.tsx';
 import { Row, Rows, Section } from '../components/ProjectPage.tsx';
-import { SettingsNav } from '../components/SettingsNav.tsx';
-import { AppShell, PageHeader, useShellPanel } from '../components/Shell.tsx';
+import { AppShell, PageHeader } from '../components/Shell.tsx';
 import { useToast } from '../components/Toasts.tsx';
 import { TokenPolicyPanel } from '../components/TokenSettings.tsx';
 import { Avatar, Banner, Empty, IconButton } from '../components/ui.tsx';
 import { formatTime } from '../format.ts';
 import { useInstance } from '../instance.ts';
 import { useMe } from '../session.ts';
-
-const SECTIONS = [
-  { to: '/admin', label: 'adm.navUsers', icon: Users },
-  { to: '/admin/invites', label: 'adm.navInvites', icon: MailPlus },
-  { to: '/admin/sign-in', label: 'adm.navSignIn', icon: KeyRound },
-  { to: '/admin/settings', label: 'adm.navSettings', icon: SettingsIcon },
-  { to: '/admin/grants', label: 'adm.navGrants', icon: ShieldCheck },
-  { to: '/admin/policy', label: 'pol.title', icon: Gauge },
-  { to: '/admin/audit', label: 'adm.navAudit', icon: ScrollText },
-] as const;
 
 /** 不是实例管理员：一律当作页面不存在（G4 的同样做法，不暴露后台存在） */
 const NotFound = () => {
@@ -91,19 +69,6 @@ export const AdminLayout = () => {
 
 const AdminShell = () => {
   const { t } = useTranslation();
-  const path = useRouterState({ select: (s) => s.location.pathname });
-  useShellPanel(
-    t('adm.panel'),
-    <SettingsNav
-      label={t('adm.panel')}
-      path={path}
-      items={SECTIONS.map((s) => {
-        const Icon = s.icon;
-        return { to: s.to, label: t(s.label), icon: <Icon size={16} aria-hidden="true" /> };
-      })}
-    />,
-    [path, t],
-  );
   return (
     <>
       <PageHeader crumbs={[{ label: t('nav.myProjects'), to: '/' }, { label: t('nav.admin') }]} />
