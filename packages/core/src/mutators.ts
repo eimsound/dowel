@@ -22,12 +22,16 @@ import {
 import { columnsOf, effectiveColumnsOf, rootTableId } from './model.ts';
 import { getDialect } from './registry.ts';
 
-const id = z
+/** mutator 参数里的对象 ID：1-64 个字符，不能是 Object.prototype 上的保留名（宏编译层复用） */
+export const objectIdArg = z
   .string()
   .min(1)
   .max(64)
   .refine((s) => !isReservedId(s), { message: '对象 ID 不能是保留名' });
-const name = z.string().min(1).max(128);
+/** mutator 参数里的对象名：1-128 个字符（具体方言上限由 validateIdent 校验；宏编译层复用） */
+export const objectNameArg = z.string().min(1).max(128);
+const id = objectIdArg;
+const name = objectNameArg;
 
 /** 修改一个 CHECK 约束的表达式（推导名会随引用的列变化） */
 export const setCheckExpr = (m: Model, checkId: string, expr: string) => {

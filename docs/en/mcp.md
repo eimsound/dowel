@@ -94,7 +94,7 @@ Tools take a `project` argument: a project ID or its `owner/project` path. Your 
 | `get_version`       | read       | One version with its frozen up/down migration                                                                                                                                                                       |
 | `preview_migration` | read       | Up/down SQL between two versions (default: latest version → working copy)                                                                                                                                           |
 | `list_environments` | read       | Environments with cached current version and drift status, and when they were cached                                                                                                                                |
-| `list_mutators`     | read       | The edit operations and the JSON Schema of their arguments                                                                                                                                                          |
+| `list_mutators`     | read       | The edit operations (the `defineTable` / `alterColumn` macros first) with a description and the JSON Schema of their arguments                                                                                      |
 | `verify_migration`  | verify     | Runs the migration in the shadow database and compares the result (same as **Verify in shadow database** in the UI)                                                                                                 |
 | `apply_changes`     | write      | Applies a batch of edit operations atomically; arguments: `baseSeq` (from `get_model`), `ops` (up to 100), optional `summary` (intent, up to 500 characters), `dryRun`; use `"$ref:<alias>"` for IDs of new objects |
 | `manage_sections`   | write      | Adjusts canvas sections incrementally; arguments: `actions` (up to 50), `dryRun`; see [Canvas sections](#sections) below                                                                                            |
@@ -104,8 +104,9 @@ A typical session: `get_model` (note `seq`) → `apply_changes` with that `baseS
 How `apply_changes` behaves:
 
 - **One call = one commit.** The whole batch is written to the working copy as a single commit (one new `seq`) and shows up as one **Batch edit** entry in **Canvas history**, with your `summary`. To undo the whole batch, restore the entry just before it. `opCount` in the response is the number of underlying operations after expansion (up to 500).
-- **Conflicts and errors.** If any operation is invalid, or an object it relies on was changed by someone else since `baseSeq`, nothing is committed, and `index` in the error points at the earliest failing operation.
-- **No net change** (for example, creating and then dropping a table) returns `noop: true` without a commit or an audit entry.
+- **Conflicts and errors.** If any operation is invalid, or an object it relies on was changed by someone else since `baseSeq`, nothing is committed, and `index` in the error points at the earliest failing operation. Errors in a macro also carry `path` (where inside the macro) and `mutator` (the underlying operation it expanded to); see below.
+- **No net change** (for example, creating and then dropping a table, or an `alterColumn` whose values already match) returns `noop: true` without a commit or an audit entry.
+- **Existing objects by ID only.** Changing or dropping an existing object only accepts its object ID (the `id` from `get_model` / `get_table`) or the `"$ref:<alias>"` of an object created earlier in the same call — never a name. Renames therefore never break references, and concurrent edits are detected precisely.
 - **Post-write checks.** Every response, including `dryRun: true`, carries `diagnostics`: all model validation errors, plus static compatibility `errors` / `warnings` for the lowest environment version in the project (read from the platform cache; the target databases are never contacted). They never block the edit, but publishing a version is refused while there are validation errors (`blocksPublish: true`).
 
 Extra context in `get_model` (in `summary`, `full`, and the truncated result above 200 tables):
@@ -140,6 +141,70 @@ Sections belong to the canvas layout only: they never enter the model, SQL, migr
     { "action": "add_tables", "section": "$ref:billing", "tables": ["<table ID>"] },
     { "action": "recolor", "section": "$ref:billing", "color": "peer-3" }
   ]
+}
+```
+
+### Macros: `defineTable` and `alterColumn` {#macros}
+
+Besides the underlying operations, `ops` accepts two macros. The server expands them into underlying operations while simulating the call; they can be mixed with underlying operations in the same call and share the same `$ref` aliases. The call still produces a single commit, and canvas history and the stored commit only contain the expanded underlying operations. At most 500 underlying operations are allowed after expansion (`opCount` in the response).
+
+**`defineTable`** declares a whole table at once: columns (same fields as `addColumn`, plus `comment`; the array order is the column order), `primaryKey`, `uniques`, `checks`, `indexes`, `foreignKeys`, the table `comment` and `ext`, and optionally `partitionBy` / `partitions`. Constraints and indexes accept an explicit `name` and a `comment`. Every `id` is optional (generated automatically); use `"$ref:<alias>"` when you need to refer to the object later.
+
+```json
+{
+  "name": "defineTable",
+  "args": {
+    "id": "$ref:orders",
+    "schema": "public",
+    "name": "orders",
+    "comment": "Orders",
+    "columns": [
+      { "id": "$ref:orders.id", "name": "id", "type": "bigint", "identity": { "always": true } },
+      { "name": "user_id", "type": "bigint", "notNull": true },
+      { "name": "status", "typeRef": "public.order_status" },
+      { "name": "parent_id", "type": "bigint" }
+    ],
+    "primaryKey": { "columns": ["id"] },
+    "checks": [{ "name": "ck_orders_user", "expr": "user_id > 0" }],
+    "indexes": [{ "elements": [{ "column": "user_id" }] }],
+    "foreignKeys": [
+      { "columns": ["user_id"], "refTable": "public.users", "refColumns": ["id"] },
+      { "columns": ["parent_id"], "refTable": "orders", "refColumns": ["id"], "onDelete": "cascade" }
+    ]
+  }
+}
+```
+
+How names are resolved:
+
+- **Columns of the new table**: constraints, indexes and partition keys can refer to the new columns by name, column ID or `$ref` (case follows the dialect: SQLite, MySQL and SQL Server are case-insensitive).
+- **References made while creating**: `schema` (defaults to the dialect's default schema such as `public` / `dbo`, or the only schema in the model), a column's `typeRef` (PostgreSQL enum) and `default.nextval` (sequence), a foreign key's `refTable` / `refColumns`, and `partitions[].schema` accept an object ID, a `$ref`, a qualified name (`schema.name`) or a globally unique name. A foreign key can reference the table itself or a table created earlier in the same call.
+- **References in `alterColumn`**: `typeRef` and `default.nextval` only reference an enum / sequence and follow the same rules (object ID, `$ref`, qualified name or globally unique name); the column being changed (`id`) still only accepts a column ID or `$ref`, never a name.
+- A name that does not exist, or matches several objects (for example `users` in two schemas), is an error that lists the candidates; use a qualified name or the object ID instead.
+- **Circular foreign keys** (A references B and B references A): create all the tables with `defineTable` first, then add the remaining foreign keys with `addForeignKey` at the end of the same call.
+
+Auto-increment per dialect: PostgreSQL uses the column's `identity`; SQL Server uses `ext.mssql.identity` (`{ "seed": "1", "increment": "1" }`); MySQL uses `ext.mysql.autoIncrement`; SQLite uses an `INTEGER` single-column primary key with `ext.sqlite.autoincrement`. Using `identity`, `typeRef` or `partitionBy` on a dialect that does not support it is an error.
+
+**`alterColumn`** patches an existing column declaratively. `id` must be the ID of an existing column, or the `$ref` of a column created earlier in the same call — **never a column name**. Fields: `name`, `type` / `typeRef`, `notNull`, `default`, `identity`, `ext` (replaced as a whole; `null` clears it) and `comment`. Leave a field out to keep it; set it to `null` to clear it.
+
+`ext` is replaced as a whole: what you pass becomes the complete column ext, and `null` clears it. One exception on SQL Server: when the column still has a default after this `alterColumn` (judged after any `default` change in the same op; `default: null` drops the name) and its constraint uses an explicit name (`ext.mssql.defaultNameMode: "explicit"`), that name is kept automatically as long as `ext.mssql` does not set `defaultName` / `defaultNameMode`, so changing another option (such as `sparse`) does not rename it back to `DF_<table>_<column>`. Passing `ext: null`, or setting those fields, does what you ask.
+
+```json
+{ "name": "alterColumn", "args": { "id": "0192…", "type": "bigint", "identity": { "always": false } } }
+```
+
+The server expands it in a fixed, safe order: drop identity → clear the default → rename → change the type → change NOT NULL → set the default → set identity → change `ext` → change the comment, skipping any step whose value already matches. Turning a column with a default into an identity column, or the other way round, therefore takes a single op. Setting both `identity` and `default`, or `identity` with `notNull: false`, is an error.
+
+**Error locations.** When a macro fails, the error carries `path` (where inside the macro) and `mutator` (the underlying operation that failed; absent when the arguments themselves are invalid) in addition to `index`, and the message starts with `ops[<index>] <path>`:
+
+```json
+{
+  "code": "invalid",
+  "index": 0,
+  "path": "defineTable(orders).foreignKeys[0]",
+  "mutator": "addForeignKey",
+  "message": "ops[0] defineTable(orders).foreignKeys[0] addForeignKey：两边列数必须相同",
+  "currentSeq": 12
 }
 ```
 

@@ -373,7 +373,8 @@ export const setTableExt = (m: Model, id: string, ext: TableExt | null) => {
   else delete t.ext;
 };
 
-const cleanExt = <T extends Record<string, unknown>>(ext: T | null | undefined): T | undefined => {
+/** 清理方言扩展：去掉值为 undefined 的键与空的方言子对象；整体为空时返回 undefined */
+export const cleanExt = <T extends Record<string, unknown>>(ext: T | null | undefined): T | undefined => {
   if (!ext) return undefined;
   const out: Record<string, unknown> = {};
   for (const [k, v] of Object.entries(ext)) {
@@ -1110,6 +1111,7 @@ export const addColumn = (m: Model, table: string, spec: ColumnSpec): string => 
   let pos: string;
   if (spec.before) {
     const i = cols.findIndex((c) => c.id === spec.before);
+    if (i < 0) throw new EditError(`列 ${spec.before} 不属于表 ${t.name}`);
     pos = generateKeyBetween(cols[i - 1]?.pos ?? null, cols[i]!.pos);
   } else pos = generateKeyBetween(cols.at(-1)?.pos ?? null, null);
   const cleanedExt = cleanExt(spec.ext);
@@ -1183,6 +1185,8 @@ export const setColumnExt = (m: Model, id: string, ext: ColumnExt | null) => {
   const cleaned = cleanExt(ext);
   if (cleaned) c.ext = cleaned as ColumnExt;
   else delete c.ext;
+  // MSSQL 带默认值的列：整体替换 ext 后重新推导默认约束名 DF_<table>_<col>（否则推导名会随 ext 一起丢失）
+  if (m.dialect === 'mssql') refreshDerivedNames(m, c.parent);
 };
 
 const identityType = (type: string): SequenceOptions['type'] =>

@@ -94,7 +94,7 @@ claude mcp add --transport http --scope user dowel https://dowel.example.com/api
 | `get_version`       | 读取 | 一个版本及其冻结的升级 / 回滚迁移                                                                                                                                 |
 | `preview_migration` | 读取 | 两个版本之间的升级 / 回滚 SQL（默认：最新版本 → 工作副本）                                                                                                        |
 | `list_environments` | 读取 | 环境及其缓存的当前版本、漂移状态和缓存时间                                                                                                                        |
-| `list_mutators`     | 读取 | 可用的修改操作及其参数的 JSON Schema                                                                                                                              |
+| `list_mutators`     | 读取 | 可用的修改操作（复合宏 `defineTable` / `alterColumn` 排在最前）及其说明和参数的 JSON Schema                                                                       |
 | `verify_migration`  | 验证 | 在影子库里执行迁移并比对结果（等同界面上的“在影子库验证”）                                                                                                        |
 | `apply_changes`     | 修改 | 整批原子执行修改操作；参数 `baseSeq`（来自 `get_model`）、`ops`（最多 100 个）、可选 `summary`（意图说明，最多 500 字）、`dryRun`；新对象的 ID 写 `"$ref:<别名>"` |
 | `manage_sections`   | 修改 | 增量调整画布板块；参数 `actions`（最多 50 个）、`dryRun`；见下文[画布板块](#sections)                                                                             |
@@ -104,8 +104,9 @@ claude mcp add --transport http --scope user dowel https://dowel.example.com/api
 `apply_changes` 的几点约定：
 
 - **一次调用 = 一次提交**：整批操作作为一个提交写入工作副本（一个新的 `seq`），在 **画布修改历史** 里只占一条“批量修改”记录，带上你传的 `summary`；要整批撤销，在历史里恢复到它的前一条即可。响应里的 `opCount` 是展开后的底层操作数（最多 500 个）。
-- **冲突与错误定位**：任一操作不合法，或基于旧 `baseSeq` 依据的对象已被别人修改，整批都不会提交，错误里的 `index` 指向最早出错的那个操作。
-- **没有净变化**（例如建了又删）时返回 `noop: true`，不产生提交、不记审计。
+- **冲突与错误定位**：任一操作不合法，或基于旧 `baseSeq` 依据的对象已被别人修改，整批都不会提交，错误里的 `index` 指向最早出错的那个操作；复合宏出错时还会带上 `path`（宏内位置）和 `mutator`（展开出的底层操作），见下文。
+- **没有净变化**（例如建了又删，或者 `alterColumn` 要改的值和现在一样）时返回 `noop: true`，不产生提交、不记审计。
+- **严格按对象 ID 修改**：修改、删除已有对象时只认对象 ID（`get_model` / `get_table` 返回的 `id`），或本次调用里前面新建对象的 `"$ref:<别名>"`，绝不按名字猜测；这样改名不会断链，并发冲突也能精确判断。
 - **写后自检**：响应（包括 `dryRun: true`）都带 `diagnostics`：完整的模型校验错误，以及按项目里版本最低的环境（读平台缓存的版本号，不连接目标库）做的静态兼容性 `errors` / `warnings`。它们不阻止这次修改，但有校验错误时发布版本会被拒绝（`blocksPublish: true`）。
 
 `get_model` 的附加上下文（`summary`、`full` 以及超过 200 张表时的截断结果都有）：
@@ -140,6 +141,70 @@ claude mcp add --transport http --scope user dowel https://dowel.example.com/api
     { "action": "add_tables", "section": "$ref:billing", "tables": ["<表 ID>"] },
     { "action": "recolor", "section": "$ref:billing", "color": "peer-3" }
   ]
+}
+```
+
+### 复合宏：`defineTable` 与 `alterColumn` {#macros}
+
+`ops` 里除了底层操作，还可以写两个复合宏。它们由服务端在预演时展开成底层操作，可以和底层操作混排在同一次调用里，共用同一套 `$ref` 别名；整次调用仍然只产生一个提交，画布修改历史和提交记录里看到的都是展开后的底层操作。展开后的底层操作总数最多 500 个（即响应里的 `opCount`）。
+
+**`defineTable`**：一次声明整张表，包括列（字段与 `addColumn` 相同，另可写 `comment`；列顺序就是数组顺序）、`primaryKey`、`uniques`、`checks`、`indexes`、`foreignKeys`、表 `comment`、`ext`，以及可选的 `partitionBy` / `partitions`。约束和索引可以写 `name`（显式名）与 `comment`。各对象的 `id` 都可以省略（自动生成），需要在后面引用时写 `"$ref:<别名>"`。
+
+```json
+{
+  "name": "defineTable",
+  "args": {
+    "id": "$ref:orders",
+    "schema": "public",
+    "name": "orders",
+    "comment": "订单",
+    "columns": [
+      { "id": "$ref:orders.id", "name": "id", "type": "bigint", "identity": { "always": true } },
+      { "name": "user_id", "type": "bigint", "notNull": true },
+      { "name": "status", "typeRef": "public.order_status" },
+      { "name": "parent_id", "type": "bigint" }
+    ],
+    "primaryKey": { "columns": ["id"] },
+    "checks": [{ "name": "ck_orders_user", "expr": "user_id > 0" }],
+    "indexes": [{ "elements": [{ "column": "user_id" }] }],
+    "foreignKeys": [
+      { "columns": ["user_id"], "refTable": "public.users", "refColumns": ["id"] },
+      { "columns": ["parent_id"], "refTable": "orders", "refColumns": ["id"], "onDelete": "cascade" }
+    ]
+  }
+}
+```
+
+名称解析的边界：
+
+- **本表的列**：约束、索引、分区键可以按列名、列 ID 或 `$ref` 引用本次新建的列（大小写规则与方言一致：SQLite / MySQL / SQL Server 不区分大小写）。
+- **新建时的引用**：`schema`（省略时用方言默认 schema，如 `public` / `dbo`；模型里只有一个 schema 时就用它）、列的 `typeRef`（PostgreSQL 枚举）与 `default.nextval`（序列）、外键的 `refTable` / `refColumns`、`partitions[].schema`，可以写对象 ID、`$ref`、限定名（`schema.name`）或全局唯一的名字。外键可以引用本表（自引用）或本次调用里前面已建的表。
+- **`alterColumn` 的引用**：`typeRef` 与 `default.nextval` 只是对枚举 / 序列的引用，规则同上（对象 ID、`$ref`、限定名或全局唯一的名字）；但要修改的列本身（`id`）只认列 ID 或 `$ref`，不按名字解析。
+- 名字找不到、或者有多个同名对象（例如两个 schema 里都有 `users`）时报错，并列出候选，请改用限定名或对象 ID。
+- **循环外键**（A 引用 B、B 又引用 A）：先用 `defineTable` 建好所有表，再在同一次调用的末尾用底层 `addForeignKey` 补上剩下的外键。
+
+各方言的自增写法：PostgreSQL 用列的 `identity`；SQL Server 用 `ext.mssql.identity`（`{ "seed": "1", "increment": "1" }`）；MySQL 用 `ext.mysql.autoIncrement`；SQLite 用 `INTEGER` 单列主键加 `ext.sqlite.autoincrement`。在不支持的方言上写 `identity`、`typeRef` 或 `partitionBy` 会直接报错。
+
+**`alterColumn`**：声明式地修改一个已有列。`id` 必须是已有列的 ID，或本次调用里前面新建的列的 `$ref`，**不接受列名**。可改字段：`name`、`type` / `typeRef`、`notNull`、`default`、`identity`、`ext`（整体替换，`null` 清空）、`comment`；不写表示不改，写 `null` 表示清除。
+
+`ext` 是整体替换：传入的内容就是改完后的完整列扩展，`null` 清空。SQL Server 有一个例外：本次修改后列仍有默认值（按同一个 `alterColumn` 里改完 `default` 之后的结果判断；`default: null` 清掉默认值时不保留）、且默认约束用的是显式名（`ext.mssql.defaultNameMode: "explicit"`）时，只要你没在 `ext.mssql` 里写 `defaultName` / `defaultNameMode`，原来的显式名会自动保留，不会因为改了别的扩展项（如 `sparse`）被改回 `DF_<表>_<列>`；传 `ext: null` 或显式写这两个字段时按你的要求处理。
+
+```json
+{ "name": "alterColumn", "args": { "id": "0192…", "type": "bigint", "identity": { "always": false } } }
+```
+
+服务端按固定的安全顺序展开：取消 identity → 清除默认值 → 改名 → 改类型 → 改 NOT NULL → 设默认值 → 设 identity → 改 `ext` → 改注释；值已经一致的步骤直接跳过。所以把有默认值的列改成 identity、或者反过来，都可以一步写完。同时写 `identity` 和 `default`、或 `identity` 配 `notNull: false` 会直接报错。
+
+**错误定位**：宏出错时，错误里除了 `index`，还有 `path`（宏内的位置）和 `mutator`（出错的底层操作；参数本身不合法时没有），消息以 `ops[<index>] <path>` 开头，例如：
+
+```json
+{
+  "code": "invalid",
+  "index": 0,
+  "path": "defineTable(orders).foreignKeys[0]",
+  "mutator": "addForeignKey",
+  "message": "ops[0] defineTable(orders).foreignKeys[0] addForeignKey：两边列数必须相同",
+  "currentSeq": 12
 }
 ```
 

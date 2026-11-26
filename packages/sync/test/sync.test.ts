@@ -1587,6 +1587,11 @@ describe('batch：整批 1 个提交（ADR 0015 第 3 节）', () => {
       },
     ]);
     expect(res).toMatchObject({ ok: false, failedIndex: 0, code: 'invalid', subIndex: 1 });
+    // subMessage 是子操作的原始错误文本（不带 `ops[i] name：` 前缀），供 MCP 映射回输入位置
+    if (res.ok) throw new Error('unreachable');
+    expect(res.subMessage).toBeTruthy();
+    expect(res.subMessage).not.toContain('ops[');
+    expect(res.message).toBe(`ops[1] createTable：${res.subMessage}`);
     expect(room.seq).toBe(2);
     expect(store.commits).toHaveLength(2);
 
@@ -1599,7 +1604,26 @@ describe('batch：整批 1 个提交（ADR 0015 第 3 节）', () => {
         reads: [],
       },
     ]);
-    expect(nested).toMatchObject({ ok: false, code: 'invalid', subIndex: 0 });
+    expect(nested).toMatchObject({
+      ok: false,
+      code: 'invalid',
+      subIndex: 0,
+      subMessage: 'batch 不能嵌套 batch',
+    });
+
+    // 非 batch 子操作的错误不带 subIndex / subMessage
+    const plain = room.simulate('mcp:a', [
+      {
+        client: 'mcp:a',
+        n: 1,
+        name: 'createTable',
+        args: { id: 't3', schema: 's1', name: 'users' },
+        reads: [],
+      },
+    ]);
+    expect(plain.ok).toBe(false);
+    expect(plain).not.toHaveProperty('subIndex');
+    expect(plain).not.toHaveProperty('subMessage');
   });
 
   test('Room.readConflict：只读检查依据，返回人类可读冲突与对象 ID，不改动任何状态', async () => {

@@ -202,6 +202,19 @@ export const MCP_MAX_EXPANDED_OPS = 500;
 /** apply_changes：可选意图说明 summary 的最大长度（与 @dowel/core 的 BATCH_SUMMARY_MAX 一致） */
 export const MCP_SUMMARY_MAX = 500;
 
+/**
+ * apply_changes 失败时的错误定位（tools/call 的 structuredContent 里与 code / message / currentSeq 并列）：
+ * - index：出错的输入操作下标（从 0 开始；整批级错误如 baseSeq 超前时没有）；
+ * - path：仅复合宏（defineTable / alterColumn）给出，形如 `defineTable(orders).foreignKeys[0]`、`alterColumn(users.email).type`；
+ * - mutator：仅复合宏展开后的底层步骤出错时给出（如 `addForeignKey`）；编译期参数错误没有。
+ * 普通 mutator 出错只有 index，消息保持子操作的原始错误文本；宏错误消息以 `ops[i] <path> [mutator]：` 开头。
+ */
+export interface McpApplyErrorLocation {
+  index?: number;
+  path?: string;
+  mutator?: string;
+}
+
 /** apply_changes 响应附带的单条静态兼容性问题（与 @dowel/core 的 ModelCompatibilityIssue 同构） */
 export interface McpCompatibilityIssue {
   code: string;

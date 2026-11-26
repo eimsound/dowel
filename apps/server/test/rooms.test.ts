@@ -1958,6 +1958,317 @@ test('applyMcpOps：onBeforeCommit 每批只调用 1 次（seq / opCount），�
   expect(stale.message).toContain(member.name);
 });
 
+describe('applyMcpOps：复合宏 defineTable / alterColumn（ADR 0015 第 2 节）', () => {
+  const newBranch = async (suffix: string) => {
+    const b = `${branchId}-mcp-macro-${suffix}`;
+    await db.query('insert into branches (id, project_id, name) values ($1, $2, $3)', [
+      b,
+      pid,
+      `macro-${suffix}`,
+    ]);
+    await rooms.init(b, model);
+    return b;
+  };
+  const base = () => ({ userId: member.id, tokenId: 'tok-macro', user: member.name });
+
+  test('宏与原语混排：共享 refs，整批 1 个 seq / 1 条 batch 提交（落库只有原语）', async () => {
+    const b = await newBranch('mix');
+    const ops = [
+      {
+        name: 'defineTable',
+        args: {
+          id: '$ref:users',
+          name: 'users',
+          columns: [
+            { id: '$ref:users.id', name: 'id', type: 'bigint' },
+            { name: 'email', type: 'text', comment: '$ref:not-expanded' },
+          ],
+          primaryKey: { columns: ['id'] },
+        },
+      },
+      {
+        name: 'addColumn',
+        args: { table: '$ref:users', column: { id: '$ref:nick', name: 'nick', type: 'text' } },
+      },
+      {
+        name: 'defineTable',
+        args: {
+          name: 'orders',
+          columns: [{ name: 'user_id', type: 'bigint', notNull: true }],
+          foreignKeys: [
+            {
+              name: 'fk_orders_user',
+              columns: ['user_id'],
+              refTable: '$ref:users',
+              refColumns: ['$ref:users.id'],
+            },
+          ],
+        },
+      },
+      { name: 'alterColumn', args: { id: '$ref:nick', notNull: true, comment: '昵称' } },
+    ];
+    const dry = await rooms.applyMcpOps(b, { ...base(), baseSeq: 0, dryRun: true, ops });
+    expect(dry).toMatchObject({ ok: true, dryRun: true, seq: 1 });
+    expect((await rooms.model(b)).seq).toBe(0);
+
+    const res = await rooms.applyMcpOps(b, { ...base(), baseSeq: 0, summary: '建 users / orders', ops });
+    expect(res.ok).toBe(true);
+    if (!res.ok) throw new Error(res.message);
+    // users：createTable + 2 addColumn + addPrimaryKey + setComment；addColumn；orders：createTable + addColumn + addForeignKey + renameKey；alterColumn：setNotNull + setComment
+    expect(res).toMatchObject({ seq: 1, opCount: 12 });
+    expect(Object.keys(res.refs).sort()).toEqual(['nick', 'users', 'users.id']);
+    const usersId = res.refs.users!;
+    const email = Object.values(res.model.objects).find((o) => o.kind === 'column' && o.name === 'email');
+    expect(email).toMatchObject({ parent: usersId, comment: '$ref:not-expanded' });
+    expect(res.model.objects[res.refs.nick!]).toMatchObject({ notNull: true, comment: '昵称' });
+    const fk = Object.values(res.model.objects).find((o) => o.kind === 'foreignKey');
+    expect(fk).toMatchObject({
+      name: 'fk_orders_user',
+      refTable: usersId,
+      refColumns: [res.refs['users.id']],
+    });
+
+    const rows = await db.query<{ op_name: string; op_args: string | { ops: { name: string }[] } }>(
+      'select op_name, op_args from room_commits where branch_id = $1',
+      [b],
+    );
+    expect(rows).toHaveLength(1);
+    expect(rows[0]!.op_name).toBe('batch');
+    const args = (typeof rows[0]!.op_args === 'string' ? JSON.parse(rows[0]!.op_args) : rows[0]!.op_args) as {
+      ops: { name: string }[];
+    };
+    const names = new Set(args.ops.map((o) => o.name));
+    expect(names.has('defineTable') || names.has('alterColumn')).toBe(false);
+    expect(args.ops).toHaveLength(12);
+  });
+
+  test('展开子操作上限 500：触顶时短路报到外层 index 与宏路径', async () => {
+    const b = await newBranch('limit');
+    const res = await rooms.applyMcpOps(b, {
+      ...base(),
+      baseSeq: 0,
+      ops: [
+        { name: 'createTable', args: { id: '$ref:t0', schema: schemaId, name: 'limit_t0' } },
+        {
+          name: 'defineTable',
+          args: {
+            name: 'big',
+            columns: Array.from({ length: 499 }, (_, i) => ({ name: `c${i}`, type: 'int' })),
+          },
+        },
+      ],
+    });
+    expect(res).toMatchObject({
+      ok: false,
+      code: 'invalid',
+      index: 1,
+      path: 'defineTable(big).columns[498]',
+      mutator: 'addColumn',
+    });
+    if (res.ok) return;
+    expect(res.message).toContain('500');
+    expect((await rooms.model(b)).seq).toBe(0);
+
+    // 恰好 500 条可以提交
+    const ok = await rooms.applyMcpOps(b, {
+      ...base(),
+      baseSeq: 0,
+      ops: [
+        {
+          name: 'defineTable',
+          args: {
+            name: 'big',
+            columns: Array.from({ length: 499 }, (_, i) => ({ name: `c${i}`, type: 'int' })),
+          },
+        },
+      ],
+    });
+    expect(ok).toMatchObject({ ok: true, seq: 1, opCount: 500 });
+  });
+
+  test('全幂等 alterColumn：0 展开返回 noop（不提交），但 extraReads 仍检测并发修改', async () => {
+    const b = await newBranch('noop');
+    const created = await rooms.applyMcpOps(b, {
+      ...base(),
+      baseSeq: 0,
+      ops: [
+        {
+          name: 'defineTable',
+          args: { name: 'users', columns: [{ id: '$ref:email', name: 'email', type: 'text' }] },
+        },
+      ],
+    });
+    if (!created.ok) throw new Error(created.message);
+    const emailId = created.refs.email!;
+    const same = [
+      { name: 'alterColumn', args: { id: emailId, name: 'email', type: 'text', notNull: false } },
+    ];
+    for (const dryRun of [true, false]) {
+      const res = await rooms.applyMcpOps(b, { ...base(), baseSeq: 1, dryRun, ops: same });
+      expect(res).toMatchObject({ ok: true, dryRun, noop: true, opCount: 0, seq: 1, changed: [] });
+    }
+    expect(await db.query('select seq from room_commits where branch_id = $1', [b])).toHaveLength(1);
+
+    // 别人在 seq 2 改了这一列：基于 seq 1 的幂等 alterColumn 也要报冲突
+    const other = await rooms.applyMcpOps(b, {
+      ...base(),
+      tokenId: 'tok-macro-other',
+      baseSeq: 1,
+      ops: [{ name: 'setComment', args: { id: emailId, comment: '别人改的' } }],
+    });
+    expect(other).toMatchObject({ ok: true, seq: 2 });
+    const stale = await rooms.applyMcpOps(b, { ...base(), baseSeq: 1, ops: same });
+    expect(stale).toMatchObject({
+      ok: false,
+      code: 'conflict',
+      index: 0,
+      path: 'alterColumn(users.email)',
+      currentSeq: 2,
+    });
+    if (stale.ok) return;
+    expect(stale.message.startsWith('ops[0] alterColumn(users.email)：')).toBe(true);
+  });
+
+  test('错误溯源：参数校验 / 编译期解析 / 展开步骤 / simulate 都映射回外层 index + path + mutator', async () => {
+    const b = await newBranch('errors');
+    const users = {
+      name: 'defineTable',
+      args: {
+        id: '$ref:users',
+        name: 'users',
+        columns: [{ name: 'id', type: 'bigint' }],
+        primaryKey: { columns: ['id'] },
+      },
+    };
+
+    // 1. zod strict：未知字段
+    const zodErr = await rooms.applyMcpOps(b, {
+      ...base(),
+      baseSeq: 0,
+      ops: [
+        users,
+        { name: 'defineTable', args: { name: 'x', columns: [{ name: 'a', type: 'int', typo: 1 }] } },
+      ],
+    });
+    expect(zodErr).toMatchObject({ ok: false, code: 'invalid', index: 1, path: 'defineTable(x).columns[0]' });
+    if (zodErr.ok) return;
+    expect(zodErr).not.toHaveProperty('mutator');
+    expect(zodErr.message.startsWith('ops[1] defineTable(x).columns[0]：')).toBe(true);
+
+    // 2. 编译期名称解析：未定义的 $ref（提示循环外键做法）
+    const refErr = await rooms.applyMcpOps(b, {
+      ...base(),
+      baseSeq: 0,
+      ops: [
+        {
+          name: 'defineTable',
+          args: {
+            name: 'orders',
+            columns: [{ name: 'uid', type: 'bigint' }],
+            foreignKeys: [{ columns: ['uid'], refTable: '$ref:users', refColumns: ['id'] }],
+          },
+        },
+        users,
+      ],
+    });
+    expect(refErr).toMatchObject({
+      ok: false,
+      code: 'invalid',
+      index: 0,
+      path: 'defineTable(orders).foreignKeys[0].refTable',
+    });
+    if (refErr.ok) return;
+    expect(refErr.message).toContain('addForeignKey');
+
+    // 3. 展开步骤失败：带 mutator
+    const stepErr = await rooms.applyMcpOps(b, {
+      ...base(),
+      baseSeq: 0,
+      ops: [
+        {
+          name: 'defineTable',
+          args: { name: 't', columns: [{ name: 'a', type: 'int' }], checks: [{ expr: 'nope > 0' }] },
+        },
+      ],
+    });
+    expect(stepErr).toMatchObject({
+      ok: false,
+      code: 'invalid',
+      index: 0,
+      path: 'defineTable(t).checks[0]',
+      mutator: 'addCheck',
+    });
+    if (stepErr.ok) return;
+    expect(stepErr.message.startsWith('ops[0] defineTable(t).checks[0] addCheck：')).toBe(true);
+
+    // 4. simulate：在 baseSeq 上合法、在最新状态上不合法（别人新建了同名表），不能泄漏展开后的内部下标
+    const first = await rooms.applyMcpOps(b, { ...base(), baseSeq: 0, ops: [users] });
+    expect(first).toMatchObject({ ok: true, seq: 1 });
+    const other = await rooms.applyMcpOps(b, {
+      ...base(),
+      tokenId: 'tok-macro-other',
+      baseSeq: 1,
+      ops: [
+        { name: 'createTable', args: { id: '$ref:d1', schema: schemaId, name: 'dup_macro' } },
+        { name: 'createTable', args: { id: '$ref:d2', schema: schemaId, name: 'dup_prim' } },
+      ],
+    });
+    expect(other).toMatchObject({ ok: true, seq: 2 });
+    const multi = {
+      name: 'defineTable',
+      args: {
+        name: 'fine',
+        columns: [
+          { name: 'a', type: 'int' },
+          { name: 'b', type: 'int' },
+        ],
+      },
+    };
+    const simMacro = await rooms.applyMcpOps(b, {
+      ...base(),
+      baseSeq: 1,
+      ops: [
+        multi,
+        { name: 'defineTable', args: { name: 'dup_macro', columns: [{ name: 'a', type: 'int' }] } },
+      ],
+    });
+    expect(simMacro).toMatchObject({
+      ok: false,
+      code: 'invalid',
+      index: 1,
+      path: 'defineTable(dup_macro)',
+      mutator: 'createTable',
+      currentSeq: 2,
+    });
+    if (simMacro.ok) return;
+    expect(simMacro.message.startsWith('ops[1] defineTable(dup_macro) createTable：')).toBe(true);
+    expect(simMacro.message).not.toContain('ops[3]');
+
+    const simPrim = await rooms.applyMcpOps(b, {
+      ...base(),
+      baseSeq: 1,
+      ops: [multi, { name: 'createTable', args: { id: '$ref:p', schema: schemaId, name: 'dup_prim' } }],
+    });
+    expect(simPrim).toMatchObject({ ok: false, code: 'invalid', index: 1, currentSeq: 2 });
+    if (simPrim.ok) return;
+    expect(simPrim).not.toHaveProperty('path');
+    expect(simPrim.message.startsWith('ops[1] createTable：')).toBe(true);
+
+    // 原语错误消息保持原样（不加宏前缀）
+    const prim = await rooms.applyMcpOps(b, {
+      ...base(),
+      baseSeq: 2,
+      ops: [{ name: 'dropTable', args: { id: 'missing-table' } }],
+    });
+    expect(prim).toMatchObject({ ok: false, code: 'invalid', index: 0 });
+    if (prim.ok) return;
+    expect(prim.message.startsWith('ops[')).toBe(false);
+    expect(prim).not.toHaveProperty('path');
+    expect(prim).not.toHaveProperty('mutator');
+    expect((await rooms.model(b)).seq).toBe(2);
+  });
+});
+
 const PASTE_SRC = { projectId: 'proj-room', projectName: '房间项目', origin: 'canvas' as const, seq: null };
 
 test('paste 房间级防护：viewer 发送 paste 被拒绝且不推进 processed、不写 room_rejections，editor 同序号粘贴正常生效', async () => {
