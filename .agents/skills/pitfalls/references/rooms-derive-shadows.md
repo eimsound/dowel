@@ -1,6 +1,6 @@
 # 三、无状态实时协作房间、派生刷新与影子库缓存（HA2 / Sync）
 
-涉及模块：`apps/server/src/rooms.ts`、`apps/server/src/derive.ts`、`apps/server/src/shadows.ts`、`apps/server/src/bus.ts`、`apps/server/src/app.ts`、`apps/server/src/routes/sync.ts`、`packages/sync/src/protocol.ts`、`packages/sync/src/server.ts`、`packages/sync/src/client.ts`。
+涉及模块：`apps/server/src/rooms.ts`、`apps/server/src/rooms/*`、`apps/server/src/derive.ts`、`apps/server/src/shadows.ts`、`apps/server/src/bus.ts`、`apps/server/src/app.ts`、`apps/server/src/routes/sync.ts`、`packages/sync/src/protocol.ts`、`packages/sync/src/server.ts`、`packages/sync/src/client.ts`。
 
 ---
 
@@ -14,7 +14,7 @@
   1. 跨副本发布/导出拿到未规范化的陈旧表达式或旧版本差异；
   2. 并发提交被跳过永久漏刷新；
   3. 旧 `canonicalize` 覆盖 `replace` 后的新基线，或 `rooms.replace` 与重读 `rooms.model` 之间的并发用户编辑被误当成规范基线写入并清掉待刷定时器。
-- **【Dowel 正确做法】**（已验证于 `derive.ts` / `ha.ts` / `app.ts` / `rooms.ts`）
+- **【Dowel 正确做法】**（已验证于 `derive.ts` / `ha.ts` / `app.ts` / `rooms.ts` / `rooms/ops.ts`）
   1. HA 模式下 `flush(branchId)` 通过按分支串行队列 + 阻塞版 `withJobLock('derive:' + branchId, ..., { timeoutMs })`，基于 DB `branches.baseline` 循环追齐最新 `rooms.state` 后才返回（无变化跳过 `shadowOf` 与冗余写库）；
   2. 后台防抖 `runBackground` 拿不到锁时短延迟重排，持锁结束后若 `seq` 前进则循环补刷（设上限并重排）；`apply()` 在 `rooms.patch` 被拒时不覆写 `branches.baseline`；
   3. `ctx.replace` 统一走 `refresher.runWithReset(branch, model, () => rooms.replace(...))`，在 `job:derive:<branchId>` 锁内保持单向锁序（derive 锁 → room 行锁），并**直接使用规范化 `model` 入参重置基线**，绝不事后重读 `rooms.model`。
@@ -29,7 +29,7 @@
   3. 连续多次 `room.refresh` 并发跑 `refreshLoadedLocal` 无互斥队列。
 - **【会出什么事】**
   - 实例管理员在 WS 升级与 `join` 之间被降级，仍以 `'admin'` 权限混入私有项目；`join` 挂起期间被 `room.refresh` 降级或踢出，恢复后又被旧查询覆盖回 `'editor'`；多次 `room.refresh` 乱序完成导致旧结果反杀新降级。
-- **【Dowel 正确做法】**（已验证于 `rooms.ts` / `rooms.test.ts` / `ha-rooms.test.ts`）
+- **【Dowel 正确做法】**（已验证于 `rooms.ts` / `rooms/access.ts` / `rooms/kernel.ts` / `rooms.test.ts` / `ha-rooms.test.ts`）
   1. 用 `fetchUserState()` 同时查 `role, status`，在 `join` 与 `runRefreshLoadedLocal` 中同步刷新 `peer.user.role` 后再 `resolveRole`；
   2. 为 `Rooms` 维护**单飞串行刷新队列 + 目标合并重跑**（全量/按分支）与**递增刷新代际**（`globalRefreshGen` / `branchRefreshGen`）；
   3. `join` 在每次 `await` 后检查 `r.peers.has(peer)` 与代际是否推进，代际变化则循环重算最新角色后再写入并下发。
@@ -57,7 +57,7 @@
   2. `Room.process()` 拒绝 `readOnly` 成员的 `op` 后仍推进 `s.processed[client] = op.n` 并写 `room_rejections`。
 - **【会出什么事】**
   - 同项目成员甚至只读 `viewer` 从广播的在线列表拿到他人 `client` ID 后冒用握手并抢发 `op`，强行推进受害者的 `processed[victimClient]`，导致受害者后续合法编辑命中 `op.n <= done` 被**静默丢弃且无任何报错**；冒用 `'system'` 会干扰系统 `replace`/`patch`。
-- **【Dowel 正确做法】**（已验证于 `packages/sync/src/{protocol,server}.ts` / `apps/server/src/rooms.ts`）
+- **【Dowel 正确做法】**（已验证于 `packages/sync/src/{protocol,server}.ts` / `apps/server/src/rooms.ts` / `apps/server/src/rooms/{client-scope,ops}.ts`）
   1. `isValidClientId()` 严格校验长度与字符集并拒绝大小写不敏感的 `'system'`；禁止同一连接在绑定后变更 `client`（非法关 `4400`，同用户同 `client` 重连踢旧连接 `4409`）；
   2. 服务端进入 `Room` 与落库的同步键统一隔离为 `${peer.user.id}:${rawClient}`，同步重写 `op.reads` 引用，广播 `commit` 时经 `forPeer()` 仅向本人还原原始 `client`（对其他连接置空，不泄露内部键）；
   3. `readOnly` / `viewer` 的 `op` 直接拒绝返回 `reject`（在服务端内存短路不占行锁），**绝不推进 `s.processed[client]`、不写 `room_rejections`、不污染 `outcome`**。
