@@ -1,11 +1,14 @@
 import {
+  type CanvasSection,
   MCP_MAX_OPS,
   MCP_SUMMARY_MAX,
   MCP_TOOLS,
   type McpApplyErrorLocation,
   type McpDiagnostics,
+  mcpManageSectionsInputSchema,
   type McpToolErrorCode,
   type McpToolName,
+  resolveSectionActions,
   type Role,
 } from '@dowel/api';
 import {
@@ -14,6 +17,7 @@ import {
   childrenOf,
   type Column,
   columnsOf,
+  describeTarget,
   diagnoseModel,
   type ForeignKey,
   getDialect,
@@ -21,6 +25,7 @@ import {
   macros,
   type Model,
   mutators,
+  newId,
   type Obj,
   PlanError,
   type PrimaryKey,
@@ -89,6 +94,7 @@ const MCP_INSTRUCTIONS = [
   '   Every response (including `dryRun`) carries `diagnostics`: full model validation errors plus static compatibility errors / warnings against the lowest cached target environment version. They never block the write, but fix them before asking a human to publish.',
   '4. Inspect mutator signatures with `list_mutators`, export DDL with `get_ddl`, and preview up/down migration SQL with `preview_migration`.',
   '5. Validate migrations against a shadow database using `verify_migration` (requires `verify` scope).',
+  '6. Canvas sections are a pure layout layer (never part of the schema, migrations or versions). `get_model` lists them (`sections`, plus `sectionId` per table) together with dialect `capabilities` and the derived lowest `target` version. Adjust them incrementally with `manage_sections` (create / rename / recolor / delete / add_tables / remove_tables; `$ref:<alias>` refers to a section created earlier in the same call). Pixel positions are laid out automatically and cannot be written via MCP.',
   'Note: Publishing versions and executing migrations against target databases are intentionally reserved for humans in the Dowel UI.',
 ].join('\n');
 
@@ -246,13 +252,42 @@ const listVisibleAllowlistedProjects = async (
   }));
 };
 
+/** 只读平台库缓存的环境数值版本号（绝不读连接串、绝不连目标库或影子库） */
+const readEnvVersionNums = async (ctx: AppContext, projectId: string): Promise<(number | null)[]> => {
+  const rows = await ctx.db.query<{ engine_version_num: number | string | null }>(
+    'select engine_version_num from environments where project_id = $1',
+    [projectId],
+  );
+  return rows.map((r) => {
+    if (r.engine_version_num === null) return null;
+    const n = Number(r.engine_version_num);
+    return Number.isFinite(n) ? n : null;
+  });
+};
+
+/** get_model 的方言 / 目标版本上下文（ADR 0015 第 5 节）：只读平台缓存，不连目标库 */
+const readTargetContext = async (ctx: AppContext, projectId: string, model: Model) => {
+  const nums = await readEnvVersionNums(ctx, projectId);
+  const info = describeTarget(model.dialect, nums);
+  return {
+    capabilities: getDialect(model.dialect).capabilities,
+    target: {
+      label: info?.label ?? null,
+      features: info?.features ?? null,
+      source: 'platform_cache' as const,
+      environments: { total: nums.length, withCachedVersion: nums.filter((n) => n !== null).length },
+    },
+  };
+};
+
 const summarizeOrReadModel = async (
   ctx: AppContext,
   project: ResolvedProject,
   opts: { schema?: string; detail: 'summary' | 'full' },
 ) => {
   await ctx.refresher.flush(project.row.branch);
-  const { model, versions, seq } = await ctx.rooms.state(project.row.branch);
+  const { model, versions, seq, sections: rawSections } = await ctx.rooms.canvasState(project.row.branch);
+  const context = await readTargetContext(ctx, project.row.id, model);
   const schemasAll = all(model, 'schema');
   const schemaById = new Map(schemasAll.map((s) => [s.id, s]));
 
@@ -269,6 +304,7 @@ const summarizeOrReadModel = async (
       project: { id: project.row.id, path: project.path, name: project.row.name },
       seq,
       dialect: model.dialect,
+      ...context,
       detail: opts.detail,
       truncated: false,
       counts: {
@@ -288,6 +324,7 @@ const summarizeOrReadModel = async (
       sequences: [],
       extensions: [],
       opaques: [],
+      sections: [],
       ...(opts.detail === 'full' ? { objects: {} } : {}),
     };
   }
@@ -328,6 +365,34 @@ const summarizeOrReadModel = async (
   const indexCountByTable = new Map<string, number>();
   for (const ix of indexes) indexCountByTable.set(ix.parent, (indexCountByTable.get(ix.parent) ?? 0) + 1);
 
+  // 画布板块（纯布局层）：只保留当前（schema 过滤后）模型里仍存活的顶层表，消除已删表留下的孤儿 ID；
+  // 分区子表经顶层父表继承 sectionId，与画布显示一致
+  const topTableIds = new Set(tables.filter((t) => !t.partitionOf).map((t) => t.id));
+  const liveSections: CanvasSection[] = rawSections.map((sec) => ({
+    ...sec,
+    tables: sec.tables.filter((id) => topTableIds.has(id)),
+  }));
+  const sectionOfTop = new Map<string, string>();
+  for (const sec of liveSections) for (const id of sec.tables) sectionOfTop.set(id, sec.id);
+  const sectionIdOf = (table: Table): string | null => {
+    let cur: Table | undefined = table;
+    const seen = new Set<string>();
+    while (cur?.partitionOf && !seen.has(cur.id)) {
+      seen.add(cur.id);
+      const parent: Obj | undefined = Object.hasOwn(model.objects, cur.partitionOf.parent)
+        ? model.objects[cur.partitionOf.parent]
+        : undefined;
+      cur = parent?.kind === 'table' ? parent : undefined;
+    }
+    return cur ? (sectionOfTop.get(cur.id) ?? null) : null;
+  };
+  const sectionSummaries = liveSections.map((sec) => ({
+    id: sec.id,
+    name: sec.name,
+    color: sec.color,
+    tableCount: sec.tables.length,
+  }));
+
   const tableSummaries = tables.map((t) => ({
     id: t.id,
     schemaId: t.parent,
@@ -339,6 +404,7 @@ const summarizeOrReadModel = async (
     indexCount: indexCountByTable.get(t.id) ?? 0,
     partitionBy: t.partitionBy,
     partitionOf: t.partitionOf,
+    sectionId: sectionIdOf(t),
   }));
 
   if (opts.detail === 'full') {
@@ -347,6 +413,7 @@ const summarizeOrReadModel = async (
         project: { id: project.row.id, path: project.path, name: project.row.name },
         seq,
         dialect: model.dialect,
+        ...context,
         detail: 'full' as const,
         truncated: true,
         totalTables: tables.length,
@@ -355,6 +422,7 @@ const summarizeOrReadModel = async (
         counts,
         schemas: schemas.map((s) => ({ id: s.id, name: s.name, ver: versions[s.id] ?? 0 })),
         tables: tableSummaries.slice(0, MAX_FULL_MODEL_TABLES_WITHOUT_SCHEMA),
+        sections: sectionSummaries,
       };
     }
 
@@ -380,10 +448,13 @@ const summarizeOrReadModel = async (
       project: { id: project.row.id, path: project.path, name: project.row.name },
       seq,
       dialect: model.dialect,
+      ...context,
       detail: 'full' as const,
       truncated: false,
       counts,
       objects,
+      // 板块不混进 objects（objects 保持纯 @dowel/core IR 对象）
+      sections: liveSections,
     };
   }
 
@@ -391,6 +462,7 @@ const summarizeOrReadModel = async (
     project: { id: project.row.id, path: project.path, name: project.row.name },
     seq,
     dialect: model.dialect,
+    ...context,
     detail: 'summary' as const,
     counts,
     schemas: schemas.map((s) => ({ id: s.id, name: s.name, ver: versions[s.id] ?? 0 })),
@@ -419,6 +491,7 @@ const summarizeOrReadModel = async (
       objType: o.objType,
       ver: verOf(versions, o.id),
     })),
+    sections: sectionSummaries,
   };
 };
 
@@ -492,11 +565,7 @@ const computeDiagnostics = async (
   model: Model,
 ): Promise<{ diagnostics: McpDiagnostics | null; diagnosticsError?: string }> => {
   try {
-    const rows = await ctx.db.query<{ engine_version_num: number | string | null }>(
-      'select engine_version_num from environments where project_id = $1',
-      [projectId],
-    );
-    const nums = rows.map((r) => (r.engine_version_num === null ? null : Number(r.engine_version_num)));
+    const nums = await readEnvVersionNums(ctx, projectId);
     return { diagnostics: sanitizeUnknown(diagnoseModel(model, nums)) as McpDiagnostics };
   } catch (e) {
     return {
@@ -602,7 +671,7 @@ export const createMcpServer = (
   addTool({
     name: 'get_model',
     description:
-      'Read working-trunk model (`seq`, `dialect`, and summary or full objects with per-object `ver`). For >200 tables in `detail="full"`, pass `schema` filter.',
+      'Read working-trunk model (`seq`, `dialect`, and summary or full objects with per-object `ver`), plus canvas `sections` (pure layout; per-table `sectionId` in summaries), dialect `capabilities`, and the derived lowest `target` version (platform cache only). For >200 tables in `detail="full"`, pass `schema` filter.',
     schema: z.object({
       project: z.string().min(1),
       schema: z.string().min(1).optional(),
@@ -1007,7 +1076,7 @@ export const createMcpServer = (
   addTool({
     name: 'apply_changes',
     description:
-      'Atomically validate and apply 1..100 ops to the working trunk based on `baseSeq`, committed as ONE canvas-history entry (single `seq`, `opCount` = expanded primitive sub-ops, at most 500). Ops are primitive mutators or the compile-time macros `defineTable` (whole table in one op; may use its own column names and resolve new references by qualified name) and `alterColumn` (declarative patch of an existing column). Edits and drops address existing objects strictly by object ID (or a `$ref:<alias>` created earlier in the same call), never by name; for circular FKs, define the tables first and add the remaining FKs with `addForeignKey`. Use `$ref:<alias>` in primitive args for new UUIDv7 IDs; `refs` maps each `alias` to its generated ID. Optional `summary` (<= 500 chars) records the intent in canvas history and audit. Set `dryRun: true` to simulate without committing. Errors carry the input `index` and, for macros, `path` (e.g. `defineTable(orders).foreignKeys[0]`) and the expanded `mutator`. Responses include `diagnostics` (validation + static target-version compatibility; never blocks the write) and `noop: true` when nothing changed.',
+      'Atomically validate and apply 1..100 ops to the working trunk based on `baseSeq`, committed as ONE canvas-history entry (single `seq`, `opCount` = expanded primitive sub-ops, at most 500). Ops are primitive mutators or the compile-time macros `defineTable` (whole table in one op; may use its own column names and resolve new references by qualified name) and `alterColumn` (declarative patch of an existing column addressed by column ID; its `typeRef` / `default.nextval` references may also use `[schema.]name`). Edits and drops address existing objects strictly by object ID (or a `$ref:<alias>` created earlier in the same call), never by name; for circular FKs, define the tables first and add the remaining FKs with `addForeignKey`. Use `$ref:<alias>` in primitive args for new UUIDv7 IDs; `refs` maps each `alias` to its generated ID. Optional `summary` (<= 500 chars) records the intent in canvas history and audit. Set `dryRun: true` to simulate without committing. Errors carry the input `index` and, for macros, `path` (e.g. `defineTable(orders).foreignKeys[0]`) and the expanded `mutator`. Responses include `diagnostics` (validation + static target-version compatibility; never blocks the write) and `noop: true` when nothing changed.',
     schema: z.object({
       project: z.string().min(1),
       baseSeq: z.number().int().min(0),
@@ -1085,6 +1154,74 @@ export const createMcpServer = (
         changed: res.changed,
         ...diag,
         ...(res.noop ? { noop: true } : {}),
+      });
+    },
+  });
+
+  addTool({
+    name: 'manage_sections',
+    description:
+      'Incrementally adjust canvas sections (pure layout layer: never part of the schema IR, migrations, versions or canvas history `seq`). Applies 1..50 actions atomically on the latest sections: `create` (`ref`, `name`, optional `color` peer-1..peer-8 and `tables`), `rename`, `recolor`, `delete` (tables become ungrouped), `add_tables` (a table already in another section is moved; partitions follow their parent), `remove_tables` (idempotent). Refer to sections by ID or `$ref:<alias>` of an earlier `create`; `refs` maps each alias to the generated ID. Table IDs come from `get_model`. Pixel coordinates cannot be written. Set `dryRun: true` to preview; `noop: true` when nothing changed.',
+    schema: mcpManageSectionsInputSchema,
+    annotations: { readOnlyHint: false, destructiveHint: true, idempotentHint: false, openWorldHint: false },
+    run: async (args) => {
+      const resolved = await resolveMcpProject(
+        ctx,
+        principal,
+        args.project,
+        MCP_TOOLS.manage_sections.action,
+      );
+      if (!resolved.ok) return toolError(resolved.code, resolved.message);
+      const { row } = resolved.project;
+
+      const parsed = resolveSectionActions(args.actions, () => `sec-${newId()}`);
+      if (!parsed.ok) {
+        return toolError(parsed.code, parsed.message, { index: parsed.index });
+      }
+      const res = await ctx.rooms.manageSections(row.branch, {
+        actions: parsed.actions,
+        dryRun: args.dryRun,
+        onBeforeCommit: async (tx, info) => {
+          await auditIn(
+            tx,
+            honoCtx,
+            {
+              action: 'sections.update',
+              actorKind: 'user',
+              actorId: principal.user.id,
+              targetKind: 'project',
+              targetId: row.id,
+              projectId: row.id,
+              data: {
+                via: 'mcp',
+                mcpToken: { id: principal.tokenId, name: principal.tokenName, prefix: principal.prefix },
+                projectId: row.id,
+                sectionsVer: info.ver,
+                opCount: args.actions.length,
+                actions: args.actions.map((a) => a.action),
+                created: info.created.length,
+                deleted: info.deleted.length,
+                moved: info.moved.length,
+              },
+            },
+            ctx.security,
+          );
+        },
+      });
+      if (!res.ok) {
+        return toolError(res.code, res.message, {
+          index: res.index,
+          ...(res.tableIds ? { tableIds: res.tableIds } : {}),
+        });
+      }
+      return toolOk({
+        dryRun: res.dryRun,
+        sectionsVer: res.sectionsVer,
+        sections: res.sections,
+        refs: parsed.refs,
+        moved: res.moved,
+        ...(res.noop ? { noop: true } : {}),
+        ...(res.superseded ? { superseded: true } : {}),
       });
     },
   });

@@ -483,7 +483,7 @@ export const alterColumnArgs = z
       .nullable()
       .optional()
       .describe(
-        'Replaces the whole column ext (null clears it). SQL Server: an explicit default-constraint name (ext.mssql.defaultNameMode "explicit") on a column with a default is kept automatically unless ext.mssql sets defaultName / defaultNameMode or ext is null',
+        'Replaces the whole column ext (null clears it). SQL Server: an explicit default-constraint name (ext.mssql.defaultNameMode "explicit") is kept automatically when the column still has a default after this alterColumn, unless ext.mssql sets defaultName / defaultNameMode or ext is null',
       ),
     comment,
   })

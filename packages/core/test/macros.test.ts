@@ -757,5 +757,26 @@ describe('defineTable / alterColumn：MSSQL', () => {
       defaultName: 'DF_t_a',
       defaultNameMode: 'derived',
     });
+
+    // 同时改 default 与 ext：按本次修改后的默认值判断，仍有默认值 → 保留显式名
+    const both = expand(kept.m, 'alterColumn', {
+      id: 'ca',
+      default: { expr: '1' },
+      ext: { mssql: { rowguidcol: false } },
+    });
+    expect(both.names).toEqual(['setDefault', 'setColumnExt']);
+    expect(get(both.m, 'ca', 'column')).toMatchObject({
+      default: { expr: '1' },
+      ext: { mssql: { rowguidcol: false, defaultName: 'DF_custom', defaultNameMode: 'explicit' } },
+    });
+
+    // default: null + ext：默认值已被清除，没有默认约束可命名 → 不再保留显式名
+    const dropped = expand(kept.m, 'alterColumn', {
+      id: 'ca',
+      default: null,
+      ext: { mssql: { sparse: true } },
+    });
+    expect(dropped.names).toEqual(['setDefault', 'setColumnExt']);
+    expect(get(dropped.m, 'ca', 'column')).toMatchObject({ default: null, ext: { mssql: { sparse: true } } });
   });
 });

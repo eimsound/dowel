@@ -1,4 +1,5 @@
 import {
+  type CanvasSection,
   MCP_MAX_EXPANDED_OPS,
   MCP_SUMMARY_MAX,
   MCP_TOOLS,
@@ -12,12 +13,13 @@ import {
   BATCH_SUMMARY_MAX,
   createSchema,
   createTable,
+  getDialect,
   newId,
 } from '@dowel/core';
 import type { Commit, ToClient } from '@dowel/sync';
 // M3-C MCP 服务集成测试（ADR 0014）：
 // 在 SQLite 与 PostgreSQL 两种平台库下通过真实 app.request 测试完整的 JSON-RPC 传输（2025-11-25 与 2026-07-28）、
-// 11 个工具、6 个资源/模板、scope ∩ 生效角色 ∩ 白名单鉴权、Rooms.applyMcpOps（$ref / baseSeq / dryRun / 冲突回滚 / 历史 / 审计）、
+// 12 个工具（含 manage_sections 增量板块）、6 个资源/模板、scope ∩ 生效角色 ∩ 白名单鉴权、Rooms.applyMcpOps（$ref / baseSeq / dryRun / 冲突回滚 / 历史 / 审计）、
 // 影子库 verify_migration 与用户级限流、list_environments 仅读平台缓存以及 HTTP 安全守卫（405 / 415 / 413 / 403）。
 import {
   CLIENT_CAPABILITIES_META_KEY,
@@ -36,6 +38,8 @@ import type { Extra, Peer } from '../src/rooms.ts';
 import { encrypt } from '../src/secrets.ts';
 import { type Shadow, ShadowUnavailableError } from '../src/shadow.ts';
 import { addTable, editModel, makeUser, PASSWORD } from './support.ts';
+
+const SECTION_ID_RE = /^sec-[0-9a-f]{8}-[0-9a-f]{4}-7[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i;
 
 process.env.DOWEL_SECRET ??= 'mcp-test-secret-key-0123456789abcdef';
 
@@ -1572,6 +1576,362 @@ describe.each([
         String(bad2.structuredContent!.message).startsWith('ops[0] defineTable(mac_t).checks[0] addCheck：'),
       ).toBe(true);
       expect((await f.created.rooms.model(f.branch1)).seq).toBe(1);
+    },
+  );
+  test.skipIf(skip)(
+    'manage_sections：scope / 角色鉴权、6 种动作与 $ref、错误码、坐标拒绝、审计与 noop / dryRun',
+    async () => {
+      const f = await setupEnv();
+      await addTable(f.created.rooms, f.db, f.p1Id, 'orders');
+      await addTable(f.created.rooms, f.db, f.p1Id, 'items');
+      await addTable(f.created.rooms, f.db, f.p1Id, 'users');
+      const { model, seq } = await f.created.rooms.model(f.branch1);
+      const idOf = (name: string) => all(model, 'table').find((t) => t.name === name)!.id;
+      const [orders, items, users] = [idOf('orders'), idOf('items'), idOf('users')];
+      const tokRead = await f.issueToken(f.alice.id, ['read']);
+      const tokAlice = await f.issueToken(f.alice.id, ['read', 'write']);
+      const tokBob = await f.issueToken(f.bob.id, ['read', 'write']);
+      const peer = makePeer(f.alice);
+      await f.created.rooms.join(f.branch1, peer.peer);
+
+      // tools/list：write scope 可见，annotations 与 apply_changes 同为破坏性写入
+      const list = await parseRpc(
+        await f.mcpPost(tokAlice.token, { jsonrpc: '2.0', id: 70, method: 'tools/list', params: {} }),
+      );
+      const tool = (list.result!.tools as { name: string; annotations: Record<string, boolean> }[]).find(
+        (t) => t.name === 'manage_sections',
+      );
+      expect(tool?.annotations).toEqual({
+        readOnlyHint: false,
+        destructiveHint: true,
+        idempotentHint: false,
+        openWorldHint: false,
+      });
+
+      const deniedScope = await f.callTool(tokRead.token, 'manage_sections', {
+        project: f.p1Id,
+        actions: [{ action: 'create', name: 'x' }],
+      });
+      expect(deniedScope.structuredContent?.code).toBe('scope_required');
+      const deniedRole = await f.callTool(tokBob.token, 'manage_sections', {
+        project: f.p1Id,
+        actions: [{ action: 'create', name: 'x' }],
+      });
+      expect(deniedRole.structuredContent?.code).toBe('forbidden');
+
+      // 坐标 / 未知字段一律 invalid_arguments
+      for (const action of [
+        { action: 'create', name: 'x', x: 1, y: 2 },
+        { action: 'add_tables', section: 'sec-x', tables: [orders], positions: { [orders]: { x: 1, y: 1 } } },
+        { action: 'rename', section: 'sec-x', name: 'n', width: 100, height: 50 },
+      ]) {
+        const res = await f.callTool(tokAlice.token, 'manage_sections', {
+          project: f.p1Id,
+          actions: [action],
+        });
+        expect(res.structuredContent?.code, JSON.stringify(action)).toBe('invalid_arguments');
+      }
+
+      // 6 种动作 + $ref（同批创建后引用）
+      const created = await f.callTool(tokAlice.token, 'manage_sections', {
+        project: 'acme/orders',
+        actions: [
+          { action: 'create', ref: 'sales', name: '销售', tables: [orders, items] },
+          { action: 'create', ref: 'crm', name: '客户', color: 'peer-5' },
+          { action: 'add_tables', section: '$ref:crm', tables: [users, items] },
+          { action: 'rename', section: '$ref:sales', name: '订单中心' },
+          { action: 'recolor', section: '$ref:sales', color: 'peer-7' },
+        ],
+      });
+      expect(created.isError).toBeFalsy();
+      const refs = created.structuredContent?.refs as Record<string, string>;
+      expect(refs.sales).toMatch(SECTION_ID_RE);
+      expect(refs.crm).toMatch(SECTION_ID_RE);
+      expect(created.structuredContent).toMatchObject({
+        dryRun: false,
+        sectionsVer: 1,
+        moved: [{ tableId: items, from: refs.sales, to: refs.crm }],
+        sections: [
+          { id: refs.sales, name: '订单中心', color: 'peer-7', tables: [orders] },
+          { id: refs.crm, name: '客户', color: 'peer-5', tables: [users, items] },
+        ],
+      });
+      expect(created.structuredContent?.noop).toBeUndefined();
+      // 纯布局层：不产生画布修改历史 / seq；在线 peer 实时收到
+      expect((await f.created.rooms.model(f.branch1)).seq).toBe(seq);
+      expect(peer.sent.at(-1)).toEqual({
+        t: 'sections',
+        sections: created.structuredContent?.sections as CanvasSection[],
+      });
+
+      const removed = await f.callTool(tokAlice.token, 'manage_sections', {
+        project: f.p1Id,
+        actions: [
+          { action: 'remove_tables', section: refs.crm, tables: [users] },
+          { action: 'delete', section: refs.sales },
+        ],
+      });
+      expect(removed.structuredContent).toMatchObject({
+        sectionsVer: 2,
+        sections: [{ id: refs.crm, tables: [items] }],
+      });
+
+      // 错误码与 index
+      const errCases: [Record<string, unknown>[], Record<string, unknown>][] = [
+        [[{ action: 'rename', section: 'sec-missing', name: 'n' }], { code: 'section_not_found', index: 0 }],
+        [
+          [
+            { action: 'create', ref: 'a', name: 'A' },
+            { action: 'delete', section: '$ref:undefined_alias' },
+          ],
+          { code: 'section_not_found', index: 1 },
+        ],
+        [
+          [{ action: 'add_tables', section: refs.crm, tables: [orders, 'no-such-table'] }],
+          { code: 'table_not_found', index: 0, tableIds: ['no-such-table'] },
+        ],
+        [
+          [
+            { action: 'create', ref: 'dup', name: 'A' },
+            { action: 'create', ref: 'dup', name: 'B' },
+          ],
+          { code: 'invalid', index: 1 },
+        ],
+      ];
+      for (const [actions, expected] of errCases) {
+        const res = await f.callTool(tokAlice.token, 'manage_sections', { project: f.p1Id, actions });
+        expect(res.isError, JSON.stringify(actions)).toBe(true);
+        expect(res.structuredContent).toMatchObject(expected);
+      }
+
+      // noop 与 dryRun：不写库、不记审计
+      const noop = await f.callTool(tokAlice.token, 'manage_sections', {
+        project: f.p1Id,
+        actions: [{ action: 'remove_tables', section: refs.crm, tables: [users] }],
+      });
+      expect(noop.structuredContent).toMatchObject({ noop: true, sectionsVer: 2 });
+      const dry = await f.callTool(tokAlice.token, 'manage_sections', {
+        project: f.p1Id,
+        dryRun: true,
+        actions: [{ action: 'create', ref: 'preview', name: '预演' }],
+      });
+      expect(dry.structuredContent).toMatchObject({ dryRun: true, sectionsVer: 3 });
+      expect((dry.structuredContent!.sections as CanvasSection[]).map((x) => x.name)).toEqual([
+        '客户',
+        '预演',
+      ]);
+      const [b] = await f.db.query<{ sections: CanvasSection[]; sections_ver: number | string }>(
+        'select sections, sections_ver from branches where id = $1',
+        [f.branch1],
+      );
+      expect(Number(b!.sections_ver)).toBe(2);
+      expect(b!.sections.map((x) => x.id)).toEqual([refs.crm]);
+
+      // 审计：仅两次真实提交各 1 条（via: 'mcp'），dryRun / noop / 失败不记
+      const auditRows = await f.db.query<{ actor_id: string; data: Record<string, unknown> | string }>(
+        "select actor_id, data from audit_events where action = 'sections.update'",
+      );
+      expect(auditRows).toHaveLength(2);
+      expect(auditRows.every((row) => row.actor_id === f.alice.id)).toBe(true);
+      const datas = auditRows
+        .map(
+          (row) =>
+            (typeof row.data === 'string' ? JSON.parse(row.data) : row.data) as Record<string, unknown>,
+        )
+        .sort((a, b) => Number(a.sectionsVer) - Number(b.sectionsVer));
+      expect(datas[0]).toMatchObject({
+        via: 'mcp',
+        mcpToken: { id: tokAlice.id, name: tokAlice.name },
+        projectId: f.p1Id,
+        sectionsVer: 1,
+        opCount: 5,
+        actions: ['create', 'create', 'add_tables', 'rename', 'recolor'],
+        created: 2,
+        deleted: 0,
+        moved: 1,
+      });
+      expect(datas[1]).toMatchObject({ sectionsVer: 2, opCount: 2, created: 0, deleted: 1, moved: 0 });
+      expect(await f.db.query("select id from audit_events where action = 'model.mutate'")).toEqual([]);
+    },
+  );
+
+  test.skipIf(skip)('manage_sections：审计写入失败时整次板块写入原子回滚', async () => {
+    const f = await setupEnv();
+    const tokAlice = await f.issueToken(f.alice.id, ['read', 'write']);
+    await f.db.query('alter table audit_events rename to audit_events_off');
+    let res: ToolCallEnvelope;
+    try {
+      res = await f.callTool(tokAlice.token, 'manage_sections', {
+        project: f.p1Id,
+        actions: [{ action: 'create', name: '会回滚' }],
+      });
+    } finally {
+      await f.db.query('alter table audit_events_off rename to audit_events');
+    }
+    expect(res.isError).toBe(true);
+    expect(res.structuredContent?.code).toBe('internal');
+    const [b] = await f.db.query<{ sections: CanvasSection[]; sections_ver: number | string }>(
+      'select sections, sections_ver from branches where id = $1',
+      [f.branch1],
+    );
+    expect(b!.sections).toEqual([]);
+    expect(Number(b!.sections_ver)).toBe(0);
+    expect((await f.created.rooms.canvasState(f.branch1)).sections).toEqual([]);
+  });
+
+  test.skipIf(skip)(
+    'get_model 全分支附带 sections / sectionId / capabilities / target（只读平台缓存，环境 URL 不可达也成功）',
+    async () => {
+      const f = await setupEnv();
+      const tokAlice = await f.issueToken(f.alice.id, ['read', 'write']);
+      let parent = '';
+      let child = '';
+      let loose = '';
+      let ghostless = '';
+      await editModel(f.created.rooms, f.db, f.p1Id, (m) => {
+        const schema = all(m, 'schema').find((x) => x.name === 'public')?.id ?? createSchema(m, 'public');
+        parent = createTable(m, schema, 'events');
+        const p = m.objects[parent]!;
+        if (p.kind === 'table') p.partitionBy = 'RANGE (id)';
+        child = createTable(m, schema, 'events_2026');
+        const c = m.objects[child]!;
+        if (c.kind === 'table') c.partitionOf = { parent, bound: 'DEFAULT' };
+        loose = createTable(m, schema, 'loose');
+        ghostless = createTable(m, schema, 'to_drop');
+      });
+      const created = await f.callTool(tokAlice.token, 'manage_sections', {
+        project: f.p1Id,
+        actions: [
+          { action: 'create', ref: 'ev', name: '事件', color: 'peer-2', tables: [parent, ghostless] },
+        ],
+      });
+      const secId = (created.structuredContent!.refs as Record<string, string>).ev;
+      // 删表后板块里留下孤儿 ID：get_model 只展示存活的顶层表
+      await editModel(f.created.rooms, f.db, f.p1Id, (m) => {
+        delete m.objects[ghostless];
+      });
+
+      // 无环境：target 全为 null
+      const none = await f.callTool(tokAlice.token, 'get_model', { project: f.p1Id });
+      expect(none.structuredContent).toMatchObject({
+        dialect: 'pg',
+        capabilities: getDialect('pg').capabilities,
+        target: {
+          label: null,
+          features: null,
+          source: 'platform_cache',
+          environments: { total: 0, withCachedVersion: 0 },
+        },
+      });
+
+      // 环境 URL 指向不可达地址：只读平台缓存的数值版本，绝不连目标库
+      for (const [name, num] of [
+        ['ctx-16', 160004],
+        ['ctx-17', 170002],
+        ['ctx-unknown', null],
+      ] as const) {
+        await f.db.query(
+          `insert into environments (id, project_id, name, url_enc, production, allow_same_instance, engine_version_num)
+           values ($1, $2, $3, $4, $5, $6, $7)`,
+          [newId(), f.p1Id, name, encrypt('postgres://u:p@127.0.0.1:1/unreachable'), false, false, num],
+        );
+      }
+
+      const summary = await f.callTool(tokAlice.token, 'get_model', { project: f.p1Id });
+      expect(summary.isError).toBeFalsy();
+      const sc = summary.structuredContent!;
+      expect(sc.dialect).toBe('pg');
+      expect(sc.capabilities).toEqual(getDialect('pg').capabilities);
+      expect(sc.target).toMatchObject({
+        label: 'PG 16',
+        source: 'platform_cache',
+        environments: { total: 3, withCachedVersion: 2 },
+      });
+      expect((sc.target as { features: Record<string, boolean> }).features).toMatchObject({
+        nullsNotDistinct: true,
+        virtualGenerated: false,
+      });
+      expect(sc.sections).toEqual([{ id: secId, name: '事件', color: 'peer-2', tableCount: 1 }]);
+      const sectionIdOf = (name: string) =>
+        (sc.tables as { name: string; sectionId: string | null }[]).find((t) => t.name === name)?.sectionId;
+      expect(sectionIdOf('events')).toBe(secId);
+      expect(sectionIdOf('events_2026')).toBe(secId);
+      expect(sectionIdOf('loose')).toBeNull();
+      expect(loose).not.toBe('');
+
+      // 与 apply_changes.diagnostics.target 完全一致
+      const dry = await f.callTool(tokAlice.token, 'apply_changes', {
+        project: f.p1Id,
+        baseSeq: sc.seq as number,
+        dryRun: true,
+        ops: [{ name: 'createSchema', args: { id: '$ref:s', name: 'ctx_s' } }],
+      });
+      expect((dry.structuredContent!.diagnostics as { target: string }).target).toBe('PG 16');
+
+      // full：sections 带存活表列表，objects 仍是纯 IR 对象
+      const full = await f.callTool(tokAlice.token, 'get_model', { project: f.p1Id, detail: 'full' });
+      expect(full.structuredContent).toMatchObject({
+        truncated: false,
+        target: { label: 'PG 16' },
+        capabilities: getDialect('pg').capabilities,
+        sections: [{ id: secId, name: '事件', color: 'peer-2', tables: [parent] }],
+      });
+      const objects = full.structuredContent?.objects as Record<string, Record<string, unknown>>;
+      expect(objects[parent]).not.toHaveProperty('sectionId');
+      expect(Object.values(objects).some((o) => o.kind === 'section')).toBe(false);
+
+      // schema 过滤不存在：sections 为空数组，但上下文字段仍在
+      const missing = await f.callTool(tokAlice.token, 'get_model', { project: f.p1Id, schema: 'nope' });
+      expect(missing.structuredContent).toMatchObject({
+        sections: [],
+        target: { label: 'PG 16' },
+        capabilities: getDialect('pg').capabilities,
+      });
+
+      // truncated（> 200 表且未过滤 schema）：sections 为摘要，表摘要带 sectionId；SQLite 项目 target 为 null
+      let firstBig = '';
+      await editModel(f.created.rooms, f.db, f.p2Id, (m) => {
+        const schemaId = all(m, 'schema')[0]?.id ?? createSchema(m, 'main');
+        for (let i = 0; i < 205; i++) {
+          const tid = createTable(m, schemaId, `big_${i}`);
+          if (i === 0) firstBig = tid;
+        }
+      });
+      await f.callTool(tokAlice.token, 'manage_sections', {
+        project: f.p2Id,
+        actions: [{ action: 'create', ref: 'big', name: '大', tables: [firstBig] }],
+      });
+      const truncated = await f.callTool(tokAlice.token, 'get_model', { project: f.p2Id, detail: 'full' });
+      expect(truncated.structuredContent).toMatchObject({
+        truncated: true,
+        dialect: 'sqlite',
+        capabilities: getDialect('sqlite').capabilities,
+        target: { label: null, features: null, source: 'platform_cache' },
+      });
+      expect((truncated.structuredContent!.sections as { tableCount: number }[])[0]!.tableCount).toBe(1);
+      expect(
+        (truncated.structuredContent!.tables as { id: string; sectionId: string | null }[]).find(
+          (t) => t.id === firstBig,
+        )?.sectionId,
+      ).toMatch(SECTION_ID_RE);
+
+      // 资源模板同样附带
+      const resModel = await parseRpc(
+        await f.mcpPost(tokAlice.token, {
+          jsonrpc: '2.0',
+          id: 71,
+          method: 'resources/read',
+          params: { uri: 'dowel://projects/acme/orders/model' },
+        }),
+      );
+      const resData = JSON.parse(((resModel.result?.contents as { text: string }[]) ?? [])[0]!.text) as {
+        sections: unknown[];
+        target: { label: string | null };
+        capabilities: unknown;
+      };
+      expect(resData.sections).toEqual([{ id: secId, name: '事件', color: 'peer-2', tableCount: 1 }]);
+      expect(resData.target.label).toBe('PG 16');
+      expect(resData.capabilities).toEqual(getDialect('pg').capabilities);
     },
   );
 });
