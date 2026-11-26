@@ -1,6 +1,6 @@
 // 画布板块（Section）的服务端验证、持久化与 HA 跨副本同步测试。
 import { type CanvasSection, SECTION_COLORS } from '@dowel/api';
-import { emptyModel, newId } from '@dowel/core';
+import { createSchema, createTable, emptyModel, type Model, newId } from '@dowel/core';
 import type { ToClient } from '@dowel/sync';
 import { afterAll, afterEach, beforeAll, describe, expect, test } from 'vitest';
 
@@ -1656,6 +1656,464 @@ describe('画布板块在途落库与重载竞态回归', () => {
       db.query = origQuery;
       rooms2.close();
       await rooms2.flush();
+    }
+  });
+});
+
+// ───── MCP manage_sections：锁内增量合并、并发重放与条件写（ADR 0015 第 1 节） ─────
+
+const makeRecordingBus = (replicaId: string) => {
+  const fake = makeFakeBus(replicaId);
+  const published: ClusterEvent[] = [];
+  (fake.bus as unknown as { publish: (e: object) => Promise<void> }).publish = async (e) => {
+    published.push({ origin: replicaId, ...e } as ClusterEvent);
+  };
+  return { ...fake, published };
+};
+
+describe('manage_sections：房间锁内增量板块写入（SQLite）', () => {
+  let db: PlatformDb;
+  let created: ReturnType<typeof createApp>;
+  let projectId: string;
+  let editorUser: User;
+  let counter = 0;
+
+  beforeAll(async () => {
+    db = await openPlatformDb(':memory:');
+    created = createApp(db);
+    await makeUser(db, 'msec-admin', { name: '板块管理员' });
+    editorUser = await makeUser(db, 'msec-editor', { name: '板块编辑者' });
+    const login = await created.app.request('/api/auth/login', {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ username: 'msec-admin', password: PASSWORD }),
+    });
+    const cookie = login.headers.get('set-cookie')!.split(';')[0]!;
+    const grp = await created.app.request('/api/groups', {
+      method: 'POST',
+      headers: { cookie, 'content-type': 'application/json' },
+      body: JSON.stringify({ slug: 'msec-g', name: '增量板块组', defaultRole: 'none' }),
+    });
+    const groupId = ((await grp.json()) as { id: string }).id;
+    const proj = await created.app.request('/api/projects', {
+      method: 'POST',
+      headers: { cookie, 'content-type': 'application/json' },
+      body: JSON.stringify({ name: '增量板块项目', groupId }),
+    });
+    projectId = ((await proj.json()) as { id: string }).id;
+    await db.query(
+      `insert into grants (id, subject_kind, subject_id, role, scope_kind, scope_id)
+       values ($1, 'user', $2, 'editor', 'project', $3)`,
+      [newId(), editorUser.id, projectId],
+    );
+  });
+
+  afterAll(async () => {
+    created.rooms.close();
+    await created.rooms.flush();
+    await created.shadows.close();
+    await created.bus.close();
+    await db.close();
+  });
+
+  const setup = async (tableCount = 3) => {
+    counter += 1;
+    const branchId = `msec-${counter}-${newId()}`;
+    await db.query('insert into branches (id, project_id, name) values ($1, $2, $3)', [
+      branchId,
+      projectId,
+      `msec-${counter}`,
+    ]);
+    const model: Model = emptyModel();
+    const schema = createSchema(model, 'public');
+    const tables = Array.from({ length: tableCount }, (_, i) => createTable(model, schema, `t${i + 1}`));
+    const part = createTable(model, schema, 'p1');
+    const partObj = model.objects[part]!;
+    if (partObj.kind === 'table') partObj.partitionOf = { parent: tables[0]!, bound: 'DEFAULT' };
+    const bus = makeRecordingBus('replica-m');
+    const rooms = new Rooms(
+      db,
+      (u, pid, lookup) => effectiveProjectRole(db, u, pid, lookup),
+      bus.bus,
+      undefined,
+      { layoutDebounceMs: 5000 },
+    );
+    await rooms.init(branchId, model);
+    const peer = makePeer(editorUser);
+    await rooms.join(branchId, peer.peer);
+    const dbRow = async () => {
+      const [row] = await db.query<{ sections: CanvasSection[]; sections_ver: number | string }>(
+        'select sections, sections_ver from branches where id = $1',
+        [branchId],
+      );
+      return { sections: row!.sections, ver: Number(row!.sections_ver) };
+    };
+    return { branchId, rooms, bus, peer, tables, part, schema, dbRow };
+  };
+
+  test('合并尚未落盘的 WS 防抖编辑，落库后清 pending，并广播给本地 peers 与其他副本；不进 IR / seq', async () => {
+    const f = await setup();
+    try {
+      const human: CanvasSection[] = [{ id: 'sec-h', name: '人工', color: 'peer-1', tables: [f.tables[0]!] }];
+      await f.rooms.message(f.branchId, f.peer.peer, { t: 'sections', sections: human });
+      const r = await f.rooms.get(f.branchId);
+      expect(r.sectionsPending).toBe(true);
+      expect((await f.dbRow()).sections).toEqual([]);
+      const before = await f.rooms.model(f.branchId);
+
+      const res = await f.rooms.manageSections(f.branchId, {
+        actions: [{ action: 'create', id: 'sec-ai', name: 'AI 板块', tables: [f.tables[1]!, f.tables[0]!] }],
+      });
+      expect(res).toMatchObject({ ok: true, dryRun: false, sectionsVer: 2 });
+      const expected: CanvasSection[] = [
+        { id: 'sec-h', name: '人工', color: 'peer-1', tables: [] },
+        { id: 'sec-ai', name: 'AI 板块', color: SECTION_COLORS[1], tables: [f.tables[1]!, f.tables[0]!] },
+      ];
+      expect(res.ok && res.sections).toEqual(expected);
+      expect(res.ok && res.moved).toEqual([{ tableId: f.tables[0]!, from: 'sec-h', to: 'sec-ai' }]);
+      expect(await f.dbRow()).toEqual({ sections: expected, ver: 2 });
+      expect(r.sectionsPending).toBe(false);
+      expect(r.sectionsTimer).toBeUndefined();
+      expect(r.sections).toEqual(expected);
+      expect(f.peer.sent.at(-1)).toEqual({ t: 'sections', sections: expected });
+      expect(f.bus.published.at(-1)).toMatchObject({ t: 'room.sections', sections: expected, ver: 2 });
+
+      const after = await f.rooms.model(f.branchId);
+      expect(after.seq).toBe(before.seq);
+      expect(after.model).toEqual(before.model);
+      expect(await db.query('select seq from room_commits where branch_id = $1', [f.branchId])).toEqual([]);
+
+      const state = await f.rooms.canvasState(f.branchId);
+      expect(state.sections).toEqual(expected);
+      expect(state.sectionsVer).toBe(2);
+    } finally {
+      f.rooms.close();
+      await f.rooms.flush();
+    }
+  });
+
+  test('校验失败 / noop / dryRun：零写库、零回调、零广播', async () => {
+    const f = await setup();
+    try {
+      const first = await f.rooms.manageSections(f.branchId, {
+        actions: [{ action: 'create', id: 'sec-1', name: '一', tables: [f.tables[0]!] }],
+      });
+      expect(first.ok).toBe(true);
+      const snapshot = await f.dbRow();
+      const sentBefore = f.peer.sent.length;
+      const publishedBefore = f.bus.published.length;
+      let calls = 0;
+      const onBeforeCommit = async () => {
+        calls += 1;
+      };
+
+      const missing = await f.rooms.manageSections(f.branchId, {
+        actions: [{ action: 'add_tables', section: 'sec-1', tables: ['no-such-table', f.schema] }],
+        onBeforeCommit,
+      });
+      expect(missing).toMatchObject({
+        ok: false,
+        code: 'table_not_found',
+        index: 0,
+        tableIds: ['no-such-table', f.schema],
+      });
+      const partition = await f.rooms.manageSections(f.branchId, {
+        actions: [{ action: 'add_tables', section: 'sec-1', tables: [f.part] }],
+        onBeforeCommit,
+      });
+      expect(partition).toMatchObject({ ok: false, code: 'invalid', index: 0 });
+      const notFound = await f.rooms.manageSections(f.branchId, {
+        actions: [
+          { action: 'rename', section: 'sec-1', name: '改名' },
+          { action: 'delete', section: 'sec-x' },
+        ],
+        onBeforeCommit,
+      });
+      expect(notFound).toMatchObject({ ok: false, code: 'section_not_found', index: 1 });
+
+      const noop = await f.rooms.manageSections(f.branchId, {
+        actions: [
+          { action: 'rename', section: 'sec-1', name: '一' },
+          { action: 'remove_tables', section: 'sec-1', tables: ['never-there'] },
+        ],
+        onBeforeCommit,
+      });
+      expect(noop).toMatchObject({ ok: true, noop: true, sectionsVer: snapshot.ver });
+
+      const dry = await f.rooms.manageSections(f.branchId, {
+        dryRun: true,
+        actions: [{ action: 'create', id: 'sec-dry', name: '预演' }],
+        onBeforeCommit,
+      });
+      expect(dry).toMatchObject({ ok: true, dryRun: true, sectionsVer: snapshot.ver + 1 });
+      expect(dry.ok && dry.sections.map((x) => x.id)).toEqual(['sec-1', 'sec-dry']);
+      expect(dry.ok && dry.noop).toBeUndefined();
+
+      expect(calls).toBe(0);
+      expect(await f.dbRow()).toEqual(snapshot);
+      expect(f.peer.sent).toHaveLength(sentBefore);
+      expect(f.bus.published).toHaveLength(publishedBefore);
+      expect((await f.rooms.get(f.branchId)).sections.map((x) => x.id)).toEqual(['sec-1']);
+    } finally {
+      f.rooms.close();
+      await f.rooms.flush();
+    }
+  });
+
+  test('onBeforeCommit 抛错：整次板块写入原子回滚，内存与 DB 均不变且不广播', async () => {
+    const f = await setup();
+    try {
+      const sentBefore = f.peer.sent.length;
+      await expect(
+        f.rooms.manageSections(f.branchId, {
+          actions: [{ action: 'create', id: 'sec-boom', name: '回滚' }],
+          onBeforeCommit: async (tx) => {
+            await tx.query("update branches set name = 'renamed-in-tx' where id = $1", [f.branchId]);
+            throw new Error('审计写入失败');
+          },
+        }),
+      ).rejects.toThrow('审计写入失败');
+      expect(await f.dbRow()).toEqual({ sections: [], ver: 0 });
+      const [b] = await db.query<{ name: string }>('select name from branches where id = $1', [f.branchId]);
+      expect(b!.name).not.toBe('renamed-in-tx');
+      const r = await f.rooms.get(f.branchId);
+      expect(r.sections).toEqual([]);
+      expect(r.sectionsPending).toBe(false);
+      expect(f.peer.sent).toHaveLength(sentBefore);
+      expect(f.bus.published.filter((e) => e.t.startsWith('room.sections'))).toEqual([]);
+    } finally {
+      f.rooms.close();
+      await f.rooms.flush();
+    }
+  });
+
+  test('事务等待期间穿插 WS 编辑：用同一批动作（复用生成的 ID）在人的最新编辑上重放并排期落盘', async () => {
+    const f = await setup();
+    try {
+      const human: CanvasSection[] = [
+        { id: 'sec-human', name: '人工新建', color: 'peer-4', tables: [f.tables[2]!] },
+      ];
+      const res = await f.rooms.manageSections(f.branchId, {
+        actions: [{ action: 'create', id: 'sec-ai', name: 'AI', tables: [f.tables[0]!] }],
+        onBeforeCommit: async () => {
+          // 事务挂起期间同副本到达了人的 WS 全量板块（基于不含本批的旧状态）
+          await f.rooms.message(f.branchId, f.peer.peer, { t: 'sections', sections: human });
+        },
+      });
+      const merged: CanvasSection[] = [
+        ...human,
+        { id: 'sec-ai', name: 'AI', color: SECTION_COLORS[1], tables: [f.tables[0]!] },
+      ];
+      expect(res).toMatchObject({ ok: true, sections: merged });
+      expect(res.ok && res.superseded).toBeUndefined();
+      const r = await f.rooms.get(f.branchId);
+      expect(r.sections).toEqual(merged);
+      expect(r.sectionsPending).toBe(true);
+      expect(res.ok && res.sectionsVer).toBe(r.sectionsVersion?.ver);
+      expect(res.ok && res.sectionsVer).toBeGreaterThan(2);
+      expect(f.peer.sent.at(-1)).toEqual({ t: 'sections', sections: merged });
+      await f.rooms.flush();
+      expect((await f.dbRow()).sections).toEqual(merged);
+    } finally {
+      f.rooms.close();
+      await f.rooms.flush();
+    }
+  });
+
+  test('事务等待期间人删掉了目标板块：重放失败时人的编辑胜出并返回 superseded', async () => {
+    const f = await setup();
+    try {
+      await f.rooms.manageSections(f.branchId, {
+        actions: [{ action: 'create', id: 'sec-a', name: 'A' }],
+      });
+      const res = await f.rooms.manageSections(f.branchId, {
+        actions: [{ action: 'add_tables', section: 'sec-a', tables: [f.tables[0]!] }],
+        onBeforeCommit: async () => {
+          await f.rooms.message(f.branchId, f.peer.peer, { t: 'sections', sections: [] });
+        },
+      });
+      expect(res).toMatchObject({ ok: true, superseded: true, sections: [] });
+      const r = await f.rooms.get(f.branchId);
+      expect(r.sections).toEqual([]);
+      await f.rooms.flush();
+      expect((await f.dbRow()).sections).toEqual([]);
+    } finally {
+      f.rooms.close();
+      await f.rooms.flush();
+    }
+  });
+
+  test('结果超 7000B 时发布 room.sections.reload（DB 已先落库）', async () => {
+    const f = await setup(60);
+    try {
+      const actions = Array.from({ length: 50 }, (_, i) => ({
+        action: 'create' as const,
+        id: `sec-big-${String(i).padStart(3, '0')}-${'x'.repeat(80)}`,
+        name: `大板块 ${i} ${'名'.repeat(40)}`,
+        tables: [f.tables[i]!],
+      }));
+      const res = await f.rooms.manageSections(f.branchId, { actions });
+      expect(res.ok).toBe(true);
+      const last = f.bus.published.at(-1);
+      expect(last).toMatchObject({ t: 'room.sections.reload', branchId: f.branchId, ver: 1 });
+      expect(f.bus.published.some((e) => e.t === 'room.sections')).toBe(false);
+      expect((await f.dbRow()).sections).toHaveLength(50);
+      expect(f.peer.sent.at(-1)).toMatchObject({ t: 'sections' });
+    } finally {
+      f.rooms.close();
+      await f.rooms.flush();
+    }
+  });
+
+  test('flushSections 条件写：DB 已有更高版本时旧副本防抖落盘绝不覆盖，转而重载获胜版本推给 peers', async () => {
+    const f = await setup();
+    try {
+      const stale: CanvasSection[] = [{ id: 'sec-stale', name: '旧副本', color: 'peer-1', tables: [] }];
+      await f.rooms.message(f.branchId, f.peer.peer, { t: 'sections', sections: stale });
+      const winner: CanvasSection[] = [{ id: 'sec-mcp', name: 'MCP 新提交', color: 'peer-2', tables: [] }];
+      // 模拟其他副本经 manage_sections 已提交 ver = 7（本副本尚未收到事件）
+      await db.query('update branches set sections = $2::text::jsonb, sections_ver = 7 where id = $1', [
+        f.branchId,
+        JSON.stringify(winner),
+      ]);
+      await f.rooms.flush();
+      expect(await f.dbRow()).toEqual({ sections: winner, ver: 7 });
+      await waitFor(() => {
+        const m = f.peer.sent.at(-1);
+        return m?.t === 'sections' && m.sections[0]?.id === 'sec-mcp';
+      });
+      const r = await f.rooms.get(f.branchId);
+      expect(r.sectionsPending).toBe(false);
+      expect(r.sections).toEqual(winner);
+      expect(r.sectionsClock).toBeGreaterThanOrEqual(7);
+
+      // 之后的本地编辑版本已推进到 DB 之上，可正常落库
+      const next: CanvasSection[] = [
+        ...winner,
+        { id: 'sec-next', name: '之后', color: 'peer-3', tables: [] },
+      ];
+      await f.rooms.message(f.branchId, f.peer.peer, { t: 'sections', sections: next });
+      await f.rooms.flush();
+      expect(await f.dbRow()).toEqual({ sections: next, ver: 8 });
+    } finally {
+      f.rooms.close();
+      await f.rooms.flush();
+    }
+  });
+
+  test('canvasState：DB 更热（跨副本已提交）且本副本无待刷写入时同步追齐内存并补发本地 peers', async () => {
+    const f = await setup();
+    try {
+      const remote: CanvasSection[] = [
+        { id: 'sec-remote', name: '远端', color: 'peer-6', tables: [f.tables[0]!] },
+      ];
+      await db.query('update branches set sections = $2::text::jsonb, sections_ver = 3 where id = $1', [
+        f.branchId,
+        JSON.stringify(remote),
+      ]);
+      const state = await f.rooms.canvasState(f.branchId);
+      expect(state.sections).toEqual(remote);
+      expect(state.sectionsVer).toBe(3);
+      const r = await f.rooms.get(f.branchId);
+      expect(r.sections).toEqual(remote);
+      expect(r.sectionsVersion).toEqual({ ver: 3, origin: '' });
+      expect(f.peer.sent.at(-1)).toEqual({ t: 'sections', sections: remote });
+      // 后续增量写入基于追齐后的版本
+      const res = await f.rooms.manageSections(f.branchId, {
+        actions: [{ action: 'rename', section: 'sec-remote', name: '远端改名' }],
+      });
+      expect(res).toMatchObject({ ok: true, sectionsVer: 4 });
+    } finally {
+      f.rooms.close();
+      await f.rooms.flush();
+    }
+  });
+});
+
+describe.skipIf(!PG_URL)('manage_sections：PG HA 双副本并发', () => {
+  const cleanups: (() => Promise<void>)[] = [];
+  afterEach(async () => {
+    while (cleanups.length) await cleanups.pop()!().catch(() => {});
+  });
+
+  test('双副本并发增量创建互不抹除，且跨副本 canvasState 立即可见；冷副本 WS 旧落盘不覆盖', async () => {
+    const pg = await createTestDb('msec_ha');
+    const dbA = await openPlatformDb(pg.url);
+    const dbB = await openPlatformDb(pg.url);
+    const channel = `dowel_msec_${newId()
+      .replace(/[^a-z0-9]/gi, '')
+      .slice(0, 8)
+      .toLowerCase()}`;
+    const appA = createApp(dbA, { bus: { replicaId: 'msec-a', channel }, rooms: { layoutDebounceMs: 5000 } });
+    const appB = createApp(dbB, { bus: { replicaId: 'msec-b', channel }, rooms: { layoutDebounceMs: 5000 } });
+    await appA.bus.start();
+    await appB.bus.start();
+    cleanups.push(async () => {
+      appA.rooms.close();
+      appB.rooms.close();
+      await Promise.all([appA.rooms.flush(), appB.rooms.flush()]);
+      await Promise.all([appA.shadows.close(), appB.shadows.close()]);
+      await Promise.all([appA.bus.close(), appB.bus.close()]);
+      await Promise.all([appA.ha.stop().catch(() => {}), appB.ha.stop().catch(() => {})]);
+      await Promise.all([dbA.close(), dbB.close()]);
+      await pg.close();
+    });
+    const branchId = `msec-ha-${newId()}`;
+    const [pr] = await dbA.query<{ id: string }>('select id from projects limit 1');
+    let projectId = pr?.id;
+    if (!projectId) {
+      await makeUser(dbA, 'msec-ha-admin', { name: '管理员', role: 'admin' });
+      const login = await appA.app.request('/api/auth/login', {
+        method: 'POST',
+        headers: { 'content-type': 'application/json' },
+        body: JSON.stringify({ username: 'msec-ha-admin', password: PASSWORD }),
+      });
+      const cookie = login.headers.get('set-cookie')!.split(';')[0]!;
+      const grp = await appA.app.request('/api/groups', {
+        method: 'POST',
+        headers: { cookie, 'content-type': 'application/json' },
+        body: JSON.stringify({ slug: 'msec-ha', name: 'HA 增量板块', defaultRole: 'editor' }),
+      });
+      const groupId = ((await grp.json()) as { id: string }).id;
+      const proj = await appA.app.request('/api/projects', {
+        method: 'POST',
+        headers: { cookie, 'content-type': 'application/json' },
+        body: JSON.stringify({ name: 'HA 增量板块项目', groupId }),
+      });
+      projectId = ((await proj.json()) as { id: string }).id;
+    }
+    await dbA.query('insert into branches (id, project_id, name) values ($1, $2, $3)', [
+      branchId,
+      projectId,
+      'msec-ha',
+    ]);
+    const model: Model = emptyModel();
+    const schema = createSchema(model, 'public');
+    const t1 = createTable(model, schema, 't1');
+    const t2 = createTable(model, schema, 't2');
+    await appA.rooms.init(branchId, model);
+
+    // 副本 B 预先加载房间（冷副本：内存板块版本为 0）
+    await appB.rooms.canvasState(branchId);
+
+    const results = await Promise.all([
+      appA.rooms.manageSections(branchId, {
+        actions: [{ action: 'create', id: 'sec-a', name: 'A', tables: [t1] }],
+      }),
+      appB.rooms.manageSections(branchId, {
+        actions: [{ action: 'create', id: 'sec-b', name: 'B', tables: [t2] }],
+      }),
+    ]);
+    expect(results.every((x) => x.ok)).toBe(true);
+    const [row] = await dbA.query<{ sections: CanvasSection[]; sections_ver: string | number }>(
+      'select sections, sections_ver from branches where id = $1',
+      [branchId],
+    );
+    expect(row!.sections.map((x) => x.id).sort()).toEqual(['sec-a', 'sec-b']);
+    expect(Number(row!.sections_ver)).toBe(2);
+    for (const app of [appA, appB]) {
+      const st = await app.rooms.canvasState(branchId);
+      expect(st.sections.map((x) => x.id).sort()).toEqual(['sec-a', 'sec-b']);
     }
   });
 });

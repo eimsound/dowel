@@ -2,7 +2,9 @@
 // 验证双副本间通过 MCP apply_changes 修改工作副本后：
 // 1. 副本 A 提交，副本 B 立即通过 MCP get_model 读到最新 seq 与模型；
 // 2. 双副本同时基于同一 baseSeq 修改同一对象，行锁串行化后仅一方提交、另一方收到 conflict；
-// 3. 副本 B 上在线的 WS 协作者实时收到副本 A 上 MCP 提交的 commit 广播。
+// 3. 副本 B 上在线的 WS 协作者实时收到副本 A 上 MCP 提交的 commit 广播；
+// 4. 双副本并发 manage_sections 增量创建板块互不抹除，跨副本 get_model 立即可见，WS peer 实时收到板块更新。
+import type { CanvasSection } from '@dowel/api';
 import { all, type Model, newId } from '@dowel/core';
 import type { Commit, ToClient } from '@dowel/sync';
 import { afterEach, describe, expect, test } from 'vitest';
@@ -368,5 +370,62 @@ describe.skipIf(!PG_URL)('HA2 MCP 服务跨副本一致性（真实 PG 双副本
     expect(modelA.result?.structuredContent).toEqual(modelB.result?.structuredContent);
     const rejRows = await f.dbA.query('select * from room_rejections where branch_id = $1', [f.branchId]);
     expect(rejRows).toEqual([]);
+  });
+  test('双副本并发 manage_sections 增量创建互不抹除，跨副本 get_model 立即可见且 WS peer 实时收到', async () => {
+    const f = await boot('sections_concurrent');
+    const seed = await callMcpTool(f.appA.app, f.tokenAlice, 'apply_changes', {
+      project: f.projectId,
+      baseSeq: 0,
+      ops: [
+        { name: 'createTable', args: { id: '$ref:a', schema: f.schemaId, name: 'sec_a' } },
+        { name: 'createTable', args: { id: '$ref:b', schema: f.schemaId, name: 'sec_b' } },
+      ],
+    });
+    const tables = seed.result?.structuredContent?.refs as Record<string, string>;
+    const peerB = makePeer(f.bob);
+    await f.appB.rooms.join(f.branchId, peerB.peer);
+
+    const [resA, resB] = await Promise.all([
+      callMcpTool(f.appA.app, f.tokenAlice, 'manage_sections', {
+        project: f.projectId,
+        actions: [{ action: 'create', ref: 'x', name: 'A 区', tables: [tables.a] }],
+      }),
+      callMcpTool(f.appB.app, f.tokenBob, 'manage_sections', {
+        project: f.projectId,
+        actions: [{ action: 'create', ref: 'y', name: 'B 区', tables: [tables.b] }],
+      }),
+    ]);
+    expect(resA.result?.isError).toBeFalsy();
+    expect(resB.result?.isError).toBeFalsy();
+    const vers = [resA, resB]
+      .map((r) => Number(r.result?.structuredContent?.sectionsVer))
+      .sort((x, y) => x - y);
+    expect(vers).toEqual([1, 2]);
+
+    for (const [app, token] of [
+      [f.appA.app, f.tokenAlice],
+      [f.appB.app, f.tokenBob],
+    ] as const) {
+      const gm = await callMcpTool(app, token, 'get_model', { project: f.projectId });
+      const sc = gm.result?.structuredContent as {
+        sections: { name: string; tableCount: number }[];
+        tables: { name: string; sectionId: string | null }[];
+      };
+      expect(sc.sections.map((x) => x.name).sort()).toEqual(['A 区', 'B 区']);
+      expect(sc.tables.every((t) => t.sectionId !== null)).toBe(true);
+    }
+    await waitFor(() => {
+      const last = peerB.sent
+        .filter((m): m is Extract<Extra, { t: 'sections' }> => m.t === 'sections')
+        .at(-1);
+      return last?.sections.length === 2;
+    });
+    const [row] = await f.dbA.query<{ sections: CanvasSection[] }>(
+      'select sections from branches where id = $1',
+      [f.branchId],
+    );
+    expect(row!.sections.map((x) => x.name).sort()).toEqual(['A 区', 'B 区']);
+    const audits = await f.dbA.query("select id from audit_events where action = 'sections.update'");
+    expect(audits).toHaveLength(2);
   });
 });

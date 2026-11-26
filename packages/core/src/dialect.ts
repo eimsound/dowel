@@ -74,6 +74,18 @@ export interface DialectVersioning {
     model: Model,
     versionNums: readonly (number | null | undefined)[],
   ): DialectCompatibility | null;
+  /**
+   * 按项目全部环境的数值版本号推导最低目标版本的展示标签与门控特性（纯函数、不连库）。
+   * 与 compatibility() 共用同一套推导，保证 label 与诊断里的 target 完全一致；
+   * 无可推导的目标版本或方言不区分版本时返回 null（不提供即视为 null）。
+   */
+  targetInfo?(versionNums: readonly (number | null | undefined)[]): DialectTargetInfo | null;
+}
+
+/** 推导出的项目最低目标版本：label 如 'PG 15'、'MySQL 8.4'、'SQL Server 2022'；features 为按该版本门控的特性开关 */
+export interface DialectTargetInfo {
+  label: string;
+  features: Record<string, boolean>;
 }
 
 /** 静态兼容性检查结果：target 为人类可读的目标版本（如 'PG 15'、'MySQL 8.4'、'SQL Server 2022'） */
