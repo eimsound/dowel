@@ -6,10 +6,10 @@
 // - rooms/ops.ts：WS hello / op 与系统 replace / patch 的有序持久化
 // - rooms/access.ts + rooms/peers.ts：成员准入、权限刷新单飞队列、跨副本在线成员与 presence
 // - rooms/layout.ts + rooms/sections.ts：画布布局 / 板块的 LWW 同步、防抖落盘与超限重载
-// - rooms/history.ts：画布修改历史；rooms/mcp.ts：MCP 原子批量写入
+// - rooms/history.ts：画布修改历史；rooms/mcp.ts：MCP 原子批量写入（板块增量写入 manage_sections 在 rooms/sections.ts）
 // - rooms/cluster.ts：集群事件分派与事件总线重连补偿
 
-import type { CanvasHistoryEntry, CanvasHistoryList } from '@dowel/api';
+import type { CanvasHistoryEntry, CanvasHistoryList, CanvasSection } from '@dowel/api';
 import type { Model, Obj } from '@dowel/core';
 import type { Commit, ToServer, Versions } from '@dowel/sync';
 
@@ -24,7 +24,7 @@ import { LayoutSync } from './rooms/layout.ts';
 import { type ApplyMcpOpsOptions, type ApplyMcpOpsResult, McpWriter } from './rooms/mcp.ts';
 import { RoomOps } from './rooms/ops.ts';
 import { RoomPeers } from './rooms/peers.ts';
-import { SectionsSync } from './rooms/sections.ts';
+import { type ManageSectionsOptions, type ManageSectionsResult, SectionsSync } from './rooms/sections.ts';
 import type { ExtraIn, Loaded, Peer, ResolveRole, RoomsOptions } from './rooms/types.ts';
 
 export {
@@ -34,6 +34,7 @@ export {
   type ApplyMcpOpsResult,
   MCP_DISALLOWED_MUTATORS,
 } from './rooms/mcp.ts';
+export { type ManageSectionsOptions, type ManageSectionsResult } from './rooms/sections.ts';
 export {
   type Extra,
   type ExtraIn,
@@ -218,6 +219,48 @@ export class Rooms {
       versions: { ...room.versions },
       seq: room.seq,
     }));
+  }
+
+  /**
+   * 画布只读上下文（get_model）：单次房间锁内原子拍下模型、对象版本、seq 与板块，
+   * 再与 DB 板块做一次 freshestSections 比较，保证跨副本 manage_sections 提交后立即强一致可见。
+   */
+  async canvasState(branchId: string): Promise<{
+    model: Model;
+    versions: Versions;
+    seq: number;
+    sections: CanvasSection[];
+    sectionsVer: number;
+  }> {
+    const snap = await this.k.readFresh(branchId, (room, r) => ({
+      r,
+      model: structuredClone(room.model),
+      versions: { ...room.versions },
+      seq: room.seq,
+      sections: structuredClone(r.sections),
+      sectionsVersion: r.sectionsVersion,
+      sectionsPending: r.sectionsPending,
+    }));
+    const fresh = await this.sections.readFreshest(branchId, snap.r, {
+      sections: snap.sections,
+      version: snap.sectionsVersion,
+      pending: snap.sectionsPending,
+    });
+    return {
+      model: snap.model,
+      versions: snap.versions,
+      seq: snap.seq,
+      sections: fresh.sections,
+      sectionsVer: fresh.ver,
+    };
+  }
+
+  /**
+   * 代表 MCP 令牌增量调整画布板块（纯布局层：只写 branches.sections / sections_ver，不进 IR、room_commits 与 seq）。
+   * 锁序：withActiveRoomLock → 板块 IO 锁 → DB 事务（PG `branches FOR UPDATE` + catchUpFrom）→ 释放锁后广播。
+   */
+  manageSections(branchId: string, opts: ManageSectionsOptions): Promise<ManageSectionsResult> {
+    return this.sections.manage(branchId, opts);
   }
 
   async model(branchId: string): Promise<{ model: Model; seq: number }> {
