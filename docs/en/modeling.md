@@ -22,7 +22,7 @@ Dowel supports importing from a live environment or from a `.sql` file. Both pat
 
 ## Shadow database isolation and safety {#shadow-database}
 
-SQLite uses an in-process `:memory:` shadow database. PostgreSQL, MySQL, and SQL Server use a real shadow database of the same dialect to normalize expressions, import SQL, run round-trip verification, and measure statement risks.
+SQLite uses an in-process `:memory:` shadow database. PostgreSQL, MySQL, and SQL Server use a real shadow database of the same dialect to normalize expressions, import SQL, run round-trip verification, and measure statement risks. Dowel does **not** connect to the shadow database in the background while you edit the canvas (see [Expression normalization](#normalization)); it is used only when you import, verify, publish, generate a migration or export DDL, or click Normalize.
 
 - **Shadow database resolution order.**
   1. An explicit separate shadow database URL configured on the environment.
@@ -112,6 +112,15 @@ GO
 - While you edit an object in the properties panel (such as a `CHECK` expression or column rename), if another editor commits a conflicting change to that object or a column it references, the server rejects your save, identifies who made the earlier change, and refreshes your client to avoid silent overwrites.
 - Dragging table positions on the canvas uses a separate layout channel that never triggers schema conflicts or enters database version snapshots.
 
+### Expression normalization {#normalization}
+
+CHECK constraints, defaults, generated columns, expression indexes, and partition expressions have a canonical form in the database (for example, PostgreSQL stores `total >= 0` as `(total >= (0)::numeric)`). After you rename tables or columns that views, triggers, and other opaque objects reference, the database must regenerate their definitions too. Dowel calls this **normalization**: it replays the model in the shadow database, reads back the engine's canonical form, and writes it to the working copy so it compares cleanly with structures read from live databases.
+
+- **No automatic normalization while editing.** After you save, the canvas keeps the text you wrote, and the model page status bar shows "N pending normalization" (or "Expressions normalized" when nothing is pending).
+- **Manual normalization.** Project editors can click **Normalize** in the status bar at any time to check in the shadow database and write back the canonical form. The button is unavailable, with the reason explained, when no shadow database is usable (for example, when the only environment is production without same-instance shadow databases allowed). If an expression fails in the shadow database, Dowel reports the error and leaves the working copy unchanged.
+- **Automatic normalization before key operations.** Before publishing a version, generating a migration, exporting DDL, verifying in the shadow database, viewing version or history diffs, previewing an import from an environment, previewing an environment attach, or reading the model through MCP, the server normalizes pending objects first, so results always use the canonical form. Without a shadow database this step is skipped (for example, the version is published as unverified), and migrations and DDL remain available.
+- Write-backs from normalization appear in canvas history as system normalization commits.
+
 ### Canvas history and restore {#canvas-history}
 
 Every structural commit to the working copy is stored with an increasing sequence number (`seq`).
@@ -181,6 +190,6 @@ Clicking Verify in shadow database runs two checks:
 
 ### General modeling boundaries {#modeling-limits}
 
-- **Opaque objects.** Views, materialized views, functions, stored procedures, triggers, row-level security policies, domains, custom composite types, and exclusion constraints are stored as opaque objects. Dowel imports them, drops and recreates them in dependency order during migrations, and rewrites their definitions when referenced tables or columns are renamed, while direct form editing in the canvas is disabled.
+- **Opaque objects.** Views, materialized views, functions, stored procedures, triggers, row-level security policies, domains, custom composite types, and exclusion constraints are stored as opaque objects. Dowel imports them, drops and recreates them in dependency order during migrations, and has the shadow database rewrite their definitions during [normalization](#normalization) (manual, or automatic before publishing and generating migrations) after referenced tables or columns are renamed, while direct form editing in the canvas is disabled.
 - **Read-only SQL views.** SQL previews and DDL panels in the UI are read-only. Modify the model on the canvas, in the properties panel, or by importing SQL.
 - **Enum types.** PostgreSQL supports standalone `ENUM` objects. Adding values generates `ALTER TYPE ... ADD VALUE`, while removing or reordering values generates steps to rebuild the type and update affected column types. MySQL uses inline column `enum(...)` and `set(...)` definitions.

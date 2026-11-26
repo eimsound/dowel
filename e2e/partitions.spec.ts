@@ -41,7 +41,17 @@ test('分区表配置、子分区增删改、脱离与挂载、发布及影子�
   await page.getByLabel('结束值（TO）').fill("'2026-01-01'");
   await page.getByRole('button', { name: '添加子分区' }).last().click();
 
-  // 影子库自动将日期字面量规范化为带时区的 timestamptz
+  // 按需规范化（ADR 0016）：点状态栏的“规范化”后，影子库将日期字面量规范化为带时区的 timestamptz
+  const normalize = async () => {
+    const btn = page
+      .locator('footer')
+      .filter({ hasText: '人在线' })
+      .getByRole('button', { name: '规范化', exact: true });
+    // 修改都已确认（不再 aria-disabled）后再点
+    await expect(btn).not.toHaveAttribute('aria-disabled', 'true');
+    await btn.click();
+  };
+  await normalize();
   await expect(
     page.getByText("FOR VALUES FROM ('2025-01-01 00:00:00+00') TO ('2026-01-01 00:00:00+00')"),
   ).toBeVisible({ timeout: 20_000 });
@@ -63,6 +73,7 @@ test('分区表配置、子分区增删改、脱离与挂载、发布及影子�
   await page.getByRole('button', { name: '修改子分区 events_2025 的边界' }).click();
   await page.getByLabel('结束值（TO）').fill("'2025-07-01'");
   await page.getByRole('button', { name: '保存边界' }).click();
+  await normalize();
   await expect(
     page.getByText("FOR VALUES FROM ('2025-01-01 00:00:00+00') TO ('2025-07-01 00:00:00+00')"),
   ).toBeVisible({ timeout: 20_000 });

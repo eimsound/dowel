@@ -35,6 +35,7 @@ import {
   verifyScripts,
 } from '@dowel/verifier';
 
+import { hasRenamedOpaqueDeps } from './derive-pending.ts';
 import { scrubSecrets } from './secrets.ts';
 
 /**
@@ -379,11 +380,23 @@ export const shadowOps = (
     return engine.importSnapshot(await engine.readSnapshot(d, schemas));
   },
   canonicalize: async (prev: Model, next: Model): Promise<Obj[]> => {
-    const d = await db();
+    let d: Db;
+    try {
+      d = await db();
+    } catch (e) {
+      if (isInfraFailure(e, statementTimeoutMs)) throw toShadowError(e);
+      throw e;
+    }
     const dDialect = next.dialect;
     const engine = getEngine(dDialect);
-    const vNum = await engine.readVersionNum?.(d);
-    const planOpts = vNum !== null && vNum !== undefined ? engine.planOptionsForVersion?.(vNum) : undefined;
+    let planOpts: PlanOptions | undefined;
+    try {
+      const vNum = await engine.readVersionNum?.(d);
+      planOpts = vNum !== null && vNum !== undefined ? engine.planOptionsForVersion?.(vNum) : undefined;
+    } catch (e) {
+      if (isInfraFailure(e, statementTimeoutMs)) throw toShadowError(e);
+      throw e;
+    }
     let steps: Step[] | null = null;
     try {
       steps = plan(prev, next, planOpts);
@@ -392,20 +405,39 @@ export const shadowOps = (
     }
     try {
       if (steps !== null) {
-        await buildTarget(d, prev, planOpts);
-        await runSteps(d, steps, dDialect);
+        let builtPrev = true;
+        try {
+          await buildTarget(d, prev, planOpts);
+        } catch (e) {
+          // 基线自己建不出来（旧版本遗留 / 升级后不再兼容的基线）：没有依赖改名的不透明对象时，
+          // 直接从空库建出 next 与增量迁移等价，借此自愈；否则（需要引擎改写引用）只能如实报错
+          const prevNonEmpty = Object.keys(prev.objects).length > 0;
+          if (!(e instanceof StepError) || !prevNonEmpty || isInfraFailure(e, statementTimeoutMs)) throw e;
+          if (hasRenamedOpaqueDeps(prev, next)) throw e;
+          builtPrev = false;
+        }
+        if (builtPrev) await runSteps(d, steps, dDialect);
+        else await buildTarget(d, next, planOpts);
       } else {
         // 未发布表发生普通表↔分区表互转或分区策略变更时无法增量规划：回退为从空库直接建出 next
         await buildTarget(d, next, planOpts);
       }
     } catch (e) {
+      if (isInfraFailure(e, statementTimeoutMs)) throw toShadowError(e);
       if (!(e instanceof StepError) && isPgPrivilegeError(e, dDialect)) {
         throw await pgShadowPrivilegeError(e, d);
       }
       throw e;
     }
     // 读回引擎里的结构，按名字对回 next 的 ID，取出规范形式
-    const imported = reconcileIds(next, engine.importSnapshot(await engine.readSnapshot(d, schemas)));
+    let snapshot: Awaited<ReturnType<typeof engine.readSnapshot>>;
+    try {
+      snapshot = await engine.readSnapshot(d, schemas);
+    } catch (e) {
+      if (isInfraFailure(e, statementTimeoutMs)) throw toShadowError(e);
+      throw e;
+    }
+    const imported = reconcileIds(next, engine.importSnapshot(snapshot));
     const out: Obj[] = [];
     for (const o of Object.values(next.objects)) {
       const e = imported.objects[o.id];

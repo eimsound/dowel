@@ -18,6 +18,11 @@
   1. HA 模式下 `flush(branchId)` 通过按分支串行队列 + 阻塞版 `withJobLock('derive:' + branchId, ..., { timeoutMs })`，基于 DB `branches.baseline` 循环追齐最新 `rooms.state` 后才返回（无变化跳过 `shadowOf` 与冗余写库）；
   2. 后台防抖 `runBackground` 拿不到锁时短延迟重排，持锁结束后若 `seq` 前进则循环补刷（设上限并重排）；`apply()` 在 `rooms.patch` 被拒时不覆写 `branches.baseline`；
   3. `ctx.replace` 统一走 `refresher.runWithReset(branch, model, () => rooms.replace(...))`，在 `job:derive:<branchId>` 锁内保持单向锁序（derive 锁 → room 行锁），并**直接使用规范化 `model` 入参重置基线**，绝不事后重读 `rooms.model`。
+- **【2026-11-27 演进：按需规范化（ADR 0016）】**
+  1. 后台防抖（`schedule` / `timers` / `runBackground`）已整体移除，编辑期间 0 影子库调用；`flush()` 只在关键出口调用，单机与 HA 统一阻塞持锁（超时 `DeriveBusyError` → `503 normalize_busy`），同分支排队未开始的 flush 合并；
+  2. **反模式**：在带 `workingSeq` 的确认请求（恢复历史、应用版本、作废/取消作废同步工作副本、拉取/接入确认覆盖）里先 `flush()`——规范化写回推进 `seq`，用户确认立刻 `409 working_changed`（自冲突）。正确做法：只在返回 `workingSeq` 的预览/详情接口 flush；
+  3. **反模式（基线投毒）**：`!needsRefresh` 时把当前模型写成基线、canonicalize 失败时“接受当前模型作为基线”、恢复历史时把历史模型写成基线。正确做法：黄金基线只在 canonical 替换或成功 canonicalize 后推进；非 canonical 替换走 `runWithoutReset`（同样排队持锁，不碰基线）；
+  4. 显式 `normalize()` 停机中拒绝（`503 shutting_down`），`forget()` 后在途任务不回写基线；只读 `status()` 不拿锁、不连影子库。
 
 ---
 

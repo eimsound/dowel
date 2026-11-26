@@ -336,6 +336,8 @@ const SchemaScope = ({
       void qc.invalidateQueries({ queryKey: ['project', pid] });
       void qc.invalidateQueries({ queryKey: ['migration', pid] });
       void qc.invalidateQueries({ queryKey: ['ddl', pid] });
+      // 影子库来源 / 基线可能变了：状态栏的规范化状态（含 shadow 配置）重查（ADR 0016）
+      void qc.invalidateQueries({ queryKey: ['normalize', pid] });
     },
   });
   // 打开这一节时先用第一个环境检查一次：schema 勾选列表直接出现，不用先点“检查连接”
@@ -350,6 +352,8 @@ const SchemaScope = ({
     mutationFn: (schemas: string[] | null) => api<ProjectInfo>('PATCH', `/api/projects/${pid}`, { schemas }),
     onSuccess: (p) => {
       qc.setQueryData(['project', pid], p);
+      // schema 范围变了：规范化读回的范围跟着变，状态栏重查（ADR 0016）
+      void qc.invalidateQueries({ queryKey: ['normalize', pid] });
       setChecked(null);
       setManual(null);
       toast(t('pset.schemaSaved'));
