@@ -60,7 +60,7 @@ export const useRangeLabel = () => {
 const useWorkingSeq = (pid: string, enabled: boolean) =>
   useQuery({
     queryKey: ['history-head', pid],
-    queryFn: () => api<CanvasHistoryList>('GET', `/api/projects/${pid}/history?limit=1`),
+    queryFn: () => api<CanvasHistoryList>('GET', `/api/projects/${pid}/history?limit=1&grouped=0`),
     enabled,
     staleTime: 0,
   });

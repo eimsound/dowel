@@ -2,6 +2,7 @@ import { readFileSync } from 'node:fs';
 import { resolve } from 'node:path';
 
 // 审计动作文案与画布历史操作名 i18n 覆盖测试（#33）。
+import { CANVAS_HISTORY_SESSION_OP } from '@dowel/api';
 import { COMPOSITE_MUTATORS, mutators } from '@dowel/core';
 import { afterEach, expect, test } from 'vitest';
 
@@ -48,8 +49,8 @@ test('hist.op.edit 在中英文下均有对应文案', async () => {
 test('所有 core mutators 在 zh / en 的 hist.op 词典中均有文案', async () => {
   for (const lng of ['zh', 'en'] as const) {
     await i18n.changeLanguage(lng);
-    // paste / batch 不在普通 mutator 表里（由 runMutator 单独分派），一并检查
-    for (const op of [...Object.keys(mutators), ...COMPOSITE_MUTATORS]) {
+    // paste / batch 不在普通 mutator 表里（由 runMutator 单独分派），一并检查；editSession 是读时归组的编辑会话
+    for (const op of [...Object.keys(mutators), ...COMPOSITE_MUTATORS, CANVAS_HISTORY_SESSION_OP]) {
       expect(i18n.exists(`hist.op.${op}`, { lng }), `${lng}: 缺少 hist.op.${op}`).toBe(true);
     }
   }

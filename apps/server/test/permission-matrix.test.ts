@@ -546,6 +546,11 @@ const matrix: Record<string, Spec> = {
     access: { kind: 'project', min: 'viewer', statuses: [200] },
     path: () => `${P()}/history/0`,
   },
+  // 展开编辑会话组单步：seq = 0 不是合法区间，viewer 及以上校验参数返回 400（权限先于参数校验）
+  'GET /api/projects/:pid/history/:seq/steps': {
+    access: { kind: 'project', min: 'viewer', statuses: [400] },
+    path: () => `${P()}/history/0/steps?from=0`,
+  },
   'POST /api/projects/:pid/history/:seq/restore': {
     access: { kind: 'project', min: 'editor', statuses: [400] },
     path: () => `${P()}/history/0/restore`,
