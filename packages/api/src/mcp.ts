@@ -1,11 +1,20 @@
 // MCP 令牌与 MCP 服务（M3-C，ADR 0014）的接口契约：个人 MCP 令牌的管理、scope、服务端 /api/mcp 的错误码与工具清单。
 // 规则：
 // - MCP 令牌属于**用户**（不是项目）：权限 = 用户当前生效角色 ∩ 令牌 scope ∩ 可选的项目白名单；修改和审计都记在本人名下（data.via = 'mcp'）。
-// - scope 正交：read 是基线（总是包含）；verify 只授权影子库验证；write 只授权工作副本的整批原子修改。
+// - scope 正交：read 是基线（总是包含）；verify 只授权影子库验证；write 只授权工作副本的整批原子修改与画布板块的增量调整（不开放像素坐标）。
 // - MCP 永远不连目标库：环境状态 / 漂移只读平台缓存（带缓存时间）；不能发布版本、不能执行 / 申请执行 / 回滚 / 标记 / 写基线。
 // - 令牌只能访问 POST /api/mcp；/api/mcp 只认 `Bearer dwm_…`（会话 cookie 与 CI 令牌一律拒绝）。
 // 实现见 apps/server/src/mcp-tokens.ts、routes/mcp.ts、routes/mcp-tokens.ts；用户文档 docs/en/mcp.md 与 docs/zh/mcp.md。
 import { z } from 'zod';
+
+import {
+  MAX_SECTION_ID_LENGTH,
+  MAX_SECTION_NAME_LENGTH,
+  MAX_SECTION_TABLE_ID_LENGTH,
+  SECTION_REF_ALIAS_PATTERN,
+  SECTION_REF_PATTERN,
+  sectionColorSchema,
+} from './sections.ts';
 
 // ───── 令牌本身 ─────
 
@@ -31,7 +40,7 @@ export type McpTokenKind = z.infer<typeof mcpTokenKindSchema>;
  * scope：
  * - read：读项目、模型、DDL、版本链、迁移预览、环境的平台缓存状态（基线，总是包含）；
  * - verify：在影子库上验证迁移（等同界面的 model.verify，不连目标库）；
- * - write：在工作副本上整批原子执行 mutator（走同步层的冲突规则，需要项目编辑者以上）。
+ * - write：在工作副本上整批原子执行 mutator（走同步层的冲突规则，需要项目编辑者以上），以及经 manage_sections 增量调整画布板块（纯布局层）。
  */
 export const mcpScopeSchema = z.enum(['read', 'verify', 'write']);
 export type McpScope = z.infer<typeof mcpScopeSchema>;
@@ -163,6 +172,8 @@ export const MCP_TOOLS = {
   list_mutators: { scope: 'read', action: null },
   verify_migration: { scope: 'verify', action: 'model.verify' },
   apply_changes: { scope: 'write', action: 'sync.edit' },
+  /** 增量调整画布板块（纯布局层；沿用 write scope 与编辑者以上角色，不新增 scope） */
+  manage_sections: { scope: 'write', action: 'sync.edit' },
 } as const satisfies Record<string, { scope: McpScope; action: string | null }>;
 export type McpToolName = keyof typeof MCP_TOOLS;
 
@@ -174,6 +185,7 @@ export type McpToolErrorCode =
   | 'invalid_arguments'
   | 'version_not_found'
   | 'table_not_found'
+  | 'section_not_found'
   | 'environment_not_found'
   | 'base_seq_ahead'
   | 'conflict'
@@ -219,6 +231,68 @@ export interface McpDiagnostics {
 /** apply_changes：参数里 `$ref:<alias>` 占位符由服务端换成新的 UUIDv7 */
 export const MCP_REF_PATTERN = /^\$ref:[A-Za-z0-9_.-]{1,64}$/;
 
+// ───── manage_sections（ADR 0015 第 1 节：板块是纯布局层，只开放增量语义写入，不开放像素坐标） ─────
+
+/** manage_sections：一次最多多少个动作 */
+export const MCP_MAX_SECTION_ACTIONS = 50;
+/** manage_sections：单个动作最多列多少张表 */
+export const MCP_MAX_SECTION_TABLES_PER_ACTION = 500;
+
+const sectionTableIdsSchema = z
+  .array(z.string().min(1).max(MAX_SECTION_TABLE_ID_LENGTH))
+  .max(MCP_MAX_SECTION_TABLES_PER_ACTION);
+const sectionNameSchema = z.string().trim().min(1).max(MAX_SECTION_NAME_LENGTH);
+/** 板块引用：真实板块 ID，或本批更早 `create.ref` 定义的 `$ref:<alias>`；绝不按名称猜测板块 */
+const sectionRefSchema = z
+  .string()
+  .min(1)
+  .max(MAX_SECTION_ID_LENGTH)
+  .refine((v) => !v.startsWith('$ref:') || SECTION_REF_PATTERN.test(v), {
+    message: '板块引用必须是板块 ID 或 `$ref:<alias>`（alias 为 1–64 位字母、数字、`_`、`.`、`-`）',
+  });
+
+/** manage_sections 的单个动作；全部分支 strict，拒绝 x / y / width / height / positions 等任何坐标字段 */
+export const mcpSectionActionSchema = z.discriminatedUnion('action', [
+  z
+    .object({
+      action: z.literal('create'),
+      /** 本批内的别名：响应 refs[ref] 返回服务端生成的板块 ID，后续动作可写 `$ref:<ref>` */
+      ref: z.string().regex(SECTION_REF_ALIAS_PATTERN).optional(),
+      name: sectionNameSchema,
+      color: sectionColorSchema.optional(),
+      tables: sectionTableIdsSchema.optional(),
+    })
+    .strict(),
+  z.object({ action: z.literal('rename'), section: sectionRefSchema, name: sectionNameSchema }).strict(),
+  z.object({ action: z.literal('recolor'), section: sectionRefSchema, color: sectionColorSchema }).strict(),
+  z.object({ action: z.literal('delete'), section: sectionRefSchema }).strict(),
+  z
+    .object({
+      action: z.literal('add_tables'),
+      section: sectionRefSchema,
+      tables: sectionTableIdsSchema.min(1),
+    })
+    .strict(),
+  z
+    .object({
+      action: z.literal('remove_tables'),
+      section: sectionRefSchema,
+      tables: sectionTableIdsSchema.min(1),
+    })
+    .strict(),
+]);
+export type McpSectionAction = z.infer<typeof mcpSectionActionSchema>;
+
+/** manage_sections 的输入 */
+export const mcpManageSectionsInputSchema = z
+  .object({
+    project: z.string().min(1),
+    actions: z.array(mcpSectionActionSchema).min(1).max(MCP_MAX_SECTION_ACTIONS),
+    dryRun: z.boolean().default(false),
+  })
+  .strict();
+export type McpManageSectionsInput = z.input<typeof mcpManageSectionsInputSchema>;
+
 // ───── 审计动作 ─────
 
 export const MCP_AUDIT_ACTIONS = [
@@ -230,5 +304,7 @@ export const MCP_AUDIT_ACTIONS = [
   'model.mutate',
   /** verify_migration（影子库验证） */
   'model.verify',
+  /** manage_sections 成功调整画布板块（dryRun 与无净变化的 noop 不记） */
+  'sections.update',
 ] as const;
 export type McpAuditAction = (typeof MCP_AUDIT_ACTIONS)[number];

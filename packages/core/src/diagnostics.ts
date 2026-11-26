@@ -1,6 +1,7 @@
 // 模型的写后静态自检（ADR 0015 第 5 节）：完整 validate 错误 + 按项目最低目标环境版本的静态兼容性问题。
 // 纯函数、不连库：调用方只需传入平台库缓存的环境数值版本号（environments.engine_version_num）。
-import type { Model } from './ir.ts';
+import type { DialectTargetInfo } from './dialect.ts';
+import type { Dialect, Model } from './ir.ts';
 import { validate, withModelIndex } from './model.ts';
 import { getDialect } from './registry.ts';
 
@@ -64,3 +65,12 @@ export const diagnoseModel = (
       blocksPublish: validationErrors.length > 0,
     };
   });
+
+/**
+ * 按项目各环境缓存的数值版本号推导最低目标版本的标签与门控特性（与 diagnoseModel 的 target 同源，纯函数、不连库）。
+ * 没有可推导的版本（无环境、版本未缓存）或方言不区分版本（SQLite）时返回 null。
+ */
+export const describeTarget = (
+  dialect: Dialect,
+  envVersionNums: readonly (number | null | undefined)[] = [],
+): DialectTargetInfo | null => getDialect(dialect).versioning.targetInfo?.(envVersionNums) ?? null;

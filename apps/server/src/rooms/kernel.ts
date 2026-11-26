@@ -502,13 +502,14 @@ export class RoomKernel {
   /**
    * 在 withRoomLock 内确保内存房间态与平台库一致（PG 追赶外部副本提交，SQLite/PG 脏态重载），
    * 并在持锁期间同步提取只读快照副本，彻底消除 SQLite/PG 并发写事务 COMMIT 前的未提交脏读窗口。
+   * 回调同时拿到房间记录 `r`（例如同一把锁内原子拍下板块等布局层状态）。
    */
-  async readFresh<T>(branchId: string, read: (room: Room) => T): Promise<T> {
+  async readFresh<T>(branchId: string, read: (room: Room, r: Loaded) => T): Promise<T> {
     const { r, value } = await this.withActiveRoomLock(branchId, async (loaded) => {
       const missed = loaded.dirty ? await this.reloadAndMissedLocked(branchId, loaded) : [];
       const fresh = this.db.dialect === 'pg' ? await this.catchUpReadOnly(branchId, loaded) : [];
       const caughtUp = missed.length > 0 ? [...missed, ...fresh] : fresh;
-      return { caughtUp, snapshot: read(loaded.room) };
+      return { caughtUp, snapshot: read(loaded.room, loaded) };
     });
     if (value.caughtUp.length) this.broadcastCommits(r, value.caughtUp);
     return value.snapshot;

@@ -835,6 +835,9 @@ const zh = {
       mutate_with_summary: '修改了工作副本（{{count}} 处操作）：{{summary}}',
       verify: '在影子库验证了迁移',
     },
+    sections: {
+      update: '调整了画布板块（{{count}} 处操作）',
+    },
     grant: {
       create: '添加了授权（{{role}}）',
       update: '把授权角色改成了 {{role}}',
@@ -3217,6 +3220,9 @@ const en: typeof zh = {
       mutate: 'edited the working copy ({{count}} operations)',
       mutate_with_summary: 'edited the working copy ({{count}} operations): {{summary}}',
       verify: 'verified the migration in the shadow database',
+    },
+    sections: {
+      update: 'updated canvas sections ({{count}} operations)',
     },
     grant: {
       create: 'added a grant ({{role}})',
