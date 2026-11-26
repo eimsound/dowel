@@ -304,6 +304,71 @@ const runPaste = (m: Model, a: z.infer<typeof pasteArgs>) => {
   }
 };
 
+/**
+ * 受控原子批处理（ADR 0015 第 3 节）：MCP `apply_changes` 把整批展开后的普通 mutator 收敛为 1 个同步层 op
+ * （1 个 seq / 1 条 room_commits / 1 次广播）。与 paste 同构：只允许 `mutators` 注册表里的普通操作，
+ * 禁止嵌套 batch 与 paste；整批在同一份草稿上依次执行，任何一步不合法整批作废（原子）。
+ */
+export const BATCH_MUTATOR = 'batch';
+/** 单个 batch 最多展开的子操作数（与 @dowel/api 的 MCP_MAX_EXPANDED_OPS 一致） */
+export const BATCH_OPS_LIMIT = 500;
+/** batch 可选意图说明的最大长度 */
+export const BATCH_SUMMARY_MAX = 500;
+/** 复合 mutator：一个 op 内部展开为多个子操作，不在 `mutators` 注册表里，由 runMutator 单独分派 */
+export const COMPOSITE_MUTATORS: ReadonlySet<string> = new Set(['paste', BATCH_MUTATOR]);
+
+export const batchArgs = z
+  .object({
+    ops: z
+      .array(z.object({ name: z.string().min(1), args: z.unknown() }).strict())
+      .min(1)
+      .max(BATCH_OPS_LIMIT),
+    summary: z.string().trim().min(1).max(BATCH_SUMMARY_MAX).optional(),
+  })
+  .strict();
+export type BatchArgs = z.infer<typeof batchArgs>;
+
+/** batch 子操作失败：index 为子操作下标（从 0 开始），rawMessage 为子操作本身的错误文本 */
+export class BatchOpError extends E.EditError {
+  readonly index: number;
+  readonly opName: string;
+  readonly rawMessage: string;
+  constructor(index: number, opName: string, rawMessage: string) {
+    super(`ops[${index}] ${opName}：${rawMessage}`);
+    this.name = 'BatchOpError';
+    this.index = index;
+    this.opName = opName;
+    this.rawMessage = rawMessage;
+  }
+}
+
+/** 取 batch 参数里的意图说明（去首尾空白，空串视为没有；超长截断），不是合法字符串时返回 null */
+export const batchSummaryOf = (args: unknown): string | null => {
+  if (!args || typeof args !== 'object' || Array.isArray(args)) return null;
+  const raw = (args as Record<string, unknown>).summary;
+  if (typeof raw !== 'string') return null;
+  const s = raw.trim();
+  return s ? s.slice(0, BATCH_SUMMARY_MAX) : null;
+};
+
+const runBatch = (m: Model, a: BatchArgs) => {
+  for (let i = 0; i < a.ops.length; i++) {
+    const op = a.ops[i]!;
+    if (COMPOSITE_MUTATORS.has(op.name)) {
+      throw new BatchOpError(i, op.name, `batch 不能嵌套 ${op.name}`);
+    }
+    if (!Object.hasOwn(mutators, op.name)) {
+      throw new BatchOpError(i, op.name, `未知的操作：${op.name}`);
+    }
+    try {
+      runMutator(m, op.name, op.args);
+    } catch (e) {
+      if (e instanceof E.EditError) throw new BatchOpError(i, op.name, e.message);
+      throw e;
+    }
+  }
+};
+
 export type MutatorName = keyof typeof mutators;
 export type PasteArgs = z.infer<typeof pasteArgs>;
 export type MutatorArgs<K extends MutatorName> = z.infer<(typeof mutators)[K]['args']>;
@@ -314,6 +379,12 @@ export const runMutator = (m: Model, name: string, args: unknown) => {
     const parsed = pasteArgs.safeParse(args);
     if (!parsed.success) throw new E.EditError(`参数不合法：${parsed.error.issues[0]?.message ?? ''}`);
     runPaste(m, parsed.data);
+    return;
+  }
+  if (name === BATCH_MUTATOR) {
+    const parsed = batchArgs.safeParse(args);
+    if (!parsed.success) throw new E.EditError(`参数不合法：${parsed.error.issues[0]?.message ?? ''}`);
+    runBatch(m, parsed.data);
     return;
   }
   const registry = mutators as Record<string, { args: z.ZodType; run: (m: Model, a: unknown) => unknown }>;
@@ -329,7 +400,8 @@ export const runMutator = (m: Model, name: string, args: unknown) => {
  * 参数里出现的、模型中存在的对象，加上参数里表达式（expr / where）引用到的本表的列。
  * 修改实际写到的对象由同步层另行计算，也算在依据里。
  */
-export const readsOf = (m: Model, args: unknown): string[] => {
+export const readsOf = (m: Model, args: unknown, name?: string): string[] => {
+  if (name === BATCH_MUTATOR) return batchReadsOf(m, args);
   const out = new Set<string>();
   const exprs: string[] = [];
   const walk = (x: unknown, k?: string) => {
@@ -368,6 +440,31 @@ export const readsOf = (m: Model, args: unknown): string[] => {
     for (const t of tables)
       for (const c of effectiveColumnsOf(m, t))
         if (exprs.some((e) => d.exprReferences(e, c.name))) out.add(c.id);
+  }
+  return [...out];
+};
+
+/**
+ * batch 的依据：在模型副本上逐步执行子操作，每一步执行前按该子操作计算依据，
+ * 只保留整批开始前就存在的对象（本批新建的对象不是外部依据）。绝不扫描 summary（自由文本可能恰好等于某个对象 ID）。
+ * 某一步执行失败就停止（整批注定会被拒绝），已收集的依据照常返回。
+ */
+const batchReadsOf = (m: Model, args: unknown): string[] => {
+  const parsed = batchArgs.safeParse(args);
+  if (!parsed.success) return [];
+  const out = new Set<string>();
+  const stepModel = structuredClone(m);
+  for (const op of parsed.data.ops) {
+    if (COMPOSITE_MUTATORS.has(op.name)) break;
+    for (const id of readsOf(stepModel, op.args, op.name)) {
+      if (Object.hasOwn(m.objects, id)) out.add(id);
+    }
+    try {
+      runMutator(stepModel, op.name, op.args);
+    } catch (e) {
+      if (e instanceof E.EditError) break;
+      throw e;
+    }
   }
   return [...out];
 };

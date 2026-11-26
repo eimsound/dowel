@@ -1312,6 +1312,7 @@ describe('Room.processedOf 与 Room.simulate', () => {
       failedIndex: 1,
       code: 'conflict',
       message: expect.stringContaining('已被 bob 修改'),
+      objectId: 't1',
     });
 
     // 非法：重复表名触发 EditError -> code: 'invalid'，且第 1 步创建在模拟结束后未残留
@@ -1513,5 +1514,145 @@ describe('原型属性名不被当作对象依赖', () => {
     ]);
     expect(res).toEqual({ ok: false, failedIndex: 1, code: 'invalid', message: `未知的操作：${name}` });
     expect(room.processedOf('mcp:t1')).toBe(0);
+  });
+});
+
+describe('batch：整批 1 个提交（ADR 0015 第 3 节）', () => {
+  const seed = async () => {
+    const store = memoryStore();
+    const room = new Room(emptyRoomState(emptyModel('pg')), store);
+    const op = (n: number, name: string, args: unknown, reads: Op['reads']): ToServer => ({
+      t: 'op',
+      op: { client: 'ws:u1', n, name, args, reads },
+    });
+    await room.handle('ws:u1', 'bob', op(1, 'createSchema', { id: 's1', name: 'public' }, [['s1', null]]));
+    await room.handle(
+      'ws:u1',
+      'bob',
+      op(2, 'createTable', { id: 't1', schema: 's1', name: 'users' }, [
+        ['s1', 1],
+        ['t1', null],
+      ]),
+    );
+    return { room, store };
+  };
+
+  test('Room.handle：batch 产生 1 个 seq、1 次广播，提交里是整批净变化', async () => {
+    const { room, store } = await seed();
+    const args = {
+      summary: '加 orders',
+      ops: [
+        { name: 'createTable', args: { id: 't2', schema: 's1', name: 'orders' } },
+        { name: 'addColumn', args: { table: 't2', column: { id: 'c1', name: 'id', type: 'bigint' } } },
+        { name: 'setComment', args: { id: 't1', comment: '用户' } },
+      ],
+    };
+    const outs = await room.handle('mcp:a', 'alice', {
+      t: 'op',
+      op: {
+        client: 'mcp:a',
+        n: 1,
+        name: 'batch',
+        args,
+        reads: [
+          ['s1', 1],
+          ['t1', 2],
+          ['t2', null],
+          ['c1', null],
+        ],
+      },
+    });
+    expect(outs).toHaveLength(1);
+    expect(outs[0]!.msg.t).toBe('commit');
+    expect(room.seq).toBe(3);
+    expect(store.commits).toHaveLength(3);
+    expect(store.commits[2]!.changes.map((c) => c.id).sort()).toEqual(['c1', 't1', 't2']);
+    expect(room.versions.t2).toBe(3);
+  });
+
+  test('Room.simulate：batch 子操作不合法返回 subIndex，零副作用', async () => {
+    const { room, store } = await seed();
+    const res = room.simulate('mcp:a', [
+      {
+        client: 'mcp:a',
+        n: 1,
+        name: 'batch',
+        args: {
+          ops: [
+            { name: 'createTable', args: { id: 't2', schema: 's1', name: 'orders' } },
+            { name: 'createTable', args: { id: 't3', schema: 's1', name: 'users' } },
+          ],
+        },
+        reads: [['s1', 1]],
+      },
+    ]);
+    expect(res).toMatchObject({ ok: false, failedIndex: 0, code: 'invalid', subIndex: 1 });
+    expect(room.seq).toBe(2);
+    expect(store.commits).toHaveLength(2);
+
+    const nested = room.simulate('mcp:a', [
+      {
+        client: 'mcp:a',
+        n: 1,
+        name: 'batch',
+        args: { ops: [{ name: 'batch', args: { ops: [] } }] },
+        reads: [],
+      },
+    ]);
+    expect(nested).toMatchObject({ ok: false, code: 'invalid', subIndex: 0 });
+  });
+
+  test('Room.readConflict：只读检查依据，返回人类可读冲突与对象 ID，不改动任何状态', async () => {
+    const { room } = await seed();
+    expect(room.readConflict('mcp:a', [['t1', 2]])).toBeNull();
+    expect(room.readConflict('mcp:a', [['t9', null]])).toBeNull();
+    expect(room.readConflict('mcp:a', [['t1', 1]])).toEqual({
+      code: 'conflict',
+      message: expect.stringContaining('表 users 已被 bob 修改'),
+      objectId: 't1',
+    });
+    expect(room.readConflict('mcp:a', [['t1', null]])).toMatchObject({ code: 'conflict', objectId: 't1' });
+    expect(room.readConflict('mcp:a', [['t1', 'p:mcp:a:1']])).toMatchObject({ code: 'dependency' });
+    expect(room.seq).toBe(2);
+    expect(room.processedOf('mcp:a')).toBe(0);
+  });
+
+  test('execute / opReads：batch 复用临时索引，依据只含整批开始前已存在的对象', async () => {
+    const { room } = await seed();
+    const args = {
+      summary: 't1',
+      ops: [
+        { name: 'createTable', args: { id: 't2', schema: 's1', name: 'orders' } },
+        { name: 'addColumn', args: { table: 't2', column: { id: 'c1', name: 'id', type: 'bigint' } } },
+      ],
+    };
+    const { changes } = execute(room.model, 'batch', args);
+    expect(changes.map((c) => c.id).sort()).toEqual(['c1', 't2']);
+    const reads = opReads(room.model, room.versions, args, changes, 'batch');
+    expect(reads).toEqual([
+      ['c1', null],
+      ['s1', 1],
+      ['t2', null],
+    ]);
+  });
+
+  test('SyncClient.mutate(batch) 带 name 计算依据并被服务器接受', async () => {
+    const { room } = await seed();
+    const c = new SyncClient('ws2', room.model);
+    c.versions = { ...room.versions };
+    c.viewVersions = c.versions;
+    c.seq = room.seq;
+    const sent: ToServer[] = [];
+    c.send = (m) => sent.push(m);
+    c.online = true;
+    c.ready = true;
+    c.mutate('batch', {
+      summary: 'users',
+      ops: [{ name: 'setComment', args: { id: 't1', comment: 'x' } }],
+    });
+    const op = sent.find((m): m is Extract<ToServer, { t: 'op' }> => m.t === 'op')!.op;
+    expect(op.reads).toEqual([['t1', 2]]);
+    const outs = await room.handle('ws2', 'carol', { t: 'op', op });
+    expect(outs[0]!.msg.t).toBe('commit');
   });
 });

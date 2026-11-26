@@ -1,5 +1,6 @@
 // MySQL 版本语义：按主次版本（8.4 / 9.7）分组验证、取最低数值版本号为项目目标；对外不暴露 PG 式大版本字段。
 import type { DialectVersioning } from '../dialect.ts';
+import { checkMysqlCompatibility } from './plan.ts';
 
 const isVersionNum = (v: number | null | undefined): v is number =>
   typeof v === 'number' && Number.isInteger(v) && v > 0;
@@ -29,4 +30,21 @@ export const mysqlVersioning: DialectVersioning = {
   },
   formatVersionNum: (versionNum) =>
     `${Math.floor(versionNum / 10000)}.${Math.floor((versionNum % 10000) / 100)}.${versionNum % 100}`,
+  compatibility: (model, versionNums) => {
+    const versionNum = minMysqlVersionNum(versionNums);
+    if (versionNum === null) return null;
+    const major = Math.floor(versionNum / 10000);
+    const minor = Math.floor((versionNum % 10000) / 100);
+    return {
+      target: `MySQL ${major}.${minor}`,
+      issues: checkMysqlCompatibility(model, versionNum).map((i) => ({
+        code: i.code,
+        severity: i.severity,
+        objectId: i.objectId,
+        objectName: i.objectName,
+        message: i.message,
+        minVersion: `MySQL ${i.minVersion}`,
+      })),
+    };
+  },
 };

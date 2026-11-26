@@ -37,6 +37,8 @@ export const canvasHistoryEntrySchema = z.object({
   version: canvasHistoryVersionRefSchema.nullable(),
   via: z.literal('mcp').optional(),
   mcpTokenPrefix: z.string().optional(),
+  /** MCP batch 提交的意图说明（apply_changes 的 summary）；与自动生成的 summary 对象列表独立 */
+  opSummary: z.string().optional(),
 });
 export type CanvasHistoryEntry = z.infer<typeof canvasHistoryEntrySchema>;
 

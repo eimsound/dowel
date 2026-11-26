@@ -1,5 +1,19 @@
-import { MCP_TOOLS, type McpScope, type McpToolName } from '@dowel/api';
-import { addColumn, all, createSchema, createTable, newId } from '@dowel/core';
+import {
+  MCP_MAX_EXPANDED_OPS,
+  MCP_SUMMARY_MAX,
+  MCP_TOOLS,
+  type McpScope,
+  type McpToolName,
+} from '@dowel/api';
+import {
+  addColumn,
+  all,
+  BATCH_OPS_LIMIT,
+  BATCH_SUMMARY_MAX,
+  createSchema,
+  createTable,
+  newId,
+} from '@dowel/core';
 import type { Commit, ToClient } from '@dowel/sync';
 // M3-C MCP 服务集成测试（ADR 0014）：
 // 在 SQLite 与 PostgreSQL 两种平台库下通过真实 app.request 测试完整的 JSON-RPC 传输（2025-11-25 与 2026-07-28）、
@@ -70,6 +84,11 @@ const makePeer = (user: User, role: Peer['role'] = 'editor') => {
   };
   return { peer, sent };
 };
+
+test('MCP 批量上限与 core batch 上限保持一致', () => {
+  expect(MCP_MAX_EXPANDED_OPS).toBe(BATCH_OPS_LIMIT);
+  expect(MCP_SUMMARY_MAX).toBe(BATCH_SUMMARY_MAX);
+});
 
 describe.each([
   { platform: 'sqlite', skip: false },
@@ -682,7 +701,14 @@ describe.each([
       });
       expect(dryRes.isError).toBeFalsy();
       expect(dryRes.structuredContent?.dryRun).toBe(true);
-      expect(dryRes.structuredContent?.seq).toBe(2);
+      expect(dryRes.structuredContent?.seq).toBe(1);
+      expect(dryRes.structuredContent?.opCount).toBe(2);
+      expect(dryRes.structuredContent?.diagnostics).toMatchObject({
+        target: null,
+        validation: { total: 0, items: [] },
+        compatibility: { errors: { total: 0 }, warnings: { total: 0 } },
+        blocksPublish: false,
+      });
       expect(dryRes.structuredContent?.refs).toMatchObject({
         s_dry: expect.stringMatching(UUID_RE),
         t_dry: expect.stringMatching(UUID_RE),
@@ -700,10 +726,11 @@ describe.each([
       expect(aheadRes.structuredContent?.code).toBe('base_seq_ahead');
       expect(aheadRes.structuredContent?.currentSeq).toBe(0);
 
-      // 3. $ref 一批建表 + 多列 + 主键 + 外键，WS peer 实时收到提交，画布历史标记 via='mcp'
+      // 3. $ref 一批建表 + 多列 + 主键 + 外键：整批 1 个 seq / 1 次 WS 广播 / 1 条画布历史（via='mcp' + opSummary）
       const batchRes = await f.callTool(tokAlice.token, 'apply_changes', {
         project: 'acme/orders',
         baseSeq: 0,
+        summary: '  新增 users / orders 表与外键  ',
         ops: [
           { name: 'createTable', args: { id: '$ref:users', schema: publicSchemaId, name: 'users' } },
           {
@@ -744,7 +771,11 @@ describe.each([
       });
       expect(batchRes.isError).toBeFalsy();
       expect(batchRes.structuredContent?.dryRun).toBe(false);
-      expect(batchRes.structuredContent?.seq).toBe(8);
+      expect(batchRes.structuredContent?.seq).toBe(1);
+      expect(batchRes.structuredContent?.opCount).toBe(8);
+      expect(batchRes.structuredContent).not.toHaveProperty('committed');
+      expect(batchRes.structuredContent?.noop).toBeUndefined();
+      expect(batchRes.structuredContent?.diagnostics).toMatchObject({ blocksPublish: false });
       const refs = batchRes.structuredContent?.refs as Record<string, string>;
       expect(Object.keys(refs).sort()).toEqual([
         'o_fk',
@@ -758,20 +789,26 @@ describe.each([
       ]);
       for (const v of Object.values(refs)) expect(v).toMatch(UUID_RE);
 
-      // WS peer 收到 8 个 commit 广播，且署名人为人类用户名“爱丽丝”
+      // WS peer 只收到 1 个 commit 广播（含整批净变化），且署名人为人类用户名“爱丽丝”
       const wsCommits = peerHuman.sent.filter((m): m is Commit => m.t === 'commit');
-      expect(wsCommits.map((c) => c.seq)).toEqual([1, 2, 3, 4, 5, 6, 7, 8]);
+      expect(wsCommits.map((c) => c.seq)).toEqual([1]);
+      expect(wsCommits[0]!.changes.map((c) => c.id).sort()).toEqual(Object.values(refs).sort());
       expect(wsCommits.every((c) => c.user === f.alice.name)).toBe(true);
 
       // 画布历史条目（含 HTTP 接口）包含 via: 'mcp' 与 mcpTokenPrefix
       const hist = await f.created.rooms.listHistory(f.branch1, { limit: 20 });
       const mcpEntries = hist.entries.filter((e) => e.seq > 0);
-      expect(mcpEntries).toHaveLength(8);
+      expect(mcpEntries).toHaveLength(1);
       for (const e of mcpEntries) {
         expect(e.user).toBe(f.alice.name);
         expect(e.via).toBe('mcp');
         expect(e.mcpTokenPrefix).toBe(tokAlice.prefix);
+        expect(e.opName).toBe('batch');
+        expect(e.opSummary).toBe('新增 users / orders 表与外键');
+        expect(e.changeCount).toBe(8);
       }
+      const detailEntry = await f.created.rooms.historyEntry(f.branch1, 1);
+      expect(detailEntry.opSummary).toBe('新增 users / orders 表与外键');
       const histHttp = await f.callHttp(
         'GET',
         `/api/projects/${f.p1Id}/history?limit=20`,
@@ -779,10 +816,16 @@ describe.each([
         f.adminCookie,
       );
       expect(histHttp.status).toBe(200);
-      const httpEntries = histHttp.data.entries as { seq: number; via?: string; mcpTokenPrefix?: string }[];
-      const httpEntry8 = httpEntries.find((e) => e.seq === 8);
-      expect(httpEntry8?.via).toBe('mcp');
-      expect(httpEntry8?.mcpTokenPrefix).toBe(tokAlice.prefix);
+      const httpEntries = histHttp.data.entries as {
+        seq: number;
+        via?: string;
+        mcpTokenPrefix?: string;
+        opSummary?: string;
+      }[];
+      const httpEntry1 = httpEntries.find((e) => e.seq === 1);
+      expect(httpEntry1?.via).toBe('mcp');
+      expect(httpEntry1?.mcpTokenPrefix).toBe(tokAlice.prefix);
+      expect(httpEntry1?.opSummary).toBe('新增 users / orders 表与外键');
 
       // 审计表写入 model.mutate，包含 via='mcp' 与 mcpToken
       const mutateAudits = await f.db.query<{
@@ -797,15 +840,16 @@ describe.each([
         via: 'mcp',
         mcpToken: { id: tokAlice.id, name: tokAlice.name, prefix: tokAlice.prefix },
         projectId: f.p1Id,
+        seq: 1,
         opCount: 8,
-        seqFrom: 1,
-        seqTo: 8,
+        summary: '新增 users / orders 表与外键',
       });
+      expect(mutateAudits[0]!.data.ops).toHaveLength(8);
 
       // 4. 批内中途非法操作：第 0 步有效 createTable，第 1 步重复列名失败 -> 整批回滚，0 提交
       const badMidRes = await f.callTool(tokAlice.token, 'apply_changes', {
         project: f.p1Id,
-        baseSeq: 8,
+        baseSeq: 1,
         ops: [
           { name: 'createTable', args: { id: '$ref:tmp', schema: publicSchemaId, name: 'should_rollback' } },
           {
@@ -817,12 +861,12 @@ describe.each([
       expect(badMidRes.isError).toBe(true);
       expect(badMidRes.structuredContent?.code).toBe('invalid');
       expect(badMidRes.structuredContent?.index).toBe(1);
-      expect((await f.created.rooms.model(f.branch1)).seq).toBe(8);
+      expect((await f.created.rooms.model(f.branch1)).seq).toBe(1);
       expect(all((await f.created.rooms.model(f.branch1)).model, 'table').map((t) => t.name)).not.toContain(
         'should_rollback',
       );
 
-      // 5. 人类通过 WS 修改 users.id（seq 8 -> 9），AI 用旧 baseSeq=8 修改同一列 -> conflict 且不写 room_rejections
+      // 5. 人类通过 WS 修改 users.id（seq 1 -> 2），AI 用旧 baseSeq=1 修改同一列 -> 报告最早冲突的子操作，且不写 room_rejections
       const seqBeforeHuman = (await f.created.rooms.model(f.branch1)).seq;
       await f.created.rooms.message(f.branch1, peerHuman.peer, {
         t: 'op',
@@ -834,11 +878,11 @@ describe.each([
           reads: [[refs.u_id!, seqBeforeHuman]],
         },
       });
-      expect((await f.created.rooms.model(f.branch1)).seq).toBe(9);
+      expect((await f.created.rooms.model(f.branch1)).seq).toBe(2);
 
       const conflictEditRes = await f.callTool(tokAlice.token, 'apply_changes', {
         project: f.p1Id,
-        baseSeq: 8,
+        baseSeq: 1,
         ops: [
           {
             name: 'createTable',
@@ -850,10 +894,11 @@ describe.each([
       expect(conflictEditRes.isError).toBe(true);
       expect(conflictEditRes.structuredContent?.code).toBe('conflict');
       expect(conflictEditRes.structuredContent?.index).toBe(1);
-      expect(conflictEditRes.structuredContent?.currentSeq).toBe(9);
-      expect((await f.created.rooms.model(f.branch1)).seq).toBe(9);
+      expect(conflictEditRes.structuredContent?.message).toContain('已被');
+      expect(conflictEditRes.structuredContent?.currentSeq).toBe(2);
+      expect((await f.created.rooms.model(f.branch1)).seq).toBe(2);
 
-      // 6. 人类通过 WS 删除 orders 表（seq 9 -> 10），AI 用 baseSeq=8 给 orders 加列 -> conflict
+      // 6. 人类通过 WS 删除 orders 表（seq 2 -> 3），AI 用 baseSeq=1 给 orders 加列 -> conflict
       await f.created.rooms.message(f.branch1, peerHuman.peer, {
         t: 'op',
         op: {
@@ -861,14 +906,14 @@ describe.each([
           n: 2,
           name: 'dropTable',
           args: { id: refs.orders },
-          reads: [[refs.orders!, 7]],
+          reads: [[refs.orders!, 1]],
         },
       });
-      expect((await f.created.rooms.model(f.branch1)).seq).toBe(10);
+      expect((await f.created.rooms.model(f.branch1)).seq).toBe(3);
 
       const conflictDelRes = await f.callTool(tokAlice.token, 'apply_changes', {
         project: f.p1Id,
-        baseSeq: 8,
+        baseSeq: 1,
         ops: [
           {
             name: 'addColumn',
@@ -878,7 +923,36 @@ describe.each([
       });
       expect(conflictDelRes.isError).toBe(true);
       expect(conflictDelRes.structuredContent?.code).toBe('conflict');
-      expect(conflictDelRes.structuredContent?.currentSeq).toBe(10);
+      expect(conflictDelRes.structuredContent?.index).toBe(0);
+      expect(conflictDelRes.structuredContent?.currentSeq).toBe(3);
+
+      // 7. 无净变化（建表后又删掉）：noop，不产生提交、不记审计、不广播
+      const wsBeforeNoop = peerHuman.sent.length;
+      const noopRes = await f.callTool(tokAlice.token, 'apply_changes', {
+        project: f.p1Id,
+        baseSeq: 3,
+        ops: [
+          { name: 'createTable', args: { id: '$ref:tmp_noop', schema: publicSchemaId, name: 'tmp_noop' } },
+          { name: 'dropTable', args: { id: '$ref:tmp_noop' } },
+        ],
+      });
+      expect(noopRes.isError).toBeFalsy();
+      expect(noopRes.structuredContent).toMatchObject({ noop: true, seq: 3, opCount: 2, changed: [] });
+      expect(noopRes.structuredContent?.diagnostics).toBeDefined();
+      expect((await f.created.rooms.model(f.branch1)).seq).toBe(3);
+      expect(peerHuman.sent.length).toBe(wsBeforeNoop);
+      expect(await f.db.query("select id from audit_events where action = 'model.mutate'")).toHaveLength(1);
+
+      // 8. batch / paste 不能经 apply_changes 直接调用
+      for (const name of ['batch', 'paste']) {
+        const nested = await f.callTool(tokAlice.token, 'apply_changes', {
+          project: f.p1Id,
+          baseSeq: 3,
+          ops: [{ name, args: { ops: [{ name: 'createSchema', args: { id: '$ref:x', name: 'x' } }] } }],
+        });
+        expect(nested.isError).toBe(true);
+        expect(nested.structuredContent).toMatchObject({ code: 'invalid', index: 0 });
+      }
 
       // 确保冲突与中途回滚均未污染 room_rejections 表
       const rejRows = await f.db.query('select * from room_rejections where branch_id = $1', [f.branch1]);
@@ -1226,72 +1300,142 @@ describe.each([
     expect(all(state.model, 'table').map((t) => t.name)).not.toContain('should_rollback');
   });
 
-  test.skipIf(skip)('list_mutators 排除 paste 且 apply_changes 拒绝 paste 以防止绕过批量上限', async () => {
-    const f = await setupEnv();
-    const tokAlice = await f.issueToken(f.alice.id, ['read', 'write']);
-
-    const lmAll = await f.callTool(tokAlice.token, 'list_mutators', {});
-    expect(lmAll.isError).toBeFalsy();
-    expect((lmAll.structuredContent!.mutators as { name: string }[]).map((m) => m.name)).not.toContain(
-      'paste',
-    );
-
-    const lmFilter = await f.callTool(tokAlice.token, 'list_mutators', {
-      names: ['paste', 'createTable'],
-    });
-    expect(lmFilter.isError).toBeFalsy();
-    expect((lmFilter.structuredContent!.mutators as { name: string }[]).map((m) => m.name)).toEqual([
-      'createTable',
-    ]);
-    expect(lmFilter.structuredContent!.unknown).toEqual(['paste']);
-
-    const resList = await parseRpc(
-      await f.mcpPost(tokAlice.token, {
-        jsonrpc: '2.0',
-        id: 90,
-        method: 'resources/read',
-        params: { uri: 'dowel://mutators' },
-      }),
-    );
-    const catalog = JSON.parse(((resList.result?.contents as { text: string }[]) ?? [])[0]!.text) as {
-      mutators: { name: string }[];
-    };
-    expect(catalog.mutators.map((m) => m.name)).not.toContain('paste');
-
-    const publicSchemaId = all((await f.created.rooms.model(f.branch1)).model, 'schema')[0]!.id;
-    for (const dryRun of [true, false]) {
-      const res = await f.callTool(tokAlice.token, 'apply_changes', {
-        project: f.p1Id,
-        baseSeq: 0,
-        dryRun,
-        ops: [
-          { name: 'createTable', args: { id: '$ref:t', schema: publicSchemaId, name: 'should_rollback' } },
-          {
-            name: 'paste',
-            args: {
-              ops: [
-                {
-                  name: 'createTable',
-                  args: { id: '$ref:p_tbl', schema: publicSchemaId, name: 'via_paste' },
-                },
-              ],
-            },
+  test.skipIf(skip)(
+    'apply_changes 响应附带 diagnostics：按缓存的最低环境版本做静态兼容性检查（dryRun 与提交一致，不连目标库）',
+    async () => {
+      const f = await setupEnv();
+      const tokAlice = await f.issueToken(f.alice.id, ['read', 'write']);
+      // 两个环境：PG 15 与 PG 17（目标库不可达，确保诊断只读平台缓存）
+      for (const [name, num] of [
+        ['diag-15', 150004],
+        ['diag-17', 170002],
+      ] as const) {
+        await f.db.query(
+          `insert into environments (id, project_id, name, url_enc, production, allow_same_instance, engine_version_num)
+           values ($1, $2, $3, $4, $5, $6, $7)`,
+          [newId(), f.p1Id, name, encrypt('postgres://u:p@127.0.0.1:1/db'), false, false, num],
+        );
+      }
+      const publicSchemaId = all((await f.created.rooms.model(f.branch1)).model, 'schema')[0]!.id;
+      const ops = [
+        { name: 'createTable', args: { id: '$ref:t', schema: publicSchemaId, name: 'diag_t' } },
+        {
+          name: 'addColumn',
+          args: {
+            table: '$ref:t',
+            column: { id: '$ref:v', name: 'v', type: 'integer', generated: { expr: '1 + 1', stored: false } },
           },
-        ],
-      });
-      expect(res.isError).toBe(true);
-      expect(res.structuredContent).toMatchObject({
-        code: 'invalid',
-        index: 1,
-        currentSeq: 0,
-      });
-      expect(res.structuredContent?.message).toContain('paste');
-    }
+        },
+        {
+          name: 'addColumn',
+          args: {
+            table: '$ref:t',
+            column: { id: '$ref:u', name: 'u', type: 'uuid', default: { expr: 'uuidv7()' } },
+          },
+        },
+      ];
+      for (const dryRun of [true, false]) {
+        const res = await f.callTool(tokAlice.token, 'apply_changes', {
+          project: f.p1Id,
+          baseSeq: 0,
+          dryRun,
+          ops,
+        });
+        expect(res.isError).toBeFalsy();
+        const diag = res.structuredContent?.diagnostics as {
+          target: string | null;
+          blocksPublish: boolean;
+          compatibility: {
+            errors: { total: number; items: { code: string; objectId?: string; minVersion?: string }[] };
+            warnings: { total: number; items: { code: string }[] };
+          };
+        };
+        const refs = res.structuredContent?.refs as Record<string, string>;
+        expect(diag.target).toBe('PG 15');
+        expect(diag.compatibility.errors.total).toBe(1);
+        expect(diag.compatibility.errors.items[0]).toMatchObject({
+          code: 'virtual_generated',
+          objectId: refs.v,
+          minVersion: 'PG 18',
+        });
+        expect(diag.compatibility.warnings.items.map((w) => w.code)).toEqual(['uuidv7_expr']);
+        // 兼容性问题不阻塞提交，也不阻塞发布判断（只有 validate 错误才算 blocksPublish）
+        expect(diag.blocksPublish).toBe(false);
+      }
+      expect((await f.created.rooms.model(f.branch1)).seq).toBe(1);
+    },
+  );
 
-    const state = await f.created.rooms.model(f.branch1);
-    expect(state.seq).toBe(0);
-    expect(all(state.model, 'table').map((t) => t.name)).toEqual([]);
-    expect(await f.db.query('select * from room_rejections where branch_id = $1', [f.branch1])).toEqual([]);
-    expect(await f.db.query("select id from audit_events where action = 'model.mutate'")).toEqual([]);
-  });
+  test.skipIf(skip)(
+    'list_mutators 排除 paste / batch 且 apply_changes 拒绝 paste 以防止绕过批量上限',
+    async () => {
+      const f = await setupEnv();
+      const tokAlice = await f.issueToken(f.alice.id, ['read', 'write']);
+
+      const lmAll = await f.callTool(tokAlice.token, 'list_mutators', {});
+      expect(lmAll.isError).toBeFalsy();
+      const allNames = (lmAll.structuredContent!.mutators as { name: string }[]).map((m) => m.name);
+      expect(allNames).not.toContain('paste');
+      expect(allNames).not.toContain('batch');
+
+      const lmFilter = await f.callTool(tokAlice.token, 'list_mutators', {
+        names: ['paste', 'batch', 'createTable'],
+      });
+      expect(lmFilter.isError).toBeFalsy();
+      expect((lmFilter.structuredContent!.mutators as { name: string }[]).map((m) => m.name)).toEqual([
+        'createTable',
+      ]);
+      expect(lmFilter.structuredContent!.unknown).toEqual(['paste', 'batch']);
+
+      const resList = await parseRpc(
+        await f.mcpPost(tokAlice.token, {
+          jsonrpc: '2.0',
+          id: 90,
+          method: 'resources/read',
+          params: { uri: 'dowel://mutators' },
+        }),
+      );
+      const catalog = JSON.parse(((resList.result?.contents as { text: string }[]) ?? [])[0]!.text) as {
+        mutators: { name: string }[];
+      };
+      expect(catalog.mutators.map((m) => m.name)).not.toContain('paste');
+      expect(catalog.mutators.map((m) => m.name)).not.toContain('batch');
+
+      const publicSchemaId = all((await f.created.rooms.model(f.branch1)).model, 'schema')[0]!.id;
+      for (const dryRun of [true, false]) {
+        const res = await f.callTool(tokAlice.token, 'apply_changes', {
+          project: f.p1Id,
+          baseSeq: 0,
+          dryRun,
+          ops: [
+            { name: 'createTable', args: { id: '$ref:t', schema: publicSchemaId, name: 'should_rollback' } },
+            {
+              name: 'paste',
+              args: {
+                ops: [
+                  {
+                    name: 'createTable',
+                    args: { id: '$ref:p_tbl', schema: publicSchemaId, name: 'via_paste' },
+                  },
+                ],
+              },
+            },
+          ],
+        });
+        expect(res.isError).toBe(true);
+        expect(res.structuredContent).toMatchObject({
+          code: 'invalid',
+          index: 1,
+          currentSeq: 0,
+        });
+        expect(res.structuredContent?.message).toContain('paste');
+      }
+
+      const state = await f.created.rooms.model(f.branch1);
+      expect(state.seq).toBe(0);
+      expect(all(state.model, 'table').map((t) => t.name)).toEqual([]);
+      expect(await f.db.query('select * from room_rejections where branch_id = $1', [f.branch1])).toEqual([]);
+      expect(await f.db.query("select id from audit_events where action = 'model.mutate'")).toEqual([]);
+    },
+  );
 });

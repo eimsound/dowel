@@ -290,8 +290,14 @@ describe.skipIf(!PG_URL)('HA2 MCP 服务跨副本一致性（真实 PG 双副本
       ],
     });
     expect(applyRes.result?.isError).toBeFalsy();
-    const scApply = applyRes.result?.structuredContent as { seq: number; refs: Record<string, string> };
-    expect(scApply.seq).toBe(2);
+    const scApply = applyRes.result?.structuredContent as {
+      seq: number;
+      opCount: number;
+      refs: Record<string, string>;
+    };
+    // 整批收敛为 1 个 batch op：1 个 seq，opCount 为展开后的子操作数
+    expect(scApply.seq).toBe(1);
+    expect(scApply.opCount).toBe(2);
     expect(scApply.refs.tbl).toBeTruthy();
 
     // 副本 B 立即通过 MCP get_model 读取最新模型与 seq
@@ -304,20 +310,21 @@ describe.skipIf(!PG_URL)('HA2 MCP 服务跨副本一致性（真实 PG 双副本
       seq: number;
       objects: Model['objects'];
     };
-    expect(scGet.seq).toBe(2);
+    expect(scGet.seq).toBe(1);
     expect(Object.values(scGet.objects).some((o) => o.kind === 'table' && o.name === 'invoices')).toBe(true);
 
-    // 副本 B 上连接的 WS peer 实时收到副本 A 的 MCP 提交
-    await waitFor(() => peerB.sent.filter((m) => m.t === 'commit').length >= 2);
+    // 副本 B 上连接的 WS peer 实时收到副本 A 的 MCP 提交（整批 1 次广播）
+    await waitFor(() => peerB.sent.filter((m) => m.t === 'commit').length >= 1);
     const commitsB = peerB.sent.filter((m): m is Commit => m.t === 'commit');
-    expect(commitsB.map((c) => c.seq)).toEqual([1, 2]);
+    expect(commitsB.map((c) => c.seq)).toEqual([1]);
+    expect(commitsB[0]!.changes).toHaveLength(2);
     expect(commitsB.every((c) => c.user === '张三')).toBe(true);
   });
 
   test('双副本同时基于同一 baseSeq 经 MCP 修改同一对象 → 仅一方成功提交，另一方返回 conflict', async () => {
     const f = await boot('concurrent_conflict');
 
-    // 先建一张共享表与列（seq = 2）
+    // 先建一张共享表与列（整批 1 个 seq = 1）
     const tblId = newId();
     const colId = newId();
     const seedRes = await callMcpTool(f.appA.app, f.tokenAlice, 'apply_changes', {
@@ -330,16 +337,16 @@ describe.skipIf(!PG_URL)('HA2 MCP 服务跨副本一致性（真实 PG 双副本
     });
     expect(seedRes.result?.isError).toBeFalsy();
 
-    // 两副本并发修改同一个列 colId（均基于 baseSeq = 2）
+    // 两副本并发修改同一个列 colId（均基于 baseSeq = 1）
     const [resA, resB] = await Promise.all([
       callMcpTool(f.appA.app, f.tokenAlice, 'apply_changes', {
         project: f.projectId,
-        baseSeq: 2,
+        baseSeq: 1,
         ops: [{ name: 'renameColumn', args: { id: colId, name: 'state_a' } }],
       }),
       callMcpTool(f.appB.app, f.tokenBob, 'apply_changes', {
         project: f.projectId,
-        baseSeq: 2,
+        baseSeq: 1,
         ops: [{ name: 'renameColumn', args: { id: colId, name: 'state_b' } }],
       }),
     ]);
@@ -350,7 +357,8 @@ describe.skipIf(!PG_URL)('HA2 MCP 服务跨副本一致性（真实 PG 双副本
     expect(okOnes).toHaveLength(1);
     expect(errOnes).toHaveLength(1);
     expect(errOnes[0]!.structuredContent?.code).toBe('conflict');
-    expect(errOnes[0]!.structuredContent?.currentSeq).toBe(3);
+    expect(errOnes[0]!.structuredContent?.currentSeq).toBe(2);
+    expect(errOnes[0]!.structuredContent?.index).toBe(0);
 
     // 确认最终两副本读到的列一致且无 room_rejections 残留
     const [modelA, modelB] = await Promise.all([

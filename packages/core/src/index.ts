@@ -1,5 +1,6 @@
 export * from './clipboard.ts';
 export * from './dialect.ts';
+export * from './diagnostics.ts';
 export * from './edit.ts';
 export * from './empty.ts';
 export * from './ids.ts';

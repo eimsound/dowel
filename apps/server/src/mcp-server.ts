@@ -1,13 +1,23 @@
-import { MCP_MAX_OPS, MCP_TOOLS, type McpToolErrorCode, type McpToolName, type Role } from '@dowel/api';
+import {
+  MCP_MAX_OPS,
+  MCP_SUMMARY_MAX,
+  MCP_TOOLS,
+  type McpDiagnostics,
+  type McpToolErrorCode,
+  type McpToolName,
+  type Role,
+} from '@dowel/api';
 import {
   all,
   type Check,
   childrenOf,
   type Column,
   columnsOf,
+  diagnoseModel,
   type ForeignKey,
   getDialect,
   type Index,
+  type Model,
   mutators,
   type Obj,
   PlanError,
@@ -70,7 +80,8 @@ const MCP_INSTRUCTIONS = [
   'Recommended workflow:',
   '1. Discover accessible projects via `list_projects` (or `dowel://projects`).',
   '2. Read the current model summary or inspect specific tables with `get_model` / `get_table`, noting `seq`.',
-  '3. Propose edits with `apply_changes` using that `baseSeq` and `$ref:<alias>` placeholders for new object IDs (`refs` returns `{ [alias]: uuid }`); run `dryRun: true` first when unsure.',
+  '3. Propose edits with `apply_changes` using that `baseSeq` and `$ref:<alias>` placeholders for new object IDs (`refs` returns `{ [alias]: uuid }`); run `dryRun: true` first when unsure. Each call is committed atomically as ONE canvas-history entry (one `seq`); pass a short `summary` describing the intent so humans can review and undo it as a unit.',
+  '   Every response (including `dryRun`) carries `diagnostics`: full model validation errors plus static compatibility errors / warnings against the lowest cached target environment version. They never block the write, but fix them before asking a human to publish.',
   '4. Inspect mutator signatures with `list_mutators`, export DDL with `get_ddl`, and preview up/down migration SQL with `preview_migration`.',
   '5. Validate migrations against a shadow database using `verify_migration` (requires `verify` scope).',
   'Note: Publishing versions and executing migrations against target databases are intentionally reserved for humans in the Dowel UI.',
@@ -467,6 +478,27 @@ const readCachedEnvironments = async (ctx: AppContext, pid: string) => {
       };
     }),
   };
+};
+
+/** apply_changes 的写后静态自检：只读平台库缓存的环境数值版本（绝不连目标库）；计算失败时返回 diagnostics: null + diagnosticsError */
+const computeDiagnostics = async (
+  ctx: AppContext,
+  projectId: string,
+  model: Model,
+): Promise<{ diagnostics: McpDiagnostics | null; diagnosticsError?: string }> => {
+  try {
+    const rows = await ctx.db.query<{ engine_version_num: number | string | null }>(
+      'select engine_version_num from environments where project_id = $1',
+      [projectId],
+    );
+    const nums = rows.map((r) => (r.engine_version_num === null ? null : Number(r.engine_version_num)));
+    return { diagnostics: sanitizeUnknown(diagnoseModel(model, nums)) as McpDiagnostics };
+  } catch (e) {
+    return {
+      diagnostics: null,
+      diagnosticsError: scrubSecrets(e instanceof Error ? e.message : String(e)),
+    };
+  }
 };
 
 const listMutatorCatalog = (names?: string[]) => {
@@ -950,7 +982,7 @@ export const createMcpServer = (
   addTool({
     name: 'apply_changes',
     description:
-      'Atomically validate and apply 1..100 mutator ops to the working trunk based on `baseSeq`. Use `$ref:<alias>` anywhere in args for new UUIDv7 IDs; `refs` maps each `alias` to its generated ID. Set `dryRun: true` to simulate without committing.',
+      'Atomically validate and apply 1..100 mutator ops to the working trunk based on `baseSeq`, committed as ONE canvas-history entry (single `seq`, `opCount` = expanded sub-ops). Use `$ref:<alias>` anywhere in args for new UUIDv7 IDs; `refs` maps each `alias` to its generated ID. Optional `summary` (<= 500 chars) records the intent in canvas history and audit. Set `dryRun: true` to simulate without committing. Responses include `diagnostics` (validation + static target-version compatibility; never blocks the write) and `noop: true` when nothing changed.',
     schema: z.object({
       project: z.string().min(1),
       baseSeq: z.number().int().min(0),
@@ -963,6 +995,7 @@ export const createMcpServer = (
         )
         .min(1)
         .max(MCP_MAX_OPS),
+      summary: z.string().trim().min(1).max(MCP_SUMMARY_MAX).optional(),
       dryRun: z.boolean().default(false),
     }),
     annotations: { readOnlyHint: false, destructiveHint: true, idempotentHint: false, openWorldHint: false },
@@ -970,6 +1003,7 @@ export const createMcpServer = (
       const resolved = await resolveMcpProject(ctx, principal, args.project, MCP_TOOLS.apply_changes.action);
       if (!resolved.ok) return toolError(resolved.code, resolved.message);
       const { row } = resolved.project;
+      const summary = args.summary ? scrubSecrets(args.summary).trim() || undefined : undefined;
 
       const res = await ctx.rooms.applyMcpOps(row.branch, {
         userId: principal.user.id,
@@ -978,6 +1012,7 @@ export const createMcpServer = (
         baseSeq: args.baseSeq,
         dryRun: args.dryRun,
         ops: args.ops,
+        ...(summary ? { summary } : {}),
         onBeforeCommit: async (tx, info) => {
           await auditIn(
             tx,
@@ -993,10 +1028,10 @@ export const createMcpServer = (
                 via: 'mcp',
                 mcpToken: { id: principal.tokenId, name: principal.tokenName, prefix: principal.prefix },
                 projectId: row.id,
-                opCount: args.ops.length,
+                seq: info.seq,
+                opCount: info.opCount,
                 ops: args.ops.map((o) => o.name),
-                seqFrom: info.seqFrom,
-                seqTo: info.seqTo,
+                ...(summary ? { summary } : {}),
               },
             },
             ctx.security,
@@ -1011,12 +1046,18 @@ export const createMcpServer = (
         });
       }
 
+      // 写后静态自检在房间锁释放之后计算（#17），只读平台库缓存的环境版本，绝不连目标库；
+      // 已提交的写入绝不因诊断失败而报错
+      const diag = await computeDiagnostics(ctx, row.id, res.model);
+
       return toolOk({
         dryRun: res.dryRun,
         seq: res.seq,
-        committed: res.committed,
+        opCount: res.opCount,
         refs: res.refs,
         changed: res.changed,
+        ...diag,
+        ...(res.noop ? { noop: true } : {}),
       });
     },
   });

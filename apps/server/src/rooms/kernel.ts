@@ -3,11 +3,12 @@
 // 权限刷新代际与集群事件发布；布局 / 板块 / 成员 / 写入 / 历史 / MCP 等子模块都经它访问共享状态。
 
 import { type CanvasSection, sanitizeSections } from '@dowel/api';
-import type { Model } from '@dowel/core';
+import { BATCH_MUTATOR, batchSummaryOf, type Model, scrubSecrets } from '@dowel/core';
 import type { Db } from '@dowel/engines';
 import {
   type Commit,
   emptyRoomState,
+  type Op,
   type Out,
   type Rejection,
   Room,
@@ -32,6 +33,13 @@ import {
   type Peer,
   SNAPSHOT_EVERY,
 } from './types.ts';
+
+/** batch 提交的意图说明（脱敏后落库 room_commits.op_summary）；其他操作为 null */
+const opSummaryOf = (op: Op): string | null => {
+  if (op.name !== BATCH_MUTATOR) return null;
+  const s = batchSummaryOf(op.args);
+  return s ? scrubSecrets(s) : null;
+};
 
 export class RoomKernel {
   readonly rooms = new Map<string, Promise<Loaded>>();
@@ -105,8 +113,8 @@ export class RoomKernel {
     return {
       append: async (commit, op) => {
         await db.query(
-          `insert into room_commits (branch_id, seq, client, n, user_name, op_name, op_args, changes)
-           values ($1, $2, $3, $4, $5, $6, $7::text::jsonb, $8::text::jsonb)`,
+          `insert into room_commits (branch_id, seq, client, n, user_name, op_name, op_args, changes, op_summary)
+           values ($1, $2, $3, $4, $5, $6, $7::text::jsonb, $8::text::jsonb, $9)`,
           [
             branchId,
             commit.seq,
@@ -116,6 +124,7 @@ export class RoomKernel {
             op.name,
             JSON.stringify(op.args ?? null),
             JSON.stringify(commit.changes),
+            opSummaryOf(op),
           ],
         );
       },

@@ -1,5 +1,6 @@
 // 多方言统一抽象契约（纯函数、无 I/O，前后端共用、浏览器轻量安全）。
 import type { ClipboardDialect } from './clipboard-dialect.ts';
+import type { ModelCompatibilityIssue } from './diagnostics.ts';
 import type { Dialect, Model } from './ir.ts';
 import type { PlanOptions } from './pg/capabilities.ts';
 import type { Step, Token } from './plan-types.ts';
@@ -65,6 +66,20 @@ export interface DialectVersioning {
   targetPlanOptions(versionNums: readonly (number | null | undefined)[]): PlanOptions | undefined;
   /** 数值版本号 → 简洁版本串（PG 160004 → '16.4'；MySQL 80413 → '8.4.13'；SQLite 3054001 → '3.54.1'） */
   formatVersionNum(versionNum: number): string;
+  /**
+   * 按项目全部环境的数值版本号推导最低目标版本，静态检查模型在该版本下的兼容性问题（不抛错、不连库）。
+   * 无可推导的目标版本或方言不区分版本时返回 null（不提供即视为 null）。
+   */
+  compatibility?(
+    model: Model,
+    versionNums: readonly (number | null | undefined)[],
+  ): DialectCompatibility | null;
+}
+
+/** 静态兼容性检查结果：target 为人类可读的目标版本（如 'PG 15'、'MySQL 8.4'、'SQL Server 2022'） */
+export interface DialectCompatibility {
+  target: string;
+  issues: ModelCompatibilityIssue[];
 }
 
 export type IdentKind = 'schema' | 'table' | 'column' | 'enum' | 'sequence' | 'constraint' | 'index';

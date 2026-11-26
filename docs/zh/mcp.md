@@ -83,21 +83,28 @@ claude mcp add --transport http --scope user dowel https://dowel.example.com/api
 
 工具的 `project` 参数可以是项目 ID，也可以是 `owner/project` 路径。客户端只会看到令牌权限允许的工具。
 
-| 工具                | 权限 | 作用                                                                                                                     |
-| ------------------- | ---- | ------------------------------------------------------------------------------------------------------------------------ |
-| `list_projects`     | 读取 | 你能访问的项目（限令牌的项目范围）                                                                                       |
-| `get_model`         | 读取 | 工作副本：摘要，或带版本号的完整对象，以及当前 `seq`                                                                     |
-| `get_table`         | 读取 | 一张表的列、主键、约束、索引和分区                                                                                       |
-| `get_ddl`           | 读取 | 工作副本或某个版本的 `CREATE` DDL                                                                                        |
-| `list_versions`     | 读取 | 版本链                                                                                                                   |
-| `get_version`       | 读取 | 一个版本及其冻结的升级 / 回滚迁移                                                                                        |
-| `preview_migration` | 读取 | 两个版本之间的升级 / 回滚 SQL（默认：最新版本 → 工作副本）                                                               |
-| `list_environments` | 读取 | 环境及其缓存的当前版本、漂移状态和缓存时间                                                                               |
-| `list_mutators`     | 读取 | 可用的修改操作及其参数的 JSON Schema                                                                                     |
-| `verify_migration`  | 验证 | 在影子库里执行迁移并比对结果（等同界面上的“在影子库验证”）                                                               |
-| `apply_changes`     | 修改 | 整批原子执行修改操作；参数 `baseSeq`（来自 `get_model`）、`ops`（最多 100 个）、`dryRun`；新对象的 ID 写 `"$ref:<别名>"` |
+| 工具                | 权限 | 作用                                                                                                                                                              |
+| ------------------- | ---- | ----------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `list_projects`     | 读取 | 你能访问的项目（限令牌的项目范围）                                                                                                                                |
+| `get_model`         | 读取 | 工作副本：摘要，或带版本号的完整对象，以及当前 `seq`                                                                                                              |
+| `get_table`         | 读取 | 一张表的列、主键、约束、索引和分区                                                                                                                                |
+| `get_ddl`           | 读取 | 工作副本或某个版本的 `CREATE` DDL                                                                                                                                 |
+| `list_versions`     | 读取 | 版本链                                                                                                                                                            |
+| `get_version`       | 读取 | 一个版本及其冻结的升级 / 回滚迁移                                                                                                                                 |
+| `preview_migration` | 读取 | 两个版本之间的升级 / 回滚 SQL（默认：最新版本 → 工作副本）                                                                                                        |
+| `list_environments` | 读取 | 环境及其缓存的当前版本、漂移状态和缓存时间                                                                                                                        |
+| `list_mutators`     | 读取 | 可用的修改操作及其参数的 JSON Schema                                                                                                                              |
+| `verify_migration`  | 验证 | 在影子库里执行迁移并比对结果（等同界面上的“在影子库验证”）                                                                                                        |
+| `apply_changes`     | 修改 | 整批原子执行修改操作；参数 `baseSeq`（来自 `get_model`）、`ops`（最多 100 个）、可选 `summary`（意图说明，最多 500 字）、`dryRun`；新对象的 ID 写 `"$ref:<别名>"` |
 
 典型流程：`get_model`（记下 `seq`）→ 用这个 `baseSeq` 调 `apply_changes` → `preview_migration` → `verify_migration` → 由人在 Dowel 里评审并发布。
+
+`apply_changes` 的几点约定：
+
+- **一次调用 = 一次提交**：整批操作作为一个提交写入工作副本（一个新的 `seq`），在 **画布修改历史** 里只占一条“批量修改”记录，带上你传的 `summary`；要整批撤销，在历史里恢复到它的前一条即可。响应里的 `opCount` 是展开后的底层操作数（最多 500 个）。
+- **冲突与错误定位**：任一操作不合法，或基于旧 `baseSeq` 依据的对象已被别人修改，整批都不会提交，错误里的 `index` 指向最早出错的那个操作。
+- **没有净变化**（例如建了又删）时返回 `noop: true`，不产生提交、不记审计。
+- **写后自检**：响应（包括 `dryRun: true`）都带 `diagnostics`：完整的模型校验错误，以及按项目里版本最低的环境（读平台缓存的版本号，不连接目标库）做的静态兼容性 `errors` / `warnings`。它们不阻止这次修改，但有校验错误时发布版本会被拒绝（`blocksPublish: true`）。
 
 另有只读资源：`dowel://projects`、`dowel://projects/{owner}/{project}/model`、`…/ddl`、`…/versions`、`…/environments` 和 `dowel://mutators`。
 
