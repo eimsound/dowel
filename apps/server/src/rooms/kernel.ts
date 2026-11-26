@@ -21,9 +21,9 @@ import type { ClusterEventPayload, EventBus } from '../bus.ts';
 import type { PlatformDb } from '../db.ts';
 import type { HaCoordinator } from '../ha.ts';
 import { forPeer, syncClientOf } from './client-scope.ts';
-import { hasPendingLayout } from './layout-state.ts';
+import { hasPendingLayout } from './layout.ts';
 import { parseClock } from './lww.ts';
-import { hasPendingSections } from './sections-state.ts';
+import { hasPendingSections } from './sections.ts';
 import {
   type Extra,
   type Layout,

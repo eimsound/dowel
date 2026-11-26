@@ -11,6 +11,10 @@ import type { LayoutVersion, Loaded, Peer } from './types.ts';
 /** 单条 room.sections 集群事件内联发送的安全字节上限（留足余量，低于 PG NOTIFY 7500B 上限） */
 const SECTIONS_INLINE_MAX_BYTES = 7000;
 
+/** 是否仍有待落盘 / 在途 IO / 已排期的板块写入（纯函数，供内核空闲卸载判断） */
+export const hasPendingSections = (r: Loaded): boolean =>
+  r.sectionsPending || r.sectionsIoCount > 0 || r.sectionsTimer !== undefined;
+
 export class SectionsSync {
   private readonly k: RoomKernel;
   private readonly opts: DebounceOptions;

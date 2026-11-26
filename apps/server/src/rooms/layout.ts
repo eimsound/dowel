@@ -8,6 +8,10 @@ import type { Layout, LayoutVersion, Loaded, Peer } from './types.ts';
 /** 单条 room.layout 集群事件内联发送的安全字节上限（留足余量，低于 PG NOTIFY 7500B 上限） */
 const LAYOUT_INLINE_MAX_BYTES = 7000;
 
+/** 是否仍有待落盘 / 在途 IO / 已排期的布局写入（纯函数，供内核空闲卸载判断） */
+export const hasPendingLayout = (r: Loaded): boolean =>
+  Object.keys(r.pendingLayout).length > 0 || r.layoutIoCount > 0 || r.layoutTimer !== undefined;
+
 export interface DebounceOptions {
   debounceMs: number;
   maxRetries: number;
