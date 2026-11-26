@@ -598,6 +598,15 @@ const zh = {
       executor: '仅限执行者',
     },
     tokens: { label: '允许 CI 令牌执行', yes: '允许', no: '不允许' },
+    tokenGuard: {
+      title: 'CI 令牌仍可直接执行迁移',
+      bodyLayer:
+        '“允许 CI 令牌执行”当前为“允许”：有权创建 CI 令牌的成员可以签发令牌，对范围内的非生产环境直接向前执行迁移，不受“谁能执行”与审批流程限制。如需让这些规则覆盖所有执行，请把它设为“不允许”并保存执行策略。',
+      bodyEnv:
+        '“允许 CI 令牌执行”当前为“允许”：有权创建 CI 令牌的成员可以签发令牌，对这个环境直接向前执行迁移，不受“谁能执行”与审批流程限制。如需让这些规则覆盖所有执行，请把它设为“不允许”并保存执行策略。',
+      action: '禁止 CI 令牌执行',
+      pending: '已把“允许 CI 令牌执行”设为“不允许”，保存执行策略后生效。',
+    },
     lockTimeout: '锁等待超时（秒）',
     ttl: '执行申请有效期（小时）',
     ttlHint: '执行申请提交后多久没执行完就过期（1～720 小时）。留空 = 继承；越短越严。默认 24 小时。',
@@ -2965,6 +2974,15 @@ const en: typeof zh = {
       executor: 'Executors only',
     },
     tokens: { label: 'Allow CI token execution', yes: 'Allowed', no: 'Not allowed' },
+    tokenGuard: {
+      title: 'CI tokens can still execute migrations directly',
+      bodyLayer:
+        '“Allow CI token execution” is set to “Allowed”: members who can create CI tokens can issue a token and execute forward migrations on non-production environments in scope, bypassing “Who can execute” and the approval flow. To make these rules cover every execution, set it to “Not allowed” and save the execution policy.',
+      bodyEnv:
+        '“Allow CI token execution” is set to “Allowed”: members who can create CI tokens can issue a token and execute forward migrations on this environment, bypassing “Who can execute” and the approval flow. To make these rules cover every execution, set it to “Not allowed” and save the execution policy.',
+      action: 'Disallow CI token execution',
+      pending: '“Allow CI token execution” is now “Not allowed”; save the execution policy to apply it.',
+    },
     lockTimeout: 'Lock wait timeout (s)',
     ttl: 'Execution request lifetime (hours)',
     ttlHint:

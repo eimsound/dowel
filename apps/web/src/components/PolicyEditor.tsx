@@ -25,11 +25,13 @@ import {
 } from '@dowel/api';
 import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query';
 import { Lock, Plus, Trash2 } from 'lucide-react';
-import { useId, useMemo, useState } from 'react';
+import { useId, useMemo, useRef, useState } from 'react';
+import { flushSync } from 'react-dom';
 import { useTranslation } from 'react-i18next';
 
 import { api } from '../api.ts';
 import { invalidatePolicyDependents } from '../policy-cache.ts';
+import { tokenBypassRisk } from '../token-guard.ts';
 import { useToast } from './Toasts.tsx';
 import { Banner, IconButton } from './ui.tsx';
 
@@ -346,6 +348,7 @@ export const PolicySetEditor = ({
   value,
   onChange,
   disabled,
+  canEdit = !disabled,
   names,
 }: {
   title?: string;
@@ -355,13 +358,24 @@ export const PolicySetEditor = ({
   value: PolicySettings;
   onChange: (v: PolicySettings) => void;
   disabled: boolean;
+  /** 这一层能不能改（区分“只读”和“正在保存”：保存中只禁用操作，不隐藏） */
+  canEdit?: boolean;
   names: PolicyNames;
 }) => {
   const { t, value: label, layer } = useLabels();
   const id = useId();
+  const tokRef = useRef<HTMLSelectElement>(null);
   const upper = useMemo(() => upperFrom(resolved), [resolved]);
   const live = resolvePolicy({ ...upper, [at]: value }, production, at);
   const problems = validateLayer(upper, value, production, at);
+  const bypass = tokenBypassRisk(live);
+  // 令牌提醒的礼貌播报：挂载时不播（静态内容读屏按顺序能读到），之后因编辑出现时播一次结论，消失时清空
+  const [announce, setAnnounce] = useState('');
+  const [prevBypass, setPrevBypass] = useState(bypass);
+  if (bypass !== prevBypass) {
+    setPrevBypass(bypass);
+    setAnnounce(bypass ? t('pol.tokenGuard.title') : '');
+  }
   const dir = useQuery({
     queryKey: ['directory', ''],
     queryFn: () => api<Directory>('GET', '/api/directory?q='),
@@ -440,10 +454,12 @@ export const PolicySetEditor = ({
           <label className="field" htmlFor={`${id}-tok`}>
             <span className="label">{t('pol.tokens.label')}</span>
             <select
+              ref={tokRef}
               id={`${id}-tok`}
               className="select"
               value={value.allowTokens === undefined ? '' : String(value.allowTokens)}
               disabled={disabled}
+              aria-describedby={`${id}-tok-hint`}
               onChange={(e) =>
                 set('allowTokens', e.target.value === '' ? undefined : e.target.value === 'true')
               }
@@ -456,7 +472,9 @@ export const PolicySetEditor = ({
               <option value="false">{t('pol.tokens.no')}</option>
             </select>
           </label>
-          <Effective field="allowTokens" r={live.allowTokens} />
+          <span id={`${id}-tok-hint`} className="block">
+            <Effective field="allowTokens" r={live.allowTokens} />
+          </span>
         </div>
         {timeout('lockTimeoutMs', 'pol.lockTimeout')}
         {timeout('statementTimeoutMs', 'pol.statementTimeout')}
@@ -562,6 +580,40 @@ export const PolicySetEditor = ({
           </button>
         )}
       </div>
+      {bypass && (
+        // 提示条本身不是 live region（里面有按钮，放进 live region 会被压平成纯文本）；出现 / 一键关闭的播报走下面单独的区域。
+        // 一键关闭只改草稿（整层替换保存，不能顺带提交其他未完成的修改），保存后才生效
+        <Banner
+          kind="warn"
+          action={
+            canEdit && (
+              <button
+                type="button"
+                className="btn sm shrink-0"
+                disabled={disabled}
+                aria-describedby={`${id}-tokwarn`}
+                onClick={() => {
+                  // 先同步提交草稿再移焦点：提示条随之消失，焦点落到本套的“允许 CI 令牌执行”时读屏读到的是新值
+                  flushSync(() => set('allowTokens', false));
+                  tokRef.current?.focus();
+                  // 稍后再播报“保存后生效”，不和聚焦时的朗读重叠
+                  window.setTimeout(() => setAnnounce(t('pol.tokenGuard.pending')), 400);
+                }}
+              >
+                {t('pol.tokenGuard.action')}
+              </button>
+            )
+          }
+        >
+          <span id={`${id}-tokwarn`} data-testid="token-bypass-warn">
+            <strong className="block">{t('pol.tokenGuard.title')}</strong>
+            {t(at === 'environment' ? 'pol.tokenGuard.bodyEnv' : 'pol.tokenGuard.bodyLayer')}
+          </span>
+        </Banner>
+      )}
+      <div className="sr-only" aria-live="polite" aria-atomic="true">
+        {announce}
+      </div>
       {problems.length > 0 && (
         <Banner kind="warn" role="status">
           {problems.map((p) => p.message).join('；')}
@@ -612,6 +664,7 @@ export const PolicyLayerPanel = ({ path, queryKey }: { path: string; queryKey: u
         value={draft.production}
         onChange={(p) => setDraft({ ...draft, production: p })}
         disabled={!v.canEdit || save.isPending}
+        canEdit={v.canEdit}
         names={v.names}
       />
       <PolicySetEditor
@@ -622,6 +675,7 @@ export const PolicyLayerPanel = ({ path, queryKey }: { path: string; queryKey: u
         value={draft.nonProduction}
         onChange={(p) => setDraft({ ...draft, nonProduction: p })}
         disabled={!v.canEdit || save.isPending}
+        canEdit={v.canEdit}
         names={v.names}
       />
       {save.error && (
@@ -698,6 +752,7 @@ export const EnvPolicyPanel = ({ pid, eid }: { pid: string; eid: string }) => {
         value={draft.settings}
         onChange={(s) => setDraft({ settings: s })}
         disabled={disabled}
+        canEdit={v.canEdit}
         names={v.names}
       />
       {save.error && (
