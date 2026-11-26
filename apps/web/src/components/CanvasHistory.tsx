@@ -1,11 +1,12 @@
 // 画布修改历史（C4）：对标在线文档的修改历史体验。
-// 左侧时间线（支持分页加载与版本徽章），右侧三维度预览（本次修改 / 当时状态 / 与当前画布的差异），
+// 左侧时间线（支持分页加载与版本徽章；同一用户的连续手工编辑由服务端归成编辑会话组，可展开查看单步），右侧三维度预览（本次修改 / 当时状态 / 与当前画布的差异），
 // 以及带二次确认与并发冲突处理的“恢复到此状态”。
 import type {
   CanvasHistoryConflict,
   CanvasHistoryDetail,
   CanvasHistoryEntry,
   CanvasHistoryList,
+  CanvasHistorySteps,
   ModelUpdate,
 } from '@dowel/api';
 import {
@@ -21,7 +22,9 @@ import {
   type Model,
 } from '@dowel/core';
 import { useInfiniteQuery, useMutation, useQuery, useQueryClient } from '@tanstack/react-query';
+import type { TFunction } from 'i18next';
 import {
+  ChevronRight,
   Copy,
   FileCode,
   GitCompareArrows,
@@ -38,6 +41,22 @@ import { useCallback, useEffect, useId, useLayoutEffect, useMemo, useRef, useSta
 import { useTranslation } from 'react-i18next';
 
 import { ApiError, api } from '../api.ts';
+import {
+  activeSelection,
+  detailPath,
+  entryKey,
+  type HistorySelection,
+  isAbsoluteTime,
+  isSession,
+  mergeHistoryPages,
+  opsPreview,
+  rangeLabel,
+  sameSelection,
+  selectionInside,
+  selectionOf,
+  stepsPath,
+  timeRange,
+} from '../canvas-history.ts';
 import { writeClipboard } from '../clipboard.ts';
 import { defaultSchemaOf } from '../dialects.ts';
 import { formatTime } from '../format.ts';
@@ -425,6 +444,351 @@ const HistorySchemaSummary = ({ model, copy }: { model: Model; copy?: HistoryCop
   );
 };
 
+/** 超过 delay 毫秒仍在加载时才为 true（DESIGN.md：加载超过 300ms 才显示骨架屏） */
+const useDelayedFlag = (on: boolean, delay: number) => {
+  const [late, setLate] = useState(false);
+  useEffect(() => {
+    if (!on) return;
+    const id = window.setTimeout(() => setLate(true), delay);
+    return () => {
+      window.clearTimeout(id);
+      setLate(false);
+    };
+  }, [on, delay]);
+  return on && late;
+};
+
+const opTextOf = (t: TFunction) => (opName: string) => t(`hist.op.${opName}`, { defaultValue: opName });
+
+/**
+ * 时间线条目里的时间：单步为一个 <time>，编辑会话为起止两个 <time>（同日绝对时间的结束只留 HH:mm）。
+ * 绝对时间用等宽字体、相对时间用等宽数字；窄侧栏下截断并用 title 给出完整文本，不挤掉左侧的用户名。
+ */
+const EntryTime = ({ entry }: { entry: CanvasHistoryEntry }) => {
+  const range = isSession(entry)
+    ? timeRange(entry.startedAt, entry.at, formatTime)
+    : { single: formatTime(entry.at), full: formatTime(entry.at) };
+  const mono = 'single' in range ? isAbsoluteTime(range.single) : isAbsoluteTime(range.start);
+  const cls = cx('min-w-0 truncate whitespace-nowrap', mono ? 'font-mono' : 'tabular-nums');
+  if ('single' in range) {
+    return (
+      <time dateTime={entry.at} className={cls} title={range.full}>
+        {range.single}
+      </time>
+    );
+  }
+  return (
+    <span className={cls} title={range.full}>
+      <time dateTime={entry.startedAt}>{range.start}</time>–<time dateTime={entry.at}>{range.end}</time>
+    </span>
+  );
+};
+
+/** 时间线上的一个可选中按钮：单步 / 初始状态 / 组内单步共用（编辑会话组的主选择按钮另见 SessionItem） */
+const EntryButton = ({
+  entry,
+  active,
+  onSelect,
+  compact = false,
+}: {
+  entry: CanvasHistoryEntry;
+  active: boolean;
+  onSelect: () => void;
+  compact?: boolean;
+}) => {
+  const { t } = useTranslation();
+  const opText = opTextOf(t);
+  const actor = entry.user || t('hist.initialUser');
+  return (
+    <button
+      type="button"
+      aria-current={active ? 'true' : undefined}
+      onClick={onSelect}
+      className={cx(
+        // 统一 2px 左边线（未选中透明），选中 / 未选中与编辑会话组行的左竖线和正文完全对齐
+        'flex w-full flex-col gap-1 rounded-sm border border-l-2 border-transparent text-left transition-colors',
+        compact ? 'px-2 py-1.5' : 'px-2.5 py-2',
+        active ? 'border-l-primary bg-primary-soft text-text' : 'text-text hover:bg-surface-hover',
+      )}
+    >
+      <div className="flex items-center gap-1.5">
+        <span className={cx('min-w-0 flex-1 truncate font-medium', compact ? 'text-xs' : 'text-sm')}>
+          {opText(entry.opName)}
+        </span>
+        <span className={cx('shrink-0 font-mono text-xs', active ? 'text-primary-text' : 'text-text-3')}>
+          #{entry.seq}
+        </span>
+      </div>
+
+      {(entry.isCurrent || entry.version) && (
+        <div className="flex flex-wrap items-center gap-1">
+          {entry.isCurrent && <span className="badge ok">{t('hist.current')}</span>}
+          {entry.version && (
+            <span className="badge font-mono">
+              v{entry.version.number} {entry.version.name}
+            </span>
+          )}
+        </div>
+      )}
+
+      {entry.opSummary && (
+        <p
+          className={cx('m-0 line-clamp-2 text-xs break-words', active ? 'text-text' : 'text-text-2')}
+          title={entry.opSummary}
+        >
+          {entry.opSummary}
+        </p>
+      )}
+
+      {entry.summary.length > 0 && (
+        <p className={cx('m-0 truncate font-mono text-xs', active ? 'text-text-2' : 'text-text-3')}>
+          {entry.summary.join(', ')}
+          {entry.changeCount > entry.summary.length ? ` (+${entry.changeCount - entry.summary.length})` : ''}
+        </p>
+      )}
+
+      {!compact && (
+        <div
+          className={cx(
+            'flex items-center justify-between gap-2 text-xs',
+            active ? 'text-text-2' : 'text-text-3',
+          )}
+        >
+          <span className="min-w-12 truncate">{actor}</span>
+          {entry.via === 'mcp' && <McpBadge />}
+          <EntryTime entry={entry} />
+        </div>
+      )}
+      {compact && (
+        <div className={cx('flex min-w-0 justify-end text-xs', active ? 'text-text-2' : 'text-text-3')}>
+          <EntryTime entry={entry} />
+        </div>
+      )}
+    </button>
+  );
+};
+
+/**
+ * 编辑会话组：<li> 内两个兄弟按钮（主选择按钮 + 独立的展开按钮，绝不嵌套 <button>），
+ * 下方是非互斥展开的单步明细 <ol>（惰性加载，超过 300ms 才显示骨架屏，失败可重试）。
+ */
+const SessionItem = ({
+  pid,
+  entry,
+  active,
+  expanded,
+  onToggle,
+  onSelect,
+}: {
+  pid: string;
+  entry: CanvasHistoryEntry;
+  active: HistorySelection | null;
+  expanded: boolean;
+  onToggle: () => void;
+  onSelect: (sel: HistorySelection) => void;
+}) => {
+  const { t } = useTranslation();
+  const opText = opTextOf(t);
+  const stepsId = useId();
+  const listRef = useRef<HTMLOListElement>(null);
+  const toggleRef = useRef<HTMLButtonElement>(null);
+  const range = rangeLabel(entry.seqFrom, entry.seq);
+  const groupSelected = sameSelection(active, selectionOf(entry));
+  const holdsSelection = !groupSelected && !expanded && selectionInside(active, entry);
+  const preview = opsPreview(entry.ops, entry.stepCount);
+
+  const stepsQuery = useQuery({
+    queryKey: ['canvas-history-steps', pid, entry.seqFrom, entry.seq],
+    queryFn: () => api<CanvasHistorySteps>('GET', stepsPath(pid, entry.seqFrom, entry.seq)),
+    enabled: expanded,
+    gcTime: 0,
+  });
+  const loading = expanded && stepsQuery.isPending;
+  const busy = expanded && stepsQuery.isFetching;
+  const showSkeleton = useDelayedFlag(loading, 300);
+
+  // 点“重试”后：成功时错误横幅（连同重试按钮）卸载，焦点移到第一步（没有则归还展开按钮）；
+  // 仍失败时回到重试按钮，避免焦点掉回 body
+  const retryRef = useRef<HTMLButtonElement>(null);
+  const refocusAfterRetry = useRef(false);
+  const retry = () => {
+    refocusAfterRetry.current = true;
+    void stepsQuery.refetch();
+  };
+  const fetching = stepsQuery.isFetching;
+  useEffect(() => {
+    if (fetching || !refocusAfterRetry.current) return;
+    refocusAfterRetry.current = false;
+    if (retryRef.current) retryRef.current.focus();
+    else (listRef.current?.querySelector<HTMLButtonElement>('button') ?? toggleRef.current)?.focus();
+  }, [fetching]);
+
+  const toggle = () => {
+    if (expanded) {
+      // 收起后不再在途重试完成时把焦点拉回已折叠的组
+      refocusAfterRetry.current = false;
+      // 收起时焦点若在子列表内，归还给展开按钮
+      if (listRef.current?.contains(document.activeElement)) toggleRef.current?.focus();
+    }
+    onToggle();
+  };
+
+  const opsText = [
+    ...preview.shown.map((o) => t('hist.opCount', { op: opText(o.name), count: o.count })),
+    ...(preview.rest > 0 ? [t('hist.opsMore', { count: preview.rest })] : []),
+  ].join(' · ');
+
+  return (
+    <li>
+      {/* 组内某一步被选中而组已折叠：比真正选中态（主色左边线 + 主色软底）弱一级的中性提示，亮 / 暗都可见。
+          竖线用不占布局宽度的伪元素，与按钮自身的 2px 左边线重合（不用 overflow-hidden，免得裁掉焦点环） */}
+      <div
+        className={cx(
+          'relative rounded-sm',
+          holdsSelection &&
+            'bg-surface before:pointer-events-none before:absolute before:inset-0 before:rounded-sm before:border before:border-l-2 before:border-transparent before:border-l-border-strong',
+        )}
+      >
+        <button
+          type="button"
+          aria-current={groupSelected ? 'true' : undefined}
+          onClick={() => onSelect(selectionOf(entry))}
+          className={cx(
+            'flex w-full flex-col gap-1 rounded-sm border border-l-2 border-transparent px-2.5 pt-2 pb-1.5 text-left transition-colors focus-visible:relative focus-visible:z-10',
+            groupSelected ? 'border-l-primary bg-primary-soft text-text' : 'text-text hover:bg-surface-hover',
+          )}
+        >
+          <div className="flex items-center gap-1.5">
+            {holdsSelection && (
+              <span aria-hidden="true" className="size-1.5 shrink-0 rounded-full bg-primary" />
+            )}
+            <span className="min-w-0 flex-1 truncate text-sm font-medium">{opText(entry.opName)}</span>
+            <span
+              className={cx(
+                'shrink-0 font-mono text-xs',
+                groupSelected ? 'text-primary-text' : 'text-text-3',
+              )}
+            >
+              {range}
+            </span>
+          </div>
+
+          {(entry.isCurrent || entry.version) && (
+            <div className="flex flex-wrap items-center gap-1">
+              {entry.isCurrent && <span className="badge ok">{t('hist.current')}</span>}
+              {entry.version && (
+                <span className="badge font-mono">
+                  v{entry.version.number} {entry.version.name}
+                </span>
+              )}
+            </div>
+          )}
+
+          {opsText && (
+            <p className={cx('m-0 truncate text-xs', groupSelected ? 'text-text' : 'text-text-2')}>
+              {opsText}
+            </p>
+          )}
+
+          {entry.summary.length > 0 && (
+            <p
+              className={cx('m-0 truncate font-mono text-xs', groupSelected ? 'text-text-2' : 'text-text-3')}
+            >
+              {entry.summary.join(', ')}
+              {entry.changeCount > entry.summary.length
+                ? ` (+${entry.changeCount - entry.summary.length})`
+                : ''}
+            </p>
+          )}
+
+          <div
+            className={cx(
+              'flex items-center justify-between gap-2 text-xs',
+              groupSelected ? 'text-text-2' : 'text-text-3',
+            )}
+          >
+            <span className="min-w-12 truncate">{entry.user}</span>
+            <EntryTime entry={entry} />
+          </div>
+          {holdsSelection && <span className="sr-only">{t('hist.containsSelected')}</span>}
+        </button>
+
+        <button
+          ref={toggleRef}
+          type="button"
+          aria-expanded={expanded}
+          aria-controls={stepsId}
+          onClick={toggle}
+          className="btn ghost sm ml-1.5 text-text-2 focus-visible:relative focus-visible:z-10"
+        >
+          <ChevronRight
+            size={14}
+            aria-hidden="true"
+            className={cx(
+              'transition-transform duration-100 motion-reduce:transition-none',
+              expanded && 'rotate-90',
+            )}
+          />
+          {t('hist.stepsToggle', { count: entry.stepCount })}
+          <span className="sr-only"> {range}</span>
+        </button>
+      </div>
+
+      <ol
+        ref={listRef}
+        id={stepsId}
+        hidden={!expanded}
+        aria-label={t('hist.stepsOf', { range })}
+        aria-busy={busy || undefined}
+        className="m-0 mt-1 ml-3 list-none space-y-0.5 border-l border-border p-0 pl-2"
+      >
+        {expanded &&
+          showSkeleton &&
+          Array.from({ length: Math.min(entry.stepCount, 3) }, (_, i) => (
+            <li
+              key={i}
+              aria-hidden="true"
+              className="h-9 animate-pulse rounded-sm bg-surface-active motion-reduce:animate-none"
+            />
+          ))}
+        {expanded && stepsQuery.error && (
+          <li>
+            <Banner
+              kind="danger"
+              role="alert"
+              action={
+                <button
+                  ref={retryRef}
+                  type="button"
+                  className="btn sm"
+                  disabled={stepsQuery.isFetching}
+                  aria-busy={stepsQuery.isFetching}
+                  onClick={retry}
+                >
+                  {t('hist.stepsRetry')}
+                </button>
+              }
+            >
+              {t('hist.stepsLoadFailed', { reason: stepsQuery.error.message })}
+            </Banner>
+          </li>
+        )}
+        {expanded &&
+          stepsQuery.data?.steps.map((step) => (
+            <li key={entryKey(step)}>
+              <EntryButton
+                compact
+                entry={step}
+                active={sameSelection(active, selectionOf(step))}
+                onSelect={() => onSelect(selectionOf(step))}
+              />
+            </li>
+          ))}
+      </ol>
+    </li>
+  );
+};
+
 export const CanvasHistory = ({
   pid,
   open,
@@ -445,7 +809,8 @@ export const CanvasHistory = ({
   const titleId = useId();
   const tabBase = useId();
 
-  const [selectedSeq, setSelectedSeq] = useState<number | null>(null);
+  const [selected, setSelected] = useState<HistorySelection | null>(null);
+  const [expanded, setExpanded] = useState<ReadonlySet<string>>(() => new Set());
   const [tab, setTab] = useState<PreviewTab>('opDiff');
   const [stateView, setStateView] = useState<StateView>('canvas');
   const [confirmOpen, setConfirmOpen] = useState(false);
@@ -491,7 +856,8 @@ export const CanvasHistory = ({
   if (open !== prevOpen) {
     setPrevOpen(open);
     if (open) {
-      setSelectedSeq(null);
+      setSelected(null);
+      setExpanded(new Set());
       setConfirmOpen(false);
       setConflict(null);
       setRestoreError(null);
@@ -512,34 +878,26 @@ export const CanvasHistory = ({
     gcTime: 0,
   });
 
-  const entries = useMemo(() => {
-    const seen = new Set<number>();
-    const out: CanvasHistoryEntry[] = [];
-    for (const page of listQuery.data?.pages ?? []) {
-      for (const e of page.entries) {
-        if (seen.has(e.seq)) continue;
-        seen.add(e.seq);
-        out.push(e);
-      }
-    }
-    return out;
-  }, [listQuery.data]);
+  const entries = useMemo(() => mergeHistoryPages(listQuery.data?.pages ?? []), [listQuery.data]);
 
-  const activeSeq = selectedSeq ?? entries[0]?.seq ?? null;
+  const active = activeSelection(selected, entries);
 
+  // 组 #1–#5 与展开后的组尾单步 #5 用不同的 from 区分缓存，互不串用
   const detailQuery = useQuery({
-    queryKey: ['canvas-history-detail', pid, activeSeq],
+    queryKey: ['canvas-history-detail', pid, active?.seq ?? null, active?.from ?? null],
     queryFn: async () => {
-      const r = await api<CanvasHistoryDetail<Model>>('GET', `/api/projects/${pid}/history/${activeSeq}`);
+      const r = await api<CanvasHistoryDetail<Model>>('GET', detailPath(pid, active!));
       // 历史详情是关键出口：服务端先按需规范化（ADR 0016），零改写时 seq 不变、只推进基线，状态栏要主动重查
       void qc.invalidateQueries({ queryKey: ['normalize', pid] });
       return r;
     },
-    enabled: open && activeSeq !== null,
+    enabled: open && active !== null,
     gcTime: 0,
   });
 
   const detail = detailQuery.data;
+  const detailIsSession = !!detail && isSession(detail.entry);
+  const detailRange = detail ? rangeLabel(detail.entry.seqFrom, detail.entry.seq) : '';
 
   const ddl = useMemo(() => {
     if (!detail || tab !== 'state' || stateView !== 'sql') return '';
@@ -560,6 +918,7 @@ export const CanvasHistory = ({
     onSuccess: (res, vars) => {
       void qc.invalidateQueries({ queryKey: ['canvas-history', pid] });
       void qc.invalidateQueries({ queryKey: ['canvas-history-detail', pid] });
+      void qc.invalidateQueries({ queryKey: ['canvas-history-steps', pid] });
       void qc.invalidateQueries({ queryKey: ['activity', pid] });
       setConfirmOpen(false);
       setConflict(null);
@@ -574,6 +933,7 @@ export const CanvasHistory = ({
         setRestoreError(null);
         void qc.invalidateQueries({ queryKey: ['canvas-history', pid] });
         void qc.invalidateQueries({ queryKey: ['canvas-history-detail', pid] });
+        void qc.invalidateQueries({ queryKey: ['canvas-history-steps', pid] });
         return;
       }
       setRestoreError(e.message || String(e));
@@ -582,7 +942,21 @@ export const CanvasHistory = ({
 
   const { reset: resetRestore } = restore;
 
-  const opText = (opName: string) => t(`hist.op.${opName}`, { defaultValue: opName });
+  const opText = opTextOf(t);
+
+  const select = (sel: HistorySelection) => {
+    setSelected(sel);
+    setConflict(null);
+    setRestoreError(null);
+    resetRestore();
+  };
+  const toggleSession = (key: string) =>
+    setExpanded((prev) => {
+      const next = new Set(prev);
+      if (next.has(key)) next.delete(key);
+      else next.add(key);
+      return next;
+    });
 
   // 复制结果写在对话框内的状态行（对话框打开时不弹通知，DESIGN.md：反馈）
   const lastCopyText = useRef('');
@@ -624,9 +998,10 @@ export const CanvasHistory = ({
       items: (tableId, ids) => reportCopy(() => copyItems(detail.model, tableId, ids, { source })),
     };
   }, [detail, pid, project.name, layout, reportCopy]);
-  const [prevCopyKey, setPrevCopyKey] = useState(`${open}:${activeSeq}`);
-  if (prevCopyKey !== `${open}:${activeSeq}`) {
-    setPrevCopyKey(`${open}:${activeSeq}`);
+  const copyKey = `${open}:${active?.from ?? ''}-${active?.seq ?? ''}`;
+  const [prevCopyKey, setPrevCopyKey] = useState(copyKey);
+  if (prevCopyKey !== copyKey) {
+    setPrevCopyKey(copyKey);
     setCopyStatus(null);
   }
 
@@ -681,20 +1056,37 @@ export const CanvasHistory = ({
       >
         <header className="flex h-12 shrink-0 items-center gap-3 border-b border-border bg-chrome px-4">
           <History size={16} aria-hidden="true" className="text-text-3" />
-          <h2 id={titleId} className="m-0 text-[length:var(--fs-lg)] font-semibold">
+          <h2
+            id={titleId}
+            className="m-0 shrink-0 text-[length:var(--fs-lg)] font-semibold whitespace-nowrap"
+          >
             {t('hist.title')}
           </h2>
           {open && detail && (
             <div className="flex min-w-0 items-center gap-2 text-xs text-text-2">
-              <span className="font-mono font-semibold text-text">#{detail.entry.seq}</span>
+              <span className="shrink-0 font-mono font-semibold whitespace-nowrap text-text">
+                {detailRange}
+              </span>
               <span className="truncate">{opText(detail.entry.opName)}</span>
-              {detail.entry.version && (
-                <span className="badge inline-flex items-center gap-1 font-mono">
-                  <Tag size={11} aria-hidden="true" />v{detail.entry.version.number}{' '}
-                  {detail.entry.version.name}
+              {detailIsSession && (
+                <span className="badge shrink-0 font-mono whitespace-nowrap">
+                  {t('hist.stepBadge', { count: detail.entry.stepCount })}
                 </span>
               )}
-              {detail.entry.isCurrent && <span className="badge ok">{t('hist.current')}</span>}
+              {detail.entry.version && (
+                <span
+                  className="badge inline-flex max-w-[180px] min-w-0 items-center gap-1 font-mono"
+                  title={`v${detail.entry.version.number} ${detail.entry.version.name}`}
+                >
+                  <Tag size={11} aria-hidden="true" className="shrink-0" />
+                  <span className="truncate">
+                    v{detail.entry.version.number} {detail.entry.version.name}
+                  </span>
+                </span>
+              )}
+              {detail.entry.isCurrent && (
+                <span className="badge ok shrink-0 whitespace-nowrap">{t('hist.current')}</span>
+              )}
             </div>
           )}
           <span className="flex-1" />
@@ -741,90 +1133,27 @@ export const CanvasHistory = ({
                 {entries.length > 0 && (
                   <ol className="m-0 list-none space-y-1 p-0">
                     {entries.map((entry) => {
-                      const active = entry.seq === activeSeq;
-                      const actor = entry.user || t('hist.initialUser');
+                      const key = entryKey(entry);
+                      if (isSession(entry)) {
+                        return (
+                          <SessionItem
+                            key={key}
+                            pid={pid}
+                            entry={entry}
+                            active={active}
+                            expanded={expanded.has(key)}
+                            onToggle={() => toggleSession(key)}
+                            onSelect={select}
+                          />
+                        );
+                      }
                       return (
-                        <li key={entry.seq}>
-                          <button
-                            type="button"
-                            aria-current={active ? 'true' : undefined}
-                            onClick={() => {
-                              setSelectedSeq(entry.seq);
-                              setConflict(null);
-                              setRestoreError(null);
-                              resetRestore();
-                            }}
-                            className={cx(
-                              'flex w-full flex-col gap-1 rounded-sm border border-transparent px-2.5 py-2 text-left transition-colors',
-                              active
-                                ? 'border-l-2 border-l-primary bg-primary-soft text-text'
-                                : 'text-text hover:bg-surface-hover',
-                            )}
-                          >
-                            <div className="flex items-center gap-1.5">
-                              <span className="min-w-0 flex-1 truncate text-sm font-medium">
-                                {opText(entry.opName)}
-                              </span>
-                              <span
-                                className={cx(
-                                  'shrink-0 font-mono text-xs',
-                                  active ? 'text-primary-text' : 'text-text-3',
-                                )}
-                              >
-                                #{entry.seq}
-                              </span>
-                            </div>
-
-                            {(entry.isCurrent || entry.version) && (
-                              <div className="flex flex-wrap items-center gap-1">
-                                {entry.isCurrent && <span className="badge ok">{t('hist.current')}</span>}
-                                {entry.version && (
-                                  <span className="badge font-mono">
-                                    v{entry.version.number} {entry.version.name}
-                                  </span>
-                                )}
-                              </div>
-                            )}
-
-                            {entry.opSummary && (
-                              <p
-                                className={cx(
-                                  'm-0 line-clamp-2 text-xs break-words',
-                                  active ? 'text-text' : 'text-text-2',
-                                )}
-                                title={entry.opSummary}
-                              >
-                                {entry.opSummary}
-                              </p>
-                            )}
-
-                            {entry.summary.length > 0 && (
-                              <p
-                                className={cx(
-                                  'm-0 truncate font-mono text-xs',
-                                  active ? 'text-text-2' : 'text-text-3',
-                                )}
-                              >
-                                {entry.summary.join(', ')}
-                                {entry.changeCount > entry.summary.length
-                                  ? ` (+${entry.changeCount - entry.summary.length})`
-                                  : ''}
-                              </p>
-                            )}
-
-                            <div
-                              className={cx(
-                                'flex items-center justify-between gap-2 text-xs',
-                                active ? 'text-text-2' : 'text-text-3',
-                              )}
-                            >
-                              <span className="truncate">{actor}</span>
-                              {entry.via === 'mcp' && <McpBadge />}
-                              <time dateTime={entry.at} className="shrink-0">
-                                {formatTime(entry.at)}
-                              </time>
-                            </div>
-                          </button>
+                        <li key={key}>
+                          <EntryButton
+                            entry={entry}
+                            active={sameSelection(active, selectionOf(entry))}
+                            onSelect={() => select(selectionOf(entry))}
+                          />
                         </li>
                       );
                     })}
@@ -920,16 +1249,32 @@ export const CanvasHistory = ({
                             </>
                           )}
                           <span>·</span>
-                          <time dateTime={detail.entry.at}>{formatTime(detail.entry.at)}</time>
+                          <EntryTime entry={detail.entry} />
                           {detail.entry.seq > 0 && (
                             <>
                               <span>·</span>
-                              <span className="font-mono">
-                                #{detail.entry.seq - 1} → #{detail.entry.seq}
-                              </span>
+                              {detailIsSession ? (
+                                // 只有序号区间用等宽字体，“N 步净差异”是界面文案
+                                <span>
+                                  <span className="font-mono">
+                                    #{detail.entry.seqFrom - 1} → #{detail.entry.seq}
+                                  </span>
+                                  {' · '}
+                                  {t('hist.groupDiffMeta', { count: detail.entry.stepCount })}
+                                </span>
+                              ) : (
+                                <span className="font-mono">
+                                  #{detail.entry.seq - 1} → #{detail.entry.seq}
+                                </span>
+                              )}
                             </>
                           )}
                         </div>
+                        {detailIsSession && (
+                          <Banner kind="info">
+                            {t('hist.groupDiffHint', { count: detail.entry.stepCount })}
+                          </Banner>
+                        )}
                         {detail.entry.opSummary && (
                           <p className="m-0 text-sm break-words whitespace-pre-wrap text-text">
                             {detail.entry.opSummary}
@@ -938,6 +1283,10 @@ export const CanvasHistory = ({
 
                         {detail.entry.seq === 0 ? (
                           <Banner kind="info">{t('hist.initNoOpDiff')}</Banner>
+                        ) : detailIsSession && detail.opDiff.total === 0 ? (
+                          <Banner kind="info">
+                            {t('hist.noGroupOpDiff', { count: detail.entry.stepCount })}
+                          </Banner>
                         ) : detail.opDiff.total === 0 ? (
                           <Banner kind="info">{t('hist.noOpDiff')}</Banner>
                         ) : (
@@ -1006,14 +1355,14 @@ export const CanvasHistory = ({
                         <div className="min-h-0 flex-1 overflow-auto">
                           {stateView === 'canvas' ? (
                             <HistoryCanvasPreview
-                              key={detail.entry.seq}
+                              key={entryKey(detail.entry)}
                               model={detail.model}
                               seedLayout={layout}
                               copy={historyCopy}
                             />
                           ) : stateView === 'schema' ? (
                             <HistorySchemaSummary
-                              key={detail.entry.seq}
+                              key={entryKey(detail.entry)}
                               model={detail.model}
                               copy={historyCopy}
                             />
@@ -1118,11 +1467,17 @@ export const CanvasHistory = ({
             )}
 
             <p className="m-0 text-text-2">
-              {t('hist.confirmBody', {
-                seq: detail.entry.seq,
-                op: opText(detail.entry.opName),
-                count: confirmDiff.total,
-              })}
+              {detailIsSession
+                ? t('hist.confirmGroupBody', {
+                    range: detailRange,
+                    seq: detail.entry.seq,
+                    count: confirmDiff.total,
+                  })
+                : t('hist.confirmBody', {
+                    seq: detail.entry.seq,
+                    op: opText(detail.entry.opName),
+                    count: confirmDiff.total,
+                  })}
             </p>
 
             {confirmDiff.total === 0 ? (

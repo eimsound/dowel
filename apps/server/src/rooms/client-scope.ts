@@ -35,3 +35,14 @@ export const forPeer = (peer: Peer, msg: ToClient): ToClient => {
   if (msg.client === SYSTEM_CLIENT) return msg;
   return { ...msg, client: '' };
 };
+
+/**
+ * 从持久化的 room_commits.client 反解出人类 WS 提交者的 userId（画布历史会话归组的身份依据，ADR 0015 §4）。
+ * 仅 `${userId}:${rawClient}` 形态返回 userId；`system`、`mcp:*`、空值与早期无前缀的旧行一律返回 null（不参与归组）。
+ * 绝不按 user_name 归组：同名不同账号不会合并，同一账号的多个标签页 / 刷新重连则自然合并。
+ */
+export const userIdOfScopedClient = (client: string | null | undefined): string | null => {
+  if (!client || client === SYSTEM_CLIENT || client.startsWith('mcp:')) return null;
+  const colon = client.indexOf(':');
+  return colon > 0 && colon < client.length - 1 ? client.slice(0, colon) : null;
+};

@@ -286,12 +286,35 @@ export class Rooms {
     return this.history.modelAt(branchId, seq);
   }
 
-  /** 分页倒序查询画布修改历史；翻到末尾时附带 seq = 0 初始状态，并匹配已发布版本标记 */
+  /**
+   * 分页倒序查询画布修改历史；翻到末尾时附带 seq = 0 初始状态，并匹配已发布版本标记。
+   * 默认按编辑会话读时归组（ADR 0015 §4），`grouped: false` 返回逐条原始单步。
+   */
   listHistory(
     branchId: string,
-    opts: { beforeSeq?: number; limit?: number } = {},
+    opts: { beforeSeq?: number; limit?: number; grouped?: boolean } = {},
   ): Promise<CanvasHistoryList> {
     return this.history.listHistory(branchId, opts);
+  }
+
+  /** 区间（编辑会话组）详情：重建一次 modelAt(from - 1) 后内存重放到 seq，返回组条目与前后模型 */
+  historyRange(
+    branchId: string,
+    from: number,
+    seq: number,
+    currentSeq: number,
+  ): Promise<{ entry: CanvasHistoryEntry; prevModel: Model; targetModel: Model }> {
+    return this.history.historyRange(branchId, from, seq, currentSeq);
+  }
+
+  /** 展开编辑会话组：[from..seq] 的倒序单步列表 */
+  historySteps(
+    branchId: string,
+    from: number,
+    seq: number,
+    currentSeq: number,
+  ): Promise<CanvasHistoryEntry[]> {
+    return this.history.historySteps(branchId, from, seq, currentSeq);
   }
 
   /** 读取单条历史记录的元信息（用于详情接口；若提供 prevModel/targetModel 可精确解析被删对象名） */
