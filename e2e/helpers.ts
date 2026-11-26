@@ -1,7 +1,7 @@
 // 端到端测试的公共步骤。
 // 注册接口已经删除（只接受邀请），用户由实例管理员创建：主实例在启动时用 DOWEL_ADMIN_* 无人值守初始化（见 playwright.config.ts），
 // 这里用管理员的浏览器上下文调 /api/admin/users；初始化流程本身由 e2e/invites.spec.ts 用独立的服务实例覆盖。
-import { type Browser, type BrowserContextOptions, expect, type Page } from '@playwright/test';
+import { type Browser, type BrowserContextOptions, expect, type Page, type Route } from '@playwright/test';
 
 const ADMIN = { username: 'admin', password: 'e2e-admin-password' };
 const TEMP_PASSWORD = 'temp-password-123';
@@ -189,4 +189,25 @@ export const instanceAdmin = async (browser: Browser, scheme: 'light' | 'dark' =
     role: 'admin',
     contextOptions: { colorScheme: scheme },
   });
+};
+
+/**
+ * 让匹配 `pattern` 且方法为 `method` 的请求停在半路，直到调用返回的 `release()` 才放行；
+ * 用来断言请求进行中（mutation pending）时的界面状态。放行后自动 unroute。
+ */
+export const holdRequest = async (page: Page, pattern: string, method: string) => {
+  let open!: () => void;
+  const gate = new Promise<void>((r) => {
+    open = r;
+  });
+  const handler = async (route: Route) => {
+    if (route.request().method() !== method) return route.fallback();
+    await gate;
+    await route.fallback();
+  };
+  await page.route(pattern, handler);
+  return async () => {
+    open();
+    await page.unroute(pattern, handler);
+  };
 };
