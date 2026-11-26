@@ -11,6 +11,7 @@ import {
   indexElementNames,
   objectsOfKinds,
 } from '../model.ts';
+import { sqliteClipboard } from './clipboard.ts';
 import { sqliteChooseName, sqliteJoinNames } from './naming.ts';
 import {
   SQLITE_INSTANCE_LEVEL_DESCRIPTION,
@@ -268,5 +269,6 @@ export const sqliteDialect: DialectSpec = {
   isConcurrentDdlSql: sqliteIsConcurrentDdlSql,
   findInstanceLevelStatement: sqliteFindInstanceLevelStatement,
   instanceLevelDescription: SQLITE_INSTANCE_LEVEL_DESCRIPTION,
+  clipboard: sqliteClipboard,
   versioning: sqliteVersioning,
 };

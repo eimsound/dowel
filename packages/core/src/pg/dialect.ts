@@ -18,6 +18,7 @@ import {
   requiredUniquePartitionKeys,
   rootTableId,
 } from '../model.ts';
+import { pgClipboard } from './clipboard.ts';
 import { columnRefs, exprReferences, renameInExpr, renameQualifiedInExpr, tokenize } from './expr.ts';
 import { chooseName, joinNames } from './naming.ts';
 import {
@@ -581,5 +582,6 @@ export const pgDialect: DialectSpec = {
   isConcurrentDdlSql: pgIsConcurrentDdlSql,
   findInstanceLevelStatement: pgFindInstanceLevelStatement,
   instanceLevelDescription: PG_INSTANCE_LEVEL_DESCRIPTION,
+  clipboard: pgClipboard,
   versioning: pgVersioning,
 };
