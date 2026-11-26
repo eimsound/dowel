@@ -46,6 +46,7 @@ import {
   detailPath,
   entryKey,
   type HistorySelection,
+  isAbsoluteTime,
   isSession,
   mergeHistoryPages,
   opsPreview,
@@ -459,20 +460,25 @@ const useDelayedFlag = (on: boolean, delay: number) => {
 
 const opTextOf = (t: TFunction) => (opName: string) => t(`hist.op.${opName}`, { defaultValue: opName });
 
-/** 时间线条目里的时间：单步为一个 <time>，编辑会话为起止两个 <time> */
+/**
+ * 时间线条目里的时间：单步为一个 <time>，编辑会话为起止两个 <time>（同日绝对时间的结束只留 HH:mm）。
+ * 绝对时间用等宽字体、相对时间用等宽数字；窄侧栏下截断并用 title 给出完整文本，不挤掉左侧的用户名。
+ */
 const EntryTime = ({ entry }: { entry: CanvasHistoryEntry }) => {
   const range = isSession(entry)
     ? timeRange(entry.startedAt, entry.at, formatTime)
-    : { single: formatTime(entry.at) };
+    : { single: formatTime(entry.at), full: formatTime(entry.at) };
+  const mono = 'single' in range ? isAbsoluteTime(range.single) : isAbsoluteTime(range.start);
+  const cls = cx('min-w-0 truncate whitespace-nowrap', mono ? 'font-mono' : 'tabular-nums');
   if ('single' in range) {
     return (
-      <time dateTime={entry.at} className="shrink-0">
+      <time dateTime={entry.at} className={cls} title={range.full}>
         {range.single}
       </time>
     );
   }
   return (
-    <span className="shrink-0">
+    <span className={cls} title={range.full}>
       <time dateTime={entry.startedAt}>{range.start}</time>–<time dateTime={entry.at}>{range.end}</time>
     </span>
   );
@@ -547,13 +553,13 @@ const EntryButton = ({
             active ? 'text-text-2' : 'text-text-3',
           )}
         >
-          <span className="truncate">{actor}</span>
+          <span className="min-w-12 truncate">{actor}</span>
           {entry.via === 'mcp' && <McpBadge />}
           <EntryTime entry={entry} />
         </div>
       )}
       {compact && (
-        <div className={cx('flex justify-end text-xs', active ? 'text-text-2' : 'text-text-3')}>
+        <div className={cx('flex min-w-0 justify-end text-xs', active ? 'text-text-2' : 'text-text-3')}>
           <EntryTime entry={entry} />
         </div>
       )}
@@ -597,7 +603,24 @@ const SessionItem = ({
     gcTime: 0,
   });
   const loading = expanded && stepsQuery.isPending;
+  const busy = expanded && stepsQuery.isFetching;
   const showSkeleton = useDelayedFlag(loading, 300);
+
+  // 点“重试”后：成功时错误横幅（连同重试按钮）卸载，焦点移到第一步（没有则归还展开按钮）；
+  // 仍失败时回到重试按钮，避免焦点掉回 body
+  const retryRef = useRef<HTMLButtonElement>(null);
+  const refocusAfterRetry = useRef(false);
+  const retry = () => {
+    refocusAfterRetry.current = true;
+    void stepsQuery.refetch();
+  };
+  const fetching = stepsQuery.isFetching;
+  useEffect(() => {
+    if (fetching || !refocusAfterRetry.current) return;
+    refocusAfterRetry.current = false;
+    if (retryRef.current) retryRef.current.focus();
+    else (listRef.current?.querySelector<HTMLButtonElement>('button') ?? toggleRef.current)?.focus();
+  }, [fetching]);
 
   const toggle = () => {
     // 收起时焦点若在子列表内，归还给展开按钮
@@ -612,7 +635,13 @@ const SessionItem = ({
 
   return (
     <li>
-      <div className={cx('rounded-sm', holdsSelection && 'bg-surface-2')}>
+      {/* 组内某一步被选中而组已折叠：比真正选中态（主色左边线 + 主色软底）弱一级的中性提示，亮 / 暗都可见 */}
+      <div
+        className={cx(
+          'rounded-sm border-l-2',
+          holdsSelection ? 'border-l-border-strong bg-surface' : 'border-l-transparent',
+        )}
+      >
         <button
           type="button"
           aria-current={groupSelected ? 'true' : undefined}
@@ -673,7 +702,7 @@ const SessionItem = ({
               groupSelected ? 'text-text-2' : 'text-text-3',
             )}
           >
-            <span className="truncate">{entry.user}</span>
+            <span className="min-w-12 truncate">{entry.user}</span>
             <EntryTime entry={entry} />
           </div>
           {holdsSelection && <span className="sr-only">{t('hist.containsSelected')}</span>}
@@ -690,7 +719,10 @@ const SessionItem = ({
           <ChevronRight
             size={14}
             aria-hidden="true"
-            className={cx('transition-transform duration-100', expanded && 'rotate-90')}
+            className={cx(
+              'transition-transform duration-100 motion-reduce:transition-none',
+              expanded && 'rotate-90',
+            )}
           />
           {t('hist.stepsToggle', { count: entry.stepCount })}
           <span className="sr-only"> {range}</span>
@@ -702,7 +734,7 @@ const SessionItem = ({
         id={stepsId}
         hidden={!expanded}
         aria-label={t('hist.stepsOf', { range })}
-        aria-busy={loading || undefined}
+        aria-busy={busy || undefined}
         className="m-0 mt-1 ml-3 list-none space-y-0.5 border-l border-border p-0 pl-2"
       >
         {expanded &&
@@ -711,7 +743,7 @@ const SessionItem = ({
             <li
               key={i}
               aria-hidden="true"
-              className="h-9 animate-pulse rounded-sm bg-surface-2 motion-reduce:animate-none"
+              className="h-9 animate-pulse rounded-sm bg-surface-active motion-reduce:animate-none"
             />
           ))}
         {expanded && stepsQuery.error && (
@@ -720,7 +752,14 @@ const SessionItem = ({
               kind="danger"
               role="alert"
               action={
-                <button type="button" className="btn sm" onClick={() => void stepsQuery.refetch()}>
+                <button
+                  ref={retryRef}
+                  type="button"
+                  className="btn sm"
+                  disabled={stepsQuery.isFetching}
+                  aria-busy={stepsQuery.isFetching}
+                  onClick={retry}
+                >
                   {t('hist.stepsRetry')}
                 </button>
               }
@@ -1007,25 +1046,37 @@ export const CanvasHistory = ({
       >
         <header className="flex h-12 shrink-0 items-center gap-3 border-b border-border bg-chrome px-4">
           <History size={16} aria-hidden="true" className="text-text-3" />
-          <h2 id={titleId} className="m-0 text-[length:var(--fs-lg)] font-semibold">
+          <h2
+            id={titleId}
+            className="m-0 shrink-0 text-[length:var(--fs-lg)] font-semibold whitespace-nowrap"
+          >
             {t('hist.title')}
           </h2>
           {open && detail && (
             <div className="flex min-w-0 items-center gap-2 text-xs text-text-2">
-              <span className="font-mono font-semibold text-text">{detailRange}</span>
+              <span className="shrink-0 font-mono font-semibold whitespace-nowrap text-text">
+                {detailRange}
+              </span>
               <span className="truncate">{opText(detail.entry.opName)}</span>
               {detailIsSession && (
-                <span className="badge font-mono">
+                <span className="badge shrink-0 font-mono whitespace-nowrap">
                   {t('hist.stepBadge', { count: detail.entry.stepCount })}
                 </span>
               )}
               {detail.entry.version && (
-                <span className="badge inline-flex items-center gap-1 font-mono">
-                  <Tag size={11} aria-hidden="true" />v{detail.entry.version.number}{' '}
-                  {detail.entry.version.name}
+                <span
+                  className="badge inline-flex max-w-[180px] min-w-0 items-center gap-1 font-mono"
+                  title={`v${detail.entry.version.number} ${detail.entry.version.name}`}
+                >
+                  <Tag size={11} aria-hidden="true" className="shrink-0" />
+                  <span className="truncate">
+                    v{detail.entry.version.number} {detail.entry.version.name}
+                  </span>
                 </span>
               )}
-              {detail.entry.isCurrent && <span className="badge ok">{t('hist.current')}</span>}
+              {detail.entry.isCurrent && (
+                <span className="badge ok shrink-0 whitespace-nowrap">{t('hist.current')}</span>
+              )}
             </div>
           )}
           <span className="flex-1" />
@@ -1192,14 +1243,20 @@ export const CanvasHistory = ({
                           {detail.entry.seq > 0 && (
                             <>
                               <span>·</span>
-                              <span className="font-mono">
-                                {detailIsSession
-                                  ? t('hist.groupDiffMeta', {
-                                      range: `#${detail.entry.seqFrom - 1} → #${detail.entry.seq}`,
-                                      count: detail.entry.stepCount,
-                                    })
-                                  : `#${detail.entry.seq - 1} → #${detail.entry.seq}`}
-                              </span>
+                              {detailIsSession ? (
+                                // 只有序号区间用等宽字体，“N 步净差异”是界面文案
+                                <span>
+                                  <span className="font-mono">
+                                    #{detail.entry.seqFrom - 1} → #{detail.entry.seq}
+                                  </span>
+                                  {' · '}
+                                  {t('hist.groupDiffMeta', { count: detail.entry.stepCount })}
+                                </span>
+                              ) : (
+                                <span className="font-mono">
+                                  #{detail.entry.seq - 1} → #{detail.entry.seq}
+                                </span>
+                              )}
                             </>
                           )}
                         </div>

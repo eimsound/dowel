@@ -6,6 +6,7 @@ import {
   activeSelection,
   detailPath,
   entryKey,
+  isAbsoluteTime,
   isSession,
   mergeHistoryPages,
   opsPreview,
@@ -111,13 +112,40 @@ test('opsPreview 取前 3 项并计算其余步数', () => {
   expect(opsPreview(undefined, 3)).toEqual({ shown: [], rest: 3 });
 });
 
-test('timeRange：起止显示相同时只给一个', () => {
+test('timeRange：起止显示相同时只给一个；同日绝对时间的结束只留 HH:mm', () => {
   const fmt = (iso: string) => iso.slice(11, 16);
   expect(timeRange('2026-11-27T09:00:00Z', '2026-11-27T09:05:00Z', fmt)).toEqual({
     start: '09:00',
     end: '09:05',
+    full: '09:00–09:05',
   });
-  expect(timeRange('2026-11-27T09:00:10Z', '2026-11-27T09:00:50Z', fmt)).toEqual({ single: '09:00' });
+  expect(timeRange('2026-11-27T09:00:10Z', '2026-11-27T09:00:50Z', fmt)).toEqual({
+    single: '09:00',
+    full: '09:00',
+  });
+  // 模拟 formatTime 的绝对时间形态
+  const abs = (iso: string) => `${iso.slice(0, 10)} ${iso.slice(11, 16)}`;
+  expect(timeRange('2026-11-25T14:20:00Z', '2026-11-25T14:45:00Z', abs)).toEqual({
+    start: '2026-11-25 14:20',
+    end: '14:45',
+    full: '2026-11-25 14:20–2026-11-25 14:45',
+  });
+  // 跨日不简写
+  expect(timeRange('2026-11-25T23:50:00Z', '2026-11-26T00:10:00Z', abs)).toEqual({
+    start: '2026-11-25 23:50',
+    end: '2026-11-26 00:10',
+    full: '2026-11-25 23:50–2026-11-26 00:10',
+  });
+  // 相对时间不简写
+  const rel = (iso: string) => (iso.endsWith('00Z') ? '5 分钟前' : '刚刚');
+  expect(timeRange('2026-11-27T09:00:00Z', '2026-11-27T09:05:01Z', rel)).toEqual({
+    start: '5 分钟前',
+    end: '刚刚',
+    full: '5 分钟前–刚刚',
+  });
+  expect(isAbsoluteTime('2026-11-25 14:20')).toBe(true);
+  expect(isAbsoluteTime('3 分钟前')).toBe(false);
+  expect(isAbsoluteTime('14:45')).toBe(false);
 });
 
 test('编辑会话归组新增文案中英文齐全且无句末拼接', async () => {
@@ -143,10 +171,13 @@ test('编辑会话归组新增文案中英文齐全且无句末拼接', async ()
   await i18n.changeLanguage('zh');
   expect(i18n.t('hist.op.editSession')).toBe('连续编辑');
   expect(i18n.t('hist.stepsToggle', { count: 5 })).toBe('5 步明细');
-  expect(i18n.t('hist.groupDiffMeta', { range: '#0 → #5', count: 5 })).toBe('#0 → #5 · 5 步净差异');
+  expect(i18n.t('hist.groupDiffMeta', { count: 5 })).toBe('5 步净差异');
+  expect(i18n.t('hist.groupDiffHint', { count: 5 })).toContain('“5 步明细”');
   expect(i18n.t('hist.confirmGroupBody', { range: '#1–#5', seq: 5, count: 2 })).toContain('连续编辑 #1–#5');
   await i18n.changeLanguage('en');
   expect(i18n.t('hist.op.editSession')).toBe('Editing session');
   expect(i18n.t('hist.stepsToggle', { count: 5 })).toBe('5 steps');
+  expect(i18n.t('hist.groupDiffMeta', { count: 5 })).toBe('net change of 5 steps');
+  expect(i18n.t('hist.groupDiffHint', { count: 5 })).toContain('“5 steps”');
   expect(i18n.t('hist.confirmGroupBody', { range: '#1–#5', seq: 5, count: 2 })).toContain('session #1–#5');
 });

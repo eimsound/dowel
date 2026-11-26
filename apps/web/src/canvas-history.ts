@@ -84,13 +84,25 @@ export const opsPreview = (
   return { shown, rest: Math.max(0, stepCount - used) };
 };
 
-/** 格式化后的时间范围：起止相同（例如都显示为“刚刚”）时只给出一个 */
+/** formatTime 的绝对时间形态 `YYYY-MM-DD HH:mm`（超过一天的记录）；相对时间（“3 分钟前”）返回 false */
+export const isAbsoluteTime = (s: string): boolean => /^\d{4}-\d{2}-\d{2} \d{2}:\d{2}$/.test(s);
+
+/**
+ * 格式化后的时间范围：起止显示相同（例如都显示为“刚刚”）时只给出一个；
+ * 起止都是同一天的绝对时间时，结束只保留 `HH:mm`（`2026-11-25 14:20–14:45`）。
+ * `full` 为不简写的完整文本（用作悬停提示，窄侧栏截断时仍可看全）。
+ */
 export const timeRange = (
   startedAt: string,
   at: string,
   format: (iso: string) => string,
-): { start: string; end: string } | { single: string } => {
+): ({ start: string; end: string } | { single: string }) & { full: string } => {
   const start = format(startedAt);
   const end = format(at);
-  return start === end ? { single: end } : { start, end };
+  if (start === end) return { single: end, full: end };
+  const full = `${start}–${end}`;
+  if (isAbsoluteTime(start) && isAbsoluteTime(end) && start.slice(0, 10) === end.slice(0, 10)) {
+    return { start, end: end.slice(11), full };
+  }
+  return { start, end, full };
 };

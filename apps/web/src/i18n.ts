@@ -2161,8 +2161,9 @@ const zh = {
     stepsLoadFailed: '单步明细加载失败：{{reason}}',
     stepsRetry: '重试',
     containsSelected: '包含当前选中的步骤',
-    groupDiffMeta: '{{range}} · {{count}} 步净差异',
-    groupDiffHint: '这里是 {{count}} 步连续编辑合起来的净差异。可以在左侧展开“步明细”查看或恢复其中每一步。',
+    groupDiffMeta: '{{count}} 步净差异',
+    groupDiffHint:
+      '这里是 {{count}} 步连续编辑合起来的净差异。可以在左侧展开“{{count}} 步明细”查看或恢复其中每一步。',
     noGroupOpDiff: '这 {{count}} 步连续编辑前后的结构没有净变化（例如改了又改回，或只调整了元数据）。',
     confirmGroupBody:
       '将把当前工作副本恢复为连续编辑 {{range}} 结束时（#{{seq}}）的状态，共涉及 {{count}} 项结构变更。恢复操作会作为一条新的修改记录追加，不会覆盖或删除任何历史。',
@@ -4628,9 +4629,9 @@ const en: typeof zh = {
     stepsLoadFailed: 'Could not load steps: {{reason}}',
     stepsRetry: 'Retry',
     containsSelected: 'Contains the selected step',
-    groupDiffMeta: '{{range}} · net change of {{count}} steps',
+    groupDiffMeta: 'net change of {{count}} steps',
     groupDiffHint:
-      'This is the net change of {{count}} consecutive edits. Expand “steps” in the timeline to inspect or restore each one.',
+      'This is the net change of {{count}} consecutive edits. Expand “{{count}} steps” in the timeline to inspect or restore each one.',
     noGroupOpDiff:
       'These {{count}} consecutive edits produced no net structural change (for example a change that was reverted, or metadata-only updates).',
     confirmGroupBody:
