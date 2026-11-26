@@ -505,9 +505,10 @@ const EntryButton = ({
       aria-current={active ? 'true' : undefined}
       onClick={onSelect}
       className={cx(
-        'flex w-full flex-col gap-1 rounded-sm border border-transparent text-left transition-colors',
+        // 统一 2px 左边线（未选中透明），选中 / 未选中与编辑会话组行的左竖线和正文完全对齐
+        'flex w-full flex-col gap-1 rounded-sm border border-l-2 border-transparent text-left transition-colors',
         compact ? 'px-2 py-1.5' : 'px-2.5 py-2',
-        active ? 'border-l-2 border-l-primary bg-primary-soft text-text' : 'text-text hover:bg-surface-hover',
+        active ? 'border-l-primary bg-primary-soft text-text' : 'text-text hover:bg-surface-hover',
       )}
     >
       <div className="flex items-center gap-1.5">
@@ -623,8 +624,12 @@ const SessionItem = ({
   }, [fetching]);
 
   const toggle = () => {
-    // 收起时焦点若在子列表内，归还给展开按钮
-    if (expanded && listRef.current?.contains(document.activeElement)) toggleRef.current?.focus();
+    if (expanded) {
+      // 收起后不再在途重试完成时把焦点拉回已折叠的组
+      refocusAfterRetry.current = false;
+      // 收起时焦点若在子列表内，归还给展开按钮
+      if (listRef.current?.contains(document.activeElement)) toggleRef.current?.focus();
+    }
     onToggle();
   };
 
@@ -635,11 +640,13 @@ const SessionItem = ({
 
   return (
     <li>
-      {/* 组内某一步被选中而组已折叠：比真正选中态（主色左边线 + 主色软底）弱一级的中性提示，亮 / 暗都可见 */}
+      {/* 组内某一步被选中而组已折叠：比真正选中态（主色左边线 + 主色软底）弱一级的中性提示，亮 / 暗都可见。
+          竖线用不占布局宽度的伪元素，与按钮自身的 2px 左边线重合（不用 overflow-hidden，免得裁掉焦点环） */}
       <div
         className={cx(
-          'rounded-sm border-l-2',
-          holdsSelection ? 'border-l-border-strong bg-surface' : 'border-l-transparent',
+          'relative rounded-sm',
+          holdsSelection &&
+            'bg-surface before:pointer-events-none before:absolute before:inset-y-0 before:left-0 before:w-0.5 before:rounded-l-sm before:bg-border-strong',
         )}
       >
         <button
@@ -647,10 +654,8 @@ const SessionItem = ({
           aria-current={groupSelected ? 'true' : undefined}
           onClick={() => onSelect(selectionOf(entry))}
           className={cx(
-            'flex w-full flex-col gap-1 rounded-sm border border-transparent px-2.5 pt-2 pb-1.5 text-left transition-colors',
-            groupSelected
-              ? 'border-l-2 border-l-primary bg-primary-soft text-text'
-              : 'text-text hover:bg-surface-hover',
+            'flex w-full flex-col gap-1 rounded-sm border border-l-2 border-transparent px-2.5 pt-2 pb-1.5 text-left transition-colors',
+            groupSelected ? 'border-l-primary bg-primary-soft text-text' : 'text-text hover:bg-surface-hover',
           )}
         >
           <div className="flex items-center gap-1.5">
