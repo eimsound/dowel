@@ -19,16 +19,7 @@ import {
   type WizardEvent,
   type WizardStage,
 } from '@dowel/api';
-import {
-  createSchema,
-  deriveTargetPgMajor,
-  emptyModel,
-  getDialect,
-  hasDialect,
-  type Model,
-  newId,
-  pgMajorOf,
-} from '@dowel/core';
+import { createSchema, emptyModel, getDialect, hasDialect, type Model, newId } from '@dowel/core';
 import { ScopeError } from '@dowel/engines';
 import type { Hono } from 'hono';
 import { HTTPException } from 'hono/http-exception';
@@ -129,21 +120,11 @@ export const registerWizard = (app: Hono<Env>, ctx: AppContext) => {
         engineVersionNum: v?.versionNum ?? null,
       };
     });
-    const targetPgMajor =
-      b.dialect === 'pg' ? deriveTargetPgMajor(envRows.map((e) => pgMajorOf(e.engineVersionNum))) : null;
-    const mysqlNums =
-      b.dialect === 'mysql'
-        ? envRows
-            .map((e) => e.engineVersionNum)
-            .filter((v): v is number => typeof v === 'number' && Number.isInteger(v) && v > 0)
-        : [];
-    const targetMysqlVersionNum = mysqlNums.length ? Math.min(...mysqlNums) : null;
-    const baselinePlanOpts =
-      targetPgMajor !== null
-        ? { pgMajor: targetPgMajor }
-        : targetMysqlVersionNum !== null
-          ? { mysqlVersionNum: targetMysqlVersionNum }
-          : undefined;
+    // 项目最低目标版本的规划选项（PG `{ pgMajor }`、MySQL `{ mysqlVersionNum }`），与 envs.projectPlanOptions 同一套推导
+    const baselinePlanOpts = getDialect(b.dialect).versioning.targetPlanOptions(
+      envRows.map((e) => e.engineVersionNum),
+    );
+    const targetMysqlVersionNum = baselinePlanOpts?.mysqlVersionNum ?? null;
     const project: ProjectCreated = {
       id: newId(),
       name: b.name,

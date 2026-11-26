@@ -243,6 +243,28 @@ export interface EngineAdapter {
   // 影子库版本与操作钩子（verifier & shadow.ts 共用）
   readVersionNum?(db: Db): Promise<number | null>;
   planOptionsForVersion?(versionNum: number): PlanOptions | undefined;
+  /**
+   * 调用方的 PlanOptions 是否已显式给出本方言的目标版本（显式时 buildTarget 不再探测影子库版本）。
+   * 未实现时视为“给了选项就算显式”。
+   */
+  hasExplicitVersionOpt?(opts: PlanOptions): boolean;
+  /**
+   * verifier.verify()（重新规划）：由影子库实测数值版本号与调用方选项解析规划选项与建库选项。
+   * 未实现时：规划用“显式 ? 调用方选项 : 影子库版本选项”，建库用“影子库版本选项 ?? 调用方选项”。
+   */
+  resolveVerifyOptions?(
+    shadowVersionNum: number | null,
+    opts: PlanOptions | undefined,
+  ): { plan: PlanOptions | undefined; build: PlanOptions | undefined };
+  /**
+   * verifier.verifyScripts()（冻结脚本）：由影子库实测数值版本号与调用方选项解析建库选项，
+   * 并在此做目标版本兼容性检查（不兼容抛 PlanError）。未实现时直接用影子库版本选项。
+   */
+  resolveScriptsBuildOptions?(
+    to: Model,
+    shadowVersionNum: number | null,
+    opts: PlanOptions,
+  ): PlanOptions | undefined;
   resetShadow(db: Db): Promise<void>;
   prepareImportShadow(db: Db): Promise<void>;
   stripImportNoise(sql: string): string;
