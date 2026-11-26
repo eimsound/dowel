@@ -5,7 +5,7 @@ import AxeBuilder from '@axe-core/playwright';
 import { expect, type Page, test } from '@playwright/test';
 
 import { addEnv, newTargetDb, openEnv, publishTable } from './exec-helpers.ts';
-import { createGroup, createProjectIn, gotoPage, instanceAdmin, newUser } from './helpers.ts';
+import { createGroup, createProjectIn, gotoPage, holdRequest, instanceAdmin, newUser } from './helpers.ts';
 
 const scan = async (page: Page, label: string) => {
   const results = await new AxeBuilder({ page }).analyze();
@@ -88,6 +88,34 @@ for (const scheme of ['light', 'dark'] as const) {
     await expect(pipeTokPanel.getByTestId('created-token-value')).toBeVisible();
   });
 }
+
+test('保存令牌创建规则进行中时“撤销修改”禁用，保存完成后回到未修改状态（组层）', async ({ browser }) => {
+  const { page } = await newUser(browser, '令牌规则保存中');
+  const group = await createGroup(page);
+  await page.goto(`/group/${group.slug}`);
+  const panel = page.getByTestId('token-policy-panel');
+  const custom = panel.getByRole('radio', { name: '在本层指定允许范围' });
+  const save = panel.getByRole('button', { name: '保存创建规则' });
+  const reset = panel.getByRole('button', { name: '撤销修改' });
+  await expect(reset).toBeDisabled();
+  await custom.check();
+  await expect(reset).toBeEnabled();
+
+  const release = await holdRequest(page, '**/api/groups/*/token-policy', 'PUT');
+  await save.click();
+  // 请求还没回来：保存、撤销、表单都不可操作
+  await expect(save).toBeDisabled();
+  await expect(reset).toBeDisabled();
+  await expect(custom).toBeDisabled();
+  await release();
+
+  await expect(page.getByText('已保存令牌创建规则')).toBeVisible();
+  await expect(custom).toBeChecked();
+  await expect(custom).toBeEnabled();
+  await expect(reset).toBeDisabled();
+  await panel.getByRole('radio', { name: /^(不额外限制|使用默认)/ }).check();
+  await expect(reset).toBeEnabled();
+});
 
 test.describe('CI 令牌真实执行（需要目标库 PG）', () => {
   test.skip(!process.env.DOWEL_TEST_PG, '没有可用的 PostgreSQL（需要 Docker）');

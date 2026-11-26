@@ -639,7 +639,12 @@ export const PolicyLayerPanel = ({ path, queryKey }: { path: string; queryKey: u
           >
             {t('pol.save')}
           </button>
-          <button type="button" className="btn ghost" disabled={!dirty} onClick={() => setDraft(v.settings)}>
+          <button
+            type="button"
+            className="btn ghost"
+            disabled={!dirty || save.isPending}
+            onClick={() => setDraft(v.settings)}
+          >
             {t('pol.reset')}
           </button>
         </div>
@@ -712,7 +717,7 @@ export const EnvPolicyPanel = ({ pid, eid }: { pid: string; eid: string }) => {
           <button
             type="button"
             className="btn ghost"
-            disabled={!dirty}
+            disabled={!dirty || save.isPending}
             onClick={() => setDraft({ settings: v.settings })}
           >
             {t('pol.reset')}
