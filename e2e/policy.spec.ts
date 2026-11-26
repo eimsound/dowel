@@ -394,4 +394,74 @@ test.describe('需要目标库', () => {
       await devDb.drop();
     }
   });
+
+  // 环境层的令牌提醒（pol.tokenGuard.bodyEnv，说“这个环境”，和组 / 项目层的 bodyLayer 区分）：
+  // 非生产环境收紧后提示，一键关闭、保存、刷新后保持关闭；生产环境无论怎么收紧（甚至显式允许令牌）都不提示。
+  test('环境页：非生产收紧后提示 CI 令牌仍可免审批执行（环境专用文案），一键关闭并保存；生产环境不提示', async ({
+    browser,
+  }) => {
+    const devDb = await newTargetDb('e2e_pol_tokdev');
+    const prodDb = await newTargetDb('e2e_pol_tokprod');
+    try {
+      const { page } = await newUser(browser, '环境令牌提醒');
+      const group = await createGroup(page);
+      await createProjectIn(page, '环境令牌提醒项目', group.name);
+      await addEnv(page, 'dev', devDb.url, false);
+      await addEnv(page, 'prod', prodDb.url, true);
+
+      // 非生产环境：默认（继承、允许令牌）不提示；收紧“谁能执行”后立刻提示，文案是环境层专用的
+      await openEnv(page, 'dev');
+      const panel = page.getByTestId('env-policy');
+      const devSet = set(panel, '本环境（非生产）');
+      const warn = devSet.getByTestId('token-bypass-warn');
+      const tok = devSet.getByLabel('允许 CI 令牌执行');
+      await expect(devSet.getByLabel('谁能执行')).toBeVisible();
+      await expect(warn).toHaveCount(0);
+      await devSet.getByLabel('谁能执行').selectOption('executor');
+      await expect(warn).toBeVisible();
+      await expect(warn).toContainText('CI 令牌仍可直接执行迁移');
+      await expect(warn).toContainText('对这个环境直接向前执行迁移');
+      await expect(warn).not.toContainText('对范围内的非生产环境');
+      await expect(tok).toHaveValue('');
+      await scan(page, '环境页 · 令牌提醒');
+
+      // 一键关闭：令牌执行改成“不允许”，提示消失，焦点落到“允许 CI 令牌执行”
+      await devSet.getByRole('button', { name: '禁止 CI 令牌执行' }).click();
+      await expect(tok).toHaveValue('false');
+      await expect(warn).toHaveCount(0);
+      await expect(tok).toBeFocused();
+      await expect(devSet).toContainText('生效：不允许 · 来自环境');
+
+      // 保存，刷新后仍是“不允许”、不提示
+      const saveRes = page.waitForResponse(
+        (r) =>
+          r.url().includes('/environments/') &&
+          r.url().includes('/exec-policy') &&
+          r.request().method() === 'PUT' &&
+          r.ok(),
+      );
+      await panel.getByRole('button', { name: '保存执行策略' }).click();
+      await saveRes;
+      await expect(page.getByText('已保存执行策略').first()).toBeVisible();
+      await page.reload();
+      const reloaded = set(page.getByTestId('env-policy'), '本环境（非生产）');
+      await expect(reloaded.getByLabel('谁能执行')).toHaveValue('executor');
+      await expect(reloaded.getByLabel('允许 CI 令牌执行')).toHaveValue('false');
+      await expect(reloaded.getByTestId('token-bypass-warn')).toHaveCount(0);
+
+      // 生产环境：收紧“谁能执行”、加审批环节、再显式允许令牌执行（只改草稿），都不提示
+      await openEnv(page, 'prod');
+      const prodSet = set(page.getByTestId('env-policy'), '本环境（生产）');
+      await expect(prodSet.getByLabel('谁能执行')).toBeVisible();
+      await prodSet.getByLabel('谁能执行').selectOption('executor');
+      await prodSet.getByRole('button', { name: '添加审批环节' }).click();
+      await prodSet.getByLabel('允许 CI 令牌执行').selectOption('true');
+      await expect(prodSet).toContainText('生效：允许 · 来自环境');
+      await expect(prodSet.getByTestId('token-bypass-warn')).toHaveCount(0);
+      await expect(prodSet.getByRole('button', { name: '禁止 CI 令牌执行' })).toHaveCount(0);
+    } finally {
+      await devDb.drop();
+      await prodDb.drop();
+    }
+  });
 });
