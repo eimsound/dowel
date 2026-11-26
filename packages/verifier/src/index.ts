@@ -6,7 +6,6 @@ import {
   findInstanceLevelStep,
   instanceLevelDescription,
   type Model,
-  pgMajorOf,
   type PlanOptions,
   plan,
   publicMajorOf,
@@ -61,12 +60,6 @@ export const runSteps = async (db: Db, steps: Step[], dialect: Dialect = 'pg') =
       throw new EngineStepError(s, e, performance.now() - t0);
     }
   }
-};
-
-/** 从 PG 影子库读取 server_version_num 并提取大版本号 */
-export const readShadowPgMajor = async (db: Db): Promise<number | null> => {
-  const vNum = await getEngine('pg').readVersionNum?.(db);
-  return vNum !== null && vNum !== undefined ? pgMajorOf(vNum) : null;
 };
 
 /** 调用方选项是否已显式给出本方言的目标版本（委托给 EngineAdapter.hasExplicitVersionOpt；未实现时给了选项即算显式） */
