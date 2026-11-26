@@ -33,6 +33,8 @@ export type ProjectAction =
   | 'migration.read'
   | 'ddl.read'
   | 'model.verify'
+  /** 显式规范化工作副本（ADR 0016）：在影子库里重放并写回表达式 / 不透明对象 DDL 的规范形式，编辑者以上 */
+  | 'model.normalize'
   | 'model.import'
   | 'environment.read'
   | 'environment.manage'
@@ -240,6 +242,7 @@ export const ACTION_MIN_ROLE: Record<ProjectAction, Role> = {
   'migration.read': 'viewer',
   'ddl.read': 'viewer',
   'model.verify': 'viewer',
+  'model.normalize': 'editor',
   'model.import': 'editor',
   'environment.read': 'viewer',
   'environment.manage': 'admin',

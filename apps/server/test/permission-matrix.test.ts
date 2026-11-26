@@ -569,6 +569,16 @@ const matrix: Record<string, Spec> = {
     path: () => `${P()}/verify`,
     body: () => ({}),
   },
+  // 按需规范化（ADR 0016）：查看者可读状态（0 影子库 I/O）；编辑者以上可显式规范化（请求体严格校验，多余字段 400）
+  'GET /api/projects/:pid/normalize': {
+    access: { kind: 'project', min: 'viewer', statuses: [200] },
+    path: () => `${P()}/normalize`,
+  },
+  'POST /api/projects/:pid/normalize': {
+    access: { kind: 'project', min: 'editor', statuses: [400] },
+    path: () => `${P()}/normalize`,
+    body: () => ({ unexpected: true }),
+  },
   'GET /api/projects/:pid/environments': {
     access: { kind: 'project', min: 'viewer', statuses: [200] },
     path: () => `${P()}/environments`,

@@ -804,25 +804,7 @@ export const createMcpServer = (
       if (!resolved.ok) return toolError(resolved.code, resolved.message);
       const { row } = resolved.project;
 
-      const toRef = await resolveModelRef(ctx.db, ctx.rooms, ctx.refresher, {
-        pid: row.id,
-        branch: row.branch,
-        schemas: row.schemas,
-        ref: args.to,
-        defaultRef: 'head',
-      });
-      if (!toRef.ok) return toolError(toRef.code, toRef.message);
-
-      const fromRef = await resolveModelRef(ctx.db, ctx.rooms, ctx.refresher, {
-        pid: row.id,
-        branch: row.branch,
-        schemas: row.schemas,
-        ref: args.from,
-        like: toRef.model,
-        defaultRef: 'latest_or_empty',
-      });
-      if (!fromRef.ok) return toolError(fromRef.code, fromRef.message);
-
+      // 先做不碰影子库的检查（环境存在、连库限速），被拒的调用不会因为解析 head 而触发影子库规范化（ADR 0016）
       let resolvedEnvId: string | undefined;
       let resolvedEnvName: string | undefined;
       if (args.env !== undefined) {
@@ -835,10 +817,35 @@ export const createMcpServer = (
         resolvedEnvName = envRow.name;
       }
 
-      const needsExternalShadow = getDialect(toRef.model.dialect).capabilities.requiresExternalShadow;
+      const needsExternalShadow = getDialect(row.dialect).capabilities.requiresExternalShadow;
       const gate = needsExternalShadow ? ctx.connectionLimiter.attempt(principal.user.id) : null;
       if (gate && !gate.allowed) {
         return toolError('rate_limited', `影子库验证请求太频繁，请在 ${gate.retryAfterSeconds} 秒后重试`);
+      }
+
+      const toRef = await resolveModelRef(ctx.db, ctx.rooms, ctx.refresher, {
+        pid: row.id,
+        branch: row.branch,
+        schemas: row.schemas,
+        ref: args.to,
+        defaultRef: 'head',
+      });
+      if (!toRef.ok) {
+        if (gate?.allowed) gate.refund();
+        return toolError(toRef.code, toRef.message);
+      }
+
+      const fromRef = await resolveModelRef(ctx.db, ctx.rooms, ctx.refresher, {
+        pid: row.id,
+        branch: row.branch,
+        schemas: row.schemas,
+        ref: args.from,
+        like: toRef.model,
+        defaultRef: 'latest_or_empty',
+      });
+      if (!fromRef.ok) {
+        if (gate?.allowed) gate.refund();
+        return toolError(fromRef.code, fromRef.message);
       }
 
       const planOpts = await projectPlanOptions(ctx.db, row.id, toRef.model.dialect);

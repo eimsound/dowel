@@ -168,9 +168,9 @@ describe.each([
     await until(() => app.rooms.has(branch!.id));
 
     // 内存里的三份缓存先都有东西：房间已加载、影子库连接（这里用 forget 的调用作为证据）、
-    // 派生刷新挂了一个 timer
+    // 派生刷新的内存基线（按需规范化后没有后台定时器，ADR 0016）
     const forgetShadow = vi.spyOn(app.shadows, 'forget');
-    app.refresher.schedule(branch!.id);
+    await app.refresher.reset(branch!.id, (await app.rooms.model(branch!.id)).model);
     expect(app.refresher.tracked(branch!.id)).toBe(true);
 
     const res = await call(adminCookie, 'DELETE', `/api/projects/${pid}`, { confirm: slug });

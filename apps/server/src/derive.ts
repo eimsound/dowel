@@ -2,43 +2,98 @@
 // 用户写的表达式会换成引擎的规范形式（如 (note <> '') → (note <> ''::text)），这样与线上库读出的结构可以直接比较；
 // 编辑操作不改写不透明对象的 SQL 文本，改名后由服务器在影子库里重放一遍，读回 PG 自动更新后的 DDL。
 //
-// 做法：记住一份“DDL 确定正确”的模型作为基线（导入、拉取后的模型，或上次刷新后的模型）；
-// 修改提交后（防抖），如果不透明对象依赖的对象改了名，就在影子库里建出基线、执行到当前模型的迁移、读回 DDL，
-// 以系统身份写回（期间被别人改过的对象不写）。
+// 按需规范化（ADR 0016）：编辑期间不在后台调影子库。只有两种入口会回影子库：
+// - 关键出口（发布、迁移 / DDL / 验证、版本差异预览、历史详情、拉取 / 接入预览、MCP 读模型）调 flush()：
+//   相对基线没有待规范化的对象时 0 影子库 I/O 直接返回；
+// - 用户在模型页点“规范化”（POST /api/projects/:pid/normalize）调 normalize()：显式在影子库里校验并写回。
+//
+// 基线（branches.baseline）是一份“确定已在影子库里规范化过”的模型（黄金基线）：只在导入 / 拉取 / 接入 / 已验证版本覆盖
+// （runWithReset）或一次成功的 canonicalize 之后推进；没有待规范化对象时、canonicalize 失败时都**不**改写它。
 import { deepEqual, type Model, type Obj } from '@dowel/core';
 import type { Versions } from '@dowel/sync';
 
+import { emptyBaseline, fullName, needsRefresh, pendingRefreshIds } from './derive-pending.ts';
 import type { HaCoordinator } from './ha.ts';
 import type { Rooms } from './rooms.ts';
-import type { Shadow } from './shadow.ts';
+import { type Shadow, ShadowError } from './shadow.ts';
+
+export {
+  exprsOf,
+  fullName,
+  hasRenamedOpaqueDeps,
+  needsRefresh,
+  pendingRefreshIds,
+} from './derive-pending.ts';
 
 const MAX_CATCHUP_ROUNDS = 5;
 const MAX_REJECT_RETRIES = 3;
 const DEFAULT_FLUSH_LOCK_TIMEOUT_MS = 30_000;
-const MAX_RETRY_DELAY_MS = 100;
+/** status() 最多列出的待规范化对象数 */
+export const STATUS_OBJECT_LIMIT = 50;
 
-/** 对象的完整限定名（沿 parent 链拼接），用于判断是否改了名 */
-const fullName = (m: Model, id: string): string | null => {
-  const parts: string[] = [];
-  for (let o: Obj | undefined = m.objects[id], i = 0; o && i < 5; i++) {
-    parts.unshift(o.name);
-    o = 'parent' in o ? m.objects[o.parent] : undefined;
+/** 等待分支 derive 锁（PG 多副本 job:derive:<branchId>）超时：HTTP 映射为 503 normalize_busy */
+export class DeriveBusyError extends Error {
+  constructor(branchId: string) {
+    super(`分支 ${branchId} 正在规范化，请稍后重试`);
   }
-  return parts.length ? parts.join('.') : null;
-};
+}
 
-/** 判断当前模型相对基线是否存在待规范化的表达式或依赖改名的不透明对象 */
-const needsRefresh = (base: Model, cur: Model): boolean => {
-  const renamed = (id: string) => {
-    const x = fullName(base, id);
-    const y = fullName(cur, id);
-    return x !== null && y !== null && x !== y;
-  };
-  return Object.values(cur.objects).some((o) =>
-    o.kind === 'opaque'
-      ? [...o.deps, o.parent].some(renamed) || !deepEqual(exprsOf(o), exprsOf(base.objects[o.id]))
-      : exprsOf(o) !== null && !deepEqual(exprsOf(o), exprsOf(base.objects[o.id])),
-  );
+/** 服务正在停机，拒绝新的显式规范化：HTTP 映射为 503 shutting_down */
+export class RefresherStoppedError extends Error {
+  constructor() {
+    super('服务正在关闭，请稍后重试');
+  }
+}
+
+/** 规范化写回时工作副本被别人改过（版本检查拒绝或房间被替换）：HTTP 映射为 409 working_changed */
+export class NormalizeConflictError extends Error {
+  readonly currentSeq: number;
+  constructor(currentSeq: number) {
+    super('规范化期间工作副本被修改了，请重试');
+    this.currentSeq = currentSeq;
+  }
+}
+
+/**
+ * flush 的结果：
+ * - clean：相对基线没有待规范化的对象（0 影子库 I/O）；
+ * - normalized：在影子库里规范化并写回了（seq 是写回后的）；
+ * - skipped：需要规范化但没做成（没有影子库、影子库不可用、表达式在影子库里报错、停机中……），模型保持原样。
+ */
+export interface FlushOutcome {
+  kind: 'clean' | 'normalized' | 'skipped';
+  seq: number;
+}
+
+export interface DerivedObjectRef {
+  id: string;
+  kind: Obj['kind'];
+  name: string;
+}
+
+export interface RefreshStatus {
+  seq: number;
+  pendingCount: number;
+  objects: DerivedObjectRef[];
+  truncated: boolean;
+  /** 是否已经有黄金基线 */
+  baseline: boolean;
+}
+
+export interface NormalizeOutcome {
+  ok: true;
+  /** clean：基线就是当前模型，未连影子库；verified：影子库里校验过，没有需要改写的；normalized：改写了 */
+  outcome: 'clean' | 'verified' | 'normalized';
+  seq: number;
+  normalizedCount: number;
+  normalizedObjects: DerivedObjectRef[];
+  checkedInShadow: boolean;
+  shadow: string;
+}
+
+const refOf = (m: Model, id: string): DerivedObjectRef => {
+  const o = m.objects[id]!;
+  return { id, kind: o.kind, name: fullName(m, id) ?? o.name };
 };
 
 export class OpaqueRefresher {
@@ -51,15 +106,15 @@ export class OpaqueRefresher {
   };
   private ha: HaCoordinator | null;
   private good = new Map<string, Model>();
-  private timers = new Map<string, ReturnType<typeof setTimeout>>();
   private running = new Map<string, Promise<void>>();
+  /** 已排队但尚未开始的 flush：同分支的并发调用合并成一次（开始时才读最新状态，结果对所有等待者都是新鲜的） */
+  private queuedFlush = new Map<string, Promise<FlushOutcome>>();
   /** 写回被拒绝后自动重试的次数（防止异常情况下无限重试） */
   private retries = new Map<string, number>();
   /** 在途任务尚未结束时被 forget 的分支，防止任务结束时回写内存/库基线 */
   private forgotten = new Set<string>();
   private stopped = false;
-  delayMs = 300;
-  /** 强一致 flush / runWithReset 等待分布式锁的超时时间（毫秒） */
+  /** flush / normalize / runWithReset 等待分布式锁的超时时间（毫秒） */
   flushLockTimeoutMs = DEFAULT_FLUSH_LOCK_TIMEOUT_MS;
 
   constructor(
@@ -72,10 +127,6 @@ export class OpaqueRefresher {
     this.shadowOf = shadowOf;
     this.store = store;
     this.ha = ha ?? null;
-  }
-
-  private retryDelayMs(): number {
-    return Math.min(this.delayMs, MAX_RETRY_DELAY_MS);
   }
 
   private async setGood(branchId: string, m: Model) {
@@ -102,7 +153,7 @@ export class OpaqueRefresher {
   }
 
   /**
-   * 进程内按分支串行排队，确保本地后台刷新、flush 与 reset/replace 不交错，
+   * 进程内按分支串行排队，确保 flush、normalize 与 reset/replace 不交错，
    * 且 drain() 可统一等待所有在途操作结束。
    */
   private enqueue<T>(branchId: string, fn: () => Promise<T>): Promise<T> {
@@ -127,9 +178,7 @@ export class OpaqueRefresher {
     const lock = await this.ha.withJobLock(`derive:${branchId}`, fn, {
       timeoutMs: this.flushLockTimeoutMs,
     });
-    if (!lock.acquired) {
-      throw new Error(`等待分支 ${branchId} 派生数据刷新锁超时`);
-    }
+    if (!lock.acquired) throw new DeriveBusyError(branchId);
     return lock.value;
   }
 
@@ -139,8 +188,6 @@ export class OpaqueRefresher {
     const baseline = structuredClone(model);
     await this.enqueue(branchId, () =>
       this.withExclusiveLock(branchId, async () => {
-        clearTimeout(this.timers.get(branchId));
-        this.timers.delete(branchId);
         await this.setGood(branchId, baseline);
         this.retries.delete(branchId);
       }),
@@ -148,9 +195,10 @@ export class OpaqueRefresher {
   }
 
   /**
-   * 在 derive 分布式锁与本地串行队列保护下执行整体模型替换并重置基线：
+   * 在 derive 分布式锁与本地串行队列保护下执行整体模型替换并重置基线（canonical 替换：导入、拉取、接入、已验证版本）：
    * - 阻塞等待任何在途 canonicalize 结束后再 replace，防止旧任务写回覆盖新基线；
    * - 以调用方传入的 model（而非事后重读 rooms.model）写入基线，防止 replace 与 reset 间的并发提交污染基线；
+   * - fn 抛错时基线不变；
    * - 锁序严格单向：本地队列 → job:derive:<branchId> → rooms.withRoomLock → branches FOR UPDATE。
    */
   async runWithReset<T>(branchId: string, model: Model, fn: () => Promise<T>): Promise<T> {
@@ -158,19 +206,7 @@ export class OpaqueRefresher {
     const baseline = structuredClone(model);
     return this.enqueue(branchId, () =>
       this.withExclusiveLock(branchId, async () => {
-        const hadTimer = this.timers.has(branchId);
-        clearTimeout(this.timers.get(branchId));
-        this.timers.delete(branchId);
-        let result: T;
-        try {
-          result = await fn();
-        } catch (err) {
-          if (hadTimer && !this.stopped && !this.forgotten.has(branchId)) {
-            this.schedule(branchId);
-          }
-          throw err;
-        }
-        // 不在 fn() 之后清 timer：fn() 返回到 setGood 之间的并发用户提交会重新 schedule，必须保留
+        const result = await fn();
         await this.setGood(branchId, baseline);
         this.retries.delete(branchId);
         return result;
@@ -178,27 +214,20 @@ export class OpaqueRefresher {
     );
   }
 
-  schedule(branchId: string, delayMs = this.delayMs) {
-    if (this.stopped) return;
-    this.forgotten.delete(branchId);
-    clearTimeout(this.timers.get(branchId));
-    const timer = setTimeout(() => {
-      this.timers.delete(branchId);
-      if (this.stopped || this.forgotten.has(branchId)) return;
-      void this.start(branchId);
-    }, delayMs);
-    timer.unref?.();
-    this.timers.set(branchId, timer);
+  /**
+   * 非 canonical 的整体替换（恢复画布历史、未验证版本）：同样排在本地队列和 derive 锁里（在途规范化先排空，
+   * 不会用旧 canonical 覆盖替换后的房间），但**不**改写黄金基线——被替换进来的模型不一定规范化过。
+   */
+  async runWithoutReset<T>(branchId: string, fn: () => Promise<T>): Promise<T> {
+    return this.enqueue(branchId, () => this.withExclusiveLock(branchId, fn));
   }
 
-  /** 停止接收新防抖调度并清理尚未触发的定时器（优雅停机用） */
+  /** 停止接收新的显式规范化（优雅停机用；flush 之后只返回 skipped） */
   stop() {
     this.stopped = true;
-    for (const timer of this.timers.values()) clearTimeout(timer);
-    this.timers.clear();
   }
 
-  /** 停止新调度并等待所有已启动的刷新任务完成（优雅停机排空用） */
+  /** 停止并等待所有已启动的刷新任务完成（优雅停机排空用） */
   async drain(): Promise<void> {
     this.stop();
     while (this.running.size > 0) {
@@ -207,127 +236,73 @@ export class OpaqueRefresher {
   }
 
   /**
-   * 分支被删掉时清理内存状态：取消挂起的 timer，丢掉已经规范化的基线和重试计数。
+   * 分支被删掉时清理内存状态：丢掉已经规范化的基线和重试计数。
    * 正在执行的刷新不在这里取消（Promise 取消不了）；它写回时会被房间的版本检查拒绝或忽略，
-   * 并通过 forgotten 标记阻止其回写内存基线。
+   * 并通过 forgotten 标记阻止其回写内存/库基线（任务结束也不会复活）。
    */
   forget(branchId: string) {
-    clearTimeout(this.timers.get(branchId));
-    this.timers.delete(branchId);
     this.good.delete(branchId);
     this.retries.delete(branchId);
     if (this.running.has(branchId)) this.forgotten.add(branchId);
   }
 
-  /** 测试和排查用：这个分支还有没有挂起的 timer / 基线 / 重试状态 */
+  /** 测试和排查用：这个分支还有没有内存基线 / 重试 / 在途任务 */
   tracked(branchId: string): boolean {
-    return this.timers.has(branchId) || this.good.has(branchId) || this.retries.has(branchId);
+    return this.good.has(branchId) || this.retries.has(branchId) || this.running.has(branchId);
   }
 
   /**
-   * 立即执行并等待该分支的派生数据刷新追齐（验证、生成迁移、导出 DDL、发布、历史恢复之前调用）。
-   * - HA（PG）模式：清掉本地定时器后阻塞等待分布式锁 job:derive:<branchId>，并在锁内循环追齐跨副本提交；
-   * - 单机模式（SQLite 或无 HA）：仅当本地有挂起定时器或在途任务时执行并等待。
+   * 关键出口之前调用（发布、生成迁移、导出 DDL、验证、版本差异预览、历史详情、拉取 / 接入预览、MCP 读模型）：
+   * 单机与 HA 统一走本地队列 + derive 锁；锁内相对黄金基线判断有没有待规范化的对象，没有就 0 影子库 I/O 返回 clean；
+   * 有就在影子库里规范化并写回。影子库不可用（ShadowError）或规范化失败时安静返回 skipped，不改基线、不报错，
+   * 保证没有影子库的项目照样能看迁移、导出 DDL、发布未验证版本。只有等锁超时（DeriveBusyError）会抛出。
    */
-  async flush(branchId: string) {
-    if (this.ha?.isDistributed) {
-      clearTimeout(this.timers.get(branchId));
-      this.timers.delete(branchId);
-      await this.enqueue(branchId, () => this.withExclusiveLock(branchId, () => this.runLocked(branchId)));
-      return;
-    }
-    // 单机模式（SQLite 或无 HA）：无跨副本编辑，仅当本地有挂起定时器或在途任务时执行并等待
-    if (this.timers.has(branchId)) {
-      clearTimeout(this.timers.get(branchId));
-      this.timers.delete(branchId);
-      await this.enqueue(branchId, () => this.withExclusiveLock(branchId, () => this.runLocked(branchId)));
-      return;
-    }
-    const inflight = this.running.get(branchId);
-    if (inflight) {
-      await inflight;
-      if (this.timers.has(branchId)) {
-        clearTimeout(this.timers.get(branchId));
-        this.timers.delete(branchId);
-        await this.enqueue(branchId, () => this.withExclusiveLock(branchId, () => this.runLocked(branchId)));
-      }
-    }
+  flush(branchId: string): Promise<FlushOutcome> {
+    const queued = this.queuedFlush.get(branchId);
+    if (queued) return queued;
+    const p: Promise<FlushOutcome> = this.enqueue(branchId, () => {
+      if (this.queuedFlush.get(branchId) === p) this.queuedFlush.delete(branchId);
+      return this.withExclusiveLock(branchId, () => this.runLocked(branchId));
+    });
+    this.queuedFlush.set(branchId, p);
+    return p;
   }
 
-  private start(branchId: string): Promise<void> {
-    return this.enqueue(branchId, () =>
-      this.runBackground(branchId).catch((e) => {
-        console.error('刷新不透明对象 DDL 失败', e);
-      }),
-    );
-  }
-
-  private async runBackground(branchId: string) {
-    if (this.stopped || this.forgotten.has(branchId)) return;
-    if (!this.ha) {
-      await this.runLocked(branchId);
-      return;
-    }
-    const lock = await this.ha.tryWithJobLock(`derive:${branchId}`, () => this.runLocked(branchId));
-    if (!lock.acquired && !this.stopped && !this.forgotten.has(branchId)) {
-      // 另一副本正在刷新同一分支：不静默丢弃，短延迟重排以防期间新提交漏刷
-      this.schedule(branchId, this.retryDelayMs());
-    }
-  }
-
-  private async runLocked(branchId: string) {
+  private async runLocked(branchId: string): Promise<FlushOutcome> {
+    let normalized = false;
+    let lastSeq = 0;
     for (let round = 0; round < MAX_CATCHUP_ROUNDS; round++) {
-      if (this.stopped || this.forgotten.has(branchId)) return;
       const { model: cur, versions, seq } = await this.rooms.state(branchId);
+      lastSeq = seq;
+      if (this.stopped || this.forgotten.has(branchId)) return { kind: 'skipped', seq };
       const good = await this.loadGood(branchId);
-      if (!good) {
-        const empty: Model = { ...cur, objects: {} };
-        if (!needsRefresh(empty, cur)) {
-          await this.setGood(branchId, cur);
-          this.retries.delete(branchId);
-          const after = await this.rooms.state(branchId);
-          if (after.seq === seq && deepEqual(after.model, cur)) return;
-          continue;
-        }
-        // 没有基线：从空模型开始规范化（相当于从零建出整个模型）
-        const shadow = await this.shadowOf(branchId);
-        if (!shadow) return;
-        try {
-          const outcome = await this.apply(branchId, shadow, empty, cur, versions, seq);
-          if (outcome === 'done' || outcome === 'give_up') return;
-        } catch (e) {
-          // 从零建不出来（例如重启前遗留了过期的不透明对象 DDL）：只能接受当前模型作为基线
-          console.error('从零规范化失败，以当前模型作为基线', e);
-          if (!this.forgotten.has(branchId)) {
-            const latest = await this.rooms.state(branchId);
-            if (latest.seq === seq) await this.setGood(branchId, cur);
-          }
-          return;
-        }
-        continue;
-      }
-      if (!needsRefresh(good, cur)) {
+      const base = good ?? emptyBaseline(cur);
+      if (!needsRefresh(base, cur)) {
         this.retries.delete(branchId);
-        if (deepEqual(good, cur)) return;
-        await this.setGood(branchId, cur);
-        const after = await this.rooms.state(branchId);
-        if (after.seq === seq && deepEqual(after.model, cur)) return;
-        continue;
+        return { kind: normalized ? 'normalized' : 'clean', seq };
       }
       const shadow = await this.shadowOf(branchId);
-      if (!shadow) return;
+      if (!shadow) return { kind: 'skipped', seq };
+      let outcome: { kind: 'done' | 'retry' | 'give_up'; seq: number };
       try {
-        const outcome = await this.apply(branchId, shadow, good, cur, versions, seq);
-        if (outcome === 'done' || outcome === 'give_up') return;
+        outcome = await this.apply(branchId, shadow, base, cur, versions, seq);
       } catch (e) {
-        console.error('刷新不透明对象 DDL 失败', e);
-        return;
+        // 影子库不可用是预期情况（没有环境、连不上……）：安静跳过；表达式在影子库里报错留给显式规范化报告给用户
+        if (!(e instanceof ShadowError)) {
+          console.warn(
+            '规范化表达式 / 不透明对象 DDL 失败（模型保持原样）',
+            e instanceof Error ? e.message : e,
+          );
+        }
+        return { kind: 'skipped', seq };
       }
+      lastSeq = outcome.seq;
+      if (outcome.kind === 'done') return { kind: 'normalized', seq: outcome.seq };
+      if (outcome.kind === 'give_up') return { kind: 'skipped', seq: outcome.seq };
+      normalized = true;
     }
-    // 单次持锁达到循环上限（防止持续编辑造成活锁）：释放锁前重排一次，确保后续提交不漏刷
-    if (!this.stopped && !this.forgotten.has(branchId)) {
-      this.schedule(branchId, this.retryDelayMs());
-    }
+    // 单次持锁达到循环上限（持续编辑造成活锁）：返回当前结果，下次出口再追
+    return { kind: normalized ? 'normalized' : 'skipped', seq: lastSeq };
   }
 
   private async apply(
@@ -337,9 +312,9 @@ export class OpaqueRefresher {
     cur: Model,
     versions: Versions,
     curSeq: number,
-  ): Promise<'done' | 'retry' | 'give_up'> {
+  ): Promise<{ kind: 'done' | 'retry' | 'give_up'; seq: number }> {
     const patched = await shadow.canonicalize(good, cur);
-    if (this.forgotten.has(branchId)) return 'done';
+    if (this.forgotten.has(branchId)) return { kind: 'done', seq: curSeq };
     const patchRes = patched.length
       ? await this.rooms.patch(branchId, 'Dowel', patched, versions)
       : undefined;
@@ -350,7 +325,7 @@ export class OpaqueRefresher {
       // 写回被版本检查拒绝或期间房间被替换：绝不用过期的 canonical 覆盖 branches.baseline
       const n = (this.retries.get(branchId) ?? 0) + 1;
       this.retries.set(branchId, n);
-      return n <= MAX_REJECT_RETRIES ? 'retry' : 'give_up';
+      return { kind: n <= MAX_REJECT_RETRIES ? 'retry' : 'give_up', seq: after.seq };
     }
     this.retries.delete(branchId);
     // 基线是“本次规范化的那份模型 + 规范形式”，而不是房间里的最新模型：
@@ -362,33 +337,73 @@ export class OpaqueRefresher {
       (after.seq !== curSeq && !deepEqual(after.model, canonical)) ||
       needsRefresh(canonical, after.model)
     ) {
-      return 'retry';
+      return { kind: 'retry', seq: after.seq };
     }
-    return 'done';
+    return { kind: 'done', seq: after.seq };
+  }
+
+  /**
+   * 显式规范化（模型页“规范化”按钮）：本地队列 + derive 锁内执行，停机中拒绝。
+   * - 黄金基线就是当前模型：直接返回 clean（不连影子库）；
+   * - 否则在给定影子库里从基线（没有就从空模型）迁移到当前模型并读回，写回规范形式、推进基线；
+   * - 影子库 / 表达式报错（ShadowError、StepError、PlanError、InstanceLevelStatementError）原样抛给路由，基线不变；
+   * - 写回被拒（期间有人改了同一对象）抛 NormalizeConflictError。
+   */
+  normalize(branchId: string, handle: { shadow: Shadow; label: string }): Promise<NormalizeOutcome> {
+    if (this.stopped) return Promise.reject(new RefresherStoppedError());
+    return this.enqueue(branchId, () =>
+      this.withExclusiveLock(branchId, async (): Promise<NormalizeOutcome> => {
+        if (this.stopped) throw new RefresherStoppedError();
+        const { model: cur, versions, seq } = await this.rooms.state(branchId);
+        const good = await this.loadGood(branchId);
+        if (good !== null && deepEqual(good, cur)) {
+          return {
+            ok: true,
+            outcome: 'clean',
+            seq,
+            normalizedCount: 0,
+            normalizedObjects: [],
+            checkedInShadow: false,
+            shadow: handle.label,
+          };
+        }
+        const patched = await handle.shadow.canonicalize(good ?? emptyBaseline(cur), cur);
+        if (this.forgotten.has(branchId)) throw new NormalizeConflictError(seq);
+        const patchRes = patched.length
+          ? await this.rooms.patch(branchId, 'Dowel', patched, versions)
+          : undefined;
+        const after = await this.rooms.state(branchId);
+        const rejected =
+          Boolean(patchRes?.rejected) || patched.some((o) => !deepEqual(after.model.objects[o.id], o));
+        if (rejected) throw new NormalizeConflictError(after.seq);
+        const canonical = structuredClone(cur);
+        for (const o of patched) canonical.objects[o.id] = o;
+        await this.setGood(branchId, canonical);
+        this.retries.delete(branchId);
+        return {
+          ok: true,
+          outcome: patched.length ? 'normalized' : 'verified',
+          seq: after.seq,
+          normalizedCount: patched.length,
+          normalizedObjects: patched.map((o) => refOf(canonical, o.id)),
+          checkedInShadow: true,
+          shadow: handle.label,
+        };
+      }),
+    );
+  }
+
+  /** 只读状态（0 影子库 I/O、不拿 derive 锁）：当前模型相对黄金基线有多少待规范化的对象 */
+  async status(branchId: string): Promise<RefreshStatus> {
+    const { model: cur, seq } = await this.rooms.model(branchId);
+    const good = await this.loadGood(branchId);
+    const ids = pendingRefreshIds(good, cur);
+    return {
+      seq,
+      pendingCount: ids.length,
+      objects: ids.slice(0, STATUS_OBJECT_LIMIT).map((id) => refOf(cur, id)),
+      truncated: ids.length > STATUS_OBJECT_LIMIT,
+      baseline: good !== null,
+    };
   }
 }
-
-/** 对象里需要规范化的表达式（没有则为 null） */
-const exprsOf = (o: Obj | undefined): unknown => {
-  if (!o) return null;
-  switch (o.kind) {
-    case 'table': {
-      const partExprs =
-        o.partitionBy && typeof o.partitionBy !== 'string' && o.partitionBy.keys.some((k) => k.expr)
-          ? o.partitionBy.keys.map((k) => k.expr)
-          : null;
-      const bound = o.partitionOf?.bound ?? null;
-      return partExprs || bound !== null ? [partExprs, bound] : null;
-    }
-    case 'check':
-      return o.expr;
-    case 'index':
-      return o.elements.some((e) => e.expr) || o.where ? [o.elements.map((e) => e.expr), o.where] : null;
-    case 'column':
-      return o.generated || (o.default && 'expr' in o.default) ? [o.generated, o.default] : null;
-    case 'opaque':
-      return o.ddl;
-    default:
-      return null;
-  }
-};

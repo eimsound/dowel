@@ -983,6 +983,20 @@ const zh = {
     shadowOf: '影子库：{{env}} 环境',
     shadowMemory: '影子库：SQLite :memory:',
     noEnv: '未配置环境',
+    noUsableShadow: '没有可用的影子库',
+    normalize: {
+      clean: '表达式已规范化',
+      pending: '{{count}} 处待规范化',
+      action: '规范化',
+      running: '规范化中…',
+      normalized: '已在影子库（{{shadow}}）里规范化 {{count}} 处表达式 / 对象定义。',
+      verifiedClean: '已在影子库（{{shadow}}）里校验，没有需要改写的地方。',
+      alreadyClean: '已经是规范形式，不需要再校验。',
+      failed: '规范化失败，请稍后重试。',
+      noShadow: '没有可用的影子库：请先在“环境”里添加非生产环境或配置独立影子库，才能规范化。',
+      notSynced: '正在同步修改，请等连接恢复、修改都已确认后再规范化。',
+      viewerTip: '编辑者点“规范化”后会换成引擎的规范写法；发布、生成迁移时也会自动规范化。',
+    },
     pgTargetMultiTip:
       '目标兼容版本由项目环境中最低的 PostgreSQL 版本推导：PG {{target}}+（当前环境：{{versions}}）',
     pgTargetSingleTip: '目标兼容版本来自项目环境：PG {{target}}+',
@@ -1020,7 +1034,7 @@ const zh = {
     fk: '外键',
     addCheck: '添加 CHECK',
     checkExpr: 'CHECK 表达式',
-    checkHint: '回车保存。保存后会换成 {{dialect}} 的规范写法。',
+    checkHint: '回车保存。点状态栏的“规范化”（或发布、生成迁移时）会换成 {{dialect}} 的规范写法。',
     addUnique: '添加唯一约束',
     pickColumns: '选择列',
     addFk: '添加外键',
@@ -1043,7 +1057,8 @@ const zh = {
     partitioned: '分区表在当前版本中只读',
     values: '值',
     addValue: '添加值',
-    readonlyObject: '这类对象只能通过导入 SQL 修改；给它引用的列、表改名时，定义会自动更新。',
+    readonlyObject:
+      '这类对象只能通过导入 SQL 修改；给它引用的列、表改名后，点状态栏的“规范化”（或发布、生成迁移时）会更新它的定义。',
     expr: '表达式',
     pin: '固定属性面板',
     unpin: '取消固定属性面板',
@@ -3373,6 +3388,23 @@ const en: typeof zh = {
     shadowOf: 'Shadow database: {{env}}',
     shadowMemory: 'Shadow database: SQLite :memory:',
     noEnv: 'No environment',
+    noUsableShadow: 'No usable shadow database',
+    normalize: {
+      clean: 'Expressions normalized',
+      pending: '{{count}} pending normalization',
+      action: 'Normalize',
+      running: 'Normalizing…',
+      normalized:
+        'Normalized {{count}} expressions / object definitions in the shadow database ({{shadow}}).',
+      verifiedClean: 'Checked in the shadow database ({{shadow}}); nothing needed rewriting.',
+      alreadyClean: 'Already in canonical form; no check needed.',
+      failed: 'Normalization failed. Please try again later.',
+      noShadow:
+        'No usable shadow database. Add a non-production environment or configure a dedicated shadow database under Environments first.',
+      notSynced: 'Changes are still syncing. Wait until you are connected and all changes are confirmed.',
+      viewerTip:
+        'An editor can click Normalize to rewrite these in the engine’s canonical form; publishing and generating migrations also normalize automatically.',
+    },
     pgTargetMultiTip:
       'Target version derived from the lowest environment PostgreSQL version: PG {{target}}+ (environments: {{versions}})',
     pgTargetSingleTip: 'Target version derived from project environment: PG {{target}}+',
@@ -3417,7 +3449,8 @@ const en: typeof zh = {
     fk: 'Foreign key',
     addCheck: 'Add check',
     checkExpr: 'Check expression',
-    checkHint: 'Press Enter to save. It is rewritten in {{dialect}}’s canonical form.',
+    checkHint:
+      'Press Enter to save. Click Normalize in the status bar (or publish / generate a migration) to rewrite it in {{dialect}}’s canonical form.',
     addUnique: 'Add unique constraint',
     pickColumns: 'Columns',
     addFk: 'Add foreign key',
@@ -3441,7 +3474,7 @@ const en: typeof zh = {
     values: 'Values',
     addValue: 'Add value',
     readonlyObject:
-      'Objects of this kind can only be changed by importing SQL; renaming the columns or tables they use updates their definition automatically.',
+      'Objects of this kind can only be changed by importing SQL; after renaming the columns or tables they use, click Normalize in the status bar (or publish / generate a migration) to update their definition.',
     expr: 'Expression',
     pin: 'Pin the properties panel',
     unpin: 'Unpin the properties panel',

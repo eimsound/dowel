@@ -23,8 +23,18 @@ test('建表、编辑、发布、生成并验证迁移', async ({ browser }) => 
   await page.getByRole('button', { name: '添加约束' }).click();
   await page.getByText('CHECK 约束', { exact: true }).click();
   await commit(page, 'CHECK 表达式', 'total >= 0');
-  // 服务器在影子库里把表达式换成引擎的规范形式
+  // 按需规范化（ADR 0016）：保存后不自动回影子库，表达式保持原文，状态栏提示待规范化
+  // 模型页底部状态栏（对话框也有 footer，用“人在线”区分）
+  const statusBar = page.locator('footer').filter({ hasText: '人在线' });
+  await expect(statusBar).toContainText('1 处待规范化');
+  await expect(page.getByLabel('表达式 orders_total_check')).toHaveValue('total >= 0');
+  // 编辑者手动点“规范化”：服务器在影子库里把表达式换成引擎的规范形式
+  const normalizeBtn = statusBar.getByRole('button', { name: '规范化', exact: true });
+  await expect(normalizeBtn).not.toHaveAttribute('aria-disabled', 'true');
+  await normalizeBtn.click();
+  await expect(page.getByText(/规范化 1 处表达式/)).toBeVisible();
   await expect(page.getByLabel('表达式 orders_total_check')).toHaveValue('(total >= (0)::numeric)');
+  await expect(statusBar).toContainText('表达式已规范化');
 
   // SQL 视图
   await page.getByRole('tab', { name: 'SQL' }).click();
@@ -43,9 +53,12 @@ test('建表、编辑、发布、生成并验证迁移', async ({ browser }) => 
   await commit(page, '列名 total', 'amount');
   await expect(page.getByLabel('表达式 orders_amount_check')).toHaveValue('(amount >= (0)::numeric)'); // 推导名和表达式跟着改
 
+  // 改名改写了表达式原文：待规范化；打开迁移（关键出口）时服务器会先按需规范化
+  await expect(statusBar).toContainText('1 处待规范化');
   await page.getByRole('button', { name: '迁移' }).click();
   const dlg = page.getByRole('dialog', { name: '迁移' });
   await expect(dlg.getByRole('list', { name: '升级脚本' })).toContainText('RENAME COLUMN total TO amount');
+  await expect(statusBar).toContainText('表达式已规范化');
   await expect(dlg.getByRole('list', { name: '升级脚本' })).toContainText(
     'RENAME CONSTRAINT orders_total_check TO orders_amount_check',
   );

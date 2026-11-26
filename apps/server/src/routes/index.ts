@@ -20,6 +20,7 @@ import { registerGrants } from './grants.ts';
 import { registerGroups } from './groups.ts';
 import { registerMcpTokens } from './mcp-tokens.ts';
 import { registerMcp } from './mcp.ts';
+import { registerNormalize } from './normalize.ts';
 import { registerOidcAdmin, registerOidcAuth, registerOidcMe } from './oidc.ts';
 import { registerPolicy } from './policy.ts';
 import { registerProjects } from './projects.ts';
@@ -99,6 +100,7 @@ export const registerRoutes = (app: Hono<Env>, ctx: AppContext) => {
   registerProjects(app, ctx);
   registerGrants(app, ctx);
   registerVersions(app, ctx);
+  registerNormalize(app, ctx);
   registerCanvasHistory(app, ctx);
   registerActivity(app, ctx);
   // attach 要在 /environments/:eid 之前注册（否则 :eid 会吃掉 attach）

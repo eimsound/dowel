@@ -166,7 +166,7 @@ M1c 中发现并修正的问题：
 | 从线上库导入   | `pullSchema`                           | 只执行 `SET` 和 `SELECT`                                                                                                                                                                                                                                            |
 | 沿用 ID        | `packages/engines/src/pg/reconcile.ts` | 重新导入（SQL 或线上库）时按限定名把对象对回已有 ID（04 3.4），改名识别和画布布局不丢                                                                                                                                                                               |
 | 过滤所有者语句 | `shadow.ts` 的 `stripOwnership`        | pg_dump 输出中的 `OWNER TO`、`GRANT`、`REVOKE` 在真实实例上常因角色不存在而失败，且不在 IR 范围内                                                                                                                                                                   |
-| 派生数据       | `derive.ts`                            | 修改提交后（防抖 300ms）在影子库里从基线重放到当前模型，读回引擎规范形式：表达式（CHECK、默认值、生成列、索引）和不透明对象 DDL（改名后视图定义随 PG 自动更新）。带版本检查写回；基线持久化在 `branches.baseline`；验证、生成迁移、导出 DDL、保存版本前先等刷新完成 |
+| 派生数据       | `derive.ts`                            | **按需规范化（2026-11-27，[ADR 0016](adr/0016-on-demand-shadow-normalization.md)）**：编辑期间不调影子库；关键出口（发布、迁移 / DDL / 验证、版本差异、历史详情、拉取 / 接入预览、MCP 读模型）`flush()`，以及模型页状态栏的“规范化”按钮（`POST /api/projects/:pid/normalize`）才在影子库里从黄金基线重放到当前模型、读回引擎规范形式（表达式和改名后的不透明对象 DDL）并带版本检查写回。基线持久化在 `branches.baseline`，只在 canonical 替换或成功规范化后推进 |
 | 界面           | `Dialogs.tsx`                          | “环境”对话框（添加、测试连接、从此库导入、删除）；迁移对话框可选验证用的影子库，结果显示实际用的影子库                                                                                                                                                              |
 
 **设计变更**：表达式不再分“原文 + 规范形式”两份存（04 1.5 / D7），而是由服务器直接把原文换成规范形式（带版本检查，不会覆盖并发修改）。数据结构更简单，界面本来也是显示规范形式。
@@ -179,7 +179,7 @@ M1c 中发现并修正的问题：
 
 1. **列改名后，引用它的视图 DDL 过期**，从零建出目标版本时视图建不出来 → 派生数据刷新（见上）。
 2. **表达式原文与引擎规范形式不同**（`(note <> '')` vs `(note <> ''::text)`），从线上库重新导入后被当成变化 → 同上，规范化所有表达式。
-3. **派生刷新把第一次运行时的模型当成已规范化的基线**（端到端测试发现：操作很快时，未规范化的 CHECK 成了基线）→ 基线持久化；没有基线时从空模型开始规范化。
+3. **派生刷新把第一次运行时的模型当成已规范化的基线**（端到端测试发现：操作很快时，未规范化的 CHECK 成了基线）→ 基线持久化；没有基线时从空模型开始规范化。2026-11-27 进一步收紧为“黄金基线不变量”（ADR 0016）：没有待规范化对象或规范化失败时都不写基线。
 4. 测试里执行下载的迁移脚本后，`search_path` 为空，未加 schema 的表名找不到（脚本本身行为正确）。
 
 ### 去掉 PGlite 兜底（2026-11-18，用户决定）
@@ -684,6 +684,16 @@ P3 审查后的修正（2026-11-19）：
 - **前端（`apps/web`）**：`clipboard.ts` 传输层——键盘 ⌘C / ⌘V 走 DOM `copy` / `paste` 事件（同步、无权限弹窗），按钮走 `navigator.clipboard`，同时写 `localStorage` 镜像与内存副本，保证同源跨标签页 / 跨项目与无头 E2E 可靠；系统剪贴板里是 Dowel 载荷时优先（除非镜像更新且那次没写进系统剪贴板），系统剪贴板为空时用镜像，是其他非空文本时不贴旧镜像；焦点在输入框、CodeMirror、可编辑区、对话框或弹出层里，或有选中文字、或在 SQL 视图时一律交给浏览器。画布支持 ⌘ / Ctrl / Shift 点击多选、Shift 拖动框选（拖动中实时累积，结束一次提交，并关闭画布上的键盘删除）、⌘A 全选可见表，折叠板块卡片可一键复制整组；属性面板标题栏“复制”菜单（整表 / 全部列 / 全部约束 / 全部索引，查看者也可用）、各行复制按钮（编辑者）与“粘贴列、约束或索引到表 …”；多选时显示多选面板。画布修改历史的“当时状态”在画布视图可多选复制、在表结构视图可勾选表 / 复制单表 / 单列 / 约束与索引，结果写在对话框内的状态区（对话框打开时不弹通知）。粘贴后新表以可见区域中心为基准保留相对位置（连续粘贴自动错开），同项目粘贴沿用来源板块；有改名 / 跳过 / 说明时在画布左下方显示常驻的粘贴结果面板（读屏经预挂载的播报区宣读，关闭后焦点回到“粘贴”按钮），否则只弹通知；跨方言、查看者、剪贴板为空等给出明确提示（新增中性 `notice` 通知样式）。
 - **设计过程与评审加固（Round 1 / Round 2）**：架构由调研协作者独立出方案后逐点对照（采纳枚举超集复用、自有序列新建、`_copy` 词干去重、单趟表达式改名、镜像新旧判定、非 PG 性能守护；否决专用全量 IR 插入 mutator、自动建 schema、自定义 MIME 等），UI / 文案由评审协作者按 DESIGN.md 与 modern-web-guidance 审查后修订（查看者复制入口、异步复制错误、空粘贴结果、框选与 Backspace、英文数量无关措辞与中文全角、顶栏分组与窄屏按钮可访问名字等）。axe 扫描顺带发现属性面板 PK / FK / NN 小标记对比度不足（4.1–4.4），已把字色向正文色靠拢。Round 1 补强多选拖动布局批量持久化与剪贴板载荷 / 同步层加固；Round 2 在 `Rooms.applyMcpOps` 与 `listMutatorCatalog` 中禁止通过 MCP 使用 `paste`（防止绕过 MCP 100-op 批量上限），并将 `clipboard.ts` 的索引元素判定与 `runPaste` 的对象存在性检查分别对齐 PR #89/#91 的 `isValidIndexElement` 与 `Object.hasOwn`。
 - **测试**：`packages/core/test/clipboard.test.ts`（序列化 / 解析 / 篡改、`renameManyInExpr`、`setSequenceOwnedBy`、`paste` 防护、提取规则与错误边界）、`clipboard-dialects.test.ts`（四方言矩阵：同模型粘贴与后缀、内部 / 自引用外键、外部外键重连与四种跳过原因、表内粘贴；PG 枚举 / 序列 / identity / 分区 / schema 回退 / 63 字节多字节截断，SQLite STRICT / WITHOUT ROWID / AUTOINCREMENT，MySQL 引擎 / UNSIGNED / AUTO_INCREMENT / FULLTEXT / 列级 enum，MSSQL IDENTITY / 显式默认值约束名 / CLUSTERED 单例）、`clipboard-property.test.ts`（fast-check 四方言随机模型多次粘贴：`validate()` 为空、ID 全新、既有对象零修改）、`packages/sync/test/clipboard-sync.test.ts`（覆盖索引 / 临时索引 / 普通副本三条路径结果一致 + 性能守护）、`apps/web/test/copy-paste.test.ts`（布局与板块）；E2E `e2e/copy-paste.spec.ts`（同画布粘贴后缀与外键、历史快照复制、项目 A → B 外键重连与跳过说明、SQLite → PG 跨方言报错、属性面板列 / 索引粘贴与重复跳过、查看者限制，亮 / 暗 axe）。
+
+### 4.24 按需规范化（2026-11-27，ADR 0016）
+
+- **编辑期零影子库调用**：`app.ts` 不再挂 `rooms.onCommit → refresher.schedule()`（`Rooms.onCommit` 保留为空钩子），添加环境 / 接入后也不再 `schedule()`；`OpaqueRefresher` 去掉 `schedule` / `timers` / `delayMs` / 后台防抖与 `tryWithJobLock` 重排。
+- **`OpaqueRefresher`（`derive.ts`）**：`flush()` 单机与 HA 统一走本地队列 + `withExclusiveLock`（等锁超时 `DeriveBusyError` → `503 normalize_busy`），排队未开始的同分支 flush 合并；锁内 `needsRefresh(good ?? 空模型, cur)` 为假时 0 影子库 I/O 返回 `clean`；`ShadowError` / canonicalize 失败安静返回 `skipped`。`normalize(branchId, shadow)` 显式规范化（停机中 `RefresherStoppedError`，写回被拒 `NormalizeConflictError`）；`status(branchId)` 只读（不拿锁、不连影子库）；`runWithReset` / 新增 `runWithoutReset` 对应 `ctx.replace(…, { canonical })`。纯判定函数在 `derive-pending.ts`（`pendingRefreshIds` / `needsRefresh` / `hasRenamedOpaqueDeps`）。
+- **出口与确认**：发布、`resolveModelRef`、`canvas-diff`、`GET /history/:seq`、拉取预览、接入预览、MCP `get_model` / `get_table` 保留 flush（返回 flush 后的 `seq`）；恢复历史、应用版本、`syncWorkingCopy`、拉取 / 接入确认阶段去掉 flush（避免自冲突 409）。MCP `verify_migration` 先校验环境与连接限速再解析 head，被限速的调用不碰影子库。
+- **`shadow.ts` canonicalize**：基线建不出来（`StepError`）且无依赖改名的不透明对象时回退从空库建 `next`（自愈旧基线）；基础设施故障统一 `toShadowError`。
+- **接口**：`GET /api/projects/:pid/normalize`（`project.read`）、`POST /api/projects/:pid/normalize`（`model.normalize`，编辑者），见 `routes/normalize.ts`；`Shadows.configState(pid)` 纯平台库查询影子库配置状态。
+- **前端**：`components/NormalizeStatus.tsx` 放在模型页底部状态栏（圆点 + 待规范化数量 + 编辑者的 ghost 按钮）；状态栏影子库来源改用 `envs.ts` 的 `usableShadowEnv`（按真实选影优先级）。
+- **测试**：`apps/server/test/derive.test.ts`（判定、黄金基线、合并、重试、replace、normalize / status、forget / stop）、`normalize.test.ts`（SQLite `:memory:` 影子库、桩影子库、PG 预连接 422 与限速退回，零 Docker）、`permission-matrix.test.ts` 登记两个新端点；`ha-jobs` / `shadow-pg` / `shutdown` / `project-delete` 随语义更新；`e2e/basic.spec.ts` 覆盖“保存后原文 → 状态栏待规范化 → 点规范化 → 规范形式”与出口触发。
 
 ## 5. 下一步
 

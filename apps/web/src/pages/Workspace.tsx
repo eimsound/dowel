@@ -49,6 +49,7 @@ import { Canvas, type CanvasApi } from '../components/Canvas.tsx';
 import { CanvasHistory } from '../components/CanvasHistory.tsx';
 import { ImportDialog, MigrationDialog, VersionDialog } from '../components/Dialogs.tsx';
 import { Inspector } from '../components/Inspector.tsx';
+import { NormalizeStatus } from '../components/NormalizeStatus.tsx';
 import {
   hasDetails,
   type PasteSummary,
@@ -66,6 +67,7 @@ import { Avatar, IconButton, peerColor } from '../components/ui.tsx';
 import { nudgeAway, placePastedTables, sectionIndex, sectionsAfterPaste } from '../copy-paste.ts';
 import { clearTables, SELECT_TABLE_EVENT, setCurrentTables } from '../current-tables.ts';
 import { dialectUiSpec } from '../dialects.ts';
+import { usableShadowEnv } from '../envs.ts';
 import { useProject } from '../project.tsx';
 import {
   buildCanvasGroups,
@@ -101,7 +103,17 @@ export const Model = () => {
     queryKey: ['versions', pid],
     queryFn: () => api<VersionInfo[]>('GET', `/api/projects/${pid}/versions`),
   });
-  const { ws, model, status, pending, layout, sections, peers, role: liveRole } = useWorkspace(pid, toast);
+  const {
+    ws,
+    model,
+    status,
+    pending,
+    seq,
+    layout,
+    sections,
+    peers,
+    role: liveRole,
+  } = useWorkspace(pid, toast);
   const modelIndex = useMemo(() => buildModelIndex(model), [model]);
   const [selected, setSelected] = useState<string | null>(null);
   const selectedRef = useRef<string | null>(selected);
@@ -726,7 +738,8 @@ export const Model = () => {
     }
   };
 
-  const env = envs.data?.[0];
+  // 状态栏的影子库：按服务端真实的选影优先级挑可用环境（不是简单取第一个环境）
+  const env = usableShadowEnv(envs.data);
   const latest = versions.data?.[0];
   const showInspector = pinned || selected !== null || liveMulti.length > 1;
   const dialectLabel =
@@ -1014,9 +1027,17 @@ export const Model = () => {
             ? t('ws.shadowMemory')
             : env
               ? t('ws.shadowOf', { env: env.name })
-              : t('ws.noEnv')}
+              : envs.data?.length
+                ? t('ws.noUsableShadow')
+                : t('ws.noEnv')}
         </span>
         <span className="flex-1" />
+        <NormalizeStatus
+          pid={pid}
+          seq={seq}
+          synced={status === 'online' && pending === 0}
+          readOnly={readOnly}
+        />
         {latest && <span className="font-mono">{latest.name}</span>}
         <span className="font-mono" title={dialectTip}>
           {dialectLabel}

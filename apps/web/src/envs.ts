@@ -7,6 +7,7 @@ import type {
   ExecErrorDetails,
   ExecEvent,
   ExecPolicy,
+  NormalizeResult,
 } from '@dowel/api';
 import { useQuery } from '@tanstack/react-query';
 import type { TFunction } from 'i18next';
@@ -102,3 +103,29 @@ export const streamExec = async (
 };
 
 export type { ExecErrorDetails };
+
+/**
+ * 状态栏显示的影子库来源：按服务端选影优先级（Shadows.candidatePriority）挑第一个可用的环境——
+ * 显式独立影子库 > 非生产环境（同实例 `{库名}_dowel`）> 允许同实例的生产环境；都不可用时返回 null。
+ */
+export const usableShadowEnv = <E extends Pick<EnvInfo, 'shadowUrl' | 'production' | 'allowSameInstance'>>(
+  envs: readonly E[] | undefined,
+): E | null => {
+  const rank = (e: E) => (e.shadowUrl != null ? 0 : !e.production ? 1 : e.allowSameInstance ? 2 : 3);
+  let best: E | null = null;
+  for (const e of envs ?? []) {
+    if (rank(e) < 3 && (best === null || rank(e) < rank(best))) best = e;
+  }
+  return best;
+};
+
+/** 手动规范化成功后的提示文案 */
+export const normalizeToast = (
+  res: Pick<NormalizeResult, 'outcome' | 'normalizedCount' | 'shadow'>,
+  t: TFunction,
+): string =>
+  res.outcome === 'normalized'
+    ? t('ws.normalize.normalized', { count: res.normalizedCount, shadow: res.shadow })
+    : res.outcome === 'verified'
+      ? t('ws.normalize.verifiedClean', { shadow: res.shadow })
+      : t('ws.normalize.alreadyClean');
