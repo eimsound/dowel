@@ -1,6 +1,6 @@
 # MCP 画布编辑能力扩展与画布修改历史降噪
 
-2026-11-26 决定（已实现：A1 PR #117、A2 PR #119、A3 PR #121、A4 PR #120、A5 PR #A5PR；承接 [ADR 0014](0014-mcp-tokens-and-boundaries.md)）：Dowel **不在平台本体内置 LLM**，AI 能力聚焦外部 AI 编程助手经内置 MCP 服务（`POST /api/mcp`）**修改画布**。继续严格维持 ADR 0014 的两条安全红线（绝不连接目标库；不能发布版本，也不能提交、审批或执行迁移）；OAuth 2.1 暂缓，沿用个人 MCP 令牌（`dwm_…`，表 `mcp_tokens.kind` 仍保留扩展点）。
+2026-11-26 决定（已实现：A1 PR #117、A2 PR #119、A3 PR #121、A4 PR #120、A5 PR #122；承接 [ADR 0014](0014-mcp-tokens-and-boundaries.md)）：Dowel **不在平台本体内置 LLM**，AI 能力聚焦外部 AI 编程助手经内置 MCP 服务（`POST /api/mcp`）**修改画布**。继续严格维持 ADR 0014 的两条安全红线（绝不连接目标库；不能发布版本，也不能提交、审批或执行迁移）；OAuth 2.1 暂缓，沿用个人 MCP 令牌（`dwm_…`，表 `mcp_tokens.kind` 仍保留扩展点）。
 
 1. **画布布局层边界：开放板块（Section）读写，不开放像素坐标。**
    - 像素坐标继续由前端 Web Worker `elkjs` 自动排布（无持久化坐标的新表排到已有内容右侧）与人工拖拽管理，MCP 不暴露坐标写接口，避免 LLM 二维排版重叠或制造布局并发噪音。

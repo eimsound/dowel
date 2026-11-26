@@ -735,7 +735,7 @@ P3 审查后的修正（2026-11-19）：
 - **MCP 暴露**：`listMutatorCatalog`（`list_mutators` 与 `dowel://mutators` 共用）把 `defineTable` / `alterColumn` 排在最前，条目带 `kind: 'macro' | 'mutator'`、`description`、`argsSchema`（`paste` / `batch` 仍隐藏）；`apply_changes` 错误 `structuredContent` 透传 `{ code, index, path?, mutator?, currentSeq }`（`@dowel/api` 的 `McpApplyErrorLocation`）；`MCP_INSTRUCTIONS` 与工具描述说明宏、循环外键做法与严格对象 ID 红线。用户文档 `docs/{zh,en}/mcp.md` 新增“复合宏”一节。
 - **测试**：`packages/core/test/macros.test.ts`（零 DB 四方言矩阵：PG 枚举 / 序列 / 分区 / 自引用外键与 alterColumn 双向互斥，SQLite STRICT / WITHOUT ROWID / autoincrement 延后与大小写，MySQL engine / charset / unsigned / autoIncrement 与拒绝 PG 特性，MSSQL 多 schema / `ext.mssql.identity` / clustered / 保留 `DF_` 名；歧义、原型键、新建 ID 查重、strict、与 batch 等价）、`packages/sync/test/sync.test.ts`（`subMessage`）、`apps/server/test/rooms.test.ts`（混排单 seq、共享 refs、500 上限、幂等 noop + `extraReads` 冲突、四类错误的 `index` / `path` / `mutator`）、`apps/server/test/mcp.test.ts`（目录暴露、dryRun、审计、错误结构）。
 
-### 4.29 MCP 只读对象上下文、只读画布历史与 MCP Prompts（2026-11-27，ADR 0015 第 6 节，#116，PR #A5PR）
+### 4.29 MCP 只读对象上下文、只读画布历史与 MCP Prompts（2026-11-27，ADR 0015 第 6 节，#116，PR #122）
 
 - **共享契约（`packages/api/src/mcp.ts`）**：`MCP_TOOLS` 新增 `get_objects` / `list_history` / `get_history_diff`（均 `{ scope: 'read', action: 'project.read' }`）；`McpToolErrorCode` 增 `history_not_found`；常量 `MCP_HISTORY_MAX_LIMIT` = 50、`MCP_HISTORY_DIFF_MAX_ITEMS` = 100、`MCP_HISTORY_SQL_MAX_CHARS` = 2000、`MCP_HISTORY_OP_SUMMARY_MAX_CHARS` = 200、`MCP_HISTORY_OBJECTS_MAX_ITEMS` = 200、`MCP_OBJECTS_DDL_BUDGET` = 200,000；`MCP_PROMPTS` 声明 4 个 Prompt 的 `name` / `requiredScope` / `description` / `arguments`（`maxLength`、`numeric`），服务端按它生成 zod 参数 schema，契约测试共用。红线：永不注册 `restore_history` / `revert_history` / `rollback` / `publish_version` / `execute_migration`。
 - **两个既有缺陷**：表级不透明对象（`trigger` / `policy` / `exclusion`）的 `parent` 是表 ID，新增 `opaqueOwner(model, o)`（`Object.hasOwn`）统一解析 `parentKind` / `schemaId` / `tableId` / `tableName`，`schema` 过滤与摘要都按所在表的 schema 归属（之前按 schema 过滤会丢掉它们，不过滤时又把表 ID 填进 `schemaId`）；`Extension.parent` 是 schema ID，`schema` 过滤不再直接返回空列表，扩展摘要补 `schemaId` / `schema` / `comment`。板块归属改为基于全模型存活顶层表构造（`sectionIndexOf`），跨 schema 的分区子表也经根表继承 `sectionId`。
@@ -748,6 +748,6 @@ P3 审查后的修正（2026-11-19）：
 
 ## 5. 下一步
 
-ADR 0015（MCP 画布编辑能力扩展与画布修改历史降噪）已全部实现：A1 `batch` 单提交与写后 `diagnostics`（PR #117）、A2 画布历史读时归组（PR #119，4.27）、A3 编译型复合宏（PR #121，4.28）、A4 板块增量读写与 `get_model` 方言 / 目标上下文（PR #120，4.25）、A5 只读对象上下文 / 只读画布历史 / MCP Prompts（PR #A5PR，4.29）。
+ADR 0015（MCP 画布编辑能力扩展与画布修改历史降噪）已全部实现：A1 `batch` 单提交与写后 `diagnostics`（PR #117）、A2 画布历史读时归组（PR #119，4.27）、A3 编译型复合宏（PR #121，4.28）、A4 板块增量读写与 `get_model` 方言 / 目标上下文（PR #120，4.25）、A5 只读对象上下文 / 只读画布历史 / MCP Prompts（PR #122，4.29）。
 
 M3 三项能力均已完成（MCP 服务见 4.21；链尾版本作废、应用到画布与公共祖先切换见 4.22；同方言画布 / 画布历史 / 跨项目复制粘贴见 4.23；模型分支与语义合并引擎已于 2026-11-24 明确不做，见 [ADR 0013](adr/0013-retire-tail-version-instead-of-branches.md)；本地离线模式已于 2026-11-22 明确不做，见 [03-open-questions.md](03-open-questions.md) Q18）。
