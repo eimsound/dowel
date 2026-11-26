@@ -37,4 +37,5 @@ flowchart LR
 
 - [CI HTTP API](api.md). Check CI token security boundaries, read-only endpoints, live drift checks, forward execution endpoints, and the complete error code reference.
 - [CI pipeline integration](ci-action.md). Run `actions/execute` in GitHub, Gitea, Forgejo, GHES, or any shell pipeline.
+- [AI assistants (MCP)](mcp.md). Create personal MCP tokens, understand read/verify/write boundaries, connect Claude Code, Cursor, or VS Code, and browse available tools.
 - [Glossary](glossary.md). Read canonical definitions for Dowel platform concepts and terms.
