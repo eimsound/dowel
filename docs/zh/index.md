@@ -37,4 +37,5 @@ flowchart LR
 
 - [CI HTTP API](api.md)：CI 令牌权限边界、只读查询、实时漂移检测、向前执行端点与完整错误码表。
 - [CI 流水线集成](ci-action.md)：在 GitHub / Gitea / Forgejo / GHES 或任意 shell 流水线中使用 `actions/execute`。
+- [AI 编程助手（MCP）](mcp.md)：个人 MCP 令牌、只读/验证/写工作副本权限边界、Claude Code / Cursor / VS Code 接入与工具清单。
 - [术语表](glossary.md)：平台核心概念与规范用语说明。

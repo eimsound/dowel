@@ -45,6 +45,7 @@ docker compose up -d
 | [Group webhooks](docs/en/webhooks.md)                         | [组级 Webhook](docs/zh/webhooks.md)                 | 5 种通知格式、事件列表、HMAC 签名校验、SSRF 出站限制与重试队列                       |
 | [CI HTTP API](docs/en/api.md)                                 | [CI HTTP API](docs/zh/api.md)                       | CI 令牌安全边界、只读与执行端点、请求响应示例与完整错误码表                          |
 | [CI pipeline integration](docs/en/ci-action.md)               | [CI 流水线集成](docs/zh/ci-action.md)               | GitHub / Gitea / Forgejo / GHES 复合 Action 与 `actions/execute/run.sh` 通用用法     |
+| [AI assistants (MCP)](docs/en/mcp.md)                         | [AI 编程助手（MCP）](docs/zh/mcp.md)                | 个人 MCP 令牌、权限与安全边界、客户端配置、工具清单与错误码                          |
 | [Glossary](docs/en/glossary.md)                               | [术语表](docs/zh/glossary.md)                       | 平台核心概念与术语辨析（对齐 [GLOSSARY.md](GLOSSARY.md)）                            |
 
 ## 本地开发与测试
@@ -69,7 +70,7 @@ pnpm docs:build   # 严格构建中英双语文档站点到 docs/site/（中文�
 
 - **目标库方言**：已支持 PostgreSQL（15–19）、SQLite、MySQL（8.4 / 9.7）与 SQL Server（2019 / 2022 / 2025）。
 - **无命令行工具**：Dowel 不提供独立的命令行工具，CI 流水线直接调用 HTTP API 或仓库内置的 [actions/execute](actions/execute/README.md)。
-- **未实现功能**：模型分支与变更评审、浏览器离线 IndexedDB 模式、MCP 服务以及邮件通知均尚未实现。
+- **明确不做的范围**：模型分支与语义合并引擎（改由链尾版本作废与画布复制粘贴替代）、浏览器离线 IndexedDB 模式、以及在平台本体内置 LLM（外部 AI 编程助手统一通过内置 [MCP 服务](docs/zh/mcp.md) 接入）。
 
 ## 协议
 
