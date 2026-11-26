@@ -4,7 +4,13 @@ import {
   BATCH_OPS_LIMIT,
   BATCH_SUMMARY_MAX,
   type BatchArgs,
+  compileMacro,
   EditError,
+  isMacro,
+  MacroError,
+  macroLabel,
+  type MacroPlan,
+  type MacroStep,
   type Model,
   MutableModelIndex,
   newId,
@@ -74,10 +80,31 @@ export type ApplyMcpOpsResult =
       ok: false;
       /** 出错的输入操作下标（从 0 开始） */
       index?: number;
+      /** 复合宏内的出错位置，如 `defineTable(orders).foreignKeys[0]`（仅宏给出） */
+      path?: string;
+      /** 复合宏展开后出错的底层 mutator（仅宏的展开步骤给出） */
+      mutator?: string;
       currentSeq: number;
       code: 'base_seq_ahead' | 'conflict' | 'invalid' | 'dependency';
       message: string;
     };
+
+/**
+ * 展开后的子操作来自哪个输入操作：普通原语 path / mutator 为空；复合宏给出完整路径（`defineTable(orders).foreignKeys[0]`）
+ * 与展开出的底层 mutator（编译期参数错误没有 mutator）。
+ */
+interface Origin {
+  index: number;
+  label: string;
+  path?: string;
+  mutator?: string;
+}
+
+const joinPath = (base: string, sub: string) => (sub ? `${base}.${sub}` : base);
+
+/** 宏错误消息：`ops[i] <path> [mutator]：<原始错误>`；普通原语保持原始错误文本不变（向后兼容） */
+const located = (o: Origin, raw: string) =>
+  o.path === undefined ? raw : `ops[${o.index}] ${o.path}${o.mutator ? ` ${o.mutator}` : ''}：${raw}`;
 
 /** 递归把参数里的 `$ref:<alias>` 占位符替换成整批共享的 UUIDv7（同 alias 同 ID，refs 键为去掉 `$ref:` 前缀的 alias） */
 const expandMcpRefs = (value: unknown, refs: Map<string, string>): unknown => {
@@ -173,11 +200,22 @@ export class McpWriter {
       const err = (
         code: Extract<ApplyMcpOpsResult, { ok: false }>['code'],
         message: string,
-        index?: number,
-      ): LockValue => ({
-        kind: 'err',
-        res: { ok: false, ...(index !== undefined ? { index } : {}), currentSeq, code, message },
-      });
+        at?: Origin | number,
+      ): LockValue => {
+        const o = typeof at === 'number' ? { index: at, label: '' } : at;
+        return {
+          kind: 'err',
+          res: {
+            ok: false,
+            ...(o ? { index: o.index } : {}),
+            ...(o?.path !== undefined ? { path: o.path } : {}),
+            ...(o?.mutator !== undefined && o.path !== undefined ? { mutator: o.mutator } : {}),
+            currentSeq,
+            code,
+            message,
+          },
+        };
+      };
       const effectiveBaseSeq = opts.baseSeq ?? currentSeq;
       if (!Number.isInteger(effectiveBaseSeq) || effectiveBaseSeq < 0) {
         return err('invalid', `无效的 baseSeq：${opts.baseSeq}`);
@@ -198,58 +236,67 @@ export class McpWriter {
       }
 
       // 在 baseModel 副本上逐步预演每个子操作：校验参数、展开 `$ref`，并收集每一步的外部依据
-      // （本批新建的对象不是外部依据；既有对象以 baseSeq 为依据版本，本批首次新建的对象要求当前仍不存在）
+      // （本批新建的对象不是外部依据；既有对象以 baseSeq 为依据版本，本批首次新建的对象要求当前仍不存在）。
+      // 复合宏（defineTable / alterColumn）在这里编译并惰性展开为底层 mutator，与普通原语共享同一个 refs。
       const refs = new Map<string, string>();
       const expandedOps: BatchArgs['ops'] = [];
-      /** 展开后子操作下标 → 输入操作下标（目前一一对应；复合宏展开后多对一） */
-      const inputIndexOf: number[] = [];
+      /** 展开后子操作下标 → 来源（输入操作下标、宏路径与 mutator） */
+      const originOf: Origin[] = [];
       const merged = new Map<string, number | null>();
-      const firstReadStep = new Map<string, number>();
+      const firstReadOrigin = new Map<string, Origin>();
       const createdInBatch = new Set<string>();
       let batchModel = structuredClone(baseModel);
       const batchIndex = new MutableModelIndex(batchModel);
 
-      for (let i = 0; i < opts.ops.length; i++) {
-        const input = opts.ops[i]!;
-        if (MCP_DISALLOWED_MUTATORS.has(input.name)) {
-          return err('invalid', `MCP apply_changes 不允许使用操作：${input.name}`, i);
-        }
-        const expandedArgs = expandMcpRefs(input.args, refs);
-        let execRes: ReturnType<typeof execute>;
-        try {
-          execRes = execute(batchModel, input.name, expandedArgs, batchIndex);
-        } catch (e) {
-          if (e instanceof EditError) return err('invalid', e.message, i);
-          throw e;
-        }
-        const stepIds = new Set([
-          ...readsOf(baseModel, expandedArgs, input.name),
-          ...readsOf(batchModel, expandedArgs, input.name),
-          ...execRes.changes.map((c) => c.id),
-        ]);
+      /** 合并一组依据并按顺序检查冲突：报告最早冲突的那一步，并给出人类可读的“X 已被 Y 修改” */
+      const recordReads = (ids: Iterable<string>, origin: Origin): LockValue | null => {
         const stepReads: Op['reads'] = [];
-        for (const id of [...stepIds].sort()) {
+        for (const id of [...new Set(ids)].sort()) {
           if (createdInBatch.has(id) || merged.has(id)) continue;
           const ver = Object.hasOwn(baseModel.objects, id) ? effectiveBaseSeq : null;
           if (ver === null) createdInBatch.add(id);
           merged.set(id, ver);
-          firstReadStep.set(id, expandedOps.length);
+          firstReadOrigin.set(id, origin);
           stepReads.push([id, ver]);
         }
-        // 按子操作顺序检查外部依据：报告最早冲突的那一步，并给出人类可读的“X 已被 Y 修改”
         const conflict = stepReads.length ? r.room.readConflict(client, stepReads) : null;
-        if (conflict) return err(conflict.code, conflict.message, i);
+        return conflict ? err(conflict.code, located(origin, conflict.message), origin) : null;
+      };
 
-        expandedOps.push({ name: input.name, args: expandedArgs });
-        inputIndexOf.push(i);
-        if (expandedOps.length > BATCH_OPS_LIMIT) {
+      /** 预演一个展开后的底层子操作（普通原语或宏的一步） */
+      const runStep = (
+        name: string,
+        args: unknown,
+        origin: Origin,
+        extraReads?: string[],
+      ): LockValue | null => {
+        if (expandedOps.length >= BATCH_OPS_LIMIT) {
           return err(
             'invalid',
-            `展开后的子操作超过上限 ${BATCH_OPS_LIMIT} 条，请拆分成多次 apply_changes`,
-            i,
+            located(origin, `展开后的子操作超过上限 ${BATCH_OPS_LIMIT} 条，请拆分成多次 apply_changes`),
+            origin,
           );
         }
+        let execRes: ReturnType<typeof execute>;
+        try {
+          execRes = execute(batchModel, name, args, batchIndex);
+        } catch (e) {
+          if (e instanceof EditError) return err('invalid', located(origin, e.message), origin);
+          throw e;
+        }
+        const conflict = recordReads(
+          [
+            ...readsOf(baseModel, args, name),
+            ...readsOf(batchModel, args, name),
+            ...execRes.changes.map((c) => c.id),
+            ...(extraReads ?? []),
+          ],
+          origin,
+        );
+        if (conflict) return conflict;
 
+        expandedOps.push({ name, args });
+        originOf.push(origin);
         const batch = execRes.changes.map((c) => ({
           id: c.id,
           prev: batchModel.objects[c.id],
@@ -257,6 +304,78 @@ export class McpWriter {
         }));
         batchIndex.applyBatch(execRes.next, batch);
         batchModel = execRes.next;
+        return null;
+      };
+
+      for (let i = 0; i < opts.ops.length; i++) {
+        const input = opts.ops[i]!;
+        if (MCP_DISALLOWED_MUTATORS.has(input.name)) {
+          return err('invalid', `MCP apply_changes 不允许使用操作：${input.name}`, i);
+        }
+        if (!isMacro(input.name)) {
+          const failed = runStep(input.name, expandMcpRefs(input.args, refs), {
+            index: i,
+            label: input.name,
+          });
+          if (failed) return failed;
+          continue;
+        }
+
+        // 复合宏：编译期错误（参数 / 互斥 / 名称解析）报到宏路径；展开步骤的错误报到步骤路径与 mutator
+        const label = macroLabel(batchModel, input.name, input.args, refs);
+        const macroOrigin: Origin = { index: i, label, path: label };
+        const compileErr = (e: unknown): LockValue => {
+          if (e instanceof MacroError) {
+            const o: Origin = { ...macroOrigin, path: joinPath(label, e.path) };
+            if (e.mutator !== undefined) o.mutator = e.mutator;
+            return err('invalid', located(o, e.rawMessage), o);
+          }
+          if (e instanceof EditError) return err('invalid', located(macroOrigin, e.message), macroOrigin);
+          throw e;
+        };
+        let plan: MacroPlan;
+        try {
+          plan = compileMacro(batchModel, input.name, input.args, refs);
+        } catch (e) {
+          return compileErr(e);
+        }
+        const extraConflict = recordReads(plan.extraReads, macroOrigin);
+        if (extraConflict) return extraConflict;
+        for (;;) {
+          let next: IteratorResult<MacroStep, void>;
+          try {
+            next = plan.steps.next(batchModel);
+          } catch (e) {
+            return compileErr(e);
+          }
+          if (next.done) break;
+          const s = next.value;
+          const failed = runStep(
+            s.name,
+            s.args,
+            { index: i, label, path: joinPath(label, s.path), mutator: s.name },
+            s.extraReads,
+          );
+          if (failed) return failed;
+        }
+      }
+
+      // 全部输入都是幂等宏（例如值已一致的 alterColumn）展开为 0 个子操作：依据已检查过冲突，直接返回 noop
+      if (expandedOps.length === 0) {
+        return {
+          kind: 'dry',
+          res: {
+            ok: true,
+            dryRun,
+            baseSeq: effectiveBaseSeq,
+            seq: currentSeq,
+            opCount: 0,
+            refs: Object.fromEntries(refs),
+            changed: [],
+            model: structuredClone(r.room.model),
+            noop: true,
+          },
+        };
       }
 
       const batchArgs: BatchArgs = { ops: expandedOps, ...(safeSummary ? { summary: safeSummary } : {}) };
@@ -269,9 +388,21 @@ export class McpWriter {
       };
       const sim = r.room.simulate(client, [batchOp]);
       if (!sim.ok) {
-        const sub =
-          sim.subIndex ?? (sim.objectId !== undefined ? firstReadStep.get(sim.objectId) : undefined);
-        return err(sim.code, sim.message, sub !== undefined ? inputIndexOf[sub] : undefined);
+        // 把展开后的内部子操作下标映射回输入位置（绝不把 `ops[<展开下标>]` 泄漏给调用方）
+        const origin =
+          sim.subIndex !== undefined
+            ? originOf[sim.subIndex]
+            : sim.objectId !== undefined
+              ? firstReadOrigin.get(sim.objectId)
+              : undefined;
+        let message = sim.message;
+        if (origin && sim.subMessage !== undefined) {
+          message =
+            origin.path === undefined
+              ? `ops[${origin.index}] ${origin.label}：${sim.subMessage}`
+              : located(origin, sim.subMessage);
+        } else if (origin) message = located(origin, sim.message);
+        return err(sim.code, message, origin);
       }
       return { batchOp, opCount: expandedOps.length, refs, sim };
     };

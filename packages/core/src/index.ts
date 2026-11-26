@@ -6,6 +6,7 @@ export * from './empty.ts';
 export * from './ids.ts';
 export * from './ir.ts';
 export * from './json.ts';
+export * from './macros.ts';
 export * from './model.ts';
 export * from './mssql/batch.ts';
 export { MSSQL_CAPABILITIES, mssqlDialect } from './mssql/dialect.ts';

@@ -1438,4 +1438,140 @@ describe.each([
       expect(await f.db.query("select id from audit_events where action = 'model.mutate'")).toEqual([]);
     },
   );
+  test.skipIf(skip)(
+    '复合宏：list_mutators / dowel://mutators 暴露宏在前，apply_changes 错误透传 path / mutator，审计记外层 op 名',
+    async () => {
+      const f = await setupEnv();
+      const tokAlice = await f.issueToken(f.alice.id, ['read', 'write']);
+
+      const lm = await f.callTool(tokAlice.token, 'list_mutators', {});
+      expect(lm.isError).toBeFalsy();
+      const items = lm.structuredContent!.mutators as {
+        name: string;
+        kind: string;
+        description: string;
+        argsSchema: { properties?: Record<string, unknown> };
+      }[];
+      expect(items.slice(0, 2).map((m) => [m.name, m.kind])).toEqual([
+        ['defineTable', 'macro'],
+        ['alterColumn', 'macro'],
+      ]);
+      expect(items.slice(2).every((m) => m.kind === 'mutator' && m.description.length > 0)).toBe(true);
+      expect(items[0]!.description).toContain('addForeignKey');
+      expect(Object.keys(items[0]!.argsSchema.properties ?? {})).toContain('foreignKeys');
+      expect(items.map((m) => m.name)).not.toContain('batch');
+      const filtered = await f.callTool(tokAlice.token, 'list_mutators', {
+        names: ['alterColumn', 'createTable'],
+      });
+      expect((filtered.structuredContent!.mutators as { name: string }[]).map((m) => m.name)).toEqual([
+        'alterColumn',
+        'createTable',
+      ]);
+
+      const resList = await parseRpc(
+        await f.mcpPost(tokAlice.token, {
+          jsonrpc: '2.0',
+          id: 91,
+          method: 'resources/read',
+          params: { uri: 'dowel://mutators' },
+        }),
+      );
+      const catalog = JSON.parse(((resList.result?.contents as { text: string }[]) ?? [])[0]!.text) as {
+        mutators: { name: string; kind: string }[];
+      };
+      expect(catalog.mutators.slice(0, 2).map((m) => m.name)).toEqual(['defineTable', 'alterColumn']);
+
+      const ops = [
+        {
+          name: 'defineTable',
+          args: {
+            name: 'mac_users',
+            columns: [
+              { id: '$ref:uid', name: 'id', type: 'bigint' },
+              { id: '$ref:email', name: 'email', type: 'text' },
+            ],
+            primaryKey: { columns: ['id'] },
+          },
+        },
+        { name: 'alterColumn', args: { id: '$ref:email', notNull: true, comment: '邮箱' } },
+      ];
+      const dry = await f.callTool(tokAlice.token, 'apply_changes', {
+        project: f.p1Id,
+        baseSeq: 0,
+        dryRun: true,
+        ops,
+      });
+      expect(dry.isError).toBeFalsy();
+      expect(dry.structuredContent).toMatchObject({ dryRun: true, opCount: 6 });
+      expect(await f.db.query("select id from audit_events where action = 'model.mutate'")).toEqual([]);
+
+      const res = await f.callTool(tokAlice.token, 'apply_changes', {
+        project: f.p1Id,
+        baseSeq: 0,
+        summary: '宏建表',
+        ops,
+      });
+      expect(res.isError).toBeFalsy();
+      expect(res.structuredContent).toMatchObject({ dryRun: false, seq: 1, opCount: 6 });
+      const refs = res.structuredContent!.refs as Record<string, string>;
+      expect(Object.keys(refs).sort()).toEqual(['email', 'uid']);
+      const audits = await f.db.query<{ data: Record<string, unknown> }>(
+        "select data from audit_events where action = 'model.mutate'",
+      );
+      expect(audits).toHaveLength(1);
+      expect(audits[0]!.data).toMatchObject({ seq: 1, opCount: 6, ops: ['defineTable', 'alterColumn'] });
+
+      // 再次执行同一个 alterColumn：全幂等 → noop，不提交、不审计
+      const again = await f.callTool(tokAlice.token, 'apply_changes', {
+        project: f.p1Id,
+        baseSeq: 1,
+        ops: [{ name: 'alterColumn', args: { id: refs.email, notNull: true, comment: '邮箱' } }],
+      });
+      expect(again.isError).toBeFalsy();
+      expect(again.structuredContent).toMatchObject({ noop: true, opCount: 0, seq: 1 });
+      expect(await f.db.query("select id from audit_events where action = 'model.mutate'")).toHaveLength(1);
+
+      // 错误：structuredContent 透传 code / index / path / mutator / currentSeq
+      const bad = await f.callTool(tokAlice.token, 'apply_changes', {
+        project: f.p1Id,
+        baseSeq: 1,
+        ops: [
+          { name: 'alterColumn', args: { id: 'email', comment: 'x' } },
+          {
+            name: 'defineTable',
+            args: { name: 'mac_t', columns: [{ name: 'a', type: 'int' }], checks: [{ expr: 'nope > 0' }] },
+          },
+        ],
+      });
+      expect(bad.isError).toBe(true);
+      expect(bad.structuredContent).toMatchObject({
+        code: 'invalid',
+        index: 0,
+        path: 'alterColumn(email).id',
+        currentSeq: 1,
+      });
+      expect(bad.structuredContent).not.toHaveProperty('mutator');
+      const bad2 = await f.callTool(tokAlice.token, 'apply_changes', {
+        project: f.p1Id,
+        baseSeq: 1,
+        ops: [
+          {
+            name: 'defineTable',
+            args: { name: 'mac_t', columns: [{ name: 'a', type: 'int' }], checks: [{ expr: 'nope > 0' }] },
+          },
+        ],
+      });
+      expect(bad2.structuredContent).toMatchObject({
+        code: 'invalid',
+        index: 0,
+        path: 'defineTable(mac_t).checks[0]',
+        mutator: 'addCheck',
+        currentSeq: 1,
+      });
+      expect(
+        String(bad2.structuredContent!.message).startsWith('ops[0] defineTable(mac_t).checks[0] addCheck：'),
+      ).toBe(true);
+      expect((await f.created.rooms.model(f.branch1)).seq).toBe(1);
+    },
+  );
 });

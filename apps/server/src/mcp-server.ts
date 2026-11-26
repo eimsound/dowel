@@ -2,6 +2,7 @@ import {
   MCP_MAX_OPS,
   MCP_SUMMARY_MAX,
   MCP_TOOLS,
+  type McpApplyErrorLocation,
   type McpDiagnostics,
   type McpToolErrorCode,
   type McpToolName,
@@ -17,6 +18,7 @@ import {
   type ForeignKey,
   getDialect,
   type Index,
+  macros,
   type Model,
   mutators,
   type Obj,
@@ -81,6 +83,9 @@ const MCP_INSTRUCTIONS = [
   '1. Discover accessible projects via `list_projects` (or `dowel://projects`).',
   '2. Read the current model summary or inspect specific tables with `get_model` / `get_table`, noting `seq`.',
   '3. Propose edits with `apply_changes` using that `baseSeq` and `$ref:<alias>` placeholders for new object IDs (`refs` returns `{ [alias]: uuid }`); run `dryRun: true` first when unsure. Each call is committed atomically as ONE canvas-history entry (one `seq`); pass a short `summary` describing the intent so humans can review and undo it as a unit.',
+  '   Prefer the compile-time macros: `defineTable` creates a whole table (columns, keys, checks, indexes, FKs, comments, ext, partitions) and may refer to its own columns by name; `alterColumn` patches one existing column declaratively. Macros mix freely with primitive mutators in the same call and share the same `$ref` aliases; they expand into at most 500 primitive sub-ops per call (`opCount`).',
+  '   Strict object-ID rule: editing or dropping existing objects (including `alterColumn.id`) only accepts existing object IDs or `$ref:<alias>` of objects created earlier in the same call — never names. Only references inside `defineTable` (schema, typeRef, refTable, refColumns, default.nextval, partitions[].schema) and its own columns may be resolved by (qualified) name; ambiguous names are rejected.',
+  '   Circular foreign keys: create every table with `defineTable` first, then add the remaining FKs with `addForeignKey` at the end of the same call. Errors report the input `index` plus, for macros, `path` (e.g. `defineTable(orders).foreignKeys[0]`) and the expanded `mutator`.',
   '   Every response (including `dryRun`) carries `diagnostics`: full model validation errors plus static compatibility errors / warnings against the lowest cached target environment version. They never block the write, but fix them before asking a human to publish.',
   '4. Inspect mutator signatures with `list_mutators`, export DDL with `get_ddl`, and preview up/down migration SQL with `preview_migration`.',
   '5. Validate migrations against a shadow database using `verify_migration` (requires `verify` scope).',
@@ -501,21 +506,47 @@ const computeDiagnostics = async (
   }
 };
 
+const PRIMITIVE_MUTATOR_DESCRIPTION =
+  'Primitive schema mutator (one atomic edit; existing objects are addressed strictly by object ID).';
+
+/**
+ * apply_changes 可用的操作目录：复合宏（defineTable / alterColumn）排在最前，随后是普通 mutator；
+ * paste / batch 一律隐藏（ADR 0015 第 2、3 节）。list_mutators 与 dowel://mutators 共用。
+ */
 const listMutatorCatalog = (names?: string[]) => {
   const registry = mutators as Record<string, { args: z.ZodType }>;
+  const macroRegistry = macros as Record<string, { args: z.ZodType; description: string }>;
   const targetNames = names?.length
     ? names
-    : Object.keys(registry).filter((n) => !MCP_DISALLOWED_MUTATORS.has(n));
-  const items: { name: string; argsSchema: Record<string, unknown> }[] = [];
+    : [
+        ...Object.keys(macroRegistry),
+        ...Object.keys(registry).filter((n) => !MCP_DISALLOWED_MUTATORS.has(n)),
+      ];
+  const items: {
+    name: string;
+    kind: 'macro' | 'mutator';
+    description: string;
+    argsSchema: Record<string, unknown>;
+  }[] = [];
   const unknown: string[] = [];
   for (const name of targetNames) {
+    if (Object.hasOwn(macroRegistry, name)) {
+      const m = macroRegistry[name]!;
+      items.push({ name, kind: 'macro', description: m.description, argsSchema: toJsonSchema(m.args) });
+      continue;
+    }
     const entry =
       !MCP_DISALLOWED_MUTATORS.has(name) && Object.hasOwn(registry, name) ? registry[name] : undefined;
     if (!entry) {
       unknown.push(name);
       continue;
     }
-    items.push({ name, argsSchema: toJsonSchema(entry.args) });
+    items.push({
+      name,
+      kind: 'mutator',
+      description: PRIMITIVE_MUTATOR_DESCRIPTION,
+      argsSchema: toJsonSchema(entry.args),
+    });
   }
   return { mutators: items, ...(unknown.length ? { unknown } : {}) };
 };
@@ -807,7 +838,8 @@ export const createMcpServer = (
 
   addTool({
     name: 'list_mutators',
-    description: 'List supported schema mutators for `apply_changes` with their JSON Schema arguments.',
+    description:
+      'List the operations accepted by `apply_changes`: compile-time macros first (`kind: "macro"`: `defineTable`, `alterColumn`), then primitive mutators (`kind: "mutator"`), each with a description and JSON Schema arguments.',
     schema: z.object({
       names: z.array(z.string().min(1)).optional(),
     }),
@@ -975,7 +1007,7 @@ export const createMcpServer = (
   addTool({
     name: 'apply_changes',
     description:
-      'Atomically validate and apply 1..100 mutator ops to the working trunk based on `baseSeq`, committed as ONE canvas-history entry (single `seq`, `opCount` = expanded sub-ops). Use `$ref:<alias>` anywhere in args for new UUIDv7 IDs; `refs` maps each `alias` to its generated ID. Optional `summary` (<= 500 chars) records the intent in canvas history and audit. Set `dryRun: true` to simulate without committing. Responses include `diagnostics` (validation + static target-version compatibility; never blocks the write) and `noop: true` when nothing changed.',
+      'Atomically validate and apply 1..100 ops to the working trunk based on `baseSeq`, committed as ONE canvas-history entry (single `seq`, `opCount` = expanded primitive sub-ops, at most 500). Ops are primitive mutators or the compile-time macros `defineTable` (whole table in one op; may use its own column names and resolve new references by qualified name) and `alterColumn` (declarative patch of an existing column). Edits and drops address existing objects strictly by object ID (or a `$ref:<alias>` created earlier in the same call), never by name; for circular FKs, define the tables first and add the remaining FKs with `addForeignKey`. Use `$ref:<alias>` in primitive args for new UUIDv7 IDs; `refs` maps each `alias` to its generated ID. Optional `summary` (<= 500 chars) records the intent in canvas history and audit. Set `dryRun: true` to simulate without committing. Errors carry the input `index` and, for macros, `path` (e.g. `defineTable(orders).foreignKeys[0]`) and the expanded `mutator`. Responses include `diagnostics` (validation + static target-version compatibility; never blocks the write) and `noop: true` when nothing changed.',
     schema: z.object({
       project: z.string().min(1),
       baseSeq: z.number().int().min(0),
@@ -1033,10 +1065,12 @@ export const createMcpServer = (
       });
 
       if (!res.ok) {
-        return toolError(res.code, res.message, {
+        const location: McpApplyErrorLocation = {
           ...(res.index !== undefined ? { index: res.index } : {}),
-          currentSeq: res.currentSeq,
-        });
+          ...(res.path !== undefined ? { path: res.path } : {}),
+          ...(res.mutator !== undefined ? { mutator: res.mutator } : {}),
+        };
+        return toolError(res.code, res.message, { ...location, currentSeq: res.currentSeq });
       }
 
       // 写后静态自检在房间锁释放之后计算（#17），只读平台库缓存的环境版本，绝不连目标库；

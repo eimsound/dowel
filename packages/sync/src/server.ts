@@ -62,6 +62,8 @@ export type SimulateResult =
       message: string;
       /** 失败的是 batch 里的哪个子操作（从 0 开始；仅 batch 子操作不合法时给出） */
       subIndex?: number;
+      /** batch 子操作本身的原始错误文本（不带 `ops[i] name：` 前缀，便于上层映射回输入位置；与 subIndex 同时给出） */
+      subMessage?: string;
       /** 冲突时，被别人改过 / 删除的对象 ID */
       objectId?: string;
     };
@@ -76,21 +78,27 @@ export interface ReadConflict {
 class Reject extends Error {
   code: Rejection['code'];
   subIndex?: number;
+  subMessage?: string;
   objectId?: string;
   constructor(
     code: Rejection['code'],
     message: string,
-    extra: { subIndex?: number; objectId?: string } = {},
+    extra: { subIndex?: number; subMessage?: string; objectId?: string } = {},
   ) {
     super(message);
     this.code = code;
     if (extra.subIndex !== undefined) this.subIndex = extra.subIndex;
+    if (extra.subMessage !== undefined) this.subMessage = extra.subMessage;
     if (extra.objectId !== undefined) this.objectId = extra.objectId;
   }
 }
 
 const invalidOf = (e: EditError): Reject =>
-  new Reject('invalid', e.message, e instanceof BatchOpError ? { subIndex: e.index } : {});
+  new Reject(
+    'invalid',
+    e.message,
+    e instanceof BatchOpError ? { subIndex: e.index, subMessage: e.rawMessage } : {},
+  );
 
 export const DEFAULT_LOG_LIMIT = 2000;
 export const DEFAULT_OUTCOME_LIMIT = 4000;
@@ -284,6 +292,7 @@ export class Room {
           code: e.code,
           message: e.message,
           ...(e.subIndex !== undefined ? { subIndex: e.subIndex } : {}),
+          ...(e.subMessage !== undefined ? { subMessage: e.subMessage } : {}),
           ...(e.objectId !== undefined ? { objectId: e.objectId } : {}),
         };
       }
