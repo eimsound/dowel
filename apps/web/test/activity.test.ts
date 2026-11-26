@@ -6,7 +6,7 @@ import { CANVAS_HISTORY_SESSION_OP } from '@dowel/api';
 import { COMPOSITE_MUTATORS, mutators } from '@dowel/core';
 import { afterEach, expect, test } from 'vitest';
 
-import { actionText } from '../src/activity.ts';
+import { actionText, viaMcp } from '../src/activity.ts';
 import i18n from '../src/i18n.ts';
 
 afterEach(async () => {
@@ -106,4 +106,14 @@ test('model.mutate：带 MCP 意图说明时使用独立文案键，空白说明
   expect(actionText('model.mutate', { opCount: 2, summary: 1 })).toBe(
     'edited the working copy (2 operations)',
   );
+});
+
+test('sections.update：MCP 调整画布板块按 opCount 渲染并识别 via: mcp', async () => {
+  const data = { opCount: 3, via: 'mcp' };
+  await i18n.changeLanguage('zh');
+  expect(actionText('sections.update', data)).toBe('调整了画布板块（3 处操作）');
+  await i18n.changeLanguage('en');
+  expect(actionText('sections.update', data)).toBe('updated canvas sections (3 operations)');
+  expect(viaMcp(data)).toBe(true);
+  expect(viaMcp({ opCount: 3 })).toBe(false);
 });

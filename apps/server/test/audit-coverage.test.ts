@@ -714,6 +714,52 @@ test('每个应审计的动作都能在 audit_events 里找到', async () => {
       },
     },
     {
+      action: 'sections.update',
+      run: async () => {
+        const p = (await call('GET', '/api/projects', undefined, adminCookie)).data as unknown as {
+          id: string;
+        }[];
+        const [adminRow] = await db.query<{ id: string }>("select id from users where username = 'admin'");
+        const tok = newMcpToken();
+        await db.query(
+          `insert into mcp_tokens (id, user_id, kind, name, prefix, token_hash, scopes, project_ids, expires_at)
+           values ($1, $2, 'personal', $3, $4, $5, $6::text::jsonb, null, $7)`,
+          [
+            'mcp-audit-tok-sections',
+            adminRow!.id,
+            'audit-mcp-sections',
+            tok.prefix,
+            tok.hash,
+            JSON.stringify(['read', 'write']),
+            new Date(Date.now() + 86_400_000).toISOString(),
+          ],
+        );
+        const res = await app.request('/api/mcp', {
+          method: 'POST',
+          headers: {
+            authorization: `Bearer ${tok.token}`,
+            'content-type': 'application/json',
+            accept: 'application/json, text/event-stream',
+          },
+          body: JSON.stringify({
+            jsonrpc: '2.0',
+            id: 3,
+            method: 'tools/call',
+            params: {
+              name: 'manage_sections',
+              // 板块动作用 JSON 字面量书写：避免 activity.test.ts 扫描审计动作名时把板块动作名误当成审计动作
+              arguments: {
+                project: p[0]!.id,
+                actions: JSON.parse('[{"action":"create","name":"审计板块"}]'),
+              },
+            },
+          }),
+        });
+        expect(res.status).toBe(200);
+        expect(await res.text()).not.toContain('"isError":true');
+      },
+    },
+    {
       action: 'model.verify',
       run: async () => {
         const p = (await call('GET', '/api/projects', undefined, adminCookie)).data as unknown as {
