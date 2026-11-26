@@ -19,7 +19,7 @@ description: >-
 | 领域 | 详细文档 | 核心源码模块 | 关联 Issue |
 | --- | --- | --- | --- |
 | 1. PG 连接池、分布式锁与冷启动 | [pg-ha-locks.md](./references/pg-ha-locks.md) | `apps/server/src/db.ts`, `ha.ts`, `routes/setup.ts`, `main.ts` | `#37` `#38` `#23` `#43` `#45` |
-| 2. 优雅停机、队列、巡检与 SSE | [shutdown-queues-sse.md](./references/shutdown-queues-sse.md) | `shutdown.ts`, `main.ts`, `requests.ts`, `webhooks.ts`, `routes/requests.ts` | `#19` `#18` `#20` `#21` `#22` `#26` `#27` `#25` |
+| 2. 优雅停机、队列、巡检与 SSE | [shutdown-queues-sse.md](./references/shutdown-queues-sse.md) | `shutdown.ts`, `main.ts`, `requests.ts`（导出门面）, `requests/*`, `webhooks.ts`, `routes/requests.ts` | `#19` `#18` `#20` `#21` `#22` `#26` `#27` `#25` |
 | 3. 协作房间、派生刷新与影子缓存 | [rooms-derive-shadows.md](./references/rooms-derive-shadows.md) | `rooms.ts`, `derive.ts`, `shadows.ts`, `bus.ts`, `packages/sync/src/*` | `#17` `#39` `#41` `#12` `#40` `#44` `#45` |
 | 4. 影子库、接手/接入/拉取与漂移 | [shadow-target-drift.md](./references/shadow-target-drift.md) | `targets.ts`, `executions.ts`, `takeover.ts`, `routes/{takeover,claims,environments}.ts` | `#11` `#24` `#42` `#13` `#14` `#15` |
 | 5. 鉴权、限流与 CI 令牌边界 | [auth-ratelimit-ci.md](./references/auth-ratelimit-ci.md) | `routes/ci.ts`, `tokens.ts`, `rate-limit.ts`, `authz.ts`, `actions/execute/*` | `#8` `#9` `#10` `#16` |
