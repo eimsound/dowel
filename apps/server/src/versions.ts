@@ -11,6 +11,7 @@ import type {
 import {
   createAll,
   formatScript,
+  getDialect,
   type Model,
   plan,
   type PlanOptions,
@@ -33,7 +34,7 @@ import { iso, projectPlanOptions } from './envs.ts';
 import type { Rooms } from './rooms.ts';
 import { scrubSecrets } from './secrets.ts';
 import { ShadowError, storedReport } from './shadow.ts';
-import { mysqlMinorGroupOf, type Shadows } from './shadows.ts';
+import type { Shadows } from './shadows.ts';
 
 /** 概要字段：版本列表用 */
 export interface InfoRow {
@@ -337,12 +338,14 @@ export type MultiVersionVerifyOutcome =
     }
   | { kind: 'missing_target'; missingMajor: number | null; reason: string; stored: StoredVerifyReport };
 
-const formatMysqlGroup = (group: number): string => `${Math.floor(group / 100)}.${group % 100}`;
-
 /**
- * 跨版本影子库闭环验证冻结脚本（按版本升序逐一执行，风险分析仅在首个可用影子库执行一次）：
- * - PG：任一大版本闭环验证失败 → 整体失败并指出具体 PG 版本；存在多个 PG 大版本且最低目标 targetPgMajor 缺少可用影子库 → missing_target；
- * - MySQL：按主次版本（如 8.4 / 9.7）分组逐一实测，并透传项目最低目标 mysqlVersionNum 阻断高版本特有类型（如 9.7 dev + 8.4 prod 混部下的 VECTOR）；
+ * 跨版本影子库闭环验证冻结脚本（按版本组升序逐一执行，风险分析仅在首个可用影子库执行一次）。
+ * 版本组、展示标签与对外大版本全部来自 DialectVersionMatrix（PG 按大版本、MySQL 按主次版本 8.4 / 9.7）；
+ * 不提供矩阵策略的方言（MSSQL / SQLite）忽略一切组键：不打版本标签、不做最低目标门禁、不记录 targets：
+ * - 任一版本组闭环验证失败 → 整体失败并指出具体版本（如“PG 16 验证失败”“MySQL 8.4 验证失败”）；
+ * - 最低目标版本组（targetGroupKey）没有通过验证的影子库（缺失、运行时不可用或实测版本错配）→ missing_target；
+ * - 项目最低目标版本的规划选项里的 mysqlVersionNum 透传给 verifyScripts，阻断高版本特有类型（如 9.7 dev + 8.4 prod 混部下的 VECTOR）；
+ * - 只有 PG 的版本组是对外大版本：仅 PG 记录 targets[].major / missingTargetMajor；
  * - 全部可用影子库均遇到 ShadowError 或项目无任何可用影子库 → 抛出 ShadowError（按基础设施/配置不可用处理）。
  */
 export const verifyAcrossVersions = async (
@@ -357,25 +360,23 @@ export const verifyAcrossVersions = async (
 ): Promise<MultiVersionVerifyOutcome> => {
   const selection = await shadows.forProjectVersions(pid);
   if (!selection.entries.length) {
-    throw new ShadowError(selection.skippedMajors[0]?.reason ?? '没有可用的影子库');
+    throw new ShadowError(selection.skippedGroups[0]?.reason ?? '没有可用的影子库');
   }
 
-  const isPg = to.dialect === 'pg';
-  const isMysql = to.dialect === 'mysql';
+  const matrix = getDialect(to.dialect).versioning.matrix;
+  const groupLabel = (key: number | null): string | null =>
+    matrix && key !== null ? matrix.groupLabel(key) : null;
+  const publicMajor = (key: number | null): number | null =>
+    matrix && key !== null ? matrix.publicMajorOfGroup(key) : null;
   const targets: VerifyTargetReport[] = [];
-  const passedShadows: {
-    major: number | null;
-    mysqlGroup: number | null;
-    versionLabel: string | null;
-    label: string;
-  }[] = [];
+  const passedShadows: { groupKey: number | null; versionLabel: string | null; label: string }[] = [];
   const runtimeSkipped = new Map<number | null, string>();
   const mismatchReasons = new Map<number, string>();
   let primaryReport: VerifyReport | null = null;
   let ranRisk = false;
 
   for (const entry of selection.entries) {
-    const groupKey = isPg ? entry.major : isMysql ? (entry.mysqlGroup ?? null) : null;
+    const entryKey = matrix ? entry.groupKey : null;
     let report: VerifyReport;
     try {
       report = await entry.shadow.verifyScripts(from, to, up, down, {
@@ -385,7 +386,7 @@ export const verifyAcrossVersions = async (
       });
     } catch (e) {
       if (!(e instanceof ShadowError)) throw e;
-      runtimeSkipped.set(groupKey, scrubSecrets(e.message));
+      runtimeSkipped.set(entryKey, scrubSecrets(e.message));
       continue;
     }
 
@@ -394,39 +395,23 @@ export const verifyAcrossVersions = async (
       ranRisk = true;
     }
 
-    const actualMajor = isPg ? (report.shadowMajor !== undefined ? report.shadowMajor : entry.major) : null;
-    if (isPg && entry.major !== null && actualMajor !== null && actualMajor !== entry.major) {
+    // 影子库实测版本组：报告带了实测数值版本号就按它分组，否则沿用选影时的版本组
+    const actualKey = !matrix
+      ? null
+      : report.shadowVersionNum !== undefined
+        ? matrix.groupKeyOf(report.shadowVersionNum)
+        : entryKey;
+    if (matrix && entryKey !== null && actualKey !== null && actualKey !== entryKey) {
+      const target = matrix.groupLabel(entryKey);
       mismatchReasons.set(
-        entry.major,
-        `影子库实际版本为 PG ${actualMajor}（${entry.label}），与目标环境 PG ${entry.major} 不一致，不能作为 PG ${entry.major} 的验证依据`,
+        entryKey,
+        `影子库实际版本为 ${matrix.groupLabel(actualKey)}（${entry.label}），与目标环境 ${target} 不一致，不能作为 ${target} 的验证依据`,
       );
     }
-    const actualMysqlGroup = isMysql
-      ? report.shadowVersionNum !== undefined
-        ? mysqlMinorGroupOf(report.shadowVersionNum)
-        : (entry.mysqlGroup ?? null)
-      : null;
-    if (
-      isMysql &&
-      entry.mysqlGroup != null &&
-      actualMysqlGroup !== null &&
-      actualMysqlGroup !== entry.mysqlGroup
-    ) {
-      mismatchReasons.set(
-        entry.mysqlGroup,
-        `影子库实际版本为 MySQL ${formatMysqlGroup(actualMysqlGroup)}（${entry.label}），与目标环境 MySQL ${formatMysqlGroup(entry.mysqlGroup)} 不一致，不能作为 MySQL ${formatMysqlGroup(entry.mysqlGroup)} 的验证依据`,
-      );
-    }
+    const versionLabel = groupLabel(actualKey ?? entryKey);
+    const actualMajor = publicMajor(actualKey);
 
-    const displayMysqlGroup = actualMysqlGroup ?? entry.mysqlGroup ?? null;
-    const versionLabel =
-      isPg && actualMajor !== null
-        ? `PG ${actualMajor}`
-        : isMysql && displayMysqlGroup !== null
-          ? `MySQL ${formatMysqlGroup(displayMysqlGroup)}`
-          : null;
-
-    if (isPg && actualMajor !== null) {
+    if (actualMajor !== null) {
       targets.push({
         major: actualMajor,
         shadow: entry.label,
@@ -463,17 +448,12 @@ export const verifyAcrossVersions = async (
       };
     }
 
-    passedShadows.push({
-      major: actualMajor,
-      mysqlGroup: actualMysqlGroup,
-      versionLabel,
-      label: entry.label,
-    });
+    passedShadows.push({ groupKey: actualKey, versionLabel, label: entry.label });
   }
 
   if (!passedShadows.length || !primaryReport) {
     const firstErr =
-      runtimeSkipped.values().next().value ?? selection.skippedMajors[0]?.reason ?? '影子库不可用';
+      runtimeSkipped.values().next().value ?? selection.skippedGroups[0]?.reason ?? '影子库不可用';
     throw new ShadowError(firstErr);
   }
 
@@ -484,48 +464,14 @@ export const verifyAcrossVersions = async (
           .map((s) => (s.versionLabel !== null ? `${s.versionLabel}（${s.label}）` : s.label))
           .join(' · ');
 
-  if (
-    isPg &&
-    selection.targetPgMajor !== null &&
-    !passedShadows.some((s) => s.major === selection.targetPgMajor)
-  ) {
-    const mismatch = mismatchReasons.get(selection.targetPgMajor);
+  const targetKey = matrix ? selection.targetGroupKey : null;
+  if (matrix && targetKey !== null && !passedShadows.some((s) => s.groupKey === targetKey)) {
+    const targetLabel = matrix.groupLabel(targetKey);
+    const mismatch = mismatchReasons.get(targetKey);
     const skippedReason =
-      runtimeSkipped.get(selection.targetPgMajor) ??
-      selection.skippedMajors.find((s) => s.major === selection.targetPgMajor)?.reason;
+      runtimeSkipped.get(targetKey) ?? selection.skippedGroups.find((s) => s.groupKey === targetKey)?.reason;
     const reason = mismatch
-      ? `${mismatch}。请为 PG ${selection.targetPgMajor} 环境配置同大版本的独立影子库或允许使用同实例影子库`
-      : skippedReason
-        ? `缺少 PG ${selection.targetPgMajor} 影子库，无法验证最低目标版本兼容性（${skippedReason}）。请为 PG ${selection.targetPgMajor} 环境配置独立影子库或允许使用同实例影子库`
-        : `缺少 PG ${selection.targetPgMajor} 影子库，无法验证最低目标版本兼容性。请为 PG ${selection.targetPgMajor} 环境配置独立影子库或允许使用同实例影子库`;
-    const incompleteReport: VerifyReport = {
-      ...primaryReport,
-      ok: false,
-      error: { step: null, message: reason },
-    };
-    return {
-      kind: 'missing_target',
-      missingMajor: selection.targetPgMajor,
-      reason,
-      stored: storedReport(incompleteReport, shadowSummary, {
-        targets: targets.length ? targets : undefined,
-        missingTargetMajor: selection.targetPgMajor,
-      }),
-    };
-  }
-
-  if (
-    isMysql &&
-    selection.targetMysqlGroup != null &&
-    !passedShadows.some((s) => s.mysqlGroup === selection.targetMysqlGroup)
-  ) {
-    const targetLabel = `MySQL ${formatMysqlGroup(selection.targetMysqlGroup)}`;
-    const mismatch = mismatchReasons.get(selection.targetMysqlGroup);
-    const skippedReason =
-      runtimeSkipped.get(selection.targetMysqlGroup) ??
-      selection.skippedMajors.find((s) => s.mysqlGroup === selection.targetMysqlGroup)?.reason;
-    const reason = mismatch
-      ? `${mismatch}。请为 ${targetLabel} 环境配置同版本的独立影子库或允许使用同实例影子库`
+      ? `${mismatch}。请为 ${targetLabel} 环境配置同${matrix.groupGranularity}的独立影子库或允许使用同实例影子库`
       : skippedReason
         ? `缺少 ${targetLabel} 影子库，无法验证最低目标版本兼容性（${skippedReason}）。请为 ${targetLabel} 环境配置独立影子库或允许使用同实例影子库`
         : `缺少 ${targetLabel} 影子库，无法验证最低目标版本兼容性。请为 ${targetLabel} 环境配置独立影子库或允许使用同实例影子库`;
@@ -534,11 +480,15 @@ export const verifyAcrossVersions = async (
       ok: false,
       error: { step: null, message: reason },
     };
+    const missingMajor = publicMajor(targetKey);
     return {
       kind: 'missing_target',
-      missingMajor: null,
+      missingMajor,
       reason,
-      stored: storedReport(incompleteReport, shadowSummary),
+      stored: storedReport(incompleteReport, shadowSummary, {
+        targets: targets.length ? targets : undefined,
+        ...(missingMajor !== null ? { missingTargetMajor: missingMajor } : {}),
+      }),
     };
   }
 

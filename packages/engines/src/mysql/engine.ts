@@ -1,8 +1,10 @@
 // MySQL EngineAdapter 实现：快照、导入、历史、超时、风险分析、影子库清理与非事务 DDL 崩溃恢复探测。
 import {
   all,
+  checkMysqlVersionCompatibility,
   childrenOf,
   get,
+  minMysqlVersionNum,
   type Model,
   mysqlLiteral,
   type MysqlPlanOptions,
@@ -793,6 +795,17 @@ export const mysqlEngine: EngineAdapter = {
   },
 
   planOptionsForVersion: (versionNum) => ({ mysqlVersionNum: versionNum }) as MysqlPlanOptions as PlanOptions,
+
+  hasExplicitVersionOpt: (opts) => opts.mysqlVersionNum !== undefined,
+
+  // 冻结脚本：影子库实测版本与项目最低目标版本取较小者，先做版本兼容性检查（如 9.0+ VECTOR），再按它建 from / to
+  resolveScriptsBuildOptions: (to, shadowVersionNum, opts) => {
+    const effective = minMysqlVersionNum([shadowVersionNum, opts.mysqlVersionNum]);
+    checkMysqlVersionCompatibility(to, effective);
+    return effective !== null
+      ? ({ mysqlVersionNum: effective } as MysqlPlanOptions as PlanOptions)
+      : undefined;
+  },
 
   resetShadow: resetMysqlShadow,
 

@@ -18,6 +18,7 @@ import { addColumn, all, type Column, setNotNull } from '@dowel/core';
 import { afterAll, beforeAll, describe, expect, test } from 'vitest';
 
 import { createTestDb, PG_URL } from '../../../test/pg.ts';
+import { projectPgVersionSummary } from '../src/envs.ts';
 import { createApp, openPlatformDb, type PlatformDb } from '../src/index.ts';
 import { LoginLimiter } from '../src/rate-limit.ts';
 import { encrypt } from '../src/secrets.ts';
@@ -270,12 +271,11 @@ describe('PG 多版本（15–19）服务端全链路', () => {
     const calls: { major: number; skipRisk: boolean }[] = [];
     const orig = created.shadows.forProjectVersions.bind(created.shadows);
     created.shadows.forProjectVersions = async () => ({
-      targetPgMajor: 15,
-      envPgMajors: [15, 18],
-      skippedMajors: [],
+      targetGroupKey: 15,
+      skippedGroups: [],
       entries: [
         {
-          major: 15,
+          groupKey: 15,
           envId: 'e15',
           label: 'prod15：shadow15',
           shadow: stubShadow(async (_f, _t, _u, _d, opts) => {
@@ -284,7 +284,7 @@ describe('PG 多版本（15–19）服务端全链路', () => {
           }),
         },
         {
-          major: 18,
+          groupKey: 18,
           envId: 'e18',
           label: 'dev18：shadow18',
           shadow: stubShadow(async (_f, _t, _u, _d, opts) => {
@@ -323,12 +323,11 @@ describe('PG 多版本（15–19）服务端全链路', () => {
 
     const orig = created.shadows.forProjectVersions.bind(created.shadows);
     created.shadows.forProjectVersions = async () => ({
-      targetPgMajor: 15,
-      envPgMajors: [15, 18],
-      skippedMajors: [],
+      targetGroupKey: 15,
+      skippedGroups: [],
       entries: [
         {
-          major: 15,
+          groupKey: 15,
           envId: 'e15',
           label: 'prod15：shadow15',
           shadow: stubShadow(async () => ({
@@ -342,7 +341,7 @@ describe('PG 多版本（15–19）服务端全链路', () => {
           })),
         },
         {
-          major: 18,
+          groupKey: 18,
           envId: 'e18',
           label: 'dev18：shadow18',
           shadow: stubShadow(async () => okVerifyReport()),
@@ -374,7 +373,7 @@ describe('PG 多版本（15–19）服务端全链路', () => {
     await addTable(created.rooms, db, pid, 'orders');
 
     // 真实走 Shadows.forProjectVersions 的选择逻辑：
-    // prod15 是生产环境且不允许同实例也无 shadowUrl → 记入 skippedMajors
+    // prod15 是生产环境且不允许同实例也无 shadowUrl → 记入 skippedGroups
     // dev18 是非生产环境 → 在 entries 中（stub forProject 返回 mock shadow）
     await insertEnvRow({
       id: 'e-prod-15',
@@ -398,12 +397,11 @@ describe('PG 多版本（15–19）服务端全链路', () => {
 
     const orig = created.shadows.forProjectVersions.bind(created.shadows);
     created.shadows.forProjectVersions = async () => ({
-      targetPgMajor: 15,
-      envPgMajors: [15, 18],
-      skippedMajors: [{ major: 15, reason: '环境“prod15”是生产环境，默认不在同一实例上建影子库' }],
+      targetGroupKey: 15,
+      skippedGroups: [{ groupKey: 15, reason: '环境“prod15”是生产环境，默认不在同一实例上建影子库' }],
       entries: [
         {
-          major: 18,
+          groupKey: 18,
           envId: 'e-dev-18',
           label: 'dev18：app_dowel',
           shadow: stubShadow(async () => okVerifyReport(true)),
@@ -447,15 +445,18 @@ describe('PG 多版本（15–19）服务端全链路', () => {
 
     const orig = created.shadows.forProjectVersions.bind(created.shadows);
     created.shadows.forProjectVersions = async () => ({
-      targetPgMajor: 15,
-      envPgMajors: [15], // 只有一个已知版本 15，另一环境 engine_version_num = null
-      skippedMajors: [{ major: 15, reason: '环境“prod15”是生产环境，默认不在同一实例上建影子库' }],
+      targetGroupKey: 15,
+      skippedGroups: [{ groupKey: 15, reason: '环境“prod15”是生产环境，默认不在同一实例上建影子库' }],
       entries: [
         {
-          major: null,
+          groupKey: null,
           envId: 'e-dev-null',
           label: 'dev：app_dowel',
-          shadow: stubShadow(async () => ({ ...okVerifyReport(true), shadowMajor: 18 })),
+          shadow: stubShadow(async () => ({
+            ...okVerifyReport(true),
+            shadowMajor: 18,
+            shadowVersionNum: 180000,
+          })),
         },
       ],
     });
@@ -487,16 +488,19 @@ describe('PG 多版本（15–19）服务端全链路', () => {
 
     const orig = created.shadows.forProjectVersions.bind(created.shadows);
     created.shadows.forProjectVersions = async () => ({
-      targetPgMajor: 15,
-      envPgMajors: [15],
-      skippedMajors: [],
+      targetGroupKey: 15,
+      skippedGroups: [],
       entries: [
         {
-          major: 15,
+          groupKey: 15,
           envId: 'e-prod-15',
           label: 'prod15：wrong_pg18_shadow',
           // 实测 shadowMajor 为 18，与环境记录的 PG 15 不一致
-          shadow: stubShadow(async () => ({ ...okVerifyReport(true), shadowMajor: 18 })),
+          shadow: stubShadow(async () => ({
+            ...okVerifyReport(true),
+            shadowMajor: 18,
+            shadowVersionNum: 180000,
+          })),
         },
       ],
     });
@@ -616,14 +620,14 @@ describe('PG 多版本（15–19）服务端全链路', () => {
     });
     try {
       const res = await shadowsTest.forProjectVersions(pid);
-      expect(res.targetPgMajor).toBe(15);
-      expect(res.envPgMajors).toEqual([15, 16]);
-      // PG 15 组仅有一个生产禁同实例环境 → 记入 skippedMajors
-      expect(res.skippedMajors).toHaveLength(1);
-      expect(res.skippedMajors[0]?.major).toBe(15);
+      expect(res.targetGroupKey).toBe(15);
+      expect(await projectPgVersionSummary(db, pid)).toEqual({ targetPgMajor: 15, envPgMajors: [15, 16] });
+      // PG 15 组仅有一个生产禁同实例环境 → 记入 skippedGroups
+      expect(res.skippedGroups).toHaveLength(1);
+      expect(res.skippedGroups[0]?.groupKey).toBe(15);
       // PG 16 组命中优先级最高的显式 shadowUrl 环境 e-16-explicit
       expect(res.entries).toHaveLength(1);
-      expect(res.entries[0]?.major).toBe(16);
+      expect(res.entries[0]?.groupKey).toBe(16);
       expect(res.entries[0]?.envId).toBe('e-16-explicit');
     } finally {
       await shadowsTest.close();
