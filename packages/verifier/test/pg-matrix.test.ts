@@ -9,28 +9,34 @@ import {
   createTable,
   emptyModel,
   MIN_PG_MAJOR,
+  pgMajorOf,
   PlanError,
   plan,
   renameColumn,
   renameTable,
   setNotNull,
 } from '@dowel/core';
-import { diffSnapshots, importSnapshot, readSnapshot, toScriptSteps } from '@dowel/engines';
+import {
+  type Db,
+  diffSnapshots,
+  getEngine,
+  importSnapshot,
+  readSnapshot,
+  toScriptSteps,
+} from '@dowel/engines';
 import { diffAgainst, importLive, planDiff } from '@dowel/executor';
 import { describe, expect, test } from 'vitest';
 
 import { PG_URL, useTestDb } from '../../../test/pg.ts';
-import {
-  analyze,
-  build,
-  readShadowPgMajor,
-  resetShadow,
-  runSteps,
-  verify,
-  verifyScripts,
-} from '../src/index.ts';
+import { analyze, build, resetShadow, runSteps, verify, verifyScripts } from '../src/index.ts';
 
 const conn = useTestDb('pg_matrix');
+
+/** 从 PG 影子库读取 server_version_num 并提取大版本号（测试本地工具） */
+const readTestPgMajor = async (db: Db): Promise<number | null> => {
+  const vNum = await getEngine('pg').readVersionNum?.(db);
+  return vNum !== null && vNum !== undefined ? pgMajorOf(vNum) : null;
+};
 
 const baseModel = () => {
   const m = emptyModel();
@@ -40,14 +46,14 @@ const baseModel = () => {
 
 describe.skipIf(!PG_URL)('PG 15–19 多版本矩阵验证', () => {
   test('自动探测影子库 PG 大版本', async () => {
-    const major = await readShadowPgMajor(conn());
+    const major = await readTestPgMajor(conn());
     expect(major).not.toBeNull();
     expect(major!).toBeGreaterThanOrEqual(MIN_PG_MAJOR);
   });
 
   test('NOT NULL 建表、增删 NOT NULL 迁移与风险分析适配当前 PG 版本', async () => {
     const db = conn();
-    const major = (await readShadowPgMajor(db))!;
+    const major = (await readTestPgMajor(db))!;
 
     const { m: m1, pub } = baseModel();
     const t = createTable(m1, pub, 'orders');
@@ -101,7 +107,7 @@ describe.skipIf(!PG_URL)('PG 15–19 多版本矩阵验证', () => {
 
   test('按 PG 15 冻结含 renameTable / renameColumn（含 NOT NULL 列）的迁移脚本在 PG 15–19 验证通过且零漂移', async () => {
     const db = conn();
-    const major = (await readShadowPgMajor(db))!;
+    const major = (await readTestPgMajor(db))!;
     const { m: m1, pub } = baseModel();
     const t = createTable(m1, pub, 'legacy_orders');
     const id = addColumn(m1, t, { name: 'id', type: 'integer', notNull: true });
@@ -209,7 +215,7 @@ describe.skipIf(!PG_URL)('PG 15–19 多版本矩阵验证', () => {
 
   test('VIRTUAL 生成列在 PG 18+ 往返通过，且对 PG < 18 目标被静态拦截', async () => {
     const db = conn();
-    const major = (await readShadowPgMajor(db))!;
+    const major = (await readTestPgMajor(db))!;
     const { m: m1, pub } = baseModel();
     const t = createTable(m1, pub, 'products');
     const id = addColumn(m1, t, { name: 'id', type: 'int', notNull: true });
@@ -236,7 +242,7 @@ describe.skipIf(!PG_URL)('PG 15–19 多版本矩阵验证', () => {
 
   test('executor diffAgainst 从 snapshot.version 推导 PG 大版本生成贴合版本的修复脚本', async () => {
     const db = conn();
-    const major = (await readShadowPgMajor(db))!;
+    const major = (await readTestPgMajor(db))!;
 
     const { m: target, pub } = baseModel();
     const t = createTable(target, pub, 'items');
