@@ -614,7 +614,7 @@ describe('优雅停机（#19）', () => {
     expect(locks.activeCount).toBe(0);
   });
 
-  test('6. OpaqueRefresher.stop()/drain() 清理未触发防抖定时器、拒绝新调度并等待在途刷新结束', async () => {
+  test('6. OpaqueRefresher.stop()/drain() 拒绝新的显式规范化、flush 跳过并等待在途刷新结束', async () => {
     const live: Model = emptyModel();
     runMutator(live, 'createSchema', { id: 's', name: 'public' });
     runMutator(live, 'createTable', { id: 't', schema: 's', name: 'orders' });
@@ -626,6 +626,7 @@ describe('优雅停机（#19）', () => {
 
     const rooms = {
       state: async () => ({ model: structuredClone(live), versions: {}, seq: 0 }),
+      model: async () => ({ model: structuredClone(live), seq: 0 }),
       patch: async (_b: string, _u: string, objects: Obj[]) => {
         for (const o of objects) live.objects[o.id] = o;
       },
@@ -645,19 +646,15 @@ describe('优雅停机（#19）', () => {
       load: async () => null,
       save: async () => {},
     });
-    refresher.delayMs = 20;
     await refresher.reset('b-running', live);
     await refresher.reset('b-pending', live);
 
-    // b-running 启动后进入 shadow.canonicalize 阻塞中；b-pending 仅挂在防抖定时器里尚未启动
+    // b-running 的 flush 进入 shadow.canonicalize 阻塞中；b-pending 的 flush 排在其后（不同分支各自排队）
     runMutator(live, 'addCheck', { id: 'k1', table: 't', expr: 'total > 0' });
-    refresher.schedule('b-running');
+    const running = refresher.flush('b-running');
     await canonEntered.promise;
 
-    refresher.delayMs = 50;
-    refresher.schedule('b-pending');
-
-    // 停机调用 stop() + drain()：清理 b-pending 定时器，等待 b-running 完成
+    // 停机调用 stop() + drain()：等待 b-running 完成
     let drained = false;
     const drainPromise = refresher.drain().then(() => {
       drained = true;
@@ -665,17 +662,15 @@ describe('优雅停机（#19）', () => {
     await flushMicrotasks(2);
     expect(drained).toBe(false);
 
-    // 停机后再调用 schedule 不应安排新任务
-    refresher.schedule('b-after-stop');
-    expect(refresher.tracked('b-after-stop')).toBe(false);
+    // 停机后：显式规范化被拒，flush 不再碰影子库
+    await expect(refresher.normalize('b-after-stop', { shadow, label: 'x' })).rejects.toThrow('服务正在关闭');
+    await expect(refresher.flush('b-pending')).resolves.toMatchObject({ kind: 'skipped' });
 
     // 放行在途的 canonicalize，drain 随后完成
     canonRelease.resolve();
+    await running;
     await drainPromise;
     expect(drained).toBe(true);
-
-    // 等超过 b-pending 原定时器的时间，确认未触发第二次 canonicalize
-    await new Promise((r) => setTimeout(r, 80));
     expect(canonCalls).toBe(1);
   });
 });

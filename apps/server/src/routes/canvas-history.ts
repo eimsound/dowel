@@ -68,6 +68,7 @@ export const registerCanvasHistory = (app: Hono<Env>, ctx: AppContext) => {
     const seq = parseSeqParam(c.req.param('seq'));
     const from = parseOptInt(c.req.query('from'), 'from');
     if (from !== undefined && from !== seq) assertRange(from, seq);
+    // 关键出口：与规范化后的当前模型比较，返回的 currentSeq 供恢复弹窗作为 workingSeq
     await refresher.flush(a.branch);
     const { model: currentModel, seq: currentSeq } = await rooms.model(a.branch);
     if (from !== undefined && from !== seq) {
@@ -103,7 +104,7 @@ export const registerCanvasHistory = (app: Hono<Env>, ctx: AppContext) => {
     const from = parseOptInt(c.req.query('from'), 'from');
     if (from === undefined) throw new HTTPException(400, { message: '缺少参数：from' });
     assertRange(from, seq);
-    await refresher.flush(a.branch);
+    // 不 flush：单步明细只读历史提交，不与当前模型比较，也不作为恢复的 workingSeq 来源
     const { seq: currentSeq } = await rooms.model(a.branch);
     if (seq > currentSeq) throw new HTTPException(404, { message: `修改记录 #${seq} 不存在` });
     const steps = await rooms.historySteps(a.branch, from, seq, currentSeq);
@@ -114,7 +115,7 @@ export const registerCanvasHistory = (app: Hono<Env>, ctx: AppContext) => {
     const a = await access(c, ctx, 'sync.edit');
     const seq = parseSeqParam(c.req.param('seq'));
     const b = await body(c, canvasHistoryRestoreSchema);
-    await refresher.flush(a.branch);
+    // 不在这里 flush：workingSeq 来自历史详情（GET /history/:seq 已经 flush 过），再规范化会推进 seq 造成自冲突的 409
     const { model: currentModel, seq: currentSeq } = await rooms.model(a.branch);
     const targetModel = await rooms.modelAt(a.branch, seq);
     const conflictOf = (curSeq: number, curModel: Model) =>
@@ -137,7 +138,10 @@ export const registerCanvasHistory = (app: Hono<Env>, ctx: AppContext) => {
     }
     const fromSeq = currentSeq;
     try {
-      await ctx.replace(a.branch, c.get('user').name, targetModel, 'restoreHistory', b.workingSeq);
+      // 历史模型不一定规范化过：只替换房间，不改写黄金基线（ADR 0016）
+      await ctx.replace(a.branch, c.get('user').name, targetModel, 'restoreHistory', b.workingSeq, {
+        canonical: false,
+      });
     } catch (e) {
       if (e instanceof WorkingChangedError) return conflictOf(e.currentSeq, e.currentModel);
       throw e;

@@ -68,6 +68,9 @@ for (const scheme of ['light', 'dark'] as const) {
     await page.getByRole('button', { name: /^total/ }).click();
     await expect(page.getByLabel('列名 total')).toBeVisible();
     await expect(page.locator('.react-flow__node')).toHaveCount(2);
+    // 状态栏的规范化状态异步加载（ADR 0016）：等它出现再截图，避免文字有无造成的抖动
+    const statusBar = page.locator('footer').filter({ hasText: '人在线' });
+    await expect(statusBar).toContainText(/表达式已规范化|处待规范化/);
     await page.mouse.move(0, 0);
     await expect(page).toHaveScreenshot(`workspace-${scheme}.png`, { maxDiffPixelRatio: 0.02 });
 
@@ -117,6 +120,7 @@ for (const scheme of ['light', 'dark'] as const) {
     await page.setViewportSize({ width: 900, height: 900 });
     await gotoPage(page, '模型');
     await page.getByRole('status').filter({ hasText: '已同步' }).waitFor();
+    await expect(statusBar).toContainText(/表达式已规范化|处待规范化/);
     await page.keyboard.press('Escape');
     await page.getByRole('button', { name: '打开侧面板' }).click();
     await expect(page.getByRole('navigation', { name: '对象' })).toBeVisible();

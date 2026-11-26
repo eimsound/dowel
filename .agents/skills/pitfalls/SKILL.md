@@ -41,7 +41,7 @@ description: >-
 - **SSE 订阅先于查初始态**：非 `once` 流先注册 `onAbort` + `subscribe` 缓冲再查 `unread`，心跳 `setTimeout` 必 `.unref()`，`stop()` 主动唤醒结束活跃流（`#26`）；显式 `sweep()` 不因非阻塞锁撞锁误推进 `done`，`onReconnect` 补 `kickLocal({ all: true })`（`#22`）。
 
 ### 3. 协作房间、派生刷新与影子缓存
-- **跨副本 `flush` 与基线保护**：HA 下 `OpaqueRefresher.flush()` 须阻塞持 `job:derive:<branchId>` 锁循环追齐 DB；`ctx.replace` 与 `reset` 经 `runWithReset` 共用同一锁且直接传规范化 `model` 入参，禁止事后重读 `rooms.model`（`#17`）。
+- **按需规范化与黄金基线（ADR 0016）**：编辑期间禁止任何隐式影子库调用（不挂 `onCommit` 刷新、无后台防抖）；关键出口 `flush()` 单机/HA 统一持本地队列 + `job:derive:<branchId>` 锁，无待规范化对象 0 I/O 返回；**确认阶段（restore / apply / syncWorkingCopy / pull·attach 确认）不得 flush**，否则推进 seq 造成自冲突 409。`branches.baseline` 只在 canonical 替换（`runWithReset` 直接用入参 `model`，#17）或成功 canonicalize 后推进；无待规范化对象、canonicalize 失败、恢复历史 / 未验证版本（`ctx.replace(…, { canonical: false })` → `runWithoutReset`）都不得写基线；“已验证”不等于模型原文是规范形式，已验证版本覆盖用 `canonical: 'ifClean'`。
 - **权限刷新单飞 + 代际防倒挂**：`Rooms.join` 必重查 `users.role, status`，经单飞串行队列与递增 `refreshGen` 在每次 `await` 后复查归属与代际（`#39`）。
 - **WS `client` 服务端强隔离**：拒非法/保留字 `system`，内部键绑定 `${userId}:${rawClient}` 并经 `forPeer()` 还原；`readOnly` 拒 `op` 绝不推进 `processed[client]` 或写 `room_rejections`（`#12`）。
 - **缓存指纹完整 + 跨副本失效**：`Shadows` 缓存须按完整配置指纹校验并接 `shadows.forget` / `onReconnect` 清空（`#41`）；跨副本同步 `peers`，大 `room.layout` 超 7500B 落库转轻量重载，远端布局清本地 `pendingLayout`（`#44`）；`loadRoom`/`catchUpFrom` 在 PG 用 `REPEATABLE READ` 防读撕裂且避免全表扫 `room_rejections`（`#40`）；空闲房间与内部 Map 有界清理，SQLite `getFresh` 走 `withRoomLock`（`#45`）。

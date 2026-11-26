@@ -11,7 +11,7 @@ import { HTTPException } from 'hono/http-exception';
 import { assertUrlAllowed } from './allowlist.ts';
 import { EventBus, type EventBusOptions } from './bus.ts';
 import type { PlatformDb } from './db.ts';
-import { OpaqueRefresher } from './derive.ts';
+import { DeriveBusyError, OpaqueRefresher } from './derive.ts';
 import { DriftScheduler } from './drift-scheduler.ts';
 import { defaultMailer, type Mailer } from './email.ts';
 import { EnvLocks, type ExecContext } from './executions.ts';
@@ -128,10 +128,17 @@ export const createApp = (db: PlatformDb, options: AppOptions = {}) => {
     },
     ha,
   );
-  rooms.onCommit = (branchId) => refresher.schedule(branchId);
-  /** 导入、拉取、恢复历史后替换模型：新模型就是引擎读出的，作为派生数据的基线 */
-  const replace = async (branch: string, user: string, model: Model, op: string, expectedSeq?: number) => {
-    await refresher.runWithReset(branch, model, () => rooms.replace(branch, user, model, op, expectedSeq));
+  // 按需规范化（ADR 0016）：编辑提交不再触发后台影子库刷新，只在关键出口 flush 或用户显式规范化时才回影子库
+  /**
+   * 整体替换工作副本：
+   * - canonical（默认 true）：导入、拉取、接入、已验证版本——新模型来自引擎读回 / 影子库验证，直接作为黄金基线；
+   * - canonical: 'ifClean'：已验证版本——相对当前黄金基线没有待规范化对象时才推进基线；
+   * - canonical: false：恢复画布历史、未验证版本——只替换房间，不改写黄金基线（被替换进来的模型不一定规范化过）。
+   */
+  const replace: AppContext['replace'] = async (branch, user, model, op, expectedSeq, opts) => {
+    const run = () => rooms.replace(branch, user, model, op, expectedSeq);
+    if (opts?.canonical === false) await refresher.runWithoutReset(branch, run);
+    else await refresher.runWithReset(branch, model, run, { onlyIfClean: opts?.canonical === 'ifClean' });
   };
   const nodeWs = createNodeWebSocket({ app });
   const { upgradeWebSocket, wss } = nodeWs;
@@ -195,6 +202,8 @@ export const createApp = (db: PlatformDb, options: AppOptions = {}) => {
     const fail = (message: string, status: 422 | 500 | HTTPException['status'], code?: string) =>
       c.json<ApiErrorBody>({ error: scrubSecrets(message), ...(code ? { code } : {}) }, status);
     if (err instanceof CodedHTTPException) return fail(err.message, err.status, err.code);
+    // 等 derive 锁超时（另一副本 / 请求正在规范化同一分支）：可重试的 503
+    if (err instanceof DeriveBusyError) return fail(err.message, 503, 'normalize_busy');
     if (err instanceof HTTPException) return fail(err.message, err.status);
     if (
       err instanceof PlanError ||

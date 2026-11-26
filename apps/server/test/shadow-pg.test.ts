@@ -433,14 +433,15 @@ describe.skipIf(!PG_URL)('pgShadow（真实 PG）', () => {
         ['b1', JSON.stringify(prev), '{}'],
       );
 
-      // 首次 flush：plain table 无表达式，直接落入 good 基线
-      refresher.schedule('b1', 0);
-      await refresher.flush('b1');
+      // 首次 flush：plain table 无表达式，没有待规范化对象 → 0 影子库 I/O，且不把未验证的模型写成黄金基线（ADR 0016）
+      await expect(refresher.flush('b1')).resolves.toMatchObject({ kind: 'clean' });
+      expect(baselines.has('b1')).toBe(false);
+      // 模拟导入：引擎读回的模型直接作为黄金基线
+      await refresher.reset('b1', prev);
       expect((baselines.get('b1')?.objects[tags] as Table | undefined)?.partitionBy).toBeNull();
 
       // 未发布态将普通表配置为表达式分区表并添加子分区
       await rooms.replace('b1', 'tester', next, 'setPartitionBy');
-      refresher.schedule('b1', 0);
       await refresher.flush('b1');
 
       const afterPart = (await rooms.model('b1')).model;
@@ -459,7 +460,6 @@ describe.skipIf(!PG_URL)('pgShadow（真实 PG）', () => {
       const nextWithCheck = structuredClone(afterPart);
       const ckId = addCheck(nextWithCheck, tags, "code <> ''", 'ck-code');
       await rooms.replace('b1', 'tester', nextWithCheck, 'addCheck');
-      refresher.schedule('b1', 0);
       await refresher.flush('b1');
       const afterCheck = (await rooms.model('b1')).model;
       expect((afterCheck.objects[ckId] as { expr: string }).expr).toContain('::text');

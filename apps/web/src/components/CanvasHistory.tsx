@@ -885,7 +885,12 @@ export const CanvasHistory = ({
   // 组 #1–#5 与展开后的组尾单步 #5 用不同的 from 区分缓存，互不串用
   const detailQuery = useQuery({
     queryKey: ['canvas-history-detail', pid, active?.seq ?? null, active?.from ?? null],
-    queryFn: () => api<CanvasHistoryDetail<Model>>('GET', detailPath(pid, active!)),
+    queryFn: async () => {
+      const r = await api<CanvasHistoryDetail<Model>>('GET', detailPath(pid, active!));
+      // 历史详情是关键出口：服务端先按需规范化（ADR 0016），零改写时 seq 不变、只推进基线，状态栏要主动重查
+      void qc.invalidateQueries({ queryKey: ['normalize', pid] });
+      return r;
+    },
     enabled: open && active !== null,
     gcTime: 0,
   });

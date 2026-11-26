@@ -46,6 +46,8 @@ export const ImportDialog = ({ pid, eid, onClose }: { pid: string; eid: string; 
       void qc.invalidateQueries({ queryKey: ['envs', pid] });
       void qc.invalidateQueries({ queryKey: ['migration', pid] });
       void qc.invalidateQueries({ queryKey: ['ddl', pid] });
+      // 影子库来源 / 基线可能变了：状态栏的规范化状态（含 shadow 配置）重查（ADR 0016）
+      void qc.invalidateQueries({ queryKey: ['normalize', pid] });
       void qc.invalidateQueries({ queryKey: ['activity', pid] });
       toast(t('dr.importDone', { count: r.objects }));
       onClose();

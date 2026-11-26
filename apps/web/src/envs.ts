@@ -7,7 +7,9 @@ import type {
   ExecErrorDetails,
   ExecEvent,
   ExecPolicy,
+  NormalizeResult,
 } from '@dowel/api';
+import { type Dialect, getDialect } from '@dowel/core';
 import { useQuery } from '@tanstack/react-query';
 import type { TFunction } from 'i18next';
 
@@ -102,3 +104,49 @@ export const streamExec = async (
 };
 
 export type { ExecErrorDetails };
+
+/**
+ * 状态栏显示的影子库来源，与服务端 `Shadows.forProjectTarget` 的选影一致：
+ * 1. 按目标库版本组（`DialectVersionMatrix.groupKeyOf(engineVersionNum)`）分组，已知版本组升序在前、未探测的在后，
+ *    优先最低已知版本组（项目兼容目标）；该组没有可用影子库时依次回退到下一组；
+ * 2. 组内按选影优先级：显式独立影子库 > 非生产环境（同实例 `{库名}_dowel`）> 允许同实例的生产环境。
+ * 都不可用时返回 null。
+ */
+export const usableShadowEnv = <
+  E extends Pick<EnvInfo, 'shadowUrl' | 'production' | 'allowSameInstance' | 'engineVersionNum'>,
+>(
+  envs: readonly E[] | undefined,
+  dialect: Dialect = 'pg',
+): E | null => {
+  const rank = (e: E) => (e.shadowUrl != null ? 0 : !e.production ? 1 : e.allowSameInstance ? 2 : 3);
+  const matrix = getDialect(dialect).versioning.matrix;
+  const groupOf = (e: E) => matrix?.groupKeyOf(e.engineVersionNum) ?? null;
+  const groups = new Map<number | null, E[]>();
+  for (const e of envs ?? []) {
+    const k = groupOf(e);
+    const list = groups.get(k);
+    if (list) list.push(e);
+    else groups.set(k, [e]);
+  }
+  const keys = [...groups.keys()].filter((k): k is number => k !== null).sort((a, b) => a - b);
+  const ordered: (number | null)[] = [...keys, ...(groups.has(null) ? [null] : [])];
+  for (const k of ordered) {
+    let best: E | null = null;
+    for (const e of groups.get(k) ?? []) {
+      if (rank(e) < 3 && (best === null || rank(e) < rank(best))) best = e;
+    }
+    if (best) return best;
+  }
+  return null;
+};
+
+/** 手动规范化成功后的提示文案 */
+export const normalizeToast = (
+  res: Pick<NormalizeResult, 'outcome' | 'normalizedCount' | 'shadow'>,
+  t: TFunction,
+): string =>
+  res.outcome === 'normalized'
+    ? t('ws.normalize.normalized', { count: res.normalizedCount, shadow: res.shadow })
+    : res.outcome === 'verified'
+      ? t('ws.normalize.verifiedClean', { shadow: res.shadow })
+      : t('ws.normalize.alreadyClean');

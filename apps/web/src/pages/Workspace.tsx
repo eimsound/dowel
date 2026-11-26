@@ -49,6 +49,7 @@ import { Canvas, type CanvasApi } from '../components/Canvas.tsx';
 import { CanvasHistory } from '../components/CanvasHistory.tsx';
 import { ImportDialog, MigrationDialog, VersionDialog } from '../components/Dialogs.tsx';
 import { Inspector } from '../components/Inspector.tsx';
+import { NormalizeStatus } from '../components/NormalizeStatus.tsx';
 import {
   hasDetails,
   type PasteSummary,
@@ -66,6 +67,7 @@ import { Avatar, IconButton, peerColor } from '../components/ui.tsx';
 import { nudgeAway, placePastedTables, sectionIndex, sectionsAfterPaste } from '../copy-paste.ts';
 import { clearTables, SELECT_TABLE_EVENT, setCurrentTables } from '../current-tables.ts';
 import { dialectUiSpec } from '../dialects.ts';
+import { usableShadowEnv } from '../envs.ts';
 import { useProject } from '../project.tsx';
 import {
   buildCanvasGroups,
@@ -101,7 +103,17 @@ export const Model = () => {
     queryKey: ['versions', pid],
     queryFn: () => api<VersionInfo[]>('GET', `/api/projects/${pid}/versions`),
   });
-  const { ws, model, status, pending, layout, sections, peers, role: liveRole } = useWorkspace(pid, toast);
+  const {
+    ws,
+    model,
+    status,
+    pending,
+    seq,
+    layout,
+    sections,
+    peers,
+    role: liveRole,
+  } = useWorkspace(pid, toast);
   const modelIndex = useMemo(() => buildModelIndex(model), [model]);
   const [selected, setSelected] = useState<string | null>(null);
   const selectedRef = useRef<string | null>(selected);
@@ -726,8 +738,16 @@ export const Model = () => {
     }
   };
 
-  const env = envs.data?.[0];
+  // 状态栏的影子库：按服务端真实的选影优先级挑可用环境（不是简单取第一个环境）
+  const env = usableShadowEnv(envs.data, model.dialect);
   const latest = versions.data?.[0];
+  const shadowLabel = !uiSpec.requiresExternalShadow
+    ? t('ws.shadowMemory')
+    : env
+      ? t('ws.shadowOf', { env: env.name })
+      : envs.data?.length
+        ? t('ws.noUsableShadow')
+        : t('ws.noEnv');
   const showInspector = pinned || selected !== null || liveMulti.length > 1;
   const dialectLabel =
     model.dialect === 'pg'
@@ -1000,25 +1020,31 @@ export const Model = () => {
         )}
       </main>
 
-      <footer className="flex h-[var(--statusbar-h)] shrink-0 items-center gap-4 border-t border-border bg-chrome px-3 text-xs text-text-3">
-        <span className="flex items-center gap-1.5">
+      <footer className="flex h-[var(--statusbar-h)] min-w-0 shrink-0 items-center gap-3 overflow-hidden border-t border-border bg-chrome px-3 text-xs whitespace-nowrap text-text-3 max-[1080px]:gap-2">
+        <span className="flex shrink-0 items-center gap-1.5 whitespace-nowrap">
           <span
             aria-hidden="true"
-            className={`size-[7px] rounded-full ${status === 'online' ? 'bg-ok' : 'bg-warn'}`}
+            className={`size-[7px] shrink-0 rounded-full ${status === 'online' ? 'bg-ok' : 'bg-warn'}`}
           />
           {t(`ws.status.${status}`)}
           {status === 'online' && ` · ${t('ws.peopleOnline', { count: people.length })}`}
         </span>
-        <span>
-          {!uiSpec.requiresExternalShadow
-            ? t('ws.shadowMemory')
-            : env
-              ? t('ws.shadowOf', { env: env.name })
-              : t('ws.noEnv')}
+        <span className="min-w-0 truncate" title={shadowLabel}>
+          {shadowLabel}
         </span>
         <span className="flex-1" />
-        {latest && <span className="font-mono">{latest.name}</span>}
-        <span className="font-mono" title={dialectTip}>
+        <NormalizeStatus
+          pid={pid}
+          seq={seq}
+          synced={status === 'online' && pending === 0}
+          readOnly={readOnly}
+        />
+        {latest && (
+          <span className="min-w-0 truncate font-mono" title={latest.name}>
+            {latest.name}
+          </span>
+        )}
+        <span className="shrink-0 font-mono whitespace-nowrap" title={dialectTip}>
           {dialectLabel}
         </span>
       </footer>
