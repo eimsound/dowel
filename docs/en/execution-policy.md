@@ -28,6 +28,7 @@ The execution policy controls who can perform privileged operations on an enviro
 
 - **Who can execute.** "Project editors" permits editors, project admins, and executors. "Project admins" permits project admins and executors. "Executors only" permits only users or groups holding an executor grant. Instance admins bypass this restriction.
 - **Defaults are not floors.** Unless an upper layer explicitly sets a rule, a lower layer can configure a looser value than the default, such as allowing editors on a specific production environment when production policies above are unset.
+- **Allow CI token execution.** CI token execution (see [CI HTTP API](api.md)) checks only this field and is **not subject to "Who can execute" or the approval flow**. Non-production environments allow it by default, so when you tighten a non-production rule set ("Who can execute" set to Project admins or Executors only, or approval stages configured) while this field stays "Allowed", members permitted to create CI tokens can still issue a token and execute forward without approval. The policy editor shows a notice at the bottom of the non-production rule set, and anyone who can edit that layer can set the field to "Not allowed" with one click (this only changes the form; save the execution policy to apply it. Turning token execution off is a tightening, so upper-layer locks never block it). The default is unchanged, so teams relying on CI deployments can keep it on.
 
 ## Privileged operations governed by policy {#privileged-ops}
 

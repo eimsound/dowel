@@ -75,6 +75,145 @@ for (const scheme of ['light', 'dark'] as const) {
   });
 }
 
+// 非生产收紧了“谁能执行” / 配了审批，但“允许 CI 令牌执行”仍开：提示令牌可以免审批执行（ADR 0010、pitfalls #10），
+// 一键关闭只改草稿；上级显式允许（下限是“允许”）不妨碍关闭；只读的人只看到提示、没有按钮。中英文 × 亮暗各覆盖一次。
+for (const [scheme, lang] of [
+  ['light', 'zh'],
+  ['dark', 'en'],
+] as const) {
+  test(`非生产收紧后提示 CI 令牌仍可免审批执行，一键关闭（${scheme} · ${lang}）`, async ({ browser }) => {
+    const L =
+      lang === 'zh'
+        ? {
+            nonProd: '非生产环境',
+            prod: '生产环境',
+            who: '谁能执行',
+            tokens: '允许 CI 令牌执行',
+            warn: 'CI 令牌仍可直接执行迁移',
+            warnBody: '不受“谁能执行”与审批流程限制',
+            action: '禁止 CI 令牌执行',
+            pending: '保存执行策略后生效',
+            save: '保存执行策略',
+            saved: '已保存执行策略',
+            reset: '撤销修改',
+            effectiveOff: '生效：不允许 · 来自组',
+            addStage: '添加审批环节',
+          }
+        : {
+            nonProd: 'Non-production environments',
+            prod: 'Production environments',
+            who: 'Who can execute',
+            tokens: 'Allow CI token execution',
+            warn: 'CI tokens can still execute migrations directly',
+            warnBody: 'bypassing “Who can execute” and the approval flow',
+            action: 'Disallow CI token execution',
+            pending: 'save the execution policy to apply it',
+            save: 'Save execution policy',
+            saved: 'Execution policy saved',
+            reset: 'Discard changes',
+            effectiveOff: 'Effective: Not allowed · from group',
+            addStage: 'Add approval stage',
+          };
+    const useLang = async (p: Page) => {
+      await p.evaluate((l) => localStorage.setItem('dowel.lang', l), lang);
+      await p.reload();
+    };
+    const { page } = await newUser(browser, '令牌提醒组管', { colorScheme: scheme });
+    const group = await createGroup(page);
+    await useLang(page);
+    await page.goto(`/group/${group.slug}`);
+    const nonProd = set(page, L.nonProd);
+    const warn = nonProd.getByTestId('token-bypass-warn');
+    // 默认（项目编辑者、无审批、允许令牌）不提示；生产那一套默认不允许令牌，从不提示
+    await expect(nonProd.getByLabel(L.who)).toBeVisible();
+    await expect(warn).toHaveCount(0);
+
+    // 收紧“谁能执行”：立刻出现提示（草稿即生效，不用先保存）
+    await nonProd.getByLabel(L.who).selectOption('executor');
+    await expect(warn).toContainText(L.warn);
+    await expect(warn).toContainText(L.warnBody);
+    await expect(set(page, L.prod).getByTestId('token-bypass-warn')).toHaveCount(0);
+    await scan(page, `组首页 · 令牌提醒（${lang}）`);
+    await shoot(page, `policy-token-guard-${lang}-${scheme}`);
+
+    // 保存收紧（令牌仍允许）：保存后仍提示
+    await page.getByRole('button', { name: L.save }).click();
+    await expect(page.getByText(L.saved)).toBeVisible();
+    await expect(warn).toBeVisible();
+
+    // 一键关闭：只改草稿，焦点落到“允许 CI 令牌执行”，提示消失；撤销修改后提示回来
+    await nonProd.getByRole('button', { name: L.action }).click();
+    await expect(warn).toHaveCount(0);
+    const tok = nonProd.getByLabel(L.tokens);
+    await expect(tok).toHaveValue('false');
+    await expect(tok).toBeFocused();
+    // 稍后礼貌播报“保存后生效”（独立的 aria-live 区域，提示条本身不是 live region）
+    await expect(nonProd.locator('[aria-live="polite"]')).toContainText(L.pending);
+    await expect(nonProd).toContainText(L.effectiveOff);
+    await page.getByRole('button', { name: L.reset }).click();
+    await expect(warn).toBeVisible();
+
+    // 审批环节也会触发（只在草稿里试，随后撤销）：谁能执行回到继承，提示消失；再加一个审批环节，提示回来
+    await nonProd.getByLabel(L.who).selectOption('');
+    await expect(warn).toHaveCount(0);
+    await nonProd.getByRole('button', { name: L.addStage }).click();
+    await expect(warn).toBeVisible();
+    await page.getByRole('button', { name: L.reset }).click();
+
+    // 只读的人（不是组管理员）看得到提示，但没有一键关闭的按钮
+    const { page: viewer } = await newUser(browser, '令牌提醒旁观', { colorScheme: scheme });
+    await useLang(viewer);
+    await viewer.goto(`/group/${group.slug}`);
+    const viewerSet = set(viewer, L.nonProd);
+    await expect(viewerSet.getByTestId('token-bypass-warn')).toContainText(L.warn);
+    await expect(viewerSet.getByRole('button', { name: L.action })).toHaveCount(0);
+    await scan(viewer, `组首页 · 令牌提醒只读（${lang}）`);
+
+    // 关闭并保存：刷新后不再提示
+    await nonProd.getByRole('button', { name: L.action }).click();
+    await page.getByRole('button', { name: L.save }).click();
+    await expect(page.getByText(L.saved).first()).toBeVisible();
+    await page.reload();
+    await expect(set(page, L.nonProd).getByLabel(L.tokens)).toHaveValue('false');
+    await expect(set(page, L.nonProd).getByTestId('token-bypass-warn')).toHaveCount(0);
+  });
+}
+
+test('上级显式允许令牌（下限“允许”）+ 上级的审批环节：项目层仍提示，一键关闭可以保存', async ({
+  browser,
+}) => {
+  const { page } = await newUser(browser, '令牌提醒锁定');
+  const group = await createGroup(page);
+  const projectUrl = await createProjectIn(page, '令牌提醒项目', group.name);
+  // 组层：显式允许令牌执行 + 一个审批环节
+  await page.goto(`/group/${group.slug}`);
+  const groupSet = set(page, '非生产环境');
+  await groupSet.getByLabel('允许 CI 令牌执行').selectOption('true');
+  await groupSet.getByRole('button', { name: '添加审批环节' }).click();
+  await page.getByRole('button', { name: '保存执行策略' }).click();
+  await expect(page.getByText('已保存执行策略')).toBeVisible();
+
+  // 项目层：审批环节来自组、令牌执行由组定为“允许”——仍提示；关闭是收紧，不受锁定限制，保存成功
+  await page.goto(projectUrl);
+  await gotoPage(page, '设置');
+  const projSet = set(page, '非生产环境');
+  await expect(projSet.getByTestId('token-bypass-warn')).toBeVisible();
+  await projSet.getByRole('button', { name: '禁止 CI 令牌执行' }).click();
+  await expect(projSet.getByLabel('允许 CI 令牌执行')).toHaveValue('false');
+  await expect(projSet).toContainText('生效：不允许 · 来自项目');
+  await page.getByRole('button', { name: '保存执行策略' }).click();
+  await expect(page.getByText('已保存执行策略')).toBeVisible();
+  await expect(page.getByRole('alert')).toHaveCount(0);
+  await expect(projSet.getByTestId('token-bypass-warn')).toHaveCount(0);
+
+  // 组层自己改成“不允许”，提示随即消失（上级锁定为不允许时下级生效值也是不允许，单测覆盖）
+  await page.goto(`/group/${group.slug}`);
+  const g2 = set(page, '非生产环境');
+  await expect(g2.getByTestId('token-bypass-warn')).toBeVisible();
+  await g2.getByLabel('允许 CI 令牌执行').selectOption('false');
+  await expect(g2.getByTestId('token-bypass-warn')).toHaveCount(0);
+});
+
 test.describe('需要目标库', () => {
   test.skip(!process.env.DOWEL_TEST_PG, '没有可用的 PostgreSQL（需要 Docker）');
   // 每条用例要建两个目标库、添加两个环境（各自连接检查 + 影子库），再走多个页面：比默认的 60 秒长
