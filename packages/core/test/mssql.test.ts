@@ -1,6 +1,11 @@
 import { describe, expect, it } from 'vitest';
 
 import {
+  checkMssqlCompatibility,
+  checkMssqlVersionCompatibility,
+  diagnoseModel,
+  minMssqlMajor,
+  mssqlVersioning,
   addCheck,
   addColumn,
   addForeignKey,
@@ -1074,5 +1079,49 @@ describe('MSSQL core dialect: quote, lexer, batch splitter, naming, types, nontx
         'DROP SCHEMA [_dowel_tmp_sch_1]',
       ]);
     }
+  });
+});
+
+describe('SQL Server 静态兼容性收集与 diagnoseModel', () => {
+  const jsonVectorModel = () => {
+    const m = emptyModel('mssql');
+    const s = createSchema(m, 'dbo');
+    const t = createTable(m, s, 'embeddings');
+    addColumn(m, t, { id: 'c1', name: 'id', type: 'int', notNull: true });
+    addColumn(m, t, { id: 'c2', name: 'payload', type: 'json' });
+    addColumn(m, t, { id: 'c3', name: 'vec', type: 'vector(3)' });
+    return m;
+  };
+
+  it('结构化报告 < 17 的原生 json / vector 列，规划器文本保持一致', () => {
+    const m = jsonVectorModel();
+    const issues = checkMssqlCompatibility(m, 16);
+    expect(issues).toEqual([
+      expect.objectContaining({
+        code: 'native_json',
+        severity: 'error',
+        objectId: 'c2',
+        objectName: 'embeddings.payload',
+      }),
+      expect.objectContaining({
+        code: 'vector_type',
+        severity: 'error',
+        objectId: 'c3',
+        objectName: 'embeddings.vec',
+      }),
+    ]);
+    expect(checkMssqlVersionCompatibility(m, 16)).toEqual(issues.map((i) => i.message));
+    expect(checkMssqlCompatibility(m, 17)).toEqual([]);
+  });
+
+  it('diagnoseModel 按环境最低主版本诊断，但不改变影子库规划目标（targetPlanOptions 仍为 undefined）', () => {
+    const m = jsonVectorModel();
+    expect(minMssqlMajor([170000, 150000, null])).toBe(15);
+    expect(mssqlVersioning.targetPlanOptions([150000])).toBeUndefined();
+    const d = diagnoseModel(m, [170000, 160000]);
+    expect(d.target).toBe('SQL Server 2022');
+    expect(d.compatibility.errors.total).toBe(2);
+    expect(d.compatibility.errors.items[0]).toMatchObject({ minVersion: 'SQL Server 2025' });
+    expect(diagnoseModel(m, [170000]).compatibility.errors.total).toBe(0);
   });
 });

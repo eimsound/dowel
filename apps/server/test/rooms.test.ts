@@ -1774,7 +1774,7 @@ test('远端 room.layout 不重置本地空闲倒计时；join 异步核验抛�
   }
 });
 
-test('applyMcpOps 批量跨越 SNAPSHOT_EVERY 时写入该点位快照', async () => {
+test('applyMcpOps 整批收敛为 1 个 seq：落在 SNAPSHOT_EVERY 的批提交写入该点位快照（含整批结果）', async () => {
   const branchSnap = `${branchId}-mcp-snapshot`;
   await db.query("insert into branches (id, project_id, name) values ($1, $2, 'mcp-snapshot')", [
     branchSnap,
@@ -1784,9 +1784,7 @@ test('applyMcpOps 批量跨越 SNAPSHOT_EVERY 时写入该点位快照', async (
 
   let currentSeq = 0;
   let nextIdx = 1;
-  const targetBeforeCross = SNAPSHOT_EVERY - 5;
-  while (currentSeq < targetBeforeCross) {
-    const count = Math.min(100, targetBeforeCross - currentSeq);
+  const call = async (count: number) => {
     const ops = Array.from({ length: count }, () => {
       const idx = nextIdx++;
       return {
@@ -1802,32 +1800,24 @@ test('applyMcpOps 批量跨越 SNAPSHOT_EVERY 时写入该点位快照', async (
       ops,
     });
     expect(r.ok).toBe(true);
-    if (r.ok) currentSeq = r.seq;
-  }
+    if (!r.ok) throw new Error(r.message);
+    expect(r.seq).toBe(currentSeq + 1);
+    expect(r.opCount).toBe(count);
+    currentSeq = r.seq;
+  };
+  // 第一批 100 个子操作只占 1 个 seq
+  await call(100);
+  while (currentSeq < SNAPSHOT_EVERY - 1) await call(1);
 
-  expect(currentSeq).toBe(SNAPSHOT_EVERY - 5);
   const snapsBefore = await db.query<{ seq: string | number }>(
     'select seq from room_snapshots where branch_id = $1 order by seq',
     [branchSnap],
   );
   expect(snapsBefore.map((s) => Number(s.seq))).toEqual([0]);
 
-  const crossOps = Array.from({ length: 10 }, () => {
-    const idx = nextIdx++;
-    return {
-      name: 'createTable',
-      args: { id: `$ref:t_${idx}`, schema: schemaId, name: `snap_t_${idx}` },
-    };
-  });
-  const crossRes = await rooms.applyMcpOps(branchSnap, {
-    userId: member.id,
-    tokenId: 'tok-snap',
-    user: member.name,
-    baseSeq: currentSeq,
-    ops: crossOps,
-  });
-  expect(crossRes.ok).toBe(true);
-  if (crossRes.ok) expect(crossRes.seq).toBe(SNAPSHOT_EVERY + 5);
+  const firstCrossIdx = nextIdx;
+  await call(10);
+  expect(currentSeq).toBe(SNAPSHOT_EVERY);
 
   const snapsAfter = await db.query<{ seq: string | number; model: Model }>(
     'select seq, model from room_snapshots where branch_id = $1 order by seq',
@@ -1836,19 +1826,20 @@ test('applyMcpOps 批量跨越 SNAPSHOT_EVERY 时写入该点位快照', async (
   expect(snapsAfter.map((s) => Number(s.seq))).toEqual([0, SNAPSHOT_EVERY]);
   const snapAtEvery = snapsAfter.find((s) => Number(s.seq) === SNAPSHOT_EVERY)!;
   const snapTableNames = new Set(all(snapAtEvery.model, 'table').map((t) => t.name));
-  expect(snapTableNames.has(`snap_t_${SNAPSHOT_EVERY}`)).toBe(true);
-  expect(snapTableNames.has(`snap_t_${SNAPSHOT_EVERY + 1}`)).toBe(false);
-  expect(snapTableNames.has(`snap_t_${SNAPSHOT_EVERY + 5}`)).toBe(false);
+  for (let i = firstCrossIdx; i < firstCrossIdx + 10; i++)
+    expect(snapTableNames.has(`snap_t_${i}`)).toBe(true);
 
-  const atEvery = await rooms.modelAt(branchSnap, SNAPSHOT_EVERY);
-  const atEveryNames = new Set(all(atEvery, 'table').map((t) => t.name));
-  expect(atEveryNames.has(`snap_t_${SNAPSHOT_EVERY}`)).toBe(true);
-  expect(atEveryNames.has(`snap_t_${SNAPSHOT_EVERY + 1}`)).toBe(false);
+  const before = await rooms.modelAt(branchSnap, SNAPSHOT_EVERY - 1);
+  const beforeNames = new Set(all(before, 'table').map((t) => t.name));
+  expect(beforeNames.has(`snap_t_${firstCrossIdx - 1}`)).toBe(true);
+  expect(beforeNames.has(`snap_t_${firstCrossIdx}`)).toBe(false);
 
-  const atMid = await rooms.modelAt(branchSnap, SNAPSHOT_EVERY + 3);
-  const atMidNames = new Set(all(atMid, 'table').map((t) => t.name));
-  expect(atMidNames.has(`snap_t_${SNAPSHOT_EVERY + 3}`)).toBe(true);
-  expect(atMidNames.has(`snap_t_${SNAPSHOT_EVERY + 4}`)).toBe(false);
+  const commits = await db.query<{ seq: string | number; op_name: string }>(
+    'select seq, op_name from room_commits where branch_id = $1 order by seq',
+    [branchSnap],
+  );
+  expect(commits).toHaveLength(SNAPSHOT_EVERY);
+  expect(new Set(commits.map((c) => c.op_name))).toEqual(new Set(['batch']));
 });
 
 test('applyMcpOps / Room.simulate：表名 constructor、列名 valueOf、注释 toString、枚举值 hasOwnProperty 不误报冲突（#87）', async () => {
@@ -1896,12 +1887,75 @@ test('applyMcpOps / Room.simulate：表名 constructor、列名 valueOf、注释
     baseSeq: first.seq,
     ops,
   });
-  expect(res).toMatchObject({ ok: true, dryRun: false, seq: first.seq + ops.length });
+  expect(res).toMatchObject({ ok: true, dryRun: false, seq: first.seq + 1, opCount: ops.length });
   if (!res.ok) return;
   const t = res.model.objects[tableId];
   expect(t).toMatchObject({ kind: 'table', name: 'constructor', comment: 'toString' });
   expect(res.model.objects[res.refs.c!]).toMatchObject({ kind: 'column', name: 'valueOf' });
   expect(res.model.objects[res.refs.e!]).toMatchObject({ kind: 'enum', values: ['hasOwnProperty'] });
+});
+
+test('applyMcpOps：onBeforeCommit 每批只调用 1 次（seq / opCount），抛错整批回滚；旧 baseSeq 冲突定位到最早的子操作', async () => {
+  const branchOne = `${branchId}-mcp-one`;
+  await db.query("insert into branches (id, project_id, name) values ($1, $2, 'mcp-one')", [branchOne, pid]);
+  await rooms.init(branchOne, model);
+  const base = { userId: member.id, tokenId: 'tok-one', user: member.name };
+
+  const calls: { seq: number; opCount: number }[] = [];
+  const ok = await rooms.applyMcpOps(branchOne, {
+    ...base,
+    baseSeq: 0,
+    summary: '建两张表',
+    ops: [
+      { name: 'createTable', args: { id: '$ref:a', schema: schemaId, name: 'one_a' } },
+      { name: 'createTable', args: { id: '$ref:b', schema: schemaId, name: 'one_b' } },
+    ],
+    onBeforeCommit: async (_tx, info) => {
+      calls.push(info);
+    },
+  });
+  expect(ok).toMatchObject({ ok: true, seq: 1, opCount: 2 });
+  expect(calls).toEqual([{ seq: 1, opCount: 2 }]);
+  if (!ok.ok) return;
+  expect(ok.changed.map((c) => c.name).sort()).toEqual(['one_a', 'one_b']);
+
+  // onBeforeCommit 抛错：整批回滚，内存房间恢复
+  await expect(
+    rooms.applyMcpOps(branchOne, {
+      ...base,
+      baseSeq: 1,
+      ops: [{ name: 'createTable', args: { id: '$ref:c', schema: schemaId, name: 'one_c' } }],
+      onBeforeCommit: async () => {
+        throw new Error('audit failed');
+      },
+    }),
+  ).rejects.toThrow('audit failed');
+  const after = await rooms.model(branchOne);
+  expect(after.seq).toBe(1);
+  expect(all(after.model, 'table').map((t) => t.name)).not.toContain('one_c');
+  const commitRows = await db.query('select seq from room_commits where branch_id = $1', [branchOne]);
+  expect(commitRows).toHaveLength(1);
+
+  // 别人改了 one_b（seq 2）后，用 baseSeq=1 的批：第 0 步无关、第 1 步改 one_b → index 1 冲突
+  const other = await rooms.applyMcpOps(branchOne, {
+    ...base,
+    tokenId: 'tok-other',
+    baseSeq: 1,
+    ops: [{ name: 'renameTable', args: { id: ok.refs.b!, name: 'one_b2' } }],
+  });
+  expect(other).toMatchObject({ ok: true, seq: 2 });
+  const stale = await rooms.applyMcpOps(branchOne, {
+    ...base,
+    baseSeq: 1,
+    ops: [
+      { name: 'setComment', args: { id: ok.refs.a!, comment: 'fine' } },
+      { name: 'setComment', args: { id: ok.refs.b!, comment: 'stale' } },
+    ],
+  });
+  expect(stale).toMatchObject({ ok: false, code: 'conflict', index: 1, currentSeq: 2 });
+  if (stale.ok) return;
+  expect(stale.message).toContain('one_b2');
+  expect(stale.message).toContain(member.name);
 });
 
 const PASTE_SRC = { projectId: 'proj-room', projectName: '房间项目', origin: 'canvas' as const, seq: null };

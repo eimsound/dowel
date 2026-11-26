@@ -1187,7 +1187,7 @@ describe('M3-C 迁移：mcp_tokens 表结构、JSON 往返、外键与幂等性'
   );
 });
 
-describe('从上一个迁移升级到最新：versions.retired_at 与 retired_by（ADR 0013）', () => {
+describe('从迁移 30 升级到最新：versions.retired_at 与 retired_by（ADR 0013）', () => {
   const cleanups: (() => Promise<void>)[] = [];
   afterAll(async () => {
     for (const c of cleanups) await c();
@@ -1211,7 +1211,8 @@ describe('从上一个迁移升级到最新：versions.retired_at 与 retired_by
         url = join(dir, 'dowel.db');
       }
 
-      const targetMigration = MIGRATIONS.length;
+      // 迁移 31（retired_at / retired_by）；之后的迁移一并回退重跑，须保持幂等
+      const targetMigration = 31;
       const base = await openPlatformDb(url);
       try {
         await base.query('insert into users (id, username, name, role, status) values ($1, $2, $3, $4, $5)', [
@@ -1355,4 +1356,78 @@ describe('从上一个迁移升级到最新：versions.retired_at 与 retired_by
       }
     },
   );
+});
+
+describe('从上一个迁移升级到最新：room_commits.op_summary（ADR 0015）', () => {
+  const cleanups: (() => Promise<void>)[] = [];
+  afterAll(async () => {
+    for (const c of cleanups) await c();
+  });
+
+  test.each([
+    { platform: 'sqlite' as const, skip: false },
+    { platform: 'pg' as const, skip: !PG_URL },
+  ])('存量提交的 op_summary 为 null，新列可读写且重跑幂等（$platform）', async ({ platform, skip }) => {
+    if (skip) return;
+    let url = '';
+    if (platform === 'pg') {
+      const pg = await createTestDb('mig32');
+      cleanups.push(pg.close);
+      url = pg.url;
+    } else {
+      const dir = mkdtempSync(join(tmpdir(), 'dowel-mig32-'));
+      cleanups.push(async () => rmSync(dir, { recursive: true, force: true }));
+      url = join(dir, 'dowel.db');
+    }
+
+    const targetMigration = MIGRATIONS.length;
+    const base = await openPlatformDb(url);
+    try {
+      await base.query("insert into groups (id, slug, name) values ('g1', 'g1', '组')");
+      await base.query("insert into projects (id, name, group_id, slug) values ('p1', 'p1', 'g1', 'p1')");
+      await base.query("insert into branches (id, project_id, name) values ('b1', 'p1', 'main')");
+      await base.exec('alter table room_commits drop column op_summary');
+      await base.query('delete from dowel_migrations where version >= $1', [targetMigration]);
+      await base.query(
+        `insert into room_commits (branch_id, seq, client, n, user_name, op_name, op_args, changes)
+         values ('b1', 1, 'c1', 1, '张三', 'createSchema', $1::text::jsonb, $2::text::jsonb)`,
+        [JSON.stringify({ id: 's1', name: 'public' }), '[]'],
+      );
+    } finally {
+      await base.close();
+    }
+
+    const upgraded = await openPlatformDb(url);
+    try {
+      const [ver] = await upgraded.query<{ v: number }>('select max(version) as v from dowel_migrations');
+      expect(ver!.v).toBe(MIGRATIONS.length);
+      await upgraded.query(
+        `insert into room_commits (branch_id, seq, client, n, user_name, op_name, op_args, changes, op_summary)
+         values ('b1', 2, 'c1', 2, '张三', 'batch', $1::text::jsonb, $2::text::jsonb, $3)`,
+        [JSON.stringify({ ops: [] }), '[]', '新增订单表'],
+      );
+      const rows = await upgraded.query<{ seq: number | string; op_summary: string | null }>(
+        'select seq, op_summary from room_commits order by seq',
+      );
+      expect(rows.map((r) => [Number(r.seq), r.op_summary])).toEqual([
+        [1, null],
+        [2, '新增订单表'],
+      ]);
+
+      await upgraded.query('delete from dowel_migrations where version >= $1', [targetMigration]);
+    } finally {
+      await upgraded.close();
+    }
+    const rerun = await openPlatformDb(url);
+    try {
+      const [ver2] = await rerun.query<{ v: number }>('select max(version) as v from dowel_migrations');
+      expect(ver2!.v).toBe(MIGRATIONS.length);
+      const [row] = await rerun.query<{ op_summary: string | null }>(
+        'select op_summary from room_commits where seq = 2',
+      );
+      expect(row!.op_summary).toBe('新增订单表');
+    } finally {
+      await rerun.close();
+    }
+  });
 });

@@ -1,6 +1,8 @@
 import { describe, expect, test } from 'vitest';
 
 import {
+  diagnoseModel,
+  createSchema,
   addCheck,
   addColumn,
   addIndex,
@@ -732,5 +734,34 @@ describe('Stage 0 review regressions', () => {
         { column: null, expr: 'public.norm_key(tag)', opclass: null, collation: null },
       ],
     });
+  });
+});
+
+describe('diagnoseModel（PG）', () => {
+  test('按环境最低大版本检查，error / warning 分开，附带对象与最低版本', () => {
+    const m = emptyModel('pg');
+    createSchema(m, 'public', 's1');
+    createTable(m, 's1', 'items', 't1');
+    addColumn(m, 't1', { id: 'c1', name: 'v', type: 'integer', generated: { expr: '1 + 1', stored: false } });
+    addColumn(m, 't1', { id: 'c2', name: 'u', type: 'uuid', default: { expr: 'uuidv7()' } });
+    const d = diagnoseModel(m, [170002, 150004, null]);
+    expect(d.target).toBe('PG 15');
+    expect(d.compatibility.errors.total).toBe(1);
+    expect(d.compatibility.errors.items[0]).toMatchObject({
+      code: 'virtual_generated',
+      severity: 'error',
+      objectId: 'c1',
+      objectName: 'public.items.v',
+      minVersion: 'PG 18',
+    });
+    expect(d.compatibility.warnings.items).toEqual([
+      expect.objectContaining({ code: 'uuidv7_expr', severity: 'warning', objectId: 'c2' }),
+    ]);
+    expect(d.blocksPublish).toBe(false);
+
+    const d18 = diagnoseModel(m, [180000]);
+    expect(d18.target).toBe('PG 18');
+    expect(d18.compatibility.errors.total).toBe(0);
+    expect(d18.compatibility.warnings.total).toBe(0);
   });
 });

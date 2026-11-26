@@ -2,7 +2,7 @@ import { readFileSync } from 'node:fs';
 import { resolve } from 'node:path';
 
 // 审计动作文案与画布历史操作名 i18n 覆盖测试（#33）。
-import { mutators } from '@dowel/core';
+import { COMPOSITE_MUTATORS, mutators } from '@dowel/core';
 import { afterEach, expect, test } from 'vitest';
 
 import { actionText } from '../src/activity.ts';
@@ -48,8 +48,8 @@ test('hist.op.edit 在中英文下均有对应文案', async () => {
 test('所有 core mutators 在 zh / en 的 hist.op 词典中均有文案', async () => {
   for (const lng of ['zh', 'en'] as const) {
     await i18n.changeLanguage(lng);
-    // paste 不在普通 mutator 表里（由 runMutator 单独分派），一并检查
-    for (const op of [...Object.keys(mutators), 'paste']) {
+    // paste / batch 不在普通 mutator 表里（由 runMutator 单独分派），一并检查
+    for (const op of [...Object.keys(mutators), ...COMPOSITE_MUTATORS]) {
       expect(i18n.exists(`hist.op.${op}`, { lng }), `${lng}: 缺少 hist.op.${op}`).toBe(true);
     }
   }
@@ -84,5 +84,25 @@ test('邮件服务与找回密码审计动作在中英文下正确渲染', async
   expect(actionText('email.test', { to: 'ops@example.com' })).toBe('sent a test email to ops@example.com');
   expect(actionText('auth.forgot_password_request', { username: 'alice' })).toBe(
     'requested a password reset for alice',
+  );
+});
+
+test('model.mutate：带 MCP 意图说明时使用独立文案键，空白说明回退为普通文案', async () => {
+  await i18n.changeLanguage('zh');
+  expect(COMPOSITE_MUTATORS.has('batch')).toBe(true);
+  expect(i18n.t('hist.op.batch')).toBe('批量修改');
+  expect(actionText('model.mutate', { opCount: 3 })).toBe('修改了工作副本（3 处操作）');
+  expect(actionText('model.mutate', { opCount: 3, summary: '  新增订单表  ' })).toBe(
+    '修改了工作副本（3 处操作）：新增订单表',
+  );
+  expect(actionText('model.mutate', { opCount: 3, summary: '   ' })).toBe('修改了工作副本（3 处操作）');
+
+  await i18n.changeLanguage('en');
+  expect(i18n.t('hist.op.batch')).toBe('Batch edit');
+  expect(actionText('model.mutate', { opCount: 2, summary: 'add orders' })).toBe(
+    'edited the working copy (2 operations): add orders',
+  );
+  expect(actionText('model.mutate', { opCount: 2, summary: 1 })).toBe(
+    'edited the working copy (2 operations)',
   );
 });

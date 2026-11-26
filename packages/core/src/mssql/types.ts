@@ -171,27 +171,52 @@ export const isMssqlIdentityEligibleType = (type: string): boolean => {
   return /^(?:decimal|numeric)\(\d+,0\)$/.test(norm);
 };
 
-/** 检查模型在指定 SQL Server 主版本下的类型兼容性（如 2019/2022 不支持原生 json 与 vector(n)） */
-export const checkMssqlVersionCompatibility = (m: Model, targetMajor: number): string[] => {
+/** SQL Server 版本兼容性问题（结构化，供 diagnoseModel 汇总） */
+export interface MssqlCompatibilityIssue {
+  code: 'native_json' | 'vector_type';
+  severity: 'error';
+  objectId: string;
+  objectName: string;
+  /** 最低需要的 SQL Server 主版本号 */
+  minMajor: number;
+  message: string;
+}
+
+/** 收集模型在指定 SQL Server 主版本下的全部类型兼容性问题（如 2019/2022 不支持原生 json 与 vector(n)） */
+export const checkMssqlCompatibility = (m: Model, targetMajor: number): MssqlCompatibilityIssue[] => {
   const cap = mssqlCapabilities(targetMajor);
-  const errs: string[] = [];
+  const issues: MssqlCompatibilityIssue[] = [];
   const year = mssqlReleaseYear(targetMajor);
   for (const c of all(m, 'column')) {
     const t = find(m, c.parent);
     const label = t?.kind === 'table' ? `${t.name}.${c.name}` : c.name;
     if (!cap.nativeJson && isMssqlNativeJsonType(c.type)) {
-      errs.push(
-        `列 ${label} 使用了原生 json 类型，需要 SQL Server 2025（主版本 17+，当前目标 SQL Server ${year} / ${targetMajor}），低版本请改用 nvarchar(max)`,
-      );
+      issues.push({
+        code: 'native_json',
+        severity: 'error',
+        objectId: c.id,
+        objectName: label,
+        minMajor: 17,
+        message: `列 ${label} 使用了原生 json 类型，需要 SQL Server 2025（主版本 17+，当前目标 SQL Server ${year} / ${targetMajor}），低版本请改用 nvarchar(max)`,
+      });
     }
     if (!cap.vectorType && isMssqlVectorType(c.type)) {
-      errs.push(
-        `列 ${label} 使用了 ${c.type} 类型，需要 SQL Server 2025（主版本 17+，当前目标 SQL Server ${year} / ${targetMajor}）`,
-      );
+      issues.push({
+        code: 'vector_type',
+        severity: 'error',
+        objectId: c.id,
+        objectName: label,
+        minMajor: 17,
+        message: `列 ${label} 使用了 ${c.type} 类型，需要 SQL Server 2025（主版本 17+，当前目标 SQL Server ${year} / ${targetMajor}）`,
+      });
     }
   }
-  return errs;
+  return issues;
 };
+
+/** 检查模型在指定 SQL Server 主版本下的类型兼容性，返回错误文本列表（规划器用） */
+export const checkMssqlVersionCompatibility = (m: Model, targetMajor: number): string[] =>
+  checkMssqlCompatibility(m, targetMajor).map((i) => i.message);
 
 /** 界面推荐的 MSSQL 常用类型 */
 export const MSSQL_COMMON_TYPES: readonly string[] = [

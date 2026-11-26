@@ -1,6 +1,10 @@
 import { describe, expect, it } from 'vitest';
 
 import {
+  PlanError,
+  checkMysqlCompatibility,
+  checkMysqlVersionCompatibility,
+  diagnoseModel,
   addCheck,
   addColumn,
   addForeignKey,
@@ -795,5 +799,38 @@ describe('MySQL dialect core (MySQL 8.4 & 9.7)', () => {
     ]) {
       expect(findInstanceLevelStatement(ok, 'mysql'), `should allow: ${ok}`).toBeNull();
     }
+  });
+});
+
+describe('MySQL 静态兼容性收集与 diagnoseModel', () => {
+  const vectorModel = () => {
+    const m = emptyModel('mysql');
+    const s = createSchema(m, 'default');
+    const t = createTable(m, s, 'emb');
+    addColumn(m, t, { id: 'c1', name: 'id', type: 'int', notNull: true });
+    addColumn(m, t, { id: 'c2', name: 'v1', type: 'vector(3)' });
+    addColumn(m, t, { id: 'c3', name: 'v2', type: 'VECTOR(8)' });
+    return m;
+  };
+
+  it('一次收集全部不兼容的 VECTOR 列；规划器仍抛出第一条 PlanError', () => {
+    const m = vectorModel();
+    const issues = checkMysqlCompatibility(m, 80400);
+    expect(issues.map((i) => i.objectId)).toEqual(['c2', 'c3']);
+    expect(issues[0]).toMatchObject({ code: 'vector_type', severity: 'error', objectName: 'emb.v1' });
+    expect(checkMysqlCompatibility(m, 90700)).toEqual([]);
+    expect(checkMysqlCompatibility(m, null)).toEqual([]);
+    expect(() => checkMysqlVersionCompatibility(m, 80400)).toThrow(PlanError);
+    expect(() => checkMysqlVersionCompatibility(m, 80400)).toThrow(issues[0]!.message);
+  });
+
+  it('diagnoseModel 取环境最低版本作为目标', () => {
+    const m = vectorModel();
+    const d = diagnoseModel(m, [90700, 80413]);
+    expect(d.target).toBe('MySQL 8.4');
+    expect(d.compatibility.errors.total).toBe(2);
+    expect(d.compatibility.errors.items[0]).toMatchObject({ minVersion: 'MySQL 9.0' });
+    expect(diagnoseModel(m, [90700]).compatibility.errors.total).toBe(0);
+    expect(diagnoseModel(m, []).target).toBeNull();
   });
 });

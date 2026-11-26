@@ -567,3 +567,68 @@ test('恢复版本不与画布提交序号撞号，遗留数据过滤 restored_a
   expect(httpDetail0.status).toBe(200);
   expect((httpDetail0.data as CanvasHistoryDetail<Model>).entry.version).toBeNull();
 });
+
+test('MCP batch 提交：1 条历史记录，opSummary 单独返回（脱敏），整批 opDiff 可查看，普通提交没有 opSummary', async () => {
+  const [editorUser] = await db.query<{ id: string; name: string }>(
+    "select id, name from users where username = 'editor'",
+  );
+  const initial = (await rooms.model(branchId)).model;
+  const publicId = all(initial, 'schema').find((s) => s.name === 'public')!.id;
+
+  const res = await rooms.applyMcpOps(branchId, {
+    userId: editorUser!.id,
+    tokenId: 'tok-hist',
+    user: editorUser!.name,
+    baseSeq: 0,
+    summary: '  新增 orders 表 password=hunter2-secret  ',
+    ops: [
+      { name: 'createTable', args: { id: '$ref:t', schema: publicId, name: 'orders' } },
+      {
+        name: 'addColumn',
+        args: { table: '$ref:t', column: { id: '$ref:c1', name: 'id', type: 'bigint', notNull: true } },
+      },
+      {
+        name: 'addColumn',
+        args: { table: '$ref:t', column: { id: '$ref:c2', name: 'note', type: 'text' } },
+      },
+    ],
+  });
+  expect(res).toMatchObject({ ok: true, seq: 1, opCount: 3 });
+  if (!res.ok) return;
+
+  const [row] = await db.query<{ op_name: string; op_summary: string | null }>(
+    'select op_name, op_summary from room_commits where branch_id = $1 and seq = 1',
+    [branchId],
+  );
+  expect(row!.op_name).toBe('batch');
+  expect(row!.op_summary).toContain('新增 orders 表');
+  expect(row!.op_summary).not.toContain('hunter2-secret');
+
+  const list = await call('GET', `/api/projects/${pid}/history?limit=10`, undefined, viewerCookie);
+  expect(list.status).toBe(200);
+  const entries = (list.data as CanvasHistoryList).entries;
+  expect(entries.map((e) => e.seq)).toEqual([1, 0]);
+  expect(entries[0]).toMatchObject({ opName: 'batch', changeCount: 3, via: 'mcp' });
+  expect(entries[0]!.opSummary).toBe(row!.op_summary);
+  expect(entries[1]!.opSummary).toBeUndefined();
+
+  const detail = await call('GET', `/api/projects/${pid}/history/1`, undefined, viewerCookie);
+  expect(detail.status).toBe(200);
+  const d = detail.data as CanvasHistoryDetail;
+  expect(d.entry.opSummary).toBe(row!.op_summary);
+  expect(d.opDiff.total).toBeGreaterThan(0);
+  expect(d.opDiff.items.some((i) => i.sql.includes('orders'))).toBe(true);
+
+  // 不带 summary 的批提交没有 opSummary
+  const plain = await rooms.applyMcpOps(branchId, {
+    userId: editorUser!.id,
+    tokenId: 'tok-hist',
+    user: editorUser!.name,
+    baseSeq: 1,
+    ops: [{ name: 'setComment', args: { id: res.refs.t!, comment: '订单' } }],
+  });
+  expect(plain).toMatchObject({ ok: true, seq: 2, opCount: 1 });
+  const e2 = await rooms.historyEntry(branchId, 2);
+  expect(e2.opName).toBe('batch');
+  expect(e2.opSummary).toBeUndefined();
+});
