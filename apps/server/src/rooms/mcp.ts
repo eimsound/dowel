@@ -1,15 +1,31 @@
 import { MCP_REF_PATTERN } from '@dowel/api';
-import { EditError, type Model, MutableModelIndex, newId, type Obj, readsOf } from '@dowel/core';
+import {
+  BATCH_MUTATOR,
+  BATCH_OPS_LIMIT,
+  BATCH_SUMMARY_MAX,
+  type BatchArgs,
+  EditError,
+  type Model,
+  MutableModelIndex,
+  newId,
+  type Obj,
+  readsOf,
+  scrubSecrets,
+} from '@dowel/core';
 import type { Db } from '@dowel/engines';
-import { type Commit, execute, type Op, type Out, type Room, type SimulateCommit } from '@dowel/sync';
+import { type Commit, execute, type Op, type Out, type Room } from '@dowel/sync';
 
 import { forPeer } from './client-scope.ts';
 import { loadModelFromSnapshot } from './history.ts';
 import type { RoomKernel } from './kernel.ts';
 import type { Loaded } from './types.ts';
 
-/** MCP `apply_changes` 禁止调用的 mutator（如 `paste` 单 op 可包裹多达 20,000 子操作，避免绕过 MCP 100 op 批量上限） */
-export const MCP_DISALLOWED_MUTATORS: ReadonlySet<string> = new Set(['paste']);
+/**
+ * MCP `apply_changes` 禁止直接调用的 mutator：
+ * - `paste` 单 op 可包裹多达 20,000 子操作，会绕过 MCP 的批量上限；
+ * - `batch` 由服务端把整批收敛为 1 个 op 时内部使用（ADR 0015 第 3 节），禁止 AI 嵌套调用。
+ */
+export const MCP_DISALLOWED_MUTATORS: ReadonlySet<string> = new Set(['paste', BATCH_MUTATOR]);
 
 export interface ApplyMcpOpInput {
   name: string;
@@ -23,14 +39,13 @@ export interface ApplyMcpOpsOptions {
   baseSeq?: number;
   dryRun?: boolean;
   ops: ApplyMcpOpInput[];
+  /** 可选意图说明：脱敏后写入 batch 参数（room_commits.op_summary 与画布修改历史）；绝不做 `$ref` 展开 */
+  summary?: string;
   /**
-   * 写事务提交前的回调（仅非 dryRun 且至少有 1 条提交时在同一个 DB 事务 `tx` 内调用）。
+   * 写事务提交前的回调（仅非 dryRun 且有净变化时，在同一个 DB 事务 `tx` 内调用 1 次）。
    * 适合写入必须与本次提交同生共死的记录（例如 `auditIn(tx, ...)`）；回调抛错会回滚整批提交并恢复内存房间，不广播也不触发派生刷新。
    */
-  onBeforeCommit?: (
-    tx: Db,
-    info: { seqFrom: number; seqTo: number; committed: { index: number; seq: number }[] },
-  ) => Promise<void>;
+  onBeforeCommit?: (tx: Db, info: { seq: number; opCount: number }) => Promise<void>;
 }
 
 export interface ApplyMcpChangedItem {
@@ -45,14 +60,19 @@ export type ApplyMcpOpsResult =
       ok: true;
       dryRun: boolean;
       baseSeq: number;
+      /** 整批对应的唯一提交序号（dryRun 时为预计序号；noop 时为当前序号） */
       seq: number;
-      committed: { index: number; seq: number }[];
+      /** 展开后的底层子操作数 */
+      opCount: number;
       refs: Record<string, string>;
       changed: ApplyMcpChangedItem[];
       model: Model;
+      /** 整批没有净变化：不产生提交、不记审计、不广播 */
+      noop?: true;
     }
   | {
       ok: false;
+      /** 出错的输入操作下标（从 0 开始） */
       index?: number;
       currentSeq: number;
       code: 'base_seq_ahead' | 'conflict' | 'invalid' | 'dependency';
@@ -84,36 +104,28 @@ const expandMcpRefs = (value: unknown, refs: Map<string, string>): unknown => {
   return value;
 };
 
-const summarizeBatchChanges = (
+/** 意图说明：去首尾空白 → 脱敏 → 截断到上限；空串视为没有 */
+const sanitizeMcpSummary = (raw: string | undefined): string | undefined => {
+  const trimmed = raw?.trim();
+  if (!trimmed) return undefined;
+  const safe = scrubSecrets(trimmed).trim().slice(0, BATCH_SUMMARY_MAX).trim();
+  return safe || undefined;
+};
+
+const summarizeNetChanges = (
   before: Model,
   after: Model,
-  commits: SimulateCommit[],
+  changes: Commit['changes'],
 ): ApplyMcpChangedItem[] => {
-  const firstCreated = new Map<string, Obj>();
-  const touchedOrder: string[] = [];
-  const seen = new Set<string>();
-  for (const c of commits) {
-    for (const ch of c.changes) {
-      if (!seen.has(ch.id)) {
-        seen.add(ch.id);
-        touchedOrder.push(ch.id);
-      }
-      if (ch.obj && !firstCreated.has(ch.id)) {
-        firstCreated.set(ch.id, ch.obj);
-      }
-    }
-  }
   const items: ApplyMcpChangedItem[] = [];
-  for (const id of touchedOrder) {
-    const fin = after.objects[id];
+  for (const ch of changes) {
+    const fin = after.objects[ch.id];
     if (fin) {
-      items.push({ id, kind: fin.kind, name: fin.name, deleted: false });
+      items.push({ id: ch.id, kind: fin.kind, name: fin.name, deleted: false });
       continue;
     }
-    const prev = before.objects[id] ?? firstCreated.get(id);
-    if (prev) {
-      items.push({ id, kind: prev.kind, name: prev.name, deleted: true });
-    }
+    const prev = Object.hasOwn(before.objects, ch.id) ? before.objects[ch.id] : undefined;
+    if (prev) items.push({ id: ch.id, kind: prev.kind, name: prev.name, deleted: true });
   }
   return items;
 };
@@ -128,19 +140,22 @@ export class McpWriter {
   }
 
   /**
-   * 代表 MCP 令牌向工作副本应用一批原子操作（支持 baseSeq 冲突检测、`$ref:<alias>` 占位符与 `dryRun`）。
+   * 代表 MCP 令牌向工作副本原子应用一批操作（支持 baseSeq 冲突检测、`$ref:<alias>` 占位符与 `dryRun`）。
+   * 整批收敛为 1 个 `batch` op（ADR 0015 第 3 节）：1 个 seq / 1 条 room_commits / 1 次快照判断 / 1 次 WS 广播。
    * 锁顺序与 WS 提交一致：withActiveRoomLock → DB 事务（PG `branches FOR UPDATE` + catchUpFrom）→ 释放锁后广播与触发派生刷新。
    */
   async apply(branchId: string, opts: ApplyMcpOpsOptions): Promise<ApplyMcpOpsResult> {
     const client = `mcp:${opts.userId}:${opts.tokenId}`;
     const dryRun = !!opts.dryRun;
+    const safeSummary = sanitizeMcpSummary(opts.summary);
     let loadedRef: Loaded | null = null;
     let caughtUp: Commit[] = [];
 
+    type OkRes = Extract<ApplyMcpOpsResult, { ok: true }>;
     type LockValue =
       | { kind: 'err'; res: Extract<ApplyMcpOpsResult, { ok: false }> }
-      | { kind: 'dry'; res: Extract<ApplyMcpOpsResult, { ok: true }> }
-      | { kind: 'ok'; res: Extract<ApplyMcpOpsResult, { ok: true }>; outs: Out[] };
+      | { kind: 'dry'; res: OkRes }
+      | { kind: 'ok'; res: OkRes; outs: Out[] };
 
     const planAndSimulate = async (
       db: Db,
@@ -148,29 +163,27 @@ export class McpWriter {
     ): Promise<
       | LockValue
       | {
-          builtOps: Op[];
+          batchOp: Op;
+          opCount: number;
           refs: Map<string, string>;
           sim: Extract<ReturnType<Room['simulate']>, { ok: true }>;
         }
     > => {
       const currentSeq = r.room.seq;
+      const err = (
+        code: Extract<ApplyMcpOpsResult, { ok: false }>['code'],
+        message: string,
+        index?: number,
+      ): LockValue => ({
+        kind: 'err',
+        res: { ok: false, ...(index !== undefined ? { index } : {}), currentSeq, code, message },
+      });
       const effectiveBaseSeq = opts.baseSeq ?? currentSeq;
       if (!Number.isInteger(effectiveBaseSeq) || effectiveBaseSeq < 0) {
-        return {
-          kind: 'err',
-          res: { ok: false, currentSeq, code: 'invalid', message: `无效的 baseSeq：${opts.baseSeq}` },
-        };
+        return err('invalid', `无效的 baseSeq：${opts.baseSeq}`);
       }
       if (effectiveBaseSeq > currentSeq) {
-        return {
-          kind: 'err',
-          res: {
-            ok: false,
-            currentSeq,
-            code: 'base_seq_ahead',
-            message: `baseSeq (${effectiveBaseSeq}) 超过了当前最新版本号 (${currentSeq})`,
-          },
-        };
+        return err('base_seq_ahead', `baseSeq (${effectiveBaseSeq}) 超过了当前最新版本号 (${currentSeq})`);
       }
 
       const baseModel =
@@ -178,64 +191,64 @@ export class McpWriter {
           ? structuredClone(r.room.model)
           : await loadModelFromSnapshot(db, branchId, effectiveBaseSeq);
       if (!baseModel) {
-        return {
-          kind: 'err',
-          res: {
-            ok: false,
-            currentSeq,
-            code: 'conflict',
-            message: `历史版本 #${effectiveBaseSeq} 的快照已不可用，请基于最新 seq=${currentSeq} 重新读取后重试`,
-          },
-        };
+        return err(
+          'conflict',
+          `历史版本 #${effectiveBaseSeq} 的快照已不可用，请基于最新 seq=${currentSeq} 重新读取后重试`,
+        );
       }
 
-      const startN = r.room.processedOf(client) + 1;
+      // 在 baseModel 副本上逐步预演每个子操作：校验参数、展开 `$ref`，并收集每一步的外部依据
+      // （本批新建的对象不是外部依据；既有对象以 baseSeq 为依据版本，本批首次新建的对象要求当前仍不存在）
       const refs = new Map<string, string>();
-      const builtOps: Op[] = [];
+      const expandedOps: BatchArgs['ops'] = [];
+      /** 展开后子操作下标 → 输入操作下标（目前一一对应；复合宏展开后多对一） */
+      const inputIndexOf: number[] = [];
+      const merged = new Map<string, number | null>();
+      const firstReadStep = new Map<string, number>();
+      const createdInBatch = new Set<string>();
       let batchModel = structuredClone(baseModel);
       const batchIndex = new MutableModelIndex(batchModel);
-      const pendingOpNById = new Map<string, number>();
 
       for (let i = 0; i < opts.ops.length; i++) {
         const input = opts.ops[i]!;
         if (MCP_DISALLOWED_MUTATORS.has(input.name)) {
-          return {
-            kind: 'err',
-            res: {
-              ok: false,
-              index: i,
-              currentSeq,
-              code: 'invalid',
-              message: `MCP apply_changes 不允许使用操作：${input.name}`,
-            },
-          };
+          return err('invalid', `MCP apply_changes 不允许使用操作：${input.name}`, i);
         }
-        const n = startN + i;
         const expandedArgs = expandMcpRefs(input.args, refs);
         let execRes: ReturnType<typeof execute>;
         try {
           execRes = execute(batchModel, input.name, expandedArgs, batchIndex);
         } catch (e) {
-          if (e instanceof EditError) {
-            return {
-              kind: 'err',
-              res: { ok: false, index: i, currentSeq, code: 'invalid', message: e.message },
-            };
-          }
+          if (e instanceof EditError) return err('invalid', e.message, i);
           throw e;
         }
-        const readIds = new Set([
-          ...readsOf(baseModel, expandedArgs),
-          ...readsOf(batchModel, expandedArgs),
+        const stepIds = new Set([
+          ...readsOf(baseModel, expandedArgs, input.name),
+          ...readsOf(batchModel, expandedArgs, input.name),
           ...execRes.changes.map((c) => c.id),
         ]);
-        const reads: Op['reads'] = [...readIds].sort().map((id) => {
-          const prevN = pendingOpNById.get(id);
-          if (prevN !== undefined) return [id, `p:${client}:${prevN}`];
-          if (Object.hasOwn(baseModel.objects, id)) return [id, effectiveBaseSeq];
-          return [id, null];
-        });
-        builtOps.push({ client, n, name: input.name, args: expandedArgs, reads });
+        const stepReads: Op['reads'] = [];
+        for (const id of [...stepIds].sort()) {
+          if (createdInBatch.has(id) || merged.has(id)) continue;
+          const ver = Object.hasOwn(baseModel.objects, id) ? effectiveBaseSeq : null;
+          if (ver === null) createdInBatch.add(id);
+          merged.set(id, ver);
+          firstReadStep.set(id, expandedOps.length);
+          stepReads.push([id, ver]);
+        }
+        // 按子操作顺序检查外部依据：报告最早冲突的那一步，并给出人类可读的“X 已被 Y 修改”
+        const conflict = stepReads.length ? r.room.readConflict(client, stepReads) : null;
+        if (conflict) return err(conflict.code, conflict.message, i);
+
+        expandedOps.push({ name: input.name, args: expandedArgs });
+        inputIndexOf.push(i);
+        if (expandedOps.length > BATCH_OPS_LIMIT) {
+          return err(
+            'invalid',
+            `展开后的子操作超过上限 ${BATCH_OPS_LIMIT} 条，请拆分成多次 apply_changes`,
+            i,
+          );
+        }
 
         const batch = execRes.changes.map((c) => ({
           id: c.id,
@@ -244,23 +257,23 @@ export class McpWriter {
         }));
         batchIndex.applyBatch(execRes.next, batch);
         batchModel = execRes.next;
-        for (const c of execRes.changes) pendingOpNById.set(c.id, n);
       }
 
-      const sim = r.room.simulate(client, builtOps);
+      const batchArgs: BatchArgs = { ops: expandedOps, ...(safeSummary ? { summary: safeSummary } : {}) };
+      const batchOp: Op = {
+        client,
+        n: r.room.processedOf(client) + 1,
+        name: BATCH_MUTATOR,
+        args: batchArgs,
+        reads: [...merged.entries()].sort(([a], [b]) => (a < b ? -1 : a > b ? 1 : 0)),
+      };
+      const sim = r.room.simulate(client, [batchOp]);
       if (!sim.ok) {
-        return {
-          kind: 'err',
-          res: {
-            ok: false,
-            index: sim.failedIndex,
-            currentSeq,
-            code: sim.code,
-            message: sim.message,
-          },
-        };
+        const sub =
+          sim.subIndex ?? (sim.objectId !== undefined ? firstReadStep.get(sim.objectId) : undefined);
+        return err(sim.code, sim.message, sub !== undefined ? inputIndexOf[sub] : undefined);
       }
-      return { builtOps, refs, sim };
+      return { batchOp, opCount: expandedOps.length, refs, sim };
     };
 
     let lockedValue: LockValue;
@@ -274,19 +287,21 @@ export class McpWriter {
           caughtUp = missed.length > 0 ? [...missed, ...fresh] : fresh;
           const prepared = await planAndSimulate(this.k.db, r);
           if ('kind' in prepared) return prepared;
-          const { refs, sim } = prepared;
-          const changed = summarizeBatchChanges(r.room.model, sim.model, sim.commits);
+          const { refs, sim, opCount } = prepared;
+          const changes = sim.commits[0]?.changes ?? [];
+          const noop = changes.length === 0;
           return {
             kind: 'dry',
             res: {
               ok: true,
               dryRun: true,
               baseSeq: opts.baseSeq ?? r.room.seq,
-              seq: sim.headSeq,
-              committed: sim.commits.map((c, idx) => ({ index: idx, seq: c.seq })),
+              seq: noop ? r.room.seq : sim.headSeq,
+              opCount,
               refs: Object.fromEntries(refs),
-              changed,
+              changed: summarizeNetChanges(r.room.model, sim.model, changes),
               model: sim.model,
+              ...(noop ? { noop: true as const } : {}),
             },
           };
         }
@@ -305,45 +320,51 @@ export class McpWriter {
             }
             const prepared = await planAndSimulate(tx, r);
             if ('kind' in prepared) return prepared;
-            const { builtOps, refs, sim } = prepared;
+            const { batchOp, refs, sim, opCount } = prepared;
+            const changes = sim.commits[0]?.changes ?? [];
+            if (changes.length === 0) {
+              // 整批没有净变化：不写提交、不记审计、不广播
+              return {
+                kind: 'dry',
+                res: {
+                  ok: true,
+                  dryRun: false,
+                  baseSeq: opts.baseSeq ?? sim.baseSeq,
+                  seq: r.room.seq,
+                  opCount,
+                  refs: Object.fromEntries(refs),
+                  changed: [],
+                  model: sim.model,
+                  noop: true,
+                },
+              };
+            }
             const beforeModel = r.room.model;
             const store = this.k.makeStore(tx, branchId);
             mutated = true;
-            const allOuts: Out[] = [];
-            for (const op of builtOps) {
-              const outs = await r.room.handle(client, opts.user, { t: 'op', op }, { store });
-              let opCommitted = false;
-              for (const o of outs) {
-                if (o.msg.t === 'reject') {
-                  throw new Error(`预期预检通过的操作被拒绝：${o.msg.message}`);
-                }
-                if (o.msg.t === 'commit') opCommitted = true;
-                allOuts.push(o);
-              }
-              if (opCommitted) await this.k.maybeSnapshot(tx, branchId, r.room);
+            const outs = await r.room.handle(client, opts.user, { t: 'op', op: batchOp }, { store });
+            const commit = outs.find((o) => o.msg.t === 'commit');
+            const rejected = outs.find((o) => o.msg.t === 'reject');
+            if (rejected?.msg.t === 'reject') {
+              throw new Error(`预期预检通过的操作被拒绝：${rejected.msg.message}`);
             }
-            const committed = sim.commits.map((c, idx) => ({ index: idx, seq: c.seq }));
-            if (committed.length > 0 && opts.onBeforeCommit) {
-              await opts.onBeforeCommit(tx, {
-                seqFrom: committed[0]!.seq,
-                seqTo: committed.at(-1)!.seq,
-                committed,
-              });
-            }
-            const changed = summarizeBatchChanges(beforeModel, r.room.model, sim.commits);
+            if (!commit || commit.msg.t !== 'commit') throw new Error('预期预检通过的操作没有产生提交');
+            await this.k.maybeSnapshot(tx, branchId, r.room);
+            const seq = commit.msg.seq;
+            if (opts.onBeforeCommit) await opts.onBeforeCommit(tx, { seq, opCount });
             return {
               kind: 'ok',
               res: {
                 ok: true,
                 dryRun: false,
                 baseSeq: opts.baseSeq ?? sim.baseSeq,
-                seq: r.room.seq,
-                committed,
+                seq,
+                opCount,
                 refs: Object.fromEntries(refs),
-                changed,
+                changed: summarizeNetChanges(beforeModel, r.room.model, commit.msg.changes),
                 model: structuredClone(r.room.model),
               },
-              outs: allOuts,
+              outs,
             };
           });
         } catch (err) {
@@ -368,10 +389,8 @@ export class McpWriter {
         for (const p of loadedRef.peers) this.k.safeSend(p, forPeer(p, o.msg));
       }
     }
-    if (lockedValue.outs.some((o) => o.msg.t === 'commit')) {
-      this.notifyCommit(branchId);
-      await this.k.publish({ t: 'room.commit', branchId, seq: lockedValue.res.seq });
-    }
+    this.notifyCommit(branchId);
+    await this.k.publish({ t: 'room.commit', branchId, seq: lockedValue.res.seq });
     return lockedValue.res;
   }
 }

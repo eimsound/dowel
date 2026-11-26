@@ -1,6 +1,7 @@
 // 同步协议的消息和公共函数（04-ir-design.md 第 2 节）。客户端和服务器共用。
 import {
   clonePlain,
+  COMPOSITE_MUTATORS,
   deepEqual,
   type Model,
   MutableModelIndex,
@@ -230,9 +231,9 @@ export const execute = (
   });
 
   const draft: Model = { ...m, objects: objectsProxy };
-  // 粘贴一次展开成上千个子操作，每个都要做重名判定：没有现成索引时（例如还有待确认修改）临时建一个，
+  // 粘贴 / batch 一次展开成成百上千个子操作，每个都要做重名判定：没有现成索引时（例如还有待确认修改）临时建一个，
   // 一次 O(n) 建索引远比每个子操作 O(n) 枚举写时复制代理便宜
-  if (!baseIndex && name === 'paste') baseIndex = new MutableModelIndex(m);
+  if (!baseIndex && COMPOSITE_MUTATORS.has(name)) baseIndex = new MutableModelIndex(m);
   if (baseIndex) {
     const overlayIndex = new OverlayModelIndex(baseIndex, overlay, draft, wrapRoot);
     withModelIndex(draft, () => runMutator(draft, name, args), overlayIndex);
@@ -273,13 +274,14 @@ export const applyChanges = (m: Model, versions: Versions, changes: Change[], ve
   }
 };
 
-/** 依据：参数里涉及的对象 + 实际写到的对象 */
+/** 依据：参数里涉及的对象 + 实际写到的对象（name 为 batch 时按子操作逐步计算，见 readsOf） */
 export const opReads = (
   m: Model,
   versions: Versions,
   args: unknown,
   changes: Change[],
+  name?: string,
 ): [string, Ver | null][] => {
-  const ids = new Set([...readsOf(m, args), ...changes.map((c) => c.id)]);
+  const ids = new Set([...readsOf(m, args, name), ...changes.map((c) => c.id)]);
   return [...ids].sort().map((id) => [id, Object.hasOwn(m.objects, id) ? verOf(versions, id) : null]);
 };

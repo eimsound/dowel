@@ -781,6 +781,18 @@ export const CanvasHistory = ({
                               </div>
                             )}
 
+                            {entry.opSummary && (
+                              <p
+                                className={cx(
+                                  'm-0 line-clamp-2 text-xs break-words',
+                                  active ? 'text-text' : 'text-text-2',
+                                )}
+                                title={entry.opSummary}
+                              >
+                                {entry.opSummary}
+                              </p>
+                            )}
+
                             {entry.summary.length > 0 && (
                               <p
                                 className={cx(
@@ -913,6 +925,11 @@ export const CanvasHistory = ({
                             </>
                           )}
                         </div>
+                        {detail.entry.opSummary && (
+                          <p className="m-0 text-sm break-words whitespace-pre-wrap text-text">
+                            {detail.entry.opSummary}
+                          </p>
+                        )}
 
                         {detail.entry.seq === 0 ? (
                           <Banner kind="info">{t('hist.initNoOpDiff')}</Banner>

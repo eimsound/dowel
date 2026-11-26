@@ -1337,6 +1337,18 @@ export const MIGRATIONS: MigrationStep[] = [
         await tx.exec('alter table versions add column retired_by text references users on delete set null;');
     },
   },
+  // ADR 0015 第 3 节：MCP `batch` 提交的可选意图说明（画布修改历史单独一行展示；其余提交为 null）
+  {
+    run: async (tx, d) => {
+      if (d === 'pg') {
+        await tx.exec('alter table room_commits add column if not exists op_summary text;');
+        return;
+      }
+      const cols = await tx.query<{ name: string }>('pragma table_info(room_commits)');
+      if (!cols.some((c) => c.name === 'op_summary'))
+        await tx.exec('alter table room_commits add column op_summary text;');
+    },
+  },
 ];
 
 /** PG 启动迁移使用的跨副本 advisory lock 键 */

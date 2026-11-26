@@ -63,7 +63,7 @@ export class SyncClient {
   mutate(name: string, args: unknown, basis?: Versions): number {
     const baseIdx = this.pending.length === 0 ? this.getConfirmedIndex() : undefined;
     const { next, changes } = execute(this.view, name, args, baseIdx);
-    let reads = opReads(this.view, this.viewVersions, args, changes);
+    let reads = opReads(this.view, this.viewVersions, args, changes, name);
     if (basis) reads = reads.map(([id, v]) => [id, Object.hasOwn(basis, id) ? basis[id]! : v]);
     const rawOp: Op = { client: this.id, n: this.nextN++, name, args, reads };
     const op: PendingOp = { ...rawOp, stale: false };

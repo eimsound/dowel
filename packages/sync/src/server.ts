@@ -1,5 +1,13 @@
 // 服务器端的房间：一个分支的工作副本。按到达顺序逐个处理修改，冲突或不合法就拒绝。
-import { clonePlain, deepEqual, EditError, type Model, MutableModelIndex, type Obj } from '@dowel/core';
+import {
+  BatchOpError,
+  clonePlain,
+  deepEqual,
+  EditError,
+  type Model,
+  MutableModelIndex,
+  type Obj,
+} from '@dowel/core';
 
 import {
   type Commit,
@@ -52,15 +60,37 @@ export type SimulateResult =
       failedIndex: number;
       code: Rejection['code'];
       message: string;
+      /** 失败的是 batch 里的哪个子操作（从 0 开始；仅 batch 子操作不合法时给出） */
+      subIndex?: number;
+      /** 冲突时，被别人改过 / 删除的对象 ID */
+      objectId?: string;
     };
+
+/** 依据冲突：哪个对象、为什么（人类可读，如“表 users 已被 alice 修改，请在最新数据上重新操作”） */
+export interface ReadConflict {
+  code: 'conflict' | 'dependency';
+  message: string;
+  objectId?: string;
+}
 
 class Reject extends Error {
   code: Rejection['code'];
-  constructor(code: Rejection['code'], message: string) {
+  subIndex?: number;
+  objectId?: string;
+  constructor(
+    code: Rejection['code'],
+    message: string,
+    extra: { subIndex?: number; objectId?: string } = {},
+  ) {
     super(message);
     this.code = code;
+    if (extra.subIndex !== undefined) this.subIndex = extra.subIndex;
+    if (extra.objectId !== undefined) this.objectId = extra.objectId;
   }
 }
+
+const invalidOf = (e: EditError): Reject =>
+  new Reject('invalid', e.message, e instanceof BatchOpError ? { subIndex: e.index } : {});
 
 export const DEFAULT_LOG_LIMIT = 2000;
 export const DEFAULT_OUTCOME_LIMIT = 4000;
@@ -228,7 +258,7 @@ export class Room {
         try {
           result = execute(simModel, op.name, op.args, simIndex);
         } catch (e) {
-          if (e instanceof EditError) throw new Reject('invalid', e.message);
+          if (e instanceof EditError) throw invalidOf(e);
           throw e;
         }
         const batch = result.changes.map((c) => ({
@@ -248,11 +278,42 @@ export class Room {
         commits.push({ n: op.n, seq: simSeq, name: op.name, changes: result.changes });
       } catch (e) {
         if (!(e instanceof Reject)) throw e;
-        return { ok: false, failedIndex: i, code: e.code, message: e.message };
+        return {
+          ok: false,
+          failedIndex: i,
+          code: e.code,
+          message: e.message,
+          ...(e.subIndex !== undefined ? { subIndex: e.subIndex } : {}),
+          ...(e.objectId !== undefined ? { objectId: e.objectId } : {}),
+        };
       }
     }
 
     return { ok: true, baseSeq, headSeq: simSeq, model: simModel, commits };
+  }
+
+  /**
+   * 只读检查一组依据在房间当前状态下是否仍然成立（与 handle 的先到先得规则一致），不修改任何内存状态。
+   * 返回第一个冲突（人类可读的“X 已被 Y 修改”），全部成立时返回 null。供 MCP 按子操作顺序定位最早冲突的子操作。
+   */
+  readConflict(client: string, reads: Op['reads']): ReadConflict | null {
+    try {
+      this.checkReadsAgainst(
+        { client, n: 0, name: '', args: null, reads },
+        this.s.model,
+        this.s.versions,
+        this.outcome,
+        false,
+      );
+      return null;
+    } catch (e) {
+      if (!(e instanceof Reject) || e.code === 'invalid') throw e;
+      return {
+        code: e.code,
+        message: e.message,
+        ...(e.objectId !== undefined ? { objectId: e.objectId } : {}),
+      };
+    }
   }
 
   get stats(): RoomMemoryStats {
@@ -613,7 +674,7 @@ export class Room {
       try {
         result = execute(s.model, op.name, op.args, this.getModelIndex()); // 在最新状态上重新执行，校验以服务器为准
       } catch (e) {
-        if (e instanceof EditError) throw new Reject('invalid', e.message);
+        if (e instanceof EditError) throw invalidOf(e);
         throw e;
       }
       const commit: Commit = { t: 'commit', seq: s.seq + 1, client, n: op.n, user, changes: result.changes };
@@ -668,7 +729,9 @@ export class Room {
       if (!ok) {
         const who = this.lastWriter.get(id) ?? '其他人';
         const what = cur ? `${kindName[cur.kind] ?? cur.kind} ${cur.name}` : '对象';
-        throw new Reject('conflict', `${what} 已被 ${who} ${cur ? '修改' : '删除'}，请在最新数据上重新操作`);
+        throw new Reject('conflict', `${what} 已被 ${who} ${cur ? '修改' : '删除'}，请在最新数据上重新操作`, {
+          objectId: id,
+        });
       }
     }
   }

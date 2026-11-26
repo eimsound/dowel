@@ -23,7 +23,9 @@ const rangeOf = (d: Record<string, unknown>): string => {
 
 export const actionText = (action: string, data: unknown) => {
   const d = (data ?? {}) as Record<string, unknown>;
-  const key = `act.${action}`;
+  // MCP apply_changes 附带的意图说明单独一个文案键（不往句末拼后缀，#36）
+  const summary = action === 'model.mutate' && typeof d.summary === 'string' ? d.summary.trim() : '';
+  const key = summary ? 'act.model.mutate_with_summary' : `act.${action}`;
   if (!i18n.exists(key)) return i18n.t('act.unknown');
   const environment = typeof d.environment === 'string' ? d.environment.trim() : '';
   const name = typeof d.name === 'string' ? d.name : environment;
@@ -37,6 +39,7 @@ export const actionText = (action: string, data: unknown) => {
     provider: typeof d.provider === 'string' ? d.provider : '',
     to: typeof d.to === 'string' ? d.to : '',
     range: rangeOf(d),
+    summary,
   });
 };
 

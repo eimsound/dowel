@@ -832,6 +832,7 @@ const zh = {
       restore: '从修改历史恢复了工作副本',
       apply_version: '将版本 {{range}} 应用到了画布',
       mutate: '修改了工作副本（{{count}} 处操作）',
+      mutate_with_summary: '修改了工作副本（{{count}} 处操作）：{{summary}}',
       verify: '在影子库验证了迁移',
     },
     grant: {
@@ -2155,6 +2156,7 @@ const zh = {
       init: '初始状态',
       edit: '编辑模型',
       paste: '粘贴',
+      batch: '批量修改',
       createSchema: '新建 Schema',
       renameSchema: '重命名 Schema',
       dropSchema: '删除 Schema',
@@ -3213,6 +3215,7 @@ const en: typeof zh = {
       restore: 'restored the working copy from canvas history',
       apply_version: 'applied version {{range}} to the canvas',
       mutate: 'edited the working copy ({{count}} operations)',
+      mutate_with_summary: 'edited the working copy ({{count}} operations): {{summary}}',
       verify: 'verified the migration in the shadow database',
     },
     grant: {
@@ -4605,6 +4608,7 @@ const en: typeof zh = {
       init: 'Initial state',
       edit: 'Edit model',
       paste: 'Paste',
+      batch: 'Batch edit',
       createSchema: 'Create schema',
       renameSchema: 'Rename schema',
       dropSchema: 'Drop schema',

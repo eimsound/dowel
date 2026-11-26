@@ -183,8 +183,39 @@ export type McpToolErrorCode =
   | 'rate_limited'
   | 'internal';
 
-/** apply_changes：一次最多多少个操作 */
+/** apply_changes：一次最多多少个输入操作 */
 export const MCP_MAX_OPS = 100;
+/** apply_changes：展开后的底层子操作上限（与 @dowel/core 的 BATCH_OPS_LIMIT 一致；整批作为 1 个 batch op 提交） */
+export const MCP_MAX_EXPANDED_OPS = 500;
+/** apply_changes：可选意图说明 summary 的最大长度（与 @dowel/core 的 BATCH_SUMMARY_MAX 一致） */
+export const MCP_SUMMARY_MAX = 500;
+
+/** apply_changes 响应附带的单条静态兼容性问题（与 @dowel/core 的 ModelCompatibilityIssue 同构） */
+export interface McpCompatibilityIssue {
+  code: string;
+  severity: 'error' | 'warning';
+  objectId?: string;
+  objectName?: string;
+  message: string;
+  minVersion?: string;
+}
+
+/**
+ * apply_changes 响应（含 dryRun）附带的写后静态自检（ADR 0015 第 5 节）：完整 validate 错误 + 基于项目最低目标环境
+ * （平台库缓存的环境版本，绝不连目标库）的静态兼容性 errors / warnings；每个列表最多 50 条，total 为完整条数。
+ * 不阻塞提交：画布准入门槛与界面一致，允许工作副本处于多步草稿中间态。
+ */
+export interface McpDiagnostics {
+  /** 推导出的项目最低目标版本（如 'PG 15'）；没有缓存的环境版本或方言不区分版本时为 null */
+  target: string | null;
+  validation: { total: number; items: string[] };
+  compatibility: {
+    errors: { total: number; items: McpCompatibilityIssue[] };
+    warnings: { total: number; items: McpCompatibilityIssue[] };
+  };
+  /** 存在 validate 错误：发布版本会被拒绝 */
+  blocksPublish: boolean;
+}
 /** apply_changes：参数里 `$ref:<alias>` 占位符由服务端换成新的 UUIDv7 */
 export const MCP_REF_PATTERN = /^\$ref:[A-Za-z0-9_.-]{1,64}$/;
 
@@ -195,7 +226,7 @@ export const MCP_AUDIT_ACTIONS = [
   'mcp_token.revoke',
   /** 停用 / 重置密码时批量吊销某个用户的全部 MCP 令牌 */
   'mcp_token.revoke_all',
-  /** apply_changes 成功提交（dryRun 不记） */
+  /** apply_changes 成功提交（dryRun 与无净变化的 noop 不记） */
   'model.mutate',
   /** verify_migration（影子库验证） */
   'model.verify',

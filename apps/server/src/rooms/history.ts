@@ -68,6 +68,12 @@ const summarizeModel = (model: Model): { changeCount: number; summary: string[] 
   return { changeCount: objs.length, summary: [...top, ...sub].slice(0, HISTORY_SUMMARY_LIMIT) };
 };
 
+/** room_commits.op_summary（MCP batch 的意图说明）→ 历史条目的 opSummary；空值不输出 */
+const opSummaryField = (raw: string | null | undefined): Pick<CanvasHistoryEntry, 'opSummary'> => {
+  const s = typeof raw === 'string' ? raw.trim() : '';
+  return s ? { opSummary: s } : {};
+};
+
 const mcpTokenIdFromClient = (client: string): string | null => {
   if (!client.startsWith('mcp:')) return null;
   const parts = client.split(':');
@@ -223,13 +229,14 @@ export class CanvasHistory {
       client: string;
       user_name: string;
       op_name: string | null;
+      op_summary: string | null;
       changes: Commit['changes'];
       created_at: unknown;
     };
     const rows =
       beforeSeq !== undefined
         ? await this.k.db.query<CommitRow>(
-            `select seq, client, user_name, op_name, changes, created_at
+            `select seq, client, user_name, op_name, op_summary, changes, created_at
                from room_commits
               where branch_id = $1 and seq < $2
               order by seq desc
@@ -237,7 +244,7 @@ export class CanvasHistory {
             [branchId, beforeSeq, limit],
           )
         : await this.k.db.query<CommitRow>(
-            `select seq, client, user_name, op_name, changes, created_at
+            `select seq, client, user_name, op_name, op_summary, changes, created_at
                from room_commits
               where branch_id = $1
               order by seq desc
@@ -273,6 +280,7 @@ export class CanvasHistory {
         isCurrent: seq === currentSeq,
         version: versions.get(seq) ?? null,
         ...this.mcpHistoryMeta(row.client, mcpPrefixes),
+        ...opSummaryField(row.op_summary),
       };
     });
 
@@ -306,10 +314,11 @@ export class CanvasHistory {
       client: string;
       user_name: string;
       op_name: string | null;
+      op_summary: string | null;
       changes: Commit['changes'];
       created_at: unknown;
     }>(
-      'select seq, client, user_name, op_name, changes, created_at from room_commits where branch_id = $1 and seq = $2',
+      'select seq, client, user_name, op_name, op_summary, changes, created_at from room_commits where branch_id = $1 and seq = $2',
       [branchId, seq],
     );
     if (!row) throw new HTTPException(404, { message: `修改记录 #${seq} 不存在` });
@@ -331,6 +340,7 @@ export class CanvasHistory {
       isCurrent: seq === currentSeq,
       version: versions.get(seq) ?? null,
       ...this.mcpHistoryMeta(row.client, mcpPrefixes),
+      ...opSummaryField(row.op_summary),
     };
   }
 }

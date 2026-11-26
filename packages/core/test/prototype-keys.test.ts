@@ -152,3 +152,28 @@ describe('原型属性名作为 mutator 名或依赖 ID', () => {
     expect(Object.keys(m.objects).sort()).toEqual(['c1', 's1', 't1']);
   });
 });
+
+describe('batch 与原型属性名（#87 / #90）', () => {
+  test('子操作名为原型属性名时按未知操作拒绝（不会命中 Object.prototype）', () => {
+    for (const k of PROTO_KEYS) {
+      const m = setup();
+      expect(() => E.runMutator(m, 'batch', { ops: [{ name: k, args: {} }] }), k).toThrow(E.BatchOpError);
+    }
+  });
+
+  test('原型属性名作为文本参数时 batch 正常执行，依据不误收集，summary 不扫描', () => {
+    const m = setup();
+    const args = {
+      summary: 'constructor',
+      ops: [
+        { name: 'renameTable', args: { id: 't1', name: 'constructor' } },
+        { name: 'setComment', args: { id: 't1', comment: 'toString' } },
+        { name: 'addColumn', args: { table: 't1', column: { id: 'c2', name: 'valueOf', type: 'text' } } },
+      ],
+    };
+    expect(E.readsOf(m, args, 'batch')).toEqual(['t1']);
+    E.runMutator(m, 'batch', args);
+    expect(E.get(m, 't1', 'table').name).toBe('constructor');
+    expect(E.get(m, 'c2', 'column').name).toBe('valueOf');
+  });
+});

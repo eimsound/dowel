@@ -246,21 +246,46 @@ const renderMysqlAddForeignKey = (
   return sql;
 };
 
-/** 校验目标 MySQL 版本是否支持模型中用到的类型特性（如 9.0+ VECTOR） */
-export const checkMysqlVersionCompatibility = (m: Model, versionNum: number | null | undefined): void => {
-  if (versionNum === null || versionNum === undefined) return;
-  if (versionNum < 90000) {
-    for (const c of all(m, 'column')) {
-      if (isMysqlVectorType(c.type)) {
-        const t = get(m, c.parent, 'table');
-        const major = Math.floor(versionNum / 10000);
-        const minor = Math.floor((versionNum % 10000) / 100);
-        throw new PlanError(
-          `列 ${t.name}.${c.name} 使用了 VECTOR 类型（${c.type}），需要 MySQL 9.0+（当前目标 MySQL ${major}.${minor}）`,
-        );
-      }
-    }
+/** MySQL 版本兼容性问题（结构化，供 diagnoseModel 汇总） */
+export interface MysqlCompatibilityIssue {
+  code: 'vector_type';
+  severity: 'error';
+  objectId: string;
+  objectName: string;
+  /** 最低需要的 MySQL 版本（如 '9.0'） */
+  minVersion: string;
+  message: string;
+}
+
+/** 收集模型在目标 MySQL 数值版本号下的全部类型兼容性问题（不抛错；如 9.0+ VECTOR） */
+export const checkMysqlCompatibility = (
+  m: Model,
+  versionNum: number | null | undefined,
+): MysqlCompatibilityIssue[] => {
+  if (versionNum === null || versionNum === undefined || versionNum >= 90000) return [];
+  const major = Math.floor(versionNum / 10000);
+  const minor = Math.floor((versionNum % 10000) / 100);
+  const issues: MysqlCompatibilityIssue[] = [];
+  for (const c of all(m, 'column')) {
+    if (!isMysqlVectorType(c.type)) continue;
+    const t = m.objects[c.parent];
+    const label = t?.kind === 'table' ? `${t.name}.${c.name}` : c.name;
+    issues.push({
+      code: 'vector_type',
+      severity: 'error',
+      objectId: c.id,
+      objectName: label,
+      minVersion: '9.0',
+      message: `列 ${label} 使用了 VECTOR 类型（${c.type}），需要 MySQL 9.0+（当前目标 MySQL ${major}.${minor}）`,
+    });
   }
+  return issues;
+};
+
+/** 校验目标 MySQL 版本是否支持模型中用到的类型特性（如 9.0+ VECTOR）；不支持时抛出第一个问题的 PlanError */
+export const checkMysqlVersionCompatibility = (m: Model, versionNum: number | null | undefined): void => {
+  const first = checkMysqlCompatibility(m, versionNum)[0];
+  if (first) throw new PlanError(first.message);
 };
 
 /** 检查一个键/索引的前缀列是否能覆盖外键列（顺序一致） */
