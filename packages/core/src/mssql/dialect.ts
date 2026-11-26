@@ -33,6 +33,7 @@ import {
   mssqlTokenize,
 } from './quote.ts';
 import { isMssqlIdentityEligibleType, MSSQL_COMMON_TYPES, mssqlNormalizeType } from './types.ts';
+import { mssqlVersioning } from './versioning.ts';
 
 const EMPTY_DBO_ID = 'dowel:empty-database:dbo';
 
@@ -370,4 +371,5 @@ export const mssqlDialect: DialectSpec = {
   findInstanceLevelStatement: mssqlFindInstanceLevelStatement,
   instanceLevelDescription: MSSQL_INSTANCE_LEVEL_DESCRIPTION,
   clipboard: mssqlClipboard,
+  versioning: mssqlVersioning,
 };

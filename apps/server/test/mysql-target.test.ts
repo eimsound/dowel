@@ -44,7 +44,7 @@ import { StepError, verifyScripts } from '@dowel/verifier';
 import { afterAll, beforeAll, describe, expect, test, vi } from 'vitest';
 
 import { createMysqlTestDb, mysqlDbUrl, useMysqlTestDb } from '../../../test/mysql.ts';
-import { formatVersionNum } from '../src/envs.ts';
+import { formatVersionNum, projectPgVersionSummary } from '../src/envs.ts';
 import { createApp, openPlatformDb, type PlatformDb } from '../src/index.ts';
 import { KeyedLimiter } from '../src/rate-limit.ts';
 import { encrypt } from '../src/secrets.ts';
@@ -363,11 +363,10 @@ describe('MySQL 目标库服务端驱动与全栈', () => {
     const mixShadows = new Shadows(pdb, async () => {});
     try {
       const sel = await mixShadows.forProjectVersions(mixPid);
-      expect(sel.targetPgMajor).toBeNull();
-      expect(sel.envPgMajors).toEqual([]);
-      expect(sel.targetMysqlGroup).toBe(804);
-      expect(sel.entries.map((e) => e.mysqlGroup)).toEqual([804, 907]);
-      expect(sel.entries.every((e) => e.major === null)).toBe(true);
+      expect(sel.targetGroupKey).toBe(804);
+      expect(sel.entries.map((e) => e.groupKey)).toEqual([804, 907]);
+      // 对外 PG 大版本字段对 MySQL 项目恒为空
+      expect(await projectPgVersionSummary(pdb, mixPid)).toEqual({ targetPgMajor: null, envPgMajors: [] });
     } finally {
       await mixShadows.close();
     }
@@ -406,8 +405,7 @@ describe('MySQL 目标库服务端驱动与全栈', () => {
       shadows.forProjectVersions = async () => ({
         entries: [
           {
-            major: null,
-            mysqlGroup: 907,
+            groupKey: 907,
             envId: 'e-dev-97',
             label: 'dev97：shadow97',
             shadow: stubShadow(async () => ({
@@ -423,16 +421,13 @@ describe('MySQL 目标库服务端驱动与全栈', () => {
             })),
           },
         ],
-        skippedMajors: [
+        skippedGroups: [
           {
-            major: null,
-            mysqlGroup: 804,
+            groupKey: 804,
             reason: '环境“prod84”是生产环境，默认不在同一实例上建影子库',
           },
         ],
-        targetPgMajor: null,
-        envPgMajors: [],
-        targetMysqlGroup: 804,
+        targetGroupKey: 804,
       });
 
       const missingRes = await req('POST', `/api/projects/${mixVerPid}/versions`, { name: 'v1-missing-84' });
@@ -459,8 +454,7 @@ describe('MySQL 目标库服务端驱动与全栈', () => {
       shadows.forProjectVersions = async () => ({
         entries: [
           {
-            major: null,
-            mysqlGroup: 804,
+            groupKey: 804,
             envId: 'e-prod-84',
             label: 'prod84：shadow84',
             shadow: stubShadow(async () => ({
@@ -476,10 +470,8 @@ describe('MySQL 目标库服务端驱动与全栈', () => {
             })),
           },
         ],
-        skippedMajors: [],
-        targetPgMajor: null,
-        envPgMajors: [],
-        targetMysqlGroup: 804,
+        skippedGroups: [],
+        targetGroupKey: 804,
       });
 
       const mismatchRes = await req('POST', `/api/projects/${mixVerPid}/versions`, {

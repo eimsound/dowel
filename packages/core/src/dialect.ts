@@ -35,6 +35,38 @@ export interface DialectCapabilities {
   comments: boolean;
 }
 
+/**
+ * 多版本影子库矩阵策略：项目环境按版本组分组，每组 1 个代表影子库，组间按键升序逐一验证，最小键即项目最低目标版本组。
+ * 只有按版本分组验证的方言（PG / MySQL）提供；不分组的方言（MSSQL / SQLite）不提供，上层把全部环境视为同一 null 组，
+ * 不打版本标签、不做最低目标门禁，也忽略任何上游传入的组键。
+ */
+export interface DialectVersionMatrix {
+  /** 数值版本号 → 版本组键（PG 大版本 160004 → 16；MySQL 主次版本 80413 → 804）；未知或非法返回 null */
+  groupKeyOf(versionNum: number | null | undefined): number | null;
+  /** 版本组展示标签（PG 16 → 'PG 16'；MySQL 804 → 'MySQL 8.4'），用于验证报告前缀与缺失目标提示 */
+  groupLabel(groupKey: number): string;
+  /** 最低目标版本组影子库实测错配时“请为 … 环境配置同{粒度}的独立影子库”里的粒度词（PG '大版本'；MySQL '版本'） */
+  readonly groupGranularity: string;
+  /**
+   * 版本组对应的对外“大版本”：对外 API 的历史字段（engineMajor / shadowMajor / targetPgMajor / envPgMajors /
+   * targets[].major / missingTargetMajor）只对 PG 有值，其余方言返回 null。
+   */
+  publicMajorOfGroup(groupKey: number): number | null;
+}
+
+/**
+ * 方言的版本语义（纯函数、无 I/O）：多版本矩阵分组、项目最低目标版本推导与版本串格式化。
+ * 上层编排（Shadows / envs / 多版本验证）只经由这些钩子处理版本，不再按方言名分支。
+ */
+export interface DialectVersioning {
+  /** 多版本影子库矩阵策略；不按版本分组验证的方言不提供 */
+  readonly matrix?: DialectVersionMatrix;
+  /** 由项目全部环境的数值版本号推导项目最低目标版本的规划选项（PG `{ pgMajor }`、MySQL `{ mysqlVersionNum }`）；无可推导时返回 undefined */
+  targetPlanOptions(versionNums: readonly (number | null | undefined)[]): PlanOptions | undefined;
+  /** 数值版本号 → 简洁版本串（PG 160004 → '16.4'；MySQL 80413 → '8.4.13'；SQLite 3054001 → '3.54.1'） */
+  formatVersionNum(versionNum: number): string;
+}
+
 export type IdentKind = 'schema' | 'table' | 'column' | 'enum' | 'sequence' | 'constraint' | 'index';
 
 export interface DialectSpec {
@@ -81,4 +113,6 @@ export interface DialectSpec {
   instanceLevelDescription: string;
   /** 画布复制粘贴的方言适配器（命名空间、推导名、类型 / 自增 / 聚集索引兼容性、分区等） */
   readonly clipboard: ClipboardDialect;
+  /** 版本语义钩子（分组、目标版本、对外大版本、格式化） */
+  readonly versioning: DialectVersioning;
 }

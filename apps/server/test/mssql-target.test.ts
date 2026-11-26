@@ -658,14 +658,13 @@ describe('MSSQL URL parsing and shadow naming (pure unit)', () => {
           close: async () => {},
         }) as Shadow;
 
-      // 即使上游 mock 传入了 major / targetPgMajor / shadowMajor，非 PG 方言也不能记录 targets 或 PG 文案
+      // 即使上游 mock 传入了版本组键 / 目标组 / shadowMajor，不按版本分组的方言也不能记录 targets 或版本标签文案
       created.shadows.forProjectVersions = async () => ({
-        targetPgMajor: 16,
-        envPgMajors: [16],
-        skippedMajors: [],
+        targetGroupKey: 16,
+        skippedGroups: [],
         entries: [
           {
-            major: 16,
+            groupKey: 16,
             envId: 'e-mssql-16',
             label: 'dev：app_dowel',
             shadow: stubShadow(async () => ({
@@ -704,12 +703,11 @@ describe('MSSQL URL parsing and shadow naming (pure unit)', () => {
       // 失败场景：错误文案与 shadow 标签不能带 "PG ..." 前缀，且不返回 targets
       await addMssqlTable('orders');
       created.shadows.forProjectVersions = async () => ({
-        targetPgMajor: 16,
-        envPgMajors: [16],
-        skippedMajors: [],
+        targetGroupKey: 16,
+        skippedGroups: [],
         entries: [
           {
-            major: 16,
+            groupKey: 16,
             envId: 'e-mssql-16',
             label: 'dev：app_dowel',
             shadow: stubShadow(async () => ({

@@ -31,6 +31,7 @@ import { parsePartitionBound, validatePartitionBound } from './partition.ts';
 import { createAll as pgCreateAll, plan as pgPlan } from './plan.ts';
 import { ident, KEYWORDS, literal, qualified } from './quote.ts';
 import { COMMON_TYPES, normalizeType as pgNormalizeType } from './types.ts';
+import { pgVersioning } from './versioning.ts';
 
 const EMPTY_PUBLIC_ID = 'dowel:empty-database:public';
 const PG_MAX_BYTES = 63;
@@ -582,4 +583,5 @@ export const pgDialect: DialectSpec = {
   findInstanceLevelStatement: pgFindInstanceLevelStatement,
   instanceLevelDescription: PG_INSTANCE_LEVEL_DESCRIPTION,
   clipboard: pgClipboard,
+  versioning: pgVersioning,
 };

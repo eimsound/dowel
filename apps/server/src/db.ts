@@ -114,10 +114,14 @@ const types = (d: Dialect) =>
         f: '0',
       };
 
-type ColumnKind = 'json' | 'bool';
+export type ColumnKind = 'json' | 'bool';
 
-/** SQLite 读出时需要转换的列，键是“表.列”（不是全局列名） */
-const COLUMN_KINDS = new Map<string, ColumnKind>([
+/**
+ * SQLite 读出时需要转换的列，键是“表.列”（不是全局列名）。
+ * 平台迁移建出的全部 PG `jsonb` / `boolean` 列都必须在这里登记、且不能留下已删除的表 / 列，
+ * 由 `apps/server/test/column-kinds.test.ts` 对照真实 PG 迁移结果守护。
+ */
+export const BUILTIN_COLUMN_KINDS: ReadonlyMap<string, ColumnKind> = new Map<string, ColumnKind>([
   ['branches.layout', 'json'],
   ['branches.sections', 'json'],
   ['branches.baseline', 'json'],
@@ -159,6 +163,9 @@ const COLUMN_KINDS = new Map<string, ColumnKind>([
   ['token_policies.rule', 'json'],
   ['users.must_change_password', 'bool'],
 ]);
+
+/** 运行时实际查询用的表：内置登记 + registerColumnKind 追加的（测试表） */
+const COLUMN_KINDS = new Map<string, ColumnKind>(BUILTIN_COLUMN_KINDS);
 
 /** 登记新增表 / 列的转换规则（测试里也用这个造同名列不同表） */
 export const registerColumnKind = (table: string, column: string, kind: ColumnKind) => {
