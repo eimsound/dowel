@@ -8,15 +8,16 @@ The server lives on the same port as the web app, at `POST /api/mcp` (stateless 
 
 ## 1. What AI can and can't do {#boundaries}
 
-| AI can                                                                                      | AI can't                                                                                    |
-| ------------------------------------------------------------------------------------------- | ------------------------------------------------------------------------------------------- |
-| List projects, read the model, tables, DDL, the version chain, and migration previews       | Publish versions                                                                            |
-| Read environment status and drift **from the platform cache** (with the time it was cached) | Connect to an environment's target database (no live status, history, or drift checks)      |
-| Verify a migration in the shadow database (`verify` permission)                             | Execute, roll back, mark as applied, write a baseline, submit or approve execution requests |
-| Edit the working copy with an atomic batch of operations (`write` permission)               | Change connection strings, execution policies, tokens, or import a whole schema             |
-| Adjust canvas sections incrementally (`write` permission)                                   | Write table positions on the canvas (auto-layout and dragging decide them)                  |
+| AI can                                                                                                                     | AI can't                                                                                    |
+| -------------------------------------------------------------------------------------------------------------------------- | ------------------------------------------------------------------------------------------- |
+| List projects, read the model, tables, objects such as views and functions, DDL, the version chain, and migration previews | Publish versions                                                                            |
+| Read environment status and drift **from the platform cache** (with the time it was cached)                                | Connect to an environment's target database (no live status, history, or drift checks)      |
+| Verify a migration in the shadow database (`verify` permission)                                                            | Execute, roll back, mark as applied, write a baseline, submit or approve execution requests |
+| Edit the working copy with an atomic batch of operations (`write` permission)                                              | Change connection strings, execution policies, tokens, or import a whole schema             |
+| Adjust canvas sections incrementally (`write` permission)                                                                  | Write table positions on the canvas (auto-layout and dragging decide them)                  |
+| Read canvas history and the diff of each change                                                                            | Restore canvas history (only people can restore, in the UI)                                 |
 
-Publishing and executing always stay with people in the Dowel UI, through your execution policies and approvals.
+Publishing and executing always stay with people in the Dowel UI, through your execution policies and approvals. Restoring canvas history is also done only by people in the UI.
 
 Edits made by AI go through the same sync layer as the canvas: if an object the AI read was changed or deleted by someone else afterwards, the whole batch is rejected with `conflict` and nothing is applied. Accepted edits appear live for everyone who has the model open, show up in **canvas history** under your name with an `MCP` mark, and can be restored like any other change.
 
@@ -84,20 +85,23 @@ Any other MCP client that supports the **Streamable HTTP** transport works with 
 
 Tools take a `project` argument: a project ID or its `owner/project` path. Your client only sees the tools allowed by the token's permissions.
 
-| Tool                | Permission | What it does                                                                                                                                                                                                        |
-| ------------------- | ---------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| `list_projects`     | read       | Projects you can access (within the token's project list)                                                                                                                                                           |
-| `get_model`         | read       | The working copy: summary or full objects with their versions, and the current `seq`; plus canvas sections, dialect capabilities, and the derived lowest target version                                             |
-| `get_table`         | read       | One table with columns, keys, constraints, indexes and partitions                                                                                                                                                   |
-| `get_ddl`           | read       | `CREATE` DDL for the working copy or a version                                                                                                                                                                      |
-| `list_versions`     | read       | The version chain                                                                                                                                                                                                   |
-| `get_version`       | read       | One version with its frozen up/down migration                                                                                                                                                                       |
-| `preview_migration` | read       | Up/down SQL between two versions (default: latest version → working copy)                                                                                                                                           |
-| `list_environments` | read       | Environments with cached current version and drift status, and when they were cached                                                                                                                                |
-| `list_mutators`     | read       | The edit operations (the `defineTable` / `alterColumn` macros first) with a description and the JSON Schema of their arguments                                                                                      |
-| `verify_migration`  | verify     | Runs the migration in the shadow database and compares the result (same as **Verify in shadow database** in the UI)                                                                                                 |
-| `apply_changes`     | write      | Applies a batch of edit operations atomically; arguments: `baseSeq` (from `get_model`), `ops` (up to 100), optional `summary` (intent, up to 500 characters), `dryRun`; use `"$ref:<alias>"` for IDs of new objects |
-| `manage_sections`   | write      | Adjusts canvas sections incrementally; arguments: `actions` (up to 50), `dryRun`; see [Canvas sections](#sections) below                                                                                            |
+| Tool                | Permission | What it does                                                                                                                                                                                                                                               |
+| ------------------- | ---------- | ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `list_projects`     | read       | Projects you can access (within the token's project list)                                                                                                                                                                                                  |
+| `get_model`         | read       | The working copy: summary or full objects with their versions, and the current `seq`; plus canvas sections, dialect capabilities, and the derived lowest target version; can filter by schema, section, or keyword and include diagnostics (see below)     |
+| `get_table`         | read       | One table with columns, keys, constraints, indexes and partitions, plus its section (`sectionId`), the triggers, policies, and exclusion constraints on it (`opaques`), and the views, functions, and other objects that depend on it (`dependentOpaques`) |
+| `get_objects`       | read       | Full definitions (with DDL and dependencies) of enums, sequences, extensions, and opaque objects such as views, functions, and triggers; look up by ID, kind, schema, or keyword; see [Object context](#objects) below                                     |
+| `get_ddl`           | read       | `CREATE` DDL for the working copy or a version                                                                                                                                                                                                             |
+| `list_versions`     | read       | The version chain                                                                                                                                                                                                                                          |
+| `get_version`       | read       | One version with its frozen up/down migration                                                                                                                                                                                                              |
+| `preview_migration` | read       | Up/down SQL between two versions (default: latest version → working copy)                                                                                                                                                                                  |
+| `list_environments` | read       | Environments with cached current version and drift status, and when they were cached                                                                                                                                                                       |
+| `list_history`      | read       | Canvas history (grouped into editing sessions by default); see [Canvas history](#history) below                                                                                                                                                            |
+| `get_history_diff`  | read       | The net change and migration diff of one history entry or a whole editing session; see [Canvas history](#history) below                                                                                                                                    |
+| `list_mutators`     | read       | The edit operations (the `defineTable` / `alterColumn` macros first) with a description and the JSON Schema of their arguments                                                                                                                             |
+| `verify_migration`  | verify     | Runs the migration in the shadow database and compares the result (same as **Verify in shadow database** in the UI)                                                                                                                                        |
+| `apply_changes`     | write      | Applies a batch of edit operations atomically; arguments: `baseSeq` (from `get_model`), `ops` (up to 100), optional `summary` (intent, up to 500 characters), `dryRun`; use `"$ref:<alias>"` for IDs of new objects                                        |
+| `manage_sections`   | write      | Adjusts canvas sections incrementally; arguments: `actions` (up to 50), `dryRun`; see [Canvas sections](#sections) below                                                                                                                                   |
 
 A typical session: `get_model` (note `seq`) → `apply_changes` with that `baseSeq` → `preview_migration` → `verify_migration` → a person reviews and publishes in Dowel.
 
@@ -113,7 +117,28 @@ Extra context in `get_model` (in `summary`, `full`, and the truncated result abo
 
 - `capabilities`: what the project's dialect supports (multiple schemas, enums, sequences, partitioning, transactional DDL, identifier length limit, and so on).
 - `target`: the lowest target version derived from the **cached** version numbers of the project's environments, for example `{ "label": "PG 15", "features": { "virtualGenerated": false, … }, "source": "platform_cache", "environments": { "total": 3, "withCachedVersion": 2 } }`. It matches `diagnostics.target` from `apply_changes`. `label` and `features` are `null` when there are no environments, no version has been cached yet, or the project uses SQLite. Only the platform database is read; target databases are never contacted.
-- `sections`: canvas sections. Summaries list `{ id, name, color, tableCount }` and every table also has a `sectionId` (`null` when it isn't in a section; partitions follow their parent). With `detail: "full"` you get `{ id, name, color, tables }`, and `objects` still contains only model objects. Deleted tables never appear in a section.
+- `sections`: canvas sections. Summaries list `{ id, name, color, tableCount }` and every table also has a `sectionId` (`null` when it isn't in a section; partitions follow their parent, even when the parent is in another schema). With `detail: "full"` you get `{ id, name, color, tables }`, and `objects` still contains only model objects. Deleted tables never appear in a section.
+
+`get_model` arguments (all optional; when several are given they are combined, and `counts` reflects the filtered result):
+
+| Argument      | Description                                                                                                                                                                                                                                                                                                              |
+| ------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------ |
+| `schema`      | Only one schema (ID or name). Triggers, policies, and exclusion constraints follow the schema of their table                                                                                                                                                                                                             |
+| `detail`      | `summary` (default) or `full`. Without `schema`, `full` returns only summaries with `truncated: true` when more than 200 tables remain after filtering                                                                                                                                                                   |
+| `q`           | Keyword (case-insensitive): matches table names, schema names, table comments, and column names (matching columns are listed in `matchedColumns`, up to 10), plus names and comments of enums, sequences, extensions, views, and other objects. When a partitioned parent table matches, all its partitions are included |
+| `section`     | A section ID, `$none` (tables in no section), or a section name (case-insensitive and must be unique; duplicates return `invalid_arguments` listing the candidate IDs). Returns only those tables and the objects attached to them; with `full`, also the enums and sequences their columns reference                    |
+| `diagnostics` | `true` adds the same `diagnostics` as `apply_changes` (platform cache only; target databases are never contacted)                                                                                                                                                                                                        |
+
+When `q` or `section` is given, the response includes `filter` (the effective `schema`, `section`, and `q`). In summaries, enums include `values`, sequences include `options` and `ownedBy`, extensions include their `schema`, and views, triggers, and other objects include `parentKind` (`schema` or `table`) and, for table-level objects, `tableId` / `table`.
+
+### Object context {#objects}
+
+`get_objects` reads objects other than tables: enums, sequences, extensions, and opaque objects (views, materialized views, functions, procedures, domains, types, aggregates, triggers, policies, and exclusion constraints).
+
+- Look up by `ids` (up to 50; unknown IDs and IDs of tables, columns, or other objects are listed in `missing` — use `get_table` for tables), or filter with `kind` (`enum`, `sequence`, `extension`, `opaque`), `objType` (such as `view`, `function`, `trigger`), `schema`, and `q`. Give at least one of `ids`, `kind`, `objType`, or `q`.
+- Results come in a fixed order; page with `limit` (up to 100, default 50) and `offset`. The response has `total` and `nextOffset`.
+- Each object is its full definition plus `ver` and `schema`; opaque objects also have `parentKind`, `tableId`, `table`, and resolved dependencies `deps: [{ id, kind, name }]`.
+- DDL on one page is capped at 200,000 characters in total. Objects after the cap omit `ddl` and are marked `ddlOmitted: true`, and the response has `truncated: true`; read them by `ids` when you need them.
 
 ### Canvas sections {#sections}
 
@@ -210,6 +235,27 @@ The server expands it in a fixed, safe order: drop identity → clear the defaul
 
 Read-only resources are also available: `dowel://projects`, `dowel://projects/{owner}/{project}/model`, `…/ddl`, `…/versions`, `…/environments`, and `dowel://mutators`.
 
+### Canvas history (read-only) {#history}
+
+AI can read the [canvas history](modeling.md#canvas-history) but can't restore it: restoring is confirmed only by people in the canvas **History** panel. These two tools only read the history stored in the platform database. They don't normalize the model, never connect to shadow or target databases, and aren't audited.
+
+- `list_history` lists history from newest to oldest. By default (`grouped: true`) it groups consecutive regular edits by the same person into editing sessions, just like the UI (`seqFrom`…`seq`, `stepCount`, `ops`); `grouped: false` lists single steps. Page with `beforeSeq` (the previous page's `nextBeforeSeq`); `limit` is up to 50 (default 20). Each entry has the user, time, an object summary, and the published `version`; MCP edits have `via: "mcp"` and their intent `opSummary` (in the list, longer than 200 characters is truncated and marked `opSummaryTruncated`).
+- `get_history_diff` shows one entry (`seq`) or a whole editing session (`from` = the session's `seqFrom`, `seq` = its last step, up to 50 steps). It returns `entry` (with the full `opSummary`), `objects` (added, removed, and modified objects, up to 200), and `diff` (migration-style steps, the first `maxItems`, default 30 and up to 100; SQL longer than 2,000 characters is truncated and marked `sqlTruncated`, and `includeSql: false` leaves SQL out). `includeSteps: true` also returns every step in the session. It never returns the full model or a diff against the current canvas (use `get_model` / `preview_migration` for that). A `seq` beyond the current one returns `history_not_found` (with `currentSeq`); an invalid range returns `invalid_arguments`.
+
+### Prompts {#prompts}
+
+Dowel also offers MCP prompts (clients usually show them as slash commands or templates) that guide the AI through the recommended tool sequence:
+
+| Prompt                       | Permission | Arguments                                     | What it does                                                                                                                                          |
+| ---------------------------- | ---------- | --------------------------------------------- | ----------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `review_unpublished_changes` | read       | `project`                                     | Reviews changes that aren't published yet: migration SQL risks, potentially lossy operations, and the history behind them                             |
+| `review_canvas_history`      | read       | `project`, optional `beforeSeq`, `limit`      | Browses the grouped canvas history and summarizes the net change of each editing session                                                              |
+| `design_tables`              | write      | `project`, `requirements`, optional `section` | Designs new tables from requirements and creates them in one atomic `apply_changes` call (`defineTable` / `addForeignKey`), then checks `diagnostics` |
+| `refactor_column`            | write      | `project`, `table`, `column`, `change`        | Checks dependencies first, then renames or retypes the column safely with `alterColumn` by column ID                                                  |
+
+- Your client only sees the prompts allowed by the token's permissions. Prompts suggest `verify_migration` only when the token has the `verify` permission.
+- Prompts are guidance text only: generating one never looks up the project (an unknown project doesn't cause an error), and project permissions are checked when the AI then calls tools. Every prompt reminds the AI that publishing versions, connecting to or running migrations on target databases, and restoring canvas history are done only by people in Dowel.
+
 ## 5. Security and administration {#security}
 
 - **Isolation.** MCP tokens (`dwm_…`) only work on `/api/mcp`, and `/api/mcp` only accepts MCP tokens: session cookies and CI tokens are rejected there, and an MCP token on any other endpoint (including `/api/ci/...`) returns `403 forbidden`.
@@ -233,4 +279,4 @@ Authentication errors are returned as JSON `{ "error": "…", "code": "…" }` b
 
 Browser-based clients sending a cross-origin `Origin` header are rejected before authentication by the origin guard with HTTP `403` and a generic `{ "error": "…" }` JSON body (without a `code` field, rather than `McpHttpErrorBody`).
 
-Tool failures are returned inside MCP as `isError: true` with a `code` such as `project_not_found`, `forbidden`, `scope_required`, `invalid_arguments`, `conflict`, `invalid`, `base_seq_ahead`, `table_not_found`, `section_not_found`, or `shadow_unavailable`.
+Tool failures are returned inside MCP as `isError: true` with a `code` such as `project_not_found`, `forbidden`, `scope_required`, `invalid_arguments`, `conflict`, `invalid`, `base_seq_ahead`, `table_not_found`, `section_not_found`, `history_not_found`, or `shadow_unavailable`.

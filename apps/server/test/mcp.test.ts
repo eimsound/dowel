@@ -1,6 +1,7 @@
 import {
   type CanvasSection,
   MCP_MAX_EXPANDED_OPS,
+  MCP_PROMPTS,
   MCP_SUMMARY_MAX,
   MCP_TOOLS,
   type McpScope,
@@ -15,18 +16,21 @@ import {
   createTable,
   getDialect,
   newId,
+  type Column,
+  type Opaque,
+  type Table,
 } from '@dowel/core';
 import type { Commit, ToClient } from '@dowel/sync';
 // M3-C MCP 服务集成测试（ADR 0014）：
 // 在 SQLite 与 PostgreSQL 两种平台库下通过真实 app.request 测试完整的 JSON-RPC 传输（2025-11-25 与 2026-07-28）、
-// 12 个工具（含 manage_sections 增量板块）、6 个资源/模板、scope ∩ 生效角色 ∩ 白名单鉴权、Rooms.applyMcpOps（$ref / baseSeq / dryRun / 冲突回滚 / 历史 / 审计）、
+// 15 个工具（含 manage_sections 增量板块与只读对象上下文 / 画布历史）、6 个资源/模板、4 个 Prompts、scope ∩ 生效角色 ∩ 白名单鉴权、Rooms.applyMcpOps（$ref / baseSeq / dryRun / 冲突回滚 / 历史 / 审计）、
 // 影子库 verify_migration 与用户级限流、list_environments 仅读平台缓存以及 HTTP 安全守卫（405 / 415 / 413 / 403）。
 import {
   CLIENT_CAPABILITIES_META_KEY,
   CLIENT_INFO_META_KEY,
   PROTOCOL_VERSION_META_KEY,
 } from '@modelcontextprotocol/server';
-import { afterAll, describe, expect, test } from 'vitest';
+import { afterAll, describe, expect, test, vi } from 'vitest';
 
 import { createTestDb, PG_URL } from '../../../test/pg.ts';
 import { createApp } from '../src/app.ts';
@@ -1932,6 +1936,811 @@ describe.each([
       expect(resData.sections).toEqual([{ id: secId, name: '事件', color: 'peer-2', tableCount: 1 }]);
       expect(resData.target.label).toBe('PG 16');
       expect(resData.capabilities).toEqual(getDialect('pg').capabilities);
+    },
+  );
+
+  // ───── ADR 0015 第 6 节（A5）：只读对象上下文、只读画布历史与 MCP Prompts ─────
+
+  /** p1（pg 方言）：跨 schema 分区、枚举 / 序列 / 扩展、schema 级与表级不透明对象、超大函数 DDL */
+  const seedContextModel = async (f: Awaited<ReturnType<typeof setupEnv>>) => {
+    const ids = {
+      publicId: '',
+      auditId: newId(),
+      bulkId: newId(),
+      orders: newId(),
+      ordersIdCol: newId(),
+      ordersEmailCol: newId(),
+      ordersStatusCol: newId(),
+      events: newId(),
+      eventsAtCol: newId(),
+      evChild: newId(),
+      evChildAtCol: newId(),
+      notes: newId(),
+      notesBodyCol: newId(),
+      orderStatus: newId(),
+      orderSeq: newId(),
+      citext: newId(),
+      pgcrypto: newId(),
+      orderView: newId(),
+      trgOrders: newId(),
+      trgChild: newId(),
+      fnA: newId(),
+      fnB: newId(),
+    };
+    await editModel(f.created.rooms, f.db, f.p1Id, (m) => {
+      ids.publicId = all(m, 'schema').find((s) => s.name === 'public')?.id ?? createSchema(m, 'public');
+      m.objects[ids.auditId] = { id: ids.auditId, kind: 'schema', name: 'audit', comment: null };
+      m.objects[ids.bulkId] = { id: ids.bulkId, kind: 'schema', name: 'bulk', comment: null };
+      m.objects[ids.orderStatus] = {
+        id: ids.orderStatus,
+        kind: 'enum',
+        parent: ids.publicId,
+        name: 'order_status',
+        values: ['new', 'paid'],
+        comment: '订单状态',
+      };
+      m.objects[ids.orderSeq] = {
+        id: ids.orderSeq,
+        kind: 'sequence',
+        parent: ids.publicId,
+        name: 'order_seq',
+        nameMode: 'explicit',
+        ownedBy: ids.ordersIdCol,
+        options: {
+          type: 'bigint',
+          increment: '1',
+          min: null,
+          max: null,
+          start: null,
+          cache: '1',
+          cycle: false,
+        },
+        comment: null,
+      };
+      m.objects[ids.citext] = {
+        id: ids.citext,
+        kind: 'extension',
+        parent: ids.publicId,
+        name: 'citext',
+        comment: null,
+      };
+      m.objects[ids.pgcrypto] = {
+        id: ids.pgcrypto,
+        kind: 'extension',
+        parent: ids.auditId,
+        name: 'pgcrypto',
+        comment: '加密函数',
+      };
+      const table = (id: string, parent: string, name: string, extra: Record<string, unknown> = {}) => {
+        m.objects[id] = {
+          id,
+          kind: 'table',
+          parent,
+          name,
+          partitionBy: null,
+          partitionOf: null,
+          comment: null,
+          ...extra,
+        } as Table;
+      };
+      table(ids.orders, ids.publicId, 'orders', { comment: '客户订单' });
+      table(ids.events, ids.publicId, 'events', {
+        partitionBy: {
+          strategy: 'range',
+          keys: [{ column: ids.eventsAtCol, expr: null, opclass: null, collation: null }],
+        },
+      });
+      // 跨 schema 的分区子表：名字不含 events，只能经父表连带保留 / 继承板块
+      table(ids.evChild, ids.auditId, 'ev_p2026', {
+        partitionOf: { parent: ids.events, bound: "FOR VALUES FROM ('2026-01-01') TO ('2027-01-01')" },
+      });
+      table(ids.notes, ids.publicId, 'notes');
+      addColumn(m, ids.orders, {
+        id: ids.ordersIdCol,
+        name: 'id',
+        type: 'bigint',
+        notNull: true,
+        default: { nextval: ids.orderSeq },
+      });
+      addColumn(m, ids.orders, { id: ids.ordersEmailCol, name: 'customer_email', type: 'text' });
+      addColumn(m, ids.orders, {
+        id: ids.ordersStatusCol,
+        name: 'status',
+        type: '',
+        typeRef: ids.orderStatus,
+      });
+      addColumn(m, ids.events, { id: ids.eventsAtCol, name: 'at', type: 'timestamp with time zone' });
+      // 分区子表不能直接 addColumn：按父表的列复制一份
+      m.objects[ids.evChildAtCol] = {
+        ...(m.objects[ids.eventsAtCol] as Column),
+        id: ids.evChildAtCol,
+        parent: ids.evChild,
+      };
+      addColumn(m, ids.notes, { id: ids.notesBodyCol, name: 'body', type: 'text' });
+      const opaque = (
+        id: string,
+        objType: Opaque['objType'],
+        parent: string,
+        name: string,
+        ddl: string[],
+        deps: string[] = [],
+      ) => {
+        m.objects[id] = {
+          id,
+          kind: 'opaque',
+          objType,
+          parent,
+          name,
+          ddl,
+          drop: `DROP ${objType} ${name}`,
+          deps,
+          order: 0,
+          comment: null,
+        };
+      };
+      opaque(
+        ids.orderView,
+        'view',
+        ids.publicId,
+        'order_view',
+        ['CREATE VIEW public.order_view AS SELECT id FROM public.orders'],
+        [ids.orders, ids.ordersIdCol],
+      );
+      opaque(ids.trgOrders, 'trigger', ids.orders, 'trg_orders', [
+        'CREATE TRIGGER trg_orders BEFORE INSERT ON public.orders FOR EACH ROW EXECUTE FUNCTION f()',
+      ]);
+      opaque(ids.trgChild, 'trigger', ids.evChild, 'trg_ev', [
+        'CREATE TRIGGER trg_ev BEFORE INSERT ON audit.ev_p2026 FOR EACH ROW EXECUTE FUNCTION f()',
+      ]);
+      const bigBody = `SELECT ${'1 + '.repeat(30_000)}1`;
+      opaque(ids.fnA, 'function', ids.bulkId, 'fn_a()', [`CREATE FUNCTION bulk.fn_a() AS $$ ${bigBody} $$`]);
+      opaque(ids.fnB, 'function', ids.bulkId, 'fn_b()', [`CREATE FUNCTION bulk.fn_b() AS $$ ${bigBody} $$`]);
+    });
+    return ids;
+  };
+
+  test.skipIf(skip)(
+    'get_model 过滤（schema / section / $none / q / diagnostics）与 opaque / extension 回归、get_objects、get_table 上下文',
+    async () => {
+      const f = await setupEnv();
+      const ids = await seedContextModel(f);
+      const tokWrite = await f.issueToken(f.alice.id, ['read', 'write']);
+      const tokRead = await f.issueToken(f.bob.id, ['read']);
+      const peer = makePeer(f.alice);
+      await f.created.rooms.join(f.branch1, peer.peer);
+
+      // 板块：Sales（orders + events，分区子表随父表）、两个大小写不同的同名板块
+      const secRes = await f.callTool(tokWrite.token, 'manage_sections', {
+        project: f.p1Id,
+        actions: [
+          { action: 'create', ref: 'sales', name: 'Sales', tables: [ids.orders, ids.events] },
+          { action: 'create', ref: 'd1', name: 'Dup' },
+          { action: 'create', ref: 'd2', name: 'dup' },
+        ],
+      });
+      expect(secRes.isError).toBeFalsy();
+      const refs = secRes.structuredContent!.refs as Record<string, string>;
+      const salesId = refs.sales!;
+
+      type TableSummary = { id: string; name: string; sectionId: string | null; matchedColumns?: string[] };
+      type OpaqueSummary = {
+        id: string;
+        schemaId: string;
+        schema: string;
+        parentKind: string;
+        tableId: string | null;
+        table: string | null;
+      };
+      const getModel = async (args: Record<string, unknown>) => {
+        const res = await f.callTool(tokRead.token, 'get_model', { project: f.p1Id, ...args });
+        return res;
+      };
+      const names = (items: unknown) => (items as { name: string }[]).map((t) => t.name).sort();
+
+      // 向后兼容：不传新参数时没有 filter / diagnostics 字段
+      const plain = await getModel({});
+      expect(plain.isError).toBeFalsy();
+      const plainData = plain.structuredContent!;
+      expect(plainData).not.toHaveProperty('filter');
+      expect(plainData).not.toHaveProperty('diagnostics');
+      expect(names(plainData.tables)).toEqual(['ev_p2026', 'events', 'notes', 'orders']);
+      const plainOpaques = plainData.opaques as OpaqueSummary[];
+      // 缺陷 1：表级 opaque 的 schemaId 是所在表的 schema，不再错填成表 ID
+      expect(plainOpaques.find((o) => o.id === ids.trgOrders)).toMatchObject({
+        schemaId: ids.publicId,
+        schema: 'public',
+        parentKind: 'table',
+        tableId: ids.orders,
+        table: 'orders',
+      });
+      expect(plainOpaques.find((o) => o.id === ids.orderView)).toMatchObject({
+        schemaId: ids.publicId,
+        parentKind: 'schema',
+        tableId: null,
+        table: null,
+      });
+      expect((plainData.enums as { id: string; values: string[]; valueCount: number }[])[0]).toMatchObject({
+        id: ids.orderStatus,
+        values: ['new', 'paid'],
+        valueCount: 2,
+        comment: '订单状态',
+      });
+      expect((plainData.sequences as Record<string, unknown>[])[0]).toMatchObject({
+        id: ids.orderSeq,
+        nameMode: 'explicit',
+        ownedBy: ids.ordersIdCol,
+        options: { type: 'bigint' },
+      });
+      expect(
+        (plainData.extensions as { name: string; schema: string; schemaId: string }[]).find(
+          (x) => x.name === 'pgcrypto',
+        ),
+      ).toMatchObject({ schemaId: ids.auditId, schema: 'audit', comment: '加密函数' });
+      const plainTables = plainData.tables as TableSummary[];
+      expect(plainTables.find((t) => t.name === 'ev_p2026')!.sectionId).toBe(salesId);
+
+      // 缺陷 1 + 2 + 跨 schema 板块继承：按 schema 过滤不丢表级 opaque 与 extension
+      const audit = (await getModel({ schema: 'audit' })).structuredContent!;
+      expect(names(audit.tables)).toEqual(['ev_p2026']);
+      expect((audit.tables as TableSummary[])[0]!.sectionId).toBe(salesId);
+      expect((audit.opaques as OpaqueSummary[]).map((o) => o.id)).toEqual([ids.trgChild]);
+      expect((audit.opaques as OpaqueSummary[])[0]).toMatchObject({
+        schemaId: ids.auditId,
+        schema: 'audit',
+        tableId: ids.evChild,
+        table: 'ev_p2026',
+      });
+      expect(names(audit.extensions)).toEqual(['pgcrypto']);
+      const pub = (await getModel({ schema: 'public' })).structuredContent!;
+      expect(names(pub.extensions)).toEqual(['citext']);
+      expect((pub.opaques as OpaqueSummary[]).map((o) => o.id).sort()).toEqual(
+        [ids.orderView, ids.trgOrders].sort(),
+      );
+
+      // q：列名命中带 matchedColumns；顶层分区父表命中时连带保留分区子表
+      const qEmail = (await getModel({ q: 'EMAIL' })).structuredContent!;
+      expect(qEmail.filter).toEqual({ schema: null, section: null, q: 'EMAIL' });
+      expect((qEmail.tables as TableSummary[]).map((t) => [t.name, t.matchedColumns])).toEqual([
+        ['orders', ['customer_email']],
+      ]);
+      expect((qEmail.counts as { tables: number }).tables).toBe(1);
+      const qEvents = (await getModel({ q: 'events' })).structuredContent!;
+      expect(names(qEvents.tables)).toEqual(['ev_p2026', 'events']);
+      const qOrder = (await getModel({ q: 'order' })).structuredContent!;
+      expect(names(qOrder.enums)).toEqual(['order_status']);
+      expect(names(qOrder.sequences)).toEqual(['order_seq']);
+      // 表级 opaque 也按 schema.table.name 匹配
+      expect(names(qOrder.opaques)).toEqual(['order_view', 'trg_orders']);
+
+      // section：大小写不敏感唯一名称；summary 不返回无关 schema 级对象，只保留命中表上的表级 opaque
+      const sales = (await getModel({ section: 'sales' })).structuredContent!;
+      expect(sales.filter).toEqual({ schema: null, section: salesId, q: null });
+      expect(names(sales.tables)).toEqual(['ev_p2026', 'events', 'orders']);
+      expect(sales.enums).toEqual([]);
+      expect(sales.sequences).toEqual([]);
+      expect(sales.extensions).toEqual([]);
+      expect((sales.opaques as OpaqueSummary[]).map((o) => o.id).sort()).toEqual(
+        [ids.trgOrders, ids.trgChild].sort(),
+      );
+      expect((sales.sections as { id: string }[]).map((s) => s.id)).toEqual([salesId]);
+      // 精确板块 ID + full：自动保留被列引用的枚举 / 序列，200 表上限豁免
+      const salesFull = (await getModel({ section: salesId, detail: 'full' })).structuredContent!;
+      expect(salesFull.truncated).toBe(false);
+      const fullObjs = salesFull.objects as Record<string, { kind: string }>;
+      expect(fullObjs[ids.orderStatus]?.kind).toBe('enum');
+      expect(fullObjs[ids.orderSeq]?.kind).toBe('sequence');
+      expect(fullObjs[ids.citext]).toBeUndefined();
+      expect(fullObjs[ids.orderView]).toBeUndefined();
+      expect(fullObjs[ids.trgOrders]?.kind).toBe('opaque');
+      expect(fullObjs[ids.notes]).toBeUndefined();
+      // $none：未分配板块的表；sections 为空
+      const none = (await getModel({ section: '$none' })).structuredContent!;
+      expect(names(none.tables)).toEqual(['notes']);
+      expect(none.sections).toEqual([]);
+      expect(none.filter).toEqual({ schema: null, section: '$none', q: null });
+      // 三者取交集
+      const inter = (await getModel({ section: 'Sales', schema: 'audit', q: 'ev' })).structuredContent!;
+      expect(names(inter.tables)).toEqual(['ev_p2026']);
+      // 同名板块歧义 / 不存在
+      const ambiguous = await getModel({ section: 'DUP' });
+      expect(ambiguous.isError).toBe(true);
+      expect(ambiguous.structuredContent?.code).toBe('invalid_arguments');
+      expect(ambiguous.structuredContent?.message as string).toContain(refs.d1!);
+      expect(ambiguous.structuredContent?.message as string).toContain(refs.d2!);
+      const noSection = await getModel({ section: 'nope' });
+      expect(noSection.structuredContent?.code).toBe('section_not_found');
+
+      // diagnostics：只读平台库缓存，绝不连影子库 / 目标库（与不带 diagnostics 的读取相比不多任何影子库调用）
+      const shadowSpy = vi.spyOn(f.created.shadows, 'forProject');
+      await getModel({});
+      const baseCalls = shadowSpy.mock.calls.length;
+      const withDiag = (await getModel({ diagnostics: true })).structuredContent!;
+      expect(withDiag).toHaveProperty('diagnostics');
+      expect(withDiag.diagnostics ?? withDiag.diagnosticsError).toBeTruthy();
+      expect(shadowSpy.mock.calls.length - baseCalls).toBe(baseCalls);
+      shadowSpy.mockRestore();
+
+      // ───── get_objects ─────
+      const flushSpy = vi.spyOn(f.created.refresher, 'flush');
+      const getObjects = (args: Record<string, unknown>) =>
+        f.callTool(tokRead.token, 'get_objects', { project: f.p1Id, ...args });
+      expect((await getObjects({})).structuredContent?.code).toBe('invalid_arguments');
+      expect((await getObjects({ kind: 'enum', objType: 'view' })).structuredContent?.code).toBe(
+        'invalid_arguments',
+      );
+      expect((await getObjects({ kind: 'enum', extra: 1 })).structuredContent?.code).toBe(
+        'invalid_arguments',
+      );
+      expect(flushSpy).not.toHaveBeenCalled();
+
+      type ObjOut = {
+        id: string;
+        kind: string;
+        name: string;
+        ver: number;
+        schema: string | null;
+        ddl?: string[];
+        ddlOmitted?: boolean;
+        parentKind?: string;
+        tableId?: string | null;
+        table?: string | null;
+        deps?: { id: string; kind: string | null; name: string | null }[];
+      };
+      const byIds = (
+        await getObjects({ ids: [ids.orderView, ids.trgOrders, 'no-such-id', ids.orders, ids.orderView] })
+      ).structuredContent!;
+      expect(flushSpy).toHaveBeenCalledWith(f.branch1);
+      expect((byIds.objects as ObjOut[]).map((o) => o.id)).toEqual([ids.orderView, ids.trgOrders]);
+      expect(byIds.missing).toEqual(['no-such-id', ids.orders]);
+      const view = (byIds.objects as ObjOut[])[0]!;
+      expect(view).toMatchObject({ kind: 'opaque', schema: 'public', parentKind: 'schema', tableId: null });
+      expect(view.ddl).toEqual(['CREATE VIEW public.order_view AS SELECT id FROM public.orders']);
+      expect(view.deps).toEqual([
+        { id: ids.orders, kind: 'table', name: 'public.orders' },
+        { id: ids.ordersIdCol, kind: 'column', name: 'public.orders.id' },
+      ]);
+      expect(typeof view.ver).toBe('number');
+      expect((byIds.objects as ObjOut[])[1]).toMatchObject({
+        parentKind: 'table',
+        tableId: ids.orders,
+        table: 'orders',
+        schema: 'public',
+      });
+
+      const enumsOut = (await getObjects({ kind: 'enum' })).structuredContent!;
+      expect(enumsOut).toMatchObject({ total: 1, nextOffset: null, truncated: false });
+      expect((enumsOut.objects as (ObjOut & { values: string[] })[])[0]!.values).toEqual(['new', 'paid']);
+      const triggers = (await getObjects({ objType: 'trigger' })).structuredContent!;
+      expect((triggers.objects as ObjOut[]).map((o) => [o.schema, o.table, o.name])).toEqual([
+        ['audit', 'ev_p2026', 'trg_ev'],
+        ['public', 'orders', 'trg_orders'],
+      ]);
+      const auditExt = (await getObjects({ kind: 'extension', schema: 'audit' })).structuredContent!;
+      expect((auditExt.objects as ObjOut[]).map((o) => o.name)).toEqual(['pgcrypto']);
+      const qOut = (await getObjects({ q: 'ORDER' })).structuredContent!;
+      expect((qOut.objects as ObjOut[]).map((o) => o.name)).toEqual([
+        'order_status',
+        'order_seq',
+        'order_view',
+        'trg_orders',
+      ]);
+      // 分页：确定性排序 + nextOffset
+      const page1 = (await getObjects({ kind: 'opaque', limit: 2 })).structuredContent!;
+      expect(page1).toMatchObject({ total: 5, offset: 0, nextOffset: 2 });
+      const page3 = (await getObjects({ kind: 'opaque', limit: 2, offset: 4 })).structuredContent!;
+      expect(page3).toMatchObject({ total: 5, nextOffset: null });
+      expect((page3.objects as ObjOut[]).length).toBe(1);
+      // 200k DDL 预算：第二个超大函数省略 ddl
+      const fns = (await getObjects({ objType: 'function', schema: 'bulk' })).structuredContent!;
+      expect(fns.truncated).toBe(true);
+      const [fa, fb] = fns.objects as ObjOut[];
+      expect(fa!.ddl?.[0]?.length).toBeGreaterThan(100_000);
+      expect(fa!.ddlOmitted).toBeUndefined();
+      expect(fb!.ddl).toBeUndefined();
+      expect(fb!.ddlOmitted).toBe(true);
+      // 单独按 ID 读取时完整返回
+      const fbOnly = (await getObjects({ ids: [ids.fnB] })).structuredContent!;
+      expect((fbOnly.objects as ObjOut[])[0]!.ddl?.length).toBe(1);
+      flushSpy.mockRestore();
+
+      // ───── get_table：sectionId、表级 opaques 与 dependentOpaques ─────
+      const gt = (await f.callTool(tokRead.token, 'get_table', { project: f.p1Id, table: 'public.orders' }))
+        .structuredContent!;
+      expect(gt.sectionId).toBe(salesId);
+      expect((gt.opaques as ObjOut[]).map((o) => [o.id, typeof o.ver])).toEqual([[ids.trgOrders, 'number']]);
+      expect(gt.dependentOpaques).toEqual([
+        {
+          id: ids.orderView,
+          schemaId: ids.publicId,
+          schema: 'public',
+          objType: 'view',
+          name: 'order_view',
+          ver: expect.any(Number),
+        },
+      ]);
+      const gtChild = (await f.callTool(tokRead.token, 'get_table', { project: f.p1Id, table: ids.evChild }))
+        .structuredContent!;
+      expect(gtChild.sectionId).toBe(salesId);
+      expect((gtChild.opaques as ObjOut[]).map((o) => o.id)).toEqual([ids.trgChild]);
+      const gtNotes = (await f.callTool(tokRead.token, 'get_table', { project: f.p1Id, table: 'notes' }))
+        .structuredContent!;
+      expect(gtNotes).toMatchObject({ sectionId: null, opaques: [], dependentOpaques: [] });
+    },
+  );
+
+  test.skipIf(skip)(
+    'get_model：q 过滤后 ≤ 200 张表时 full 不截断，截断分支同样返回非表对象摘要',
+    async () => {
+      const f = await setupEnv();
+      await editModel(f.created.rooms, f.db, f.p2Id, (m) => {
+        const sid = all(m, 'schema')[0]?.id ?? newId();
+        if (!m.objects[sid]) m.objects[sid] = { id: sid, kind: 'schema', name: 'main', comment: null };
+        for (let i = 0; i < 205; i++) {
+          const tid = newId();
+          const name = i < 3 ? `special_${i}` : `tbl_${i}`;
+          m.objects[tid] = {
+            id: tid,
+            kind: 'table',
+            parent: sid,
+            name,
+            partitionBy: null,
+            partitionOf: null,
+            comment: null,
+          };
+        }
+      });
+      const tok = await f.issueToken(f.alice.id, ['read']);
+      const truncated = (await f.callTool(tok.token, 'get_model', { project: f.p2Id, detail: 'full' }))
+        .structuredContent!;
+      expect(truncated.truncated).toBe(true);
+      for (const key of ['enums', 'sequences', 'extensions', 'opaques']) expect(truncated[key]).toEqual([]);
+      const scoped = (
+        await f.callTool(tok.token, 'get_model', { project: f.p2Id, detail: 'full', q: 'special' })
+      ).structuredContent!;
+      expect(scoped.truncated).toBe(false);
+      expect((scoped.counts as { tables: number }).tables).toBe(3);
+      expect(
+        Object.values(scoped.objects as Record<string, { kind: string; name: string }>)
+          .filter((o) => o.kind === 'table')
+          .map((o) => o.name)
+          .sort(),
+      ).toEqual(['special_0', 'special_1', 'special_2']);
+    },
+  );
+
+  test.skipIf(skip)(
+    'list_history / get_history_diff：归组、净差异、截断、区间校验、history_not_found，绝不 flush、不写审计',
+    async () => {
+      const f = await setupEnv();
+      const tokWrite = await f.issueToken(f.alice.id, ['read', 'write']);
+      const tokRead = await f.issueToken(f.bob.id, ['read']);
+      const { peer } = makePeer(f.alice);
+      await f.created.rooms.join(f.branch1, peer);
+      await f.created.rooms.message(f.branch1, peer, { t: 'hello', client: 'c1', lastSeq: 0 });
+      const publicId = all((await f.created.rooms.model(f.branch1)).model, 'schema').find(
+        (s) => s.name === 'public',
+      )!.id;
+      const orders = newId();
+      const sendOp = (n: number, name: string, args: unknown) =>
+        f.created.rooms.message(f.branch1, peer, {
+          t: 'op',
+          op: { client: 'c1', n, name, args, reads: [] },
+        });
+      // #1–#3：同一人的连续单步 → 一个编辑会话
+      await sendOp(1, 'createTable', { id: orders, schema: publicId, name: 'orders' });
+      await sendOp(2, 'addColumn', {
+        table: orders,
+        column: { id: newId(), name: 'id', type: 'bigint', notNull: true },
+      });
+      await sendOp(3, 'addColumn', {
+        table: orders,
+        column: { id: newId(), name: 'total', type: 'integer', notNull: false },
+      });
+      await f.created.rooms.leave(f.branch1, peer);
+      // #4：MCP batch，超长 opSummary 与超长注释 SQL
+      const longSummary = `重构订单表：${'说明'.repeat(150)}`;
+      const batch = await f.callTool(tokWrite.token, 'apply_changes', {
+        project: f.p1Id,
+        baseSeq: 3,
+        summary: longSummary,
+        ops: [
+          {
+            name: 'addColumn',
+            args: { table: orders, column: { id: '$ref:note', name: 'note', type: 'text' } },
+          },
+          { name: 'setComment', args: { id: orders, comment: 'c'.repeat(2500) } },
+        ],
+      });
+      expect(batch.isError).toBeFalsy();
+      expect(batch.structuredContent?.seq).toBe(4);
+
+      const flushSpy = vi.spyOn(f.created.refresher, 'flush');
+      const shadowSpy = vi.spyOn(f.created.shadows, 'forProject');
+      const auditCount = async () =>
+        Number((await f.db.query<{ n: number | string }>('select count(*) as n from audit_events'))[0]!.n);
+      const auditBefore = await auditCount();
+
+      type Entry = {
+        seq: number;
+        seqFrom: number;
+        stepCount: number;
+        opName: string;
+        via?: string;
+        opSummary?: string;
+        opSummaryTruncated?: boolean;
+      };
+      // 默认归组
+      const grouped = (await f.callTool(tokRead.token, 'list_history', { project: 'acme/orders' }))
+        .structuredContent!;
+      expect(grouped).toMatchObject({
+        project: 'acme/orders',
+        grouped: true,
+        currentSeq: 4,
+        nextBeforeSeq: null,
+      });
+      const gEntries = grouped.entries as Entry[];
+      expect(gEntries.map((e) => [e.seqFrom, e.seq, e.opName])).toEqual([
+        [4, 4, 'batch'],
+        [1, 3, 'editSession'],
+        [0, 0, 'init'],
+      ]);
+      expect(gEntries[0]).toMatchObject({ via: 'mcp', opSummaryTruncated: true });
+      expect(gEntries[0]!.opSummary!.length).toBe(200);
+      expect(gEntries[0]!.opSummary!.endsWith('…')).toBe(true);
+      expect(gEntries[1]!.opSummary).toBeUndefined();
+      // 原始单步 + 分页
+      const raw = (
+        await f.callTool(tokRead.token, 'list_history', { project: f.p1Id, grouped: false, limit: 2 })
+      ).structuredContent!;
+      expect((raw.entries as Entry[]).map((e) => e.seq)).toEqual([4, 3]);
+      expect(raw).toMatchObject({ grouped: false, nextBeforeSeq: 3 });
+      const raw2 = (
+        await f.callTool(tokRead.token, 'list_history', { project: f.p1Id, grouped: false, beforeSeq: 3 })
+      ).structuredContent!;
+      expect((raw2.entries as Entry[]).map((e) => e.seq)).toEqual([2, 1, 0]);
+      // 严格参数与上限
+      for (const bad of [{ limit: 51 }, { limit: 0 }, { beforeSeq: -1 }, { extra: true }]) {
+        const r = await f.callTool(tokRead.token, 'list_history', { project: f.p1Id, ...bad });
+        expect(r.structuredContent?.code, JSON.stringify(bad)).toBe('invalid_arguments');
+      }
+
+      type DiffOut = {
+        currentSeq: number;
+        entry: Entry;
+        objects: {
+          total: number;
+          truncated: boolean;
+          items: { id: string; kind: string; label: string; change: string }[];
+        };
+        diff: {
+          total: number;
+          truncated: boolean;
+          items: { kind: string; target: string; sql?: string; sqlTruncated?: boolean }[];
+        };
+        steps?: Entry[];
+      };
+      const diffOf = async (args: Record<string, unknown>) =>
+        (await f.callTool(tokRead.token, 'get_history_diff', { project: f.p1Id, ...args }))
+          .structuredContent as unknown as DiffOut & { code?: string };
+
+      // 整组净差异
+      const group = await diffOf({ seq: 3, from: 1, includeSteps: true });
+      expect(group.entry).toMatchObject({ seq: 3, seqFrom: 1, stepCount: 3, opName: 'editSession' });
+      expect(group.objects.items.map((i) => `${i.label}:${i.change}`).sort()).toEqual([
+        'orders.id:added',
+        'orders.total:added',
+        'orders:added',
+      ]);
+      expect(group.diff.total).toBeGreaterThan(0);
+      expect(group.diff.items[0]!.sql).toContain('CREATE TABLE');
+      expect(group.steps!.map((s) => s.seq)).toEqual([3, 2, 1]);
+      expect(group).not.toHaveProperty('model');
+      expect(group).not.toHaveProperty('diffToCurrent');
+      // 单步 MCP batch：完整 opSummary、SQL 截断、maxItems
+      const step = await diffOf({ seq: 4 });
+      expect(step.entry.opSummary).toBe(longSummary);
+      expect(step).not.toHaveProperty('steps');
+      expect(step.objects.items.map((i) => `${i.label}:${i.change}`).sort()).toEqual([
+        'orders.note:added',
+        'orders:modified',
+      ]);
+      const longSql = step.diff.items.find((i) => i.sqlTruncated);
+      expect(longSql?.sql?.length).toBe(2001);
+      expect(longSql?.sql?.endsWith('…')).toBe(true);
+      const noSql = await diffOf({ seq: 4, includeSql: false, maxItems: 1 });
+      expect(noSql.diff.items).toHaveLength(1);
+      expect(noSql.diff.items[0]).not.toHaveProperty('sql');
+      expect(noSql.diff.truncated).toBe(noSql.diff.total > 1);
+      // seq = 0：没有前一个状态，diff 为空，steps 为空
+      const init = await diffOf({ seq: 0, includeSteps: true });
+      expect(init.diff).toEqual({ total: 0, truncated: false, items: [] });
+      expect(init.steps).toEqual([]);
+      expect(init.entry).toMatchObject({ seq: 0, opName: 'init' });
+
+      // 区间越界：查库前直接 invalid_arguments（项目不存在也一样，不触发任何查询）
+      for (const bad of [
+        { seq: 3, from: 4 },
+        { seq: 0, from: 1 },
+        { seq: 60, from: 1 },
+        { seq: 1, from: 0 },
+      ]) {
+        const r = await f.callTool(tokRead.token, 'get_history_diff', { project: 'nope/nope', ...bad });
+        expect(r.structuredContent?.code, JSON.stringify(bad)).toBe('invalid_arguments');
+      }
+      const missing = await diffOf({ seq: 99 });
+      expect(missing).toMatchObject({ code: 'history_not_found', currentSeq: 4 });
+
+      // 只读：绝不 flush、绝不连影子库、不写审计
+      expect(flushSpy).not.toHaveBeenCalled();
+      expect(shadowSpy).not.toHaveBeenCalled();
+      expect(await auditCount()).toBe(auditBefore);
+      flushSpy.mockRestore();
+      shadowSpy.mockRestore();
+    },
+  );
+
+  test.skipIf(skip)(
+    'MCP Prompts（2025-11-25 与 2026-07-28）：能力声明、按 scope 列出、verify 段落、原型键与越权拒绝、零项目查询；工具红线',
+    async () => {
+      const f = await setupEnv();
+      const tokRead = await f.issueToken(f.bob.id, ['read']);
+      const tokVerify = await f.issueToken(f.alice.id, ['read', 'verify']);
+      const tokAll = await f.issueToken(f.alice.id, ['read', 'verify', 'write']);
+      const meta2026 = {
+        [PROTOCOL_VERSION_META_KEY]: '2026-07-28',
+        [CLIENT_INFO_META_KEY]: { name: 'test-2026', version: '1.0' },
+        [CLIENT_CAPABILITIES_META_KEY]: {},
+      };
+      const rpc = async (
+        token: string,
+        method: string,
+        params: Record<string, unknown>,
+        era: '2025' | '2026' = '2025',
+      ) => {
+        const headers: Record<string, string> = {};
+        let p = params;
+        if (era === '2026') {
+          p = { ...params, _meta: meta2026 };
+          headers['MCP-Protocol-Version'] = '2026-07-28';
+          headers['Mcp-Method'] = method;
+          if (typeof params.name === 'string') headers['Mcp-Name'] = params.name;
+        }
+        const res = await f.mcpPost(token, { jsonrpc: '2.0', id: 1, method, params: p }, headers);
+        return parseRpc(res);
+      };
+
+      // 能力声明
+      const init = await rpc(tokRead.token, 'initialize', {
+        protocolVersion: '2025-11-25',
+        capabilities: {},
+        clientInfo: { name: 'vitest', version: '1.0' },
+      });
+      expect((init.result!.capabilities as Record<string, unknown>).prompts).toBeDefined();
+      expect(init.result?.instructions as string).toContain('list_history');
+      const discover = await rpc(tokRead.token, 'server/discover', {}, '2026');
+      expect(discover.error).toBeUndefined();
+      expect((discover.result!.capabilities as Record<string, unknown>).prompts).toBeDefined();
+
+      type PromptInfo = {
+        name: string;
+        arguments?: { name: string; required: boolean; description?: string }[];
+      };
+      for (const era of ['2025', '2026'] as const) {
+        const readList = await rpc(tokRead.token, 'prompts/list', {}, era);
+        expect(readList.error).toBeUndefined();
+        expect(((readList.result?.prompts as PromptInfo[]) ?? []).map((p) => p.name).sort()).toEqual([
+          'review_canvas_history',
+          'review_unpublished_changes',
+        ]);
+        const allList = await rpc(tokAll.token, 'prompts/list', {}, era);
+        const allPrompts = (allList.result?.prompts as PromptInfo[]) ?? [];
+        expect(allPrompts.map((p) => p.name).sort()).toEqual(MCP_PROMPTS.map((p) => p.name).sort());
+        const design = allPrompts.find((p) => p.name === 'design_tables')!;
+        expect(design.arguments?.map((a) => [a.name, a.required])).toEqual([
+          ['project', true],
+          ['requirements', true],
+          ['section', false],
+        ]);
+        expect(design.arguments?.every((a) => (a.description ?? '').length > 0)).toBe(true);
+      }
+
+      const textOf = (r: Awaited<ReturnType<typeof rpc>>) =>
+        ((r.result?.messages as { content: { type: string; text: string } }[]) ?? [])[0]?.content.text ?? '';
+
+      // verify 段落随 scope 变化；永远声明人工边界；未知项目不报错（零数据库查询，不做存在性 Oracle）
+      for (const era of ['2025', '2026'] as const) {
+        const readOnly = await rpc(
+          tokRead.token,
+          'prompts/get',
+          { name: 'review_unpublished_changes', arguments: { project: 'nobody/nothing' } },
+          era,
+        );
+        expect(readOnly.error).toBeUndefined();
+        const t = textOf(readOnly);
+        expect(t).toContain('"nobody/nothing"');
+        expect(t).toContain('preview_migration');
+        expect(t).not.toContain('verify_migration');
+        expect(t).toContain('reserved for humans');
+        const withVerify = await rpc(
+          tokVerify.token,
+          'prompts/get',
+          { name: 'review_unpublished_changes', arguments: { project: 'acme/orders' } },
+          era,
+        );
+        expect(textOf(withVerify)).toContain('verify_migration');
+      }
+
+      const history = await rpc(tokRead.token, 'prompts/get', {
+        name: 'review_canvas_history',
+        arguments: { project: f.p1Id, limit: '10', beforeSeq: '42' },
+      });
+      expect(textOf(history)).toContain('limit: 10');
+      expect(textOf(history)).toContain('beforeSeq: 42');
+      for (const args of [{ project: f.p1Id, limit: 'abc' }, { project: f.p1Id, limit: '500' }, {}]) {
+        const bad = await rpc(tokRead.token, 'prompts/get', {
+          name: 'review_canvas_history',
+          arguments: args,
+        });
+        expect(bad.error?.code, JSON.stringify(args)).toBe(-32602);
+      }
+
+      // 写类 prompt：write 令牌可渲染；只读令牌越权、原型属性名、未知名称一律 InvalidParams
+      const designed = await rpc(tokAll.token, 'prompts/get', {
+        name: 'design_tables',
+        arguments: { project: 'acme/orders', requirements: 'customers and invoices', section: 'Billing' },
+      });
+      expect(designed.error).toBeUndefined();
+      expect(textOf(designed)).toContain('customers and invoices');
+      expect(textOf(designed)).toContain('defineTable');
+      expect(textOf(designed)).toContain('"Billing"');
+      expect(textOf(designed)).toContain('verify_migration');
+      const refactor = await rpc(tokAll.token, 'prompts/get', {
+        name: 'refactor_column',
+        arguments: {
+          project: 'acme/orders',
+          table: 'public.orders',
+          column: 'email',
+          change: 'rename to mail',
+        },
+      });
+      expect(textOf(refactor)).toContain('alterColumn');
+      for (const era of ['2025', '2026'] as const) {
+        for (const name of [
+          'design_tables',
+          'refactor_column',
+          'toString',
+          '__proto__',
+          'constructor',
+          'nope',
+        ]) {
+          const denied = await rpc(
+            tokRead.token,
+            'prompts/get',
+            {
+              name,
+              arguments: { project: 'acme/orders', requirements: 'x', table: 't', column: 'c', change: 'x' },
+            },
+            era,
+          );
+          expect(denied.result, `${era} ${name}`).toBeUndefined();
+          expect(denied.error?.code, `${era} ${name}`).toBe(-32602);
+        }
+      }
+
+      // 工具红线：tools/list 永远不含恢复历史 / 回滚 / 发布 / 执行迁移
+      const tools = await rpc(tokAll.token, 'tools/list', {});
+      const toolNames = ((tools.result?.tools as { name: string }[]) ?? []).map((t) => t.name);
+      expect(toolNames).toEqual(expect.arrayContaining(['get_objects', 'list_history', 'get_history_diff']));
+      for (const name of [
+        'restore_history',
+        'revert_history',
+        'rollback',
+        'publish_version',
+        'execute_migration',
+      ]) {
+        expect(toolNames).not.toContain(name);
+        expect(Object.keys(MCP_TOOLS)).not.toContain(name);
+      }
     },
   );
 });

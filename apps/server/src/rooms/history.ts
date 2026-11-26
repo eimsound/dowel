@@ -543,6 +543,29 @@ export class CanvasHistory {
   }
 
   /**
+   * 历史详情共用的前后模型（HTTP `GET /history/:seq` 与 MCP get_history_diff 共用）：
+   * - seq = 0：初始状态，prevModel 为 null；
+   * - 单步（from 省略或 from = seq，seq >= 1）与区间（1 <= from < seq）统一走 historyRange：
+   *   最多重建一次 modelAt(from - 1)，在内存中顺次重放 [from..seq] 得到目标模型。
+   * 只读平台库（快照与提交），绝不 flush、绝不连影子库或目标库。调用方需已校验 seq <= currentSeq（越界抛 404）。
+   */
+  async historyDetailModels(
+    branchId: string,
+    seq: number,
+    from: number | undefined,
+    currentSeq: number,
+  ): Promise<{ entry: CanvasHistoryEntry; prevModel: Model | null; targetModel: Model }> {
+    if (!Number.isInteger(seq) || seq < 0 || seq > currentSeq)
+      throw new HTTPException(404, { message: `修改记录 #${seq} 不存在` });
+    if (seq === 0) {
+      const targetModel = await this.modelAt(branchId, 0);
+      const entry = await this.historyEntry(branchId, 0, { prevModel: null, targetModel, currentSeq });
+      return { entry, prevModel: null, targetModel };
+    }
+    return this.historyRange(branchId, from ?? seq, seq, currentSeq);
+  }
+
+  /**
    * 展开编辑会话组：重建一次 modelAt(from - 1) 后逐步重放，借每步前后的对象精确解析被删对象名；
    * 返回倒序单步列表（绝不含 seq = 0）。调用方需已校验 1 <= from <= seq <= currentSeq。
    */

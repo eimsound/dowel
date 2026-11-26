@@ -1012,3 +1012,70 @@ test('MCP batch 与人类单步相邻时互不合并', async () => {
   expect(l.entries[1]).toMatchObject({ via: 'mcp' });
   expect(l.entries[1]!.ops).toBeUndefined();
 });
+
+test('historyDetailModels：seq = 0 / 单步 / 区间共用一次重建，与 modelAt 与 HTTP 详情保持一致', async () => {
+  const peer = await peerOf('editor');
+  await rooms.join(branchId, peer);
+  await rooms.message(branchId, peer, { t: 'hello', client: 'c1', lastSeq: 0 });
+  const publicId = all((await rooms.model(branchId)).model, 'schema').find((s) => s.name === 'public')!.id;
+  const t1 = newId();
+  const c1 = newId();
+  await sendOp(peer, 'c1', 1, 'createTable', { id: t1, schema: publicId, name: 'orders' });
+  await sendOp(peer, 'c1', 2, 'addColumn', {
+    table: t1,
+    column: { id: c1, name: 'id', type: 'bigint', notNull: true },
+  });
+  await sendOp(peer, 'c1', 3, 'renameTable', { id: t1, name: 'purchases' });
+  await rooms.leave(branchId, peer);
+  const { seq: currentSeq } = await rooms.model(branchId);
+  expect(currentSeq).toBe(3);
+
+  // seq = 0：初始状态，prevModel 为 null
+  const init = await rooms.historyDetailModels(branchId, 0, undefined, currentSeq);
+  expect(init.prevModel).toBeNull();
+  expect(init.targetModel).toEqual(await rooms.modelAt(branchId, 0));
+  expect(init.entry).toMatchObject({ seq: 0, opName: 'init' });
+
+  // 单步（from 省略）与 from = seq 等价，前后模型与 modelAt 一致，条目与 historyEntry 一致
+  for (const seq of [1, 2, 3]) {
+    const single = await rooms.historyDetailModels(branchId, seq, undefined, currentSeq);
+    const same = await rooms.historyDetailModels(branchId, seq, seq, currentSeq);
+    expect(same).toEqual(single);
+    expect(single.prevModel).toEqual(await rooms.modelAt(branchId, seq - 1));
+    expect(single.targetModel).toEqual(await rooms.modelAt(branchId, seq));
+    expect(single.entry).toEqual(
+      await rooms.historyEntry(branchId, seq, {
+        prevModel: single.prevModel,
+        targetModel: single.targetModel,
+        currentSeq,
+      }),
+    );
+  }
+
+  // 区间：与 historyRange 完全一致
+  const range = await rooms.historyDetailModels(branchId, 3, 1, currentSeq);
+  expect(range).toEqual(await rooms.historyRange(branchId, 1, 3, currentSeq));
+  expect(range.prevModel).toEqual(await rooms.modelAt(branchId, 0));
+  expect(range.targetModel).toEqual(await rooms.modelAt(branchId, 3));
+
+  // 越界抛 404
+  await expect(rooms.historyDetailModels(branchId, 4, undefined, currentSeq)).rejects.toMatchObject({
+    status: 404,
+  });
+
+  // HTTP 单步详情行为不变：model = modelAt(seq)，opDiff 为相邻两步的差异，seq = 0 时 opDiff 为空
+  const d2 = await call('GET', `/api/projects/${pid}/history/2`, undefined, viewerCookie);
+  expect(d2.status).toBe(200);
+  const detail2 = d2.data as CanvasHistoryDetail<Model>;
+  expect(detail2.model).toEqual(await rooms.modelAt(branchId, 2));
+  expect(detail2.entry).toMatchObject({ seq: 2, seqFrom: 2, stepCount: 1, opName: 'addColumn' });
+  expect(detail2.opDiff.total).toBeGreaterThan(0);
+  expect(detail2.currentSeq).toBe(3);
+  const d0 = await call('GET', `/api/projects/${pid}/history/0`, undefined, viewerCookie);
+  expect(d0.status).toBe(200);
+  expect((d0.data as CanvasHistoryDetail<Model>).opDiff).toEqual({ total: 0, items: [] });
+  expect((await call('GET', `/api/projects/${pid}/history/9`, undefined, viewerCookie)).status).toBe(404);
+  // from = seq 走单步路径
+  const d22 = await call('GET', `/api/projects/${pid}/history/2?from=2`, undefined, viewerCookie);
+  expect(d22.data).toEqual(detail2);
+});

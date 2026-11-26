@@ -71,28 +71,18 @@ export const registerCanvasHistory = (app: Hono<Env>, ctx: AppContext) => {
     // 关键出口：与规范化后的当前模型比较，返回的 currentSeq 供恢复弹窗作为 workingSeq
     await refresher.flush(a.branch);
     const { model: currentModel, seq: currentSeq } = await rooms.model(a.branch);
-    if (from !== undefined && from !== seq) {
-      // 整组净差异：只重建一次 modelAt(from - 1)，在内存中顺次重放 [from..seq]（不从快照重放两次）
-      if (seq > currentSeq) throw new HTTPException(404, { message: `修改记录 #${seq} 不存在` });
-      const { entry, prevModel, targetModel } = await rooms.historyRange(a.branch, from, seq, currentSeq);
-      return c.json<CanvasHistoryDetail<Model>>({
-        entry,
-        opDiff: planDiff(prevModel, targetModel),
-        model: targetModel,
-        diffToCurrent: planDiff(currentModel, targetModel),
-        currentSeq,
-      });
-    }
-    const targetModel = await rooms.modelAt(a.branch, seq);
-    const prevModel = seq > 0 ? await rooms.modelAt(a.branch, seq - 1) : null;
-    const opDiff = prevModel ? planDiff(prevModel, targetModel) : { total: 0, items: [] };
-    const diffToCurrent = planDiff(currentModel, targetModel);
-    const entry = await rooms.historyEntry(a.branch, seq, { prevModel, targetModel, currentSeq });
+    // 单步与整组净差异共用 historyDetailModels：最多重建一次 modelAt，在内存中顺次重放（不从快照重放两次）
+    const { entry, prevModel, targetModel } = await rooms.historyDetailModels(
+      a.branch,
+      seq,
+      from !== undefined && from !== seq ? from : undefined,
+      currentSeq,
+    );
     return c.json<CanvasHistoryDetail<Model>>({
       entry,
-      opDiff,
+      opDiff: prevModel ? planDiff(prevModel, targetModel) : { total: 0, items: [] },
       model: targetModel,
-      diffToCurrent,
+      diffToCurrent: planDiff(currentModel, targetModel),
       currentSeq,
     });
   });

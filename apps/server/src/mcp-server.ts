@@ -1,6 +1,14 @@
 import {
+  CANVAS_HISTORY_GROUP_MAX_STEPS,
   type CanvasSection,
+  MAX_SECTION_ID_LENGTH,
+  MCP_HISTORY_DIFF_MAX_ITEMS,
+  MCP_HISTORY_MAX_LIMIT,
+  MCP_HISTORY_OBJECTS_MAX_ITEMS,
+  MCP_HISTORY_OP_SUMMARY_MAX_CHARS,
+  MCP_HISTORY_SQL_MAX_CHARS,
   MCP_MAX_OPS,
+  MCP_OBJECTS_DDL_BUDGET,
   MCP_SUMMARY_MAX,
   MCP_TOOLS,
   type McpApplyErrorLocation,
@@ -17,8 +25,11 @@ import {
   childrenOf,
   type Column,
   columnsOf,
+  deepEqual,
   describeTarget,
   diagnoseModel,
+  type Enum,
+  type Extension,
   type ForeignKey,
   getDialect,
   type Index,
@@ -27,15 +38,20 @@ import {
   mutators,
   newId,
   type Obj,
+  type Opaque,
+  OpaqueType,
   PlanError,
   type PrimaryKey,
+  type Sequence,
   type Table,
   type Unique,
 } from '@dowel/core';
+import { planDiff } from '@dowel/executor';
 import type { Versions } from '@dowel/sync';
 // Dowel MCP 服务端实现（M3-C，ADR 0014）：基于 @modelcontextprotocol/server 的无状态 McpServer。
 // - 每个请求按当前 `McpPrincipal` 构建独立的 McpServer：实时生效项目权限 ∩ 令牌 scope ∩ 可选项目白名单。
 // - tools/list 仅暴露令牌 scope 允许的工具；tools/call 对越权或缺少 scope 的调用返回结构化 tool error（isError: true）。
+// - prompts/list 只列令牌 scope 允许的 Prompt（见 mcp-prompts.ts）；永不注册恢复历史 / 发布版本 / 执行迁移类工具（ADR 0015 第 6 节）。
 // - 严禁连目标库：list_environments 仅读平台库缓存字段（带缓存时间与 source: 'platform_cache'）；
 //   verify_migration 仅使用影子库并按用户扣减 connectionLimiter 配额；所有错误文本经 scrubSecrets 脱敏。
 import {
@@ -50,6 +66,7 @@ import {
   type Tool,
 } from '@modelcontextprotocol/server';
 import type { Context } from 'hono';
+import { HTTPException } from 'hono/http-exception';
 import { z } from 'zod';
 
 import pkg from '../package.json' with { type: 'json' };
@@ -58,6 +75,7 @@ import { type Action, can, userActor } from './authz.ts';
 import { inList } from './db.ts';
 import { iso, loadVersionRefs, projectPlanOptions, sanitizeSummary, versionRef } from './envs.ts';
 import { groupBySlug } from './groups.ts';
+import { registerMcpPrompts } from './mcp-prompts.ts';
 import type { McpPrincipal } from './mcp-tokens.ts';
 import {
   effectiveProjectRole,
@@ -86,7 +104,7 @@ const MCP_INSTRUCTIONS = [
   'Dowel is a collaborative database schema modeling and frozen-migration platform (single main trunk per project).',
   'Recommended workflow:',
   '1. Discover accessible projects via `list_projects` (or `dowel://projects`).',
-  '2. Read the current model summary or inspect specific tables with `get_model` / `get_table`, noting `seq`.',
+  '2. Read the current model summary or inspect specific tables with `get_model` / `get_table`, noting `seq`. Narrow large models with `get_model` filters (`schema`, `section` — a section ID, `$none` or a unique name — and `q`); add `diagnostics: true` for validation / compatibility diagnostics. Read enums, sequences, extensions and opaque objects (views, functions, triggers, policies…) with full DDL and resolved `deps` via `get_objects`.',
   '3. Propose edits with `apply_changes` using that `baseSeq` and `$ref:<alias>` placeholders for new object IDs (`refs` returns `{ [alias]: uuid }`); run `dryRun: true` first when unsure. Each call is committed atomically as ONE canvas-history entry (one `seq`); pass a short `summary` describing the intent so humans can review and undo it as a unit.',
   '   Prefer the compile-time macros: `defineTable` creates a whole table (columns, keys, checks, indexes, FKs, comments, ext, partitions) and may refer to its own columns by name; `alterColumn` patches one existing column declaratively. Macros mix freely with primitive mutators in the same call and share the same `$ref` aliases; they expand into at most 500 primitive sub-ops per call (`opCount`).',
   '   Strict object-ID rule: editing or dropping existing objects (including `alterColumn.id`) only accepts existing object IDs or `$ref:<alias>` of objects created earlier in the same call — never names. Only reference slots may be resolved by (qualified) name: inside `defineTable` (schema, typeRef, refTable, refColumns, default.nextval, partitions[].schema) and its own columns, plus the references `typeRef` / `default.nextval` of `alterColumn`; ambiguous names are rejected. `alterColumn.ext` replaces the whole column ext (null clears it); on SQL Server an explicit default-constraint name is kept unless `ext.mssql` sets `defaultName` / `defaultNameMode`.',
@@ -95,7 +113,9 @@ const MCP_INSTRUCTIONS = [
   '4. Inspect mutator signatures with `list_mutators`, export DDL with `get_ddl`, and preview up/down migration SQL with `preview_migration`.',
   '5. Validate migrations against a shadow database using `verify_migration` (requires `verify` scope).',
   '6. Canvas sections are a pure layout layer (never part of the schema, migrations or versions). `get_model` lists them (`sections`, plus `sectionId` per table) together with dialect `capabilities` and the derived lowest `target` version. Adjust them incrementally with `manage_sections` (create / rename / recolor / delete / add_tables / remove_tables; `$ref:<alias>` refers to a section created earlier in the same call). Pixel positions are laid out automatically and cannot be written via MCP.',
-  'Note: Publishing versions and executing migrations against target databases are intentionally reserved for humans in the Dowel UI.',
+  '7. Browse canvas history read-only with `list_history` (grouped into edit sessions by default) and inspect one entry or a whole group with `get_history_diff` (net object changes + migration-style diff). History cannot be restored via MCP.',
+  '8. Prompts (`prompts/list`) offer guided workflows: `review_unpublished_changes` and `review_canvas_history` (read), plus `design_tables` and `refactor_column` (write scope only).',
+  'Note: Publishing versions, executing migrations against target databases and restoring canvas history are intentionally reserved for humans in the Dowel UI.',
 ].join('\n');
 
 const toJsonSchema = (schema: z.ZodType): Tool['inputSchema'] => {
@@ -280,16 +300,115 @@ const readTargetContext = async (ctx: AppContext, projectId: string, model: Mode
   };
 };
 
+/** 表级不透明对象（trigger / policy / exclusion）的 parent 是表 ID，其余是 schema ID；统一解析所属 schema 与表 */
+export const opaqueOwner = (model: Model, o: Opaque) => {
+  const parent = Object.hasOwn(model.objects, o.parent) ? model.objects[o.parent] : undefined;
+  if (parent?.kind === 'table') {
+    return {
+      parentKind: 'table' as const,
+      schemaId: parent.parent,
+      tableId: parent.id as string | null,
+      tableName: parent.name as string | null,
+    };
+  }
+  return { parentKind: 'schema' as const, schemaId: o.parent, tableId: null, tableName: null };
+};
+
+/** 分区子表沿 partitionOf 链找到顶层根表（防环） */
+const rootTableOf = (model: Model, table: Table): Table => {
+  let cur: Table = table;
+  const seen = new Set<string>();
+  while (cur.partitionOf && !seen.has(cur.id)) {
+    seen.add(cur.id);
+    const parent: Obj | undefined = Object.hasOwn(model.objects, cur.partitionOf.parent)
+      ? model.objects[cur.partitionOf.parent]
+      : undefined;
+    if (parent?.kind !== 'table') break;
+    cur = parent;
+  }
+  return cur;
+};
+
+/**
+ * 表 → 板块 ID：基于全模型（不受 schema / section / q 过滤影响）的存活顶层表构造，
+ * 分区子表经根表继承板块（跨 schema 的分区子表同样继承）
+ */
+const sectionIndexOf = (model: Model, rawSections: readonly CanvasSection[]) => {
+  const liveTop = new Set(
+    all(model, 'table')
+      .filter((t) => !t.partitionOf)
+      .map((t) => t.id),
+  );
+  const sectionOfTop = new Map<string, string>();
+  for (const sec of rawSections)
+    for (const id of sec.tables) if (liveTop.has(id) && !sectionOfTop.has(id)) sectionOfTop.set(id, sec.id);
+  return (table: Table): string | null => {
+    const root = rootTableOf(model, table);
+    return root.partitionOf ? null : (sectionOfTop.get(root.id) ?? null);
+  };
+};
+
+/** get_model 的 `section` 过滤：精确板块 ID → `$none`（未分配板块的表）→ 大小写不敏感的唯一板块名 */
+const resolveSectionFilter = (
+  rawSections: readonly CanvasSection[],
+  input: string,
+):
+  | { ok: true; filter: { kind: 'section'; section: CanvasSection } | { kind: 'none' } }
+  | { ok: false; code: McpToolErrorCode; message: string; extra?: Record<string, unknown> } => {
+  const byId = rawSections.find((s) => s.id === input);
+  if (byId) return { ok: true, filter: { kind: 'section', section: byId } };
+  if (input === SECTION_NONE) return { ok: true, filter: { kind: 'none' } };
+  const lower = input.toLowerCase();
+  const byName = rawSections.filter((s) => s.name.toLowerCase() === lower);
+  if (byName.length === 1) return { ok: true, filter: { kind: 'section', section: byName[0]! } };
+  if (byName.length > 1) {
+    const candidates = byName.map((s) => s.id);
+    return {
+      ok: false,
+      code: 'invalid_arguments',
+      message: `板块名 ${input} 不唯一，请改用板块 ID：${candidates.join(', ')}`,
+      extra: { candidates: byName.map((s) => ({ id: s.id, name: s.name })) },
+    };
+  }
+  return { ok: false, code: 'section_not_found', message: `板块不存在：${input}` };
+};
+
+/** get_model 的 `section` 取值：未分配给任何板块的表 */
+const SECTION_NONE = '$none';
+/** get_model：表摘要里 matchedColumns 最多列多少个 */
+const MAX_MATCHED_COLUMNS = 10;
+
+type ModelReadResult =
+  | { ok: true; data: Record<string, unknown> }
+  | { ok: false; code: McpToolErrorCode; message: string; extra?: Record<string, unknown> };
+
 const summarizeOrReadModel = async (
   ctx: AppContext,
   project: ResolvedProject,
-  opts: { schema?: string; detail: 'summary' | 'full' },
-) => {
+  opts: {
+    schema?: string;
+    detail: 'summary' | 'full';
+    q?: string;
+    section?: string;
+    diagnostics?: boolean;
+  },
+): Promise<ModelReadResult> => {
   await ctx.refresher.flush(project.row.branch);
   const { model, versions, seq, sections: rawSections } = await ctx.rooms.canvasState(project.row.branch);
+
+  let sectionFilter: { kind: 'section'; section: CanvasSection } | { kind: 'none' } | null = null;
+  if (opts.section !== undefined) {
+    const r = resolveSectionFilter(rawSections, opts.section);
+    if (!r.ok) return r;
+    sectionFilter = r.filter;
+  }
+
   const context = await readTargetContext(ctx, project.row.id, model);
+  const diag = opts.diagnostics ? await computeDiagnostics(ctx, project.row.id, model) : {};
   const schemasAll = all(model, 'schema');
   const schemaById = new Map(schemasAll.map((s) => [s.id, s]));
+  const qLower = opts.q?.toLowerCase();
+  const filtered = qLower !== undefined || sectionFilter !== null;
 
   let schemaIdFilter: string | null = null;
   let schemaFilterMissing = false;
@@ -298,39 +417,97 @@ const summarizeOrReadModel = async (
     if (!matchSchema) schemaFilterMissing = true;
     else schemaIdFilter = matchSchema.id;
   }
+  const filterEcho = filtered
+    ? {
+        filter: {
+          schema: schemaIdFilter,
+          section: sectionFilter
+            ? sectionFilter.kind === 'none'
+              ? SECTION_NONE
+              : sectionFilter.section.id
+            : null,
+          q: opts.q ?? null,
+        },
+      }
+    : {};
 
   if (schemaFilterMissing) {
     return {
-      project: { id: project.row.id, path: project.path, name: project.row.name },
-      seq,
-      dialect: model.dialect,
-      ...context,
-      detail: opts.detail,
-      truncated: false,
-      counts: {
-        schemas: 0,
-        tables: 0,
-        columns: 0,
-        constraints: 0,
-        indexes: 0,
-        enums: 0,
-        sequences: 0,
-        extensions: 0,
-        opaques: 0,
+      ok: true,
+      data: {
+        project: { id: project.row.id, path: project.path, name: project.row.name },
+        seq,
+        dialect: model.dialect,
+        ...context,
+        detail: opts.detail,
+        truncated: false,
+        ...filterEcho,
+        counts: {
+          schemas: 0,
+          tables: 0,
+          columns: 0,
+          constraints: 0,
+          indexes: 0,
+          enums: 0,
+          sequences: 0,
+          extensions: 0,
+          opaques: 0,
+        },
+        schemas: [],
+        tables: [],
+        enums: [],
+        sequences: [],
+        extensions: [],
+        opaques: [],
+        sections: [],
+        ...(opts.detail === 'full' ? { objects: {} } : {}),
+        ...diag,
       },
-      schemas: [],
-      tables: [],
-      enums: [],
-      sequences: [],
-      extensions: [],
-      opaques: [],
-      sections: [],
-      ...(opts.detail === 'full' ? { objects: {} } : {}),
     };
   }
 
-  const schemas = schemaIdFilter ? schemasAll.filter((s) => s.id === schemaIdFilter) : schemasAll;
-  const tables = all(model, 'table').filter((t) => !schemaIdFilter || t.parent === schemaIdFilter);
+  const schemaName = (id: string) => schemaById.get(id)?.name ?? id;
+  const sectionIdOf = sectionIndexOf(model, rawSections);
+  const includes = (text: string | null | undefined) =>
+    qLower !== undefined && typeof text === 'string' && text.toLowerCase().includes(qLower);
+
+  // 1. 表：schema ∩ section ∩ q
+  const schemaTables = all(model, 'table').filter((t) => !schemaIdFilter || t.parent === schemaIdFilter);
+  const sectionTables = sectionFilter
+    ? schemaTables.filter((t) => {
+        const sid = sectionIdOf(t);
+        return sectionFilter.kind === 'none' ? sid === null : sid === sectionFilter.section.id;
+      })
+    : schemaTables;
+  const columnsByTable = new Map<string, Column[]>();
+  for (const c of all(model, 'column')) {
+    const list = columnsByTable.get(c.parent);
+    if (list) list.push(c);
+    else columnsByTable.set(c.parent, [c]);
+  }
+  const matchedColumnsOf = new Map<string, string[]>();
+  let tables = sectionTables;
+  if (qLower !== undefined) {
+    const hit = new Set<string>();
+    for (const t of sectionTables) {
+      const cols = (columnsByTable.get(t.id) ?? []).filter((c) => includes(c.name)).map((c) => c.name);
+      if (cols.length) matchedColumnsOf.set(t.id, cols.slice(0, MAX_MATCHED_COLUMNS));
+      if (includes(t.name) || includes(schemaName(t.parent)) || includes(t.comment) || cols.length) {
+        hit.add(t.id);
+      }
+    }
+    // 顶层分区父表命中时连带保留它的全部分区子表（仍受 schema / section 过滤约束）
+    const hitRoots = new Set(
+      sectionTables.filter((t) => hit.has(t.id) && !t.partitionOf && t.partitionBy).map((t) => t.id),
+    );
+    if (hitRoots.size) {
+      for (const t of sectionTables) {
+        if (t.partitionOf && hitRoots.has(rootTableOf(model, t).id)) hit.add(t.id);
+      }
+    }
+    tables = sectionTables.filter((t) => hit.has(t.id));
+  }
+
   const tableIds = new Set(tables.map((t) => t.id));
   const columns = all(model, 'column').filter((c) => tableIds.has(c.parent));
   const pks = all(model, 'primaryKey').filter((k) => tableIds.has(k.parent));
@@ -338,10 +515,47 @@ const summarizeOrReadModel = async (
   const checks = all(model, 'check').filter((c) => tableIds.has(c.parent));
   const fks = all(model, 'foreignKey').filter((f) => tableIds.has(f.parent));
   const indexes = all(model, 'index').filter((i) => tableIds.has(i.parent));
-  const enums = all(model, 'enum').filter((e) => !schemaIdFilter || e.parent === schemaIdFilter);
-  const sequences = all(model, 'sequence').filter((s) => !schemaIdFilter || s.parent === schemaIdFilter);
-  const extensions = schemaIdFilter ? [] : all(model, 'extension');
-  const opaques = all(model, 'opaque').filter((o) => !schemaIdFilter || o.parent === schemaIdFilter);
+
+  // 2. schema 级对象：schema 过滤；传 section 时不返回无关对象（full 模式保留被命中表的列引用到的枚举 / 序列）
+  const referencedIds = new Set<string>();
+  if (opts.detail === 'full' && filtered) {
+    for (const c of columns) {
+      if (c.typeRef) referencedIds.add(c.typeRef);
+      if (c.default && 'nextval' in c.default) referencedIds.add(c.default.nextval);
+    }
+    const columnIds = new Set(columns.map((c) => c.id));
+    for (const s of all(model, 'sequence'))
+      if (s.ownedBy && columnIds.has(s.ownedBy)) referencedIds.add(s.id);
+  }
+  const keepSchemaLevel = (o: Enum | Sequence | Extension): boolean => {
+    if (schemaIdFilter && o.parent !== schemaIdFilter) return referencedIds.has(o.id);
+    if (referencedIds.has(o.id)) return true;
+    if (sectionFilter) return false;
+    if (qLower !== undefined) {
+      return includes(o.name) || includes(`${schemaName(o.parent)}.${o.name}`) || includes(o.comment);
+    }
+    return true;
+  };
+  const enums = all(model, 'enum').filter(keepSchemaLevel);
+  const sequences = all(model, 'sequence').filter(keepSchemaLevel);
+  const extensions = all(model, 'extension').filter(keepSchemaLevel);
+
+  // 3. 不透明对象：按所属 schema（表级的按所在表的 schema）过滤；传 section 时只保留挂在命中表上的表级对象
+  const opaques = all(model, 'opaque').filter((o) => {
+    const owner = opaqueOwner(model, o);
+    if (schemaIdFilter && owner.schemaId !== schemaIdFilter) return false;
+    if (sectionFilter && !(owner.tableId !== null && tableIds.has(owner.tableId))) return false;
+    if (qLower !== undefined) {
+      const qualified =
+        owner.tableName !== null
+          ? `${schemaName(owner.schemaId)}.${owner.tableName}.${o.name}`
+          : `${schemaName(owner.schemaId)}.${o.name}`;
+      return includes(o.name) || includes(qualified) || includes(o.comment);
+    }
+    return true;
+  });
+
+  const schemas = schemaIdFilter ? schemasAll.filter((s) => s.id === schemaIdFilter) : schemasAll;
 
   const counts = {
     schemas: schemas.length,
@@ -355,7 +569,6 @@ const summarizeOrReadModel = async (
     opaques: opaques.length,
   };
 
-  const schemaName = (id: string) => schemaById.get(id)?.name ?? id;
   const columnCountByTable = new Map<string, number>();
   for (const c of columns) columnCountByTable.set(c.parent, (columnCountByTable.get(c.parent) ?? 0) + 1);
   const constraintCountByTable = new Map<string, number>();
@@ -365,27 +578,19 @@ const summarizeOrReadModel = async (
   const indexCountByTable = new Map<string, number>();
   for (const ix of indexes) indexCountByTable.set(ix.parent, (indexCountByTable.get(ix.parent) ?? 0) + 1);
 
-  // 画布板块（纯布局层）：只保留当前（schema 过滤后）模型里仍存活的顶层表，消除已删表留下的孤儿 ID；
-  // 分区子表经顶层父表继承 sectionId，与画布显示一致
-  const topTableIds = new Set(tables.filter((t) => !t.partitionOf).map((t) => t.id));
-  const liveSections: CanvasSection[] = rawSections.map((sec) => ({
+  // 画布板块（纯布局层）：只保留（schema 过滤后）模型里仍存活的顶层表，消除已删表留下的孤儿 ID；
+  // 传 section 时只返回该板块，`$none` 返回空列表
+  const schemaTopIds = new Set(schemaTables.filter((t) => !t.partitionOf).map((t) => t.id));
+  const visibleSections =
+    sectionFilter === null
+      ? rawSections
+      : sectionFilter.kind === 'none'
+        ? []
+        : rawSections.filter((s) => s.id === sectionFilter.section.id);
+  const liveSections: CanvasSection[] = visibleSections.map((sec) => ({
     ...sec,
-    tables: sec.tables.filter((id) => topTableIds.has(id)),
+    tables: sec.tables.filter((id) => schemaTopIds.has(id)),
   }));
-  const sectionOfTop = new Map<string, string>();
-  for (const sec of liveSections) for (const id of sec.tables) sectionOfTop.set(id, sec.id);
-  const sectionIdOf = (table: Table): string | null => {
-    let cur: Table | undefined = table;
-    const seen = new Set<string>();
-    while (cur?.partitionOf && !seen.has(cur.id)) {
-      seen.add(cur.id);
-      const parent: Obj | undefined = Object.hasOwn(model.objects, cur.partitionOf.parent)
-        ? model.objects[cur.partitionOf.parent]
-        : undefined;
-      cur = parent?.kind === 'table' ? parent : undefined;
-    }
-    return cur ? (sectionOfTop.get(cur.id) ?? null) : null;
-  };
   const sectionSummaries = liveSections.map((sec) => ({
     id: sec.id,
     name: sec.name,
@@ -393,36 +598,98 @@ const summarizeOrReadModel = async (
     tableCount: sec.tables.length,
   }));
 
-  const tableSummaries = tables.map((t) => ({
-    id: t.id,
-    schemaId: t.parent,
-    schema: schemaName(t.parent),
-    name: t.name,
-    ver: versions[t.id] ?? 0,
-    columnCount: columnCountByTable.get(t.id) ?? 0,
-    constraintCount: constraintCountByTable.get(t.id) ?? 0,
-    indexCount: indexCountByTable.get(t.id) ?? 0,
-    partitionBy: t.partitionBy,
-    partitionOf: t.partitionOf,
-    sectionId: sectionIdOf(t),
+  const tableSummaries = tables.map((t) => {
+    const matchedColumns = matchedColumnsOf.get(t.id);
+    return {
+      id: t.id,
+      schemaId: t.parent,
+      schema: schemaName(t.parent),
+      name: t.name,
+      ver: versions[t.id] ?? 0,
+      columnCount: columnCountByTable.get(t.id) ?? 0,
+      constraintCount: constraintCountByTable.get(t.id) ?? 0,
+      indexCount: indexCountByTable.get(t.id) ?? 0,
+      partitionBy: t.partitionBy,
+      partitionOf: t.partitionOf,
+      sectionId: sectionIdOf(t),
+      ...(matchedColumns ? { matchedColumns } : {}),
+    };
+  });
+
+  const enumSummaries = enums.map((e) => ({
+    id: e.id,
+    schemaId: e.parent,
+    schema: schemaName(e.parent),
+    name: e.name,
+    ver: versions[e.id] ?? 0,
+    valueCount: e.values.length,
+    values: e.values,
+    comment: e.comment ?? null,
   }));
+  const sequenceSummaries = sequences.map((s) => ({
+    id: s.id,
+    schemaId: s.parent,
+    schema: schemaName(s.parent),
+    name: s.name,
+    ver: versions[s.id] ?? 0,
+    nameMode: s.nameMode,
+    ownedBy: s.ownedBy,
+    options: s.options,
+    comment: s.comment ?? null,
+  }));
+  const extensionSummaries = extensions.map((x) => ({
+    id: x.id,
+    schemaId: x.parent,
+    schema: schemaName(x.parent),
+    name: x.name,
+    ver: versions[x.id] ?? 0,
+    comment: x.comment ?? null,
+  }));
+  const opaqueSummaries = opaques.map((o) => {
+    const owner = opaqueOwner(model, o);
+    return {
+      id: o.id,
+      schemaId: owner.schemaId,
+      schema: schemaName(owner.schemaId),
+      parentKind: owner.parentKind,
+      tableId: owner.tableId,
+      table: owner.tableName,
+      name: o.name,
+      objType: o.objType,
+      ver: verOf(versions, o.id),
+      comment: o.comment ?? null,
+    };
+  });
+
+  const head = {
+    project: { id: project.row.id, path: project.path, name: project.row.name },
+    seq,
+    dialect: model.dialect,
+    ...context,
+  };
 
   if (opts.detail === 'full') {
     if (!schemaIdFilter && tables.length > MAX_FULL_MODEL_TABLES_WITHOUT_SCHEMA) {
       return {
-        project: { id: project.row.id, path: project.path, name: project.row.name },
-        seq,
-        dialect: model.dialect,
-        ...context,
-        detail: 'full' as const,
-        truncated: true,
-        totalTables: tables.length,
-        maxTablesWithoutSchemaFilter: MAX_FULL_MODEL_TABLES_WITHOUT_SCHEMA,
-        message: `模型包含 ${tables.length} 张表（超过 ${MAX_FULL_MODEL_TABLES_WITHOUT_SCHEMA} 上限）；请传入 schema 过滤全量对象，或使用 get_table 查看单表详情。`,
-        counts,
-        schemas: schemas.map((s) => ({ id: s.id, name: s.name, ver: versions[s.id] ?? 0 })),
-        tables: tableSummaries.slice(0, MAX_FULL_MODEL_TABLES_WITHOUT_SCHEMA),
-        sections: sectionSummaries,
+        ok: true,
+        data: {
+          ...head,
+          detail: 'full' as const,
+          truncated: true,
+          ...filterEcho,
+          totalTables: tables.length,
+          maxTablesWithoutSchemaFilter: MAX_FULL_MODEL_TABLES_WITHOUT_SCHEMA,
+          message: `模型包含 ${tables.length} 张表（超过 ${MAX_FULL_MODEL_TABLES_WITHOUT_SCHEMA} 上限）；请传入 schema / section / q 过滤全量对象，或使用 get_table 查看单表详情。`,
+          counts,
+          schemas: schemas.map((s) => ({ id: s.id, name: s.name, ver: versions[s.id] ?? 0 })),
+          tables: tableSummaries.slice(0, MAX_FULL_MODEL_TABLES_WITHOUT_SCHEMA),
+          enums: enumSummaries,
+          sequences: sequenceSummaries,
+          extensions: extensionSummaries,
+          opaques: opaqueSummaries,
+          sections: sectionSummaries,
+          ...diag,
+        },
       };
     }
 
@@ -445,53 +712,37 @@ const summarizeOrReadModel = async (
     }
 
     return {
-      project: { id: project.row.id, path: project.path, name: project.row.name },
-      seq,
-      dialect: model.dialect,
-      ...context,
-      detail: 'full' as const,
-      truncated: false,
-      counts,
-      objects,
-      // 板块不混进 objects（objects 保持纯 @dowel/core IR 对象）
-      sections: liveSections,
+      ok: true,
+      data: {
+        ...head,
+        detail: 'full' as const,
+        truncated: false,
+        ...filterEcho,
+        counts,
+        objects,
+        // 板块不混进 objects（objects 保持纯 @dowel/core IR 对象）
+        sections: liveSections,
+        ...diag,
+      },
     };
   }
 
   return {
-    project: { id: project.row.id, path: project.path, name: project.row.name },
-    seq,
-    dialect: model.dialect,
-    ...context,
-    detail: 'summary' as const,
-    counts,
-    schemas: schemas.map((s) => ({ id: s.id, name: s.name, ver: versions[s.id] ?? 0 })),
-    tables: tableSummaries,
-    enums: enums.map((e) => ({
-      id: e.id,
-      schemaId: e.parent,
-      schema: schemaName(e.parent),
-      name: e.name,
-      ver: versions[e.id] ?? 0,
-      valueCount: e.values.length,
-    })),
-    sequences: sequences.map((s) => ({
-      id: s.id,
-      schemaId: s.parent,
-      schema: schemaName(s.parent),
-      name: s.name,
-      ver: versions[s.id] ?? 0,
-    })),
-    extensions: extensions.map((x) => ({ id: x.id, name: x.name, ver: versions[x.id] ?? 0 })),
-    opaques: opaques.map((o) => ({
-      id: o.id,
-      schemaId: o.parent,
-      schema: schemaName(o.parent),
-      name: o.name,
-      objType: o.objType,
-      ver: verOf(versions, o.id),
-    })),
-    sections: sectionSummaries,
+    ok: true,
+    data: {
+      ...head,
+      detail: 'summary' as const,
+      ...filterEcho,
+      counts,
+      schemas: schemas.map((s) => ({ id: s.id, name: s.name, ver: versions[s.id] ?? 0 })),
+      tables: tableSummaries,
+      enums: enumSummaries,
+      sequences: sequenceSummaries,
+      extensions: extensionSummaries,
+      opaques: opaqueSummaries,
+      sections: sectionSummaries,
+      ...diag,
+    },
   };
 };
 
@@ -573,6 +824,197 @@ const computeDiagnostics = async (
       diagnosticsError: scrubSecrets(e instanceof Error ? e.message : String(e)),
     };
   }
+};
+
+// ───── get_objects（ADR 0015 第 6 节：非表对象的完整只读上下文） ─────
+
+type ContextObject = Enum | Sequence | Extension | Opaque;
+const CONTEXT_KINDS: readonly ContextObject['kind'][] = ['extension', 'enum', 'sequence', 'opaque'];
+const isContextObject = (o: Obj | undefined): o is ContextObject =>
+  o !== undefined && (CONTEXT_KINDS as readonly string[]).includes(o.kind);
+
+/** 依赖 / 引用对象的可读名：schema 级对象 `schema.name`，列 `schema.table.column`，其余子对象 `table.name` */
+const qualifiedNameOf = (model: Model, o: Obj): string => {
+  const get = (id: string) => (Object.hasOwn(model.objects, id) ? model.objects[id] : undefined);
+  if (o.kind === 'schema') return o.name;
+  if (o.kind === 'opaque') {
+    const owner = opaqueOwner(model, o);
+    const schema = get(owner.schemaId);
+    const prefix = schema?.kind === 'schema' ? `${schema.name}.` : '';
+    return owner.tableName !== null ? `${prefix}${owner.tableName}.${o.name}` : `${prefix}${o.name}`;
+  }
+  const parent = get(o.parent);
+  if (!parent) return o.name;
+  if (parent.kind === 'schema') return `${parent.name}.${o.name}`;
+  if (parent.kind === 'table') {
+    const schema = get(parent.parent);
+    return schema?.kind === 'schema' ? `${schema.name}.${parent.name}.${o.name}` : `${parent.name}.${o.name}`;
+  }
+  return `${parent.name}.${o.name}`;
+};
+
+const readObjects = (
+  model: Model,
+  versions: Versions,
+  args: {
+    ids?: string[];
+    kind?: ContextObject['kind'];
+    objType?: OpaqueType;
+    schema?: string;
+    q?: string;
+    limit: number;
+    offset: number;
+  },
+) => {
+  const get = (id: string) => (Object.hasOwn(model.objects, id) ? model.objects[id] : undefined);
+  const schemaNameOf = (id: string) => {
+    const s = get(id);
+    return s?.kind === 'schema' ? s.name : null;
+  };
+  const schemaIdOf = (o: ContextObject) => (o.kind === 'opaque' ? opaqueOwner(model, o).schemaId : o.parent);
+
+  let schemaFilter: string | null = null;
+  let schemaMissing = false;
+  if (args.schema !== undefined) {
+    const match = all(model, 'schema').find((s) => s.id === args.schema || s.name === args.schema);
+    if (match) schemaFilter = match.id;
+    else schemaMissing = true;
+  }
+  const qLower = args.q?.toLowerCase();
+  const kind = args.objType ? 'opaque' : args.kind;
+
+  const matches = (o: ContextObject): boolean => {
+    if (schemaMissing) return false;
+    if (kind && o.kind !== kind) return false;
+    if (args.objType && (o.kind !== 'opaque' || o.objType !== args.objType)) return false;
+    if (schemaFilter && schemaIdOf(o) !== schemaFilter) return false;
+    if (qLower !== undefined) {
+      const texts = [o.name, qualifiedNameOf(model, o), o.comment ?? null];
+      if (!texts.some((t) => typeof t === 'string' && t.toLowerCase().includes(qLower))) return false;
+    }
+    return true;
+  };
+
+  const missing: string[] = [];
+  let candidates: ContextObject[];
+  if (args.ids) {
+    const seen = new Set<string>();
+    candidates = [];
+    for (const id of args.ids) {
+      if (seen.has(id)) continue;
+      seen.add(id);
+      const o = get(id);
+      if (!isContextObject(o)) missing.push(id);
+      else if (matches(o)) candidates.push(o);
+    }
+  } else {
+    const kindRank = (k: string) => CONTEXT_KINDS.indexOf(k as ContextObject['kind']);
+    const sortKey = (o: ContextObject) => {
+      const owner = o.kind === 'opaque' ? opaqueOwner(model, o) : null;
+      return [schemaNameOf(schemaIdOf(o)) ?? '', owner?.tableName ?? '', o.name, o.id];
+    };
+    candidates = Object.values(model.objects)
+      .filter(isContextObject)
+      .filter(matches)
+      .sort((a, b) => {
+        const kr = kindRank(a.kind) - kindRank(b.kind);
+        if (kr !== 0) return kr;
+        const ka = sortKey(a);
+        const kb = sortKey(b);
+        for (let i = 0; i < ka.length; i++) {
+          if (ka[i]! < kb[i]!) return -1;
+          if (ka[i]! > kb[i]!) return 1;
+        }
+        return 0;
+      });
+  }
+
+  const total = candidates.length;
+  const page = candidates.slice(args.offset, args.offset + args.limit);
+  const nextOffset = args.offset + page.length < total ? args.offset + page.length : null;
+
+  let ddlChars = 0;
+  let budgetExceeded = false;
+  let omitted = 0;
+  const objects = page.map((o) => {
+    const schemaId = schemaIdOf(o);
+    const common = { ver: verOf(versions, o.id), schemaId, schema: schemaNameOf(schemaId) };
+    if (o.kind !== 'opaque') return { ...o, ...common };
+    const owner = opaqueOwner(model, o);
+    const deps = o.deps.map((id) => {
+      const d = get(id);
+      return d ? { id, kind: d.kind, name: qualifiedNameOf(model, d) } : { id, kind: null, name: null };
+    });
+    const ownerFields = { parentKind: owner.parentKind, tableId: owner.tableId, table: owner.tableName };
+    const size = o.ddl.reduce((n, stmt) => n + stmt.length, 0);
+    if (!budgetExceeded && ddlChars + size <= MCP_OBJECTS_DDL_BUDGET) {
+      ddlChars += size;
+      return { ...o, ...common, ...ownerFields, deps };
+    }
+    budgetExceeded = true;
+    omitted++;
+    const { ddl: _omitted, ...rest } = o;
+    return { ...rest, ...common, ...ownerFields, deps, ddlOmitted: true };
+  });
+
+  return {
+    total,
+    offset: args.offset,
+    limit: args.limit,
+    nextOffset,
+    truncated: omitted > 0,
+    ...(omitted > 0 ? { ddlOmitted: omitted, ddlBudget: MCP_OBJECTS_DDL_BUDGET } : {}),
+    objects,
+    ...(args.ids ? { missing } : {}),
+    ...(schemaMissing ? { schemaNotFound: args.schema } : {}),
+  };
+};
+
+// ───── get_history_diff：两次模型之间的 IR 对象净变化 ─────
+
+/** 与画布历史摘要一致的对象标签：schema 级对象只用名字，子对象（列、约束、索引、表级 opaque）为 `表名.名字` */
+const historyObjectLabel = (o: Obj, lookup: (id: string) => Obj | undefined): string => {
+  if (o.kind === 'schema') return o.name;
+  const parent = lookup(o.parent);
+  if (!parent || parent.kind === 'schema') return o.name;
+  return `${parent.name}.${o.name}`;
+};
+
+/** prevModel → targetModel 之间新增 / 删除 / 修改的对象（最多 MCP_HISTORY_OBJECTS_MAX_ITEMS 条） */
+const netObjectChanges = (prevModel: Model | null, targetModel: Model) => {
+  const prev = prevModel?.objects ?? {};
+  const next = targetModel.objects;
+  const lookup = (id: string): Obj | undefined =>
+    (Object.hasOwn(next, id) ? next[id] : undefined) ?? (Object.hasOwn(prev, id) ? prev[id] : undefined);
+  const items: {
+    id: string;
+    kind: Obj['kind'];
+    name: string;
+    label: string;
+    change: 'added' | 'removed' | 'modified';
+  }[] = [];
+  for (const [id, o] of Object.entries(next)) {
+    const before = Object.hasOwn(prev, id) ? prev[id] : undefined;
+    if (!before)
+      items.push({ id, kind: o.kind, name: o.name, label: historyObjectLabel(o, lookup), change: 'added' });
+    else if (!deepEqual(before, o))
+      items.push({
+        id,
+        kind: o.kind,
+        name: o.name,
+        label: historyObjectLabel(o, lookup),
+        change: 'modified',
+      });
+  }
+  for (const [id, o] of Object.entries(prev)) {
+    if (!Object.hasOwn(next, id))
+      items.push({ id, kind: o.kind, name: o.name, label: historyObjectLabel(o, lookup), change: 'removed' });
+  }
+  return {
+    total: items.length,
+    truncated: items.length > MCP_HISTORY_OBJECTS_MAX_ITEMS,
+    items: items.slice(0, MCP_HISTORY_OBJECTS_MAX_ITEMS),
+  };
 };
 
 const PRIMITIVE_MUTATOR_DESCRIPTION =
@@ -671,26 +1113,35 @@ export const createMcpServer = (
   addTool({
     name: 'get_model',
     description:
-      'Read working-trunk model (`seq`, `dialect`, and summary or full objects with per-object `ver`), plus canvas `sections` (pure layout; per-table `sectionId` in summaries), dialect `capabilities`, and the derived lowest `target` version (platform cache only). For >200 tables in `detail="full"`, pass `schema` filter.',
+      'Read working-trunk model (`seq`, `dialect`, and summary or full objects with per-object `ver`), plus canvas `sections` (pure layout; per-table `sectionId` in summaries, partitions inherit their root table), dialect `capabilities`, and the derived lowest `target` version (platform cache only). Summaries include enum `values`, sequence `options` / `ownedBy`, extension and opaque owners (`parentKind`, `tableId`, `table` for table-level triggers / policies / exclusions). Optional filters (intersected): `schema`; `section` (section ID, `$none` for unsectioned tables, or a unique case-insensitive name); `q` (case-insensitive substring of table / schema / comment / column names — `matchedColumns` lists column hits — and of object names). `diagnostics: true` adds full validation + static compatibility diagnostics (platform cache only, never connects to target DBs). For >200 tables in `detail="full"`, filter by `schema`, `section` or `q`.',
     schema: z.object({
       project: z.string().min(1),
       schema: z.string().min(1).optional(),
       detail: z.enum(['summary', 'full']).default('summary'),
+      q: z.string().trim().min(1).max(100).optional(),
+      section: z.string().trim().min(1).max(MAX_SECTION_ID_LENGTH).optional(),
+      diagnostics: z.boolean().default(false),
     }),
     annotations: { readOnlyHint: true, destructiveHint: false, idempotentHint: true, openWorldHint: false },
     run: async (args) => {
       const resolved = await resolveMcpProject(ctx, principal, args.project, MCP_TOOLS.get_model.action);
       if (!resolved.ok) return toolError(resolved.code, resolved.message);
-      return toolOk(
-        await summarizeOrReadModel(ctx, resolved.project, { schema: args.schema, detail: args.detail }),
-      );
+      const res = await summarizeOrReadModel(ctx, resolved.project, {
+        schema: args.schema,
+        detail: args.detail,
+        q: args.q,
+        section: args.section,
+        diagnostics: args.diagnostics,
+      });
+      if (!res.ok) return toolError(res.code, res.message, res.extra);
+      return toolOk(res.data);
     },
   });
 
   addTool({
     name: 'get_table',
     description:
-      'Inspect a single table (by id, `schema.name`, or unique `name`) with columns, constraints, indexes, partitions, IDs, `ver`, and working `seq`.',
+      'Inspect a single table (by id, `schema.name`, or unique `name`) with columns, constraints, indexes, partitions, IDs, `ver`, and working `seq`, plus its canvas `sectionId` (partitions inherit their root table), table-level `opaques` (triggers / policies / exclusion constraints, full objects with `ver`) and `dependentOpaques` (views, functions, etc. elsewhere whose `deps` reference this table or any of its columns).',
     schema: z.object({
       project: z.string().min(1),
       table: z.string().min(1),
@@ -701,7 +1152,7 @@ export const createMcpServer = (
       if (!resolved.ok) return toolError(resolved.code, resolved.message);
       const { row } = resolved.project;
       await ctx.refresher.flush(row.branch);
-      const { model, versions, seq } = await ctx.rooms.state(row.branch);
+      const { model, versions, seq, sections: rawSections } = await ctx.rooms.canvasState(row.branch);
 
       const schemas = all(model, 'schema');
       const tables = all(model, 'table');
@@ -743,6 +1194,27 @@ export const createMcpServer = (
       const indexes: Index[] = childrenOf(model, matched.id, 'index');
       const columns: Column[] = columnsOf(model, matched.id);
       const partitions = tables.filter((t) => t.partitionOf?.parent === matched.id);
+      const tableId = matched.id;
+      const ownIds = new Set([tableId, ...columns.map((c) => c.id)]);
+      const opaquesAll = all(model, 'opaque');
+      const ownOpaques = opaquesAll.filter((o) => o.parent === tableId);
+      const schemaNameOf = (id: string) => {
+        const o = Object.hasOwn(model.objects, id) ? model.objects[id] : undefined;
+        return o?.kind === 'schema' ? o.name : id;
+      };
+      const dependentOpaques = opaquesAll
+        .filter((o) => o.parent !== tableId && o.deps.some((d) => ownIds.has(d)))
+        .map((o) => {
+          const owner = opaqueOwner(model, o);
+          return {
+            id: o.id,
+            schemaId: owner.schemaId,
+            schema: schemaNameOf(owner.schemaId),
+            objType: o.objType,
+            name: o.name,
+            ver: verOf(versions, o.id),
+          };
+        });
 
       return toolOk({
         seq,
@@ -759,7 +1231,51 @@ export const createMcpServer = (
         foreignKeys: fks.map((f) => withVer(f, versions)),
         indexes: indexes.map((ix) => withVer(ix, versions)),
         partitions: partitions.map((p) => withVer(p, versions)),
+        sectionId: sectionIndexOf(model, rawSections)(matched),
+        opaques: ownOpaques.map((o) => withVer(o, versions)),
+        dependentOpaques,
       });
+    },
+  });
+
+  addTool({
+    name: 'get_objects',
+    description: `Read full IR (with \`ver\`) of non-table objects: enums, sequences, extensions and opaque objects (views, materialized views, functions, procedures, domains, types, aggregates, triggers, policies, exclusion constraints). Look up by \`ids\` (unknown or non-supported IDs are listed in \`missing\`; use \`get_table\` for tables / columns / constraints) or filter by \`kind\`, \`objType\` (implies kind "opaque"), \`schema\` and \`q\` (case-insensitive substring of name, qualified name or comment); results are sorted deterministically and paged with \`limit\` / \`offset\` (\`total\`, \`nextOffset\`). Opaque objects carry their owner (\`parentKind\`, \`tableId\`, \`table\` for table-level ones) and resolved \`deps\` ({ id, kind, name }). DDL text on one page is capped at ${MCP_OBJECTS_DDL_BUDGET} characters: later objects omit \`ddl\` (\`ddlOmitted: true\`, top-level \`truncated: true\`) — fetch them by \`ids\`.`,
+    schema: z
+      .object({
+        project: z.string().min(1),
+        ids: z.array(z.string().min(1).max(128)).min(1).max(50).optional(),
+        kind: z.enum(['enum', 'sequence', 'extension', 'opaque']).optional(),
+        objType: OpaqueType.optional(),
+        schema: z.string().min(1).optional(),
+        q: z.string().trim().min(1).max(100).optional(),
+        limit: z.number().int().min(1).max(100).default(50),
+        offset: z.number().int().min(0).default(0),
+      })
+      .strict(),
+    annotations: { readOnlyHint: true, destructiveHint: false, idempotentHint: true, openWorldHint: false },
+    run: async (args) => {
+      if (!args.ids && !args.kind && !args.objType && !args.q) {
+        return toolError('invalid_arguments', '请至少传入 ids，或 kind / objType / q 之一');
+      }
+      if (args.objType && args.kind && args.kind !== 'opaque') {
+        return toolError('invalid_arguments', `objType 只适用于 kind "opaque"（收到 kind "${args.kind}"）`);
+      }
+      const resolved = await resolveMcpProject(ctx, principal, args.project, MCP_TOOLS.get_objects.action);
+      if (!resolved.ok) return toolError(resolved.code, resolved.message);
+      const { row } = resolved.project;
+      // 关键出口：读前按需规范化，不透明对象 DDL 里引用的依赖名与当前模型一致（05-implementation.md 4.26）
+      await ctx.refresher.flush(row.branch);
+      const { model, versions, seq } = await ctx.rooms.canvasState(row.branch);
+      const res = readObjects(model, versions, args);
+      return toolOk(
+        sanitizeUnknown({
+          project: resolved.project.path,
+          seq,
+          dialect: model.dialect,
+          ...res,
+        }) as Record<string, unknown>,
+      );
     },
   });
 
@@ -902,6 +1418,124 @@ export const createMcpServer = (
       );
       if (!resolved.ok) return toolError(resolved.code, resolved.message);
       return toolOk(await readCachedEnvironments(ctx, resolved.project.row.id));
+    },
+  });
+
+  // ───── 只读画布历史（ADR 0015 第 6 节）：绝不 flush、绝不连影子库 / 目标库、不写审计；恢复只在界面由人工操作 ─────
+
+  addTool({
+    name: 'list_history',
+    description: `Browse the canvas history of the working trunk, newest first (read-only). Default \`grouped: true\` folds consecutive edits by the same person into edit sessions (\`seqFrom\`..\`seq\`, \`stepCount\`, \`ops\`); \`grouped: false\` lists single steps. Page with \`beforeSeq\` (use \`nextBeforeSeq\`); \`limit\` 1..${MCP_HISTORY_MAX_LIMIT}. Each entry shows who / when / what (\`summary\`, \`changeCount\`, published \`version\`, \`via: "mcp"\` and \`opSummary\` truncated to ${MCP_HISTORY_OP_SUMMARY_MAX_CHARS} chars). Inspect one entry or group with \`get_history_diff\`. Restoring history is reserved for humans in the Dowel UI.`,
+    schema: z
+      .object({
+        project: z.string().min(1),
+        beforeSeq: z.number().int().min(0).optional(),
+        limit: z.number().int().min(1).max(MCP_HISTORY_MAX_LIMIT).default(20),
+        grouped: z.boolean().default(true),
+      })
+      .strict(),
+    annotations: { readOnlyHint: true, destructiveHint: false, idempotentHint: true, openWorldHint: false },
+    run: async (args) => {
+      const resolved = await resolveMcpProject(ctx, principal, args.project, MCP_TOOLS.list_history.action);
+      if (!resolved.ok) return toolError(resolved.code, resolved.message);
+      // 不 flush：历史只读平台库里的提交与快照，不触发规范化，也不会凭空推进 seq
+      const list = await ctx.rooms.listHistory(resolved.project.row.branch, {
+        beforeSeq: args.beforeSeq,
+        limit: args.limit,
+        grouped: args.grouped,
+      });
+      const entries = list.entries.map((e) =>
+        e.opSummary && e.opSummary.length > MCP_HISTORY_OP_SUMMARY_MAX_CHARS
+          ? {
+              ...e,
+              opSummary: `${e.opSummary.slice(0, MCP_HISTORY_OP_SUMMARY_MAX_CHARS - 1)}…`,
+              opSummaryTruncated: true,
+            }
+          : e,
+      );
+      return toolOk(
+        sanitizeUnknown({ project: resolved.project.path, ...list, entries }) as Record<string, unknown>,
+      );
+    },
+  });
+
+  addTool({
+    name: 'get_history_diff',
+    description: `Inspect one canvas-history entry (\`seq\`) or a whole edit-session group (\`from\`..\`seq\`, at most ${CANVAS_HISTORY_GROUP_MAX_STEPS} steps) read-only: the entry metadata (full \`opSummary\`), the net object changes (\`objects\`: added / removed / modified IR objects) and the migration-style \`diff\` between the states before and after (first \`maxItems\` items, \`total\`, \`truncated\`; per-item \`sql\` capped at ${MCP_HISTORY_SQL_MAX_CHARS} chars with \`sqlTruncated\`, omitted with \`includeSql: false\`). \`includeSteps: true\` adds the single steps of the group. Never returns the full model or a diff to the current canvas (use \`get_model\` / \`preview_migration\`); never connects to shadow or target databases. Restoring history is reserved for humans in the Dowel UI.`,
+    schema: z
+      .object({
+        project: z.string().min(1),
+        seq: z.number().int().min(0),
+        from: z.number().int().min(1).optional(),
+        maxItems: z.number().int().min(1).max(MCP_HISTORY_DIFF_MAX_ITEMS).default(30),
+        includeSql: z.boolean().default(true),
+        includeSteps: z.boolean().default(false),
+      })
+      .strict(),
+    annotations: { readOnlyHint: true, destructiveHint: false, idempotentHint: true, openWorldHint: false },
+    run: async (args) => {
+      const { seq, from } = args;
+      // 查库前 O(1) 校验区间：1 <= from <= seq 且不超过单组步数上限
+      if (
+        from !== undefined &&
+        (seq === 0 || from > seq || seq - from + 1 > CANVAS_HISTORY_GROUP_MAX_STEPS)
+      ) {
+        return toolError(
+          'invalid_arguments',
+          `无效的历史区间：需要 1 <= from <= seq 且最多 ${CANVAS_HISTORY_GROUP_MAX_STEPS} 步`,
+        );
+      }
+      const resolved = await resolveMcpProject(
+        ctx,
+        principal,
+        args.project,
+        MCP_TOOLS.get_history_diff.action,
+      );
+      if (!resolved.ok) return toolError(resolved.code, resolved.message);
+      const branch = resolved.project.row.branch;
+      // 不 flush：只读历史提交，不与规范化后的当前模型比较
+      const { seq: currentSeq } = await ctx.rooms.model(branch);
+      if (seq > currentSeq) {
+        return toolError('history_not_found', `修改记录 #${seq} 不存在`, { currentSeq });
+      }
+      let detail: Awaited<ReturnType<typeof ctx.rooms.historyDetailModels>>;
+      let steps: Awaited<ReturnType<typeof ctx.rooms.historySteps>> | undefined;
+      try {
+        detail = await ctx.rooms.historyDetailModels(branch, seq, from, currentSeq);
+        if (args.includeSteps) {
+          steps = seq === 0 ? [] : await ctx.rooms.historySteps(branch, from ?? seq, seq, currentSeq);
+        }
+      } catch (e) {
+        if (e instanceof HTTPException && e.status === 404) {
+          return toolError('history_not_found', e.message, { currentSeq });
+        }
+        throw e;
+      }
+      const { entry, prevModel, targetModel } = detail;
+
+      const planned = prevModel ? planDiff(prevModel, targetModel) : { total: 0, items: [] };
+      const diffItems = planned.items.slice(0, args.maxItems).map((item) => {
+        if (!args.includeSql) return { kind: item.kind, target: item.target };
+        if (item.sql.length > MCP_HISTORY_SQL_MAX_CHARS) {
+          return { ...item, sql: `${item.sql.slice(0, MCP_HISTORY_SQL_MAX_CHARS)}…`, sqlTruncated: true };
+        }
+        return item;
+      });
+
+      return toolOk(
+        sanitizeUnknown({
+          project: resolved.project.path,
+          currentSeq,
+          entry,
+          objects: netObjectChanges(prevModel, targetModel),
+          diff: {
+            total: planned.total,
+            truncated: planned.total > diffItems.length,
+            items: diffItems,
+          },
+          ...(steps ? { steps } : {}),
+        }) as Record<string, unknown>,
+      );
     },
   });
 
@@ -1349,7 +1983,9 @@ export const createMcpServer = (
         varStr(variables.project),
         'project.read',
       );
-      const data = await summarizeOrReadModel(ctx, p, { detail: 'summary' });
+      const res = await summarizeOrReadModel(ctx, p, { detail: 'summary' });
+      if (!res.ok) throw new ProtocolError(ProtocolErrorCode.InvalidParams, scrubSecrets(res.message));
+      const data = res.data;
       return {
         contents: [
           { uri: uri.toString(), mimeType: 'application/json', text: JSON.stringify(data, null, 2) },
@@ -1424,6 +2060,9 @@ export const createMcpServer = (
       };
     },
   );
+
+  // ───── MCP Prompts（read：审查类；write：建表 / 改列；渲染时零数据库查询） ─────
+  registerMcpPrompts(server, principal);
 
   return server;
 };

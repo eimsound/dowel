@@ -307,6 +307,19 @@ export class Rooms {
     return this.history.historyRange(branchId, from, seq, currentSeq);
   }
 
+  /**
+   * 历史详情的前后模型：seq = 0 时 prevModel 为 null；单步与区间统一最多重建一次 modelAt 后内存重放
+   * （HTTP 历史详情与 MCP get_history_diff 共用；只读，不 flush）
+   */
+  historyDetailModels(
+    branchId: string,
+    seq: number,
+    from: number | undefined,
+    currentSeq: number,
+  ): Promise<{ entry: CanvasHistoryEntry; prevModel: Model | null; targetModel: Model }> {
+    return this.history.historyDetailModels(branchId, seq, from, currentSeq);
+  }
+
   /** 展开编辑会话组：[from..seq] 的倒序单步列表 */
   historySteps(
     branchId: string,

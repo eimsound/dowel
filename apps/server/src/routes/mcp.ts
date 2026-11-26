@@ -110,7 +110,7 @@ export const mcpAuth =
 
 /**
  * 注册 MCP 服务。认证中间件之后由 @modelcontextprotocol/server 的无状态 handler 负责
- * （支持 2026-07-28 与 2025-era 无会话请求：initialize / tools/* / resources/* / ping）。
+ * （支持 2026-07-28 与 2025-era 无会话请求：initialize / server/discover / tools/* / resources/* / prompts/* / ping）。
  */
 export const registerMcp = (app: Hono<Env>, ctx: AppContext) => {
   const handler = createMcpHandler(
