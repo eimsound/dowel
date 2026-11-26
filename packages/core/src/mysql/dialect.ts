@@ -11,6 +11,7 @@ import {
   indexElementNames,
   objectsOfKinds,
 } from '../model.ts';
+import { mysqlClipboard } from './clipboard.ts';
 import {
   MAX_MYSQL_IDENT,
   MYSQL_SAFE_IDENT_RE,
@@ -363,4 +364,5 @@ export const mysqlDialect: DialectSpec = {
   isConcurrentDdlSql: mysqlIsConcurrentDdlSql,
   findInstanceLevelStatement: mysqlFindInstanceLevelStatement,
   instanceLevelDescription: MYSQL_INSTANCE_LEVEL_DESCRIPTION,
+  clipboard: mysqlClipboard,
 };

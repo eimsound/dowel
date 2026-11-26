@@ -1,4 +1,5 @@
 // 多方言统一抽象契约（纯函数、无 I/O，前后端共用、浏览器轻量安全）。
+import type { ClipboardDialect } from './clipboard-dialect.ts';
 import type { Dialect, Model } from './ir.ts';
 import type { PlanOptions } from './pg/capabilities.ts';
 import type { Step, Token } from './plan-types.ts';
@@ -78,4 +79,6 @@ export interface DialectSpec {
   isConcurrentDdlSql(sql: string): boolean;
   findInstanceLevelStatement(sql: string): string | null;
   instanceLevelDescription: string;
+  /** 画布复制粘贴的方言适配器（命名空间、推导名、类型 / 自增 / 聚集索引兼容性、分区等） */
+  readonly clipboard: ClipboardDialect;
 }
