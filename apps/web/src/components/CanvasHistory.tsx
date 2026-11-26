@@ -646,7 +646,7 @@ const SessionItem = ({
         className={cx(
           'relative rounded-sm',
           holdsSelection &&
-            'bg-surface before:pointer-events-none before:absolute before:inset-y-0 before:left-0 before:w-0.5 before:rounded-l-sm before:bg-border-strong',
+            'bg-surface before:pointer-events-none before:absolute before:inset-0 before:rounded-sm before:border before:border-l-2 before:border-transparent before:border-l-border-strong',
         )}
       >
         <button
@@ -654,7 +654,7 @@ const SessionItem = ({
           aria-current={groupSelected ? 'true' : undefined}
           onClick={() => onSelect(selectionOf(entry))}
           className={cx(
-            'flex w-full flex-col gap-1 rounded-sm border border-l-2 border-transparent px-2.5 pt-2 pb-1.5 text-left transition-colors',
+            'flex w-full flex-col gap-1 rounded-sm border border-l-2 border-transparent px-2.5 pt-2 pb-1.5 text-left transition-colors focus-visible:relative focus-visible:z-10',
             groupSelected ? 'border-l-primary bg-primary-soft text-text' : 'text-text hover:bg-surface-hover',
           )}
         >
@@ -719,7 +719,7 @@ const SessionItem = ({
           aria-expanded={expanded}
           aria-controls={stepsId}
           onClick={toggle}
-          className="btn ghost sm ml-1 text-text-2"
+          className="btn ghost sm ml-1.5 text-text-2 focus-visible:relative focus-visible:z-10"
         >
           <ChevronRight
             size={14}
