@@ -635,6 +635,7 @@ export const PolicyLayerPanel = ({ path, queryKey }: { path: string; queryKey: u
             type="button"
             className="btn primary"
             disabled={!dirty || save.isPending}
+            aria-busy={save.isPending}
             onClick={() => save.mutate(draft)}
           >
             {t('pol.save')}
@@ -710,6 +711,7 @@ export const EnvPolicyPanel = ({ pid, eid }: { pid: string; eid: string }) => {
             type="button"
             className="btn primary"
             disabled={!dirty || save.isPending}
+            aria-busy={save.isPending}
             onClick={() => save.mutate(draft)}
           >
             {t('pol.save')}

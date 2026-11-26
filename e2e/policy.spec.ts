@@ -93,11 +93,13 @@ test('保存执行策略进行中时“撤销修改”禁用，保存完成后�
   await save.click();
   // 请求还没回来：保存、撤销、表单都不可操作，避免撤销后又被迟到的保存结果覆盖
   await expect(save).toBeDisabled();
+  await expect(save).toHaveAttribute('aria-busy', 'true');
   await expect(reset).toBeDisabled();
   await expect(set(panel, '非生产环境').getByLabel('谁能执行')).toBeDisabled();
   await release();
 
   await expect(page.getByText('已保存执行策略')).toBeVisible();
+  await expect(save).toHaveAttribute('aria-busy', 'false');
   await expect(set(panel, '非生产环境').getByLabel('谁能执行')).toHaveValue('admin');
   await expect(set(panel, '非生产环境').getByLabel('谁能执行')).toBeEnabled();
   // 已保存：没有未保存的修改，撤销仍禁用；再改一次又可撤销
@@ -227,11 +229,13 @@ test.describe('需要目标库', () => {
       const release = await holdRequest(page, '**/api/projects/*/environments/*/exec-policy', 'PUT');
       await save.click();
       await expect(save).toBeDisabled();
+      await expect(save).toHaveAttribute('aria-busy', 'true');
       await expect(reset).toBeDisabled();
       await expect(who).toBeDisabled();
       await release();
 
       await expect(page.getByText('已保存执行策略')).toBeVisible();
+      await expect(save).toHaveAttribute('aria-busy', 'false');
       await expect(who).toHaveValue('admin');
       await expect(reset).toBeDisabled();
       await who.selectOption('');
