@@ -38,7 +38,7 @@ export type McpTokenKind = z.infer<typeof mcpTokenKindSchema>;
 
 /**
  * scope：
- * - read：读项目、模型、DDL、版本链、迁移预览、环境的平台缓存状态（基线，总是包含）；
+ * - read：读项目、模型、DDL、版本链、迁移预览、环境的平台缓存状态与画布修改历史（只读，不能恢复；基线，总是包含）；
  * - verify：在影子库上验证迁移（等同界面的 model.verify，不连目标库）；
  * - write：在工作副本上整批原子执行 mutator（走同步层的冲突规则，需要项目编辑者以上），以及经 manage_sections 增量调整画布板块（纯布局层）。
  */
@@ -159,16 +159,26 @@ export interface McpHttpErrorBody {
 
 // ───── 工具清单（tools/list 的名字；输入 schema 由服务端用 zod 4 的 z.toJSONSchema() 生成） ─────
 
-/** 每个工具需要的 scope 与项目动作（authz.ts 的 ProjectAction） */
+/**
+ * 每个工具需要的 scope 与项目动作（authz.ts 的 ProjectAction）。
+ * 红线（ADR 0015 第 6 节）：永远不注册恢复 / 回滚画布历史、发布版本或执行迁移之类的工具（如 restore_history、
+ * revert_history、rollback、publish_version、execute_migration）；这些动作只能由人工在 Dowel 界面完成。
+ */
 export const MCP_TOOLS = {
   list_projects: { scope: 'read', action: null },
   get_model: { scope: 'read', action: 'project.read' },
   get_table: { scope: 'read', action: 'project.read' },
+  /** 按 ID / 种类 / schema / 关键字读取枚举、序列、扩展与不透明对象（视图、函数、触发器等）的完整 IR（ADR 0015 第 6 节） */
+  get_objects: { scope: 'read', action: 'project.read' },
   get_ddl: { scope: 'read', action: 'ddl.read' },
   list_versions: { scope: 'read', action: 'project.read' },
   get_version: { scope: 'read', action: 'migration.read' },
   preview_migration: { scope: 'read', action: 'migration.read' },
   list_environments: { scope: 'read', action: 'environment.read' },
+  /** 只读浏览画布修改历史（默认按编辑会话归组；绝不恢复历史，恢复只在 Dowel 界面由人工操作） */
+  list_history: { scope: 'read', action: 'project.read' },
+  /** 只读查看单步或整组历史的净变化与迁移差异（不返回完整模型、不连影子库 / 目标库） */
+  get_history_diff: { scope: 'read', action: 'project.read' },
   list_mutators: { scope: 'read', action: null },
   verify_migration: { scope: 'verify', action: 'model.verify' },
   apply_changes: { scope: 'write', action: 'sync.edit' },
@@ -186,6 +196,8 @@ export type McpToolErrorCode =
   | 'version_not_found'
   | 'table_not_found'
   | 'section_not_found'
+  /** get_history_diff：历史序号超过当前 seq 或记录不存在（附带 currentSeq） */
+  | 'history_not_found'
   | 'environment_not_found'
   | 'base_seq_ahead'
   | 'conflict'
@@ -243,6 +255,127 @@ export interface McpDiagnostics {
 }
 /** apply_changes：参数里 `$ref:<alias>` 占位符由服务端换成新的 UUIDv7 */
 export const MCP_REF_PATTERN = /^\$ref:[A-Za-z0-9_.-]{1,64}$/;
+
+// ───── 只读画布历史（ADR 0015 第 6 节：list_history / get_history_diff） ─────
+
+/** list_history：一页最多多少条（归组视图按组计数） */
+export const MCP_HISTORY_MAX_LIMIT = 50;
+/** get_history_diff：迁移差异 diff.items 最多返回多少条（maxItems 的上限） */
+export const MCP_HISTORY_DIFF_MAX_ITEMS = 100;
+/** get_history_diff：单条差异 SQL 超过这个字符数时截断并标记 sqlTruncated */
+export const MCP_HISTORY_SQL_MAX_CHARS = 2000;
+/** list_history：列表里每条 opSummary 最多保留多少字符（超出截断并以 `…` 结尾；完整文本用 get_history_diff 查看） */
+export const MCP_HISTORY_OP_SUMMARY_MAX_CHARS = 200;
+/** get_history_diff：净变化对象列表 objects.items 最多返回多少条 */
+export const MCP_HISTORY_OBJECTS_MAX_ITEMS = 200;
+/** get_objects：单页返回对象的 DDL 字符总预算；超出后的对象省略 ddl 并标记 ddlOmitted */
+export const MCP_OBJECTS_DDL_BUDGET = 200_000;
+
+// ───── MCP Prompts（ADR 0015 第 6 节：引导 AI 按推荐工作流调用工具；渲染时零数据库查询） ─────
+
+/** Prompt 参数（MCP prompts 的参数一律是字符串） */
+export interface McpPromptArgumentMeta {
+  name: string;
+  description: string;
+  required: boolean;
+  /** 字符串最大长度 */
+  maxLength: number;
+  /** 只接受十进制非负整数字符串（如 `20`） */
+  numeric?: boolean;
+}
+
+export interface McpPromptMeta {
+  name: string;
+  /** 注册该 Prompt 需要的 scope：write 类 Prompt 只对带 write scope 的令牌可见 */
+  requiredScope: 'read' | 'write';
+  description: string;
+  arguments: readonly McpPromptArgumentMeta[];
+}
+
+const PROJECT_PROMPT_ARG: McpPromptArgumentMeta = {
+  name: 'project',
+  description: 'Project ID or `owner/project` path',
+  required: true,
+  maxLength: 200,
+};
+
+/** 服务端注册的 MCP Prompts（服务端与契约测试共用） */
+export const MCP_PROMPTS = [
+  {
+    name: 'design_tables',
+    requiredScope: 'write',
+    description:
+      'Design new tables from natural-language requirements: inspect the model, then create them in ONE atomic apply_changes call with defineTable / addForeignKey and check diagnostics.',
+    arguments: [
+      PROJECT_PROMPT_ARG,
+      {
+        name: 'requirements',
+        description: 'What the new tables should model (entities, fields, relations, constraints)',
+        required: true,
+        maxLength: 4000,
+      },
+      {
+        name: 'section',
+        description: 'Optional canvas section (ID or name) to place the new tables in',
+        required: false,
+        maxLength: 100,
+      },
+    ],
+  },
+  {
+    name: 'refactor_column',
+    requiredScope: 'write',
+    description:
+      'Safely rename / retype / alter one existing column by column ID with alterColumn, after checking dependent views, checks, indexes and foreign keys via get_table.',
+    arguments: [
+      PROJECT_PROMPT_ARG,
+      {
+        name: 'table',
+        description: 'Table ID, `schema.name`, or unique name',
+        required: true,
+        maxLength: 200,
+      },
+      { name: 'column', description: 'Column name or ID inside that table', required: true, maxLength: 200 },
+      {
+        name: 'change',
+        description: 'The intended change (e.g. rename to `email_address`, widen to varchar(320))',
+        required: true,
+        maxLength: 1000,
+      },
+    ],
+  },
+  {
+    name: 'review_unpublished_changes',
+    requiredScope: 'read',
+    description:
+      'Review working-copy changes not yet published as a version: migration SQL risks, silent data-loss issues and the canvas history behind them.',
+    arguments: [PROJECT_PROMPT_ARG],
+  },
+  {
+    name: 'review_canvas_history',
+    requiredScope: 'read',
+    description:
+      'Browse the grouped canvas history (edit sessions) and summarize the net change of each group, read-only.',
+    arguments: [
+      PROJECT_PROMPT_ARG,
+      {
+        name: 'beforeSeq',
+        description: 'Optional cursor: only entries with seq below this value (decimal integer)',
+        required: false,
+        maxLength: 16,
+        numeric: true,
+      },
+      {
+        name: 'limit',
+        description: `Optional page size 1..${MCP_HISTORY_MAX_LIMIT} (decimal integer)`,
+        required: false,
+        maxLength: 4,
+        numeric: true,
+      },
+    ],
+  },
+] as const satisfies readonly McpPromptMeta[];
+export type McpPromptName = (typeof MCP_PROMPTS)[number]['name'];
 
 // ───── manage_sections（ADR 0015 第 1 节：板块是纯布局层，只开放增量语义写入，不开放像素坐标） ─────
 
