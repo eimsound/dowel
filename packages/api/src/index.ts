@@ -876,8 +876,8 @@ export interface NormalizeResult {
   normalizedCount: number;
   normalizedObjects: NormalizeObjectRef[];
   checkedInShadow: boolean;
-  /** 所用影子库的显示名 */
-  shadow: string;
+  /** 所用影子库的显示名；clean 且没有连影子库时为 null */
+  shadow: string | null;
 }
 
 /** 存在版本里的验证报告：不含 up / down（它们就是冻结的脚本本身） */

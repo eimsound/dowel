@@ -855,29 +855,39 @@ export const createMcpServer = (
         return toolError('rate_limited', `影子库验证请求太频繁，请在 ${gate.retryAfterSeconds} 秒后重试`);
       }
 
-      const toRef = await resolveModelRef(ctx.db, ctx.rooms, ctx.refresher, {
-        pid: row.id,
-        branch: row.branch,
-        schemas: row.schemas,
-        ref: args.to,
-        defaultRef: 'head',
-      });
-      if (!toRef.ok) {
+      // 解析 head 会触发按需规范化：解析失败（版本不存在、等 derive 锁超时 DeriveBusyError 等）时还没做影子库验证，退回限速额度
+      const refund = () => {
         if (gate?.allowed) gate.refund();
-        return toolError(toRef.code, toRef.message);
-      }
-
-      const fromRef = await resolveModelRef(ctx.db, ctx.rooms, ctx.refresher, {
-        pid: row.id,
-        branch: row.branch,
-        schemas: row.schemas,
-        ref: args.from,
-        like: toRef.model,
-        defaultRef: 'latest_or_empty',
-      });
-      if (!fromRef.ok) {
-        if (gate?.allowed) gate.refund();
-        return toolError(fromRef.code, fromRef.message);
+      };
+      let toRef: Awaited<ReturnType<typeof resolveModelRef>>;
+      let fromRef: Awaited<ReturnType<typeof resolveModelRef>>;
+      try {
+        toRef = await resolveModelRef(ctx.db, ctx.rooms, ctx.refresher, {
+          pid: row.id,
+          branch: row.branch,
+          schemas: row.schemas,
+          ref: args.to,
+          defaultRef: 'head',
+        });
+        if (!toRef.ok) {
+          refund();
+          return toolError(toRef.code, toRef.message);
+        }
+        fromRef = await resolveModelRef(ctx.db, ctx.rooms, ctx.refresher, {
+          pid: row.id,
+          branch: row.branch,
+          schemas: row.schemas,
+          ref: args.from,
+          like: toRef.model,
+          defaultRef: 'latest_or_empty',
+        });
+        if (!fromRef.ok) {
+          refund();
+          return toolError(fromRef.code, fromRef.message);
+        }
+      } catch (e) {
+        refund();
+        throw e;
       }
 
       const planOpts = await projectPlanOptions(ctx.db, row.id, toRef.model.dialect);

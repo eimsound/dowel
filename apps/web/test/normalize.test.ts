@@ -6,12 +6,18 @@ import i18n from '../src/i18n.ts';
 
 const env = (
   name: string,
-  o: { shadowUrl?: string | null; production?: boolean; allowSameInstance?: boolean },
+  o: {
+    shadowUrl?: string | null;
+    production?: boolean;
+    allowSameInstance?: boolean;
+    engineVersionNum?: number | null;
+  },
 ) => ({
   name,
   shadowUrl: o.shadowUrl ?? null,
   production: o.production ?? false,
   allowSameInstance: o.allowSameInstance ?? false,
+  engineVersionNum: o.engineVersionNum ?? null,
 });
 
 afterEach(async () => {
@@ -28,6 +34,19 @@ test('usableShadowEnv：独立影子库 > 非生产 > 允许同实例的生产�
   expect(usableShadowEnv([prod, prodSame])?.name).toBe('prod-same');
   expect(usableShadowEnv([prod, prodSame, dev])?.name).toBe('dev');
   expect(usableShadowEnv([prod, prodSame, dev, dedicated])?.name).toBe('prod-shadow');
+});
+
+test('usableShadowEnv：与服务端 forProjectTarget 一致，先选最低已知版本组，再按优先级；该组不可用时回退', () => {
+  const pg16Dev = env('pg16-dev', { engineVersionNum: 160004 });
+  const pg17Shadow = env('pg17-shadow', { shadowUrl: 'postgres://x/s', engineVersionNum: 170002 });
+  const pg16Prod = env('pg16-prod', { production: true, engineVersionNum: 160010 });
+  const unknown = env('unknown', { shadowUrl: 'postgres://y/s' });
+  // 最低已知版本组 PG 16 优先，哪怕 PG 17 组有显式影子库
+  expect(usableShadowEnv([pg17Shadow, pg16Dev, unknown], 'pg')?.name).toBe('pg16-dev');
+  // PG 16 组只有禁止同实例的生产环境：回退到下一个已知组
+  expect(usableShadowEnv([pg17Shadow, pg16Prod, unknown], 'pg')?.name).toBe('pg17-shadow');
+  // 已知组都不可用时才用未探测版本的环境
+  expect(usableShadowEnv([pg16Prod, unknown], 'pg')?.name).toBe('unknown');
 });
 
 test('normalizeToast 与 ws.normalize.* 词条在中英文下完整对齐', async () => {

@@ -89,7 +89,7 @@ export const registerVersions = (app: Hono<Env>, ctx: AppContext) => {
   /**
    * 在平台库事务外同步或回退工作副本，避免持有平台库锁期间等待房间 / 派生队列（#17）。
    * 不在这里 flush：requestedSeq 是用户确认时看到的 seq，先规范化会推进 seq 造成自冲突（ADR 0016）。
-   * 目标版本已在影子库验证过（verified）时它的模型就是规范形式，作为黄金基线；否则只替换房间、不改写基线。
+   * 目标版本已在影子库验证过（verified）且相对当前黄金基线没有待规范化对象时推进基线（'ifClean'）；否则只替换房间、不改写基线。
    */
   const syncWorkingCopy = async (
     branch: string,
@@ -104,7 +104,9 @@ export const registerVersions = (app: Hono<Env>, ctx: AppContext) => {
       if (requestedSeq !== undefined && requestedSeq !== currentSeq) return 'changed';
       const expectedSeq = requestedSeq ?? currentSeq;
       if (deepEqual(currentModel, targetModel)) return 'unchanged';
-      await ctx.replace(branch, userName, targetModel, opName, expectedSeq, { canonical: target.verified });
+      await ctx.replace(branch, userName, targetModel, opName, expectedSeq, {
+        canonical: target.verified ? 'ifClean' : false,
+      });
       return 'reverted';
     } catch (e) {
       if (e instanceof WorkingChangedError) return 'changed';
@@ -847,9 +849,9 @@ export const registerVersions = (app: Hono<Env>, ctx: AppContext) => {
     }
     const fromSeq = currentSeq;
     try {
-      // 已验证版本的模型是影子库读回的规范形式，作为黄金基线；未验证版本只替换房间、不改写基线
+      // 已验证版本：相对当前黄金基线没有待规范化对象时才推进基线（验证不保证模型原文是规范形式）；未验证版本只替换房间
       await ctx.replace(a.branch, c.get('user').name, v.model, 'applyVersion', b.workingSeq, {
-        canonical: v.verifiedAt !== null,
+        canonical: v.verifiedAt !== null ? 'ifClean' : false,
       });
     } catch (e) {
       if (e instanceof WorkingChangedError) return conflictOf(e.currentSeq, e.currentModel);

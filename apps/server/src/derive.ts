@@ -88,7 +88,13 @@ export interface NormalizeOutcome {
   normalizedCount: number;
   normalizedObjects: DerivedObjectRef[];
   checkedInShadow: boolean;
-  shadow: string;
+  /** 所用影子库的显示名；clean 且没有解析影子库时为 null */
+  shadow: string | null;
+}
+
+export interface ShadowHandle {
+  shadow: Shadow;
+  label: string;
 }
 
 const refOf = (m: Model, id: string): DerivedObjectRef => {
@@ -199,14 +205,23 @@ export class OpaqueRefresher {
    * - 阻塞等待任何在途 canonicalize 结束后再 replace，防止旧任务写回覆盖新基线；
    * - 以调用方传入的 model（而非事后重读 rooms.model）写入基线，防止 replace 与 reset 间的并发提交污染基线；
    * - fn 抛错时基线不变；
+   * - `onlyIfClean`（已验证版本的覆盖）：闭环验证比较的是影子库读回的结构、不是模型原文，“已验证”不保证模型里的表达式
+   *   就是规范形式（例如发布时 flush 被跳过）。所以只有 model 相对当前黄金基线没有待规范化对象时才推进基线，否则只替换房间；
    * - 锁序严格单向：本地队列 → job:derive:<branchId> → rooms.withRoomLock → branches FOR UPDATE。
    */
-  async runWithReset<T>(branchId: string, model: Model, fn: () => Promise<T>): Promise<T> {
+  async runWithReset<T>(
+    branchId: string,
+    model: Model,
+    fn: () => Promise<T>,
+    opts: { onlyIfClean?: boolean } = {},
+  ): Promise<T> {
     this.forgotten.delete(branchId);
     const baseline = structuredClone(model);
     return this.enqueue(branchId, () =>
       this.withExclusiveLock(branchId, async () => {
+        const reset = !opts.onlyIfClean || !needsRefresh(await this.loadGood(branchId), baseline);
         const result = await fn();
+        if (!reset) return result;
         await this.setGood(branchId, baseline);
         this.retries.delete(branchId);
         return result;
@@ -344,12 +359,15 @@ export class OpaqueRefresher {
 
   /**
    * 显式规范化（模型页“规范化”按钮）：本地队列 + derive 锁内执行，停机中拒绝。
-   * - 黄金基线就是当前模型：直接返回 clean（不连影子库）；
+   * - 黄金基线就是当前模型：直接返回 clean（不连影子库；handle 是函数时也不会去解析影子库）；
    * - 否则在给定影子库里从基线（没有就从空模型）迁移到当前模型并读回，写回规范形式、推进基线；
    * - 影子库 / 表达式报错（ShadowError、StepError、PlanError、InstanceLevelStatementError）原样抛给路由，基线不变；
    * - 写回被拒（期间有人改了同一对象）抛 NormalizeConflictError。
    */
-  normalize(branchId: string, handle: { shadow: Shadow; label: string }): Promise<NormalizeOutcome> {
+  normalize(
+    branchId: string,
+    handleOrResolve: ShadowHandle | (() => Promise<ShadowHandle>),
+  ): Promise<NormalizeOutcome> {
     if (this.stopped) return Promise.reject(new RefresherStoppedError());
     return this.enqueue(branchId, () =>
       this.withExclusiveLock(branchId, async (): Promise<NormalizeOutcome> => {
@@ -364,9 +382,10 @@ export class OpaqueRefresher {
             normalizedCount: 0,
             normalizedObjects: [],
             checkedInShadow: false,
-            shadow: handle.label,
+            shadow: typeof handleOrResolve === 'function' ? null : handleOrResolve.label,
           };
         }
+        const handle = typeof handleOrResolve === 'function' ? await handleOrResolve() : handleOrResolve;
         const patched = await handle.shadow.canonicalize(good ?? emptyBaseline(cur), cur);
         if (this.forgotten.has(branchId)) throw new NormalizeConflictError(seq);
         const patchRes = patched.length

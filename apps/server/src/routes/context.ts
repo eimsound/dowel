@@ -98,7 +98,8 @@ export interface AppContext {
   allowPasswordLogin: boolean;
   /**
    * 整体替换工作副本；传入 expectedSeq 时原子校验当前 seq。
-   * `canonical`（默认 true）：新模型来自引擎读回或影子库验证（导入、拉取、接入、已验证版本），同时作为派生数据的黄金基线；
+   * `canonical`（默认 true）：新模型来自引擎读回（导入、拉取、接入），同时作为派生数据的黄金基线；
+   * 'ifClean'：已验证版本——闭环验证不保证模型原文是规范形式，只有相对当前基线没有待规范化对象时才推进基线；
    * false：恢复画布历史、未验证版本等不一定规范化过的模型，只替换房间、不改写基线（ADR 0016）。
    */
   replace: (
@@ -107,7 +108,7 @@ export interface AppContext {
     model: Model,
     op: string,
     expectedSeq?: number,
-    opts?: { canonical?: boolean },
+    opts?: { canonical?: boolean | 'ifClean' },
   ) => Promise<void>;
   upgradeWebSocket: ReturnType<typeof import('@hono/node-ws').createNodeWebSocket>['upgradeWebSocket'];
 }

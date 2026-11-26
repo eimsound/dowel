@@ -132,12 +132,13 @@ export const createApp = (db: PlatformDb, options: AppOptions = {}) => {
   /**
    * 整体替换工作副本：
    * - canonical（默认 true）：导入、拉取、接入、已验证版本——新模型来自引擎读回 / 影子库验证，直接作为黄金基线；
+   * - canonical: 'ifClean'：已验证版本——相对当前黄金基线没有待规范化对象时才推进基线；
    * - canonical: false：恢复画布历史、未验证版本——只替换房间，不改写黄金基线（被替换进来的模型不一定规范化过）。
    */
   const replace: AppContext['replace'] = async (branch, user, model, op, expectedSeq, opts) => {
     const run = () => rooms.replace(branch, user, model, op, expectedSeq);
     if (opts?.canonical === false) await refresher.runWithoutReset(branch, run);
-    else await refresher.runWithReset(branch, model, run);
+    else await refresher.runWithReset(branch, model, run, { onlyIfClean: opts?.canonical === 'ifClean' });
   };
   const nodeWs = createNodeWebSocket({ app });
   const { upgradeWebSocket, wss } = nodeWs;

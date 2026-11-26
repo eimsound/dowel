@@ -291,4 +291,22 @@ describe('PG 预连接失败（无 Docker）', () => {
     const second = await call('POST', `/api/projects/${pid}/normalize`, {}, editorCookie);
     expect(second.status).toBe(429);
   });
+
+  test('精确退回限速：指定的环境不存在（404）、clean 未解析影子库时都不占额度', async () => {
+    const { pid, branch } = await newProject('退回额度', 'pg');
+    for (let i = 0; i < 3; i++) {
+      const res = await call('POST', `/api/projects/${pid}/normalize`, { env: 'no-such-env' }, editorCookie);
+      expect(res.status, JSON.stringify(res.data)).toBe(404);
+    }
+    // 基线就是当前模型：clean，不解析影子库（桩如果被调用就抛错）
+    await created.refresher.reset(branch, (await created.rooms.model(branch)).model);
+    created.shadows.forProjectTarget = async () => {
+      throw new Error('clean 时不应解析影子库');
+    };
+    for (let i = 0; i < 3; i++) {
+      const res = await call('POST', `/api/projects/${pid}/normalize`, {}, editorCookie);
+      expect(res.status, JSON.stringify(res.data)).toBe(200);
+      expect(res.data).toMatchObject({ outcome: 'clean', shadow: null, checkedInShadow: false });
+    }
+  });
 });

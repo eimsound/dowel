@@ -739,8 +739,15 @@ export const Model = () => {
   };
 
   // 状态栏的影子库：按服务端真实的选影优先级挑可用环境（不是简单取第一个环境）
-  const env = usableShadowEnv(envs.data);
+  const env = usableShadowEnv(envs.data, model.dialect);
   const latest = versions.data?.[0];
+  const shadowLabel = !uiSpec.requiresExternalShadow
+    ? t('ws.shadowMemory')
+    : env
+      ? t('ws.shadowOf', { env: env.name })
+      : envs.data?.length
+        ? t('ws.noUsableShadow')
+        : t('ws.noEnv');
   const showInspector = pinned || selected !== null || liveMulti.length > 1;
   const dialectLabel =
     model.dialect === 'pg'
@@ -1013,23 +1020,17 @@ export const Model = () => {
         )}
       </main>
 
-      <footer className="flex h-[var(--statusbar-h)] shrink-0 items-center gap-4 border-t border-border bg-chrome px-3 text-xs text-text-3">
-        <span className="flex items-center gap-1.5">
+      <footer className="flex h-[var(--statusbar-h)] min-w-0 shrink-0 items-center gap-3 overflow-hidden border-t border-border bg-chrome px-3 text-xs whitespace-nowrap text-text-3 max-[1080px]:gap-2">
+        <span className="flex shrink-0 items-center gap-1.5 whitespace-nowrap">
           <span
             aria-hidden="true"
-            className={`size-[7px] rounded-full ${status === 'online' ? 'bg-ok' : 'bg-warn'}`}
+            className={`size-[7px] shrink-0 rounded-full ${status === 'online' ? 'bg-ok' : 'bg-warn'}`}
           />
           {t(`ws.status.${status}`)}
           {status === 'online' && ` · ${t('ws.peopleOnline', { count: people.length })}`}
         </span>
-        <span>
-          {!uiSpec.requiresExternalShadow
-            ? t('ws.shadowMemory')
-            : env
-              ? t('ws.shadowOf', { env: env.name })
-              : envs.data?.length
-                ? t('ws.noUsableShadow')
-                : t('ws.noEnv')}
+        <span className="min-w-0 truncate" title={shadowLabel}>
+          {shadowLabel}
         </span>
         <span className="flex-1" />
         <NormalizeStatus
@@ -1038,8 +1039,12 @@ export const Model = () => {
           synced={status === 'online' && pending === 0}
           readOnly={readOnly}
         />
-        {latest && <span className="font-mono">{latest.name}</span>}
-        <span className="font-mono" title={dialectTip}>
+        {latest && (
+          <span className="min-w-0 truncate font-mono" title={latest.name}>
+            {latest.name}
+          </span>
+        )}
+        <span className="shrink-0 font-mono whitespace-nowrap" title={dialectTip}>
           {dialectLabel}
         </span>
       </footer>

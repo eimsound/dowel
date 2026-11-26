@@ -44,7 +44,8 @@ export const NormalizeStatus = ({
   const q = useQuery({
     queryKey: ['normalize', pid, debouncedSeq],
     queryFn: () => api<NormalizeStatusBody>('GET', `/api/projects/${pid}/normalize`),
-    enabled: synced,
+    // 只在防抖追上当前 seq 后查询：否则 synced 由 false 变 true 时会先按旧 seq 查一次、300ms 后再查一次
+    enabled: synced && debouncedSeq === seq,
     placeholderData: keepPreviousData,
   });
   const run = useMutation({
@@ -67,16 +68,21 @@ export const NormalizeStatus = ({
   const running = run.isPending;
   /** 不能点的原因（按钮保持在 Tab 顺序里，点了给出中性提示） */
   const blocked = !synced ? t('ws.normalize.notSynced') : noShadow ? t('ws.normalize.noShadow') : null;
-  const describe = blocked ?? (count > 0 ? t('ws.normalize.pending', { count }) : t('ws.normalize.clean'));
+  /** 按钮的补充说明：不能点的原因，或当前待规范化数量；状态还没取到时不给说明（避免读出不准确的“已规范化”） */
+  const describe =
+    blocked ?? (st ? (count > 0 ? t('ws.normalize.pending', { count }) : t('ws.normalize.clean')) : null);
 
   return (
-    <span className="flex items-center gap-1.5">
+    <span className="flex shrink-0 items-center gap-1.5 whitespace-nowrap">
       {st && (
         <span
-          className="flex items-center gap-1.5"
+          className="flex shrink-0 items-center gap-1.5 whitespace-nowrap"
           title={readOnly && count > 0 ? t('ws.normalize.viewerTip') : undefined}
         >
-          <span aria-hidden="true" className={`size-[7px] rounded-full ${count > 0 ? 'bg-warn' : 'bg-ok'}`} />
+          <span
+            aria-hidden="true"
+            className={`size-[7px] shrink-0 rounded-full ${count > 0 ? 'bg-warn' : 'bg-ok'}`}
+          />
           {count > 0 ? t('ws.normalize.pending', { count }) : t('ws.normalize.clean')}
         </span>
       )}
@@ -84,11 +90,12 @@ export const NormalizeStatus = ({
         <>
           <button
             type="button"
-            className="btn ghost sm px-1.5 text-xs"
+            className="btn ghost sm shrink-0 px-1.5 text-xs"
             disabled={running}
             aria-busy={running || undefined}
             aria-disabled={(!running && blocked !== null) || undefined}
-            aria-describedby={descId}
+            aria-describedby={describe !== null ? descId : undefined}
+            title={blocked ?? undefined}
             onClick={() => {
               if (blocked) {
                 toast(blocked, 'notice');
@@ -100,9 +107,11 @@ export const NormalizeStatus = ({
             <RefreshCw size={12} aria-hidden="true" className={running ? 'animate-spin' : undefined} />
             {running ? t('ws.normalize.running') : t('ws.normalize.action')}
           </button>
-          <span id={descId} className="sr-only">
-            {describe}
-          </span>
+          {describe !== null && (
+            <span id={descId} className="sr-only">
+              {describe}
+            </span>
+          )}
         </>
       )}
     </span>

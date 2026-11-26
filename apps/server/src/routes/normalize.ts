@@ -13,7 +13,12 @@ import { InstanceLevelStatementError, StepError } from '@dowel/verifier';
 import type { Hono } from 'hono';
 import { HTTPException } from 'hono/http-exception';
 
-import { NormalizeConflictError, RefresherStoppedError } from '../derive.ts';
+import {
+  DeriveBusyError,
+  NormalizeConflictError,
+  RefresherStoppedError,
+  type ShadowHandle,
+} from '../derive.ts';
 import { scrubSecrets } from '../secrets.ts';
 import { ShadowError } from '../shadow.ts';
 import { type AppContext, access, type Env } from './context.ts';
@@ -78,19 +83,31 @@ export const registerNormalize = (app: Hono<Env>, ctx: AppContext) => {
       return fail(422, `模型校验未通过，无法规范化：${problems[0]}`, 'model_invalid');
     }
 
-    let handle: { shadow: Parameters<typeof refresher.normalize>[1]['shadow']; label: string };
-    try {
-      handle = b.env ? await shadows.forProject(a.pid, b.env) : await shadows.forProjectTarget(a.pid);
-    } catch (e) {
-      if (e instanceof ShadowError) {
-        if (e.preConnect) refund();
-        return fail(422, e.message, 'shadow_unavailable');
+    /**
+     * 解析影子库句柄：没真正连库就失败的（ShadowError.preConnect：没有环境、生产环境不允许同实例；指定的环境不存在 404）
+     * 精确退回限速额度（#9）。refund 幂等，后面再退一次也不会多退。
+     */
+    let resolved = false;
+    const resolveHandle = async (): Promise<ShadowHandle> => {
+      try {
+        const h = b.env ? await shadows.forProject(a.pid, b.env) : await shadows.forProjectTarget(a.pid);
+        resolved = true;
+        return h;
+      } catch (e) {
+        if ((e instanceof ShadowError && e.preConnect) || (e instanceof HTTPException && e.status === 404)) {
+          refund();
+        }
+        throw e;
       }
-      throw e;
-    }
+    };
 
     try {
-      return c.json<NormalizeResult>(await refresher.normalize(a.branch, handle));
+      // 指定了环境：先解析（校验环境存在、确实用它的影子库）；没指定：交给 normalize 在锁内按需解析，
+      // 基线就是当前模型（clean）时根本不碰影子库
+      const handle = b.env ? await resolveHandle() : resolveHandle;
+      const out = await refresher.normalize(a.branch, handle);
+      if (!resolved) refund();
+      return c.json<NormalizeResult>(out);
     } catch (e) {
       if (e instanceof ShadowError) return fail(422, e.message, 'shadow_unavailable');
       if (e instanceof StepError || e instanceof PlanError || e instanceof InstanceLevelStatementError) {
@@ -100,8 +117,13 @@ export const registerNormalize = (app: Hono<Env>, ctx: AppContext) => {
       if (e instanceof NormalizeConflictError) {
         return fail(409, e.message, 'working_changed', { currentSeq: e.currentSeq });
       }
-      if (e instanceof RefresherStoppedError) return fail(503, e.message, 'shutting_down');
-      // DeriveBusyError 交给 app.onError 统一映射为 503 normalize_busy
+      // 没做成任何规范化的忙 / 停机：退回限速额度
+      if (e instanceof RefresherStoppedError) {
+        refund();
+        return fail(503, e.message, 'shutting_down');
+      }
+      if (e instanceof DeriveBusyError) refund();
+      // DeriveBusyError 交给 app.onError 统一映射为 503 normalize_busy；404（环境不存在）等 HTTPException 原样抛出
       throw e;
     }
   });

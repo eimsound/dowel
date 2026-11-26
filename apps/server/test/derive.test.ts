@@ -232,6 +232,46 @@ describe('OpaqueRefresher', () => {
     expect((live.m.objects.k_conc as { expr: string }).expr).toBe('(total > 5::integer)');
   });
 
+  test('runWithReset onlyIfClean：模型相对基线有待规范化对象时只替换、不推进基线；没有时推进', async () => {
+    const live = { m: base(), seq: 0 };
+    const { saved, store } = memStore();
+    const r = new OpaqueRefresher(memRooms(live), async () => canonicalShadow(), store);
+    await r.reset('b', live.m);
+    // “已验证”版本的模型里仍有未规范化的 CHECK：不得写成黄金基线
+    const dirty = base();
+    runMutator(dirty, 'addCheck', { id: 'k', table: 't', expr: 'total > 0' });
+    await r.runWithReset('b', dirty, async () => void (live.m = structuredClone(dirty)), {
+      onlyIfClean: true,
+    });
+    expect(saved).toHaveLength(1);
+    expect(saved[0]!.objects.k).toBeUndefined();
+    // 只多了普通列：表达式都和基线一致，可以推进
+    const plain = base();
+    runMutator(plain, 'addColumn', { table: 't', column: { id: 'c2', name: 'note', type: 'text' } });
+    await r.runWithReset('b', plain, async () => void (live.m = structuredClone(plain)), {
+      onlyIfClean: true,
+    });
+    expect(saved).toHaveLength(2);
+    expect(saved[1]).toEqual(plain);
+  });
+
+  test('normalize 传入解析函数：clean 时不解析影子库；需要时才在锁内解析', async () => {
+    const live = { m: base(), seq: 0 };
+    const { store } = memStore();
+    const r = new OpaqueRefresher(memRooms(live), async () => null, store);
+    await r.reset('b', live.m);
+    let resolved = 0;
+    const resolve = async () => {
+      resolved++;
+      return { shadow: canonicalShadow(), label: 'lazy' };
+    };
+    await expect(r.normalize('b', resolve)).resolves.toMatchObject({ outcome: 'clean', shadow: null });
+    expect(resolved).toBe(0);
+    runMutator(live.m, 'addCheck', { id: 'k', table: 't', expr: 'total > 0' });
+    await expect(r.normalize('b', resolve)).resolves.toMatchObject({ outcome: 'normalized', shadow: 'lazy' });
+    expect(resolved).toBe(1);
+  });
+
   test('runWithoutReset 只替换房间、不改写黄金基线', async () => {
     const live = { m: base(), seq: 0 };
     const { saved, store } = memStore();

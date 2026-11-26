@@ -46,6 +46,7 @@ export const ImportDialog = ({ pid, open, onClose }: Base) => {
   const { t } = useTranslation();
   const { project } = useProject();
   const toast = useToast();
+  const qc = useQueryClient();
   const [text, setText] = useState('');
   const [error, setError] = useState('');
   const dialect = project.dialect;
@@ -55,6 +56,8 @@ export const ImportDialog = ({ pid, open, onClose }: Base) => {
       setText('');
       setError('');
       onClose();
+      // 导入的模型直接作为黄金基线（ADR 0016）
+      void qc.invalidateQueries({ queryKey: ['normalize', pid] });
       toast(t('dlg.imported', { count: r.objects }));
     },
     onError: (e) => setError(e.message),
@@ -160,6 +163,8 @@ export const VersionDialog = ({ pid, open, onClose }: Base) => {
     onSuccess: (v) => {
       void qc.invalidateQueries({ queryKey: ['versions', pid] });
       void qc.invalidateQueries({ queryKey: ['published-tables', pid] });
+      // 发布前服务端会先按需规范化（ADR 0016）：零改写时 seq 不变、只推进了基线，状态栏要主动重查
+      void qc.invalidateQueries({ queryKey: ['normalize', pid] });
       setName('');
       const args = {
         name: v.name,
@@ -393,9 +398,19 @@ export const MigrationDialog = ({ pid, open, onClose }: Base) => {
   const [copied, setCopied] = useState(false);
   // 默认和活跃链头比较（ADR 0013：编号最大的版本可能已作废）
   const effFrom = from ?? versions.data?.find((v) => v.latest)?.id ?? 'empty';
+  const qc = useQueryClient();
+  /** 涉及工作副本（head）时服务端会先按需规范化（ADR 0016）：零改写时 seq 不变、只推进基线，状态栏要主动重查 */
+  const touchesHead = effFrom === 'head' || to === 'head';
+  const refreshNormalize = () => {
+    if (touchesHead) void qc.invalidateQueries({ queryKey: ['normalize', pid] });
+  };
   const mig = useQuery({
     queryKey: ['migration', pid, effFrom, to],
-    queryFn: () => api<MigrationResult>('GET', `/api/projects/${pid}/migration?from=${effFrom}&to=${to}`),
+    queryFn: async () => {
+      const r = await api<MigrationResult>('GET', `/api/projects/${pid}/migration?from=${effFrom}&to=${to}`);
+      refreshNormalize();
+      return r;
+    },
     enabled: open && !!versions.data,
   });
   const verify = useMutation({
@@ -405,6 +420,7 @@ export const MigrationDialog = ({ pid, open, onClose }: Base) => {
         to,
         env: uiSpec.requiresExternalShadow ? env || undefined : undefined,
       }),
+    onSuccess: refreshNormalize,
   });
   const steps = mig.data?.[dir] ?? [];
   const text = formatScript(steps, project.dialect);

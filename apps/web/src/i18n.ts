@@ -991,11 +991,12 @@ const zh = {
       action: '规范化',
       running: '规范化中…',
       normalized: '已在影子库（{{shadow}}）里规范化 {{count}} 处表达式 / 对象定义。',
-      verifiedClean: '已在影子库（{{shadow}}）里校验，没有需要改写的地方。',
-      alreadyClean: '已经是规范形式，不需要再校验。',
+      verifiedClean: '已在影子库（{{shadow}}）里规范化，没有需要改写的地方。',
+      alreadyClean: '已经是规范形式，不需要再规范化。',
       failed: '规范化失败，请稍后重试。',
-      noShadow: '没有可用的影子库：请先在“环境”里添加非生产环境或配置独立影子库，才能规范化。',
-      notSynced: '正在同步修改，请等连接恢复、修改都已确认后再规范化。',
+      noShadow:
+        '没有可用的影子库：请先在“环境”里添加非生产环境、为生产环境配置独立影子库，或允许生产环境使用同实例影子库，才能规范化。',
+      notSynced: '尚未同步，请等连接恢复且修改都已确认后再规范化。',
       viewerTip: '编辑者点“规范化”后会换成引擎的规范写法；发布、生成迁移时也会自动规范化。',
     },
     pgTargetMultiTip:
@@ -2221,7 +2222,7 @@ const zh = {
       unretireVersions: '取消作废后同步工作副本',
       applyVersion: '应用版本到画布',
       replaceModel: '替换模型',
-      derive: '刷新派生定义',
+      derive: '系统规范化',
     },
   },
   // ───── PG 分区表编辑 ─────
@@ -3398,13 +3399,13 @@ const en: typeof zh = {
       action: 'Normalize',
       running: 'Normalizing…',
       normalized:
-        'Normalized {{count}} expressions / object definitions in the shadow database ({{shadow}}).',
-      verifiedClean: 'Checked in the shadow database ({{shadow}}); nothing needed rewriting.',
-      alreadyClean: 'Already in canonical form; no check needed.',
+        'Normalized {{count}} expression(s) / object definition(s) in the shadow database ({{shadow}}).',
+      verifiedClean: 'Normalized in the shadow database ({{shadow}}); nothing needed rewriting.',
+      alreadyClean: 'Already in canonical form; no normalization needed.',
       failed: 'Normalization failed. Please try again later.',
       noShadow:
-        'No usable shadow database. Add a non-production environment or configure a dedicated shadow database under Environments first.',
-      notSynced: 'Changes are still syncing. Wait until you are connected and all changes are confirmed.',
+        'No usable shadow database. Under Environments, add a non-production environment, configure a dedicated shadow database for a production environment, or allow a production environment to use a same-instance shadow database first.',
+      notSynced: 'Not synced yet. Wait until you are connected and all changes are confirmed.',
       viewerTip:
         'An editor can click Normalize to rewrite these in the engine’s canonical form; publishing and generating migrations also normalize automatically.',
     },
@@ -4691,7 +4692,7 @@ const en: typeof zh = {
       unretireVersions: 'Sync working copy after unretiring versions',
       applyVersion: 'Apply version to canvas',
       replaceModel: 'Replace model',
-      derive: 'Refresh derived DDL',
+      derive: 'System normalization',
     },
   },
   // ───── PG Partition Table Editing ─────
