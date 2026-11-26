@@ -283,7 +283,8 @@ export const registerClaims = (app: Hono<Env>, ctx: AppContext) => {
 
         if (newActiveHead) {
           // 检查工作副本是否相对原活跃链头有未发布的修改（与 pull 相同的并发保护）
-          await refresher.flush(a.branch);
+          // 预览阶段是关键出口（先规范化，返回的 workingSeq 是规范后的）；确认覆盖阶段带着预览时的 seq，不再 flush 以免自冲突
+          if (!b.confirmOverwrite) await refresher.flush(a.branch);
           const { model: working, seq: workingSeq } = await rooms.model(a.branch);
           const baseHeadModel = platActiveHead?.model ?? emptyBase(working, a.schemas);
           const isDirty = (w: Model) => planDiff(baseHeadModel, w).total > 0;
@@ -452,8 +453,6 @@ export const registerClaims = (app: Hono<Env>, ctx: AppContext) => {
         } catch (e) {
           console.error('接入：重新加载版本链失败', e instanceof Error ? scrubSecrets(e.message) : e);
         }
-      } else {
-        refresher.schedule(a.branch);
       }
 
       // ④+⑤ 提交之后：若有历史，复用同一条目标库短连接依次完成认领（若需）与目标库状态同步；失败环境照样保留，作为 warning

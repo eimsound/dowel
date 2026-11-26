@@ -192,6 +192,8 @@ const EnvForm = ({ pid }: { pid: string }) => {
       void qc.invalidateQueries({ queryKey: ['activity', pid] });
       void qc.invalidateQueries({ queryKey: ['migration', pid] });
       void qc.invalidateQueries({ queryKey: ['ddl', pid] });
+      // 影子库来源 / 基线可能变了：状态栏的规范化状态（含 shadow 配置）重查（ADR 0016）
+      void qc.invalidateQueries({ queryKey: ['normalize', pid] });
     },
     onError: (e) => {
       // 这个库里的项目由另一个实例认领：弹出认领确认（说明后果），确认后带 claim: true 重新提交
@@ -681,6 +683,8 @@ const EnvironmentDetailView = ({ eid }: { eid: string }) => {
     void qc.invalidateQueries({ queryKey: ['project', pid] });
     void qc.invalidateQueries({ queryKey: ['migration', pid] });
     void qc.invalidateQueries({ queryKey: ['ddl', pid] });
+    // 影子库来源 / 基线可能变了：状态栏的规范化状态（含 shadow 配置）重查（ADR 0016）
+    void qc.invalidateQueries({ queryKey: ['normalize', pid] });
     void qc.invalidateQueries({ queryKey: ['env-status', pid, eid] });
     void qc.invalidateQueries({ queryKey: ['env-history', pid, eid] });
   };
@@ -707,6 +711,8 @@ const EnvironmentDetailView = ({ eid }: { eid: string }) => {
       void qc.invalidateQueries({ queryKey: ['project', pid] });
       void qc.invalidateQueries({ queryKey: ['migration', pid] });
       void qc.invalidateQueries({ queryKey: ['ddl', pid] });
+      // 影子库来源 / 基线可能变了：状态栏的规范化状态（含 shadow 配置）重查（ADR 0016）
+      void qc.invalidateQueries({ queryKey: ['normalize', pid] });
     },
     onError: (e) => setResult({ ok: false, text: e.message }),
   });
@@ -743,6 +749,9 @@ const EnvironmentDetailView = ({ eid }: { eid: string }) => {
       void invalidatePolicyDependents(qc);
       void qc.invalidateQueries({ queryKey: ['activity', pid] });
       void invalidateRequests(qc);
+      // 生产标记决定能不能用同实例影子库：状态栏的影子库来源与规范化状态重查（ADR 0016）
+      void qc.invalidateQueries({ queryKey: ['envs', pid] });
+      void qc.invalidateQueries({ queryKey: ['normalize', pid] });
     },
     onError: (e, production) => {
       if (production) toast(e.message, 'error');
@@ -755,6 +764,8 @@ const EnvironmentDetailView = ({ eid }: { eid: string }) => {
       void qc.invalidateQueries({ queryKey: ['project', pid] });
       void qc.invalidateQueries({ queryKey: ['migration', pid] });
       void qc.invalidateQueries({ queryKey: ['ddl', pid] });
+      // 影子库来源 / 基线可能变了：状态栏的规范化状态（含 shadow 配置）重查（ADR 0016）
+      void qc.invalidateQueries({ queryKey: ['normalize', pid] });
       void qc.invalidateQueries({ queryKey: ['activity', pid] });
       void invalidateRequests(qc);
       toast(t('envp.deleted', { name: env?.name ?? '' }));

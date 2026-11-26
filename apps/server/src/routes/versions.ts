@@ -86,21 +86,27 @@ export const registerVersions = (app: Hono<Env>, ctx: AppContext) => {
     if (db.dialect === 'pg') await tx.query('select id from projects where id = $1 for update', [pid]);
   };
 
-  /** 在平台库事务外同步或回退工作副本，避免持有平台库锁期间等待房间 / 派生队列（#17） */
+  /**
+   * 在平台库事务外同步或回退工作副本，避免持有平台库锁期间等待房间 / 派生队列（#17）。
+   * 不在这里 flush：requestedSeq 是用户确认时看到的 seq，先规范化会推进 seq 造成自冲突（ADR 0016）。
+   * 目标版本已在影子库验证过（verified）且相对当前黄金基线没有待规范化对象时推进基线（'ifClean'）；否则只替换房间、不改写基线。
+   */
   const syncWorkingCopy = async (
     branch: string,
     userName: string,
-    targetModel: Model,
+    target: { model: Model; verified: boolean },
     opName: string,
     requestedSeq: number | undefined,
   ): Promise<WorkingCopyOutcome> => {
+    const targetModel = target.model;
     try {
-      await refresher.flush(branch);
       const { model: currentModel, seq: currentSeq } = await rooms.model(branch);
       if (requestedSeq !== undefined && requestedSeq !== currentSeq) return 'changed';
       const expectedSeq = requestedSeq ?? currentSeq;
       if (deepEqual(currentModel, targetModel)) return 'unchanged';
-      await ctx.replace(branch, userName, targetModel, opName, expectedSeq);
+      await ctx.replace(branch, userName, targetModel, opName, expectedSeq, {
+        canonical: target.verified ? 'ifClean' : false,
+      });
       return 'reverted';
     } catch (e) {
       if (e instanceof WorkingChangedError) return 'changed';
@@ -567,12 +573,15 @@ export const registerVersions = (app: Hono<Env>, ctx: AppContext) => {
         }
       }
 
-      let parentModel: Model | null = null;
+      let parentModel: { model: Model; verified: boolean } | null = null;
       if (!b.keepWorkingCopy) {
-        const [pRow] = await tx.query<{ model: Model }>('select model from versions where id = $1', [
-          newHead.id,
-        ]);
-        parentModel = pRow?.model ?? null;
+        const [pRow] = await tx.query<{ model: Model; verifiedAt: unknown }>(
+          'select model, verified_at as "verifiedAt" from versions where id = $1',
+          [newHead.id],
+        );
+        parentModel = pRow
+          ? { model: pRow.model, verified: pRow.verifiedAt !== null && pRow.verifiedAt !== undefined }
+          : null;
       }
 
       return {
@@ -741,12 +750,15 @@ export const registerVersions = (app: Hono<Env>, ctx: AppContext) => {
         spanIds,
       );
 
-      let headModel: Model | null = null;
+      let headModel: { model: Model; verified: boolean } | null = null;
       if (b.syncWorkingCopy) {
-        const [hRow] = await tx.query<{ model: Model }>('select model from versions where id = $1', [
-          newHead.id,
-        ]);
-        headModel = hRow?.model ?? null;
+        const [hRow] = await tx.query<{ model: Model; verifiedAt: unknown }>(
+          'select model, verified_at as "verifiedAt" from versions where id = $1',
+          [newHead.id],
+        );
+        headModel = hRow
+          ? { model: hRow.model, verified: hRow.verifiedAt !== null && hRow.verifiedAt !== undefined }
+          : null;
       }
 
       return { span, headBefore, newHead, anyExecuted, headModel };
@@ -799,6 +811,7 @@ export const registerVersions = (app: Hono<Env>, ctx: AppContext) => {
   app.get('/api/projects/:pid/versions/:vid/canvas-diff', async (c) => {
     const a = await access(c, ctx, 'project.read');
     const v = await loadVersion(db, a.pid, c.req.param('vid'));
+    // 关键出口：与规范化后的当前模型比较，返回的 currentSeq 供“应用版本”作为 workingSeq
     await refresher.flush(a.branch);
     const { model: currentModel, seq: currentSeq } = await rooms.model(a.branch);
     const planOpts = await projectPlanOptions(db, a.pid, a.dialect);
@@ -813,7 +826,7 @@ export const registerVersions = (app: Hono<Env>, ctx: AppContext) => {
     const a = await access(c, ctx, 'sync.edit');
     const b = await body(c, versionApplySchema);
     const v = await loadVersion(db, a.pid, c.req.param('vid'));
-    await refresher.flush(a.branch);
+    // 不在这里 flush：workingSeq 来自差异预览（canvas-diff 已经 flush 过），再规范化会推进 seq 造成自冲突的 409
     const { model: currentModel, seq: currentSeq } = await rooms.model(a.branch);
     const planOpts = await projectPlanOptions(db, a.pid, a.dialect);
     const conflictOf = (curSeq: number, curModel: Model) =>
@@ -836,7 +849,10 @@ export const registerVersions = (app: Hono<Env>, ctx: AppContext) => {
     }
     const fromSeq = currentSeq;
     try {
-      await ctx.replace(a.branch, c.get('user').name, v.model, 'applyVersion', b.workingSeq);
+      // 已验证版本：相对当前黄金基线没有待规范化对象时才推进基线（验证不保证模型原文是规范形式）；未验证版本只替换房间
+      await ctx.replace(a.branch, c.get('user').name, v.model, 'applyVersion', b.workingSeq, {
+        canonical: v.verifiedAt !== null ? 'ifClean' : false,
+      });
     } catch (e) {
       if (e instanceof WorkingChangedError) return conflictOf(e.currentSeq, e.currentModel);
       throw e;

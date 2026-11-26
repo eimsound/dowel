@@ -529,7 +529,12 @@ export const CanvasHistory = ({
 
   const detailQuery = useQuery({
     queryKey: ['canvas-history-detail', pid, activeSeq],
-    queryFn: () => api<CanvasHistoryDetail<Model>>('GET', `/api/projects/${pid}/history/${activeSeq}`),
+    queryFn: async () => {
+      const r = await api<CanvasHistoryDetail<Model>>('GET', `/api/projects/${pid}/history/${activeSeq}`);
+      // 历史详情是关键出口：服务端先按需规范化（ADR 0016），零改写时 seq 不变、只推进基线，状态栏要主动重查
+      void qc.invalidateQueries({ queryKey: ['normalize', pid] });
+      return r;
+    },
     enabled: open && activeSeq !== null,
     gcTime: 0,
   });

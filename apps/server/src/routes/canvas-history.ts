@@ -49,6 +49,7 @@ export const registerCanvasHistory = (app: Hono<Env>, ctx: AppContext) => {
   app.get('/api/projects/:pid/history/:seq', async (c) => {
     const a = await access(c, ctx, 'project.read');
     const seq = parseSeqParam(c.req.param('seq'));
+    // 关键出口：与规范化后的当前模型比较，返回的 currentSeq 供恢复弹窗作为 workingSeq
     await refresher.flush(a.branch);
     const { model: currentModel, seq: currentSeq } = await rooms.model(a.branch);
     const targetModel = await rooms.modelAt(a.branch, seq);
@@ -69,7 +70,7 @@ export const registerCanvasHistory = (app: Hono<Env>, ctx: AppContext) => {
     const a = await access(c, ctx, 'sync.edit');
     const seq = parseSeqParam(c.req.param('seq'));
     const b = await body(c, canvasHistoryRestoreSchema);
-    await refresher.flush(a.branch);
+    // 不在这里 flush：workingSeq 来自历史详情（GET /history/:seq 已经 flush 过），再规范化会推进 seq 造成自冲突的 409
     const { model: currentModel, seq: currentSeq } = await rooms.model(a.branch);
     const targetModel = await rooms.modelAt(a.branch, seq);
     const conflictOf = (curSeq: number, curModel: Model) =>
@@ -92,7 +93,10 @@ export const registerCanvasHistory = (app: Hono<Env>, ctx: AppContext) => {
     }
     const fromSeq = currentSeq;
     try {
-      await ctx.replace(a.branch, c.get('user').name, targetModel, 'restoreHistory', b.workingSeq);
+      // 历史模型不一定规范化过：只替换房间，不改写黄金基线（ADR 0016）
+      await ctx.replace(a.branch, c.get('user').name, targetModel, 'restoreHistory', b.workingSeq, {
+        canonical: false,
+      });
     } catch (e) {
       if (e instanceof WorkingChangedError) return conflictOf(e.currentSeq, e.currentModel);
       throw e;

@@ -225,6 +225,10 @@ dialog::backdrop {
   ::after {
     transition-duration: 0s !important;
   }
+  /* 旋转图标减速而不是停转：仍然看得出“正在进行”（DESIGN.md：Motion） */
+  .animate-spin {
+    animation-duration: 3s !important;
+  }
 }
 
 /* ---------- 组件 ---------- */

@@ -579,11 +579,9 @@ describe.skipIf(!PG_URL)('P7 HA Wave 2B：持久化队列、分布式巡检、�
 
       const refA = new OpaqueRefresher(fakeRooms, async () => shadowA, store, haA);
       const refB = new OpaqueRefresher(fakeRooms, async () => shadowB, store, haB);
-      refA.delayMs = 1;
-      refB.delayMs = 1;
 
       try {
-        refA.schedule('branch-ha-1');
+        // 按需规范化（ADR 0016）：没有后台防抖，副本 A 的关键出口 flush 直接持锁规范化
         const flushA = refA.flush('branch-ha-1');
         await inCanonA;
 
@@ -669,8 +667,7 @@ describe.skipIf(!PG_URL)('P7 HA Wave 2B：持久化队列、分布式巡检、�
     const { shadowA, shadowB } = makeShadows();
     const refA = new OpaqueRefresher(roomsA, async () => shadowA, storeOf(dbA), haA);
     const refB = new OpaqueRefresher(roomsB, async () => shadowB, storeOf(dbB), haB);
-    roomsA.onCommit = (b) => refA.schedule(b);
-    roomsB.onCommit = (b) => refB.schedule(b);
+    // 按需规范化（ADR 0016）：提交不再触发后台刷新，测试里显式调用 flush
 
     const peerA: Peer = { user, role: 'admin', send: () => {} };
     const peerB: Peer = { user, role: 'admin', send: () => {} };
@@ -729,7 +726,7 @@ describe.skipIf(!PG_URL)('P7 HA Wave 2B：持久化队列、分布式巡检、�
       .filter((o) => o.kind === 'check' && !o.expr.startsWith('('))
       .map((o) => ({ ...o, expr: `(${(o as { expr: string }).expr}::integer)` }) as Obj);
 
-  test('5. 跨副本 OpaqueRefresher.flush：副本 A 防抖未触发或正在 canonicalize 期间，副本 B flush 阻塞等待/接手并看到规范化模型', async () => {
+  test('5. 跨副本 OpaqueRefresher.flush：副本 A 提交后副本 B 接手规范化；副本 A 正在 canonicalize 期间副本 B flush 阻塞等待并看到规范化模型', async () => {
     let canonCountA = 0;
     let canonCountB = 0;
     let gateA: { entered: () => void; hold: Promise<void> } | null = null;
@@ -756,10 +753,9 @@ describe.skipIf(!PG_URL)('P7 HA Wave 2B：持久化队列、分布式巡检、�
     try {
       const { branchId, roomsB, refA, refB, addCheckOnA } = cluster;
 
-      // (a) 副本 A 提交后尚在长防抖期（未触发 canonicalize），副本 B 内存无 timer/running 立即 flush → 接手完成规范化
-      refA.delayMs = 60_000;
-      refB.delayMs = 60_000;
+      // (a) 副本 A 提交后（编辑期间不会触发后台 canonicalize），副本 B 立即 flush → 接手完成规范化
       await addCheckOnA('k1', 'n > 0');
+      expect(canonCountA).toBe(0);
 
       await refB.flush(branchId);
       const afterB1 = (await roomsB.model(branchId)).model;
@@ -782,8 +778,8 @@ describe.skipIf(!PG_URL)('P7 HA Wave 2B：持久化队列、分布式巡检、�
       });
       gateA = { entered: enteredA, hold: holdA };
 
-      refA.delayMs = 5;
       await addCheckOnA('k2', 'n > 1');
+      const flushA = refA.flush(branchId);
       await inCanonA;
 
       let flushBDone = false;
@@ -794,6 +790,7 @@ describe.skipIf(!PG_URL)('P7 HA Wave 2B：持久化队列、分布式巡检、�
       expect(flushBDone).toBe(false);
 
       releaseA();
+      await flushA;
       await flushB;
       expect(flushBDone).toBe(true);
       const afterB2 = (await roomsB.model(branchId)).model;
@@ -806,7 +803,7 @@ describe.skipIf(!PG_URL)('P7 HA Wave 2B：持久化队列、分布式巡检、�
     }
   });
 
-  test('6. 跨副本并发提交无漏刷：副本 A 规范化 seq=1 期间副本 B 提交 seq=2，两项最终均规范化', async () => {
+  test('6. 跨副本并发提交无漏刷：副本 A flush 规范化 seq=1 期间副本 B 提交 seq=2，持锁追齐后两项均规范化', async () => {
     let enteredFirst!: () => void;
     const inFirstCanon = new Promise<void>((r) => {
       enteredFirst = r;
@@ -834,20 +831,19 @@ describe.skipIf(!PG_URL)('P7 HA Wave 2B：持久化队列、分布式巡检、�
     }));
 
     try {
-      const { branchId, roomsA, roomsB, refA, refB, addCheckOnA, addCheckOnB } = cluster;
-      refA.delayMs = 5;
-      refB.delayMs = 5;
+      const { branchId, roomsA, roomsB, refA, addCheckOnA, addCheckOnB } = cluster;
 
-      // 副本 A 提交 seq=1（k1），进入 shadowA.canonicalize 持锁阻塞
+      // 副本 A 提交 seq=1（k1），关键出口 flush 进入 shadowA.canonicalize 持锁阻塞
       await addCheckOnA('k1', 'n > 0');
+      const flushA = refA.flush(branchId);
       await inFirstCanon;
 
-      // 持锁期间副本 B 提交 seq=2（k2），并让副本 B 的后台防抖在锁被占用期间触发（验证不会静默丢弃）
+      // 持锁期间副本 B 提交 seq=2（k2）
       await addCheckOnB('k2', 'n > 10');
-      await new Promise((r) => setTimeout(r, 40));
 
-      // 放行副本 A 后，无需再手动 flush，后台追齐/重排必须自动完成两项规范化
+      // 放行副本 A 后，同一次 flush 在锁内循环追齐，两项都必须规范化
       releaseFirst();
+      await flushA;
       await waitFor(async () => {
         const m = (await roomsB.model(branchId)).model;
         return (
@@ -896,11 +892,10 @@ describe.skipIf(!PG_URL)('P7 HA Wave 2B：持久化队列、分布式巡检、�
 
     try {
       const { branchId, initial, roomsA, roomsB, refA, refB, addCheckOnA, readBaseline } = cluster;
-      refA.delayMs = 5;
-      refB.delayMs = 5;
 
       // (a) 副本 A 正在 canonicalize 旧模型（含 k_old）期间，副本 B 执行 ctx.replace（runWithReset + rooms.replace）
       await addCheckOnA('k_old', 'n > 0');
+      const flushOld = refA.flush(branchId);
       await inOldCanon;
 
       const restored = structuredClone(initial);
@@ -923,6 +918,7 @@ describe.skipIf(!PG_URL)('P7 HA Wave 2B：持久化队列、分布式巡检、�
       expect(replaceDone).toBe(false);
 
       releaseOld();
+      await flushOld;
       await replacePromise;
       await refA.flush(branchId);
 
@@ -932,8 +928,6 @@ describe.skipIf(!PG_URL)('P7 HA Wave 2B：持久化队列、分布式巡检、�
       expect(await readBaseline()).toEqual(restored);
 
       // (b) replace 刚写完房间、尚未写 branches.baseline 的窗口内，副本 A 并发提交未规范化表达式 → 绝不污染基线
-      refA.delayMs = 60_000;
-      refB.delayMs = 60_000;
       const imported = structuredClone(initial);
       runMutator(imported, 'addColumn', {
         table: 't1',

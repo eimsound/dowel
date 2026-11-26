@@ -831,6 +831,55 @@ export const verifyRequestSchema = z.object({
 });
 export type VerifyRequest = z.infer<typeof verifyRequestSchema>;
 
+/**
+ * 按需规范化（ADR 0016）：编辑期间不自动回影子库，模型页状态栏显示待规范化数量，编辑者点“规范化”显式触发。
+ * POST /api/projects/:pid/normalize 的请求体：可指定用哪个环境的影子库（缺省同发布：最低目标版本组的影子库）。
+ */
+export const normalizeRequestSchema = z.strictObject({
+  env: z.string().min(1).optional(),
+});
+export type NormalizeRequest = z.infer<typeof normalizeRequestSchema>;
+
+/** 待规范化 / 已规范化的对象 */
+export interface NormalizeObjectRef {
+  id: string;
+  kind: string;
+  /** 完整限定名（schema.table.name） */
+  name: string;
+}
+
+/**
+ * 影子库配置状态（不连库）：memory 进程内影子库（SQLite）；configured 至少有一个可用的影子库来源；
+ * none 没有可用影子库（没有环境，或只有不允许同实例的生产环境）。
+ */
+export type ShadowConfigState = 'memory' | 'configured' | 'none';
+
+/** GET /api/projects/:pid/normalize：当前工作副本相对黄金基线的待规范化状态（0 影子库 I/O） */
+export interface NormalizeStatus {
+  seq: number;
+  pending: boolean;
+  pendingCount: number;
+  /** 最多 50 个 */
+  objects: NormalizeObjectRef[];
+  truncated: boolean;
+  /** 是否已经有黄金基线（没有时按空基线计算） */
+  baseline: boolean;
+  shadow: ShadowConfigState;
+}
+
+/** POST /api/projects/:pid/normalize 的成功结果 */
+export interface NormalizeResult {
+  ok: true;
+  /** clean：基线就是当前模型，未连影子库；verified：影子库校验通过、无需改写；normalized：改写了 normalizedCount 个对象 */
+  outcome: 'clean' | 'verified' | 'normalized';
+  seq: number;
+  normalizedCount: number;
+  normalizedObjects: NormalizeObjectRef[];
+  checkedInShadow: boolean;
+  /** 所用影子库的显示名；clean 且没有连影子库时为 null */
+  shadow: string | null;
+}
+
 /** 存在版本里的验证报告：不含 up / down（它们就是冻结的脚本本身） */
 export const storedVerifyReportSchema = z.object({
   ok: z.boolean(),

@@ -101,8 +101,7 @@ export const registerEnvironments = (app: Hono<Env>, ctx: AppContext) => {
         info.versionNum,
       ],
     );
-    // 有了真实的影子库，补做表达式和不透明对象 DDL 的规范化
-    refresher.schedule(a.branch);
+    // 按需规范化（ADR 0016）：有了影子库也不在后台补做规范化；模型页状态栏会显示待规范化数量，由用户点“规范化”或关键出口触发
     await audit(
       db,
       c,
@@ -377,7 +376,10 @@ export const registerEnvironments = (app: Hono<Env>, ctx: AppContext) => {
     const preview = b.success && b.data.preview === true;
     connectionLimit(c, ctx);
     const env = await loadEnv(db, a.pid, c.req.param('eid')!);
-    await refresher.flush(a.branch);
+    const expectedSeq = b.success ? b.data.workingSeq : undefined;
+    // 预览（以及不带预览 seq 的直接覆盖）是关键出口：先规范化，让差异与返回的 workingSeq 都基于规范后的工作副本；
+    // 确认覆盖阶段带着预览时的 seq，不能再 flush（写回会推进 seq，造成自己跟自己冲突的 409 working_changed）
+    if (preview || expectedSeq === undefined) await refresher.flush(a.branch);
     const { model: working, seq: workingSeq } = await rooms.model(a.branch);
     const live = await readLive(ctx.exec, env, a.schemas, working);
     /** 预览：差异 + 指纹 + 三种只警告不拦截的情况 */
@@ -414,7 +416,6 @@ export const registerEnvironments = (app: Hono<Env>, ctx: AppContext) => {
       };
     };
     if (preview) return c.json<PullPreview>(await previewOf());
-    const expectedSeq = b.success ? b.data.workingSeq : undefined;
     const workingChangedResponse = async (model: Model, seq: number) =>
       c.json(
         {

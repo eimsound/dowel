@@ -57,7 +57,10 @@ const DEFAULT_LAYOUT_FLUSH_MAX_RETRIES = 3;
 const DEFAULT_LAYOUT_RETRY_BASE_MS = 500;
 
 export class Rooms {
-  /** 有新的修改提交之后调用（用于安排派生数据的刷新） */
+  /**
+   * 有新的修改提交之后调用的可选钩子（默认空操作）。
+   * 派生数据已改为按需规范化（ADR 0016），createApp 不再挂这个钩子做后台影子库刷新；保留给测试与扩展用。
+   */
   onCommit: (branchId: string) => void = () => {};
 
   private k: RoomKernel;

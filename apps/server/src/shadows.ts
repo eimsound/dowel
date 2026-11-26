@@ -5,6 +5,7 @@
 //     2. 默认：目标实例上的 {原库名}_dowel（生产环境需要明确同意才用同一实例）。
 import { createHash } from 'node:crypto';
 
+import type { ShadowConfigState } from '@dowel/api';
 import { type Dialect, getDialect, publicMajorOf } from '@dowel/core';
 import { HTTPException } from 'hono/http-exception';
 
@@ -373,6 +374,25 @@ export class Shadows {
     const first = res.entries[0];
     if (first) return { shadow: first.shadow, label: first.label };
     throw new ShadowError(res.skippedGroups[0]?.reason ?? '没有可用的影子库');
+  }
+
+  /**
+   * 影子库的配置状态（纯平台库查询，不建任何影子库连接）：
+   * - memory：不需要外部影子库的方言（SQLite 进程内 `:memory:`）；
+   * - none：没有环境，或所有环境都是“生产且不允许同实例、也没配独立影子库”（candidatePriority 3）；
+   * - configured：至少有一个可用的影子库来源（连不连得上要真正连了才知道）。
+   */
+  async configState(pid: string): Promise<ShadowConfigState> {
+    const dialect = await this.projectDialect(pid);
+    if (!getDialect(dialect).capabilities.requiresExternalShadow) return 'memory';
+    const rows = await this.db.query<{
+      production: boolean;
+      allow_same_instance: boolean;
+      shadow_url_enc: string | null;
+    }>('select production, allow_same_instance, shadow_url_enc from environments where project_id = $1', [
+      pid,
+    ]);
+    return rows.some((r) => candidatePriority(r) < 3) ? 'configured' : 'none';
   }
 
   /** 项目的 schema 范围变了或项目被删除：关闭并移除该项目下所有环境的影子库缓存，并广播给其他副本 */
