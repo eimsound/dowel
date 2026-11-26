@@ -1790,7 +1790,7 @@ const zh = {
       writeLong: '修改工作副本',
     },
     scopeHint: {
-      read: '读取项目、模型、DDL、版本和迁移预览，以及环境的缓存状态。始终包含。',
+      read: '读取项目、模型、DDL、版本和迁移预览、环境的缓存状态，以及画布修改历史（只读，不能恢复）。始终包含。',
       verify: '在影子库里执行迁移并比对结果。不连接目标库。',
       write:
         '和你在画布上编辑一样：走冲突检测，实时同步给其他成员，可以在修改历史里恢复。需要项目编辑者及以上角色。',
@@ -4255,7 +4255,7 @@ const en: typeof zh = {
       writeLong: 'Edit working copy',
     },
     scopeHint: {
-      read: 'Read projects, models, DDL, versions, migration previews and cached environment status. Always included.',
+      read: 'Read projects, models, DDL, versions, migration previews, cached environment status, and canvas history (read-only, no restore). Always included.',
       verify:
         'Run migrations in the shadow database and compare the result. Never connects to the target database.',
       write:

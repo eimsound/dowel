@@ -8,15 +8,16 @@ Dowel 内置 [Model Context Protocol](https://modelcontextprotocol.io)（MCP）�
 
 ## 1. AI 能做什么、不能做什么 {#boundaries}
 
-| AI 能做                                          | AI 不能做                                              |
-| ------------------------------------------------ | ------------------------------------------------------ |
-| 列出项目，读取模型、表、DDL、版本链和迁移预览    | 发布版本                                               |
-| 从**平台缓存**读取环境状态和漂移（带缓存时间）   | 连接环境的目标库（不能实时读状态、读历史或检查漂移）   |
-| 在影子库验证迁移（需要“在影子库验证”权限）       | 执行、回滚、标记为已执行、写入基线，提交或审批执行申请 |
-| 整批原子地修改工作副本（需要“修改工作副本”权限） | 修改连接串、执行策略、令牌，或整库导入覆盖             |
-| 增量调整画布板块（需要“修改工作副本”权限）       | 写入表在画布上的坐标（由自动排布与人工拖动决定）       |
+| AI 能做                                                          | AI 不能做                                              |
+| ---------------------------------------------------------------- | ------------------------------------------------------ |
+| 列出项目，读取模型、表、视图 / 函数等对象、DDL、版本链和迁移预览 | 发布版本                                               |
+| 从**平台缓存**读取环境状态和漂移（带缓存时间）                   | 连接环境的目标库（不能实时读状态、读历史或检查漂移）   |
+| 在影子库验证迁移（需要“在影子库验证”权限）                       | 执行、回滚、标记为已执行、写入基线，提交或审批执行申请 |
+| 整批原子地修改工作副本（需要“修改工作副本”权限）                 | 修改连接串、执行策略、令牌，或整库导入覆盖             |
+| 增量调整画布板块（需要“修改工作副本”权限）                       | 写入表在画布上的坐标（由自动排布与人工拖动决定）       |
+| 查看画布修改历史和每次修改的差异                                 | 恢复画布修改历史（只能由人在界面上恢复）               |
 
-发布和执行始终由人在 Dowel 界面上完成，走执行策略与审批。
+发布和执行始终由人在 Dowel 界面上完成，走执行策略与审批；恢复画布修改历史也只能由人在界面上操作。
 
 AI 的修改和画布编辑走同一个同步层：AI 读取之后，如果它依据的对象被别人改过或删掉，整批修改以 `conflict` 拒绝，一条都不生效。生效的修改会实时出现在所有打开模型的人面前，在**画布修改历史**里记在你名下并带 `MCP` 标记，可以像其他修改一样恢复。
 
@@ -87,13 +88,16 @@ claude mcp add --transport http --scope user dowel https://dowel.example.com/api
 | 工具                | 权限 | 作用                                                                                                                                                              |
 | ------------------- | ---- | ----------------------------------------------------------------------------------------------------------------------------------------------------------------- |
 | `list_projects`     | 读取 | 你能访问的项目（限令牌的项目范围）                                                                                                                                |
-| `get_model`         | 读取 | 工作副本：摘要，或带版本号的完整对象，以及当前 `seq`；另附画布板块、方言能力和推导出的最低目标版本                                                                |
-| `get_table`         | 读取 | 一张表的列、主键、约束、索引和分区                                                                                                                                |
+| `get_model`         | 读取 | 工作副本：摘要，或带版本号的完整对象，以及当前 `seq`；另附画布板块、方言能力和推导出的最低目标版本；可按 schema、板块、关键字过滤，可附带诊断（见下文）           |
+| `get_table`         | 读取 | 一张表的列、主键、约束、索引和分区，以及所在板块 `sectionId`、挂在表上的触发器 / 策略 / 排他约束（`opaques`）和依赖这张表的视图、函数等（`dependentOpaques`）     |
+| `get_objects`       | 读取 | 枚举、序列、扩展，以及视图、函数、触发器等不透明对象的完整定义（含 DDL 与依赖）；按 ID、种类、schema 或关键字查询，见下文[对象上下文](#objects)                   |
 | `get_ddl`           | 读取 | 工作副本或某个版本的 `CREATE` DDL                                                                                                                                 |
 | `list_versions`     | 读取 | 版本链                                                                                                                                                            |
 | `get_version`       | 读取 | 一个版本及其冻结的升级 / 回滚迁移                                                                                                                                 |
 | `preview_migration` | 读取 | 两个版本之间的升级 / 回滚 SQL（默认：最新版本 → 工作副本）                                                                                                        |
 | `list_environments` | 读取 | 环境及其缓存的当前版本、漂移状态和缓存时间                                                                                                                        |
+| `list_history`      | 读取 | 画布修改历史（默认按编辑会话归组），见下文[画布修改历史](#history)                                                                                                |
+| `get_history_diff`  | 读取 | 一条历史或一整组编辑会话的净变化与迁移差异，见下文[画布修改历史](#history)                                                                                        |
 | `list_mutators`     | 读取 | 可用的修改操作（复合宏 `defineTable` / `alterColumn` 排在最前）及其说明和参数的 JSON Schema                                                                       |
 | `verify_migration`  | 验证 | 在影子库里执行迁移并比对结果（等同界面上的“在影子库验证”）                                                                                                        |
 | `apply_changes`     | 修改 | 整批原子执行修改操作；参数 `baseSeq`（来自 `get_model`）、`ops`（最多 100 个）、可选 `summary`（意图说明，最多 500 字）、`dryRun`；新对象的 ID 写 `"$ref:<别名>"` |
@@ -113,7 +117,28 @@ claude mcp add --transport http --scope user dowel https://dowel.example.com/api
 
 - `capabilities`：项目方言的能力（是否支持多 schema、枚举、序列、分区、事务性 DDL、标识符长度上限等）。
 - `target`：按项目各环境**缓存的**数值版本号推导出的最低目标版本，例如 `{ "label": "PG 15", "features": { "virtualGenerated": false, … }, "source": "platform_cache", "environments": { "total": 3, "withCachedVersion": 2 } }`；与 `apply_changes` 的 `diagnostics.target` 一致。没有环境、版本还没缓存或是 SQLite 时 `label` / `features` 为 `null`。只读平台库，不连接目标库。
-- `sections`：画布板块。摘要里是 `{ id, name, color, tableCount }`，每张表另带 `sectionId`（不在板块里为 `null`；分区子表跟随父表）；`detail: "full"` 时是 `{ id, name, color, tables }`，`objects` 里仍然只有模型对象。已删除的表不会出现在板块里。
+- `sections`：画布板块。摘要里是 `{ id, name, color, tableCount }`，每张表另带 `sectionId`（不在板块里为 `null`；分区子表跟随父表，父表在别的 schema 也一样）；`detail: "full"` 时是 `{ id, name, color, tables }`，`objects` 里仍然只有模型对象。已删除的表不会出现在板块里。
+
+`get_model` 的参数（都可省略；同时给出时取交集，`counts` 是过滤后的数量）：
+
+| 参数          | 说明                                                                                                                                                                                                    |
+| ------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `schema`      | 只看一个 schema（ID 或名字）；表上的触发器、策略、排他约束跟随表所在的 schema                                                                                                                           |
+| `detail`      | `summary`（默认）或 `full`；`full` 在过滤后超过 200 张表且没给 `schema` 时只返回摘要并标记 `truncated: true`                                                                                            |
+| `q`           | 关键字（不区分大小写）：匹配表名、schema 名、表注释和列名（命中的列列在 `matchedColumns`，最多 10 个），以及枚举、序列、扩展、视图等对象的名字和注释；分区父表命中时带上全部分区                        |
+| `section`     | 板块 ID、`$none`（不在任何板块里的表），或板块名称（不区分大小写，必须唯一；重名时返回 `invalid_arguments` 并列出候选 ID）；只返回这些表和挂在这些表上的对象，`full` 时另带被这些表的列引用的枚举和序列 |
+| `diagnostics` | `true` 时附带和 `apply_changes` 相同的 `diagnostics`（只读平台缓存，不连接目标库）                                                                                                                      |
+
+传了 `q` 或 `section` 时响应带 `filter`（回显生效的 `schema`、`section`、`q`）。摘要里枚举带 `values`，序列带 `options`、`ownedBy`，扩展带所在 `schema`，视图、触发器等对象带 `parentKind`（`schema` 或 `table`）以及所在表的 `tableId` / `table`。
+
+### 对象上下文 {#objects}
+
+`get_objects` 读取表以外的对象：枚举、序列、扩展，以及视图、物化视图、函数、过程、域、类型、聚合、触发器、策略、排他约束这些不透明对象。
+
+- 按 `ids`（最多 50 个；不存在或是表、列等其他对象的 ID 列在 `missing`，表请用 `get_table`）查询，或者用 `kind`（`enum`、`sequence`、`extension`、`opaque`）、`objType`（如 `view`、`function`、`trigger`）、`schema`、`q` 过滤，至少给 `ids`、`kind`、`objType`、`q` 之一。
+- 结果顺序固定，用 `limit`（最多 100，默认 50）和 `offset` 翻页，响应带 `total` 与 `nextOffset`。
+- 每个对象是完整定义加 `ver`、`schema`；不透明对象另带 `parentKind`、`tableId`、`table` 和解析后的依赖 `deps: [{ id, kind, name }]`。
+- 一页的 DDL 合计最多 20 万字符，超出后的对象省略 `ddl` 并标记 `ddlOmitted: true`，响应带 `truncated: true`；需要时按 `ids` 单独读取。
 
 ### 画布板块 {#sections}
 
@@ -210,6 +235,27 @@ claude mcp add --transport http --scope user dowel https://dowel.example.com/api
 
 另有只读资源：`dowel://projects`、`dowel://projects/{owner}/{project}/model`、`…/ddl`、`…/versions`、`…/environments` 和 `dowel://mutators`。
 
+### 画布修改历史（只读） {#history}
+
+AI 可以查看[画布修改历史](modeling.md#canvas-history)，但不能恢复：恢复只能由人在画布的 **修改历史** 面板里确认完成。这两个工具只读平台库里的历史记录，不规范化模型、不连接影子库或目标库，也不记审计。
+
+- `list_history`：从新到旧列出历史。默认 `grouped: true`，和界面一样把同一个人连续的普通编辑归成一个编辑会话（`seqFrom`…`seq`、`stepCount`、`ops`）；`grouped: false` 逐条列出。用 `beforeSeq`（上一页的 `nextBeforeSeq`）翻页，`limit` 最多 50（默认 20）。每条带操作人、时间、对象摘要、所在版本 `version`，MCP 修改带 `via: "mcp"` 和意图说明 `opSummary`（列表里超过 200 字的截断并标记 `opSummaryTruncated`）。
+- `get_history_diff`：查看一条历史（`seq`）或一整组编辑会话（`from` = 组的 `seqFrom`，`seq` = 组尾，最多 50 步）。返回 `entry`（完整的 `opSummary`）、`objects`（新增 / 删除 / 修改的对象，最多 200 条）和 `diff`（迁移式差异，前 `maxItems` 条，默认 30、最多 100；单条 SQL 超过 2000 字截断并标记 `sqlTruncated`，`includeSql: false` 不返回 SQL）；`includeSteps: true` 另返回组内每一步。不返回完整模型，也不和当前画布比较（需要时用 `get_model` / `preview_migration`）。`seq` 超过当前序号时返回 `history_not_found`（带 `currentSeq`），区间不合法时返回 `invalid_arguments`。
+
+### Prompts {#prompts}
+
+Dowel 还提供 MCP Prompts（客户端里通常显示为斜杠命令或模板），引导 AI 按推荐顺序调用工具：
+
+| Prompt                       | 需要的权限   | 参数                                      | 作用                                                                                                  |
+| ---------------------------- | ------------ | ----------------------------------------- | ----------------------------------------------------------------------------------------------------- |
+| `review_unpublished_changes` | 读取         | `project`                                 | 审阅还没发布的修改：迁移 SQL 风险、可能丢数据的操作，以及对应的修改历史                               |
+| `review_canvas_history`      | 读取         | `project`，可选 `beforeSeq`、`limit`      | 浏览归组后的画布修改历史，总结每个编辑会话的净变化                                                    |
+| `design_tables`              | 修改工作副本 | `project`、`requirements`，可选 `section` | 按需求设计新表，用一次 `apply_changes`（`defineTable` / `addForeignKey`）原子建好并检查 `diagnostics` |
+| `refactor_column`            | 修改工作副本 | `project`、`table`、`column`、`change`    | 先查依赖再用 `alterColumn` 按列 ID 安全地改名、改类型                                                 |
+
+- 客户端只会看到令牌权限允许的 Prompt；令牌带“在影子库验证”权限时，Prompt 才会建议运行 `verify_migration`。
+- Prompt 只是指引文字：生成时不查询项目（不存在的项目也不会报错），项目权限在 AI 随后调用工具时检查。所有 Prompt 都会提醒 AI：发布版本、连接或在目标库执行迁移、恢复画布修改历史只能由人在 Dowel 里完成。
+
 ## 5. 安全与管理 {#security}
 
 - **隔离**：MCP 令牌（`dwm_…`）只能访问 `/api/mcp`，`/api/mcp` 也只接受 MCP 令牌；会话 cookie 与 CI 令牌在这里一律被拒绝，MCP 令牌访问其他任何接口（包括 `/api/ci/...`）返回 `403 forbidden`。
@@ -233,4 +279,4 @@ claude mcp add --transport http --scope user dowel https://dowel.example.com/api
 
 浏览器内客户端如果携带跨源 `Origin` 请求头，会在认证之前被来源校验拦截，返回 HTTP `403` 与通用的 `{ "error": "…" }` JSON（不含 `code` 字段，而不是 `McpHttpErrorBody`）。
 
-工具执行失败在 MCP 消息里以 `isError: true` 返回，`code` 如 `project_not_found`、`forbidden`、`scope_required`、`invalid_arguments`、`conflict`、`invalid`、`base_seq_ahead`、`table_not_found`、`section_not_found`、`shadow_unavailable`。
+工具执行失败在 MCP 消息里以 `isError: true` 返回，`code` 如 `project_not_found`、`forbidden`、`scope_required`、`invalid_arguments`、`conflict`、`invalid`、`base_seq_ahead`、`table_not_found`、`section_not_found`、`history_not_found`、`shadow_unavailable`。

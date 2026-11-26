@@ -130,6 +130,7 @@ Every structural commit to the working copy is stored with an increasing sequenc
 - When an editing session is selected, This change shows the session's **net change** (from the step before the session to its last step, so a column that was added and then dropped does not appear). Click **N steps** below the session to expand every step in it; select any step to see its single-step diff or restore to it.
 - Selecting any revision shows both the diff of that step (or session) and the full diff against the current working copy.
 - Clicking Restore to this state (for a session, this restores to its last step; for an expanded step, to that step) appends a new commit to the working copy without erasing earlier history. The client sends the viewed `workingSeq`; if another editor modified the canvas in the meantime, the server returns HTTP `409 working_changed` and displays the updated diff for reconfirmation.
+- AI coding assistants can read the same grouped history and diffs through the read-only MCP tools `list_history` / `get_history_diff` (see [MCP: canvas history](mcp.md#history)), but restoring is still done only by people here.
 
 ### Copy and paste tables, columns, constraints, and indexes {#copy-paste}
 
