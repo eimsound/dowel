@@ -142,12 +142,15 @@ How names are resolved:
 
 - **Columns of the new table**: constraints, indexes and partition keys can refer to the new columns by name, column ID or `$ref` (case follows the dialect: SQLite, MySQL and SQL Server are case-insensitive).
 - **References made while creating**: `schema` (defaults to the dialect's default schema such as `public` / `dbo`, or the only schema in the model), a column's `typeRef` (PostgreSQL enum) and `default.nextval` (sequence), a foreign key's `refTable` / `refColumns`, and `partitions[].schema` accept an object ID, a `$ref`, a qualified name (`schema.name`) or a globally unique name. A foreign key can reference the table itself or a table created earlier in the same call.
+- **References in `alterColumn`**: `typeRef` and `default.nextval` only reference an enum / sequence and follow the same rules (object ID, `$ref`, qualified name or globally unique name); the column being changed (`id`) still only accepts a column ID or `$ref`, never a name.
 - A name that does not exist, or matches several objects (for example `users` in two schemas), is an error that lists the candidates; use a qualified name or the object ID instead.
 - **Circular foreign keys** (A references B and B references A): create all the tables with `defineTable` first, then add the remaining foreign keys with `addForeignKey` at the end of the same call.
 
 Auto-increment per dialect: PostgreSQL uses the column's `identity`; SQL Server uses `ext.mssql.identity` (`{ "seed": "1", "increment": "1" }`); MySQL uses `ext.mysql.autoIncrement`; SQLite uses an `INTEGER` single-column primary key with `ext.sqlite.autoincrement`. Using `identity`, `typeRef` or `partitionBy` on a dialect that does not support it is an error.
 
 **`alterColumn`** patches an existing column declaratively. `id` must be the ID of an existing column, or the `$ref` of a column created earlier in the same call — **never a column name**. Fields: `name`, `type` / `typeRef`, `notNull`, `default`, `identity`, `ext` (replaced as a whole; `null` clears it) and `comment`. Leave a field out to keep it; set it to `null` to clear it.
+
+`ext` is replaced as a whole: what you pass becomes the complete column ext, and `null` clears it. One exception on SQL Server: when the column has a default whose constraint uses an explicit name (`ext.mssql.defaultNameMode: "explicit"`), that name is kept automatically as long as `ext.mssql` does not set `defaultName` / `defaultNameMode`, so changing another option (such as `sparse`) does not rename it back to `DF_<table>_<column>`. Passing `ext: null`, or setting those fields, does what you ask.
 
 ```json
 { "name": "alterColumn", "args": { "id": "0192…", "type": "bigint", "identity": { "always": false } } }

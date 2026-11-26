@@ -142,12 +142,15 @@ claude mcp add --transport http --scope user dowel https://dowel.example.com/api
 
 - **本表的列**：约束、索引、分区键可以按列名、列 ID 或 `$ref` 引用本次新建的列（大小写规则与方言一致：SQLite / MySQL / SQL Server 不区分大小写）。
 - **新建时的引用**：`schema`（省略时用方言默认 schema，如 `public` / `dbo`；模型里只有一个 schema 时就用它）、列的 `typeRef`（PostgreSQL 枚举）与 `default.nextval`（序列）、外键的 `refTable` / `refColumns`、`partitions[].schema`，可以写对象 ID、`$ref`、限定名（`schema.name`）或全局唯一的名字。外键可以引用本表（自引用）或本次调用里前面已建的表。
+- **`alterColumn` 的引用**：`typeRef` 与 `default.nextval` 只是对枚举 / 序列的引用，规则同上（对象 ID、`$ref`、限定名或全局唯一的名字）；但要修改的列本身（`id`）只认列 ID 或 `$ref`，不按名字解析。
 - 名字找不到、或者有多个同名对象（例如两个 schema 里都有 `users`）时报错，并列出候选，请改用限定名或对象 ID。
 - **循环外键**（A 引用 B、B 又引用 A）：先用 `defineTable` 建好所有表，再在同一次调用的末尾用底层 `addForeignKey` 补上剩下的外键。
 
 各方言的自增写法：PostgreSQL 用列的 `identity`；SQL Server 用 `ext.mssql.identity`（`{ "seed": "1", "increment": "1" }`）；MySQL 用 `ext.mysql.autoIncrement`；SQLite 用 `INTEGER` 单列主键加 `ext.sqlite.autoincrement`。在不支持的方言上写 `identity`、`typeRef` 或 `partitionBy` 会直接报错。
 
 **`alterColumn`**：声明式地修改一个已有列。`id` 必须是已有列的 ID，或本次调用里前面新建的列的 `$ref`，**不接受列名**。可改字段：`name`、`type` / `typeRef`、`notNull`、`default`、`identity`、`ext`（整体替换，`null` 清空）、`comment`；不写表示不改，写 `null` 表示清除。
+
+`ext` 是整体替换：传入的内容就是改完后的完整列扩展，`null` 清空。SQL Server 有一个例外：列有默认值、且默认约束用的是显式名（`ext.mssql.defaultNameMode: "explicit"`）时，只要你没在 `ext.mssql` 里写 `defaultName` / `defaultNameMode`，原来的显式名会自动保留，不会因为改了别的扩展项（如 `sparse`）被改回 `DF_<表>_<列>`；传 `ext: null` 或显式写这两个字段时按你的要求处理。
 
 ```json
 { "name": "alterColumn", "args": { "id": "0192…", "type": "bigint", "identity": { "always": false } } }

@@ -6,9 +6,10 @@
 // 调用方每执行完一步就把最新的模型经 `next(model)` 传回，生成器据此决定下一步（读取最新状态、值已一致则跳过），
 // 全程不额外复制模型。
 //
-// 严格对象 ID 底线：只有 defineTable 的新建引用（schema、typeRef、refTable、refColumns、default.nextval、
-// partitions[].schema）与本表列允许按名称 / 限定名解析；编辑目标（alterColumn.id）只认已有对象 ID 或
-// 同批前序 `$ref:<alias>`，绝不按名字猜测。
+// 严格对象 ID 底线：编辑目标（alterColumn.id）只认已有对象 ID 或同批前序 `$ref:<alias>`，绝不按名字猜测。
+// 允许按名称 / 限定名解析的只有“引用槽位”：defineTable 的新建引用（schema、typeRef、refTable、refColumns、
+// default.nextval、partitions[].schema）与本表列，以及 alterColumn 的外部引用 typeRef 与 default.nextval
+// （同样做歧义检测，按名称解析出的外部 schema ID 记入 extraReads）。
 import { z } from 'zod';
 
 import { cleanExt, EditError } from './edit.ts';
@@ -478,7 +479,12 @@ export const alterColumnArgs = z
     notNull: z.boolean().optional(),
     default: macroDefault.nullable().optional(),
     identity: z.object({ always: z.boolean() }).strict().nullable().optional(),
-    ext: columnExtArg.nullable().optional().describe('Replaces the whole column ext (null clears it)'),
+    ext: columnExtArg
+      .nullable()
+      .optional()
+      .describe(
+        'Replaces the whole column ext (null clears it). SQL Server: an explicit default-constraint name (ext.mssql.defaultNameMode "explicit") on a column with a default is kept automatically unless ext.mssql sets defaultName / defaultNameMode or ext is null',
+      ),
     comment,
   })
   .strict()
@@ -862,6 +868,32 @@ const existingColumnId = (m: Model, scope: RefScope, raw: string): string => {
   return id;
 };
 
+/**
+ * alterColumn 的目标列扩展：整体替换（null 清空）。MSSQL 例外：列有默认值且当前默认约束名是显式的
+ * （defaultNameMode: 'explicit'），而调用方没有在 ext.mssql 里指定 defaultName / defaultNameMode 时，
+ * 自动保留原有的显式名（避免一次无关的 ext 修改顺带改掉默认约束名）；传 ext: null 或显式指定时按调用方请求。
+ */
+const targetColumnExt = (
+  m: Model,
+  ext: ColumnExt | null,
+  cur: Extract<Obj, { kind: 'column' }>,
+): ColumnExt | null => {
+  if (ext === null) return null;
+  const x: ColumnExt = clonePlain(cleanExt(ext)) ?? {};
+  const curMssql = cur.ext?.mssql;
+  if (
+    m.dialect === 'mssql' &&
+    cur.default !== null &&
+    curMssql?.defaultNameMode === 'explicit' &&
+    curMssql.defaultName !== undefined &&
+    x.mssql?.defaultName === undefined &&
+    x.mssql?.defaultNameMode === undefined
+  ) {
+    x.mssql = { ...x.mssql, defaultName: curMssql.defaultName, defaultNameMode: 'explicit' };
+  }
+  return cleanExt(x) ?? null;
+};
+
 /** 比较列扩展时忽略 MSSQL 自动推导的默认约束名（defaultName / defaultNameMode 为 derived 或缺省） */
 const comparableExt = (m: Model, ext: ColumnExt | null | undefined): ColumnExt | undefined => {
   const x = clonePlain(cleanExt(ext ?? undefined));
@@ -956,13 +988,12 @@ const compileAlterColumn = (m0: Model, a: AlterColumnArgs, scope: RefScope, labe
         m = yield step('setIdentity', { id: colId, identity: { always: a.identity.always } }, 'identity');
       }
     }
-    // 8. 列扩展（整体替换；MSSQL 忽略自动推导的默认约束名）
-    if (a.ext !== undefined && !deepEqual(comparableExt(m, a.ext), comparableExt(m, col().ext))) {
-      m = yield step(
-        'setColumnExt',
-        { id: colId, ext: a.ext === null ? null : (cleanExt(a.ext) ?? null) },
-        'ext',
-      );
+    // 8. 列扩展（整体替换；MSSQL 比较时忽略自动推导的默认约束名，并自动保留显式默认约束名）
+    if (a.ext !== undefined) {
+      const target = targetColumnExt(m, a.ext, col());
+      if (!deepEqual(comparableExt(m, target), comparableExt(m, col().ext))) {
+        m = yield step('setColumnExt', { id: colId, ext: target }, 'ext');
+      }
     }
     // 9. 注释
     if (a.comment !== undefined && a.comment !== col().comment) {
@@ -987,13 +1018,13 @@ export const macros = {
   defineTable: macroDef({
     args: defineTableArgs,
     description:
-      "Macro: create a table with columns, primary key, uniques, checks, indexes, foreign keys, comments, ext and optional partitions in one op. Columns / keys may refer to this table's columns by name; schema / typeRef / refTable / refColumns / default.nextval / partitions[].schema may be resolved by ID, `$ref:<alias>` or (qualified) name. Expands to primitive mutators in a fixed order (createTable → addColumn → setPartitionBy → addPrimaryKey → setTableExt → uniques → checks → indexes → foreignKeys → createPartition → setComment). For circular foreign keys, define all tables first and add the remaining FKs with addForeignKey.",
+      "Macro: create a table with columns, primary key, uniques, checks, indexes, foreign keys, comments, ext and optional partitions in one op. Columns / keys may refer to this table's columns by name; schema / typeRef / refTable / refColumns / default.nextval / partitions[].schema may be resolved by ID, `$ref:<alias>` or (qualified) name. Expands to primitive mutators in a fixed order (createTable → addColumn → setPartitionBy → addPrimaryKey (+ renameKey) → setTableExt → deferred SQLite setColumnExt (autoincrement) → addUnique / addCheck / addIndex / addForeignKey (each followed by renameKey when `name` is given) → createPartition → setComment). For circular foreign keys, define all tables first and add the remaining FKs with addForeignKey.",
     compile: compileDefineTable,
   }),
   alterColumn: macroDef({
     args: alterColumnArgs,
     description:
-      'Macro: declaratively patch an existing column (name, type / typeRef, notNull, default, identity, ext, comment; omitted = unchanged, null = clear). `id` must be an existing column ID or a `$ref:<alias>` created earlier in this batch — never a name. Expands safely in the order: drop identity → clear default → renameColumn → setColumnType → setNotNull → set default → set identity → setColumnExt → setComment; steps whose value already matches are skipped.',
+      'Macro: declaratively patch an existing column (name, type / typeRef, notNull, default, identity, ext, comment; omitted = unchanged, null = clear). `id` must be an existing column ID or a `$ref:<alias>` created earlier in this batch — never a name; the references typeRef / default.nextval may also be ID, `$ref` or `[schema.]name`. `ext` replaces the whole column ext (null clears it); on SQL Server an explicit default-constraint name is kept automatically unless ext.mssql sets defaultName / defaultNameMode. Expands safely in the order: drop identity → clear default → renameColumn → setColumnType → setNotNull → set default → set identity → setColumnExt → setComment; steps whose value already matches are skipped.',
     compile: compileAlterColumn,
   }),
 };

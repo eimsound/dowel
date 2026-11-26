@@ -703,4 +703,59 @@ describe('defineTable / alterColumn：MSSQL', () => {
       'ext.mssql.identity',
     );
   });
+  test('alterColumn.ext 整体替换时自动保留 MSSQL 显式默认约束名；ext: null 仍可清除', () => {
+    const m = setup();
+    const r = expand(m, 'defineTable', {
+      name: 't',
+      columns: [
+        {
+          id: 'ca',
+          name: 'a',
+          type: 'int',
+          default: { expr: '0' },
+          ext: { mssql: { defaultName: 'DF_custom', defaultNameMode: 'explicit' } },
+        },
+      ],
+    });
+    expect(get(r.m, 'ca', 'column').ext?.mssql).toEqual({
+      defaultName: 'DF_custom',
+      defaultNameMode: 'explicit',
+    });
+
+    const kept = expand(r.m, 'alterColumn', { id: 'ca', ext: { mssql: { sparse: true } } });
+    expect(kept.ops).toEqual([
+      {
+        name: 'setColumnExt',
+        args: {
+          id: 'ca',
+          ext: { mssql: { sparse: true, defaultName: 'DF_custom', defaultNameMode: 'explicit' } },
+        },
+      },
+    ]);
+    expect(get(kept.m, 'ca', 'column').ext?.mssql).toEqual({
+      sparse: true,
+      defaultName: 'DF_custom',
+      defaultNameMode: 'explicit',
+    });
+    // 再次传同样的 ext：已一致，0 展开
+    expect(expand(kept.m, 'alterColumn', { id: 'ca', ext: { mssql: { sparse: true } } }).ops).toEqual([]);
+
+    // 显式指定 defaultNameMode：按调用方请求改回推导名
+    const derived = expand(kept.m, 'alterColumn', {
+      id: 'ca',
+      ext: { mssql: { defaultNameMode: 'derived' } },
+    });
+    expect(get(derived.m, 'ca', 'column').ext?.mssql).toEqual({
+      defaultName: 'DF_t_a',
+      defaultNameMode: 'derived',
+    });
+
+    // ext: null 清除整个 ext（默认值仍在，推导名随即重新生成）
+    const cleared = expand(kept.m, 'alterColumn', { id: 'ca', ext: null });
+    expect(cleared.ops).toEqual([{ name: 'setColumnExt', args: { id: 'ca', ext: null } }]);
+    expect(get(cleared.m, 'ca', 'column').ext?.mssql).toEqual({
+      defaultName: 'DF_t_a',
+      defaultNameMode: 'derived',
+    });
+  });
 });
