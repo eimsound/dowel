@@ -518,7 +518,7 @@ P3 审查后的修正（2026-11-19）：
 
 - **策略模型加一个字段**：`requestTtlHours`（执行申请有效期，1～720 小时，默认 24）进 `SCALAR_FIELDS`，`compareField` 越短越严（没有“不限”），参与四层逐层取更严、写入校验、放宽检测、转组 / 改生产标记时的固定；随机测试的生成器加上它（三条随机测试原样通过）。
 - **存储**（平台库迁移第 20 条）：`exec_requests`（绑定的迁移快照 `migrations`、预演摘要 `dry_run`、审批流程快照 `flow`、连接串指纹 `conn_hash`、提交时的生产标记、状态 / 当前环节 / 原因 / 有效期 / 执行人 / 结果、`emergency`）、`exec_approvals`（每环节每人一次决定，唯一约束 `(request_id, stage, user_id)`）、`inbox_items`、`webhooks`、`webhook_deliveries`；环境 / 项目 / 组删除时级联删除（审计里有完整记录）。
-- **服务端**（`apps/server/src/requests.ts` + `routes/requests.ts`）：
+- **服务端**（`apps/server/src/requests.ts` + `routes/requests.ts`；后经 PR #96 拆分为 `apps/server/src/requests/*.ts`，`requests.ts` 仅保留对外导出门面，状态机与生命周期在 `requests/service.ts`、绑定检查在 `requests/binding.ts`、巡检调度在 `requests/sweeper.ts`、SSE 订阅中心在 `requests/inbox-hub.ts`）：
   - 提交 `POST …/environments/:eid/requests`（`environment.request`：项目编辑者以上或执行者；`dryRun: true` 只返回预演，没有直接执行权的人在对话框里预演用它）：先用和直接执行同一个 `dryRunFor` 预演，不通过 422；通过后在执行策略锁里重新读项目、成员关系、环境，确认预演读到的起点等于平台缓存的当前版本（不等 409，提示刷新执行历史），快照迁移和校验和、生效流程，到期时间取生效的 `requestTtlHours`。
   - 审批 / 驳回 / 撤回 / 执行（`…/requests/:rid/{approve,reject,withdraw,execute}`）共用 `decideIn`：锁内 `accessIn` → 重新读申请 → `bindingProblem`（失效就在同一事务里转终态并 409 `request_invalid` / `request_expired`）→ 资格（`eligibleFor`，按锁内的成员关系、项目当前的组、生效策略）→ 推进。请求带环节号，必须等于当前环节（一次只推进一个环节）；申请人不能审批自己的申请；最后一个环节设了“最后一个审批人即执行者”时，凑够人数的那次通过必须是“通过并执行”（同一事务里通过 + 转为 `executing`），并要求执行权（`hasExecRight`：满足生效的“谁能执行”或是执行者，**审批不给执行权**，理由见 ADR 0006）。执行前在锁里再查前置环境（不满足 422，申请保持原状态）和生产环境名。
   - 执行（`runRequest`）复用直接执行的 `execStream`（从 `routes/executions.ts` 提到模块级，和 `dryRunFor`、`prerequisiteOf`、`assertVersion`、`confirmed` 一起导出），传入 `expect` 绑定；结束后 `finishExecution` 在锁里把申请转为已执行 / 执行失败（执行器报 `request_stale` 时转为失效），审计里 `environment.execute` 带 `requestId`。
@@ -598,7 +598,7 @@ P3 审查后的修正（2026-11-19）：
   - `packages/sync/src/server.ts` 扩展 `applyExternalCommit` / `applyExternalRejection` 与事务级 `store` 透传；`apps/server/src/rooms.ts` 在 PG 下按分支行锁（`select id from branches where id = $1 for update`）串行化 `op` / `replace` / `patch`，锁内先追赶外部提交再同事务落库（回滚时标记 `dirty` 从库重建防内存污染），提交后经 `EventBus` 广播轻量 `room.commit`、`room.layout`、`room.presence`、`room.kick`、`room.refresh`，并在读前保鲜与 `LISTEN` 断线重连时自动追赶。
 - **持久化队列、分布式巡检与跨副本 SSE（HA3）**：
   - `apps/server/src/webhooks.ts` 将异步投递与指数退避重试迁入 `webhook_jobs`（PG 上 `FOR UPDATE SKIP LOCKED` 认领 + 租约防重，重启不丢任务），并由 `webhooks.wake` 实时唤醒；
-  - `apps/server/src/requests.ts` 为执行中申请写入 `worker_id`，`recoverInterrupted` 结合 `HaCoordinator.isNodeAlive` 仅恢复已离线/租约过期节点的卡死申请（不误杀存活副本）；`sweepOnce`、`DriftScheduler`（`drift-scheduler.ts`）与 `OpaqueRefresher`（`derive.ts`）通过 `tryWithJobLock` 防多副本重复执行；收件箱未读数经 `inbox.changed` 跨副本推送至活跃 SSE 连接。
+  - `apps/server/src/requests.ts`（现位于 `requests/service.ts`）为执行中申请写入 `worker_id`，`recoverInterrupted` 结合 `HaCoordinator.isNodeAlive` 仅恢复已离线/租约过期节点的卡死申请（不误杀存活副本）；`sweepOnce`（现位于 `requests/sweeper.ts`）、`DriftScheduler`（`drift-scheduler.ts`）与 `OpaqueRefresher`（`derive.ts`）通过 `tryWithJobLock` 防多副本重复执行；收件箱未读数经 `inbox.changed` 跨副本推送至活跃 SSE 连接（现位于 `requests/inbox-hub.ts`）。
 - **真实 PG 双副本测试（HA5）**：新增 `apps/server/test/ha-foundation.test.ts`（15 项）、`apps/server/test/ha-rooms.test.ts`（7 项）与 `apps/server/test/ha-jobs.test.ts`（4 项），全面验证双副本并发协作、停用踢人与角色降级、断线重连追赶、Webhook 持久化防重与崩溃续投、跨副本收件箱 SSE、按租约恢复、跨副本环境锁与共享初始化令牌。
 - **收尾结果**（2026-11-21）：`pnpm lint` 通过（0 errors）、`pnpm typecheck` 通过、`pnpm test` 56 个文件通过（2 个跳过）、1231 项通过（3 项跳过）、`pnpm build` 通过、`pnpm e2e` 80 项通过。
 

@@ -1,6 +1,6 @@
 # 执行申请绑定“起止版本 + 迁移校验和 + 环境指纹”，失效在三处判定，最终以目标库历史为准
 
-2026-11-20 决定（P5b，E3）。审批规则见 [ADR 0006](0006-approval-snapshot-and-execution-right.md)。实现：`apps/server/src/requests.ts` 的 `bindingProblem`、`packages/executor` 的 `ExecuteOptions.expect`。
+2026-11-20 决定（P5b，E3）。审批规则见 [ADR 0006](0006-approval-snapshot-and-execution-right.md)。实现：`apps/server/src/requests/binding.ts` 的 `bindingProblem`、`packages/executor` 的 `ExecuteOptions.expect`。
 
 **绑定什么。** 提交前先跑一次预演（和直接执行前完全相同的检查），预演的计划就是申请绑定的内容：起始版本（提交时环境的当前版本，可以为空）、目标版本和方向、要执行的迁移列表（版本、方向、顺序）和每个版本的校验和；另外记下提交时的“生产”标记、连接串的指纹和审批流程快照。审批人看到的就是这些，批准的也只是这些。
 
