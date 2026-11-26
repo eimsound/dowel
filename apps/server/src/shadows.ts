@@ -5,7 +5,7 @@
 //     2. 默认：目标实例上的 {原库名}_dowel（生产环境需要明确同意才用同一实例）。
 import { createHash } from 'node:crypto';
 
-import { type Dialect, deriveTargetPgMajor, getDialect, pgMajorOf } from '@dowel/core';
+import { type Dialect, getDialect, publicMajorOf } from '@dowel/core';
 import { HTTPException } from 'hono/http-exception';
 
 import type { ClusterEvent, ClusterEventPayload, EventBus } from './bus.ts';
@@ -34,45 +34,32 @@ export interface Env {
   schemas: string[] | null;
   /** 目标库版本号数值（尚未探测为 null） */
   engineVersionNum: number | null;
-  /** 目标库 PG 大版本（仅 PG；尚未探测或非 PG 为 null） */
+  /** 目标库对外大版本（core publicMajorOf：仅 PG 有值；尚未探测或非 PG 为 null） */
   engineMajor: number | null;
 }
 
 export interface VersionShadowEntry {
-  /** 该代表影子库对应的 PG 大版本号；非 PG 或未探测版本时为 null */
-  major: number | null;
-  /** MySQL 主次版本分组键（如 804 = 8.4、907 = 9.7）；仅 MySQL 且已知版本时填充 */
-  mysqlGroup?: number | null;
+  /** 该代表影子库所在的版本组（DialectVersionMatrix.groupKeyOf，如 PG 16、MySQL 804）；不分组的方言或未探测版本为 null */
+  groupKey: number | null;
   envId: string;
   shadow: Shadow;
   label: string;
 }
 
-export interface SkippedMajorEntry {
-  major: number | null;
-  /** MySQL 主次版本分组键（如 804 / 907）；仅 MySQL 且已知版本时填充 */
-  mysqlGroup?: number | null;
+export interface SkippedVersionGroup {
+  /** 没有可用影子库的版本组（同 VersionShadowEntry.groupKey） */
+  groupKey: number | null;
   reason: string;
 }
 
 export interface ProjectVersionShadows {
-  /** 按版本升序排列（已知版本在前，null 在后），每个版本组至多 1 个代表影子库 */
+  /** 按版本组升序排列（已知版本组在前，null 在后），每个版本组至多 1 个代表影子库 */
   entries: VersionShadowEntry[];
   /** 无法获取可用影子库的版本组及其首个失败原因 */
-  skippedMajors: SkippedMajorEntry[];
-  /** 项目所有环境推导出的最低目标 PG 大版本（仅 PG 已知版本；非 PG 为 null） */
-  targetPgMajor: number | null;
-  /** 项目所有环境去重升序的已知 PG 大版本（非 PG 为空数组） */
-  envPgMajors: number[];
-  /** MySQL 项目所有环境推导出的最低主次版本分组（如 804；非 MySQL 或无已探测环境为 null） */
-  targetMysqlGroup?: number | null;
+  skippedGroups: SkippedVersionGroup[];
+  /** 项目最低目标版本组（已知版本组的最小键；不分组的方言或无已探测环境为 null） */
+  targetGroupKey: number | null;
 }
-
-/** MySQL 主次版本分组键（如 80413 → 804、90700 → 907）；非法或未知返回 null */
-export const mysqlMinorGroupOf = (versionNum: number | null | undefined): number | null =>
-  typeof versionNum === 'number' && Number.isInteger(versionNum) && versionNum >= 10000
-    ? Math.floor(versionNum / 100)
-    : null;
 
 /**
  * 为一个环境准备影子库（共识 4.4）：按方言分派到对应目标库驱动。
@@ -111,7 +98,7 @@ const configFingerprint = (env: Env): string =>
     )
     .digest('hex');
 
-/** 同大版本内候选环境选影优先级：显式 shadowUrl(0) > 非生产(1) > 允许同实例生产(2) > 其余(3) */
+/** 同版本组内候选环境选影优先级：显式 shadowUrl(0) > 非生产(1) > 允许同实例生产(2) > 其余(3) */
 const candidatePriority = (r: {
   shadow_url_enc: string | null;
   production: boolean;
@@ -177,7 +164,7 @@ export class Shadows {
       shadowUrl: r.shadow_url_enc ? decrypt(r.shadow_url_enc) : null,
       schemas: r.schemas ?? null,
       engineVersionNum,
-      engineMajor: r.dialect === 'pg' ? pgMajorOf(engineVersionNum) : null,
+      engineMajor: publicMajorOf(r.dialect, engineVersionNum),
     };
   }
 
@@ -284,30 +271,26 @@ export class Shadows {
   }
 
   /**
-   * 按项目全部环境的 PG 大版本分组（去重升序，未知版本归为 null 组），为每个大版本选出 1 个代表影子库：
-   * 优先级：显式 shadowUrl > 非生产环境 > 允许同实例的生产环境；该大版本全部不可用时记入 skippedMajors。
+   * 按项目全部环境的版本组分组（DialectVersionMatrix.groupKeyOf；去重升序，未知版本归为 null 组），为每个版本组选出 1 个代表影子库：
+   * 优先级：显式 shadowUrl > 非生产环境 > 允许同实例的生产环境；该版本组全部不可用时记入 skippedGroups。
    * 兼容测试中直接覆写实例级 `forProject` 的场景。
    */
   async forProjectVersions(pid: string): Promise<ProjectVersionShadows> {
     if (this.forProject !== Shadows.prototype.forProject) {
       const s = await this.forProject(pid);
       return {
-        entries: [{ major: null, envId: '', shadow: s.shadow, label: s.label }],
-        skippedMajors: [],
-        targetPgMajor: null,
-        envPgMajors: [],
-        targetMysqlGroup: null,
+        entries: [{ groupKey: null, envId: '', shadow: s.shadow, label: s.label }],
+        skippedGroups: [],
+        targetGroupKey: null,
       };
     }
 
-    const dialect = await this.projectDialect(pid);
-    if (!getDialect(dialect).capabilities.requiresExternalShadow) {
+    const spec = getDialect(await this.projectDialect(pid));
+    if (!spec.capabilities.requiresExternalShadow) {
       return {
-        entries: [{ major: null, envId: '', shadow: sqliteMemoryShadow(), label: 'SQLite :memory:' }],
-        skippedMajors: [],
-        targetPgMajor: null,
-        envPgMajors: [],
-        targetMysqlGroup: null,
+        entries: [{ groupKey: null, envId: '', shadow: sqliteMemoryShadow(), label: 'SQLite :memory:' }],
+        skippedGroups: [],
+        targetGroupKey: null,
       };
     }
 
@@ -334,29 +317,21 @@ export class Shadows {
     const groups = new Map<number | null, typeof rows>();
     const knownKeys = new Set<number>();
     for (const r of rows) {
-      const key =
-        dialect === 'pg'
-          ? pgMajorOf(r.engine_version_num)
-          : dialect === 'mysql'
-            ? mysqlMinorGroupOf(r.engine_version_num)
-            : null;
+      const key = spec.versioning.matrix?.groupKeyOf(r.engine_version_num) ?? null;
       if (key !== null) knownKeys.add(key);
       const list = groups.get(key);
       if (list) list.push(r);
       else groups.set(key, [r]);
     }
     const sortedKnownKeys = [...knownKeys].sort((a, b) => a - b);
-    const envPgMajors = dialect === 'pg' ? sortedKnownKeys : [];
-    const targetPgMajor = dialect === 'pg' ? deriveTargetPgMajor(envPgMajors) : null;
-    const targetMysqlGroup = dialect === 'mysql' ? (sortedKnownKeys[0] ?? null) : null;
+    // 最低已知版本组即项目兼容目标（PG 最低大版本、MySQL 最低主次版本）
+    const targetGroupKey = sortedKnownKeys[0] ?? null;
     const orderedKeys: (number | null)[] = [...sortedKnownKeys, ...(groups.has(null) ? [null] : [])];
 
     const entries: VersionShadowEntry[] = [];
-    const skippedMajors: SkippedMajorEntry[] = [];
-    for (const key of orderedKeys) {
-      const major = dialect === 'pg' ? key : null;
-      const mysqlGroup = dialect === 'mysql' ? key : undefined;
-      const candidates = [...(groups.get(key) ?? [])].sort(
+    const skippedGroups: SkippedVersionGroup[] = [];
+    for (const groupKey of orderedKeys) {
+      const candidates = [...(groups.get(groupKey) ?? [])].sort(
         (a, b) => candidatePriority(a) - candidatePriority(b),
       );
       let picked = false;
@@ -365,8 +340,7 @@ export class Shadows {
         try {
           const s = await this.forProject(pid, cand.id);
           entries.push({
-            major,
-            ...(mysqlGroup !== undefined ? { mysqlGroup } : {}),
+            groupKey,
             envId: cand.id,
             shadow: s.shadow,
             label: s.label,
@@ -379,34 +353,26 @@ export class Shadows {
         }
       }
       if (!picked) {
-        skippedMajors.push({
-          major,
-          ...(mysqlGroup !== undefined ? { mysqlGroup } : {}),
-          reason: firstReason,
-        });
+        skippedGroups.push({ groupKey, reason: firstReason });
       }
     }
 
-    return { entries, skippedMajors, targetPgMajor, envPgMajors, targetMysqlGroup };
+    return { entries, skippedGroups, targetGroupKey };
   }
 
   /**
-   * 为 OpaqueRefresher 等单影子库派生场景选影：优先选择 `engineMajor === targetPgMajor`（或 MySQL `mysqlGroup === targetMysqlGroup`）的可用环境影子库，
+   * 为 OpaqueRefresher 等单影子库派生场景选影：优先选择最低目标版本组（`groupKey === targetGroupKey`）的可用环境影子库，
    * 若无可用则回退到首个可用环境影子库。
    */
   async forProjectTarget(pid: string): Promise<{ shadow: Shadow; label: string }> {
     const res = await this.forProjectVersions(pid);
-    if (res.targetPgMajor !== null) {
-      const exact = res.entries.find((e) => e.major === res.targetPgMajor);
-      if (exact) return { shadow: exact.shadow, label: exact.label };
-    }
-    if (res.targetMysqlGroup != null) {
-      const exact = res.entries.find((e) => e.mysqlGroup === res.targetMysqlGroup);
+    if (res.targetGroupKey !== null) {
+      const exact = res.entries.find((e) => e.groupKey === res.targetGroupKey);
       if (exact) return { shadow: exact.shadow, label: exact.label };
     }
     const first = res.entries[0];
     if (first) return { shadow: first.shadow, label: first.label };
-    throw new ShadowError(res.skippedMajors[0]?.reason ?? '没有可用的影子库');
+    throw new ShadowError(res.skippedGroups[0]?.reason ?? '没有可用的影子库');
   }
 
   /** 项目的 schema 范围变了或项目被删除：关闭并移除该项目下所有环境的影子库缓存，并广播给其他副本 */

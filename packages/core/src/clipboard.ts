@@ -1,9 +1,18 @@
 // 画布复制粘贴（ADR 0013 第 2 节）：剪贴板载荷、复制提取与粘贴计划编译。纯函数、无 I/O，前后端共用。
 // 粘贴计划编译成一组普通 mutator 调用，经单个原子 mutator `paste` 提交（见 mutators.ts），
 // 因此沿用全部方言校验、乐观冲突、只读拒绝与画布历史（一次粘贴 = 一条历史记录）。
+// 方言差异（命名空间、推导名、类型 / 自增 / 聚集索引兼容性、分区等）一律经 DialectSpec.clipboard 适配器（clipboard-dialect.ts）。
 import { z } from 'zod';
 
-import type { IdentKind } from './dialect.ts';
+import {
+  type ClipboardDialect,
+  type ClipboardNamespace,
+  type DeferredExt,
+  type DerivedNameInput,
+  type QualifiedTypeRename,
+  utf8ByteLen,
+} from './clipboard-dialect.ts';
+import type { DialectSpec } from './dialect.ts';
 import { newId } from './ids.ts';
 import {
   Check,
@@ -26,7 +35,6 @@ import {
   Schema,
   Sequence,
   Table,
-  type TableExt,
   Unique,
 } from './ir.ts';
 import { clonePlain, deepEqual } from './json.ts';
@@ -39,18 +47,8 @@ import {
   rootTableId,
   withModelIndex,
 } from './model.ts';
-import { mssqlChooseName, mssqlJoinNames } from './mssql/naming.ts';
-import { isMssqlPkClustered, mssqlDefaultNameOf } from './mssql/plan.ts';
-import { isMssqlIdentityEligibleType } from './mssql/types.ts';
 import { runMutator } from './mutators.ts';
-import { mysqlChooseName, mysqlJoinNames } from './mysql/naming.ts';
-import { isMysqlAutoIncrementType, splitMysqlTypeModifiers } from './mysql/types.ts';
-import { chooseName, joinNames } from './pg/naming.ts';
-import { resolvePartitionBy } from './pg/partition.ts';
-import { ident as pgQuoteIdent } from './pg/quote.ts';
 import { getDialect } from './registry.ts';
-import { sqliteChooseName, sqliteJoinNames } from './sqlite/naming.ts';
-import { SQLITE_STRICT_TYPES } from './sqlite/types.ts';
 
 export const CLIPBOARD_FORMAT = 'dowel/clipboard';
 export const CLIPBOARD_VERSION = 1;
@@ -250,51 +248,8 @@ export interface PasteOptions {
 
 // ───── 通用工具与标识符/表达式辅助 ─────
 
-const textEncoder = new TextEncoder();
-
-const utf8ByteLen = (s: string): number => textEncoder.encode(s).length;
-
-const isCaseInsensitiveDialect = (dialect: Dialect): boolean =>
-  dialect === 'sqlite' || dialect === 'mysql' || dialect === 'mssql';
-
-const normIdent = (dialect: Dialect, name: string): string =>
-  isCaseInsensitiveDialect(dialect) ? name.toLowerCase() : name;
-
-const stripCopySuffix = (name: string): string => name.replace(/_copy\d*$/, '');
-
-const clipByUnit = (s: string, maxLen: number, unit: 'bytes' | 'chars'): string => {
-  if (maxLen <= 0) return '';
-  if (unit === 'chars') return Array.from(s).slice(0, maxLen).join('');
-  let out = '';
-  let bytes = 0;
-  for (const ch of s) {
-    const chBytes = utf8ByteLen(ch);
-    if (bytes + chBytes > maxLen) break;
-    out += ch;
-    bytes += chBytes;
-  }
-  return out;
-};
-
-const identUnitLen = (s: string, unit: 'bytes' | 'chars'): number =>
-  unit === 'bytes' ? utf8ByteLen(s) : Array.from(s).length;
-
-/** 清理对象的空方言扩展槽位，避免向 mutator 传入空对象 */
-const cleanExt = <T extends Record<string, unknown>>(ext: T | null | undefined): T | undefined => {
-  if (!ext) return undefined;
-  const out: Record<string, unknown> = {};
-  for (const [k, v] of Object.entries(ext)) {
-    if (v && typeof v === 'object' && !Array.isArray(v)) {
-      const inner = Object.fromEntries(
-        Object.entries(v as Record<string, unknown>).filter(([, iv]) => iv !== undefined),
-      );
-      if (Object.keys(inner).length > 0) out[k] = inner;
-    } else if (v !== undefined) {
-      out[k] = v;
-    }
-  }
-  return Object.keys(out).length > 0 ? (out as T) : undefined;
-};
+const normIdent = (cb: ClipboardDialect, name: string): string =>
+  cb.caseInsensitiveIdents ? name.toLowerCase() : name;
 
 /**
  * 单趟改写表达式里的多个列名引用（避免 a→a_copy 与 a_copy→a_copy2 发生级联替换）。
@@ -307,7 +262,7 @@ export const renameManyInExpr = (
 ): string => {
   if (renames.size === 0) return expr;
   const d = getDialect(dialect);
-  const ci = isCaseInsensitiveDialect(dialect);
+  const ci = d.clipboard.caseInsensitiveIdents;
   const lookup = new Map<string, string>();
   for (const [from, to] of renames) {
     const key = ci ? from.toLowerCase() : from;
@@ -325,47 +280,22 @@ export const renameManyInExpr = (
   return out;
 };
 
-/** 单趟改写 PG 表达式里的限定枚举名 `schema.enum` */
+/** 单趟改写表达式里的限定类型名 `schema.enum`（方言不支持限定类型引用时原样返回） */
 const renameQualifiedManyInExpr = (
-  dialect: Dialect,
+  cb: ClipboardDialect,
   expr: string,
-  renames: readonly { fromSchema: string; fromName: string; toSchema: string; toName: string }[],
+  renames: readonly QualifiedTypeRename[],
 ): string => {
-  if (dialect !== 'pg' || renames.length === 0) return expr;
-  const effective = renames.filter((r) => r.fromSchema !== r.toSchema || r.fromName !== r.toName);
-  if (effective.length === 0) return expr;
-  const d = getDialect(dialect);
-  const tokens = d.tokenize(expr);
-  const bySchema = new Map<string, Map<string, { toSchema: string; toName: string }>>();
-  for (const r of effective) {
-    let inner = bySchema.get(r.fromSchema);
-    if (!inner) {
-      inner = new Map();
-      bySchema.set(r.fromSchema, inner);
-    }
-    inner.set(r.fromName, { toSchema: r.toSchema, toName: r.toName });
-  }
-  let out = expr;
-  for (let i = tokens.length - 1; i >= 0; i--) {
-    const t0 = tokens[i];
-    if (!t0 || (t0.kind !== 'ident' && t0.kind !== 'qident')) continue;
-    if (tokens[i + 1]?.text !== '.') continue;
-    const t2 = tokens[i + 2];
-    if (!t2 || (t2.kind !== 'ident' && t2.kind !== 'qident')) continue;
-    const target = bySchema.get(t0.text)?.get(t2.text);
-    if (!target) continue;
-    out = `${out.slice(0, t0.start)}${pgQuoteIdent(target.toSchema)}.${pgQuoteIdent(target.toName)}${out.slice(t2.end)}`;
-  }
-  return out;
+  if (renames.length === 0 || !cb.rewriteQualifiedTypeRefs) return expr;
+  return cb.rewriteQualifiedTypeRefs(expr, renames);
 };
 
 const findUnknownExprColumns = (
-  dialect: Dialect,
+  d: DialectSpec,
   expr: string,
   allowedNormNames: ReadonlySet<string>,
 ): string[] => {
-  const d = getDialect(dialect);
-  const ci = isCaseInsensitiveDialect(dialect);
+  const ci = d.clipboard.caseInsensitiveIdents;
   const out: string[] = [];
   const seen = new Set<string>();
   for (const t of d.columnRefs(expr)) {
@@ -928,389 +858,20 @@ export const parseClipboard = (text: string): ClipboardPayload | null => {
   return data;
 };
 
-// ───── 命名空间跟踪与后缀分配 ─────
+// ───── 推导名预占 ─────
 
-const addToSetMap = (map: Map<string, Set<string>>, container: string, name: string) => {
-  let set = map.get(container);
-  if (!set) {
-    set = new Set();
-    map.set(container, set);
-  }
-  set.add(name);
-};
-
-const delFromSetMap = (map: Map<string, Set<string>>, container: string, name: string) => {
-  const set = map.get(container);
-  if (!set) return;
-  set.delete(name);
-  if (set.size === 0) map.delete(container);
-};
-
-const hasInSetMap = (map: Map<string, Set<string>>, container: string, name: string): boolean =>
-  map.get(container)?.has(name) ?? false;
-
-/**
- * 跟踪目标模型与本次粘贴已占用的全部标识符命名空间（按各方言精确规则）。
- * - PG：按 schema / table 的 rel / type / con / col，依赖 targetIdx 进行 O(1) 查询 + 本地新建集合。
- * - SQLite / MySQL / MSSQL：在构造时单趟扫描 target.objects 构建哈希集，所有冲突判定均 O(1)。
- */
-class NamespaceTracker {
-  private readonly dialect: Dialect;
-  private readonly target: Model;
-  private readonly targetIdx: ModelIndex;
-
-  private readonly colsByTable = new Map<string, Set<string>>();
-
-  // PG
-  private readonly pgRel = new Map<string, Set<string>>();
-  private readonly pgType = new Map<string, Set<string>>();
-  private readonly pgCon = new Map<string, Set<string>>();
-  private readonly pgPropCon = new Map<string, Set<string>>();
-
-  // SQLite
-  private readonly sqliteRel = new Set<string>();
-  private readonly sqliteCon = new Map<string, Set<string>>();
-
-  // MySQL
-  private readonly mysqlRel = new Set<string>();
-  private readonly mysqlSchemaCon = new Set<string>();
-  private readonly mysqlIdx = new Map<string, Set<string>>();
-
-  // MSSQL
-  private readonly mssqlObj = new Map<string, Set<string>>();
-  private readonly mssqlIdx = new Map<string, Set<string>>();
-
-  constructor(target: Model, targetIdx: ModelIndex) {
-    this.dialect = target.dialect;
-    this.target = target;
-    this.targetIdx = targetIdx;
-
-    if (this.dialect === 'sqlite') {
-      for (const o of Object.values(target.objects)) {
-        const low = o.name.toLowerCase();
-        if (o.kind === 'table' || o.kind === 'index' || o.kind === 'opaque') {
-          this.sqliteRel.add(low);
-        } else if (
-          o.kind === 'primaryKey' ||
-          o.kind === 'unique' ||
-          o.kind === 'check' ||
-          o.kind === 'foreignKey'
-        ) {
-          addToSetMap(this.sqliteCon, o.parent, low);
-        }
-      }
-    } else if (this.dialect === 'mysql') {
-      for (const o of Object.values(target.objects)) {
-        const low = o.name.toLowerCase();
-        if (o.kind === 'table' || (o.kind === 'opaque' && o.objType === 'view')) {
-          this.mysqlRel.add(low);
-        } else if (o.kind === 'unique' || o.kind === 'index') {
-          addToSetMap(this.mysqlIdx, o.parent, low);
-        } else if (o.kind === 'foreignKey') {
-          this.mysqlSchemaCon.add(low);
-          addToSetMap(this.mysqlIdx, o.parent, low);
-        } else if (o.kind === 'check') {
-          this.mysqlSchemaCon.add(low);
-        }
-      }
-    } else if (this.dialect === 'mssql') {
-      const tableSchema = new Map<string, string>();
-      const tableName = new Map<string, string>();
-      for (const t of targetIdx.allRef('table')) {
-        tableSchema.set(t.id, t.parent);
-        tableName.set(t.id, t.name);
-      }
-      for (const o of Object.values(target.objects)) {
-        const low = o.name.toLowerCase();
-        if (o.kind === 'table' || o.kind === 'sequence') {
-          addToSetMap(this.mssqlObj, o.parent, low);
-        } else if (o.kind === 'primaryKey' || o.kind === 'unique') {
-          const sch = tableSchema.get(o.parent);
-          if (sch) addToSetMap(this.mssqlObj, sch, low);
-          addToSetMap(this.mssqlIdx, o.parent, low);
-        } else if (o.kind === 'foreignKey' || o.kind === 'check') {
-          const sch = tableSchema.get(o.parent);
-          if (sch) addToSetMap(this.mssqlObj, sch, low);
-        } else if (o.kind === 'index') {
-          addToSetMap(this.mssqlIdx, o.parent, low);
-        } else if (o.kind === 'column' && o.default) {
-          const sch = tableSchema.get(o.parent);
-          const tname = tableName.get(o.parent);
-          if (sch && tname) {
-            const df = mssqlDefaultNameOf(o, tname);
-            addToSetMap(this.mssqlObj, sch, df.toLowerCase());
-          }
-        } else if (o.kind === 'opaque') {
-          const sch = tableSchema.has(o.parent) ? tableSchema.get(o.parent) : o.parent;
-          if (sch) addToSetMap(this.mssqlObj, sch, low);
-        }
-      }
-    }
-  }
-
-  /** 为现有表预载列名（items 模式使用） */
-  initTableColumns(tableId: string) {
-    for (const c of effectiveColumnsOf(this.target, tableId)) {
-      addToSetMap(this.colsByTable, tableId, normIdent(this.dialect, c.name));
-    }
-  }
-
-  isColTaken(tableId: string, name: string): boolean {
-    return hasInSetMap(this.colsByTable, tableId, normIdent(this.dialect, name));
-  }
-
-  addColumn(tableId: string, name: string) {
-    addToSetMap(this.colsByTable, tableId, normIdent(this.dialect, name));
-  }
-
-  removeColumn(tableId: string, name: string) {
-    delFromSetMap(this.colsByTable, tableId, normIdent(this.dialect, name));
-  }
-
-  isTableTaken(schemaId: string, name: string): boolean {
-    if (this.dialect === 'pg') {
-      return (
-        hasInSetMap(this.pgRel, schemaId, name) ||
-        hasInSetMap(this.pgType, schemaId, name) ||
-        this.targetIdx.isPgRelTaken(schemaId, name, '') ||
-        this.targetIdx.isPgTypeTaken(schemaId, name, '')
-      );
-    }
-    if (this.dialect === 'sqlite') return this.sqliteRel.has(name.toLowerCase());
-    if (this.dialect === 'mysql') return this.mysqlRel.has(name.toLowerCase());
-    return hasInSetMap(this.mssqlObj, schemaId, name.toLowerCase());
-  }
-
-  addTable(schemaId: string, name: string) {
-    if (this.dialect === 'pg') {
-      addToSetMap(this.pgRel, schemaId, name);
-      addToSetMap(this.pgType, schemaId, name);
-    } else if (this.dialect === 'sqlite') {
-      this.sqliteRel.add(name.toLowerCase());
-    } else if (this.dialect === 'mysql') {
-      this.mysqlRel.add(name.toLowerCase());
-    } else {
-      addToSetMap(this.mssqlObj, schemaId, name.toLowerCase());
-    }
-  }
-
-  isEnumTaken(schemaId: string, name: string): boolean {
-    if (this.dialect !== 'pg') return false;
-    return hasInSetMap(this.pgType, schemaId, name) || this.targetIdx.isPgTypeTaken(schemaId, name, '');
-  }
-
-  addEnum(schemaId: string, name: string) {
-    if (this.dialect === 'pg') addToSetMap(this.pgType, schemaId, name);
-  }
-
-  isSequenceTaken(schemaId: string, name: string): boolean {
-    if (this.dialect === 'pg') {
-      return hasInSetMap(this.pgRel, schemaId, name) || this.targetIdx.isPgRelTaken(schemaId, name, '');
-    }
-    if (this.dialect === 'mssql') {
-      return hasInSetMap(this.mssqlObj, schemaId, name.toLowerCase());
-    }
-    return false;
-  }
-
-  addSequence(schemaId: string, name: string) {
-    if (this.dialect === 'pg') addToSetMap(this.pgRel, schemaId, name);
-    else if (this.dialect === 'mssql') addToSetMap(this.mssqlObj, schemaId, name.toLowerCase());
-  }
-
-  isPgRelTaken(schemaId: string, name: string): boolean {
-    return hasInSetMap(this.pgRel, schemaId, name) || this.targetIdx.isPgRelTaken(schemaId, name, '');
-  }
-
-  addPgRel(schemaId: string, name: string) {
-    addToSetMap(this.pgRel, schemaId, name);
-  }
-
-  isPgConTaken(tableId: string, name: string, propagates: boolean): boolean {
-    if (hasInSetMap(this.pgCon, tableId, name)) return true;
-    if (propagates) {
-      return this.targetIdx.isPgConTaken(tableId, name, '');
-    }
-    // 非继承约束（PK / UNIQUE）仅检查本表约束、本表列 NOT NULL 及祖先下传的 CHECK / FK / NOT NULL
-    for (const o of this.targetIdx.allChildrenOf(tableId)) {
-      if (o.kind === 'column') {
-        if (o.notNull && o.notNullName === name) return true;
-      } else if (
-        (o.kind === 'primaryKey' || o.kind === 'unique' || o.kind === 'check' || o.kind === 'foreignKey') &&
-        o.name === name
-      ) {
-        return true;
-      }
-    }
-    if (tableId in this.target.objects) {
-      for (const anc of partitionAncestors(this.target, tableId)) {
-        for (const c of this.targetIdx.childrenRef(anc.id, 'column')) {
-          if (c.notNull && c.notNullName === name) return true;
-        }
-        for (const ck of this.targetIdx.childrenRef(anc.id, 'check')) {
-          if (ck.name === name) return true;
-        }
-        for (const fk of this.targetIdx.childrenRef(anc.id, 'foreignKey')) {
-          if (fk.name === name) return true;
-        }
-      }
-    }
-    return false;
-  }
-
-  addPgNotNull(tableId: string, name: string) {
-    addToSetMap(this.pgCon, tableId, name);
-    addToSetMap(this.pgPropCon, tableId, name);
-  }
-
-  isMssqlDefaultTaken(schemaId: string, name: string): boolean {
-    return hasInSetMap(this.mssqlObj, schemaId, name.toLowerCase());
-  }
-
-  addMssqlDefault(schemaId: string, name: string) {
-    addToSetMap(this.mssqlObj, schemaId, name.toLowerCase());
-  }
-
-  isIndexTaken(schemaId: string, tableId: string, name: string): boolean {
-    if (this.dialect === 'pg') {
-      return this.isPgRelTaken(schemaId, name);
-    }
-    if (this.dialect === 'sqlite') {
-      return this.sqliteRel.has(name.toLowerCase());
-    }
-    if (this.dialect === 'mysql') {
-      const low = name.toLowerCase();
-      return low === 'primary' || hasInSetMap(this.mysqlIdx, tableId, low);
-    }
-    const low = name.toLowerCase();
-    return hasInSetMap(this.mssqlObj, schemaId, low) || hasInSetMap(this.mssqlIdx, tableId, low);
-  }
-
-  addIndex(schemaId: string, tableId: string, name: string) {
-    if (this.dialect === 'pg') {
-      this.addPgRel(schemaId, name);
-    } else if (this.dialect === 'sqlite') {
-      this.sqliteRel.add(name.toLowerCase());
-    } else if (this.dialect === 'mysql') {
-      addToSetMap(this.mysqlIdx, tableId, name.toLowerCase());
-    } else {
-      addToSetMap(this.mssqlIdx, tableId, name.toLowerCase());
-    }
-  }
-
-  isKeyTaken(
-    schemaId: string,
-    tableId: string,
-    kind: 'primaryKey' | 'unique' | 'check' | 'foreignKey',
-    name: string,
-    pgAncestorIds: readonly string[] = [],
-  ): boolean {
-    if (this.dialect === 'pg') {
-      const propagates = kind === 'check' || kind === 'foreignKey';
-      if (this.isPgConTaken(tableId, name, propagates)) return true;
-      for (const aid of pgAncestorIds) {
-        if (hasInSetMap(this.pgPropCon, aid, name)) return true;
-      }
-      if ((kind === 'primaryKey' || kind === 'unique') && this.isPgRelTaken(schemaId, name)) {
-        return true;
-      }
-      return false;
-    }
-    if (this.dialect === 'sqlite') {
-      return hasInSetMap(this.sqliteCon, tableId, name.toLowerCase());
-    }
-    if (this.dialect === 'mysql') {
-      const low = name.toLowerCase();
-      if (kind === 'primaryKey') return false;
-      if (kind === 'unique') return low === 'primary' || hasInSetMap(this.mysqlIdx, tableId, low);
-      if (kind === 'check') return this.mysqlSchemaCon.has(low);
-      return low === 'primary' || this.mysqlSchemaCon.has(low) || hasInSetMap(this.mysqlIdx, tableId, low);
-    }
-    const low = name.toLowerCase();
-    return hasInSetMap(this.mssqlObj, schemaId, low) || hasInSetMap(this.mssqlIdx, tableId, low);
-  }
-
-  addKey(
-    schemaId: string,
-    tableId: string,
-    kind: 'primaryKey' | 'unique' | 'check' | 'foreignKey',
-    name: string,
-  ) {
-    if (this.dialect === 'pg') {
-      addToSetMap(this.pgCon, tableId, name);
-      if (kind === 'primaryKey' || kind === 'unique') {
-        addToSetMap(this.pgRel, schemaId, name);
-      } else {
-        addToSetMap(this.pgPropCon, tableId, name);
-      }
-    } else if (this.dialect === 'sqlite') {
-      addToSetMap(this.sqliteCon, tableId, name.toLowerCase());
-    } else if (this.dialect === 'mysql') {
-      if (kind === 'primaryKey') return;
-      const low = name.toLowerCase();
-      if (kind === 'unique') {
-        addToSetMap(this.mysqlIdx, tableId, low);
-      } else if (kind === 'check') {
-        this.mysqlSchemaCon.add(low);
-      } else {
-        this.mysqlSchemaCon.add(low);
-        addToSetMap(this.mysqlIdx, tableId, low);
-      }
-    } else {
-      const low = name.toLowerCase();
-      addToSetMap(this.mssqlObj, schemaId, low);
-      if (kind === 'primaryKey' || kind === 'unique') {
-        addToSetMap(this.mssqlIdx, tableId, low);
-      }
-    }
-  }
-
-  /** 为一个新名做冲突后缀与方言长度裁剪；原名可用直接返回 */
-  allocateName(original: string, identKind: IdentKind, isTaken: (candidate: string) => boolean): string {
-    const d = getDialect(this.dialect);
-    const { maxIdentLength, maxIdentUnit } = d.capabilities;
-
-    if (
-      identUnitLen(original, maxIdentUnit) <= maxIdentLength &&
-      d.validateIdent(original, identKind) === null &&
-      !isTaken(original)
-    ) {
-      return original;
-    }
-
-    const stripped = stripCopySuffix(original);
-    let baseRoot = stripped.length > 0 ? stripped : 'c';
-    // 若原始前缀触发保留字/保留前缀校验（如 sqlite_ / dowel_），前置安全前缀避免死循环
-    if (d.validateIdent(`${baseRoot}_copy`, identKind) !== null) {
-      baseRoot = `c_${baseRoot}`;
-    }
-
-    for (let i = 1; ; i++) {
-      const suffix = i === 1 ? '_copy' : `_copy${i}`;
-      const suffixLen = identUnitLen(suffix, maxIdentUnit);
-      const clippedBase = clipByUnit(baseRoot, maxIdentLength - suffixLen, maxIdentUnit) || 'c';
-      const candidate = `${clippedBase}${suffix}`;
-      if (d.validateIdent(candidate, identKind) === null && !isTaken(candidate)) {
-        return candidate;
-      }
-    }
-  }
-}
-
-/** 模拟各方的推导名规则并预占到 NamespaceTracker（用于表粒度批量规划） */
+/** 未显式命名的约束 / 索引：按方言推导名规则预占到命名空间（用于表粒度批量规划） */
 const reserveDerivedKeyOrIndex = (
-  ns: NamespaceTracker,
-  dialect: Dialect,
+  ctx: PasteContext,
   schemaId: string,
   tableId: string,
   tableName: string,
-  obj: Obj,
+  obj: DerivedNameInput['obj'],
   newColNameById: ReadonlyMap<string, string>,
   exprColNames: readonly string[],
 ) => {
-  const d = getDialect(dialect);
-  const colNames = (ids: string[]) => ids.map((cid) => newColNameById.get(cid) ?? '');
-  const idxElNames = (ix: Pick<Index, 'elements' | 'include'>): string[] => {
+  const colNames = (ids: readonly string[]) => ids.map((cid) => newColNameById.get(cid) ?? '');
+  const indexElementNames = (ix: Pick<Index, 'elements' | 'include'>): string[] => {
     const raw = [
       ...ix.elements.map((e) => {
         if (e.column) return newColNameById.get(e.column) ?? '';
@@ -1328,213 +889,18 @@ const reserveDerivedKeyOrIndex = (
     return out;
   };
   const singleCheckRef = (expr: string): string | null => {
-    const refs = exprColNames.filter((cname) => d.exprReferences(expr, cname));
+    const refs = exprColNames.filter((cname) => ctx.d.exprReferences(expr, cname));
     return refs.length === 1 ? refs[0]! : null;
   };
-
-  if (dialect === 'pg') {
-    switch (obj.kind) {
-      case 'primaryKey':
-        ns.addKey(
-          schemaId,
-          tableId,
-          'primaryKey',
-          chooseName(tableName, null, 'pkey', (n) => ns.isKeyTaken(schemaId, tableId, 'primaryKey', n)),
-        );
-        break;
-      case 'unique':
-        ns.addKey(
-          schemaId,
-          tableId,
-          'unique',
-          chooseName(tableName, joinNames(colNames(obj.columns)), 'key', (n) =>
-            ns.isKeyTaken(schemaId, tableId, 'unique', n),
-          ),
-        );
-        break;
-      case 'foreignKey':
-        ns.addKey(
-          schemaId,
-          tableId,
-          'foreignKey',
-          chooseName(tableName, joinNames(colNames(obj.columns)), 'fkey', (n) =>
-            ns.isKeyTaken(schemaId, tableId, 'foreignKey', n),
-          ),
-        );
-        break;
-      case 'check':
-        ns.addKey(
-          schemaId,
-          tableId,
-          'check',
-          chooseName(tableName, singleCheckRef(obj.expr), 'check', (n) =>
-            ns.isKeyTaken(schemaId, tableId, 'check', n),
-          ),
-        );
-        break;
-      case 'index':
-        ns.addIndex(
-          schemaId,
-          tableId,
-          chooseName(tableName, joinNames(idxElNames(obj)), 'idx', (n) =>
-            ns.isIndexTaken(schemaId, tableId, n),
-          ),
-        );
-        break;
-    }
-    return;
-  }
-
-  if (dialect === 'sqlite') {
-    switch (obj.kind) {
-      case 'primaryKey':
-        ns.addKey(
-          schemaId,
-          tableId,
-          'primaryKey',
-          sqliteChooseName(tableName, null, 'pkey', (n) => ns.isKeyTaken(schemaId, tableId, 'primaryKey', n)),
-        );
-        break;
-      case 'unique':
-        ns.addKey(
-          schemaId,
-          tableId,
-          'unique',
-          sqliteChooseName(tableName, sqliteJoinNames(colNames(obj.columns)), 'key', (n) =>
-            ns.isKeyTaken(schemaId, tableId, 'unique', n),
-          ),
-        );
-        break;
-      case 'foreignKey':
-        ns.addKey(
-          schemaId,
-          tableId,
-          'foreignKey',
-          sqliteChooseName(tableName, sqliteJoinNames(colNames(obj.columns)), 'fkey', (n) =>
-            ns.isKeyTaken(schemaId, tableId, 'foreignKey', n),
-          ),
-        );
-        break;
-      case 'check':
-        ns.addKey(
-          schemaId,
-          tableId,
-          'check',
-          sqliteChooseName(tableName, singleCheckRef(obj.expr), 'check', (n) =>
-            ns.isKeyTaken(schemaId, tableId, 'check', n),
-          ),
-        );
-        break;
-      case 'index':
-        ns.addIndex(
-          schemaId,
-          tableId,
-          sqliteChooseName(tableName, sqliteJoinNames(idxElNames(obj)), 'idx', (n) =>
-            ns.isIndexTaken(schemaId, tableId, n),
-          ),
-        );
-        break;
-    }
-    return;
-  }
-
-  if (dialect === 'mysql') {
-    switch (obj.kind) {
-      case 'primaryKey':
-        break;
-      case 'unique':
-        ns.addKey(
-          schemaId,
-          tableId,
-          'unique',
-          mysqlChooseName(tableName, mysqlJoinNames(colNames(obj.columns)), 'key', (n) =>
-            ns.isKeyTaken(schemaId, tableId, 'unique', n),
-          ),
-        );
-        break;
-      case 'foreignKey':
-        ns.addKey(
-          schemaId,
-          tableId,
-          'foreignKey',
-          mysqlChooseName(tableName, mysqlJoinNames(colNames(obj.columns)), 'fkey', (n) =>
-            ns.isKeyTaken(schemaId, tableId, 'foreignKey', n),
-          ),
-        );
-        break;
-      case 'check':
-        ns.addKey(
-          schemaId,
-          tableId,
-          'check',
-          mysqlChooseName(tableName, singleCheckRef(obj.expr), 'check', (n) =>
-            ns.isKeyTaken(schemaId, tableId, 'check', n),
-          ),
-        );
-        break;
-      case 'index':
-        ns.addIndex(
-          schemaId,
-          tableId,
-          mysqlChooseName(tableName, mysqlJoinNames(idxElNames(obj)), 'idx', (n) =>
-            ns.isIndexTaken(schemaId, tableId, n),
-          ),
-        );
-        break;
-    }
-    return;
-  }
-
-  // MSSQL
-  switch (obj.kind) {
-    case 'primaryKey':
-      ns.addKey(
-        schemaId,
-        tableId,
-        'primaryKey',
-        mssqlChooseName('PK', tableName, null, (n) => ns.isKeyTaken(schemaId, tableId, 'primaryKey', n)),
-      );
-      break;
-    case 'unique':
-      ns.addKey(
-        schemaId,
-        tableId,
-        'unique',
-        mssqlChooseName('UQ', tableName, mssqlJoinNames(colNames(obj.columns)), (n) =>
-          ns.isKeyTaken(schemaId, tableId, 'unique', n),
-        ),
-      );
-      break;
-    case 'foreignKey':
-      ns.addKey(
-        schemaId,
-        tableId,
-        'foreignKey',
-        mssqlChooseName('FK', tableName, mssqlJoinNames(colNames(obj.columns)), (n) =>
-          ns.isMssqlDefaultTaken(schemaId, n),
-        ),
-      );
-      break;
-    case 'check':
-      ns.addKey(
-        schemaId,
-        tableId,
-        'check',
-        mssqlChooseName('CK', tableName, singleCheckRef(obj.expr), (n) =>
-          ns.isMssqlDefaultTaken(schemaId, n),
-        ),
-      );
-      break;
-    case 'index':
-      ns.addIndex(
-        schemaId,
-        tableId,
-        mssqlChooseName('IX', tableName, mssqlJoinNames(idxElNames(obj)), (n) =>
-          ns.isIndexTaken(schemaId, tableId, n),
-        ),
-      );
-      break;
-  }
+  ctx.ns.reserveDerivedName({
+    schemaId,
+    tableId,
+    tableName,
+    obj,
+    columnNames: colNames,
+    indexElementNames,
+    singleCheckRef,
+  });
 };
 
 // ───── 计划编译公共上下文与外部外键重连 ─────
@@ -1542,35 +908,37 @@ const reserveDerivedKeyOrIndex = (
 interface PasteContext {
   target: Model;
   targetIdx: ModelIndex;
+  /** 目标方言规格与其剪贴板适配器 */
+  d: DialectSpec;
+  cb: ClipboardDialect;
   frag: Record<string, Obj>;
   fragModel: Model;
   fragIdx: ModelIndex;
-  ns: NamespaceTracker;
+  ns: ClipboardNamespace;
   allocId: () => string;
   ops: PasteOp[];
   report: PasteReport;
   commentQueue: { id: string; comment: string }[];
   enumResolutionCache: Map<string, { id: string; name: string; schemaName: string }>;
-  qualifiedEnumRenames: { fromSchema: string; fromName: string; toSchema: string; toName: string }[];
+  qualifiedEnumRenames: QualifiedTypeRename[];
   seqResolutionCache: Map<string, string>;
   copiedColIds: Set<string>;
 }
 
-const findExactSchemaInTarget = (target: Model, targetIdx: ModelIndex, name: string): Schema | undefined => {
-  const cap = getDialect(target.dialect).capabilities;
-  if (!cap.schemas) {
-    return targetIdx.allRef('schema')[0];
+const findExactSchemaInTarget = (ctx: PasteContext, name: string): Schema | undefined => {
+  if (!ctx.d.capabilities.schemas) {
+    return ctx.targetIdx.allRef('schema')[0];
   }
-  const ci = target.dialect === 'mssql';
-  return targetIdx
+  const ci = ctx.cb.caseInsensitiveCatalog;
+  return ctx.targetIdx
     .allRef('schema')
     .find((s) => (ci ? s.name.toLowerCase() === name.toLowerCase() : s.name === name));
 };
 
-const defaultTargetSchema = (target: Model, targetIdx: ModelIndex): Schema => {
-  const cap = getDialect(target.dialect).capabilities;
-  const schemas = targetIdx.allRef('schema');
-  const ci = target.dialect === 'mssql';
+const defaultTargetSchema = (ctx: PasteContext): Schema => {
+  const cap = ctx.d.capabilities;
+  const schemas = ctx.targetIdx.allRef('schema');
+  const ci = ctx.cb.caseInsensitiveCatalog;
   const def = schemas.find((s) =>
     ci ? s.name.toLowerCase() === cap.defaultSchema.toLowerCase() : s.name === cap.defaultSchema,
   );
@@ -1658,7 +1026,7 @@ const resolveSequenceInTarget = (
     if (cached) {
       return { newSeqId: cached, isOwnedByCopiedCol: false, srcOwnerColId: null };
     }
-    const ci = ctx.target.dialect === 'mssql';
+    const ci = ctx.cb.caseInsensitiveCatalog;
     const existing = ctx.targetIdx
       .childrenRef(targetSchemaId, 'sequence')
       .find((s) => (ci ? s.name.toLowerCase() === srcSeq.name.toLowerCase() : s.name === srcSeq.name));
@@ -1706,81 +1074,25 @@ const resolveSequenceInTarget = (
   };
 };
 
-const columnTypeLabel = (dialect: Dialect, col: Column, lookupObjects: Record<string, Obj>): string => {
+const columnTypeLabel = (cb: ClipboardDialect, col: Column, lookupObjects: Record<string, Obj>): string => {
   if (col.typeRef) {
     const en = lookupObjects[col.typeRef];
     const enumName = en?.kind === 'enum' ? en.name : '?';
     return `${enumName}${col.type.trim().replace(/\s+/g, '')}`;
   }
-  const d = getDialect(dialect);
-  if (dialect === 'mysql') {
-    const split = splitMysqlTypeModifiers(col.type);
-    const unsigned = Boolean(col.ext?.mysql?.unsigned || split.unsigned || col.ext?.mysql?.zerofill);
-    return `${split.baseType}${unsigned ? ' unsigned' : ''}`.trim().replace(/\s+/g, ' ').toLowerCase();
-  }
-  return d.normalizeType(col.type).trim().replace(/\s+/g, ' ').toLowerCase();
-};
-
-const sameColumnSet = (actual: readonly string[], expectedSet: ReadonlySet<string>): boolean =>
-  actual.length === expectedSet.size && actual.every((c) => expectedSet.has(c));
-
-const sameLeadingColumns = (actual: readonly string[], expectedSet: ReadonlySet<string>): boolean => {
-  const k = expectedSet.size;
-  if (actual.length < k) return false;
-  const seen = new Set<string>();
-  for (let i = 0; i < k; i++) {
-    const cid = actual[i]!;
-    if (!expectedSet.has(cid) || seen.has(cid)) return false;
-    seen.add(cid);
-  }
-  return seen.size === k;
+  return cb.typeLabel(col);
 };
 
 const isTargetColsUniqueBacked = (
-  target: Model,
-  targetIdx: ModelIndex,
+  ctx: PasteContext,
   refTableId: string,
   refColIds: readonly string[],
 ): boolean => {
   const refSet = new Set(refColIds);
   if (refSet.size !== refColIds.length) return false;
 
-  const tablesToCheck = [refTableId, ...partitionAncestors(target, refTableId).map((a) => a.id)];
-  const isMysql = target.dialect === 'mysql';
-
-  for (const tid of tablesToCheck) {
-    for (const pk of targetIdx.childrenRef(tid, 'primaryKey')) {
-      if (isMysql ? sameLeadingColumns(pk.columns, refSet) : sameColumnSet(pk.columns, refSet)) return true;
-    }
-    for (const u of targetIdx.childrenRef(tid, 'unique')) {
-      if (isMysql ? sameLeadingColumns(u.columns, refSet) : sameColumnSet(u.columns, refSet)) return true;
-    }
-    for (const ix of targetIdx.childrenRef(tid, 'index')) {
-      if (ix.where) continue;
-      if (isMysql) {
-        const idxType = (ix.ext?.mysql?.indexType ?? ix.method).toUpperCase();
-        if (idxType === 'FULLTEXT' || idxType === 'SPATIAL') continue;
-        if (ix.elements.length < refSet.size) continue;
-        const leadCols: string[] = [];
-        let ok = true;
-        for (let i = 0; i < refSet.size; i++) {
-          const c = ix.elements[i]?.column;
-          if (!c) {
-            ok = false;
-            break;
-          }
-          leadCols.push(c);
-        }
-        if (ok && sameLeadingColumns(leadCols, refSet)) return true;
-      } else {
-        if (!ix.unique) continue;
-        if (ix.elements.some((e) => e.column === null)) continue;
-        const cols = ix.elements.map((e) => e.column!);
-        if (sameColumnSet(cols, refSet)) return true;
-      }
-    }
-  }
-  return false;
+  const tablesToCheck = [refTableId, ...partitionAncestors(ctx.target, refTableId).map((a) => a.id)];
+  return ctx.cb.isUniqueBacked(ctx.targetIdx, tablesToCheck, refSet);
 };
 
 const reconnectExternalFk = (
@@ -1788,7 +1100,7 @@ const reconnectExternalFk = (
   fk: ForeignKey,
   reportTableName: string,
 ): { refTable: string; refColumns: string[] } | null => {
-  const d = getDialect(ctx.target.dialect);
+  const d = ctx.d;
   const srcRefTbl = ctx.frag[fk.refTable];
   if (srcRefTbl?.kind !== 'table') {
     ctx.report.skipped.push({
@@ -1804,7 +1116,7 @@ const reconnectExternalFk = (
   const srcSchemaName = srcRefSchema?.kind === 'schema' ? srcRefSchema.name : d.capabilities.defaultSchema;
   const displayTable = d.capabilities.schemas ? `${srcSchemaName}.${srcRefTbl.name}` : srcRefTbl.name;
 
-  const tgtSchema = findExactSchemaInTarget(ctx.target, ctx.targetIdx, srcSchemaName);
+  const tgtSchema = findExactSchemaInTarget(ctx, srcSchemaName);
   if (!tgtSchema) {
     ctx.report.skipped.push({
       kind: 'foreignKey',
@@ -1816,7 +1128,7 @@ const reconnectExternalFk = (
     return null;
   }
 
-  const ci = isCaseInsensitiveDialect(ctx.target.dialect);
+  const ci = ctx.cb.caseInsensitiveIdents;
   const tgtRefTbl = ctx.targetIdx
     .childrenRef(tgtSchema.id, 'table')
     .find((t) => (ci ? t.name.toLowerCase() === srcRefTbl.name.toLowerCase() : t.name === srcRefTbl.name));
@@ -1833,7 +1145,7 @@ const reconnectExternalFk = (
   }
 
   const tgtRefCols = effectiveColumnsOf(ctx.target, tgtRefTbl.id);
-  const tgtColByName = new Map(tgtRefCols.map((c) => [normIdent(ctx.target.dialect, c.name), c]));
+  const tgtColByName = new Map(tgtRefCols.map((c) => [normIdent(ctx.cb, c.name), c]));
 
   const mappedRefCols: Column[] = [];
   const srcRefCols: Column[] = [];
@@ -1845,7 +1157,7 @@ const reconnectExternalFk = (
       missingNames.push(srcRefColId);
       continue;
     }
-    const tgtCol = tgtColByName.get(normIdent(ctx.target.dialect, srcCol.name));
+    const tgtCol = tgtColByName.get(normIdent(ctx.cb, srcCol.name));
     if (!tgtCol) {
       missingNames.push(srcCol.name);
       continue;
@@ -1868,8 +1180,8 @@ const reconnectExternalFk = (
   for (let i = 0; i < srcRefCols.length; i++) {
     const srcCol = srcRefCols[i]!;
     const tgtCol = mappedRefCols[i]!;
-    const srcType = columnTypeLabel(ctx.target.dialect, srcCol, ctx.frag);
-    const tgtType = columnTypeLabel(ctx.target.dialect, tgtCol, ctx.target.objects);
+    const srcType = columnTypeLabel(ctx.cb, srcCol, ctx.frag);
+    const tgtType = columnTypeLabel(ctx.cb, tgtCol, ctx.target.objects);
     if (srcType !== tgtType) {
       ctx.report.skipped.push({
         kind: 'foreignKey',
@@ -1883,7 +1195,7 @@ const reconnectExternalFk = (
   }
 
   const mappedRefIds = mappedRefCols.map((c) => c.id);
-  if (!isTargetColsUniqueBacked(ctx.target, ctx.targetIdx, tgtRefTbl.id, mappedRefIds)) {
+  if (!isTargetColsUniqueBacked(ctx, tgtRefTbl.id, mappedRefIds)) {
     ctx.report.skipped.push({
       kind: 'foreignKey',
       name: fk.name,
@@ -1900,7 +1212,7 @@ const reconnectExternalFk = (
 // ───── 表粒度粘贴规划 ─────
 
 const planTablesPaste = (ctx: PasteContext, payload: ClipboardPayload): PastePlan => {
-  const d = getDialect(ctx.target.dialect);
+  const d = ctx.d;
   const tableMap: Record<string, string> = {};
   const newTables: string[] = [];
   const schemaFallbackCounts = new Map<string, { from: string; to: string; tables: number }>();
@@ -1913,9 +1225,9 @@ const planTablesPaste = (ctx: PasteContext, payload: ClipboardPayload): PastePla
   const mapSchema = (srcSchemaId: string, countFallback: boolean): string => {
     const srcSchema = ctx.frag[srcSchemaId];
     const srcName = srcSchema?.kind === 'schema' ? srcSchema.name : d.capabilities.defaultSchema;
-    const exact = findExactSchemaInTarget(ctx.target, ctx.targetIdx, srcName);
+    const exact = findExactSchemaInTarget(ctx, srcName);
     if (exact) return exact.id;
-    const fallback = defaultTargetSchema(ctx.target, ctx.targetIdx);
+    const fallback = defaultTargetSchema(ctx);
     if (countFallback) {
       const k = `${srcName}\0${fallback.name}`;
       const entry = schemaFallbackCounts.get(k);
@@ -1977,13 +1289,11 @@ const planTablesPaste = (ctx: PasteContext, payload: ClipboardPayload): PastePla
     const tableColIdMap = new Map<string, string>();
     colIdsByTable.set(srcRootId, tableColIdMap);
 
-    // SQLite WITHOUT ROWID 需要等主键创建后通过 setTableExt 设置
-    const hasSqliteWithoutRowid = Boolean(srcTbl.ext?.sqlite?.withoutRowid);
-    const createTableExt = hasSqliteWithoutRowid
-      ? (cleanExt({
-          ...srcTbl.ext,
-          sqlite: srcTbl.ext?.sqlite ? { ...srcTbl.ext.sqlite, withoutRowid: undefined } : undefined,
-        } as Record<string, unknown>) as TableExt | undefined)
+    // 依赖主键的表扩展（如 SQLite WITHOUT ROWID）需要等主键创建后通过 setTableExt 设置
+    const deferredTableExt =
+      srcTbl.ext && ctx.cb.deferTableExtUntilPk ? ctx.cb.deferTableExtUntilPk(clonePlain(srcTbl.ext)) : null;
+    const createTableExt = deferredTableExt
+      ? deferredTableExt.stripped
       : srcTbl.ext
         ? clonePlain(srcTbl.ext)
         : undefined;
@@ -2061,64 +1371,24 @@ const planTablesPaste = (ctx: PasteContext, payload: ClipboardPayload): PastePla
           }
         } else {
           let defExpr = renameManyInExpr(ctx.target.dialect, srcCol.default.expr, colRenameMap);
-          defExpr = renameQualifiedManyInExpr(ctx.target.dialect, defExpr, ctx.qualifiedEnumRenames);
+          defExpr = renameQualifiedManyInExpr(ctx.cb, defExpr, ctx.qualifiedEnumRenames);
           mappedDefault = { expr: defExpr };
         }
       }
 
-      // 扩展属性（SQLite autoincrement 延后；MSSQL defaultName 校验与后缀）
+      // 扩展属性：依赖主键的列扩展（如 SQLite AUTOINCREMENT）延后到主键之后设置
       let colExt = srcCol.ext ? clonePlain(srcCol.ext) : undefined;
-      if (ctx.target.dialect === 'sqlite' && srcCol.ext?.sqlite?.autoincrement) {
+      const deferredColExt =
+        colExt && ctx.cb.deferColumnExtUntilPk ? ctx.cb.deferColumnExtUntilPk(colExt) : null;
+      if (deferredColExt && srcCol.ext) {
         deferredAutoIncCols.push({ colId: newColId, ext: clonePlain(srcCol.ext) });
-        colExt = cleanExt({
-          ...colExt,
-          sqlite: colExt?.sqlite ? { ...colExt.sqlite, autoincrement: undefined } : undefined,
-        } as Record<string, unknown>) as ColumnExt | undefined;
-      }
-
-      if (ctx.target.dialect === 'mssql' && mappedDefault) {
-        const mssqlExt = colExt?.mssql;
-        if (mssqlExt?.defaultNameMode === 'explicit' && mssqlExt.defaultName) {
-          const newDfName = ctx.ns.allocateName(mssqlExt.defaultName, 'constraint', (n) =>
-            ctx.ns.isMssqlDefaultTaken(newSchemaId, n),
-          );
-          ctx.ns.addMssqlDefault(newSchemaId, newDfName);
-          if (newDfName !== mssqlExt.defaultName) {
-            ctx.report.renamed.push({
-              kind: 'column',
-              table: newTableName,
-              from: mssqlExt.defaultName,
-              to: newDfName,
-            });
-          }
-          colExt = {
-            ...colExt,
-            mssql: { ...mssqlExt, defaultName: newDfName, defaultNameMode: 'explicit' },
-          };
-        } else {
-          // 推导默认约束名由 addColumn -> refreshDerivedNames 重算
-          const derivedDf = mssqlChooseName('DF', newTableName, newColName, (n) =>
-            ctx.ns.isMssqlDefaultTaken(newSchemaId, n),
-          );
-          ctx.ns.addMssqlDefault(newSchemaId, derivedDf);
-          if (colExt?.mssql) {
-            colExt = cleanExt({
-              ...colExt,
-              mssql: { ...colExt.mssql, defaultName: undefined, defaultNameMode: undefined },
-            } as Record<string, unknown>) as ColumnExt | undefined;
-          }
-        }
-      } else if (ctx.target.dialect === 'mssql' && !mappedDefault && colExt?.mssql) {
-        colExt = cleanExt({
-          ...colExt,
-          mssql: { ...colExt.mssql, defaultName: undefined, defaultNameMode: undefined },
-        } as Record<string, unknown>) as ColumnExt | undefined;
+        colExt = deferredColExt.stripped;
       }
 
       let mappedGenerated: { expr: string; stored: boolean } | null = null;
       if (srcCol.generated) {
         let genExpr = renameManyInExpr(ctx.target.dialect, srcCol.generated.expr, colRenameMap);
-        genExpr = renameQualifiedManyInExpr(ctx.target.dialect, genExpr, ctx.qualifiedEnumRenames);
+        genExpr = renameQualifiedManyInExpr(ctx.cb, genExpr, ctx.qualifiedEnumRenames);
         mappedGenerated = { expr: genExpr, stored: srcCol.generated.stored };
       }
 
@@ -2126,21 +1396,20 @@ const planTablesPaste = (ctx: PasteContext, payload: ClipboardPayload): PastePla
         ? { always: srcCol.identity.always, options: clonePlain(srcCol.identity.options) }
         : null;
 
-      // PG addColumn 会触发推导 NOT NULL 名与 IDENTITY 序列名，同步预占
-      if (ctx.target.dialect === 'pg') {
-        if (srcCol.notNull || mappedIdentity) {
-          const nnName = chooseName(newTableName, newColName, 'not_null', (n) =>
-            ctx.ns.isPgConTaken(newTableId, n, true),
-          );
-          ctx.ns.addPgNotNull(newTableId, nnName);
-        }
-        if (mappedIdentity) {
-          const seqName = chooseName(newTableName, newColName, 'seq', (n) =>
-            ctx.ns.isPgRelTaken(newSchemaId, n),
-          );
-          ctx.ns.addPgRel(newSchemaId, seqName);
-        }
-      }
+      // addColumn 会按方言推导附属名字（如 PG NOT NULL / IDENTITY 序列名、MSSQL 默认约束名），同步预占
+      colExt = ctx.ns.prepareTableColumn(
+        {
+          schemaId: newSchemaId,
+          tableId: newTableId,
+          tableName: newTableName,
+          columnName: newColName,
+          ext: colExt,
+          hasDefault: mappedDefault !== null,
+          notNull: srcCol.notNull,
+          hasIdentity: mappedIdentity !== null,
+        },
+        (from, to) => ctx.report.renamed.push({ kind: 'column', table: newTableName, from, to }),
+      );
 
       ctx.ops.push({
         name: 'addColumn',
@@ -2197,7 +1466,7 @@ const planTablesPaste = (ctx: PasteContext, payload: ClipboardPayload): PastePla
         },
       });
       createdPk = true;
-      if (pk.nameMode === 'explicit' && ctx.target.dialect !== 'mysql') {
+      if (pk.nameMode === 'explicit' && ctx.cb.explicitPrimaryKeyNames) {
         const newName = ctx.ns.allocateName(pk.name, 'constraint', (n) =>
           ctx.ns.isKeyTaken(newSchemaId, newTableId, 'primaryKey', n),
         );
@@ -2213,8 +1482,7 @@ const planTablesPaste = (ctx: PasteContext, payload: ClipboardPayload): PastePla
         ctx.ops.push({ name: 'renameKey', args: { id: newPkId, name: newName } });
       } else {
         reserveDerivedKeyOrIndex(
-          ctx.ns,
-          ctx.target.dialect,
+          ctx,
           newSchemaId,
           newTableId,
           newTableName,
@@ -2228,8 +1496,8 @@ const planTablesPaste = (ctx: PasteContext, payload: ClipboardPayload): PastePla
       }
     }
 
-    // SQLite 延迟的 WITHOUT ROWID 与 AUTOINCREMENT 扩展
-    if (hasSqliteWithoutRowid && createdPk && srcTbl.ext) {
+    // 延后的依赖主键的表 / 列扩展（如 SQLite WITHOUT ROWID 与 AUTOINCREMENT）
+    if (deferredTableExt && createdPk && srcTbl.ext) {
       ctx.ops.push({
         name: 'setTableExt',
         args: { id: newTableId, ext: clonePlain(srcTbl.ext) },
@@ -2242,7 +1510,7 @@ const planTablesPaste = (ctx: PasteContext, payload: ClipboardPayload): PastePla
       });
     }
 
-    // PG 分区设置与全部后代子分区（BFS 顺序）
+    // 分区设置与全部后代子分区（BFS 顺序）
     const mapPartitionSpec = (spec: PartitionSpec): PartitionSpec | null => {
       const keys: PartitionKey[] = [];
       for (const k of spec.keys) {
@@ -2255,7 +1523,7 @@ const planTablesPaste = (ctx: PasteContext, payload: ClipboardPayload): PastePla
         let expr = k.expr;
         if (expr) {
           expr = renameManyInExpr(ctx.target.dialect, expr, colRenameMap);
-          expr = renameQualifiedManyInExpr(ctx.target.dialect, expr, ctx.qualifiedEnumRenames);
+          expr = renameQualifiedManyInExpr(ctx.cb, expr, ctx.qualifiedEnumRenames);
         }
         if ((mappedCol !== null) === (expr !== null && expr.length > 0)) return null;
         keys.push({
@@ -2268,8 +1536,9 @@ const planTablesPaste = (ctx: PasteContext, payload: ClipboardPayload): PastePla
       return keys.length > 0 ? { strategy: spec.strategy, keys } : null;
     };
 
-    if (d.capabilities.partitioning && srcTbl.partitionBy !== null) {
-      const rootSpec = resolvePartitionBy(ctx.fragModel, srcTbl);
+    const partitionSpecOf = d.capabilities.partitioning ? ctx.cb.partitionSpecOf : undefined;
+    if (partitionSpecOf && srcTbl.partitionBy !== null) {
+      const rootSpec = partitionSpecOf(ctx.fragModel, srcTbl);
       const mappedRootSpec = rootSpec ? mapPartitionSpec(rootSpec) : null;
       if (mappedRootSpec) {
         ctx.ops.push({
@@ -2303,7 +1572,7 @@ const planTablesPaste = (ctx: PasteContext, payload: ClipboardPayload): PastePla
             },
           });
           if (srcDesc.partitionBy !== null) {
-            const descSpec = resolvePartitionBy(ctx.fragModel, srcDesc);
+            const descSpec = partitionSpecOf(ctx.fragModel, srcDesc);
             const mappedDescSpec = descSpec ? mapPartitionSpec(descSpec) : null;
             if (mappedDescSpec) {
               ctx.ops.push({
@@ -2366,8 +1635,7 @@ const planTablesPaste = (ctx: PasteContext, payload: ClipboardPayload): PastePla
         ctx.ops.push({ name: 'renameKey', args: { id: newUid, name: newName } });
       } else {
         reserveDerivedKeyOrIndex(
-          ctx.ns,
-          ctx.target.dialect,
+          ctx,
           newSchemaId,
           newTableId,
           newTableName,
@@ -2384,7 +1652,7 @@ const planTablesPaste = (ctx: PasteContext, payload: ClipboardPayload): PastePla
     for (const ck of ctx.fragIdx.childrenRef(srcRootId, 'check')) {
       const newCkId = ctx.allocId();
       let expr = renameManyInExpr(ctx.target.dialect, ck.expr, colRenameMap);
-      expr = renameQualifiedManyInExpr(ctx.target.dialect, expr, ctx.qualifiedEnumRenames);
+      expr = renameQualifiedManyInExpr(ctx.cb, expr, ctx.qualifiedEnumRenames);
       ctx.ops.push({
         name: 'addCheck',
         args: { id: newCkId, table: newTableId, expr, noInherit: ck.noInherit },
@@ -2400,8 +1668,7 @@ const planTablesPaste = (ctx: PasteContext, payload: ClipboardPayload): PastePla
         ctx.ops.push({ name: 'renameKey', args: { id: newCkId, name: newName } });
       } else {
         reserveDerivedKeyOrIndex(
-          ctx.ns,
-          ctx.target.dialect,
+          ctx,
           newSchemaId,
           newTableId,
           newTableName,
@@ -2433,7 +1700,7 @@ const planTablesPaste = (ctx: PasteContext, payload: ClipboardPayload): PastePla
         const mappedExpr =
           e.expr !== null
             ? renameQualifiedManyInExpr(
-                ctx.target.dialect,
+                ctx.cb,
                 renameManyInExpr(ctx.target.dialect, e.expr, colRenameMap),
                 ctx.qualifiedEnumRenames,
               )
@@ -2476,7 +1743,7 @@ const planTablesPaste = (ctx: PasteContext, payload: ClipboardPayload): PastePla
       const newIxId = ctx.allocId();
       const mappedWhere = ix.where
         ? renameQualifiedManyInExpr(
-            ctx.target.dialect,
+            ctx.cb,
             renameManyInExpr(ctx.target.dialect, ix.where, colRenameMap),
             ctx.qualifiedEnumRenames,
           )
@@ -2506,8 +1773,7 @@ const planTablesPaste = (ctx: PasteContext, payload: ClipboardPayload): PastePla
         ctx.ops.push({ name: 'renameKey', args: { id: newIxId, name: newName } });
       } else {
         reserveDerivedKeyOrIndex(
-          ctx.ns,
-          ctx.target.dialect,
+          ctx,
           newSchemaId,
           newTableId,
           newTableName,
@@ -2620,8 +1886,7 @@ const planTablesPaste = (ctx: PasteContext, payload: ClipboardPayload): PastePla
       ctx.ops.push({ name: 'renameKey', args: { id: newFkId, name: newName } });
     } else {
       reserveDerivedKeyOrIndex(
-        ctx.ns,
-        ctx.target.dialect,
+        ctx,
         newSchemaId,
         newTableId,
         newTableName,
@@ -2665,23 +1930,10 @@ const planTablesPaste = (ctx: PasteContext, payload: ClipboardPayload): PastePla
 
 // ───── 表内粒度粘贴规划 ─────
 
-const hasMssqlClusteredOnTable = (m: Model, tableId: string): boolean => {
-  for (const pk of childrenOf(m, tableId, 'primaryKey')) {
-    if (isMssqlPkClustered(m, pk)) return true;
-  }
-  for (const u of childrenOf(m, tableId, 'unique')) {
-    if (u.ext?.mssql?.clustered === true) return true;
-  }
-  for (const ix of childrenOf(m, tableId, 'index')) {
-    if (ix.ext?.mssql?.clustered === true) return true;
-  }
-  return false;
-};
-
 const normExprText = (s: string | null): string | null => (s === null ? null : s.trim().replace(/\s+/g, ' '));
 
 const planItemsPaste = (ctx: PasteContext, payload: ClipboardPayload, tgtTbl: Table): PastePlan => {
-  const d = getDialect(ctx.target.dialect);
+  const d = ctx.d;
   const tgtSchemaId = tgtTbl.parent;
   const rawSrcTbl = payload.table ? ctx.frag[payload.table] : undefined;
   if (!rawSrcTbl || rawSrcTbl.kind !== 'table') {
@@ -2690,7 +1942,7 @@ const planItemsPaste = (ctx: PasteContext, payload: ClipboardPayload, tgtTbl: Ta
   const srcTbl = rawSrcTbl;
   const srcRootId = rootTableId(ctx.fragModel, srcTbl.id);
 
-  ctx.ns.initTableColumns(tgtTbl.id);
+  for (const c of effectiveColumnsOf(ctx.target, tgtTbl.id)) ctx.ns.addColumn(tgtTbl.id, c.name);
 
   // 构造轻量级本地草稿模型（只深拷贝目标表及其家族、新建对象与涉事 schema），绝不修改 target
   const scratch: Model = {
@@ -2756,24 +2008,18 @@ const planItemsPaste = (ctx: PasteContext, payload: ClipboardPayload, tgtTbl: Ta
 
   // 预检已有列与表级约束
   const existingCols = columnsOf(scratch, tgtTbl.id);
-  const existingColByNormName = new Map(existingCols.map((c) => [normIdent(ctx.target.dialect, c.name), c]));
+  const existingColByNormName = new Map(existingCols.map((c) => [normIdent(ctx.cb, c.name), c]));
   let hasTargetPk = childrenOf(scratch, tgtTbl.id, 'primaryKey').length > 0;
-  let hasSqliteAutoInc = existingCols.some((c) => Boolean(c.ext?.sqlite?.autoincrement));
-  let hasMysqlAutoInc = existingCols.some((c) => Boolean(c.ext?.mysql?.autoIncrement));
-  let hasMssqlIdentity = existingCols.some((c) => Boolean(c.ext?.mssql?.identity));
 
   const batchPkItem = srcKeyItems.find((o): o is PrimaryKey => o.kind === 'primaryKey');
-  const batchUniqueItems = srcKeyItems.filter((o): o is Unique => o.kind === 'unique');
-  const batchIndexItems = srcKeyItems.filter((o): o is Index => o.kind === 'index');
-
-  const hasMysqlCoveringKeyInBatch = (srcColId: string): boolean => {
-    if (!hasTargetPk && batchPkItem && batchPkItem.columns[0] === srcColId) return true;
-    if (batchUniqueItems.some((u) => u.columns[0] === srcColId)) return true;
-    return batchIndexItems.some((ix) => {
-      const idxType = (ix.ext?.mysql?.indexType ?? ix.method).toUpperCase();
-      return idxType !== 'FULLTEXT' && idxType !== 'SPATIAL' && ix.elements[0]?.column === srcColId;
-    });
-  };
+  const checkColumn = ctx.cb.createItemColumnGuard?.({
+    table: tgtTbl,
+    existingCols,
+    hasTargetPk,
+    batchPk: batchPkItem,
+    batchUniques: srcKeyItems.filter((o): o is Unique => o.kind === 'unique'),
+    batchIndexes: srcKeyItems.filter((o): o is Index => o.kind === 'index'),
+  });
 
   // 第 1 趟：单列能力检查与新列名分配
   interface CandidateCol {
@@ -2781,134 +2027,23 @@ const planItemsPaste = (ctx: PasteContext, payload: ClipboardPayload, tgtTbl: Ta
     newId: string;
     newName: string;
     renamed: boolean;
-    deferredSqliteAutoInc: boolean;
+    /** 依赖主键、需延后到主键之后设置的列扩展（如 SQLite AUTOINCREMENT） */
+    deferredExt: DeferredExt<ColumnExt> | null;
   }
   const candidates: CandidateCol[] = [];
   const colRenameMap = new Map<string, string>();
 
   for (const sc of srcColItems) {
-    if (ctx.target.dialect === 'sqlite') {
-      if (tgtTbl.ext?.sqlite?.strict && !SQLITE_STRICT_TYPES.has(sc.type.trim().toUpperCase())) {
-        ctx.report.skipped.push({
-          kind: 'column',
-          name: sc.name,
-          table: tgtTbl.name,
-          reason: 'unsupported',
-          detail: `STRICT 表不支持列类型 ${sc.type}`,
-        });
-        continue;
-      }
-      if (sc.ext?.sqlite?.autoincrement) {
-        if (tgtTbl.ext?.sqlite?.withoutRowid) {
-          ctx.report.skipped.push({
-            kind: 'column',
-            name: sc.name,
-            table: tgtTbl.name,
-            reason: 'unsupported',
-            detail: 'WITHOUT ROWID 表不能使用 AUTOINCREMENT',
-          });
-          continue;
-        }
-        if (sc.type.trim().toUpperCase() !== 'INTEGER') {
-          ctx.report.skipped.push({
-            kind: 'column',
-            name: sc.name,
-            table: tgtTbl.name,
-            reason: 'unsupported',
-            detail: 'AUTOINCREMENT 只能用于 INTEGER 类型列',
-          });
-          continue;
-        }
-        if (hasSqliteAutoInc || hasTargetPk) {
-          ctx.report.skipped.push({
-            kind: 'column',
-            name: sc.name,
-            table: tgtTbl.name,
-            reason: 'unsupported',
-            detail: '目标表已有主键或 AUTOINCREMENT 列',
-          });
-          continue;
-        }
-        if (!batchPkItem || batchPkItem.columns.length !== 1 || batchPkItem.columns[0] !== sc.id) {
-          ctx.report.skipped.push({
-            kind: 'column',
-            name: sc.name,
-            table: tgtTbl.name,
-            reason: 'unsupported',
-            detail: 'AUTOINCREMENT 列必须同批粘贴对应的单列主键',
-          });
-          continue;
-        }
-        hasSqliteAutoInc = true;
-      }
-    } else if (ctx.target.dialect === 'mysql') {
-      if (sc.ext?.mysql?.autoIncrement) {
-        if (hasMysqlAutoInc) {
-          ctx.report.skipped.push({
-            kind: 'column',
-            name: sc.name,
-            table: tgtTbl.name,
-            reason: 'unsupported',
-            detail: 'MySQL 每张表最多只能有一列 AUTO_INCREMENT',
-          });
-          continue;
-        }
-        if (!isMysqlAutoIncrementType(sc.type) || sc.generated || sc.default || !sc.notNull) {
-          ctx.report.skipped.push({
-            kind: 'column',
-            name: sc.name,
-            table: tgtTbl.name,
-            reason: 'unsupported',
-            detail: `列 ${sc.name} 不满足 AUTO_INCREMENT 条件`,
-          });
-          continue;
-        }
-        if (!hasMysqlCoveringKeyInBatch(sc.id)) {
-          ctx.report.skipped.push({
-            kind: 'column',
-            name: sc.name,
-            table: tgtTbl.name,
-            reason: 'unsupported',
-            detail: 'AUTO_INCREMENT 列需同批粘贴以其为首列的主键、唯一约束或索引',
-          });
-          continue;
-        }
-        hasMysqlAutoInc = true;
-      }
-    } else if (ctx.target.dialect === 'mssql') {
-      if (sc.ext?.mssql?.identity) {
-        if (hasMssqlIdentity) {
-          ctx.report.skipped.push({
-            kind: 'column',
-            name: sc.name,
-            table: tgtTbl.name,
-            reason: 'unsupported',
-            detail: 'SQL Server 每张表最多只能有一个 IDENTITY 列',
-          });
-          continue;
-        }
-        if (!isMssqlIdentityEligibleType(sc.type) || !sc.notNull || sc.default || sc.generated) {
-          ctx.report.skipped.push({
-            kind: 'column',
-            name: sc.name,
-            table: tgtTbl.name,
-            reason: 'unsupported',
-            detail: `列 ${sc.name} 不满足 MSSQL IDENTITY 条件`,
-          });
-          continue;
-        }
-        hasMssqlIdentity = true;
-      }
-      if (sc.generated && !sc.generated.stored && sc.notNull) {
-        ctx.report.skipped.push({
-          kind: 'column',
-          name: sc.name,
-          table: tgtTbl.name,
-          reason: 'unsupported',
-          detail: 'SQL Server 非 PERSISTED 计算列不能声明 NOT NULL',
-        });
-        continue;
-      }
+    const unsupported = checkColumn ? checkColumn(sc) : null;
+    if (unsupported !== null) {
+      ctx.report.skipped.push({
+        kind: 'column',
+        name: sc.name,
+        table: tgtTbl.name,
+        reason: 'unsupported',
+        detail: unsupported,
+      });
+      continue;
     }
 
     const newColId = ctx.allocId();
@@ -2921,29 +2056,25 @@ const planItemsPaste = (ctx: PasteContext, payload: ClipboardPayload, tgtTbl: Ta
       newId: newColId,
       newName,
       renamed,
-      deferredSqliteAutoInc: Boolean(ctx.target.dialect === 'sqlite' && sc.ext?.sqlite?.autoincrement),
+      deferredExt:
+        sc.ext && ctx.cb.deferColumnExtUntilPk ? ctx.cb.deferColumnExtUntilPk(clonePlain(sc.ext)) : null,
     });
   }
 
-  // 第 1.5 趟：不动点检查生成列表达式引用（保证无悬空引用与 MySQL 生成列不引用 AUTO_INCREMENT 列）
+  // 第 1.5 趟：不动点检查生成列表达式引用（保证无悬空引用，并满足方言的额外引用限制，如 MySQL 生成列不引用 AUTO_INCREMENT 列）
   let surviving = candidates;
   for (;;) {
-    const allowedNormNames = new Set<string>(existingCols.map((c) => normIdent(ctx.target.dialect, c.name)));
-    const autoIncNames = new Set<string>(
-      existingCols.filter((c) => c.ext?.mysql?.autoIncrement).map((c) => c.name.toLowerCase()),
-    );
+    const allowedNormNames = new Set<string>(existingCols.map((c) => normIdent(ctx.cb, c.name)));
     for (const c of surviving) {
-      allowedNormNames.add(normIdent(ctx.target.dialect, c.newName));
-      if (ctx.target.dialect === 'mysql' && c.src.ext?.mysql?.autoIncrement) {
-        autoIncNames.add(c.newName.toLowerCase());
-      }
+      allowedNormNames.add(normIdent(ctx.cb, c.newName));
     }
+    const checkGeneratedRefs = ctx.cb.createGeneratedRefGuard?.(existingCols, surviving);
     const nextSurviving: CandidateCol[] = [];
     let droppedAny = false;
     for (const c of surviving) {
       if (c.src.generated) {
         const rewritten = renameManyInExpr(ctx.target.dialect, c.src.generated.expr, colRenameMap);
-        const unknown = findUnknownExprColumns(ctx.target.dialect, rewritten, allowedNormNames);
+        const unknown = findUnknownExprColumns(ctx.d, rewritten, allowedNormNames);
         if (unknown.length > 0) {
           ctx.ns.removeColumn(tgtTbl.id, c.newName);
           colRenameMap.delete(c.src.name);
@@ -2957,10 +2088,8 @@ const planItemsPaste = (ctx: PasteContext, payload: ClipboardPayload, tgtTbl: Ta
           droppedAny = true;
           continue;
         }
-        if (
-          ctx.target.dialect === 'mysql' &&
-          [...autoIncNames].some((aiName) => getDialect('mysql').exprReferences(rewritten, aiName))
-        ) {
+        const refViolation = checkGeneratedRefs ? checkGeneratedRefs(rewritten) : null;
+        if (refViolation !== null) {
           ctx.ns.removeColumn(tgtTbl.id, c.newName);
           colRenameMap.delete(c.src.name);
           ctx.report.skipped.push({
@@ -2968,7 +2097,7 @@ const planItemsPaste = (ctx: PasteContext, payload: ClipboardPayload, tgtTbl: Ta
             name: c.src.name,
             table: tgtTbl.name,
             reason: 'unsupported',
-            detail: 'MySQL 生成列不能引用 AUTO_INCREMENT 列',
+            detail: refViolation,
           });
           droppedAny = true;
           continue;
@@ -2983,7 +2112,7 @@ const planItemsPaste = (ctx: PasteContext, payload: ClipboardPayload, tgtTbl: Ta
   // 第 2 趟：在 scratch 上逐列预演并提交
   const pastedColBySrcId = new Map<string, { id: string; name: string }>();
   const newItems: string[] = [];
-  let pendingSqliteAutoInc: { colId: string; srcColId: string; ext: ColumnExt } | null = null;
+  let pendingDeferredExt: { colId: string; srcColId: string; ext: ColumnExt } | null = null;
 
   for (const cand of surviving) {
     const sc = cand.src;
@@ -3025,62 +2154,39 @@ const planItemsPaste = (ctx: PasteContext, payload: ClipboardPayload, tgtTbl: Ta
         }
       } else {
         let defExpr = renameManyInExpr(ctx.target.dialect, sc.default.expr, colRenameMap);
-        defExpr = renameQualifiedManyInExpr(ctx.target.dialect, defExpr, ctx.qualifiedEnumRenames);
+        defExpr = renameQualifiedManyInExpr(ctx.cb, defExpr, ctx.qualifiedEnumRenames);
         mappedDefault = { expr: defExpr };
       }
     }
 
-    let colExt = sc.ext ? clonePlain(sc.ext) : undefined;
-    if (cand.deferredSqliteAutoInc) {
-      colExt = cleanExt({
-        ...colExt,
-        sqlite: colExt?.sqlite ? { ...colExt.sqlite, autoincrement: undefined } : undefined,
-      } as Record<string, unknown>) as ColumnExt | undefined;
-    }
-
-    let reservedDfName: string | null = null;
-    if (ctx.target.dialect === 'mssql' && mappedDefault) {
-      const mssqlExt = colExt?.mssql;
-      if (mssqlExt?.defaultNameMode === 'explicit' && mssqlExt.defaultName) {
-        const newDfName = ctx.ns.allocateName(mssqlExt.defaultName, 'constraint', (n) =>
-          ctx.ns.isMssqlDefaultTaken(tgtSchemaId, n),
-        );
-        reservedDfName = newDfName;
-        if (newDfName !== mssqlExt.defaultName) {
-          ctx.report.renamed.push({
-            kind: 'column',
-            table: tgtTbl.name,
-            from: mssqlExt.defaultName,
-            to: newDfName,
-          });
-        }
-        colExt = {
-          ...colExt,
-          mssql: { ...mssqlExt, defaultName: newDfName, defaultNameMode: 'explicit' },
-        };
-      } else if (colExt?.mssql) {
-        colExt = cleanExt({
-          ...colExt,
-          mssql: { ...colExt.mssql, defaultName: undefined, defaultNameMode: undefined },
-        } as Record<string, unknown>) as ColumnExt | undefined;
-      }
-    } else if (ctx.target.dialect === 'mssql' && !mappedDefault && colExt?.mssql) {
-      colExt = cleanExt({
-        ...colExt,
-        mssql: { ...colExt.mssql, defaultName: undefined, defaultNameMode: undefined },
-      } as Record<string, unknown>) as ColumnExt | undefined;
-    }
-
-    let mappedGenerated: { expr: string; stored: boolean } | null = null;
-    if (sc.generated) {
-      let genExpr = renameManyInExpr(ctx.target.dialect, sc.generated.expr, colRenameMap);
-      genExpr = renameQualifiedManyInExpr(ctx.target.dialect, genExpr, ctx.qualifiedEnumRenames);
-      mappedGenerated = { expr: genExpr, stored: sc.generated.stored };
-    }
+    let colExt = cand.deferredExt ? cand.deferredExt.stripped : sc.ext ? clonePlain(sc.ext) : undefined;
 
     const mappedIdentity = sc.identity
       ? { always: sc.identity.always, options: clonePlain(sc.identity.options) }
       : null;
+
+    // 方言附属名字（如 MSSQL 显式默认约束名的冲突后缀）；推导名在预演成功后由 commit 登记
+    const preparedCol = ctx.ns.prepareItemColumn(
+      {
+        schemaId: tgtSchemaId,
+        tableId: tgtTbl.id,
+        tableName: tgtTbl.name,
+        columnName: cand.newName,
+        ext: colExt,
+        hasDefault: mappedDefault !== null,
+        notNull: sc.notNull,
+        hasIdentity: mappedIdentity !== null,
+      },
+      (from, to) => ctx.report.renamed.push({ kind: 'column', table: tgtTbl.name, from, to }),
+    );
+    colExt = preparedCol.ext;
+
+    let mappedGenerated: { expr: string; stored: boolean } | null = null;
+    if (sc.generated) {
+      let genExpr = renameManyInExpr(ctx.target.dialect, sc.generated.expr, colRenameMap);
+      genExpr = renameQualifiedManyInExpr(ctx.cb, genExpr, ctx.qualifiedEnumRenames);
+      mappedGenerated = { expr: genExpr, stored: sc.generated.stored };
+    }
 
     candidateOps.push({
       name: 'addColumn',
@@ -3143,20 +2249,10 @@ const planItemsPaste = (ctx: PasteContext, payload: ClipboardPayload, tgtTbl: Ta
         to: cand.newName,
       });
     }
-    if (reservedDfName) ctx.ns.addMssqlDefault(tgtSchemaId, reservedDfName);
     const createdCol = scratch.objects[cand.newId];
-    if (createdCol?.kind === 'column') {
-      if (ctx.target.dialect === 'pg') {
-        if (createdCol.notNull && createdCol.notNullName)
-          ctx.ns.addPgNotNull(tgtTbl.id, createdCol.notNullName);
-        if (createdCol.identity?.sequenceName) ctx.ns.addPgRel(tgtSchemaId, createdCol.identity.sequenceName);
-      } else if (ctx.target.dialect === 'mssql' && createdCol.default && !reservedDfName) {
-        const df = mssqlDefaultNameOf(createdCol, tgtTbl.name);
-        ctx.ns.addMssqlDefault(tgtSchemaId, df);
-      }
-    }
-    if (cand.deferredSqliteAutoInc && sc.ext) {
-      pendingSqliteAutoInc = { colId: cand.newId, srcColId: sc.id, ext: clonePlain(sc.ext) };
+    preparedCol.commit(createdCol?.kind === 'column' ? createdCol : undefined);
+    if (cand.deferredExt && sc.ext) {
+      pendingDeferredExt = { colId: cand.newId, srcColId: sc.id, ext: clonePlain(sc.ext) };
     }
     if (sc.comment !== null) {
       ctx.commentQueue.push({ id: cand.newId, comment: sc.comment });
@@ -3165,7 +2261,7 @@ const planItemsPaste = (ctx: PasteContext, payload: ClipboardPayload, tgtTbl: Ta
 
   // 批后允许的全部列名（用于 CHECK / INDEX 表达式引用校验）
   const postBatchCols = columnsOf(scratch, tgtTbl.id);
-  const postBatchAllowedNames = new Set(postBatchCols.map((c) => normIdent(ctx.target.dialect, c.name)));
+  const postBatchAllowedNames = new Set(postBatchCols.map((c) => normIdent(ctx.cb, c.name)));
 
   const resolveItemColumns = (
     srcColIds: readonly string[],
@@ -3183,7 +2279,7 @@ const planItemsPaste = (ctx: PasteContext, payload: ClipboardPayload, tgtTbl: Ta
         missing.push(srcColId);
         continue;
       }
-      const existing = existingColByNormName.get(normIdent(ctx.target.dialect, srcCol.name));
+      const existing = existingColByNormName.get(normIdent(ctx.cb, srcCol.name));
       if (!existing) {
         missing.push(srcCol.name);
         continue;
@@ -3217,17 +2313,16 @@ const planItemsPaste = (ctx: PasteContext, payload: ClipboardPayload, tgtTbl: Ta
         });
         continue;
       }
-      if (ctx.target.dialect === 'mssql' && item.ext?.mssql?.clustered === true) {
-        if (hasMssqlClusteredOnTable(scratch, tgtTbl.id)) {
-          ctx.report.skipped.push({
-            kind: 'primaryKey',
-            name: item.name,
-            table: tgtTbl.name,
-            reason: 'unsupported',
-            detail: '目标表已有 CLUSTERED 约束或索引',
-          });
-          continue;
-        }
+      const keyViolation = ctx.cb.checkKeyItem ? ctx.cb.checkKeyItem(scratch, tgtTbl.id, item) : null;
+      if (keyViolation !== null) {
+        ctx.report.skipped.push({
+          kind: 'primaryKey',
+          name: item.name,
+          table: tgtTbl.name,
+          reason: 'unsupported',
+          detail: keyViolation,
+        });
+        continue;
       }
 
       const newPkId = ctx.allocId();
@@ -3244,7 +2339,7 @@ const planItemsPaste = (ctx: PasteContext, payload: ClipboardPayload, tgtTbl: Ta
       ];
       let renamedInfo: PasteRename | null = null;
       let explicitName: string | null = null;
-      if (item.nameMode === 'explicit' && ctx.target.dialect !== 'mysql') {
+      if (item.nameMode === 'explicit' && ctx.cb.explicitPrimaryKeyNames) {
         explicitName = ctx.ns.allocateName(item.name, 'constraint', (n) =>
           ctx.ns.isKeyTaken(tgtSchemaId, tgtTbl.id, 'primaryKey', n),
         );
@@ -3253,10 +2348,10 @@ const planItemsPaste = (ctx: PasteContext, payload: ClipboardPayload, tgtTbl: Ta
         }
         candidateOps.push({ name: 'renameKey', args: { id: newPkId, name: explicitName } });
       }
-      if (pendingSqliteAutoInc && mapped.length === 1 && mapped[0] === pendingSqliteAutoInc.colId) {
+      if (pendingDeferredExt && mapped.length === 1 && mapped[0] === pendingDeferredExt.colId) {
         candidateOps.push({
           name: 'setColumnExt',
-          args: { id: pendingSqliteAutoInc.colId, ext: pendingSqliteAutoInc.ext },
+          args: { id: pendingDeferredExt.colId, ext: pendingDeferredExt.ext },
         });
       }
 
@@ -3308,17 +2403,16 @@ const planItemsPaste = (ctx: PasteContext, payload: ClipboardPayload, tgtTbl: Ta
         });
         continue;
       }
-      if (ctx.target.dialect === 'mssql' && item.ext?.mssql?.clustered === true) {
-        if (hasMssqlClusteredOnTable(scratch, tgtTbl.id)) {
-          ctx.report.skipped.push({
-            kind: 'unique',
-            name: item.name,
-            table: tgtTbl.name,
-            reason: 'unsupported',
-            detail: '目标表已有 CLUSTERED 约束或索引',
-          });
-          continue;
-        }
+      const keyViolation = ctx.cb.checkKeyItem ? ctx.cb.checkKeyItem(scratch, tgtTbl.id, item) : null;
+      if (keyViolation !== null) {
+        ctx.report.skipped.push({
+          kind: 'unique',
+          name: item.name,
+          table: tgtTbl.name,
+          reason: 'unsupported',
+          detail: keyViolation,
+        });
+        continue;
       }
 
       const newUid = ctx.allocId();
@@ -3368,8 +2462,8 @@ const planItemsPaste = (ctx: PasteContext, payload: ClipboardPayload, tgtTbl: Ta
 
     if (item.kind === 'check') {
       let expr = renameManyInExpr(ctx.target.dialect, item.expr, colRenameMap);
-      expr = renameQualifiedManyInExpr(ctx.target.dialect, expr, ctx.qualifiedEnumRenames);
-      const unknown = findUnknownExprColumns(ctx.target.dialect, expr, postBatchAllowedNames);
+      expr = renameQualifiedManyInExpr(ctx.cb, expr, ctx.qualifiedEnumRenames);
+      const unknown = findUnknownExprColumns(ctx.d, expr, postBatchAllowedNames);
       if (unknown.length > 0) {
         ctx.report.skipped.push({
           kind: 'check',
@@ -3445,11 +2539,7 @@ const planItemsPaste = (ctx: PasteContext, payload: ClipboardPayload, tgtTbl: Ta
         let mappedElExpr = el.expr;
         if (mappedElExpr !== null) {
           mappedElExpr = renameManyInExpr(ctx.target.dialect, mappedElExpr, colRenameMap);
-          mappedElExpr = renameQualifiedManyInExpr(
-            ctx.target.dialect,
-            mappedElExpr,
-            ctx.qualifiedEnumRenames,
-          );
+          mappedElExpr = renameQualifiedManyInExpr(ctx.cb, mappedElExpr, ctx.qualifiedEnumRenames);
         }
         if (!isValidIndexElement({ column: el.column, expr: mappedElExpr })) invalidElement = true;
         mappedElements.push({
@@ -3487,16 +2577,14 @@ const planItemsPaste = (ctx: PasteContext, payload: ClipboardPayload, tgtTbl: Ta
       const unknownExprCols: string[] = [];
       for (const el of mappedElements) {
         if (el.expr !== null) {
-          unknownExprCols.push(...findUnknownExprColumns(ctx.target.dialect, el.expr, postBatchAllowedNames));
+          unknownExprCols.push(...findUnknownExprColumns(ctx.d, el.expr, postBatchAllowedNames));
         }
       }
       let mappedWhere = item.where;
       if (mappedWhere !== null) {
         mappedWhere = renameManyInExpr(ctx.target.dialect, mappedWhere, colRenameMap);
-        mappedWhere = renameQualifiedManyInExpr(ctx.target.dialect, mappedWhere, ctx.qualifiedEnumRenames);
-        unknownExprCols.push(
-          ...findUnknownExprColumns(ctx.target.dialect, mappedWhere, postBatchAllowedNames),
-        );
+        mappedWhere = renameQualifiedManyInExpr(ctx.cb, mappedWhere, ctx.qualifiedEnumRenames);
+        unknownExprCols.push(...findUnknownExprColumns(ctx.d, mappedWhere, postBatchAllowedNames));
       }
       if (unknownExprCols.length > 0) {
         ctx.report.skipped.push({
@@ -3509,6 +2597,8 @@ const planItemsPaste = (ctx: PasteContext, payload: ClipboardPayload, tgtTbl: Ta
         continue;
       }
 
+      const indexVariant = (ix: Index): unknown =>
+        ctx.cb.indexVariant ? ctx.cb.indexVariant(ix) : undefined;
       const normEls = (els: readonly IndexElement[]) =>
         els.map((e) => ({ ...e, expr: normExprText(e.expr) }));
       const isDup = childrenOf(scratch, tgtTbl.id, 'index').some(
@@ -3519,7 +2609,7 @@ const planItemsPaste = (ctx: PasteContext, payload: ClipboardPayload, tgtTbl: Ta
           ix.nullsNotDistinct === item.nullsNotDistinct &&
           deepEqual(ix.include, incRes.mapped!) &&
           deepEqual(normEls(ix.elements), normEls(mappedElements)) &&
-          deepEqual(ix.ext?.mysql?.indexType, item.ext?.mysql?.indexType),
+          deepEqual(indexVariant(ix), indexVariant(item)),
       );
       if (isDup) {
         ctx.report.skipped.push({
@@ -3532,17 +2622,16 @@ const planItemsPaste = (ctx: PasteContext, payload: ClipboardPayload, tgtTbl: Ta
         continue;
       }
 
-      if (ctx.target.dialect === 'mssql' && item.ext?.mssql?.clustered === true) {
-        if (hasMssqlClusteredOnTable(scratch, tgtTbl.id)) {
-          ctx.report.skipped.push({
-            kind: 'index',
-            name: item.name,
-            table: tgtTbl.name,
-            reason: 'unsupported',
-            detail: '目标表已有 CLUSTERED 约束或索引',
-          });
-          continue;
-        }
+      const keyViolation = ctx.cb.checkKeyItem ? ctx.cb.checkKeyItem(scratch, tgtTbl.id, item) : null;
+      if (keyViolation !== null) {
+        ctx.report.skipped.push({
+          kind: 'index',
+          name: item.name,
+          table: tgtTbl.name,
+          reason: 'unsupported',
+          detail: keyViolation,
+        });
+        continue;
       }
 
       const newIxId = ctx.allocId();
@@ -3759,6 +2848,7 @@ export const planPaste = (target: Model, payload: ClipboardPayload, opts: PasteO
 
   const frag = payload.fragment as Record<string, Obj>;
   const fragModel: Model = { format: 1, dialect: payload.dialect, objects: frag };
+  const d = getDialect(target.dialect);
 
   return withModelIndex(target, (targetIdx) =>
     withModelIndex(fragModel, (fragIdx) => {
@@ -3768,7 +2858,9 @@ export const planPaste = (target: Model, payload: ClipboardPayload, opts: PasteO
         frag,
         fragModel,
         fragIdx,
-        ns: new NamespaceTracker(target, targetIdx),
+        d,
+        cb: d.clipboard,
+        ns: d.clipboard.createNamespace(target, targetIdx, d),
         allocId,
         ops: [],
         report: { renamed: [], skipped: [], notes: [] },

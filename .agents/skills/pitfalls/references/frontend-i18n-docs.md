@@ -97,4 +97,4 @@
 - **【会出什么事】**
   - 误导用户与后续维护者（尤其 AI/新协作者读到旧注释误以为仍是单进程模型，重新引入非 HA 写法）。
 - **【Dowel 正确做法】**
-  - 架构或能力演进合入前，用 `rg` 搜一遍受影响模块与 `docs/` 中的“限制”“单进程”“进程内”“尚未”，同步清理旧描述；每增改一个 Webhook 事件、收件箱类型或通知触发条件，同步校验 `packages/api/src/webhooks.ts`、`requests.ts`、`routes/ci.ts` 与 `docs/{webhooks,approvals,api,getting-started}.md` 逐项一致。
+  - 架构或能力演进合入前，用 `rg` 搜一遍受影响模块与 `docs/` 中的“限制”“单进程”“进程内”“尚未”，同步清理旧描述；每增改一个 Webhook 事件、收件箱类型或通知触发条件，同步校验 `packages/api/src/webhooks.ts`、`requests/notice.ts`（通知与 Webhook 事件内容）、`requests/service.ts`（触发条件）、`routes/ci.ts` 与 `docs/{webhooks,approvals,api,getting-started}.md` 逐项一致。

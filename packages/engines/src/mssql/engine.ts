@@ -335,6 +335,18 @@ export const mssqlEngine: EngineAdapter = {
     return m !== null ? { mssqlMajor: m } : undefined;
   },
 
+  hasExplicitVersionOpt: (opts) => opts.mssqlMajor !== undefined,
+
+  // 重新规划：调用方给了非空 mssqlMajor 就按它规划（否则按影子库实测主版本），其余选项原样保留；建库按影子库实测主版本
+  resolveVerifyOptions: (shadowVersionNum, opts) => {
+    const shadowMajor = mssqlMajorOf(shadowVersionNum);
+    const planMajor = opts?.mssqlMajor ?? shadowMajor;
+    return {
+      plan: planMajor !== null ? { ...opts, mssqlMajor: planMajor } : opts,
+      build: shadowMajor !== null ? { mssqlMajor: shadowMajor } : undefined,
+    };
+  },
+
   resetShadow: resetMssqlShadow,
 
   prepareImportShadow: async (db) => {

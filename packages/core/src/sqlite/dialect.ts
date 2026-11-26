@@ -11,6 +11,7 @@ import {
   indexElementNames,
   objectsOfKinds,
 } from '../model.ts';
+import { sqliteClipboard } from './clipboard.ts';
 import { sqliteChooseName, sqliteJoinNames } from './naming.ts';
 import {
   SQLITE_INSTANCE_LEVEL_DESCRIPTION,
@@ -31,6 +32,7 @@ import {
   sqliteTokenize,
 } from './quote.ts';
 import { SQLITE_COMMON_TYPES, SQLITE_STRICT_TYPES, sqliteNormalizeType } from './types.ts';
+import { sqliteVersioning } from './versioning.ts';
 
 const EMPTY_MAIN_ID = 'dowel:empty-database:main';
 const MAX_IDENT_CHARS = 128;
@@ -267,4 +269,6 @@ export const sqliteDialect: DialectSpec = {
   isConcurrentDdlSql: sqliteIsConcurrentDdlSql,
   findInstanceLevelStatement: sqliteFindInstanceLevelStatement,
   instanceLevelDescription: SQLITE_INSTANCE_LEVEL_DESCRIPTION,
+  clipboard: sqliteClipboard,
+  versioning: sqliteVersioning,
 };

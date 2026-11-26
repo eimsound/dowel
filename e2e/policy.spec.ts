@@ -1,11 +1,11 @@
 // 执行策略（P5a）：各层配置页（含上级锁定的显示）、授予执行者（“仅限执行者 + 生产”时非实例管理员不能选）、
-// 项目层收紧后缓存失效；相关页面的 axe 扫描（亮 / 暗）。
-// 后两条需要 PG 作目标库（Testcontainers 或 DOWEL_TEST_PG），没有 Docker 时跳过。
+// 项目层收紧后缓存失效；保存进行中“撤销修改”禁用（组层 / 环境层）；相关页面的 axe 扫描（亮 / 暗）。
+// “需要目标库”分组里的用例需要 PG 作目标库（Testcontainers 或 DOWEL_TEST_PG），没有 Docker 时跳过。
 import AxeBuilder from '@axe-core/playwright';
 import { expect, type Locator, type Page, test } from '@playwright/test';
 
 import { addEnv, execDialog, newTargetDb, openEnv, publishTable } from './exec-helpers.ts';
-import { createGroup, createProjectIn, gotoPage, instanceAdmin, newUser } from './helpers.ts';
+import { createGroup, createProjectIn, gotoPage, holdRequest, instanceAdmin, newUser } from './helpers.ts';
 
 const scan = async (page: Page, label: string) => {
   const results = await new AxeBuilder({ page }).analyze();
@@ -227,6 +227,35 @@ test('上级显式允许令牌（下限“允许”）+ 上级的审批环节：
   await expect(g2.getByTestId('token-bypass-warn')).toHaveCount(0);
 });
 
+test('保存执行策略进行中时“撤销修改”禁用，保存完成后回到未修改状态（组层）', async ({ browser }) => {
+  const { page } = await newUser(browser, '策略保存中');
+  const group = await createGroup(page);
+  await page.goto(`/group/${group.slug}`);
+  // 组页上令牌创建规则面板也有一个“撤销修改”，限定在执行策略这一节里
+  const panel = policySection(page);
+  const save = panel.getByRole('button', { name: '保存执行策略' });
+  const reset = panel.getByRole('button', { name: '撤销修改' });
+  await expect(reset).toBeDisabled();
+  await set(panel, '非生产环境').getByLabel('谁能执行').selectOption('admin');
+  await expect(reset).toBeEnabled();
+
+  const release = await holdRequest(page, '**/api/groups/*/exec-policy', 'PUT');
+  await save.click();
+  // 请求还没回来：保存、撤销、表单都不可操作，避免撤销后又被迟到的保存结果覆盖
+  await expect(save).toBeDisabled();
+  await expect(reset).toBeDisabled();
+  await expect(set(panel, '非生产环境').getByLabel('谁能执行')).toBeDisabled();
+  await release();
+
+  await expect(page.getByText('已保存执行策略')).toBeVisible();
+  await expect(set(panel, '非生产环境').getByLabel('谁能执行')).toHaveValue('admin');
+  await expect(set(panel, '非生产环境').getByLabel('谁能执行')).toBeEnabled();
+  // 已保存：没有未保存的修改，撤销仍禁用；再改一次又可撤销
+  await expect(reset).toBeDisabled();
+  await set(panel, '非生产环境').getByLabel('谁能执行').selectOption('');
+  await expect(reset).toBeEnabled();
+});
+
 test.describe('需要目标库', () => {
   test.skip(!process.env.DOWEL_TEST_PG, '没有可用的 PostgreSQL（需要 Docker）');
   // 每条用例要建两个目标库、添加两个环境（各自连接检查 + 影子库），再走多个页面：比默认的 60 秒长
@@ -324,6 +353,39 @@ test.describe('需要目标库', () => {
       await openEnv(page, 'dev');
       await expect(page.getByRole('button', { name: '执行迁移' })).toHaveCount(0);
       await expect(page.getByRole('button', { name: '提交执行申请' })).toBeVisible();
+    } finally {
+      await devDb.drop();
+    }
+  });
+
+  test('保存环境执行策略进行中时“撤销修改”禁用（环境层）', async ({ browser }) => {
+    const devDb = await newTargetDb('e2e_pol_reset');
+    try {
+      const { page } = await newUser(browser, '环境策略保存中');
+      const group = await createGroup(page);
+      await createProjectIn(page, '撤销禁用项目', group.name);
+      await addEnv(page, 'dev', devDb.url, false);
+      await openEnv(page, 'dev');
+      const panel = page.getByTestId('env-policy');
+      const who = set(page, '本环境（非生产）').getByLabel('谁能执行');
+      const save = panel.getByRole('button', { name: '保存执行策略' });
+      const reset = panel.getByRole('button', { name: '撤销修改' });
+      await expect(reset).toBeDisabled();
+      await who.selectOption('admin');
+      await expect(reset).toBeEnabled();
+
+      const release = await holdRequest(page, '**/api/projects/*/environments/*/exec-policy', 'PUT');
+      await save.click();
+      await expect(save).toBeDisabled();
+      await expect(reset).toBeDisabled();
+      await expect(who).toBeDisabled();
+      await release();
+
+      await expect(page.getByText('已保存执行策略')).toBeVisible();
+      await expect(who).toHaveValue('admin');
+      await expect(reset).toBeDisabled();
+      await who.selectOption('');
+      await expect(reset).toBeEnabled();
     } finally {
       await devDb.drop();
     }

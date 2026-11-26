@@ -445,7 +445,12 @@ export const TokenPolicyPanel = ({ path, queryKey }: { path: string; queryKey: u
           >
             {t('tok.policy.save')}
           </button>
-          <button type="button" className="btn ghost" disabled={!dirty} onClick={() => setDraft(v.rule)}>
+          <button
+            type="button"
+            className="btn ghost"
+            disabled={!dirty || save.isPending}
+            onClick={() => setDraft(v.rule)}
+          >
             {t('pol.reset')}
           </button>
         </div>

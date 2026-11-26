@@ -11,6 +11,7 @@ import {
   indexElementNames,
   objectsOfKinds,
 } from '../model.ts';
+import { mysqlClipboard } from './clipboard.ts';
 import {
   MAX_MYSQL_IDENT,
   MYSQL_SAFE_IDENT_RE,
@@ -37,6 +38,7 @@ import {
   mysqlTokenize,
 } from './quote.ts';
 import { isMysqlAutoIncrementType, MYSQL_COMMON_TYPES, mysqlNormalizeType } from './types.ts';
+import { mysqlVersioning } from './versioning.ts';
 
 const EMPTY_DEFAULT_ID = 'dowel:empty-database:default';
 
@@ -363,4 +365,6 @@ export const mysqlDialect: DialectSpec = {
   isConcurrentDdlSql: mysqlIsConcurrentDdlSql,
   findInstanceLevelStatement: mysqlFindInstanceLevelStatement,
   instanceLevelDescription: MYSQL_INSTANCE_LEVEL_DESCRIPTION,
+  clipboard: mysqlClipboard,
+  versioning: mysqlVersioning,
 };

@@ -1,6 +1,6 @@
 # 二、优雅停机、后台队列、巡检与跨副本 SSE（HA3）
 
-涉及模块：`apps/server/src/main.ts`、`apps/server/src/shutdown.ts`、`apps/server/src/requests.ts`、`apps/server/src/routes/requests.ts`、`apps/server/src/webhooks.ts`、`apps/server/src/executions.ts`、`apps/server/src/drift-scheduler.ts`。
+涉及模块：`apps/server/src/main.ts`、`apps/server/src/shutdown.ts`、`apps/server/src/requests.ts`（仅对外导出的门面）与 `apps/server/src/requests/*.ts`（`service.ts`、`sweeper.ts`、`inbox-hub.ts`、`model.ts`、`views.ts` 等）、`apps/server/src/routes/requests.ts`、`apps/server/src/webhooks.ts`、`apps/server/src/executions.ts`、`apps/server/src/drift-scheduler.ts`。
 
 ---
 
@@ -32,7 +32,7 @@
   3. `recheck`、详情操作与 `decideIn` 允许对 `interrupted` 申请直接重试、撤回或重检失效。
 - **【会出什么事】**
   - 抹除 `interrupted` 中断原因，连发自相矛盾的第二条通知与 `request.invalidated` Webhook；更严重的是 `finish()` 仅允许覆写 `executing` 或 `failed(interrupted)`，被改成 `invalid`/`expired` 后，原节点短暂心跳抖动恢复完成时的 `finish()` 终态兜底被彻底击穿。
-- **【Dowel 正确做法】**（已验证于 `requests.ts` / `routes/requests.ts`）
+- **【Dowel 正确做法】**（已验证于 `requests/model.ts`（`isInterrupted` / `sweepWhere`）/ `requests/service.ts`（`runSweep` / `closeStale` / `recheck` / `setStatus`）/ `requests/views.ts`（`actionsFor`）/ `routes/requests.ts`）
   1. 使用 `isInterrupted(req)` 与 PG/SQLite 双语法兼容的 `sweepWhere(dialect)`，在 `runSweep`、`closeStale`（锁内重查）及详情 `recheck` 中统一排除 `status = 'failed' && result.code === 'interrupted'`；
   2. `setStatus` 增加防线：仅允许携带 `extra.result` 的 `finish()` 覆写 `interrupted` 申请，并同步更新内存 `req.result`；
   3. `actionsFor` 与 `decideIn` 对 `interrupted` 申请禁用直接重试与撤回（返回 `409`），提示人工核对目标环境历史后再新建申请。
@@ -45,7 +45,7 @@
   - 虽已实现事务内持久化方法 `webhooks.enqueueIn(tx, ...)`，但业务代码在事务 `COMMIT` 之后才调用不 `await` 的 `this.webhooks.emit(...)` 异步写 `webhook_jobs`。
 - **【会出什么事】**
   - 进程在事务提交后、异步写 `webhook_jobs` 完成前遇到 OOM/`SIGKILL` 或数据库瞬断，审计与收件箱已落库但 Webhook 通知永久丢失，违背持久化不丢通知的承诺。
-- **【Dowel 正确做法】**（已验证于 `requests.ts` / `routes/requests.ts` / `webhooks.ts`）
+- **【Dowel 正确做法】**（已验证于 `requests/service.ts` / `routes/requests.ts` / `webhooks.ts`）
   1. 在所有带平台库事务的业务路径（申请创建、审批、驳回、撤回、过期/失效、中断恢复、`finish` 等），于事务提交前 `await webhooks.enqueueIn(tx, ...)` 原子写入 `webhook_jobs`，回滚自动零残留；事务提交后在 `flushEffects` 统一调用 `webhooks.wake(true)` 唤醒本地与集群；
   2. 对 `afterDirectRun` / `afterTokenRun` 等收尾路径，同步 `await webhooks.enqueueIn(...)`（生产非 noop 场景合并进写 `inbox_items` 的同一事务）再 `wake(true)`，确保接口返回前事件已落盘。
 
@@ -63,7 +63,7 @@
 
 ---
 
-## 5. `requests.ts` `sweep()`/`drain()` 撞非阻塞锁误推进 `done` 与 `onReconnect` 漏巡检（`#22` · Medium）
+## 5. `requests/sweeper.ts` `sweep()`/`drain()` 撞非阻塞锁误推进 `done` 与 `onReconnect` 漏巡检（`#22` · Medium）
 
 - **【反模式】**
   1. `drain()` 调 `tryWithJobLock('requests.sweep', ...)` 未获锁返回 `0` 时，仍清空 `this.pending` 并推进 `this.done = gen`；
@@ -71,9 +71,9 @@
 - **【会出什么事】**
   1. 显式调用 `await requests.sweep(...)` 在多副本撞锁时提前返回 `0`，违背等待契约；局部不同环境的 `kick` 在总线瞬断期被本地静默丢弃；
   2. 总线断连期间错过的 `requests.kick` 无人补巡，申请状态延迟失效。
-- **【Dowel 正确做法】**
+- **【Dowel 正确做法】**（已验证于 `requests/sweeper.ts`（`SweepScheduler`）/ `requests/service.ts`（`onReconnect`））
   1. 区分后台事件/定时驱动的非阻塞巡检与显式 `await sweep()`：显式 `sweep()` 使用带超时的阻塞分布式锁确保真正执行完毕再推进 `done`，未获锁时不得误推进调用者的 `done` 或静默清空未执行的局部 `pending`；
-  2. `bus.onReconnect` 回调内补充 `this.kickLocal({ all: true })`。
+  2. `bus.onReconnect` 回调内补充全量巡检（`requests/service.ts` 中 `this.sweeper.kickLocal({ all: true })`）。
 
 ---
 
@@ -85,10 +85,10 @@
   3. `requests.stop()` 不通知活跃 SSE 流退出。
 - **【会出什么事】**
   - 查初始值到订阅之间的 `inbox.changed` 事件丢失，角标漂移；心跳定时器和长挂 SSE 拖住优雅停机。
-- **【Dowel 正确做法】**（已验证于 `requests.ts` / `routes/requests.ts`）
+- **【Dowel 正确做法】**（已验证于 `requests/service.ts` / `requests/inbox-hub.ts` / `routes/requests.ts`）
   1. 非 `once` 模式下**先注册 `s.onAbort` 与 `requests.subscribe`（期间到达事件入缓冲队列），再查询并发送初始 `unread`**，随后消费缓冲进入主循环；
   2. 心跳 `setTimeout` 必须调用 `t.unref?.()` 并在唤醒后 `clearTimeout`；
-  3. `Requests` 维护 `stopped` 标记与 `stopListeners`，`requests.stop()` 立即唤醒并优雅关闭所有活跃 SSE 流（`start()` 复位状态）。
+  3. `Requests`（`requests/service.ts`）维护 `stopped` 标记，`InboxHub`（`requests/inbox-hub.ts`）维护 `stopListeners`，`requests.stop()` 立即唤醒并优雅关闭所有活跃 SSE 流（`start()` 复位状态）。
 
 ---
 

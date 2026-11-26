@@ -67,3 +67,14 @@ export const commonTypes = (dialect: Dialect = 'pg'): readonly string[] => getDi
 
 export const formatScript = (steps: readonly { sql: string }[], dialect: Dialect = 'pg'): string =>
   getDialect(dialect).formatScript(steps);
+
+/** 环境数值版本号在该方言多版本矩阵里的版本组键（不按版本分组的方言恒为 null） */
+export const versionGroupKeyOf = (dialect: Dialect, versionNum: number | null | undefined): number | null =>
+  getDialect(dialect).versioning.matrix?.groupKeyOf(versionNum) ?? null;
+
+/** 数值版本号对应的对外“大版本”（engineMajor / shadowMajor 等历史字段；仅 PG 有值，其余方言为 null） */
+export const publicMajorOf = (dialect: Dialect, versionNum: number | null | undefined): number | null => {
+  const matrix = getDialect(dialect).versioning.matrix;
+  const key = matrix?.groupKeyOf(versionNum) ?? null;
+  return matrix && key !== null ? matrix.publicMajorOfGroup(key) : null;
+};

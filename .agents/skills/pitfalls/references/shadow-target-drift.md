@@ -1,6 +1,6 @@
 # 四、影子库生命周期、目标库接手/接入/拉取与漂移检测
 
-涉及模块：`apps/server/src/targets.ts`、`apps/server/src/shadow.ts`、`apps/server/src/executions.ts`、`apps/server/src/takeover.ts`、`apps/server/src/rooms.ts`、`apps/server/src/routes/{wizard,takeover,claims,environments}.ts`。
+涉及模块：`apps/server/src/targets.ts`、`apps/server/src/shadow.ts`、`apps/server/src/executions.ts`、`apps/server/src/takeover.ts`、`apps/server/src/rooms.ts`、`apps/server/src/rooms/*`、`apps/server/src/routes/{wizard,takeover,claims,environments}.ts`。
 
 ---
 
@@ -49,7 +49,7 @@
 
 - **【反模式】**
   1. `takeover.ts` 的 `insertRestoredVersions` 将版本号 `v.number`（`0, 1, 2, 3`）写入 `versions.seq`；
-  2. `rooms.ts` 的 `versionsInRange` 仅按 `branch_id` 与 `seq` 区间查，未过滤 `and restored_at is null`。
+  2. `rooms/history.ts` 的 `versionsInRange` 仅按 `branch_id` 与 `seq` 区间查，未过滤 `and restored_at is null`。
 - **【会出什么事】**
   - 接手项目后画布从 `seq = 0`（实际是链头 `v3`）起步，后续普通画布编辑的 `room_commits.seq = 1, 2, 3` 与恢复版本的 `versions.seq` 撞号，导致画布修改历史把未发布的普通编辑错标为“已发布 `v1`/`v2`/`v3`”；接入领先环境也会错标早期普通提交。
 - **【Dowel 正确做法】**

@@ -428,6 +428,24 @@ export const pgEngine: EngineAdapter = {
     return pgMajor !== null ? { pgMajor } : undefined;
   },
 
+  hasExplicitVersionOpt: (opts) => opts.pgMajor !== undefined,
+
+  // 重新规划：调用方给了非空 pgMajor 就按它规划（否则按影子库实测大版本）；建库始终按影子库实测大版本
+  resolveVerifyOptions: (shadowVersionNum, opts) => {
+    const shadowMajor = pgMajorOf(shadowVersionNum);
+    const planMajor = opts?.pgMajor ?? shadowMajor;
+    return {
+      plan: planMajor !== null ? { pgMajor: planMajor } : undefined,
+      build: shadowMajor !== null ? { pgMajor: shadowMajor } : undefined,
+    };
+  },
+
+  // 冻结脚本：调用方显式给出的 pgMajor（含 null）优先，否则按影子库实测大版本建 from / to
+  resolveScriptsBuildOptions: (_to, shadowVersionNum, opts) => {
+    const pgMajor = opts.pgMajor !== undefined ? opts.pgMajor : pgMajorOf(shadowVersionNum);
+    return pgMajor !== null ? { pgMajor } : undefined;
+  },
+
   resetShadow: resetPgShadow,
 
   prepareImportShadow: async (db) => {

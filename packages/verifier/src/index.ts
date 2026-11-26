@@ -1,21 +1,20 @@
 // 闭环验证：迁移后的结构必须等于直接按目标版本建出来的结构；反向迁移后必须回到原来的结构。
 // 全面通过 @dowel/engines 的 getEngine(dialect) 驱动，支持 PG / SQLite / MySQL / MSSQL。
 import {
-  checkMysqlVersionCompatibility,
   createAll,
   type Dialect,
   findInstanceLevelStep,
   instanceLevelDescription,
   type Model,
-  mssqlMajorOf,
-  pgMajorOf,
   type PlanOptions,
   plan,
+  publicMajorOf,
   type Step,
 } from '@dowel/core';
 import {
   type AnalyzeOptions,
   type Db,
+  type EngineAdapter,
   EngineStepError,
   getEngine,
   NON_TRANSACTIONAL_NOTE,
@@ -63,26 +62,29 @@ export const runSteps = async (db: Db, steps: Step[], dialect: Dialect = 'pg') =
   }
 };
 
-/** 从 PG 影子库读取 server_version_num 并提取大版本号 */
-export const readShadowPgMajor = async (db: Db): Promise<number | null> => {
-  const vNum = await getEngine('pg').readVersionNum?.(db);
-  return vNum !== null && vNum !== undefined ? pgMajorOf(vNum) : null;
-};
+/** 调用方选项是否已显式给出本方言的目标版本（委托给 EngineAdapter.hasExplicitVersionOpt；未实现时给了选项即算显式） */
+const hasExplicitVersionOpt = (engine: EngineAdapter, opts?: PlanOptions): boolean =>
+  !!opts && (engine.hasExplicitVersionOpt?.(opts) ?? true);
 
-const hasExplicitVersionOpt = (dialect: Dialect, opts?: PlanOptions): boolean => {
-  if (!opts) return false;
-  if (dialect === 'pg') return opts.pgMajor !== undefined;
-  if (dialect === 'mysql') return opts.mysqlVersionNum !== undefined;
-  if (dialect === 'mssql') return opts.mssqlMajor !== undefined;
-  return true;
-};
+/**
+ * 读影子库实测数值版本号：只有同时实现了 readVersionNum 与 planOptionsForVersion 的引擎才按版本解析选项
+ * （SQLite 只有 readVersionNum，不读，shadowVersionNum 保持 null）。返回 undefined 表示该引擎不参与版本解析。
+ */
+const readShadowVersion = async (engine: EngineAdapter, db: Db): Promise<number | null | undefined> =>
+  engine.readVersionNum && engine.planOptionsForVersion
+    ? ((await engine.readVersionNum(db)) ?? null)
+    : undefined;
+
+/** 影子库实测版本号 → 该版本的规划选项（版本未知返回 undefined） */
+const shadowPlanOptions = (engine: EngineAdapter, vNum: number | null): PlanOptions | undefined =>
+  vNum !== null ? engine.planOptionsForVersion?.(vNum) : undefined;
 
 /** 多方言：在影子库里从零建出模型，返回统一的 TargetSnapshot */
 export const buildTarget = async (db: Db, m: Model, opts?: PlanOptions): Promise<TargetSnapshot> => {
   const engine = getEngine(m.dialect);
   await engine.resetShadow(db);
   let buildOpts: PlanOptions | undefined = opts;
-  if (!hasExplicitVersionOpt(m.dialect, opts) && engine.readVersionNum && engine.planOptionsForVersion) {
+  if (!hasExplicitVersionOpt(engine, opts) && engine.readVersionNum && engine.planOptionsForVersion) {
     const vNum = await engine.readVersionNum(db);
     const detected = vNum !== null && vNum !== undefined ? engine.planOptionsForVersion(vNum) : undefined;
     buildOpts = detected ? { ...opts, ...detected } : opts;
@@ -102,7 +104,7 @@ export interface VerifyResult {
   upDiff: string[];
   /** 反向迁移后与原版本的差异 */
   downDiff: string[];
-  /** 实际执行本次验证的影子库 PG 大版本（仅 PG，其他方言为 null） */
+  /** 实际执行本次验证的影子库对外大版本（core publicMajorOf：仅 PG 有值，其他方言为 null） */
   shadowMajor?: number | null;
   /** 实际执行本次验证的影子库数值版本号（如 80413 / 90700 / 160004） */
   shadowVersionNum?: number | null;
@@ -116,22 +118,15 @@ export const verify = async (db: Db, from: Model, to: Model, opts?: PlanOptions)
   let shadowVersionNum: number | null = null;
   let planOpts: PlanOptions | undefined = opts;
   let buildOpts: PlanOptions | undefined = opts;
-  if (engine.readVersionNum && engine.planOptionsForVersion) {
-    const vNum = await engine.readVersionNum(db);
-    shadowVersionNum = vNum ?? null;
-    const shadowOpts = vNum !== null && vNum !== undefined ? engine.planOptionsForVersion(vNum) : undefined;
-    if (dialect === 'pg') {
-      shadowMajor = vNum !== null && vNum !== undefined ? pgMajorOf(vNum) : null;
-      const planMajor = opts?.pgMajor ?? shadowMajor;
-      planOpts = planMajor !== null ? { pgMajor: planMajor } : undefined;
-      buildOpts = shadowMajor !== null ? { pgMajor: shadowMajor } : undefined;
-    } else if (dialect === 'mssql') {
-      const mssqlMajor = mssqlMajorOf(vNum);
-      const planMajor = opts?.mssqlMajor ?? mssqlMajor;
-      planOpts = planMajor !== null ? { ...opts, mssqlMajor: planMajor } : opts;
-      buildOpts = mssqlMajor !== null ? { mssqlMajor } : undefined;
+  const vNum = await readShadowVersion(engine, db);
+  if (vNum !== undefined) {
+    shadowVersionNum = vNum;
+    shadowMajor = publicMajorOf(dialect, vNum);
+    if (engine.resolveVerifyOptions) {
+      ({ plan: planOpts, build: buildOpts } = engine.resolveVerifyOptions(vNum, opts));
     } else {
-      planOpts = hasExplicitVersionOpt(dialect, opts) ? opts : shadowOpts;
+      const shadowOpts = shadowPlanOptions(engine, vNum);
+      planOpts = hasExplicitVersionOpt(engine, opts) ? opts : shadowOpts;
       buildOpts = shadowOpts ?? opts;
     }
   }
@@ -168,9 +163,9 @@ const frozenSteps = (dir: 'up' | 'down', steps: ScriptStep[]): Step[] =>
 export interface VerifyScriptsOptions {
   /** 是否检查回滚。v0 基线没有回滚脚本（down 为空），只检查建库那一半 */
   checkDown?: boolean;
-  /** 构建 from / to 基准结构时使用的 PG 大版本；缺省自动从影子库读取 server_version_num */
+  /** 构建 from / to 基准结构时使用的 PG 大版本；缺省自动从影子库读取 server_version_num（由 PG 引擎的 resolveScriptsBuildOptions 解读） */
   pgMajor?: number | null;
-  /** 目标 MySQL 最低数值版本号（如 80400）；与影子库实测版本取较小者执行版本兼容性检查 */
+  /** 目标 MySQL 最低数值版本号（如 80400）；与影子库实测版本取较小者执行版本兼容性检查（由 MySQL 引擎的 resolveScriptsBuildOptions 解读） */
   mysqlVersionNum?: number | null;
 }
 
@@ -194,29 +189,14 @@ export const verifyScripts = async (
   let shadowMajor: number | null = null;
   let shadowVersionNum: number | null = null;
   let buildOpts: PlanOptions | undefined;
-  if (dialect === 'pg') {
-    shadowVersionNum = (await engine.readVersionNum?.(db)) ?? null;
-    shadowMajor = shadowVersionNum !== null ? pgMajorOf(shadowVersionNum) : null;
-    const pgMajor = options.pgMajor !== undefined ? options.pgMajor : shadowMajor;
-    buildOpts = pgMajor !== null ? { pgMajor } : undefined;
-  } else if (dialect === 'mysql') {
-    shadowVersionNum = (await engine.readVersionNum?.(db)) ?? null;
-    const candidates = [shadowVersionNum, options.mysqlVersionNum].filter(
-      (v): v is number => typeof v === 'number' && Number.isInteger(v) && v > 0,
-    );
-    const effectiveVersionNum = candidates.length ? Math.min(...candidates) : null;
-    checkMysqlVersionCompatibility(to, effectiveVersionNum);
-    buildOpts =
-      effectiveVersionNum !== null ? engine.planOptionsForVersion?.(effectiveVersionNum) : undefined;
-  } else if (dialect === 'mssql') {
-    const vNum = await engine.readVersionNum?.(db);
-    shadowVersionNum = vNum ?? null;
-    const mssqlMajor = mssqlMajorOf(vNum);
-    buildOpts = mssqlMajor !== null ? { mssqlMajor } : undefined;
-  } else if (engine.readVersionNum && engine.planOptionsForVersion) {
-    const vNum = await engine.readVersionNum(db);
-    shadowVersionNum = vNum ?? null;
-    buildOpts = vNum !== null && vNum !== undefined ? engine.planOptionsForVersion(vNum) : undefined;
+  const vNum = await readShadowVersion(engine, db);
+  if (vNum !== undefined) {
+    shadowVersionNum = vNum;
+    shadowMajor = publicMajorOf(dialect, vNum);
+    // 版本兼容性检查（如 MySQL 目标版本不支持 VECTOR）在建库之前由引擎钩子执行，不兼容抛 PlanError
+    buildOpts = engine.resolveScriptsBuildOptions
+      ? engine.resolveScriptsBuildOptions(to, vNum, options)
+      : shadowPlanOptions(engine, vNum);
   }
   const toSnap = await buildTarget(db, to, buildOpts);
   const fromSnap = await buildTarget(db, from, buildOpts);
