@@ -148,7 +148,7 @@ IR(v1), IR(v2)
 | 风险分析（PG） | `pg_locks`、`relfilenode`、`pg_stat_xact_user_tables`                    |
 | 多环境验证     | 项目涉及几个环境（大版本），就在各自的影子库上跑一遍                     |
 
-检查结果由服务器写回并广播给所有协作者，只算一次。
+按设计，检查结果应由服务器写回协作文档并广播给所有协作者，只算一次，但目前尚未实现：检查结果只返回给发起请求的一方，或随版本记录存入平台库（`verified_at` / `verify_report`），写回文档的位置仍待定（见 [03-open-questions.md](03-open-questions.md) Q2）。
 
 ### 4.6 导入与解析
 
