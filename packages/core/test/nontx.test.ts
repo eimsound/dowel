@@ -10,27 +10,55 @@ import {
 } from '../src/index.ts';
 
 describe('isNontransactionalSql', () => {
-  // 线性度：输入放大 4 倍，耗时不能放大到 8 倍以上（二次方会放大 16 倍）；再加一个宽松的绝对上限。
-  // 不用“多少毫秒内完成”这种墙钟断言，机器忙的时候会误报。取 3 次里最快的一次，先预热
-  const timeOf = (sql: string) => {
-    let best = Number.POSITIVE_INFINITY;
-    for (let k = 0; k < 3; k++) {
-      const t0 = performance.now();
-      isNontransactionalSql(sql);
-      best = Math.min(best, performance.now() - t0);
-    }
-    return best;
+  // 线性度：在输入长度约 5k / 10k / 20k / 40k 字符上测单次调用耗时，对 log(耗时)~log(长度) 做最小二乘，
+  // 斜率就是增长指数：线性 ≈ 1、二次方 ≈ 2，阈值取中间的 1.5（长度放大 8 倍时线性 ≈ 8 倍、二次方 ≈ 64 倍，
+  // 阈值约 22.6 倍，两边各留约 2.8 倍余量）；再加一个宽松的绝对上限。
+  // 不用“多少毫秒内完成”这种墙钟断言，也不只比两个规模的墙钟比值——机器忙的时候都会误报。抗抖动的做法：
+  // - 每次采样取墙钟和本进程 CPU 时间里较小的一个：两者都不小于这段代码真正花的时间。被调度器抢占只抬高墙钟
+  //   （大输入采样更长、更容易被抢占，只看墙钟时比值会被系统性放大），同进程其他线程（GC、后台编译）只抬高 CPU 时间；
+  // - 重复次数按最小规模倍增校准，每次采样至少约 2ms，计时分辨率不再起作用，也不需要下限钳位；
+  // - 各规模交错轮流采样（每轮换个起点），每个规模取多轮里最快的一次，短时负载高峰要打中某个规模的每一轮才会抬高它；
+  // - 规模不取太大：输入越大越容易因为缓存、内存带宽被别的进程抢走而变慢，那也会被误当成增长。
+  const SIZES = [5_000, 10_000, 20_000, 40_000];
+  const ROUNDS = 10;
+  const SAMPLE_MS = 2;
+  /** 连续调用 reps 次，返回平均单次耗时（ms） */
+  const sampleMs = (sql: string, reps: number) => {
+    const cpu0 = process.cpuUsage();
+    const t0 = performance.now();
+    for (let k = 0; k < reps; k++) isNontransactionalSql(sql);
+    const wall = performance.now() - t0;
+    const cpu = process.cpuUsage(cpu0);
+    return Math.min(wall, (cpu.user + cpu.system) / 1_000) / reps;
   };
   const expectLinear = (make: (n: number) => string, expected: boolean) => {
-    expect(isNontransactionalSql(make(1_000))).toBe(expected); // 预热
-    const small = Math.max(timeOf(make(10_000)), 0.5);
-    const big = timeOf(make(40_000));
-    expect(big / small).toBeLessThan(8);
-    expect(big).toBeLessThan(2_000);
+    const inputs = SIZES.map(make);
+    for (const sql of inputs) expect(isNontransactionalSql(sql)).toBe(expected);
+    let reps = 1; // 倍增校准，顺带预热
+    while (sampleMs(inputs[0]!, reps) * reps < SAMPLE_MS) reps *= 2;
+    const best = inputs.map(() => Number.POSITIVE_INFINITY);
+    for (let round = 0; round < ROUNDS; round++) {
+      for (let j = 0; j < inputs.length; j++) {
+        const i = (round + j) % inputs.length;
+        best[i] = Math.min(best[i]!, sampleMs(inputs[i]!, reps));
+      }
+    }
+    const xs = SIZES.map(Math.log);
+    const ys = best.map((t) => Math.log(Math.max(t, 1e-6)));
+    const mean = (v: number[]) => v.reduce((a, b) => a + b, 0) / v.length;
+    const mx = mean(xs);
+    const my = mean(ys);
+    const slope =
+      xs.reduce((acc, x, k) => acc + (x - mx) * (ys[k]! - my), 0) /
+      xs.reduce((acc, x) => acc + (x - mx) ** 2, 0);
+    const detail = `增长指数 ${slope.toFixed(2)}，各规模单次耗时（ms）${best.map((t) => t.toFixed(4)).join(' / ')}`;
+    expect(slope, detail).toBeLessThan(1.5);
+    expect(best.at(-1)!, detail).toBeLessThan(2_000);
   };
 
   test('长输入是线性的：大量 $1 参数（每个 $ 都不能复制一遍后缀）', () => {
-    expectLinear((n) => `SELECT ${Array.from({ length: n }, () => '$1').join(', ')}; VACUUM t`, true);
+    // 每个 `$1, ` 4 个字符，n 个字符大约 n / 4 个参数
+    expectLinear((n) => `SELECT ${Array.from({ length: n / 4 }, () => '$1').join(', ')}; VACUUM t`, true);
   });
 
   test('长输入是线性的：开头一个没有闭合的 $a$，后面是不含 $a$ 的大量内容（indexOf 找不到闭合，直接跳到结尾）', () => {

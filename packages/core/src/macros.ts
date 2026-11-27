@@ -959,7 +959,11 @@ const compileAlterColumn = (m0: Model, a: AlterColumnArgs, scope: RefScope, labe
         const t = a.type.trim();
         // 枚举列只改数组维度（或写成枚举名加维度）时保留枚举；否则切换为普通类型
         const dims = a.typeRef === undefined && c.typeRef !== null ? enumDimsOf(m, c.typeRef, t) : null;
-        target = dims !== null ? { type: dims, typeRef: c.typeRef } : { type: t, typeRef: null };
+        // 普通类型按方言规范写法比较（setColumnType 也会这样写入），int → integer 这类只换写法的修改不产生空操作
+        target =
+          dims !== null
+            ? { type: dims, typeRef: c.typeRef }
+            : { type: t ? getDialect(m.dialect).normalizeType(t) : t, typeRef: null };
       }
       if (target && (target.type !== c.type || target.typeRef !== c.typeRef)) {
         m = yield step(

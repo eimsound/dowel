@@ -225,12 +225,17 @@ export class OpaqueRefresher {
   }
 
   /**
-   * 在 derive 分布式锁与本地串行队列保护下执行整体模型替换并重置基线（canonical 替换：导入、拉取、接入、已验证版本）：
-   * - 阻塞等待任何在途 canonicalize 结束后再 replace，防止旧任务写回覆盖新基线；
-   * - 以调用方传入的 model（而非事后重读 rooms.model）写入基线，防止 replace 与 reset 间的并发提交污染基线；
-   * - fn 抛错时基线不变；
-   * - `onlyIfClean`（已验证版本的覆盖）：闭环验证比较的是影子库读回的结构、不是模型原文，“已验证”不保证模型里的表达式
-   *   就是规范形式（例如发布时 flush 被跳过）。所以只有 model 相对当前黄金基线没有待规范化对象时才推进基线，否则只替换房间；
+   * 在 derive 分布式锁与本地串行队列保护下执行整体模型替换并按需重置黄金基线
+   * （默认 `onlyIfClean: false` 用于 canonical 替换：导入、拉取、接入领先版本；`onlyIfClean: true` 用于已验证版本覆盖）：
+   * - 阻塞等待任何在途 canonicalize 结束后再 replace，防止旧任务写回覆盖新黄金基线；
+   * - 以调用方传入的 model（而非事后重读 rooms.model）写入黄金基线，防止 replace 与 reset 间的并发提交污染黄金基线；
+   * - fn 抛错时黄金基线不变；
+   * - 接入领先版本直接用链头版本模型作黄金基线依赖严格的读回核对（#123，ADR 0016 / ADR 0017）：当前执行读回校验
+   *   （`verifyAndRecord`）已对四种方言严格校验（MySQL 表达式纯格式容忍已于 #162 移除），恢复时闭环验证的读回核对
+   *   待 #132 落地；
+   * - `onlyIfClean`（已验证版本的应用 / 作废 / 取消作废）：当前闭环验证尚未核对模型原文（待 #132 落地），按 ADR 0017
+   *   落地后验证记录也将按数据库完整版本号区分、SQL Server 生成列 `type` 规划器不比较，“已验证”不保证是当前影子库的规范形式。
+   *   因此只有 model 相对当前黄金基线没有待规范化对象时才推进黄金基线（同时作为防御性确认），否则只替换房间；
    * - 锁序严格单向：本地队列 → job:derive:<branchId> → rooms.withRoomLock → branches FOR UPDATE。
    */
   async runWithReset<T>(
