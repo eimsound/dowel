@@ -196,7 +196,7 @@ export const CI_ERROR_STATUS = {
   unfinished_run: 409,
   /** 目标库里的这个项目由别的 Dowel 实例认领 */
   foreign_instance: 409,
-  /** 其他执行前检查没通过（实例级语句等），details.reason 是执行器的原因代码 */
+  /** 其他执行前检查没通过（实例级语句、首次命中首版本且无后续迁移时的 mark_required 等），details.reason 是执行器的原因代码 */
   rejected: 409,
   /** 等执行锁超时（另一个执行正在进行） */
   lock_timeout: 423,

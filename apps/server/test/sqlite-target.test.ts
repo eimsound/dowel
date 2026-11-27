@@ -332,13 +332,47 @@ describe('SQLite 目标库全栈', () => {
     }[];
     const v0Id = vers0[0]!.id;
 
-    // 2. 直接执行到 v0 被拒绝（mark_required，不写入历史）
+    // 2. 直接执行到 v0 被拒绝（mark_required，不写入历史）；CI 接口返回 409 rejected (details.reason = 'mark_required')
     const dryV0Res = await req('POST', `/api/projects/${pid}/environments/${envId}/execute`, {
       to: v0Id,
       dryRun: true,
     });
     expect(dryV0Res.status).toBe(200);
     expect(await dryV0Res.json()).toMatchObject({ ok: false, code: 'mark_required' });
+
+    const tokRes = await req('POST', `/api/projects/${pid}/tokens`, {
+      name: 'ci-sqlite',
+      expiresInDays: 7,
+    });
+    expect(tokRes.status).toBe(201);
+    const { token } = (await tokRes.json()) as { token: string };
+    const pInfo = (await (await req('GET', `/api/projects/${pid}`)).json()) as ProjectInfo;
+    const ciExecPath = `/api/ci/projects/${pInfo.group.slug}/${pInfo.slug}/environments/local/execute`;
+
+    for (const payload of [{ to: 'v0', dryRun: true }, { to: 'latest' }]) {
+      const ciMarkRes = await app.request(ciExecPath, {
+        method: 'POST',
+        headers: {
+          authorization: `Bearer ${token}`,
+          'content-type': 'application/json',
+        },
+        body: JSON.stringify(payload),
+      });
+      expect(ciMarkRes.status).toBe(409);
+      expect(await ciMarkRes.json()).toMatchObject({
+        ok: false,
+        code: 'rejected',
+        details: { reason: 'mark_required' },
+        reached: null,
+      });
+    }
+
+    const checkNoHistory = openSqliteDb(targetFile, { readOnly: true });
+    const dowelTables = await checkNoHistory.db.query<{ name: string }>(
+      "SELECT name FROM sqlite_master WHERE type = 'table' AND name LIKE 'dowel_%'",
+    );
+    checkNoHistory.close();
+    expect(dowelTables).toEqual([]);
 
     // 3. 编辑模型：新增列并修改 title 类型触发 12 步重建，发布 v1
     await editModel(rooms, pdb, pid!, (m) => {
@@ -377,25 +411,14 @@ describe('SQLite 目标库全栈', () => {
     expect(rbEvents.some((e) => e.stage === 'done')).toBe(true);
 
     // 6. 使用 CI 令牌重新升级到 latest (v1)
-    const tokRes = await req('POST', `/api/projects/${pid}/tokens`, {
-      name: 'ci-sqlite',
-      expiresInDays: 7,
-    });
-    expect(tokRes.status).toBe(201);
-    const { token } = (await tokRes.json()) as { token: string };
-
-    const pInfo = (await (await req('GET', `/api/projects/${pid}`)).json()) as ProjectInfo;
-    const ciRes = await app.request(
-      `/api/ci/projects/${pInfo.group.slug}/${pInfo.slug}/environments/local/execute`,
-      {
-        method: 'POST',
-        headers: {
-          authorization: `Bearer ${token}`,
-          'content-type': 'application/json',
-        },
-        body: JSON.stringify({ to: 'latest' }),
+    const ciRes = await app.request(ciExecPath, {
+      method: 'POST',
+      headers: {
+        authorization: `Bearer ${token}`,
+        'content-type': 'application/json',
       },
-    );
+      body: JSON.stringify({ to: 'latest' }),
+    });
     expect(ciRes.status).toBe(200);
     const ciOut = (await ciRes.json()) as CiExecuteResult;
     expect(ciOut.ok).toBe(true);

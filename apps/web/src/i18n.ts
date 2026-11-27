@@ -354,6 +354,8 @@ const zh = {
         '所有步骤都执行完了但读回的结构不对：继续执行解决不了，需要手工修正目标库（漂移差异见环境页）。',
       failedStep: '失败在第 {{step}} 步。',
       unverifiedHint: '到版本详情页点“重新验证”，通过后再执行。',
+      markRequiredHint:
+        '目标库还没有迁移历史，且结构已等于首版本，没有可执行的后续迁移。请到环境页使用“标记为已执行”建立历史基准，或等发布新版本后再执行（届时会自动写入基线）。',
     },
   },
   dr: {
@@ -818,6 +820,8 @@ const zh = {
       pull: '从环境导入了结构（{{count}} 个对象）',
       execute: '执行了环境 {{name}} 的迁移',
       rollback: '回滚了环境 {{name}}',
+      // 历史审计兼容（#159 起不再产生）
+      baseline: '为环境 {{name}} 写入了基线',
       mark: '标记了环境 {{name}} 的当前版本',
       switch: '切换了环境 {{name}} 的版本（先回滚再升级）',
       attach_history: '接入了环境 {{name}} 的已有历史',
@@ -2739,6 +2743,8 @@ const en: typeof zh = {
         'All steps ran but the structure read back is wrong: resuming cannot fix it, the target database must be fixed by hand (see the drift differences on the environment page).',
       failedStep: 'Failed at step {{step}}.',
       unverifiedHint: 'Open the version page and click "Re-verify"; execute once it passes.',
+      markRequiredHint:
+        'The target database has no migration history yet and already matches the first version, with no newer migrations to run. Use "Mark as applied" on the environment page to record the baseline, or wait until a newer version is published (executing it will write the baseline automatically).',
     },
   },
   dr: {
@@ -3230,6 +3236,8 @@ const en: typeof zh = {
       pull: 'imported the structure from an environment ({{count}} objects)',
       execute: 'executed migrations on {{name}}',
       rollback: 'rolled back {{name}}',
+      // Legacy audit compatibility (no longer emitted since #159)
+      baseline: 'wrote the baseline on {{name}}',
       mark: 'marked the current version on {{name}}',
       switch: 'switched {{name}} (rolled back, then upgraded)',
       attach_history: 'attached existing history on {{name}}',

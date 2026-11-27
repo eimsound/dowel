@@ -168,7 +168,7 @@ export interface DryRunMigration {
 
 /** 预演的结果：通过了全部检查，真执行时会做什么 */
 export interface DryRunPlan {
-  /** 目标库还没有这个项目的历史：baseline = 结构等于基线，只写基线；empty = 空库，执行第一个版本建库；null = 已有历史 */
+  /** 目标库还没有这个项目的历史：baseline = 结构等于基线，先写入基线再执行后续迁移；empty = 空库，执行第一个版本建库；null = 已有历史 */
   firstRun: 'baseline' | 'empty' | null;
   /** 会先写入基线（库里的结构等于第一个版本） */
   baseline: boolean;

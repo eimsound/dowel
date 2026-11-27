@@ -701,13 +701,10 @@ export class Requests {
         this.kick({ envIds: [a.env.id] });
         const s = await this.scopeOf(this.db, { project_id: a.pid, environment_id: a.env.id });
         if (!s) return;
-        const toRef = run.to
-          ? (
-              await this.db.query<RequestVersionRef>('select id, number, name from versions where id = $1', [
-                run.to,
-              ])
-            )[0]
-          : undefined;
+        const [toRef] = await this.db.query<RequestVersionRef>(
+          'select id, number, name from versions where id = $1',
+          [run.to],
+        );
         const hookEvent = directRunHookEvent(user, s, run, r, toRef);
         try {
           const inserted = await this.webhooks.enqueueIn(this.db, s.project.groupId, hookEvent);

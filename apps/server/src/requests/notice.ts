@@ -194,8 +194,8 @@ export const requestHookEvent = (
 
 /** 直接执行 / 回滚的参数 */
 export interface DirectRun {
-  to?: string;
-  direction?: 'up' | 'down' | 'switch';
+  to: string;
+  direction: 'up' | 'down' | 'switch';
 }
 
 /** 直接执行 / 回滚的结果 */
@@ -238,9 +238,9 @@ export const directRunHookEvent = (
         group: s.project.groupSlug,
       },
       environment: { id: s.env.id, name: s.env.name, production: s.env.production },
-      direction: run.direction ?? 'up',
+      direction: run.direction,
       ...(r.lca ? { lca: r.lca } : {}),
-      toVersionId: run.to ?? null,
+      toVersionId: run.to,
       actor: user.name,
       ok: r.ok,
       code: r.error?.code ?? null,

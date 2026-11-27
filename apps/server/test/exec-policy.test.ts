@@ -1,7 +1,7 @@
 // H6 基础执行权限：谁能执行三档——项目编辑者 / 项目管理员 / 仅限执行者；
 // 默认非生产为编辑者、生产为项目管理员；档位存在环境上（P5a 起是执行策略的环境层，存在 exec_policies）。
 // 这里的用户都不是执行者，所以“仅限执行者”只有实例管理员能过；执行者授权的场景见 policy.test.ts。
-// 特权操作：执行 / 回滚 / 写基线、改连接串和影子库、删除环境、取消“生产”标记（以及改档位本身）。
+// 特权操作：执行 / 回滚、改连接串和影子库、删除环境、取消“生产”标记（以及改档位本身）。
 // 模型的编辑和发布不受约束。不需要真实 PG：环境直接写库，授权检查在连接目标库之前。
 import { type EnvInfo, type ExecPolicy, POLICY_DEFAULTS, type Role, resolvePolicy } from '@dowel/api';
 import { afterAll, beforeAll, describe, expect, test } from 'vitest';

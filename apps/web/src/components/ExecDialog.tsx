@@ -175,6 +175,7 @@ const DryRunPanel = ({
             </button>
           </div>
         </Banner>
+        {res.code === 'mark_required' && <p className="hint m-0">{t('envx.exec.markRequiredHint')}</p>}
         {res.details?.diff && res.details.diff.length > 0 && (
           <DiffList items={res.details.diff} total={res.details.diffTotal} />
         )}
@@ -752,6 +753,7 @@ export const ExecDialog = ({
               </ul>
             )}
             {error.code === 'unverified' && <p className="hint">{t('envx.exec.unverifiedHint')}</p>}
+            {error.code === 'mark_required' && <p className="hint">{t('envx.exec.markRequiredHint')}</p>}
           </div>
         )}
       </div>
