@@ -32,7 +32,7 @@ import { emptyBase, versionExecutedAnywhere } from './chain.ts';
 import type { OpaqueRefresher } from './derive.ts';
 import { iso, projectPlanOptions } from './envs.ts';
 import { scrubSecrets } from './secrets.ts';
-import { ShadowError, storedReport } from './shadow.ts';
+import { ShadowConfigChangedError, ShadowError, storedReport } from './shadow.ts';
 import type { Shadows } from './shadows.ts';
 
 /** 概要字段：版本列表用 */
@@ -346,6 +346,7 @@ export type MultiVersionVerifyOutcome =
  * - 项目最低目标版本的规划选项里的 mysqlVersionNum 透传给 verifyScripts，阻断高版本特有类型（如 9.7 dev + 8.4 prod 混部下的 VECTOR）；
  * - 只有 PG 的版本组是对外大版本：仅 PG 记录 targets[].major / missingTargetMajor；
  * - 全部可用影子库均遇到 ShadowError 或项目无任何可用影子库 → 抛出 ShadowError（按基础设施/配置不可用处理）。
+ * - 任一影子库句柄因配置变更被关闭（ShadowConfigChangedError）→ 原样抛出（可重试），不当成该版本组不可用。
  */
 export const verifyAcrossVersions = async (
   shadows: Shadows,
@@ -384,7 +385,8 @@ export const verifyAcrossVersions = async (
         ...(planOpts?.mysqlVersionNum !== undefined ? { mysqlVersionNum: planOpts.mysqlVersionNum } : {}),
       });
     } catch (e) {
-      if (!(e instanceof ShadowError)) throw e;
+      // 配置已变更：旧影子库上的结论不能用，也不能当成“这个版本组运行时不可用”跳过（会少验证一组），整体抛给调用方重试
+      if (!(e instanceof ShadowError) || e instanceof ShadowConfigChangedError) throw e;
       runtimeSkipped.set(entryKey, scrubSecrets(e.message));
       continue;
     }

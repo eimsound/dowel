@@ -204,6 +204,8 @@ export type McpToolErrorCode =
   | 'invalid'
   | 'dependency'
   | 'shadow_unavailable'
+  /** 影子库句柄因环境配置变更被关闭：可重试（与 HTTP 503 shadow_config_changed 一致） */
+  | 'shadow_config_changed'
   | 'rate_limited'
   | 'internal';
 

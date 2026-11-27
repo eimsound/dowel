@@ -70,7 +70,7 @@ export class BranchForgottenError extends Error {
  * - stopped / forgotten：服务正在停机，或分支已被 forget（项目被删；含其他副本经 derive.forget 通知的删除，以及失败路径 /
  *   保存基线时从平台库发现分支行已不存在）；
  * - no_shadow：没有可用的影子库（shadowOf 返回 null）；
- * - shadow_unavailable：影子库连不上、超时、被占用（ShadowError）；
+ * - shadow_unavailable：影子库连不上、超时、被占用，或句柄因配置变更被关闭（ShadowError，含 ShadowConfigChangedError：flush 安静跳过即可）；
  * - canonicalize_failed：表达式 / 不透明对象 DDL 在影子库 `canonicalize` 里报错（留给显式规范化或闭环验证报告给用户）；
  * - store_failed：平台库读写失败（`rooms.patch` / `rooms.state` / 保存 `branches.baseline` 抛错）；若写回已被接受但保存基线失败，返回的 `model` / `seq` 仍是写回后的房间状态，基线不推进；
  * - write_conflict：写回连续被版本检查拒绝超过 MAX_REJECT_RETRIES 次（期间一直有人改同一对象）；

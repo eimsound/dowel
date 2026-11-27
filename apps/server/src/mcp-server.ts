@@ -91,7 +91,7 @@ import {
 import { MCP_DISALLOWED_MUTATORS } from './rooms.ts';
 import type { AppContext, Env } from './routes/context.ts';
 import { scrubSecrets } from './secrets.ts';
-import { ShadowError } from './shadow.ts';
+import { ShadowConfigChangedError, ShadowError } from './shadow.ts';
 import {
   buildDdlSql,
   buildMigrationPreview,
@@ -142,6 +142,10 @@ const toolError = (
     structuredContent: { code, message: safe, ...extra },
   };
 };
+
+/** 影子库错误 → 工具错误码：句柄因配置变更被关闭是可重试的 shadow_config_changed（Issue #154），其余为 shadow_unavailable */
+const shadowToolErrorCode = (e: ShadowError): McpToolErrorCode =>
+  e instanceof ShadowConfigChangedError ? 'shadow_config_changed' : 'shadow_unavailable';
 
 const toolOk = (data: Record<string, unknown>): CallToolResult => ({
   content: [{ type: 'text', text: JSON.stringify(data, null, 2) }],
@@ -1665,7 +1669,7 @@ export const createMcpServer = (
             },
             ctx.security,
           );
-          return toolError('shadow_unavailable', e.message);
+          return toolError(shadowToolErrorCode(e), e.message);
         }
         throw e;
       }
@@ -1727,7 +1731,7 @@ export const createMcpServer = (
             },
             ctx.security,
           );
-          return toolError('shadow_unavailable', e.message);
+          return toolError(shadowToolErrorCode(e), e.message);
         }
         throw e;
       }
@@ -1936,7 +1940,7 @@ export const createMcpServer = (
         return server.server.projectCallToolResult(toolError('invalid', e.message), undefined);
       }
       if (e instanceof ShadowError) {
-        return server.server.projectCallToolResult(toolError('shadow_unavailable', e.message), undefined);
+        return server.server.projectCallToolResult(toolError(shadowToolErrorCode(e), e.message), undefined);
       }
       const msg = e instanceof Error ? e.message : String(e);
       return server.server.projectCallToolResult(toolError('internal', msg), undefined);

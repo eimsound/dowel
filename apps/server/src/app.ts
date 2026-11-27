@@ -43,7 +43,7 @@ import {
 } from './security.ts';
 import { passwordLoginForced, readSettings } from './settings.ts';
 import { DEFAULT_ADMIN_USERNAME } from './setup.ts';
-import { ShadowError } from './shadow.ts';
+import { ShadowConfigChangedError, ShadowError } from './shadow.ts';
 import { Shadows } from './shadows.ts';
 import type { ConnectionGuard } from './targets.ts';
 import { ActiveTokenCache } from './tokens.ts';
@@ -241,6 +241,8 @@ export const createApp = (db: PlatformDb, options: AppOptions = {}) => {
     if (err instanceof CodedHTTPException) return fail(err.message, err.status, err.code);
     // 等 derive 锁超时（另一副本 / 请求正在规范化同一分支）：可重试的 503
     if (err instanceof DeriveBusyError) return fail(err.message, 503, 'normalize_busy');
+    // 影子库句柄因环境配置变更被关闭（Issue #154）：可重试的 503，不是“影子库不可用”的 422
+    if (err instanceof ShadowConfigChangedError) return fail(err.message, 503, err.code);
     // 规范化 / flush 期间分支已删（未读到房间状态或显式规范化）：与 accessIn 一致返回 404
     if (err instanceof BranchForgottenError) return fail('项目不存在', 404);
     if (err instanceof HTTPException) return fail(err.message, err.status);
