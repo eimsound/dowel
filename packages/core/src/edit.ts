@@ -38,6 +38,7 @@ import {
   effectiveColumnsOf,
   find,
   get,
+  getActiveModelIndex,
   partitionDescendants,
   partitionsOf,
   requiredUniquePartitionKeys,
@@ -52,8 +53,9 @@ import {
   resolvePartitionBy,
   validatePartitionBound,
 } from './pg/partition.ts';
+import { isPgSerialArrayType, parsePgSerialType, PG_SERIAL_BASE, type PgSerialBase } from './pg/serial.ts';
 import { getDialect } from './registry.ts';
-import { SQLITE_STRICT_TYPES } from './sqlite/types.ts';
+import { SQLITE_STRICT_TYPES, sqliteNormalizeCollation } from './sqlite/types.ts';
 
 export { EditError, exprReferences, renameInExpr, renameQualifiedInExpr, type Token, tokenize };
 
@@ -1079,9 +1081,100 @@ export interface ColumnSpec {
   ext?: ColumnExt;
 }
 
+/**
+ * 普通列类型的规范写法（各方言 normalizeType，与界面输入类型时的规范化一致），让模型与引擎读回的写法可以直接比较（#132）。
+ * 枚举列（有 typeRef，type 只是数组维度）与空类型原样保留。
+ */
+const canonicalColumnType = (m: Model, type: string, typeRef: string | null | undefined): string =>
+  typeRef || !type.trim() ? type : getDialect(m.dialect).normalizeType(type);
+
+/** 排序规则的规范写法：目前只有 SQLite 内置排序规则（大写），其他方言的排序规则名依赖目标库目录，原样保留 */
+const canonicalCollation = (m: Model, collation: string | null): string | null =>
+  m.dialect === 'sqlite' ? sqliteNormalizeCollation(collation) : collation;
+
+const PG_SEQ_TYPE_LIMITS: Readonly<Record<PgSerialBase, readonly [bigint, bigint]>> = {
+  smallint: [-32768n, 32767n],
+  integer: [-2147483648n, 2147483647n],
+  bigint: [-9223372036854775808n, 9223372036854775807n],
+};
+
+const parseBigInt = (s: string | null): bigint | null => {
+  if (s === null) return null;
+  try {
+    return BigInt(s.trim());
+  } catch {
+    return null;
+  }
+};
+
+const clampSeqOptionsForType = (
+  opts: SequenceOptions,
+  base: PgSerialBase,
+): { min: string | null; max: string | null; start: string | null } => {
+  const [typeMin, typeMax] = PG_SEQ_TYPE_LIMITS[base];
+  const minVal = parseBigInt(opts.min);
+  const nextMin = minVal !== null && minVal >= typeMin && minVal <= typeMax ? opts.min : null;
+  const maxVal = parseBigInt(opts.max);
+  const nextMax = maxVal !== null && maxVal >= typeMin && maxVal <= typeMax ? opts.max : null;
+
+  const inc = parseBigInt(opts.increment);
+  const asc = inc === null ? !opts.increment.trim().startsWith('-') : inc >= 0n;
+  const effectiveMin = nextMin !== null ? parseBigInt(nextMin)! : asc ? 1n : typeMin;
+  const effectiveMax = nextMax !== null ? parseBigInt(nextMax)! : asc ? typeMax : -1n;
+
+  const startVal = parseBigInt(opts.start);
+  const nextStart =
+    startVal !== null &&
+    startVal >= typeMin &&
+    startVal <= typeMax &&
+    startVal >= effectiveMin &&
+    startVal <= effectiveMax
+      ? opts.start
+      : null;
+
+  return { min: nextMin, max: nextMax, start: nextStart };
+};
+
+const makeDerivedSerialSequence = (
+  m: Model,
+  schemaId: string,
+  colId: string,
+  base: PgSerialBase,
+): Sequence => {
+  let seqId = nextDetId(m, `${colId}:serial-seq`);
+  if (seqId === colId) {
+    for (let i = 1; ; i++) {
+      const candidate = derivedUuid(`${colId}:serial-seq#${i}`);
+      if (candidate !== colId && !Object.hasOwn(m.objects, candidate)) {
+        seqId = candidate;
+        break;
+      }
+    }
+  }
+  return {
+    id: seqId,
+    kind: 'sequence',
+    parent: schemaId,
+    name: '',
+    nameMode: 'derived',
+    ownedBy: colId,
+    options: {
+      type: base,
+      increment: '1',
+      min: null,
+      max: null,
+      start: null,
+      cache: '1',
+      cycle: false,
+    },
+    comment: null,
+  };
+};
+
 export const addColumn = (m: Model, table: string, spec: ColumnSpec): string => {
   const t = get(m, table, 'table');
   const d = getDialect(m.dialect);
+  const type = canonicalColumnType(m, spec.type, spec.typeRef);
   assertIdent(m, spec.name, 'column');
   normalizePartitionFamily(m, table);
   assertNotPartitionChild(m, table);
@@ -1104,9 +1197,18 @@ export const addColumn = (m: Model, table: string, spec: ColumnSpec): string => 
   if (
     m.dialect === 'sqlite' &&
     t.ext?.sqlite?.strict &&
-    !SQLITE_STRICT_TYPES.has(spec.type.trim().toUpperCase())
+    !SQLITE_STRICT_TYPES.has(type.trim().toUpperCase())
   ) {
     throw new EditError(`STRICT 表不支持列类型 ${spec.type}（仅允许 INT/INTEGER/REAL/TEXT/BLOB/ANY）`);
+  }
+  const serialKind = m.dialect === 'pg' && !spec.typeRef ? parsePgSerialType(spec.type) : null;
+  if (m.dialect === 'pg' && !spec.typeRef) {
+    if (isPgSerialArrayType(spec.type)) throw new EditError('serial 不能用作数组类型');
+    if (serialKind) {
+      if (spec.identity) throw new EditError('IDENTITY 列不能同时是 serial');
+      if (spec.generated) throw new EditError('生成列不能改成 serial');
+      if (spec.default != null) throw new EditError('列已有默认值，不能改成 serial，请先清空默认值');
+    }
   }
   let pos: string;
   if (spec.before) {
@@ -1114,19 +1216,27 @@ export const addColumn = (m: Model, table: string, spec: ColumnSpec): string => 
     if (i < 0) throw new EditError(`列 ${spec.before} 不属于表 ${t.name}`);
     pos = generateKeyBetween(cols[i - 1]?.pos ?? null, cols[i]!.pos);
   } else pos = generateKeyBetween(cols.at(-1)?.pos ?? null, null);
+  const colId = spec.id ?? newId();
+  const serialSeq = serialKind
+    ? makeDerivedSerialSequence(m, t.parent, colId, PG_SERIAL_BASE[serialKind])
+    : null;
   const cleanedExt = cleanExt(spec.ext);
   const c: Column = {
-    id: spec.id ?? newId(),
+    id: colId,
     kind: 'column',
     parent: table,
     name: spec.name,
     pos,
-    type: spec.type,
-    typeRef: spec.typeRef ?? null,
-    notNull: !!(spec.notNull || spec.identity),
+    type: serialKind ? PG_SERIAL_BASE[serialKind] : type,
+    typeRef: serialKind ? null : (spec.typeRef ?? null),
+    notNull: !!(spec.notNull || spec.identity || serialKind),
     notNullName: null,
     notNullNameMode: 'derived',
-    default: spec.identity || spec.generated ? null : (spec.default ?? null),
+    default: serialSeq
+      ? { nextval: serialSeq.id }
+      : spec.identity || spec.generated
+        ? null
+        : (spec.default ?? null),
     identity: spec.identity
       ? {
           always: spec.identity.always,
@@ -1144,7 +1254,7 @@ export const addColumn = (m: Model, table: string, spec: ColumnSpec): string => 
         }
       : null,
     generated: spec.generated ?? null,
-    collation: spec.collation ?? null,
+    collation: canonicalCollation(m, spec.collation ?? null),
     comment: null,
     ...(cleanedExt ? { ext: cleanedExt as ColumnExt } : {}),
   };
@@ -1158,6 +1268,7 @@ export const addColumn = (m: Model, table: string, spec: ColumnSpec): string => 
     }
   }
   m.objects[c.id] = c;
+  if (serialSeq) m.objects[serialSeq.id] = serialSeq;
   refreshDerivedNames(m, t.id);
   return c.id;
 };
@@ -1293,8 +1404,9 @@ export const dropColumn = (m: Model, id: string) => {
   delete m.objects[id];
 };
 
-export const setColumnType = (m: Model, id: string, type: string, typeRef: string | null = null) => {
+export const setColumnType = (m: Model, id: string, rawType: string, typeRef: string | null = null) => {
   const c = get(m, id, 'column');
+  const type = canonicalColumnType(m, rawType, typeRef);
   assertNotPartitionChild(m, c.parent);
   normalizePartitionFamily(m, c.parent);
   assertNotPartitionKeyCol(m, id, '修改类型');
@@ -1302,10 +1414,79 @@ export const setColumnType = (m: Model, id: string, type: string, typeRef: strin
     if (!getDialect(m.dialect).capabilities.enums) throw new EditError('当前方言不支持独立枚举类型');
     get(m, typeRef, 'enum');
   }
+  if (m.dialect === 'pg' && !typeRef) {
+    if (isPgSerialArrayType(rawType)) throw new EditError('serial 不能用作数组类型');
+    const serialKind = parsePgSerialType(rawType);
+    if (serialKind) {
+      if (c.generated) throw new EditError('生成列不能改成 serial');
+      if (c.identity) throw new EditError('IDENTITY 列不能改成 serial，请先取消自增（IDENTITY）');
+      let seq: Sequence | null = null;
+      if (c.default !== null) {
+        if ('nextval' in c.default) {
+          const existing = find(m, c.default.nextval);
+          if (existing?.kind === 'sequence' && existing.ownedBy === c.id) seq = existing;
+        }
+        if (!seq) throw new EditError('列已有默认值，不能改成 serial，请先清空默认值');
+      } else {
+        const activeIdx = getActiveModelIndex(m);
+        const owned = activeIdx
+          ? activeIdx.sequencesOwnedBy(c.id)
+          : all(m, 'sequence').filter((s) => s.ownedBy === c.id);
+        if (owned.length > 0) {
+          owned.sort((a, b) => (a.id < b.id ? -1 : a.id > b.id ? 1 : 0));
+          seq = owned[0]!;
+        }
+      }
+      const base = PG_SERIAL_BASE[serialKind];
+      if (seq) {
+        const clamped = clampSeqOptionsForType(seq.options, base);
+        const needsColUpdate =
+          c.type !== base ||
+          c.typeRef !== null ||
+          !c.notNull ||
+          !c.default ||
+          !('nextval' in c.default) ||
+          c.default.nextval !== seq.id;
+        const needsSeqUpdate =
+          seq.options.type !== base ||
+          seq.options.min !== clamped.min ||
+          seq.options.max !== clamped.max ||
+          seq.options.start !== clamped.start;
+        if (!needsColUpdate && !needsSeqUpdate) return;
+        c.type = base;
+        c.typeRef = null;
+        c.default = { nextval: seq.id };
+        if (!c.notNull) {
+          c.notNull = true;
+          c.notNullName = null;
+          c.notNullNameMode = 'derived';
+        }
+        seq.options.type = base;
+        seq.options.min = clamped.min;
+        seq.options.max = clamped.max;
+        seq.options.start = clamped.start;
+        refreshDerivedNames(m, c.parent);
+        return;
+      }
+      const t = get(m, c.parent, 'table');
+      const newSeq = makeDerivedSerialSequence(m, t.parent, c.id, base);
+      m.objects[newSeq.id] = newSeq;
+      c.type = base;
+      c.typeRef = null;
+      c.default = { nextval: newSeq.id };
+      if (!c.notNull) {
+        c.notNull = true;
+        c.notNullName = null;
+        c.notNullNameMode = 'derived';
+      }
+      refreshDerivedNames(m, c.parent);
+      return;
+    }
+  }
   if (m.dialect === 'sqlite') {
     const t = get(m, c.parent, 'table');
     if (t.ext?.sqlite?.strict && !SQLITE_STRICT_TYPES.has(type.trim().toUpperCase())) {
-      throw new EditError(`STRICT 表不支持列类型 ${type}（仅允许 INT/INTEGER/REAL/TEXT/BLOB/ANY）`);
+      throw new EditError(`STRICT 表不支持列类型 ${rawType}（仅允许 INT/INTEGER/REAL/TEXT/BLOB/ANY）`);
     }
     if (c.ext?.sqlite?.autoincrement && type.trim().toUpperCase() !== 'INTEGER') {
       clearSqliteAutoincrement(c);
@@ -1634,6 +1815,7 @@ export const addIndex = (
     collation: null,
     ...e,
   }));
+  for (const e of fullElements) e.collation = canonicalCollation(m, e.collation);
   const elCols = fullElements.flatMap((e) => (e.column ? [e.column] : []));
   if (elCols.length) checkCols(m, table, elCols);
   if (opts.include?.length) checkCols(m, table, opts.include);

@@ -4,13 +4,17 @@
 import {
   addCheck,
   addColumn,
+  attachPartition,
   createPartition,
   createSchema,
   createTable,
+  detachPartition,
   emptyModel,
   ident,
   literal,
   type Model,
+  runMutator,
+  setColumnType,
   setPartitionBy,
   type Table,
 } from '@dowel/core';
@@ -22,7 +26,7 @@ import { connect, createTestDb, dbUrl, PG_URL } from '../../../test/pg.ts';
 import { createApp } from '../src/app.ts';
 import { type ClusterEvent, EventBus } from '../src/bus.ts';
 import { openPlatformDb } from '../src/db.ts';
-import { OpaqueRefresher } from '../src/derive.ts';
+import { OpaqueRefresher, pendingRefreshIds } from '../src/derive.ts';
 import { Rooms } from '../src/rooms.ts';
 import { encrypt, scrubSecrets } from '../src/secrets.ts';
 import { assertImportable, ShadowError, ShadowUnavailableError, toShadowError } from '../src/shadow.ts';
@@ -1437,6 +1441,192 @@ describe.skipIf(!PG_URL)('受限权限账号与影子库生命周期测试（真
       await shadow?.close();
       await admin.db.exec(`DROP DATABASE IF EXISTS ${ident(dbName)} WITH (FORCE)`).catch(() => {});
       await admin.db.exec(`DROP ROLE IF EXISTS ${ident(role)}`).catch(() => {});
+    }
+  });
+});
+
+describe.skipIf(!PG_URL)('待规范化判定与真实 PG 读回一致（#134）', () => {
+  test('分区子表本地 CHECK：根父表列改类型后判为待规范化，影子库读回的规范形式也确实变了', async () => {
+    const shadowDb = await createTestDb('derive_pending_part');
+    await claimShadow(shadowDb.url);
+    const shadow = pgShadow(shadowDb.url);
+    try {
+      const m = emptyModel();
+      const pub = createSchema(m, 'public', 's-pub');
+      const events = createTable(m, pub, 'events', 't-events');
+      const day = addColumn(m, events, { name: 'day', type: 'integer', notNull: true, id: 'c-day' });
+      addColumn(m, events, { name: 'amount', type: 'integer', id: 'c-amount' });
+      setPartitionBy(m, events, {
+        strategy: 'range',
+        keys: [{ column: day, expr: null, opclass: null, collation: null }],
+      });
+      const child = createPartition(m, events, 'events_a', 'FOR VALUES FROM (0) TO (100)', 't-events-a');
+      const ck = addCheck(m, child, 'amount >= 0', 'ck-amount');
+      // 黄金基线：影子库规范化之后的模型
+      const good = structuredClone(m);
+      for (const o of await shadow.canonicalize(emptyModel(), m)) good.objects[o.id] = o;
+      const before = (good.objects[ck] as { expr: string }).expr;
+
+      const cur = structuredClone(good);
+      setColumnType(cur, 'c-amount', 'numeric');
+      expect(pendingRefreshIds(good, cur)).toContain(ck);
+      const changed = await shadow.canonicalize(good, cur);
+      const after = changed.find((o) => o.id === ck) as { expr: string } | undefined;
+      // 例：(amount >= 0) → (amount >= (0)::numeric)；漏判时这份过期原文会留在模型里
+      expect(after?.expr).toBeDefined();
+      expect(after?.expr).not.toBe(before);
+      expect(after?.expr).toContain('numeric');
+    } finally {
+      await shadow.close();
+      await shadowDb.close();
+    }
+  });
+
+  test('分区子表边界：父表分区键从 date 切换/改类型为 timestamp 后判为待规范化，PG 读回边界变为 timestamp 格式', async () => {
+    const shadowDb = await createTestDb('derive_pending_part_bound');
+    await claimShadow(shadowDb.url);
+    const shadow = pgShadow(shadowDb.url);
+    try {
+      const m = emptyModel();
+      const pub = createSchema(m, 'public', 's-pub');
+      const events = createTable(m, pub, 'events', 't-events');
+      const day = addColumn(m, events, { name: 'day', type: 'date', notNull: true, id: 'c-day' });
+      const ts = addColumn(m, events, { name: 'ts', type: 'timestamp', notNull: true, id: 'c-ts' });
+      setPartitionBy(m, events, {
+        strategy: 'range',
+        keys: [{ column: day, expr: null, opclass: null, collation: null }],
+      });
+      const child = createPartition(
+        m,
+        events,
+        'events_2020',
+        "FOR VALUES FROM ('2020-01-01') TO ('2021-01-01')",
+        't-events-2020',
+      );
+      const good = structuredClone(m);
+      for (const o of await shadow.canonicalize(emptyModel(), m)) good.objects[o.id] = o;
+      const before = (good.objects[child] as Table).partitionOf!.bound;
+
+      // 路径 A：有子分区时直接 setPartitionBy 切换到 timestamp 列
+      const curA = structuredClone(good);
+      setPartitionBy(curA, events, {
+        strategy: 'range',
+        keys: [{ column: ts, expr: null, opclass: null, collation: null }],
+      });
+      expect(pendingRefreshIds(good, curA)).toContain(child);
+      const changedA = await shadow.canonicalize(good, curA);
+      const afterA = changedA.find((o): o is Table => o.kind === 'table' && o.id === child);
+      expect(afterA?.partitionOf?.bound).toBeDefined();
+      expect(afterA?.partitionOf?.bound).not.toBe(before);
+      expect(afterA?.partitionOf?.bound).toBe(
+        "FOR VALUES FROM ('2020-01-01 00:00:00') TO ('2021-01-01 00:00:00')",
+      );
+      const goodA = structuredClone(curA);
+      for (const o of changedA) goodA.objects[o.id] = o;
+      expect(pendingRefreshIds(goodA, structuredClone(goodA))).toEqual([]);
+
+      // 路径 A2：detach → 取消分区 → 改键列为 timestamp → 重新分区 → 用原边界原文 attach
+      const curA2 = structuredClone(good);
+      detachPartition(curA2, child);
+      setPartitionBy(curA2, events, null);
+      setColumnType(curA2, day, 'timestamp');
+      setPartitionBy(curA2, events, {
+        strategy: 'range',
+        keys: [{ column: day, expr: null, opclass: null, collation: null }],
+      });
+      const childDay = Object.values(curA2.objects).find(
+        (o) => o.kind === 'column' && o.parent === child && o.name === 'day',
+      )!;
+      setColumnType(curA2, childDay.id, 'timestamp');
+      attachPartition(curA2, events, child, before);
+      expect(pendingRefreshIds(good, curA2)).toContain(child);
+      const changedA2 = await shadow.canonicalize(good, curA2);
+      const afterA2 = changedA2.find((o): o is Table => o.kind === 'table' && o.id === child);
+      expect(afterA2?.partitionOf?.bound).toBe(
+        "FOR VALUES FROM ('2020-01-01 00:00:00') TO ('2021-01-01 00:00:00')",
+      );
+    } finally {
+      await shadow.close();
+      await shadowDb.close();
+    }
+  });
+});
+
+describe.skipIf(!PG_URL)('待规范化判定与真实 PG 读回一致：表达式直接引用枚举（#146）', () => {
+  /** orders(status text)：默认值与 CHECK 直接写枚举转换，没有列的 typeRef 指向枚举 */
+  const enumModel = (ty: string): Model => {
+    const m = emptyModel();
+    runMutator(m, 'createSchema', { id: 's', name: 'public' });
+    runMutator(m, 'createEnum', { id: 'e1', schema: 's', name: 'mood', values: ['ok', 'bad'] });
+    runMutator(m, 'createEnum', { id: 'e2', schema: 's', name: 'tone', values: ['ok', 'lo'] });
+    runMutator(m, 'createTable', { id: 't', schema: 's', name: 'orders' });
+    runMutator(m, 'addColumn', {
+      table: 't',
+      column: { id: 'st', name: 'status', type: 'text', default: { expr: `('ok'::${ty})::text` } },
+    });
+    runMutator(m, 'addCheck', { id: 'k', table: 't', expr: `((status)::${ty} IS NOT NULL)` });
+    return m;
+  };
+  const textOf = (m: Model) => [
+    (m.objects.st as { default: { expr: string } }).default.expr,
+    (m.objects.k as { expr: string }).expr,
+    (m.objects.ix as { where: string }).where,
+  ];
+
+  test('两个枚举对调名字后换回旧快照：表达式原文与基线逐字相同，判为待规范化，影子库读回的类型名确实变了', async () => {
+    const shadowDb = await createTestDb('derive_pending_enum');
+    await claimShadow(shadowDb.url);
+    const shadow = pgShadow(shadowDb.url);
+    try {
+      const m = enumModel('public.mood');
+      runMutator(m, 'addIndex', {
+        id: 'ix',
+        table: 't',
+        elements: [{ column: 'st' }],
+        where: "('ok'::public.mood IS NOT NULL)",
+      });
+      const good = structuredClone(m);
+      for (const o of await shadow.canonicalize(emptyModel(), m)) good.objects[o.id] = o;
+      expect(textOf(good)).toEqual([
+        "('ok'::public.mood)::text",
+        '((status)::public.mood IS NOT NULL)',
+        "('ok'::public.mood IS NOT NULL)",
+      ]);
+
+      // 换入另一条历史上两个枚举对调过名字的快照：表达式原文不变，名字换了绑定
+      const cur = structuredClone(good);
+      (cur.objects.e1 as { name: string }).name = 'tone';
+      (cur.objects.e2 as { name: string }).name = 'mood';
+      expect(pendingRefreshIds(good, cur)).toEqual(['st', 'k', 'ix']);
+      const changed = await shadow.canonicalize(good, cur);
+      const after = structuredClone(cur);
+      for (const o of changed) after.objects[o.id] = o;
+      // 实测：影子库从基线增量迁移（ALTER TYPE ... RENAME），PG 按 OID 存表达式，读回跟着 e1 的新名字走。
+      // 漏判时出口 0 I/O，这份与影子库不一致的原文会留在模型里
+      expect(changed.map((o) => o.id)).toEqual(['st', 'k', 'ix']);
+      expect(textOf(after)).toEqual([
+        "('ok'::public.tone)::text",
+        '((status)::public.tone IS NOT NULL)',
+        "('ok'::public.tone IS NOT NULL)",
+      ]);
+      expect(pendingRefreshIds(after, structuredClone(after))).toEqual([]);
+    } finally {
+      await shadow.close();
+      await shadowDb.close();
+    }
+  });
+
+  test('非限定写法 ::mood 在影子库（search_path 为空）里建不出来：黄金基线里只会有带 schema 的枚举转换', async () => {
+    const shadowDb = await createTestDb('derive_pending_enum_unq');
+    await claimShadow(shadowDb.url);
+    const shadow = pgShadow(shadowDb.url);
+    try {
+      await expect(shadow.canonicalize(emptyModel(), enumModel('mood'))).rejects.toThrow(
+        /type "mood" does not exist/,
+      );
+    } finally {
+      await shadow.close();
+      await shadowDb.close();
     }
   });
 });

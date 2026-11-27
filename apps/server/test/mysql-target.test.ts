@@ -29,17 +29,19 @@ import {
   PlanError,
 } from '@dowel/core';
 import {
-  alignMysqlImportedLive,
   type Db,
   detectMysqlStepAlreadyApplied,
   fromMysql2,
   HistoryError,
-  mysqlExprCanonEqual,
+  mysqlEngine,
   mysqlGrantMatchesDb,
   mysqlHistory,
+  type MysqlColSnap,
+  type MysqlSnapshot,
   parseMysqlGrantPrivileges,
   updateExistingTablesAfterStep,
 } from '@dowel/engines';
+import { importLive, planDiff } from '@dowel/executor';
 import { StepError, verifyScripts } from '@dowel/verifier';
 import { afterAll, beforeAll, describe, expect, test, vi } from 'vitest';
 
@@ -220,16 +222,8 @@ describe('MySQL 目标库服务端驱动与全栈', () => {
     expect(mysqlGrantMatchesDb('GRANT CREATE ON `app\\_%`.* TO `u`@`%`', 'app_dowel')).toBe(true);
     expect(mysqlGrantMatchesDb('GRANT ALL PRIVILEGES ON *.* TO `root`@`localhost`', 'anydb')).toBe(true);
 
-    // M5: MySQL 表达式规范化等价与 alignMysqlImportedLive
-    expect(
-      mysqlExprCanonEqual(
-        "((`status` in (_utf8mb4'open',_utf8mb4'closed')))",
-        "status IN ('open', 'closed')",
-      ),
-    ).toBe(true);
-    expect(mysqlExprCanonEqual('((`age` >= 18) and (`score` <> 0))', 'age >= 18 AND score != 0')).toBe(true);
-    expect(mysqlExprCanonEqual("(_utf8mb4'it\\'s')", "'it''s'")).toBe(true);
-    expect(mysqlExprCanonEqual('(a + b) * 2', 'a + b * 2')).toBe(false);
+    // M5: MySQL 读回不做表达式纯格式容忍（ADR 0017）：未经影子库规范化的表达式必须产生差异
+    expect('alignImportedLive' in mysqlEngine).toBe(false);
 
     const refM = emptyModel('mysql');
     const rs = createSchema(refM, 'default');
@@ -244,12 +238,61 @@ describe('MySQL 目标库服务端驱动与全栈', () => {
     addPrimaryKey(refM, rt, [rid]);
     const rck = addCheck(refM, rt, "status IN ('open', 'closed')");
 
+    const rawCheck = "(`status` in (_utf8mb4'open',_utf8mb4'closed'))";
+    const rawDefault = "(_utf8mb4'open')";
+    const colSnap = (ordinalPosition: number, type: string, def: string | null): MysqlColSnap => ({
+      ordinalPosition,
+      type,
+      unsigned: false,
+      zerofill: false,
+      notNull: true,
+      default: def,
+      generated: null,
+      charset: null,
+      collation: null,
+      autoIncrement: false,
+      onUpdateCurrentTimestamp: false,
+      comment: null,
+    });
+    const liveSnap: MysqlSnapshot = {
+      version: '8.4.0',
+      versionNum: 80400,
+      defaultCharset: 'utf8mb4',
+      defaultCollation: 'utf8mb4_0900_ai_ci',
+      tables: {
+        users: {
+          name: 'users',
+          engine: 'InnoDB',
+          charset: 'utf8mb4',
+          collation: 'utf8mb4_0900_ai_ci',
+          comment: null,
+          columns: {
+            id: colSnap(1, 'int', null),
+            status: colSnap(2, 'varchar(20)', rawDefault),
+          },
+          primaryKey: { columns: ['id'] },
+          uniques: {},
+          checks: { [refM.objects[rck]!.name]: { name: refM.objects[rck]!.name, expr: rawCheck } },
+          foreignKeys: {},
+          indexes: {},
+        },
+      },
+      opaques: {},
+    };
+    const imported = importLive(
+      { dialect: 'mysql', version: liveSnap.version, versionNum: liveSnap.versionNum, payload: liveSnap },
+      refM,
+    );
+    // importLive 原样保留读回表达式，不再改写为参考模型写法
+    expect(all(imported, 'check').map((c) => c.expr)).toEqual([rawCheck]);
+    expect(all(imported, 'column').find((c) => c.name === 'status')?.default).toEqual({ expr: rawDefault });
+
+    // 仅表达式写法不同的模型在 planDiff 中必须报告差异，而不是静默通过
     const liveM = structuredClone(refM);
-    (liveM.objects[rck] as { expr: string }).expr = "(`status` in (_utf8mb4'open',_utf8mb4'closed'))";
-    (liveM.objects[rst] as { default: { expr: string } }).default = { expr: "(_utf8mb4'open')" };
-    const aligned = alignMysqlImportedLive(liveM, refM);
-    expect((aligned.objects[rck] as { expr: string }).expr).toBe("status IN ('open', 'closed')");
-    expect((aligned.objects[rst] as { default: { expr: string } }).default).toEqual({ expr: "'open'" });
+    (liveM.objects[rck] as { expr: string }).expr = rawCheck;
+    (liveM.objects[rst] as { default: { expr: string } }).default = { expr: rawDefault };
+    const diff = planDiff(liveM, refM);
+    expect(diff.total).toBeGreaterThan(0);
 
     // M4: detectMysqlStepAlreadyApplied 错误码过滤、拒绝跨库限定与 KEY_COLUMN_USAGE 列序核对
     const mockConn: Db = {

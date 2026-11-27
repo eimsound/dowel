@@ -19,6 +19,7 @@ import { tokenize } from './expr.ts';
 import { chooseName, joinNames } from './naming.ts';
 import { resolvePartitionBy } from './partition.ts';
 import { ident } from './quote.ts';
+import { parsePgSerialType } from './serial.ts';
 import { normalizeType } from './types.ts';
 
 /**
@@ -188,15 +189,16 @@ class PgClipboardNamespace extends ClipboardNamespace {
     }
   }
 
-  /** addColumn 会推导 NOT NULL 约束名与 IDENTITY 序列名，同步预占 */
+  /** addColumn 会推导 NOT NULL 约束名与 IDENTITY / serial 序列名，同步预占 */
   override prepareTableColumn(input: PastedColumnInput): PastedColumnInput['ext'] {
-    if (input.notNull || input.hasIdentity) {
+    const isSerial = !input.typeRef && input.type !== undefined && parsePgSerialType(input.type) !== null;
+    if (input.notNull || input.hasIdentity || isSerial) {
       const nnName = chooseName(input.tableName, input.columnName, 'not_null', (n) =>
         this.isConTaken(input.tableId, n, true),
       );
       this.addNotNull(input.tableId, nnName);
     }
-    if (input.hasIdentity) {
+    if (input.hasIdentity || isSerial) {
       const seqName = chooseName(input.tableName, input.columnName, 'seq', (n) =>
         this.isRelTaken(input.schemaId, n),
       );

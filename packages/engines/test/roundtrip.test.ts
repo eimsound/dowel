@@ -1,8 +1,28 @@
-import { createAll, plan, validate } from '@dowel/core';
+import {
+  addColumn,
+  addPrimaryKey,
+  type Column,
+  createAll,
+  createSchema,
+  createSequence,
+  createTable,
+  emptyModel,
+  type Model,
+  normalizeType,
+  pgSerialOf,
+  plan,
+  renameTable,
+  type Sequence,
+  type SequenceOptions,
+  setColumnType,
+  setDefault,
+  validate,
+} from '@dowel/core';
 import { describe, expect, test } from 'vitest';
 
 import { PG_URL, useTestDb } from '../../../test/pg.ts';
-import { build, resetShadow, runSteps } from '../../verifier/src/index.ts';
+import { diffAgainst } from '../../executor/src/index.ts';
+import { build, resetShadow, runSteps, verify } from '../../verifier/src/index.ts';
 import { diffSnapshots, importSnapshot, readSnapshot } from '../src/index.ts';
 
 const db = useTestDb('roundtrip');
@@ -69,6 +89,232 @@ describe.skipIf(!PG_URL)('导入 → 重建 往返一致', () => {
         email non_empty_email
       );
     `);
+  });
+
+  test('PG normalizeType 与真实 PG format_type 读回一致', async () => {
+    await resetShadow(db());
+    await db().exec('CREATE SCHEMA public');
+    await db().exec(`
+      SET search_path = public;
+      CREATE DOMAIN "MyDomain" AS integer;
+      CREATE DOMAIN "My  Domain" AS text;
+    `);
+    const hasVector =
+      (await db().query<{ ok: number }>("SELECT 1 AS ok FROM pg_available_extensions WHERE name = 'vector'"))
+        .length > 0;
+    if (hasVector) {
+      await db().exec('CREATE EXTENSION IF NOT EXISTS vector WITH SCHEMA public');
+    }
+
+    // CI 镜像为 pgvector/pgvector:pg15..19（不含 PostGIS），因此 geometry(Point,4326) 的保留逻辑由 packages/core/test/column-normalization.test.ts 覆盖
+    const cases: string[] = [
+      'int',
+      'INT4',
+      'int2',
+      'int8',
+      'bool',
+      'varchar',
+      'varchar(255)',
+      'CHARACTER   VARYING ( 64 )',
+      'char',
+      'character',
+      'char(4)',
+      '"char"',
+      'decimal',
+      'decimal(10, 2)',
+      'numeric(12, 4)',
+      'bit',
+      'bit(8)',
+      'bit[]',
+      'varbit',
+      'varbit(16)',
+      'bit varying(16)',
+      'float',
+      'float(1)',
+      'float(10)',
+      'float(24)',
+      'float(25)',
+      'float(53)',
+      'float(10)[]',
+      'float4',
+      'float8',
+      'double   precision',
+      'timestamp',
+      'timestamptz',
+      'timestamp(3)',
+      'TIMESTAMP(3) WITH TIME ZONE',
+      'TIMESTAMPTZ(3)[]',
+      'time',
+      'timetz',
+      'time(3)',
+      'TIME(3) WITH TIME ZONE',
+      'interval',
+      'interval(3)',
+      'interval year to month',
+      'INTERVAL YEAR TO MONTH',
+      'INTERVAL DAY TO SECOND(3)',
+      '  Text  ',
+      'text [ ]',
+      'public."MyDomain"',
+      'PUBLIC."My  Domain"[]',
+    ];
+    if (hasVector) cases.push('PUBLIC.VECTOR( 3 )');
+
+    const cols = cases.map((t, i) => `c${i} ${t}`).join(', ');
+    await db().exec(`SET search_path = public; CREATE TABLE norm_check (${cols})`);
+    const snap = await readSnapshot(db());
+    const table = snap.tables['public.norm_check']!;
+    for (const [i, raw] of cases.entries()) {
+      expect(table.columns[`c${i}`]!.type, raw).toBe(normalizeType(raw, 'pg'));
+    }
+  });
+
+  test('PG serial 写入展开与原生 DDL 往返一致、导入识别及迁移闭环验证', async () => {
+    const m = emptyModel('pg');
+    const pub = createSchema(m, 'public', 's_pub');
+    const app = createSchema(m, 'My App', 's_app');
+    const items = createTable(m, pub, 'items', 't_items');
+    const idCol = addColumn(m, items, { id: 'c_id', name: 'id', type: 'serial' });
+    addPrimaryKey(m, items, [idCol], 'pk_items');
+    const bigCol = addColumn(m, items, { id: 'c_big', name: 'big', type: 'bigserial' });
+    const smallCol = addColumn(m, items, { id: 'c_small', name: 'small', type: 'smallserial' });
+
+    const order = createTable(m, app, 'Order', 't_order');
+    addColumn(m, order, { id: 'c_ord_id', name: 'Id', type: 'SERIAL4' });
+
+    expect(validate(m)).toEqual([]);
+    const s2 = await build(db(), m);
+
+    await resetShadow(db());
+    await db().exec(`
+      CREATE SCHEMA public;
+      CREATE SCHEMA "My App";
+      CREATE TABLE public.items (
+        id serial PRIMARY KEY,
+        big bigserial,
+        small smallserial
+      );
+      CREATE TABLE "My App"."Order" (
+        "Id" SERIAL4
+      );
+    `);
+    const s1 = await readSnapshot(db());
+    expect(diffSnapshots(s1, s2)).toEqual([]);
+    expect(diffAgainst(s1, m).total).toBe(0);
+
+    // 2. 导入原生快照后 pgSerialOf 识别全部 3 种 serial
+    const imported = importSnapshot(s1);
+    const importedCols = Object.values(imported.objects).filter(
+      (o): o is Extract<typeof o, { kind: 'column' }> => o.kind === 'column',
+    );
+    expect(
+      pgSerialOf(
+        imported,
+        importedCols.find((c) => c.name === 'id')!,
+      )?.kind,
+    ).toBe('serial');
+    expect(
+      pgSerialOf(
+        imported,
+        importedCols.find((c) => c.name === 'big')!,
+      )?.kind,
+    ).toBe('bigserial');
+    expect(
+      pgSerialOf(
+        imported,
+        importedCols.find((c) => c.name === 'small')!,
+      )?.kind,
+    ).toBe('smallserial');
+    expect(
+      pgSerialOf(
+        imported,
+        importedCols.find((c) => c.name === 'Id')!,
+      )?.kind,
+    ).toBe('serial');
+
+    // 3. 迁移 m → m2 → m3 闭环验证
+    const m2 = structuredClone(m);
+    setColumnType(m2, idCol, 'bigserial');
+    addColumn(m2, items, { id: 'c_extra', name: 'extra', type: 'smallserial' });
+    expect(validate(m2)).toEqual([]);
+    const r1 = await verify(db(), m, m2);
+    expect(r1.upDiff).toEqual([]);
+    expect(r1.downDiff).toEqual([]);
+    await runSteps(db(), r1.up);
+    expect(diffAgainst(await readSnapshot(db()), m2).total).toBe(0);
+
+    const m3 = structuredClone(m2);
+    renameTable(m3, items, 'renamed_items');
+    setColumnType(m3, bigCol, 'integer');
+    setDefault(m3, smallCol, null);
+    expect(validate(m3)).toEqual([]);
+    const r2 = await verify(db(), m2, m3);
+    expect(r2.upDiff).toEqual([]);
+    expect(r2.downDiff).toEqual([]);
+    await runSteps(db(), r2.up);
+    expect(diffAgainst(await readSnapshot(db()), m3).total).toBe(0);
+  });
+
+  // PG 省略 START WITH 会保留旧 seqstart；前后 start 都为 null 时 min/max/递增方向改变默认起始值也要补发
+  const seqModel = (opts: Partial<SequenceOptions>) => {
+    const m = emptyModel('pg');
+    createSequence(m, createSchema(m, 'public', 's_pub'), 'x', { type: 'integer', ...opts }, 'q_x');
+    return m;
+  };
+  const withSeqOpts = (m: Model, patch: Partial<SequenceOptions>) => {
+    const m2 = structuredClone(m);
+    Object.assign((m2.objects.q_x as Sequence).options, patch);
+    expect(validate(m2)).toEqual([]);
+    return m2;
+  };
+
+  test.each<[string, Partial<SequenceOptions>, Partial<SequenceOptions>]>([
+    ['升序 min 10 → null', { min: '10' }, { min: null }],
+    ['降序 max -5 → null', { increment: '-1', max: '-5' }, { max: null }],
+    ['递增方向 1 → -1（显式 min/max）', { min: '-100', max: '100' }, { increment: '-1' }],
+  ])('ALTER SEQUENCE start 为 null 时有效起始值变化：%s（verify 双向零差异）', async (_, opts, patch) => {
+    const from = seqModel(opts);
+    const to = withSeqOpts(from, patch);
+    const r = await verify(db(), from, to);
+    expect(r.up.map((s) => s.sql).join('\n')).toContain('START WITH');
+    expect(r.upDiff).toEqual([]);
+    expect(r.downDiff).toEqual([]);
+  });
+
+  // 新建序列的当前值就是旧 seqstart，PG 还会校验当前值落在新范围内（那需要 RESTART，不属于结构迁移）；
+  // 这里先用 setval 把当前值推进到新范围内，模拟已在使用中的序列，只验证 START WITH 本身
+  const migrateUsedSeq = async (from: Model, to: Model, seq: string, value: string) => {
+    await build(db(), from);
+    await db().exec(`SELECT setval('${seq}', ${value})`);
+    const up = plan(from, to);
+    expect(up.map((s) => s.sql).join('\n')).toContain('START WITH');
+    await runSteps(db(), up);
+    expect(diffAgainst(await readSnapshot(db()), to).total).toBe(0);
+    await runSteps(db(), plan(to, from));
+    expect(diffAgainst(await readSnapshot(db()), from).total).toBe(0);
+  };
+
+  test('ALTER SEQUENCE start 为 null：升序 min null → 10（使用中的序列）', async () => {
+    const from = seqModel({});
+    await migrateUsedSeq(from, withSeqOpts(from, { min: '10' }), 'public.x', '50');
+  });
+
+  test('ALTER SEQUENCE start 为 null：降序 max -5 → -20（使用中的序列）', async () => {
+    const from = seqModel({ increment: '-1', max: '-5' });
+    await migrateUsedSeq(from, withSeqOpts(from, { max: '-20' }), 'public.x', '-30');
+  });
+
+  test('bigserial 带超出 integer 范围的显式 start 缩窄为 serial', async () => {
+    const m = emptyModel('pg');
+    const t = createTable(m, createSchema(m, 'public', 's_pub'), 'items', 't_items');
+    const id = addColumn(m, t, { id: 'c_id', name: 'id', type: 'bigserial' });
+    pgSerialOf(m, m.objects[id] as Column)!.sequence.options.start = '5000000000';
+    expect(validate(m)).toEqual([]);
+    const m2 = structuredClone(m);
+    setColumnType(m2, id, 'serial');
+    expect(validate(m2)).toEqual([]);
+    expect(pgSerialOf(m2, m2.objects[id] as Column)!.sequence.options.start).toBeNull();
+    await migrateUsedSeq(m, m2, 'public.items_id_seq', '100');
   });
 });
 

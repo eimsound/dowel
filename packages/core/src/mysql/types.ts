@@ -107,20 +107,22 @@ export const mysqlNormalizeType = (input: string): string => {
   if (!raw) return 'varchar(255)';
 
   // 剥离尾部 unsigned / zerofill 修饰符（MySQL 规范顺序：base unsigned zerofill）
-  let rest = raw;
+  // raw 已去除首尾空白并压缩内部空白为单空格，从尾部移动索引线性剥离避免反复正则扫描与整串拷贝（O(n²)）
+  let end = raw.length;
   let hasUnsigned = false;
   let hasZerofill = false;
   for (;;) {
-    if (/\s+zerofill$/i.test(rest)) {
+    if (end >= 9 && raw.slice(end - 9, end).toLowerCase() === ' zerofill') {
       hasZerofill = true;
-      rest = rest.replace(/\s+zerofill$/i, '').trim();
-    } else if (/\s+unsigned$/i.test(rest)) {
+      end -= 9;
+    } else if (end >= 9 && raw.slice(end - 9, end).toLowerCase() === ' unsigned') {
       hasUnsigned = true;
-      rest = rest.replace(/\s+unsigned$/i, '').trim();
+      end -= 9;
     } else {
       break;
     }
   }
+  const rest = raw.slice(0, end);
   if (hasZerofill) hasUnsigned = true; // MySQL ZEROFILL 自动隐含 UNSIGNED
 
   const low = rest.toLowerCase();

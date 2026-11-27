@@ -1093,6 +1093,7 @@ const zh = {
     mysqlCollation: '排序规则',
     mysqlSafeIdentErr: '仅允许 1–64 位 ASCII 字母、数字与下划线',
     mysqlTypeHint: "支持直接输入 enum('a','b')、set('x','y') 等内联类型",
+    serialKeptHint: '自增仍保留：默认值仍指向所属序列，清空默认值即可取消。',
     mysqlColumnOptions: 'MySQL 列选项',
     mysqlUnsigned: 'UNSIGNED',
     mysqlAutoIncrement: 'AUTO_INCREMENT',
@@ -3530,6 +3531,8 @@ const en: typeof zh = {
     mysqlCollation: 'Collation',
     mysqlSafeIdentErr: 'Only 1–64 ASCII letters, digits, and underscores are allowed',
     mysqlTypeHint: "Supports inline types such as enum('a','b') and set('x','y')",
+    serialKeptHint:
+      "Auto-increment stays enabled because the default still uses this column's sequence. Clear the default to disable it.",
     mysqlColumnOptions: 'MySQL column options',
     mysqlUnsigned: 'UNSIGNED',
     mysqlAutoIncrement: 'AUTO_INCREMENT',

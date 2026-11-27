@@ -41,6 +41,20 @@ Dowel 的每个项目在创建时绑定一种目标数据库方言，并在全�
 | `uuidv7()` 内置函数调用                       | PostgreSQL 18+ | 静态规则发出兼容警告（不阻断用户自定义同名函数） |
 | `REPACK`                                      | PostgreSQL 19+ | 按 PG 19 能力标识                                |
 
+### serial 写法 {#pg-serial}
+
+列类型输入 `serial`、`bigserial` 或 `smallserial`（也可写 `serial4`、`serial8`、`serial2`，不区分大小写；带双引号的 `"serial"` 视为自定义类型名，不展开）时，Dowel 在写入模型时把它展开成 PostgreSQL 实际建出的结构，模型里不保存 `serial`：
+
+- 对应的 `integer`、`bigint` 或 `smallint` 列，并设为 `NOT NULL`；
+- 一个归属于该列的序列，默认按 `{表名}_{列名}_seq` 派生命名（超长截断、重名加数字后缀的规则与 PostgreSQL 相同），表或列改名时跟着改名；
+- 指向该序列的 `nextval(...)` 默认值。
+
+属性面板、MCP 和粘贴等所有写入入口都按这一规则写入。属性面板在某列同时满足“整数类型、默认值指向一个序列、该序列归属于此列”时，把类型显示为 `serial (integer)`、`bigserial (bigint)` 或 `smallserial (smallint)`（列表折叠行简写为 `serial`、`bigserial`、`smallserial`），从数据库导入的同类列也这样显示；类型候选里也有这三项。
+
+- **在 serial 写法之间切换**（如 `serial (integer)` 改成 `bigserial (bigint)`）：列类型和所属序列的类型一起调整，不新建序列。
+- **改成其他类型**（包括重新输入 `integer` 等底层整数类型）：只改列类型，默认值与序列保持不变，自增仍然有效；要取消自增，清空默认值即可。清空默认值后再改回 serial 写法，会复用原来归属此列的序列。
+- **不能直接改成 serial 的列**：已有其他默认值、`IDENTITY` 或生成列，需先清空默认值或取消 `IDENTITY`；serial 也不能用作数组类型。
+
 ### 非事务语句与中断恢复 {#pg-nontx}
 
 `CREATE/DROP INDEX CONCURRENTLY`、`VACUUM`、`REINDEX DATABASE/SYSTEM`、无表名 `CLUSTER` 与 `ALTER TYPE … ADD VALUE` 等在事务外逐段执行并记录断点。对于 `CREATE INDEX CONCURRENTLY` 失败遗留的 `INVALID` 索引，重试前自动精确删除；对于 `ALTER TABLE … DETACH PARTITION … CONCURRENTLY` 因等锁超时停在 `detach pending` 状态的步骤，重试时自动改用 `FINALIZE` 完成分离。
