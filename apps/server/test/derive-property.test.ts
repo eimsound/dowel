@@ -2,15 +2,16 @@
 //
 // 用一个假引擎代替影子库：规范形式只取决于对象自身文本和 derive-pending.ts 声明会影响它的上下文
 // （表达式：同表被引用列的 type / typeRef / collation，列自身的默认值 / 生成列再加上自己的类型；
-// 不透明对象：父对象与依赖的完整限定名、依赖列的类型）。真实 canonicalize 读回全部对象，判定正确时变化的也只会是
-// 待规范化对象；假引擎刻意只改写 pendingRefreshIds(prev, next) 里的对象——这样判定漏掉的对象不会被顺手改好，
+// 不透明对象：父对象与依赖的完整限定名、依赖列的类型）。真实 canonicalize（apps/server/src/shadow.ts:442）会读回并比较全部对象，
+// 判定正确时变化的也只会是待规范化对象；假引擎刻意更严格，只改写 pendingRefreshIds(prev, next) 里的对象——这样判定漏掉的对象不会被顺手改好，
 // 会在 I1 / I2 里暴露出来（规范形式本身用不依赖判定的 canonObj 独立计算）。
 //
 // 随机生成一串操作（画布编辑、flush、normalize、runWithReset / runWithoutReset 整体替换、新建 refresher、故障注入），
 // 操作按它调用的 OpaqueRefresher API 命名，不断言“哪个路由用哪种模式”。每步之后断言：
 // - I1：基线不为空时，基线里每个对象都是假引擎下的不动点；
 // - I2：不在 pendingRefreshIds(baseline, cur) 里的对象，再规范化一次不变；
-// - I3：失败的 flush / normalize / runWithReset（期间没有任何一次规范化写回被接受）前后基线 deepEqual；
+// - I3：失败或写回全被拒绝的 flush / normalize / runWithReset（期间没有任何一次写回被接受，saves === accepted）前后基线 deepEqual，
+//   且被拒绝 / 失败的写回绝不持久化基线；
 // - I4：影子库可用且没有并发写入 / 写回拒绝时，一次 flush 之后 needsRefresh(baseline, cur) === false。
 //
 // 前置条件（生成器保证）：无条件 runWithReset 与“带基线新建 refresher”只喂假引擎下的不动点模型（canonModel）。
@@ -26,7 +27,7 @@
 import { deepEqual, EditError, emptyModel, type Model, type Obj, runMutator } from '@dowel/core';
 import { StepError } from '@dowel/verifier';
 import fc from 'fast-check';
-import { describe, expect, onTestFinished, test, vi } from 'vitest';
+import { describe, expect, test, vi } from 'vitest';
 
 import { exprsOf, fullName, needsRefresh, OpaqueRefresher, pendingRefreshIds } from '../src/derive.ts';
 import type { Rooms } from '../src/rooms.ts';
@@ -35,10 +36,6 @@ import { type Shadow, ShadowError } from '../src/shadow.ts';
 const RUNS = Number(process.env.DERIVE_RUNS ?? 200);
 const SEED = Number(process.env.DERIVE_SEED ?? 20261127);
 const BRANCH = 'b';
-
-/** 覆盖率统计：防止生成器空转（某类操作 / 结果从没真正发生过时，属性测试会“绿”得毫无意义） */
-const stats = new Map<string, number>();
-const hit = (k: string) => stats.set(k, (stats.get(k) ?? 0) + 1);
 
 type Column = Extract<Obj, { kind: 'column' }>;
 type Check = Extract<Obj, { kind: 'check' }>;
@@ -553,6 +550,17 @@ class World {
   shadowAsked = 0;
   base = memStore();
   refresher = this.newRefresher();
+  /** 覆盖率统计：每次运行独立持有，避免全局状态依赖测试执行顺序 */
+  private stats?: Map<string, number>;
+
+  constructor(stats?: Map<string, number>) {
+    this.stats = stats;
+  }
+
+  private hit(k: string) {
+    if (!this.stats) return;
+    this.stats.set(k, (this.stats.get(k) ?? 0) + 1);
+  }
 
   newRefresher(seed?: Model): OpaqueRefresher {
     this.base = memStore();
@@ -581,7 +589,7 @@ class World {
       // canonicalize 期间别人提交了一次编辑（只发生一次）
       const edit = this.fault.edit;
       this.fault = { kind: 'none' };
-      this.edit(edit);
+      if (this.edit(edit)) this.hit('concurrent:applied');
     }
     this.canonReturned++;
     const out: Obj[] = [];
@@ -589,18 +597,20 @@ class World {
       const o = next.objects[id]!;
       const c = canonObj(next, o);
       if (!deepEqual(c, o)) {
-        hit(`rewrite:${o.kind}`);
+        this.hit(`rewrite:${o.kind}`);
         out.push(structuredClone(c));
       }
     }
     return out;
   }
 
-  edit(e: Edit) {
+  edit(e: Edit): boolean {
     const draft = structuredClone(this.room.m);
-    if (!applyEdit(draft, e)) return;
-    hit(`edit:${e.k}`);
+    if (!applyEdit(draft, e)) return false;
+    this.hit(`edit:${e.k}`);
+    const seq0 = this.room.seq;
     this.room.commit(draft);
+    return this.room.seq !== seq0;
   }
 
   snapshot(h: number): Model {
@@ -624,10 +634,12 @@ class World {
         const asked0 = this.shadowAsked;
         const saves0 = this.base.saved.length;
         let failed: boolean;
+        let flushKind: 'clean' | 'normalized' | 'skipped' | null = null;
         if (op.op === 'flush') {
           const out = await r.flush(BRANCH);
           failed = out.kind === 'skipped';
-          hit(`flush:${out.kind}`);
+          flushKind = out.kind;
+          this.hit(`flush:${out.kind}`);
           if (out.kind === 'clean') {
             // 出口 0 I/O：没有待规范化对象时不连影子库、不写基线
             expect(this.shadowAsked, 'clean flush 不应解析影子库').toBe(asked0);
@@ -647,19 +659,27 @@ class World {
             () => true,
           );
           if (!faulty) expect(failed, 'normalize 无故障时应成功').toBe(false);
-          hit(`normalize:${failed ? 'failed' : 'ok'}`);
+          this.hit(`normalize:${failed ? 'failed' : 'ok'}`);
+        }
+        if (op.op === 'flush' && this.canonReturned - canon0 > 1) {
+          this.hit('flush:retried');
+          if (op.fault.kind === 'concurrent') this.hit('flush:retried:concurrent');
         }
         const accepted = this.canonReturned - canon0 - (this.room.patchRejected - rej0);
+        const saves = this.base.saved.length - saves0;
         this.fault = { kind: 'none' };
         this.room.rejectNext = 0;
-        // I3：失败且期间没有被接受的写回 → 基线不变
-        if (failed && accepted === 0) {
-          hit(`I3:${op.op}:${op.fault.kind}`);
-          expect(this.baseline(), `I3：${op.op} 失败后基线被改写`).toEqual(before);
+        // I3：每次基线持久化都必须对应一次被接受的写回；被拒绝 / 失败的写回绝不能推进基线
+        expect(saves, `I3：${op.op} 写回被拒或失败时不应写入基线`).toBe(accepted);
+        // 期间没有任何一次写回被接受（失败、写回全被拒绝或未连影子库）→ 基线不变
+        if (accepted === 0) {
+          if (failed) this.hit(`I3:${op.op}:${op.fault.kind}`);
+          expect(this.baseline(), `I3：${op.op} 无有效写回却改写了基线`).toEqual(before);
         }
         // I4：影子库可用且无并发写入时，一次出口之后不再有待规范化对象
         if (!faulty) {
-          hit(`I4:${op.op}`);
+          this.hit(`I4:${op.op}`);
+          if (flushKind === 'normalized') this.hit('I4:flush:normalized');
           expect(needsRefresh(this.baseline(), this.room.m), `I4：${op.op} 之后仍有待规范化对象`).toBe(false);
           // 只读状态与之一致（状态栏显示“表达式已规范化”）
           await expect(r.status(BRANCH)).resolves.toMatchObject({
@@ -672,14 +692,14 @@ class World {
       case 'runWithoutReset': {
         const m = this.snapshot(op.h);
         await r.runWithoutReset(BRANCH, async () => this.room.commit(m));
-        hit(`runWithoutReset:${needsRefresh(before, m) ? 'dirty' : 'clean'}`);
+        this.hit(`runWithoutReset:${needsRefresh(before, m) ? 'dirty' : 'clean'}`);
         expect(this.baseline(), 'runWithoutReset 不应改写基线').toEqual(before);
         break;
       }
       case 'runWithResetIfClean': {
         const m = op.canonical ? canonModel(this.snapshot(op.h)) : this.snapshot(op.h);
         const dirty = needsRefresh(before, m);
-        hit(`runWithResetIfClean:${dirty ? 'kept' : 'advanced'}`);
+        this.hit(`runWithResetIfClean:${dirty ? 'kept' : 'advanced'}`);
         await r.runWithReset(BRANCH, m, async () => this.room.commit(m), { onlyIfClean: true });
         expect(this.baseline(), 'onlyIfClean：基线只能不变或推进到传入模型').toEqual(dirty ? before : m);
         break;
@@ -687,7 +707,7 @@ class World {
       case 'runWithResetFixedPoint': {
         const m = canonModel(this.snapshot(op.h));
         await r.runWithReset(BRANCH, m, async () => this.room.commit(m));
-        hit('runWithResetFixedPoint');
+        this.hit('runWithResetFixedPoint');
         expect(this.baseline()).toEqual(m);
         break;
       }
@@ -704,7 +724,7 @@ class World {
             { onlyIfClean: op.onlyIfClean },
           ),
         ).rejects.toThrow('working changed');
-        hit('I3:runWithResetThrows');
+        this.hit('I3:runWithResetThrows');
         expect(this.baseline(), 'I3：runWithReset 失败后基线被改写').toEqual(before);
         break;
       }
@@ -718,7 +738,7 @@ class World {
           if (op.h !== null) this.room.commit(canonModel(this.snapshot(op.h)));
           this.refresher = this.newRefresher();
         }
-        hit(`freshRefresher:${op.seeded ? 'seeded' : 'null'}`);
+        this.hit(`freshRefresher:${op.seeded ? 'seeded' : 'null'}`);
         break;
       }
       case 'violatePrecondition': {
@@ -741,20 +761,26 @@ class World {
   checkInvariants(step: number) {
     const b = this.baseline();
     if (b) {
-      if (Object.values(b.objects).some((o) => exprsOf(o) !== null)) hit('I1:withExprs');
-      expect(nonFixed(b, Object.keys(b.objects)), `I1：第 ${step} 步后基线里有非不动点`).toEqual([]);
+      if (Object.values(b.objects).some((o) => exprsOf(o) !== null)) this.hit('I1:withExprs');
+      const bad = nonFixed(b, Object.keys(b.objects));
+      if (bad.length) expect(bad, `I1：第 ${step} 步后基线里有非不动点：${JSON.stringify(bad)}`).toEqual([]);
     }
     const cur = this.room.m;
     const pending = new Set(pendingRefreshIds(b, cur));
     const rest = Object.keys(cur.objects).filter((id) => !pending.has(id));
-    if (rest.some((id) => exprsOf(cur.objects[id]) !== null)) hit('I2:withExprs');
-    expect(nonFixed(cur, rest), `I2：第 ${step} 步后有未判为待规范化、却会被规范化改写的对象`).toEqual([]);
+    if (rest.some((id) => exprsOf(cur.objects[id]) !== null)) this.hit('I2:withExprs');
+    const bad = nonFixed(cur, rest);
+    if (bad.length)
+      expect(
+        bad,
+        `I2：第 ${step} 步后有未判为待规范化、却会被规范化改写的对象：${JSON.stringify(bad)}`,
+      ).toEqual([]);
   }
 }
 
-const runOps = async (ops: Op[]) => {
+const runOps = async (ops: Op[], stats?: Map<string, number>) => {
   fresh = 0;
-  const w = new World();
+  const w = new World(stats);
   w.checkInvariants(0);
   for (const [i, op] of ops.entries()) {
     await w.run(op);
@@ -813,69 +839,94 @@ describe('假引擎自检', () => {
 });
 
 describe('OpaqueRefresher 黄金基线不变量（I1–I4）', () => {
-  test('随机操作序列', async () => {
+  let cachedStats: Map<string, number> | null = null;
+  const runRandomSuite = async (): Promise<Map<string, number>> => {
+    const s = new Map<string, number>();
     // 非 ShadowError 的规范化失败会 console.warn（预期内的故障注入），这里静音
     const warn = vi.spyOn(console, 'warn').mockImplementation(() => {});
-    onTestFinished(() => warn.mockRestore());
-    await fc.assert(fc.asyncProperty(fc.array(opArb, { minLength: 1, maxLength: 50, size: 'max' }), runOps), {
-      numRuns: RUNS,
-      seed: SEED,
-    });
+    try {
+      await fc.assert(
+        fc.asyncProperty(fc.array(opArb, { minLength: 1, maxLength: 50, size: 'max' }), (ops) =>
+          runOps(ops, s),
+        ),
+        {
+          numRuns: RUNS,
+          seed: SEED,
+        },
+      );
+    } finally {
+      warn.mockRestore();
+    }
+    return s;
+  };
+
+  test('随机操作序列', async () => {
+    cachedStats = await runRandomSuite();
   }, 120_000);
 
-  // 只在默认及以上的运行次数下检查（DERIVE_RUNS 调小做冒烟时不强求每类都出现）
-  test.skipIf(RUNS < 200)('覆盖率：每类操作、故障与结果都真实发生过', () => {
-    const want = [
-      ...[
-        'addCheck',
-        'setCheckExpr',
-        'setDefault',
-        'addGenerated',
-        'addIndexExpr',
-        'addColumn',
-        'setColumnType',
-        'setCollation',
-        'renameColumn',
-        'renameTable',
-        'renameEnum',
-        'renameSchema',
-        'dropColumn',
-        'addView',
-        'editViewDdl',
-      ].map((k) => `edit:${k}`),
-      'flush:clean',
-      'flush:normalized',
-      'flush:skipped',
-      'normalize:ok',
-      'normalize:failed',
-      'rewrite:check',
-      'rewrite:column',
-      'rewrite:index',
-      'rewrite:opaque',
-      ...['nullShadow', 'shadowError', 'stepError', 'otherError', 'reject'].flatMap((k) => [
-        `I3:flush:${k}`,
-        `I3:normalize:${k}`,
-      ]),
-      'I3:runWithResetThrows',
-      'I4:flush',
-      'I4:normalize',
-      'runWithoutReset:dirty',
-      'runWithResetIfClean:kept',
-      'runWithResetIfClean:advanced',
-      'runWithResetFixedPoint',
-      'freshRefresher:null',
-      'freshRefresher:seeded',
-      'I1:withExprs',
-      'I2:withExprs',
-    ];
-    const missing = want.filter((k) => !stats.get(k));
-    if (process.env.DERIVE_STATS)
-      console.log(Object.fromEntries([...stats].sort(([a], [b]) => a.localeCompare(b))));
-    expect(missing).toEqual([]);
-  });
+  // 自包含：单独用 `-t 覆盖率` 或乱序执行时若尚未跑过随机用例，会自动补跑同一批随机序列再校验覆盖率；
+  // 只在默认及以上的运行次数下检查（DERIVE_RUNS 调小做冒烟时不强求每类都出现）。
+  test.skipIf(RUNS < 200)(
+    '覆盖率：每类操作、故障与结果都真实发生过',
+    async () => {
+      const stats = cachedStats ?? (await runRandomSuite());
+      const want = [
+        ...[
+          'addCheck',
+          'setCheckExpr',
+          'setDefault',
+          'addGenerated',
+          'addIndexExpr',
+          'addColumn',
+          'setColumnType',
+          'setCollation',
+          'renameColumn',
+          'renameTable',
+          'renameEnum',
+          'renameSchema',
+          'dropColumn',
+          'addView',
+          'editViewDdl',
+        ].map((k) => `edit:${k}`),
+        'flush:clean',
+        'flush:normalized',
+        'flush:skipped',
+        'normalize:ok',
+        'normalize:failed',
+        'rewrite:check',
+        'rewrite:column',
+        'rewrite:index',
+        'rewrite:opaque',
+        ...['nullShadow', 'shadowError', 'stepError', 'otherError', 'reject'].flatMap((k) => [
+          `I3:flush:${k}`,
+          `I3:normalize:${k}`,
+        ]),
+        'I3:runWithResetThrows',
+        'concurrent:applied',
+        'flush:retried',
+        'flush:retried:concurrent',
+        'I4:flush',
+        'I4:flush:normalized',
+        'I4:normalize',
+        'runWithoutReset:dirty',
+        'runWithResetIfClean:kept',
+        'runWithResetIfClean:advanced',
+        'runWithResetFixedPoint',
+        'freshRefresher:null',
+        'freshRefresher:seeded',
+        'I1:withExprs',
+        'I2:withExprs',
+      ];
+      const missing = want.filter((k) => !stats.get(k));
+      if (process.env.DERIVE_STATS)
+        console.log(Object.fromEntries([...stats].sort(([a], [b]) => a.localeCompare(b))));
+      expect(missing).toEqual([]);
+    },
+    120_000,
+  );
 });
 
-// ───── 已知缺陷（待修复，另提 Issue；修好后把 it.fails 改回 test） ─────
+// ───── 已知缺陷（待修复，另提 Issue；修好后把这两条改成普通 test，直接 runOps([...]) 并去掉 expectViolation） ─────
 //
 // 表达式按“列名”引用列，pendingRefreshIds 却只按“列 ID”比较同表列的 type / typeRef / collation（derive-pending.ts
 // columnTypeChanged / anyColumnChanged），不把同表列改名（名字 → 列的绑定变化）当作上下文变化。
@@ -911,18 +962,21 @@ const expectViolation = async (ops: Op[], invariant: RegExp) => {
 describe('已知缺陷：同表列名对调后过期表达式漏判', () => {
   // history[4] 是第 4 步之后的房间模型 H
   test.fails('runWithoutReset 换入过期模型后漏判（I2）', () =>
-    expectViolation([...COLUMN_SWAP, { op: 'runWithoutReset', h: 4 }], /^I2：第 9 步后/));
+    expectViolation(
+      [...COLUMN_SWAP, { op: 'runWithoutReset', h: 4 }],
+      /^I2：第 9 步后[\s\S]*"kind":"check"[\s\S]*\(note::text > 0\)/,
+    ));
   test.fails('runWithReset({ onlyIfClean: true }) 把未规范化模型写成基线（I1）', () =>
     expectViolation(
       [...COLUMN_SWAP, { op: 'runWithResetIfClean', h: 4, canonical: false }],
-      /^I1：第 9 步后/,
+      /^I1：第 9 步后[\s\S]*"kind":"check"[\s\S]*\(note::text > 0\)/,
     ));
-  test('对照：不对调列名时同一序列满足全部不变量', () =>
-    runOps([
-      ...COLUMN_SWAP.slice(0, 4),
-      { op: 'flush', fault: { kind: 'none' } },
-      { op: 'runWithoutReset', h: 4 },
-    ]));
+  // 严格差分对照：只去掉两次 renameColumn，保留其余全部步骤（含 setCheckExpr 与第二次 flush）
+  test('对照：不对调列名时同一序列满足全部不变量', async () => {
+    const noSwap = COLUMN_SWAP.filter((op) => op.op !== 'edit' || op.edit.k !== 'renameColumn');
+    await runOps([...noSwap, { op: 'runWithoutReset', h: 4 }]);
+    await runOps([...noSwap, { op: 'runWithResetIfClean', h: 4, canonical: false }]);
+  });
 });
 
 // ───── 前置条件依赖（文档性示例，不是生产缺陷） ─────
