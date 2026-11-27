@@ -1,8 +1,12 @@
 // 工作区状态：WebSocket 连接同步房间（断线自动重连），SyncClient 维护模型，另外管理画布布局、板块和在线成员。
 import { type CanvasSection, type Role, sanitizeSections } from '@dowel/api';
 import { EditError, emptyModel, type Model, newId } from '@dowel/core';
-import { SyncClient, type ToClient, type Versions } from '@dowel/sync';
+import { SyncClient, SyncMessageTooLargeError, type ToClient, type Versions } from '@dowel/sync';
 import { useEffect, useLayoutEffect, useState, useSyncExternalStore } from 'react';
+
+import i18n from './i18n.ts';
+
+const mb = (bytes: number) => (bytes / 1048576).toFixed(1);
 
 export type Layout = Record<string, { x: number; y: number }>;
 export type Status = 'connecting' | 'online' | 'offline';
@@ -113,6 +117,12 @@ export class Workspace {
         this.onNotice(e.reason || '没有权限', 'error');
         return;
       }
+      // 1009：发出的消息超过服务端单条上限。正常情况下发送前就会在本地拦下（SyncClient.mutate），
+      // 走到这里说明两边上限不一致：丢掉待确认修改再重连，否则重连后会重发同一批消息被反复断开
+      if (e.code === 1009) {
+        const dropped = this.client.dropPending();
+        this.onNotice(i18n.t('ws.messageTooLarge', { count: dropped }), 'error');
+      }
       this.update({ status: 'offline' });
       const delay = Math.min(10_000, 500 * 2 ** this.retry++);
       setTimeout(() => !this.stopped && this.start(), delay);
@@ -130,6 +140,13 @@ export class Workspace {
       this.client.mutate(name, args, basis);
       return true;
     } catch (e) {
+      if (e instanceof SyncMessageTooLargeError) {
+        this.onNotice(
+          i18n.t('ws.opTooLarge', { size: mb(e.bytes), max: Math.round(e.max / 1048576) }),
+          'error',
+        );
+        return false;
+      }
       if (e instanceof EditError) {
         this.onNotice(e.message, 'error');
         return false;

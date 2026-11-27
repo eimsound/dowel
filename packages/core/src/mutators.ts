@@ -32,6 +32,13 @@ export const objectIdArg = z
 export const objectNameArg = z.string().min(1).max(128);
 const id = objectIdArg;
 const name = objectNameArg;
+/**
+ * mutator 参数里单个自由文本字段（类型、表达式、分区边界、注释、排序规则……）的字符上限（Issue #150）。
+ * 与冻结脚本单步 SQL 的上限（stepsPatchSchema，100 万字符）一致：合法内容远小于它，
+ * 超长的单个字段在 zod 校验处就被拒绝，不进入 normalizeType / 表达式扫描，也不会写进模型
+ */
+export const MAX_TEXT_ARG_LENGTH = 1_000_000;
+const text = z.string().max(MAX_TEXT_ARG_LENGTH, '文本太长：单个字段最多 100 万个字符');
 
 /** 修改一个 CHECK 约束的表达式（推导名会随引用的列变化） */
 export const setCheckExpr = (m: Model, checkId: string, expr: string) => {
@@ -50,13 +57,12 @@ export const mutators = {
   renameSchema: def(z.object({ id, name }), (m, a) => E.renameSchema(m, a.id, a.name)),
   dropSchema: def(z.object({ id }), (m, a) => E.dropSchema(m, a.id)),
 
-  createEnum: def(z.object({ id, schema: id, name, values: z.array(z.string().min(1)).min(1) }), (m, a) =>
+  createEnum: def(z.object({ id, schema: id, name, values: z.array(text.min(1)).min(1) }), (m, a) =>
     E.createEnum(m, a.schema, a.name, a.values, a.id),
   ),
   renameEnum: def(z.object({ id, name }), (m, a) => E.renameEnum(m, a.id, a.name)),
-  addEnumValue: def(
-    z.object({ id, value: z.string().min(1), index: z.number().int().min(0).optional() }),
-    (m, a) => E.addEnumValue(m, a.id, a.value, a.index),
+  addEnumValue: def(z.object({ id, value: text.min(1), index: z.number().int().min(0).optional() }), (m, a) =>
+    E.addEnumValue(m, a.id, a.value, a.index),
   ),
   dropEnum: def(z.object({ id }), (m, a) => E.dropEnum(m, a.id)),
 
@@ -88,13 +94,13 @@ export const mutators = {
     E.setPartitionBy(m, a.id, a.partitionBy),
   ),
   createPartition: def(
-    z.object({ id, parent: id, name, bound: z.string().min(1), schema: id.optional() }),
+    z.object({ id, parent: id, name, bound: text.min(1), schema: id.optional() }),
     (m, a) => E.createPartition(m, a.parent, a.name, a.bound, a.id, a.schema),
   ),
-  setPartitionBound: def(z.object({ id, bound: z.string().min(1) }), (m, a) =>
+  setPartitionBound: def(z.object({ id, bound: text.min(1) }), (m, a) =>
     E.setPartitionBound(m, a.id, a.bound),
   ),
-  attachPartition: def(z.object({ parent: id, child: id, bound: z.string().min(1) }), (m, a) =>
+  attachPartition: def(z.object({ parent: id, child: id, bound: text.min(1) }), (m, a) =>
     E.attachPartition(m, a.parent, a.child, a.bound),
   ),
   detachPartition: def(z.object({ id }), (m, a) => E.detachPartition(m, a.id)),
@@ -105,7 +111,7 @@ export const mutators = {
       column: z.object({
         id,
         name,
-        type: z.string(),
+        type: text,
         typeRef: id.nullable().optional(),
         notNull: z.boolean().optional(),
         default: ColumnDefault.nullable().optional(),
@@ -114,10 +120,10 @@ export const mutators = {
           .nullable()
           .optional(),
         generated: z
-          .object({ expr: z.string().min(1), stored: z.boolean() })
+          .object({ expr: text.min(1), stored: z.boolean() })
           .nullable()
           .optional(),
-        collation: z.string().nullable().optional(),
+        collation: text.nullable().optional(),
         before: id.optional(),
         ext: ColumnExt.optional(),
       }),
@@ -126,7 +132,7 @@ export const mutators = {
   ),
   renameColumn: def(z.object({ id, name }), (m, a) => E.renameColumn(m, a.id, a.name)),
   dropColumn: def(z.object({ id }), (m, a) => E.dropColumn(m, a.id)),
-  setColumnType: def(z.object({ id, type: z.string(), typeRef: id.nullable() }), (m, a) =>
+  setColumnType: def(z.object({ id, type: text, typeRef: id.nullable() }), (m, a) =>
     E.setColumnType(m, a.id, a.type, a.typeRef),
   ),
   setNotNull: def(z.object({ id, notNull: z.boolean() }), (m, a) => E.setNotNull(m, a.id, a.notNull)),
@@ -157,11 +163,10 @@ export const mutators = {
     }),
     (m, a) => E.addUnique(m, a.table, a.columns, a.nullsNotDistinct ?? false, a.id, a.ext),
   ),
-  addCheck: def(
-    z.object({ id, table: id, expr: z.string().min(1), noInherit: z.boolean().optional() }),
-    (m, a) => E.addCheck(m, a.table, a.expr, a.id, a.noInherit ?? false),
+  addCheck: def(z.object({ id, table: id, expr: text.min(1), noInherit: z.boolean().optional() }), (m, a) =>
+    E.addCheck(m, a.table, a.expr, a.id, a.noInherit ?? false),
   ),
-  setCheckExpr: def(z.object({ id, expr: z.string().min(1) }), (m, a) => setCheckExpr(m, a.id, a.expr)),
+  setCheckExpr: def(z.object({ id, expr: text.min(1) }), (m, a) => setCheckExpr(m, a.id, a.expr)),
   addForeignKey: def(
     z.object({
       id,
@@ -198,9 +203,9 @@ export const mutators = {
         )
         .min(1, { message: '索引至少需要一个元素' }),
       unique: z.boolean().optional(),
-      method: z.string().optional(),
+      method: text.optional(),
       include: z.array(id).optional(),
-      where: z.string().nullable().optional(),
+      where: text.nullable().optional(),
       nullsNotDistinct: z.boolean().optional(),
       ext: IndexExt.optional(),
     }),
@@ -217,9 +222,7 @@ export const mutators = {
   renameKey: def(z.object({ id, name }), (m, a) => E.renameKey(m, a.id, a.name)),
   resetKeyName: def(z.object({ id }), (m, a) => E.resetKeyName(m, a.id)),
 
-  setComment: def(z.object({ id, comment: z.string().nullable() }), (m, a) =>
-    E.setComment(m, a.id, a.comment),
-  ),
+  setComment: def(z.object({ id, comment: text.nullable() }), (m, a) => E.setComment(m, a.id, a.comment)),
 };
 
 /**

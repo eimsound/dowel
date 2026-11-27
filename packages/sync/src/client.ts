@@ -4,11 +4,14 @@ import { EditError, type Model, MutableModelIndex } from '@dowel/core';
 import {
   applyChanges,
   type Commit,
+  exceedsUtf8Bytes,
   execute,
+  MAX_SYNC_MESSAGE_BYTES,
   type Op,
   opReads,
   type ToClient,
   type ToServer,
+  utf8Bytes,
   type Ver,
   type Versions,
   verOf,
@@ -17,6 +20,24 @@ import {
 export interface PendingOp extends Op {
   /** 在当前已确认状态上已经执行不了：服务器一定会拒绝它，界面上标为冲突 */
   stale?: boolean;
+}
+
+/** 修改序列化后超过单条同步消息上限：本地拒绝，不发送、不进待确认队列 */
+export class SyncMessageTooLargeError extends EditError {
+  readonly bytes: number;
+  readonly max: number;
+  constructor(bytes: number, max: number) {
+    super(
+      `这次修改太大（约 ${(bytes / 1048576).toFixed(1)} MB），超过单条同步消息上限 ${(max / 1048576).toFixed(0)} MB，没有提交。请分批操作。`,
+    );
+    this.bytes = bytes;
+    this.max = max;
+  }
+}
+
+export interface SyncClientOptions {
+  /** 单条 op 消息的字节上限（默认 MAX_SYNC_MESSAGE_BYTES，测试可调小） */
+  maxMessageBytes?: number;
 }
 
 export class SyncClient {
@@ -37,11 +58,13 @@ export class SyncClient {
   private listeners = new Set<() => void>();
   private confirmedIndex: MutableModelIndex | null = null;
   send: (m: ToServer) => void = () => {};
+  private readonly maxMessageBytes: number;
 
-  constructor(id: string, model: Model) {
+  constructor(id: string, model: Model, options: SyncClientOptions = {}) {
     this.id = id;
     this.confirmed = model;
     this.view = model;
+    this.maxMessageBytes = options.maxMessageBytes ?? MAX_SYNC_MESSAGE_BYTES;
   }
 
   private getConfirmedIndex(): MutableModelIndex {
@@ -58,14 +81,20 @@ export class SyncClient {
 
   /**
    * 发起修改。basis：编辑框打开时记下的对象版本（草稿场景，见 04-ir-design.md 2.3）。
-   * 本地执行不合法时直接抛 EditError，不发给服务器。
+   * 本地执行不合法时直接抛 EditError，不发给服务器；序列化后超过单条消息上限时抛 SyncMessageTooLargeError
+   * （服务端会以 1009 断开这样的连接，重连后重发同一条又会被断开，所以必须在进队列之前拒绝）。
    */
   mutate(name: string, args: unknown, basis?: Versions): number {
     const baseIdx = this.pending.length === 0 ? this.getConfirmedIndex() : undefined;
     const { next, changes } = execute(this.view, name, args, baseIdx);
     let reads = opReads(this.view, this.viewVersions, args, changes, name);
     if (basis) reads = reads.map(([id, v]) => [id, Object.hasOwn(basis, id) ? basis[id]! : v]);
-    const rawOp: Op = { client: this.id, n: this.nextN++, name, args, reads };
+    const rawOp: Op = { client: this.id, n: this.nextN, name, args, reads };
+    const frame = JSON.stringify({ t: 'op', op: rawOp } satisfies ToServer);
+    if (exceedsUtf8Bytes(frame, this.maxMessageBytes))
+      throw new SyncMessageTooLargeError(utf8Bytes(frame), this.maxMessageBytes);
+    // 序号只在确定要发出时才占用：服务端要求每个客户端的 n 严格连续
+    this.nextN++;
     const op: PendingOp = { ...rawOp, stale: false };
     this.pending.push(op);
     this.view = next;
@@ -162,6 +191,17 @@ export class SyncClient {
       this.viewVersions = vv;
     }
     for (const fn of this.listeners) fn();
+  }
+
+  /**
+   * 丢弃全部待确认修改，界面回到已确认状态；返回丢弃的条数。
+   * 服务端以 1009（消息过大）断开时调用：否则重连收到 welcome 后会重发同一批修改，再次被断开。
+   */
+  dropPending(): number {
+    const dropped = this.pending.length;
+    this.pending = [];
+    this.rebuild();
+    return dropped;
   }
 
   connect() {

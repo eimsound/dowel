@@ -958,6 +958,8 @@ const zh = {
     status: { connecting: '连接中', online: '已连接', offline: '已断开，正在重连' },
     sync: { connecting: '连接中…', online: '已同步', offline: '重新连接中…' },
     pending: '{{count}} 处修改待确认',
+    opTooLarge: '这次修改太大（约 {{size}} MB），超过单条同步消息上限 {{max}} MB，没有提交。请分批操作。',
+    messageTooLarge: '发出的同步消息超过服务器上限，连接已重置，{{count}} 处未确认的修改已丢弃。',
     canvas: '画布',
     sql: 'SQL',
     view: '视图',
@@ -3385,6 +3387,10 @@ const en: typeof zh = {
     status: { connecting: 'Connecting', online: 'Connected', offline: 'Disconnected, reconnecting' },
     sync: { connecting: 'Connecting…', online: 'Synced', offline: 'Reconnecting…' },
     pending: '{{count}} changes pending',
+    opTooLarge:
+      'This change is too large (about {{size}} MB); a single sync message is limited to {{max}} MB, so it was not submitted. Split it into smaller steps.',
+    messageTooLarge:
+      'A sync message exceeded the server limit. The connection was reset and {{count}} unconfirmed changes were discarded.',
     canvas: 'Canvas',
     sql: 'SQL',
     view: 'View',
