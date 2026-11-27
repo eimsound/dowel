@@ -53,7 +53,7 @@ import {
   validatePartitionBound,
 } from './pg/partition.ts';
 import { getDialect } from './registry.ts';
-import { SQLITE_STRICT_TYPES } from './sqlite/types.ts';
+import { SQLITE_STRICT_TYPES, sqliteNormalizeCollation } from './sqlite/types.ts';
 
 export { EditError, exprReferences, renameInExpr, renameQualifiedInExpr, type Token, tokenize };
 
@@ -1079,9 +1079,21 @@ export interface ColumnSpec {
   ext?: ColumnExt;
 }
 
+/**
+ * 普通列类型的规范写法（各方言 normalizeType，与界面输入类型时的规范化一致），让模型与引擎读回的写法可以直接比较（#132）。
+ * 枚举列（有 typeRef，type 只是数组维度）与空类型原样保留。
+ */
+const canonicalColumnType = (m: Model, type: string, typeRef: string | null | undefined): string =>
+  typeRef || !type.trim() ? type : getDialect(m.dialect).normalizeType(type);
+
+/** 排序规则的规范写法：目前只有 SQLite 内置排序规则（大写），其他方言的排序规则名依赖目标库目录，原样保留 */
+const canonicalCollation = (m: Model, collation: string | null): string | null =>
+  m.dialect === 'sqlite' ? sqliteNormalizeCollation(collation) : collation;
+
 export const addColumn = (m: Model, table: string, spec: ColumnSpec): string => {
   const t = get(m, table, 'table');
   const d = getDialect(m.dialect);
+  const type = canonicalColumnType(m, spec.type, spec.typeRef);
   assertIdent(m, spec.name, 'column');
   normalizePartitionFamily(m, table);
   assertNotPartitionChild(m, table);
@@ -1104,7 +1116,7 @@ export const addColumn = (m: Model, table: string, spec: ColumnSpec): string => 
   if (
     m.dialect === 'sqlite' &&
     t.ext?.sqlite?.strict &&
-    !SQLITE_STRICT_TYPES.has(spec.type.trim().toUpperCase())
+    !SQLITE_STRICT_TYPES.has(type.trim().toUpperCase())
   ) {
     throw new EditError(`STRICT 表不支持列类型 ${spec.type}（仅允许 INT/INTEGER/REAL/TEXT/BLOB/ANY）`);
   }
@@ -1121,7 +1133,7 @@ export const addColumn = (m: Model, table: string, spec: ColumnSpec): string => 
     parent: table,
     name: spec.name,
     pos,
-    type: spec.type,
+    type,
     typeRef: spec.typeRef ?? null,
     notNull: !!(spec.notNull || spec.identity),
     notNullName: null,
@@ -1144,7 +1156,7 @@ export const addColumn = (m: Model, table: string, spec: ColumnSpec): string => 
         }
       : null,
     generated: spec.generated ?? null,
-    collation: spec.collation ?? null,
+    collation: canonicalCollation(m, spec.collation ?? null),
     comment: null,
     ...(cleanedExt ? { ext: cleanedExt as ColumnExt } : {}),
   };
@@ -1293,8 +1305,9 @@ export const dropColumn = (m: Model, id: string) => {
   delete m.objects[id];
 };
 
-export const setColumnType = (m: Model, id: string, type: string, typeRef: string | null = null) => {
+export const setColumnType = (m: Model, id: string, rawType: string, typeRef: string | null = null) => {
   const c = get(m, id, 'column');
+  const type = canonicalColumnType(m, rawType, typeRef);
   assertNotPartitionChild(m, c.parent);
   normalizePartitionFamily(m, c.parent);
   assertNotPartitionKeyCol(m, id, '修改类型');
@@ -1305,7 +1318,7 @@ export const setColumnType = (m: Model, id: string, type: string, typeRef: strin
   if (m.dialect === 'sqlite') {
     const t = get(m, c.parent, 'table');
     if (t.ext?.sqlite?.strict && !SQLITE_STRICT_TYPES.has(type.trim().toUpperCase())) {
-      throw new EditError(`STRICT 表不支持列类型 ${type}（仅允许 INT/INTEGER/REAL/TEXT/BLOB/ANY）`);
+      throw new EditError(`STRICT 表不支持列类型 ${rawType}（仅允许 INT/INTEGER/REAL/TEXT/BLOB/ANY）`);
     }
     if (c.ext?.sqlite?.autoincrement && type.trim().toUpperCase() !== 'INTEGER') {
       clearSqliteAutoincrement(c);
@@ -1634,6 +1647,7 @@ export const addIndex = (
     collation: null,
     ...e,
   }));
+  for (const e of fullElements) e.collation = canonicalCollation(m, e.collation);
   const elCols = fullElements.flatMap((e) => (e.column ? [e.column] : []));
   if (elCols.length) checkCols(m, table, elCols);
   if (opts.include?.length) checkCols(m, table, opts.include);
