@@ -117,3 +117,25 @@ test('sections.update：MCP 调整画布板块按 opCount 渲染并识别 via: m
   expect(viaMcp(data)).toBe(true);
   expect(viaMcp({ opCount: 3 })).toBe(false);
 });
+
+test('历史审计动作 environment.baseline 在中英文下保留兼容文案，不回退到 act.unknown', async () => {
+  await i18n.changeLanguage('zh');
+  expect(i18n.exists('act.environment.baseline')).toBe(true);
+  expect(actionText('environment.baseline', { name: 'dev' })).toBe('为环境 dev 写入了基线');
+  expect(actionText('environment.baseline', { name: 'dev' })).not.toBe(i18n.t('act.unknown'));
+
+  await i18n.changeLanguage('en');
+  expect(i18n.exists('act.environment.baseline')).toBe(true);
+  expect(actionText('environment.baseline', { name: 'dev' })).toBe('wrote the baseline on dev');
+  expect(actionText('environment.baseline', { name: 'dev' })).not.toBe(i18n.t('act.unknown'));
+});
+
+test('envx.exec.markRequiredHint 在中英文下存在并指向标记为已执行', async () => {
+  await i18n.changeLanguage('zh');
+  expect(i18n.exists('envx.exec.markRequiredHint')).toBe(true);
+  expect(i18n.t('envx.exec.markRequiredHint')).toContain('标记为已执行');
+
+  await i18n.changeLanguage('en');
+  expect(i18n.exists('envx.exec.markRequiredHint')).toBe(true);
+  expect(i18n.t('envx.exec.markRequiredHint')).toContain('Mark as applied');
+});

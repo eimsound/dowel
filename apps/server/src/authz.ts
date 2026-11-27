@@ -51,7 +51,7 @@ export type ProjectAction =
 /**
  * 环境上的特权操作（02-consensus.md 11.3）：受环境生效的执行策略里“谁能执行”约束（P5a：四层合并，见 policy.ts）。
  * 模型的编辑和发布不在其中。
- * - environment.execute / rollback / baseline：执行、回滚、写入基线；
+ * - environment.execute / rollback：执行、回滚；
  * - environment.mark：标记为已执行（ADR 0004）——不执行 SQL，把环境记为已到达链上某个版本，前提是线上结构等于它的模型；
  *   取代 P4b 预留的 resolve_drift。**CI 令牌不能标记**（P6 接入令牌时，令牌的 Actor 不能通过这个动作）；
  * - environment.change_connection：改连接串、影子库、是否允许同实例影子库；
@@ -64,7 +64,6 @@ export type EnvAction =
   | 'environment.attach_history'
   | 'environment.execute'
   | 'environment.rollback'
-  | 'environment.baseline'
   | 'environment.mark'
   | 'environment.change_connection'
   | 'environment.unmark_production'
@@ -115,7 +114,7 @@ export type TokenAction = 'token.create' | 'token.list' | 'token.revoke';
  * **只有 CI 令牌**能做的动作（P6，/api/ci/…）：令牌的能力只有“只读 + 执行”。
  * - ci.read：读项目的版本链、环境状态、执行历史、漂移检测；
  * - ci.execute：执行（和预演）到指定版本——只看环境生效的“允许令牌执行”（Resource.allowTokens），不看“谁能执行”、不走审批。
- * 令牌不能做任何别的动作（编辑模型、发布、改策略、改连接串、标记为已执行、写基线、处理漂移、认领、接手、令牌管理……）。
+ * 令牌不能做任何别的动作（编辑模型、发布、改策略、改连接串、标记为已执行、处理漂移、认领、接手、令牌管理……）。
  */
 export type CiAction = 'ci.read' | 'ci.execute';
 
@@ -202,7 +201,6 @@ export const ENV_ACTIONS: EnvAction[] = [
   'environment.attach_history',
   'environment.execute',
   'environment.rollback',
-  'environment.baseline',
   'environment.mark',
   'environment.change_connection',
   'environment.unmark_production',

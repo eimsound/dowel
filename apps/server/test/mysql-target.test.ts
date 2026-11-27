@@ -897,16 +897,10 @@ describe('MySQL 目标库服务端驱动与全栈', () => {
       const envId = envs[0]!.id;
       expect(envs[0]!.engineVersion).toMatch(/^[89]\./);
 
-      // 4. 写基线
-      const baseRes = await req('POST', `/api/projects/${pid}/environments/${envId}/baseline`, {});
-      expect(baseRes.status).toBe(200);
-      const baseEvents = parseSse<ExecEvent>(await baseRes.text());
-      expect(baseEvents.some((e) => e.stage === 'done')).toBe(true);
-
       const vers0 = (await (await req('GET', `/api/projects/${pid}/versions`)).json()) as { id: string }[];
       const v0Id = vers0[0]!.id;
 
-      // 5. 编辑模型加列并发布 v1（同实例影子库自动闭环验证 + 风险分析）
+      // 4. 编辑模型加列并发布 v1（同实例影子库自动闭环验证 + 风险分析）
       await editModel(rooms, pdb, pid!, (m) => {
         const notes = all(m, 'table').find((t) => t.name === 'notes')!;
         addColumn(m, notes.id, { name: 'body', type: 'text', notNull: false });
@@ -916,17 +910,19 @@ describe('MySQL 目标库服务端驱动与全栈', () => {
       const v1 = (await pubRes.json()) as VersionCreated;
       expect(v1.verified).toBe(true);
 
-      // 6. 执行升级到 v1 并验证数据保留
+      // 5. 执行升级到 v1（自动先写 v0 基线再执行 v1）并验证数据保留
       const execRes = await req('POST', `/api/projects/${pid}/environments/${envId}/execute`, { to: v1.id });
       expect(execRes.status).toBe(200);
-      expect(parseSse<ExecEvent>(await execRes.text()).some((e) => e.stage === 'done')).toBe(true);
+      const execEvents = parseSse<ExecEvent>(await execRes.text());
+      expect(execEvents.find((e) => e.stage === 'plan')).toMatchObject({ baseline: true });
+      expect(execEvents.some((e) => e.stage === 'done')).toBe(true);
 
       const rows = await tdb.db.query<{ title: string; body: string | null }>(
         'SELECT `title`, `body` FROM `notes`',
       );
       expect(rows).toEqual([{ title: 'hello', body: null }]);
 
-      // 7. 回滚到 v0
+      // 6. 回滚到 v0
       const rbRes = await req('POST', `/api/projects/${pid}/environments/${envId}/rollback`, { to: v0Id });
       expect(rbRes.status).toBe(200);
       expect(parseSse<ExecEvent>(await rbRes.text()).some((e) => e.stage === 'done')).toBe(true);

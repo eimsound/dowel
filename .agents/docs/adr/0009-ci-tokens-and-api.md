@@ -4,7 +4,7 @@
 
 **令牌哈希用 SHA-256，不用慢哈希也不做 HMAC。** 令牌格式为 `dwl_` + 32 字节密码学随机数的 base64url（43 字符，256 位熵），列表辨认用的前缀取前 12 个字符（`dwl_` + 8 字符，仅占 48 位，剩余 208 位熵）。高熵随机令牌不存在离线词典爆破风险，因此不需要 Argon2/scrypt 等慢哈希（每个 API 请求都要校验令牌，慢哈希会引入额外 CPU 放大面）。同时不与 `DOWEL_SECRET` 做 HMAC：会话令牌与邀请令牌在 `auth.ts` 里已经统一用 SHA-256；如果 CI 令牌依赖 `DOWEL_SECRET`，轮换实例加密密钥会导致所有流水线里的长期令牌瞬间全部失效，运维成本过高。数据库泄露且攻击者拿到明文前提下才能冒充，而拿到哈希值无法反推 256 位随机明文。
 
-**令牌只能访问 `/api/ci/…`，不能走普通界面端点。** 在 `routes/index.ts` 最前面挂 `rejectTokens` 中间件：携带 `Authorization: Bearer dwl_…` 访问任何 `/api/ci/…` 之外的接口一律直接返回 `403 forbidden`，不回落到会话 Cookie。这样结构上就把“只读 + 执行”的能力边界锁死了：编辑模型、发布、改策略、改连接串、标记为已执行（`mark`）、写基线、认领、接手、令牌管理本身都不可能被令牌调用，也便于在 `permission-matrix.test.ts` 里遍历全部路由表做穷举断言。非 `dwl_` 的 Bearer 头在普通路由上放行（例如反向代理注入的 OIDC 令牌），而在 `/api/ci/*` 里会按 `token_invalid` 拒绝。
+**令牌只能访问 `/api/ci/…`，不能走普通界面端点。** 在 `routes/index.ts` 最前面挂 `rejectTokens` 中间件：携带 `Authorization: Bearer dwl_…` 访问任何 `/api/ci/…` 之外的接口一律直接返回 `403 forbidden`，不回落到会话 Cookie。这样结构上就把“只读 + 执行”的能力边界锁死了：编辑模型、发布、改策略、改连接串、标记为已执行（`mark`）、认领、接手、令牌管理本身都不可能被令牌调用，也便于在 `permission-matrix.test.ts` 里遍历全部路由表做穷举断言。非 `dwl_` 的 Bearer 头在普通路由上放行（例如反向代理注入的 OIDC 令牌），而在 `/api/ci/*` 里会按 `token_invalid` 拒绝。
 
 **令牌不能回滚（`409 rollback_not_allowed`）。** 执行接口固定传 `direction: 'up'`；如果目标版本早于环境当前版本，拒绝并返回 `409 rollback_not_allowed`（`details.current` 标明当前版本）。回滚属于高风险的数据破坏性操作（往往伴随 `DROP TABLE` / `DROP COLUMN`），应当由人在界面上确认并经过环境的审批流程或紧急执行，而不是由 CI 流水线在分支切换或误填旧版本号时静默触发。
 

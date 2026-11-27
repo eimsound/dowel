@@ -285,30 +285,27 @@ const zh = {
       default: '默认（{{policy}}）',
       defaultTag: '（默认）',
       saved: '已更新执行权限',
-      hint: '执行、回滚、写入基线、改连接串和影子库、取消“生产”标记、删除环境都受这个档位约束；模型的编辑和发布不受约束。默认：非生产为项目编辑者，生产为项目管理员。',
+      hint: '执行、回滚、改连接串和影子库、取消“生产”标记、删除环境都受这个档位约束；模型的编辑和发布不受约束。默认：非生产为项目编辑者，生产为项目管理员。',
       executorNote:
         '“仅限执行者”：只有被授予“执行者”的用户或组（以及实例管理员）能执行；生产环境上只认实例管理员授予的执行者。',
       readonly: '只有项目管理员（并且满足这个档位）能修改。',
     },
     denied: {
-      editor: '这个环境需要项目编辑者才能执行、回滚或写入基线。',
-      admin: '这个环境需要项目管理员才能执行、回滚或写入基线。',
-      executor: '这个环境设置为“仅限执行者”：只有执行者可以执行、回滚或写入基线。',
+      editor: '这个环境需要项目编辑者才能执行或回滚。',
+      admin: '这个环境需要项目管理员才能执行或回滚。',
+      executor: '这个环境设置为“仅限执行者”：只有执行者可以执行或回滚。',
     },
     exec: {
       button: '执行迁移',
       rollbackButton: '回滚迁移',
-      baselineButton: '写入基线',
       toLabel: '执行到版本',
       rollToLabel: '回滚到版本',
       titleExecute: '执行到 v{{number}}（{{name}}）',
       titleRollback: '回滚到 v{{number}}（{{name}}）',
       titleSwitch: '切换到 v{{number}}（{{name}}）',
-      titleBaseline: '写入基线（{{name}}）',
       confirmExecute: '确认执行',
       confirmRollback: '确认回滚',
       confirmSwitch: '确认切换',
-      confirmBaseline: '确认写入基线',
       executeIntro: '将依次执行下面 {{count}} 个迁移，每个迁移在目标库里一个事务，执行完都会读回结构并校验。',
       executeIntroNonTx:
         '将依次执行下面 {{count}} 个迁移。{{dialect}} 的 DDL 会隐式提交：每条语句会按顺序在目标库直接生效并记录检查点；如果中途失败，之前已执行的步骤不会自动回滚，后续可在环境页从失败步修复或继续，执行完都会读回结构并校验。',
@@ -328,7 +325,6 @@ const zh = {
       switchWarn:
         '回滚段会执行已作废版本的回滚脚本，可能删除列、表和其中的数据。如果不能接受数据丢失，请先手工让线上结构与目标版本一致，再用“标记为已执行”跨岔路对齐，不执行 SQL。',
       switchAck: '我已了解回滚段会执行已作废版本的回滚脚本，可能导致数据丢失',
-      baselineHint: '库的结构已经等于基线，只在目标库里写入 Dowel 的历史，不执行任何 SQL。',
       migrations: '要执行的迁移',
       steps: '{{count}} 步',
       risk: { high: '高风险', medium: '中等风险' },
@@ -358,6 +354,8 @@ const zh = {
         '所有步骤都执行完了但读回的结构不对：继续执行解决不了，需要手工修正目标库（漂移差异见环境页）。',
       failedStep: '失败在第 {{step}} 步。',
       unverifiedHint: '到版本详情页点“重新验证”，通过后再执行。',
+      markRequiredHint:
+        '目标库还没有迁移历史，且结构已等于首版本，没有可执行的后续迁移。请到环境页使用“标记为已执行”建立历史基准，或等发布新版本后再执行（届时会自动写入基线）。',
     },
   },
   dr: {
@@ -498,7 +496,7 @@ const zh = {
     // 环境页：认领
     claimBannerTitle: '这个库里的项目由另一个实例认领',
     claimBannerBody:
-      '认领它的实例是 {{id}}。本实例现在不能在这个环境上执行、回滚或写基线；漂移检查和执行历史照常可用。',
+      '认领它的实例是 {{id}}。本实例现在不能在这个环境上执行或回滚；漂移检查和执行历史照常可用。',
     claimButton: '认领这个库',
     claimAdminOnly: '认领需要实例管理员。',
     claimRow: '认领',
@@ -552,7 +550,8 @@ const zh = {
         history_writable: '历史表可写',
       },
       firstRunEmpty: '目标库还没有历史，而且是空库：会先建出 dowel 历史，再执行第一个版本建库。',
-      firstRunBaseline: '目标库还没有历史，但结构已经等于基线：只会写入基线，不执行 SQL。',
+      firstRunBaseline:
+        '目标库还没有历史，且结构已等于基线：将先写入基线（不执行基线的建库 SQL），再执行后续迁移。',
       createsHistory: '会在目标库里新建 dowel schema（存迁移历史）。',
       createsHistoryPrefix: '会在目标库里新建 dowel_* 历史表（存迁移历史）。',
       resume: '上一次停在中途：会从 v{{number}} 的第 {{step}} 步接着跑。',
@@ -821,6 +820,7 @@ const zh = {
       pull: '从环境导入了结构（{{count}} 个对象）',
       execute: '执行了环境 {{name}} 的迁移',
       rollback: '回滚了环境 {{name}}',
+      // 历史审计兼容（#159 起不再产生）
       baseline: '为环境 {{name}} 写入了基线',
       mark: '标记了环境 {{name}} 的当前版本',
       switch: '切换了环境 {{name}} 的版本（先回滚再升级）',
@@ -2689,31 +2689,27 @@ const en: typeof zh = {
       default: 'Default ({{policy}})',
       defaultTag: '(default)',
       saved: 'Execution permission updated',
-      hint: 'Executing, rolling back, writing the baseline, changing the connection or shadow database, unmarking production and deleting the environment are all governed by this level; editing and publishing the model are not. Default: project editors for non-production, project admins for production.',
+      hint: 'Executing, rolling back, changing the connection or shadow database, unmarking production and deleting the environment are all governed by this level; editing and publishing the model are not. Default: project editors for non-production, project admins for production.',
       executorNote:
         '"Executors only": only users or groups granted "executor" (and instance admins) can execute; on production only executors granted by instance admins count.',
       readonly: 'Only project admins (who also satisfy this level) can change it.',
     },
     denied: {
-      editor: 'This environment needs a project editor to execute, roll back or write the baseline.',
-      admin: 'This environment needs a project admin to execute, roll back or write the baseline.',
-      executor:
-        'This environment is "executors only": only executors can execute, roll back or write the baseline.',
+      editor: 'This environment needs a project editor to execute or roll back.',
+      admin: 'This environment needs a project admin to execute or roll back.',
+      executor: 'This environment is "executors only": only executors can execute or roll back.',
     },
     exec: {
       button: 'Execute migrations',
       rollbackButton: 'Roll back migrations',
-      baselineButton: 'Write baseline',
       toLabel: 'Execute up to',
       rollToLabel: 'Roll back to',
       titleExecute: 'Execute up to v{{number}} ({{name}})',
       titleRollback: 'Roll back to v{{number}} ({{name}})',
       titleSwitch: 'Switch to v{{number}} ({{name}})',
-      titleBaseline: 'Write baseline ({{name}})',
       confirmExecute: 'Confirm execution',
       confirmRollback: 'Confirm rollback',
       confirmSwitch: 'Confirm switch',
-      confirmBaseline: 'Confirm baseline',
       executeIntro:
         'These {{count}} migrations will run in order, each in one transaction in the target database; the structure is read back and verified after each.',
       executeIntroNonTx:
@@ -2736,8 +2732,6 @@ const en: typeof zh = {
         'The rollback segment runs rollback scripts of retired versions and may drop columns, tables, and their data. If data loss is not acceptable, align the schema manually and use "Mark as applied" across branches without running SQL.',
       switchAck:
         'I understand the rollback segment runs rollback scripts of retired versions and may cause data loss',
-      baselineHint:
-        'The database structure already equals the baseline. Only Dowel history is written to the target database; no SQL runs.',
       migrations: 'Migrations to run',
       steps: '{{count}} steps',
       risk: { high: 'High risk', medium: 'Medium risk' },
@@ -2768,6 +2762,8 @@ const en: typeof zh = {
         'All steps ran but the structure read back is wrong: resuming cannot fix it, the target database must be fixed by hand (see the drift differences on the environment page).',
       failedStep: 'Failed at step {{step}}.',
       unverifiedHint: 'Open the version page and click "Re-verify"; execute once it passes.',
+      markRequiredHint:
+        'The target database has no migration history yet and already matches the first version, with no newer migrations to run. Use "Mark as applied" on the environment page to record the baseline, or wait until a newer version is published (executing it will write the baseline automatically).',
     },
   },
   dr: {
@@ -2927,7 +2923,7 @@ const en: typeof zh = {
     openProject: 'Open project',
     claimBannerTitle: 'The project in this database is claimed by another instance',
     claimBannerBody:
-      'It is claimed by instance {{id}}. This instance cannot execute, roll back or write a baseline on this environment now; drift checks and the run history still work.',
+      'It is claimed by instance {{id}}. This instance cannot execute or roll back on this environment now; drift checks and the run history still work.',
     claimButton: 'Claim this database',
     claimAdminOnly: 'Claiming needs an instance admin.',
     claimRow: 'Claim',
@@ -2983,7 +2979,7 @@ const en: typeof zh = {
       firstRunEmpty:
         'The target has no history and is empty: the dowel history is created first, then the first version builds the database.',
       firstRunBaseline:
-        'The target has no history but its structure already equals the baseline: only the baseline is written, no SQL runs.',
+        'The target has no history and its structure already equals the baseline: Dowel will record the baseline without running its setup SQL, then apply the subsequent migrations.',
       createsHistory:
         'Will create the dowel schema in the target database (it stores the migration history).',
       createsHistoryPrefix:
@@ -3259,6 +3255,7 @@ const en: typeof zh = {
       pull: 'imported the structure from an environment ({{count}} objects)',
       execute: 'executed migrations on {{name}}',
       rollback: 'rolled back {{name}}',
+      // Legacy audit compatibility (no longer emitted since #159)
       baseline: 'wrote the baseline on {{name}}',
       mark: 'marked the current version on {{name}}',
       switch: 'switched {{name}} (rolled back, then upgraded)',
