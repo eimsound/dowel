@@ -1050,7 +1050,7 @@ export interface EnvPolicyView {
 }
 
 export const envPermissionsSchema = z.object({
-  /** 能否执行 / 回滚 / 写基线（按环境的执行档位） */
+  /** 能否执行 / 回滚（按环境的执行档位） */
   execute: z.boolean(),
   /** 能否改连接串、影子库、执行档位和删除环境 */
   configure: z.boolean(),
@@ -1187,13 +1187,6 @@ export const markRequestSchema = z.object({
   dryRun: z.boolean().optional(),
 });
 export type MarkRequest = z.infer<typeof markRequestSchema>;
-
-export const baselineRequestSchema = z.object({
-  confirm: z.string().optional(),
-  /** 只预演：做完全部执行前检查、列出要做的事，不写目标库、不写平台库的登记 */
-  dryRun: z.boolean().optional(),
-});
-export type BaselineRequest = z.infer<typeof baselineRequestSchema>;
 
 /** 执行进度的阶段：拿锁 → 完整性检查 → 漂移检查 → 计划 → 逐个迁移 → 完成 */
 export const execStageSchema = z.enum(['lock', 'integrity', 'drift', 'plan', 'migration', 'done']);
@@ -1450,12 +1443,11 @@ export const dryRunMigrationSchema = z.object({
 export type DryRunMigration = z.infer<typeof dryRunMigrationSchema>;
 
 export const dryRunPlanSchema = z.object({
-  mode: z.enum(['migrate', 'baseline']),
   /** switch：先回滚到最近公共祖先（lca）再升级到目标（ADR 0013） */
   direction: z.enum(['up', 'down', 'switch', 'none']),
   /** 切换路线经过的最近公共祖先（回滚段的终点）；其他情况为 null */
   lca: envVersionRefSchema.nullable(),
-  /** 目标库还没有历史：baseline 只写基线，empty 在空库上建库；已有历史为 null */
+  /** 目标库还没有历史：baseline 先写入基线再执行后续迁移，empty 在空库上建库；已有历史为 null */
   firstRun: z.enum(['baseline', 'empty']).nullable(),
   baseline: z.boolean(),
   from: envVersionRefSchema.nullable(),

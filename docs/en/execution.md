@@ -58,7 +58,7 @@ When a target database contains no Dowel history for the current project, Dowel 
 | **Empty database** with no user objects inside the schema scope                               | Creates history tables and runs the first version's upgrade script to build the schema                                                                    |
 | Any other mismatched structure                                                                | Reports **drift** with differences against the baseline, refuses execution, and creates no `dowel` history tables                                         |
 
-You can also click Write baseline on the environment details page before running subsequent migrations.
+The baseline is only recorded automatically during your first migration execution (for example, executing `v1` or later). If you need to establish migration history at `v0` before publishing newer versions, use [Mark as applied](#mark-as-applied) (executing directly to `v0` with no further migrations on a matching database is rejected with `mark_required`).
 
 ## Execution validation order {#execution-steps}
 
@@ -90,7 +90,7 @@ Every execution or rollback passes through six sequential checks. Failure at any
 
 ## Dry run {#dry-run}
 
-Opening the Execute migrations, Roll back migrations, or Write baseline dialog triggers a read-only dry run automatically:
+Opening the Execute migrations or Roll back migrations dialog triggers a read-only dry run automatically:
 
 - Runs the exact same pre-execution checks as live execution (project lock, integrity, claim, drift, verification status, dangerous statements, and history table write permissions).
 - Previews the planned migrations, every SQL statement, non-transactional or implicit-commit flags, stored risk summaries, checkpoint resume offsets, and whether `dowel` history tables will be created on first run.

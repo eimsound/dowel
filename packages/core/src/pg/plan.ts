@@ -571,15 +571,25 @@ const planWithIndexes = (
       : 'expr' in c.default
         ? c.default.expr
         : `nextval(${literal(qname(cur, get(cur, c.default.nextval, 'sequence')))}::regclass)`;
+  /** PG 的默认起始值：升序取 min（缺省 1），降序取 max（缺省 -1），与类型无关 */
   const defaultSeqStart = (o: SequenceOptions): string =>
     o.increment.trim().startsWith('-') ? (o.max ?? '-1') : (o.min ?? '1');
-  const seqOptions = (o: SequenceOptions, withType: boolean, startOverride?: string): string => {
+  /**
+   * ALTER 序列时要写的 START WITH（null 表示不写）。PG 省略 START WITH 时保留旧 seqstart，
+   * 不会按新的 min/max/递增方向重算默认值：旧值落在新范围外直接报错，落在范围内也会读回成显式 start。
+   * 所以目标 start 为 null 但有效起始值（显式 start 或默认值）变了时，要显式写出目标默认值。
+   */
+  const alterSeqStart = (from: SequenceOptions, to: SequenceOptions): string | null => {
+    if (to.start !== null) return to.start;
+    const target = defaultSeqStart(to);
+    return (from.start ?? defaultSeqStart(from)) === target ? null : target;
+  };
+  const seqOptions = (o: SequenceOptions, withType: boolean, start = o.start): string => {
     const p: string[] = [];
     if (withType) p.push(`AS ${o.type}`);
     p.push(`INCREMENT BY ${o.increment}`);
     p.push(o.min === null ? 'NO MINVALUE' : `MINVALUE ${o.min}`);
     p.push(o.max === null ? 'NO MAXVALUE' : `MAXVALUE ${o.max}`);
-    const start = o.start ?? startOverride ?? null;
     if (start !== null) p.push(`START WITH ${start}`);
     p.push(`CACHE ${o.cache}`);
     p.push(o.cycle ? 'CYCLE' : 'NO CYCLE');
@@ -2065,14 +2075,10 @@ const planWithIndexes = (
     if (!inFrom(o.id)) continue;
     const c = get(cur, o.id, 'sequence');
     if (sameSeqOpts(c.options, o.options)) continue;
-    const startOverride =
-      o.options.start === null && (c.options.start !== null || c.options.type !== o.options.type)
-        ? defaultSeqStart(o.options)
-        : undefined;
     emit(
       'alterSequence',
       o.id,
-      `ALTER SEQUENCE ${qname(cur, c)} ${seqOptions(o.options, true, startOverride)}`,
+      `ALTER SEQUENCE ${qname(cur, c)} ${seqOptions(o.options, true, alterSeqStart(c.options, o.options))}`,
     );
     c.options = clone(o.options);
   }
@@ -2534,7 +2540,8 @@ const planWithIndexes = (
         `SET CACHE ${p.cache}`,
         p.cycle ? 'SET CYCLE' : 'SET NO CYCLE',
       ];
-      if (p.start !== null) sets.push(`SET START WITH ${p.start}`);
+      const start = alterSeqStart(c.identity.options, p);
+      if (start !== null) sets.push(`SET START WITH ${start}`);
       emit('alterIdentity', o.id, `${A(c)} ${sets.join(' ')}`);
     }
     c.identity = clone(o.identity);

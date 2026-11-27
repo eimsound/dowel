@@ -1,4 +1,4 @@
-// 环境执行（P4b H3 / H4 / H7）：通过 HTTP 接口执行 / 回滚 / 写基线、环境状态与历史、漂移检查（手动 + 定时）、
+// 环境执行（P4b H3 / H4 / H7）：通过 HTTP 接口执行 / 回滚、环境状态与历史、漂移检查（手动 + 定时）、
 // 生产确认、执行过的版本不能再编辑（409）、并发、错误脱敏。平台库在 SQLite 和 PostgreSQL 上各跑一遍；
 // 目标库 / 影子库用测试 PG（Testcontainers 或 DOWEL_TEST_PG），没有 Docker 时跳过。
 import type {
@@ -464,61 +464,90 @@ describe.each([
     expect(JSON.stringify(h.data)).not.toContain('s3cr3tpw');
   });
 
-  test.skipIf(skip || !PG_URL)('写基线：导入来源库的项目，只写历史，不执行任何 SQL', async () => {
-    const src = await createTestDb('exec_import');
-    targets.push(src);
-    await src.db.exec(
-      'create table public.legacy (id int primary key, name text); insert into public.legacy values (1, $$keep$$)',
-    );
-    const w = await created.app.request('/api/projects/wizard', {
-      method: 'POST',
-      headers: { 'content-type': 'application/json', cookie: admin },
-      body: JSON.stringify({
-        groupId,
-        name: 'imported',
-        environments: [{ name: 'dev', url: src.url, production: false, allowSameInstance: true }],
-        content: { kind: 'database', env: 'dev' },
-      }),
-    });
-    const events = (await w.text())
-      .split('\n\n')
-      .filter((x) => x.trim())
-      .map((chunk) => JSON.parse(chunk.replace(/^data: /, '')) as WizardEvent);
-    const project = events.at(-1)!.project as ProjectCreated;
-    expect(project, JSON.stringify(events)).toBeTruthy();
-    const pid = project.id;
-    const [env] = (await call('GET', `/api/projects/${pid}/environments`)).data as unknown as EnvInfo[];
-    // 没有历史时的漂移检查：结构等于基线 → ok
-    const d = (await call('POST', `/api/projects/${pid}/environments/${env!.id}/drift-check`))
-      .data as unknown as DriftCheckResponse;
-    expect(d.status).toBe('ok');
-    const v0 = ((await call('GET', `/api/projects/${pid}/versions`)).data as unknown as VersionInfo[]).at(
-      -1,
-    )!;
-    expect(v0.number).toBe(0);
+  test.skipIf(skip || !PG_URL)(
+    '首次执行命中基线：单独入口已移除，直接执行到 v0 报 mark_required，执行 v1 时先写基线再升级',
+    async () => {
+      const src = await createTestDb('exec_import');
+      targets.push(src);
+      await src.db.exec(
+        'create table public.legacy (id int primary key, name text); insert into public.legacy values (1, $$keep$$)',
+      );
+      const w = await created.app.request('/api/projects/wizard', {
+        method: 'POST',
+        headers: { 'content-type': 'application/json', cookie: admin },
+        body: JSON.stringify({
+          groupId,
+          name: 'imported',
+          environments: [{ name: 'dev', url: src.url, production: false, allowSameInstance: true }],
+          content: { kind: 'database', env: 'dev' },
+        }),
+      });
+      const events = (await w.text())
+        .split('\n\n')
+        .filter((x) => x.trim())
+        .map((chunk) => JSON.parse(chunk.replace(/^data: /, '')) as WizardEvent);
+      const project = events.at(-1)!.project as ProjectCreated;
+      expect(project, JSON.stringify(events)).toBeTruthy();
+      const pid = project.id;
+      const [env] = (await call('GET', `/api/projects/${pid}/environments`)).data as unknown as EnvInfo[];
+      // 没有历史时的漂移检查：结构等于基线 → ok
+      const d = (await call('POST', `/api/projects/${pid}/environments/${env!.id}/drift-check`))
+        .data as unknown as DriftCheckResponse;
+      expect(d.status).toBe('ok');
+      const v0 = ((await call('GET', `/api/projects/${pid}/versions`)).data as unknown as VersionInfo[]).at(
+        -1,
+      )!;
+      expect(v0.number).toBe(0);
 
-    // 写基线（没有历史时才能写；非生产不用确认）
-    const r = await call('POST', `/api/projects/${pid}/environments/${env!.id}/baseline`, {});
-    expect(last(r.events)).toMatchObject({ stage: 'done', current: { number: 0 } });
-    expect(r.events.find((e) => e.stage === 'plan')).toMatchObject({ baseline: true });
-    const h = await history(pid, env!.id);
-    expect(h.runs.map((x) => [x.direction, x.status])).toEqual([['baseline', 'done']]);
-    expect((await src.db.query<{ name: string }>('select name from public.legacy'))[0]!.name).toBe('keep');
-    // v0 已经写进目标库历史：不能再编辑它的脚本
-    const d0 = (await call('GET', `/api/projects/${pid}/versions/${v0.id}`)).data as unknown as VersionDetail;
-    expect(
-      (
-        await call('PATCH', `/api/projects/${pid}/versions/${v0.id}/steps`, {
-          up: d0.upSteps,
-          down: d0.downSteps,
-        })
-      ).status,
-    ).toBe(409);
-    // 再写一次：库里已经有历史
-    expect(
-      last((await call('POST', `/api/projects/${pid}/environments/${env!.id}/baseline`, {})).events).code,
-    ).toBe('baseline_not_applicable');
-  });
+      // 单独的 /baseline 接口已移除
+      expect((await call('POST', `/api/projects/${pid}/environments/${env!.id}/baseline`, {})).status).toBe(
+        404,
+      );
+
+      // 库结构已等于 v0 且没有后续迁移：预演与执行 v0 均以 mark_required 拒绝（不建 dowel 历史，不锁定 v0）
+      const dryV0 = (await exec(pid, env!.id, 'execute', v0.id, { dryRun: true }))
+        .data as unknown as DryRunResponse;
+      expect(dryV0).toMatchObject({ ok: false, code: 'mark_required' });
+      expect(last((await exec(pid, env!.id, 'execute', v0.id)).events).code).toBe('mark_required');
+      expect(await src.db.query("select 1 from pg_namespace where nspname = 'dowel'")).toEqual([]);
+      const d0Before = (await call('GET', `/api/projects/${pid}/versions/${v0.id}`))
+        .data as unknown as VersionDetail;
+      expect(
+        (
+          await call('PATCH', `/api/projects/${pid}/versions/${v0.id}/steps`, {
+            up: d0Before.upSteps,
+            down: d0Before.downSteps,
+          })
+        ).status,
+      ).toBe(200);
+
+      // 发布 v1（给 legacy 表新增列）并执行到 v1：自动先写 v0 基线再跑 v1 迁移
+      await editModel(created.rooms, db, pid, (m) => {
+        addColumn(m, tableOf(m, 'legacy'), { name: 'note', type: 'text' });
+      });
+      const v1 = await publish(pid, 'v1');
+      const r = await exec(pid, env!.id, 'execute', v1.id);
+      expect(last(r.events)).toMatchObject({ stage: 'done', current: { number: 1 } });
+      expect(r.events.find((e) => e.stage === 'plan')).toMatchObject({ baseline: true });
+      const h = await history(pid, env!.id);
+      expect(h.runs.map((x) => [x.direction, x.status])).toEqual([
+        ['up', 'done'],
+        ['baseline', 'done'],
+      ]);
+      expect((await src.db.query<{ name: string }>('select name from public.legacy'))[0]!.name).toBe('keep');
+      // v0 已经写进目标库历史：不能再编辑它的脚本
+      const d0 = (await call('GET', `/api/projects/${pid}/versions/${v0.id}`))
+        .data as unknown as VersionDetail;
+      expect(
+        (
+          await call('PATCH', `/api/projects/${pid}/versions/${v0.id}/steps`, {
+            up: d0.upSteps,
+            down: d0.downSteps,
+          })
+        ).status,
+      ).toBe(409);
+    },
+  );
 
   test.skipIf(skip || !PG_URL)('定时漂移检查：runOnce 逐个环境检查并写进缓存；间隔可配、可关', async () => {
     const { pid, eid, target } = await newProject('scheduler');
@@ -1443,7 +1472,6 @@ describe.each([
           pid,
           projectName: 'adr13-switch',
           env: envRow!,
-          mode: 'migrate',
           to: v3Id,
           direction: 'up',
           userId: 'admin',

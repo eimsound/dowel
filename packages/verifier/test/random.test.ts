@@ -172,7 +172,7 @@ test.skipIf(!PG_URL)(
             executedBy: null,
           };
           const up = await execute({ ...base, to: 'v2' });
-          // v1 本来就等于全新的库（模型里几乎什么都没有）时，库的结构已经是 v1：只写基线，不执行 SQL
+          // v1 本来就等于全新的库（模型里几乎什么都没有）时，库的结构已经是 v1：v1 只写基线不执行 SQL，再继续执行 v2
           const first = up.ran[0]!.direction;
           expect(['up', 'baseline']).toContain(first);
           expect(up.ran.map((r) => [r.number, r.direction])).toEqual([

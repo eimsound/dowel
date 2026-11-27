@@ -150,8 +150,12 @@ const createItemColumnGuard = (input: ItemColumnGuardInput) => {
   const { table, hasTargetPk, batchPk } = input;
   let hasAutoInc = input.existingCols.some((c) => Boolean(c.ext?.sqlite?.autoincrement));
   return (sc: Column): string | null => {
-    if (table.ext?.sqlite?.strict && !SQLITE_STRICT_TYPES.has(sc.type.trim().toUpperCase())) {
-      return `STRICT 表不支持列类型 ${sc.type}`;
+    if (table.ext?.sqlite?.strict) {
+      const normalized = sqliteNormalizeType(sc.type);
+      if (!normalized) return 'STRICT 表的列必须声明类型';
+      if (!SQLITE_STRICT_TYPES.has(normalized)) {
+        return `STRICT 表不支持列类型 ${sc.type}`;
+      }
     }
     if (sc.ext?.sqlite?.autoincrement) {
       if (table.ext?.sqlite?.withoutRowid) return 'WITHOUT ROWID 表不能使用 AUTOINCREMENT';

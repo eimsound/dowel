@@ -10,15 +10,18 @@ import { describe, expect, it } from 'vitest';
 
 import { analyze, verify, verifyScripts } from '../src/index.ts';
 
-const SQLITE_TYPES = ['INTEGER', 'TEXT', 'REAL', 'BLOB', 'ANY'] as const;
-const STRICT_TYPES = ['INTEGER', 'TEXT', 'REAL', 'BLOB', 'ANY'] as const;
+const SQLITE_TYPES = ['INTEGER', 'INT', 'BIGINT', 'TEXT', 'REAL', 'BLOB', 'ANY', ''] as const;
+const STRICT_TYPES = [...E.SQLITE_STRICT_TYPES] as const;
 
 const DEFAULTS_BY_TYPE: Record<string, string[]> = {
   INTEGER: ['0', '1', '-5', '42'],
+  INT: ['0', '1', '-5'],
+  BIGINT: ['0', '1', '1000000'],
   TEXT: ["''", "'hello'", "'a''b'"],
   REAL: ['0.0', '1.5', '-3.25'],
   BLOB: ["X'0102'"],
   ANY: ['0', "'x'"],
+  '': ['0', "'x'"],
 };
 
 const FK_ACTIONS: E.FkAction[] = ['noAction', 'restrict', 'cascade', 'setNull', 'setDefault'];
@@ -203,6 +206,19 @@ const mutateSqlite = (m: Model, r: () => number): boolean => {
           });
         } else {
           const nextWithout = !t.ext?.sqlite?.withoutRowid;
+          if (nextWithout) {
+            const pk = E.childrenOf(m, t.id, 'primaryKey')[0];
+            if (
+              pk &&
+              E.childrenOf(m, t.id, 'unique').some(
+                (u) =>
+                  u.columns.length === pk.columns.length &&
+                  u.columns.every((cid) => pk.columns.includes(cid)),
+              )
+            ) {
+              return false;
+            }
+          }
           E.setTableExt(m, t.id, {
             sqlite: {
               ...(t.ext?.sqlite ?? {}),
@@ -239,8 +255,11 @@ const mutateSqlite = (m: Model, r: () => number): boolean => {
         const cols = E.columnsOf(m, t.id).filter((x) => !x.generated);
         const c = pick(cols, r);
         if (!c) return false;
-        // 避免和已有同列 UNIQUE 重复
-        if (E.childrenOf(m, t.id, 'unique').some((u) => u.columns.length === 1 && u.columns[0] === c.id)) {
+        // 避免和已有同列 UNIQUE 或单列 PRIMARY KEY 重复（WITHOUT ROWID 表上 SQLite 会把与主键同列的 UNIQUE 合并进 pk）
+        if (
+          E.childrenOf(m, t.id, 'unique').some((u) => u.columns.length === 1 && u.columns[0] === c.id) ||
+          E.childrenOf(m, t.id, 'primaryKey').some((p) => p.columns.length === 1 && p.columns[0] === c.id)
+        ) {
           return false;
         }
         E.addUnique(m, t.id, [c.id]);

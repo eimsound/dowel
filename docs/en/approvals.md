@@ -9,7 +9,7 @@ When a user lacks direct execution rights or an environment defines approval sta
 | Default (no stages configured) | Click Execute migrations or Roll back migrations directly    | Submit request; an authorized user clicks Approve and execute     |
 | One or more stages configured  | Must submit an execution request first (instance admins too) | Submit request; once all stages pass, an authorized user executes |
 
-When approval is required, buttons on the environment page read Submit execution request or Request rollback. Project editors and above, or environment executors, can submit requests; viewers cannot. Write baseline and [mark as applied](execution.md#mark-as-applied) execute no SQL and bypass approval flows while remaining subject to "Who can execute".
+When approval is required, buttons on the environment page read Submit execution request or Request rollback. Project editors and above, or environment executors, can submit requests; viewers cannot. [Mark as applied](execution.md#mark-as-applied) executes no SQL and bypasses approval flows while remaining subject to "Who can execute".
 
 ## Submission and snapshot invalidation {#submit-and-invalidation}
 

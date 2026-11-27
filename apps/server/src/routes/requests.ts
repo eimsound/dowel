@@ -294,7 +294,7 @@ const runRequest = (c: Context<Env>, ctx: AppContext, req: RequestRow, { a }: Ru
     ctx,
     a,
     action,
-    { mode: 'migrate', to: req.to_version_id, direction: dir },
+    { to: req.to_version_id, direction: dir },
     {
       auditExtra: { requestId: req.id, ...(req.emergency ? { emergency: true, reason: req.reason } : {}) },
       expect: {
@@ -416,7 +416,7 @@ export const registerRequests = (app: Hono<Env>, ctx: AppContext) => {
         );
     }
     connectionLimit(c, ctx);
-    const dry = await dryRunFor(ctx, a, user.id, { mode: 'migrate', to: b.to, direction: execDir });
+    const dry = await dryRunFor(ctx, a, user.id, { to: b.to, direction: execDir });
     if (b.dryRun) return c.json(dry);
     if (!dry.ok || !dry.plan)
       return c.json(
@@ -660,7 +660,7 @@ export const registerRequests = (app: Hono<Env>, ctx: AppContext) => {
       );
     confirmed(a.env, b.confirm);
     connectionLimit(c, ctx);
-    const dry = await dryRunFor(ctx, a, user.id, { mode: 'migrate', to: b.to, direction: execDir });
+    const dry = await dryRunFor(ctx, a, user.id, { to: b.to, direction: execDir });
     if (!dry.ok || !dry.plan)
       return c.json(
         {

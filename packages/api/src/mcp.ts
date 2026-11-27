@@ -2,7 +2,7 @@
 // 规则：
 // - MCP 令牌属于**用户**（不是项目）：权限 = 用户当前生效角色 ∩ 令牌 scope ∩ 可选的项目白名单；修改和审计都记在本人名下（data.via = 'mcp'）。
 // - scope 正交：read 是基线（总是包含）；verify 只授权影子库验证；write 只授权工作副本的整批原子修改与画布板块的增量调整（不开放像素坐标）。
-// - MCP 永远不连目标库：环境状态 / 漂移只读平台缓存（带缓存时间）；不能发布版本、不能执行 / 申请执行 / 回滚 / 标记 / 写基线。
+// - MCP 永远不连目标库：环境状态 / 漂移只读平台缓存（带缓存时间）；不能发布版本、不能执行 / 申请执行 / 回滚 / 标记。
 // - 令牌只能访问 POST /api/mcp；/api/mcp 只认 `Bearer dwm_…`（会话 cookie 与 CI 令牌一律拒绝）。
 // 实现见 apps/server/src/mcp-tokens.ts、routes/mcp.ts、routes/mcp-tokens.ts；用户文档 docs/en/mcp.md 与 docs/zh/mcp.md。
 import { z } from 'zod';

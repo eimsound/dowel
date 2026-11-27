@@ -488,7 +488,6 @@ const assertExpected = (
 const locked = async (conn: Db, c: Ctx): Promise<ExecuteResult> => {
   const { o, dialect, engine } = c;
   const { chain } = o;
-  const mode = o.mode ?? 'migrate';
   await c.emit({ type: 'phase', phase: 'integrity' });
   if (o.dryRun) {
     const problem = await engine.history.historyWriteProblem(conn);
@@ -500,8 +499,8 @@ const locked = async (conn: Db, c: Ctx): Promise<ExecuteResult> => {
   const byId = indexTree(chain);
   const first = chain.find((v) => v.parentId === null) ?? chain[0];
   if (!first) throw new ExecutorError('unknown_version', '项目还没有发布任何版本');
-  const target = mode === 'baseline' ? first : byId.get(o.to ?? '');
-  if (!target) throw new ExecutorError('unknown_version', `目标版本不存在：${o.to ?? '（未指定）'}`);
+  const target = byId.get(o.to);
+  if (!target) throw new ExecutorError('unknown_version', `目标版本不存在：${o.to}`);
   const cur = state.current === null ? null : (byId.get(state.current) ?? null);
   if (state.current !== null && !cur)
     throw new ExecutorError(
@@ -520,8 +519,6 @@ const locked = async (conn: Db, c: Ctx): Promise<ExecuteResult> => {
 
   if (state.unfinished) {
     const p = state.unfinished;
-    if (mode === 'baseline')
-      throw new ExecutorError('baseline_not_applicable', '上一次执行停在中途，必须先继续执行它，不能写基线');
     const want = runVersionId(p);
     const openVer = want ? byId.get(want) : undefined;
     // 上一次升级停在中途的版本已被作废：给出可操作的错误码 retired_target，而不是令人困惑的 unfinished_run
@@ -559,16 +556,7 @@ const locked = async (conn: Db, c: Ctx): Promise<ExecuteResult> => {
     await c.emit({ type: 'phase', phase: 'drift' });
     const snapshot = await engine.readSnapshot(conn, first.scope);
     const cls = classifyFirstRun(snapshot, first, emptyBase(first.model, first.scope));
-    if (mode === 'baseline') {
-      if (cls.kind !== 'baseline')
-        throw new ExecutorError(
-          'baseline_not_applicable',
-          cls.kind === 'empty'
-            ? '库里还没有任何结构，没有可以写入的基线：直接执行即可建库'
-            : `库的结构与基线版本 ${label(first)} 不一致（${cls.diff.total} 处差异），不能写入基线`,
-          { diff: cls.diff.items, diffTotal: cls.diff.total },
-        );
-    } else if (cls.kind === 'drift')
+    if (cls.kind === 'drift')
       throw new ExecutorError(
         'first_run_drift',
         `这个库还没有 Dowel 的历史，而且它的结构既不等于基线版本 ${label(first)}、也不是空库（${cls.diff.total} 处差异）。` +
@@ -583,20 +571,25 @@ const locked = async (conn: Db, c: Ctx): Promise<ExecuteResult> => {
         },
       );
     if (cls.kind === 'baseline') {
+      planned = buildRoute(byId, first.id, target.id);
+      if (!planned.migrations.length) {
+        if (o.direction === 'down')
+          throw new ExecutorError('wrong_direction', '这个库还没有 Dowel 的历史，不能回滚', {
+            versionId: target.id,
+            reached: null,
+          });
+        throw new ExecutorError(
+          'mark_required',
+          `这个库还没有 Dowel 的历史，且结构已经等于 ${label(first)}，没有可执行的迁移。` +
+            '如果只想先建立历史基准而不执行迁移，请改用“标记为已执行”；或者等发布新版本后，在执行新版本时自动写入基线',
+          { versionId: first.id, number: first.number, reached: null },
+        );
+      }
       baseline = baselineMigration(first);
       snapshotFp = engine.fingerprint(snapshot);
-      planned =
-        mode === 'baseline'
-          ? { lca: null, shape: 'none', migrations: [] }
-          : buildRoute(byId, first.id, target.id);
     } else planned = buildRoute(byId, null, target.id);
     migrations = planned.migrations;
   } else {
-    if (mode === 'baseline')
-      throw new ExecutorError(
-        'baseline_not_applicable',
-        '这个库里已经有这个项目的 Dowel 历史，不需要再写基线',
-      );
     planned = buildRoute(byId, state.current, target.id);
     migrations = planned.migrations;
     if (!migrations.length) {
@@ -610,7 +603,6 @@ const locked = async (conn: Db, c: Ctx): Promise<ExecuteResult> => {
       if (o.expect) assertExpected(o.expect, state.current, migrations);
       const ref = refOf(cur);
       return {
-        mode,
         direction: 'none',
         lca: null,
         baseline: false,
@@ -707,7 +699,6 @@ const locked = async (conn: Db, c: Ctx): Promise<ExecuteResult> => {
     const lastTo = migrations.at(-1)?.to ?? (baseline ? first : cur);
     const stepNonTx = (s: ScriptStep) => isNonTx(s, dialect);
     return {
-      mode,
       direction,
       lca: lcaRef,
       baseline: baseline !== null,
@@ -830,7 +821,6 @@ const locked = async (conn: Db, c: Ctx): Promise<ExecuteResult> => {
     throw e;
   }
   return {
-    mode,
     direction,
     lca: lcaRef,
     baseline: baseline !== null,
