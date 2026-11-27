@@ -1,14 +1,19 @@
 import {
   addColumn,
   addPrimaryKey,
+  type Column,
   createAll,
   createSchema,
+  createSequence,
   createTable,
   emptyModel,
+  type Model,
   normalizeType,
   pgSerialOf,
   plan,
   renameTable,
+  type Sequence,
+  type SequenceOptions,
   setColumnType,
   setDefault,
   validate,
@@ -248,6 +253,68 @@ describe.skipIf(!PG_URL)('导入 → 重建 往返一致', () => {
     expect(r2.downDiff).toEqual([]);
     await runSteps(db(), r2.up);
     expect(diffAgainst(await readSnapshot(db()), m3).total).toBe(0);
+  });
+
+  // PG 省略 START WITH 会保留旧 seqstart；前后 start 都为 null 时 min/max/递增方向改变默认起始值也要补发
+  const seqModel = (opts: Partial<SequenceOptions>) => {
+    const m = emptyModel('pg');
+    createSequence(m, createSchema(m, 'public', 's_pub'), 'x', { type: 'integer', ...opts }, 'q_x');
+    return m;
+  };
+  const withSeqOpts = (m: Model, patch: Partial<SequenceOptions>) => {
+    const m2 = structuredClone(m);
+    Object.assign((m2.objects.q_x as Sequence).options, patch);
+    expect(validate(m2)).toEqual([]);
+    return m2;
+  };
+
+  test.each<[string, Partial<SequenceOptions>, Partial<SequenceOptions>]>([
+    ['升序 min 10 → null', { min: '10' }, { min: null }],
+    ['降序 max -5 → null', { increment: '-1', max: '-5' }, { max: null }],
+    ['递增方向 1 → -1（显式 min/max）', { min: '-100', max: '100' }, { increment: '-1' }],
+  ])('ALTER SEQUENCE start 为 null 时有效起始值变化：%s（verify 双向零差异）', async (_, opts, patch) => {
+    const from = seqModel(opts);
+    const to = withSeqOpts(from, patch);
+    const r = await verify(db(), from, to);
+    expect(r.up.map((s) => s.sql).join('\n')).toContain('START WITH');
+    expect(r.upDiff).toEqual([]);
+    expect(r.downDiff).toEqual([]);
+  });
+
+  // 新建序列的当前值就是旧 seqstart，PG 还会校验当前值落在新范围内（那需要 RESTART，不属于结构迁移）；
+  // 这里先用 setval 把当前值推进到新范围内，模拟已在使用中的序列，只验证 START WITH 本身
+  const migrateUsedSeq = async (from: Model, to: Model, seq: string, value: string) => {
+    await build(db(), from);
+    await db().exec(`SELECT setval('${seq}', ${value})`);
+    const up = plan(from, to);
+    expect(up.map((s) => s.sql).join('\n')).toContain('START WITH');
+    await runSteps(db(), up);
+    expect(diffAgainst(await readSnapshot(db()), to).total).toBe(0);
+    await runSteps(db(), plan(to, from));
+    expect(diffAgainst(await readSnapshot(db()), from).total).toBe(0);
+  };
+
+  test('ALTER SEQUENCE start 为 null：升序 min null → 10（使用中的序列）', async () => {
+    const from = seqModel({});
+    await migrateUsedSeq(from, withSeqOpts(from, { min: '10' }), 'public.x', '50');
+  });
+
+  test('ALTER SEQUENCE start 为 null：降序 max -5 → -20（使用中的序列）', async () => {
+    const from = seqModel({ increment: '-1', max: '-5' });
+    await migrateUsedSeq(from, withSeqOpts(from, { max: '-20' }), 'public.x', '-30');
+  });
+
+  test('bigserial 带超出 integer 范围的显式 start 缩窄为 serial', async () => {
+    const m = emptyModel('pg');
+    const t = createTable(m, createSchema(m, 'public', 's_pub'), 'items', 't_items');
+    const id = addColumn(m, t, { id: 'c_id', name: 'id', type: 'bigserial' });
+    pgSerialOf(m, m.objects[id] as Column)!.sequence.options.start = '5000000000';
+    expect(validate(m)).toEqual([]);
+    const m2 = structuredClone(m);
+    setColumnType(m2, id, 'serial');
+    expect(validate(m2)).toEqual([]);
+    expect(pgSerialOf(m2, m2.objects[id] as Column)!.sequence.options.start).toBeNull();
+    await migrateUsedSeq(m, m2, 'public.items_id_seq', '100');
   });
 });
 

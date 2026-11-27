@@ -1,8 +1,18 @@
 // 工作区状态：WebSocket 连接同步房间（断线自动重连），SyncClient 维护模型，另外管理画布布局、板块和在线成员。
 import { type CanvasSection, type Role, sanitizeSections } from '@dowel/api';
 import { EditError, emptyModel, type Model, newId } from '@dowel/core';
-import { SyncClient, type ToClient, type Versions } from '@dowel/sync';
+import {
+  SyncClient,
+  type SyncClientOptions,
+  SyncMessageTooLargeError,
+  type ToClient,
+  type Versions,
+} from '@dowel/sync';
 import { useEffect, useLayoutEffect, useState, useSyncExternalStore } from 'react';
+
+import i18n from './i18n.ts';
+
+const mib = (bytes: number) => (bytes / 1048576).toFixed(1);
 
 export type Layout = Record<string, { x: number; y: number }>;
 export type Status = 'connecting' | 'online' | 'offline';
@@ -25,16 +35,18 @@ export class Workspace {
   private ws: WebSocket | null = null;
   private stopped = false;
   private retry = 0;
+  private pendingOversizeDropped: number | null = null;
+  private reconnectTimer: ReturnType<typeof setTimeout> | null = null;
   private listeners = new Set<() => void>();
   private snap: Snapshot;
   private seenNotices = 0;
   /** 冲突、校验失败等需要告诉用户的消息 */
   onNotice: (message: string, kind: 'error' | 'info') => void = () => {};
 
-  constructor(pid: string) {
+  constructor(pid: string, options?: SyncClientOptions) {
     this.pid = pid;
     // 每个浏览器标签页是一个独立的客户端
-    this.client = new SyncClient(`tab-${newId()}`, emptyModel());
+    this.client = new SyncClient(`tab-${newId()}`, emptyModel(), options);
     this.client.send = (m) => {
       if (this.ws?.readyState === WebSocket.OPEN) this.ws.send(JSON.stringify(m));
     };
@@ -67,6 +79,10 @@ export class Workspace {
 
   start() {
     this.stopped = false;
+    if (this.reconnectTimer !== null) {
+      clearTimeout(this.reconnectTimer);
+      this.reconnectTimer = null;
+    }
     const url = `${location.protocol === 'https:' ? 'wss' : 'ws'}://${location.host}/api/projects/${this.pid}/sync`;
     const ws = new WebSocket(url);
     this.ws = ws;
@@ -84,10 +100,20 @@ export class Workspace {
       const m = JSON.parse(String(e.data)) as ToClient | { t: string; [k: string]: unknown };
       switch (m.t) {
         case 'welcome':
-        case 'snapshot':
         case 'commit':
         case 'reject':
           this.client.receive(m as ToClient);
+          break;
+        case 'snapshot':
+          this.client.receive(m as ToClient);
+          if (this.pendingOversizeDropped !== null) {
+            const count = this.pendingOversizeDropped;
+            this.pendingOversizeDropped = null;
+            this.onNotice(
+              count > 0 ? i18n.t('ws.messageTooLarge', { count }) : i18n.t('ws.messageTooLargeNone'),
+              'error',
+            );
+          }
           break;
         case 'layout':
           this.update({ layout: { ...this.snap.layout, ...(m.positions as Layout) } });
@@ -109,18 +135,34 @@ export class Workspace {
       if (this.stopped) return;
       // 4401：没有权限；4403：账号被停用或项目权限被收回。都不再重连，避免刷屏
       if (e.code === 4401 || e.code === 4403) {
+        this.pendingOversizeDropped = null;
         this.update({ status: 'offline' });
         this.onNotice(e.reason || '没有权限', 'error');
         return;
       }
+      // 1009：发出的消息超过服务端单条上限。正常情况下发送前就会在本地拦下（SyncClient.mutate），
+      // 走到这里说明两边上限不一致：丢掉待确认修改、轮换客户端标识并重置序号后重连，等服务端快照刷新画布再提示
+      if (e.code === 1009) {
+        const dropped = this.client.dropPending();
+        this.pendingOversizeDropped = (this.pendingOversizeDropped ?? 0) + dropped;
+      }
       this.update({ status: 'offline' });
       const delay = Math.min(10_000, 500 * 2 ** this.retry++);
-      setTimeout(() => !this.stopped && this.start(), delay);
+      if (this.reconnectTimer !== null) clearTimeout(this.reconnectTimer);
+      this.reconnectTimer = setTimeout(() => {
+        this.reconnectTimer = null;
+        if (!this.stopped) this.start();
+      }, delay);
     };
   }
 
   stop() {
     this.stopped = true;
+    this.pendingOversizeDropped = null;
+    if (this.reconnectTimer !== null) {
+      clearTimeout(this.reconnectTimer);
+      this.reconnectTimer = null;
+    }
     this.ws?.close();
   }
 
@@ -130,6 +172,13 @@ export class Workspace {
       this.client.mutate(name, args, basis);
       return true;
     } catch (e) {
+      if (e instanceof SyncMessageTooLargeError) {
+        this.onNotice(
+          i18n.t('ws.opTooLarge', { size: mib(e.bytes), max: Math.round(e.max / 1048576) }),
+          'error',
+        );
+        return false;
+      }
       if (e instanceof EditError) {
         this.onNotice(e.message, 'error');
         return false;
