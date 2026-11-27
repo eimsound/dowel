@@ -15,7 +15,6 @@ import type { Dialect } from '@dowel/core';
 import { useMutation, useQueryClient } from '@tanstack/react-query';
 import { Link, useNavigate, useParams } from '@tanstack/react-router';
 import {
-  ArrowDownToLine,
   Database,
   FileInput,
   Play,
@@ -813,8 +812,6 @@ const EnvironmentDetailView = ({ eid }: { eid: string }) => {
       ? 'switch'
       : 'execute';
   const rollTarget = rollbackTargets.find((v) => v.id === rollTo) ?? rollbackTargets.at(-1);
-  const showBaseline =
-    !!status && !!history && !history.initialized && !current && status.versions[0]?.number === 0;
   const deniedText = status ? denied(status.effectiveExecPolicy) : '';
   // 上一次执行没有结束（停在中途 / 读回校验失败）时，当前版本也可以作为标记目标：手工改回当前版本之后放弃那次未完成的运行
   // “当前版本”以执行器读目标库历史得到的为准（history.currentVersion），不用平台缓存（缓存可能过期）；
@@ -834,10 +831,6 @@ const EnvironmentDetailView = ({ eid }: { eid: string }) => {
   const canRun = direct || viaRequest;
   const runTitle = canRun ? undefined : deniedText;
   const run = (kind: ExecKind, to?: EnvVersion) => {
-    if (kind === 'baseline') {
-      if (canExec) setDlg({ kind, to, mode: 'direct' });
-      return;
-    }
     if (!canRun) return;
     setDlg({ kind, to, mode: direct ? 'direct' : 'request' });
   };
@@ -1098,23 +1091,8 @@ const EnvironmentDetailView = ({ eid }: { eid: string }) => {
                       </button>
                     </div>
                   )}
-                  {showBaseline && (
-                    <div className="space-y-1">
-                      <button
-                        type="button"
-                        className="btn"
-                        aria-disabled={!canExec || undefined}
-                        title={canExec ? undefined : deniedText}
-                        onClick={() => run('baseline')}
-                      >
-                        <ArrowDownToLine size={16} aria-hidden="true" />
-                        {t('envx.exec.baselineButton')}
-                      </button>
-                    </div>
-                  )}
                 </div>
               )}
-              {showBaseline && <p className="hint m-0">{t('envx.exec.baselineHint')}</p>}
               {status && perm.approvalRequired && (
                 <p className="hint m-0" role="note" data-testid="approval-required">
                   {t('req.envApprovalRequired')}

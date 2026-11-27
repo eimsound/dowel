@@ -562,12 +562,11 @@ test('每个应审计的动作都能在 audit_events 里找到', async () => {
     { action: 'environment.create', run: () => directAudit('environment.create', 'environment', 'e1') },
     { action: 'environment.delete', run: () => directAudit('environment.delete', 'environment', 'e1') },
     { action: 'environment.pull', run: () => directAudit('environment.pull', 'environment', 'e1') },
-    // P4b：环境的修改、执行、回滚、写基线（路由级覆盖在 executions.test.ts / exec-policy.test.ts 里）
+    // P4b：环境的修改、执行、回滚（路由级覆盖在 executions.test.ts / exec-policy.test.ts 里）
     { action: 'environment.update', run: () => directAudit('environment.update', 'environment', 'e1') },
     { action: 'environment.execute', run: () => directAudit('environment.execute', 'environment', 'e1') },
     { action: 'environment.rollback', run: () => directAudit('environment.rollback', 'environment', 'e1') },
     { action: 'environment.switch', run: () => directAudit('environment.switch', 'environment', 'e1') },
-    { action: 'environment.baseline', run: () => directAudit('environment.baseline', 'environment', 'e1') },
     // P4c：接手、认领、接入已有历史（路由级覆盖在 takeover.test.ts）
     { action: 'project.takeover', run: () => directAudit('project.takeover', 'project', 'p1') },
     { action: 'project.claim', run: () => directAudit('project.claim', 'environment', 'e1') },

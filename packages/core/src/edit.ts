@@ -56,7 +56,7 @@ import {
 } from './pg/partition.ts';
 import { isPgSerialArrayType, parsePgSerialType, PG_SERIAL_BASE, type PgSerialBase } from './pg/serial.ts';
 import { getDialect } from './registry.ts';
-import { SQLITE_STRICT_TYPES, sqliteNormalizeCollation } from './sqlite/types.ts';
+import { SQLITE_STRICT_TYPES, sqliteNormalizeCollation, sqliteNormalizeType } from './sqlite/types.ts';
 
 export { EditError, exprReferences, renameInExpr, renameQualifiedInExpr, type Token, tokenize };
 
@@ -358,7 +358,13 @@ export const setTableExt = (m: Model, id: string, ext: TableExt | null) => {
     }
     if (ext.sqlite.strict) {
       for (const c of columnsOf(m, id)) {
-        if (!SQLITE_STRICT_TYPES.has(c.type.trim().toUpperCase())) {
+        const normalized = c.type.trim().toUpperCase();
+        if (!normalized) {
+          throw new EditError(
+            `列 ${c.name} 未声明类型，STRICT 表要求声明 INT/INTEGER/REAL/TEXT/BLOB/ANY 之一`,
+          );
+        }
+        if (!SQLITE_STRICT_TYPES.has(normalized)) {
           throw new EditError(
             `列 ${c.name} 的类型 ${c.type} 不符合 STRICT 表要求（仅允许 INT/INTEGER/REAL/TEXT/BLOB/ANY）`,
           );
@@ -1084,10 +1090,13 @@ export interface ColumnSpec {
 
 /**
  * 普通列类型的规范写法（各方言 normalizeType，与界面输入类型时的规范化一致），让模型与引擎读回的写法可以直接比较（#132）。
- * 枚举列（有 typeRef，type 只是数组维度）与空类型原样保留。
+ * SQLite 始终走 sqliteNormalizeType（纯空白同样归为 ''）；其他方言中枚举列（有 typeRef）与空类型原样保留。
  */
-const canonicalColumnType = (m: Model, type: string, typeRef: string | null | undefined): string =>
-  typeRef || !type.trim() ? type : getDialect(m.dialect).normalizeType(type);
+const canonicalColumnType = (m: Model, type: string, typeRef: string | null | undefined): string => {
+  if (typeRef) return type;
+  if (m.dialect === 'sqlite') return sqliteNormalizeType(type);
+  return !type.trim() ? type : getDialect(m.dialect).normalizeType(type);
+};
 
 /** 排序规则的规范写法：目前只有 SQLite 内置排序规则（大写），其他方言的排序规则名依赖目标库目录，原样保留 */
 const canonicalCollation = (m: Model, collation: string | null): string | null =>
@@ -1195,12 +1204,13 @@ export const addColumn = (m: Model, table: string, spec: ColumnSpec): string => 
     assertMysqlSafeOption(spec.ext?.mysql?.charset, '字符集名');
     assertMysqlSafeOption(spec.collation, '排序规则名');
   }
-  if (
-    m.dialect === 'sqlite' &&
-    t.ext?.sqlite?.strict &&
-    !SQLITE_STRICT_TYPES.has(type.trim().toUpperCase())
-  ) {
-    throw new EditError(`STRICT 表不支持列类型 ${spec.type}（仅允许 INT/INTEGER/REAL/TEXT/BLOB/ANY）`);
+  if (m.dialect === 'sqlite' && t.ext?.sqlite?.strict) {
+    if (!type) {
+      throw new EditError('STRICT 表的列必须声明类型（仅允许 INT/INTEGER/REAL/TEXT/BLOB/ANY）');
+    }
+    if (!SQLITE_STRICT_TYPES.has(type)) {
+      throw new EditError(`STRICT 表不支持列类型 ${spec.type}（仅允许 INT/INTEGER/REAL/TEXT/BLOB/ANY）`);
+    }
   }
   const serialKind = m.dialect === 'pg' && !spec.typeRef ? parsePgSerialType(spec.type) : null;
   if (m.dialect === 'pg' && !spec.typeRef) {
@@ -1490,10 +1500,15 @@ export const setColumnType = (m: Model, id: string, rawType: string, typeRef: st
   }
   if (m.dialect === 'sqlite') {
     const t = get(m, c.parent, 'table');
-    if (t.ext?.sqlite?.strict && !SQLITE_STRICT_TYPES.has(type.trim().toUpperCase())) {
-      throw new EditError(`STRICT 表不支持列类型 ${rawType}（仅允许 INT/INTEGER/REAL/TEXT/BLOB/ANY）`);
+    if (t.ext?.sqlite?.strict) {
+      if (!type) {
+        throw new EditError('STRICT 表的列必须声明类型（仅允许 INT/INTEGER/REAL/TEXT/BLOB/ANY）');
+      }
+      if (!SQLITE_STRICT_TYPES.has(type)) {
+        throw new EditError(`STRICT 表不支持列类型 ${rawType}（仅允许 INT/INTEGER/REAL/TEXT/BLOB/ANY）`);
+      }
     }
-    if (c.ext?.sqlite?.autoincrement && type.trim().toUpperCase() !== 'INTEGER') {
+    if (c.ext?.sqlite?.autoincrement && type !== 'INTEGER') {
       clearSqliteAutoincrement(c);
     }
   }

@@ -32,6 +32,7 @@ import {
   type PartitionStrategy,
   resolvePartitionBy,
   splitMysqlTypeModifiers,
+  SQLITE_STRICT_TYPES,
   type Table,
   validatePartitionBoundCode,
   withModelIndex,
@@ -79,7 +80,7 @@ import {
 import { useProject } from '../project.tsx';
 import { resolveTopLevelTableId } from '../sections.ts';
 import type { Workspace } from '../workspace.ts';
-import { shortType, typeLabel } from './Canvas.tsx';
+import { isUntypedColumn, shortType, typeLabel } from './Canvas.tsx';
 import { Modal } from './Modal.tsx';
 import { Banner, cx, Empty, IconButton, Menu, type MenuItem, Sql } from './ui.tsx';
 
@@ -649,6 +650,9 @@ interface KeyDraft {
 const isIntegerColumn = (c: Column) =>
   !c.typeRef && (c.type === 'smallint' || c.type === 'integer' || c.type === 'bigint');
 
+/** 开启 STRICT 被拦下时最多列出的列名个数，其余按数量概括 */
+const STRICT_BLOCKED_MAX_NAMES = 5;
+
 const MYSQL_UNSIGNED_BASE_TYPES = new Set([
   'tinyint',
   'smallint',
@@ -704,6 +708,8 @@ const TableInspector = ({
   const dialectSpec = getDialect(model.dialect);
   const uiSpec = dialectUiSpec(model.dialect);
   const idx = useMemo(() => modelIndex ?? buildModelIndex(model), [model, modelIndex]);
+  // 尝试开启 STRICT 但有不兼容列时，在表选项下就地提示（列改好、切换表或已开启后自动消失）
+  const [strictBlockedTable, setStrictBlockedTable] = useState<string | null>(null);
   const versions = useQuery({
     queryKey: ['versions', pid],
     queryFn: () => api<VersionInfo[]>('GET', `/api/projects/${pid}/versions`),
@@ -736,6 +742,24 @@ const TableInspector = ({
     ? withModelIndex(model, () => effectiveColumnsOf(model, table.id), idx)
     : idx.columnsOf(table.id);
   const pk = idx.childrenRef(table.id, 'primaryKey')[0];
+  const sqliteStrict = model.dialect === 'sqlite' && !!table.ext?.sqlite?.strict;
+  // 开启 STRICT 前不兼容的列：无类型，或类型不在 INT / INTEGER / REAL / TEXT / BLOB / ANY 之内（与核心校验同一规则）
+  const strictIncompatible =
+    model.dialect === 'sqlite' && !sqliteStrict
+      ? cols.filter((c) => !SQLITE_STRICT_TYPES.has(c.type.trim().toUpperCase()))
+      : [];
+  const strictBlockedShown = strictBlockedTable === table.id && strictIncompatible.length > 0;
+  /** 列类型框的提交前校验：STRICT 表只接受白名单类型且必须声明；SQLite 非 STRICT 表允许清空（无类型）；其他方言不能为空 */
+  const validateColumnType = (v: string): string | null => {
+    if (model.dialect === 'sqlite') {
+      if (!sqliteStrict) return null;
+      if (!v) return t('insp.sqliteStrictTypeRequiredErr');
+      return SQLITE_STRICT_TYPES.has(normalizeType(v, 'sqlite'))
+        ? null
+        : t('insp.sqliteStrictTypeInvalidErr', { type: v });
+    }
+    return v ? null : t('insp.typeRequiredErr');
+  };
   const checks = idx.childrenRef(table.id, 'check');
   const uniques = idx.childrenRef(table.id, 'unique');
   const fks = idx.childrenRef(table.id, 'foreignKey');
@@ -788,6 +812,7 @@ const TableInspector = ({
   const mysqlTypeHintId = useId();
   const serialHintId = useId();
   const nnInferredBaseId = useId();
+  const untypedHintId = useId();
   const fillFactorErrId = useId();
   // PG serial 列被重新选成普通整数类型时，在该列类型框下提示“自增仍保留”（只是提示，不改默认值与序列）
   const [serialHintCol, setSerialHintCol] = useState<string | null>(null);
@@ -1067,7 +1092,13 @@ const TableInspector = ({
               <input
                 type="checkbox"
                 checked={!!table.ext?.sqlite?.strict}
+                aria-describedby={strictBlockedShown ? `${untypedHintId}-strict` : undefined}
                 onChange={(e) => {
+                  if (e.target.checked && strictIncompatible.length > 0) {
+                    setStrictBlockedTable(table.id);
+                    return;
+                  }
+                  setStrictBlockedTable(null);
                   const next = { ...table.ext?.sqlite, strict: e.target.checked };
                   ws.act('setTableExt', {
                     id: table.id,
@@ -1093,6 +1124,21 @@ const TableInspector = ({
               {t('insp.sqliteWithoutRowid')}
             </label>
           </div>
+          {strictBlockedShown && (
+            <p id={`${untypedHintId}-strict`} className="hint error" role="alert">
+              {strictIncompatible.length > STRICT_BLOCKED_MAX_NAMES
+                ? t('insp.sqliteStrictBlockedMore', {
+                    cols: strictIncompatible
+                      .slice(0, STRICT_BLOCKED_MAX_NAMES)
+                      .map((c) => c.name)
+                      .join(t('insp.listSep')),
+                    rest: strictIncompatible.length - STRICT_BLOCKED_MAX_NAMES,
+                  })
+                : t('insp.sqliteStrictBlocked', {
+                    cols: strictIncompatible.map((c) => c.name).join(t('insp.listSep')),
+                  })}
+            </p>
+          )}
         </div>
       )}
 
@@ -1224,7 +1270,7 @@ const TableInspector = ({
         {!isChild && (
           <datalist id={typesId}>
             {[
-              ...dialectSpec.commonTypes,
+              ...(sqliteStrict ? [...SQLITE_STRICT_TYPES] : dialectSpec.commonTypes),
               ...(model.dialect === 'pg' ? PG_SERIAL_TYPE_OPTIONS : []),
               ...(model.dialect === 'mysql' ? ["enum('a','b')", "set('x','y')"] : []),
               ...enumNames,
@@ -1260,6 +1306,18 @@ const TableInspector = ({
             const rowInferredId = `${nnInferredBaseId}-row-${c.id}`;
             const hintInferredId = `${nnInferredBaseId}-hint-${c.id}`;
             const showRowInferred = !isPk && nn.inferredOnly;
+            // SQLite 非 STRICT 表的无类型列：类型框下说明 BLOB 亲和性
+            const showUntypedHint = open && !sqliteStrict && isUntypedColumn(model, c);
+            // 单列 INT / BIGINT 等整数主键不是 rowid 别名，说明为什么没有 AUTOINCREMENT
+            const showNotRowidAliasHint =
+              open &&
+              model.dialect === 'sqlite' &&
+              isPk &&
+              pk?.columns.length === 1 &&
+              !table.ext?.sqlite?.withoutRowid &&
+              c.generated === null &&
+              /INT/i.test(c.type) &&
+              c.type.trim().toUpperCase() !== 'INTEGER';
             if (isChild) {
               return (
                 <li
@@ -1298,12 +1356,16 @@ const TableInspector = ({
                     <ChevronRight size={14} aria-hidden="true" className="text-text-3" />
                   )}
                   <span className="min-w-0 flex-1 truncate font-mono">{c.name}</span>
-                  <span
-                    className={cx('truncate font-mono text-xs', c.typeRef ? 'text-enum' : 'text-text-3')}
-                    title={serial?.label}
-                  >
-                    {rowType}
-                  </span>
+                  {isUntypedColumn(model, c) ? (
+                    <span className="truncate font-sans text-xs text-text-3 italic">{t('insp.untyped')}</span>
+                  ) : (
+                    <span
+                      className={cx('truncate font-mono text-xs', c.typeRef ? 'text-enum' : 'text-text-3')}
+                      title={serial?.label}
+                    >
+                      {rowType}
+                    </span>
+                  )}
                   <span className="flex min-w-[52px] shrink-0 justify-end gap-[3px]">
                     {isPk && <b className="flag pk">PK</b>}
                     {fkCols.has(c.id) && <b className="flag fk">FK</b>}
@@ -1336,20 +1398,31 @@ const TableInspector = ({
                           label={`${t('insp.type')} ${c.name}`}
                           value={serial?.label ?? typeLabel(model, c)}
                           list={typesId}
+                          placeholder={
+                            model.dialect === 'sqlite' && !sqliteStrict
+                              ? t('insp.sqliteUntypedPlaceholder')
+                              : undefined
+                          }
                           basisIds={
                             model.dialect === 'pg'
                               ? // 改成 serial 会改写（或新建）归属此列的序列，派生序列名还取决于表名
                                 [c.id, table.id, ...idx.sequencesOwnedBy(c.id).map((s) => s.id)]
-                              : [c.id]
+                              : model.dialect === 'sqlite'
+                                ? // 能否清空 / 用哪些类型取决于表的 STRICT 选项
+                                  [c.id, table.id]
+                                : [c.id]
                           }
                           mono
                           disabled={isPartKey}
+                          validate={validateColumnType}
                           describedBy={
                             model.dialect === 'mysql'
                               ? mysqlTypeHintId
                               : showSerialHint
                                 ? serialHintId
-                                : undefined
+                                : showUntypedHint
+                                  ? untypedHintId
+                                  : undefined
                           }
                           onCommit={(v, b) => {
                             // 只在显示写法前后加了空格：不算修改
@@ -1409,6 +1482,11 @@ const TableInspector = ({
                     {showSerialHint && (
                       <p id={serialHintId} className="hint m-0 block">
                         {t('insp.serialKeptHint')}
+                      </p>
+                    )}
+                    {showUntypedHint && (
+                      <p id={untypedHintId} className="hint m-0">
+                        {t('insp.sqliteUntypedHint')}
                       </p>
                     )}
                     {isPartKey && <p className="hint">{t('part.keyColLockedHint')}</p>}
@@ -1520,7 +1598,7 @@ const TableInspector = ({
                         {model.dialect === 'sqlite' &&
                           isPk &&
                           pk?.columns.length === 1 &&
-                          c.type.toUpperCase() === 'INTEGER' &&
+                          c.type.trim().toUpperCase() === 'INTEGER' &&
                           !table.ext?.sqlite?.withoutRowid && (
                             <label>
                               <input
@@ -1590,6 +1668,9 @@ const TableInspector = ({
                       <p id={hintInferredId} className="hint m-0">
                         {t('insp.notNullInferredHint')}
                       </p>
+                    )}
+                    {showNotRowidAliasHint && (
+                      <p className="hint m-0">{t('insp.sqliteNotRowidAliasHint', { type: c.type })}</p>
                     )}
                     {model.dialect === 'mysql' && mysqlSplit && (
                       <div className="space-y-2 border-t border-border pt-2">

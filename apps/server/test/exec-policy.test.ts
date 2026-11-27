@@ -1,7 +1,7 @@
 // H6 基础执行权限：谁能执行三档——项目编辑者 / 项目管理员 / 仅限执行者；
 // 默认非生产为编辑者、生产为项目管理员；档位存在环境上（P5a 起是执行策略的环境层，存在 exec_policies）。
 // 这里的用户都不是执行者，所以“仅限执行者”只有实例管理员能过；执行者授权的场景见 policy.test.ts。
-// 特权操作：执行 / 回滚 / 写基线、改连接串和影子库、删除环境、取消“生产”标记（以及改档位本身）。
+// 特权操作：执行 / 回滚、改连接串和影子库、删除环境、取消“生产”标记（以及改档位本身）。
 // 模型的编辑和发布不受约束。不需要真实 PG：环境直接写库，授权检查在连接目标库之前。
 import { type EnvInfo, type ExecPolicy, POLICY_DEFAULTS, type Role, resolvePolicy } from '@dowel/api';
 import { afterAll, beforeAll, describe, expect, test } from 'vitest';
@@ -184,15 +184,6 @@ describe('接口：档位存在环境上，默认值、修改、特权操作', (
       expect(await tryExecute('prod', 'pa', action), `${action} prod pa`).toBe(404);
       expect(await tryExecute('prod', 'admin', action), `${action} prod admin`).toBe(404);
     }
-    // 写基线（不带版本）：通过鉴权后，非生产环境直接开始（SSE，连不上目标库以 error 事件结束，HTTP 200）；
-    // 生产环境先要求输入环境名确认（422）
-    const baseline = async (id: string, who: string) =>
-      (await call('POST', `${env(id)}/baseline`, {}, who)).status;
-    expect(await baseline('dev', 'viewer')).toBe(403);
-    expect(await baseline('dev', 'editor')).toBe(200);
-    expect(await baseline('prod', 'editor')).toBe(403);
-    expect(await baseline('prod', 'pa')).toBe(422);
-    expect(await baseline('prod', 'admin')).toBe(422);
 
     const dev = (await call('GET', `${env('dev')}/status`, undefined, 'editor')).data as {
       permissions: unknown;

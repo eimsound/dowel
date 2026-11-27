@@ -1945,7 +1945,7 @@ describe('Webhook 事务内持久化入队（#20）', () => {
       await appObj.requests.afterDirectRun(
         { id: admin.id, name: admin.name },
         { pid: 'p-wh-tx', env: stgEnv! },
-        { mode: 'migrate', to: 'v-wh-1', direction: 'up' },
+        { to: 'v-wh-1', direction: 'up' },
         { ok: true, current: { id: 'v-wh-1', number: 1, name: 'init' }, ran: 1, error: null },
       );
       jobs = await jobsOf();

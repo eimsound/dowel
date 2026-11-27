@@ -358,14 +358,13 @@ export const errorEvent = (e: unknown): { error: string; code?: string; details?
   return { error: c.message, code: c.kind, details: { partial } };
 };
 
-// ───── 执行 / 回滚 / 写基线 ─────
+// ───── 执行 / 回滚 ─────
 
 export interface RunInput {
   pid: string;
   projectName: string;
   env: EnvRow;
-  mode: 'migrate' | 'baseline';
-  to?: string;
+  to: string;
   direction?: 'up' | 'down' | 'switch';
   /** 写进目标库历史的执行者：用户 ID；CI 令牌执行时是令牌 ID（via = ci） */
   userId: string;
@@ -579,7 +578,6 @@ export const dryRunExecution = async (
       projectName: input.projectName,
       instanceId: settings.instanceId,
       chain,
-      mode: input.mode,
       to: input.to,
       direction: input.direction,
       executedBy: input.userId,
@@ -630,7 +628,6 @@ export const runExecution = async (
         projectName: input.projectName,
         instanceId: settings.instanceId,
         chain,
-        mode: input.mode,
         to: input.to,
         direction: input.direction,
         executedBy: input.userId,

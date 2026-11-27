@@ -78,9 +78,42 @@ const PG_CASES: readonly [string, string][] = [
   ['foo(Bar) BAZ(Qux)', 'foo(Bar) baz(Qux)'],
 ];
 
+const SQLITE_CASES: readonly [string, string][] = [
+  ['int', 'INT'],
+  ['integer', 'INTEGER'],
+  ['bigint', 'BIGINT'],
+  ['boolean', 'BOOLEAN'],
+  ['bool', 'BOOL'],
+  ['  unsigned  big   int ', 'UNSIGNED BIG INT'],
+  ['', ''],
+  ['   ', ''],
+  ['varchar(255)', 'VARCHAR(255)'],
+  ['double precision', 'DOUBLE PRECISION'],
+  ['clob', 'CLOB'],
+  ['decimal', 'DECIMAL'],
+  ['any', 'ANY'],
+  ['"MyType"', 'MYTYPE'],
+  ['[weird]', 'WEIRD'],
+  ['`bt`', 'BT'],
+  ["'Text'", 'TEXT'],
+  ['"INTEGER"', 'INTEGER'],
+  ['"  My  Type  "', 'MY TYPE'],
+  ['"a""b"', '"A""B"'],
+  ['"varchar"(10)', '"VARCHAR"(10)'],
+  ['"a" "b"', '"A" "B"'],
+  ['[a][b]', '[A][B]'],
+  ['""', '""'],
+];
+
 describe('PG normalizeType', () => {
   test.each(PG_CASES)('%s → %s', (input, out) => {
     expect(normalizeType(input, 'pg')).toBe(out);
+  });
+});
+
+describe('SQLite normalizeType', () => {
+  test.each(SQLITE_CASES)('%s → %s', (input, out) => {
+    expect(normalizeType(input, 'sqlite')).toBe(out);
   });
 });
 
@@ -89,22 +122,7 @@ describe('normalizeType 幂等性（四方言）', () => {
     pg: [
       ...new Set([...PG_CASES.flat(), 'char', 'character', 'double   precision', 'varchar', 'text[]', '']),
     ],
-    sqlite: [
-      'int',
-      'integer',
-      'BIGINT',
-      'boolean',
-      'text',
-      'varchar(255)',
-      'decimal(10, 2)',
-      'real',
-      'double precision',
-      'blob',
-      'numeric',
-      'any',
-      '  int  ',
-      '',
-    ],
+    sqlite: [...new Set([...SQLITE_CASES.flat(), 'decimal(10, 2)', 'real', 'blob', 'numeric', '  int  '])],
     mysql: [
       'INT',
       'INT(11)',
@@ -174,9 +192,15 @@ describe('normalizeType 幂等性（四方言）', () => {
 
 describe('addColumn / setColumnType 写入规范类型', () => {
   test.each([
+    ['sqlite', 'int', 'INT'],
     ['sqlite', 'integer', 'INTEGER'],
+    ['sqlite', 'bigint', 'BIGINT'],
+    ['sqlite', 'boolean', 'BOOLEAN'],
     ['sqlite', 'text', 'TEXT'],
     ['sqlite', 'varchar(10)', 'VARCHAR(10)'],
+    ['sqlite', '"MyType"', 'MYTYPE'],
+    ['sqlite', '   ', ''],
+    ['sqlite', '', ''],
     ['pg', 'int', 'integer'],
     ['pg', 'varchar(255)', 'character varying(255)'],
     ['mysql', 'INT', 'int'],
@@ -193,6 +217,7 @@ describe('addColumn / setColumnType 写入规范类型', () => {
   test('空类型、枚举列（typeRef，type 只是数组维度）原样保留', () => {
     const { m, t } = withTable('pg');
     expect(col(m, addColumn(m, t, { name: 'x', type: '' })).type).toBe('');
+    expect(col(m, addColumn(m, t, { name: 'w', type: '   ' })).type).toBe('   ');
     const schema = Object.values(m.objects).find((o) => o.kind === 'schema')!.id;
     m.objects.e = { id: 'e', kind: 'enum', parent: schema, name: 'mood', values: ['a'], comment: null };
     const c = addColumn(m, t, { name: 'y', type: '[]', typeRef: 'e' });
@@ -239,8 +264,11 @@ describe('addColumn / setColumnType 写入规范类型', () => {
 
   test('SQLite STRICT 表按规范类型检查，报错里仍是用户写的类型', () => {
     const { m, t } = withTable('sqlite', true);
-    expect(col(m, addColumn(m, t, { name: 'x', type: 'int' })).type).toBe('INTEGER');
+    expect(col(m, addColumn(m, t, { name: 'x', type: 'int' })).type).toBe('INT');
     expect(() => addColumn(m, t, { name: 'y', type: 'varchar(10)' })).toThrow(/varchar\(10\)/);
+    expect(() => addColumn(m, t, { name: 'b', type: 'bigint' })).toThrow(/bigint/);
+    expect(() => addColumn(m, t, { name: 'e', type: '' })).toThrow(/必须声明类型/);
+    expect(() => addColumn(m, t, { name: 'w', type: '   ' })).toThrow(/必须声明类型/);
   });
 });
 
@@ -439,6 +467,9 @@ describe('normalizeType 线性时间守卫', () => {
     ['mysql', '长连续空格', `int${' '.repeat(N)}x`, 'int x'],
     ['sqlite', '长连续空格', `int${' '.repeat(N)}x`, 'INT X'],
     ['sqlite', '大量 [] 后接非括号', `${'[]'.repeat(N / 2)}x`, `${'[]'.repeat(N / 2)}X`],
+    ['sqlite', '长带引号普通类型名去引号', `"${'a'.repeat(N)}"`, 'A'.repeat(N)],
+    ['sqlite', '长未闭合双引号', `"${'a'.repeat(N)}`, `"${'A'.repeat(N)}`],
+    ['sqlite', '长纯空白返回空串', ' '.repeat(N), ''],
     ['mssql', '长连续空格', `int${' '.repeat(N)}x`, 'int x'],
     ['mssql', '大量 [] 后接非括号', `${'[]'.repeat(N / 2)}x`, `${'[]'.repeat(N / 2)}x`],
   ];

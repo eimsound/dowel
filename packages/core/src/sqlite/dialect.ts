@@ -197,10 +197,17 @@ const validateSqliteModel = (m: Model): string[] => {
       errs.push(`表 ${t.name}：WITHOUT ROWID 表必须定义 PRIMARY KEY`);
     }
     for (const c of cols) {
-      if (t.ext?.sqlite?.strict && !SQLITE_STRICT_TYPES.has(c.type.trim().toUpperCase())) {
-        errs.push(
-          `表 ${t.name} 列 ${c.name}：STRICT 表仅支持 INT / INTEGER / REAL / TEXT / BLOB / ANY 类型（当前为 ${c.type}）`,
-        );
+      if (t.ext?.sqlite?.strict) {
+        const normalized = c.type.trim().toUpperCase();
+        if (!normalized) {
+          errs.push(
+            `表 ${t.name} 列 ${c.name}：STRICT 表的列必须声明类型（INT / INTEGER / REAL / TEXT / BLOB / ANY）`,
+          );
+        } else if (!SQLITE_STRICT_TYPES.has(normalized)) {
+          errs.push(
+            `表 ${t.name} 列 ${c.name}：STRICT 表仅支持 INT / INTEGER / REAL / TEXT / BLOB / ANY 类型（当前为 ${c.type}）`,
+          );
+        }
       }
       if (c.ext?.sqlite?.autoincrement) {
         if (t.ext?.sqlite?.withoutRowid) {

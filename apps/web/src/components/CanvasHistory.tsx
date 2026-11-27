@@ -63,7 +63,7 @@ import { defaultSchemaOf } from '../dialects.ts';
 import { formatTime } from '../format.ts';
 import { useProject } from '../project.tsx';
 import type { Layout } from '../workspace.ts';
-import { Canvas, shortType, typeLabel } from './Canvas.tsx';
+import { Canvas, isUntypedColumn, shortType, typeLabel } from './Canvas.tsx';
 import { DiffList } from './ExecDialog.tsx';
 import { McpBadge } from './McpTokens.tsx';
 import { Modal } from './Modal.tsx';
@@ -345,9 +345,13 @@ const HistorySchemaSummary = ({ model, copy }: { model: Model; copy?: HistoryCop
                             {c.name}
                             {!nn && <span className="text-text-3">?</span>}
                           </span>
-                          <span className={cx('shrink-0', c.typeRef ? 'text-enum' : 'text-text-3')}>
-                            {shortType(typeLabel(model, c))}
-                          </span>
+                          {isUntypedColumn(model, c) ? (
+                            <span className="shrink-0 font-sans text-text-3 italic">{t('insp.untyped')}</span>
+                          ) : (
+                            <span className={cx('shrink-0', c.typeRef ? 'text-enum' : 'text-text-3')}>
+                              {shortType(typeLabel(model, c))}
+                            </span>
+                          )}
                           {copy && (
                             <IconButton
                               label={t('clip.copyColumn', { name: `${fullName}.${c.name}` })}

@@ -82,7 +82,7 @@ export const attachRetiredMessage = (
 };
 
 /**
- * 读执行 / 回滚 / 写基线的 SSE：每条消息 `data: {ExecEvent JSON}`（解析见 sse.ts）。
+ * 读执行 / 回滚的 SSE：每条消息 `data: {ExecEvent JSON}`（解析见 sse.ts）。
  * 请求本身被拒绝（403 / 422 / 404，还没开始流）抛 ApiError；流里出错是最后一条带 error 的事件，由调用方处理。
  */
 export const streamExec = async (
