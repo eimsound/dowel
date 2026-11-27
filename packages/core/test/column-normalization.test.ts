@@ -2,7 +2,7 @@
 // - addColumn / setColumnType 按方言 normalizeType 写入（枚举列、空类型原样保留），MCP 宏与粘贴都经过它们；
 // - SQLite 内置排序规则（BINARY / NOCASE / RTRIM）写入时大写；
 // - SQLite 规划器比较列类型与内置排序规则时不区分大小写（已存的小写模型与引擎读回的大写写法不再算改动）；
-// - PG normalizeType 补齐 bit / varbit / float(p)，双引号里的标识符不转小写。
+// - PG normalizeType 补齐 bit / varbit / float(p)，双引号里的标识符与非纯数字类型修饰符不转小写。
 import { describe, expect, test } from 'vitest';
 
 import {
@@ -30,31 +30,139 @@ const withTable = (dialect: Dialect, strict = false) => {
 
 const col = (m: Model, id: string) => m.objects[id] as Extract<Model['objects'][string], { kind: 'column' }>;
 
+const PG_CASES: readonly [string, string][] = [
+  ['int', 'integer'],
+  ['INT4', 'integer'],
+  ['varchar(255)', 'character varying(255)'],
+  ['timestamptz', 'timestamp with time zone'],
+  ['bit', 'bit(1)'],
+  ['bit(8)', 'bit(8)'],
+  ['varbit', 'bit varying'],
+  ['varbit(16)', 'bit varying(16)'],
+  ['bit varying(16)', 'bit varying(16)'],
+  ['BIT VARYING(8)', 'bit varying(8)'],
+  ['float(10)', 'real'],
+  ['float(24)', 'real'],
+  ['float(25)', 'double precision'],
+  ['float(53)', 'double precision'],
+  ['float', 'double precision'],
+  ['bit[]', 'bit(1)[]'],
+  ['float(10)[]', 'real[]'],
+  ['"MyDomain"', '"MyDomain"'],
+  ['public."MyDomain"', 'public."MyDomain"'],
+  ['PUBLIC."My  Domain"[]', 'public."My  Domain"[]'],
+  ['"My(Type)"', '"My(Type)"'],
+  ['  Text  ', 'text'],
+  ['geometry(Point,4326)', 'geometry(Point,4326)'],
+  ['GEOMETRY(Point,4326)', 'geometry(Point,4326)'],
+  ['geometry(Point,4326)[]', 'geometry(Point,4326)[]'],
+  ['GEOMETRY (PointZ, 4326) [ ]', 'geometry(PointZ, 4326)[]'],
+  ['public.GEOMETRY(Point,4326)', 'public.geometry(Point,4326)'],
+  ['PUBLIC."GeoType"(Point,4326)[]', 'public."GeoType"(Point,4326)[]'],
+  ['NUMERIC(10, 2)', 'numeric(10,2)'],
+  ['TIMESTAMP(3) WITH TIME ZONE', 'timestamp(3) with time zone'],
+  ['timestamp(3)', 'timestamp(3) without time zone'],
+  ['TIMESTAMPTZ(3)[]', 'timestamp(3) with time zone[]'],
+  ['TIME(3) WITH TIME ZONE', 'time(3) with time zone'],
+  ['TIMETZ(2)', 'time(2) with time zone'],
+  ['INTERVAL YEAR TO MONTH', 'interval year to month'],
+  ['INTERVAL DAY TO SECOND(3)', 'interval day to second(3)'],
+  ["custom(Nested(Arg), 'A')", "custom(Nested(Arg), 'A')"],
+  ['foo(Bar) BAZ(Qux)', 'foo(Bar) baz(Qux)'],
+];
+
 describe('PG normalizeType', () => {
-  test.each([
-    ['int', 'integer'],
-    ['INT4', 'integer'],
-    ['varchar(255)', 'character varying(255)'],
-    ['timestamptz', 'timestamp with time zone'],
-    ['bit', 'bit(1)'],
-    ['bit(8)', 'bit(8)'],
-    ['varbit', 'bit varying'],
-    ['varbit(16)', 'bit varying(16)'],
-    ['bit varying(16)', 'bit varying(16)'],
-    ['float(10)', 'real'],
-    ['float(24)', 'real'],
-    ['float(25)', 'double precision'],
-    ['float(53)', 'double precision'],
-    ['float', 'double precision'],
-    ['bit[]', 'bit(1)[]'],
-    ['float(10)[]', 'real[]'],
-    ['"MyDomain"', '"MyDomain"'],
-    ['public."MyDomain"', 'public."MyDomain"'],
-    ['PUBLIC."My  Domain"[]', 'public."My  Domain"[]'],
-    ['  Text  ', 'text'],
-  ])('%s → %s', (input, out) => {
+  test.each(PG_CASES)('%s → %s', (input, out) => {
     expect(normalizeType(input, 'pg')).toBe(out);
   });
+});
+
+describe('normalizeType 幂等性（四方言）', () => {
+  const samples: Record<Dialect, readonly string[]> = {
+    pg: [
+      ...new Set([...PG_CASES.flat(), 'char', 'character', 'double   precision', 'varchar', 'text[]', '']),
+    ],
+    sqlite: [
+      'int',
+      'integer',
+      'BIGINT',
+      'boolean',
+      'text',
+      'varchar(255)',
+      'decimal(10, 2)',
+      'real',
+      'double precision',
+      'blob',
+      'numeric',
+      'any',
+      '  int  ',
+      '',
+    ],
+    mysql: [
+      'INT',
+      'INT(11)',
+      'INTEGER',
+      'BIGINT(20) UNSIGNED',
+      'TINYINT(1)',
+      'TINYINT(4)',
+      'BOOLEAN',
+      'DECIMAL',
+      'NUMERIC(12, 4)',
+      'DOUBLE PRECISION',
+      'REAL',
+      'CHAR',
+      'VARCHAR(255)',
+      'BIT',
+      'BINARY',
+      'DATETIME(0)',
+      'DATETIME(6)',
+      'TIMESTAMP(3)',
+      "ENUM('Open', 'Closed')",
+      "SET('A', 'B')",
+      'VECTOR(1536)',
+      'JSON',
+      'INT ZEROFILL',
+      '',
+    ],
+    mssql: [
+      'INT',
+      'INTEGER',
+      'INT8',
+      'BIT',
+      'BOOL',
+      'DECIMAL',
+      'DECIMAL(10)',
+      'DECIMAL(10, 2)',
+      'NUMERIC(18, 0)',
+      'FLOAT(10)',
+      'FLOAT(24)',
+      'FLOAT(25)',
+      'FLOAT(53)',
+      'NVARCHAR',
+      'NVARCHAR( 255 )',
+      'NVARCHAR(MAX)',
+      'CHARACTER VARYING(50)',
+      'DATETIME2',
+      'DATETIME2(3)',
+      'DATETIMEOFFSET',
+      'TIME',
+      'UUID',
+      'TIMESTAMP',
+      'JSON',
+      'VECTOR( 1536 )',
+      '',
+    ],
+  };
+
+  test.each(['pg', 'sqlite', 'mysql', 'mssql'] as const)(
+    '%s：normalizeType(normalizeType(x)) === normalizeType(x)',
+    (dialect) => {
+      for (const raw of samples[dialect]) {
+        const once = normalizeType(raw, dialect);
+        expect(normalizeType(once, dialect), `${dialect}: ${raw}`).toBe(once);
+      }
+    },
+  );
 });
 
 describe('addColumn / setColumnType 写入规范类型', () => {
@@ -102,6 +210,24 @@ describe('addColumn / setColumnType 写入规范类型', () => {
     const r = runMacro(m, 'alterColumn', { id: c, type: 'int8' }, new Map());
     expect(r.ops).toHaveLength(1);
     expect(col(m, c).type).toBe('bigint');
+  });
+
+  test('PG 非纯数字类型修饰符（geometry(Point,4326)）在写入与 alterColumn 中保留原文', () => {
+    const { m, t } = withTable('pg');
+    const g = addColumn(m, t, { name: 'geom', type: 'geometry(Point,4326)' });
+    expect(col(m, g).type).toBe('geometry(Point,4326)');
+    expect(
+      runMacro(structuredClone(m), 'alterColumn', { id: g, type: 'GEOMETRY(Point,4326)' }, new Map()).ops,
+    ).toEqual([]);
+    const changed = runMacro(
+      structuredClone(m),
+      'alterColumn',
+      { id: g, type: 'geometry(Polygon,4326)' },
+      new Map(),
+    );
+    expect(changed.ops).toHaveLength(1);
+    setColumnType(m, g, 'geometry(Polygon,4326)');
+    expect(col(m, g).type).toBe('geometry(Polygon,4326)');
   });
 
   test('SQLite STRICT 表按规范类型检查，报错里仍是用户写的类型', () => {
