@@ -20,6 +20,7 @@ import {
   UniqueExt,
 } from './ir.ts';
 import { columnsOf, effectiveColumnsOf, rootTableId } from './model.ts';
+import { PG_SERIAL_TYPE_NOTE } from './pg/serial.ts';
 import { getDialect } from './registry.ts';
 
 /** mutator 参数里的对象 ID：1-64 个字符，不能是 Object.prototype 上的保留名（宏编译层复用） */
@@ -105,11 +106,7 @@ export const mutators = {
       column: z.object({
         id,
         name,
-        type: z
-          .string()
-          .describe(
-            'Column type text. PG: `serial` / `bigserial` / `smallserial` (aliases serial4 / serial8 / serial2, case-insensitive, unquoted) are expanded on write into an `integer` / `bigint` / `smallint` column + NOT NULL + an owned sequence named `<table>_<column>_seq` + default `nextval(<that sequence>)`; the model stores the integer type, never `serial`. Cannot be combined with default / identity / generated.',
-          ),
+        type: z.string().describe(`Column type text. ${PG_SERIAL_TYPE_NOTE}`),
         typeRef: id.nullable().optional(),
         notNull: z.boolean().optional(),
         default: ColumnDefault.nullable().optional(),
@@ -133,11 +130,7 @@ export const mutators = {
   setColumnType: def(
     z.object({
       id,
-      type: z
-        .string()
-        .describe(
-          "Column type text. PG: `serial` / `bigserial` / `smallserial` (aliases serial4 / serial8 / serial2, case-insensitive, unquoted) are expanded on write into an `integer` / `bigint` / `smallint` column + NOT NULL + an owned sequence named `<table>_<column>_seq` + default `nextval(<that sequence>)`; the model stores the integer type, never `serial`. Switching between serial variants updates the owned sequence's type in place; setting any other type (including plain integer) changes only the type — clear the default to stop auto-incrementing.",
-        ),
+      type: z.string().describe(`Column type text. ${PG_SERIAL_TYPE_NOTE}`),
       typeRef: id.nullable(),
     }),
     (m, a) => E.setColumnType(m, a.id, a.type, a.typeRef),

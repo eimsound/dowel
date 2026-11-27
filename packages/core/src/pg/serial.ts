@@ -5,6 +5,10 @@ import type { Column, Model, Sequence } from '../ir.ts';
 export type PgSerialKind = 'serial' | 'bigserial' | 'smallserial';
 export type PgSerialBase = 'integer' | 'bigint' | 'smallint';
 
+/** 给 MCP / AI 调用方的 serial 写入规则说明（宏与原语 mutator 的参数描述共用） */
+export const PG_SERIAL_TYPE_NOTE =
+  "PG: `serial` / `bigserial` / `smallserial` (aliases serial4 / serial8 / serial2, case-insensitive, unquoted) are expanded on write into an `integer` / `bigint` / `smallint` column + NOT NULL + an owned sequence named `<table>_<column>_seq` + default `nextval(<that sequence>)`; the model stores the integer type, never `serial`. Cannot be combined with default / identity / generated / notNull: false. Switching between serial variants updates the owned sequence's type in place; setting any other type (including plain integer) changes only the type — clear the default to stop auto-incrementing.";
+
 /** 界面候选顺序 */
 export const PG_SERIAL_KINDS: readonly PgSerialKind[] = ['serial', 'bigserial', 'smallserial'];
 

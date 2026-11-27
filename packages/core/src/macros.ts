@@ -29,11 +29,14 @@ import {
 import { clonePlain, deepEqual } from './json.ts';
 import { all, effectiveColumnsOf } from './model.ts';
 import { BATCH_OPS_LIMIT, type MutatorName, objectIdArg, objectNameArg, runMutator } from './mutators.ts';
-import { isPgSerialArrayType, parsePgSerialType, PG_SERIAL_BASE, pgSerialOf } from './pg/serial.ts';
+import {
+  isPgSerialArrayType,
+  parsePgSerialType,
+  PG_SERIAL_BASE,
+  PG_SERIAL_TYPE_NOTE,
+  pgSerialOf,
+} from './pg/serial.ts';
 import { getDialect } from './registry.ts';
-
-const PG_SERIAL_DESC =
-  "PG: `serial` / `bigserial` / `smallserial` (aliases serial4 / serial8 / serial2, case-insensitive, unquoted) are expanded on write into an `integer` / `bigint` / `smallint` column + NOT NULL + an owned sequence named `<table>_<column>_seq` + default `nextval(<that sequence>)`; the model stores the integer type, never `serial`. Cannot be combined with default / identity / generated / notNull: false. Switching between serial variants updates the owned sequence's type in place; setting any other type (including plain integer) changes only the type — clear the default to stop auto-incrementing.";
 
 // ───── 公共类型 ─────
 
@@ -324,7 +327,7 @@ const macroColumn = z
       .string()
       .optional()
       .describe(
-        `Type text; may be omitted (or only array dims like \`[]\`) when typeRef is set. ${PG_SERIAL_DESC}`,
+        `Type text; may be omitted (or only array dims like \`[]\`) when typeRef is set. ${PG_SERIAL_TYPE_NOTE}`,
       ),
     typeRef: refSlot.nullable().optional().describe('PG enum: ID / `$ref:<alias>` / `[schema.]name`'),
     notNull: z.boolean().optional(),
@@ -477,7 +480,7 @@ export const alterColumnArgs = z
         'Existing column ID, or `$ref:<alias>` of a column created earlier in this batch (never a name)',
       ),
     name: objectNameArg.optional(),
-    type: z.string().optional().describe(`Type text. ${PG_SERIAL_DESC}`),
+    type: z.string().optional().describe(`Type text. ${PG_SERIAL_TYPE_NOTE}`),
     typeRef: refSlot
       .nullable()
       .optional()
@@ -1062,12 +1065,12 @@ const macroDef = <A extends z.ZodType>(d: MacroDef<A>) => d;
 export const macros = {
   defineTable: macroDef({
     args: defineTableArgs,
-    description: `Macro: create a table with columns, primary key, uniques, checks, indexes, foreign keys, comments, ext and optional partitions in one op. Columns / keys may refer to this table's columns by name; schema / typeRef / refTable / refColumns / default.nextval / partitions[].schema may be resolved by ID, \`$ref:<alias>\` or (qualified) name. Expands to primitive mutators in a fixed order (createTable → addColumn → setPartitionBy → addPrimaryKey (+ renameKey) → setTableExt → deferred SQLite setColumnExt (autoincrement) → addUnique / addCheck / addIndex / addForeignKey (each followed by renameKey when \`name\` is given) → createPartition → setComment). For circular foreign keys, define all tables first and add the remaining FKs with addForeignKey. ${PG_SERIAL_DESC}`,
+    description: `Macro: create a table with columns, primary key, uniques, checks, indexes, foreign keys, comments, ext and optional partitions in one op. Columns / keys may refer to this table's columns by name; schema / typeRef / refTable / refColumns / default.nextval / partitions[].schema may be resolved by ID, \`$ref:<alias>\` or (qualified) name. Expands to primitive mutators in a fixed order (createTable → addColumn → setPartitionBy → addPrimaryKey (+ renameKey) → setTableExt → deferred SQLite setColumnExt (autoincrement) → addUnique / addCheck / addIndex / addForeignKey (each followed by renameKey when \`name\` is given) → createPartition → setComment). For circular foreign keys, define all tables first and add the remaining FKs with addForeignKey. ${PG_SERIAL_TYPE_NOTE}`,
     compile: compileDefineTable,
   }),
   alterColumn: macroDef({
     args: alterColumnArgs,
-    description: `Macro: declaratively patch an existing column (name, type / typeRef, notNull, default, identity, ext, comment; omitted = unchanged, null = clear). \`id\` must be an existing column ID or a \`$ref:<alias>\` created earlier in this batch — never a name; the references typeRef / default.nextval may also be ID, \`$ref\` or \`[schema.]name\`. \`ext\` replaces the whole column ext (null clears it); on SQL Server an explicit default-constraint name is kept automatically unless ext.mssql sets defaultName / defaultNameMode. Expands safely in the order: drop identity → clear default → renameColumn → setColumnType → setNotNull → set default → set identity → setColumnExt → setComment; steps whose value already matches are skipped. ${PG_SERIAL_DESC}`,
+    description: `Macro: declaratively patch an existing column (name, type / typeRef, notNull, default, identity, ext, comment; omitted = unchanged, null = clear). \`id\` must be an existing column ID or a \`$ref:<alias>\` created earlier in this batch — never a name; the references typeRef / default.nextval may also be ID, \`$ref\` or \`[schema.]name\`. \`ext\` replaces the whole column ext (null clears it); on SQL Server an explicit default-constraint name is kept automatically unless ext.mssql sets defaultName / defaultNameMode. Expands safely in the order: drop identity → clear default → renameColumn → setColumnType → setNotNull → set default → set identity → setColumnExt → setComment; steps whose value already matches are skipped. ${PG_SERIAL_TYPE_NOTE}`,
     compile: compileAlterColumn,
   }),
 };
