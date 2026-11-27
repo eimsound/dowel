@@ -14,16 +14,18 @@ import type {
 } from '@dowel/api';
 import { useQuery, useQueryClient } from '@tanstack/react-query';
 import { useNavigate, useSearch } from '@tanstack/react-router';
-import { Check, CircleCheck, Database, FileUp, Plus, Trash2, TriangleAlert } from 'lucide-react';
+import { Check, FileUp, Plus, Trash2 } from 'lucide-react';
 import { useId, useRef, useState } from 'react';
 import { useTranslation } from 'react-i18next';
 
 import { api } from '../api.ts';
 import { ClaimDialog } from '../components/ClaimDialog.tsx';
+import { DbConnectionBlock } from '../components/DbConnectionBlock.tsx';
 import { AppShell, PageHeader } from '../components/Shell.tsx';
 import { Banner, cx, IconButton } from '../components/ui.tsx';
 import { DIALECT_UI_LIST, dialectUiSpec } from '../dialects.ts';
 import { useMe } from '../session.ts';
+import { slugify } from '../slug.ts';
 import { readSse } from '../sse.ts';
 
 type Kind = 'blank' | 'database' | 'sql' | 'takeover';
@@ -60,21 +62,12 @@ const EMPTY_ENV = (key: string): EnvDraft => ({
   name: '',
   url: '',
   production: true,
-  allowSameInstance: false,
+  allowSameInstance: true,
   shadowUrl: '',
   result: null,
   error: '',
   pending: false,
 });
-
-/** 由项目名生成 slug：小写、非字母数字换成 -、去掉首尾 -、最多 39 位（和服务的 slugSchema 一致） */
-const slugify = (name: string) =>
-  name
-    .trim()
-    .toLowerCase()
-    .replace(/[^a-z0-9]+/g, '-')
-    .replace(/^-+|-+$/g, '')
-    .slice(0, 39);
 
 /** 界面上的“全部”用 null 表示（与 projects.schemas 的含义一致）；一个都不选是无效状态，不能提交 */
 const scopeOf = (selected: string[], all: string[]) =>
@@ -126,7 +119,6 @@ export const NewProject = () => {
   const [stage, setStage] = useState<WizardStage | null>(null);
   const [stageDetail, setStageDetail] = useState<string | null>(null);
   const [busy, setBusy] = useState(false);
-  const shadowHintId = useId();
   const envSeq = useRef(0);
   /** 接手读取的代次（切组递增）与每环境序号（失效或重读递增），防止在途旧请求晚返回污染状态 */
   const takeGroupGenRef = useRef(0);
@@ -569,127 +561,48 @@ export const NewProject = () => {
           )}
 
           {step === 1 && (
-            <section className="mt-4 space-y-4">
-              <p className="hint">
+            <section className="mt-4 flex flex-col gap-4">
+              <p className="hint m-0">
                 {uiSpec.requiresExternalShadow
                   ? t('wiz.databaseHint', { dialect: uiSpec.name })
                   : t('wiz.databaseHintSqlite')}
               </p>
               {dialect === 'mssql' && envs.length > 0 && <Banner kind="info">{t('wiz.mssqlTlsHint')}</Banner>}
-              {envs.length === 0 && <p className="hint">{t('wiz.envEmpty')}</p>}
-              <ul className="m-0 list-none space-y-3 p-0">
-                {envs.map((env) => (
-                  <li key={env.key} className="space-y-2.5 rounded-md border border-border bg-panel p-4">
-                    <div className="grid grid-cols-2 gap-x-3 gap-y-2.5 max-[800px]:grid-cols-1">
-                      <label className="field">
-                        <span className="label">{t('wiz.envName')}</span>
-                        <input
-                          className="input"
-                          aria-label={t('wiz.envName')}
-                          value={env.name}
-                          placeholder="dev"
-                          autoCapitalize="none"
-                          autoCorrect="off"
-                          spellCheck={false}
-                          onChange={(e) => patchEnv(env.key, { name: e.target.value })}
-                        />
-                      </label>
-                      <label className="field">
-                        <span className="label">{t('wiz.envUrl')}</span>
-                        <input
-                          className="input font-mono"
-                          aria-label={t('wiz.envUrl')}
-                          value={env.url}
-                          placeholder={uiSpec.urlPlaceholder}
-                          autoCapitalize="none"
-                          autoCorrect="off"
-                          spellCheck={false}
-                          onChange={(e) => {
-                            // 连接串变了，之前的检查结果和接手读取缓存都作废
-                            patchEnv(env.key, { url: e.target.value, result: null, error: '' });
-                            invalidateTakeRead(env.key);
-                          }}
-                        />
-                      </label>
-                      {uiSpec.requiresExternalShadow && (
-                        <div className="field col-span-2">
-                          <label className="field">
-                            <span className="label">{t('wiz.envShadowUrl')}</span>
-                            <input
-                              className="input font-mono"
-                              aria-label={t('wiz.envShadowUrl')}
-                              aria-describedby={`${shadowHintId}-${env.key}`}
-                              value={env.shadowUrl}
-                              placeholder={uiSpec.shadowPlaceholder}
-                              autoCapitalize="none"
-                              autoCorrect="off"
-                              spellCheck={false}
-                              onChange={(e) => patchEnv(env.key, { shadowUrl: e.target.value })}
-                            />
-                          </label>
-                          <span id={`${shadowHintId}-${env.key}`} className="hint">
-                            {t('wiz.envShadowHint')}
-                          </span>
-                        </div>
-                      )}
-                      <div className="checks col-span-2">
-                        <label>
-                          <input
-                            type="checkbox"
-                            checked={env.production}
-                            onChange={(e) => patchEnv(env.key, { production: e.target.checked })}
-                          />
-                          {t('wiz.envProduction')}
-                        </label>
-                        {uiSpec.requiresExternalShadow && (
-                          <label>
-                            <input
-                              type="checkbox"
-                              checked={env.allowSameInstance}
-                              onChange={(e) => patchEnv(env.key, { allowSameInstance: e.target.checked })}
-                            />
-                            {t('wiz.envAllowSame')}
-                          </label>
-                        )}
-                      </div>
-                    </div>
-                    <div className="flex flex-wrap items-center gap-2">
-                      <button
-                        type="button"
-                        className="btn"
-                        disabled={env.pending || !env.url.trim() || !effectiveGroupId}
-                        aria-busy={env.pending}
-                        onClick={() => void check(env)}
-                      >
-                        {env.pending ? t('wiz.checking') : t('wiz.check')}
-                      </button>
-                      <IconButton
-                        label={t('wiz.removeEnv', { name: env.name || env.url || t('wiz.envName') })}
-                        onClick={() => {
-                          setEnvs((list) => list.filter((x) => x.key !== env.key));
-                          invalidateTakeRead(env.key);
-                        }}
-                      >
-                        <Trash2 size={16} aria-hidden="true" />
-                      </IconButton>
-                    </div>
-                    {env.error && (
-                      <Banner kind="danger" role="alert">
-                        {env.error}
-                      </Banner>
-                    )}
-                    {env.result && <CheckResult info={env.result} dialect={dialect} />}
-                  </li>
-                ))}
-              </ul>
-              <button
-                type="button"
-                className="btn"
-                onClick={() => setEnvs((list) => [...list, EMPTY_ENV(`env-${++envSeq.current}`)])}
-              >
-                <Plus size={16} aria-hidden="true" />
-                {t('wiz.addEnv')}
-              </button>
+              {envs.length === 0 ? (
+                <p className="hint m-0">{t('wiz.envEmpty')}</p>
+              ) : (
+                <ul className="m-0 list-none space-y-4 p-0">
+                  {envs.map((env) => (
+                    <WizardEnvCard
+                      key={env.key}
+                      env={env}
+                      dialect={dialect}
+                      canTest={!!effectiveGroupId}
+                      onPatch={(patch) => patchEnv(env.key, patch)}
+                      onUrlChange={(url) => {
+                        // 连接串变了，之前的检查结果和接手读取缓存都作废
+                        patchEnv(env.key, { url, result: null, error: '' });
+                        invalidateTakeRead(env.key);
+                      }}
+                      onTest={() => void check(env)}
+                      onRemove={() => {
+                        setEnvs((list) => list.filter((x) => x.key !== env.key));
+                        invalidateTakeRead(env.key);
+                      }}
+                    />
+                  ))}
+                </ul>
+              )}
+              <div>
+                <button
+                  type="button"
+                  className="btn"
+                  onClick={() => setEnvs((list) => [...list, EMPTY_ENV(`env-${++envSeq.current}`)])}
+                >
+                  <Plus size={16} aria-hidden="true" />
+                  {t('wiz.addEnv')}
+                </button>
+              </div>
             </section>
           )}
 
@@ -1184,60 +1097,111 @@ export const NewProject = () => {
 
 const cap = (s: string) => s.charAt(0).toUpperCase() + s.slice(1);
 
-/** 连接检查的结果：版本、账号、权限、schema（每个带表数） */
-const CheckResult = ({ info, dialect }: { info: TargetInfo; dialect: Dialect }) => {
+/** 向导第 2 步单张数据库卡片：身份（名字/生产标记/删除） + 连接整块（含测试） + 影子库策略 */
+const WizardEnvCard = ({
+  env,
+  dialect,
+  canTest,
+  onPatch,
+  onUrlChange,
+  onTest,
+  onRemove,
+}: {
+  env: EnvDraft;
+  dialect: Dialect;
+  canTest: boolean;
+  onPatch: (patch: Partial<EnvDraft>) => void;
+  onUrlChange: (url: string) => void;
+  onTest: () => void;
+  onRemove: () => void;
+}) => {
   const { t } = useTranslation();
+  const id = useId();
   const uiSpec = dialectUiSpec(dialect);
-  const yesNo = (v: boolean) => (v ? t('wiz.yes') : t('wiz.no'));
   return (
-    <div className="space-y-2 rounded-sm border border-border bg-surface-2 p-3 text-xs">
-      <p className="flex items-center gap-1.5 font-medium">
-        <CircleCheck size={14} aria-hidden="true" className="text-ok" />
-        {t('wiz.checkOk')}
-        <span className="text-text-2">
-          {t('wiz.checkVersionGeneric', { dialect: uiSpec.name, version: info.version })}
-        </span>
-      </p>
-      <dl className="grid grid-cols-[auto_1fr] gap-x-4 gap-y-1">
-        {uiSpec.requiresExternalShadow && (
-          <>
-            <dt className="text-text-2">{t('wiz.checkUser')}</dt>
-            <dd className="m-0 font-mono">{info.currentUser}</dd>
-            <dt className="text-text-2">{t('wiz.checkSuper')}</dt>
-            <dd className="m-0">
-              {yesNo(info.superuser)}
-              {!info.superuser && (
-                <span className="ml-3 text-text-2">
-                  {t('wiz.checkCreateDb')}：{yesNo(info.canCreateDb)}
-                  {uiSpec.schemas && (
-                    <>
-                      {' · '}
-                      {t('wiz.checkCreateSchema')}：{yesNo(info.canCreateSchema)}
-                    </>
-                  )}
-                </span>
-              )}
-            </dd>
-          </>
-        )}
-        <dt className="text-text-2">{uiSpec.schemas ? t('wiz.schemasTitle') : t('wiz.databaseTitle')}</dt>
-        <dd className="m-0 flex flex-wrap items-center gap-1.5">
-          {info.schemas.length === 0 && <span className="text-text-2">{t('wiz.noSchemas')}</span>}
-          {info.schemas.map((s) => (
-            <span key={s.name} className="chip font-mono">
-              {s.name} · {t('wiz.tables', { count: s.tables })}
+    <li className="space-y-3 rounded-md border border-border bg-panel p-4">
+      <div className="flex flex-wrap items-end gap-x-4 gap-y-2.5">
+        <div className="field max-w-[280px] min-w-[180px] flex-1">
+          <label className="label" htmlFor={`${id}-name`}>
+            {t('wiz.envName')}
+          </label>
+          <input
+            id={`${id}-name`}
+            className="input"
+            value={env.name}
+            placeholder="dev"
+            autoComplete="off"
+            autoCapitalize="none"
+            autoCorrect="off"
+            spellCheck={false}
+            onChange={(e) => onPatch({ name: e.target.value })}
+          />
+        </div>
+        <div className="checks min-h-[var(--ctl-h)] items-center">
+          <label>
+            <input
+              type="checkbox"
+              checked={env.production}
+              onChange={(e) => onPatch({ production: e.target.checked })}
+            />
+            {t('wiz.envProduction')}
+          </label>
+        </div>
+        <span className="flex-1" />
+        <IconButton
+          label={t('wiz.removeEnv', { name: env.name || env.url || t('wiz.envName') })}
+          onClick={onRemove}
+        >
+          <Trash2 size={16} aria-hidden="true" />
+        </IconButton>
+      </div>
+
+      <DbConnectionBlock
+        dialect={dialect}
+        url={env.url}
+        onUrlChange={onUrlChange}
+        onTest={onTest}
+        testPending={env.pending}
+        testDisabled={!canTest}
+        testError={env.error}
+        testResult={env.result}
+      />
+
+      {uiSpec.requiresExternalShadow && (
+        <div className="space-y-2.5 border-t border-border pt-3">
+          <div className="checks">
+            <label>
+              <input
+                type="checkbox"
+                checked={env.allowSameInstance}
+                onChange={(e) => onPatch({ allowSameInstance: e.target.checked })}
+              />
+              {t('wiz.envAllowSame')}
+            </label>
+          </div>
+          <div className="field">
+            <label className="label" htmlFor={`${id}-shadow`}>
+              {t('wiz.envShadowUrl')}
+            </label>
+            <input
+              id={`${id}-shadow`}
+              className="input font-mono"
+              aria-describedby={`${id}-shadow-hint`}
+              value={env.shadowUrl}
+              placeholder={uiSpec.shadowPlaceholder}
+              autoComplete="off"
+              autoCapitalize="none"
+              autoCorrect="off"
+              spellCheck={false}
+              onChange={(e) => onPatch({ shadowUrl: e.target.value })}
+            />
+            <span id={`${id}-shadow-hint`} className="hint">
+              {t('wiz.envShadowHint')}
             </span>
-          ))}
-          {info.dowelSchema && (
-            <span className="chip flex items-center gap-1 font-mono" title={t('wiz.schemasHint')}>
-              <TriangleAlert size={12} aria-hidden="true" />
-              dowel
-              {info.dowelMeta && <Database size={12} aria-hidden="true" />}
-            </span>
-          )}
-        </dd>
-      </dl>
-    </div>
+          </div>
+        </div>
+      )}
+    </li>
   );
 };
 

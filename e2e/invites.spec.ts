@@ -98,8 +98,12 @@ test('首次启动临时密码 → 强制改密 → 邀请 → 后台重置密�
   await admin.goto(`${BASE}/`);
   await expect(admin).toHaveURL(`${BASE}/change-password`);
 
-  // 完成改密后进入首页，并自动删除 initial-admin-password 文件
-  await admin.getByLabel('当前密码（或临时密码）').fill(initialPassword);
+  // 完成改密（无需再输入临时密码）后进入首页，并自动删除 initial-admin-password 文件
+  await expect(admin.locator('input[name="oldPassword"]')).toHaveCount(0);
+  await admin.getByLabel(/^新密码/).fill(initialPassword);
+  await admin.getByLabel('确认新密码').fill(initialPassword);
+  await admin.getByRole('button', { name: '保存新密码并继续' }).click();
+  await expect(admin.getByText('新密码不能与临时密码相同')).toBeVisible();
   await admin.getByLabel(/^新密码/).fill(ADMIN_NEW_PASSWORD);
   await admin.getByLabel('确认新密码').fill(ADMIN_NEW_PASSWORD);
   await admin.getByRole('button', { name: '保存新密码并继续' }).click();
@@ -161,7 +165,6 @@ test('首次启动临时密码 → 强制改密 → 邀请 → 后台重置密�
   await wang.getByLabel('密码').fill('temp-wangwu-1');
   await wang.getByRole('button', { name: '登录', exact: true }).click();
   await expect(wang).toHaveURL(`${BASE}/change-password`);
-  await wang.getByLabel('当前密码（或临时密码）').fill('temp-wangwu-1');
   await wang.getByLabel(/^新密码/).fill('wangwu-new-1');
   await wang.getByLabel('确认新密码').fill('wangwu-new-1');
   await wang.getByRole('button', { name: '保存新密码并继续' }).click();
@@ -192,7 +195,6 @@ test('首次启动临时密码 → 强制改密 → 邀请 → 后台重置密�
   await guest.getByLabel('密码').fill(generatedTempPw);
   await guest.getByRole('button', { name: '登录', exact: true }).click();
   await expect(guest).toHaveURL(`${BASE}/change-password`);
-  await guest.getByLabel('当前密码（或临时密码）').fill(generatedTempPw);
   await guest.getByLabel(/^新密码/).fill('lisi-after-temp');
   await guest.getByLabel('确认新密码').fill('lisi-after-temp');
   await guest.getByRole('button', { name: '保存新密码并继续' }).click();

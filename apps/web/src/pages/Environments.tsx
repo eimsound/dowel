@@ -20,6 +20,7 @@ import { useTranslation } from 'react-i18next';
 
 import { ApiError, api } from '../api.ts';
 import { ClaimDialog } from '../components/ClaimDialog.tsx';
+import { DbConnectionBlock } from '../components/DbConnectionBlock.tsx';
 import { DriftBadge, useDeniedHint } from '../components/EnvBits.tsx';
 import { DiffList, ExecDialog, type ExecKind, type ExecMode, routeFor } from '../components/ExecDialog.tsx';
 import { ImportDialog } from '../components/ImportDialog.tsx';
@@ -48,7 +49,7 @@ const EnvForm = ({ pid }: { pid: string }) => {
   const qc = useQueryClient();
   const toast = useToast();
   const me = useMe().data;
-  const empty = { name: '', url: '', production: true, allowSameInstance: false, shadowUrl: '' };
+  const empty = { name: '', url: '', production: true, allowSameInstance: true, shadowUrl: '' };
   const [form, setForm] = useState(empty);
   /** 接入这个库里已有的迁移历史（特权操作；由另一个实例认领的库要确认认领；领先于平台链且工作副本脏时需确认覆盖） */
   const [attach, setAttach] = useState(false);
@@ -60,6 +61,8 @@ const EnvForm = ({ pid }: { pid: string }) => {
   } | null>(null);
   const attachCodeOf = (e: Error | null) =>
     e instanceof ApiError && e.status === 409 ? (e.body as { code?: string } | undefined)?.code : undefined;
+  const nameId = useId();
+  const shadowId = useId();
   const shadowHintId = useId();
   const add = useMutation<
     unknown,
@@ -167,75 +170,76 @@ const EnvForm = ({ pid }: { pid: string }) => {
       <h2 className="section-title">{t('envp.add')}</h2>
       <p className="hint">{uiSpec.requiresExternalShadow ? t('dlg.envHint') : t('envp.addHintSqlite')}</p>
       {project.dialect === 'mssql' && <Banner kind="info">{t('wiz.mssqlTlsHint')}</Banner>}
-      <div className="grid grid-cols-2 gap-x-3 gap-y-2.5 max-[800px]:grid-cols-1">
-        <label className="field">
-          <span className="label">{t('dlg.envName')}</span>
+      <div className="flex flex-wrap items-end gap-x-4 gap-y-2.5">
+        <div className="field max-w-[280px] min-w-[180px] flex-1">
+          <label className="label" htmlFor={nameId}>
+            {t('dlg.envName')}
+          </label>
           <input
+            id={nameId}
             className="input"
-            aria-label={t('dlg.envName')}
             value={form.name}
             onChange={set('name')}
             placeholder="dev"
+            autoComplete="off"
             autoCapitalize="none"
             autoCorrect="off"
             spellCheck={false}
             required
           />
-        </label>
-        <label className="field">
-          <span className="label">{t('dlg.envUrl')}</span>
-          <input
-            className="input font-mono"
-            aria-label={t('dlg.envUrl')}
-            value={form.url}
-            onChange={set('url')}
-            placeholder={uiSpec.urlPlaceholder}
-            autoCapitalize="none"
-            autoCorrect="off"
-            spellCheck={false}
-            required
-          />
-        </label>
-        <div className="checks col-span-2">
+        </div>
+        <div className="checks min-h-[var(--ctl-h)] items-center">
           <label>
             <input type="checkbox" checked={form.production} onChange={set('production')} />
             {t('dlg.envProduction')}
           </label>
-          {uiSpec.requiresExternalShadow && (
+        </div>
+      </div>
+
+      <DbConnectionBlock
+        dialect={project.dialect}
+        url={form.url}
+        onUrlChange={(url) => setForm((f) => ({ ...f, url }))}
+        required
+      />
+
+      {uiSpec.requiresExternalShadow && (
+        <div className="space-y-2.5 border-t border-border pt-3">
+          <div className="checks">
             <label>
               <input type="checkbox" checked={form.allowSameInstance} onChange={set('allowSameInstance')} />
               {t('dlg.envAllowSame')}
             </label>
-          )}
-        </div>
-        {uiSpec.requiresExternalShadow && (
-          <div className="field col-span-2">
-            <label className="field">
-              <span className="label">{t('dlg.envShadowUrl')}</span>
-              <input
-                className="input font-mono"
-                aria-label={t('dlg.envShadowUrl')}
-                aria-describedby={shadowHintId}
-                value={form.shadowUrl}
-                onChange={set('shadowUrl')}
-                placeholder={uiSpec.shadowPlaceholder}
-                autoCapitalize="none"
-                autoCorrect="off"
-                spellCheck={false}
-              />
+          </div>
+          <div className="field">
+            <label className="label" htmlFor={shadowId}>
+              {t('dlg.envShadowUrl')}
             </label>
+            <input
+              id={shadowId}
+              className="input font-mono"
+              aria-describedby={shadowHintId}
+              value={form.shadowUrl}
+              onChange={set('shadowUrl')}
+              placeholder={uiSpec.shadowPlaceholder}
+              autoComplete="off"
+              autoCapitalize="none"
+              autoCorrect="off"
+              spellCheck={false}
+            />
             <span id={shadowHintId} className="hint">
               {t('wiz.envShadowHint')}
             </span>
           </div>
-        )}
-        <div className="checks col-span-2">
-          <label>
-            <input type="checkbox" checked={attach} onChange={(e) => setAttach(e.target.checked)} />
-            {t('tk.attachLabel')}
-          </label>
-          <p className="hint m-0 basis-full">{t('tk.attachHint')}</p>
         </div>
+      )}
+
+      <div className="checks">
+        <label>
+          <input type="checkbox" checked={attach} onChange={(e) => setAttach(e.target.checked)} />
+          {t('tk.attachLabel')}
+        </label>
+        <p className="hint m-0 basis-full">{t('tk.attachHint')}</p>
       </div>
       <ClaimDialog
         open={claimAsk !== null}

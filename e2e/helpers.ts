@@ -52,7 +52,7 @@ const createAndLoginUser = async (
   });
   expect(loginRes.ok(), `登录 ${opts.username} 失败：${await loginRes.text()}`).toBe(true);
   const changeRes = await ctx.request.post('/api/me/password', {
-    data: { oldPassword: TEMP_PASSWORD, newPassword: PASSWORD },
+    data: { newPassword: PASSWORD },
   });
   expect(changeRes.ok(), `修改临时密码失败：${await changeRes.text()}`).toBe(true);
 

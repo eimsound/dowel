@@ -60,7 +60,7 @@ test('从数据库导入：勾选一个 schema，完成后有 v0 基线，模型
   await page.getByRole('textbox', { name: /^名字/ }).fill('dev');
   await page.getByLabel('连接串', { exact: true }).fill(url);
   await page.getByLabel('生产环境').uncheck();
-  await page.getByRole('button', { name: '检查连接' }).click();
+  await page.getByRole('button', { name: '测试', exact: true }).click();
   await expect(page.getByText('连接正常')).toBeVisible();
   await expect(page.getByText(/PostgreSQL 18/)).toBeVisible();
   await expect(page.getByText('alpha · 2 张表')).toBeVisible();
@@ -189,7 +189,7 @@ test('schema 范围：范围为全部时取消勾选一个，保存后是除它�
   await page.getByRole('textbox', { name: /^名字/ }).fill('dev');
   await page.getByLabel('连接串', { exact: true }).fill(url);
   await page.getByLabel('生产环境').uncheck();
-  await page.getByRole('button', { name: '检查连接' }).click();
+  await page.getByRole('button', { name: '测试', exact: true }).click();
   await expect(page.getByText('连接正常')).toBeVisible();
   await page.getByRole('button', { name: '下一步' }).click();
   await page.getByRole('radio', { name: /从数据库导入/ }).check();

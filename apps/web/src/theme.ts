@@ -1,6 +1,6 @@
-// 配色：默认跟随系统；用户可在设置菜单里固定为亮色或暗色（DESIGN.md：Implementation）。
-// 设置在 <html style="color-scheme: …"> 上，所有 light-dark() token 随之切换。
-// 存 localStorage；用一个小订阅让界面里的“切到亮色 / 暗色”文案跟着变（命令面板、账户菜单）。
+// 配色：默认跟随系统；用户可在设置菜单或登录页右上角固定为亮色或暗色（DESIGN.md：Implementation）。
+// 同时同步 <html style="color-scheme: …"> 与 <meta name="color-scheme">，所有 light-dark() token 随之切换。
+// 存 localStorage，并在存储异常时仍保证当前页面生效；同时监听 storage 实现跨标签页同步。
 import { useSyncExternalStore } from 'react';
 
 export type Scheme = 'auto' | 'light' | 'dark';
@@ -8,18 +8,45 @@ const KEY = 'dowel.scheme';
 
 const listeners = new Set<() => void>();
 
-export const getScheme = (): Scheme => (localStorage.getItem(KEY) as Scheme | null) ?? 'auto';
+export const getScheme = (): Scheme => {
+  try {
+    const raw =
+      typeof localStorage !== 'undefined' && typeof localStorage.getItem === 'function'
+        ? localStorage.getItem(KEY)
+        : null;
+    return raw === 'light' || raw === 'dark' ? raw : 'auto';
+  } catch {
+    return 'auto';
+  }
+};
 
 export const applyScheme = (s: Scheme = getScheme()) => {
+  if (typeof document === 'undefined') return;
   document.documentElement.style.colorScheme = s === 'auto' ? '' : s;
+  const meta = document.querySelector<HTMLMetaElement>('meta[name="color-scheme"]');
+  if (meta) meta.content = s === 'auto' ? 'light dark' : s;
 };
 
 export const setScheme = (s: Scheme) => {
-  if (s === 'auto') localStorage.removeItem(KEY);
-  else localStorage.setItem(KEY, s);
+  try {
+    if (typeof localStorage !== 'undefined') {
+      if (s === 'auto' && typeof localStorage.removeItem === 'function') localStorage.removeItem(KEY);
+      else if (s !== 'auto' && typeof localStorage.setItem === 'function') localStorage.setItem(KEY, s);
+    }
+  } catch {
+    // 存储受限或被禁用时仍即时切换当前页面配色
+  }
   applyScheme(s);
   for (const fn of listeners) fn();
 };
+
+if (typeof window !== 'undefined') {
+  window.addEventListener('storage', (e) => {
+    if (e.key !== KEY && e.key !== null) return;
+    applyScheme();
+    for (const fn of listeners) fn();
+  });
+}
 
 /** 命令面板等地方用：跟随系统时按当前实际配色取反，得到“切换”后的配色 */
 export const nextScheme = (current: Scheme): Scheme => {

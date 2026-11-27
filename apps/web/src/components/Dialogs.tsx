@@ -35,6 +35,7 @@ import { useTranslation } from 'react-i18next';
 import { ApiError, api } from '../api.ts';
 import { dialectUiSpec } from '../dialects.ts';
 import { useProject } from '../project.tsx';
+import { slugify } from '../slug.ts';
 import { Modal } from './Modal.tsx';
 import { useToast } from './Toasts.tsx';
 import { Banner, cx, Sql } from './ui.tsx';
@@ -588,8 +589,15 @@ export const GroupDialog = ({ open, onClose }: { open: boolean; onClose: () => v
   const { t } = useTranslation();
   const qc = useQueryClient();
   const [slug, setSlug] = useState('');
+  const [slugTouched, setSlugTouched] = useState(false);
   const [name, setName] = useState('');
   const [description, setDescription] = useState('');
+  const resetFields = () => {
+    setSlug('');
+    setSlugTouched(false);
+    setName('');
+    setDescription('');
+  };
   const create = useMutation({
     mutationFn: () =>
       api<GroupInfo>('POST', '/api/groups', {
@@ -599,20 +607,26 @@ export const GroupDialog = ({ open, onClose }: { open: boolean; onClose: () => v
       }),
     onSuccess: () => {
       void qc.invalidateQueries({ queryKey: ['groups'] });
+      resetFields();
       onClose();
     },
   });
+  const close = () => {
+    resetFields();
+    create.reset();
+    onClose();
+  };
   return (
     <Modal
       open={open}
-      onClose={onClose}
+      onClose={close}
       title={t('groups.new')}
       icon={<Users size={16} aria-hidden="true" />}
       size="sm"
       footer={
         <>
           <span className="flex-1" />
-          <button type="button" className="btn" onClick={onClose}>
+          <button type="button" className="btn" onClick={close}>
             {t('dlg.cancel')}
           </button>
           <button type="submit" form="group-form" className="btn primary" disabled={create.isPending}>
@@ -634,7 +648,11 @@ export const GroupDialog = ({ open, onClose }: { open: boolean; onClose: () => v
           <input
             className="input"
             value={name}
-            onChange={(e) => setName(e.target.value)}
+            onChange={(e) => {
+              const next = e.target.value;
+              setName(next);
+              if (!slugTouched) setSlug(slugify(next));
+            }}
             required
             autoFocus
           />
@@ -644,7 +662,10 @@ export const GroupDialog = ({ open, onClose }: { open: boolean; onClose: () => v
           <input
             className="input font-mono"
             value={slug}
-            onChange={(e) => setSlug(e.target.value)}
+            onChange={(e) => {
+              setSlug(e.target.value);
+              setSlugTouched(true);
+            }}
             required
             autoCapitalize="none"
             spellCheck={false}

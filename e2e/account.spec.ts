@@ -124,3 +124,55 @@ test('登录方式：关联外部账户，最后一种可用方式不能解除�
     await admin.request.delete(`/api/admin/oidc/${provider.id}`);
   }
 });
+
+test('登录页右上角：切换语言与配色并持久化', async ({ browser }) => {
+  const ctx = await browser.newContext({ locale: 'zh-CN' });
+  const page = await ctx.newPage();
+  // 测试工程 tsconfig 不带 DOM 类型，用字符串在页面里求值
+  const readLangState = () =>
+    page.evaluate<{ lang: string; stored: string | null }>(
+      `({ lang: document.documentElement.lang, stored: localStorage.getItem('dowel.lang') })`,
+    );
+  const readSchemeState = () =>
+    page.evaluate<{ style: string; meta: string | null; stored: string | null }>(
+      `({
+        style: document.documentElement.style.colorScheme,
+        meta: document.querySelector('meta[name="color-scheme"]')?.getAttribute('content') ?? null,
+        stored: localStorage.getItem('dowel.scheme'),
+      })`,
+    );
+
+  await page.goto('/login');
+  await expect(page.getByRole('heading', { name: '登录' })).toBeVisible();
+  await expect(page.getByRole('button', { name: '语言' })).toBeVisible();
+  await expect(page.getByRole('button', { name: '配色' })).toBeVisible();
+
+  // 切换语言为英文并验证刷新后保留，再切回中文
+  await page.getByRole('button', { name: '语言' }).click();
+  await page.getByRole('menuitemradio', { name: 'English' }).click();
+  await expect(page.getByRole('heading', { name: 'Log in' })).toBeVisible();
+  await expect.poll(readLangState).toEqual({ lang: 'en', stored: 'en' });
+
+  await page.reload();
+  await expect(page.getByRole('heading', { name: 'Log in' })).toBeVisible();
+
+  await page.getByRole('button', { name: 'Language' }).click();
+  await page.getByRole('menuitemradio', { name: '中文' }).click();
+  await expect(page.getByRole('heading', { name: '登录' })).toBeVisible();
+  await expect.poll(readLangState).toEqual({ lang: 'zh-CN', stored: 'zh' });
+
+  // 切换配色为暗色、亮色并恢复跟随系统
+  await page.getByRole('button', { name: '配色' }).click();
+  await page.getByRole('menuitemradio', { name: '暗色' }).click();
+  await expect.poll(readSchemeState).toEqual({ style: 'dark', meta: 'dark', stored: 'dark' });
+
+  await page.getByRole('button', { name: '配色' }).click();
+  await page.getByRole('menuitemradio', { name: '亮色' }).click();
+  await expect.poll(readSchemeState).toEqual({ style: 'light', meta: 'light', stored: 'light' });
+
+  await page.getByRole('button', { name: '配色' }).click();
+  await page.getByRole('menuitemradio', { name: '跟随系统' }).click();
+  await expect.poll(readSchemeState).toEqual({ style: '', meta: 'light dark', stored: null });
+
+  await ctx.close();
+});

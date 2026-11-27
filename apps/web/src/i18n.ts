@@ -894,12 +894,9 @@ const zh = {
     newPassword: '新密码',
     changePasswordTitle: '修改密码',
     changePasswordBanner: '当前使用的是初始或重置后的临时密码，请先设置新密码再继续使用。',
-    oldPassword: '当前密码（或临时密码）',
     confirmPassword: '确认新密码',
     changePasswordSubmit: '保存新密码并继续',
-    oldPasswordRequired: '请输入当前密码',
     passwordTooShort: '密码至少需要 8 个字符',
-    passwordSameAsOld: '新密码不能与当前密码相同',
     passwordMismatch: '两次输入的新密码不一致',
     goLogin: '去登录',
     passwordLoginOff: '密码登录已关闭，请联系实例管理员。',
@@ -1265,8 +1262,8 @@ const zh = {
     dialectHint: '创建后不可更改。',
     dialectComingSoon: '开发中',
     dialectDesc: {
-      pg: '支持多 Schema、枚举、序列与声明式分区',
-      sqlite: '内置 :memory: 影子库，零环境即可导入 SQL 与验证',
+      pg: '支持 PostgreSQL 15–19：多 Schema、枚举、序列与声明式分区',
+      sqlite: '支持 SQLite 3：内置 :memory: 影子库，零环境即可导入 SQL 与验证',
       mysql: '支持 MySQL 8.4 / 9.7：引擎、字符集、内联 enum/set 与非事务 DDL 检查点',
       mssql: '支持 SQL Server 2019 / 2022 / 2025：多 Schema、序列、聚集索引与 GO 批处理',
     },
@@ -1371,6 +1368,20 @@ const zh = {
     running: '正在创建…',
     failed: '创建失败',
     retry: '重试',
+  },
+  conn: {
+    title: '连接',
+    test: '测试',
+    testing: '测试中…',
+    host: '主机',
+    port: '端口',
+    database: '数据库',
+    user: '用户名',
+    password: '密码',
+    params: '连接参数',
+    filePath: '文件路径',
+    showPassword: '显示密码',
+    hidePassword: '隐藏密码',
   },
   acc: {
     title: '个人设置',
@@ -3335,12 +3346,9 @@ const en: typeof zh = {
     changePasswordTitle: 'Change password',
     changePasswordBanner:
       'You are signed in with a temporary password. Set a new password before continuing.',
-    oldPassword: 'Current or temporary password',
     confirmPassword: 'Confirm new password',
     changePasswordSubmit: 'Save new password and continue',
-    oldPasswordRequired: 'Enter your current password',
     passwordTooShort: 'Password must be at least 8 characters',
-    passwordSameAsOld: 'New password cannot be the same as the current password',
     passwordMismatch: 'Passwords do not match',
     goLogin: 'Go to login',
     passwordLoginOff: 'Password login is turned off. Ask your instance admin.',
@@ -3730,8 +3738,8 @@ const en: typeof zh = {
     dialectHint: 'Cannot be changed after creation.',
     dialectComingSoon: 'Coming soon',
     dialectDesc: {
-      pg: 'Multi-schema, enums, sequences, and declarative partitioning',
-      sqlite: 'Built-in :memory: shadow database for zero-environment SQL import & verification',
+      pg: 'PostgreSQL 15–19: multi-schema, enums, sequences & declarative partitioning',
+      sqlite: 'SQLite 3: built-in :memory: shadow database for zero-environment SQL import & verification',
       mysql: 'MySQL 8.4 / 9.7: engine, charset, inline enum/set & auto-commit DDL checkpoints',
       mssql: 'SQL Server 2019 / 2022 / 2025: multi-schema, sequences, clustered keys & GO batches',
     },
@@ -3841,6 +3849,20 @@ const en: typeof zh = {
     running: 'Creating…',
     failed: 'Creation failed',
     retry: 'Retry',
+  },
+  conn: {
+    title: 'Connection',
+    test: 'Test',
+    testing: 'Testing…',
+    host: 'Host',
+    port: 'Port',
+    database: 'Database',
+    user: 'Username',
+    password: 'Password',
+    params: 'Parameters',
+    filePath: 'File path',
+    showPassword: 'Show password',
+    hidePassword: 'Hide password',
   },
   acc: {
     title: 'Personal settings',
@@ -4910,22 +4932,55 @@ const en: typeof zh = {
   err: { generic: 'Error: {{msg}}', notFound: 'This page does not exist.' },
 };
 
-const saved =
-  typeof localStorage !== 'undefined' && typeof localStorage.getItem === 'function'
-    ? localStorage.getItem('dowel.lang')
-    : null;
-const browserLang = typeof navigator !== 'undefined' ? navigator.language : '';
+const resolveInitialLang = (): 'zh' | 'en' => {
+  let saved: string | null = null;
+  try {
+    saved =
+      typeof localStorage !== 'undefined' && typeof localStorage.getItem === 'function'
+        ? localStorage.getItem('dowel.lang')
+        : null;
+  } catch {
+    saved = null;
+  }
+  if (saved === 'zh' || saved === 'en') return saved;
+  const browserLang = typeof navigator !== 'undefined' ? navigator.language : '';
+  return browserLang.startsWith('zh') ? 'zh' : 'en';
+};
+
+const initialLang = resolveInitialLang();
+if (typeof document !== 'undefined') {
+  document.documentElement.lang = initialLang === 'zh' ? 'zh-CN' : 'en';
+}
 void i18n.use(initReactI18next).init({
   resources: { zh: { translation: zh }, en: { translation: en } },
-  lng: saved ?? (browserLang.startsWith('zh') ? 'zh' : 'en'),
+  lng: initialLang,
   fallbackLng: 'zh',
   interpolation: { escapeValue: false },
 });
 
 export const setLang = (lng: 'zh' | 'en') => {
-  localStorage.setItem('dowel.lang', lng);
-  document.documentElement.lang = lng === 'zh' ? 'zh-CN' : 'en';
+  try {
+    if (typeof localStorage !== 'undefined' && typeof localStorage.setItem === 'function') {
+      localStorage.setItem('dowel.lang', lng);
+    }
+  } catch {
+    // 存储受限或被禁用时仍即时切换当前页面语言
+  }
+  if (typeof document !== 'undefined') {
+    document.documentElement.lang = lng === 'zh' ? 'zh-CN' : 'en';
+  }
   void i18n.changeLanguage(lng);
 };
+
+if (typeof window !== 'undefined') {
+  window.addEventListener('storage', (e) => {
+    if (e.key !== 'dowel.lang' && e.key !== null) return;
+    const nextLang = resolveInitialLang();
+    if (typeof document !== 'undefined') {
+      document.documentElement.lang = nextLang === 'zh' ? 'zh-CN' : 'en';
+    }
+    void i18n.changeLanguage(nextLang);
+  });
+}
 
 export default i18n;

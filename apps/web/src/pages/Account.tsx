@@ -25,7 +25,7 @@ const stateMessage = (state: InviteInfo['state'], t: (k: string) => string) =>
     expired: t('account.inviteExpired'),
   })[state];
 
-type ChangePasswordField = 'oldPassword' | 'newPassword' | 'confirmPassword';
+type ChangePasswordField = 'newPassword' | 'confirmPassword';
 
 export const ChangePassword = () => {
   const { t } = useTranslation();
@@ -37,28 +37,21 @@ export const ChangePassword = () => {
   const next = safeNextPath(rawNext, AUTH_NEXT_EXCLUDES);
 
   const [values, setValues] = useState({
-    oldPassword: '',
     newPassword: '',
     confirmPassword: '',
   });
   const [dirty, setDirty] = useState<Record<ChangePasswordField, boolean>>({
-    oldPassword: false,
     newPassword: false,
     confirmPassword: false,
   });
   const [errors, setErrors] = useState<Partial<Record<ChangePasswordField, string>>>({});
 
-  const oldRef = useRef<HTMLInputElement>(null);
   const newRef = useRef<HTMLInputElement>(null);
   const confirmRef = useRef<HTMLInputElement>(null);
 
   const validateField = (field: ChangePasswordField, vals: typeof values): string | undefined => {
-    if (field === 'oldPassword') {
-      return vals.oldPassword ? undefined : t('account.oldPasswordRequired');
-    }
     if (field === 'newPassword') {
       if (!vals.newPassword || vals.newPassword.length < 8) return t('account.passwordTooShort');
-      if (vals.oldPassword && vals.newPassword === vals.oldPassword) return t('account.passwordSameAsOld');
       return undefined;
     }
     if (!vals.confirmPassword || vals.confirmPassword !== vals.newPassword) {
@@ -73,9 +66,6 @@ export const ChangePassword = () => {
     setDirty((prev) => ({ ...prev, [field]: true }));
     setErrors((prev) => {
       const nextErrors = { ...prev, [field]: undefined };
-      if (field === 'oldPassword' && prev.newPassword === t('account.passwordSameAsOld')) {
-        nextErrors.newPassword = undefined;
-      }
       if (field === 'newPassword') {
         nextErrors.confirmPassword = undefined;
       }
@@ -88,9 +78,6 @@ export const ChangePassword = () => {
     setErrors((prev) => ({
       ...prev,
       [field]: validateField(field, values),
-      ...(field === 'oldPassword' && dirty.newPassword
-        ? { newPassword: validateField('newPassword', values) }
-        : {}),
       ...(field === 'newPassword' && dirty.confirmPassword
         ? { confirmPassword: validateField('confirmPassword', values) }
         : {}),
@@ -100,7 +87,6 @@ export const ChangePassword = () => {
   const run = useMutation({
     mutationFn: () =>
       api<Ok>('POST', '/api/me/password', {
-        oldPassword: values.oldPassword,
         newPassword: values.newPassword,
       }),
     onSuccess: async () => {
@@ -113,18 +99,14 @@ export const ChangePassword = () => {
   const onSubmit = (e: React.FormEvent) => {
     e.preventDefault();
     const nextErrors: Partial<Record<ChangePasswordField, string>> = {
-      oldPassword: validateField('oldPassword', values),
       newPassword: validateField('newPassword', values),
       confirmPassword: validateField('confirmPassword', values),
     };
-    const firstInvalid = (['oldPassword', 'newPassword', 'confirmPassword'] as const).find(
-      (k) => nextErrors[k],
-    );
+    const firstInvalid = (['newPassword', 'confirmPassword'] as const).find((k) => nextErrors[k]);
     if (firstInvalid) {
-      setDirty({ oldPassword: true, newPassword: true, confirmPassword: true });
+      setDirty({ newPassword: true, confirmPassword: true });
       setErrors(nextErrors);
-      if (firstInvalid === 'oldPassword') oldRef.current?.focus();
-      else if (firstInvalid === 'newPassword') newRef.current?.focus();
+      if (firstInvalid === 'newPassword') newRef.current?.focus();
       else confirmRef.current?.focus();
       return;
     }
@@ -139,26 +121,6 @@ export const ChangePassword = () => {
     >
       <Banner kind="warn">{t('account.changePasswordBanner')}</Banner>
       <form className="space-y-3.5" noValidate onSubmit={onSubmit}>
-        <label className="field">
-          <span className="label">{t('account.oldPassword')}</span>
-          <input
-            ref={oldRef}
-            className="input"
-            type="password"
-            name="oldPassword"
-            value={values.oldPassword}
-            onChange={onChange('oldPassword')}
-            onBlur={onBlur('oldPassword')}
-            autoComplete="current-password"
-            aria-invalid={errors.oldPassword ? 'true' : 'false'}
-            aria-describedby={errors.oldPassword ? 'cp-old-err' : undefined}
-          />
-          {errors.oldPassword && (
-            <p id="cp-old-err" className="hint error">
-              {errors.oldPassword}
-            </p>
-          )}
-        </label>
         <label className="field">
           <span className="label">{t('account.newPassword')}</span>
           <input

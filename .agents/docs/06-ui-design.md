@@ -96,7 +96,7 @@ M1 的界面能用但难看。原因不在“哪里没调好”，而在两件�
 - 模型页的实时模型、在线成员、同步状态在 `workspace.ts` 的 `Workspace` 里（WebSocket）；其它页面不连接房间。
 - 全局导航侧边栏的收起状态存 `localStorage['dowel.sidebar']`（`Ctrl+\` 切换，无对象树页面 `[` 也切换它）；模型页对象树侧面板的收起状态为外壳组件状态（`[` 切换）。当前页面与上下文由路径决定。
 - 模型页属性面板的固定状态存在 `localStorage` 的 `dowel.inspector`（`pinned` / `auto`，默认按需）；取消选中来自画布空白处点击或 `Esc`。
-- 语言和配色沿用 `dowel.lang` / `dowel.scheme`，入口在侧边栏顶部工具条的账户菜单与个人设置“偏好”页。
+- 语言和配色沿用 `dowel.lang` / `dowel.scheme`，入口在侧边栏顶部工具条的账户菜单、个人设置“偏好”页以及登录等认证页（`AuthShell`）右上角工具栏。
 
 **测试**：`e2e/navigation.spec.ts` 覆盖侧边栏导航、`[`、收起持久化、`Ctrl+\`、搜索按钮、上下文切换器与新建菜单；`e2e/visual.spec.ts` 在亮 / 暗两种配色下对比模型页和迁移对话框，`SHOOT_APP=1` 时另外输出 `.agents/docs/ui/shots/app-*.png` 的文档截图。
 
