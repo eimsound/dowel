@@ -24,6 +24,7 @@ import {
   type BaseNamingState,
   delNsOwner,
   entryKey,
+  hasOwnerOtherThan,
   type MarkHost,
   markChange,
   type NsOwners,
@@ -206,6 +207,18 @@ export class OverlayNameTracker implements NamingView, MarkHost {
   hasOther(ns: string, name: string, self: string): boolean {
     this.flush();
     return this.hasOtherRaw(ns, name, self);
+  }
+
+  /** 除 self（占用者 ID 或其所属对象 ID）以外是否还有占用者（方言 isNameTaken 用，见 ModelIndex.nsTaken） */
+  hasOtherThan(ns: string, name: string, self: string): boolean {
+    this.flush();
+    if (hasOwnerOtherThan(this.ov.get(ns)?.get(name), self)) return true;
+    const baseOwners = this.state.owners.get(ns)?.get(name);
+    if (baseOwners) {
+      for (const [owner, root] of baseOwners)
+        if (owner !== self && root !== self && !this.masked(root)) return true;
+    }
+    return false;
   }
 
   hasAny(ns: string, name: string): boolean {

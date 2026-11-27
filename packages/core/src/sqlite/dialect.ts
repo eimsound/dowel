@@ -20,6 +20,7 @@ import {
   columnsOf,
   getActiveModelIndex,
   indexElementNames,
+  nsNameTaken,
   objectsOfKinds,
   OverlayModelIndex,
 } from '../model.ts';
@@ -70,6 +71,8 @@ export const SQLITE_CAPABILITIES: DialectCapabilities = {
 
 const isSqliteRelTaken = (m: Model, name: string, selfId: string): boolean => {
   const low = name.toLowerCase();
+  const fast = nsNameTaken(m, SQLITE_REL_NS, low, selfId);
+  if (fast !== undefined) return fast;
   return objectsOfKinds(m, ['table', 'index', 'opaque']).some((o) => {
     if (o.id === selfId) return false;
     if (o.kind === 'table' || o.kind === 'index' || o.kind === 'opaque') {
@@ -81,6 +84,8 @@ const isSqliteRelTaken = (m: Model, name: string, selfId: string): boolean => {
 
 const isSqliteConTaken = (m: Model, tableId: string, name: string, selfId: string): boolean => {
   const low = name.toLowerCase();
+  const fast = nsNameTaken(m, sqliteConNs(tableId), low, selfId);
+  if (fast !== undefined) return fast;
   return childrenOfKinds(m, tableId, ['primaryKey', 'unique', 'check', 'foreignKey']).some((o) => {
     if (o.id === selfId) return false;
     if (

@@ -19,6 +19,7 @@
     "bench:core": "node --expose-gc --conditions=@dowel/source bench/core.ts",
     "bench:ui": "node --conditions=@dowel/source bench/ui.ts",
     "bench:shadow": "node --expose-gc --conditions=@dowel/source bench/shadow.ts",
+    "bench:paste": "node --conditions=@dowel/source bench/paste.ts",
     "bench:all": "pnpm bench:core && pnpm bench:ui && pnpm bench:shadow"
   },
   "devDependencies": {

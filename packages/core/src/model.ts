@@ -19,7 +19,14 @@ import { resolvePartitionBy } from './pg/partition.ts';
 import { ident } from './pg/quote.ts';
 import { getDialect } from './registry.ts';
 
-export { buildModelIndex, type ModelIndex, MutableModelIndex, OverlayModelIndex } from './model-index.ts';
+export {
+  buildModelIndex,
+  type ModelIndex,
+  modelIndexStats,
+  MutableModelIndex,
+  OverlayModelIndex,
+  resetModelIndexStats,
+} from './model-index.ts';
 
 /**
  * 仅在受控只读/作用域事务内有效的索引栈（进入前压栈，finally 必弹栈）。
@@ -81,6 +88,16 @@ export const objectsOfKinds = (m: Model, kinds: readonly Kind[]): readonly Obj[]
   if (idx) return kinds.length === 1 ? idx.allRef(kinds[0]!) : kinds.flatMap((k) => idx.allRef(k));
   const want = new Set<string>(kinds);
   return Object.values(m.objects).filter((o) => want.has(o.kind));
+};
+
+/**
+ * 方言重名判定（isNameTaken）的索引快路径：有活动索引且它能直接回答时，按命名空间分桶（naming-ns.ts）O(1) 判定，
+ * 与各方言的扫描判定逐条一致；否则返回 undefined，调用方退回扫描。norm 是已按方言归一化的名字；
+ * 空名字不登记在命名空间里，也退回扫描。
+ */
+export const nsNameTaken = (m: Model, ns: string, norm: string, self: string): boolean | undefined => {
+  if (norm === '') return undefined;
+  return getActiveModelIndex(m)?.nsTaken(ns, norm, self);
 };
 
 /** 某父对象下指定几种 kind 的直接子对象（有活动索引时走索引） */
