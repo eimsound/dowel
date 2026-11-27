@@ -686,7 +686,7 @@ export class Requests {
   // ───── 直接执行之后 ─────
 
   /**
-   * 不经申请的直接执行 / 回滚 / 写基线结束之后：发 execution.finished 的 Webhook（执行和回滚），
+   * 不经申请的直接执行 / 回滚结束之后：发 execution.finished 的 Webhook（执行和回滚），
    * 并让这个环境上还没结束的申请马上重新检查（环境状态变了的会失效）。
    */
   afterDirectRun(
@@ -699,7 +699,6 @@ export class Requests {
       (async () => {
         // 环境状态变了：这个环境上还没结束的申请要重新检查
         this.kick({ envIds: [a.env.id] });
-        if (run.mode !== 'migrate') return;
         const s = await this.scopeOf(this.db, { project_id: a.pid, environment_id: a.env.id });
         if (!s) return;
         const toRef = run.to

@@ -17,7 +17,7 @@ Authorization: Bearer dwl_<43 random characters>
 ```
 
 - **No cookie sessions or `Origin` checks.** Suitable for `curl` and headless CI runners. (The OpenAPI specification `/api/ci/openapi.json` and interactive docs `/api/ci/docs` additionally accept a logged-in browser session cookie; see [OpenAPI specification and interactive reference](#openapi-docs).)
-- **Read-only plus forward apply scope.** A CI token only works under `/api/ci/...` for its single owning project. Passing `Bearer dwl_...` to any other endpoint (including model editing, version publishing, policy edits, connection edits, mark as applied, write baseline, claiming, takeover, or token management) returns `403 forbidden` without falling back to cookie authentication.
+- **Read-only plus forward apply scope.** A CI token only works under `/api/ci/...` for its single owning project. Passing `Bearer dwl_...` to any other endpoint (including model editing, version publishing, policy edits, connection edits, mark as applied, claiming, takeover, or token management) returns `403 forbidden` without falling back to cookie authentication.
 - **Project ownership.** Tokens belong to the project rather than a user account, so disabling or removing the creator never breaks pipelines.
 - **Mandatory expiration.** Every token expires after a configured lifetime (default 90 days, maximum 365 days). Expiration and revocation take effect immediately.
 - **Rate limits** (tracked per replica in memory; multi-replica HA deployments scale total cluster capacity roughly by replica count).

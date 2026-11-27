@@ -192,9 +192,8 @@ export const requestHookEvent = (
   };
 };
 
-/** 直接执行 / 回滚的参数（写基线不发 Webhook） */
+/** 直接执行 / 回滚的参数 */
 export interface DirectRun {
-  mode: 'migrate' | 'baseline';
   to?: string;
   direction?: 'up' | 'down' | 'switch';
 }

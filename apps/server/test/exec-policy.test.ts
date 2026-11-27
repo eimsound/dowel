@@ -184,15 +184,6 @@ describe('接口：档位存在环境上，默认值、修改、特权操作', (
       expect(await tryExecute('prod', 'pa', action), `${action} prod pa`).toBe(404);
       expect(await tryExecute('prod', 'admin', action), `${action} prod admin`).toBe(404);
     }
-    // 写基线（不带版本）：通过鉴权后，非生产环境直接开始（SSE，连不上目标库以 error 事件结束，HTTP 200）；
-    // 生产环境先要求输入环境名确认（422）
-    const baseline = async (id: string, who: string) =>
-      (await call('POST', `${env(id)}/baseline`, {}, who)).status;
-    expect(await baseline('dev', 'viewer')).toBe(403);
-    expect(await baseline('dev', 'editor')).toBe(200);
-    expect(await baseline('prod', 'editor')).toBe(403);
-    expect(await baseline('prod', 'pa')).toBe(422);
-    expect(await baseline('prod', 'admin')).toBe(422);
 
     const dev = (await call('GET', `${env('dev')}/status`, undefined, 'editor')).data as {
       permissions: unknown;

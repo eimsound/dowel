@@ -1842,7 +1842,7 @@ describe.skipIf(!PG_URL)('只预演不执行（dry run）', () => {
   });
   afterAll(drain);
 
-  const dry = async (pid: string, eid: string, action: 'execute' | 'rollback' | 'baseline', to?: string) => {
+  const dry = async (pid: string, eid: string, action: 'execute' | 'rollback', to?: string) => {
     const r = await A.call('POST', `/api/projects/${pid}/environments/${eid}/${action}`, {
       to,
       dryRun: true,
@@ -1867,7 +1867,6 @@ describe.skipIf(!PG_URL)('只预演不执行（dry run）', () => {
     const r = await dry(pid, eid, 'execute', chain[1]!.id);
     expect(r.ok, JSON.stringify(r)).toBe(true);
     expect(r.plan).toMatchObject({
-      mode: 'migrate',
       direction: 'up',
       firstRun: 'empty',
       createsHistory: true,
@@ -1975,8 +1974,6 @@ describe.skipIf(!PG_URL)('只预演不执行（dry run）', () => {
     } finally {
       await holder.close();
     }
-    // 已经有历史：不能写基线
-    expect(await dry(pid, eid, 'baseline')).toMatchObject({ ok: false, code: 'baseline_not_applicable' });
     expect((await dev.db.query('select * from dowel.history')).length).toBe(before);
   });
 

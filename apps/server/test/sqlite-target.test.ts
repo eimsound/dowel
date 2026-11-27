@@ -326,17 +326,19 @@ describe('SQLite 目标库全栈', () => {
     expect(envs[0]!.engineMajor).toBeNull();
     expect(envs[0]!.engineVersion).toMatch(/^3\./);
 
-    // 2. 写基线（baseline）
-    const baseRes = await req('POST', `/api/projects/${pid}/environments/${envId}/baseline`, {});
-    expect(baseRes.status).toBe(200);
-    const baseEvents = parseSse<ExecEvent>(await baseRes.text());
-    expect(baseEvents.some((e) => e.stage === 'done')).toBe(true);
-
-    const versAfterBase = (await (await req('GET', `/api/projects/${pid}/versions`)).json()) as {
+    const vers0 = (await (await req('GET', `/api/projects/${pid}/versions`)).json()) as {
       id: string;
       number: number;
     }[];
-    const v0Id = versAfterBase[0]!.id;
+    const v0Id = vers0[0]!.id;
+
+    // 2. 直接执行到 v0 被拒绝（mark_required，不写入历史）
+    const dryV0Res = await req('POST', `/api/projects/${pid}/environments/${envId}/execute`, {
+      to: v0Id,
+      dryRun: true,
+    });
+    expect(dryV0Res.status).toBe(200);
+    expect(await dryV0Res.json()).toMatchObject({ ok: false, code: 'mark_required' });
 
     // 3. 编辑模型：新增列并修改 title 类型触发 12 步重建，发布 v1
     await editModel(rooms, pdb, pid!, (m) => {
@@ -350,12 +352,13 @@ describe('SQLite 目标库全栈', () => {
     const v1 = (await pub1Res.json()) as VersionCreated;
     expect(v1.verified).toBe(true);
 
-    // 4. 通过 UI SSE 接口执行升级到 v1，验证历史数据保留
+    // 4. 通过 UI SSE 接口执行升级到 v1（自动先写 v0 基线再跑 v1），验证历史数据保留
     const execRes = await req('POST', `/api/projects/${pid}/environments/${envId}/execute`, {
       to: v1.id,
     });
     expect(execRes.status).toBe(200);
     const execEvents = parseSse<ExecEvent>(await execRes.text());
+    expect(execEvents.find((e) => e.stage === 'plan')).toMatchObject({ baseline: true });
     expect(execEvents.some((e) => e.stage === 'done')).toBe(true);
 
     const checkAfterUp = openSqliteDb(targetFile, { readOnly: true });
@@ -581,9 +584,7 @@ describe('SQLite 目标库全栈', () => {
     expect(envMkRes.status).toBe(201);
     const eidMk = ((await envMkRes.json()) as { id: string }).id;
 
-    // 写基线 v0，然后发布 v1（添加 legacy_tag 列）并执行两个环境到 v1
-    const baseRes = await req('POST', `/api/projects/${pid}/environments/${eidSw}/baseline`, {});
-    expect(parseSse<ExecEvent>(await baseRes.text()).some((e) => e.stage === 'done')).toBe(true);
+    // 发布 v1（添加 legacy_tag 列）并直接执行两个环境到 v1（首次执行自动先写 v0 基线再跑 v1）
     const [v0] = (await (await req('GET', `/api/projects/${pid}/versions`)).json()) as {
       id: string;
       number: number;

@@ -728,17 +728,6 @@ const matrix: Record<string, Spec> = {
       ctx.envName = e.name;
     },
   },
-  'POST /api/projects/:pid/environments/:eid/baseline': {
-    // 通过鉴权后进入 SSE，连不上目标库以 error 事件结束（HTTP 状态仍是 200）
-    access: { kind: 'project', min: 'editor', statuses: [200] },
-    path: (ctx) => `${P()}/environments/${ctx.envId}/baseline`,
-    body: () => ({}),
-    prepare: async (ctx) => {
-      const e = await freshEnv(ctx.pid, ++unique);
-      ctx.envId = e.id;
-      ctx.envName = e.name;
-    },
-  },
   // 执行申请（P5b）：项目可见即可列表 / 看详情；提交要编辑者（或执行者）；审批类操作看得到项目就能进到申请
   // 里的检查（不存在的申请 404；请求体不合法 400）；具体的资格规则在 requests.test.ts 里逐项验证
   'GET /api/projects/:pid/requests': {
