@@ -172,10 +172,22 @@ describe.each([
     const forgetShadow = vi.spyOn(app.shadows, 'forget');
     await app.refresher.reset(branch!.id, (await app.rooms.model(branch!.id)).model);
     expect(app.refresher.tracked(branch!.id)).toBe(true);
+    const published = vi.spyOn(app.bus, 'publish');
 
     const res = await call(adminCookie, 'DELETE', `/api/projects/${pid}`, { confirm: slug });
     expect(res.status, JSON.stringify(res.data)).toBe(200);
     expect(await closed).toBe(4403);
+
+    // 跨副本（Issue #153）：derive.forget 带上被删分支，且先于踢房间（room.refresh）与关影子库（shadows.forget）发出——
+    // 其他副本按同样的先后处理，在途任务因房间被踢 / 影子库关闭抛错时已经看得到 forgotten
+    const kinds = published.mock.calls.map(([e]) => e.t);
+    expect(published.mock.calls.map(([e]) => e)).toContainEqual({
+      t: 'derive.forget',
+      branchIds: [branch!.id],
+    });
+    expect(kinds.indexOf('derive.forget')).toBeLessThan(kinds.indexOf('room.refresh'));
+    expect(kinds.indexOf('derive.forget')).toBeLessThan(kinds.indexOf('shadows.forget'));
+    published.mockRestore();
 
     // 内存状态在事务提交后清理：房间卸载、影子库缓存移除、派生刷新状态清空。
     // 房间这里等一下：连接关闭时 onClose 会再去加载一次已经不存在的分支，失败的加载会把自己从缓存里删掉。

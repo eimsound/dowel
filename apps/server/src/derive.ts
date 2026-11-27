@@ -9,9 +9,10 @@
 //
 // 基线（branches.baseline）是一份“确定已在影子库里规范化过”的模型（黄金基线）：只在导入 / 拉取 / 接入 / 已验证版本覆盖
 // （runWithReset）或一次成功的 canonicalize 之后推进；没有待规范化对象时、canonicalize 失败时都**不**改写它。
-import { deepEqual, type Model, type Obj } from '@dowel/core';
+import { deepEqual, emptyModel, type Model, type Obj } from '@dowel/core';
 import type { Versions } from '@dowel/sync';
 
+import type { EventBus } from './bus.ts';
 import { emptyBaseline, fullName, needsRefresh, pendingRefreshIds } from './derive-pending.ts';
 import type { HaCoordinator } from './ha.ts';
 import type { Rooms } from './rooms.ts';
@@ -66,7 +67,8 @@ export class BranchForgottenError extends Error {
 
 /**
  * flush 没做成规范化的原因：
- * - stopped / forgotten：服务正在停机，或分支已被 forget（项目 / 分支被删）；
+ * - stopped / forgotten：服务正在停机，或分支已被 forget（项目被删；含其他副本经 derive.forget 通知的删除，以及失败路径 /
+ *   保存基线时从平台库发现分支行已不存在）；
  * - no_shadow：没有可用的影子库（shadowOf 返回 null）；
  * - shadow_unavailable：影子库连不上、超时、被占用（ShadowError）；
  * - canonicalize_failed：表达式 / 不透明对象 DDL 在影子库 `canonicalize` 里报错（留给显式规范化或闭环验证报告给用户）；
@@ -133,6 +135,24 @@ export interface ShadowHandle {
   label: string;
 }
 
+/** 跨副本同步 forget 用到的事件总线子集（单机 / 测试可不传） */
+export type RefresherBus = Pick<EventBus, 'replicaId' | 'onEvent' | 'onReconnect' | 'publish'>;
+
+/** 基线的持久化（branches.baseline）与分支存在性复核 */
+export interface BaselineStore {
+  load(branchId: string): Promise<Model | null>;
+  /** 返回 false 表示分支行已不存在（更新了 0 行，项目已被删）；不返回值视作已写入 */
+  save(branchId: string, m: Model): Promise<boolean | void>;
+  /**
+   * 返回给定分支里仍存在的 ID（查询失败时抛错）。只在失败路径与总线重连 / 退化事件时调用，稳态不查；
+   * 不提供则不复核（只靠 forget 标记）。
+   */
+  existing?(branchIds: string[]): Promise<Set<string>>;
+}
+
+/** 断线重连 / 退化事件复核时每条查询最多带的分支 ID 数 */
+const EXISTING_CHUNK = 500;
+
 const refOf = (m: Model, id: string): DerivedObjectRef => {
   const o = m.objects[id]!;
   return { id, kind: o.kind, name: fullName(m, id) ?? o.name };
@@ -142,45 +162,112 @@ export class OpaqueRefresher {
   private rooms: Rooms;
   private shadowOf: (branchId: string) => Promise<Shadow | null>;
   /** 基线的持久化（重启后仍知道哪份模型已规范化） */
-  private store: {
-    load(branchId: string): Promise<Model | null>;
-    save(branchId: string, m: Model): Promise<void>;
-  };
+  private store: BaselineStore;
   private ha: HaCoordinator | null;
+  private bus: RefresherBus | null;
   private good = new Map<string, Model>();
   private running = new Map<string, Promise<void>>();
   /** 已排队但尚未开始的 flush：同分支的并发调用合并成一次（开始时才读最新状态，结果对所有等待者都是新鲜的） */
   private queuedFlush = new Map<string, Promise<FlushOutcome>>();
-  /** 在途任务尚未结束时被 forget 的分支，防止任务结束时回写内存/库基线 */
+  /**
+   * 在途任务尚未结束时被 forget 的分支，防止任务结束时回写内存/库基线。
+   * 只在该分支本地队列非空时存在，队列排空即清除（集合大小不超过在途分支数）；
+   * 期间不会被 reset / runWithReset 清掉——标记只打在确实已删除的分支上，分支 ID 不复用。
+   */
   private forgotten = new Set<string>();
   private stopped = false;
+  /**
+   * 每次 forget / 复核递增：不排队的读（status() 里的 loadGood）跨过 await 回来时若代际变了就不写内存基线，
+   * 防止读到删除前的旧基线、在 forget 之后把已删分支写回 good（此时没有在途队列，forgotten 标记挡不住）
+   */
+  private forgetGen = 0;
   /** flush / normalize / runWithReset 等待分布式锁的超时时间（毫秒） */
   flushLockTimeoutMs = DEFAULT_FLUSH_LOCK_TIMEOUT_MS;
 
   constructor(
     rooms: Rooms,
     shadowOf: (branchId: string) => Promise<Shadow | null>,
-    store: OpaqueRefresher['store'],
+    store: BaselineStore,
     ha?: HaCoordinator,
+    bus?: RefresherBus,
   ) {
     this.rooms = rooms;
     this.shadowOf = shadowOf;
     this.store = store;
     this.ha = ha ?? null;
+    this.bus = bus ?? null;
+    if (bus) {
+      // 别的副本删了分支（derive.forget）：同步清内存基线、给在途任务打标记。处理器必须同步完成 forget：
+      // 删除方先广播 derive.forget 再踢房间（room.refresh）、关影子库（shadows.forget），同一副本按提交顺序收到，
+      // 本副本在途任务随后因房间被踢 / 影子库关闭抛错时已能看到 forgotten。
+      bus.onEvent((e) => {
+        if (e.t !== 'derive.forget' || e.origin === bus.replicaId) return;
+        if (e.branchIds) for (const id of e.branchIds) this.forget(id);
+        else return this.revalidate();
+      });
+      // 断线期间可能错过 derive.forget：清内存基线并复核在途分支
+      bus.onReconnect(() => this.revalidate());
+    }
   }
 
   private async setGood(branchId: string, m: Model) {
     if (this.forgotten.has(branchId)) return;
-    await this.store.save(branchId, m);
+    // 更新 0 行：分支已被删（可能是别的副本删的、事件还没到或丢了），按 forget 处理
+    if ((await this.store.save(branchId, m)) === false) this.forget(branchId);
     if (this.forgotten.has(branchId)) return;
     this.good.set(branchId, m);
   }
 
+  /**
+   * 失败路径上判断分支是不是已经被删：已打 forgotten 标记直接是；否则查一次 branches（只在失败路径上查，
+   * 稳态 0 额外 I/O），已删就补打标记。查询失败保守视作仍存在，按原失败原因报告，不吞掉真实故障。
+   * 覆盖删除方的 derive.forget 晚到 / 丢失（断线）、以及本副本先从平台库观察到删除（分支行已没有）的窗口。
+   */
+  private async gone(branchId: string): Promise<boolean> {
+    if (this.forgotten.has(branchId)) return true;
+    if (!this.store.existing) return false;
+    let alive: Set<string>;
+    try {
+      alive = await this.store.existing([branchId]);
+    } catch {
+      return this.forgotten.has(branchId);
+    }
+    if (!alive.has(branchId)) this.forget(branchId);
+    return this.forgotten.has(branchId);
+  }
+
+  /**
+   * 总线重连或收到不带分支列表的 derive.forget（可能错过了删除）时调用：
+   * - 内存基线整体清掉，不查库：PG 多副本模式下 loadGood 始终以 branches.baseline 为准，内存里只是副本，清掉不影响正确性；
+   * - 只对在途分支（通常为 0 个或很少）按 branches 复核，已删的打 forgotten 标记；没有在途分支时不查库。
+   */
+  private async revalidate(): Promise<void> {
+    this.forgetGen++;
+    this.good.clear();
+    if (!this.store.existing) return;
+    const ids = [...this.running.keys()];
+    for (let i = 0; i < ids.length; i += EXISTING_CHUNK) {
+      const chunk = ids.slice(i, i + EXISTING_CHUNK);
+      let alive: Set<string>;
+      try {
+        alive = await this.store.existing(chunk);
+      } catch (e) {
+        console.warn(
+          '复核在途派生任务的分支是否仍存在失败（在途任务按失败路径各自复核）',
+          e instanceof Error ? e.message : e,
+        );
+        return;
+      }
+      for (const id of chunk) if (!alive.has(id)) this.forget(id);
+    }
+  }
+
   private async loadGood(branchId: string): Promise<Model | null> {
+    const gen = this.forgetGen;
     if (this.ha?.isDistributed) {
       // PG 多副本模式：始终以平台库 branches.baseline 为准，避免读取过期的本地缓存
       const fromDb = await this.store.load(branchId);
-      if (!this.forgotten.has(branchId)) {
+      if (!this.forgotten.has(branchId) && gen === this.forgetGen) {
         if (fromDb) this.good.set(branchId, fromDb);
         else this.good.delete(branchId);
       }
@@ -189,7 +276,7 @@ export class OpaqueRefresher {
     const cached = this.good.get(branchId);
     if (cached) return cached;
     const fromDb = await this.store.load(branchId);
-    if (fromDb && !this.forgotten.has(branchId)) this.good.set(branchId, fromDb);
+    if (fromDb && !this.forgotten.has(branchId) && gen === this.forgetGen) this.good.set(branchId, fromDb);
     return fromDb;
   }
 
@@ -223,9 +310,12 @@ export class OpaqueRefresher {
     return lock.value;
   }
 
-  /** 导入、拉取之后：新模型就是引擎刚读出来的，直接作为基线（受 derive 锁保护） */
+  /**
+   * 导入、拉取之后：新模型就是引擎刚读出来的，直接作为基线（受 derive 锁保护）。
+   * 与 runWithReset 一样不清 forgotten 标记：删除项目前已过权限检查、删除后才排进来的请求，不能让还在跑的旧任务
+   * 或它自己给已删分支写回基线（Issue #153）。
+   */
   async reset(branchId: string, model: Model) {
-    this.forgotten.delete(branchId);
     const baseline = structuredClone(model);
     await this.enqueue(branchId, () =>
       this.withExclusiveLock(branchId, async () => {
@@ -246,7 +336,8 @@ export class OpaqueRefresher {
    * - `onlyIfClean`（已验证版本的应用 / 作废 / 取消作废）：当前闭环验证尚未核对模型原文（待 #132 落地），按 ADR 0017
    *   落地后验证记录也将按数据库完整版本号区分、SQL Server 生成列 `type` 规划器不比较，“已验证”不保证是当前影子库的规范形式。
    *   因此只有 model 相对当前黄金基线没有待规范化对象时才推进黄金基线（同时作为防御性确认），否则只替换房间；
-   * - 锁序严格单向：本地队列 → job:derive:<branchId> → rooms.withRoomLock → branches FOR UPDATE。
+   * - 锁序严格单向：本地队列 → job:derive:<branchId> → rooms.withRoomLock → branches FOR UPDATE；
+   * - 不清 forgotten 标记（见 reset）：分支在途期间已被 forget 时 fn 照常执行（它自己会因分支不存在失败），基线不写。
    */
   async runWithReset<T>(
     branchId: string,
@@ -254,7 +345,6 @@ export class OpaqueRefresher {
     fn: () => Promise<T>,
     opts: { onlyIfClean?: boolean } = {},
   ): Promise<T> {
-    this.forgotten.delete(branchId);
     const baseline = structuredClone(model);
     return this.enqueue(branchId, () =>
       this.withExclusiveLock(branchId, async () => {
@@ -292,10 +382,27 @@ export class OpaqueRefresher {
    * 分支被删掉时清理内存状态：丢掉已经规范化的基线。
    * 正在执行的刷新不在这里取消（Promise 取消不了）；它写回时会被房间的版本检查拒绝或忽略，
    * 并通过 forgotten 标记阻止其回写内存/库基线（任务结束也不会复活）。
+   * 只动本副本；删除分支的路由用 forgetBranches（同时通知其他副本）。
    */
   forget(branchId: string) {
+    this.forgetGen++;
     this.good.delete(branchId);
     if (this.running.has(branchId)) this.forgotten.add(branchId);
+  }
+
+  /**
+   * 删除分支（项目）的事务提交后调用，必须排在 rooms.kickBranches 与 shadows.forget* 之前：
+   * 先同步 forget 本副本，再广播 derive.forget 让其他副本同样清内存基线、给在途任务打标记。
+   * 同一副本按 await 顺序发出的 NOTIFY 按提交顺序送达，其他副本因此先于 room.refresh / shadows.forget 收到它。
+   * 广播失败只记日志（删除已提交）：其他副本的在途任务仍会在失败路径 / 保存基线时从平台库发现分支已删，
+   * 残留的内存基线在总线重连复核时清掉。
+   */
+  async forgetBranches(branchIds: string[]): Promise<void> {
+    for (const id of branchIds) this.forget(id);
+    if (!this.bus || branchIds.length === 0) return;
+    await this.bus.publish({ t: 'derive.forget', branchIds }).catch((e) => {
+      console.error('广播派生基线清理事件失败', e);
+    });
   }
 
   /** 测试和排查用：这个分支还有没有内存基线 / 在途任务 */
@@ -336,9 +443,18 @@ export class OpaqueRefresher {
     let wrote = false;
     /** 连续被拒的次数（写回被接受后清零） */
     let rejects = 0;
-    let last!: { model: Model; seq: number };
+    let last: { model: Model; seq: number } | undefined;
     for (let round = 0; round < MAX_CATCHUP_ROUNDS; round++) {
-      const { model: cur, versions, seq } = await this.rooms.state(branchId);
+      let state: { model: Model; versions: Versions; seq: number };
+      try {
+        state = await this.rooms.state(branchId);
+      } catch (e) {
+        // 排队等到锁时房间已被踢、快照已删（别的副本删了项目，room.refresh 先生效）：按已删报 forgotten；
+        // 分支还在时照旧抛出（不改变活分支上读房间失败的语义）
+        if (await this.gone(branchId)) return skipped('forgotten', last ?? { model: emptyModel(), seq: 0 });
+        throw e;
+      }
+      const { model: cur, versions, seq } = state;
       last = { model: cur, seq };
       if (this.stopped) return skipped('stopped', last);
       if (this.forgotten.has(branchId)) return skipped('forgotten', last);
@@ -348,7 +464,8 @@ export class OpaqueRefresher {
       if (!needsRefresh(base, cur)) return { kind: wrote ? 'normalized' : 'clean', seq, model: cur };
       const shadow = await this.shadowOf(branchId);
       if (this.forgotten.has(branchId)) return skipped('forgotten', last);
-      if (!shadow) return skipped('no_shadow', last);
+      // 解析不到影子库也可能是因为分支已被删（branches 行没了，删除方的 derive.forget 还没到）
+      if (!shadow) return skipped((await this.gone(branchId)) ? 'forgotten' : 'no_shadow', last);
       const outcome = await this.apply(branchId, shadow, base, cur, versions, seq);
       last = { model: outcome.model, seq: outcome.seq };
       switch (outcome.kind) {
@@ -366,7 +483,7 @@ export class OpaqueRefresher {
       }
     }
     // 单次持锁达到循环上限（持续编辑造成活锁）：仍有待规范化对象，如实报 skipped，下次出口再追
-    return skipped('round_limit', last);
+    return skipped('round_limit', last!);
   }
 
   /**
@@ -391,7 +508,8 @@ export class OpaqueRefresher {
     try {
       patched = await shadow.canonicalize(good, cur);
     } catch (e) {
-      if (this.forgotten.has(branchId)) {
+      // 被 forget，或从平台库发现分支已删（删除方事件晚到 / 丢失时影子库可能先被关掉）：不报影子库错误
+      if (await this.gone(branchId)) {
         return { kind: 'skipped', reason: 'forgotten', seq: curSeq, model: cur };
       }
       // 影子库不可用是预期情况（没有环境、连不上……）：安静跳过；表达式在影子库里报错留给显式规范化报告给用户
@@ -410,7 +528,7 @@ export class OpaqueRefresher {
       patchRes = patched.length ? await this.rooms.patch(branchId, 'Dowel', patched, versions) : undefined;
       after = await this.rooms.state(branchId);
     } catch (e) {
-      if (this.forgotten.has(branchId)) {
+      if (await this.gone(branchId)) {
         return { kind: 'skipped', reason: 'forgotten', seq: curSeq, model: cur };
       }
       console.warn('写回规范化结果或读取房间状态失败（模型保持原样）', e instanceof Error ? e.message : e);
@@ -430,7 +548,7 @@ export class OpaqueRefresher {
     try {
       await this.setGood(branchId, canonical);
     } catch (e) {
-      if (this.forgotten.has(branchId)) {
+      if (await this.gone(branchId)) {
         return { kind: 'skipped', reason: 'forgotten', seq: after.seq, model: after.model };
       }
       console.warn('保存规范化基线失败（模型已写回，基线未推进）', e instanceof Error ? e.message : e);
@@ -455,7 +573,9 @@ export class OpaqueRefresher {
    * - 影子库 / 表达式报错（ShadowError、StepError、PlanError、InstanceLevelStatementError）原样抛给路由，基线不变；
    * - 写回被拒（期间有人改了同一对象）抛 NormalizeConflictError；
    * - 期间分支被 forget（项目被删）：不论卡在哪一步（排队、读房间、读基线、解析影子库、影子库校验、写回、读回、保存基线），
-   *   也不论那一步是否因此抛错（删除项目事务提交后会先同步 forget 再踢房间与关影子库），一律抛 BranchForgottenError，不报成功。
+   *   也不论那一步是否因此抛错（删除项目事务提交后会先同步 forget 再踢房间与关影子库；其他副本先收到 derive.forget 再收到
+   *   room.refresh / shadows.forget；事件晚到 / 丢失时失败路径复核 branches、保存基线更新 0 行也按已删处理），
+   *   一律抛 BranchForgottenError，不报成功。
    */
   normalize(
     branchId: string,
@@ -468,7 +588,8 @@ export class OpaqueRefresher {
         try {
           out = await this.normalizeLocked(branchId, handleOrResolve);
         } catch (e) {
-          if (this.forgotten.has(branchId)) throw new BranchForgottenError(branchId);
+          // 被 forget，或从平台库发现分支已删（跨副本删除的事件晚到 / 丢失）：与项目不存在一致
+          if (await this.gone(branchId)) throw new BranchForgottenError(branchId);
           throw e;
         }
         // 写回 / 读回 / 保存基线期间被 forget：setGood 不写内存基线，这里也不能报成功

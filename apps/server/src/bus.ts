@@ -90,6 +90,11 @@ export type ClusterEvent =
   | { t: 'ci_tokens.changed'; origin: string }
   /** MCP 令牌创建 / 吊销 / 批量吊销（M3-C）：其他副本清空活跃 MCP 令牌哈希缓存 */
   | { t: 'mcp_tokens.changed'; origin: string }
+  /**
+   * 分支被删（项目删除，Issue #153）：其他副本的 OpaqueRefresher 清内存基线、给在途任务打 forgotten 标记。
+   * 删除方先于 room.refresh / shadows.forget 发出；不带 branchIds（超长退化）= 按 branches 复核本地跟踪的全部分支。
+   */
+  | { t: 'derive.forget'; origin: string; branchIds?: string[] }
   | {
       t: 'shadows.forget';
       origin: string;
@@ -204,6 +209,9 @@ export class EventBus {
         // 避免发出被截断的非法 JSON：能退化为全量刷新信号的退化，否则告警丢弃
         if (full.t === 'room.refresh') {
           full = { t: 'room.refresh', origin: this.replicaId };
+          json = JSON.stringify(full);
+        } else if (full.t === 'derive.forget') {
+          full = { t: 'derive.forget', origin: this.replicaId };
           json = JSON.stringify(full);
         } else if (full.t === 'requests.kick') {
           full = { t: 'requests.kick', origin: this.replicaId, all: true };

@@ -122,14 +122,30 @@ export const createApp = (db: PlatformDb, options: AppOptions = {}) => {
             branchId,
           ])
         )[0]?.baseline ?? null,
-      save: async (branchId, m) => {
-        await db.query('update branches set baseline = $2::text::jsonb where id = $1', [
-          branchId,
-          JSON.stringify(m),
-        ]);
-      },
+      // 更新 0 行 = 分支已被删（可能是别的副本删的，derive.forget 还没到）
+      save: async (branchId, m) =>
+        (
+          await db.query<{ id: string }>(
+            'update branches set baseline = $2::text::jsonb where id = $1 returning id',
+            [branchId, JSON.stringify(m)],
+          )
+        ).length > 0,
+      // 只在失败路径与总线重连 / 退化事件时调用（OpaqueRefresher 按 500 个一批）
+      existing: async (branchIds) =>
+        new Set(
+          branchIds.length
+            ? (
+                await db.query<{ id: string }>(
+                  `select id from branches where id in (${branchIds.map((_, i) => `$${i + 1}`).join(', ')})`,
+                  branchIds,
+                )
+              ).map((r) => r.id)
+            : [],
+        ),
     },
     ha,
+    // 跨副本同步 forget（Issue #153）：收 derive.forget、总线重连时复核
+    bus,
   );
   // 按需规范化（ADR 0016）：编辑提交不再触发后台影子库刷新，只在关键出口 flush 或用户显式规范化时才回影子库
   /**
