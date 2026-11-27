@@ -27,7 +27,7 @@
 6. **canonicalize 自愈**：基线自己在影子库里建不出来（旧版本遗留 / 升级后不兼容，`StepError`）且没有依赖改名的不透明对象时，直接从空库建出 `next`（与增量迁移等价）；有改名依赖时如实报错。基础设施故障统一经 `isInfraFailure` → `toShadowError` 映射为 `ShadowError`。
 7. **手动规范化接口与按钮**：
    - `GET /api/projects/:pid/normalize`（`project.read`，查看者即可）：`{ seq, pending, pendingCount, objects（≤50）, truncated, baseline, shadow }`，0 影子库 I/O、不拿 derive 锁；`shadow` 来自 `Shadows.configState`（`memory` / `configured` / `none`，纯平台库查询、复用 `candidatePriority`）。
-   - `POST /api/projects/:pid/normalize`（新动作 `model.normalize`，编辑者以上；严格请求体 `{ env?: string }`）：外部影子库方言过连接限速（#15），预连接失败（`ShadowError.preConnect`）或静态 `validate` 不通过（`422 model_invalid`）精确退回（#8 #9）；指定的环境不存在（404）、`normalize_busy`、`shutting_down` 同样退回。未指定 `env` 时影子库句柄在 derive 锁内按需解析：基线等于当前模型时直接返回 `clean`（不解析、不连影子库，额度退回，`shadow` 为 `null`）；否则在影子库里 canonicalize、写回（`room_commits.op_name = 'derive'`）、推进基线，返回 `normalized` / `verified`。错误码：`422 shadow_unavailable`、`422 canonicalize_failed`（经 `scrubSecrets`）、`409 working_changed`、`503 normalize_busy`、`503 shutting_down`。不写 `audit_events`（派生写回已在画布修改历史里）。
+   - `POST /api/projects/:pid/normalize`（新动作 `model.normalize`，编辑者以上；严格请求体 `{ env?: string }`）：外部影子库方言过连接限速（#15），预连接失败（`ShadowError.preConnect`）或静态 `validate` 不通过（`422 model_invalid`）精确退回（#8 #9）；指定的环境不存在（404）、`normalize_busy`、`shutting_down` 同样退回。未指定 `env` 时影子库句柄在 derive 锁内按需解析：基线等于当前模型时直接返回 `clean`（不解析、不连影子库，额度退回，`shadow` 为 `null`）；否则在影子库里 canonicalize、写回（`room_commits.op_name = 'derive'`）、推进基线，返回 `normalized` / `verified`。错误码：`422 shadow_unavailable`、`422 canonicalize_failed`（经 `scrubSecrets`）、`409 working_changed`、`503 normalize_busy`、`503 shutting_down`；规范化期间项目被删（分支被 `forget()`）返回 `404`（同项目不存在，#144）。不写 `audit_events`（派生写回已在画布修改历史里）。
    - 模型页底部状态栏（不进顶栏，`迁移` 仍是唯一 `.btn.primary`）：`bg-ok` 圆点 +“表达式已规范化”或 `bg-warn` 圆点 +“N 处待规范化”（查看者也能看到）；编辑者另有紧凑 ghost 按钮“规范化”：没有可用影子库或未同步时 `aria-disabled` 并说明原因（点击给中性提示），运行中 `disabled` + `aria-busy` + 旋转图标。成功后失效 `normalize` / `migration` / `ddl` / `canvas-history` / `history-head` 查询（#32）。关键出口（迁移预览 / 验证、发布、历史详情）与环境、schema 范围变更后也失效 `['normalize', pid]`：零改写的 flush 只推进基线、`seq` 不变，不主动重查状态栏会一直停在“N 处待规范化”。状态查询只在防抖后的 `seq` 追上当前 `seq` 时启用，避免同步恢复瞬间按旧 `seq` 多查一次。
    - 状态栏的影子库来源与服务端 `forProjectTarget` 对齐：先选最低已知版本组（该组不可用时依次回退），组内按显式 `shadowUrl` > 非生产 > 允许同实例的生产挑选，没有可用影子库时显示“没有可用的影子库”。
 
@@ -43,5 +43,5 @@
 ## 影响与边界
 
 - 发布 / 迁移 / DDL 等出口的正确性不变：直接使用 `flush()` 返回的 `model` / `seq`（MCP 读模型工具仍在 `flush()` 后读 `canvasState` 以在同一把房间锁内拿到对象版本与板块）；没有影子库时与以前一样跳过（发布为未验证）。
-- 停机：`stop()` 后 `normalize()` 拒绝（`503 shutting_down`），`flush()` 返回 `skipped`；`drain()` 等待在途任务（#19）。`forget()` 后在途任务不回写内存 / 库基线（#41 #44 #45）。
+- 停机：`stop()` 后 `normalize()` 拒绝（`503 shutting_down`），`flush()` 返回 `skipped`；`drain()` 等待在途任务（#19）。`forget()` 后在途任务不回写内存 / 库基线（#41 #44 #45），也不报成功：`flush()` 返回 `skipped('forgotten')`，`normalize()` 抛 `BranchForgottenError`（#137 #144）。
 - 已有项目升级后基线可能是旧逻辑写入的未规范化模型：首次规范化时若基线建不出来会走自愈分支；建得出来则按差异正常规范化。

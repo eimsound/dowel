@@ -55,6 +55,16 @@ export class NormalizeConflictError extends Error {
 }
 
 /**
+ * 显式规范化期间分支被 forget（项目已被删除）：不论写回 / 保存基线做到哪一步都不报成功。
+ * HTTP 映射为 404（与项目不存在一致）。
+ */
+export class BranchForgottenError extends Error {
+  constructor(branchId: string) {
+    super(`分支 ${branchId} 已被删除`);
+  }
+}
+
+/**
  * flush 没做成规范化的原因：
  * - stopped / forgotten：服务正在停机，或分支已被 forget（项目 / 分支被删）；
  * - no_shadow：没有可用的影子库（shadowOf 返回 null）；
@@ -328,6 +338,7 @@ export class OpaqueRefresher {
       if (this.stopped) return skipped('stopped', last);
       if (this.forgotten.has(branchId)) return skipped('forgotten', last);
       const good = await this.loadGood(branchId);
+      if (this.forgotten.has(branchId)) return skipped('forgotten', last);
       const base = good ?? emptyBaseline(cur);
       if (!needsRefresh(base, cur)) return { kind: wrote ? 'normalized' : 'clean', seq, model: cur };
       const shadow = await this.shadowOf(branchId);
@@ -437,7 +448,9 @@ export class OpaqueRefresher {
    * - 黄金基线就是当前模型：直接返回 clean（不连影子库；handle 是函数时也不会去解析影子库）；
    * - 否则在给定影子库里从基线（没有就从空模型）迁移到当前模型并读回，写回规范形式、推进基线；
    * - 影子库 / 表达式报错（ShadowError、StepError、PlanError、InstanceLevelStatementError）原样抛给路由，基线不变；
-   * - 写回被拒（期间有人改了同一对象）抛 NormalizeConflictError。
+   * - 写回被拒（期间有人改了同一对象）抛 NormalizeConflictError；
+   * - 期间分支被 forget（项目被删）：不论卡在哪一步（读房间、读基线、影子库、写回、读回、保存基线），也不论那一步
+   *   是否因此抛错（删除项目会先踢掉房间），一律抛 BranchForgottenError，不报成功。
    */
   normalize(
     branchId: string,
@@ -446,44 +459,61 @@ export class OpaqueRefresher {
     if (this.stopped) return Promise.reject(new RefresherStoppedError());
     return this.enqueue(branchId, () =>
       this.withExclusiveLock(branchId, async (): Promise<NormalizeOutcome> => {
-        if (this.stopped) throw new RefresherStoppedError();
-        const { model: cur, versions, seq } = await this.rooms.state(branchId);
-        const good = await this.loadGood(branchId);
-        if (good !== null && deepEqual(good, cur)) {
-          return {
-            ok: true,
-            outcome: 'clean',
-            seq,
-            normalizedCount: 0,
-            normalizedObjects: [],
-            checkedInShadow: false,
-            shadow: typeof handleOrResolve === 'function' ? null : handleOrResolve.label,
-          };
+        let out: NormalizeOutcome;
+        try {
+          out = await this.normalizeLocked(branchId, handleOrResolve);
+        } catch (e) {
+          if (this.forgotten.has(branchId)) throw new BranchForgottenError(branchId);
+          throw e;
         }
-        const handle = typeof handleOrResolve === 'function' ? await handleOrResolve() : handleOrResolve;
-        const patched = await handle.shadow.canonicalize(good ?? emptyBaseline(cur), cur);
-        if (this.forgotten.has(branchId)) throw new NormalizeConflictError(seq);
-        const patchRes = patched.length
-          ? await this.rooms.patch(branchId, 'Dowel', patched, versions)
-          : undefined;
-        const after = await this.rooms.state(branchId);
-        const rejected =
-          Boolean(patchRes?.rejected) || patched.some((o) => !deepEqual(after.model.objects[o.id], o));
-        if (rejected) throw new NormalizeConflictError(after.seq);
-        const canonical = structuredClone(cur);
-        for (const o of patched) canonical.objects[o.id] = o;
-        await this.setGood(branchId, canonical);
-        return {
-          ok: true,
-          outcome: patched.length ? 'normalized' : 'verified',
-          seq: after.seq,
-          normalizedCount: patched.length,
-          normalizedObjects: patched.map((o) => refOf(canonical, o.id)),
-          checkedInShadow: true,
-          shadow: handle.label,
-        };
+        // 写回 / 读回 / 保存基线期间被 forget：setGood 不写内存基线，这里也不能报成功
+        if (this.forgotten.has(branchId)) throw new BranchForgottenError(branchId);
+        return out;
       }),
     );
+  }
+
+  private async normalizeLocked(
+    branchId: string,
+    handleOrResolve: ShadowHandle | (() => Promise<ShadowHandle>),
+  ): Promise<NormalizeOutcome> {
+    if (this.stopped) throw new RefresherStoppedError();
+    const { model: cur, versions, seq } = await this.rooms.state(branchId);
+    const good = await this.loadGood(branchId);
+    if (good !== null && deepEqual(good, cur)) {
+      return {
+        ok: true,
+        outcome: 'clean',
+        seq,
+        normalizedCount: 0,
+        normalizedObjects: [],
+        checkedInShadow: false,
+        shadow: typeof handleOrResolve === 'function' ? null : handleOrResolve.label,
+      };
+    }
+    const handle = typeof handleOrResolve === 'function' ? await handleOrResolve() : handleOrResolve;
+    const patched = await handle.shadow.canonicalize(good ?? emptyBaseline(cur), cur);
+    // 已被 forget：不再写回（normalize 外层把它报成 BranchForgottenError）
+    if (this.forgotten.has(branchId)) throw new BranchForgottenError(branchId);
+    const patchRes = patched.length
+      ? await this.rooms.patch(branchId, 'Dowel', patched, versions)
+      : undefined;
+    const after = await this.rooms.state(branchId);
+    const rejected =
+      Boolean(patchRes?.rejected) || patched.some((o) => !deepEqual(after.model.objects[o.id], o));
+    if (rejected) throw new NormalizeConflictError(after.seq);
+    const canonical = structuredClone(cur);
+    for (const o of patched) canonical.objects[o.id] = o;
+    await this.setGood(branchId, canonical);
+    return {
+      ok: true,
+      outcome: patched.length ? 'normalized' : 'verified',
+      seq: after.seq,
+      normalizedCount: patched.length,
+      normalizedObjects: patched.map((o) => refOf(canonical, o.id)),
+      checkedInShadow: true,
+      shadow: handle.label,
+    };
   }
 
   /** 只读状态（0 影子库 I/O、不拿 derive 锁）：当前模型相对黄金基线有多少待规范化的对象 */

@@ -14,6 +14,7 @@ import type { Hono } from 'hono';
 import { HTTPException } from 'hono/http-exception';
 
 import {
+  BranchForgottenError,
   DeriveBusyError,
   NormalizeConflictError,
   RefresherStoppedError,
@@ -114,6 +115,8 @@ export const registerNormalize = (app: Hono<Env>, ctx: AppContext) => {
         const reason = e instanceof StepError ? e.reason : e.message;
         return fail(422, `规范化失败（工作副本保持原样）：${reason}`, 'canonicalize_failed');
       }
+      // 规范化期间项目被删（分支被 forget）：和项目不存在同一个响应（accessIn 的 404）
+      if (e instanceof BranchForgottenError) throw new HTTPException(404, { message: '项目不存在' });
       if (e instanceof NormalizeConflictError) {
         return fail(409, e.message, 'working_changed', { currentSeq: e.currentSeq });
       }

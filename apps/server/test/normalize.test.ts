@@ -249,6 +249,31 @@ describe('桩影子库', () => {
   });
 });
 
+describe('规范化期间项目被删除（Issue #144）', () => {
+  test('影子库规范化期间项目被删：404（同项目不存在），不报 200 / 409，删除照常成功', async () => {
+    const { pid } = await newProject('删除中', 'pg');
+    const [row] = await db.query<{ slug: string }>('select slug from projects where id = $1', [pid]);
+    let deleted: { status: number; data: unknown } | undefined;
+    const fake = {
+      canonicalize: async (_prev: Model, next: Model) => {
+        // 规范化还在影子库里时，管理员删掉了项目（踢房间、forget 分支）
+        deleted = await call('DELETE', `/api/projects/${pid}`, { confirm: row!.slug }, adminCookie);
+        return Object.values(next.objects)
+          .filter((o) => o.kind === 'check' && !o.expr.startsWith('('))
+          .map((o) => ({ ...o, expr: `(${(o as { expr: string }).expr})` }) as Obj);
+      },
+      close: async () => {},
+    } as unknown as Shadow;
+    created.shadows.forProjectTarget = async () => ({ shadow: fake, label: 'fake-shadow' });
+    await seedCheck(pid);
+    const res = await call('POST', `/api/projects/${pid}/normalize`, {}, editorCookie);
+    expect(deleted?.status, JSON.stringify(deleted?.data)).toBe(200);
+    expect(res.status, JSON.stringify(res.data)).toBe(404);
+    expect(res.data).toMatchObject({ error: '项目不存在' });
+    expect((await call('GET', `/api/projects/${pid}/normalize`, undefined, editorCookie)).status).toBe(404);
+  });
+});
+
 describe('PG 预连接失败（无 Docker）', () => {
   test('没有环境：GET 显示 none；POST 422 shadow_unavailable 且精确退回连接限速', async () => {
     const { pid } = await newProject('无影子库', 'pg');
