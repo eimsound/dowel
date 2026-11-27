@@ -7,7 +7,8 @@ import { afterEach, beforeEach, describe, expect, test, vi } from 'vitest';
 import { BranchForgottenError } from '../src/derive.ts';
 import { createApp, openPlatformDb, type PlatformDb } from '../src/index.ts';
 import { KeyedLimiter, LoginLimiter } from '../src/rate-limit.ts';
-import { type Shadow, ShadowError } from '../src/shadow.ts';
+import { type Shadow, ShadowConfigChangedError, ShadowError } from '../src/shadow.ts';
+import { pgShadow } from '../src/targets/pg.ts';
 import { editModel, makeUser, PASSWORD } from './support.ts';
 
 process.env.DOWEL_SECRET ??= 'normalize-test-secret-0123456789';
@@ -615,6 +616,103 @@ describe('规范化期间项目被删除（Issue #144）', () => {
     },
   );
 
+  test('兜底覆盖类型化错误（ShadowConfigChangedError）：项目并发被删且未打 forgotten 标记 → 404（非 503），未解析影子库时退回限速，已解析不退回', async () => {
+    const p1 = await newProject('兜底-ConfigChanged-未解析', 'pg');
+    const p2 = await newProject('兜底-ConfigChanged-未解析后续', 'pg');
+    const p3 = await newProject('兜底-ConfigChanged-已解析', 'pg');
+    const p4 = await newProject('兜底-ConfigChanged-已解析后续', 'pg');
+    const [row1] = await db.query<{ slug: string }>('select slug from projects where id = $1', [p1.pid]);
+    const [row3] = await db.query<{ slug: string }>('select slug from projects where id = $1', [p3.pid]);
+    await seedCheck(p1.pid);
+    await seedCheck(p2.pid);
+    await seedCheck(p3.pid);
+    await seedCheck(p4.pid);
+
+    const okShadow = {
+      canonicalize: async (_prev: Model, next: Model) =>
+        Object.values(next.objects)
+          .filter((o) => o.kind === 'check' && !o.expr.startsWith('('))
+          .map((o) => ({ ...o, expr: `(${(o as { expr: string }).expr})` }) as Obj),
+      close: async () => {},
+    } as unknown as Shadow;
+    const closedShadow = pgShadow('postgres://u:p@127.0.0.1:1/app_dowel');
+    await closedShadow.close();
+
+    const origKick = created.rooms.kickBranches.bind(created.rooms);
+    const origModel = created.rooms.model.bind(created.rooms);
+    const origForProjectTarget = created.shadows.forProjectTarget.bind(created.shadows);
+
+    // 情况 1（editorCookie）：forProjectTarget 直接抛 ShadowConfigChangedError（resolved === false）→ 404 且退回限速
+    let kickEntered = deferred();
+    let kickGate = deferred();
+    created.rooms.kickBranches = async (branchIds, reason) => {
+      kickEntered.resolve();
+      await kickGate.promise;
+      return origKick(branchIds, reason);
+    };
+    let del1P: Promise<{ status: number; data: unknown }> | undefined;
+    created.rooms.model = async (branchId) => {
+      const res = await origModel(branchId);
+      if (branchId === p1.branch) {
+        del1P = call('DELETE', `/api/projects/${p1.pid}`, { confirm: row1!.slug }, adminCookie);
+        await kickEntered.promise;
+      }
+      return res;
+    };
+    created.shadows.forProjectTarget = async (targetPid) => {
+      if (targetPid === p1.pid) throw new ShadowConfigChangedError();
+      return { shadow: okShadow, label: 'fake-shadow' };
+    };
+
+    let res1!: { status: number; data: unknown };
+    try {
+      res1 = await call('POST', `/api/projects/${p1.pid}/normalize`, {}, editorCookie);
+    } finally {
+      kickGate.resolve();
+    }
+    expect((await del1P!).status).toBe(200);
+    expect(res1.status, JSON.stringify(res1.data)).toBe(404);
+    expect(res1.data).toEqual({ error: '项目不存在' });
+
+    // 额度已退回：同一 editorCookie 紧接着规范化 p2 仍可成功（limit = 1 不会 429）
+    const res2 = await call('POST', `/api/projects/${p2.pid}/normalize`, {}, editorCookie);
+    expect(res2.status, JSON.stringify(res2.data)).toBe(200);
+
+    // 情况 2（adminCookie）：forProjectTarget 返回已关闭句柄（resolved === true），canonicalize 抛 ShadowConfigChangedError → 404 且不退回限速
+    kickEntered = deferred();
+    kickGate = deferred();
+    let del3P: Promise<{ status: number; data: unknown }> | undefined;
+    created.rooms.model = async (branchId) => {
+      const res = await origModel(branchId);
+      if (branchId === p3.branch) {
+        del3P = call('DELETE', `/api/projects/${p3.pid}`, { confirm: row3!.slug }, adminCookie);
+        await kickEntered.promise;
+      }
+      return res;
+    };
+    created.shadows.forProjectTarget = async (targetPid) => {
+      if (targetPid === p3.pid) return { shadow: closedShadow, label: 'stale' };
+      return { shadow: okShadow, label: 'fake-shadow' };
+    };
+
+    let res3!: { status: number; data: unknown };
+    try {
+      res3 = await call('POST', `/api/projects/${p3.pid}/normalize`, {}, adminCookie);
+    } finally {
+      kickGate.resolve();
+      created.rooms.model = origModel;
+      created.rooms.kickBranches = origKick;
+      created.shadows.forProjectTarget = origForProjectTarget;
+    }
+    expect((await del3P!).status).toBe(200);
+    expect(res3.status, JSON.stringify(res3.data)).toBe(404);
+    expect(res3.data).toEqual({ error: '项目不存在' });
+
+    // 已解析影子库，没有退回：紧接着再发起一次命中 429
+    const res4 = await call('POST', `/api/projects/${p4.pid}/normalize`, {}, adminCookie);
+    expect(res4.status).toBe(429);
+  });
+
   test('兜底覆盖其他类型化错误（StepError）：canonicalize 期间库行被删且未打 forgotten 标记 → 404；活分支仍回 422 canonicalize_failed', async () => {
     const { pid: pid1, branch: branch1 } = await newProject('兜底-StepError-已删', 'sqlite');
     await seedCheck(pid1, 'no_such_column > 0');
@@ -846,6 +944,18 @@ describe('PG 预连接失败（无 Docker）', () => {
     expect(second.status).toBe(429);
   });
 
+  test('影子库句柄因配置变更被关闭（#154）：503 shadow_config_changed，不是 422 shadow_unavailable', async () => {
+    const { pid } = await newProject('配置变了', 'pg');
+    await seedCheck(pid);
+    // 真实的 PG 影子库句柄、已被缓存淘汰关闭（不会连库）
+    const closed = pgShadow('postgres://u:p@127.0.0.1:1/app_dowel');
+    await closed.close();
+    created.shadows.forProjectTarget = async () => ({ shadow: closed, label: 'stale' });
+    const res = await call('POST', `/api/projects/${pid}/normalize`, {}, editorCookie);
+    expect(res.status, JSON.stringify(res.data)).toBe(503);
+    expect(res.data).toMatchObject({ code: 'shadow_config_changed', error: '影子库配置已变更，请重试' });
+  });
+
   test('精确退回限速：指定的环境不存在（404）、clean 未解析影子库时都不占额度', async () => {
     const { pid, branch } = await newProject('退回额度', 'pg');
     for (let i = 0; i < 3; i++) {
@@ -861,6 +971,27 @@ describe('PG 预连接失败（无 Docker）', () => {
       const res = await call('POST', `/api/projects/${pid}/normalize`, {}, editorCookie);
       expect(res.status, JSON.stringify(res.data)).toBe(200);
       expect(res.data).toMatchObject({ outcome: 'clean', shadow: null, checkedInShadow: false });
+    }
+  });
+
+  test('无环境项目带待规范化对象 flush → skipped(no_shadow) 且不触发二次 branches 复核查询', async () => {
+    const { pid, branch } = await newProject('无环境不重查branches', 'pg');
+    await seedCheck(pid);
+    const origQuery = db.query.bind(db);
+    let shadowLookupQueries = 0;
+    let existingCheckQueries = 0;
+    db.query = (async <T = Record<string, unknown>>(sql: string, params?: unknown[]) => {
+      if (sql.includes('select project_id from branches where id = $1')) shadowLookupQueries++;
+      if (sql.includes('from branches where id in')) existingCheckQueries++;
+      return origQuery<T>(sql, params);
+    }) as typeof db.query;
+    try {
+      const out = await created.refresher.flush(branch);
+      expect(out).toMatchObject({ kind: 'skipped', skippedReason: 'no_shadow' });
+      expect(shadowLookupQueries).toBe(1);
+      expect(existingCheckQueries).toBe(0);
+    } finally {
+      db.query = origQuery;
     }
   });
 });

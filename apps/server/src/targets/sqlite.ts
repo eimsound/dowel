@@ -14,7 +14,7 @@ import {
 import { HTTPException } from 'hono/http-exception';
 
 import { resolveSqlitePath } from '../allowlist.ts';
-import { type Shadow, shadowOps } from '../shadow.ts';
+import { type Shadow, ShadowConfigChangedError, shadowOps } from '../shadow.ts';
 import {
   CHECK_CONNECT_TIMEOUT,
   ConnectError,
@@ -31,10 +31,17 @@ const rawError = (e: unknown) => (e instanceof Error ? e.message : String(e));
  * 内存 SQLite 影子库：每次操作打开独立 `:memory:` 数据库并在结束时关闭（毫秒级开销、天然并发安全、免环境配置）。
  */
 export const sqliteMemoryShadow = (): Shadow => {
+  // 每次操作各开各的 :memory:，没有外部连接可泄漏；只为和外部影子库同一份 close() 契约：关闭后拒绝所有操作
+  let closed = false;
   const withMem = async <T>(fn: (ops: ReturnType<typeof shadowOps>) => Promise<T>): Promise<T> => {
+    if (closed) throw new ShadowConfigChangedError();
     const handle = openSqliteDb(':memory:');
     try {
-      return await fn(shadowOps(async () => handle.db, null, { dialect: 'sqlite' }));
+      const result = await fn(shadowOps(async () => handle.db, null, { dialect: 'sqlite' })).catch((e) => {
+        throw closed ? new ShadowConfigChangedError() : e;
+      });
+      if (closed) throw new ShadowConfigChangedError();
+      return result;
     } finally {
       handle.close();
     }
@@ -45,7 +52,9 @@ export const sqliteMemoryShadow = (): Shadow => {
     verifyScripts: (from, to, up, down, options): Promise<VerifyReport> =>
       withMem((ops) => ops.verifyScripts(from, to, up, down, options)),
     canonicalize: (prev, next) => withMem((ops) => ops.canonicalize(prev, next)),
-    close: async () => {},
+    close: async () => {
+      closed = true;
+    },
   };
 };
 

@@ -57,7 +57,7 @@ import {
 } from '../requests.ts';
 import { WorkingChangedError } from '../rooms.ts';
 import { scrubSecrets } from '../secrets.ts';
-import { ShadowError } from '../shadow.ts';
+import { ShadowConfigChangedError, ShadowError } from '../shadow.ts';
 import {
   activeHead,
   activeHeadWithModel,
@@ -219,8 +219,9 @@ export const registerVersions = (app: Hono<Env>, ctx: AppContext) => {
       }
     } catch (e) {
       // 连接断开、超时、被占用这类基础设施故障（shadow.ts 统一抛 ShadowError）不是“脚本有问题”：
-      // 和“没有影子库”同样处理，发布但标为未验证，原因写明
-      if (!(e instanceof ShadowError)) throw e;
+      // 和“没有影子库”同样处理，发布但标为未验证，原因写明。
+      // 影子库配置在验证途中变了（ShadowConfigChangedError）是可重试的暂时状态：不发布，交给 onError 返回 503 让用户重试
+      if (!(e instanceof ShadowError) || e instanceof ShadowConfigChangedError) throw e;
       unverifiedReason = scrubSecrets(e.message);
     }
 

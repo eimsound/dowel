@@ -16,6 +16,7 @@ import {
   ShadowUnavailableError,
   shadowOps,
 } from '../shadow.ts';
+import { serialShadowConnection } from './shadow-handle.ts';
 import {
   CHECK_CONNECT_TIMEOUT,
   ConnectError,
@@ -427,17 +428,10 @@ export const dropPgSameInstanceShadow = async (targetUrl: string, name: string, 
 };
 
 export const pgShadow = (shadowUrl: string, schemas?: string[] | null, guard?: ConnectionGuard): Shadow => {
-  let conn: TargetConnection | null = null;
-  let queue: Promise<unknown> = Promise.resolve();
-  const discard = async () => {
-    const old = conn;
-    conn = null;
-    await old?.close().catch(() => {});
-  };
-  const run = <T>(fn: (ops: ReturnType<typeof shadowOps>) => Promise<T>): Promise<T> => {
-    const p = queue.then(async () => {
-      conn ??= connectPg(shadowUrl, 10, guard);
-      const db = conn.db;
+  // 串行、懒建连、关闭后永不重连（Issue #154，见 serialShadowConnection）
+  const session = serialShadowConnection(() => connectPg(shadowUrl, 10, guard));
+  const run = <T>(fn: (ops: ReturnType<typeof shadowOps>) => Promise<T>): Promise<T> =>
+    session.run(async ({ db }, discard) => {
       try {
         await db.exec(
           `SET lock_timeout = '10s'; SET statement_timeout = '${SHADOW_STATEMENT_TIMEOUT_MS / 1000}s'`,
@@ -484,19 +478,13 @@ export const pgShadow = (shadowUrl: string, schemas?: string[] | null, guard?: C
         if (!clean || !unlocked) await discard();
       }
     });
-    queue = p.catch(() => {});
-    return p;
-  };
   return {
     importSql: (sql) => run((ops) => ops.importSql(sql)),
     verify: (from, to, opts): Promise<VerifyReport> => run((ops) => ops.verify(from, to, opts)),
     verifyScripts: (from, to, up, down, options): Promise<VerifyReport> =>
       run((ops) => ops.verifyScripts(from, to, up, down, options)),
     canonicalize: (prev, next) => run((ops) => ops.canonicalize(prev, next)),
-    close: async () => {
-      await conn?.close();
-      conn = null;
-    },
+    close: () => session.close(),
   };
 };
 

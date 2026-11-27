@@ -4,7 +4,8 @@
 // （表达式：同表被引用列的 type / typeRef / collation——按列名解析，分区子表沿 partitionOf 用根父表的列——，
 // 列自身的默认值 / 生成列再加上自己的类型；不透明对象：父对象与依赖的完整限定名、依赖列的类型，
 // 依赖的不透明对象再递归带上它自己的这份签名，模拟视图叠视图；表达式里直接写的枚举转换 `0::mood` 标上它当前按名字
-// 绑定的枚举 ID，#146；MSSQL 世界里持久化计算列的 notNull 由被引用普通列的 notNull 推断，#145；解析不出来的存量字符串
+// 绑定的枚举 ID，#146；MSSQL 世界里持久化计算列的推断非空 ext.mssql.inferredNotNull 由被引用普通列的 notNull 推断、
+// 与列自己的显式 notNull 无关（显式 notNull 永不改写，#145 / #161）；解析不出来的存量字符串
 // 分区键按表达式处理，子分区边界带上它引用的父表列类型）。真实 canonicalize（apps/server/src/shadow.ts 的 shadowOps.canonicalize）会读回并比较全部对象，
 // 判定正确时变化的也只会是待规范化对象；假引擎刻意更严格，只改写 pendingRefreshIds(prev, next) 里的对象——这样判定漏掉的对象不会被顺手改好，
 // 会在 I1 / I2 里暴露出来（规范形式本身用不依赖判定的 canonObj 独立计算）。
@@ -182,6 +183,18 @@ const canonBound = (m: Model, o: Table): string => {
   return pof.bound;
 };
 
+/** 列的 ext.mssql.inferredNotNull 换成 v（false 时删键并收掉空的 ext.mssql / ext），返回新列 */
+const withInferred = (o: Column, v: boolean): Column => {
+  const { inferredNotNull: _old, ...mssql } = o.ext?.mssql ?? {};
+  const ext: NonNullable<Column['ext']> = {
+    ...o.ext,
+    mssql: v ? { ...mssql, inferredNotNull: true } : mssql,
+  };
+  if (!Object.keys(ext.mssql!).length) delete ext.mssql;
+  const { ext: _ext, ...rest } = o;
+  return Object.keys(ext).length ? { ...rest, ext } : rest;
+};
+
 /** 假引擎对单个对象的规范形式（与它在模型 m 里的上下文有关） */
 const canonObj = (m: Model, o: Obj): Obj => {
   switch (o.kind) {
@@ -224,14 +237,17 @@ const canonObj = (m: Model, o: Obj): Obj => {
         default:
           o.default && 'expr' in o.default ? { expr: canonExpr(m, o.default.expr, cols, o) } : o.default,
       };
-      // MSSQL 持久化计算列：引擎按被引用列推断可空性并写回 notNull（声明了 NOT NULL 或被引用的普通列全都 NOT NULL 时
-      // 读回 NOT NULL，#145）。SQL Server 不允许计算列引用计算列；引用了生成列按可空处理，规范形式因此幂等
-      if (m.dialect === 'mssql' && o.generated?.stored) {
+      // MSSQL 持久化计算列：引擎按被引用列推断非空并写回 ext.mssql.inferredNotNull（被引用的普通列全都 NOT NULL 时
+      // 推断非空，#145）。推断只看表达式与被引用列，与列自己的显式 notNull 无关；显式 notNull 原样保留（#161，ADR 0019）。
+      // SQL Server 不允许计算列引用计算列；引用了生成列按可空处理，规范形式因此幂等。非持久化计算列不带推断值
+      if (m.dialect === 'mssql' && o.generated) {
         const refs = coreTokens(o.generated.expr).flatMap((t) => {
           const c = cols.get(t);
           return c && c.id !== o.id ? [c] : [];
         });
-        out.notNull = o.notNull || (refs.length > 0 && refs.every((c) => c.notNull && !c.generated));
+        const inferred =
+          o.generated.stored && refs.length > 0 && refs.every((c) => c.notNull && !c.generated);
+        return withInferred(out, inferred);
       }
       return out;
     }
@@ -373,6 +389,7 @@ type Edit =
   | { k: 'attachPartition'; t: number; p: number; lo: number }
   | { k: 'setPartitionBy'; t: number; col: number; expr: ExprSpec | null }
   | { k: 'setNotNull'; c: number; v: boolean }
+  | { k: 'setInferredNotNull'; c: number; v: boolean }
   | { k: 'createEnum'; name: number }
   | { k: 'dropEnum'; e: number }
   | { k: 'swapEnumNames'; a: number; b: number }
@@ -638,6 +655,18 @@ const applyEdit = (m: Model, e: Edit): boolean => {
         runMutator(m, 'setNotNull', { id, notNull: e.v });
         return true;
       }
+      case 'setInferredNotNull': {
+        // 没有 mutator（派生字段，setColumnExt / addColumn 都忽略传入值）：模拟换入另一份历史快照里过期的推断值（#161）
+        const id = pick(
+          idsOf(m, 'column', (o) => !!(o as Column).generated?.stored),
+          e.c,
+        );
+        if (!id) return false;
+        const c = m.objects[id] as Column;
+        if (Boolean(c.ext?.mssql?.inferredNotNull) === e.v) return false;
+        m.objects[id] = withInferred(c, e.v);
+        return true;
+      }
       case 'createEnum': {
         // 同名枚举删掉后再建：名字一样、ID 不同（表达式原文不变，绑定换了）
         runMutator(m, 'createEnum', {
@@ -891,6 +920,10 @@ const mssqlEditArb: fc.Arbitrary<Edit> = fc.oneof(
   { weight: 3, arbitrary: fc.record({ k: fc.constant('setNotNull' as const), c: nat, v: fc.boolean() }) },
   {
     weight: 1,
+    arbitrary: fc.record({ k: fc.constant('setInferredNotNull' as const), c: nat, v: fc.boolean() }),
+  },
+  {
+    weight: 1,
     arbitrary: fc.record({
       k: fc.constant('addGenerated' as const),
       t: nat,
@@ -1007,8 +1040,17 @@ class World {
             .match(/::en_[A-Za-z0-9_]+/g)
             ?.join() ?? '';
         if (enAnnots(o) && enAnnots(c) !== enAnnots(o)) this.hit('rewrite:enumBinding');
-        if (o.kind === 'column' && c.kind === 'column' && c.notNull !== o.notNull)
+        // MSSQL 推断非空被改写（键名沿用 #145；现在改写的是 ext.mssql.inferredNotNull，#161）。假引擎绝不改显式 notNull
+        if (
+          o.kind === 'column' &&
+          c.kind === 'column' &&
+          Boolean(c.ext?.mssql?.inferredNotNull) !== Boolean(o.ext?.mssql?.inferredNotNull)
+        ) {
           this.hit('rewrite:column:mssqlNotNull');
+          if (o.notNull) this.hit('rewrite:column:mssqlInferredUnderExplicit');
+        }
+        if (o.kind === 'column' && c.kind === 'column' && c.notNull !== o.notNull)
+          throw new Error(`假引擎改写了显式 notNull：${o.id}`);
         if (o.kind === 'table' && o.partitionOf) {
           const parent = next.objects[o.partitionOf.parent];
           if (parent?.kind === 'table' && typeof parent.partitionBy === 'string')
@@ -1457,7 +1499,9 @@ describe('OpaqueRefresher 黄金基线不变量（I1–I4）', () => {
       const wantMssql = [
         'edit:setNotNull',
         'edit:addGenerated',
+        'edit:setInferredNotNull',
         'rewrite:column:mssqlNotNull',
+        'rewrite:column:mssqlInferredUnderExplicit',
         'I4:flush:normalized',
       ];
       const missing = [

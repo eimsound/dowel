@@ -16,8 +16,11 @@
 //   public.tone）；按词法粗匹配（忽略大小写，字符串字面量里的也算），只会多报。PG 只拒绝在索引 / 生成列 / 分区键
 //   表达式里做运行期 enum_in / enum_out 转换（如 status::public.mood），解析期折叠的枚举常量（如 'ok'::public.mood）
 //   可以出现在部分索引 WHERE、表达式索引、生成列与分区键表达式里且读回同样随 OID 变化；这些载体虽较罕见，同样会扫描。
-// - MSSQL 持久化计算列：引擎按表达式与被引用列的可空性推断 is_nullable，canonicalize 会写回 notNull（shadow.ts）；
-//   列自己的 notNull 变了，或所在表按列名对齐的列 notNull 变了（#145）。其他方言、非持久化计算列不看 notNull。
+// - MSSQL 持久化计算列：引擎按表达式与被引用列的可空性推断非空，canonicalize 写回 ext.mssql.inferredNotNull
+//   （显式 notNull 不动，ADR 0019；shadow.ts）。表达式 / PERSISTED 变了已由上一条覆盖；另外所在表按列名对齐的普通列
+//   notNull 变了（#145）、列自己的推断值相对基线变了（派生字段被历史快照等换掉）、或列自己的显式 notNull 变了
+//   （推断本身与显式无关，但存量基线里显式 notNull 可能是旧规则写回的推断值、没有 inferredNotNull，切换时顺带补算；
+//   只在编辑时多一次，稳态不触发）。其他方言、非持久化计算列不看可空性。
 // - 不透明对象：依赖或所在父对象改了名；deps 集合变了；依赖的列（按 ID，及按它在表里的列名对齐）或依赖 / 父对象表的
 //   列上下文变了；DDL 文本变了；或依赖的不透明对象本身待规范化（视图叠视图，沿依赖传递，带环保护，#136）。
 import { deepEqual, type Model, type Obj, resolvePartitionBy, rootTableId } from '@dowel/core';
@@ -98,7 +101,7 @@ export const emptyBaseline = (cur: Model): Model => ({ ...cur, objects: {} });
 const caseInsensitive = (m: Model) =>
   m.dialect === 'sqlite' || m.dialect === 'mysql' || m.dialect === 'mssql';
 
-/** MSSQL 持久化计算列：引擎推断出的可空性会被 canonicalize 写回 notNull（shadow.ts），其他情况 notNull 不是规范形式的一部分 */
+/** MSSQL 持久化计算列：引擎推断出的非空会被 canonicalize 写回 ext.mssql.inferredNotNull（shadow.ts，ADR 0019），其他情况可空性不是规范形式的一部分 */
 const isMssqlPersisted = (m: Model, o: Obj): o is Column =>
   m.dialect === 'mssql' && o.kind === 'column' && !!o.generated?.stored;
 
@@ -270,11 +273,17 @@ export const pendingRefreshIds = (baseline: Model | null, cur: Model): string[] 
     }
     return v;
   };
-  // MSSQL 持久化计算列的可空性上下文：列自己的 notNull（按 ID）或所在表按列名对齐的列 notNull 变了（#145）
+  // MSSQL 持久化计算列的可空性上下文（ADR 0019）：列自己的显式 notNull 或推断值 inferredNotNull（按 ID），
+  // 或所在表按列名对齐的普通列 notNull 变了（#145）
   const nullChanged = new Map<string, boolean>();
   const mssqlNullabilityChanged = (c: Column): boolean => {
     const was = base.objects[c.id];
-    if (was?.kind === 'column' && was.notNull !== c.notNull) return true;
+    if (
+      was?.kind === 'column' &&
+      (was.notNull !== c.notNull ||
+        Boolean(was.ext?.mssql?.inferredNotNull) !== Boolean(c.ext?.mssql?.inferredNotNull))
+    )
+      return true;
     const baseRoot = rootTableId(base, c.parent);
     const curRoot = rootTableId(cur, c.parent);
     const key = `${baseRoot}\0${curRoot}`;

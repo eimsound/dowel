@@ -21,7 +21,7 @@ import {
   type ShadowHandle,
 } from '../derive.ts';
 import { scrubSecrets } from '../secrets.ts';
-import { ShadowError } from '../shadow.ts';
+import { ShadowConfigChangedError, ShadowError } from '../shadow.ts';
 import { type AppContext, access, type Env } from './context.ts';
 
 export const registerNormalize = (app: Hono<Env>, ctx: AppContext) => {
@@ -110,11 +110,11 @@ export const registerNormalize = (app: Hono<Env>, ctx: AppContext) => {
       if (!resolved) refund();
       return c.json<NormalizeResult>(out);
     } catch (e) {
-      // 规范化期间项目被删（分支被 forget）：和项目不存在同一个响应（accessIn 的 404）；
+      // 规范化期间项目被删（分支被 forget）：由全局 app.onError 统一映射为 404（与 accessIn 一致）；
       // 还没解析到影子库句柄（例如排队中或 loadGood 期间被删、未指定 env）则精确退回限速额度
       if (e instanceof BranchForgottenError) {
         if (!resolved) refund();
-        throw new HTTPException(404, { message: '项目不存在' });
+        throw e;
       }
       // 没做成任何规范化的停机 / 忙：已有明确语义，退回限速额度
       if (e instanceof RefresherStoppedError) {
@@ -138,6 +138,8 @@ export const registerNormalize = (app: Hono<Env>, ctx: AppContext) => {
         if (!resolved) refund();
         throw new HTTPException(404, { message: '项目不存在' });
       }
+      // 影子库配置在规范化途中变了（Issue #154）：可重试，不是“影子库不可用”
+      if (e instanceof ShadowConfigChangedError) return fail(503, e.message, e.code);
       if (e instanceof ShadowError) return fail(422, e.message, 'shadow_unavailable');
       if (e instanceof StepError || e instanceof PlanError || e instanceof InstanceLevelStatementError) {
         const reason = e instanceof StepError ? e.reason : e.message;
