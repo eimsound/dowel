@@ -41,6 +41,8 @@ export const sqliteConNs = (table: string) => `sc\0${table}`;
 export const mssqlObjNs = (schema: string) => `mo\0${schema}`;
 /** MSSQL：表级 sys.indexes（索引、PK、UNIQUE） */
 export const mssqlIdxNs = (table: string) => `mx\0${table}`;
+/** 各方言：表级列名（推导名引擎按名字找列，不参与任何"名字是否已占用"判定） */
+export const colNs = (table: string) => `cn\0${table}`;
 
 /**
  * 对象依赖父表属性的条目：父表换 schema（PG / MSSQL）或改名（MSSQL 推导 DEFAULT 名）时，
@@ -55,8 +57,9 @@ export const nsDependsOnTable = (dialect: Dialect, prev: Table, next: Table): bo
 /** 一个对象贡献的全部占用条目（追加到 out） */
 export const nameEntriesOf = (dialect: Dialect, o: Obj, tableOf: TableLookup, out: NsEntry[]): void => {
   const push = (ns: string, name: string | null | undefined, owner: string) => {
-    if (typeof name === 'string') out.push({ ns, name: nsNorm(dialect, name), owner });
+    if (typeof name === 'string' && name !== '') out.push({ ns, name: nsNorm(dialect, name), owner });
   };
+  if (o.kind === 'column') push(colNs(o.parent), o.name, o.id);
   switch (dialect) {
     case 'pg':
       switch (o.kind) {

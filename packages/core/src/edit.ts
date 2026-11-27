@@ -1935,6 +1935,7 @@ export const resetKeyName = (m: Model, id: string) => {
   if ('nameMode' in o && o.kind !== 'sequence') {
     normalizePartitionFamily(m, o.parent);
     o.nameMode = 'derived';
+    o.name = ''; // 清空当前名字，按推导规则重新取最小空位（稳定推导名只在输入变化或显式重置时重算）
     refreshDerivedNames(m, o.parent);
   }
 };

@@ -1,11 +1,18 @@
-// Issue #164：推导名增量化的差分测试与复杂度守卫。
-// 参照实现是 main 上原样拷贝的四种方言 refreshDerivedNames（packages/core/test/support/legacy-derived-names.ts），
-// 并关闭叠加索引的写入跟踪（等价于 main 的扫描判定）。随机修改序列分别走普通模型、逐个 execute（MCP 逐步预演）、
-// 整批 execute('batch') 与 execute('paste')（含带基线对象的起始模型），新旧实现的模型与变更列表必须逐字节一致。
+// Issue #164：稳定推导名引擎的差分测试、不变式检查与复杂度守卫。
+// 语义（见 packages/core/src/derived-names.ts）：推导名只在自身输入变化、撞名或 resetKeyName 时重算，
+// 同表其他对象保留名字（不再级联压缩）；需要重算的取命名序列里最小的空位。
+// 1. 随机修改序列分别走普通模型、逐个 execute（共享索引，MCP 逐步预演形态）、无索引 execute、整批 batch / paste
+//    （含先提交一段前缀让对象进到基线），模型、变更列表与错误信息必须逐字节一致；
+// 2. 普通模型每一步后检查不变式：推导名有效且不撞名、未受影响的对象名字不变、重算的对象取到最小空位；
+// 3. 确定性计数守卫（不依赖墙钟）：大表单步 execute、交错 addColumn / addCheck、交错 renameKey / dropKey / addCheck、
+//    MCP 500 步预演、batchReadsOf、分词缓存，以及工作量预算熔断（病态改表名 / 改列名循环抛 EditError 并原子回滚）。
 import {
   clonePlain,
   createSchema,
+  DERIVED_NAME_WORK_BUDGET,
   type Dialect,
+  DerivedNameBudget,
+  DerivedNameBudgetError,
   derivedNameStats,
   EditError,
   emptyModel,
@@ -13,16 +20,26 @@ import {
   type Model,
   MutableModelIndex,
   type Obj,
-  OverlayModelIndex,
+  partitionAncestors,
+  partitionDescendants,
   resetDerivedNameStats,
+  rootTableId,
   runMutator,
   stableJson,
 } from '@dowel/core';
 import fc from 'fast-check';
-import { afterEach, describe, expect, test, vi } from 'vitest';
+import { describe, expect, test } from 'vitest';
 
-import { LEGACY_REFRESH } from '../../core/test/support/legacy-derived-names.ts';
-import { execute } from '../src/index.ts';
+import {
+  candIndex,
+  dialectNaming,
+  type NamingView,
+  type NameSpec,
+  SLOT_OBJ_KINDS,
+  slotTableOf,
+} from '../../core/src/derived-names.ts';
+import { colNs, nameEntriesOf, type NsEntry } from '../../core/src/naming-ns.ts';
+import { execute, opReads } from '../src/index.ts';
 
 const DIALECTS: readonly Dialect[] = ['pg', 'sqlite', 'mysql', 'mssql'];
 const INT: Record<Dialect, string> = { pg: 'integer', sqlite: 'INTEGER', mysql: 'int', mssql: 'int' };
@@ -31,22 +48,6 @@ interface Op {
   name: string;
   args: Record<string, unknown>;
 }
-
-/** 在参照实现下执行 fn：替换方言的 refreshDerivedNames，并关闭叠加索引写入跟踪 */
-const withLegacy = <T>(dialect: Dialect, fn: () => T): T => {
-  const refresh = vi
-    .spyOn(getDialect(dialect), 'refreshDerivedNames')
-    .mockImplementation(LEGACY_REFRESH[dialect]);
-  const spy = vi.spyOn(OverlayModelIndex.prototype, 'trackWrites').mockImplementation(() => () => {});
-  try {
-    return fn();
-  } finally {
-    refresh.mockRestore();
-    spy.mockRestore();
-  }
-};
-
-afterEach(() => vi.restoreAllMocks());
 
 const schemaOf = (m: Model) => Object.values(m.objects).find((o) => o.kind === 'schema')!.id;
 
@@ -374,6 +375,117 @@ const buildOp = (m: Model, a: Abstract, nextId: () => string): Op | null => {
   return null;
 };
 
+// ───── 独立的扫描视图（不复用引擎里的视图实现），供不变式检查计算规格与占用 ─────
+
+class TestView implements NamingView {
+  readonly owners = new Map<string, Map<string, Set<string>>>();
+  private readonly m: Model;
+  constructor(m: Model) {
+    this.m = m;
+    const tableOf = (id: string) => {
+      const t = m.objects[id];
+      return t?.kind === 'table' ? t : undefined;
+    };
+    for (const o of Object.values(m.objects)) {
+      const es: NsEntry[] = [];
+      nameEntriesOf(m.dialect, o, tableOf, es);
+      for (const e of es) {
+        let byName = this.owners.get(e.ns);
+        if (!byName) this.owners.set(e.ns, (byName = new Map()));
+        let set = byName.get(e.name);
+        if (!set) byName.set(e.name, (set = new Set()));
+        set.add(e.owner);
+      }
+    }
+  }
+  ownersOf(ns: string, name: string): ReadonlySet<string> {
+    return this.owners.get(ns)?.get(name) ?? new Set();
+  }
+  hasOther(ns: string, name: string, self: string) {
+    return [...this.ownersOf(ns, name)].some((o) => o !== self);
+  }
+  hasAny(ns: string, name: string) {
+    return this.ownersOf(ns, name).size > 0;
+  }
+  columnIdByName(tableId: string, norm: string) {
+    return [...this.ownersOf(colNs(tableId), norm)][0];
+  }
+  ancestors(tableId: string) {
+    return partitionAncestors(this.m, tableId).map((t) => t.id);
+  }
+  descendants(tableId: string) {
+    return partitionDescendants(this.m, tableId).map((t) => t.id);
+  }
+  rootOf(tableId: string) {
+    return rootTableId(this.m, tableId);
+  }
+  written() {}
+}
+
+interface SlotInfo {
+  obj: string;
+  table: string;
+  spec: NameSpec;
+  cur: string;
+  j: number;
+  /** 当前名字被别的对象占用 */
+  clash: boolean;
+}
+
+/** 模型里全部推导名槽位（含规格、序号与是否撞名） */
+const slotInfos = (m: Model): Map<string, SlotInfo> => {
+  const view = new TestView(m);
+  const naming = dialectNaming(m.dialect);
+  const out = new Map<string, SlotInfo>();
+  const taken = (spec: NameSpec, norm: string, self: string) =>
+    !!spec.extraTaken?.(norm) || spec.ns.some((ns) => view.hasOther(ns, norm, self));
+  for (const o of Object.values(m.objects)) {
+    if (!SLOT_OBJ_KINDS.has(o.kind)) continue;
+    const slots = naming.slotsOf(m, view, o, new Map());
+    if (typeof slots === 'symbol') continue;
+    const table = slotTableOf((id) => m.objects[id], o)!;
+    for (const s of slots) {
+      if (!s.spec) continue;
+      const cur = s.cur ?? '';
+      out.set(s.self, {
+        obj: o.id,
+        table,
+        spec: s.spec,
+        cur,
+        j: candIndex(s.spec, cur),
+        clash: cur !== '' && taken(s.spec, s.spec.norm(cur), s.self),
+      });
+    }
+  }
+  return out;
+};
+
+/** 不变式：一步操作之后（普通模型） */
+const checkInvariants = (before: Model, after: Model, op: Op) => {
+  const b = slotInfos(before);
+  const a = slotInfos(after);
+  const view = new TestView(after);
+  const label = `${op.name} ${JSON.stringify(op.args)}`;
+  const reset = op.name === 'resetKeyName' ? (op.args.id as string) : null;
+  for (const [self, s] of a) {
+    const prev = b.get(self);
+    if (prev && prev.cur === s.cur) continue;
+    // 1. 稳定：输入没变（命名序列相同）、原来有效且不撞名的槽位不会改名（例如同表另一个对象被删除或改名）
+    if (prev && prev.spec.key === s.spec.key && prev.j >= 0 && !prev.clash && s.obj !== reset)
+      expect.fail(`${label}: ${self} 输入未变却改名 ${prev.cur} → ${s.cur}`);
+    // 2. 新建或重算过的槽位：名字有效、不撞名，且取到的是最小空位（更小的候选名都被别的对象占用）
+    expect(s.j, `${label}: ${self} = ${s.cur}`).toBeGreaterThanOrEqual(0);
+    expect(s.clash, `${label}: ${self} = ${s.cur} 撞名`).toBe(false);
+    for (let j = 0; j < s.j; j++) {
+      const n = s.spec.norm(s.spec.cand(j));
+      const occupied = !!s.spec.extraTaken?.(n) || s.spec.ns.some((ns) => view.hasOther(ns, n, self));
+      expect(occupied, `${label}: ${self} = ${s.cur}，更小的 ${s.spec.cand(j)} 还空着`).toBe(true);
+    }
+  }
+};
+
+// ───── 各执行路径 ─────
+
 const tryRun = (fn: () => void): string | null => {
   try {
     fn();
@@ -384,129 +496,126 @@ const tryRun = (fn: () => void): string | null => {
   }
 };
 
-/** 普通模型逐步执行：新旧实现每一步的模型（或错误）都相同；返回成功执行的操作 */
-const runPlainDifferential = (dialect: Dialect, abstracts: Abstract[]): Op[] => {
+/** 普通模型逐步执行，每步检查不变式；返回成功的操作与每步的结果（模型或错误） */
+const runPlain = (dialect: Dialect, abstracts: Abstract[]) => {
   const cur = baseModel(dialect);
-  const ref = clonePlain(cur);
   let n = 0;
   const nextId = () => `n${++n}`;
-  const ok: Op[] = [];
+  const ops: Op[] = [];
+  const trace: string[] = [];
   for (const a of abstracts) {
     const op = buildOp(cur, a, nextId);
     if (!op) continue;
-    const errNew = tryRun(() => runMutator(cur, op.name, op.args));
-    const errOld = withLegacy(dialect, () => tryRun(() => runMutator(ref, op.name, op.args)));
-    expect(errNew, `${op.name} ${JSON.stringify(op.args)}`).toBe(errOld);
-    expect(stableJson(cur), `${op.name} ${JSON.stringify(op.args)}`).toBe(stableJson(ref));
-    if (!errNew) ok.push(op);
+    const before = clonePlain(cur);
+    const err = tryRun(() => runMutator(cur, op.name, op.args));
+    ops.push(op);
+    if (err) {
+      // 不合法的操作不能留下半截修改（runMutator 本身不回滚，这里只比较之后各路径的错误信息）
+      trace.push(`error: ${err}`);
+      Object.assign(cur, clonePlain(before));
+      continue;
+    }
+    checkInvariants(before, cur, op);
+    trace.push(stableJson(cur));
   }
-  return ok;
+  return { ops, trace, model: cur };
 };
 
-/** 同步层逐个 execute（共享 MutableModelIndex，MCP 逐步预演的形态） */
-const runStepwiseFrom = (start: Model, ops: Op[], legacy: boolean) => {
+const commitTo = (idx: MutableModelIndex, m: Model, res: ReturnType<typeof execute>): Model => {
+  idx.applyBatch(
+    res.next,
+    res.changes.map((c) => ({
+      id: c.id,
+      prev: m.objects[c.id],
+      next: c.obj ? res.next.objects[c.id] : undefined,
+    })),
+  );
+  return res.next;
+};
+
+/** 逐个 execute：shared 为真时共享 MutableModelIndex 并 applyBatch（MCP 逐步预演 / 服务端形态），否则不带索引 */
+const runStepwise = (start: Model, ops: Op[], shared: boolean) => {
   let m = start;
-  const idx = new MutableModelIndex(m);
+  const idx = shared ? new MutableModelIndex(m) : undefined;
   const trace: string[] = [];
   for (const op of ops) {
     let res: ReturnType<typeof execute>;
     try {
-      res = legacy
-        ? withLegacy(m.dialect, () => execute(m, op.name, op.args, idx))
-        : execute(m, op.name, op.args, idx);
+      res = execute(m, op.name, op.args, idx);
     } catch (e) {
       if (!(e instanceof EditError)) throw e;
       trace.push(`error: ${e.message}`);
       continue;
     }
-    trace.push(stableJson(res.changes));
-    idx.applyBatch(
-      res.next,
-      res.changes.map((c) => ({
-        id: c.id,
-        prev: m.objects[c.id],
-        next: c.obj ? res.next.objects[c.id] : undefined,
-      })),
-    );
-    m = res.next;
+    m = idx ? commitTo(idx, m, res) : res.next;
+    trace.push(stableJson(m));
   }
-  return { model: m, modelJson: stableJson(m), trace };
+  return { model: m, trace };
 };
 
-const runCompositeFrom = (
-  start: Model,
-  name: 'batch' | 'paste',
-  ops: Op[],
-  legacy: boolean,
-  withIdx: boolean,
-) => {
-  const run = () => {
-    try {
-      const res = execute(start, name, { ops }, withIdx ? new MutableModelIndex(start) : undefined);
-      return { model: stableJson(res.next), changes: stableJson(res.changes) };
-    } catch (e) {
-      if (e instanceof EditError) return { error: e.message };
-      throw e;
-    }
-  };
-  return legacy ? withLegacy(start.dialect, run) : run();
+const runComposite = (start: Model, name: 'batch' | 'paste', ops: Op[], withIdx: boolean) => {
+  try {
+    const res = execute(start, name, { ops }, withIdx ? new MutableModelIndex(start) : undefined);
+    return { model: stableJson(res.next), changes: stableJson(res.changes) };
+  } catch (e) {
+    if (e instanceof EditError) return { error: e.message };
+    throw e;
+  }
 };
 
-const pasteSeedOps = (dialect: Dialect): Op[] => [
-  { name: 'addCheck', args: { id: 'seed_ck0', table: 't0', expr: '1 = 1' } },
-  { name: 'addCheck', args: { id: 'seed_ck1', table: 't0', expr: 'a > 0' } },
-  { name: 'addUnique', args: { id: 'seed_uq0', table: 't0', columns: ['t0_a'] } },
-  { name: 'addIndex', args: { id: 'seed_ix0', table: 't1', elements: [{ column: 't1_b' }] } },
-  { name: 'addCheck', args: { id: 'seed_ck_exp', table: 't0', expr: 'b > 0' } },
-  {
-    name: 'renameKey',
-    args: { id: 'seed_ck_exp', name: dialect === 'mssql' ? 'CK_orders_1' : 'orders_check1' },
-  },
-];
+/** 整批执行与逐步执行的最终模型一致（整批失败时逐步也必有一步失败） */
+const expectCompositeMatchesStepwise = (start: Model, name: 'batch' | 'paste', ops: Op[]) => {
+  const withIdx = runComposite(start, name, ops, true);
+  expect(runComposite(start, name, ops, false)).toEqual(withIdx);
+  const step = runStepwise(start, ops, true);
+  if ('error' in withIdx) expect(step.trace.some((t) => t.startsWith('error: '))).toBe(true);
+  else if (!step.trace.some((t) => t.startsWith('error: ')))
+    expect(withIdx.model).toBe(stableJson(step.model));
+  return withIdx;
+};
 
-describe('推导名增量化与 main 参照实现逐字节一致（Issue #164）', () => {
+describe('稳定推导名：普通模型 / 逐个 execute / 无索引 execute / 整批 batch / paste 逐字节一致（Issue #164）', () => {
   for (const dialect of DIALECTS) {
-    test(`${dialect}: 随机修改序列（普通模型 / 逐个 execute / 整批 batch，含基线预置）`, () => {
+    test(`${dialect}: 随机修改序列（含先提交前缀让对象进到基线）`, () => {
       fc.assert(
         fc.property(
           fc.array(abstractArb, { minLength: 5, maxLength: 45 }),
           fc.nat(100),
           (abstracts, split) => {
-            const ops = runPlainDifferential(dialect, abstracts);
-            const fullNew = runStepwiseFrom(baseModel(dialect), ops, false);
-            const fullRef = runStepwiseFrom(baseModel(dialect), ops, true);
-            expect(fullNew.modelJson).toBe(fullRef.modelJson);
-            expect(fullNew.trace).toEqual(fullRef.trace);
-            if (ops.length) {
-              expect(runCompositeFrom(baseModel(dialect), 'batch', ops, false, true)).toEqual(
-                runCompositeFrom(baseModel(dialect), 'batch', ops, true, true),
-              );
+            const plain = runPlain(dialect, abstracts);
+            const shared = runStepwise(baseModel(dialect), plain.ops, true);
+            expect(shared.trace).toEqual(plain.trace);
+            const bare = runStepwise(baseModel(dialect), plain.ops, false);
+            expect(bare.trace).toEqual(plain.trace);
+            const okOps = plain.ops.filter((_, i) => !plain.trace[i]!.startsWith('error: '));
+            if (okOps.length) {
+              const got = expectCompositeMatchesStepwise(baseModel(dialect), 'batch', okOps);
+              expect('error' in got ? got.error : got.model).toBe(stableJson(plain.model));
             }
-            if (ops.length >= 2) {
-              const prefixLen = 1 + (split % (ops.length - 1));
-              const prefix = ops.slice(0, prefixLen);
-              const rest = ops.slice(prefixLen);
-              const seeded = runStepwiseFrom(baseModel(dialect), prefix, false).model;
-              const batchNew = runCompositeFrom(seeded, 'batch', rest, false, true);
-              const batchRef = runCompositeFrom(seeded, 'batch', rest, true, true);
-              const stepNew = runStepwiseFrom(seeded, rest, false);
-              const stepRef = runStepwiseFrom(seeded, rest, true);
-              expect(batchNew).toEqual(batchRef);
-              expect(stepNew.modelJson).toBe(stepRef.modelJson);
-              expect(stepNew.trace).toEqual(stepRef.trace);
-              // 少数序列里同一张表上两个既有对象在叠加层被逆序改写后又触发压缩时，OverlayModelIndex.allChildrenOf 的
-              // 插入顺序会使参照实现本身的 batch 也与逐步不同（既有遍历顺序差异）；其余情况 batch 与逐步一致。
-              if (!('error' in batchRef) && batchRef.model === stepRef.modelJson) {
-                expect('error' in batchNew ? '' : batchNew.model).toBe(stepNew.modelJson);
-              }
+            if (okOps.length >= 2) {
+              const prefixLen = 1 + (split % (okOps.length - 1));
+              const seeded = runStepwise(baseModel(dialect), okOps.slice(0, prefixLen), true).model;
+              const got = expectCompositeMatchesStepwise(seeded, 'batch', okOps.slice(prefixLen));
+              expect('error' in got ? got.error : got.model).toBe(stableJson(plain.model));
             }
           },
         ),
-        { numRuns: Number(process.env.RUNS164 ?? 250), seed: Number(process.env.SEED164 ?? 164) },
+        { numRuns: Number(process.env.RUNS164 ?? 200), seed: Number(process.env.SEED164 ?? 164) },
       );
     });
 
     test(`${dialect}: 粘贴同一张表的大量约束（显式名 / 推导名交错、撞名，含基线表与新建表）`, () => {
+      const seedOps: Op[] = [
+        { name: 'addCheck', args: { id: 'seed_ck0', table: 't0', expr: '1 = 1' } },
+        { name: 'addCheck', args: { id: 'seed_ck1', table: 't0', expr: 'a > 0' } },
+        { name: 'addUnique', args: { id: 'seed_uq0', table: 't0', columns: ['t0_a'] } },
+        { name: 'addIndex', args: { id: 'seed_ix0', table: 't1', elements: [{ column: 't1_b' }] } },
+        { name: 'addCheck', args: { id: 'seed_ck_exp', table: 't0', expr: 'b > 0' } },
+        {
+          name: 'renameKey',
+          args: { id: 'seed_ck_exp', name: dialect === 'mssql' ? 'CK_orders_1' : 'orders_check1' },
+        },
+      ];
       fc.assert(
         fc.property(
           fc.array(fc.record({ kind: fc.nat(9), a: fc.nat(100), b: fc.nat(100), named: fc.nat(3) }), {
@@ -515,7 +624,7 @@ describe('推导名增量化与 main 参照实现逐字节一致（Issue #164）
           }),
           fc.boolean(),
           (items, ontoExisting) => {
-            const seeded = runStepwiseFrom(baseModel(dialect), pasteSeedOps(dialect), false).model;
+            const seeded = runStepwise(baseModel(dialect), seedOps, true).model;
             const sch = schemaOf(seeded);
             const targetTable = ontoExisting ? 't0' : 'pt';
             const targetTableName = ontoExisting ? 'orders' : 'orders_b';
@@ -568,30 +677,17 @@ describe('推导名增量化与 main 参照实现逐字节一致（Issue #164）
                 });
               if (it.named === 1)
                 ops.push({ name: 'renameKey', args: { id, name: names[(it.a * 7 + it.b) % names.length]! } });
-              // 给更早建的对象起显式名：腾出的推导名会让后面同序列的对象在下一趟里改用更小的后缀
+              // 给更早建的对象起显式名：腾出的推导名之后被新对象复用（不再让同序列的其他对象级联下移）
               if (it.named === 2 && n > 1)
                 ops.push({
                   name: 'renameKey',
                   args: { id: `pk${1 + ((it.a + it.b) % (n - 1))}`, name: `explicit_${n}` },
                 });
             }
-            const got = runCompositeFrom(seeded, 'paste', ops, false, true);
-            const want = runCompositeFrom(seeded, 'paste', ops, true, true);
-            expect(got).toEqual(want);
-            expect(runCompositeFrom(seeded, 'paste', ops, false, false)).toEqual(
-              runCompositeFrom(seeded, 'paste', ops, true, false),
-            );
-            if (!('error' in want)) {
-              const stepNew = runStepwiseFrom(seeded, ops, false);
-              const stepRef = runStepwiseFrom(seeded, ops, true);
-              expect(stepNew.modelJson).toBe(stepRef.modelJson);
-              if (want.model === stepRef.modelJson) {
-                expect('error' in got ? '' : got.model).toBe(stepNew.modelJson);
-              }
-            }
+            expectCompositeMatchesStepwise(seeded, 'paste', ops);
           },
         ),
-        { numRuns: Number(process.env.RUNS164 ?? 150), seed: Number(process.env.SEED164 ?? 1640) },
+        { numRuns: Number(process.env.RUNS164 ?? 120), seed: Number(process.env.SEED164 ?? 1640) },
       );
     });
   }
@@ -599,249 +695,314 @@ describe('推导名增量化与 main 参照实现逐字节一致（Issue #164）
 
 // ───── 固定回归用例 ─────
 
-const assertBatchMatchesLegacyAndStepwise = (seeded: Model, batchOps: Op[]): Model => {
-  const batchNew = runCompositeFrom(seeded, 'batch', batchOps, false, true);
-  const batchRef = runCompositeFrom(seeded, 'batch', batchOps, true, true);
-  const stepNew = runStepwiseFrom(seeded, batchOps, false);
-  const stepRef = runStepwiseFrom(seeded, batchOps, true);
-  expect(batchNew).toEqual(batchRef);
-  expect(runCompositeFrom(seeded, 'batch', batchOps, false, false)).toEqual(
-    runCompositeFrom(seeded, 'batch', batchOps, true, false),
-  );
-  expect(stepNew.modelJson).toBe(stepRef.modelJson);
-  expect(stepNew.trace).toEqual(stepRef.trace);
-  expect('error' in batchNew ? '' : batchNew.model).toBe(stepNew.modelJson);
-  return stepNew.model;
+const nameOf = (m: Model, id: string): string | undefined => {
+  const o = m.objects[id];
+  return o && 'name' in o ? o.name : undefined;
 };
 
-describe('回归用例：跨表删表腾名、认证不动点与重名失效', () => {
-  test('pg: 同一次 execute 内 dropTable 腾出跨表 index 推导名并压缩他表索引', () => {
-    const seeded = runStepwiseFrom(
+/** 同一组操作在普通模型、逐个 execute、整批 batch 下结果相同，返回普通模型的结果 */
+const runAllPaths = (start: Model, ops: Op[]): Model => {
+  const plain = clonePlain(start);
+  for (const op of ops) {
+    const before = clonePlain(plain);
+    runMutator(plain, op.name, op.args);
+    checkInvariants(before, plain, op);
+  }
+  expect(stableJson(runStepwise(start, ops, true).model)).toBe(stableJson(plain));
+  expect(stableJson(runStepwise(start, ops, false).model)).toBe(stableJson(plain));
+  const batch = runComposite(start, 'batch', ops, true);
+  expect('error' in batch ? batch.error : batch.model).toBe(stableJson(plain));
+  return plain;
+};
+
+const CK = (dialect: Dialect, table: string, j: number) =>
+  dialect === 'mssql' ? `CK_${table}${j ? `_${j}` : ''}` : `${table}_check${j || ''}`;
+
+describe('回归用例：稳定推导名', () => {
+  for (const dialect of DIALECTS) {
+    test(`${dialect}: 删除不级联下移，新对象复用最小空位；改表名只重算受影响对象`, () => {
+      const start = baseModel(dialect);
+      const m1 = runAllPaths(start, [
+        { name: 'addCheck', args: { id: 'c1', table: 't0', expr: '1 = 1' } },
+        { name: 'addCheck', args: { id: 'c2', table: 't0', expr: '2 = 2' } },
+      ]);
+      expect([nameOf(m1, 'c1'), nameOf(m1, 'c2')]).toEqual([
+        CK(dialect, 'orders', 0),
+        CK(dialect, 'orders', 1),
+      ]);
+      // 删 c1：c2 保持 orders_check1；新建 c3 取最小空位 orders_check
+      const m2 = runAllPaths(m1, [
+        { name: 'dropKey', args: { id: 'c1' } },
+        { name: 'addCheck', args: { id: 'c3', table: 't0', expr: '3 = 3' } },
+      ]);
+      expect([nameOf(m2, 'c2'), nameOf(m2, 'c3')]).toEqual([
+        CK(dialect, 'orders', 1),
+        CK(dialect, 'orders', 0),
+      ]);
+      // 删 c1 后改表名：c2 自己的输入（表名）变了，重算为 invoices_check
+      const m3 = runAllPaths(m1, [
+        { name: 'dropKey', args: { id: 'c1' } },
+        { name: 'renameTable', args: { id: 't0', name: 'invoices' } },
+      ]);
+      expect(nameOf(m3, 'c2')).toBe(CK(dialect, 'invoices', 0));
+      // 改表名时多个对象按原后缀顺序依次取最小空位
+      const m4 = runAllPaths(m1, [{ name: 'renameTable', args: { id: 't0', name: 'invoices' } }]);
+      expect([nameOf(m4, 'c1'), nameOf(m4, 'c2')]).toEqual([
+        CK(dialect, 'invoices', 0),
+        CK(dialect, 'invoices', 1),
+      ]);
+      // resetKeyName：显式名恢复为推导名时取最小空位
+      const m5 = runAllPaths(m1, [
+        { name: 'renameKey', args: { id: 'c1', name: 'my_ck' } },
+        { name: 'addCheck', args: { id: 'c4', table: 't0', expr: '4 = 4' } },
+        { name: 'dropKey', args: { id: 'c2' } },
+        { name: 'resetKeyName', args: { id: 'c1' } },
+      ]);
+      expect([nameOf(m5, 'c4'), nameOf(m5, 'c1')]).toEqual([
+        CK(dialect, 'orders', 0),
+        CK(dialect, 'orders', 1),
+      ]);
+      // 改被引用的列名：引用它的 CHECK 重算，其他 CHECK 不动
+      const m6 = runAllPaths(m1, [
+        { name: 'addCheck', args: { id: 'c5', table: 't0', expr: 'b > 0' } },
+        { name: 'renameColumn', args: { id: 't0_b', name: 'bb' } },
+      ]);
+      expect(nameOf(m6, 'c5')).toBe(dialect === 'mssql' ? 'CK_orders_bb' : 'orders_bb_check');
+      expect([nameOf(m6, 'c1'), nameOf(m6, 'c2')]).toEqual([
+        CK(dialect, 'orders', 0),
+        CK(dialect, 'orders', 1),
+      ]);
+    });
+  }
+
+  test('pg: 同一次 execute 内 dropTable 腾出跨表推导名：之后新建的对象复用，既有对象不动', () => {
+    const seeded = runStepwise(
       baseModel('pg'),
       [
         { name: 'addIndex', args: { id: 'k0', table: 't0', elements: [{ column: 't0_a_b' }] } },
         { name: 'addIndex', args: { id: 'k1', table: 't1', elements: [{ column: 't1_b' }] } },
-      ],
-      false,
-    ).model;
-    const after = assertBatchMatchesLegacyAndStepwise(seeded, [
-      { name: 'addCheck', args: { id: 'ck_a', table: 't1', expr: '1 = 1' } },
-      { name: 'dropTable', args: { id: 't0' } },
-      { name: 'addCheck', args: { id: 'ck_b', table: 't1', expr: '2 = 2' } },
-    ]);
-    const k1 = after.objects.k1;
-    expect(k1?.kind === 'index' && k1.name).toBe('orders_a_b_idx');
-  });
-
-  test('pg: 同一次 execute 内 dropTable 腾出跨表 unique 推导名', () => {
-    const seeded = runStepwiseFrom(
-      baseModel('pg'),
-      [
-        { name: 'addUnique', args: { id: 'u0', table: 't0', columns: ['t0_a_b'] } },
-        { name: 'addUnique', args: { id: 'u1', table: 't1', columns: ['t1_b'] } },
-      ],
-      false,
-    ).model;
-    const after = assertBatchMatchesLegacyAndStepwise(seeded, [
-      { name: 'addCheck', args: { id: 'ck_a', table: 't1', expr: '1 = 1' } },
-      { name: 'dropTable', args: { id: 't0' } },
-      { name: 'addCheck', args: { id: 'ck_b', table: 't1', expr: '2 = 2' } },
-    ]);
-    const u1 = after.objects.u1;
-    expect(u1?.kind === 'unique' && u1.name).toBe('orders_a_b_key');
-  });
-
-  test('pg: 同一次 execute 内 dropTable 腾出跨表 identity 序列推导名', () => {
-    const seeded = runStepwiseFrom(
-      baseModel('pg'),
-      [
         { name: 'setIdentity', args: { id: 't0_a_b', identity: { always: false } } },
         { name: 'setIdentity', args: { id: 't1_b', identity: { always: false } } },
       ],
-      false,
+      true,
     ).model;
-    const after = assertBatchMatchesLegacyAndStepwise(seeded, [
+    expect(nameOf(seeded, 'k1')).toBe('orders_a_b_idx1');
+    const after = runAllPaths(seeded, [
       { name: 'addCheck', args: { id: 'ck_a', table: 't1', expr: '1 = 1' } },
       { name: 'dropTable', args: { id: 't0' } },
+      { name: 'addIndex', args: { id: 'k2', table: 't1', elements: [{ column: 't1_b' }] } },
       { name: 'addCheck', args: { id: 'ck_b', table: 't1', expr: '2 = 2' } },
     ]);
+    expect(nameOf(after, 'k1')).toBe('orders_a_b_idx1');
+    expect(nameOf(after, 'k2')).toBe('orders_a_b_idx');
     const col = after.objects.t1_b;
-    expect(col?.kind === 'column' && col.identity?.sequenceName).toBe('orders_a_b_seq');
+    expect(col?.kind === 'column' && col.identity?.sequenceName).toBe('orders_a_b_seq1');
   });
 
-  test('pg: 同一次 execute 内 dropTable / dropColumn 腾出 serial 归属序列推导名', () => {
-    const seeded = runStepwiseFrom(
-      baseModel('pg'),
-      [
-        { name: 'dropColumn', args: { id: 't0_a_b' } },
-        { name: 'dropColumn', args: { id: 't1_b' } },
-        { name: 'addColumn', args: { table: 't0', column: { id: 't0_ser', name: 'a_b', type: 'serial' } } },
-        { name: 'addColumn', args: { table: 't1', column: { id: 't1_ser', name: 'b', type: 'serial' } } },
-      ],
-      false,
-    ).model;
-    const seqIdOf = (m: Model, colId: string) =>
-      Object.values(m.objects).find((o) => o.kind === 'sequence' && o.ownedBy === colId)?.id;
-    const t1SeqId = seqIdOf(seeded, 't1_ser')!;
-    expect(t1SeqId).toBeTruthy();
-
-    const afterDropTable = assertBatchMatchesLegacyAndStepwise(seeded, [
-      { name: 'addCheck', args: { id: 'ck_a', table: 't1', expr: '1 = 1' } },
-      { name: 'dropTable', args: { id: 't0' } },
-      { name: 'addCheck', args: { id: 'ck_b', table: 't1', expr: '2 = 2' } },
-    ]);
-    const seqAfterTable = afterDropTable.objects[t1SeqId];
-    expect(seqAfterTable?.kind === 'sequence' && seqAfterTable.name).toBe('orders_a_b_seq');
-
-    const afterDropCol = assertBatchMatchesLegacyAndStepwise(seeded, [
-      { name: 'addCheck', args: { id: 'ck_a', table: 't1', expr: '1 = 1' } },
-      { name: 'dropColumn', args: { id: 't0_ser' } },
-      { name: 'addCheck', args: { id: 'ck_b', table: 't1', expr: '2 = 2' } },
-    ]);
-    const seqAfterCol = afterDropCol.objects[t1SeqId];
-    expect(seqAfterCol?.kind === 'sequence' && seqAfterCol.name).toBe('orders_a_b_seq');
-  });
-
-  test('mssql: 同一次 execute 内 dropTable 腾出跨表 schema 级 CHECK 推导名', () => {
-    const seeded = runStepwiseFrom(
+  test('mssql: 同一次 execute 内 dropTable 腾出 schema 级 CHECK / DEFAULT 推导名并被复用', () => {
+    const seeded = runStepwise(
       baseModel('mssql'),
       [
         { name: 'addCheck', args: { id: 'ck0', table: 't0', expr: 'a_b > 0' } },
         { name: 'addCheck', args: { id: 'ck1', table: 't1', expr: 'b > 0' } },
-      ],
-      false,
-    ).model;
-    const after = assertBatchMatchesLegacyAndStepwise(seeded, [
-      { name: 'addCheck', args: { id: 'ck_a', table: 't1', expr: '1 = 1' } },
-      { name: 'dropTable', args: { id: 't0' } },
-      { name: 'addCheck', args: { id: 'ck_b', table: 't1', expr: '2 = 2' } },
-    ]);
-    const ck1 = after.objects.ck1;
-    expect(ck1?.kind === 'check' && ck1.name).toBe('CK_orders_a_b');
-  });
-
-  test('mssql: 同一次 execute 内 dropTable 腾出跨表带名 DEFAULT 推导名', () => {
-    const seeded = runStepwiseFrom(
-      baseModel('mssql'),
-      [
         { name: 'setDefault', args: { id: 't0_a_b', default: { expr: '((0))' } } },
-        { name: 'setDefault', args: { id: 't1_b', default: { expr: '((0))' } } },
       ],
-      false,
+      true,
     ).model;
-    const after = assertBatchMatchesLegacyAndStepwise(seeded, [
-      { name: 'addCheck', args: { id: 'ck_a', table: 't1', expr: '1 = 1' } },
+    expect(nameOf(seeded, 'ck1')).toBe('CK_orders_a_b_1');
+    const after = runAllPaths(seeded, [
       { name: 'dropTable', args: { id: 't0' } },
-      { name: 'addCheck', args: { id: 'ck_b', table: 't1', expr: '2 = 2' } },
+      { name: 'addCheck', args: { id: 'ck2', table: 't1', expr: 'b < 9' } },
+      { name: 'setDefault', args: { id: 't1_b', default: { expr: '((0))' } } },
     ]);
+    expect(nameOf(after, 'ck1')).toBe('CK_orders_a_b_1');
+    expect(nameOf(after, 'ck2')).toBe('CK_orders_a_b');
     const col = after.objects.t1_b;
     expect(col?.kind === 'column' && col.ext?.mssql?.defaultName).toBe('DF_orders_a_b');
   });
 
-  for (const dialect of DIALECTS) {
-    test(`${dialect}: 未过不动点认证时不得走快路径（杀死 certified 恒真变异体）`, () => {
-      const seeded = runStepwiseFrom(
-        baseModel(dialect),
-        [
-          { name: 'addCheck', args: { id: 'ckB', table: 't0', expr: '1 = 1' } },
-          { name: 'addCheck', args: { id: 'ckA', table: 't0', expr: '2 = 2' } },
-        ],
-        false,
-      ).model;
-      const after = assertBatchMatchesLegacyAndStepwise(seeded, [
-        { name: 'setCheckExpr', args: { id: 'ckB', expr: 'a > 0' } },
-        { name: 'addCheck', args: { id: 'ckC', table: 't0', expr: '3 = 3' } },
-      ]);
-      const ckA = after.objects.ckA;
-      const ckC = after.objects.ckC;
-      expect(ckA?.kind === 'check' && ckA.name).toBe(dialect === 'mssql' ? 'CK_orders' : 'orders_check');
-      expect(ckC?.kind === 'check' && ckC.name).toBe(dialect === 'mssql' ? 'CK_orders_1' : 'orders_check1');
-    });
-  }
-
-  test('mssql: setColumnExt 写入与他表推导名冲突的显式 defaultName 时触发 noteDup 取消认证', () => {
-    const seeded = runStepwiseFrom(
+  test('mssql: setColumnExt 写入与他表推导名冲突的显式 defaultName，下次刷新那张表时让出名字', () => {
+    const seeded = runStepwise(
       baseModel('mssql'),
       [
         { name: 'setDefault', args: { id: 't0_a', default: { expr: '((0))' } } },
-        { name: 'addCheck', args: { id: 'ck1', table: 't1', expr: '1 = 1' } },
+        { name: 'addCheck', args: { id: 'ck1', table: 't1', expr: 'a > 0' } },
       ],
-      false,
+      true,
     ).model;
-    const after = assertBatchMatchesLegacyAndStepwise(seeded, [
-      { name: 'addCheck', args: { id: 'ck2', table: 't1', expr: '2 = 2' } },
+    expect(nameOf(seeded, 'ck1')).toBe('CK_orders_a_a');
+    const after = runAllPaths(seeded, [
       {
         name: 'setColumnExt',
-        args: { id: 't0_a', ext: { mssql: { defaultName: 'CK_orders_a', defaultNameMode: 'explicit' } } },
+        args: { id: 't0_a', ext: { mssql: { defaultName: 'CK_orders_a_a', defaultNameMode: 'explicit' } } },
       },
-      { name: 'addCheck', args: { id: 'ck3', table: 't1', expr: '3 = 3' } },
+      { name: 'addCheck', args: { id: 'ck2', table: 't1', expr: '2 = 2' } },
     ]);
-    const ck1 = after.objects.ck1;
-    expect(ck1?.kind === 'check' && ck1.name).not.toBe('CK_orders_a');
+    expect(nameOf(after, 'ck1')).toBe('CK_orders_a_a_1');
+  });
+
+  test('mssql: 新列的隐式 DEFAULT 名截断后与已有名字相同时，已有列保留名字、新列取下一个空位', () => {
+    const dfOf = (m: Model, id: string) => {
+      const c = m.objects[id];
+      return c?.kind === 'column' ? c.ext?.mssql?.defaultName : undefined;
+    };
+    const col = (id: string, name: string) => ({
+      name: 'addColumn',
+      args: { table: 't1', column: { id, name, type: 'int', notNull: false, default: { expr: '((0))' } } },
+    });
+    const seeded = runStepwise(baseModel('mssql'), [col('n3', `c_${'y'.repeat(118)}`)], true).model;
+    const before = dfOf(seeded, 'n3');
+    expect(before).toBeTruthy();
+    const after = runAllPaths(seeded, [col('n10', `c_${'y'.repeat(117)}w`)]);
+    expect(dfOf(after, 'n3')).toBe(before);
+    expect(dfOf(after, 'n10')).toBe(`${before!.slice(0, 126)}_1`);
+    expect(dfOf(after, 'n10')).not.toBe(before);
+  });
+
+  test('mssql: 去掉默认值后清理遗留的推导 DEFAULT 名', () => {
+    const after = runAllPaths(baseModel('mssql'), [
+      { name: 'setDefault', args: { id: 't0_b', default: { expr: '((0))' } } },
+      { name: 'setDefault', args: { id: 't0_b', default: null } },
+    ]);
+    const col = after.objects.t0_b;
+    expect(col?.kind === 'column' && col.ext?.mssql?.defaultName).toBeFalsy();
+  });
+
+  test('pg: 分区家族：子分区 CHECK 沿用根表列，attach 后与父表继承约束避让', () => {
+    const after = runAllPaths(baseModel('pg'), [
+      { name: 'addCheck', args: { id: 'pc', table: 'tp', expr: 'a > 0' } },
+      { name: 'addCheck', args: { id: 'cc', table: 'tp1', expr: 'a > 1' } },
+      { name: 'renameColumn', args: { id: 'tp_a', name: 'aa' } },
+      { name: 'addCheck', args: { id: 'cc2', table: 'tp1', expr: 'aa > 2' } },
+    ]);
+    expect(nameOf(after, 'pc')).toBe('p_aa_check');
+    expect(nameOf(after, 'cc2')).toMatch(/^p_1_aa_check\d*$/);
   });
 });
 
 // ───── 复杂度守卫：确定性计数，不依赖墙钟 ─────
 
-const pasteOps = (dialect: Dialect, n: number, kind: 'check' | 'unique' | 'index' | 'foreignKey'): Op[] => {
-  const ops: Op[] = [{ name: 'createTable', args: { id: 'big', schema: 's0', name: 'big' } }];
-  const cols = ['a', 'b', 'c', 'd'];
-  for (const c of cols) {
-    ops.push({
-      name: 'addColumn',
-      args: { table: 'big', column: { id: `big_${c}`, name: c, type: INT[dialect] } },
-    });
-  }
-  for (let i = 0; i < n; i++) {
-    const id = `k${i}`;
-    if (kind === 'check') {
-      // 约 400 字节、引用多列的表达式：推导名都是 big_check、big_check1……（同一命名序列，最坏情况）
-      let e = '';
-      for (let j = 0; e.length < 380; j++) e += `${e ? ' AND ' : ''}${cols[j % 4]} + ${i} > ${j}`;
-      ops.push({ name: 'addCheck', args: { id, table: 'big', expr: e } });
-    } else if (kind === 'unique') {
-      ops.push({ name: 'addUnique', args: { id, table: 'big', columns: ['big_a', 'big_b'] } });
-    } else if (kind === 'index') {
-      ops.push({ name: 'addIndex', args: { id, table: 'big', elements: [{ column: 'big_a' }] } });
-    } else {
-      ops.push({
-        name: 'addForeignKey',
-        args: { id, table: 'big', columns: ['big_a'], refTable: 'ref', refColumns: ['ref_id'] },
-      });
-    }
-  }
-  return ops;
-};
-
-const countPaste = (dialect: Dialect, n: number, kind: 'check' | 'unique' | 'index' | 'foreignKey') => {
+const bigModel = (dialect: Dialect, n: number) => {
   const m = emptyModel(dialect);
   createSchema(m, getDialect(dialect).capabilities.defaultSchema, 's0');
-  runMutator(m, 'createTable', { id: 'ref', schema: 's0', name: 'ref' });
-  runMutator(m, 'addColumn', {
-    table: 'ref',
-    column: { id: 'ref_id', name: 'id', type: INT[dialect], notNull: true },
-  });
-  runMutator(m, 'addPrimaryKey', { id: 'ref_pk', table: 'ref', columns: ['ref_id'] });
-  resetDerivedNameStats();
-  const res = execute(m, 'paste', { ops: pasteOps(dialect, n, kind) }, new MutableModelIndex(m));
-  expect(res.changes.length).toBeGreaterThan(n);
-  return { ...derivedNameStats };
+  runMutator(m, 'createTable', { id: 'big', schema: 's0', name: 'big' });
+  for (const c of ['a', 'b', 'c', 'd'])
+    runMutator(m, 'addColumn', { table: 'big', column: { id: `big_${c}`, name: c, type: INT[dialect] } });
+  const idx = new MutableModelIndex(m);
+  const ops: Op[] = [];
+  for (let i = 0; i < n; i++)
+    ops.push({ name: 'addCheck', args: { id: `k${i}`, table: 'big', expr: `a + b > ${i} AND c < ${i}` } });
+  const res = execute(m, 'paste', { ops }, idx);
+  return { m: commitTo(idx, m, res), idx };
 };
 
-describe('复杂度守卫：同一张表上粘贴 N 个约束 / 索引，推导名工作量近似线性', () => {
+const stats = () => ({ ...derivedNameStats });
+const work = (s: ReturnType<typeof stats>) => s.validations + s.probes + s.marks;
+
+describe('复杂度守卫：推导名工作量只与变化量有关，与表大小无关', () => {
   for (const dialect of DIALECTS) {
-    for (const kind of ['check', 'unique', 'index', 'foreignKey'] as const) {
-      test(`${dialect}: ${kind} × 100 → × 400`, () => {
-        const small = countPaste(dialect, 100, kind);
-        const large = countPaste(dialect, 400, kind);
-        // 线性时 4 倍；原实现（每加一个全表重算 + 逐个后缀试探）约 16～64 倍
-        for (const k of ['slotVisits', 'probes', 'exprLexes'] as const) {
-          expect(large[k], `${k}: ${small[k]} → ${large[k]}`).toBeLessThanOrEqual(Math.max(5 * small[k], 50));
+    test(`${dialect}: 粘贴 N 条 CHECK 线性（400 → 1600）`, () => {
+      resetDerivedNameStats();
+      bigModel(dialect, 400);
+      const small = stats();
+      resetDerivedNameStats();
+      bigModel(dialect, 1600);
+      const large = stats();
+      expect(work(large)).toBeLessThanOrEqual(5 * work(small));
+      expect(large.exprLexes).toBeLessThanOrEqual(1600 + 10);
+    });
+
+    test(`${dialect}: 大表上单步 execute（500 / 2000 条 CHECK 时计数相同且为常数）`, () => {
+      const per = (n: number) => {
+        let { m, idx } = bigModel(dialect, n);
+        resetDerivedNameStats();
+        for (let i = 0; i < 20; i++)
+          m = commitTo(idx, m, execute(m, 'addCheck', { id: `x${i}`, table: 'big', expr: `d > ${i}` }, idx));
+        expect(derivedNameStats.stateBuilds).toBe(0);
+        return stats();
+      };
+      const small = per(500);
+      const large = per(2000);
+      expect(work(large)).toBe(work(small));
+      expect(work(large)).toBeLessThanOrEqual(20 * 10);
+    });
+
+    test(`${dialect}: 交错 addColumn + addCheck、renameKey / dropKey + addCheck 每步常数`, () => {
+      const run = (n: number, k: number) => {
+        let { m, idx } = bigModel(dialect, n);
+        resetDerivedNameStats();
+        for (let i = 0; i < k; i++) {
+          m = commitTo(
+            idx,
+            m,
+            execute(
+              m,
+              'addColumn',
+              { table: 'big', column: { id: `nc${i}`, name: `col${i}`, type: INT[dialect] } },
+              idx,
+            ),
+          );
+          m = commitTo(
+            idx,
+            m,
+            execute(m, 'addCheck', { id: `s${i}`, table: 'big', expr: `col${i} > 0 AND a > 1` }, idx),
+          );
+          const op: Op =
+            i % 2
+              ? { name: 'dropKey', args: { id: `k${i}` } }
+              : { name: 'renameKey', args: { id: `k${i}`, name: `ex_${i}` } };
+          m = commitTo(idx, m, execute(m, op.name, op.args, idx));
+          m = commitTo(
+            idx,
+            m,
+            execute(m, 'addCheck', { id: `r${i}`, table: 'big', expr: `a + b > ${i} AND c < 0` }, idx),
+          );
         }
-        expect(large.fullPasses).toBeLessThanOrEqual(small.fullPasses + 2);
-        expect(large.probes).toBeLessThan(20 * 400);
-      });
-    }
+        // 腾出的最小空位被复用：r0 取到 k0 让出的 big_check
+        expect(nameOf(m, 'r0')).toBe(CK(dialect, 'big', 0));
+        return stats();
+      };
+      const small = run(400, 50);
+      const large = run(1600, 200);
+      expect(work(large)).toBeLessThanOrEqual(5 * work(small));
+      expect(work(large)).toBeLessThanOrEqual(200 * 4 * 8);
+    });
+
+    test(`${dialect}: MCP 500 步预演（共享索引与预算）在大表上每步常数，只构建一次基线状态`, () => {
+      const { m: big } = bigModel(dialect, 2000);
+      let m = clonePlain(big);
+      const idx = new MutableModelIndex(m);
+      const budget = new DerivedNameBudget();
+      resetDerivedNameStats();
+      for (let i = 0; i < 500; i++)
+        m = commitTo(
+          idx,
+          m,
+          execute(m, 'addCheck', { id: `p${i}`, table: 'big', expr: `d > ${i}` }, idx, { budget }),
+        );
+      const s = stats();
+      expect(s.stateBuilds).toBe(1);
+      // 基线首次构建（只读校验 2000 条）之外，每步只有常数次校验 / 试探 / 标脏
+      expect(budget.used).toBeLessThanOrEqual(500 * 6);
+      expect(s.validations).toBeLessThanOrEqual(2000 + 4 + 500 * 3);
+    });
+
+    test(`${dialect}: batchReadsOf 在大表上逐步执行 500 步，推导名工作量与表大小无关`, () => {
+      const run = (n: number) => {
+        const { m } = bigModel(dialect, n);
+        const ops = Array.from({ length: 500 }, (_, i) => ({
+          name: 'addCheck',
+          args: { id: `q${i}`, table: 'big', expr: `d > ${i}` },
+        }));
+        resetDerivedNameStats();
+        const reads = opReads(m, {}, { ops }, [], 'batch');
+        expect(reads.map(([id]) => id)).toContain('big');
+        const s = stats();
+        expect(s.stateBuilds).toBe(1);
+        return s.validations - (n + 4) + s.marks + s.recomputes;
+      };
+      expect(run(2000)).toBe(run(500));
+    });
   }
 });
 
@@ -851,63 +1012,252 @@ describe('分词缓存守卫：普通模型逐条 addCheck 与 >4096 条 CHECK �
       const m = emptyModel(dialect);
       const sch = createSchema(m, getDialect(dialect).capabilities.defaultSchema, 's0');
       runMutator(m, 'createTable', { id: 'big', schema: sch, name: 'big' });
-      for (const c of ['a', 'b', 'c', 'd']) {
-        runMutator(m, 'addColumn', {
-          table: 'big',
-          column: { id: `big_${c}`, name: c, type: INT[dialect] },
-        });
-      }
+      for (const c of ['a', 'b', 'c', 'd'])
+        runMutator(m, 'addColumn', { table: 'big', column: { id: `big_${c}`, name: c, type: INT[dialect] } });
       resetDerivedNameStats();
-      for (let i = 0; i < 100; i++) {
+      for (let i = 0; i < 100; i++)
         runMutator(m, 'addCheck', {
           id: `ck${i}`,
           table: 'big',
           expr: `a + b + ${i} > ${10000 + i} AND c + d > ${i}`,
         });
-      }
       expect(derivedNameStats.exprLexes).toBeLessThanOrEqual(100);
     });
   }
 
   test('pg: 表上超过 4096 条不同 CHECK 时续加不再触发全表重分词', () => {
-    const m0 = emptyModel('pg');
-    const sch = createSchema(m0, 'public', 's0');
-    runMutator(m0, 'createTable', { id: 'big', schema: sch, name: 'big' });
-    runMutator(m0, 'addColumn', { table: 'big', column: { id: 'big_a', name: 'a', type: 'integer' } });
-    runMutator(m0, 'addColumn', { table: 'big', column: { id: 'big_b', name: 'b', type: 'integer' } });
-    const ops: Op[] = [];
-    for (let i = 0; i < 4500; i++) {
-      ops.push({ name: 'addCheck', args: { id: `ck${i}`, table: 'big', expr: `a + b > ${50000 + i}` } });
-    }
-    const idx = new MutableModelIndex(m0);
-    const init = execute(m0, 'paste', { ops }, idx);
-    idx.applyBatch(
-      init.next,
-      init.changes.map((c) => ({
-        id: c.id,
-        prev: m0.objects[c.id],
-        next: c.obj ? init.next.objects[c.id] : undefined,
-      })),
-    );
-    let cur = init.next;
+    let { m, idx } = bigModel('pg', 4500);
     resetDerivedNameStats();
-    for (let k = 0; k < 3; k++) {
-      const res = execute(
-        cur,
-        'addCheck',
-        { id: `extra_${k}`, table: 'big', expr: `a + b > ${60000 + k}` },
+    for (let k = 0; k < 3; k++)
+      m = commitTo(
         idx,
+        m,
+        execute(m, 'addCheck', { id: `extra_${k}`, table: 'big', expr: `a + b > ${60000 + k}` }, idx),
       );
-      idx.applyBatch(
-        res.next,
-        res.changes.map((c) => ({
-          id: c.id,
-          prev: cur.objects[c.id],
-          next: c.obj ? res.next.objects[c.id] : undefined,
-        })),
-      );
-      cur = res.next;
-    }
     expect(derivedNameStats.exprLexes).toBeLessThanOrEqual(3);
+  });
+});
+
+// ───── 工作量预算熔断 ─────
+
+describe('工作量预算：病态改表名 / 改列名循环抛 EditError 并原子回滚，正常大编辑不受影响', () => {
+  for (const dialect of DIALECTS) {
+    test(`${dialect}: batch 里反复改大表的表名 / 列名被拒绝，索引状态不受影响`, () => {
+      let { m, idx } = bigModel(dialect, 1500);
+      const before = stableJson(m);
+      const renameTables: Op[] = Array.from({ length: 200 }, (_, i) => ({
+        name: 'renameTable',
+        args: { id: 'big', name: `big${i}` },
+      }));
+      const renameCols: Op[] = Array.from({ length: 200 }, (_, i) => ({
+        name: 'renameColumn',
+        args: { id: 'big_a', name: i % 2 ? 'a' : 'z' },
+      }));
+      for (const ops of [renameTables, renameCols]) {
+        let err: unknown;
+        try {
+          execute(m, 'batch', { ops }, idx);
+        } catch (e) {
+          err = e;
+        }
+        expect(err).toBeInstanceOf(EditError);
+        expect(String((err as Error).message)).toContain('推导名重算工作量超出上限');
+        expect(stableJson(m)).toBe(before);
+      }
+      // 回滚后基线状态仍然正确：继续执行的结果与全新索引一致
+      const fresh = execute(
+        m,
+        'addCheck',
+        { id: 'after', table: 'big', expr: 'b > 0' },
+        new MutableModelIndex(m),
+      );
+      const reused = execute(m, 'addCheck', { id: 'after', table: 'big', expr: 'b > 0' }, idx);
+      expect(stableJson(reused.changes)).toBe(stableJson(fresh.changes));
+      m = commitTo(idx, m, reused);
+      // 单次改大表的表名在预算内
+      const once = execute(m, 'renameTable', { id: 'big', name: 'big_renamed' }, idx);
+      expect(nameOf(once.next, 'k0')).toBe(CK(dialect, 'big_renamed', 0));
+    });
+
+    test(`${dialect}: MCP 预演共享一份预算：逐步改表名的循环在预算耗尽时被拒绝`, () => {
+      let { m, idx } = bigModel(dialect, 1500);
+      const budget = new DerivedNameBudget();
+      let failedAt = -1;
+      for (let i = 0; i < 200; i++) {
+        try {
+          m = commitTo(idx, m, execute(m, 'renameTable', { id: 'big', name: `big${i}` }, idx, { budget }));
+        } catch (e) {
+          expect(e).toBeInstanceOf(DerivedNameBudgetError);
+          failedAt = i;
+          break;
+        }
+      }
+      expect(failedAt).toBeGreaterThan(0);
+      expect(budget.used).toBeGreaterThan(DERIVED_NAME_WORK_BUDGET);
+    });
+  }
+
+  test('pg: 正常的大规模粘贴每个子操作只消耗常数预算（按 2 万个子操作折算低于一半）', () => {
+    const m = emptyModel('pg');
+    createSchema(m, 'public', 's0');
+    const ops: Op[] = [];
+    for (let t = 0; t < 120; t++) {
+      ops.push({ name: 'createTable', args: { id: `t${t}`, schema: 's0', name: `t${t}` } });
+      for (const c of ['id', 'a', 'b'])
+        ops.push({
+          name: 'addColumn',
+          args: {
+            table: `t${t}`,
+            column: { id: `t${t}_${c}`, name: c, type: 'integer', notNull: c === 'id' },
+          },
+        });
+      ops.push({ name: 'addPrimaryKey', args: { id: `t${t}_pk`, table: `t${t}`, columns: [`t${t}_id`] } });
+      for (let k = 0; k < 40; k++)
+        ops.push({ name: 'addCheck', args: { id: `t${t}_ck${k}`, table: `t${t}`, expr: `a > ${k}` } });
+    }
+    const budget = new DerivedNameBudget();
+    const res = execute(m, 'paste', { ops }, new MutableModelIndex(m), { budget });
+    expect(res.changes.length).toBe(120 * 45);
+    // 每个子操作只有常数步（校验 + 试探 + 标脏），2 万个子操作也在预算的一半以内
+    expect(budget.used).toBeLessThan((120 * 45 * DERIVED_NAME_WORK_BUDGET) / 2 / 20000);
+  });
+});
+
+describe('回归用例：失败（回滚）的 execute 不能吞掉基线命名序列的空位', () => {
+  for (const dialect of DIALECTS) {
+    test(`${dialect}: 取用了腾出的空位后整批失败，之后仍取到同一个最小空位`, () => {
+      let { m, idx } = bigModel(dialect, 50);
+      // 腾出中间的 big_check5（基线空位堆里有 5）
+      m = commitTo(idx, m, execute(m, 'dropKey', { id: 'k5' }, idx));
+      // 整批：先加一条（取用空位 5），再失败 → 回滚
+      expect(() =>
+        execute(
+          m,
+          'batch',
+          {
+            ops: [
+              { name: 'addCheck', args: { id: 'tmp', table: 'big', expr: 'a + b > 1' } },
+              { name: 'addCheck', args: { id: 'bad', table: 'missing', expr: 'a > 1' } },
+            ],
+          },
+          idx,
+        ),
+      ).toThrow(EditError);
+      const reused = execute(m, 'addCheck', { id: 'after', table: 'big', expr: 'a + b > 2' }, idx);
+      const fresh = execute(
+        m,
+        'addCheck',
+        { id: 'after', table: 'big', expr: 'a + b > 2' },
+        new MutableModelIndex(m),
+      );
+      expect(nameOf(reused.next, 'after')).toBe(CK(dialect, 'big', 5));
+      expect(stableJson(reused.changes)).toBe(stableJson(fresh.changes));
+    });
+  }
+});
+
+// ───── 提交级写入（历史恢复 / 导入 / 其他副本的提交，不经 mutator 校验）之后的增量维护 ─────
+
+/**
+ * start 上先应用一次不经 mutator 的提交 raw（基线索引经 applyBatch 增量维护，事先已构建推导名状态），
+ * 再执行 ops：普通模型与共享索引的逐个 execute 结果必须一致，且普通模型每步满足不变式。
+ */
+const runAfterRawCommit = (start: Model, raw: (m: Model) => void, ops: Op[]): Model => {
+  const idx = new MutableModelIndex(start);
+  idx.namingState();
+  const next = clonePlain(start);
+  raw(next);
+  const ids = new Set([...Object.keys(start.objects), ...Object.keys(next.objects)]);
+  const batch = [...ids]
+    .filter((id) => stableJson(start.objects[id] ?? null) !== stableJson(next.objects[id] ?? null))
+    .map((id) => ({ id, prev: start.objects[id], next: next.objects[id] }));
+  idx.applyBatch(next, batch);
+  let m = next;
+  for (const op of ops) m = commitTo(idx, m, execute(m, op.name, op.args, idx));
+  const plain = clonePlain(next);
+  for (const op of ops) {
+    const before = clonePlain(plain);
+    runMutator(plain, op.name, op.args);
+    checkInvariants(before, plain, op);
+  }
+  expect(stableJson(m)).toBe(stableJson(plain));
+  return plain;
+};
+
+describe('回归用例：提交级写入后，标脏规则覆盖倒排索引、分区拓扑与撞名', () => {
+  for (const dialect of DIALECTS) {
+    test(`${dialect}: CHECK 引用的标识符后来成了列（倒排索引标脏）`, () => {
+      const seeded = runStepwise(
+        baseModel(dialect),
+        [{ name: 'addCheck', args: { id: 'ck', table: 't0', expr: 'a > 0' } }],
+        true,
+      ).model;
+      const after = runAfterRawCommit(
+        seeded,
+        (m) => {
+          // 导入的模型里 CHECK 可能引用当时不存在的列名
+          const ck = m.objects.ck;
+          if (ck?.kind === 'check') ck.expr = 'a > 0 AND zz > 0';
+        },
+        [
+          {
+            name: 'addColumn',
+            args: { table: 't0', column: { id: 't0_zz', name: 'zz', type: INT[dialect] } },
+          },
+        ],
+      );
+      expect(nameOf(after, 'ck')).toBe(CK(dialect, 'orders', 0));
+    });
+
+    test(`${dialect}: 两个推导名撞名时一起重算，最小空位按确定顺序分配`, () => {
+      const seeded = runStepwise(
+        baseModel(dialect),
+        [
+          { name: 'addCheck', args: { id: 'c1', table: 't0', expr: '1 = 1' } },
+          { name: 'addCheck', args: { id: 'c2', table: 't0', expr: '2 = 2' } },
+        ],
+        true,
+      ).model;
+      const after = runAfterRawCommit(
+        seeded,
+        (m) => {
+          const c2 = m.objects.c2;
+          if (c2?.kind === 'check') c2.name = CK(dialect, 'orders', 0);
+        },
+        [{ name: 'addCheck', args: { id: 'c3', table: 't0', expr: '3 = 3' } }],
+      );
+      expect([nameOf(after, 'c3'), nameOf(after, 'c1'), nameOf(after, 'c2')]).toEqual([
+        CK(dialect, 'orders', 0),
+        CK(dialect, 'orders', 1),
+        CK(dialect, 'orders', 2),
+      ]);
+    });
+  }
+
+  test('pg: 表被并入分区家族后，与父表继承约束撞名的 CHECK 重算（分区拓扑标脏）', () => {
+    const start = baseModel('pg');
+    const seeded = runStepwise(
+      start,
+      [
+        { name: 'addCheck', args: { id: 'pck', table: 'tp', expr: 'a > 0' } },
+        { name: 'createTable', args: { id: 'tc', schema: schemaOf(start), name: 'p_a' } },
+        { name: 'addColumn', args: { table: 'tc', column: { id: 'tc_x', name: 'x', type: 'integer' } } },
+        { name: 'addCheck', args: { id: 'cck', table: 'tc', expr: '1 = 1' } },
+      ],
+      true,
+    ).model;
+    expect([nameOf(seeded, 'pck'), nameOf(seeded, 'cck')]).toEqual(['p_a_check', 'p_a_check']);
+    const after = runAfterRawCommit(
+      seeded,
+      (m) => {
+        // 历史恢复 / 导入直接把表挂到分区父表下（子分区不带自己的列）
+        delete m.objects.tc_x;
+        const t = m.objects.tc;
+        if (t?.kind === 'table') t.partitionOf = { parent: 'tp', bound: 'FOR VALUES FROM (100) TO (200)' };
+      },
+      [{ name: 'addCheck', args: { id: 'pck2', table: 'tp', expr: '2 = 2' } }],
+    );
+    // 父表的 CHECK 现在要避让子分区的全部约束名：刷新父表时它让出名字（子分区自己的 CHECK 等子分区刷新时再处理）
+    expect([nameOf(after, 'pck'), nameOf(after, 'cck')]).toEqual(['p_a_check1', 'p_a_check']);
   });
 });

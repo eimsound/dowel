@@ -1,28 +1,30 @@
 import {
+  colNamesOf,
   type DialectNaming,
   exprRefNames,
+  indexColsResolved,
+  keySlot,
   nameKey,
   type NameSpec,
-  runDerivedNames,
-  singleReferencedColumn,
+  registerDialectNaming,
+  singleRefColumn,
+  UNRESOLVED,
 } from '../derived-names.ts';
 // MySQL 方言规格实现（注册到 @dowel/core registry）。
 import type { DialectCapabilities, DialectSpec, IdentKind } from '../dialect.ts';
 import { emptyModel, type Model, type Obj } from '../ir.ts';
 import {
   all,
-  allChildrenOf,
   childrenOf,
   childrenOfKinds,
   columnsOf,
-  find,
-  get,
   getActiveModelIndex,
   indexElementNames,
   objectsOfKinds,
   OverlayModelIndex,
 } from '../model.ts';
-import { MYSQL_CON_NS, mysqlIdxNs, nameEntriesOf } from '../naming-ns.ts';
+import { MYSQL_CON_NS, mysqlIdxNs } from '../naming-ns.ts';
+import { plainRefresh } from '../naming-state.ts';
 import { mysqlClipboard } from './clipboard.ts';
 import {
   MAX_MYSQL_IDENT,
@@ -124,115 +126,99 @@ const isMysqlConTaken = (m: Model, tableId: string, name: string, selfId: string
   });
 };
 
-interface MysqlNamingCache {
-  tName: string;
-  colNames: string[];
-}
-
 const lower = (n: string) => n.toLowerCase();
 /** isMysqlTableIndexTaken 把保留索引名 PRIMARY 视为恒被占用 */
 const primaryTaken = (norm: string) => norm === 'primary';
 const MYSQL_CON_ONLY = [MYSQL_CON_NS];
+const NO_NS: string[] = [];
 
 const mysqlSpec = (
   tableId: string,
   ns: string[],
   extra: ((norm: string) => boolean) | undefined,
-  self: string,
-  cur: string,
   n1: string,
   n2: string | null,
   label: string,
 ): NameSpec => ({
-  table: tableId,
   key: nameKey(tableId, label, n1, n2, ns),
   cand: (j) => mysqlMakeObjectName(n1, n2, j === 0 ? label : `${label}${j}`),
   norm: lower,
   ns,
   ...(extra ? { extraTaken: extra } : {}),
-  self,
-  cur,
+});
+
+/** 主键名固定为 PRIMARY（不参与任何命名空间） */
+const primarySpec = (tableId: string): NameSpec => ({
+  key: nameKey(tableId, 'PRIMARY', '', null, NO_NS),
+  cand: () => 'PRIMARY',
+  norm: lower,
+  ns: NO_NS,
 });
 
 /** 各类对象的选名规格（与 isMysqlTableIndexTaken / isMysqlSchemaConstraintTaken 的组合一致） */
-const mysqlSlotSpec = (m: Model, tableId: string, o: Obj, c: MysqlNamingCache): NameSpec | null => {
-  const joinCols = (ids: string[]) => mysqlJoinNames(ids.map((x) => get(m, x, 'column').name));
-  const idx = [mysqlIdxNs(tableId)];
-  switch (o.kind) {
-    case 'unique':
-      return mysqlSpec(tableId, idx, primaryTaken, o.id, o.name, c.tName, joinCols(o.columns), 'key');
-    case 'foreignKey':
-      return mysqlSpec(
-        tableId,
-        [MYSQL_CON_NS, mysqlIdxNs(tableId)],
-        primaryTaken,
-        o.id,
-        o.name,
-        c.tName,
-        joinCols(o.columns),
-        'fkey',
-      );
-    case 'check': {
-      const ref = singleReferencedColumn('mysql', exprRefNames('mysql', o.expr, mysqlColumnRefs), c.colNames);
-      return mysqlSpec(tableId, MYSQL_CON_ONLY, undefined, o.id, o.name, c.tName, ref, 'check');
-    }
-    case 'index':
-      return mysqlSpec(
-        tableId,
-        idx,
-        primaryTaken,
-        o.id,
-        o.name,
-        c.tName,
-        mysqlJoinNames(indexElementNames(m, o)),
-        'idx',
-      );
-    default:
-      return null;
-  }
-};
-
 const mysqlNaming: DialectNaming = {
   dialect: 'mysql',
-  wantNs: (_m, tableId) => {
-    const idx = mysqlIdxNs(tableId);
-    return (ns) => ns === MYSQL_CON_NS || ns === idx;
-  },
-  entriesOf: (m) => (o, out) =>
-    nameEntriesOf(
-      'mysql',
-      o,
-      (id) => {
-        const t = find(m, id);
-        return t?.kind === 'table' ? t : undefined;
-      },
-      out,
-    ),
-  fullPass: (m, tableId, ctx) => {
-    const t = get(m, tableId, 'table');
-    const cache: MysqlNamingCache = { tName: t.name, colNames: columnsOf(m, tableId).map((c) => c.name) };
-    for (const o of allChildrenOf(m, tableId)) {
-      if (!('nameMode' in o) || o.nameMode !== 'derived') continue;
-      if (o.kind === 'primaryKey') {
-        o.name = 'PRIMARY';
-      } else {
-        const spec = mysqlSlotSpec(m, tableId, o, cache);
-        if (!spec) continue;
-        o.name = ctx.choose(spec);
+  checkRefs: (expr) => exprRefNames('mysql', expr, mysqlColumnRefs),
+  slotsOf: (m, view, o) => {
+    if (
+      !(
+        o.kind === 'primaryKey' ||
+        o.kind === 'unique' ||
+        o.kind === 'foreignKey' ||
+        o.kind === 'check' ||
+        o.kind === 'index'
+      ) ||
+      o.nameMode !== 'derived'
+    )
+      return [];
+    const t = Object.hasOwn(m.objects, o.parent) ? m.objects[o.parent] : undefined;
+    if (t?.kind !== 'table') return [];
+    const idx = [mysqlIdxNs(o.parent)];
+    switch (o.kind) {
+      case 'primaryKey':
+        return [keySlot(o, primarySpec(o.parent))];
+      case 'unique':
+      case 'foreignKey': {
+        const names = colNamesOf(m, o.columns);
+        if (!names) return UNRESOLVED;
+        return [
+          keySlot(
+            o,
+            o.kind === 'unique'
+              ? mysqlSpec(o.parent, idx, primaryTaken, t.name, mysqlJoinNames(names), 'key')
+              : mysqlSpec(
+                  o.parent,
+                  [MYSQL_CON_NS, mysqlIdxNs(o.parent)],
+                  primaryTaken,
+                  t.name,
+                  mysqlJoinNames(names),
+                  'fkey',
+                ),
+          ),
+        ];
       }
-      ctx.written(o);
+      case 'check': {
+        const ref = singleRefColumn(m, view, o.parent, exprRefNames('mysql', o.expr, mysqlColumnRefs));
+        return [keySlot(o, mysqlSpec(o.parent, MYSQL_CON_ONLY, undefined, t.name, ref, 'check'))];
+      }
+      case 'index':
+        if (!indexColsResolved(m, o)) return UNRESOLVED;
+        return [
+          keySlot(
+            o,
+            mysqlSpec(o.parent, idx, primaryTaken, t.name, mysqlJoinNames(indexElementNames(m, o)), 'idx'),
+          ),
+        ];
     }
-    return cache;
-  },
-  slotSpec: (m, tableId, o, cache) => {
-    if (o.kind === 'primaryKey') return null;
-    return mysqlSlotSpec(m, tableId, o, cache as MysqlNamingCache);
   },
 };
+registerDialectNaming(mysqlNaming);
 
 const refreshMysqlDerivedNames = (m: Model, tableId: string): void => {
   const idx = getActiveModelIndex(m);
-  runDerivedNames(m, tableId, mysqlNaming, idx instanceof OverlayModelIndex ? idx.nameTracker() : undefined);
+  const tr = idx instanceof OverlayModelIndex ? idx.nameTracker() : undefined;
+  if (tr) tr.refresh(m, tableId);
+  else plainRefresh(m, mysqlNaming, tableId);
 };
 
 const isReservedMysqlName = (val: string): string | null => {

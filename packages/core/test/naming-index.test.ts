@@ -1,5 +1,5 @@
 // Issue #164：命名空间索引的失效点。
-// 1. MutableModelIndex 的命名空间分桶在 applyObjectChange / applyBatch（提交）后与全量重建一致，
+// 1. MutableModelIndex 的命名空间分桶与推导名状态（倒排索引、脏集合）在 applyObjectChange / applyBatch（提交）后与全量重建一致，
 //    覆盖改表名、改列名、改约束名、删除、表换 schema、MSSQL 改表名（推导 DEFAULT 名随之变化）。
 // 2. OverlayModelIndex 开启写入跟踪后的 PG 判重与原扫描实现逐项一致（含分区家族、叠加层改名 / 删除 / 新增）。
 import { describe, expect, test } from 'vitest';
@@ -29,7 +29,12 @@ const entriesOfModel = (m: Model): NsEntry[] => {
 };
 
 /** 用历次出现过的全部 (命名空间, 名字) 探查：增量索引与全量重建的占用者集合必须相同（也能发现残留的旧条目） */
-const expectSameNamespaces = (idx: MutableModelIndex, m: Model, probes: Map<string, NsEntry>) => {
+const expectSameNamespaces = (
+  idx: MutableModelIndex,
+  m: Model,
+  probes: Map<string, NsEntry>,
+  exactDirty = true,
+) => {
   const fresh = new MutableModelIndex(m);
   const owners = (x: MutableModelIndex, e: NsEntry) =>
     [...(x.nsOwnersOf(e.ns, e.name)?.entries() ?? [])]
@@ -39,7 +44,21 @@ const expectSameNamespaces = (idx: MutableModelIndex, m: Model, probes: Map<stri
   for (const e of probes.values()) {
     expect(owners(idx, e), `${e.ns.replace('\0', ':')} ${e.name}`).toEqual(owners(fresh, e));
   }
+  // 推导名状态：倒排索引（标识符 → CHECK、列 → 约束 / 索引）与脏集合同样与全量重建一致
+  const dump = (x: MutableModelIndex) => {
+    const st = x.namingState();
+    const flat = (mm: Map<string, Set<string>>) =>
+      [...mm].map(([k, v]) => `${k}=${[...v].sort(cmp).join(',')}`).sort(cmp);
+    return { refs: flat(st.refIndex.refs), cols: flat(st.refIndex.cols) };
+  };
+  expect(dump(idx)).toEqual(dump(fresh));
+  // 脏集合：提交（applyBatch）后只读校验，与全量重建相同；单对象路径（applyObjectChange）不校验，只要求是超集
+  const dirty = (x: MutableModelIndex) => x.namingState().dirty.ids().sort(cmp);
+  if (exactDirty) expect(dirty(idx)).toEqual(dirty(fresh));
+  else for (const id of dirty(fresh)) expect(dirty(idx)).toContain(id);
 };
+
+const cmp = (p: string, q: string) => (p < q ? -1 : p > q ? 1 : 0);
 
 const buildModel = (dialect: Dialect): Model => {
   const m = emptyModel(dialect);
@@ -96,7 +115,7 @@ describe('MutableModelIndex 命名空间分桶：增量维护与全量重建一�
       let m = buildModel(dialect);
       const idx = new MutableModelIndex(m);
       const probes = new Map<string, NsEntry>();
-      idx.nsOwnersOf('', ''); // 先建好分桶，之后全走增量路径
+      idx.namingState(); // 先建好分桶与推导名状态，之后全走增量路径
       expectSameNamespaces(idx, m, probes);
       const steps: ((d: Model) => void)[] = [
         (d) => runMutator(d, 'renameTable', { id: 't0', name: 'orders2' }),
@@ -123,7 +142,7 @@ describe('MutableModelIndex 命名空间分桶：增量维护与全量重建一�
       runMutator(draft, 'renameKey', { id: 'ix0', name: 'renamed_ix' });
       idx.applyObjectChange('ix0', m.objects.ix0, draft.objects.ix0);
       idx.setModel(draft);
-      expectSameNamespaces(idx, draft, probes);
+      expectSameNamespaces(idx, draft, probes, false);
     });
   }
 });

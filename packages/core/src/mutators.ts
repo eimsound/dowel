@@ -456,8 +456,14 @@ export const runMutator = (m: Model, name: string, args: unknown) => {
  * 参数里出现的、模型中存在的对象，加上参数里表达式（expr / where）引用到的本表的列。
  * 修改实际写到的对象由同步层另行计算，也算在依据里。
  */
-export const readsOf = (m: Model, args: unknown, name?: string): string[] => {
-  if (name === BATCH_MUTATOR) return batchReadsOf(m, args);
+/**
+ * 逐步执行 batch 子操作的方式（返回执行后的模型；不合法时抛 EditError）。同步层传入带持久推导名状态的增量执行，
+ * 使 500 步的 batch 在大表上也只做 O(变化量) 的推导名工作；默认在模型副本上原地执行（每步全量校验推导名）。
+ */
+export type BatchStepper = (m: Model, name: string, args: unknown) => Model;
+
+export const readsOf = (m: Model, args: unknown, name?: string, step?: BatchStepper): string[] => {
+  if (name === BATCH_MUTATOR) return batchReadsOf(m, args, step);
   const out = new Set<string>();
   const exprs: string[] = [];
   const walk = (x: unknown, k?: string) => {
@@ -507,18 +513,19 @@ export const readsOf = (m: Model, args: unknown, name?: string): string[] => {
  * 只保留整批开始前就存在的对象（本批新建的对象不是外部依据）。绝不扫描 summary（自由文本可能恰好等于某个对象 ID）。
  * 某一步执行失败就停止（整批注定会被拒绝），已收集的依据照常返回。
  */
-const batchReadsOf = (m: Model, args: unknown): string[] => {
+const batchReadsOf = (m: Model, args: unknown, step?: BatchStepper): string[] => {
   const parsed = batchArgs.safeParse(args);
   if (!parsed.success) return [];
   const out = new Set<string>();
-  const stepModel = structuredClone(m);
+  let stepModel = step ? m : structuredClone(m);
   for (const op of parsed.data.ops) {
     if (COMPOSITE_MUTATORS.has(op.name)) break;
     for (const id of readsOf(stepModel, op.args, op.name)) {
       if (Object.hasOwn(m.objects, id)) out.add(id);
     }
     try {
-      runMutator(stepModel, op.name, op.args);
+      if (step) stepModel = step(stepModel, op.name, op.args);
+      else runMutator(stepModel, op.name, op.args);
     } catch (e) {
       if (e instanceof E.EditError) break;
       throw e;

@@ -1,22 +1,23 @@
 import {
+  colNameOf,
   type DialectNaming,
   exprRefNames,
   nameKey,
   type NameSpec,
-  runDerivedNames,
-  singleReferencedColumn,
+  type NamingView,
+  registerDialectNaming,
+  singleRefColumn,
+  type Slot,
+  type TableCtxCache,
+  UNRESOLVED,
 } from '../derived-names.ts';
 // PostgreSQL 方言规格实现（包装既有 PG 模块，保证 100% 向后兼容）。
 import type { DialectCapabilities, DialectSpec, IdentKind } from '../dialect.ts';
-import { type Column, emptyModel, type Model, type Obj, type Sequence } from '../ir.ts';
+import { emptyModel, type Model, type Obj } from '../ir.ts';
 import {
   all,
-  allChildrenOf,
   childrenOf,
-  colName,
   columnsOf,
-  effectiveColumnsOf,
-  find,
   get,
   getActiveModelIndex,
   indexElementNames,
@@ -27,7 +28,8 @@ import {
   requiredUniquePartitionKeys,
   rootTableId,
 } from '../model.ts';
-import { nameEntriesOf, type NsEntry, pgAllConNs, pgPropConNs, pgRelNs } from '../naming-ns.ts';
+import { pgAllConNs, pgPropConNs, pgRelNs } from '../naming-ns.ts';
+import { plainRefresh } from '../naming-state.ts';
 import { pgClipboard } from './clipboard.ts';
 import { columnRefs, exprReferences, renameInExpr, renameQualifiedInExpr, tokenize } from './expr.ts';
 import { joinNames, makeObjectName } from './naming.ts';
@@ -127,174 +129,152 @@ const pgTypeTaken = (m: Model, schema: string, name: string, self: string): bool
   );
 };
 
-interface PgNamingCache {
+interface PgTableCtx {
   tName: string;
+  root: string;
   rel: string[];
   relCon: string[];
   conProp: string[];
-  effColNames: string[];
 }
 
-const pgSpec = (
-  tableId: string,
-  ns: string[],
-  self: string,
-  cur: string | null | undefined,
-  n1: string,
-  n2: string | null,
-  label: string,
-): NameSpec => ({
-  table: tableId,
+const pgSpec = (tableId: string, ns: string[], n1: string, n2: string | null, label: string): NameSpec => ({
   key: nameKey(tableId, label, n1, n2, ns),
   cand: (j) => makeObjectName(n1, n2, j === 0 ? label : `${label}${j}`),
   norm: (n) => n,
   ns,
-  self,
-  cur,
 });
 
-/** 本表推导名用到的命名空间：关系（schema 级）、本表全部约束 + 祖先继承约束、（会继承的约束还要避让）后代全部约束 */
-const pgNsLists = (m: Model, tableId: string, schema: string) => {
-  const anc = partitionAncestors(m, tableId).map((a) => a.id);
-  const desc = partitionDescendants(m, tableId).map((d) => d.id);
-  const rel = [pgRelNs(schema)];
-  const conLocal = [pgAllConNs(tableId), ...anc.map(pgPropConNs)];
-  const conProp = [...conLocal, ...desc.map(pgAllConNs)];
-  return { rel, relCon: [...rel, ...conLocal], conProp };
+/**
+ * 本表推导名用到的命名空间：关系（schema 级）、本表全部约束 + 祖先继承约束、（会继承的约束还要避让）后代全部约束
+ * （与 pgRelTaken / pgConTaken 的判定一致）。
+ */
+const pgTableCtx = (m: Model, view: NamingView, tableId: string, cache: TableCtxCache): PgTableCtx | null => {
+  const hit = cache.get(tableId);
+  if (hit !== undefined) return hit as PgTableCtx | null;
+  const t = Object.hasOwn(m.objects, tableId) ? m.objects[tableId] : undefined;
+  let ctx: PgTableCtx | null = null;
+  if (t?.kind === 'table') {
+    const rel = [pgRelNs(t.parent)];
+    const conLocal = [pgAllConNs(tableId), ...view.ancestors(tableId).map(pgPropConNs)];
+    ctx = {
+      tName: t.name,
+      root: view.rootOf(tableId),
+      rel,
+      relCon: [...rel, ...conLocal],
+      conProp: [...conLocal, ...view.descendants(tableId).map(pgAllConNs)],
+    };
+  }
+  cache.set(tableId, ctx);
+  return ctx;
 };
-
-const pgEntriesOf = (m: Model) => (o: Obj, out: NsEntry[]) =>
-  nameEntriesOf(
-    'pg',
-    o,
-    (id) => {
-      const t = find(m, id);
-      return t?.kind === 'table' ? t : undefined;
-    },
-    out,
-  );
 
 const pgNaming: DialectNaming = {
   dialect: 'pg',
-  wantNs: (m, tableId) => {
-    const { relCon, conProp } = pgNsLists(m, tableId, get(m, tableId, 'table').parent);
-    const want = new Set([...relCon, ...conProp]);
-    return (ns) => want.has(ns);
-  },
-  entriesOf: pgEntriesOf,
-  fullPass: (m, tableId, ctx) => {
-    const t = get(m, tableId, 'table');
-    const schema = t.parent;
-    const { rel, relCon, conProp } = pgNsLists(m, tableId, schema);
-    const joinCols = (ids: string[]) => joinNames(ids.map((c) => colName(m, c)));
-    const activeIdx = getActiveModelIndex(m);
-    // 遍历顺序与原实现一致：叠加索引走索引顺序，否则按 m.objects 顺序单趟收集
-    let cols: Column[];
-    let children: Obj[];
-    let ownedSeqs: (colId: string) => Sequence[];
-    let effCols: Column[];
-    if (activeIdx instanceof OverlayModelIndex) {
-      cols = columnsOf(m, tableId);
-      ownedSeqs = (cid) => activeIdx.sequencesOwnedBy(cid);
-      effCols = [];
-      children = [];
-    } else {
-      children = [];
-      const ownedSeqsByCol = new Map<string, Sequence[]>();
-      for (const o of Object.values(m.objects)) {
-        if ('parent' in o && o.parent === tableId) children.push(o);
-        if (o.kind === 'sequence' && o.ownedBy) {
-          const list = ownedSeqsByCol.get(o.ownedBy);
-          if (list) list.push(o);
-          else ownedSeqsByCol.set(o.ownedBy, [o]);
-        }
-      }
-      cols = children
-        .filter((o): o is Column => o.kind === 'column')
-        .sort((a, b) => (a.pos < b.pos ? -1 : a.pos > b.pos ? 1 : a.id < b.id ? -1 : 1));
-      ownedSeqs = (cid) => ownedSeqsByCol.get(cid) ?? [];
-      effCols = t.partitionOf ? effectiveColumnsOf(m, tableId) : cols;
-    }
-    for (const c of cols) {
-      if (c.notNull && c.notNullNameMode === 'derived') {
-        c.notNullName = ctx.choose(
-          pgSpec(tableId, conProp, `${c.id}#nn`, c.notNullName, t.name, c.name, 'not_null'),
-        );
-        ctx.written(c);
-      }
-      if (c.identity?.sequenceNameMode === 'derived') {
-        c.identity.sequenceName = ctx.choose(
-          pgSpec(tableId, rel, `${c.id}#seq`, c.identity.sequenceName, t.name, c.name, 'seq'),
-        );
-        ctx.written(c);
-      }
-      for (const s of ownedSeqs(c.id)) {
-        if (s.nameMode === 'derived') {
-          s.name = ctx.choose(pgSpec(tableId, rel, s.id, s.name, t.name, c.name, 'seq'));
-          ctx.written(s);
-        }
-      }
-    }
-    if (activeIdx instanceof OverlayModelIndex) {
-      effCols = effectiveColumnsOf(m, tableId);
-      children = allChildrenOf(m, tableId);
-    }
-    const effColNames = effCols.map((c) => c.name);
-    for (const o of children) {
-      if (!('nameMode' in o) || o.nameMode !== 'derived') continue;
-      switch (o.kind) {
-        case 'primaryKey':
-          o.name = ctx.choose(pgSpec(tableId, relCon, o.id, o.name, t.name, null, 'pkey'));
-          break;
-        case 'unique':
-          o.name = ctx.choose(pgSpec(tableId, relCon, o.id, o.name, t.name, joinCols(o.columns), 'key'));
-          break;
-        case 'foreignKey':
-          o.name = ctx.choose(pgSpec(tableId, conProp, o.id, o.name, t.name, joinCols(o.columns), 'fkey'));
-          break;
-        case 'check': {
-          const ref = singleReferencedColumn('pg', exprRefNames('pg', o.expr, columnRefs), effColNames);
-          o.name = ctx.choose(pgSpec(tableId, conProp, o.id, o.name, t.name, ref, 'check'));
-          break;
-        }
-        case 'index':
-          o.name = ctx.choose(
-            pgSpec(tableId, rel, o.id, o.name, t.name, joinNames(indexElementNames(m, o)), 'idx'),
-          );
-          break;
-        default:
-          continue;
-      }
-      ctx.written(o);
-    }
-    const cache: PgNamingCache = { tName: t.name, rel, relCon, conProp, effColNames };
-    return cache;
-  },
-  slotSpec: (m, tableId, o, raw) => {
-    const c = raw as PgNamingCache;
-    const joinCols = (ids: string[]) => joinNames(ids.map((x) => colName(m, x)));
+  checkRefs: (expr) => exprRefNames('pg', expr, columnRefs),
+  slotsOf: (m, view, o, cache) => {
     switch (o.kind) {
-      case 'primaryKey':
-        return pgSpec(tableId, c.relCon, o.id, o.name, c.tName, null, 'pkey');
-      case 'unique':
-        return pgSpec(tableId, c.relCon, o.id, o.name, c.tName, joinCols(o.columns), 'key');
-      case 'foreignKey':
-        return pgSpec(tableId, c.conProp, o.id, o.name, c.tName, joinCols(o.columns), 'fkey');
-      case 'check': {
-        const ref = singleReferencedColumn('pg', exprRefNames('pg', o.expr, columnRefs), c.effColNames);
-        return pgSpec(tableId, c.conProp, o.id, o.name, c.tName, ref, 'check');
+      case 'column': {
+        const out: Slot[] = [];
+        const c = o;
+        if (!(c.notNull && c.notNullNameMode === 'derived') && c.identity?.sequenceNameMode !== 'derived')
+          return out;
+        const ctx = pgTableCtx(m, view, c.parent, cache);
+        if (!ctx) return out;
+        if (c.notNull && c.notNullNameMode === 'derived') {
+          out.push({
+            self: `${c.id}#nn`,
+            spec: pgSpec(c.parent, ctx.conProp, ctx.tName, c.name, 'not_null'),
+            cur: c.notNullName,
+            write: (n) => {
+              c.notNullName = n;
+            },
+          });
+        }
+        if (c.identity?.sequenceNameMode === 'derived') {
+          const ident = c.identity;
+          out.push({
+            self: `${c.id}#seq`,
+            spec: pgSpec(c.parent, ctx.rel, ctx.tName, c.name, 'seq'),
+            cur: ident.sequenceName,
+            write: (n) => {
+              ident.sequenceName = n ?? '';
+            },
+          });
+        }
+        return out;
       }
-      case 'index':
-        return pgSpec(tableId, c.rel, o.id, o.name, c.tName, joinNames(indexElementNames(m, o)), 'idx');
+      case 'sequence': {
+        if (o.nameMode !== 'derived' || !o.ownedBy) return [];
+        const col = Object.hasOwn(m.objects, o.ownedBy) ? m.objects[o.ownedBy] : undefined;
+        if (col?.kind !== 'column') return [];
+        const ctx = pgTableCtx(m, view, col.parent, cache);
+        if (!ctx) return [];
+        const s = o;
+        return [
+          {
+            self: s.id,
+            spec: pgSpec(col.parent, ctx.rel, ctx.tName, col.name, 'seq'),
+            cur: s.name,
+            write: (n) => {
+              s.name = n ?? '';
+            },
+          },
+        ];
+      }
+      case 'primaryKey':
+      case 'unique':
+      case 'foreignKey':
+      case 'check':
+      case 'index': {
+        if (o.nameMode !== 'derived') return [];
+        const ctx = pgTableCtx(m, view, o.parent, cache);
+        if (!ctx) return [];
+        let spec: NameSpec;
+        if (o.kind === 'primaryKey') {
+          spec = pgSpec(o.parent, ctx.relCon, ctx.tName, null, 'pkey');
+        } else if (o.kind === 'unique' || o.kind === 'foreignKey') {
+          const names: string[] = [];
+          for (const id of o.columns) {
+            const n = colNameOf(m, id);
+            if (n === undefined) return UNRESOLVED;
+            names.push(n);
+          }
+          spec =
+            o.kind === 'unique'
+              ? pgSpec(o.parent, ctx.relCon, ctx.tName, joinNames(names), 'key')
+              : pgSpec(o.parent, ctx.conProp, ctx.tName, joinNames(names), 'fkey');
+        } else if (o.kind === 'check') {
+          const ref = singleRefColumn(m, view, ctx.root, exprRefNames('pg', o.expr, columnRefs));
+          spec = pgSpec(o.parent, ctx.conProp, ctx.tName, ref, 'check');
+        } else {
+          for (const e of o.elements) if (e.column && colNameOf(m, e.column) === undefined) return UNRESOLVED;
+          for (const id of o.include) if (colNameOf(m, id) === undefined) return UNRESOLVED;
+          spec = pgSpec(o.parent, ctx.rel, ctx.tName, joinNames(indexElementNames(m, o)), 'idx');
+        }
+        const k = o;
+        return [
+          {
+            self: k.id,
+            spec,
+            cur: k.name,
+            write: (n) => {
+              k.name = n ?? '';
+            },
+          },
+        ];
+      }
       default:
-        return null;
+        return [];
     }
   },
 };
+registerDialectNaming(pgNaming);
 
 const refreshPgDerivedNames = (m: Model, tableId: string): void => {
   const idx = getActiveModelIndex(m);
-  runDerivedNames(m, tableId, pgNaming, idx instanceof OverlayModelIndex ? idx.nameTracker() : undefined);
+  const tr = idx instanceof OverlayModelIndex ? idx.nameTracker() : undefined;
+  if (tr) tr.refresh(m, tableId);
+  else plainRefresh(m, pgNaming, tableId);
 };
 
 const validatePgModel = (m: Model): string[] => {

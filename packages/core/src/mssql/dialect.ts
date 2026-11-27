@@ -1,28 +1,32 @@
 import {
+  colNamesOf,
   type DialectNaming,
   exprRefNames,
+  indexColsResolved,
+  keySlot,
   nameKey,
   type NameSpec,
-  runDerivedNames,
-  singleReferencedColumn,
+  registerDialectNaming,
+  singleRefColumn,
+  type Slot,
+  UNRESOLVED,
 } from '../derived-names.ts';
 // MSSQL（SQL Server 2019 / 2022 / 2025）方言规格实现（注册到 @dowel/core registry）。
 import type { DialectCapabilities, DialectSpec, IdentKind } from '../dialect.ts';
-import { emptyModel, type Model, type Obj } from '../ir.ts';
+import { type Column, emptyModel, type Model } from '../ir.ts';
 import {
   all,
-  allChildrenOf,
   childrenOf,
   childrenOfKinds,
   columnsOf,
-  find,
   get,
   getActiveModelIndex,
   indexElementNames,
   objectsOfKinds,
   OverlayModelIndex,
 } from '../model.ts';
-import { mssqlIdxNs, mssqlObjNs, nameEntriesOf } from '../naming-ns.ts';
+import { mssqlIdxNs, mssqlObjNs } from '../naming-ns.ts';
+import { plainRefresh } from '../naming-state.ts';
 import { formatMssqlScript } from './batch.ts';
 import { mssqlClipboard } from './clipboard.ts';
 import { isReservedMssqlSchema, MAX_MSSQL_IDENT, mssqlJoinNames, mssqlMakeObjectName } from './naming.ts';
@@ -122,128 +126,120 @@ const isMssqlIdxTaken = (m: Model, tableId: string, name: string, selfId: string
   });
 };
 
-interface MssqlNamingCache {
-  tName: string;
-  obj: string[];
-  objIdx: string[];
-  idx: string[];
-  colNames: string[];
-}
-
 const mssqlSpec = (
   tableId: string,
   ns: string[],
-  self: string,
-  cur: string | null | undefined,
   prefix: string,
   n1: string,
   n2: string | null,
 ): NameSpec => ({
-  table: tableId,
   key: nameKey(tableId, prefix, n1, n2, ns),
   cand: (j) => mssqlMakeObjectName(prefix, n1, n2, j === 0 ? null : String(j)),
   norm: (n) => n.toLowerCase(),
   ns,
-  self,
-  cur,
 });
 
-/** 约束避让 schema 级 sys.objects（PK / UQ 还要避让表级 sys.indexes），索引只避让 sys.indexes */
-const mssqlSlotSpec = (m: Model, tableId: string, o: Obj, c: MssqlNamingCache): NameSpec | null => {
-  const joinCols = (ids: string[]) => mssqlJoinNames(ids.map((x) => get(m, x, 'column').name));
-  switch (o.kind) {
-    case 'primaryKey':
-      return mssqlSpec(tableId, c.objIdx, o.id, o.name, 'PK', c.tName, null);
-    case 'unique':
-      return mssqlSpec(tableId, c.objIdx, o.id, o.name, 'UQ', c.tName, joinCols(o.columns));
-    case 'foreignKey':
-      return mssqlSpec(tableId, c.obj, o.id, o.name, 'FK', c.tName, joinCols(o.columns));
-    case 'check': {
-      const ref = singleReferencedColumn('mssql', exprRefNames('mssql', o.expr, mssqlColumnRefs), c.colNames);
-      return mssqlSpec(tableId, c.obj, o.id, o.name, 'CK', c.tName, ref);
-    }
-    case 'index':
-      return mssqlSpec(tableId, c.idx, o.id, o.name, 'IX', c.tName, mssqlJoinNames(indexElementNames(m, o)));
-    default:
-      return null;
+/** 列上的带名 DEFAULT 约束推导名（DF_<table>_<col>）：有默认值且推导时为槽位，没有默认值时清理遗留的推导名 */
+const mssqlColumnSlots = (m: Model, c: Column): Slot[] => {
+  const ms = c.ext?.mssql;
+  if (!c.default) {
+    if (ms?.defaultNameMode !== 'derived' || ms.defaultName === undefined) return [];
+    return [
+      {
+        self: `${c.id}#df`,
+        spec: null,
+        cur: ms.defaultName,
+        write: () => {
+          const mm = c.ext?.mssql;
+          if (!mm) return;
+          delete mm.defaultName;
+          delete mm.defaultNameMode;
+          if (Object.keys(mm).length === 0) {
+            delete c.ext!.mssql;
+            if (Object.keys(c.ext!).length === 0) delete c.ext;
+          }
+        },
+      },
+    ];
   }
+  if ((ms?.defaultNameMode ?? 'derived') !== 'derived') return [];
+  const t = Object.hasOwn(m.objects, c.parent) ? m.objects[c.parent] : undefined;
+  if (t?.kind !== 'table') return [];
+  const setName = (n: string) => {
+    c.ext = { ...c.ext, mssql: { ...c.ext?.mssql, defaultName: n, defaultNameMode: 'derived' } };
+  };
+  const cur = ms?.defaultName;
+  return [
+    {
+      self: `${c.id}#df`,
+      spec: mssqlSpec(c.parent, [mssqlObjNs(t.parent)], 'DF', t.name, c.name),
+      cur,
+      write: (n) => setName(n ?? ''),
+      // 尚未写进 ext 的名字只按 DF_<table>_<col> 隐式占用命名空间（与 nameEntriesOf 一致），按新对象取名
+      ...(cur === undefined
+        ? { implicit: true }
+        : ms?.defaultNameMode === undefined
+          ? { fix: () => setName(cur) }
+          : {}),
+    },
+  ];
 };
 
-/** 重新计算一张表上所有推导名（包括带名 DEFAULT 约束 DF_<table>_<col>、PK、UQ、FK、CK、IX） */
+/** 约束避让 schema 级 sys.objects（PK / UQ 还要避让表级 sys.indexes），索引只避让 sys.indexes */
 const mssqlNaming: DialectNaming = {
   dialect: 'mssql',
-  wantNs: (m, tableId) => {
-    const obj = mssqlObjNs(schemaOfTable(m, tableId));
-    const idx = mssqlIdxNs(tableId);
-    return (ns) => ns === obj || ns === idx;
-  },
-  entriesOf: (m) => (o, out) =>
-    nameEntriesOf(
-      'mssql',
-      o,
-      (id) => {
-        const t = find(m, id);
-        return t?.kind === 'table' ? t : undefined;
-      },
-      out,
-    ),
-  fullPass: (m, tableId, ctx) => {
-    const t = get(m, tableId, 'table');
+  checkRefs: (expr) => exprRefNames('mssql', expr, mssqlColumnRefs),
+  slotsOf: (m, view, o) => {
+    if (o.kind === 'column') return mssqlColumnSlots(m, o);
+    if (
+      !(
+        o.kind === 'primaryKey' ||
+        o.kind === 'unique' ||
+        o.kind === 'foreignKey' ||
+        o.kind === 'check' ||
+        o.kind === 'index'
+      ) ||
+      o.nameMode !== 'derived'
+    )
+      return [];
+    const t = Object.hasOwn(m.objects, o.parent) ? m.objects[o.parent] : undefined;
+    if (t?.kind !== 'table') return [];
     const obj = [mssqlObjNs(t.parent)];
-    const idx = [mssqlIdxNs(tableId)];
-    const tableCols = columnsOf(m, tableId);
-    const cache: MssqlNamingCache = {
-      tName: t.name,
-      obj,
-      objIdx: [...obj, ...idx],
-      idx,
-      colNames: tableCols.map((c) => c.name),
-    };
-
-    // 同步列上的带名 DEFAULT 约束推导名
-    for (const c of tableCols) {
-      if (c.default) {
-        const mode = c.ext?.mssql?.defaultNameMode ?? 'derived';
-        if (mode === 'derived') {
-          const dfName = ctx.choose(
-            mssqlSpec(tableId, obj, `${c.id}#df`, c.ext?.mssql?.defaultName, 'DF', t.name, c.name),
-          );
-          c.ext = {
-            ...c.ext,
-            mssql: {
-              ...c.ext?.mssql,
-              defaultName: dfName,
-              defaultNameMode: 'derived',
-            },
-          };
-          ctx.written(c);
-        }
-      } else if (c.ext?.mssql?.defaultNameMode === 'derived' && c.ext.mssql.defaultName !== undefined) {
-        delete c.ext.mssql.defaultName;
-        delete c.ext.mssql.defaultNameMode;
-        if (Object.keys(c.ext.mssql).length === 0) {
-          delete c.ext.mssql;
-          if (Object.keys(c.ext).length === 0) delete c.ext;
-        }
-        ctx.written(c);
+    const idx = [mssqlIdxNs(o.parent)];
+    switch (o.kind) {
+      case 'primaryKey':
+        return [keySlot(o, mssqlSpec(o.parent, [...obj, ...idx], 'PK', t.name, null))];
+      case 'unique':
+      case 'foreignKey': {
+        const names = colNamesOf(m, o.columns);
+        if (!names) return UNRESOLVED;
+        return [
+          keySlot(
+            o,
+            o.kind === 'unique'
+              ? mssqlSpec(o.parent, [...obj, ...idx], 'UQ', t.name, mssqlJoinNames(names))
+              : mssqlSpec(o.parent, obj, 'FK', t.name, mssqlJoinNames(names)),
+          ),
+        ];
       }
+      case 'check': {
+        const ref = singleRefColumn(m, view, o.parent, exprRefNames('mssql', o.expr, mssqlColumnRefs));
+        return [keySlot(o, mssqlSpec(o.parent, obj, 'CK', t.name, ref))];
+      }
+      case 'index':
+        if (!indexColsResolved(m, o)) return UNRESOLVED;
+        return [keySlot(o, mssqlSpec(o.parent, idx, 'IX', t.name, mssqlJoinNames(indexElementNames(m, o))))];
     }
-
-    for (const o of allChildrenOf(m, tableId)) {
-      if (!('nameMode' in o) || o.nameMode !== 'derived') continue;
-      const spec = mssqlSlotSpec(m, tableId, o, cache);
-      if (!spec) continue;
-      o.name = ctx.choose(spec);
-      ctx.written(o);
-    }
-    return cache;
   },
-  slotSpec: (m, tableId, o, cache) => mssqlSlotSpec(m, tableId, o, cache as MssqlNamingCache),
 };
+registerDialectNaming(mssqlNaming);
 
+/** 推导名：带名 DEFAULT 约束 DF_<table>_<col>、PK、UQ、FK、CK、IX（稳定推导名，见 derived-names.ts） */
 const refreshMssqlDerivedNames = (m: Model, tableId: string): void => {
   const idx = getActiveModelIndex(m);
-  runDerivedNames(m, tableId, mssqlNaming, idx instanceof OverlayModelIndex ? idx.nameTracker() : undefined);
+  const tr = idx instanceof OverlayModelIndex ? idx.nameTracker() : undefined;
+  if (tr) tr.refresh(m, tableId);
+  else plainRefresh(m, mssqlNaming, tableId);
 };
 
 const validateMssqlIdent = (name: string, kind: IdentKind): string | null => {

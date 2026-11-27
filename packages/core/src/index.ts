@@ -1,6 +1,14 @@
 export * from './clipboard.ts';
 export * from './dialect.ts';
-export { type DerivedNameStats, derivedNameStats, resetDerivedNameStats } from './derived-names.ts';
+export {
+  DERIVED_NAME_WORK_BUDGET,
+  DerivedNameBudget,
+  DerivedNameBudgetError,
+  type DerivedNameStats,
+  derivedNameStats,
+  resetDerivedNameStats,
+  withDerivedNameBudget,
+} from './derived-names.ts';
 export * from './diagnostics.ts';
 export * from './edit.ts';
 export * from './empty.ts';

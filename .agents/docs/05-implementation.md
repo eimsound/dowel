@@ -758,13 +758,30 @@ P3 审查后的修正（2026-11-19）：
 - **移除独立入口**：删除环境页“写入基线”按钮（`Environments.tsx`）、`ExecDialog` 的 `'baseline'` 类型与独立分支、服务端 `POST /api/projects/:pid/environments/:eid/baseline` 路由、权限与审计动作 `environment.baseline`、`baselineRequestSchema` / `BaselineRequest`、执行器 `mode: 'migrate' | 'baseline'`（`to` 改为必填）与 `baseline_not_applicable` 错误码，以及 `dryRunPlanSchema.mode`。
 - **仅在实际执行迁移时写入基线**：保留 `classifyFirstRun`、`writeBaseline` 与历史记录 `direction = 'baseline'`，用于目标库尚无历史、结构匹配首版本（如 `v0`）且存在后续迁移要执行（`v1+`）时自动写入基线；空库直接执行 `v0` 仍正常执行 `v0` 建库脚本。当目标库尚无历史、结构已匹配首版本且目标版本就是首版本（0 条业务迁移）时，以新错误码 `mark_required`（回滚方向报 `wrong_direction`）拒绝，引导用户改用「标记为已执行」或等待发布新版本时自动建立基线。
 
-### 4.32 核心层推导名增量化与命名空间分桶索引（2026-11-28，#164，PR #187）
+### 4.32 核心层推导名稳定化与增量化（2026-11-28，#164，PR #187）
 
-- **列引用单趟分词与缓存（`packages/core/src/derived-names.ts`）**：`exprRefNames` 对每个表达式只调用一次方言 `columnRefs` 并按方言规则归一化（PG 原样，其余方言转小写），配合 `singleReferencedColumn` / `refsHaveName` 与表内有效列名求交，取代对每列逐次分词；按 `${dialect}\0${expr}` 做 LRU 缓存并以加权成本预算（`REF_CACHE_MAX_COST` = 8,000,000，含每条 128 固定开销 + 键长 + 提取列名估算）淘汰，避免固定条数上限在 > 4096 条 CHECK 的大表上每趟全量失效。同步覆盖推导名刷新、`readsOf`（`mutators.ts`）、`planPaste` 的 `singleCheckRef`（`clipboard.ts`）与 PG 分区键列检查（`pg/partition.ts`）。
-- **命名空间分桶与 O(1) 判重（`packages/core/src/naming-ns.ts`、`model-index.ts`）**：`nameEntriesOf` 将四种方言的名字占用判定统一拆为 `(ns, name, owner)` 条目（PG `r`/`t`/`a`/`p`、MySQL `mc`/`mr`/`mi`、SQLite `sr`/`sc`、MSSQL `mo`/`mx`）。`MutableModelIndex` 惰性建桶并随 `applyObjectChange` / `applyBatch` 增量维护 `nsOwners`（PG / MSSQL 父表换 schema 或 MSSQL 表改名改变子对象条目时整表清空下次重建），支撑 O(1) 的 `isPgRelTaken` / `isPgTypeTaken` / `isPgConTaken`（含分区祖先继承与后代全部约束）。
-- **后缀游标与快路径认证（`packages/core/src/derived-names.ts`）**：`NameRegistry` 为每个 `(table, label, n1, n2, ns)` 序列维护游标 `L`（不变式：`< L` 的候选均被占用）；`choose()` 若当前名已在 `L` 之前且未被他人占用则直接保留，否则从 `L` 起试探；腾出名字时 `noteFreed()` 降低游标 `L`，若序列内仍有更大后缀成员则触发 `onHarm(table)` 取消认证；命名空间出现多占用者时 `noteDup()` 触发 `onHarm(table)`。`trackedFullPass` 在整趟并 `flush()` 后验证每个 `records` 项在最终状态下复选仍得同一序号才置 `certified = true`（保证是全局不动点）；`tryFastPath` 要求 `certified && !global` 且本表至多有 1 个推导名 `SLOT_KINDS` 对象脏且 `!freeingHarms(tableId, oldNorm, self)`（换名不会导致同序列更大后缀成员压缩），否则回退 `trackedFullPass`。无跟踪路径（普通模型、`broken` 或未跟踪索引）走 `plainPass` + `ScanNsView`（一趟前扫描一次，写回经 `written()` 增量同步）。
-- **写入跟踪器生命周期与失效点（`packages/core/src/name-tracker.ts`、`packages/sync/src/protocol.ts`）**：`OverlayModelIndex.trackWrites()` 在 `execute()` 的空叠加层上启用 `OverlayNameTracker`，仅在当次 `execute` 代理内存活；提交经 `applyBatch` 进基线，抛错回滚直接丢弃，快照加载 / 历史恢复沿用既有置空索引并重建。`flush()` 分两阶段惰性折叠脏对象：第一阶段更新 `ov` 与叠加层子分区 `ovChildren`（基线对象的旧快照通过 `baseTableOf` 与 `this.base.getObj` 按基线解析父表及序列归属列，保证同批先删父表时仍能触发跨表腾出事件），第二阶段统一判重 / 腾出并标脏或 `markGlobal` / `markFamily`（本趟内通过 `inPass` 抑制自标脏）。遇到 `nsDependsOnTable` 变化（PG 表换 schema，或 MSSQL 表换 schema / 改名）调用 `goBroken()` 清空跟踪器并退回扫描判定。
-- **辅助优化与验证**：PG `makeObjectName` / `clip` / `len`（`pg/naming.ts`）对可打印 ASCII 走字符计数快路径；`packages/core/test/naming-index.test.ts` 覆盖索引增量维护与失效点，`packages/sync/test/derived-names.test.ts` 对照 `packages/core/test/support/legacy-derived-names.ts`（`main` 原样拷贝）跑四方言逐字节差分与确定性计数守卫。
+- **语义：稳定推导名，不再级联压缩（`packages/core/src/derived-names.ts`）**：推导名只在对象自身的命名输入变化（表名、引用列名、标签、所在命名空间）、与其他对象撞名或显式 `resetKeyName` 时重算；同表其他对象保留原名；需要重算的对象取命名序列（`<base>`、`<base>1`、`<base>2`…，各方言后缀格式不同）里最小的空位。例如 c1 = `orders_check`、c2 = `orders_check1`：删掉 c1 后 c2 不变，新加的 c3 取 `orders_check`；删掉 c1 再改表名，c2 变成 `invoices_check`。之前的语义是每次刷新都把同序列成员压缩成 0..k-1：一次删除或改名可能连带改掉整张表（PG 还包括整个分区家族）的约束名，因此每步都要整表重算，大表上不可能做到增量。稳定语义下，“保留”只需检查“当前名在自己的序列里，且命名空间里没有其他占用者”，重算范围就缩小到真正变化的对象。槽位保留的条件是 `candIndex(spec, cur) >= 0 && !takenByOther`，其余的为待重算。处理待重算槽位时，先全部释放旧名（互不阻挡），再按（旧名长度、旧名、占用者 ID）的确定顺序依次取最小空位，结果与遍历顺序无关。MSSQL 新列的 DEFAULT 名尚未写进 ext 时，只在命名空间里按 `DF_<table>_<col>` 隐式占位（`Slot.implicit`）：这类槽位按新对象处理，并在校验其他槽位之前先释放，避免截断到 128 字符后与已有名字相同、把已有对象挤走。刷新按表进行（`refreshDerivedNames(m, tableId)`），与 `main` 的分表行为一致。
+- **命名序列：最小堆空位 + 高水位（`SeqRegistry` / `SeqState`）**：每个 `(table, label, n1, n2, ns)` 序列维护高水位 `H` 和一个空位最小堆，保证不变式：`< H` 的序号要么已被占用，要么在堆里（堆里的过期项在弹出时惰性校验）。`choose()` 先弹出堆里 `< H` 的空位，否则从 `H` 开始试探；`noteFreed()` 把腾出的 `< H` 序号推回堆里。基线构建阶段用 `warm` 推进 `H`，不计入预算。条目数超过 max(4096, 2 × 存活序列数) 时 `sweep` 回收。execute 内取用的序号记入 `consumed` 日志，跟踪器 `finish()` 时把基线里仍空着的序号推回堆里，因此失败回滚的 execute 不会吞掉空位。
+- **列标识符倒排索引（`packages/core/src/naming-state.ts` 的 `RefIndex`）**：`refs` 记录“标识符 → 引用它的 CHECK”（由 `exprRefNames` 单趟分词得到，沿用按成本淘汰的 LRU 缓存：`REF_CACHE_MAX_COST`，以及 `exprLexes` 计数守卫）；`cols` 记录“列 → 引用它的 UNIQUE / FK / 索引”。列创建、删除、改名或换表时，只标脏 `colUsers(id)`，以及通过 `refHits(norm(name))` 找到的同家族 CHECK，不再整表扫描。CHECK 是否“恰好引用一列”由列名命名空间 `colNs(table)` 在 O(|refs|) 内判定。
+- **基线持久化的命名状态（`BaseNamingState`，挂在 `MutableModelIndex` 上）**：包括命名空间占用者（ns → name → owner → root）、每个对象的快照（已登记条目、refs、cols）、`RefIndex`、按表分组的脏集合 `DirtyByTable` 和 `SeqRegistry`。首次使用时由 `ensureNaming()` 构建：对全部槽位做一次只读校验，失败的留作脏，同时预热高水位。之后由 `applyObjectChange` / `applyBatch` 的 `beforeBatch` / `afterBatch` 增量维护：注销旧条目并登记新条目，PG / MSSQL 表换 schema 或 MSSQL 表改名（`tableEntriesMoved`）时重新登记子对象，处理腾出和撞名事件，按 `markChange` 规则标脏，最后对脏对象做只读校验。`markChange` 规则：
+  - 槽位对象和序列：标脏自己。
+  - 列：标脏自己及其拥有的序列；列名或所属表变化（含创建、删除）时，再标脏 `colUsers` 和 `refHits` 命中的 CHECK。
+  - 表：指纹变化时整表标脏；`partitionParent` 变化时，对本表、旧父表、新父表调用 `markFamily`。
+  - 撞名：标脏全部占用者所属的根对象。
+
+  execute 期间由 `OverlayNameTracker` 在叠加层上记增量：屏蔽有快照对象的基线条目，再叠加 `ov` 占用者、`ovRefs`、`ovKids`、`ovParts`、`ovSeqs`；`flush` 分两阶段惰性执行，`inPass` 抑制本趟自标脏。提交后状态随基线前进，因此 MCP `apply_changes` 500 步预演共用同一个 `batchIndex`，只构建一次基线命名状态（`stateBuilds === 1`）。没有索引的普通模型走 `plainRefresh` + `ScanView`，处理该表全部槽位。差分测试保证两条路径逐字节一致。
+
+- **`batchReadsOf` 走索引（`packages/core/src/mutators.ts`、`packages/sync/src/protocol.ts`）**：`batchReadsOf(m, args, step?)` 接受 `BatchStepper`。`opReads` 遇到 `batch` 时传入 `indexedBatchStepper(base)`：用一个 `MutableModelIndex` 加 `execute` + `applyBatch` 逐步推进，大表上推导名工作量与表大小无关。
+- **确定性工作量预算熔断**：`DERIVED_NAME_WORK_BUDGET` = 200,000，客户端和服务端共用，不设单表约束数上限。只在跟踪路径计费：每次槽位校验、`choose` 的每次试探、每次标脏、每次子对象重快照记 1。一次 `execute`（WS 操作、粘贴、`batch`、客户端乐观执行）用一份预算；MCP `apply_changes` 整个预演共用一份（`mcp.ts` 的 `previewBudget`，经 `ExecuteOptions.budget` 传入）。超出时抛 `DerivedNameBudgetError extends EditError`（消息含“推导名重算工作量超出上限”），沿用现有写时复制回滚与 `invalid` 拒绝，模型和基线索引都不受影响。标定数据（开发机，`node --conditions=@dowel/source`）：
+  - PG 1 万条 CHECK 的大表上，单次 `addCheck` 约 3 ms（2 次校验）。
+  - 交错的逐步 execute 每步约 1 次校验、2–4 次试探、1.25–2 次标脏；正常粘贴每个子操作消耗常数预算，按 2 万个子操作折算仍低于预算的一半。
+  - `batch` 里反复改这张大表的表名或列名（每次都要重算全部 CHECK）约 1.05–1.1 s 时触发熔断；其余方言 4000 条 CHECK 时约 0.9 s 触发。
+- **剩余的非推导名开销（不在本 PR 范围）**：MCP 500 步预演约 1.56 s，其中纯 500 × `setComment` 已占约 1.37 s，推导名只占约 80 ms；粘贴 1 万条 CHECK 约 4.1–4.7 s，推导名不到 2%。剩余开销主要来自 `execute` 的 `{...m.objects}` 拷贝，以及 `OverlayModelIndex.columnsOf` / `childrenRef` / `effectiveColumnsOf` 的叠加层扫描（#165）。
+- **验证**：
+  - `packages/sync/test/derived-names.test.ts` 对四方言跑随机修改序列，比较普通模型、逐个 execute（共享索引）、无索引 execute、整批 `batch` / paste（含先提交前缀进基线）的结果，要求逐字节一致；每步检查不变式：未受影响对象名字不变、推导名有效、不撞名、重算者取最小空位。
+  - 同一文件还有：回归用例；确定性计数守卫（大表单步、交错 addColumn / addCheck、交错 renameKey / dropKey / addCheck、MCP 500 步、`batchReadsOf`、分词缓存）；预算熔断与原子回滚；失败 execute 不吞空位；提交级写入后的标脏覆盖（倒排索引、撞名顺序、分区拓扑）。
+  - `packages/core/test/naming-index.test.ts` 把增量维护的命名空间、倒排索引和脏集合与全新构建对比。
+  - 原先作为对照的 `packages/core/test/support/legacy-derived-names.ts` 已删除，因为语义已经改变；`packages/core` 原有测试无一依赖级联压缩，全部未改动通过。
 
 ## 5. 下一步
 
