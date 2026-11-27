@@ -338,6 +338,7 @@ All errors use a unified JSON envelope:
 | Error code (`code`)        | HTTP status | Meaning and common causes                                                                                                  |
 | -------------------------- | ----------- | -------------------------------------------------------------------------------------------------------------------------- |
 | `invalid_request`          | `400`       | Invalid JSON body or out-of-range `to`, `dryRun`, or `lockTimeoutSeconds`                                                  |
+| `payload_too_large`        | `413`       | Request body exceeds the 16 MiB limit and is rejected before parsing                                                       |
 | `token_missing`            | `401`       | Missing `Authorization` header                                                                                             |
 | `token_invalid`            | `401`       | Malformed token, missing `dwl_` prefix, or unknown token                                                                   |
 | `token_expired`            | `401`       | Token passed its expiration timestamp                                                                                      |

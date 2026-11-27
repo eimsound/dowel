@@ -73,6 +73,20 @@ pnpm check        # 依次执行 pnpm lint（Oxlint --type-aware --deny-warnings
 
 > 限流参数补充说明：上述 14 项限流配置（`DOWEL_*_LIMIT` 与 `DOWEL_*_WINDOW_MS`）仅接受不超过 `2147483647` 的正整数，非法值或超上限时自动回退默认值；所有限流器均为**单副本进程内内存计数**，在多副本 HA 部署下实际全集群总配额约为设定值 × 副本数。
 
+## 单条消息大小上限 {#message-size-limits}
+
+服务端对每条入站请求 / 消息设有固定上限，超限的在读完、解析之前就被拒绝，不会进入业务处理（不提供环境变量调整）：
+
+| 入口                                                    | 上限                 | 超限时                                                                                                                                                               |
+| ------------------------------------------------------- | -------------------- | -------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| HTTP 接口请求体（`/api/mcp` 之外）                      | 16 MiB（UTF-8 字节） | `413`，响应体 `{ "error": "请求体太大：超过 16 MiB 上限", "code": "payload_too_large" }`；CI 接口（`/api/ci/…`）为 `{ "ok": false, "code": "payload_too_large", … }` |
+| 协作画布 WebSocket（`/api/projects/:pid/sync`）单条消息 | 16 MiB（UTF-8 字节） | 服务端以关闭码 `1009` 断开连接；网页端在发出前就会自查，超限的修改不提交并提示“请分批操作”                                                                           |
+| MCP（`POST /api/mcp`）请求体                            | 1 MiB                | `413` 与 JSON-RPC 错误体                                                                                                                                             |
+
+另外，画布修改里单个文本字段（列类型、CHECK / 生成列表达式、分区边界、注释、排序规则等）最多 100 万个字符。
+
+这些数值按现有的最大合法操作留足了余量：导入 SQL 与新建项目向导的 SQL 最多 500 万字符（JSON 编码后最多约 15 MB）；一次粘贴受剪贴板 4 MB 与 20000 个子操作的限制，实测粘贴 200 张表 × 12 列（带中文注释）约 1.4 MiB、接近上限的 680 张表约 4.9 MiB。服务端发给浏览器的消息（如打开项目时的整份模型快照）不受这些上限约束。
+
 ## 多副本高可用部署（HA） {#ha}
 
 将 `DOWEL_DB` 设为外部 PostgreSQL 连接串（`postgres://…`），且所有副本配置相同的 `DOWEL_SECRET` 时，可直接启动多个对等 Dowel 副本实现无状态多活，**无需引入 Redis**：
@@ -92,10 +106,11 @@ pnpm check        # 依次执行 pnpm lint（Oxlint --type-aware --deny-warnings
 
 ## 反向代理配置 {#reverse-proxy}
 
-当 Dowel 运行在 Nginx、Caddy、Traefik 或云负载均衡之后时，需满足以下两项配置：
+当 Dowel 运行在 Nginx、Caddy、Traefik 或云负载均衡之后时，需满足以下三项配置：
 
 1. **环境变量**：同时设置 `DOWEL_TRUST_PROXY=1` 与 `DOWEL_PUBLIC_URL=https://你的对外域名`。启用后服务端从 `X-Forwarded-For`（取最后一个由可信代理追加的地址）获取客户端 IP，并使用 `DOWEL_PUBLIC_URL` 统一校验 CSRF `Origin` 和生成 OIDC 回调地址。
 2. **WebSocket 与 SSE 转发**：代理需正确传递 `Upgrade`、`Connection` 头并配置长连接超时，同时关闭 SSE 响应缓冲以配合服务端返回的 `X-Accel-Buffering: no`，确保协作画布 WebSocket（`/api/projects/:pid/sync`）与收件箱实时 SSE（`/api/me/inbox/stream`）不被提前中断或缓冲延迟；若需要服务端感知真实请求来源，传递 `X-Forwarded-Proto`、`X-Forwarded-Host` 与 `X-Forwarded-For`。
+3. **请求体大小**：代理自身的请求体上限要不小于 Dowel 的 16 MiB（见 [单条消息大小上限](#message-size-limits)），否则大的 SQL 导入会先被代理拦下。例如 Nginx 默认 `client_max_body_size 1m`，建议设为 `client_max_body_size 17m;`，让超限请求由 Dowel 返回结构化的 `413`。
 
 ## 数据库连接安全边界 {#connection-security}
 

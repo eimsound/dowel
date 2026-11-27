@@ -73,6 +73,20 @@ During `pnpm dev` and `pnpm test`, internal workspace packages resolve TypeScrip
 
 > The 14 rate-limit variables (`DOWEL_*_LIMIT` and `DOWEL_*_WINDOW_MS`) accept positive integers up to `2147483647`. Invalid values fall back to defaults. Rate limiters store counters in process memory per replica, so cluster-wide capacity in multi-replica HA deployments is approximately the configured limit multiplied by the number of replicas.
 
+## Message size limits {#message-size-limits}
+
+The server enforces fixed per-request / per-message limits. Oversized input is rejected before it is fully read or parsed and never reaches business logic (there are no environment variables to change them):
+
+| Entry point                                                      | Limit                | When exceeded                                                                                                                                                |
+| ---------------------------------------------------------------- | -------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------ |
+| HTTP request bodies (everything except `/api/mcp`)               | 16 MiB (UTF-8 bytes) | `413` with `{ "error": "…", "code": "payload_too_large" }`; CI endpoints (`/api/ci/...`) return `{ "ok": false, "code": "payload_too_large", … }`            |
+| Collaboration WebSocket (`/api/projects/:pid/sync`), per message | 16 MiB (UTF-8 bytes) | The server closes the connection with code `1009`. The web app checks before sending, so an oversized edit is not submitted and you are asked to split it up |
+| MCP request bodies (`POST /api/mcp`)                             | 1 MiB                | `413` with a JSON-RPC error body                                                                                                                             |
+
+In addition, each free-text field in a canvas edit (column type, CHECK / generated-column expression, partition bound, comment, collation, and so on) is limited to 1,000,000 characters.
+
+The values leave ample headroom over the largest legitimate operations: SQL import and the new-project wizard accept up to 5,000,000 characters of SQL (at most about 15 MB once JSON-encoded); a paste is bounded by the 4 MB clipboard limit and 20,000 sub-operations, and measured pastes of 200 tables × 12 columns with Chinese comments are about 1.4 MiB, while 680 tables near the paste limit are about 4.9 MiB. Messages the server sends to the browser (such as the full model snapshot when a project opens) are not subject to these limits.
+
 ## Multi-replica high availability {#ha}
 
 Set `DOWEL_DB` to an external `postgres://` connection string and configure the same `DOWEL_SECRET` on every replica to run multiple stateless Dowel instances in active-active mode without Redis.
@@ -92,10 +106,11 @@ Set `DOWEL_DB` to an external `postgres://` connection string and configure the 
 
 ## Reverse proxy configuration {#reverse-proxy}
 
-When running Dowel behind Nginx, Caddy, Traefik, or a cloud load balancer, configure both of the following items:
+When running Dowel behind Nginx, Caddy, Traefik, or a cloud load balancer, configure the following three items:
 
 1. **Environment variables.** Set `DOWEL_TRUST_PROXY=1` and `DOWEL_PUBLIC_URL=https://your-domain.example`. The server reads the client IP from the last address in `X-Forwarded-For` and uses `DOWEL_PUBLIC_URL` for CSRF Origin checks and OIDC callback URLs.
 2. **WebSocket and SSE forwarding.** Configure your proxy to pass `Upgrade` and `Connection` headers with long connection timeouts, and disable response buffering for SSE alongside the server `X-Accel-Buffering: no` header. This keeps the collaboration WebSocket at `/api/projects/:pid/sync` and the inbox SSE stream at `/api/me/inbox/stream` responsive. Forward `X-Forwarded-Proto`, `X-Forwarded-Host`, and `X-Forwarded-For` when the server must inspect the public request origin.
+3. **Request body size.** The proxy's own body limit must be at least Dowel's 16 MiB (see [Message size limits](#message-size-limits)), or large SQL imports are blocked by the proxy first. Nginx defaults to `client_max_body_size 1m`; set `client_max_body_size 17m;` so that oversized requests receive Dowel's structured `413`.
 
 ## Database connection security boundaries {#connection-security}
 
