@@ -19,6 +19,7 @@ const PID = 'p-stale';
 const EID = 'e-stale';
 const URL_1 = 'postgres://u:p@db-1.invalid:5432/app';
 const URL_2 = 'postgres://u:p@db-2.invalid:5432/app';
+const URL_3 = 'postgres://u:p@db-3.invalid:5432/app';
 
 interface FakeShadow extends Shadow {
   url: string;
@@ -26,6 +27,15 @@ interface FakeShadow extends Shadow {
 }
 
 const built: FakeShadow[] = [];
+let beforePrepare: (() => Promise<void> | void) | undefined;
+
+const deferred = <T = void>() => {
+  let resolve!: (value: T | PromiseLike<T>) => void;
+  const promise = new Promise<T>((res) => {
+    resolve = res;
+  });
+  return { promise, resolve };
+};
 
 /** 假总线：事件只在测试调用 deliver 时送达，并等处理器跑完 */
 const fakeBus = () => {
@@ -56,6 +66,7 @@ beforeAll(() => {
   registerTargetDriver({
     ...pgTargetDriver,
     prepareShadow: async (env) => {
+      await beforePrepare?.();
       const shadow = {
         url: env!.shadowUrl ?? env!.url,
         importSql: async () => {
@@ -89,6 +100,7 @@ describe('Shadows：跨副本 shadows.forget 晚到时按最新配置复核缓�
 
   beforeEach(async () => {
     built.length = 0;
+    beforePrepare = undefined;
     db = await openPlatformDb(':memory:');
     await db.query("insert into groups (id, slug, name) values ('g-stale', 'g-stale', '组')");
     await db.query(
@@ -106,6 +118,7 @@ describe('Shadows：跨副本 shadows.forget 晚到时按最新配置复核缓�
   });
 
   afterEach(async () => {
+    beforePrepare = undefined;
     await shadows.close();
     await db.close();
   });
@@ -113,6 +126,30 @@ describe('Shadows：跨副本 shadows.forget 晚到时按最新配置复核缓�
   /** 模拟副本 A 改连接串（A 的路由随后会广播 shadows.forget，送达时间由测试决定） */
   const changeUrl = (url: string) =>
     db.query('update environments set url_enc = $2 where id = $1', [EID, encrypt(url)]);
+
+  /** 挂起下一次读环境配置的 SQL（revalidateLocal 查库），返回进入信号、放行函数与恢复 spy 函数 */
+  const holdNextEnvQuery = () => {
+    const entered = deferred();
+    const gate = deferred();
+    const origQuery = db.query.bind(db);
+    let intercepted = false;
+    const spy = vi.spyOn(db, 'query').mockImplementation((async (sql: string, params?: unknown[]) => {
+      if (!intercepted && sql.includes('from environments e join projects p')) {
+        intercepted = true;
+        entered.resolve();
+        await gate.promise;
+      }
+      return origQuery(sql, params);
+    }) as typeof db.query);
+    return {
+      entered: entered.promise,
+      release: () => gate.resolve(),
+      restore: () => {
+        gate.resolve();
+        spy.mockRestore();
+      },
+    };
+  };
 
   test('B 已按新配置重建缓存后，晚到的 envIds 事件不关闭新条目；旧条目照样只关一次', async () => {
     const s1 = (await shadows.forProject(PID, EID)).shadow as FakeShadow;
@@ -200,5 +237,91 @@ describe('Shadows：跨副本 shadows.forget 晚到时按最新配置复核缓�
 
     expect(s1.close).toHaveBeenCalledTimes(1);
     expect(shadows.size).toBe(0);
+  });
+
+  test('prepareShadow 期间缓存为空时收到远端 shadows.forget：关闭旧配置句柄并按最新配置重建', async () => {
+    const entered = deferred();
+    const gate = deferred();
+    beforePrepare = async () => {
+      beforePrepare = undefined;
+      entered.resolve();
+      await gate.promise;
+    };
+
+    try {
+      const pending = shadows.forProject(PID, EID);
+      await entered.promise;
+      expect(shadows.has(EID)).toBe(false);
+
+      await changeUrl(URL_2);
+      await deliver({ t: 'shadows.forget', envIds: [EID] });
+
+      gate.resolve();
+      const res = await pending;
+
+      expect(built).toHaveLength(2);
+      const [s1, s2] = built;
+      expect(s1!.url).toBe(URL_1);
+      expect(s1!.close).toHaveBeenCalledTimes(1);
+      expect(res.shadow).toBe(s2);
+      expect(s2!.url).toBe(URL_2);
+      expect(s2!.close).not.toHaveBeenCalled();
+      expect(shadows.has(EID)).toBe(true);
+      expect((await shadows.forProject(PID, EID)).shadow).toBe(s2);
+    } finally {
+      beforePrepare = undefined;
+      gate.resolve();
+    }
+  });
+
+  test('revalidateLocal 读配置期间条目被并发替换为最新条目：不按旧条目误关新条目并保留在缓存', async () => {
+    const s1 = (await shadows.forProject(PID, EID)).shadow as FakeShadow;
+    await changeUrl(URL_2);
+
+    const held = holdNextEnvQuery();
+    try {
+      const delivered = deliver({ t: 'shadows.forget', envIds: [EID] });
+      await held.entered;
+
+      const s2 = (await shadows.forProject(PID, EID)).shadow as FakeShadow;
+      expect(s2).not.toBe(s1);
+      expect(s2.url).toBe(URL_2);
+      expect(s1.close).toHaveBeenCalledTimes(1);
+
+      held.release();
+      await delivered;
+
+      expect(s2.close).not.toHaveBeenCalled();
+      expect(shadows.has(EID)).toBe(true);
+      expect((await shadows.forProject(PID, EID)).shadow).toBe(s2);
+      expect(s1.close).toHaveBeenCalledTimes(1);
+    } finally {
+      held.restore();
+    }
+  });
+
+  test('revalidateLocal 读配置期间条目被并发替换，若新条目相对最新配置仍过期则继续复核并关闭', async () => {
+    const s1 = (await shadows.forProject(PID, EID)).shadow as FakeShadow;
+    await changeUrl(URL_2);
+
+    const held = holdNextEnvQuery();
+    try {
+      const delivered = deliver({ t: 'shadows.forget', envIds: [EID] });
+      await held.entered;
+
+      const s2 = (await shadows.forProject(PID, EID)).shadow as FakeShadow;
+      expect(s2.url).toBe(URL_2);
+      expect(s1.close).toHaveBeenCalledTimes(1);
+
+      await changeUrl(URL_3);
+      held.release();
+      await delivered;
+
+      expect(s2.close).toHaveBeenCalledTimes(1);
+      expect(shadows.has(EID)).toBe(false);
+      expect(((await shadows.forProject(PID, EID)).shadow as FakeShadow).url).toBe(URL_3);
+    } finally {
+      held.restore();
+    }
   });
 });
