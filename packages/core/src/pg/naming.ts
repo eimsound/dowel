@@ -2,9 +2,12 @@
 // 实验依据见 .agents/docs/01-research.md 5.1。
 const NAMEDATALEN = 64;
 const enc = new TextEncoder();
+// 可打印 ASCII 时字节数等于字符数，免去逐字符编码（推导名热点路径）；其他字符走原逻辑
+const ASCII_RE = /^[ -~]*$/;
 
 /** 按字节截断到 n 字节以内，不截断多字节字符（等价于 pg_mbcliplen） */
 const clip = (s: string, maxBytes: number): string => {
+  if (ASCII_RE.test(s)) return s.length <= maxBytes ? s : s.slice(0, Math.max(0, maxBytes));
   let out = '';
   let bytes = 0;
   for (const ch of s) {
@@ -15,7 +18,7 @@ const clip = (s: string, maxBytes: number): string => {
   }
   return out;
 };
-const len = (s: string) => enc.encode(s).length;
+const len = (s: string) => (ASCII_RE.test(s) ? s.length : enc.encode(s).length);
 
 /** makeObjectName(name1, name2, label)：总长不超过 63 字节，较长的一段先截 */
 export const makeObjectName = (name1: string, name2: string | null, label: string | null): string => {

@@ -1,6 +1,9 @@
-// 可变/叠加模型索引：一次线性建表，支撑 O(1) 按 kind / parent / 分区父表 / PG 命名空间查询。
+// 可变/叠加模型索引：一次线性建表，支撑 O(1) 按 kind / parent / 分区父表 / 命名空间查询。
 // 绝不跨外部调用挂靠在可变的 Model 上，必须由 withModelIndex 或同步层显式增量维护，杜绝脏缓存。
 import type { Column, Kind, Model, Obj, ObjOf, Sequence, Table } from './ir.ts';
+import { OverlayNameTracker } from './name-tracker.ts';
+import { pgAllConNs, pgPropConNs, pgRelNs, pgTypeNs } from './naming-ns.ts';
+import { BaseNamingState, type NsOwners, type Snap } from './naming-state.ts';
 
 export interface ModelIndex {
   all<K extends Kind>(kind: K): ObjOf<K>[];
@@ -38,70 +41,46 @@ const delBucket = <K1, V>(map: Map<K1, Map<string, V>>, k1: K1, id: string) => {
   if (inner.size === 0) map.delete(k1);
 };
 
-const addOwner = (
-  map: Map<string, Map<string, Set<string>>>,
-  container: string,
-  name: string,
-  ownerId: string,
-) => {
-  let byName = map.get(container);
-  if (!byName) {
-    byName = new Map();
-    map.set(container, byName);
-  }
-  let owners = byName.get(name);
-  if (!owners) {
-    owners = new Set();
-    byName.set(name, owners);
-  }
-  owners.add(ownerId);
-};
-
-const delOwner = (
-  map: Map<string, Map<string, Set<string>>>,
-  container: string,
-  name: string,
-  ownerId: string,
-) => {
-  const byName = map.get(container);
-  if (!byName) return;
-  const owners = byName.get(name);
-  if (!owners) return;
-  owners.delete(ownerId);
-  if (owners.size === 0) {
-    byName.delete(name);
-    if (byName.size === 0) map.delete(container);
-  }
-};
-
-const hasOtherOwner = (
-  map: Map<string, Map<string, Set<string>>>,
-  container: string,
-  name: string,
-  selfId: string,
-): boolean => {
-  const owners = map.get(container)?.get(name);
+const hasOtherOwner = (map: NsOwners, ns: string, name: string, selfId: string): boolean => {
+  const owners = map.get(ns)?.get(name);
   if (!owners || owners.size === 0) return false;
   if (owners.size > 1) return true;
   return !owners.has(selfId);
 };
 
 const hasOwnOther = (
-  map: Map<string, Map<string, Set<string>>>,
-  container: string,
+  map: NsOwners,
+  ns: string,
   name: string,
   selfId: string,
   extraExclude?: string,
 ): boolean => {
-  const owners = map.get(container)?.get(name);
+  const owners = map.get(ns)?.get(name);
   if (!owners || owners.size === 0) return false;
-  for (const ow of owners) {
+  for (const ow of owners.keys()) {
     if (ow !== selfId && ow !== extraExclude) return true;
   }
   return false;
 };
 
 const EMPTY_LIST: readonly Obj[] = [];
+const EMPTY_IDS: readonly string[] = [];
+
+/** 沿 partitionOf 向上的祖先表 ID（不含自身，带环保护；与 model.ts 的 partitionAncestors 同语义） */
+export const pgAncestorIds = (m: Model, tableId: string): string[] => {
+  const out: string[] = [];
+  const seen = new Set<string>([tableId]);
+  const self = Object.hasOwn(m.objects, tableId) ? m.objects[tableId] : undefined;
+  let cur = self?.kind === 'table' && self.partitionOf ? self.partitionOf.parent : null;
+  while (cur && !seen.has(cur)) {
+    seen.add(cur);
+    const t = Object.hasOwn(m.objects, cur) ? m.objects[cur] : undefined;
+    if (t?.kind !== 'table') break;
+    out.push(t.id);
+    cur = t.partitionOf?.parent ?? null;
+  }
+  return out;
+};
 
 export class MutableModelIndex implements ModelIndex {
   private model: Model;
@@ -115,14 +94,8 @@ export class MutableModelIndex implements ModelIndex {
   private columnsCache = new Map<string, Column[]>();
   private seqsByOwnedCol = new Map<string, Map<string, Sequence>>();
 
-  // PG 命名空间惰性索引（首次查询时一次构建，之后随 applyObjectChange O(1) 同步）
-  private pgNamespacesReady = false;
-  private pgRelOwners = new Map<string, Map<string, Set<string>>>();
-  private pgTypeOwners = new Map<string, Map<string, Set<string>>>();
-  /** 表级全部约束（PK / UNIQUE / CHECK / FK / #nn）归属：tableId -> name -> Set<ownerId> */
-  private pgAllConOwners = new Map<string, Map<string, Set<string>>>();
-  /** 表级向下继承约束（CHECK / FK / #nn）归属：tableId -> name -> Set<ownerId> */
-  private pgPropConOwners = new Map<string, Map<string, Set<string>>>();
+  // 命名空间与推导名状态（首次查询时一次构建，之后随 applyObjectChange / applyBatch 增量同步），见 naming-state.ts
+  private naming: BaseNamingState | null = null;
 
   constructor(model: Model) {
     this.model = model;
@@ -176,78 +149,42 @@ export class MutableModelIndex implements ModelIndex {
     }
   }
 
-  private tableSchema(tableId: string): string | undefined {
+  private readonly tableLookup = (tableId: string): Table | undefined => {
     const indexed = this.byKind.get('table')?.get(tableId);
-    if (indexed?.kind === 'table') return indexed.parent;
-    const t = this.model.objects[tableId];
-    return t?.kind === 'table' ? t.parent : undefined;
-  }
+    if (indexed?.kind === 'table') return indexed;
+    const t = Object.hasOwn(this.model.objects, tableId) ? this.model.objects[tableId] : undefined;
+    return t?.kind === 'table' ? t : undefined;
+  };
 
-  private invalidatePgNamespaces() {
-    this.pgNamespacesReady = false;
-    this.pgRelOwners.clear();
-    this.pgTypeOwners.clear();
-    this.pgAllConOwners.clear();
-    this.pgPropConOwners.clear();
-  }
-
-  private indexPgNsObj(o: Obj, add: boolean) {
-    const fn = add ? addOwner : delOwner;
-    if (o.kind === 'table') {
-      fn(this.pgRelOwners, o.parent, o.name, o.id);
-      fn(this.pgTypeOwners, o.parent, o.name, o.id);
-    } else if (o.kind === 'enum') {
-      fn(this.pgTypeOwners, o.parent, o.name, o.id);
-    } else if (o.kind === 'sequence') {
-      fn(this.pgRelOwners, o.parent, o.name, o.id);
-    } else if (o.kind === 'index') {
-      const sch = this.tableSchema(o.parent);
-      if (sch) fn(this.pgRelOwners, sch, o.name, o.id);
-    } else if (o.kind === 'primaryKey' || o.kind === 'unique') {
-      const sch = this.tableSchema(o.parent);
-      if (sch) fn(this.pgRelOwners, sch, o.name, o.id);
-      fn(this.pgAllConOwners, o.parent, o.name, o.id);
-    } else if (o.kind === 'check' || o.kind === 'foreignKey') {
-      fn(this.pgAllConOwners, o.parent, o.name, o.id);
-      fn(this.pgPropConOwners, o.parent, o.name, o.id);
-    } else if (o.kind === 'column') {
-      if (o.identity) {
-        const sch = this.tableSchema(o.parent);
-        if (sch) fn(this.pgRelOwners, sch, o.identity.sequenceName, `${o.id}#seq`);
-      }
-      if (o.notNull && o.notNullName) {
-        fn(this.pgAllConOwners, o.parent, o.notNullName, `${o.id}#nn`);
-        fn(this.pgPropConOwners, o.parent, o.notNullName, `${o.id}#nn`);
-      }
+  /** 命名空间分桶（惰性构建） */
+  private ns(): BaseNamingState {
+    if (!this.naming) {
+      this.naming = new BaseNamingState(this.model.dialect, {
+        model: () => this.model,
+        getObj: (id) => this.getObj(id) ?? this.byKind.get('table')?.get(id),
+        childIds: (t) => this.childrenByParent.get(t)?.keys() ?? EMPTY_IDS,
+        partitionChildIds: (t) => this.partitionsByParent.get(t)?.keys() ?? EMPTY_IDS,
+        ownedSeqIds: (c) => this.seqsByOwnedCol.get(c)?.keys() ?? EMPTY_IDS,
+      });
+      this.naming.build();
     }
+    return this.naming;
   }
 
-  private ensurePgNamespaces() {
-    if (this.pgNamespacesReady) return;
-    this.pgNamespacesReady = true;
-    for (const o of Object.values(this.model.objects)) {
-      this.indexPgNsObj(o, true);
-    }
+  /** 推导名持久状态（叠加层跟踪器使用；首次调用时校验全部推导名对象） */
+  namingState(): BaseNamingState {
+    const st = this.ns();
+    st.ensureNaming();
+    return st;
   }
 
   applyObjectChange(id: string, prev: Obj | undefined, next: Obj | undefined) {
     if (prev && prev === next) return;
-    if (
-      this.pgNamespacesReady &&
-      prev?.kind === 'table' &&
-      next?.kind === 'table' &&
-      prev.parent !== next.parent
-    ) {
-      this.invalidatePgNamespaces();
-    }
-    if (this.pgNamespacesReady && prev) {
-      this.indexPgNsObj(prev, false);
-    }
+    const st = this.naming;
+    const prevs = st ? st.beforeBatch([{ id, prev }]) : null;
     if (prev) this.removeObj(prev);
     if (next) this.insertObj(next);
-    if (this.pgNamespacesReady && next) {
-      this.indexPgNsObj(next, true);
-    }
+    if (st && prevs) st.afterBatch([{ id, next }], prevs, false);
   }
 
   setModel(m: Model) {
@@ -255,42 +192,32 @@ export class MutableModelIndex implements ModelIndex {
   }
 
   getObj(id: string): Obj | undefined {
-    return this.model.objects[id];
+    return Object.hasOwn(this.model.objects, id) ? this.model.objects[id] : undefined;
   }
 
-  getPgRelOwnerIds(schema: string, name: string): ReadonlySet<string> | undefined {
-    this.ensurePgNamespaces();
-    return this.pgRelOwners.get(schema)?.get(name);
+  /** 命名空间里某个（已归一化的）名字的占用者：占用者 ID -> 对象 ID */
+  nsOwnersOf(ns: string, name: string): ReadonlyMap<string, string> | undefined {
+    return this.ns().owners.get(ns)?.get(name);
   }
 
-  getPgTypeOwnerIds(schema: string, name: string): ReadonlySet<string> | undefined {
-    this.ensurePgNamespaces();
-    return this.pgTypeOwners.get(schema)?.get(name);
+  getPgRelOwnerIds(schema: string, name: string): ReadonlyMap<string, string> | undefined {
+    return this.nsOwnersOf(pgRelNs(schema), name);
+  }
+
+  getPgTypeOwnerIds(schema: string, name: string): ReadonlyMap<string, string> | undefined {
+    return this.nsOwnersOf(pgTypeNs(schema), name);
   }
 
   /**
-   * 批量应用一个提交的对象变更：先在旧索引状态上移除 PG 命名空间（保障 tableSchema 可解析被删表），
-   * 再移除旧对象并切换为 nextModel，接着插入全部新对象，最后更新 PG 命名空间（保障新建表可解析）。
+   * 批量应用一个提交的对象变更：先按登记内容移除命名空间条目（与父表的当前状态无关），
+   * 再移除旧对象并切换为 nextModel，接着插入全部新对象，最后登记新条目、处理腾出 / 撞名并维护推导名脏集合。
    */
   applyBatch(
     nextModel: Model,
     changes: readonly { id: string; prev: Obj | undefined; next: Obj | undefined }[],
   ) {
-    if (this.pgNamespacesReady) {
-      for (let i = 0; i < changes.length; i++) {
-        const { prev, next } = changes[i]!;
-        if (prev?.kind === 'table' && next?.kind === 'table' && prev.parent !== next.parent) {
-          this.invalidatePgNamespaces();
-          break;
-        }
-      }
-    }
-    if (this.pgNamespacesReady) {
-      for (let i = 0; i < changes.length; i++) {
-        const prev = changes[i]!.prev;
-        if (prev) this.indexPgNsObj(prev, false);
-      }
-    }
+    const st = this.naming;
+    const prevs: (Snap | null)[] | null = st ? st.beforeBatch(changes) : null;
     for (let i = 0; i < changes.length; i++) {
       const prev = changes[i]!.prev;
       if (prev) this.removeObj(prev);
@@ -300,12 +227,7 @@ export class MutableModelIndex implements ModelIndex {
       const next = changes[i]!.next;
       if (next) this.insertObj(next);
     }
-    if (this.pgNamespacesReady) {
-      for (let i = 0; i < changes.length; i++) {
-        const next = changes[i]!.next;
-        if (next) this.indexPgNsObj(next, true);
-      }
-    }
+    if (st && prevs) st.afterBatch(changes, prevs);
   }
 
   allRef<K extends Kind>(kind: K): readonly ObjOf<K>[] {
@@ -393,19 +315,17 @@ export class MutableModelIndex implements ModelIndex {
   }
 
   isPgRelTaken(schema: string, name: string, self: string): boolean {
-    this.ensurePgNamespaces();
-    return hasOtherOwner(this.pgRelOwners, schema, name, self);
+    return hasOtherOwner(this.ns().owners, pgRelNs(schema), name, self);
   }
 
   isPgTypeTaken(schema: string, name: string, self: string): boolean {
-    this.ensurePgNamespaces();
-    return hasOtherOwner(this.pgTypeOwners, schema, name, self);
+    return hasOtherOwner(this.ns().owners, pgTypeNs(schema), name, self);
   }
 
   isPgConTaken(tableId: string, name: string, self: string): boolean {
-    this.ensurePgNamespaces();
+    const owners = this.ns().owners;
     const excludeNn = self.endsWith('#nn') ? self : undefined;
-    if (hasOwnOther(this.pgAllConOwners, tableId, name, self, excludeNn)) return true;
+    if (hasOwnOther(owners, pgAllConNs(tableId), name, self, excludeNn)) return true;
 
     const selfObj = self && !self.endsWith('#nn') ? this.model.objects[self] : undefined;
     const selfPropagates =
@@ -419,14 +339,14 @@ export class MutableModelIndex implements ModelIndex {
       seenAnc.add(ancId);
       const t = this.model.objects[ancId];
       if (t?.kind !== 'table') break;
-      if (hasOwnOther(this.pgPropConOwners, ancId, name, self, excludeNn)) return true;
+      if (hasOwnOther(owners, pgPropConNs(ancId), name, self, excludeNn)) return true;
       curObj = t;
       ancId = t.partitionOf?.parent ?? null;
     }
 
     if (selfPropagates && this.partitionsByParent.has(tableId)) {
       for (const desc of this.partitionDescendants(tableId)) {
-        if (hasOwnOther(this.pgAllConOwners, desc.id, name, self, excludeNn)) return true;
+        if (hasOwnOther(owners, pgAllConNs(desc.id), name, self, excludeNn)) return true;
       }
     }
     return false;
@@ -437,12 +357,17 @@ export class MutableModelIndex implements ModelIndex {
  * 面向同步层的写时复制增量索引：底层只读复用基线 MutableModelIndex，
  * 所有查询跳过 overlay 中已被改写/删除的对象 ID，并现场折叠小规模 overlay（通常仅 1–10 个对象）。
  * 即使 mutator 原地修改 overlay 内对象的属性（name / parent / partitionOf 等），依然 100% 实时准确。
+ *
+ * 创建方若保证所有写入都经过它的代理并通知 trackWrites 返回的回调（同步层 execute 如此），
+ * 名字占用查询改走写入跟踪器的命名空间分桶（O(1)），推导名刷新只处理输入变化的对象（见 derived-names.ts）；
+ * 执行结束（提交或回滚）后必须调用 finishTracking()。
  */
 export class OverlayModelIndex implements ModelIndex {
   private base: MutableModelIndex;
   private overlay: Map<string, Obj | undefined>;
   private model: Model;
   private wrap?: <T extends Obj>(o: T) => T;
+  private tracker: OverlayNameTracker | undefined;
 
   constructor(
     base: MutableModelIndex,
@@ -454,6 +379,29 @@ export class OverlayModelIndex implements ModelIndex {
     this.overlay = overlay;
     this.model = model;
     this.wrap = wrap;
+  }
+
+  /**
+   * 开启写入跟踪：返回的回调必须在每次写入叠加层对象（新增、删除、改任意字段）后以对象 ID 调用。
+   * 只能在叠加层还为空时开启。
+   */
+  trackWrites(): (id: string) => void {
+    if (this.overlay.size !== 0) throw new Error('trackWrites 只能在叠加层为空时开启');
+    const tracker = new OverlayNameTracker(this.base, this.base.namingState(), this.overlay);
+    this.tracker = tracker;
+    return (id) => tracker.noteWrite(id);
+  }
+
+  /** 可用的写入跟踪器（未开启或已结束时为 undefined） */
+  nameTracker(): OverlayNameTracker | undefined {
+    return this.tracker;
+  }
+
+  /** 结束写入跟踪：撤销叠加层对基线命名序列的消耗（execute 无论成功与否都要调用） */
+  finishTracking() {
+    const tr = this.tracker;
+    this.tracker = undefined;
+    tr?.finish();
   }
 
   private wrapOut<T extends Obj>(o: T): T {
@@ -646,6 +594,8 @@ export class OverlayModelIndex implements ModelIndex {
   }
 
   isPgRelTaken(schema: string, name: string, self: string): boolean {
+    const tr = this.nameTracker();
+    if (tr) return tr.hasOther(pgRelNs(schema), name, self);
     if (this.overlay.size === 0) return this.base.isPgRelTaken(schema, name, self);
     if (this.overlayPgRelMatch(schema, name, self)) return true;
     for (const o of this.overlayVals()) {
@@ -672,7 +622,7 @@ export class OverlayModelIndex implements ModelIndex {
     }
     const baseOwners = this.base.getPgRelOwnerIds(schema, name);
     if (!baseOwners || baseOwners.size === 0) return false;
-    for (const ownerId of baseOwners) {
+    for (const ownerId of baseOwners.keys()) {
       if (ownerId === self) continue;
       const rawId = ownerId.endsWith('#seq') ? ownerId.slice(0, -4) : ownerId;
       if (this.overlay.has(rawId)) continue;
@@ -694,6 +644,8 @@ export class OverlayModelIndex implements ModelIndex {
   }
 
   isPgTypeTaken(schema: string, name: string, self: string): boolean {
+    const tr = this.nameTracker();
+    if (tr) return tr.hasOther(pgTypeNs(schema), name, self);
     if (this.overlay.size === 0) return this.base.isPgTypeTaken(schema, name, self);
     for (const o of this.overlayVals()) {
       if (
@@ -708,13 +660,32 @@ export class OverlayModelIndex implements ModelIndex {
     }
     const baseOwners = this.base.getPgTypeOwnerIds(schema, name);
     if (!baseOwners || baseOwners.size === 0) return false;
-    for (const ownerId of baseOwners) {
+    for (const ownerId of baseOwners.keys()) {
       if (ownerId !== self && !this.overlay.has(ownerId)) return true;
     }
     return false;
   }
 
+  /** 与下面的扫描实现同语义：本表全部约束 + 祖先的继承约束 + （自身会继承时）后代的全部约束 */
+  private isPgConTakenTracked(tr: OverlayNameTracker, tableId: string, name: string, self: string): boolean {
+    if (tr.hasOther(pgAllConNs(tableId), name, self)) return true;
+    for (const anc of pgAncestorIds(this.model, tableId)) {
+      if (tr.hasOther(pgPropConNs(anc), name, self)) return true;
+    }
+    const selfObj = self && !self.endsWith('#nn') ? this.model.objects[self] : undefined;
+    const selfPropagates =
+      self === '' || self.endsWith('#nn') || selfObj?.kind === 'check' || selfObj?.kind === 'foreignKey';
+    if (selfPropagates) {
+      for (const d of tr.descendants(tableId)) {
+        if (tr.hasOther(pgAllConNs(d), name, self)) return true;
+      }
+    }
+    return false;
+  }
+
   isPgConTaken(tableId: string, name: string, self: string): boolean {
+    const tr = this.nameTracker();
+    if (tr) return this.isPgConTakenTracked(tr, tableId, name, self);
     if (this.overlay.size === 0) return this.base.isPgConTaken(tableId, name, self);
     const selfObj = self && !self.endsWith('#nn') ? this.model.objects[self] : undefined;
     const selfPropagates =

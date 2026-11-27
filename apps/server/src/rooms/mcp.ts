@@ -5,6 +5,7 @@ import {
   BATCH_SUMMARY_MAX,
   type BatchArgs,
   compileMacro,
+  DerivedNameBudget,
   EditError,
   isMacro,
   MacroError,
@@ -247,6 +248,8 @@ export class McpWriter {
       const createdInBatch = new Set<string>();
       let batchModel = structuredClone(baseModel);
       const batchIndex = new MutableModelIndex(batchModel);
+      // 整个预演（至多 500 步）共用一份推导名工作量预算：病态的改表名 / 改列名循环在这里就被拒绝（Issue #164）
+      const previewBudget = new DerivedNameBudget();
 
       /** 合并一组依据并按顺序检查冲突：报告最早冲突的那一步，并给出人类可读的“X 已被 Y 修改” */
       const recordReads = (ids: Iterable<string>, origin: Origin): LockValue | null => {
@@ -279,7 +282,7 @@ export class McpWriter {
         }
         let execRes: ReturnType<typeof execute>;
         try {
-          execRes = execute(batchModel, name, args, batchIndex);
+          execRes = execute(batchModel, name, args, batchIndex, { budget: previewBudget });
         } catch (e) {
           if (e instanceof EditError) return err('invalid', located(origin, e.message), origin);
           throw e;

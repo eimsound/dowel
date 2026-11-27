@@ -14,8 +14,10 @@ import {
   BATCH_SUMMARY_MAX,
   createSchema,
   createTable,
+  derivedNameStats,
   getDialect,
   newId,
+  resetDerivedNameStats,
   SQLITE_COLUMN_TYPE_NOTE,
   type Column,
   type Opaque,
@@ -2857,6 +2859,83 @@ describe.each([
         expect(toolNames).not.toContain(name);
         expect(Object.keys(MCP_TOOLS)).not.toContain(name);
       }
+    },
+  );
+
+  test.skipIf(skip)(
+    'apply_changes 预演阶段共享推导名工作量预算（previewBudget），超限后拒绝且模型不变',
+    async () => {
+      const f = await setupEnv();
+      const tokAlice = await f.issueToken(f.alice.id, ['read', 'verify', 'write']);
+
+      let bigId = '';
+      await editModel(f.created.rooms, f.db, f.p1Id, (m) => {
+        const schema = all(m, 'schema').find((x) => x.name === 'public')?.id ?? createSchema(m, 'public');
+        bigId = createTable(m, schema, 'big');
+        addColumn(m, bigId, { name: 'a', type: 'integer' });
+        addColumn(m, bigId, { name: 'b', type: 'integer' });
+        for (let i = 0; i < 1500; i++) {
+          const cid = newId();
+          m.objects[cid] = {
+            id: cid,
+            kind: 'check',
+            parent: bigId,
+            name: i === 0 ? 'big_check' : `big_check${i}`,
+            nameMode: 'derived',
+            expr: `a + b > ${i}`,
+            noInherit: false,
+            comment: null,
+          };
+        }
+      });
+
+      const before = await f.created.rooms.model(f.branch1);
+      const beforeSeq = before.seq;
+      const beforeJson = JSON.stringify(before.model);
+
+      // 1. 100 步改表名（均在 MCP_MAX_OPS=100 上限内），预演阶段提前在预算耗尽处停止
+      resetDerivedNameStats();
+      const res = await f.callTool(tokAlice.token, 'apply_changes', {
+        project: f.p1Id,
+        baseSeq: beforeSeq,
+        ops: Array.from({ length: 100 }, (_, i) => ({
+          name: 'renameTable',
+          args: { id: bigId, name: `big_${i}` },
+        })),
+      });
+      expect(res.isError).toBe(true);
+      expect(res.structuredContent?.code).toBe('invalid');
+      expect(res.content?.[0]?.text).toContain('推导名重算工作量超出上限');
+      expect(typeof res.structuredContent?.index).toBe('number');
+      expect(res.structuredContent?.index as number).toBeLessThan(99);
+      expect(derivedNameStats.passes).toBeLessThan(60);
+
+      const after1 = await f.created.rooms.model(f.branch1);
+      expect(after1.seq).toBe(beforeSeq);
+      expect(JSON.stringify(after1.model)).toBe(beforeJson);
+
+      // 2. 99 步改表名 + 末尾 1 步不存在的 dropTable：有 previewBudget 会在前 99 步内先触发预算超限，
+      //    若移除 previewBudget 则预演跑完前 99 步并在 index=99 报“表不存在”
+      const res2 = await f.callTool(tokAlice.token, 'apply_changes', {
+        project: f.p1Id,
+        baseSeq: beforeSeq,
+        ops: [
+          ...Array.from({ length: 99 }, (_, i) => ({
+            name: 'renameTable',
+            args: { id: bigId, name: `big_b_${i}` },
+          })),
+          { name: 'dropTable', args: { id: newId() } },
+        ],
+      });
+      expect(res2.isError).toBe(true);
+      expect(res2.structuredContent?.code).toBe('invalid');
+      expect(res2.content?.[0]?.text).toContain('推导名重算工作量超出上限');
+      expect(typeof res2.structuredContent?.index).toBe('number');
+      expect(res2.structuredContent?.index as number).toBeLessThan(99);
+
+      const after2 = await f.created.rooms.model(f.branch1);
+      expect(after2.seq).toBe(beforeSeq);
+      expect(JSON.stringify(after2.model)).toBe(beforeJson);
     },
   );
 });

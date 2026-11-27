@@ -2,6 +2,7 @@
 // 客户端乐观执行，服务器在最新状态上重新执行；参数由服务器用 zod 校验，不信任客户端。
 import { z } from 'zod';
 
+import { DerivedNameBudgetError, exprRefNames, refsHaveName } from './derived-names.ts';
 import * as E from './edit.ts';
 import { isReservedId } from './ids.ts';
 import {
@@ -455,8 +456,14 @@ export const runMutator = (m: Model, name: string, args: unknown) => {
  * 参数里出现的、模型中存在的对象，加上参数里表达式（expr / where）引用到的本表的列。
  * 修改实际写到的对象由同步层另行计算，也算在依据里。
  */
-export const readsOf = (m: Model, args: unknown, name?: string): string[] => {
-  if (name === BATCH_MUTATOR) return batchReadsOf(m, args);
+/**
+ * 逐步执行 batch 子操作的方式（返回执行后的模型；不合法时抛 EditError）。同步层传入带持久推导名状态的增量执行，
+ * 使 500 步的 batch 在大表上也只做 O(变化量) 的推导名工作；默认在模型副本上原地执行（每步全量校验推导名）。
+ */
+export type BatchStepper = (m: Model, name: string, args: unknown) => Model;
+
+export const readsOf = (m: Model, args: unknown, name?: string, step?: BatchStepper): string[] => {
+  if (name === BATCH_MUTATOR) return batchReadsOf(m, args, step);
   const out = new Set<string>();
   const exprs: string[] = [];
   const walk = (x: unknown, k?: string) => {
@@ -492,31 +499,92 @@ export const readsOf = (m: Model, args: unknown, name?: string): string[] => {
       if (o.kind === 'table') tables.add(o.id);
       else if ('parent' in o && m.objects[o.parent]?.kind === 'table') tables.add(o.parent);
     }
+    // 每个表达式只分词一次，再与各列名求交（原先按列逐个重新分词）
+    const refSets = exprs.map((e) => exprRefNames(m.dialect, e, (x) => d.columnRefs(x)));
     for (const t of tables)
       for (const c of effectiveColumnsOf(m, t))
-        if (exprs.some((e) => d.exprReferences(e, c.name))) out.add(c.id);
+        if (refSets.some((r) => refsHaveName(m.dialect, r, c.name))) out.add(c.id);
   }
   return [...out];
+};
+
+const ownObj = (m: Model, id: string): Obj | undefined =>
+  Object.hasOwn(m.objects, id) ? m.objects[id] : undefined;
+
+const hasExprArg = (x: unknown, k?: string): boolean => {
+  if (typeof x === 'string') return k === 'expr' || k === 'where';
+  if (Array.isArray(x)) return x.some((v) => hasExprArg(v, k));
+  if (x && typeof x === 'object') return Object.entries(x).some(([kk, v]) => hasExprArg(v, kk));
+  return false;
+};
+
+/** 逐步执行遇到推导名预算超限时，对后续子操作退回保守依据收集（不依赖步骤之后的模型状态） */
+const collectConservativeReads = (
+  m: Model,
+  stepModel: Model,
+  args: unknown,
+  name: string,
+  out: Set<string>,
+) => {
+  const stepIds = new Set<string>();
+  for (const id of readsOf(m, args, name)) {
+    stepIds.add(id);
+    out.add(id);
+  }
+  for (const id of readsOf(stepModel, args, name)) {
+    if (Object.hasOwn(m.objects, id)) {
+      stepIds.add(id);
+      out.add(id);
+    }
+  }
+  if (!hasExprArg(args)) return;
+  const tables = new Set<string>();
+  for (const id of stepIds) {
+    const o = ownObj(m, id) ?? ownObj(stepModel, id);
+    if (!o) continue;
+    if (o.kind === 'table') tables.add(o.id);
+    else if ('parent' in o) {
+      const p = ownObj(m, o.parent) ?? ownObj(stepModel, o.parent);
+      if (p?.kind === 'table') tables.add(o.parent);
+    }
+  }
+  for (const t of tables) {
+    for (const c of effectiveColumnsOf(m, t)) {
+      if (Object.hasOwn(m.objects, c.id)) out.add(c.id);
+    }
+  }
 };
 
 /**
  * batch 的依据：在模型副本上逐步执行子操作，每一步执行前按该子操作计算依据，
  * 只保留整批开始前就存在的对象（本批新建的对象不是外部依据）。绝不扫描 summary（自由文本可能恰好等于某个对象 ID）。
- * 某一步执行失败就停止（整批注定会被拒绝），已收集的依据照常返回。
+ * 某一步执行失败（非预算超限）就停止（整批注定会被拒绝），已收集的依据照常返回；
+ * 若遇到推导名工作量预算超限（DerivedNameBudgetError），对其余子操作退回保守依据收集，避免静默截断。
  */
-const batchReadsOf = (m: Model, args: unknown): string[] => {
+const batchReadsOf = (m: Model, args: unknown, step?: BatchStepper): string[] => {
   const parsed = batchArgs.safeParse(args);
   if (!parsed.success) return [];
   const out = new Set<string>();
-  const stepModel = structuredClone(m);
-  for (const op of parsed.data.ops) {
+  let stepModel = step ? m : structuredClone(m);
+  const ops = parsed.data.ops;
+  for (let i = 0; i < ops.length; i++) {
+    const op = ops[i]!;
     if (COMPOSITE_MUTATORS.has(op.name)) break;
     for (const id of readsOf(stepModel, op.args, op.name)) {
       if (Object.hasOwn(m.objects, id)) out.add(id);
     }
     try {
-      runMutator(stepModel, op.name, op.args);
+      if (step) stepModel = step(stepModel, op.name, op.args);
+      else runMutator(stepModel, op.name, op.args);
     } catch (e) {
+      if (e instanceof DerivedNameBudgetError) {
+        for (let j = i + 1; j < ops.length; j++) {
+          const rest = ops[j]!;
+          if (COMPOSITE_MUTATORS.has(rest.name)) break;
+          collectConservativeReads(m, stepModel, rest.args, rest.name, out);
+        }
+        break;
+      }
       if (e instanceof E.EditError) break;
       throw e;
     }

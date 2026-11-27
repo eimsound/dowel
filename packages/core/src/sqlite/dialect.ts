@@ -1,18 +1,32 @@
+import {
+  colNamesOf,
+  type DialectNaming,
+  exprRefNames,
+  indexColsResolved,
+  keySlot,
+  nameKey,
+  type NameSpec,
+  registerDialectNaming,
+  singleRefColumn,
+  UNRESOLVED,
+} from '../derived-names.ts';
 // SQLite 方言规格实现（注册到 @dowel/core registry）。
 import type { DialectCapabilities, DialectSpec, IdentKind } from '../dialect.ts';
 import { emptyModel, type Model, type Obj } from '../ir.ts';
 import {
   all,
-  allChildrenOf,
   childrenOf,
   childrenOfKinds,
   columnsOf,
-  get,
+  getActiveModelIndex,
   indexElementNames,
   objectsOfKinds,
+  OverlayModelIndex,
 } from '../model.ts';
+import { SQLITE_REL_NS, sqliteConNs } from '../naming-ns.ts';
+import { plainRefresh } from '../naming-state.ts';
 import { sqliteClipboard } from './clipboard.ts';
-import { sqliteChooseName, sqliteJoinNames } from './naming.ts';
+import { sqliteJoinNames, sqliteMakeObjectName } from './naming.ts';
 import {
   SQLITE_INSTANCE_LEVEL_DESCRIPTION,
   sqliteFindInstanceLevelStatement,
@@ -79,39 +93,72 @@ const isSqliteConTaken = (m: Model, tableId: string, name: string, selfId: strin
   });
 };
 
-const refreshSqliteDerivedNames = (m: Model, tableId: string): void => {
-  const t = get(m, tableId, 'table');
-  const choose = (id: string, n1: string, n2: string | null, label: string, rel: boolean, con: boolean) =>
-    sqliteChooseName(
-      n1,
-      n2,
-      label,
-      (n) => (rel && isSqliteRelTaken(m, n, id)) || (con && isSqliteConTaken(m, tableId, n, id)),
-    );
-  const joinCols = (ids: string[]) => sqliteJoinNames(ids.map((c) => get(m, c, 'column').name));
-  const tableCols = columnsOf(m, tableId);
-  for (const o of allChildrenOf(m, tableId)) {
-    if (!('nameMode' in o) || o.nameMode !== 'derived') continue;
+const SQLITE_REL_ONLY = [SQLITE_REL_NS];
+
+const sqliteSpec = (
+  tableId: string,
+  ns: string[],
+  n1: string,
+  n2: string | null,
+  label: string,
+): NameSpec => ({
+  key: nameKey(tableId, label, n1, n2, ns),
+  cand: (j) => sqliteMakeObjectName(n1, n2, j === 0 ? label : `${label}${j}`),
+  norm: (n) => n.toLowerCase(),
+  ns,
+});
+
+/** 约束避让表级约束名，索引避让全库关系名（与 isSqliteConTaken / isSqliteRelTaken 一致） */
+const sqliteNaming: DialectNaming = {
+  dialect: 'sqlite',
+  checkRefs: (expr) => exprRefNames('sqlite', expr, sqliteColumnRefs),
+  slotsOf: (m, view, o) => {
+    if (
+      !(
+        o.kind === 'primaryKey' ||
+        o.kind === 'unique' ||
+        o.kind === 'foreignKey' ||
+        o.kind === 'check' ||
+        o.kind === 'index'
+      ) ||
+      o.nameMode !== 'derived'
+    )
+      return [];
+    const t = Object.hasOwn(m.objects, o.parent) ? m.objects[o.parent] : undefined;
+    if (t?.kind !== 'table') return [];
+    const con = [sqliteConNs(o.parent)];
     switch (o.kind) {
       case 'primaryKey':
-        o.name = choose(o.id, t.name, null, 'pkey', false, true);
-        break;
+        return [keySlot(o, sqliteSpec(o.parent, con, t.name, null, 'pkey'))];
       case 'unique':
-        o.name = choose(o.id, t.name, joinCols(o.columns), 'key', false, true);
-        break;
-      case 'foreignKey':
-        o.name = choose(o.id, t.name, joinCols(o.columns), 'fkey', false, true);
-        break;
+      case 'foreignKey': {
+        const names = colNamesOf(m, o.columns);
+        if (!names) return UNRESOLVED;
+        const label = o.kind === 'unique' ? 'key' : 'fkey';
+        return [keySlot(o, sqliteSpec(o.parent, con, t.name, sqliteJoinNames(names), label))];
+      }
       case 'check': {
-        const refs = tableCols.filter((c) => sqliteExprReferences(o.expr, c.name));
-        o.name = choose(o.id, t.name, refs.length === 1 ? refs[0]!.name : null, 'check', false, true);
-        break;
+        const ref = singleRefColumn(m, view, o.parent, exprRefNames('sqlite', o.expr, sqliteColumnRefs));
+        return [keySlot(o, sqliteSpec(o.parent, con, t.name, ref, 'check'))];
       }
       case 'index':
-        o.name = choose(o.id, t.name, sqliteJoinNames(indexElementNames(m, o)), 'idx', true, false);
-        break;
+        if (!indexColsResolved(m, o)) return UNRESOLVED;
+        return [
+          keySlot(
+            o,
+            sqliteSpec(o.parent, SQLITE_REL_ONLY, t.name, sqliteJoinNames(indexElementNames(m, o)), 'idx'),
+          ),
+        ];
     }
-  }
+  },
+};
+registerDialectNaming(sqliteNaming);
+
+const refreshSqliteDerivedNames = (m: Model, tableId: string): void => {
+  const idx = getActiveModelIndex(m);
+  const tr = idx instanceof OverlayModelIndex ? idx.nameTracker() : undefined;
+  if (tr) tr.refresh(m, tableId);
+  else plainRefresh(m, sqliteNaming, tableId);
 };
 
 const validateSqliteModel = (m: Model): string[] => {

@@ -1,14 +1,18 @@
 // 同步协议的消息和公共函数（04-ir-design.md 第 2 节）。客户端和服务器共用。
 import {
+  BATCH_MUTATOR,
+  type BatchStepper,
   clonePlain,
   COMPOSITE_MUTATORS,
   deepEqual,
+  DerivedNameBudget,
   type Model,
   MutableModelIndex,
   type Obj,
   OverlayModelIndex,
   readsOf,
   runMutator,
+  withDerivedNameBudget,
   withModelIndex,
 } from '@dowel/core';
 
@@ -104,15 +108,26 @@ export interface ExecuteResult {
   overlay: Map<string, Obj | undefined>;
 }
 
+export interface ExecuteOptions {
+  /**
+   * 推导名工作量预算（Issue #164）。默认每次 execute 一份新的 DERIVED_NAME_WORK_BUDGET；
+   * MCP apply_changes 的逐步预演让全部子操作共用一份。超出时抛 EditError（写时复制，原模型不受影响）。
+   */
+  budget?: DerivedNameBudget;
+}
+
 /** 在模型的副本上执行一个修改，返回改动了哪些对象（写时复制，绝不修改传入的模型） */
 export const execute = (
   m: Model,
   name: string,
   args: unknown,
   baseIndex?: MutableModelIndex,
+  opts: ExecuteOptions = {},
 ): ExecuteResult => {
   const overlay = new Map<string, Obj | undefined>();
   const proxyCache = new Map<string, Obj>();
+  // 叠加索引的写入跟踪（有索引时才有）：每次写入后通知，使名字占用查询与推导名刷新可以增量进行
+  let noteWrite: ((id: string) => void) | null = null;
 
   const ensureCloned = (rootId: string): Obj | undefined => {
     if (overlay.has(rootId)) return overlay.get(rootId);
@@ -159,12 +174,16 @@ export const execute = (
         const mut = getMutableParent();
         if (!mut) return false;
         const clean = value !== null && typeof value === 'object' ? clonePlain(value) : value;
-        return Reflect.set(mut, prop, clean);
+        const ok = Reflect.set(mut, prop, clean);
+        noteWrite?.(rootId);
+        return ok;
       },
       deleteProperty(_t, prop) {
         const mut = getMutableParent();
         if (!mut) return false;
-        return Reflect.deleteProperty(mut, prop);
+        const ok = Reflect.deleteProperty(mut, prop);
+        noteWrite?.(rootId);
+        return ok;
       },
       defineProperty(_t, prop, desc) {
         const mut = getMutableParent();
@@ -173,7 +192,9 @@ export const execute = (
           'value' in desc && desc.value !== null && typeof desc.value === 'object'
             ? { ...desc, value: clonePlain(desc.value) }
             : desc;
-        return Reflect.defineProperty(mut, prop, cleanDesc);
+        const ok = Reflect.defineProperty(mut, prop, cleanDesc);
+        noteWrite?.(rootId);
+        return ok;
       },
       ownKeys() {
         const cur = getCurrent();
@@ -220,12 +241,14 @@ export const execute = (
     set(_t, prop, value) {
       if (typeof prop !== 'string') return false;
       overlay.set(prop, clonePlain(value as Obj));
+      noteWrite?.(prop);
       return true;
     },
     deleteProperty(_t, prop) {
       if (typeof prop !== 'string') return true;
       if (Object.hasOwn(m.objects, prop) || overlay.has(prop)) {
         overlay.set(prop, undefined);
+        noteWrite?.(prop);
       }
       return true;
     },
@@ -253,11 +276,20 @@ export const execute = (
   // 粘贴 / batch 一次展开成成百上千个子操作，每个都要做重名判定：没有现成索引时（例如还有待确认修改）临时建一个，
   // 一次 O(n) 建索引远比每个子操作 O(n) 枚举写时复制代理便宜
   if (!baseIndex && COMPOSITE_MUTATORS.has(name)) baseIndex = new MutableModelIndex(m);
+  const budget = opts.budget ?? new DerivedNameBudget();
   if (baseIndex) {
     const overlayIndex = new OverlayModelIndex(baseIndex, overlay, draft, wrapRoot);
-    withModelIndex(draft, () => runMutator(draft, name, args), overlayIndex);
+    noteWrite = overlayIndex.trackWrites();
+    try {
+      withDerivedNameBudget(budget, () =>
+        withModelIndex(draft, () => runMutator(draft, name, args), overlayIndex),
+      );
+    } finally {
+      // 提交或回滚都要撤销叠加层对基线命名序列的消耗（基线状态只随 applyBatch 前进）
+      overlayIndex.finishTracking();
+    }
   } else {
-    runMutator(draft, name, args);
+    withDerivedNameBudget(budget, () => runMutator(draft, name, args));
   }
 
   const changes: Change[] = [];
@@ -293,6 +325,29 @@ export const applyChanges = (m: Model, versions: Versions, changes: Change[], ve
   }
 };
 
+/**
+ * batch 依据的逐步执行器：带持久推导名状态的索引 + 每步一次 execute（写时复制）后 applyBatch，
+ * 每步只做 O(变化量) 的推导名工作（Issue #164）。
+ */
+export const indexedBatchStepper = (
+  base: Model,
+  budget: DerivedNameBudget = new DerivedNameBudget(),
+): BatchStepper => {
+  const idx = new MutableModelIndex(base);
+  return (cur, name, args) => {
+    const r = execute(cur, name, args, idx, { budget });
+    idx.applyBatch(
+      r.next,
+      r.changes.map((c) => ({
+        id: c.id,
+        prev: ownObj(cur, c.id),
+        next: c.obj ? r.next.objects[c.id] : undefined,
+      })),
+    );
+    return r.next;
+  };
+};
+
 /** 依据：参数里涉及的对象 + 实际写到的对象（name 为 batch 时按子操作逐步计算，见 readsOf） */
 export const opReads = (
   m: Model,
@@ -301,6 +356,7 @@ export const opReads = (
   changes: Change[],
   name?: string,
 ): [string, Ver | null][] => {
-  const ids = new Set([...readsOf(m, args, name), ...changes.map((c) => c.id)]);
+  const step = name === BATCH_MUTATOR ? indexedBatchStepper(m) : undefined;
+  const ids = new Set([...readsOf(m, args, name, step), ...changes.map((c) => c.id)]);
   return [...ids].sort().map((id) => [id, Object.hasOwn(m.objects, id) ? verOf(versions, id) : null]);
 };

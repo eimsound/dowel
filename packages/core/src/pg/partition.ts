@@ -1,7 +1,8 @@
+import { exprRefNames } from '../derived-names.ts';
 // PostgreSQL 分区边界解析/格式化/校验、存量 partitionBy 字符串解析与分区键列引用提取。
 import type { Column, Model, PartitionKey, PartitionSpec, PartitionStrategy, Table } from '../ir.ts';
 import { getActiveModelIndex } from '../model.ts';
-import { exprReferences } from './expr.ts';
+import { columnRefs } from './expr.ts';
 
 export type PartitionBound =
   | { kind: 'default' }
@@ -460,8 +461,10 @@ export const partitionKeyColumns = (
       if (!direct.includes(k.column)) direct.push(k.column);
     } else if (k.expr) {
       hasExprKey = true;
+      // 表达式只分词一次，再与各列名求交
+      const refs = exprRefNames('pg', k.expr, columnRefs);
       for (const c of cols) {
-        if (exprReferences(k.expr, c.name) && !expr.includes(c.id)) expr.push(c.id);
+        if (refs.has(c.name) && !expr.includes(c.id)) expr.push(c.id);
       }
     }
   }
