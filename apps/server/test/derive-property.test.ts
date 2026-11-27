@@ -67,12 +67,12 @@ const TYPES = ['integer', 'bigint', 'text', 'numeric'] as const;
 const COLLATIONS = [null, 'C', 'POSIX'] as const;
 const OPS = ['>', '<', '<>', '>='] as const;
 
-/** 类型注解：`::` 之后的单个标识符（PG 列引用分析会跳过它，renameInExpr / exprReferences 不受影响） */
+/** 类型注解：`::` 之后的单个标识符，带 `ty_` 前缀以与各方言规范化后的类型拼写及用户原文里的枚举转换彻底隔离（PG 列引用分析会跳过它，renameInExpr / exprReferences 不受影响） */
 const annot = (c: Column): string =>
-  `${c.type}${c.typeRef ? `_r_${c.typeRef}` : ''}${c.collation ? `_c_${c.collation}` : ''}`;
+  `ty_${c.type.replace(/[^A-Za-z0-9_]/g, '_')}${c.typeRef ? `_r_${c.typeRef}` : ''}${c.collation ? `_c_${c.collation.replace(/[^A-Za-z0-9_]/g, '_')}` : ''}`;
 
-/** 假引擎加的注解：列类型注解（以 TYPES 之一开头）与枚举绑定注解（en_ 开头）；用户原文里的 `::mood` 不是注解 */
-const ANNOT_RE = new RegExp(`::(?:${TYPES.join('|')}|en_)[A-Za-z0-9_]*`, 'g');
+/** 假引擎加的注解：列类型注解（ty_ 开头）与枚举绑定注解（en_ 开头）；与列类型拼写无关，也不会误剥用户原文里的 `::mood` / `::public."Mood"` */
+const ANNOT_RE = /::(?:ty_|en_)[A-Za-z0-9_]*/g;
 
 /** 去掉规范化加上的注解和括号，得到用户原文的词序列（规范化因此幂等） */
 const coreTokens = (s: string): string[] =>
@@ -651,11 +651,14 @@ const applyEdit = (m: Model, e: Edit): boolean => {
       case 'swapEnumNames': {
         // 没有 mutator：模拟换入另一条历史分支上两个枚举对调过名字的快照（表达式原文逐字不变，名字换了绑定，#146）
         const a = pick(enums, e.a);
-        const b = pick(enums, e.b);
-        if (!a || !b || a === b) return false;
+        if (!a) return false;
         const ea = m.objects[a] as Extract<Obj, { kind: 'enum' }>;
+        const others = enums.filter(
+          (id) => id !== a && (m.objects[id] as Extract<Obj, { kind: 'enum' }>).parent === ea.parent,
+        );
+        const b = pick(others, e.b);
+        if (!b) return false;
         const eb = m.objects[b] as Extract<Obj, { kind: 'enum' }>;
-        if (ea.parent !== eb.parent) return false;
         [ea.name, eb.name] = [eb.name, ea.name];
         return true;
       }
@@ -791,7 +794,7 @@ const exprArb: fc.Arbitrary<ExprSpec> = fc.record({
   refs: fc.array(nat, { minLength: 1, maxLength: 2 }),
   op: nat,
   lit: fc.integer({ min: 0, max: 9 }),
-  en: fc.option(nat, { freq: 2 }),
+  en: fc.option(nat, { freq: 4 }),
   q: fc.boolean(),
 });
 const editArb: fc.Arbitrary<Edit> = fc.oneof(
@@ -829,7 +832,7 @@ const editArb: fc.Arbitrary<Edit> = fc.oneof(
   { weight: 1, arbitrary: fc.record({ k: fc.constant('renameSchema' as const), name: nat }) },
   { weight: 1, arbitrary: fc.record({ k: fc.constant('dropColumn' as const), c: nat }) },
   {
-    weight: 2,
+    weight: 4,
     arbitrary: fc.record({
       k: fc.constant('addView' as const),
       t: nat,
@@ -839,10 +842,10 @@ const editArb: fc.Arbitrary<Edit> = fc.oneof(
       viewDep: fc.option(nat),
     }),
   },
-  { weight: 1, arbitrary: fc.record({ k: fc.constant('editViewDdl' as const), v: nat, rev: nat }) },
-  { weight: 1, arbitrary: fc.record({ k: fc.constant('detachPartition' as const), t: nat }) },
+  { weight: 2, arbitrary: fc.record({ k: fc.constant('editViewDdl' as const), v: nat, rev: nat }) },
+  { weight: 2, arbitrary: fc.record({ k: fc.constant('detachPartition' as const), t: nat }) },
   {
-    weight: 3,
+    weight: 4,
     arbitrary: fc.record({
       k: fc.constant('attachPartition' as const),
       t: nat,
@@ -859,10 +862,10 @@ const editArb: fc.Arbitrary<Edit> = fc.oneof(
       expr: fc.option(exprArb, { freq: 3 }),
     }),
   },
-  { weight: 2, arbitrary: fc.record({ k: fc.constant('setNotNull' as const), c: nat, v: fc.boolean() }) },
+  { weight: 1, arbitrary: fc.record({ k: fc.constant('setNotNull' as const), c: nat, v: fc.boolean() }) },
   { weight: 1, arbitrary: fc.record({ k: fc.constant('createEnum' as const), name: nat }) },
   { weight: 1, arbitrary: fc.record({ k: fc.constant('dropEnum' as const), e: nat }) },
-  { weight: 1, arbitrary: fc.record({ k: fc.constant('swapEnumNames' as const), a: nat, b: nat }) },
+  { weight: 3, arbitrary: fc.record({ k: fc.constant('swapEnumNames' as const), a: nat, b: nat }) },
   {
     weight: 1,
     arbitrary: fc.record({ k: fc.constant('setLegacyPartitionBy' as const), t: nat, col: nat }),
@@ -871,14 +874,14 @@ const editArb: fc.Arbitrary<Edit> = fc.oneof(
 const faultArb: fc.Arbitrary<Fault> = fc.oneof(
   { weight: 6, arbitrary: fc.constant({ kind: 'none' as const }) },
   {
-    weight: 2,
+    weight: 3,
     arbitrary: fc
       .constantFrom('nullShadow', 'shadowError', 'stepError', 'otherError')
       .map((kind) => ({ kind })),
   },
   {
-    weight: 1,
-    arbitrary: fc.record({ kind: fc.constant('reject' as const), times: fc.integer({ min: 1, max: 5 }) }),
+    weight: 2,
+    arbitrary: fc.record({ kind: fc.constant('reject' as const), times: fc.integer({ min: 1, max: 6 }) }),
   },
   { weight: 2, arbitrary: fc.record({ kind: fc.constant('concurrent' as const), edit: editArb }) },
 );
@@ -901,7 +904,7 @@ const opArbFor = (editArb: fc.Arbitrary<Edit>): fc.Arbitrary<Op> =>
   fc.oneof(
     { weight: 8, arbitrary: editArb.map((edit) => ({ op: 'edit' as const, edit })) },
     { weight: 4, arbitrary: faultArb.map((fault) => ({ op: 'flush' as const, fault })) },
-    { weight: 2, arbitrary: faultArb.map((fault) => ({ op: 'normalize' as const, fault })) },
+    { weight: 3, arbitrary: faultArb.map((fault) => ({ op: 'normalize' as const, fault })) },
     { weight: 1, arbitrary: fc.record({ op: fc.constant('runWithoutReset' as const), h: nat }) },
     {
       weight: 2,
@@ -1230,6 +1233,83 @@ describe('假引擎自检', () => {
       { numRuns: RUNS, seed: SEED },
     );
   });
+
+  test.each(['pg', 'mysql', 'mssql', 'sqlite'] as const)(
+    '规范形式幂等（%s，含 #139 规范类型与带引号枚举名）：固定样例保持不动点',
+    (dialect) => {
+      const m = emptyModel(dialect);
+      const schemaName = { pg: 'public', mysql: 'default', mssql: 'dbo', sqlite: 'main' }[dialect];
+      runMutator(m, 'createSchema', { id: 's', name: schemaName });
+      runMutator(m, 'createTable', { id: 't1', schema: 's', name: 'orders' });
+      runMutator(m, 'addColumn', { table: 't1', column: { id: 'c1', name: 'qty', type: 'integer' } });
+      runMutator(m, 'addColumn', {
+        table: 't1',
+        column: { id: 'c2', name: 'price', type: 'numeric', notNull: true },
+      });
+      runMutator(m, 'addColumn', {
+        table: 't1',
+        column: {
+          id: 'c3',
+          name: 'note',
+          type: 'varchar(32)',
+          collation: dialect === 'sqlite' ? 'nocase' : null,
+          default: { expr: "'ok'" },
+        },
+      });
+      runMutator(m, 'addColumn', {
+        table: 't1',
+        column: {
+          id: 'g1',
+          name: 'qty_g',
+          type: 'int',
+          generated: { expr: 'qty + 1', stored: true },
+        },
+      });
+      let checkExpr = "qty > 0 AND price >= 0 AND note <> ''";
+      if (dialect === 'pg') {
+        runMutator(m, 'addColumn', { table: 't1', column: { id: 'c4', name: 'ts', type: 'timestamptz' } });
+        runMutator(m, 'addColumn', { table: 't1', column: { id: 'c5', name: 'bits', type: 'bit' } });
+        runMutator(m, 'createEnum', { id: 'e1', schema: 's', name: 'mood', values: ['ok'] });
+        runMutator(m, 'createEnum', { id: 'e2', schema: 's', name: 'Mood', values: ['ok'] });
+        runMutator(m, 'createEnum', { id: 'e3', schema: 's', name: 'x"y', values: ['ok'] });
+        runMutator(m, 'createEnum', { id: 'e4', schema: 's', name: '情绪', values: ['ok'] });
+        checkExpr =
+          'qty > 0 AND price >= 0 AND note <> \'\' AND ts IS NOT NULL AND bits IS NOT NULL AND 0::mood = 0::public."Mood" AND 0::"Mood" = 0::public."x""y" AND 0::public."情绪" = 0::missing';
+      }
+      runMutator(m, 'addCheck', { id: 'k1', table: 't1', expr: checkExpr });
+
+      const c1 = canonModel(m);
+      expect(nonFixed(c1, Object.keys(c1.objects))).toEqual([]);
+      const c2 = canonModel(c1);
+      expect(c2).toEqual(c1);
+      const expr = (c1.objects.k1 as Check).expr;
+      if (dialect === 'mssql') {
+        expect(expr).toContain('qty::ty_int');
+        expect(expr).toContain('price::ty_numeric_18_0_');
+        expect(expr).toContain('note::ty_varchar_32_');
+      } else if (dialect === 'mysql') {
+        expect(expr).toContain('qty::ty_int');
+        expect(expr).toContain('price::ty_decimal_10_0_');
+        expect(expr).toContain('note::ty_varchar_32_');
+      } else if (dialect === 'sqlite') {
+        expect(expr).toContain('qty::ty_INTEGER');
+        expect(expr).toContain('price::ty_NUMERIC');
+        expect(expr).toContain('note::ty_VARCHAR_32__c_NOCASE');
+      } else {
+        expect(expr).toContain('qty::ty_integer');
+        expect(expr).toContain('price::ty_numeric');
+        expect(expr).toContain('note::ty_character_varying_32_');
+        expect(expr).toContain('ts::ty_timestamp_with_time_zone');
+        expect(expr).toContain('bits::ty_bit_1_');
+        expect(expr).toContain('0::mood::en_e1');
+        expect(expr).toContain('0::public."Mood"::en_e2');
+        expect(expr).toContain('0::"Mood"::en_e2');
+        expect(expr).toContain('0::public."x""y"::en_e3');
+        expect(expr).toContain('0::public."情绪"::en_e4');
+        expect(expr).toContain('0::missing::en_none');
+      }
+    },
+  );
 
   test.each(['pg', 'mssql'] as const)(
     '判定与假引擎一致（%s）：规范模型上只改上下文，凡是规范形式变了的对象都被判为待规范化',
