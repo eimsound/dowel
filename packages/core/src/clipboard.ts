@@ -12,6 +12,7 @@ import {
   type QualifiedTypeRename,
   utf8ByteLen,
 } from './clipboard-dialect.ts';
+import { exprRefNames, singleReferencedColumn } from './derived-names.ts';
 import type { DialectSpec } from './dialect.ts';
 import { newId } from './ids.ts';
 import {
@@ -888,10 +889,13 @@ const reserveDerivedKeyOrIndex = (
     }
     return out;
   };
-  const singleCheckRef = (expr: string): string | null => {
-    const refs = exprColNames.filter((cname) => ctx.d.exprReferences(expr, cname));
-    return refs.length === 1 ? refs[0]! : null;
-  };
+  // 等价于按列逐个 exprReferences 后取唯一一列，但表达式只分词一次
+  const singleCheckRef = (expr: string): string | null =>
+    singleReferencedColumn(
+      ctx.d.id,
+      exprRefNames(ctx.d.id, expr, (e) => ctx.d.columnRefs(e)),
+      exprColNames,
+    );
   ctx.ns.reserveDerivedName({
     schemaId,
     tableId,

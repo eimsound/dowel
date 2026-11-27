@@ -2,6 +2,7 @@
 // 客户端乐观执行，服务器在最新状态上重新执行；参数由服务器用 zod 校验，不信任客户端。
 import { z } from 'zod';
 
+import { exprRefNames, refsHaveName } from './derived-names.ts';
 import * as E from './edit.ts';
 import { isReservedId } from './ids.ts';
 import {
@@ -447,9 +448,11 @@ export const readsOf = (m: Model, args: unknown, name?: string): string[] => {
       if (o.kind === 'table') tables.add(o.id);
       else if ('parent' in o && m.objects[o.parent]?.kind === 'table') tables.add(o.parent);
     }
+    // 每个表达式只分词一次，再与各列名求交（原先按列逐个重新分词）
+    const refSets = exprs.map((e) => exprRefNames(m.dialect, e, (x) => d.columnRefs(x)));
     for (const t of tables)
       for (const c of effectiveColumnsOf(m, t))
-        if (exprs.some((e) => d.exprReferences(e, c.name))) out.add(c.id);
+        if (refSets.some((r) => refsHaveName(m.dialect, r, c.name))) out.add(c.id);
   }
   return [...out];
 };
