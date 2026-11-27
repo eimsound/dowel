@@ -177,7 +177,11 @@ const changedEnumNames = (base: Model, cur: Model): Set<string> => {
 /** 带引号标识符（"..."，"" 转义）或普通标识符；字符串字面量里的词也会被扫到（只会多报） */
 const IDENT_RE = /"((?:[^"]|"")*)"|[\p{L}_][\p{L}\p{N}_$]*/gu;
 
-/** 表达式（exprsOf 的返回值：字符串 / 数组 / 普通对象）里是否出现了 names 里的某个名字（忽略大小写，按词匹配） */
+/**
+ * 表达式（exprsOf 的返回值：字符串 / 数组 / 普通对象）里是否出现了 names 里的某个名字（忽略大小写，按词匹配）。
+ * 小写折叠是有意的过近似：覆盖手写基线或 PG 原样保留的 $$...$$ 函数体里非引号大写拼写（如 public.MOOD）与目录小写名（mood）
+ * 的大小写差异；若存在带引号且仅大小写不同的同名枚举，至多引起一次瞬态多报、flush 后即归零。
+ */
 const mentionsAny = (e: unknown, names: ReadonlySet<string>): boolean => {
   if (typeof e === 'string') {
     for (const x of e.matchAll(IDENT_RE)) {
@@ -307,7 +311,9 @@ export const pendingRefreshIds = (baseline: Model | null, cur: Model): string[] 
     const b = curPartKey(parentId);
     if (a?.sig !== b?.sig) return true;
     if (!a?.hasExpr && !b?.hasExpr) return false;
-    // a.sig === b.sig 保证两边的键表达式原文（或存量字符串）一致，扫当前一侧即可
+    // a.sig === b.sig 保证两边的键表达式一致，但不保证 partitionKeyText 逐字相同：若基线是可解析的存量字符串、
+    // 当前已结构化，基线侧多出的策略关键字、键列名、collation、opclass 都不是枚举引用，键列的枚举类型已由 colSig 覆盖，
+    // 因此只扫当前一侧即可
     return tableCtxChanged(parentId) || mentionsChangedEnum(partitionKeyText(cur.objects[parentId]));
   };
   /** 表达式按列名引用的那张表：CHECK / 索引 / 列是 parent；有表达式分区键的表是自己；否则不看列上下文 */

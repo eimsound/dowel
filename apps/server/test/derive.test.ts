@@ -1140,6 +1140,36 @@ describe('pendingRefreshIds：表达式直接引用枚举、表内没有指向�
     (renamedTo.objects.e2 as { name: string }).name = 'mood';
     expect(pendingRefreshIds(good, renamedTo)).toEqual(['st', 'k']);
   });
+
+  test('大小写折叠：手写基线或函数体里的未加引号大写写法（public.MOOD / MOOD）对目录小写枚举 mood 仍检出', () => {
+    const good = base();
+    runMutator(good, 'createEnum', { id: 'e1', schema: 's', name: 'mood', values: ['ok', 'bad'] });
+    runMutator(good, 'createEnum', { id: 'e2', schema: 's', name: 'tone', values: ['ok', 'lo'] });
+    runMutator(good, 'addColumn', { table: 't', column: { id: 'st', name: 'status', type: 'text' } });
+    runMutator(good, 'addCheck', { id: 'k', table: 't', expr: '((status)::public.MOOD IS NOT NULL)' });
+    runMutator(good, 'addCheck', { id: 'k0', table: 't', expr: '(total > 0)' });
+    good.objects.fn = view('fn', ['s'], {
+      objType: 'function',
+      ddl: [
+        "CREATE FUNCTION public.fn() RETURNS text LANGUAGE sql AS $$ SELECT ('ok'::public.MOOD)::text $$",
+      ],
+    });
+    expect(pendingRefreshIds(good, structuredClone(good))).toEqual([]);
+
+    const swapped = structuredClone(good);
+    (swapped.objects.e1 as { name: string }).name = 'tone';
+    (swapped.objects.e2 as { name: string }).name = 'mood';
+    expect(pendingRefreshIds(good, swapped)).toEqual(['k', 'fn']);
+
+    const unq = base();
+    runMutator(unq, 'createEnum', { id: 'e1', schema: 's', name: 'mood', values: ['ok', 'bad'] });
+    runMutator(unq, 'addColumn', { table: 't', column: { id: 'st', name: 'status', type: 'text' } });
+    runMutator(unq, 'addCheck', { id: 'k', table: 't', expr: '((status)::MOOD IS NOT NULL)' });
+    const renamed = structuredClone(unq);
+    runMutator(renamed, 'renameEnum', { id: 'e1', name: 'feeling' });
+    expect((renamed.objects.k as { expr: string }).expr).toBe('((status)::MOOD IS NOT NULL)');
+    expect(pendingRefreshIds(unq, renamed)).toEqual(['k']);
+  });
 });
 
 describe('pendingRefreshIds：分区键签名的保守规则（PR #138 评审补测）', () => {
