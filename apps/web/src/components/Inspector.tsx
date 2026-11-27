@@ -70,7 +70,7 @@ import { useTranslation } from 'react-i18next';
 
 import { api } from '../api.ts';
 import { dialectUiSpec } from '../dialects.ts';
-import { columnNullability } from '../nullability.ts';
+import { showRowInferredDescription } from '../nullability.ts';
 import {
   columnSerial,
   keepsSerialOnPlainInteger,
@@ -81,6 +81,11 @@ import { useProject } from '../project.tsx';
 import { resolveTopLevelTableId } from '../sections.ts';
 import type { Workspace } from '../workspace.ts';
 import { isUntypedColumn, shortType, typeLabel } from './Canvas.tsx';
+import {
+  ColumnNotNullBadge,
+  ColumnNotNullCheckbox,
+  ColumnNotNullInferredHint,
+} from './ColumnNullability.tsx';
 import { Modal } from './Modal.tsx';
 import { Banner, cx, Empty, IconButton, Menu, type MenuItem, Sql } from './ui.tsx';
 
@@ -1294,18 +1299,9 @@ const TableInspector = ({
             const showSerialHint = open && serial !== null && serialHintCol === c.id;
             // 显式 NOT NULL 与引擎推断的非空分开（SQL Server 持久化计算列，ADR 0019）：复选框只绑显式，徽标按有效值
             // 只由推断得出的 NN 用虚线框区分（不降对比度）；鼠标悬停看 title，读屏经行按钮的 aria-describedby 读到同一句
-            const nn = columnNullability(model, c);
-            const nnBadge = nn.effective && (
-              <b
-                className={cx('flag', nn.inferredOnly && 'inferred')}
-                title={nn.inferredOnly ? t('insp.notNullInferred') : undefined}
-              >
-                NN
-              </b>
-            );
             const rowInferredId = `${nnInferredBaseId}-row-${c.id}`;
             const hintInferredId = `${nnInferredBaseId}-hint-${c.id}`;
-            const showRowInferred = !isPk && nn.inferredOnly;
+            const showRowInferred = showRowInferredDescription(model, c, isPk);
             // SQLite 非 STRICT 表的无类型列：类型框下说明 BLOB 亲和性
             const showUntypedHint = open && !sqliteStrict && isUntypedColumn(model, c);
             // 单列 INT / BIGINT 等整数主键不是 rowid 别名，说明为什么没有 AUTOINCREMENT
@@ -1331,7 +1327,9 @@ const TableInspector = ({
                   >
                     {rowType}
                   </span>
-                  <span className="flex w-[52px] justify-end gap-[3px]">{nnBadge}</span>
+                  <span className="flex w-[52px] justify-end gap-[3px]">
+                    <ColumnNotNullBadge model={model} column={c} inferredTitle={t('insp.notNullInferred')} />
+                  </span>
                 </li>
               );
             }
@@ -1370,7 +1368,13 @@ const TableInspector = ({
                     {isPk && <b className="flag pk">PK</b>}
                     {fkCols.has(c.id) && <b className="flag fk">FK</b>}
                     {isPartKey && <b className="flag">PT</b>}
-                    {!isPk && nnBadge}
+                    {!isPk && (
+                      <ColumnNotNullBadge
+                        model={model}
+                        column={c}
+                        inferredTitle={t('insp.notNullInferred')}
+                      />
+                    )}
                   </span>
                 </button>
                 {showRowInferred && (
@@ -1541,26 +1545,13 @@ const TableInspector = ({
                     )}
                     <div className="flex items-center gap-1">
                       <div className="checks flex-1">
-                        <label>
-                          <input
-                            type="checkbox"
-                            checked={nn.explicit}
-                            aria-describedby={nn.inferredOnly ? hintInferredId : undefined}
-                            disabled={
-                              c.identity !== null ||
-                              !!c.ext?.mssql?.identity ||
-                              !!c.ext?.mysql?.autoIncrement ||
-                              (model.dialect === 'mssql' && c.generated !== null && !c.generated.stored) ||
-                              (model.dialect === 'mssql' && !c.notNull && !!c.ext?.mssql?.sparse)
-                            }
-                            onChange={(e) => {
-                              const on = e.target.checked;
-                              if (on && model.dialect === 'mssql' && !!c.ext?.mssql?.sparse) return;
-                              ws.act('setNotNull', { id: c.id, notNull: on });
-                            }}
-                          />
-                          {t('insp.notNull')}
-                        </label>
+                        <ColumnNotNullCheckbox
+                          model={model}
+                          column={c}
+                          hintId={hintInferredId}
+                          label={t('insp.notNull')}
+                          onChange={(on) => ws.act('setNotNull', { id: c.id, notNull: on })}
+                        />
                         <label>
                           <input
                             type="checkbox"
@@ -1664,11 +1655,12 @@ const TableInspector = ({
                         <Trash2 size={14} aria-hidden="true" />
                       </IconButton>
                     </div>
-                    {nn.inferredOnly && (
-                      <p id={hintInferredId} className="hint m-0">
-                        {t('insp.notNullInferredHint')}
-                      </p>
-                    )}
+                    <ColumnNotNullInferredHint
+                      model={model}
+                      column={c}
+                      id={hintInferredId}
+                      text={t('insp.notNullInferredHint')}
+                    />
                     {showNotRowidAliasHint && (
                       <p className="hint m-0">{t('insp.sqliteNotRowidAliasHint', { type: c.type })}</p>
                     )}

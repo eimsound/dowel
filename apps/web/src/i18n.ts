@@ -3479,9 +3479,9 @@ const en: typeof zh = {
     columnName: 'Column name',
     type: 'Type',
     notNull: 'Not null',
-    notNullInferred: 'Inferred non-null from the expression (not explicit)',
+    notNullInferred: 'Inferred as non-null from the expression (not explicit)',
     notNullInferredHint:
-      'Inferred non-null from the expression; the DDL does not add NOT NULL. Check the box to declare it explicitly. Updated on normalization.',
+      'Inferred as non-null from the expression; the DDL does not add NOT NULL. Check the box to declare it explicitly. Updated on normalization.',
     default: 'Default',
     none: 'None',
     pk: 'Primary key',

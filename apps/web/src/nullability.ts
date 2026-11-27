@@ -15,3 +15,19 @@ export const columnNullability = (m: Model, c: Column): ColumnNullability => {
   const inferredOnly = m.dialect === 'mssql' && !c.notNull && mssqlInferredNotNull(c);
   return { explicit: c.notNull, effective: effectiveNotNull(m.dialect, c), inferredOnly };
 };
+
+/** 画布 / 历史快照里的列非空标记：按有效可空性或主键决定是否隐藏 `?` */
+export const canvasColumnNotNull = (m: Model, c: Column, isPk: boolean): boolean =>
+  effectiveNotNull(m.dialect, c) || isPk;
+
+/** Inspector 里“非空”复选框的禁用条件 */
+export const notNullCheckboxDisabled = (m: Model, c: Column): boolean =>
+  c.identity !== null ||
+  !!c.ext?.mssql?.identity ||
+  !!c.ext?.mysql?.autoIncrement ||
+  (m.dialect === 'mssql' && c.generated !== null && !c.generated.stored) ||
+  (m.dialect === 'mssql' && !c.notNull && !!c.ext?.mssql?.sparse);
+
+/** 列行（非主键）是否附带读屏用“由表达式推断为非空”说明 */
+export const showRowInferredDescription = (m: Model, c: Column, isPk: boolean): boolean =>
+  !isPk && columnNullability(m, c).inferredOnly;

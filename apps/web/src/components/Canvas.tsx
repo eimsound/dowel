@@ -2,7 +2,7 @@
 import { type CanvasSection, sectionColorCssVar } from '@dowel/api';
 import {
   buildModelIndex,
-  effectiveNotNull,
+  type Column,
   type Model,
   type ModelIndex,
   partitionKeyColumns,
@@ -30,6 +30,7 @@ import { memo, useCallback, useEffect, useLayoutEffect, useMemo, useRef, useStat
 import { useTranslation } from 'react-i18next';
 
 import { defaultSchemaOf } from '../dialects.ts';
+import { canvasColumnNotNull } from '../nullability.ts';
 import {
   buildCanvasGroups,
   type CanvasGroup,
@@ -45,7 +46,7 @@ import { runElkLayout, StaleLayoutError } from '../workers/elk-client.ts';
 import type { Layout } from '../workspace.ts';
 import { IconButton } from './ui.tsx';
 
-type Col = {
+export type Col = {
   id: string;
   name: string;
   type: string;
@@ -57,6 +58,30 @@ type Col = {
   hasSourceHandle: boolean;
   hasTargetHandle: boolean;
 };
+
+export const buildCanvasColumn = (
+  model: Model,
+  c: Column,
+  opts: {
+    isPk: boolean;
+    isFk: boolean;
+    isUq: boolean;
+    isPartKey: boolean;
+    hasSourceHandle: boolean;
+    hasTargetHandle: boolean;
+  },
+): Col => ({
+  id: c.id,
+  name: c.name,
+  type: shortType(typeLabel(model, c)),
+  isEnum: !!c.typeRef,
+  isUntyped: isUntypedColumn(model, c),
+  key: opts.isPk ? 'PK' : opts.isFk ? 'FK' : opts.isUq ? 'UQ' : '',
+  notNull: canvasColumnNotNull(model, c, opts.isPk),
+  isPartKey: opts.isPartKey,
+  hasSourceHandle: opts.hasSourceHandle,
+  hasTargetHandle: opts.hasTargetHandle,
+});
 type TableData = {
   table: Table;
   schema: string;
@@ -661,18 +686,16 @@ export const Canvas = memo(
           table: tb,
           schema: model.objects[tb.parent]?.name ?? '',
           defaultSchema: defSchema,
-          columns: cols.map((c) => ({
-            id: c.id,
-            name: c.name,
-            type: shortType(typeLabel(model, c)),
-            isEnum: !!c.typeRef,
-            isUntyped: isUntypedColumn(model, c),
-            key: pkCols.has(c.id) ? 'PK' : fkCols.has(c.id) ? 'FK' : uqCols.has(c.id) ? 'UQ' : '',
-            notNull: effectiveNotNull(model.dialect, c) || pkCols.has(c.id),
-            isPartKey: partKeySet.has(c.id),
-            hasSourceHandle: fkSourceCols.has(c.id),
-            hasTargetHandle: fkTargetCols.has(c.id),
-          })),
+          columns: cols.map((c) =>
+            buildCanvasColumn(model, c, {
+              isPk: pkCols.has(c.id),
+              isFk: fkCols.has(c.id),
+              isUq: uqCols.has(c.id),
+              isPartKey: partKeySet.has(c.id),
+              hasSourceHandle: fkSourceCols.has(c.id),
+              hasTargetHandle: fkTargetCols.has(c.id),
+            }),
+          ),
           partitions: effectiveIdx.partitionsRef(tb.id).length,
           partitionStrategy: partStrategy,
         };

@@ -18,7 +18,6 @@ import {
   copyItems,
   copyTables,
   createAll,
-  effectiveNotNull,
   formatScript,
   type Model,
 } from '@dowel/core';
@@ -61,6 +60,7 @@ import {
 import { writeClipboard } from '../clipboard.ts';
 import { defaultSchemaOf } from '../dialects.ts';
 import { formatTime } from '../format.ts';
+import { canvasColumnNotNull } from '../nullability.ts';
 import { useProject } from '../project.tsx';
 import type { Layout } from '../workspace.ts';
 import { Canvas, isUntypedColumn, shortType, typeLabel } from './Canvas.tsx';
@@ -327,7 +327,7 @@ const HistorySchemaSummary = ({ model, copy }: { model: Model; copy?: HistoryCop
                           : uqCols.has(c.id)
                             ? 'UQ'
                             : '';
-                      const nn = effectiveNotNull(model.dialect, c) || pkCols.has(c.id);
+                      const nn = canvasColumnNotNull(model, c, pkCols.has(c.id));
                       return (
                         <li
                           key={c.id}
