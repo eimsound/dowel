@@ -53,9 +53,9 @@
 - 发布 / 迁移 / DDL 等出口的正确性不变：直接使用 `flush()` 返回的 `model` / `seq`（MCP 读模型工具仍在 `flush()` 后读 `canvasState` 以在同一把房间锁内拿到对象版本与板块）；没有影子库时与以前一样跳过（发布为未验证）。
 - 停机：`stop()` 后 `normalize()` 拒绝（`503 shutting_down`），`flush()` 返回 `skipped`；`drain()` 等待在途任务（#19）。`forget()` 后在途任务不回写内存 / 库基线（#41 #44 #45），也不报成功：`flush()` 返回 `skipped('forgotten')`，`normalize()` 抛 `BranchForgottenError`（#137 #144）。删除项目事务提交后必须**先**同步调 `refresher.forget()`，再 `rooms.kickBranches` 与 `shadows.forget*`，避免房间/影子库报错先到达 catch 时 `forgotten` 仍为 `false`；`POST /normalize` 的 `catch` 在排除了已有明确语义的异常（`BranchForgottenError` / `RefresherStoppedError` / `DeriveBusyError` / `HTTPException`）之后，于所有类型化映射（`ShadowError` / `StepError` / `PlanError` / `InstanceLevelStatementError` / `NormalizeConflictError`）与通用报错之前复查 `branches` 存在性（查询失败保守视作仍存在；已消失且 `!resolved` 时退回限速并返回 404），同时覆盖 PG 跨连接 / 跨副本删除窗口以及请求停在 `rooms.model` 尚未入队时删除路由已执行 `forget()` 但未打标记的窗口。
 
-> **2026-11-27 部分修订（按 [ADR 0017](0017-verified-means-executable.md) 规划，除 MySQL 读回容忍已于 #162 移除外，其余待 Issue #132 实现合入）**：
+> **2026-11-27 部分修订（按 [ADR 0017](0017-verified-means-executable.md)；MySQL 读回容忍于 #162 移除，其余随 Issue #132 的实现合入）**：
 >
 > - 决定 2：发布将不再属于“没有影子库或 `flush()` 被跳过时照常放行”的出口。没有可用影子库、或 `flush()` 返回 `skipped` 且仍有待规范化对象时，发布将被拒绝；查看迁移、导出 DDL 等其余出口不变。
-> - 决定 4：按 ADR 0017 规划（待 #132 实现合入），闭环验证将增加与执行读回校验一致的读回核对，使“已验证”意味着同版本数据库上的读回校验一定通过；MySQL 原先 `alignMysqlImportedLive` 的表达式纯格式容忍已于 #162 移除，四种方言均按冻结的版本模型严格读回校验。`canonical: 'ifClean'` 仍保留，理由在 #132 落地后转为：验证记录按数据库完整版本号区分，在其他版本上验证通过的版本不保证是当前影子库的规范形式；SQL Server 生成列的 `type` 规划器不比较，“已验证”不约束它；以及推进黄金基线前的防御性确认。
-> - 决定 4（Issue #123 安全不变量）：接手与接入领先版本时直接用链头版本模型作为黄金基线（`canonical: true`），依赖两道严格读回——执行读回校验（`verifyAndRecord`，当前已对四种方言严格，MySQL 表达式纯格式容忍已于 #162 移除）与恢复时闭环验证的读回核对（按 ADR 0017 规划，待 #132 实现合入）。放宽其中任何一道，都要重新审视这条路径。
-> - 「影响与边界」第一条“发布……正确性不变：……没有影子库时与以前一样跳过（发布为未验证）”将在 #132 实现合入后废止：原做法会产生已验证却无法执行的版本，改为没有影子库不能发布。
+> - 决定 4：按 ADR 0017，闭环验证增加了与执行读回校验一致的读回核对，“已验证”意味着同版本数据库上的读回校验一定通过；MySQL 原先 `alignMysqlImportedLive` 的表达式纯格式容忍已于 #162 移除，四种方言均按冻结的版本模型严格读回校验。`canonical: 'ifClean'` 仍保留，理由转为：验证记录按数据库完整版本号区分，在其他版本上验证通过的版本不保证是当前影子库的规范形式；SQL Server 生成列的 `type` 规划器不比较，“已验证”不约束它；以及推进黄金基线前的防御性确认。
+> - 决定 4（Issue #123 安全不变量）：接手与接入领先版本时直接用链头版本模型作为黄金基线（`canonical: true`），依赖两道严格读回——执行读回校验（`verifyAndRecord`，当前已对四种方言严格，MySQL 表达式纯格式容忍已于 #162 移除）与恢复时闭环验证的读回核对（ADR 0017，随 #132 合入）。放宽其中任何一道，都要重新审视这条路径。
+> - 「影响与边界」第一条“发布……正确性不变：……没有影子库时与以前一样跳过（发布为未验证）”已随 #132 废止：原做法会产生已验证却无法执行的版本，现在没有影子库不能发布；`flush()` 被跳过且仍有待规范化对象时发布在验证之前就被拒绝（`normalize_pending`，列出待处理对象）。
