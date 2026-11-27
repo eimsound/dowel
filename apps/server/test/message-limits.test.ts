@@ -2,7 +2,8 @@
 // 用注入的小上限验证行为（超限在解析与认证之前被拒、恰好等于上限放行），默认值另行断言。
 import type { AddressInfo } from 'node:net';
 
-import { MAX_SYNC_MESSAGE_BYTES } from '@dowel/sync';
+import { emptyModel } from '@dowel/core';
+import { MAX_SYNC_MESSAGE_BYTES, SyncClient, type ToClient, type ToServer } from '@dowel/sync';
 import { serve } from '@hono/node-server';
 import { afterAll, beforeAll, describe, expect, test } from 'vitest';
 import WebSocket from 'ws';
@@ -183,24 +184,47 @@ describe('协作 WebSocket 单条消息上限', () => {
     });
     sockets.add(ws);
     const received: { t: string; [k: string]: unknown }[] = [];
+    const waiters: {
+      pred: (m: { t: string; [k: string]: unknown }) => boolean;
+      resolve: (m: { t: string; [k: string]: unknown }) => void;
+      reject: (err: Error) => void;
+    }[] = [];
+    let closedCode: number | null = null;
     let rawMax = 0;
     ws.on('message', (data) => {
       const text = (data as Buffer).toString('utf8');
       rawMax = Math.max(rawMax, Buffer.byteLength(text));
-      received.push(JSON.parse(text));
+      const parsed = JSON.parse(text) as { t: string; [k: string]: unknown };
+      received.push(parsed);
+      for (let i = waiters.length - 1; i >= 0; i--) {
+        if (waiters[i]!.pred(parsed)) {
+          const [w] = waiters.splice(i, 1);
+          w!.resolve(parsed);
+        }
+      }
     });
-    const closed = new Promise<number>((r) => ws.once('close', (code) => r(code)));
+    const closed = new Promise<number>((r) =>
+      ws.once('close', (code) => {
+        closedCode = code;
+        for (const w of waiters.splice(0)) {
+          w.reject(new Error(`连接在收到期望消息前关闭：${code}`));
+        }
+        r(code);
+      }),
+    );
     await new Promise((r, reject) => {
       ws.once('open', r);
       ws.once('error', reject);
     });
-    const waitFor = async (pred: (m: { t: string; [k: string]: unknown }) => boolean) => {
-      for (let i = 0; i < 200; i++) {
-        const hit = received.find(pred);
-        if (hit) return hit;
-        await new Promise((r) => setTimeout(r, 10));
+    const waitFor = (pred: (m: { t: string; [k: string]: unknown }) => boolean) => {
+      const hit = received.find(pred);
+      if (hit) return Promise.resolve(hit);
+      if (closedCode !== null) {
+        return Promise.reject(new Error(`连接已关闭（${closedCode}），未等到期望消息`));
       }
-      throw new Error('没等到期望的消息');
+      return new Promise<{ t: string; [k: string]: unknown }>((resolve, reject) => {
+        waiters.push({ pred, resolve, reject });
+      });
     };
     return { ws, received, closed, waitFor, rawMax: () => rawMax };
   };
@@ -217,14 +241,85 @@ describe('协作 WebSocket 单条消息上限', () => {
     c.ws.close();
   });
 
-  test('超过上限：以 1009 关闭连接，消息不进入处理（工作副本 seq 不变）', async () => {
-    const before = (await rooms.model(branch)).seq;
-    const c = await connect();
-    const hello = JSON.stringify({ t: 'hello', client: 'c-over', lastSeq: 0 });
-    c.ws.send(hello + ' '.repeat(WS_LIMIT + 1 - Buffer.byteLength(hello)));
-    expect(await c.closed).toBe(1009);
-    expect(c.received.some((m) => m.t === 'welcome')).toBe(false);
-    expect((await rooms.model(branch)).seq).toBe(before);
+  test('超过上限：含中文 op 恰好等于上限可提交，超出 1 字节以 1009 关闭且 seq、模型与 room_commits 不变', async () => {
+    const makeCommentOp = (
+      clientId: string,
+      n: number,
+      tableId: string,
+      ver: number,
+      targetBytes: number,
+    ) => {
+      const base = JSON.stringify({
+        t: 'op',
+        op: {
+          client: clientId,
+          n,
+          name: 'setComment',
+          args: { id: tableId, comment: '' },
+          reads: [[tableId, ver]],
+        },
+      });
+      const room = targetBytes - Buffer.byteLength(base);
+      const comment = '中'.repeat(Math.floor(room / 3)) + 'a'.repeat(room % 3);
+      const frame = JSON.stringify({
+        t: 'op',
+        op: {
+          client: clientId,
+          n,
+          name: 'setComment',
+          args: { id: tableId, comment },
+          reads: [[tableId, ver]],
+        },
+      });
+      expect(Buffer.byteLength(frame)).toBe(targetBytes);
+      expect(frame.length).toBeLessThan(targetBytes);
+      return { frame, comment };
+    };
+
+    // 1. 恰好等于 WS_LIMIT 字节的含中文 op 正常提交
+    const okConn = await connect();
+    okConn.ws.send(JSON.stringify({ t: 'hello', client: 'c-op-at', lastSeq: 0 }));
+    await okConn.waitFor((m) => m.t === 'welcome');
+    const snap1 = (await okConn.waitFor((m) => m.t === 'snapshot')) as unknown as Extract<
+      ToClient,
+      { t: 'snapshot' }
+    >;
+    const tableId = Object.values(snap1.model.objects).find(
+      (o) => o.kind === 'table' && o.name === 't_0',
+    )!.id;
+    const atOp = makeCommentOp('c-op-at', 1, tableId, Number(snap1.versions[tableId] ?? 0), WS_LIMIT);
+    okConn.ws.send(atOp.frame);
+    const commitMsg = await okConn.waitFor((m) => m.t === 'commit' && m.client === 'c-op-at');
+    expect(commitMsg.seq).toBe(snap1.seq + 1);
+    const afterAt = await rooms.model(branch);
+    expect(afterAt.seq).toBe(snap1.seq + 1);
+    expect((afterAt.model.objects[tableId] as { comment: string | null }).comment).toBe(atOp.comment);
+    okConn.ws.close();
+
+    // 2. 超出 1 字节的含中文 op 以 1009 关闭，不改 seq / 模型 / room_commits
+    const overConn = await connect();
+    overConn.ws.send(JSON.stringify({ t: 'hello', client: 'c-op-over', lastSeq: 0 }));
+    await overConn.waitFor((m) => m.t === 'welcome');
+    const snap2 = (await overConn.waitFor((m) => m.t === 'snapshot')) as unknown as Extract<
+      ToClient,
+      { t: 'snapshot' }
+    >;
+    const beforeModel = await rooms.model(branch);
+    const [commitBefore] = await db.query<{ n: number | string }>(
+      'select count(*) as n from room_commits where branch_id = $1',
+      [branch],
+    );
+    const overOp = makeCommentOp('c-op-over', 1, tableId, Number(snap2.versions[tableId] ?? 0), WS_LIMIT + 1);
+    overConn.ws.send(overOp.frame);
+    expect(await overConn.closed).toBe(1009);
+    const afterOver = await rooms.model(branch);
+    expect(afterOver.seq).toBe(beforeModel.seq);
+    expect(afterOver.model).toEqual(beforeModel.model);
+    const [commitAfter] = await db.query<{ n: number | string }>(
+      'select count(*) as n from room_commits where branch_id = $1',
+      [branch],
+    );
+    expect(Number(commitAfter!.n)).toBe(Number(commitBefore!.n));
   });
 
   test('分片发送也按整条消息累计：总长超限同样 1009', async () => {
@@ -234,7 +329,7 @@ describe('协作 WebSocket 单条消息上限', () => {
     expect(await c.closed).toBe(1009);
   });
 
-  test('presence 数据超过上限直接丢弃，不转发给其他连接', async () => {
+  test('presence 数据超过上限直接丢弃，不转发给其他连接（含中文按字节计）', async () => {
     const a = await connect();
     const b = await connect();
     a.ws.send(JSON.stringify({ t: 'hello', client: 'c-pres-a', lastSeq: 0 }));
@@ -242,11 +337,123 @@ describe('协作 WebSocket 单条消息上限', () => {
     await a.waitFor((m) => m.t === 'welcome');
     await b.waitFor((m) => m.t === 'welcome');
     a.ws.send(JSON.stringify({ t: 'presence', data: { big: 'x'.repeat(MAX_PRESENCE_BYTES) } }));
+    const cjkData = { cjk: '中'.repeat(1400) };
+    expect(JSON.stringify(cjkData).length).toBeLessThan(MAX_PRESENCE_BYTES);
+    expect(Buffer.byteLength(JSON.stringify(cjkData))).toBeGreaterThan(MAX_PRESENCE_BYTES);
+    a.ws.send(JSON.stringify({ t: 'presence', data: cjkData }));
     a.ws.send(JSON.stringify({ t: 'presence', data: { cursor: 1 } }));
     const got = await b.waitFor((m) => m.t === 'presence');
     expect(got.data).toEqual({ cursor: 1 });
     expect(b.received.filter((m) => m.t === 'presence')).toHaveLength(1);
     a.ws.close();
     b.ws.close();
+  });
+
+  test('客户端与服务端上限不一致：超限 1009 后 dropPending 并重连，后续小修改可正常提交且不陷入 1011 循环', async () => {
+    // 客户端用默认 16 MiB 上限，服务端用 WS_LIMIT（16 KiB），模拟两端上限不一致
+    const client = new SyncClient('tab-mismatch', emptyModel());
+    const closeCodes: number[] = [];
+    let activeWs: WebSocket | null = null;
+    let holdFirstCommit = true;
+    let reconnects = 0;
+    let stopped = false;
+
+    let resolveFirstCommit!: () => void;
+    const firstCommitSeen = new Promise<void>((r) => {
+      resolveFirstCommit = r;
+    });
+    let resolveReadyAfter1009!: () => void;
+    const readyAfter1009 = new Promise<void>((r) => {
+      resolveReadyAfter1009 = r;
+    });
+    let resolveDone!: () => void;
+    const done = new Promise<void>((r) => {
+      resolveDone = r;
+    });
+
+    const openConn = () => {
+      const ws = new WebSocket(`${base.replace('http', 'ws')}/api/projects/${pid}/sync`, {
+        headers: { cookie, origin: base },
+      });
+      sockets.add(ws);
+      activeWs = ws;
+      client.send = (m: ToServer) => {
+        if (ws.readyState === WebSocket.OPEN) ws.send(JSON.stringify(m));
+      };
+      ws.on('open', () => {
+        if (activeWs !== ws) return;
+        client.connect();
+      });
+      ws.on('message', (data) => {
+        if (activeWs !== ws) return;
+        const msg = JSON.parse((data as Buffer).toString('utf8')) as ToClient | { t: string };
+        if (msg.t === 'commit' && holdFirstCommit) {
+          resolveFirstCommit();
+          return;
+        }
+        if (msg.t === 'welcome' || msg.t === 'snapshot' || msg.t === 'commit' || msg.t === 'reject') {
+          client.receive(msg as ToClient);
+          if (closeCodes.includes(1009) && client.ready) {
+            resolveReadyAfter1009();
+          }
+          if (Object.hasOwn(client.confirmed.objects, 't_after_1009') && client.pending.length === 0) {
+            stopped = true;
+            ws.close();
+            resolveDone();
+          }
+        }
+      });
+      ws.on('close', (code) => {
+        if (activeWs !== ws) return;
+        client.disconnect();
+        if (stopped) return;
+        closeCodes.push(code);
+        if (code === 1009) {
+          holdFirstCommit = false;
+          expect(client.dropPending()).toBe(2);
+        }
+        if (reconnects < 5) {
+          reconnects += 1;
+          openConn();
+        } else {
+          resolveDone();
+        }
+      });
+    };
+
+    const initialSync = new Promise<void>((resolve) => {
+      const off = client.subscribe(() => {
+        if (client.ready && client.seq > 0) {
+          off();
+          resolve();
+        }
+      });
+    });
+
+    openConn();
+    await initialSync;
+
+    const schemaId = Object.values(client.view.objects).find(
+      (o) => o.kind === 'schema' && o.name === 'public',
+    )!.id;
+
+    // 1. 先发一条小修改（n=1），等服务端已落库并广播 commit，但暂不交给 client.receive，让 pending 留有未确认项
+    client.mutate('createTable', { id: 't_before_1009', schema: schemaId, name: 't_before_1009' });
+    await firstCommitSeen;
+    // 2. 再发一条超过服务端 WS_LIMIT 的大修改（n=2），触发服务端以 1009 断开
+    client.mutate('setComment', { id: 't_before_1009', comment: 'x'.repeat(WS_LIMIT + 4096) });
+
+    await readyAfter1009;
+    expect(client.view.objects.t_before_1009).toBeDefined();
+    expect((client.view.objects.t_before_1009 as { comment: string | null }).comment).toBeNull();
+    // 3. 重连完成同步后，再做一条小修改，必须能被服务端正常接受并确认
+    client.mutate('createTable', { id: 't_after_1009', schema: schemaId, name: 't_after_1009' });
+    await done;
+
+    expect(closeCodes).toEqual([1009]);
+    expect(client.pending).toEqual([]);
+    expect(client.confirmed.objects.t_before_1009).toBeDefined();
+    expect((client.confirmed.objects.t_before_1009 as { comment: string | null }).comment).toBeNull();
+    expect(client.confirmed.objects.t_after_1009).toBeDefined();
   });
 });

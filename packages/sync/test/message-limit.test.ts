@@ -59,16 +59,85 @@ describe('SyncClient 发送前自查单条消息大小', () => {
     expect(bytes(ok.frames[0]!)).toBe(size);
   });
 
-  test('dropPending：丢掉全部待确认修改并回到已确认状态', () => {
+  test('含中文消息按 UTF-8 字节而非字符数自查：恰好等于字节上限放行，超出 1 字节拒绝', () => {
+    const m = emptyModel('pg');
+    const schema = createSchema(m, 'public');
+    const probe = onlineClient(m);
+    probe.c.mutate('createTable', { id: 't1', schema, name: 'orders' });
+    probe.c.receive({
+      t: 'commit',
+      seq: 1,
+      client: probe.c.id,
+      n: 1,
+      user: 'u',
+      changes: [{ id: 't1', obj: probe.c.view.objects.t1! }],
+    });
+    probe.frames.length = 0;
+
+    const cjkComment = '中'.repeat(200);
+    probe.c.mutate('setComment', { id: 't1', comment: cjkComment });
+    const frame = probe.frames[0]!;
+    const byteLen = bytes(frame);
+    // 字符数远低于字节上限（至少少 400），确保按字符计数的变异会被这里直接抓到
+    expect(frame.length).toBeLessThan(byteLen - 1);
+
+    const { c, frames } = onlineClient(probe.c.confirmed, byteLen - 1);
+    expect(() => c.mutate('setComment', { id: 't1', comment: cjkComment })).toThrow(SyncMessageTooLargeError);
+    expect(frames).toEqual([]);
+    expect(c.pending).toEqual([]);
+    expect(c.view).toBe(c.confirmed);
+    // 被拒后不占用序号，较小的修改仍从 n=1 开始
+    expect(c.mutate('setComment', { id: 't1', comment: 'ok' })).toBe(1);
+
+    const ok = onlineClient(probe.c.confirmed, byteLen);
+    expect(ok.c.mutate('setComment', { id: 't1', comment: cjkComment })).toBe(1);
+    expect(ok.frames).toHaveLength(1);
+    expect(bytes(ok.frames[0]!)).toBe(byteLen);
+    expect(schema).toBeDefined();
+  });
+
+  test('dropPending：丢掉全部待确认修改、换新客户端标识并重置序号，重连强制拉取快照', () => {
     const m = emptyModel('pg');
     createSchema(m, 'public');
     const schema = Object.keys(m.objects)[0]!;
-    const { c } = onlineClient(m);
+    const { c, frames } = onlineClient(m);
+    const oldId = c.id;
     c.mutate('createTable', { id: 't1', schema, name: 'a' });
+    c.receive({
+      t: 'commit',
+      seq: 1,
+      client: oldId,
+      n: 1,
+      user: 'u',
+      changes: [{ id: 't1', obj: c.view.objects.t1! }],
+    });
     c.mutate('createTable', { id: 't2', schema, name: 'b' });
+    c.mutate('createTable', { id: 't3', schema, name: 'c' });
+
     expect(c.dropPending()).toBe(2);
     expect(c.pending).toEqual([]);
-    expect(c.view.objects.t1).toBeUndefined();
+    expect(c.view.objects.t2).toBeUndefined();
+    expect(c.view.objects.t3).toBeUndefined();
+    expect(c.id).not.toBe(oldId);
+
+    frames.length = 0;
+    c.disconnect();
+    c.connect();
+    expect(JSON.parse(frames[0]!)).toEqual({ t: 'hello', client: c.id, lastSeq: 0 });
+    // 收到 welcome 时若 snapshot 尚未到达，ready 仍保持 false，等 snapshot 到后再开放发送
+    c.receive({ t: 'welcome', lastProcessed: 0, rejected: [] });
+    expect(c.ready).toBe(false);
+    c.receive({
+      t: 'snapshot',
+      seq: 1,
+      model: c.confirmed,
+      versions: c.versions,
+      lastProcessed: 0,
+    });
+    expect(c.ready).toBe(true);
+    frames.length = 0;
+    expect(c.mutate('createTable', { id: 't4', schema, name: 'd' })).toBe(1);
+    expect(JSON.parse(frames[0]!)).toMatchObject({ t: 'op', op: { client: c.id, n: 1 } });
   });
 });
 

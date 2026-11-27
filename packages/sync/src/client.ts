@@ -1,5 +1,5 @@
 // 客户端：已确认状态 + 待确认修改队列；收到服务器的提交后在新状态上重放队列（rebase）。
-import { EditError, type Model, MutableModelIndex } from '@dowel/core';
+import { EditError, type Model, MutableModelIndex, newId } from '@dowel/core';
 
 import {
   applyChanges,
@@ -28,7 +28,7 @@ export class SyncMessageTooLargeError extends EditError {
   readonly max: number;
   constructor(bytes: number, max: number) {
     super(
-      `这次修改太大（约 ${(bytes / 1048576).toFixed(1)} MB），超过单条同步消息上限 ${(max / 1048576).toFixed(0)} MB，没有提交。请分批操作。`,
+      `这次修改的数据量太大（约 ${(bytes / 1048576).toFixed(1)} MiB，上限 ${(max / 1048576).toFixed(0)} MiB），没有保存。请减少一次操作的内容。`,
     );
     this.bytes = bytes;
     this.max = max;
@@ -41,7 +41,7 @@ export interface SyncClientOptions {
 }
 
 export class SyncClient {
-  readonly id: string;
+  id: string;
   confirmed: Model;
   versions: Versions = {};
   seq = 0;
@@ -54,6 +54,7 @@ export class SyncClient {
   ready = false;
   notices: { n: number; message: string }[] = [];
   private nextN = 1;
+  private forceSnapshot = false;
   private early = new Map<number, Commit>();
   private listeners = new Set<() => void>();
   private confirmedIndex: MutableModelIndex | null = null;
@@ -122,8 +123,10 @@ export class SyncClient {
         if (this.pending.some((p) => p.n === r.n)) this.notices.push({ n: r.n, message: r.message });
       const rejected = new Set(m.rejected.map((r) => r.n));
       this.pending = this.pending.filter((p) => p.n > m.lastProcessed || !rejected.has(p.n));
-      for (const p of this.pending) if (p.n > m.lastProcessed) this.send({ t: 'op', op: stripLocal(p) });
-      this.ready = true;
+      if (!this.forceSnapshot) {
+        for (const p of this.pending) if (p.n > m.lastProcessed) this.send({ t: 'op', op: stripLocal(p) });
+        this.ready = true;
+      }
     } else if (m.t === 'snapshot') {
       this.confirmed = m.model;
       this.versions = m.versions;
@@ -131,6 +134,13 @@ export class SyncClient {
       this.confirmedIndex = null;
       for (const k of this.early.keys()) if (k <= m.seq) this.early.delete(k);
       this.pending = this.pending.filter((p) => p.n > m.lastProcessed);
+      if (this.forceSnapshot) {
+        this.forceSnapshot = false;
+        if (this.online && !this.ready) {
+          for (const p of this.pending) if (p.n > m.lastProcessed) this.send({ t: 'op', op: stripLocal(p) });
+          this.ready = true;
+        }
+      }
     } else if (m.t === 'commit') {
       if (m.seq <= this.seq) return;
       this.early.set(m.seq, m);
@@ -194,12 +204,17 @@ export class SyncClient {
   }
 
   /**
-   * 丢弃全部待确认修改，界面回到已确认状态；返回丢弃的条数。
-   * 服务端以 1009（消息过大）断开时调用：否则重连收到 welcome 后会重发同一批修改，再次被断开。
+   * 丢弃全部待确认修改，换用新客户端标识、重置序号为 1，并在重连时强制拉取服务端快照；返回丢弃的待确认条数。
+   * 服务端以 1009（消息过大）断开时调用：只清空队列而不换标识和序号会让服务端报“修改乱序”并以 1011 反复断开。
    */
-  dropPending(): number {
+  dropPending(nextId = `tab-${newId()}`): number {
     const dropped = this.pending.length;
     this.pending = [];
+    this.early.clear();
+    this.id = nextId;
+    this.nextN = 1;
+    this.forceSnapshot = true;
+    this.ready = false;
     this.rebuild();
     return dropped;
   }
@@ -207,7 +222,7 @@ export class SyncClient {
   connect() {
     this.online = true;
     this.ready = false;
-    this.send({ t: 'hello', client: this.id, lastSeq: this.seq });
+    this.send({ t: 'hello', client: this.id, lastSeq: this.forceSnapshot ? 0 : this.seq });
   }
   disconnect() {
     this.online = false;
