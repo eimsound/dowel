@@ -47,13 +47,20 @@ export const resetDerivedNameStats = (): void => {
 
 // ───── 表达式引用的列名（单趟分词 + 缓存） ─────
 
-const REF_CACHE_MAX_ENTRIES = 4096;
-const REF_CACHE_MAX_CHARS = 8_000_000;
-const refCache = new Map<string, ReadonlySet<string>>();
-let refCacheChars = 0;
+interface RefCacheEntry {
+  refs: ReadonlySet<string>;
+  cost: number;
+}
+
+// 按加权预算淘汰（每条计固定元数据开销 + 键长 + 提取列名估算），既防止海量极短表达式撑爆内存，
+// 也避免固定条数上限在 >4096 条 CHECK 的大表上每趟全量失效。
+const REF_CACHE_MAX_COST = 8_000_000;
+const REF_CACHE_ENTRY_OVERHEAD = 128;
+const refCache = new Map<string, RefCacheEntry>();
+let refCacheCost = 0;
 
 /**
- * 表达式里作为列引用出现的名字集合（PG 原样比较，其他方言转小写）。纯函数结果按表达式文本缓存（LRU，有总长上限），
+ * 表达式里作为列引用出现的名字集合（PG 原样比较，其他方言转小写）。纯函数结果按表达式文本缓存（LRU，按加权成本预算淘汰），
  * 与模型状态无关，不会脏。
  */
 export const exprRefNames = (
@@ -66,19 +73,20 @@ export const exprRefNames = (
   if (hit) {
     refCache.delete(key);
     refCache.set(key, hit);
-    return hit;
+    return hit.refs;
   }
   derivedNameStats.exprLexes++;
   const ci = dialect !== 'pg';
   const out = new Set<string>();
   for (const t of columnRefs(expr)) out.add(ci ? t.text.toLowerCase() : t.text);
-  if (key.length <= REF_CACHE_MAX_CHARS / 4) {
-    refCache.set(key, out);
-    refCacheChars += key.length;
-    while (refCache.size > REF_CACHE_MAX_ENTRIES || refCacheChars > REF_CACHE_MAX_CHARS) {
-      const oldest = refCache.keys().next().value as string;
-      refCache.delete(oldest);
-      refCacheChars -= oldest.length;
+  const cost = REF_CACHE_ENTRY_OVERHEAD + key.length + out.size * 16;
+  if (cost <= REF_CACHE_MAX_COST / 4) {
+    refCache.set(key, { refs: out, cost });
+    refCacheCost += cost;
+    while (refCacheCost > REF_CACHE_MAX_COST) {
+      const oldest = refCache.entries().next().value as [string, RefCacheEntry];
+      refCache.delete(oldest[0]);
+      refCacheCost -= oldest[1].cost;
     }
   }
   return out;
@@ -413,7 +421,7 @@ export class NameRegistry {
     }
   }
 
-  /** 名字在 ns 里出现了多个占用者：用到这个候选名的表不再稳定 */
+  /** 名字在 ns 里出现了多个占用者：用到这个候选名的表不再稳定（例如 MSSQL setColumnExt 写入与他表推导名冲突的显式 defaultName） */
   noteDup(ns: string, norm: string) {
     const set = this.byName.get(norm);
     if (!set) return;

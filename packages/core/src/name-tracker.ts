@@ -73,10 +73,15 @@ export class OverlayNameTracker implements TrackedNaming {
     return o?.kind === 'table' ? o : undefined;
   };
 
-  private snapOf(o: Obj | undefined): Snap | null {
+  private readonly baseTableOf = (id: string): Table | undefined => {
+    const o = this.base.getObj(id);
+    return o?.kind === 'table' ? o : undefined;
+  };
+
+  private snapOf(o: Obj | undefined, fromBase = false): Snap | null {
     if (!o) return null;
     const entries: NsEntry[] = [];
-    nameEntriesOf(this.dialect, o, this.tableOf, entries);
+    nameEntriesOf(this.dialect, o, fromBase ? this.baseTableOf : this.tableOf, entries);
     let keyFp = '';
     let outFp = '';
     let ownerTable: string | null = null;
@@ -122,7 +127,7 @@ export class OverlayNameTracker implements TrackedNaming {
         outFp = o.name;
         break;
       case 'sequence': {
-        const col = o.ownedBy ? this.cur(o.ownedBy) : undefined;
+        const col = o.ownedBy ? (fromBase ? this.base.getObj(o.ownedBy) : this.cur(o.ownedBy)) : undefined;
         ownerTable = col?.kind === 'column' ? col.parent : null;
         keyFp = JSON.stringify([o.parent, o.nameMode, o.ownedBy, ownerTable]);
         outFp = o.name;
@@ -248,7 +253,9 @@ export class OverlayNameTracker implements TrackedNaming {
       const changes: { id: string; prev: Snap | null; next: Snap | null }[] = [];
       // 第一阶段：所有写入对象的条目先换成新状态，再判定腾出 / 重复（避免同批对象互相看不到）
       for (const id of ids) {
-        const prev = this.snaps.has(id) ? this.snaps.get(id)! : this.snapOf(this.base.getObj(id));
+        // 基线对象的惰性旧快照按基线解析父表与序列归属列（与基线索引登记条目时一致），
+        // 避免同一次 flush 窗口内 dropTable / dropColumn 先删父对象导致 prev.entries / ownerTable 缺失。
+        const prev = this.snaps.has(id) ? this.snaps.get(id)! : this.snapOf(this.base.getObj(id), true);
         const next = this.snapOf(this.cur(id));
         if (prev?.kind === 'table' && next?.kind === 'table' && this.tableAttrsChanged(prev, next)) {
           this.goBroken();
