@@ -1577,7 +1577,7 @@ const TableInspector = ({
                         {model.dialect === 'sqlite' &&
                           isPk &&
                           pk?.columns.length === 1 &&
-                          c.type.toUpperCase() === 'INTEGER' &&
+                          c.type.trim().toUpperCase() === 'INTEGER' &&
                           !table.ext?.sqlite?.withoutRowid && (
                             <label>
                               <input
