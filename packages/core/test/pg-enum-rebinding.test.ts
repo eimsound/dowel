@@ -714,5 +714,322 @@ describe('早期不透明对象依赖被删或重建枚举时的规划规则', (
     delete recreatedDropFn.objects.f1;
     createEnum(recreatedDropFn, 'pub', 'gone', ['x', 'y'], 'e_new');
     expect(() => plan(mParam, recreatedDropFn)).toThrow(PlanError);
+
+    const recreatedRedefFn = structuredClone(mParam);
+    delete recreatedRedefFn.objects.e_gone;
+    createEnum(recreatedRedefFn, 'pub', 'gone', ['x', 'y'], 'e_new');
+    (recreatedRedefFn.objects.f1 as Opaque).name = 'f(text)';
+    (recreatedRedefFn.objects.f1 as Opaque).ddl = [
+      'CREATE OR REPLACE FUNCTION public.f(x text) RETURNS integer LANGUAGE sql IMMUTABLE AS $$select 1$$',
+    ];
+    (recreatedRedefFn.objects.f1 as Opaque).drop = 'DROP FUNCTION public.f(text)';
+    (recreatedRedefFn.objects.f1 as Opaque).deps = [];
+    expect(() => plan(mParam, recreatedRedefFn)).toThrow(PlanError);
+  });
+});
+
+describe('P8b 早期不透明对象原地替换与先删后建规则', () => {
+  const withOpaque = (objs: Omit<Opaque, 'kind' | 'parent' | 'comment'>[]) => {
+    const m = emptyModel();
+    createSchema(m, 'public', 'pub');
+    for (const o of objs) {
+      m.objects[o.id] = { ...o, kind: 'opaque', parent: 'pub', comment: null };
+    }
+    return m;
+  };
+
+  test('函数 / 存储过程仅新增或修改参数默认值、或只改函数体 / 属性时原地 CREATE OR REPLACE，不发 DROP', () => {
+    // 1) 修改参数默认值
+    const fnBase = withOpaque([
+      {
+        id: 'f1',
+        objType: 'function',
+        name: 'f(a integer)',
+        ddl: [
+          'CREATE OR REPLACE FUNCTION public.f(a integer DEFAULT 5) RETURNS integer LANGUAGE sql IMMUTABLE AS $function$select a$function$',
+        ],
+        drop: 'DROP FUNCTION public.f(a integer)',
+        deps: [],
+        order: 1,
+      },
+    ]);
+    const fnChangedDef = structuredClone(fnBase);
+    const changedDefDdl =
+      'CREATE OR REPLACE FUNCTION public.f(a integer DEFAULT 7) RETURNS integer LANGUAGE sql IMMUTABLE AS $function$select a$function$';
+    (fnChangedDef.objects.f1 as Opaque).ddl = [changedDefDdl];
+    expect(sqls(fnBase, fnChangedDef)).toEqual([changedDefDdl]);
+
+    // 2) 新增参数默认值（无默认 → 有默认）
+    const fnNoDef = structuredClone(fnBase);
+    (fnNoDef.objects.f1 as Opaque).ddl = [
+      'CREATE OR REPLACE FUNCTION public.f(a integer) RETURNS integer LANGUAGE sql IMMUTABLE AS $function$select a$function$',
+    ];
+    const fnAddedDef = structuredClone(fnBase);
+    const addedDefDdl =
+      'CREATE OR REPLACE FUNCTION public.f(a integer DEFAULT 5) RETURNS integer LANGUAGE sql IMMUTABLE AS $function$select a$function$';
+    (fnAddedDef.objects.f1 as Opaque).ddl = [addedDefDdl];
+    expect(sqls(fnNoDef, fnAddedDef)).toEqual([addedDefDdl]);
+
+    // 3) 复杂默认值（= 与 DEFAULT 混用、逗号、嵌套括号、数组方括号、字符串字面量、类型强转、VARIADIC、RETURNS TABLE）
+    const complex1 = withOpaque([
+      {
+        id: 'f1',
+        objType: 'function',
+        name: 'f(a integer, b text, c integer, VARIADIC d integer[])',
+        ddl: [
+          "CREATE OR REPLACE FUNCTION public.f(a integer = 5, b text DEFAULT 'a, b) = ''c'''::text, c integer DEFAULT coalesce(1, (2 + 3)), VARIADIC d integer[] DEFAULT ARRAY[1, 2]) RETURNS TABLE(x integer, y text) LANGUAGE sql AS $$select a, b$$",
+        ],
+        drop: 'DROP FUNCTION public.f(a integer, b text, c integer, VARIADIC d integer[])',
+        deps: [],
+        order: 1,
+      },
+    ]);
+    const complex2 = structuredClone(complex1);
+    const complex2Ddl =
+      'CREATE OR REPLACE FUNCTION public.f(a integer DEFAULT 9, b text DEFAULT $$x, y)$$, c integer DEFAULT 0, VARIADIC d integer[] DEFAULT ARRAY[3, 4]) RETURNS TABLE(x integer, y text) LANGUAGE sql AS $$select a, b$$';
+    (complex2.objects.f1 as Opaque).ddl = [complex2Ddl];
+    expect(sqls(complex1, complex2)).toEqual([complex2Ddl]);
+
+    // 4) INOUT / OUT 参数上的默认值变更
+    const inout1 = withOpaque([
+      {
+        id: 'f1',
+        objType: 'function',
+        name: 'f(INOUT a integer, OUT b text)',
+        ddl: [
+          "CREATE OR REPLACE FUNCTION public.f(INOUT a integer DEFAULT 1, OUT b text) RETURNS record LANGUAGE sql AS $$select a, 'ok'::text$$",
+        ],
+        drop: 'DROP FUNCTION public.f(INOUT a integer, OUT b text)',
+        deps: [],
+        order: 1,
+      },
+    ]);
+    const inout2 = structuredClone(inout1);
+    const inout2Ddl =
+      "CREATE OR REPLACE FUNCTION public.f(INOUT a integer DEFAULT 2, OUT b text) RETURNS record LANGUAGE sql AS $$select a, 'ok'::text$$";
+    (inout2.objects.f1 as Opaque).ddl = [inout2Ddl];
+    expect(sqls(inout1, inout2)).toEqual([inout2Ddl]);
+
+    // 5) 存储过程参数默认值变更
+    const proc1 = withOpaque([
+      {
+        id: 'p1',
+        objType: 'procedure',
+        name: 'p(IN a integer)',
+        ddl: ['CREATE OR REPLACE PROCEDURE public.p(IN a integer DEFAULT 5) LANGUAGE sql AS $$select 1$$'],
+        drop: 'DROP PROCEDURE public.p(IN a integer)',
+        deps: [],
+        order: 1,
+      },
+    ]);
+    const proc2 = structuredClone(proc1);
+    const proc2Ddl =
+      'CREATE OR REPLACE PROCEDURE public.p(IN a integer DEFAULT 7) LANGUAGE sql AS $$select 1$$';
+    (proc2.objects.p1 as Opaque).ddl = [proc2Ddl];
+    expect(sqls(proc1, proc2)).toEqual([proc2Ddl]);
+
+    // 6) 仅改函数体或属性（VOLATILE → IMMUTABLE STRICT）
+    const opt1 = withOpaque([
+      {
+        id: 'f1',
+        objType: 'function',
+        name: 'f(a integer)',
+        ddl: [
+          'CREATE OR REPLACE FUNCTION public.f(a integer DEFAULT 5) RETURNS integer LANGUAGE sql VOLATILE AS $$select a$$',
+        ],
+        drop: 'DROP FUNCTION public.f(a integer)',
+        deps: [],
+        order: 1,
+      },
+    ]);
+    const opt2 = structuredClone(opt1);
+    const opt2Ddl =
+      'CREATE OR REPLACE FUNCTION public.f(a integer DEFAULT 5) RETURNS integer LANGUAGE sql IMMUTABLE STRICT AS $$select a + 1$$';
+    (opt2.objects.f1 as Opaque).ddl = [opt2Ddl];
+    expect(sqls(opt1, opt2)).toEqual([opt2Ddl]);
+  });
+
+  test('函数 / 存储过程移除参数默认值，或变更参数名 / 模式 / 类型 / 返回类型时先 DROP 再 CREATE OR REPLACE', () => {
+    // 1) 函数移除参数默认值
+    const fnWithDef = withOpaque([
+      {
+        id: 'f1',
+        objType: 'function',
+        name: 'f(a integer)',
+        ddl: [
+          'CREATE OR REPLACE FUNCTION public.f(a integer DEFAULT 5) RETURNS integer LANGUAGE sql IMMUTABLE AS $function$select a$function$',
+        ],
+        drop: 'DROP FUNCTION public.f(a integer)',
+        deps: [],
+        order: 1,
+      },
+    ]);
+    const fnRemovedDef = structuredClone(fnWithDef);
+    const fnRemovedDefDdl =
+      'CREATE OR REPLACE FUNCTION public.f(a integer) RETURNS integer LANGUAGE sql IMMUTABLE AS $function$select a$function$';
+    (fnRemovedDef.objects.f1 as Opaque).ddl = [fnRemovedDefDdl];
+    const fnRemSql = sqls(fnWithDef, fnRemovedDef);
+    expect(at(fnRemSql, 'DROP FUNCTION public.f(a integer)')).toBeLessThan(at(fnRemSql, fnRemovedDefDdl));
+
+    // 2) 存储过程移除参数默认值
+    const procWithDef = withOpaque([
+      {
+        id: 'p1',
+        objType: 'procedure',
+        name: 'p(IN a integer)',
+        ddl: ['CREATE OR REPLACE PROCEDURE public.p(IN a integer DEFAULT 5) LANGUAGE sql AS $$select 1$$'],
+        drop: 'DROP PROCEDURE public.p(IN a integer)',
+        deps: [],
+        order: 1,
+      },
+    ]);
+    const procRemovedDef = structuredClone(procWithDef);
+    const procRemovedDefDdl =
+      'CREATE OR REPLACE PROCEDURE public.p(IN a integer) LANGUAGE sql AS $$select 1$$';
+    (procRemovedDef.objects.p1 as Opaque).ddl = [procRemovedDefDdl];
+    const procRemSql = sqls(procWithDef, procRemovedDef);
+    expect(at(procRemSql, 'DROP PROCEDURE public.p(IN a integer)')).toBeLessThan(
+      at(procRemSql, procRemovedDefDdl),
+    );
+
+    // 3) 同 ID 修改参数名
+    const fnRenamedParam = structuredClone(fnWithDef);
+    const fnRenamedParamDdl =
+      'CREATE OR REPLACE FUNCTION public.f(b integer DEFAULT 5) RETURNS integer LANGUAGE sql IMMUTABLE AS $function$select b$function$';
+    (fnRenamedParam.objects.f1 as Opaque).name = 'f(b integer)';
+    (fnRenamedParam.objects.f1 as Opaque).ddl = [fnRenamedParamDdl];
+    (fnRenamedParam.objects.f1 as Opaque).drop = 'DROP FUNCTION public.f(b integer)';
+    const renameParamSql = sqls(fnWithDef, fnRenamedParam);
+    expect(at(renameParamSql, 'DROP FUNCTION public.f(a integer)')).toBeLessThan(
+      at(renameParamSql, fnRenamedParamDdl),
+    );
+
+    // 4) 修改参数模式（INOUT → OUT）
+    const mode1 = withOpaque([
+      {
+        id: 'f1',
+        objType: 'function',
+        name: 'f(INOUT a integer, OUT b text)',
+        ddl: [
+          "CREATE OR REPLACE FUNCTION public.f(INOUT a integer, OUT b text) RETURNS record LANGUAGE sql AS $$select a, 'ok'::text$$",
+        ],
+        drop: 'DROP FUNCTION public.f(INOUT a integer, OUT b text)',
+        deps: [],
+        order: 1,
+      },
+    ]);
+    const mode2 = structuredClone(mode1);
+    const mode2Ddl =
+      "CREATE OR REPLACE FUNCTION public.f(OUT a integer, OUT b text) RETURNS record LANGUAGE sql AS $$select 1, 'ok'::text$$";
+    (mode2.objects.f1 as Opaque).name = 'f(OUT a integer, OUT b text)';
+    (mode2.objects.f1 as Opaque).ddl = [mode2Ddl];
+    (mode2.objects.f1 as Opaque).drop = 'DROP FUNCTION public.f(OUT a integer, OUT b text)';
+    const modeSql = sqls(mode1, mode2);
+    expect(at(modeSql, 'DROP FUNCTION public.f(INOUT a integer, OUT b text)')).toBeLessThan(
+      at(modeSql, mode2Ddl),
+    );
+
+    // 5) 修改参数类型
+    const fnTypeChanged = structuredClone(fnRemovedDef);
+    const fnTypeChangedDdl =
+      'CREATE OR REPLACE FUNCTION public.f(a text) RETURNS integer LANGUAGE sql IMMUTABLE AS $function$select 1$function$';
+    (fnTypeChanged.objects.f1 as Opaque).name = 'f(a text)';
+    (fnTypeChanged.objects.f1 as Opaque).ddl = [fnTypeChangedDdl];
+    (fnTypeChanged.objects.f1 as Opaque).drop = 'DROP FUNCTION public.f(a text)';
+    const typeSql = sqls(fnRemovedDef, fnTypeChanged);
+    expect(at(typeSql, 'DROP FUNCTION public.f(a integer)')).toBeLessThan(at(typeSql, fnTypeChangedDdl));
+
+    // 6) 修改返回类型（普通类型与 RETURNS TABLE 列名变化）
+    const fnRetChanged = structuredClone(fnRemovedDef);
+    const fnRetChangedDdl =
+      'CREATE OR REPLACE FUNCTION public.f(a integer) RETURNS text LANGUAGE sql IMMUTABLE AS $function$select a::text$function$';
+    (fnRetChanged.objects.f1 as Opaque).ddl = [fnRetChangedDdl];
+    const retSql = sqls(fnRemovedDef, fnRetChanged);
+    expect(at(retSql, 'DROP FUNCTION public.f(a integer)')).toBeLessThan(at(retSql, fnRetChangedDdl));
+
+    const tab1 = withOpaque([
+      {
+        id: 'f1',
+        objType: 'function',
+        name: 'f(a integer)',
+        ddl: [
+          "CREATE OR REPLACE FUNCTION public.f(a integer) RETURNS TABLE(x integer, y text) LANGUAGE sql AS $$select a, 'hi'::text$$",
+        ],
+        drop: 'DROP FUNCTION public.f(a integer)',
+        deps: [],
+        order: 1,
+      },
+    ]);
+    const tab2 = structuredClone(tab1);
+    const tab2Ddl =
+      "CREATE OR REPLACE FUNCTION public.f(a integer) RETURNS TABLE(x integer, z text) LANGUAGE sql AS $$select a, 'hi'::text$$";
+    (tab2.objects.f1 as Opaque).ddl = [tab2Ddl];
+    const tabSql = sqls(tab1, tab2);
+    expect(at(tabSql, 'DROP FUNCTION public.f(a integer)')).toBeLessThan(at(tabSql, tab2Ddl));
+  });
+
+  test('嵌套域同时修改时按逆拓扑顺序删除、按正拓扑顺序重建', () => {
+    const m1 = withOpaque([
+      {
+        id: 'd1',
+        objType: 'domain',
+        name: 'd1',
+        ddl: ['CREATE DOMAIN public.d1 AS integer'],
+        drop: 'DROP DOMAIN public.d1',
+        deps: [],
+        order: 1,
+      },
+      {
+        id: 'd2',
+        objType: 'domain',
+        name: 'd2',
+        ddl: ['CREATE DOMAIN public.d2 AS public.d1'],
+        drop: 'DROP DOMAIN public.d2',
+        deps: ['d1'],
+        order: 2,
+      },
+    ]);
+    const m2 = structuredClone(m1);
+    const d1NewDdl = 'CREATE DOMAIN public.d1 AS integer CHECK (VALUE > 0)';
+    const d2NewDdl = 'CREATE DOMAIN public.d2 AS public.d1 CHECK (VALUE < 100)';
+    (m2.objects.d1 as Opaque).ddl = [d1NewDdl];
+    (m2.objects.d2 as Opaque).ddl = [d2NewDdl];
+
+    const up = sqls(m1, m2);
+    expect(at(up, 'DROP DOMAIN public.d2')).toBeLessThan(at(up, 'DROP DOMAIN public.d1'));
+    expect(at(up, 'DROP DOMAIN public.d1')).toBeLessThan(at(up, d1NewDdl));
+    expect(at(up, d1NewDdl)).toBeLessThan(at(up, d2NewDdl));
+
+    const down = sqls(m2, m1);
+    expect(at(down, 'DROP DOMAIN public.d2')).toBeLessThan(at(down, 'DROP DOMAIN public.d1'));
+    expect(at(down, 'DROP DOMAIN public.d1')).toBeLessThan(at(down, 'CREATE DOMAIN public.d1 AS integer'));
+    expect(at(down, 'CREATE DOMAIN public.d1 AS integer')).toBeLessThan(
+      at(down, 'CREATE DOMAIN public.d2 AS public.d1'),
+    );
+  });
+
+  test('聚合函数 STYPE 变化时先 DROP 再 CREATE OR REPLACE；仅改 INITCOND 时原地替换', () => {
+    const m1 = withOpaque([
+      {
+        id: 'agg1',
+        objType: 'aggregate',
+        name: 'my_agg(integer)',
+        ddl: ['CREATE OR REPLACE AGGREGATE public.my_agg(integer) (SFUNC = int4pl, STYPE = integer)'],
+        drop: 'DROP AGGREGATE public.my_agg(integer)',
+        deps: [],
+        order: 1,
+      },
+    ]);
+    const m2 = structuredClone(m1);
+    const m2Ddl = 'CREATE OR REPLACE AGGREGATE public.my_agg(integer) (SFUNC = int8_sum, STYPE = bigint)';
+    (m2.objects.agg1 as Opaque).ddl = [m2Ddl];
+    const s = sqls(m1, m2);
+    expect(at(s, 'DROP AGGREGATE public.my_agg(integer)')).toBeLessThan(at(s, m2Ddl));
+
+    const m3 = structuredClone(m1);
+    const m3Ddl =
+      "CREATE OR REPLACE AGGREGATE public.my_agg(integer) (SFUNC = int4pl, STYPE = integer, INITCOND = '0')";
+    (m3.objects.agg1 as Opaque).ddl = [m3Ddl];
+    expect(sqls(m1, m3)).toEqual([m3Ddl]);
   });
 });

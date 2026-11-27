@@ -41,7 +41,7 @@ import {
 } from '../model.ts';
 import { PlanError, type Step } from '../plan-types.ts';
 import { checkPgCompatibility, LATEST_PG_MAJOR, pgCapabilities, type PlanOptions } from './capabilities.ts';
-import { qualifiedRefs, remapQualifiedInExpr, tokenize } from './expr.ts';
+import { qualifiedRefs, remapQualifiedInExpr, type Token, tokenize } from './expr.ts';
 import { chooseName, joinNames } from './naming.ts';
 import { derivedUuid, partitionKeyColumns } from './partition.ts';
 import { ident, literal, qualified } from './quote.ts';
@@ -271,20 +271,137 @@ const ROUTINE_OPTION_WORDS = new Set([
   'begin',
 ]);
 
-/** 提取函数 / 过程 DDL 的签名头部（参数列表与 RETURNS 子句，不含属性与函数体），用于判断能否原地 CREATE OR REPLACE */
-const routineSignatureHeader = (ddl: string): string => {
+interface RoutineSignature {
+  /** 去掉参数默认值子句（DEFAULT ... / = ...）后的签名头部（含参数名、模式、类型与 RETURNS 子句） */
+  header: string;
+  /** 每个位置的参数是否带有默认值 */
+  paramDefaults: boolean[];
+}
+
+/**
+ * 提取函数 / 过程 DDL 的签名头部（去掉参数 DEFAULT / = 默认值子句，保留参数名、模式、类型与 RETURNS 子句），
+ * 并记录每个参数是否带有默认值，用于判断能否原地 CREATE OR REPLACE。
+ */
+const parseRoutineSignature = (ddl: string): RoutineSignature => {
   const toks = tokenize(ddl).filter((t) => !(t.kind === 'other' && /^\s+$/.test(t.text)));
-  let depth = 0;
-  let seenParams = false;
   const out: string[] = [];
+  const paramDefaults: boolean[] = [];
+  let inParams = false;
+  let seenParams = false;
+  let paramParen = 0;
+  let paramBracket = 0;
+  let inDefault = false;
+  let curHasDefault = false;
+  let curHasTokens = false;
+  let postDepth = 0;
+  const pushTok = (t: Token) => out.push(t.kind === 'qident' ? `"${t.text.replaceAll('"', '""')}"` : t.text);
+
   for (let i = 0; i < toks.length; i++) {
     const t = toks[i]!;
+    if (
+      !inParams &&
+      !seenParams &&
+      i === 1 &&
+      toks[0]?.kind === 'ident' &&
+      toks[0].text === 'create' &&
+      t.kind === 'ident' &&
+      t.text === 'or' &&
+      toks[2]?.kind === 'ident' &&
+      toks[2].text === 'replace'
+    ) {
+      i++;
+      continue;
+    }
+    if (!inParams && !seenParams) {
+      if (t.kind === 'other' && t.text === '(') inParams = true;
+      pushTok(t);
+      continue;
+    }
+    if (inParams) {
+      if (t.kind === 'other' && t.text === ')' && paramParen === 0 && paramBracket === 0) {
+        if (curHasTokens) paramDefaults.push(curHasDefault);
+        inParams = false;
+        seenParams = true;
+        inDefault = false;
+        pushTok(t);
+        continue;
+      }
+      if (t.kind === 'other' && t.text === ',' && paramParen === 0 && paramBracket === 0) {
+        paramDefaults.push(curHasDefault);
+        curHasDefault = false;
+        curHasTokens = false;
+        inDefault = false;
+        pushTok(t);
+        continue;
+      }
+      if (t.kind === 'other' && t.text === '(') {
+        paramParen++;
+        if (!inDefault) {
+          curHasTokens = true;
+          pushTok(t);
+        }
+        continue;
+      }
+      if (t.kind === 'other' && t.text === ')') {
+        paramParen = Math.max(0, paramParen - 1);
+        if (!inDefault) {
+          curHasTokens = true;
+          pushTok(t);
+        }
+        continue;
+      }
+      if (t.kind === 'other' && t.text === '[') {
+        paramBracket++;
+        if (!inDefault) {
+          curHasTokens = true;
+          pushTok(t);
+        }
+        continue;
+      }
+      if (t.kind === 'other' && t.text === ']') {
+        paramBracket = Math.max(0, paramBracket - 1);
+        if (!inDefault) {
+          curHasTokens = true;
+          pushTok(t);
+        }
+        continue;
+      }
+      if (
+        !inDefault &&
+        paramParen === 0 &&
+        paramBracket === 0 &&
+        ((t.kind === 'ident' && t.text === 'default') || (t.kind === 'other' && t.text === '='))
+      ) {
+        inDefault = true;
+        curHasDefault = true;
+        continue;
+      }
+      if (!inDefault) {
+        if (
+          paramParen === 0 &&
+          paramBracket === 0 &&
+          t.kind === 'ident' &&
+          t.text === 'in' &&
+          toks[i - 1]?.text !== '.'
+        ) {
+          const next = toks[i + 1];
+          if (next?.kind === 'ident' && next.text === 'out') {
+            curHasTokens = true;
+            out.push('inout');
+            i++;
+          }
+          continue;
+        }
+        curHasTokens = true;
+        pushTok(t);
+      }
+      continue;
+    }
     if (t.kind === 'other' && t.text === '(') {
-      depth++;
+      postDepth++;
     } else if (t.kind === 'other' && t.text === ')') {
-      depth = Math.max(0, depth - 1);
-      if (depth === 0) seenParams = true;
-    } else if (depth === 0 && seenParams && t.kind === 'ident') {
+      postDepth = Math.max(0, postDepth - 1);
+    } else if (postDepth === 0 && t.kind === 'ident' && toks[i - 1]?.text !== '.') {
       const next = toks[i + 1];
       if (
         ROUTINE_OPTION_WORDS.has(t.text) ||
@@ -294,9 +411,9 @@ const routineSignatureHeader = (ddl: string): string => {
         break;
       }
     }
-    out.push(t.kind === 'qident' ? `"${t.text}"` : t.text);
+    pushTok(t);
   }
-  return out.join(' ');
+  return { header: out.join(' '), paramDefaults };
 };
 
 const aggregateStype = (ddl: string): string => {
@@ -308,7 +425,10 @@ const earlyNeedsDropBeforeCreate = (w: Opaque, o: Opaque): boolean => {
   if (o.objType === 'domain' || o.objType === 'type') return true;
   if (w.drop !== o.drop) return true;
   if (o.objType === 'function' || o.objType === 'procedure') {
-    return routineSignatureHeader(w.ddl[0] ?? '') !== routineSignatureHeader(o.ddl[0] ?? '');
+    const prev = parseRoutineSignature(w.ddl[0] ?? '');
+    const next = parseRoutineSignature(o.ddl[0] ?? '');
+    if (prev.header !== next.header) return true;
+    return prev.paramDefaults.some((had, i) => had && !next.paramDefaults[i]);
   }
   if (o.objType === 'aggregate') {
     return aggregateStype(w.ddl[0] ?? '') !== aggregateStype(o.ddl[0] ?? '');

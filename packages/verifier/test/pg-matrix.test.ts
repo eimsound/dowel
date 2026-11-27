@@ -509,4 +509,77 @@ describe.skipIf(!PG_URL)('PG 枚举换绑定时重建依赖对象（#160）', ()
     expect(rDrop.upDiff).toEqual([]);
     expect(rDrop.downDiff).toEqual([]);
   });
+
+  test('函数仅修改或新增参数默认值时原地 CREATE OR REPLACE，被 CHECK / 默认值 / BEGIN ATOMIC 函数依赖时执行与回滚闭环通过', async () => {
+    const db = conn();
+    const m1 = await loadDdl(
+      db,
+      `CREATE FUNCTION f(a int DEFAULT 5) RETURNS int LANGUAGE sql IMMUTABLE AS 'select a';
+       CREATE TABLE t (x int DEFAULT f(1) CHECK (f(x) > 0));
+       CREATE FUNCTION g() RETURNS int LANGUAGE sql BEGIN ATOMIC SELECT f(2); END`,
+    );
+    const m2 = reconcileIds(
+      m1,
+      await loadDdl(
+        db,
+        `CREATE FUNCTION f(a int DEFAULT 7) RETURNS int LANGUAGE sql IMMUTABLE AS 'select a';
+         CREATE TABLE t (x int DEFAULT f(1) CHECK (f(x) > 0));
+         CREATE FUNCTION g() RETURNS int LANGUAGE sql BEGIN ATOMIC SELECT f(2); END`,
+      ),
+    );
+    const r = await verify(db, m1, m2);
+    expect(r.upDiff).toEqual([]);
+    expect(r.downDiff).toEqual([]);
+    expect(r.up.map((s) => s.sql)).toHaveLength(1);
+    expect(r.up[0]!.sql).toMatch(/^CREATE OR REPLACE FUNCTION public\.f\(a integer DEFAULT 7\)/);
+    expect(r.down.map((s) => s.sql)).toHaveLength(1);
+    expect(r.down[0]!.sql).toMatch(/^CREATE OR REPLACE FUNCTION public\.f\(a integer DEFAULT 5\)/);
+
+    // 新增参数默认值（无默认 → 有默认）升级同样原地替换，不触发 DROP FUNCTION
+    const mNoDef = await loadDdl(
+      db,
+      `CREATE FUNCTION f_add(a int) RETURNS int LANGUAGE sql IMMUTABLE AS 'select a';
+       CREATE TABLE t_add (x int DEFAULT f_add(1) CHECK (f_add(x) > 0))`,
+    );
+    const mWithDef = reconcileIds(
+      mNoDef,
+      await loadDdl(
+        db,
+        `CREATE FUNCTION f_add(a int DEFAULT 5) RETURNS int LANGUAGE sql IMMUTABLE AS 'select a';
+         CREATE TABLE t_add (x int DEFAULT f_add(1) CHECK (f_add(x) > 0))`,
+      ),
+    );
+    const addSteps = plan(mNoDef, mWithDef);
+    expect(addSteps).toHaveLength(1);
+    expect(addSteps[0]!.sql).toMatch(/^CREATE OR REPLACE FUNCTION public\.f_add\(a integer DEFAULT 5\)/);
+    await build(db, mNoDef);
+    await runSteps(db, addSteps);
+    const snapAfter = await readSnapshot(db);
+    await build(db, mWithDef);
+    const snapExpected = await readSnapshot(db);
+    expect(diffSnapshots(snapExpected, snapAfter)).toEqual([]);
+  });
+
+  test('嵌套域同时修改定义时按逆拓扑顺序删除、正拓扑顺序重建，闭环验证通过', async () => {
+    const db = conn();
+    const m1 = await loadDdl(
+      db,
+      `CREATE DOMAIN d1 AS int;
+       CREATE DOMAIN d2 AS d1`,
+    );
+    const m2 = reconcileIds(
+      m1,
+      await loadDdl(
+        db,
+        `CREATE DOMAIN d1 AS int CHECK (VALUE > 0);
+         CREATE DOMAIN d2 AS d1 CHECK (VALUE < 100)`,
+      ),
+    );
+    const r = await verify(db, m1, m2);
+    expect(r.upDiff).toEqual([]);
+    expect(r.downDiff).toEqual([]);
+    const upSqls = r.up.map((s) => s.sql);
+    expect(upSqls.indexOf('DROP DOMAIN public.d2')).toBeGreaterThanOrEqual(0);
+    expect(upSqls.indexOf('DROP DOMAIN public.d2')).toBeLessThan(upSqls.indexOf('DROP DOMAIN public.d1'));
+  });
 });
