@@ -1,20 +1,24 @@
 // 普通列类型与 SQLite 内置排序规则的静态规范化（Issue #132 路径 C）：
-// - addColumn / setColumnType 按方言 normalizeType 写入（枚举列、空类型原样保留），MCP 宏与粘贴都经过它们；
+// - addColumn / setColumnType 按方言 normalizeType 写入（枚举列、空类型原样保留），MCP 宏、粘贴、WebSocket op 都经过它们；
 // - SQLite 内置排序规则（BINARY / NOCASE / RTRIM）写入时大写；
-// - SQLite 规划器比较列类型与内置排序规则时不区分大小写（已存的小写模型与引擎读回的大写写法不再算改动）；
+// - 规范化只在写入这一层（ADR 0017 决定 6）：SQLite 规划器严格按原文比较，与执行器读回核对一样严格，
+//   某个入口漏了规范化时会暴露出差异，而不是被规划器吞掉；
 // - PG normalizeType 补齐 bit / varbit / float(p)，双引号里的标识符与非纯数字类型修饰符不转小写。
 import { describe, expect, test } from 'vitest';
 
 import {
   addColumn,
   addIndex,
+  copyTables,
   createSchema,
   createTable,
   emptyModel,
   type Model,
   normalizeType,
   plan,
+  planPaste,
   runMacro,
+  runMutator,
   setColumnType,
 } from '../src/index.ts';
 
@@ -260,8 +264,28 @@ describe('SQLite 内置排序规则', () => {
   });
 });
 
-describe('SQLite 规划器：类型与内置排序规则不区分大小写', () => {
-  /** 绕过 mutator 直接写原文，模拟升级前已经存下的小写模型 */
+describe('SQLite 规划器：列类型与内置排序规则严格按原文比较（ADR 0017 决定 6）', () => {
+  /** 模拟引擎读回：SQLite 读回的列类型与内置排序规则都是大写 */
+  const engineReadback = (m: Model): Model => {
+    const r = structuredClone(m);
+    for (const o of Object.values(r.objects)) {
+      if (o.kind === 'column') {
+        o.type = o.type.toUpperCase();
+        o.collation =
+          o.collation && /^(binary|nocase|rtrim)$/i.test(o.collation)
+            ? o.collation.toUpperCase()
+            : o.collation;
+      }
+      if (o.kind === 'index') {
+        for (const e of o.elements)
+          if (e.collation && /^(binary|nocase|rtrim)$/i.test(e.collation))
+            e.collation = e.collation.toUpperCase();
+      }
+    }
+    return r;
+  };
+
+  /** 绕过 mutator 直接写原文，模拟某个写入入口漏了规范化的缺陷 */
   const stored = (type: string, collation: string | null) => {
     const { m, t } = withTable('sqlite');
     const c = addColumn(m, t, { id: 'c', name: 'x', type: 'TEXT' });
@@ -272,16 +296,109 @@ describe('SQLite 规划器：类型与内置排序规则不区分大小写', () 
     return m;
   };
 
-  test('小写 integer / nocase 与读回的大写写法之间没有迁移步骤', () => {
-    expect(plan(stored('integer', 'nocase'), stored('INTEGER', 'NOCASE'))).toEqual([]);
-    expect(plan(stored('INTEGER', 'NOCASE'), stored('integer', 'nocase'))).toEqual([]);
+  test('绕过规范化写入的小写 integer / text / nocase 与读回的大写写法之间有差异，缺陷会暴露而不是被吞掉', () => {
+    for (const type of ['integer', 'text']) {
+      const raw = stored(type, null);
+      expect(plan(engineReadback(raw), raw), type).not.toEqual([]);
+    }
+    const rawColl = stored('TEXT', 'nocase');
+    const steps = plan(engineReadback(rawColl), rawColl);
+    expect(steps).not.toEqual([]);
+    expect(plan(stored('INTEGER', 'NOCASE'), stored('integer', 'nocase'))).not.toEqual([]);
   });
 
   test('真正的类型或排序规则变化仍然重建表', () => {
-    expect(plan(stored('integer', null), stored('TEXT', null)).map((s) => s.kind)).toContain('rebuildTable');
-    expect(plan(stored('TEXT', 'nocase'), stored('TEXT', 'RTRIM')).map((s) => s.kind)).toContain(
+    expect(plan(stored('INTEGER', null), stored('TEXT', null)).map((s) => s.kind)).toContain('rebuildTable');
+    expect(plan(stored('TEXT', 'NOCASE'), stored('TEXT', 'RTRIM')).map((s) => s.kind)).toContain(
       'rebuildTable',
     );
+  });
+
+  /** 写入入口得到的模型：类型与内置排序规则必须已是规范写法，且与引擎读回零差异 */
+  const expectCanonical = (m: Model, cols: Record<string, [string, string | null]>, ixColl?: string) => {
+    const byName = Object.fromEntries(
+      Object.values(m.objects).flatMap((o) => (o.kind === 'column' ? [[o.name, [o.type, o.collation]]] : [])),
+    );
+    expect(byName).toEqual(cols);
+    if (ixColl !== undefined) {
+      const ix = Object.values(m.objects).find((o) => o.kind === 'index');
+      expect(ix?.kind === 'index' && ix.elements[0]!.collation).toBe(ixColl);
+    }
+    expect(plan(engineReadback(m), m)).toEqual([]);
+  };
+
+  test('addColumn / setColumnType / addIndex 写入规范写法，与读回零差异', () => {
+    const { m, t } = withTable('sqlite');
+    const id = addColumn(m, t, { name: 'id', type: 'integer', notNull: true });
+    const email = addColumn(m, t, { name: 'email', type: 'varchar(10)', collation: 'nocase' });
+    setColumnType(m, email, 'text');
+    addIndex(m, t, [{ column: email, collation: 'nocase' }]);
+    expect(col(m, id).type).toBe('INTEGER');
+    expectCanonical(m, { id: ['INTEGER', null], email: ['TEXT', 'NOCASE'] }, 'NOCASE');
+  });
+
+  test('MCP defineTable / alterColumn 写入规范写法，与读回零差异', () => {
+    const m = emptyModel('sqlite');
+    createSchema(m, 'main', 's');
+    runMacro(
+      m,
+      'defineTable',
+      {
+        schema: 'main',
+        name: 'users',
+        columns: [
+          { name: 'id', type: 'integer', notNull: true },
+          { name: 'email', type: 'varchar(10)', collation: 'nocase' },
+        ],
+        indexes: [{ elements: [{ column: 'email', collation: 'nocase' }] }],
+      },
+      new Map(),
+    );
+    const email = Object.values(m.objects).find((o) => o.kind === 'column' && o.name === 'email')!.id;
+    runMacro(m, 'alterColumn', { id: email, type: 'text' }, new Map());
+    expectCanonical(m, { id: ['INTEGER', null], email: ['TEXT', 'NOCASE'] }, 'NOCASE');
+  });
+
+  test('粘贴：载荷里的小写类型与排序规则落地为规范写法，与读回零差异', () => {
+    const src = emptyModel('sqlite');
+    const s = createSchema(src, 'main', 's');
+    const t = createTable(src, s, 'users', 't');
+    const email = addColumn(src, t, { name: 'email', type: 'TEXT', collation: 'NOCASE' });
+    addIndex(src, t, [{ column: email, collation: 'NOCASE' }]);
+    const payload = copyTables(src, [t], {
+      source: { projectId: null, projectName: null, origin: 'canvas', seq: null },
+    });
+    // 模拟来自旧版本或手写的载荷：原文是小写
+    for (const o of Object.values(payload.fragment)) {
+      if (o.kind === 'column') {
+        o.type = 'text';
+        o.collation = 'nocase';
+      }
+      if (o.kind === 'index') for (const e of o.elements) e.collation = 'nocase';
+    }
+    const target = emptyModel('sqlite');
+    createSchema(target, 'main', 's');
+    runMutator(target, 'paste', { ops: planPaste(target, payload).ops });
+    expectCanonical(target, { email: ['TEXT', 'NOCASE'] }, 'NOCASE');
+  });
+
+  test('WebSocket op（runMutator）写入规范写法，与读回零差异', () => {
+    const { m, t } = withTable('sqlite');
+    runMutator(m, 'batch', {
+      ops: [
+        {
+          name: 'addColumn',
+          args: { table: t, column: { id: 'ci', name: 'id', type: 'integer', notNull: true } },
+        },
+        {
+          name: 'addColumn',
+          args: { table: t, column: { id: 'ce', name: 'email', type: 'blob', collation: 'nocase' } },
+        },
+        { name: 'setColumnType', args: { id: 'ce', type: 'text', typeRef: null } },
+        { name: 'addIndex', args: { table: t, id: 'ix', elements: [{ column: 'ce', collation: 'nocase' }] } },
+      ],
+    });
+    expectCanonical(m, { id: ['INTEGER', null], email: ['TEXT', 'NOCASE'] }, 'NOCASE');
   });
 });
 

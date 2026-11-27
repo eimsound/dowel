@@ -1,5 +1,6 @@
 // Issue #132：“已验证”的冻结版本必须能通过执行器读回校验（readback_mismatch）。
 // 不变式：一个版本 verified = true，就必须能在空目标库上执行成功（执行器读回 diffAgainst 为 0）。
+// 规范化只在写入这一层（ADR 0017 决定 6）：经 mutator 写入的模型与读回零差异；绕过规范化的原文不被规划器容忍。
 // 全部用 SQLite（:memory: 影子库 + 本地文件目标库），不依赖 Docker。
 import { mkdtempSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
@@ -134,57 +135,74 @@ describe('Issue #132：已验证版本必须能通过执行器读回校验（SQL
     }).toMatchObject(pub.verified ? { executed: true, code: null } : { verified: false });
   };
 
-  /** 列的类型 / 排序规则：mutator 写入的规范写法，或绕过 mutator 的原文（模拟升级前已经存下的模型） */
+  /** 列的 [名称, 类型, 排序规则] */
   const columnsOf = (m: Model) => all(m, 'column').map((c) => [c.name, c.type, c.collation]);
 
-  test.each([
-    ['经 mutator 写入', false],
-    ['升级前已存的原文', true],
-  ])('路径 C：小写普通列类型 integer / text（%s），发布 verified 且能执行', async (_label, raw) => {
-    const { pid, branch, envId } = await blankProject(`C types ${raw}`);
+  test('路径 C：经 mutator 写入的小写类型 integer / text 与排序规则 nocase 存为规范写法，发布 verified 且执行零读回差异', async () => {
+    const { pid, branch, envId } = await blankProject('C canonical');
     await edit(branch, (m) => {
-      const t = createTable(m, schemaOf(m), 'notes');
-      const id = addColumn(m, t, { name: 'id', type: 'integer', notNull: true });
-      const title = addColumn(m, t, { name: 'title', type: 'text' });
-      if (raw) {
-        (m.objects[id] as { type: string }).type = 'integer';
-        (m.objects[title] as { type: string }).type = 'text';
-      }
+      const t = createTable(m, schemaOf(m), 'users');
+      addColumn(m, t, { name: 'id', type: 'integer', notNull: true });
+      addColumn(m, t, { name: 'title', type: 'text' });
+      addColumn(m, t, { name: 'email', type: 'text', collation: 'nocase' });
     });
     const { model } = await created.rooms.model(branch);
-    expect(columnsOf(model)).toEqual(
-      raw
-        ? [
-            ['id', 'integer', null],
-            ['title', 'text', null],
-          ]
-        : [
-            ['id', 'INTEGER', null],
-            ['title', 'TEXT', null],
-          ],
-    );
+    expect(columnsOf(model)).toEqual([
+      ['id', 'INTEGER', null],
+      ['title', 'TEXT', null],
+      ['email', 'TEXT', 'NOCASE'],
+    ]);
     expect((await created.refresher.flush(branch)).kind).toBe('clean');
-    const pub = await publish(pid, 'lowercase types');
+    const pub = await publish(pid, 'canonical');
     expect(pub.verified).toBe(true);
-    expectVerifiedImpliesExecutable(pub, await execute(pid, envId, pub.id));
+    const run = await execute(pid, envId, pub.id);
+    expectVerifiedImpliesExecutable(pub, run);
+    expect(run).toMatchObject({ done: true, code: null });
   });
 
   test.each([
-    ['经 mutator 写入', false],
-    ['升级前已存的原文', true],
-  ])('路径 C：小写内置排序规则 nocase（%s），发布 verified 且能执行', async (_label, raw) => {
-    const { pid, branch, envId } = await blankProject(`C collation ${raw}`);
-    await edit(branch, (m) => {
-      const t = createTable(m, schemaOf(m), 'users');
-      addColumn(m, t, { name: 'id', type: 'INTEGER', notNull: true });
-      const email = addColumn(m, t, { name: 'email', type: 'TEXT', collation: 'nocase' });
-      if (raw) (m.objects[email] as { collation: string | null }).collation = 'nocase';
-    });
-    const { model } = await created.rooms.model(branch);
-    expect(columnsOf(model)[1]).toEqual(['email', 'TEXT', raw ? 'nocase' : 'NOCASE']);
-    expect((await created.refresher.flush(branch)).kind).toBe('clean');
-    const pub = await publish(pid, 'lowercase collation');
-    expect(pub.verified).toBe(true);
-    expectVerifiedImpliesExecutable(pub, await execute(pid, envId, pub.id));
-  });
+    ['类型 integer / text', 'types'],
+    ['排序规则 nocase', 'collation'],
+  ] as const)(
+    '绕过规范化直接写入原文（%s，模拟写入入口漏了规范化）：规划器不容忍，缺陷暴露为 readback_mismatch',
+    async (_label, kind) => {
+      const { pid, branch, envId } = await blankProject(`C raw ${kind}`);
+      await edit(branch, (m) => {
+        const t = createTable(m, schemaOf(m), 'notes');
+        const id = addColumn(m, t, { name: 'id', type: 'INTEGER', notNull: true });
+        const title = addColumn(m, t, {
+          name: 'title',
+          type: 'TEXT',
+          collation: kind === 'collation' ? 'NOCASE' : null,
+        });
+        if (kind === 'types') {
+          (m.objects[id] as { type: string }).type = 'integer';
+          (m.objects[title] as { type: string }).type = 'text';
+        } else {
+          (m.objects[title] as { collation: string | null }).collation = 'nocase';
+        }
+      });
+      const { model } = await created.rooms.model(branch);
+      expect(columnsOf(model)).toEqual(
+        kind === 'types'
+          ? [
+              ['id', 'integer', null],
+              ['title', 'text', null],
+            ]
+          : [
+              ['id', 'INTEGER', null],
+              ['title', 'TEXT', 'nocase'],
+            ],
+      );
+      expect((await created.refresher.flush(branch)).kind).toBe('clean');
+      // 发布流水线在验证前拦下这类模型由 ADR 0017 决定 1 负责；这里只钉住规划器不再容忍：
+      // 读回的大写写法与模型原文之间有差异，执行器读回核对把缺陷报成 readback_mismatch，而不是静默通过
+      const pub = await publish(pid, 'raw');
+      const run = await execute(pid, envId, pub.id);
+      expect(run).toMatchObject({ done: false, code: 'readback_mismatch' });
+      expect((run.details as { diff: { kind: string; target: string }[] }).diff).toEqual([
+        expect.objectContaining({ kind: 'rebuildTable', target: 'notes' }),
+      ]);
+    },
+  );
 });
