@@ -41,6 +41,20 @@ When Dowel probes an environment, the server records `server_version_num` and th
 | Built-in `uuidv7()` function calls                      | PostgreSQL 18+  | Emits a compatibility warning without blocking user-defined `uuidv7()`  |
 | `REPACK`                                                | PostgreSQL 19+  | Tagged under PG 19 capability rules                                     |
 
+### serial shorthand {#pg-serial}
+
+When a column type is entered as `serial`, `bigserial`, or `smallserial` (or `serial4`, `serial8`, `serial2`, case-insensitive; a double-quoted `"serial"` is treated as a custom type name and is not expanded), Dowel expands it on write into the structure PostgreSQL actually creates. The model never stores `serial`:
+
+- An `integer`, `bigint`, or `smallint` column marked `NOT NULL`.
+- A sequence owned by the column, named `{table}_{column}_seq` by default (truncated and suffixed on collisions the same way PostgreSQL does), renamed along with the table or column.
+- A `nextval(...)` default that references that sequence.
+
+Every write path, including the properties panel, MCP, and paste, follows this rule. Whenever a column is an integer type with a default that points to a sequence owned by that column, the properties panel shows its type as `serial (integer)`, `bigserial (bigint)`, or `smallserial (smallint)` (shortened to `serial`, `bigserial`, or `smallserial` in collapsed column rows), including columns imported from a database. The type suggestions include these three entries.
+
+- **Switching between serial shorthands**, such as from `serial (integer)` to `bigserial (bigint)`, changes the column type and the owned sequence's type together without creating a new sequence.
+- **Changing to any other type**, including re-entering the underlying `integer`, `bigint`, or `smallint`, changes only the column type. The default and sequence stay as they are, so auto-increment keeps working. Clear the default to disable auto-increment. Switching back to a serial shorthand after clearing the default reuses the sequence the column still owns.
+- **Columns that cannot become serial directly.** Columns with another default, `IDENTITY`, or a generated expression must have the default cleared or `IDENTITY` removed first. serial cannot be used as an array element type.
+
 ### Non-transactional statements and resume {#pg-nontx}
 
 Statements such as `CREATE/DROP INDEX CONCURRENTLY`, `VACUUM`, `REINDEX DATABASE/SYSTEM`, table-less `CLUSTER`, and `ALTER TYPE ... ADD VALUE` run outside transactions with per-step checkpoints. If `CREATE INDEX CONCURRENTLY` fails and leaves an `INVALID` index, Dowel drops that index cleanly before retrying. If `ALTER TABLE ... DETACH PARTITION ... CONCURRENTLY` times out on a lock in the `detach pending` state, retrying switches automatically to `FINALIZE`.

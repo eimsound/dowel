@@ -526,13 +526,16 @@ const planWithIndexes = (
       : 'expr' in c.default
         ? c.default.expr
         : `nextval(${literal(qname(cur, get(cur, c.default.nextval, 'sequence')))}::regclass)`;
-  const seqOptions = (o: SequenceOptions, withType: boolean): string => {
+  const defaultSeqStart = (o: SequenceOptions): string =>
+    o.increment.trim().startsWith('-') ? (o.max ?? '-1') : (o.min ?? '1');
+  const seqOptions = (o: SequenceOptions, withType: boolean, startOverride?: string): string => {
     const p: string[] = [];
     if (withType) p.push(`AS ${o.type}`);
     p.push(`INCREMENT BY ${o.increment}`);
     p.push(o.min === null ? 'NO MINVALUE' : `MINVALUE ${o.min}`);
     p.push(o.max === null ? 'NO MAXVALUE' : `MAXVALUE ${o.max}`);
-    if (o.start !== null) p.push(`START WITH ${o.start}`);
+    const start = o.start ?? startOverride ?? null;
+    if (start !== null) p.push(`START WITH ${start}`);
     p.push(`CACHE ${o.cache}`);
     p.push(o.cycle ? 'CYCLE' : 'NO CYCLE');
     return p.join(' ');
@@ -1960,7 +1963,15 @@ const planWithIndexes = (
     if (!inFrom(o.id)) continue;
     const c = get(cur, o.id, 'sequence');
     if (sameSeqOpts(c.options, o.options)) continue;
-    emit('alterSequence', o.id, `ALTER SEQUENCE ${qname(cur, c)} ${seqOptions(o.options, true)}`);
+    const startOverride =
+      o.options.start === null && (c.options.start !== null || c.options.type !== o.options.type)
+        ? defaultSeqStart(o.options)
+        : undefined;
+    emit(
+      'alterSequence',
+      o.id,
+      `ALTER SEQUENCE ${qname(cur, c)} ${seqOptions(o.options, true, startOverride)}`,
+    );
     c.options = clone(o.options);
   }
   // ───── P10 建表（列内联；约束和索引后面统一加；按分区深度升序，父表先于子表，天然支持多级分区） ─────

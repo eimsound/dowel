@@ -1,8 +1,23 @@
-import { createAll, normalizeType, plan, validate } from '@dowel/core';
+import {
+  addColumn,
+  addPrimaryKey,
+  createAll,
+  createSchema,
+  createTable,
+  emptyModel,
+  normalizeType,
+  pgSerialOf,
+  plan,
+  renameTable,
+  setColumnType,
+  setDefault,
+  validate,
+} from '@dowel/core';
 import { describe, expect, test } from 'vitest';
 
 import { PG_URL, useTestDb } from '../../../test/pg.ts';
-import { build, resetShadow, runSteps } from '../../verifier/src/index.ts';
+import { diffAgainst } from '../../executor/src/index.ts';
+import { build, resetShadow, runSteps, verify } from '../../verifier/src/index.ts';
 import { diffSnapshots, importSnapshot, readSnapshot } from '../src/index.ts';
 
 const db = useTestDb('roundtrip');
@@ -147,6 +162,92 @@ describe.skipIf(!PG_URL)('导入 → 重建 往返一致', () => {
     for (const [i, raw] of cases.entries()) {
       expect(table.columns[`c${i}`]!.type, raw).toBe(normalizeType(raw, 'pg'));
     }
+  });
+
+  test('PG serial 写入展开与原生 DDL 往返一致、导入识别及迁移闭环验证', async () => {
+    const m = emptyModel('pg');
+    const pub = createSchema(m, 'public', 's_pub');
+    const app = createSchema(m, 'My App', 's_app');
+    const items = createTable(m, pub, 'items', 't_items');
+    const idCol = addColumn(m, items, { id: 'c_id', name: 'id', type: 'serial' });
+    addPrimaryKey(m, items, [idCol], 'pk_items');
+    const bigCol = addColumn(m, items, { id: 'c_big', name: 'big', type: 'bigserial' });
+    const smallCol = addColumn(m, items, { id: 'c_small', name: 'small', type: 'smallserial' });
+
+    const order = createTable(m, app, 'Order', 't_order');
+    addColumn(m, order, { id: 'c_ord_id', name: 'Id', type: 'SERIAL4' });
+
+    expect(validate(m)).toEqual([]);
+    const s2 = await build(db(), m);
+
+    await resetShadow(db());
+    await db().exec(`
+      CREATE SCHEMA public;
+      CREATE SCHEMA "My App";
+      CREATE TABLE public.items (
+        id serial PRIMARY KEY,
+        big bigserial,
+        small smallserial
+      );
+      CREATE TABLE "My App"."Order" (
+        "Id" SERIAL4
+      );
+    `);
+    const s1 = await readSnapshot(db());
+    expect(diffSnapshots(s1, s2)).toEqual([]);
+    expect(diffAgainst(s1, m).total).toBe(0);
+
+    // 2. 导入原生快照后 pgSerialOf 识别全部 3 种 serial
+    const imported = importSnapshot(s1);
+    const importedCols = Object.values(imported.objects).filter(
+      (o): o is Extract<typeof o, { kind: 'column' }> => o.kind === 'column',
+    );
+    expect(
+      pgSerialOf(
+        imported,
+        importedCols.find((c) => c.name === 'id')!,
+      )?.kind,
+    ).toBe('serial');
+    expect(
+      pgSerialOf(
+        imported,
+        importedCols.find((c) => c.name === 'big')!,
+      )?.kind,
+    ).toBe('bigserial');
+    expect(
+      pgSerialOf(
+        imported,
+        importedCols.find((c) => c.name === 'small')!,
+      )?.kind,
+    ).toBe('smallserial');
+    expect(
+      pgSerialOf(
+        imported,
+        importedCols.find((c) => c.name === 'Id')!,
+      )?.kind,
+    ).toBe('serial');
+
+    // 3. 迁移 m → m2 → m3 闭环验证
+    const m2 = structuredClone(m);
+    setColumnType(m2, idCol, 'bigserial');
+    addColumn(m2, items, { id: 'c_extra', name: 'extra', type: 'smallserial' });
+    expect(validate(m2)).toEqual([]);
+    const r1 = await verify(db(), m, m2);
+    expect(r1.upDiff).toEqual([]);
+    expect(r1.downDiff).toEqual([]);
+    await runSteps(db(), r1.up);
+    expect(diffAgainst(await readSnapshot(db()), m2).total).toBe(0);
+
+    const m3 = structuredClone(m2);
+    renameTable(m3, items, 'renamed_items');
+    setColumnType(m3, bigCol, 'integer');
+    setDefault(m3, smallCol, null);
+    expect(validate(m3)).toEqual([]);
+    const r2 = await verify(db(), m2, m3);
+    expect(r2.upDiff).toEqual([]);
+    expect(r2.downDiff).toEqual([]);
+    await runSteps(db(), r2.up);
+    expect(diffAgainst(await readSnapshot(db()), m3).total).toBe(0);
   });
 });
 
