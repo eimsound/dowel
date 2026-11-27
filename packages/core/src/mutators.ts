@@ -22,6 +22,7 @@ import {
 import { columnsOf, effectiveColumnsOf, rootTableId } from './model.ts';
 import { PG_SERIAL_TYPE_NOTE } from './pg/serial.ts';
 import { getDialect } from './registry.ts';
+import { SQLITE_COLUMN_TYPE_NOTE } from './sqlite/types.ts';
 
 /** mutator 参数里的对象 ID：1-64 个字符，不能是 Object.prototype 上的保留名（宏编译层复用） */
 export const objectIdArg = z
@@ -106,7 +107,7 @@ export const mutators = {
       column: z.object({
         id,
         name,
-        type: z.string().describe(`Column type text. ${PG_SERIAL_TYPE_NOTE}`),
+        type: z.string().describe(`Column type text. ${PG_SERIAL_TYPE_NOTE} ${SQLITE_COLUMN_TYPE_NOTE}`),
         typeRef: id.nullable().optional(),
         notNull: z.boolean().optional(),
         default: ColumnDefault.nullable().optional(),
@@ -130,7 +131,7 @@ export const mutators = {
   setColumnType: def(
     z.object({
       id,
-      type: z.string().describe(`Column type text. ${PG_SERIAL_TYPE_NOTE}`),
+      type: z.string().describe(`Column type text. ${PG_SERIAL_TYPE_NOTE} ${SQLITE_COLUMN_TYPE_NOTE}`),
       typeRef: id.nullable(),
     }),
     (m, a) => E.setColumnType(m, a.id, a.type, a.typeRef),
