@@ -31,11 +31,13 @@ const entriesOfModel = (m: Model): NsEntry[] => {
 /** 用历次出现过的全部 (命名空间, 名字) 探查：增量索引与全量重建的占用者集合必须相同（也能发现残留的旧条目） */
 const expectSameNamespaces = (idx: MutableModelIndex, m: Model, probes: Map<string, NsEntry>) => {
   const fresh = new MutableModelIndex(m);
+  const owners = (x: MutableModelIndex, e: NsEntry) =>
+    [...(x.nsOwnersOf(e.ns, e.name)?.entries() ?? [])]
+      .map(([owner, root]) => `${owner}=${root}`)
+      .sort((p, q) => (p < q ? -1 : p > q ? 1 : 0));
   for (const e of entriesOfModel(m)) probes.set(`${e.ns}\0${e.name}`, e);
   for (const e of probes.values()) {
-    const a = [...(idx.nsOwnersOf(e.ns, e.name)?.entries() ?? [])].sort();
-    const b = [...(fresh.nsOwnersOf(e.ns, e.name)?.entries() ?? [])].sort();
-    expect(a, `${e.ns.replace('\0', ':')} ${e.name}`).toEqual(b);
+    expect(owners(idx, e), `${e.ns.replace('\0', ':')} ${e.name}`).toEqual(owners(fresh, e));
   }
 };
 
