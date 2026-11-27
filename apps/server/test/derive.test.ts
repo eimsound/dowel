@@ -1,6 +1,13 @@
 // 派生数据按需规范化（ADR 0016）：pendingRefreshIds 判定、黄金基线不变量、flush 合并与 0 I/O、
 // 写回被拒绝时不覆盖基线并自动重试、runWithReset / runWithoutReset、normalize / status、forget / stop。
-import { emptyModel, type Model, type Obj, runMutator } from '@dowel/core';
+import {
+  type Column,
+  emptyModel,
+  type Model,
+  type Obj,
+  runMutator,
+  setMssqlInferredNotNull,
+} from '@dowel/core';
 import { describe, expect, test } from 'vitest';
 
 import {
@@ -939,9 +946,10 @@ describe('pendingRefreshIds：MSSQL 持久化计算列的可空性（#145）', (
     const cur = structuredClone(good);
     runMutator(cur, 'setNotNull', { id: 'c', notNull: true });
     expect(pendingRefreshIds(good, cur)).toEqual(['g']);
-    // 稳态：规范化写回 notNull 之后不再待规范化
+    // 稳态：规范化写回推断值 ext.mssql.inferredNotNull（显式 notNull 不动，ADR 0019）之后不再待规范化
     const after = structuredClone(cur);
-    (after.objects.g as { notNull: boolean }).notNull = true;
+    setMssqlInferredNotNull(after.objects.g as Column, true);
+    expect((after.objects.g as Column).notNull).toBe(false);
     expect(pendingRefreshIds(after, structuredClone(after))).toEqual([]);
     // 换回列名对调前的快照（表达式原文不变、按列名对齐）：code 现在指向另一列，可空性不同
     const good2 = structuredClone(good);
@@ -955,11 +963,30 @@ describe('pendingRefreshIds：MSSQL 持久化计算列的可空性（#145）', (
     expect(pendingRefreshIds(good2, swapped)).toEqual(['g']);
   });
 
-  test('持久化计算列自己的 notNull 改了：待规范化（读回的是引擎推断值）', () => {
+  test('持久化计算列自己的显式 notNull 改了：待规范化（顺带给存量基线补算推断值，ADR 0019）', () => {
     const good = mssqlBase();
     const cur = structuredClone(good);
     (cur.objects.g as { notNull: boolean }).notNull = true;
     expect(pendingRefreshIds(good, cur)).toEqual(['g']);
+    // 存量基线：旧规则把推断值写进了 notNull、没有 inferredNotNull；取消勾选后待规范化，规范化补上推断值
+    const legacy = structuredClone(good);
+    (legacy.objects.g as { notNull: boolean }).notNull = true;
+    const unchecked = structuredClone(legacy);
+    runMutator(unchecked, 'setNotNull', { id: 'g', notNull: false });
+    expect(pendingRefreshIds(legacy, unchecked)).toEqual(['g']);
+  });
+
+  test('推断值 inferredNotNull 相对基线变了（历史快照换入、被篡改）：待规范化重算', () => {
+    const good = mssqlBase();
+    setMssqlInferredNotNull(good.objects.g as Column, true);
+    const cur = structuredClone(good);
+    setMssqlInferredNotNull(cur.objects.g as Column, false);
+    expect(pendingRefreshIds(good, cur)).toEqual(['g']);
+    expect(pendingRefreshIds(cur, good)).toEqual(['g']);
+    // 非持久化计算列上的标记不看（推断值对它没有意义）
+    const v = structuredClone(good);
+    (v.objects.v as Column).ext = { mssql: { inferredNotNull: true } };
+    expect(pendingRefreshIds(good, v)).toEqual([]);
   });
 
   test('不误报：没有持久化计算列的表、其他方言的 STORED 生成列，普通列改 NOT NULL 都不待规范化', () => {

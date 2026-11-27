@@ -62,6 +62,12 @@ export const MssqlColumnExt = z.object({
   defaultNameMode: nameMode.optional(),
   sparse: z.boolean().optional(),
   rowguidcol: z.boolean().optional(),
+  inferredNotNull: z
+    .boolean()
+    .optional()
+    .describe(
+      'Read-only, SQL Server PERSISTED computed columns only: the engine infers the column as non-null from its expression (written back by shadow normalization; ignored on input). It is never rendered as NOT NULL; `notNull` is only the explicit declaration, effective nullability is `notNull || inferredNotNull`',
+    ),
 });
 
 export const ColumnExt = z.object({
