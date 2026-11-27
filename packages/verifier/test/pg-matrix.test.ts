@@ -5,14 +5,19 @@ import {
   addColumn,
   addPrimaryKey,
   addUnique,
+  createEnum,
   createSchema,
   createTable,
   emptyModel,
+  type Enum,
   MIN_PG_MAJOR,
+  type Model,
+  type Opaque,
   pgMajorOf,
   PlanError,
   plan,
   renameColumn,
+  renameEnum,
   renameTable,
   setNotNull,
 } from '@dowel/core';
@@ -22,6 +27,7 @@ import {
   getEngine,
   importSnapshot,
   readSnapshot,
+  reconcileIds,
   toScriptSteps,
 } from '@dowel/engines';
 import { diffAgainst, importLive, planDiff } from '@dowel/executor';
@@ -262,5 +268,318 @@ describe.skipIf(!PG_URL)('PG 15–19 多版本矩阵验证', () => {
       expect(diff.items.some((s) => /ADD CONSTRAINT .* NOT NULL/i.test(s.sql))).toBe(false);
       expect(diff.items.some((s) => /SET NOT NULL/i.test(s.sql))).toBe(true);
     }
+  });
+});
+
+// #160：两个枚举对调名字、轮换、删后重建同名枚举时，引用它们的表达式对象要按新版本模型绑定（PG 按 OID 绑定类型）
+describe.skipIf(!PG_URL)('PG 枚举换绑定时重建依赖对象（#160）', () => {
+  const DDL = `
+    SET search_path = public;
+    CREATE TYPE mood AS ENUM ('ok', 'sad');
+    CREATE TYPE tone AS ENUM ('ok', 'sad', 'meh');
+    CREATE TABLE t (
+      id int PRIMARY KEY,
+      k text DEFAULT ('ok'::mood)::text,
+      g boolean GENERATED ALWAYS AS ('ok'::mood < 'sad'::mood) STORED,
+      CONSTRAINT t_mood_check CHECK ('ok'::mood IS NOT NULL)
+    );
+    CREATE INDEX t_part ON t (id) WHERE ('ok'::mood IS NOT NULL);
+    CREATE INDEX t_expr ON t ((('ok'::mood < 'sad'::mood)));
+    CREATE VIEW v AS SELECT 'ok'::mood AS x;
+    RESET search_path;
+  `;
+  const load = async (db: Db): Promise<Model> => {
+    await resetShadow(db);
+    await db.exec('CREATE SCHEMA public');
+    await db.exec(DDL);
+    return importSnapshot(await readSnapshot(db));
+  };
+  const enumId = (m: Model, name: string) =>
+    Object.values(m.objects).find((o): o is Enum => o.kind === 'enum' && o.name === name)!.id;
+  const view = (m: Model) => Object.values(m.objects).find((o): o is Opaque => o.kind === 'opaque')!;
+  /** 各依赖对象在库里实际绑定的枚举：名字与值（按 pg_depend 查 OID，不看表达式文本） */
+  const boundEnums = async (db: Db) =>
+    db.query<{ what: string; typ: string; labels: string }>(`
+      SELECT CASE d.classid
+               WHEN 'pg_constraint'::regclass THEN 'check'
+               WHEN 'pg_attrdef'::regclass THEN 'default'
+               WHEN 'pg_rewrite'::regclass THEN 'view'
+               ELSE (SELECT relname FROM pg_class WHERE oid = d.objid) || ':' || d.objsubid
+             END AS what,
+             t.typname AS typ,
+             (SELECT string_agg(enumlabel, ',' ORDER BY enumsortorder) FROM pg_enum WHERE enumtypid = t.oid) AS labels
+        FROM pg_depend d JOIN pg_type t ON t.oid = d.refobjid
+       WHERE d.refclassid = 'pg_type'::regclass AND t.typtype = 'e' AND d.deptype = 'n'
+       ORDER BY 1`);
+
+  test('两个枚举对调名字：迁移后 CHECK / 默认值 / 部分索引 / 表达式索引 / 生成列 / 视图都绑定到模型所写的枚举，数据保留，回滚复原', async () => {
+    const db = conn();
+    const m1 = await load(db);
+    const before = await boundEnums(db);
+    expect(new Set(before.map((r) => `${r.typ}=${r.labels}`))).toEqual(new Set(['mood=ok,sad']));
+    const m2 = structuredClone(m1);
+    const e1 = enumId(m1, 'mood');
+    const e2 = enumId(m1, 'tone');
+    (m2.objects[e1] as Enum).name = 'tone';
+    (m2.objects[e2] as Enum).name = 'mood';
+    // 视图按依赖的 ID 表达绑定：新版本里它依赖的是现在叫 mood 的那个枚举
+    view(m2).deps = view(m2).deps.map((d) => (d === e1 ? e2 : d));
+
+    const r = await verify(db, m1, m2);
+    expect(r.upDiff).toEqual([]);
+    expect(r.downDiff).toEqual([]);
+
+    await build(db, m1);
+    await db.exec(`INSERT INTO public.t (id) VALUES (1), (2)`);
+    await runSteps(db, plan(m1, m2));
+    const after = await boundEnums(db);
+    expect(after.length).toBe(before.length);
+    // 名字仍是 mood，但绑定的是原来的 tone（三个值）
+    expect(new Set(after.map((r) => `${r.typ}=${r.labels}`))).toEqual(new Set(['mood=ok,sad,meh']));
+    expect(await db.query(`SELECT id, k, g FROM public.t ORDER BY id`)).toEqual([
+      { id: 1, k: 'ok', g: true },
+      { id: 2, k: 'ok', g: true },
+    ]);
+    const def = await db.query<{ d: string }>(
+      `SELECT pg_get_constraintdef(oid) AS d FROM pg_constraint WHERE conname = 't_mood_check'`,
+    );
+    expect(def[0]!.d).toMatch(/'ok'::(public\.)?mood/);
+
+    await runSteps(db, plan(m2, m1));
+    expect(new Set((await boundEnums(db)).map((r) => `${r.typ}=${r.labels}`))).toEqual(
+      new Set(['mood=ok,sad']),
+    );
+    expect((await db.query(`SELECT count(*)::int AS n FROM public.t`))[0]).toEqual({ n: 2 });
+  });
+
+  test('三个枚举轮换名字：闭环验证通过', async () => {
+    const db = conn();
+    const m1 = await load(db);
+    createEnum(m1, Object.values(m1.objects).find((o) => o.kind === 'schema')!.id, 'hue', ['ok', 'sad']);
+    const m2 = structuredClone(m1);
+    const [e1, e2, e3] = [enumId(m1, 'mood'), enumId(m1, 'tone'), enumId(m1, 'hue')];
+    (m2.objects[e1] as Enum).name = 'tone';
+    (m2.objects[e2] as Enum).name = 'hue';
+    (m2.objects[e3] as Enum).name = 'mood';
+    view(m2).deps = view(m2).deps.map((d) => (d === e1 ? e3 : d));
+    const r = await verify(db, m1, m2);
+    expect(r.upDiff).toEqual([]);
+    expect(r.downDiff).toEqual([]);
+  });
+
+  test('只是改名（表达式跟着改写）：不重建任何对象，闭环验证通过', async () => {
+    const db = conn();
+    const m1 = await load(db);
+    const m2 = structuredClone(m1);
+    renameEnum(m2, enumId(m1, 'mood'), 'feeling');
+    // 视图 DDL 由规范化读回，这里手工写成改名后的样子
+    view(m2).ddl = view(m2).ddl.map((x) => x.replaceAll('public.mood', 'public.feeling'));
+    const r = await verify(db, m1, m2);
+    expect(r.upDiff).toEqual([]);
+    expect(r.downDiff).toEqual([]);
+    expect(r.up.filter((s) => !/^(ALTER TYPE|DROP VIEW|CREATE VIEW)/.test(s.sql))).toEqual([]);
+  });
+
+  test('删掉枚举再建同名枚举（只被表达式引用）：迁移成功执行，依赖对象绑定到新类型，回滚复原', async () => {
+    const db = conn();
+    const m1 = await load(db);
+    const m2 = structuredClone(m1);
+    const e1 = enumId(m1, 'mood');
+    const sch = (m1.objects[e1] as Enum).parent;
+    delete m2.objects[e1];
+    const e9 = createEnum(m2, sch, 'mood', ['ok', 'sad', 'new']);
+    view(m2).deps = view(m2).deps.map((d) => (d === e1 ? e9 : d));
+
+    const r = await verify(db, m1, m2);
+    expect(r.upDiff).toEqual([]);
+    expect(r.downDiff).toEqual([]);
+
+    await build(db, m1);
+    await db.exec(`INSERT INTO public.t (id) VALUES (1)`);
+    await runSteps(db, plan(m1, m2));
+    expect(new Set((await boundEnums(db)).map((r) => `${r.typ}=${r.labels}`))).toEqual(
+      new Set(['mood=ok,sad,new']),
+    );
+    expect(await db.query(`SELECT id, k, g FROM public.t`)).toEqual([{ id: 1, k: 'ok', g: true }]);
+    await runSteps(db, plan(m2, m1));
+    expect(new Set((await boundEnums(db)).map((r) => `${r.typ}=${r.labels}`))).toEqual(
+      new Set(['mood=ok,sad']),
+    );
+  });
+
+  /** 从一段 DDL 导入模型（用于下面几个小场景） */
+  const loadDdl = async (db: Db, ddl: string): Promise<Model> => {
+    await resetShadow(db);
+    await db.exec('CREATE SCHEMA public');
+    await db.exec(`SET search_path = public; ${ddl}; RESET search_path;`);
+    return importSnapshot(await readSnapshot(db));
+  };
+  const reorder = (m: Model) => {
+    const b = structuredClone(m);
+    const e = b.objects[enumId(m, 'mood')] as Enum;
+    e.values = [...e.values].reverse();
+    return b;
+  };
+
+  test('枚举重排值（需重建类型）时，依赖枚举列的视图与生成列一起重建，闭环验证通过', async () => {
+    const db = conn();
+    const m1 = await loadDdl(
+      db,
+      `CREATE TYPE mood AS ENUM ('ok', 'sad');
+       CREATE TABLE t (id int, m mood, g boolean GENERATED ALWAYS AS (m IS NULL) STORED);
+       CREATE VIEW v AS SELECT m FROM t`,
+    );
+    const r = await verify(db, m1, reorder(m1));
+    expect(r.upDiff).toEqual([]);
+    expect(r.downDiff).toEqual([]);
+  });
+
+  test('枚举重排值而它是分区键列、函数签名依赖被删掉重建的枚举：规划时明确报错', async () => {
+    const db = conn();
+    const p1 = await loadDdl(
+      db,
+      `CREATE TYPE mood AS ENUM ('ok', 'sad');
+       CREATE TABLE p (id int, m mood) PARTITION BY LIST (m);
+       CREATE TABLE p1 PARTITION OF p FOR VALUES IN ('ok')`,
+    );
+    expect(() => plan(p1, reorder(p1))).toThrow(PlanError);
+    const f1 = await loadDdl(
+      db,
+      `CREATE TYPE mood AS ENUM ('ok', 'sad');
+       CREATE FUNCTION f(x mood) RETURNS int LANGUAGE sql IMMUTABLE AS 'select 1'`,
+    );
+    const f2 = structuredClone(f1);
+    const e1 = enumId(f1, 'mood');
+    delete f2.objects[e1];
+    const e9 = createEnum(f2, (f1.objects[e1] as Enum).parent, 'mood', ['ok', 'sad', 'x']);
+    for (const o of Object.values(f2.objects))
+      if (o.kind === 'opaque') o.deps = o.deps.map((d) => (d === e1 ? e9 : d));
+    expect(() => plan(f1, f2)).toThrow(/依赖的枚举 public\.mood/);
+  });
+
+  test('枚举重排值（只被表达式引用，表里没有该枚举类型的列）：执行成功并绑定到新类型，回滚复原', async () => {
+    const db = conn();
+    const m1 = await load(db);
+    const m2 = reorder(m1);
+
+    const r = await verify(db, m1, m2);
+    expect(r.upDiff).toEqual([]);
+    expect(r.downDiff).toEqual([]);
+
+    await build(db, m1);
+    await db.exec(`INSERT INTO public.t (id) VALUES (1)`);
+    await runSteps(db, plan(m1, m2));
+    const after = await boundEnums(db);
+    expect(after.length).toBeGreaterThanOrEqual(5);
+    expect(new Set(after.map((row) => `${row.typ}=${row.labels}`))).toEqual(new Set(['mood=sad,ok']));
+    expect(await db.query(`SELECT id, k, g FROM public.t`)).toEqual([{ id: 1, k: 'ok', g: false }]);
+
+    await runSteps(db, plan(m2, m1));
+    expect(new Set((await boundEnums(db)).map((row) => `${row.typ}=${row.labels}`))).toEqual(
+      new Set(['mood=ok,sad']),
+    );
+    expect(await db.query(`SELECT id, k, g FROM public.t`)).toEqual([{ id: 1, k: 'ok', g: true }]);
+  });
+
+  test('域 / 复合类型 / 函数同版本改为不再依赖被删枚举，或与被删枚举一并删除：PG 真实执行与回滚闭环通过', async () => {
+    const db = conn();
+    const m1 = await loadDdl(
+      db,
+      `CREATE TYPE gone AS ENUM ('x', 'y');
+       CREATE DOMAIN d AS gone;
+       CREATE TYPE comp AS (a gone, b int);
+       CREATE FUNCTION f_ret(x int) RETURNS gone LANGUAGE sql IMMUTABLE AS 'select ''x''::public.gone';
+       CREATE FUNCTION f_arg(x gone) RETURNS int LANGUAGE sql IMMUTABLE AS 'select 1'`,
+    );
+    const rawM2 = await loadDdl(
+      db,
+      `CREATE DOMAIN d AS text;
+       CREATE TYPE comp AS (a text, b int);
+       CREATE FUNCTION f_ret(x int) RETURNS text LANGUAGE sql IMMUTABLE AS 'select ''x''::text';
+       CREATE FUNCTION f_arg(x text) RETURNS int LANGUAGE sql IMMUTABLE AS 'select 1'`,
+    );
+    const m2 = reconcileIds(m1, rawM2);
+
+    const r = await verify(db, m1, m2);
+    expect(r.upDiff).toEqual([]);
+    expect(r.downDiff).toEqual([]);
+
+    const m3 = reconcileIds(m1, await loadDdl(db, ''));
+    const rDrop = await verify(db, m1, m3);
+    expect(rDrop.upDiff).toEqual([]);
+    expect(rDrop.downDiff).toEqual([]);
+  });
+
+  test('函数仅修改或新增参数默认值时原地 CREATE OR REPLACE，被 CHECK / 默认值 / BEGIN ATOMIC 函数依赖时执行与回滚闭环通过', async () => {
+    const db = conn();
+    const m1 = await loadDdl(
+      db,
+      `CREATE FUNCTION f(a int DEFAULT 5) RETURNS int LANGUAGE sql IMMUTABLE AS 'select a';
+       CREATE TABLE t (x int DEFAULT f(1) CHECK (f(x) > 0));
+       CREATE FUNCTION g() RETURNS int LANGUAGE sql BEGIN ATOMIC SELECT f(2); END`,
+    );
+    const m2 = reconcileIds(
+      m1,
+      await loadDdl(
+        db,
+        `CREATE FUNCTION f(a int DEFAULT 7) RETURNS int LANGUAGE sql IMMUTABLE AS 'select a';
+         CREATE TABLE t (x int DEFAULT f(1) CHECK (f(x) > 0));
+         CREATE FUNCTION g() RETURNS int LANGUAGE sql BEGIN ATOMIC SELECT f(2); END`,
+      ),
+    );
+    const r = await verify(db, m1, m2);
+    expect(r.upDiff).toEqual([]);
+    expect(r.downDiff).toEqual([]);
+    expect(r.up.map((s) => s.sql)).toHaveLength(1);
+    expect(r.up[0]!.sql).toMatch(/^CREATE OR REPLACE FUNCTION public\.f\(a integer DEFAULT 7\)/);
+    expect(r.down.map((s) => s.sql)).toHaveLength(1);
+    expect(r.down[0]!.sql).toMatch(/^CREATE OR REPLACE FUNCTION public\.f\(a integer DEFAULT 5\)/);
+
+    // 新增参数默认值（无默认 → 有默认）升级同样原地替换，不触发 DROP FUNCTION
+    const mNoDef = await loadDdl(
+      db,
+      `CREATE FUNCTION f_add(a int) RETURNS int LANGUAGE sql IMMUTABLE AS 'select a';
+       CREATE TABLE t_add (x int DEFAULT f_add(1) CHECK (f_add(x) > 0))`,
+    );
+    const mWithDef = reconcileIds(
+      mNoDef,
+      await loadDdl(
+        db,
+        `CREATE FUNCTION f_add(a int DEFAULT 5) RETURNS int LANGUAGE sql IMMUTABLE AS 'select a';
+         CREATE TABLE t_add (x int DEFAULT f_add(1) CHECK (f_add(x) > 0))`,
+      ),
+    );
+    const addSteps = plan(mNoDef, mWithDef);
+    expect(addSteps).toHaveLength(1);
+    expect(addSteps[0]!.sql).toMatch(/^CREATE OR REPLACE FUNCTION public\.f_add\(a integer DEFAULT 5\)/);
+    await build(db, mNoDef);
+    await runSteps(db, addSteps);
+    const snapAfter = await readSnapshot(db);
+    await build(db, mWithDef);
+    const snapExpected = await readSnapshot(db);
+    expect(diffSnapshots(snapExpected, snapAfter)).toEqual([]);
+  });
+
+  test('嵌套域同时修改定义时按逆拓扑顺序删除、正拓扑顺序重建，闭环验证通过', async () => {
+    const db = conn();
+    const m1 = await loadDdl(
+      db,
+      `CREATE DOMAIN d1 AS int;
+       CREATE DOMAIN d2 AS d1`,
+    );
+    const m2 = reconcileIds(
+      m1,
+      await loadDdl(
+        db,
+        `CREATE DOMAIN d1 AS int CHECK (VALUE > 0);
+         CREATE DOMAIN d2 AS d1 CHECK (VALUE < 100)`,
+      ),
+    );
+    const r = await verify(db, m1, m2);
+    expect(r.upDiff).toEqual([]);
+    expect(r.downDiff).toEqual([]);
+    const upSqls = r.up.map((s) => s.sql);
+    expect(upSqls.indexOf('DROP DOMAIN public.d2')).toBeGreaterThanOrEqual(0);
+    expect(upSqls.indexOf('DROP DOMAIN public.d2')).toBeLessThan(upSqls.indexOf('DROP DOMAIN public.d1'));
   });
 });

@@ -2,12 +2,7 @@
 // 规划时维护一份“当前状态” cur：每生成一步就把它更新到执行这一步之后的样子，
 // 所以每条语句引用的都是当时实际存在的名字；结束时断言 cur 等于目标版本。
 
-import {
-  exprReferences,
-  normalizeAllPartitionFamilies,
-  renameInExpr,
-  renameQualifiedInExpr,
-} from '../edit.ts';
+import { exprReferences, normalizeAllPartitionFamilies, renameInExpr } from '../edit.ts';
 import type {
   Check,
   Column,
@@ -46,6 +41,7 @@ import {
 } from '../model.ts';
 import { PlanError, type Step } from '../plan-types.ts';
 import { checkPgCompatibility, LATEST_PG_MAJOR, pgCapabilities, type PlanOptions } from './capabilities.ts';
+import { qualifiedRefs, remapQualifiedInExpr, type Token, tokenize } from './expr.ts';
 import { chooseName, joinNames } from './naming.ts';
 import { derivedUuid, partitionKeyColumns } from './partition.ts';
 import { ident, literal, qualified } from './quote.ts';
@@ -241,6 +237,205 @@ const pickExprs = (o: Obj): Partial<Obj> =>
       ? { elements: clonePlain(o.elements), where: o.where }
       : {};
 
+const OPAQUE_KIND_LABEL: Record<Opaque['objType'], string> = {
+  domain: '域',
+  type: '复合类型',
+  function: '函数',
+  procedure: '存储过程',
+  aggregate: '聚合函数',
+  view: '视图',
+  materializedView: '物化视图',
+  trigger: '触发器',
+  policy: '策略',
+  exclusion: '排他约束',
+};
+
+const ROUTINE_OPTION_WORDS = new Set([
+  'language',
+  'transform',
+  'window',
+  'immutable',
+  'stable',
+  'volatile',
+  'leakproof',
+  'called',
+  'strict',
+  'external',
+  'security',
+  'parallel',
+  'cost',
+  'rows',
+  'support',
+  'set',
+  'as',
+  'begin',
+]);
+
+interface RoutineSignature {
+  /** 去掉参数默认值子句（DEFAULT ... / = ...）后的签名头部（含参数名、模式、类型与 RETURNS 子句） */
+  header: string;
+  /** 每个位置的参数是否带有默认值 */
+  paramDefaults: boolean[];
+}
+
+/**
+ * 提取函数 / 过程 DDL 的签名头部（去掉参数 DEFAULT / = 默认值子句，保留参数名、模式、类型与 RETURNS 子句），
+ * 并记录每个参数是否带有默认值，用于判断能否原地 CREATE OR REPLACE。
+ */
+const parseRoutineSignature = (ddl: string): RoutineSignature => {
+  const toks = tokenize(ddl).filter((t) => !(t.kind === 'other' && /^\s+$/.test(t.text)));
+  const out: string[] = [];
+  const paramDefaults: boolean[] = [];
+  let inParams = false;
+  let seenParams = false;
+  let paramParen = 0;
+  let paramBracket = 0;
+  let inDefault = false;
+  let curHasDefault = false;
+  let curHasTokens = false;
+  let postDepth = 0;
+  const pushTok = (t: Token) => out.push(t.kind === 'qident' ? `"${t.text.replaceAll('"', '""')}"` : t.text);
+
+  for (let i = 0; i < toks.length; i++) {
+    const t = toks[i]!;
+    if (
+      !inParams &&
+      !seenParams &&
+      i === 1 &&
+      toks[0]?.kind === 'ident' &&
+      toks[0].text === 'create' &&
+      t.kind === 'ident' &&
+      t.text === 'or' &&
+      toks[2]?.kind === 'ident' &&
+      toks[2].text === 'replace'
+    ) {
+      i++;
+      continue;
+    }
+    if (!inParams && !seenParams) {
+      if (t.kind === 'other' && t.text === '(') inParams = true;
+      pushTok(t);
+      continue;
+    }
+    if (inParams) {
+      if (t.kind === 'other' && t.text === ')' && paramParen === 0 && paramBracket === 0) {
+        if (curHasTokens) paramDefaults.push(curHasDefault);
+        inParams = false;
+        seenParams = true;
+        inDefault = false;
+        pushTok(t);
+        continue;
+      }
+      if (t.kind === 'other' && t.text === ',' && paramParen === 0 && paramBracket === 0) {
+        paramDefaults.push(curHasDefault);
+        curHasDefault = false;
+        curHasTokens = false;
+        inDefault = false;
+        pushTok(t);
+        continue;
+      }
+      if (t.kind === 'other' && t.text === '(') {
+        paramParen++;
+        if (!inDefault) {
+          curHasTokens = true;
+          pushTok(t);
+        }
+        continue;
+      }
+      if (t.kind === 'other' && t.text === ')') {
+        paramParen = Math.max(0, paramParen - 1);
+        if (!inDefault) {
+          curHasTokens = true;
+          pushTok(t);
+        }
+        continue;
+      }
+      if (t.kind === 'other' && t.text === '[') {
+        paramBracket++;
+        if (!inDefault) {
+          curHasTokens = true;
+          pushTok(t);
+        }
+        continue;
+      }
+      if (t.kind === 'other' && t.text === ']') {
+        paramBracket = Math.max(0, paramBracket - 1);
+        if (!inDefault) {
+          curHasTokens = true;
+          pushTok(t);
+        }
+        continue;
+      }
+      if (
+        !inDefault &&
+        paramParen === 0 &&
+        paramBracket === 0 &&
+        ((t.kind === 'ident' && t.text === 'default') || (t.kind === 'other' && t.text === '='))
+      ) {
+        inDefault = true;
+        curHasDefault = true;
+        continue;
+      }
+      if (!inDefault) {
+        if (
+          paramParen === 0 &&
+          paramBracket === 0 &&
+          t.kind === 'ident' &&
+          t.text === 'in' &&
+          toks[i - 1]?.text !== '.'
+        ) {
+          const next = toks[i + 1];
+          if (next?.kind === 'ident' && next.text === 'out') {
+            curHasTokens = true;
+            out.push('inout');
+            i++;
+          }
+          continue;
+        }
+        curHasTokens = true;
+        pushTok(t);
+      }
+      continue;
+    }
+    if (t.kind === 'other' && t.text === '(') {
+      postDepth++;
+    } else if (t.kind === 'other' && t.text === ')') {
+      postDepth = Math.max(0, postDepth - 1);
+    } else if (postDepth === 0 && t.kind === 'ident' && toks[i - 1]?.text !== '.') {
+      const next = toks[i + 1];
+      if (
+        ROUTINE_OPTION_WORDS.has(t.text) ||
+        (t.text === 'not' && next?.kind === 'ident' && next.text === 'leakproof') ||
+        (t.text === 'returns' && next?.kind === 'ident' && next.text === 'null')
+      ) {
+        break;
+      }
+    }
+    pushTok(t);
+  }
+  return { header: out.join(' '), paramDefaults };
+};
+
+const aggregateStype = (ddl: string): string => {
+  const m = /\bSTYPE\s*=\s*([^,)]+)/i.exec(ddl);
+  return m ? m[1]!.trim().toLowerCase() : '';
+};
+
+const earlyNeedsDropBeforeCreate = (w: Opaque, o: Opaque): boolean => {
+  if (o.objType === 'domain' || o.objType === 'type') return true;
+  if (w.drop !== o.drop) return true;
+  if (o.objType === 'function' || o.objType === 'procedure') {
+    const prev = parseRoutineSignature(w.ddl[0] ?? '');
+    const next = parseRoutineSignature(o.ddl[0] ?? '');
+    if (prev.header !== next.header) return true;
+    return prev.paramDefaults.some((had, i) => had && !next.paramDefaults[i]);
+  }
+  if (o.objType === 'aggregate') {
+    return aggregateStype(w.ddl[0] ?? '') !== aggregateStype(o.ddl[0] ?? '');
+  }
+  return false;
+};
+
 export const plan = (rawFrom: Model, rawTo: Model, opts?: PlanOptions): Step[] => {
   const from = normalizeAllPartitionFamilies(rawFrom);
   const to = normalizeAllPartitionFamilies(rawTo);
@@ -346,14 +541,55 @@ const planWithIndexes = (
     attachColMap.set(tId, map);
   }
 
+  // 枚举要重建（删值或重排值）：旧类型改临时名 → 建新类型 → 列转到新类型 → 删旧类型，OID 会变
+  const enumRebuild = new Set<string>();
+  for (const o of common) {
+    if (o.kind !== 'enum') continue;
+    const old = was(o).values;
+    if (
+      !sameStrArr(
+        o.values.filter((v) => old.includes(v)),
+        old,
+      )
+    ) {
+      enumRebuild.add(o.id);
+    }
+  }
+
   // ───── 改名带来的表达式变化：PG 按 OID 记录引用，改名时会自动更新表达式，不需要重建 ─────
-  // 把旧版本表达式里的 schema、枚举、列名换成新名字后再比较；相同就说明只是改名带来的变化
+  // 把旧版本表达式里的 schema、枚举、列名换成新名字后再比较；相同就说明只是改名带来的变化。
+  // 表达式按名字写、数据库按 OID 绑定：旧表达式里的 `schema.枚举` 先按**旧模型**解析成枚举 ID，再换成该 ID 在新模型里的名字
+  // （一趟替换，对调、轮换都正确）。枚举被删除或要重建时，旧 OID 在迁移后不复存在，换成一个不可能出现的名字，
+  // 于是引用它的表达式一定和新模型对不上 → 重建，重建后按新模型的名字绑定到当时同名的那个类型。
   const schemaRenames = common
     .filter((o): o is Schema => o.kind === 'schema' && o.name !== was(o).name)
     .map((o) => [was(o).name, o.name] as const);
-  const enumRenames = common
-    .filter((o): o is Enum => o.kind === 'enum' && o.name !== was(o).name)
-    .map((o) => [(to.objects[o.parent] as Schema).name, was(o).name, o.name] as const);
+  const exprSchemaMap = new Map<string, string>(schemaRenames);
+  const exprTypeMap = new Map<string, Map<string, { schema: string; name: string }>>();
+  for (const e of fromIdx.allRef('enum')) {
+    const fromSchema = get(from, e.parent, 'schema').name;
+    const now = to.objects[e.id];
+    let target: { schema: string; name: string };
+    if (now?.kind === 'enum' && !enumRebuild.has(e.id)) {
+      target = { schema: get(to, now.parent, 'schema').name, name: now.name };
+      if (target.schema === fromSchema && target.name === e.name) continue;
+    } else {
+      target = { schema: fromSchema, name: `__dowel_rebound_${e.id}__` };
+    }
+    let m = exprTypeMap.get(fromSchema);
+    if (!m) exprTypeMap.set(fromSchema, (m = new Map()));
+    m.set(e.name, target);
+  }
+  const exprRemap = { schemas: exprSchemaMap, types: exprTypeMap };
+  /** 旧模型里的表达式引用了哪些在本次迁移中改名、被删除或重建的枚举（旧的显示名，用于报错） */
+  const remappedEnumsIn = (expr: string | null | undefined): string[] => {
+    if (!expr || exprTypeMap.size === 0) return [];
+    const out: string[] = [];
+    for (const { schema, name } of qualifiedRefs(expr)) {
+      if (exprTypeMap.get(schema.text)?.has(name.text)) out.push(`${schema.text}.${name.text}`);
+    }
+    return out;
+  };
   const colRenames = new Map<string, [string, string][]>();
   for (const o of common)
     if (o.kind === 'column' && o.name !== was(o).name)
@@ -363,13 +599,11 @@ const planWithIndexes = (
     if (tc.name !== rc.name)
       colRenames.set(tc.parent, [...(colRenames.get(tc.parent) ?? []), [rc.name, tc.name]]);
   }
-  const hasGlobalRename = schemaRenames.length > 0 || enumRenames.length > 0;
+  const hasGlobalRename = exprSchemaMap.size > 0 || exprTypeMap.size > 0;
   const hasAnyExprMigration =
     hasGlobalRename || colRenames.size > 0 || willDetach.size > 0 || willAttach.size > 0;
   const migrateExpr = (expr: string, table: string): string => {
-    let e = expr;
-    for (const [a, b] of schemaRenames) e = renameQualifiedInExpr(e, a, null, { schema: b, name: null });
-    for (const [sch, a, b] of enumRenames) e = renameQualifiedInExpr(e, sch, a, { schema: sch, name: b });
+    let e = hasGlobalRename ? remapQualifiedInExpr(expr, exprRemap) : expr;
     // 两阶段：先换成占位名，再换成目标名（处理互换）
     const rs = colRenames.get(table) ?? colRenames.get(rootTableId(from, table)) ?? [];
     rs.forEach(([a], i) => {
@@ -502,6 +736,16 @@ const planWithIndexes = (
           }
         }
         if (!samePartBy) {
+          const keyExprs =
+            typeof w.partitionBy === 'string' ? [w.partitionBy] : w.partitionBy.keys.map((k) => k.expr);
+          const enums = [...new Set(keyExprs.flatMap(remappedEnumsIn))];
+          if (enums.length > 0) {
+            throw new PlanError(
+              `分区表 ${o.name} 的分区键表达式引用了枚举 ${enums.join('、')}，它在本次迁移中改名、与其他枚举对调名字、被删除或重建，` +
+                '分区键在迁移后会绑定到与新版本不同的类型；PG 不能修改已有表的分区键。' +
+                '请先让分区键不再引用该枚举，或手工重建这张分区表',
+            );
+          }
           throw new PlanError(`暂不支持修改已存在表的分区策略或分区键：${o.name}`);
         }
       }
@@ -606,7 +850,6 @@ const planWithIndexes = (
   // ───── 预先计算：需要重建的约束 / 索引、需要重建的生成列、类型变化的列 ─────
   const typeChanged = new Set<string>();
   const renamedColIds = new Set<string>();
-  const enumRebuild = new Set<string>();
   const opaqueChanged = new Set<string>();
   for (let i = 0; i < common.length; i++) {
     const o = common[i]!;
@@ -614,16 +857,6 @@ const planWithIndexes = (
       const w = was(o);
       if (!sameColType(o, w)) typeChanged.add(o.id);
       if (o.name !== w.name) renamedColIds.add(o.id);
-    } else if (o.kind === 'enum') {
-      const old = was(o).values;
-      if (
-        !sameStrArr(
-          o.values.filter((v) => old.includes(v)),
-          old,
-        )
-      ) {
-        enumRebuild.add(o.id);
-      }
     } else if (o.kind === 'opaque') {
       if (!sameDef(o, was(o))) opaqueChanged.add(o.id);
     }
@@ -653,6 +886,14 @@ const planWithIndexes = (
     });
   };
 
+  // 类型是被重建枚举的列：重建时会改到新类型（OID 变了）。外键必须先删；引用它的生成列、视图要重建；不能是分区键
+  const enumCols = new Set<string>();
+  if (enumRebuild.size > 0) {
+    for (const c of fromIdx.allRef('column')) {
+      if (c.typeRef && enumRebuild.has(c.typeRef)) enumCols.add(c.id);
+    }
+  }
+
   // 生成列：定义变了、或表达式引用的列类型变了 → 删掉重建（生成列的值可以重新算出，不丢数据）
   const regen = new Set<string>();
   for (const c of toIdx.allRef('column')) {
@@ -662,7 +903,9 @@ const planWithIndexes = (
     if (
       !sameGenerated(c.generated, migrated(w).generated) ||
       typeChanged.has(c.id) ||
-      (c.generated && exprTouches(c.generated.expr, colsOfTable(c.parent, typeChanged)))
+      enumCols.has(c.id) ||
+      (c.generated && exprTouches(c.generated.expr, colsOfTable(c.parent, typeChanged))) ||
+      (c.generated && enumCols.size > 0 && exprTouches(c.generated.expr, colsOfTable(c.parent, enumCols)))
     )
       regen.add(c.id);
   }
@@ -680,15 +923,39 @@ const planWithIndexes = (
   }
   for (const id of regen) typeChanged.delete(id);
 
+  // 默认值文本没变、但它引用的枚举换了绑定（两个枚举 / schema 对调名字、删后重建同名枚举、枚举重建）：
+  // 文本比较看不出来，要显式重设，让它按新模型的名字重新绑定（P12 先 DROP DEFAULT 再 SET DEFAULT）。
+  // 默认值不能引用列（PG 限制），所以只看全局改名
+  const rebindDefault = new Set<string>();
+  if (hasGlobalRename) {
+    const check = (c: Column, old: Column['default'], moved: Column['default']) => {
+      if (regen.has(c.id) || !c.default || !('expr' in c.default)) return;
+      if (sameDefault(old, c.default) && !sameDefault(moved, c.default)) rebindDefault.add(c.id);
+    };
+    for (const c of toIdx.allRef('column'))
+      if (inFrom(c.id)) check(c, was(c).default, migrated(was(c)).default);
+    // 脱离为独立表的子分区：列从根父表物化出来，默认值文本也来自根父表
+    for (const [toColId, rc] of detachToRootCol) {
+      const tc = get(to, toColId, 'column');
+      const moved =
+        rc.default && 'expr' in rc.default ? { expr: migrateExpr(rc.default.expr, tc.parent) } : rc.default;
+      check(tc, rc.default, moved);
+    }
+  }
+
   // 分区键引用的列不允许改类型（PG 报错 cannot alter type of column named in partition key）
-  if (typeChanged.size > 0 || regen.size > 0) {
+  if (typeChanged.size > 0 || regen.size > 0 || enumCols.size > 0) {
     for (const o of toIdx.allRef('table')) {
       if (!o.partitionBy || !inFrom(o.id)) continue;
       const refIds = new Set([...partitionKeyColumns(to, o).all, ...partitionKeyColumns(from, was(o)).all]);
       for (const colId of refIds) {
-        if (typeChanged.has(colId) || regen.has(colId)) {
+        if (typeChanged.has(colId) || regen.has(colId) || enumCols.has(colId)) {
           const colName = find(to, colId)?.name ?? find(from, colId)?.name ?? colId;
-          throw new PlanError(`列 ${colName} 被分区表 ${o.name} 的分区键引用，不能修改类型`);
+          throw new PlanError(
+            enumCols.has(colId)
+              ? `列 ${colName} 被分区表 ${o.name} 的分区键引用，它的枚举类型要删值或重排值（需重建类型），PG 不能修改分区键列的类型`
+              : `列 ${colName} 被分区表 ${o.name} 的分区键引用，不能修改类型`,
+          );
         }
       }
     }
@@ -723,14 +990,6 @@ const planWithIndexes = (
       (e) => ids.has(was(from.objects[e] as Enum).name) || ids.has((to.objects[e] as Enum).name),
     );
   };
-
-  // 类型是被重建枚举的列：重建时会改到新类型，外键必须先删
-  const enumCols = new Set<string>();
-  if (enumRebuild.size > 0) {
-    for (const c of fromIdx.allRef('column')) {
-      if (c.typeRef && enumRebuild.has(c.typeRef)) enumCols.add(c.id);
-    }
-  }
 
   // PG 中 ALTER TABLE RENAME COLUMN 不会更新分区父表索引关系（relkind='I'）上的 pg_attribute.attname，
   // 导致后续新建或重挂子分区时 PG 仍按旧列名生成继承 UNIQUE/INDEX 约束与索引名；
@@ -835,12 +1094,65 @@ const planWithIndexes = (
     ...typeChanged,
     ...regen,
     ...enumRebuild,
+    ...enumCols,
     ...opaqueChanged,
     ...detaching,
     ...attaching,
     ...rebinding,
   ]);
   const lateRebuild = new Set([...opaqueChanged].filter((id) => isLate(from.objects[id] as Opaque)));
+  // DDL 文本没变、但依赖的枚举换成了另一个（按 ID）：PG 里它仍绑定旧类型，要删掉重建才会按新版本绑定
+  const enumDepsOf = (m: Model, o: Opaque) => o.deps.filter((d) => m.objects[d]?.kind === 'enum').sort();
+  for (const o of toIdx.allRef('opaque')) {
+    if (!inFrom(o.id) || lateRebuild.has(o.id)) continue;
+    const w = was(o);
+    if (isLate(w) && !sameStrArr(enumDepsOf(to, o), enumDepsOf(from, w))) {
+      lateRebuild.add(o.id);
+      unstable.add(o.id);
+    }
+  }
+  // 早期不透明对象（域、复合类型、函数、存储过程、聚合函数）依赖被删除或重建的枚举：
+  // - 枚举要重建（enumRebuild）：P8 在 P8b / P14 之前就删旧类型，无论该对象是否改动或删除都无法直接通过，明确报错；
+  // - 枚举被删除（isRemoved）：若同一版本把该对象一并删除或重定义为不再依赖该枚举（及其同名重建枚举），
+  //   且对函数 / 存储过程 / 聚合函数而言该枚举的类型名未被新对象复用（否则 P6 先把旧枚举改临时名导致静态 DROP 语句失效），
+  //   则允许放行（P8b 先删后建或 P14 先于 DROP TYPE 删除）；其余情况明确报错。
+  for (const w of fromIdx.allRef('opaque')) {
+    if (isLate(w)) continue;
+    const blocked: string[] = [];
+    for (const d of w.deps) {
+      const e = from.objects[d];
+      if (e?.kind !== 'enum') continue;
+      if (enumRebuild.has(d)) {
+        blocked.push(d);
+        continue;
+      }
+      if (!isRemoved(d)) continue;
+      const replacement = toIdx.allRef('enum').find((x) => x.parent === e.parent && x.name === e.name);
+      const reusedTypeSlot =
+        !!replacement || toIdx.allRef('table').some((x) => x.parent === e.parent && x.name === e.name);
+      const isTypeObj = w.objType === 'domain' || w.objType === 'type';
+      if (!inTo(w.id)) {
+        if (!isTypeObj && reusedTypeSlot) blocked.push(d);
+        continue;
+      }
+      const o = to.objects[w.id] as Opaque;
+      const allowed =
+        opaqueChanged.has(o.id) &&
+        !isLate(o) &&
+        !o.deps.includes(d) &&
+        (!replacement || !o.deps.includes(replacement.id)) &&
+        (isTypeObj || !reusedTypeSlot);
+      if (!allowed) blocked.push(d);
+    }
+    if (blocked.length > 0) {
+      const kindLabel = OPAQUE_KIND_LABEL[w.objType];
+      const names = blocked.map((d) => qname(from, from.objects[d] as Enum)).join('、');
+      throw new PlanError(
+        `${kindLabel} ${w.name} 依赖的枚举 ${names} 在本次迁移中被删除或要重建（删值 / 重排值），暂不支持自动重建依赖它的${kindLabel}；` +
+          '请先在一个版本里删掉该对象（或改为不依赖这个枚举），再在后续版本里重建枚举或该对象',
+      );
+    }
+  }
   for (let changed = true; changed;) {
     changed = false;
     for (const o of all(from, 'opaque')) {
@@ -1901,6 +2213,15 @@ const planWithIndexes = (
     emit('createExtension', o.id, `CREATE EXTENSION ${ident(o.name)} WITH SCHEMA ${schema}`);
   }
   // ───── P8 建枚举、给枚举加值 ─────
+  const dropDefaultCascade = (col: Column) => {
+    emit('dropDefault', col.id, `ALTER TABLE ${T(col.parent)} ALTER COLUMN ${C(col.id)} DROP DEFAULT`);
+    if (get(cur, col.parent, 'table').partitionBy !== null) {
+      for (const desc of partitionDescendants(cur, col.parent)) {
+        emit('dropDefault', col.id, `ALTER TABLE ${T(desc.id)} ALTER COLUMN ${C(col.id)} DROP DEFAULT`);
+      }
+    }
+    col.default = null;
+  };
   for (const o of added) {
     if (o.kind !== 'enum') continue;
     cur.objects[o.id] = fresh(o);
@@ -1921,17 +2242,22 @@ const planWithIndexes = (
       c.values = [...o.values];
       c.comment = null; // 新类型没有注释，最后统一加
       emit('createEnum', o.id, `CREATE TYPE ${qname(cur, c)} AS ENUM (${o.values.map(literal).join(', ')})`);
+      // 引用旧类型的其他列默认值（如 text 列的 'a'::枚举::text）也要先去掉，否则删不掉旧类型；P12 再按新模型重设
+      const w = was(o);
+      const wSchema = get(from, w.parent, 'schema').name;
+      for (const col of all(cur, 'column')) {
+        if (
+          col.typeRef === o.id ||
+          !col.default ||
+          !('expr' in col.default) ||
+          !qualifiedRefs(col.default.expr).some((r) => r.schema.text === wSchema && r.name.text === w.name)
+        )
+          continue;
+        dropDefaultCascade(col);
+      }
       for (const col of all(cur, 'column')) {
         if (col.typeRef !== o.id) continue;
-        if (col.default) {
-          emit('dropDefault', col.id, `ALTER TABLE ${T(col.parent)} ALTER COLUMN ${C(col.id)} DROP DEFAULT`);
-          if (get(cur, col.parent, 'table').partitionBy !== null) {
-            for (const desc of partitionDescendants(cur, col.parent)) {
-              emit('dropDefault', col.id, `ALTER TABLE ${T(desc.id)} ALTER COLUMN ${C(col.id)} DROP DEFAULT`);
-            }
-          }
-          col.default = null;
-        }
+        if (col.default) dropDefaultCascade(col);
         const arr = col.type;
         emit(
           'alterType',
@@ -1958,11 +2284,11 @@ const planWithIndexes = (
   const earlyCreates = all(to, 'opaque').filter(
     (o) => !isLate(o) && (!inFrom(o.id) || opaqueChanged.has(o.id)),
   );
-  for (const o of topo(earlyCreates)) {
-    if (inFrom(o.id) && (o.objType === 'domain' || o.objType === 'type'))
-      dropOpaque(get(cur, o.id, 'opaque'));
-    createOpaque(o); // 函数、聚合的 DDL 是 CREATE OR REPLACE，可以直接覆盖
-  }
+  const earlyRedefDrops = earlyCreates
+    .filter((o) => inFrom(o.id) && earlyNeedsDropBeforeCreate(was(o), o))
+    .map((o) => was(o));
+  for (const w of topo(earlyRedefDrops).reverse()) dropOpaque(get(cur, w.id, 'opaque'));
+  for (const o of topo(earlyCreates)) createOpaque(o);
   // ───── P9 建序列（属于哪一列在列建好之后再设）、改序列选项 ─────
   for (const o of added) {
     if (o.kind !== 'sequence') continue;
@@ -2339,7 +2665,8 @@ const planWithIndexes = (
       c.notNullNameMode !== o.notNullNameMode ||
       (cap.namedNotNull && o.notNull && c.notNullName !== o.notNullName) ||
       !sameIdentity(c.identity, o.identity) ||
-      !sameDefault(c.default, o.default)
+      !sameDefault(c.default, o.default) ||
+      rebindDefault.has(o.id)
     ) {
       altered.push(o);
     }
@@ -2365,7 +2692,7 @@ const planWithIndexes = (
   // b. 去掉默认值（默认值要变、或类型要变时先去掉，避免旧默认值无法转换）
   for (const o of altered) {
     const c = get(cur, o.id, 'column');
-    if (c.default && (!same(c.default, o.default) || typeChanged.has(o.id))) {
+    if (c.default && (!same(c.default, o.default) || typeChanged.has(o.id) || rebindDefault.has(o.id))) {
       emitDefaultCascade(c, 'dropDefault', 'DROP DEFAULT');
       c.default = null;
     }
