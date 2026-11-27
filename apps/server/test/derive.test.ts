@@ -668,3 +668,51 @@ describe('pendingRefreshIds：不透明对象沿依赖传递（#136）', () => {
     expect(st.objects.map((o) => o.id)).toEqual(['v1', 'v2', 'v3']);
   });
 });
+
+describe('pendingRefreshIds：列签名的补充规则（枚举限定名、大小写、改挂分区父表）', () => {
+  test('两个枚举对调名字：列的 typeRef 不变，表达式里的类型名换了绑定', () => {
+    const good = base();
+    runMutator(good, 'createEnum', { id: 'e1', schema: 's', name: 'mood', values: ['ok', 'bad'] });
+    runMutator(good, 'createEnum', { id: 'e2', schema: 's', name: 'tone', values: ['ok', 'lo'] });
+    runMutator(good, 'addColumn', {
+      table: 't',
+      column: { id: 'cm', name: 'm', type: 'mood', typeRef: 'e1' },
+    });
+    runMutator(good, 'addCheck', { id: 'k', table: 't', expr: "(m = 'ok'::mood)" });
+    const cur = structuredClone(good);
+    (cur.objects.e1 as { name: string }).name = 'tone';
+    (cur.objects.e2 as { name: string }).name = 'mood';
+    expect(pendingRefreshIds(good, cur)).toEqual(['k']);
+  });
+
+  test('大小写不敏感的方言：列名只改大小写也算变化（读回的引用写法可能跟着变）', () => {
+    const good = emptyModel('mysql');
+    runMutator(good, 'createSchema', { id: 's', name: 'default' });
+    runMutator(good, 'createTable', { id: 't', schema: 's', name: 'orders' });
+    runMutator(good, 'addColumn', { table: 't', column: { id: 'c', name: 'Total', type: 'int' } });
+    runMutator(good, 'addCheck', { id: 'k', table: 't', expr: '(`Total` > 0)' });
+    const cur = structuredClone(good);
+    (cur.objects.c as { name: string }).name = 'total';
+    expect(pendingRefreshIds(good, cur)).toEqual(['k']);
+  });
+
+  test('子分区改挂到另一个分区父表下：边界原文不变也待规范化', () => {
+    const good = partitionFamily();
+    runMutator(good, 'createTable', { id: 'q', schema: 's', name: 'events2' });
+    runMutator(good, 'addColumn', {
+      table: 'q',
+      column: { id: 'qd', name: 'day', type: 'integer', notNull: true },
+    });
+    runMutator(good, 'addColumn', { table: 'q', column: { id: 'qa', name: 'amount', type: 'integer' } });
+    runMutator(good, 'setPartitionBy', {
+      id: 'q',
+      partitionBy: {
+        strategy: 'range',
+        keys: [{ column: 'qd', expr: null, opclass: null, collation: null }],
+      },
+    });
+    const cur = structuredClone(good);
+    (cur.objects.lf as { partitionOf: { parent: string; bound: string } }).partitionOf.parent = 'q';
+    expect(pendingRefreshIds(good, cur)).toEqual(['lf']);
+  });
+});

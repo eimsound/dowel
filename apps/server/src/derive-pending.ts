@@ -6,9 +6,11 @@
 //   （同表列改类型，也包括列名对调、删列后新建同名列，#133）；只在一边出现的列名（新增 / 删除 / 改名到新名字）不算。
 //   分区子表没有自己的列，沿 partitionOf 用根父表的列（两个模型各自解析根表，覆盖多级分区与 attach / detach，#134）。
 //   列自己的默认值 / 生成列另外按 ID 比较列自身的类型（列改名的同时改类型时，按名字对不上）。
+//   列签名含枚举的完整限定名（两个枚举对调名字时 typeRef 不变、表达式里的类型名却换了绑定）；
 //   只有分区边界、没有表达式分区键的表不看列上下文：边界只取决于分区键列的类型，而分区键引用的列不能改类型 / 删除；
-// - 不透明对象：依赖或所在父对象改了名；依赖的列（按 ID，及按它在表里的列名对齐）或依赖 / 父对象表的列上下文变了；
-//   DDL 文本变了；或依赖的不透明对象本身待规范化（视图叠视图，沿依赖传递，带环保护，#136）。
+//   但子分区改挂到另一个分区父表下时算变化。
+// - 不透明对象：依赖或所在父对象改了名；deps 集合变了；依赖的列（按 ID，及按它在表里的列名对齐）或依赖 / 父对象表的
+//   列上下文变了；DDL 文本变了；或依赖的不透明对象本身待规范化（视图叠视图，沿依赖传递，带环保护，#136）。
 import { deepEqual, type Model, type Obj, rootTableId } from '@dowel/core';
 
 type Column = Extract<Obj, { kind: 'column' }>;
@@ -53,15 +55,25 @@ export const exprsOf = (o: Obj | undefined): unknown => {
 const hasPartitionExprs = (o: Table): boolean =>
   !!o.partitionBy && typeof o.partitionBy !== 'string' && o.partitionBy.keys.some((k) => k.expr);
 
-/** 列的类型上下文：类型、枚举引用、排序规则 */
-const colSig = (c: Column): string => JSON.stringify([c.type, c.typeRef, c.collation]);
+/**
+ * 列的类型上下文：类型、枚举引用（ID 与完整限定名：枚举 / 所在 schema 改名时规范形式里的类型名跟着变）、排序规则；
+ * withName 时再带上列名原文（大小写不敏感的方言按折叠后的名字对齐，只改大小写时读回的引用写法可能跟着变）。
+ */
+const colSig = (m: Model, c: Column, withName = false): string =>
+  JSON.stringify([
+    c.type,
+    c.typeRef,
+    c.typeRef ? fullName(m, c.typeRef) : null,
+    c.collation,
+    withName ? c.name : null,
+  ]);
 
-/** 新旧两边都存在的同一列（按 ID）：类型、枚举引用或排序规则变了 */
+/** 新旧两边都存在的同一列（按 ID）：类型、枚举引用或排序规则变了（不看列名：只改名不影响列自身的默认值） */
 const columnTypeChanged = (base: Model, cur: Model, id: string): boolean => {
   const a = base.objects[id];
   const b = cur.objects[id];
   if (a?.kind !== 'column' || b?.kind !== 'column') return false;
-  return colSig(a) !== colSig(b);
+  return colSig(base, a) !== colSig(cur, b);
 };
 
 const sameSet = (a: readonly string[], b: readonly string[]): boolean => {
@@ -84,7 +96,8 @@ const caseInsensitive = (m: Model) =>
 const columnContext = (m: Model) => {
   let byTable: Map<string, Column[]> | null = null;
   const byRoot = new Map<string, Map<string, string>>();
-  const fold = caseInsensitive(m) ? (n: string) => n.toLowerCase() : (n: string) => n;
+  const ci = caseInsensitive(m);
+  const fold = ci ? (n: string) => n.toLowerCase() : (n: string) => n;
   const sigs = (tableId: string): Map<string, string> => {
     const root = rootTableId(m, tableId);
     let out = byRoot.get(root);
@@ -102,8 +115,9 @@ const columnContext = (m: Model) => {
     for (const c of byTable.get(root) ?? []) {
       const k = fold(c.name);
       const list = grouped.get(k);
-      if (list) list.push(colSig(c));
-      else grouped.set(k, [colSig(c)]);
+      const sig = colSig(m, c, ci);
+      if (list) list.push(sig);
+      else grouped.set(k, [sig]);
     }
     out = new Map([...grouped].map(([k, v]) => [k, v.sort().join('|')]));
     byRoot.set(root, out);
@@ -150,6 +164,16 @@ export const pendingRefreshIds = (baseline: Model | null, cur: Model): string[] 
     const old = baseCtx.sigs(col.parent).get(k);
     return old !== undefined && old !== curCtx.sigs(col.parent).get(k);
   };
+  /** 子分区挂到了另一个分区父表下（边界原文可能不变，但它按新父表的分区键解释） */
+  const partitionParentChanged = (o: Table): boolean => {
+    const was = base.objects[o.id];
+    return (
+      was?.kind === 'table' &&
+      !!was.partitionOf &&
+      !!o.partitionOf &&
+      was.partitionOf.parent !== o.partitionOf.parent
+    );
+  };
   /** 表达式按列名引用的那张表：CHECK / 索引 / 列是 parent；有表达式分区键的表是自己；否则不看列上下文 */
   const tableOf = (o: Obj): string | null => {
     if (o.kind === 'table') return hasPartitionExprs(o) ? o.id : null;
@@ -184,7 +208,10 @@ export const pendingRefreshIds = (baseline: Model | null, cur: Model): string[] 
       pending.add(o.id);
       continue;
     }
-    if (o.kind === 'column' && columnTypeChanged(base, cur, o.id)) {
+    if (
+      (o.kind === 'column' && columnTypeChanged(base, cur, o.id)) ||
+      (o.kind === 'table' && partitionParentChanged(o))
+    ) {
       pending.add(o.id);
       continue;
     }
