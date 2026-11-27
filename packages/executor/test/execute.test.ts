@@ -1553,3 +1553,36 @@ test.skipIf(!PG_URL)(
     });
   },
 );
+
+// ───── 整版本门禁（ADR 0017 决定 5）─────
+
+test.skipIf(!PG_URL)(
+  '整版本门禁：没在目标库完整版本上验证通过的版本，执行 / 回滚都在动库之前拒绝；版本对得上才放行',
+  async () => {
+    const models = [await canon(m0()), await canon(withEmail(m0()))];
+    await withTarget(async (t) => {
+      const vNum = (await t.db.query<{ v: string }>(`select current_setting('server_version_num') as v`))[0]!
+        .v;
+      const full = `${Math.floor(Number(vNum) / 10000)}.${Number(vNum) % 10000}`;
+      const other = `${Math.floor(Number(vNum) / 10000)}.${(Number(vNum) % 10000) + 1}`;
+      const gated = (verifiedOn: string[]) => chainOf(models).map((v) => ({ ...v, verifiedOn }));
+
+      const e = await fails(run(t.db, gated([other]), 2));
+      expect(e.code).toBe('unverified');
+      expect(e.message).toContain(full);
+      expect(e.details).toMatchObject({ engineVersion: full, verifiedOn: [other] });
+      expect(await hasDowelSchema(t.db)).toBe(false);
+      // 没有任何记录（旧版本 / 记录被人工编辑清空）同样拒绝，没有绕过
+      expect((await fails(run(t.db, gated([]), 2))).code).toBe('unverified');
+
+      await run(t.db, gated([other, full]), 2);
+      await structureIs(t.db, models[1]!);
+      // 回滚到 v1 也要求目标版本有记录
+      const back = await fails(run(t.db, gated([other]), 1));
+      expect(back.code).toBe('unverified');
+      await structureIs(t.db, models[1]!);
+      await run(t.db, gated([full]), 1);
+      await structureIs(t.db, models[0]!);
+    });
+  },
+);

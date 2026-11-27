@@ -38,9 +38,52 @@ import { useProject } from '../project.tsx';
 import { Modal } from './Modal.tsx';
 import { useToast } from './Toasts.tsx';
 import { Banner, cx, Sql } from './ui.tsx';
-import { RiskNote, useVersionName, VerifyBanner } from './VersionStatus.tsx';
+import { EnvVersionList, RiskNote, useVersionName, VerifyBanner } from './VersionStatus.tsx';
 
 type Base = { pid: string; open: boolean; onClose: () => void };
+
+/**
+ * 发布被拒绝（ADR 0017 决定 1）的详情：没有可用影子库 / 还有待规范化对象（列出对象）/ 没有版本一致的影子库（列出环境）/
+ * 验证没通过（验证报告，含读回核对的写法差异）。错误原文由调用方用 role=alert 的横幅显示，这里只补充结构化的内容
+ */
+const PublishRejectedDetails = ({ body }: { body: PublishRejected }) => {
+  const { t } = useTranslation();
+  const pending = body.pending ?? [];
+  const more = (body.pendingCount ?? pending.length) - pending.length;
+  return (
+    <>
+      {body.code === 'shadow_unavailable' && (
+        <Banner kind="warn" title={t('dlg.rejectShadowUnavailable')} role="status">
+          {t('dlg.rejectShadowUnavailableBody')}
+        </Banner>
+      )}
+      {body.code === 'normalize_pending' && (
+        <Banner kind="warn" title={t('dlg.rejectNormalizePending')} role="status">
+          {t('dlg.rejectNormalizePendingBody')}
+        </Banner>
+      )}
+      {pending.length > 0 && (
+        <div className="text-sm">
+          <h3 className="section-title">
+            {t('dlg.pendingTitle', { count: body.pendingCount ?? pending.length })}
+          </h3>
+          <ul className="m-0 list-disc pl-5 font-mono text-xs">
+            {pending.map((o) => (
+              <li key={o.id}>{o.name}</li>
+            ))}
+          </ul>
+          {more > 0 && <p className="hint">{t('dlg.pendingMore', { count: more })}</p>}
+        </div>
+      )}
+      {body.code === 'no_matching_shadow' && (
+        <Banner kind="warn" title={t('dlg.rejectNoMatching')} role="status">
+          {t('dlg.rejectNoMatchingBody')}
+          {body.environments && <EnvVersionList envs={body.environments} />}
+        </Banner>
+      )}
+    </>
+  );
+};
 
 export const ImportDialog = ({ pid, open, onClose }: Base) => {
   const { t } = useTranslation();
@@ -147,8 +190,8 @@ export const VersionDialog = ({ pid, open, onClose }: Base) => {
   const toast = useToast();
   const qc = useQueryClient();
   const [name, setName] = useState('');
-  // 发布成功但用户需要知道一件事——没有验证（影子库不可用），或者验证通过但风险分析没有完成：
-  // 对话框留着，用醒目的横幅说明原因，而不是一闪而过的通知
+  // 发布成功（发布出来的版本一定已通过验证，ADR 0017）但用户需要知道一件事——风险分析没有完成，
+  // 或者有环境没有同版本的验证记录（执行到那里会被拒绝）：对话框留着，用醒目的横幅说明，而不是一闪而过的通知
   const [notice, setNotice] = useState<VersionCreated | null>(null);
   const close = () => {
     setNotice(null);
@@ -166,13 +209,14 @@ export const VersionDialog = ({ pid, open, onClose }: Base) => {
       // 发布前服务端会先按需规范化（ADR 0016）：零改写时 seq 不变、只推进了基线，状态栏要主动重查
       void qc.invalidateQueries({ queryKey: ['normalize', pid] });
       setName('');
+      const uncovered = v.uncovered ?? [];
       const args = {
         name: v.name,
         number: v.number,
-        reason: v.unverifiedReason ?? '',
         riskError: v.riskError ?? '',
+        count: uncovered.length,
       };
-      if (v.verified && !v.riskError) {
+      if (!v.riskError && !uncovered.length) {
         toast(t('dlg.versionSaved', args));
         if (openRef.current) onClose();
       } else if (openRef.current) {
@@ -180,26 +224,28 @@ export const VersionDialog = ({ pid, open, onClose }: Base) => {
         setNotice(v);
       } else {
         // 发布期间用户把对话框关了：横幅没人看，改用通知给出同样的内容（整句由 i18n 生成）
-        toast(
-          t(
-            !v.verified
-              ? v.unverifiedReason
-                ? 'dlg.versionSavedUnverifiedReason'
-                : 'dlg.versionSavedUnverified'
-              : 'dlg.versionSavedRiskError',
-            args,
-          ),
-        );
+        toast(t(v.riskError ? 'dlg.versionSavedRiskError' : 'dlg.versionSavedUncovered', args));
       }
     },
     onError: (e) => {
       if (openRef.current) return; // 对话框开着时错误显示在对话框里
       // 发布期间对话框被关了：失败也要告诉用户；验证没通过（422 + 报告）要说明是验证没有通过
       const report = e instanceof ApiError ? (e.body as PublishRejected | undefined)?.report : undefined;
+      const readback = report?.readbackDiff?.[0];
       toast(
         report
           ? t('dlg.versionFailedVerify', {
-              detail: report.error?.message ?? [...report.upDiff, ...report.downDiff][0] ?? e.message,
+              detail:
+                report.error?.message ??
+                [...report.upDiff, ...report.downDiff][0] ??
+                (readback
+                  ? t('dlg.readbackToast', {
+                      object: readback.object,
+                      property: readback.property,
+                      model: readback.modelValue ?? t('dlg.readbackNull'),
+                      live: readback.liveValue ?? t('dlg.readbackNull'),
+                    })
+                  : e.message),
             })
           : t('dlg.versionFailed', { message: e.message }),
       );
@@ -218,16 +264,19 @@ export const VersionDialog = ({ pid, open, onClose }: Base) => {
       reset();
     }
   }, [open, reset]);
-  // 验证失败时服务端返回 422 和报告：显示在对话框里，版本没有发布
-  const rejected =
-    run.error instanceof ApiError ? (run.error.body as PublishRejected | undefined)?.report : undefined;
+  // 发布被拒绝时服务端返回 422（拒绝码 + 报告 / 待规范化对象 / 环境列表）：显示在对话框里，版本没有发布
+  const rejectedBody =
+    run.error instanceof ApiError && run.error.status === 422
+      ? (run.error.body as PublishRejected | undefined)
+      : undefined;
+  const rejected = rejectedBody?.report;
   return (
     <Modal
       open={open}
       onClose={close}
       title={t('dlg.versionTitle')}
       icon={<BookmarkPlus size={16} aria-hidden="true" />}
-      size={rejected ? 'lg' : 'sm'}
+      size={rejected || rejectedBody?.pending?.length || notice?.uncovered?.length ? 'lg' : 'sm'}
       footer={
         notice ? (
           <Fragment key="done">
@@ -256,21 +305,29 @@ export const VersionDialog = ({ pid, open, onClose }: Base) => {
       }
     >
       {notice ? (
-        notice.verified ? (
-          // 已发布、已通过验证，但风险分析没有完成：别让用户以为“没有风险”
+        <div className="space-y-3">
           <Banner
             kind="warn"
             title={t('dlg.versionPublishedVerified', { name: notice.name, number: notice.number })}
             role="status"
           >
-            {t('dlg.riskFailedBody', { reason: notice.riskError ?? '' })}
+            {/* 已发布、已通过验证，但风险分析没有完成：别让用户以为“没有风险” */}
+            {notice.riskError && (
+              <p className="m-0">{t('dlg.riskFailedBody', { reason: notice.riskError })}</p>
+            )}
+            {notice.verifiedOn.length > 0 && (
+              <p className="m-0 font-mono text-xs text-text-2">
+                {t('dlg.verifyRecordsPassed', { versions: notice.verifiedOn.join(' · ') })}
+              </p>
+            )}
           </Banner>
-        ) : (
-          <Banner kind="warn" title={t('versions.unavailableTitle')} role="status">
-            {t('dlg.versionSavedUnverified', { name: notice.name, number: notice.number })}
-            {notice.unverifiedReason && <strong className="mt-1.5 block">{notice.unverifiedReason}</strong>}
-          </Banner>
-        )
+          {notice.uncovered.length > 0 && (
+            <Banner kind="warn" title={t('dlg.uncoveredTitle')} role="status">
+              {t('dlg.uncoveredBody')}
+              <EnvVersionList envs={notice.uncovered} />
+            </Banner>
+          )}
+        </div>
       ) : (
         <form
           id="version-form"
@@ -303,6 +360,7 @@ export const VersionDialog = ({ pid, open, onClose }: Base) => {
               {run.error.message}
             </Banner>
           )}
+          {rejectedBody && <PublishRejectedDetails body={rejectedBody} />}
           {rejected && <VerifyBanner report={rejected} dialect={project.dialect} />}
         </form>
       )}

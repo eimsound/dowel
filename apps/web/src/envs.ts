@@ -106,9 +106,10 @@ export const streamExec = async (
 export type { ExecErrorDetails };
 
 /**
- * 状态栏显示的影子库来源，与服务端 `Shadows.forProjectTarget` 的选影一致：
+ * 状态栏显示的按需规范化影子库来源，与服务端 `Shadows.forProjectTarget` 的选影一致（仅用于按需规范化；
+ * 发布与重新验证按数据库完整版本号逐组选影）：
  * 1. 按目标库版本组（`DialectVersionMatrix.groupKeyOf(engineVersionNum)`）分组，已知版本组升序在前、未探测的在后，
- *    优先最低已知版本组（项目兼容目标）；该组没有可用影子库时依次回退到下一组；
+ *    优先最低已知版本组；该组没有可用影子库时依次回退到下一组；
  * 2. 组内按选影优先级：显式独立影子库 > 非生产环境（同实例 `{库名}_dowel`）> 允许同实例的生产环境。
  * 都不可用时返回 null。
  */

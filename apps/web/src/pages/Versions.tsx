@@ -39,6 +39,7 @@ import {
   unretireSpan,
 } from '../components/VersionLifecycle.tsx';
 import {
+  EnvVersionList,
   RiskNote,
   useVersionName,
   VerifyBanner,
@@ -335,11 +336,11 @@ const VersionDetailView = ({ vid }: { vid: string }) => {
       void qc.invalidateQueries({ queryKey: ['versions', pid] });
       toast(
         t(
-          r.report.ok
-            ? 'versions.verifyPassed'
-            : r.report.missingTargetMajor != null
-              ? 'versions.verifyMissingTarget'
-              : 'versions.verifyFailed',
+          !r.report.ok
+            ? 'versions.verifyFailed'
+            : r.uncovered.length
+              ? 'versions.verifyUncovered'
+              : 'versions.verifyPassed',
         ),
       );
     },
@@ -518,7 +519,16 @@ const VersionDetailView = ({ vid }: { vid: string }) => {
               </Banner>
             )
           )}
+          {verify.data && verify.data.uncovered.length > 0 && (
+            <Banner kind="warn" title={t('dlg.uncoveredTitle')} role="status">
+              {t('dlg.uncoveredBody')}
+              <EnvVersionList envs={verify.data.uncovered} />
+            </Banner>
+          )}
           {report && <p className="hint">{t('versions.verifiedAtHint', { time: formatTime(report.at) })}</p>}
+          {version.verifiedOn.length > 0 && (
+            <p className="hint">{t('versions.verifiedOn', { versions: version.verifiedOn.join(' · ') })}</p>
+          )}
           {!editing && dir === 'up' && <RiskNote report={report} />}
           {editing ? (
             <StepsEditor detail={version} onDone={() => setEditing(false)} />

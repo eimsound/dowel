@@ -44,6 +44,10 @@ export const mysqlVersioning: DialectVersioning = {
   },
   formatVersionNum: (versionNum) =>
     `${Math.floor(versionNum / 10000)}.${Math.floor((versionNum % 10000) / 100)}.${versionNum % 100}`,
+  fullVersion: ({ versionNum }) =>
+    typeof versionNum === 'number' && Number.isInteger(versionNum) && versionNum > 0
+      ? `${Math.floor(versionNum / 10000)}.${Math.floor((versionNum % 10000) / 100)}.${versionNum % 100}`
+      : null,
   targetInfo: mysqlTargetInfo,
   compatibility: (model, versionNums) => {
     const versionNum = minMysqlVersionNum(versionNums);

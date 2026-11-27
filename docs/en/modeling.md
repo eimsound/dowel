@@ -118,7 +118,7 @@ CHECK constraints, defaults, generated columns, expression indexes, and partitio
 
 - **No automatic normalization while editing.** After you save, the canvas keeps the text you wrote, and the model page status bar shows "N pending normalization" (or "Expressions normalized" when nothing is pending).
 - **Manual normalization.** Project editors can click **Normalize** in the status bar at any time to check in the shadow database and write back the canonical form. The button is unavailable, with the reason explained, when no shadow database is usable (for example, when the only environment is production without same-instance shadow databases allowed). If an expression fails in the shadow database, Dowel reports the error and leaves the working copy unchanged.
-- **Automatic normalization before key operations.** Before publishing a version, generating a migration, exporting DDL, verifying in the shadow database, viewing version or history diffs, previewing an import from an environment, previewing an environment attach, or reading the model through MCP, the server normalizes pending objects first, so results always use the canonical form. Without a shadow database this step is skipped (for example, the version is published as unverified), and migrations and DDL remain available.
+- **Automatic normalization before key operations.** Before publishing a version, generating a migration, exporting DDL, verifying in the shadow database, viewing version or history diffs, previewing an import from an environment, previewing an environment attach, or reading the model through MCP, the server normalizes pending objects first, so results always use the canonical form. Without a shadow database, migrations and DDL remain available (using the unnormalized spelling), but publishing is refused; see [Publishing and frozen scripts](#publish-and-freeze).
 - Write-backs from normalization appear in canvas history as system normalization commits.
 
 ### Canvas history and restore {#canvas-history}
@@ -168,14 +168,21 @@ For large schemas with dozens or hundreds of tables, Dowel provides layout-only 
 ### Publishing and frozen scripts {#publish-and-freeze}
 
 - Click Publish to freeze the working copy into a read-only version snapshot along with upgrade (`up`) and rollback (`down`) migration scripts. The `v0 · Baseline` version has no rollback script.
-- Only the latest version in the chain that has never executed against any environment allows manual script edits. Editing a script resets that version to unverified, so you must verify it again before execution.
+- **Every published version is verified.** Publishing first normalizes pending objects, then runs closed-loop verification in a shadow database, and only writes the version if it passes; the frozen model is exactly the one that was verified. Nothing is published in these cases, and the dialog explains why and what to do:
+  - **No usable shadow database** (the project has no environments, every environment is production without a dedicated shadow URL or same-instance permission, or the shadow database is temporarily unreachable): configure a shadow database or allow a same-instance shadow on the Environments page, or try again later. Publishing as unverified no longer exists.
+  - **Some objects could not be normalized**: the dialog lists them; try again later, or click Normalize in the status bar to see why.
+  - **Verification failed**, including the **readback check**: after the upgrade, the structure read back from the shadow database must match this version's model property by property, and after the rollback it must match the previous version's model. Mismatches list the object, property, model value, and the value read back (differences marked "After rollback" are against the previous version). Dowel does not fix them automatically; change the model to the database's spelling and publish again.
+  - **No shadow database matches the environments' versions**: the shadow databases that passed run versions that match none of the project's environments.
+- Publishing groups the project's environments by **full database version**, verifies on one usable shadow database per version, and records one verification record per version; if any usable shadow database fails, nothing is published. A version with no usable shadow database does not block publishing; the dialog lists those uncovered environments instead. Executing on them is refused until you configure a shadow database with the same version and click Verify again on the version page (new records are merged with earlier ones by version).
+- The `v0 · Baseline` created when importing an existing database is the only version that may be unverified when created.
+- Only the latest version in the chain that has never executed against any environment allows manual script edits. Editing a script resets that version to unverified (clearing all verification records), so you must verify it again before execution.
 - On the Versions or Migration page, download `.sql` scripts with pinned session parameters such as timezone and strict mode.
 
 ### Round-trip verification and lock or rewrite risk measurement {#verification-and-risk}
 
 Clicking Verify in shadow database runs two checks:
 
-1. **Round-trip parity.** Dowel starts from the previous version's structure, executes the upgrade script, reads back the live structure to confirm it matches the new version, runs the rollback script, and confirms the structure matches the starting version.
+1. **Round-trip parity.** Dowel starts from the previous version's structure, executes the upgrade script, reads back the live structure to confirm it matches the new version, runs the rollback script, and confirms the structure matches the starting version. The comparison is the same one the executor uses for its readback check, so a version verified on a database of the same version always passes that check when it runs.
 2. **Measured risk analysis.** Dowel executes each step in the shadow database, records actual locks, sequential scans, and table rewrites, and assigns a `high`, `medium`, or `low` risk level:
    - **PostgreSQL.** Inspects relation locks in `pg_locks`, `relfilenode` changes for table rewrites, and `pg_stat_xact_user_tables` sequential scan counts.
    - **SQLite.** Flags 12-step table rebuilds (`EXCLUSIVE` lock and table rewrite), `VACUUM` database rewrites, and `DROP COLUMN` or `CREATE INDEX` (`RESERVED` lock).

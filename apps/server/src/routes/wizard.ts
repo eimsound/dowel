@@ -238,9 +238,12 @@ export const registerWizard = (app: Hono<Env>, ctx: AppContext) => {
           try {
             // database 路径本来没有用到影子库（SQL Server 拆分可空性时可能已经准备过）：和 sql 路径、forProject 用同一份选择逻辑
             const verifier = await ensureShadow();
+            // 与发布、重新验证同一套闭环验证（含读回核对，ADR 0017 决定 4）；不通过或没有影子库都不阻止建项目，
+            // 基线标为未验证——这是唯一“没验证就存在”的版本（模型是从数据库读出来的，不是手写的）
             baselineReport = storedReport(
               await verifier.verifyScripts(baseline.from, model, baseline.up, [], {
                 checkDown: false,
+                scope,
                 ...(targetMysqlVersionNum !== null ? { mysqlVersionNum: targetMysqlVersionNum } : {}),
               }),
               shadowLabel,

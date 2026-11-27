@@ -1,7 +1,7 @@
 // 影子库上的操作：导入 DDL、闭环验证、风险分析、派生数据的规范化。
 // PG 使用真实 PostgreSQL 影子库实例；SQLite 使用进程内 `:memory:` 影子库。
 
-import type { StepRisk, StoredVerifyReport, VerifyReport, VerifyTargetReport } from '@dowel/api';
+import type { ReadbackDiffItem, StepRisk, StoredVerifyReport, VerifyRecord, VerifyReport } from '@dowel/api';
 import {
   deepEqual,
   type Dialect,
@@ -33,8 +33,10 @@ import {
   InstanceLevelStatementError,
   runSteps,
   StepError,
+  type VerifyResult,
   type VerifyScriptsOptions,
   verify,
+  verifyPassed,
   verifyScripts,
 } from '@dowel/verifier';
 
@@ -224,23 +226,77 @@ const pgShadowPrivilegeError = async (e: unknown, d: Db): Promise<ShadowError> =
   );
 };
 
-/** 影子库给的完整报告 → 存进版本里的报告（up / down 就是冻结的脚本本身，不重复存） */
+/** 读回核对的最多明细条数（与执行器 MAX_DIFF 一致） */
+const MAX_READBACK_ITEMS = 100;
+
+/**
+ * verifier 的读回核对 → 报告里的明细（ADR 0017 决定 2）：up 是升级后读回对本版本模型，down 是回滚后读回对上一个版本模型。
+ * 有差异但没有属性级明细（例如规划器报了 unresolvable）时，按规划出的步骤给一条，不让差异“看不见”。
+ */
+const readbackItemsOf = (r: Pick<VerifyResult, 'readback'>): { total: number; items: ReadbackDiffItem[] } => {
+  const items: ReadbackDiffItem[] = [];
+  let total = 0;
+  for (const direction of ['up', 'down'] as const) {
+    const d = r.readback?.[direction];
+    if (!d?.total) continue;
+    total += d.total;
+    if (d.details.length) for (const x of d.details) items.push({ direction, ...x });
+    else
+      for (const step of d.items)
+        items.push({
+          direction,
+          object: step.target,
+          property: step.kind,
+          modelValue: null,
+          liveValue: step.sql,
+        });
+  }
+  return { total, items: items.slice(0, MAX_READBACK_ITEMS) };
+};
+
+/** 一份报告的一句话失败原因（验证记录里用） */
+const failureOf = (r: VerifyReport): string | null => {
+  if (r.ok) return null;
+  if (r.error) return r.error.message;
+  if (r.upDiff.length) return `升级后结构与本版本模型不一致（${r.upDiff.length} 处）`;
+  if (r.downDiff.length) return `回滚后结构与上一个版本不一致（${r.downDiff.length} 处）`;
+  if (r.readbackTotal) return `读回核对不一致（${r.readbackTotal} 处写法差异）`;
+  return '验证未通过';
+};
+
+/** 一份影子库报告 → 一条验证记录（ADR 0017 决定 5：按影子库的数据库完整版本号记录） */
+export const recordOf = (r: VerifyReport, shadow: string, at: string): VerifyRecord => ({
+  engineVersion: r.engineVersion ?? null,
+  ok: r.ok,
+  shadow,
+  at,
+  error: failureOf(r),
+});
+
+/**
+ * 影子库给的完整报告 → 存进版本里的报告（up / down 就是冻结的脚本本身，不重复存）。
+ * `records` 缺省为这份报告自己的一条验证记录；多影子库验证（发布 / 重新验证）传入合并后的记录。
+ */
 export const storedReport = (
   r: VerifyReport,
   shadow: string,
-  extra?: { targets?: VerifyTargetReport[]; missingTargetMajor?: number | null },
-): StoredVerifyReport => ({
-  ok: r.ok,
-  upDiff: r.upDiff,
-  downDiff: r.downDiff,
-  risks: r.risks,
-  riskError: r.riskError,
-  error: r.error,
-  shadow,
-  at: new Date().toISOString(),
-  ...(extra?.targets?.length ? { targets: extra.targets } : {}),
-  ...(extra?.missingTargetMajor !== undefined ? { missingTargetMajor: extra.missingTargetMajor } : {}),
-});
+  extra?: { records?: VerifyRecord[]; at?: string },
+): StoredVerifyReport => {
+  const at = extra?.at ?? new Date().toISOString();
+  return {
+    ok: r.ok,
+    upDiff: r.upDiff,
+    downDiff: r.downDiff,
+    risks: r.risks,
+    riskError: r.riskError,
+    error: r.error,
+    shadow,
+    at,
+    engineVersion: r.engineVersion ?? null,
+    ...(r.readbackTotal ? { readbackTotal: r.readbackTotal, readbackDiff: r.readbackDiff ?? [] } : {}),
+    records: extra?.records ?? [recordOf(r, shadow, at)],
+  };
+};
 
 /**
  * 基础设施故障 vs 用户的脚本 / 模型问题：
@@ -376,6 +432,25 @@ export const assertImportable = (sql: string, dialect: Dialect = 'pg'): Importab
   if (hit !== null)
     throw new ShadowError(`导入的 SQL 含实例级语句（${hit}）。${instanceLevelDescription(dialect)}`);
   return checked as ImportableSql;
+};
+
+/**
+ * verifier 的结果 → 影子库报告：ok 要求两份快照一致且读回核对没有差异（verifyPassed，ADR 0017 决定 2）。
+ * readback 本身不发给客户端，换成 readbackTotal / readbackDiff 明细。
+ */
+const reportOf = (r: VerifyResult, risk: { risks: StepRisk[]; riskError?: string }): VerifyReport => {
+  const { readback: _readback, ...rest } = r;
+  const rb = readbackItemsOf(r);
+  return {
+    ...rest,
+    ok: verifyPassed(r),
+    ...risk,
+    error: null,
+    shadowMajor: r.shadowMajor,
+    shadowVersionNum: r.shadowVersionNum,
+    engineVersion: r.engineVersion ?? null,
+    ...(rb.total ? { readbackTotal: rb.total, readbackDiff: rb.items } : {}),
+  };
 };
 
 type Column = Extract<Obj, { kind: 'column' }>;
@@ -656,7 +731,11 @@ export const shadowOps = (
     const d = await db();
     const dDialect = to.dialect;
     try {
-      const r = await verifyScripts(d, from, to, up, down, options);
+      // 读回核对只读冻结时的 schema 范围：调用方给了就用它（版本的 scope），否则用这个影子库的项目范围
+      const r = await verifyScripts(d, from, to, up, down, {
+        ...options,
+        scope: options?.scope !== undefined ? options.scope : (schemas ?? null),
+      });
       const risk = options?.skipRisk
         ? { risks: [] }
         : await risksOf(d, from, r.up, statementTimeoutMs, dDialect, {
@@ -664,14 +743,7 @@ export const shadowOps = (
             mysqlVersionNum: options?.mysqlVersionNum,
             reuseShadowFrom: options?.checkDown !== false && r.upDiff.length === 0 && r.downDiff.length === 0,
           });
-      return {
-        ok: !r.upDiff.length && !r.downDiff.length,
-        ...r,
-        ...risk,
-        error: null,
-        shadowMajor: r.shadowMajor,
-        shadowVersionNum: r.shadowVersionNum,
-      };
+      return reportOf(r, risk);
     } catch (e) {
       if (e instanceof PlanError) {
         return {
@@ -694,19 +766,12 @@ export const shadowOps = (
     const d = await db();
     const dDialect = to.dialect;
     try {
-      const r = await verify(d, from, to, opts);
+      const r = await verify(d, from, to, opts, schemas);
       const risk = await risksOf(d, from, r.up, statementTimeoutMs, dDialect, {
         ...opts,
         reuseShadowFrom: r.upDiff.length === 0 && r.downDiff.length === 0,
       });
-      return {
-        ok: !r.upDiff.length && !r.downDiff.length,
-        ...r,
-        ...risk,
-        error: null,
-        shadowMajor: r.shadowMajor,
-        shadowVersionNum: r.shadowVersionNum,
-      };
+      return reportOf(r, risk);
     } catch (e) {
       if (!(e instanceof StepError) && isPgPrivilegeError(e, dDialect)) {
         throw await pgShadowPrivilegeError(e, d);

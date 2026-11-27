@@ -9,15 +9,18 @@ import type {
   EnvPermissions,
   EnvVersion,
   EnvVersionRef,
+  VerifyRecord,
 } from '@dowel/api';
 import { needsManualSchema } from '@dowel/api';
 import {
   deriveTargetPgMajor,
   type Dialect,
+  engineFullVersion,
   getDialect,
   type Model,
   type PlanOptions,
   publicMajorOf,
+  verifiedForEngine,
 } from '@dowel/core';
 import { type Db, indexTree, pathFromRoot, type ScriptStep } from '@dowel/engines';
 import { type ChainVersion, isNonTx, runTouched, runVersionId, type TargetState } from '@dowel/executor';
@@ -54,6 +57,21 @@ export interface EnvRow {
   engine_version?: string | null;
   engine_version_num?: number | null;
 }
+
+/** 环境行缓存的目标库版本 → 数据库完整版本号（ADR 0017 决定 5）；尚未探测为 null */
+export const envFullVersion = (
+  dialect: Dialect,
+  r: { engine_version?: string | null; engine_version_num?: number | null },
+): string | null =>
+  engineFullVersion(dialect, { version: r.engine_version ?? null, versionNum: r.engine_version_num ?? null });
+
+/** 验证报告里通过的验证记录 → 去重的数据库完整版本号（ADR 0017 决定 5；没有记录为空） */
+export const verifiedOnOf = (report: { records?: VerifyRecord[] } | null | undefined): string[] => {
+  const out: string[] = [];
+  for (const r of report?.records ?? [])
+    if (r.ok && r.engineVersion !== null && !out.includes(r.engineVersion)) out.push(r.engineVersion);
+  return out;
+};
 
 /**
  * 从版本号数值回退格式化简洁版本串（委托 DialectVersioning.formatVersionNum：
@@ -153,7 +171,11 @@ export interface VersionMeta {
   edited: boolean;
   upSteps: ScriptStep[];
   downSteps: ScriptStep[];
-  verifyReport: { risks?: { level: 'low' | 'medium' | 'high'; note?: string }[]; riskError?: string } | null;
+  verifyReport: {
+    risks?: { level: 'low' | 'medium' | 'high'; note?: string }[];
+    riskError?: string;
+    records?: VerifyRecord[];
+  } | null;
 }
 
 export const loadVersionMetas = async (db: Db, pid: string): Promise<VersionMeta[]> => {
@@ -183,16 +205,22 @@ export const loadChain = async (db: Db, pid: string): Promise<ChainVersion[]> =>
     downSteps: ScriptStep[];
     checksum: string;
     verifiedAt: unknown;
+    verifyReport: { records?: VerifyRecord[] } | null;
     createdAt: unknown;
     createdBy: string | null;
     scope: string[] | null;
   }>(
     `select id, number, parent_id as "parentId", retired_at as "retiredAt", name, model,
             up_steps as "upSteps", down_steps as "downSteps", checksum,
-            verified_at as "verifiedAt", created_at as "createdAt", created_by as "createdBy", scope
+            verified_at as "verifiedAt", verify_report as "verifyReport",
+            created_at as "createdAt", created_by as "createdBy", scope
        from versions where project_id = $1 order by number`,
     [pid],
   );
+  // ADR 0017 决定 5：需要外部影子库的方言按目标库的数据库完整版本号把关（执行器读目标库版本后比对 verifiedOn）；
+  // SQLite 影子库与目标库是同一个内置库，视为恒等，不给 verifiedOn（只看 verified）
+  const [proj] = await db.query<{ dialect: Dialect }>('select dialect from projects where id = $1', [pid]);
+  const gated = getDialect(proj?.dialect ?? 'pg').capabilities.requiresExternalShadow;
   return rows.map((r) => ({
     id: r.id,
     number: r.number,
@@ -203,6 +231,7 @@ export const loadChain = async (db: Db, pid: string): Promise<ChainVersion[]> =>
     downSteps: r.downSteps,
     checksum: r.checksum,
     verified: r.verifiedAt !== null && r.verifiedAt !== undefined,
+    ...(gated ? { verifiedOn: verifiedOnOf(r.verifyReport) } : {}),
     retired: r.retiredAt !== null && r.retiredAt !== undefined,
     publishedAt: iso(r.createdAt) ?? new Date(0).toISOString(),
     publishedBy: r.createdBy,
@@ -403,6 +432,7 @@ export const toEnvInfo = (
   engineVersion: r.engine_version ?? null,
   engineVersionNum: r.engine_version_num ?? null,
   engineMajor: publicMajorOf(dialect, r.engine_version_num),
+  engineFullVersion: envFullVersion(dialect, r),
   drift: driftInfo(r),
   permissions: permissionsOf(actor, r, role, auth),
 });
@@ -447,6 +477,8 @@ export const toEnvVersion = (
   executed: Set<string>,
   dialect: Dialect = 'pg',
   states?: ReadonlyMap<string, EnvVersionState>,
+  /** 环境的数据库完整版本号（envFullVersion）；不给按 verified 算 verifiedHere */
+  envEngineVersion?: string | null,
 ): EnvVersion => {
   const state: EnvVersionState =
     states?.get(m.id) ??
@@ -469,6 +501,11 @@ export const toEnvVersion = (
     parentId: m.parentId,
     retired: m.retired,
     verified: m.verifiedAt !== null && m.verifiedAt !== undefined,
+    verifiedHere:
+      m.verifiedAt !== null &&
+      m.verifiedAt !== undefined &&
+      (envEngineVersion === undefined ||
+        verifiedForEngine(dialect, verifiedOnOf(m.verifyReport), envEngineVersion)),
     edited: m.edited,
     upSteps: m.upSteps.length,
     downSteps: m.downSteps.length,

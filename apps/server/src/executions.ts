@@ -330,8 +330,21 @@ export const toExecEvent = (e: ExecutorEvent): ExecEvent => {
 /** 错误 → 给客户端的 error 事件字段。预期的拒绝给原因（脱敏在发送时统一做），意外错误只记日志 */
 export const errorEvent = (e: unknown): { error: string; code?: string; details?: ExecEvent['details'] } => {
   if (e instanceof ExecutorError && e.code !== 'unexpected') {
-    const { diff, diffTotal, problems, versionId, number, step, partial, needsManual, claim, timeout, lca } =
-      e.details;
+    const {
+      diff,
+      diffTotal,
+      problems,
+      versionId,
+      number,
+      step,
+      partial,
+      needsManual,
+      claim,
+      timeout,
+      lca,
+      engineVersion,
+      verifiedOn,
+    } = e.details;
     return {
       error: e.message,
       code: e.code,
@@ -347,6 +360,8 @@ export const errorEvent = (e: unknown): { error: string; code?: string; details?
         claim,
         timeout,
         lca,
+        engineVersion,
+        verifiedOn,
       },
     };
   }

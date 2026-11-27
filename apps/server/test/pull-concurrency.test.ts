@@ -12,7 +12,7 @@ import { createApp, openPlatformDb, type PlatformDb } from '../src/index.ts';
 import { KeyedLimiter, LoginLimiter } from '../src/rate-limit.ts';
 import type { Peer } from '../src/rooms.ts';
 import { encrypt } from '../src/secrets.ts';
-import { addTable, makeUser, PASSWORD } from './support.ts';
+import { addTable, makeUser, PASSWORD, stubPassingShadow } from './support.ts';
 
 process.env.DOWEL_SECRET ??= 'pull-concurrency-test-secret-0123456789';
 
@@ -122,6 +122,8 @@ describe('POST /api/projects/:pid/environments/:eid/pull 并发 workingSeq 保�
       loginLimiter: new LoginLimiter({ limit: 10_000, ipLimit: 10_000 }),
       connectionLimiter: new KeyedLimiter({ limit: 10_000, windowMs: 60_000 }),
     });
+    // 发布必须经影子库验证（ADR 0017）：这里只要一个已发布版本作基线，用影子库替身
+    stubPassingShadow(created.shadows);
     await makeUser(db, 'admin', { name: '管理员', role: 'admin' });
     editorUser = await makeUser(db, 'editor', { name: '协作者' });
     adminCookie = await loginAs(created.app, 'admin');
@@ -380,6 +382,9 @@ describe.skipIf(!PG_URL)('POST .../pull 跨副本 PostgreSQL 并发保护（#42�
       loginLimiter: new LoginLimiter({ limit: 10_000, ipLimit: 10_000 }),
       connectionLimiter: new KeyedLimiter({ limit: 10_000, windowMs: 60_000 }),
     });
+    // 发布必须经影子库验证（ADR 0017）：这里只要一个已发布版本作基线，用影子库替身
+    stubPassingShadow(appA.shadows);
+    stubPassingShadow(appB.shadows);
 
     try {
       await makeUser(dbA, 'admin', { name: '管理员', role: 'admin' });

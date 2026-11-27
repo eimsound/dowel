@@ -31,6 +31,7 @@ import type {
   ShadowSource,
   TargetConnection,
 } from '../src/targets/types.ts';
+import { verifyOnShadows } from '../src/versions.ts';
 
 interface Deferred {
   promise: Promise<void>;
@@ -640,6 +641,70 @@ describe('Shadows.forProject：每次 await 之后都重新检查 closed 与失�
     expect(ctx.shadows.size).toBe(0);
   });
 
+  test('按完整版本选影（forProjectEngineVersions）：候选环境报“配置已变更”时整体抛出重试，不记录到 skipped', async () => {
+    const urls = [URL_2, URL_3, URL_1, URL_2];
+    for (let i = 0; i < 4; i++) {
+      hooks[i] = async () => {
+        await changeUrl(urls[i]!);
+        await ctx.deliver({ t: 'shadows.forget', envIds: [EID] });
+      };
+    }
+    expect(await settle(ctx.shadows.forProjectEngineVersions(PID))).toBeInstanceOf(ShadowConfigChangedError);
+    expect(ctx.shadows.size).toBe(0);
+  });
+
+  test('多版本闭环验证（verifyOnShadows）：任一完整版本组遇到已关闭句柄时直接抛出 ShadowConfigChangedError，不跳过漏验', async () => {
+    const closed = pgShadow('postgres://u:p@127.0.0.1:1/app_dowel');
+    await closed.close();
+    const passingShadow: Shadow = {
+      importSql: async () => {
+        throw new Error('not used');
+      },
+      verify: async () => {
+        throw new Error('not used');
+      },
+      verifyScripts: async () => ({
+        ok: true,
+        up: [],
+        down: [],
+        upDiff: [],
+        downDiff: [],
+        risks: [],
+        error: null,
+        engineVersion: '18.0',
+      }),
+      canonicalize: async () => [],
+      close: async () => {},
+    };
+    const spy = vi.spyOn(ctx.shadows, 'forProjectEngineVersions').mockResolvedValueOnce({
+      entries: [
+        { engineVersion: '18.0', envId: EID, shadow: passingShadow, label: 'env-18' },
+        { engineVersion: '17.4', envId: 'e-17', shadow: closed, label: 'env-17' },
+      ],
+      skipped: [],
+      environments: [
+        { id: EID, name: 'env-18', engineVersion: '18.0' },
+        { id: 'e-17', name: 'env-17', engineVersion: '17.4' },
+      ],
+      identical: false,
+    });
+    try {
+      const err = await settle(
+        verifyOnShadows(ctx.shadows, PID, 'pg', {
+          from: empty,
+          to: empty,
+          up: [],
+          down: [],
+          checkDown: true,
+          scope: null,
+        }),
+      );
+      expect(err).toBeInstanceOf(ShadowConfigChangedError);
+    } finally {
+      spy.mockRestore();
+    }
+  });
+
   test('读环境配置返回旧快照且晚到（本副本改配置 + forget）：不关掉 B 已建好的新条目，也不按旧配置 prepareShadow', async () => {
     const held = holdNextEnvResult();
     try {
@@ -1053,6 +1118,52 @@ describe('Shadows.forProject：每次 await 之后都重新检查 closed 与失�
       gate.resolve();
       const resList = await pList;
       expect(resList.shadow).toBe(e1);
+      expect(e2.close).not.toHaveBeenCalled();
+      expect(ctx.shadows.has('e-closed-2')).toBe(true);
+      expect(ctx.shadows.size).toBe(2);
+    } finally {
+      gate.resolve();
+      spy.mockRestore();
+    }
+  });
+
+  test('forProjectEngineVersions / pruneRemovedForProject：列环境返回旧快照且晚到时，不误杀挂起期间新建并已缓存的环境', async () => {
+    const e1 = (await ctx.shadows.forProject(PID, EID)).shadow as FakeShadow;
+
+    const origQuery = ctx.db.query.bind(ctx.db);
+    const entered = deferred();
+    const gate = deferred();
+    let intercepted = false;
+    const spy = vi.spyOn(ctx.db, 'query').mockImplementation((async (sql: string, params?: unknown[]) => {
+      if (
+        !intercepted &&
+        sql.includes('engine_version, engine_version_num') &&
+        sql.includes('from environments where project_id = $1 order by created_at')
+      ) {
+        intercepted = true;
+        const r = await origQuery(sql, params);
+        entered.resolve();
+        await gate.promise;
+        return r;
+      }
+      return origQuery(sql, params);
+    }) as typeof ctx.db.query);
+    try {
+      const pList = ctx.shadows.forProjectEngineVersions(PID);
+      await entered.promise;
+
+      await ctx.db.query(
+        `insert into environments (id, project_id, name, url_enc, production, allow_same_instance, shadow_url_enc)
+         values ('e-closed-2', $1, 'staging', $2, false, false, null)`,
+        [PID, encrypt(URL_2)],
+      );
+      const e2 = (await ctx.shadows.forProject(PID, 'e-closed-2')).shadow as FakeShadow;
+      expect(e2.url).toBe(URL_2);
+
+      gate.resolve();
+      const sel = await pList;
+      expect(sel.entries.map((e) => e.envId)).toEqual([EID]);
+      expect(sel.entries[0]?.shadow).toBe(e1);
       expect(e2.close).not.toHaveBeenCalled();
       expect(ctx.shadows.has('e-closed-2')).toBe(true);
       expect(ctx.shadows.size).toBe(2);

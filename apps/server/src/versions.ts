@@ -2,21 +2,23 @@
 // 供 HTTP 路由（routes/versions.ts）与 MCP 工具（mcp-server.ts）共同复用，避免两套实现分叉。
 import type {
   StoredVerifyReport,
+  UncoveredEnvironment,
+  VerifyRecord,
   VerifyReport,
   VerifyResponse,
-  VerifyTargetReport,
   VersionDetail,
   VersionInfo,
 } from '@dowel/api';
 import {
   createAll,
+  type Dialect,
   formatScript,
-  getDialect,
   type Model,
   plan,
   type PlanOptions,
   type Step,
   validate,
+  verifiedForEngine,
 } from '@dowel/core';
 import {
   type Db,
@@ -30,9 +32,9 @@ import { HTTPException } from 'hono/http-exception';
 
 import { emptyBase, versionExecutedAnywhere } from './chain.ts';
 import type { OpaqueRefresher } from './derive.ts';
-import { iso, projectPlanOptions } from './envs.ts';
+import { iso, projectPlanOptions, verifiedOnOf } from './envs.ts';
 import { scrubSecrets } from './secrets.ts';
-import { ShadowConfigChangedError, ShadowError, storedReport } from './shadow.ts';
+import { recordOf, ShadowConfigChangedError, ShadowError, storedReport } from './shadow.ts';
 import type { Shadows } from './shadows.ts';
 
 /** 概要字段：版本列表用 */
@@ -50,6 +52,8 @@ export interface InfoRow {
   retiredBy: string | null;
   executedAt: unknown;
   restoredAt: unknown;
+  /** 验证报告（列表只用它的 records 算 verifiedOn） */
+  verifyReport: StoredVerifyReport | null;
 }
 
 /** 详情字段：模型、冻结脚本和验证报告 */
@@ -58,7 +62,6 @@ export interface Detail {
   upSteps: ScriptStep[];
   downSteps: ScriptStep[];
   checksum: string;
-  verifyReport: StoredVerifyReport | null;
   /** 冻结时项目的 schema 范围（null 表示全部）：第一个版本的 from（空库模型）由它决定 */
   scope: string[] | null;
 }
@@ -68,9 +71,9 @@ export type VersionRow = InfoRow & Detail;
 /** 列表只要概要：不读模型和冻结脚本（模型可能很大，版本又多） */
 export const INFO_COLUMNS = `v.id, v.name, v.seq, v.number, v.parent_id as "parentId", v.verified_at as "verifiedAt", v.edited,
   v.created_at as "createdAt", u.name as "createdBy", v.retired_at as "retiredAt", ru.name as "retiredBy",
-  v.executed_at as "executedAt", v.restored_at as "restoredAt"`;
+  v.executed_at as "executedAt", v.restored_at as "restoredAt", v.verify_report as "verifyReport"`;
 export const ROW_COLUMNS = `${INFO_COLUMNS}, v.model, v.up_steps as "upSteps", v.down_steps as "downSteps", v.checksum,
-  v.verify_report as "verifyReport", v.scope`;
+  v.scope`;
 
 /** 取项目里的一个版本（带冻结脚本和验证报告）；不存在抛 404 */
 export const loadVersion = async (db: Db, pid: string, vid: string): Promise<VersionRow> => {
@@ -255,6 +258,7 @@ export const toVersionInfo = (v: InfoRow, flags: InfoFlags): VersionInfo => ({
   createdAt: v.createdAt,
   createdBy: v.createdBy,
   verifiedAt: v.verifiedAt,
+  verifiedOn: verifiedOnOf(v.verifyReport),
   edited: v.edited,
   latest: flags.latest,
   retiredAt: iso(v.retiredAt),
@@ -326,179 +330,173 @@ export const listProjectVersions = async (db: Db, pid: string, limit?: number): 
   );
 };
 
-export type MultiVersionVerifyOutcome =
-  | { kind: 'ok'; stored: StoredVerifyReport }
+/** 合并验证记录（ADR 0017 决定 5）：同一个数据库完整版本号以新的为准，其余保留；读不到版本的记录不合并、只保留最新一批 */
+export const mergeRecords = (
+  previous: readonly VerifyRecord[],
+  fresh: readonly VerifyRecord[],
+): VerifyRecord[] => {
+  const freshKeys = new Set(fresh.map((r) => r.engineVersion).filter((v): v is string => v !== null));
+  return [...previous.filter((r) => r.engineVersion !== null && !freshKeys.has(r.engineVersion)), ...fresh];
+};
+
+export type ShadowVerifyOutcome =
+  /** 通过：verifiedOn 是合并后通过的完整版本号，uncovered 是还没有覆盖到的环境 */
+  | { kind: 'ok'; stored: StoredVerifyReport; verifiedOn: string[]; uncovered: UncoveredEnvironment[] }
+  /** 某个可用影子库验证失败（脚本失败、结构不一致，或读回核对发现写法差异 readback = true） */
   | {
       kind: 'failed';
       report: VerifyResponse;
       stored: StoredVerifyReport;
-      failedMajor: number | null;
-      failedVersionLabel: string | null;
+      readback: boolean;
+      engineVersion: string | null;
+      verifiedOn: string[];
+      uncovered: UncoveredEnvironment[];
     }
-  | { kind: 'missing_target'; missingMajor: number | null; reason: string; stored: StoredVerifyReport };
+  /** 都通过了，但没有一个影子库与项目环境的数据库完整版本号一致（或环境的版本还未知） */
+  | {
+      kind: 'unmatched';
+      stored: StoredVerifyReport;
+      reason: string;
+      verifiedOn: string[];
+      uncovered: UncoveredEnvironment[];
+    };
 
 /**
- * 跨版本影子库闭环验证冻结脚本（按版本组升序逐一执行，风险分析仅在首个可用影子库执行一次）。
- * 版本组、展示标签与对外大版本全部来自 DialectVersionMatrix（PG 按大版本、MySQL 按主次版本 8.4 / 9.7）；
- * 不提供矩阵策略的方言（MSSQL / SQLite）忽略一切组键：不打版本标签、不做最低目标门禁、不记录 targets：
- * - 任一版本组闭环验证失败 → 整体失败并指出具体版本（如“PG 16 验证失败”“MySQL 8.4 验证失败”）；
- * - 最低目标版本组（targetGroupKey）没有通过验证的影子库（缺失、运行时不可用或实测版本错配）→ missing_target；
- * - 项目最低目标版本的规划选项里的 mysqlVersionNum 透传给 verifyScripts，阻断高版本特有类型（如 9.7 dev + 8.4 prod 混部下的 VECTOR）；
- * - 只有 PG 的版本组是对外大版本：仅 PG 记录 targets[].major / missingTargetMajor；
- * - 全部可用影子库均遇到 ShadowError 或项目无任何可用影子库 → 抛出 ShadowError（按基础设施/配置不可用处理）。
- * - 任一影子库句柄因配置变更被关闭（ShadowConfigChangedError）→ 原样抛出（可重试），不当成该版本组不可用。
+ * 读回核对发现的写法差异（要求 upDiff 与 downDiff 均为空，既不是脚本失败也不是两份影子库快照不一致）；
+ * 若同一份报告里同时存在快照差异（upDiff / downDiff）和读回差异，按常规 verify_failed 处理，不单独归为读回差异并打印服务端日志。
  */
-export const verifyAcrossVersions = async (
+const isReadbackOnly = (r: VerifyReport) =>
+  !r.ok && !r.error && !r.upDiff.length && !r.downDiff.length && (r.readbackTotal ?? 0) > 0;
+
+/**
+ * 闭环验证冻结脚本，发布、重新验证共用（ADR 0017 决定 1 / 4 / 5）：
+ * - 按项目环境的**数据库完整版本号**分组选影子库（Shadows.forProjectEngineVersions），逐个验证（含读回核对），
+ *   风险分析只在第一个可用的影子库上做一次；每个影子库按它实际读到的完整版本号记一条验证记录，与 previous 合并；
+ * - 任何一个可用影子库验证失败 → failed（发布拒绝；重新验证如实记下）；
+ * - 只有与某个环境的完整版本号一致、且通过的记录才算验证依据：一条都没有 → unmatched；SQLite 内置库视为恒等；
+ * - 没有任何可用影子库（没有环境、全部连不上）→ 抛 ShadowError（发布拒绝、稍后重试）；
+ * - 任一影子库句柄因配置变更被关闭（ShadowConfigChangedError）→ 原样抛出（可重试），不当成该版本组不可用。
+ * 原先“最低目标版本组必须有影子库”的规则已删除：每个环境由自己的数据库版本把关（执行器按目标库完整版本号检查）。
+ */
+export const verifyOnShadows = async (
   shadows: Shadows,
   pid: string,
-  from: Model,
-  to: Model,
-  up: ScriptStep[],
-  down: ScriptStep[],
-  checkDown = true,
-  planOpts?: PlanOptions,
-): Promise<MultiVersionVerifyOutcome> => {
-  const selection = await shadows.forProjectVersions(pid);
+  dialect: Dialect,
+  o: {
+    from: Model;
+    to: Model;
+    up: ScriptStep[];
+    down: ScriptStep[];
+    checkDown: boolean;
+    planOpts?: PlanOptions;
+    /** 冻结时的 schema 范围：读回核对只读范围内的 schema */
+    scope: string[] | null;
+    /** 已有的验证记录（重新验证时合并；发布为空） */
+    previous?: readonly VerifyRecord[];
+  },
+): Promise<ShadowVerifyOutcome> => {
+  const selection = await shadows.forProjectEngineVersions(pid);
   if (!selection.entries.length) {
-    throw new ShadowError(selection.skippedGroups[0]?.reason ?? '没有可用的影子库');
+    throw new ShadowError(selection.skipped[0]?.reason ?? '没有可用的影子库');
   }
+  const at = new Date().toISOString();
+  const fresh: VerifyRecord[] = [];
+  const passed: { label: string; engineVersion: string | null }[] = [];
+  const runtimeSkipped: string[] = [];
+  let primary: { report: VerifyReport; label: string } | null = null;
 
-  const matrix = getDialect(to.dialect).versioning.matrix;
-  const groupLabel = (key: number | null): string | null =>
-    matrix && key !== null ? matrix.groupLabel(key) : null;
-  const publicMajor = (key: number | null): number | null =>
-    matrix && key !== null ? matrix.publicMajorOfGroup(key) : null;
-  const targets: VerifyTargetReport[] = [];
-  const passedShadows: { groupKey: number | null; versionLabel: string | null; label: string }[] = [];
-  const runtimeSkipped = new Map<number | null, string>();
-  const mismatchReasons = new Map<number, string>();
-  let primaryReport: VerifyReport | null = null;
-  let ranRisk = false;
+  const coverage = (records: readonly VerifyRecord[]) => {
+    const merged = mergeRecords(o.previous ?? [], records);
+    const verifiedOn = verifiedOnOf({ records: merged });
+    const uncovered = selection.environments.filter(
+      (e) =>
+        !(selection.identical
+          ? verifiedOn.length > 0
+          : verifiedForEngine(dialect, verifiedOn, e.engineVersion)),
+    );
+    return { merged, verifiedOn, uncovered };
+  };
 
   for (const entry of selection.entries) {
-    const entryKey = matrix ? entry.groupKey : null;
     let report: VerifyReport;
     try {
-      report = await entry.shadow.verifyScripts(from, to, up, down, {
-        checkDown,
-        skipRisk: ranRisk,
-        ...(planOpts?.mysqlVersionNum !== undefined ? { mysqlVersionNum: planOpts.mysqlVersionNum } : {}),
+      report = await entry.shadow.verifyScripts(o.from, o.to, o.up, o.down, {
+        checkDown: o.checkDown,
+        skipRisk: primary !== null,
+        scope: o.scope,
+        ...(o.planOpts?.mysqlVersionNum !== undefined ? { mysqlVersionNum: o.planOpts.mysqlVersionNum } : {}),
       });
     } catch (e) {
       // 配置已变更：旧影子库上的结论不能用，也不能当成“这个版本组运行时不可用”跳过（会少验证一组），整体抛给调用方重试
       if (!(e instanceof ShadowError) || e instanceof ShadowConfigChangedError) throw e;
-      runtimeSkipped.set(entryKey, scrubSecrets(e.message));
+      runtimeSkipped.push(scrubSecrets(e.message));
       continue;
     }
-
-    if (!ranRisk) {
-      primaryReport = report;
-      ranRisk = true;
-    }
-
-    // 影子库实测版本组：报告带了实测数值版本号就按它分组，否则沿用选影时的版本组
-    const actualKey = !matrix
-      ? null
-      : report.shadowVersionNum !== undefined
-        ? matrix.groupKeyOf(report.shadowVersionNum)
-        : entryKey;
-    if (matrix && entryKey !== null && actualKey !== null && actualKey !== entryKey) {
-      const target = matrix.groupLabel(entryKey);
-      mismatchReasons.set(
-        entryKey,
-        `影子库实际版本为 ${matrix.groupLabel(actualKey)}（${entry.label}），与目标环境 ${target} 不一致，不能作为 ${target} 的验证依据`,
-      );
-    }
-    const versionLabel = groupLabel(actualKey ?? entryKey);
-    const actualMajor = publicMajor(actualKey);
-
-    if (actualMajor !== null) {
-      targets.push({
-        major: actualMajor,
-        shadow: entry.label,
-        ok: report.ok,
-        error: report.error?.message ?? null,
-        upDiffCount: report.upDiff.length,
-        downDiffCount: report.downDiff.length,
-      });
-    }
-
+    // 记录按影子库实际读到的完整版本号；读不到（测试替身等）时沿用选它时依据的环境版本
+    const engineVersion = selection.identical
+      ? (report.engineVersion ?? null)
+      : (report.engineVersion ?? entry.engineVersion);
+    report = { ...report, engineVersion };
+    fresh.push(recordOf(report, entry.label, at));
+    primary ??= { report, label: entry.label };
+    const shadowLabel =
+      engineVersion !== null && !selection.identical ? `${entry.label}（${engineVersion}）` : entry.label;
     if (!report.ok) {
-      const shadowLabel = versionLabel !== null ? `${versionLabel}（${entry.label}）` : entry.label;
+      const cov = coverage(fresh);
       const withPrefix =
-        versionLabel !== null && report.error
+        engineVersion !== null && !selection.identical && report.error
           ? {
               ...report,
-              error: {
-                ...report.error,
-                message: `${versionLabel} 验证失败：${report.error.message}`,
-              },
+              error: { ...report.error, message: `${engineVersion} 验证失败：${report.error.message}` },
             }
           : report;
-      const extra = targets.length ? { targets } : undefined;
       return {
         kind: 'failed',
-        failedMajor: actualMajor,
-        failedVersionLabel: versionLabel,
-        report: {
-          ...withPrefix,
-          shadow: shadowLabel,
-          ...(targets.length ? { targets } : {}),
-        },
-        stored: storedReport(withPrefix, shadowLabel, extra),
+        readback: isReadbackOnly(report),
+        engineVersion,
+        report: { ...withPrefix, shadow: shadowLabel, records: cov.merged },
+        stored: storedReport(withPrefix, shadowLabel, { records: cov.merged, at }),
+        verifiedOn: cov.verifiedOn,
+        uncovered: cov.uncovered,
       };
     }
-
-    passedShadows.push({ groupKey: actualKey, versionLabel, label: entry.label });
+    passed.push({ label: entry.label, engineVersion });
   }
 
-  if (!passedShadows.length || !primaryReport) {
-    const firstErr =
-      runtimeSkipped.values().next().value ?? selection.skippedGroups[0]?.reason ?? '影子库不可用';
-    throw new ShadowError(firstErr);
+  if (!primary) {
+    throw new ShadowError(runtimeSkipped[0] ?? selection.skipped[0]?.reason ?? '影子库不可用');
   }
-
-  const shadowSummary =
-    passedShadows.length === 1
-      ? passedShadows[0]!.label
-      : passedShadows
-          .map((s) => (s.versionLabel !== null ? `${s.versionLabel}（${s.label}）` : s.label))
+  const cov = coverage(fresh);
+  const summary =
+    passed.length === 1 && (selection.identical || passed[0]!.engineVersion === null)
+      ? passed[0]!.label
+      : passed
+          .map((p) => (p.engineVersion !== null ? `${p.label}（${p.engineVersion}）` : p.label))
           .join(' · ');
-
-  const targetKey = matrix ? selection.targetGroupKey : null;
-  if (matrix && targetKey !== null && !passedShadows.some((s) => s.groupKey === targetKey)) {
-    const targetLabel = matrix.groupLabel(targetKey);
-    const mismatch = mismatchReasons.get(targetKey);
-    const skippedReason =
-      runtimeSkipped.get(targetKey) ?? selection.skippedGroups.find((s) => s.groupKey === targetKey)?.reason;
-    const reason = mismatch
-      ? `${mismatch}。请为 ${targetLabel} 环境配置同${matrix.groupGranularity}的独立影子库或允许使用同实例影子库`
-      : skippedReason
-        ? `缺少 ${targetLabel} 影子库，无法验证最低目标版本兼容性（${skippedReason}）。请为 ${targetLabel} 环境配置独立影子库或允许使用同实例影子库`
-        : `缺少 ${targetLabel} 影子库，无法验证最低目标版本兼容性。请为 ${targetLabel} 环境配置独立影子库或允许使用同实例影子库`;
-    const incompleteReport: VerifyReport = {
-      ...primaryReport,
-      ok: false,
-      error: { step: null, message: reason },
-    };
-    const missingMajor = publicMajor(targetKey);
+  const stored = storedReport(primary.report, summary, { records: cov.merged, at });
+  const matched = selection.identical
+    ? cov.verifiedOn.length > 0
+    : selection.environments.some(
+        (e) => e.engineVersion !== null && cov.verifiedOn.includes(e.engineVersion),
+      );
+  if (!matched) {
+    const envVersions = [...new Set(selection.environments.map((e) => e.engineVersion ?? '未知'))].join('、');
+    const shadowVersions = passed.map((p) => p.engineVersion ?? '未知').join('、');
+    const extra =
+      runtimeSkipped.length || selection.skipped.length
+        ? `（另有影子库不可用：${runtimeSkipped[0] ?? selection.skipped[0]!.reason}）`
+        : '';
     return {
-      kind: 'missing_target',
-      missingMajor,
-      reason,
-      stored: storedReport(incompleteReport, shadowSummary, {
-        targets: targets.length ? targets : undefined,
-        ...(missingMajor !== null ? { missingTargetMajor: missingMajor } : {}),
-      }),
+      kind: 'unmatched',
+      reason:
+        `通过验证的影子库版本（${shadowVersions}）与项目环境的数据库版本（${envVersions}）都不一致${extra}。` +
+        '发布需要至少一个与环境数据库版本一致的影子库：请为环境配置版本相同的独立影子库，或允许使用同实例影子库',
+      stored,
+      verifiedOn: cov.verifiedOn,
+      uncovered: cov.uncovered,
     };
   }
-
-  return {
-    kind: 'ok',
-    stored: storedReport(primaryReport, shadowSummary, {
-      targets: targets.length ? targets : undefined,
-    }),
-  };
+  return { kind: 'ok', stored, verifiedOn: cov.verifiedOn, uncovered: cov.uncovered };
 };
 
 export interface ResolveModelRefOptions {

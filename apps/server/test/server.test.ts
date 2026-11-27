@@ -11,16 +11,18 @@ import WebSocket from 'ws';
 import { createTestDb, dbUrl, PG_URL } from '../../../test/pg.ts';
 import { createApp, openPlatformDb, type PlatformDb } from '../src/index.ts';
 import { connectPg } from '../src/targets.ts';
-import { makeUser, PASSWORD } from './support.ts';
+import { makeUser, PASSWORD, stubPassingShadow } from './support.ts';
 
 process.env.DOWEL_SECRET ??= 'test-secret-0123456789';
 let db: PlatformDb;
 let base: string;
 let close: () => Promise<void>;
+let appShadows: ReturnType<typeof createApp>['shadows'];
 const sockets = new Set<WebSocket>();
 
 const start = async () => {
   const { app, injectWebSocket, rooms, shadows } = createApp(db);
+  appShadows = shadows;
   const server = serve({ fetch: app.fetch, port: 0 });
   injectWebSocket(server);
   await new Promise((r) => server.once('listening', r));
@@ -187,7 +189,10 @@ describe.each([
   let v1 = '';
 
   test.skipIf(skip)('版本、迁移脚本、导出 DDL；没有环境时验证和导入直接报错（不用任何兜底）', async () => {
+    // 发布必须经影子库验证（ADR 0017）：还没有环境，这一次发布用影子库替身
+    const restore = stubPassingShadow(appShadows);
     const r1 = await zhang.call('POST', `/api/projects/${pid}/versions`, { name: 'v1' });
+    restore();
     expect(r1.status).toBe(201);
     v1 = r1.data.id as string;
     const mig = await zhang.call('GET', `/api/projects/${pid}/migration?from=empty&to=${v1}`);

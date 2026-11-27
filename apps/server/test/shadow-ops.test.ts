@@ -9,7 +9,7 @@
 import { addColumn, createSchema, createTable, emptyModel, type Model } from '@dowel/core';
 import type { Db } from '@dowel/engines';
 import { StepError } from '@dowel/verifier';
-import { describe, expect, test } from 'vitest';
+import { describe, expect, test, vi } from 'vitest';
 
 import {
   assertImportable,
@@ -18,6 +18,13 @@ import {
   shadowOps,
   ShadowUnavailableError,
 } from '../src/shadow.ts';
+
+// 假 Db 读回的结构永远是空的：读回核对（ADR 0017 决定 2）在这里必然“不一致”，与本文件关心的基础设施 / 风险分析分类无关。
+// 这里把读回核对替换成“一致”，读回核对本身由 verified-readback.test.ts 与真实数据库测试覆盖
+vi.mock('@dowel/executor', async (importOriginal) => ({
+  ...(await importOriginal<typeof import('@dowel/executor')>()),
+  readbackDiff: () => ({ total: 0, items: [], details: [] }),
+}));
 
 const modelWith = (schema: string): Model => {
   const m = emptyModel();

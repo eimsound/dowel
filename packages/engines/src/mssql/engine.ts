@@ -334,6 +334,13 @@ export const mssqlEngine: EngineAdapter = {
 
   readVersionNum: readMssqlVersionNum,
 
+  readFullVersion: async (db) => {
+    const [r] = await db.query<{ v: string | null }>(
+      `SELECT CAST(SERVERPROPERTY('ProductVersion') AS nvarchar(64)) AS v`,
+    );
+    return r?.v ? String(r.v).trim() || null : null;
+  },
+
   planOptionsForVersion: (versionNum) => {
     const m = mssqlMajorOf(versionNum);
     return m !== null ? { mssqlMajor: m } : undefined;

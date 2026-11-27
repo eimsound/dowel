@@ -752,7 +752,20 @@ export const ExecDialog = ({
                 ))}
               </ul>
             )}
-            {error.code === 'unverified' && <p className="hint">{t('envx.exec.unverifiedHint')}</p>}
+            {error.code === 'unverified' && (
+              <p className="hint">
+                {details?.verifiedOn
+                  ? details.engineVersion
+                    ? t('envx.exec.unverifiedEngineHint', {
+                        version: details.engineVersion,
+                        verifiedOn: details.verifiedOn.length
+                          ? details.verifiedOn.join(' · ')
+                          : t('envx.exec.unverifiedNone'),
+                      })
+                    : t('envx.exec.unverifiedEngineUnknown')
+                  : t('envx.exec.unverifiedHint')}
+              </p>
+            )}
             {error.code === 'mark_required' && <p className="hint">{t('envx.exec.markRequiredHint')}</p>}
           </div>
         )}

@@ -242,6 +242,11 @@ export interface EngineAdapter {
 
   // 影子库版本与操作钩子（verifier & shadow.ts 共用）
   readVersionNum?(db: Db): Promise<number | null>;
+  /**
+   * 读数据库完整版本号（ADR 0017 决定 5，语义同 core `engineFullVersion`）。未实现时由 readVersionNum 推导
+   * （见 `readEngineFullVersion`）；SQL Server 的构建号不在数值版本号里，必须实现。
+   */
+  readFullVersion?(db: Db): Promise<string | null>;
   planOptionsForVersion?(versionNum: number): PlanOptions | undefined;
   /**
    * 调用方的 PlanOptions 是否已显式给出本方言的目标版本（显式时 buildTarget 不再探测影子库版本）。

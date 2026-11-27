@@ -517,6 +517,12 @@ const VersionChain = ({
               retiredAt: v.retired && v.state !== 'retired' ? 'x' : null,
             }}
           />
+          {v.verified && !v.verifiedHere && (
+            <span className="risk medium" title={t('envx.notVerifiedHereHint')}>
+              {t('envx.notVerifiedHere')}
+              <span className="sr-only"> ({t('envx.notVerifiedHereHint')})</span>
+            </span>
+          )}
           {v.nonTransactional && (
             <span className="risk medium" title={nonTxHint}>
               {t('envx.nonTxShort')}
@@ -1241,6 +1247,14 @@ const EnvironmentDetailView = ({ eid }: { eid: string }) => {
                   <span className="text-text-2">
                     {project.dialect === 'pg' ? t('envp.pgVersionUnknown') : t('envp.engineVersionUnknown')}
                   </span>
+                )}
+              </dd>
+              <dt className="text-text-2">{t('envp.fullVersion')}</dt>
+              <dd className="m-0">
+                {env.engineFullVersion ? (
+                  <span className="font-mono text-xs">{env.engineFullVersion}</span>
+                ) : (
+                  <span className="text-text-2">{t('envp.fullVersionUnknown')}</span>
                 )}
               </dd>
               <dt className="text-text-2">{t('dlg.envProduction')}</dt>

@@ -1,5 +1,5 @@
 // 结构比较：把目标库读出来的快照和版本模型比（全面按 model.dialect 派发到 EngineAdapter）。
-import { type Dialect, type Model, type PlanOptions, plan } from '@dowel/core';
+import { deepEqual, type Dialect, type Model, type Obj, type PlanOptions, plan } from '@dowel/core';
 import {
   getEngine,
   ignoreDefaultPublicCommentSnap,
@@ -68,17 +68,90 @@ const unresolvable = (e: unknown): DiffResult => ({
   items: [{ kind: 'unresolvable', target: '', sql: e instanceof Error ? e.message : String(e) }],
 });
 
-/** 线上结构 → 版本模型的差异；total = 0 表示相等 */
-export const diffAgainst = (snapshot: TargetSnapshot | Snapshot, model: Model): DiffResult => {
+/** 读回比较的核心：线上结构导入成模型（importLive），再规划到版本模型（planDiff）。执行读回、漂移与闭环验证的读回核对共用 */
+const compareLive = (
+  snapshot: TargetSnapshot | Snapshot,
+  model: Model,
+): { diff: DiffResult; live: Model | null } => {
   try {
     const engine = getEngine(model.dialect);
     const wrapped = asTargetSnapshot(snapshot, model.dialect);
     const planOpts = engine.planOptionsForVersion?.(wrapped.versionNum);
     const live = importLive(wrapped, model);
-    return planDiff(live, model, planOpts);
+    return { diff: planDiff(live, model, planOpts), live };
   } catch (e) {
-    return unresolvable(e);
+    return { diff: unresolvable(e), live: null };
   }
+};
+
+/** 线上结构 → 版本模型的差异；total = 0 表示相等 */
+export const diffAgainst = (snapshot: TargetSnapshot | Snapshot, model: Model): DiffResult =>
+  compareLive(snapshot, model).diff;
+
+/** 读回核对里的一处写法差异：哪个对象的哪个属性，模型里存的值与数据库读回的值（非字符串按 JSON 显示；不存在为 null） */
+export interface ReadbackDetail {
+  object: string;
+  property: string;
+  modelValue: string | null;
+  liveValue: string | null;
+}
+
+/** 读回核对的结果：和执行读回校验同一个比较（diffAgainst），差异时另给对象 / 属性级的明细（最多 MAX_DIFF 项） */
+export interface ReadbackDiff extends DiffResult {
+  details: ReadbackDetail[];
+}
+
+const objectName = (m: Model, id: string): string => {
+  const parts: string[] = [];
+  for (let o: Obj | undefined = m.objects[id], i = 0; o && i < 5; i++) {
+    parts.unshift(o.name);
+    o = 'parent' in o ? m.objects[o.parent] : undefined;
+  }
+  return parts.join('.') || id;
+};
+
+const shown = (v: unknown): string | null =>
+  v === undefined || v === null ? null : typeof v === 'string' ? v : JSON.stringify(v);
+
+/** 模型与读回模型（对象 ID 已按名字对齐）逐对象、逐属性的差异 */
+const propertyDiffs = (model: Model, live: Model): ReadbackDetail[] => {
+  const out: ReadbackDetail[] = [];
+  const ids = [...new Set([...Object.keys(model.objects), ...Object.keys(live.objects)])];
+  for (const id of ids) {
+    if (out.length >= MAX_DIFF) break;
+    const a = model.objects[id] as Record<string, unknown> | undefined;
+    const b = live.objects[id] as Record<string, unknown> | undefined;
+    if (!a || !b) {
+      out.push({
+        object: objectName(a ? model : live, id),
+        property: 'kind',
+        modelValue: shown(a?.kind),
+        liveValue: shown(b?.kind),
+      });
+      continue;
+    }
+    for (const key of [...new Set([...Object.keys(a), ...Object.keys(b)])]) {
+      if (key === 'id' || deepEqual(a[key], b[key])) continue;
+      out.push({
+        object: objectName(model, id),
+        property: key,
+        modelValue: shown(a[key]),
+        liveValue: shown(b[key]),
+      });
+      if (out.length >= MAX_DIFF) break;
+    }
+  }
+  return out;
+};
+
+/**
+ * 闭环验证的读回核对（ADR 0017 决定 2）：用执行读回校验的**同一个比较**（diffAgainst）判断读回的结构是否等于模型，
+ * 不一致时附上对象 / 属性级明细（模型里的值 vs 数据库读回的值），便于用户把模型改成数据库的写法。不做任何容忍或自动修复。
+ */
+export const readbackDiff = (snapshot: TargetSnapshot | Snapshot, model: Model): ReadbackDiff => {
+  const { diff, live } = compareLive(snapshot, model);
+  if (!diff.total || !live) return { ...diff, details: [] };
+  return { ...diff, details: propertyDiffs(model, live) };
 };
 
 export type FirstRunKind = 'baseline' | 'empty' | 'drift';

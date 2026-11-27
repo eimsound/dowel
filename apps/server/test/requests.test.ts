@@ -28,7 +28,7 @@ import { connHash, Effects, type RequestRow, Requests } from '../src/requests.ts
 import { encrypt } from '../src/secrets.ts';
 import { securityConfigFromEnv } from '../src/security.ts';
 import { Webhooks } from '../src/webhooks.ts';
-import { addTable, editModel, makeUser, PASSWORD } from './support.ts';
+import { addTable, editModel, makeUser, PASSWORD, recordVerifiedOnEnvs } from './support.ts';
 
 process.env.DOWEL_SECRET ??= 'requests-test-secret-0123456789';
 
@@ -718,6 +718,7 @@ describe.skipIf(!PG_URL)('执行申请：表驱动场景（目标库 PG）', () 
         new Date().toISOString(),
       ],
     );
+    await recordVerifiedOnEnvs(db, pid, [v3Id]);
     await db.query('update versions set retired_at = $2 where id = $1', [v2!.id, new Date().toISOString()]);
 
     // 1. 提交校验：针对已作废版本 v2 提交非 rollback 申请 → 409 retired_target；switch 缺 ack → 422

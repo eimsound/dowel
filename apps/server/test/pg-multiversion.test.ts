@@ -3,13 +3,13 @@
 // - 项目目标最低版本推导（targetPgMajor / envPgMajors）
 // - 跨版本不兼容特性拦截（VIRTUAL 生成列 / 显式命名 NOT NULL）
 // - 按 targetPgMajor 冻结脚本与导出 DDL / 迁移
-// - Shadows.forProjectVersions 选影优先级与去重升序分组
-// - 多版本影子库验证编排：全通过（仅首版本跑风险分析）、某版本失败拒发布、缺失最低目标版本影子库拒标已验证
+// - Shadows.forProjectVersions / forProjectEngineVersions 选影优先级与分组（大版本组 / 数据库完整版本号）
+// - 多版本影子库验证编排（ADR 0017 决定 5）：按完整版本号逐条记录（仅首个跑风险分析）、任一失败拒发布、
+//   没有与环境版本一致的通过记录拒发布、未覆盖的环境列出但不阻止发布
 import type {
   EnvInfo,
   ProjectInfo,
   PublishRejected,
-  StoredVerifyReport,
   VersionCreated,
   VersionDetail,
   VersionVerifyResponse,
@@ -24,7 +24,7 @@ import { LoginLimiter } from '../src/rate-limit.ts';
 import { encrypt } from '../src/secrets.ts';
 import { type Shadow, ShadowError } from '../src/shadow.ts';
 import { Shadows } from '../src/shadows.ts';
-import { addTable, editModel, makeUser, PASSWORD } from './support.ts';
+import { addTable, editModel, makeUser, PASSWORD, stubPassingShadow } from './support.ts';
 
 process.env.DOWEL_SECRET ??= 'pg-multiversion-test-secret-0123456789';
 
@@ -205,9 +205,14 @@ describe('PG 多版本（15–19）服务端全链路', () => {
       engineVersionNum: 160004,
     });
 
-    // 先建一张普通表并发布（无可用影子库 → 未验证但成功冻结）
+    // 先建一张普通表并发布：生产环境没有可用影子库 → 拒绝发布（ADR 0017 决定 1）；换成 16.4 的影子库替身后冻结
     await addTable(created.rooms, db, pid, 'orders');
+    const noShadow = await call<PublishRejected>('POST', `/api/projects/${pid}/versions`, { name: 'v1' });
+    expect(noShadow.status).toBe(422);
+    expect(noShadow.data.code).toBe('shadow_unavailable');
+    const restoreShadow = stubPassingShadow(created.shadows, { pids: [pid], engineVersion: '16.4' });
     const pub1 = await call<VersionCreated>('POST', `/api/projects/${pid}/versions`, { name: 'v1' });
+    restoreShadow();
     expect(pub1.status).toBe(201);
     const v1 = await call<VersionDetail>('GET', `/api/projects/${pid}/versions/${pub1.data.id}`);
     expect(v1.status).toBe(200);
@@ -264,32 +269,51 @@ describe('PG 多版本（15–19）服务端全链路', () => {
     expect(pubNn.data.error).toContain('18');
   });
 
-  test('多版本影子库验证：按大版本升序全跑且仅首版本跑风险分析，全部通过后标为已验证', async () => {
+  /** 把 Shadows.forProjectEngineVersions 换成固定的选影结果（环境列表 + 各完整版本号的代表影子库）；返回还原函数 */
+  const stubEngineShadows = (o: {
+    environments: { id: string; name: string; engineVersion: string | null }[];
+    entries: { engineVersion: string | null; envId: string; label: string; shadow: Shadow }[];
+    skipped?: { engineVersion: string | null; reason: string }[];
+  }) => {
+    const orig = created.shadows.forProjectEngineVersions.bind(created.shadows);
+    created.shadows.forProjectEngineVersions = async () => ({
+      entries: o.entries,
+      skipped: o.skipped ?? [],
+      environments: o.environments,
+      identical: false,
+    });
+    return () => {
+      created.shadows.forProjectEngineVersions = orig;
+    };
+  };
+
+  test('多版本影子库验证（ADR 0017 决定 5）：按环境的数据库完整版本号逐个验证，仅首个跑风险分析，每个版本记一条通过记录', async () => {
     const pid = await newProject('multi-shadow-ok');
     await addTable(created.rooms, db, pid, 'orders');
 
-    const calls: { major: number; skipRisk: boolean }[] = [];
-    const orig = created.shadows.forProjectVersions.bind(created.shadows);
-    created.shadows.forProjectVersions = async () => ({
-      targetGroupKey: 15,
-      skippedGroups: [],
+    const calls: { version: string; skipRisk: boolean }[] = [];
+    const restore = stubEngineShadows({
+      environments: [
+        { id: 'e15', name: 'prod15', engineVersion: '15.8' },
+        { id: 'e18', name: 'dev18', engineVersion: '18.1' },
+      ],
       entries: [
         {
-          groupKey: 15,
+          engineVersion: '15.8',
           envId: 'e15',
           label: 'prod15：shadow15',
           shadow: stubShadow(async (_f, _t, _u, _d, opts) => {
-            calls.push({ major: 15, skipRisk: Boolean(opts?.skipRisk) });
-            return okVerifyReport(true);
+            calls.push({ version: '15.8', skipRisk: Boolean(opts?.skipRisk) });
+            return { ...okVerifyReport(true), engineVersion: '15.8' };
           }),
         },
         {
-          groupKey: 18,
+          engineVersion: '18.1',
           envId: 'e18',
           label: 'dev18：shadow18',
           shadow: stubShadow(async (_f, _t, _u, _d, opts) => {
-            calls.push({ major: 18, skipRisk: Boolean(opts?.skipRisk) });
-            return okVerifyReport(false);
+            calls.push({ version: '18.1', skipRisk: Boolean(opts?.skipRisk) });
+            return { ...okVerifyReport(false), engineVersion: '18.1' };
           }),
         },
       ],
@@ -297,37 +321,38 @@ describe('PG 多版本（15–19）服务端全链路', () => {
     try {
       const r = await call<VersionCreated>('POST', `/api/projects/${pid}/versions`, { name: 'v1' });
       expect(r.status).toBe(201);
-      expect(r.data.verified).toBe(true);
-      expect(r.data.unverifiedReason).toBeNull();
+      expect(r.data).toMatchObject({ verified: true, verifiedOn: ['15.8', '18.1'], uncovered: [] });
       expect(calls).toEqual([
-        { major: 15, skipRisk: false },
-        { major: 18, skipRisk: true },
+        { version: '15.8', skipRisk: false },
+        { version: '18.1', skipRisk: true },
       ]);
 
       const d = await call<VersionDetail>('GET', `/api/projects/${pid}/versions/${r.data.id}`);
       expect(d.status).toBe(200);
       expect(d.data.verifiedAt).not.toBeNull();
-      expect(d.data.verifyReport?.targets).toEqual([
-        { major: 15, shadow: 'prod15：shadow15', ok: true, error: null, upDiffCount: 0, downDiffCount: 0 },
-        { major: 18, shadow: 'dev18：shadow18', ok: true, error: null, upDiffCount: 0, downDiffCount: 0 },
+      expect(d.data.verifiedOn).toEqual(['15.8', '18.1']);
+      expect(d.data.verifyReport?.records).toEqual([
+        expect.objectContaining({ engineVersion: '15.8', ok: true, shadow: 'prod15：shadow15', error: null }),
+        expect.objectContaining({ engineVersion: '18.1', ok: true, shadow: 'dev18：shadow18', error: null }),
       ]);
       expect(d.data.verifyReport?.risks).toHaveLength(1);
     } finally {
-      created.shadows.forProjectVersions = orig;
+      restore();
     }
   });
 
-  test('任一大版本影子库验证失败：整体验证失败并指明具体失败的 PG 版本', async () => {
+  test('任一可用影子库验证失败：整体拒绝发布（verify_failed）并指明失败的数据库完整版本号', async () => {
     const pid = await newProject('multi-shadow-fail');
     await addTable(created.rooms, db, pid, 'orders');
 
-    const orig = created.shadows.forProjectVersions.bind(created.shadows);
-    created.shadows.forProjectVersions = async () => ({
-      targetGroupKey: 15,
-      skippedGroups: [],
+    const restore = stubEngineShadows({
+      environments: [
+        { id: 'e15', name: 'prod15', engineVersion: '15.8' },
+        { id: 'e18', name: 'dev18', engineVersion: '18.1' },
+      ],
       entries: [
         {
-          groupKey: 15,
+          engineVersion: '15.8',
           envId: 'e15',
           label: 'prod15：shadow15',
           shadow: stubShadow(async () => ({
@@ -338,194 +363,157 @@ describe('PG 多版本（15–19）服务端全链路', () => {
             downDiff: [],
             risks: [],
             error: { step: null, message: 'syntax error at or near "VIRTUAL"' },
+            engineVersion: '15.8',
           })),
         },
         {
-          groupKey: 18,
+          engineVersion: '18.1',
           envId: 'e18',
           label: 'dev18：shadow18',
-          shadow: stubShadow(async () => okVerifyReport()),
+          shadow: stubShadow(async () => ({ ...okVerifyReport(), engineVersion: '18.1' })),
         },
       ],
     });
     try {
       const r = await call<PublishRejected>('POST', `/api/projects/${pid}/versions`, { name: 'v1' });
       expect(r.status).toBe(422);
-      expect(r.data.error).toContain('PG 15');
+      expect(r.data.code).toBe('verify_failed');
+      expect(r.data.error).toContain('15.8');
       expect(r.data.report?.ok).toBe(false);
-      expect(r.data.report?.targets).toEqual([
-        {
-          major: 15,
-          shadow: 'prod15：shadow15',
+      expect(r.data.report?.error?.message).toContain('15.8 验证失败');
+      expect(r.data.report?.records).toEqual([
+        expect.objectContaining({
+          engineVersion: '15.8',
           ok: false,
-          error: 'syntax error at or near "VIRTUAL"',
-          upDiffCount: 0,
-          downDiffCount: 0,
-        },
+          error: expect.stringContaining('VIRTUAL'),
+        }),
       ]);
+      expect((await call<unknown[]>('GET', `/api/projects/${pid}/versions`)).data).toHaveLength(0);
     } finally {
-      created.shadows.forProjectVersions = orig;
+      restore();
     }
   });
 
-  test('严格安全规则：多版本项目缺少最低目标版本影子库时，不得仅凭高版本通过标记已验证', async () => {
+  test('某个环境版本没有可用影子库：凭与其他环境一致的通过记录发布，未覆盖的环境列在 uncovered（最低目标版本门禁已删除）', async () => {
     const pid = await newProject('missing-lowest-shadow');
     await addTable(created.rooms, db, pid, 'orders');
 
-    // 真实走 Shadows.forProjectVersions 的选择逻辑：
-    // prod15 是生产环境且不允许同实例也无 shadowUrl → 记入 skippedGroups
-    // dev18 是非生产环境 → 在 entries 中（stub forProject 返回 mock shadow）
-    await insertEnvRow({
-      id: 'e-prod-15',
-      pid,
-      name: 'prod15',
-      production: true,
-      allowSameInstance: false,
-      shadowUrl: null,
-      engineVersion: '15.8',
-      engineVersionNum: 150008,
-    });
-    await insertEnvRow({
-      id: 'e-dev-18',
-      pid,
-      name: 'dev18',
-      production: false,
-      allowSameInstance: true,
-      engineVersion: '18.1',
-      engineVersionNum: 180001,
-    });
-
-    const orig = created.shadows.forProjectVersions.bind(created.shadows);
-    created.shadows.forProjectVersions = async () => ({
-      targetGroupKey: 15,
-      skippedGroups: [{ groupKey: 15, reason: '环境“prod15”是生产环境，默认不在同一实例上建影子库' }],
+    const restore = stubEngineShadows({
+      environments: [
+        { id: 'e-prod-15', name: 'prod15', engineVersion: '15.8' },
+        { id: 'e-dev-18', name: 'dev18', engineVersion: '18.1' },
+      ],
+      skipped: [{ engineVersion: '15.8', reason: '环境“prod15”是生产环境，默认不在同一实例上建影子库' }],
       entries: [
         {
-          groupKey: 18,
+          engineVersion: '18.1',
           envId: 'e-dev-18',
           label: 'dev18：app_dowel',
-          shadow: stubShadow(async () => okVerifyReport(true)),
+          shadow: stubShadow(async () => ({ ...okVerifyReport(true), engineVersion: '18.1' })),
         },
       ],
     });
     try {
-      // 1) 发布版本：允许发布，但 verified 必须为 false，unverifiedReason 与 verifyReport 明确指出缺少 PG 15 影子库
       const pub = await call<VersionCreated>('POST', `/api/projects/${pid}/versions`, { name: 'v1' });
       expect(pub.status).toBe(201);
-      expect(pub.data.verified).toBe(false);
-      expect(pub.data.unverifiedReason).toContain('PG 15');
-
+      expect(pub.data).toMatchObject({
+        verified: true,
+        verifiedOn: ['18.1'],
+        uncovered: [{ id: 'e-prod-15', name: 'prod15', engineVersion: '15.8' }],
+      });
       const d = await call<VersionDetail>('GET', `/api/projects/${pid}/versions/${pub.data.id}`);
-      expect(d.status).toBe(200);
-      expect(d.data.verifiedAt).toBeNull();
-      const rep = d.data.verifyReport as StoredVerifyReport;
-      expect(rep.ok).toBe(false);
-      expect(rep.missingTargetMajor).toBe(15);
-      expect(rep.targets).toEqual([
-        { major: 18, shadow: 'dev18：app_dowel', ok: true, error: null, upDiffCount: 0, downDiffCount: 0 },
+      expect(d.data.verifiedAt).not.toBeNull();
+      expect(d.data.verifyReport?.records).toEqual([
+        expect.objectContaining({ engineVersion: '18.1', ok: true }),
       ]);
 
-      // 2) 重新验证：依然缺少 PG 15 影子库 → verifiedAt 必须继续为 null
+      // 重新验证：仍然只覆盖 18.1；记录按完整版本号合并，不重复
       const rev = await call<VersionVerifyResponse>(
         'POST',
         `/api/projects/${pid}/versions/${pub.data.id}/verify`,
       );
       expect(rev.status).toBe(200);
-      expect(rev.data.verifiedAt).toBeNull();
-      expect(rev.data.report.ok).toBe(false);
-      expect(rev.data.report.missingTargetMajor).toBe(15);
+      expect(rev.data.verifiedAt).not.toBeNull();
+      expect(rev.data.verifiedOn).toEqual(['18.1']);
+      expect(rev.data.uncovered).toEqual([{ id: 'e-prod-15', name: 'prod15', engineVersion: '15.8' }]);
+      expect(rev.data.report.records).toHaveLength(1);
     } finally {
-      created.shadows.forProjectVersions = orig;
+      restore();
     }
   });
 
-  test('严格安全规则：prod=PG 15（无影子库）+ dev=null 未探测环境，不得借未探测环境绕过最低版本门禁', async () => {
+  test('严格安全规则：通过验证的影子库版本与任何环境都不一致（含未探测版本的环境）时拒绝发布（no_matching_shadow）', async () => {
     const pid = await newProject('missing-lowest-with-null-env');
     await addTable(created.rooms, db, pid, 'orders');
 
-    const orig = created.shadows.forProjectVersions.bind(created.shadows);
-    created.shadows.forProjectVersions = async () => ({
-      targetGroupKey: 15,
-      skippedGroups: [{ groupKey: 15, reason: '环境“prod15”是生产环境，默认不在同一实例上建影子库' }],
+    const restore = stubEngineShadows({
+      environments: [
+        { id: 'e-prod-15', name: 'prod15', engineVersion: '15.8' },
+        { id: 'e-dev-null', name: 'dev', engineVersion: null },
+      ],
+      skipped: [{ engineVersion: '15.8', reason: '环境“prod15”是生产环境，默认不在同一实例上建影子库' }],
       entries: [
         {
-          groupKey: null,
+          engineVersion: null,
           envId: 'e-dev-null',
           label: 'dev：app_dowel',
           shadow: stubShadow(async () => ({
             ...okVerifyReport(true),
             shadowMajor: 18,
             shadowVersionNum: 180000,
+            engineVersion: '18.0',
           })),
         },
       ],
     });
     try {
-      const pub = await call<VersionCreated>('POST', `/api/projects/${pid}/versions`, { name: 'v1' });
-      expect(pub.status).toBe(201);
-      expect(pub.data.verified).toBe(false);
-      expect(pub.data.unverifiedReason).toContain('PG 15');
-
-      const d = await call<VersionDetail>('GET', `/api/projects/${pid}/versions/${pub.data.id}`);
-      expect(d.data.verifiedAt).toBeNull();
-      expect(d.data.verifyReport?.missingTargetMajor).toBe(15);
-
-      const rev = await call<VersionVerifyResponse>(
-        'POST',
-        `/api/projects/${pid}/versions/${pub.data.id}/verify`,
-      );
-      expect(rev.status).toBe(200);
-      expect(rev.data.verifiedAt).toBeNull();
-      expect(rev.data.report.missingTargetMajor).toBe(15);
+      const pub = await call<PublishRejected>('POST', `/api/projects/${pid}/versions`, { name: 'v1' });
+      expect(pub.status).toBe(422);
+      expect(pub.data.code).toBe('no_matching_shadow');
+      expect(pub.data.error).toContain('18.0');
+      expect(pub.data.error).toContain('15.8');
+      expect(pub.data.environments).toEqual([
+        { id: 'e-prod-15', name: 'prod15', engineVersion: '15.8' },
+        { id: 'e-dev-null', name: 'dev', engineVersion: null },
+      ]);
+      expect((await call<unknown[]>('GET', `/api/projects/${pid}/versions`)).data).toHaveLength(0);
     } finally {
-      created.shadows.forProjectVersions = orig;
+      restore();
     }
   });
 
-  test('严格安全规则：prod=PG 15 配置了 PG 18 独立 shadowUrl（版本错配）时，不得误记为 PG 15 通过', async () => {
+  test('严格安全规则：prod=PG 15 配了 PG 18 的独立影子库（版本错配）时，按影子库实测版本记录，不误记为 15 通过', async () => {
     const pid = await newProject('shadow-version-mismatch');
     await addTable(created.rooms, db, pid, 'orders');
 
-    const orig = created.shadows.forProjectVersions.bind(created.shadows);
-    created.shadows.forProjectVersions = async () => ({
-      targetGroupKey: 15,
-      skippedGroups: [],
+    const restore = stubEngineShadows({
+      environments: [{ id: 'e-prod-15', name: 'prod15', engineVersion: '15.8' }],
       entries: [
         {
-          groupKey: 15,
+          engineVersion: '15.8',
           envId: 'e-prod-15',
           label: 'prod15：wrong_pg18_shadow',
-          // 实测 shadowMajor 为 18，与环境记录的 PG 15 不一致
+          // 实测影子库是 18.0，与环境记录的 15.8 不一致
           shadow: stubShadow(async () => ({
             ...okVerifyReport(true),
             shadowMajor: 18,
             shadowVersionNum: 180000,
+            engineVersion: '18.0',
           })),
         },
       ],
     });
     try {
-      const pub = await call<VersionCreated>('POST', `/api/projects/${pid}/versions`, { name: 'v1' });
-      expect(pub.status).toBe(201);
-      expect(pub.data.verified).toBe(false);
-      expect(pub.data.unverifiedReason).toContain('PG 18');
-      expect(pub.data.unverifiedReason).toContain('PG 15');
-
-      const d = await call<VersionDetail>('GET', `/api/projects/${pid}/versions/${pub.data.id}`);
-      expect(d.data.verifiedAt).toBeNull();
-      expect(d.data.verifyReport?.missingTargetMajor).toBe(15);
-      expect(d.data.verifyReport?.targets).toEqual([
-        {
-          major: 18,
-          shadow: 'prod15：wrong_pg18_shadow',
-          ok: true,
-          error: null,
-          upDiffCount: 0,
-          downDiffCount: 0,
-        },
+      const pub = await call<PublishRejected>('POST', `/api/projects/${pid}/versions`, { name: 'v1' });
+      expect(pub.status).toBe(422);
+      expect(pub.data.code).toBe('no_matching_shadow');
+      expect(pub.data.error).toContain('18.0');
+      expect(pub.data.error).toContain('15.8');
+      expect(pub.data.report?.records).toEqual([
+        expect.objectContaining({ engineVersion: '18.0', ok: true }),
       ]);
     } finally {
-      created.shadows.forProjectVersions = orig;
+      restore();
     }
   });
 
@@ -629,6 +617,37 @@ describe('PG 多版本（15–19）服务端全链路', () => {
       expect(res.entries).toHaveLength(1);
       expect(res.entries[0]?.groupKey).toBe(16);
       expect(res.entries[0]?.envId).toBe('e-16-explicit');
+
+      // 闭环验证按数据库完整版本号分组（ADR 0017 决定 5）：同一个大版本里不同的小版本各自成组
+      await insertEnvRow({
+        id: 'e-16-6-dev',
+        pid,
+        name: 'dev16-6',
+        url: 'postgres://postgres:secret@127.0.0.1:5432/app16_explicit',
+        production: false,
+        shadowUrl: 'postgres://postgres:secret@127.0.0.1:5432/shadow16',
+        engineVersion: '16.6',
+        engineVersionNum: 160006,
+      });
+      const byVersion = await shadowsTest.forProjectEngineVersions(pid);
+      expect(byVersion.identical).toBe(false);
+      expect(
+        byVersion.environments
+          .map((e) => [e.id, e.engineVersion])
+          .sort((a, b) => String(a[0]).localeCompare(String(b[0]))),
+      ).toEqual([
+        ['e-15-prod-blocked', '15.7'],
+        ['e-16-6-dev', '16.6'],
+        ['e-16-dev', '16.4'],
+        ['e-16-explicit', '16.4'],
+        ['e-16-prod-no', '16.4'],
+        ['e-16-prod-same', '16.4'],
+      ]);
+      expect(byVersion.skipped.map((x) => x.engineVersion)).toEqual(['15.7']);
+      expect(byVersion.entries.map((e) => [e.engineVersion, e.envId])).toEqual([
+        ['16.4', 'e-16-explicit'],
+        ['16.6', 'e-16-6-dev'],
+      ]);
     } finally {
       await shadowsTest.close();
     }
