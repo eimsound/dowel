@@ -11,6 +11,7 @@ import {
   ident,
   literal,
   type Model,
+  setColumnType,
   setPartitionBy,
   type Table,
 } from '@dowel/core';
@@ -22,7 +23,7 @@ import { connect, createTestDb, dbUrl, PG_URL } from '../../../test/pg.ts';
 import { createApp } from '../src/app.ts';
 import { type ClusterEvent, EventBus } from '../src/bus.ts';
 import { openPlatformDb } from '../src/db.ts';
-import { OpaqueRefresher } from '../src/derive.ts';
+import { OpaqueRefresher, pendingRefreshIds } from '../src/derive.ts';
 import { Rooms } from '../src/rooms.ts';
 import { encrypt, scrubSecrets } from '../src/secrets.ts';
 import { assertImportable, ShadowError, ShadowUnavailableError, toShadowError } from '../src/shadow.ts';
@@ -1437,6 +1438,44 @@ describe.skipIf(!PG_URL)('受限权限账号与影子库生命周期测试（真
       await shadow?.close();
       await admin.db.exec(`DROP DATABASE IF EXISTS ${ident(dbName)} WITH (FORCE)`).catch(() => {});
       await admin.db.exec(`DROP ROLE IF EXISTS ${ident(role)}`).catch(() => {});
+    }
+  });
+});
+
+describe.skipIf(!PG_URL)('待规范化判定与真实 PG 读回一致（#134）', () => {
+  test('分区子表本地 CHECK：根父表列改类型后判为待规范化，影子库读回的规范形式也确实变了', async () => {
+    const shadowDb = await createTestDb('derive_pending_part');
+    await claimShadow(shadowDb.url);
+    const shadow = pgShadow(shadowDb.url);
+    try {
+      const m = emptyModel();
+      const pub = createSchema(m, 'public', 's-pub');
+      const events = createTable(m, pub, 'events', 't-events');
+      const day = addColumn(m, events, { name: 'day', type: 'integer', notNull: true, id: 'c-day' });
+      addColumn(m, events, { name: 'amount', type: 'integer', id: 'c-amount' });
+      setPartitionBy(m, events, {
+        strategy: 'range',
+        keys: [{ column: day, expr: null, opclass: null, collation: null }],
+      });
+      const child = createPartition(m, events, 'events_a', 'FOR VALUES FROM (0) TO (100)', 't-events-a');
+      const ck = addCheck(m, child, 'amount >= 0', 'ck-amount');
+      // 黄金基线：影子库规范化之后的模型
+      const good = structuredClone(m);
+      for (const o of await shadow.canonicalize(emptyModel(), m)) good.objects[o.id] = o;
+      const before = (good.objects[ck] as { expr: string }).expr;
+
+      const cur = structuredClone(good);
+      setColumnType(cur, 'c-amount', 'numeric');
+      expect(pendingRefreshIds(good, cur)).toContain(ck);
+      const changed = await shadow.canonicalize(good, cur);
+      const after = changed.find((o) => o.id === ck) as { expr: string } | undefined;
+      // 例：(amount >= 0) → (amount >= (0)::numeric)；漏判时这份过期原文会留在模型里
+      expect(after?.expr).toBeDefined();
+      expect(after?.expr).not.toBe(before);
+      expect(after?.expr).toContain('numeric');
+    } finally {
+      await shadow.close();
+      await shadowDb.close();
     }
   });
 });

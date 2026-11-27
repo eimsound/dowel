@@ -384,3 +384,287 @@ describe('OpaqueRefresher', () => {
     expect(r.tracked('b')).toBe(false);
   });
 });
+
+// ───── 待规范化判定的漏判修复（#133 同表列名绑定、#134 分区子表按根父表解析列、#136 不透明对象依赖闭包） ─────
+
+const setType = (m: Model, id: string, type: string) =>
+  runMutator(m, 'setColumnType', { id, type, typeRef: null });
+
+describe('pendingRefreshIds：同表列按列名对齐（#133）', () => {
+  /** orders(total integer, note text)，CHECK 引用 total；基线已规范化 */
+  const swapBase = () => {
+    const m = base();
+    runMutator(m, 'addColumn', { table: 't', column: { id: 'c2', name: 'note', type: 'text' } });
+    runMutator(m, 'addCheck', { id: 'k', table: 't', expr: '(total > 0)' });
+    return m;
+  };
+
+  test('列名对调：表达式原文与基线相同，但同名列换成了另一种类型的列', () => {
+    const good = swapBase();
+    const cur = structuredClone(good);
+    // 恢复历史 / 应用版本换入的快照：total 现在指 c2(text)，CHECK 原文逐字不变
+    (cur.objects.c as { name: string }).name = 'note';
+    (cur.objects.c2 as { name: string }).name = 'total';
+    expect(pendingRefreshIds(good, cur)).toEqual(['k']);
+    expect(needsRefresh(good, cur)).toBe(true);
+  });
+
+  test('删列后新建同名、不同 ID、不同类型的列', () => {
+    const good = swapBase();
+    const cur = structuredClone(good);
+    delete cur.objects.c;
+    cur.objects.c9 = { ...structuredClone(good.objects.c!), id: 'c9', type: 'text' } as Obj;
+    expect(pendingRefreshIds(good, cur)).toEqual(['k']);
+    // 反方向（基线是重建后的模型，换回删列前的快照）同样检出
+    expect(pendingRefreshIds(cur, good)).toEqual(['k']);
+  });
+
+  test('不误报：新增列、删列、改名到基线里没有的名字、同类型列对调', () => {
+    const good = swapBase();
+    runMutator(good, 'addColumn', { table: 't', column: { id: 'c3', name: 'qty', type: 'integer' } });
+    const added = structuredClone(good);
+    runMutator(added, 'addColumn', { table: 't', column: { id: 'c4', name: 'extra', type: 'bigint' } });
+    expect(pendingRefreshIds(good, added)).toEqual([]);
+    const dropped = structuredClone(good);
+    runMutator(dropped, 'dropColumn', { id: 'c2' });
+    expect(pendingRefreshIds(good, dropped)).toEqual([]);
+    const renamed = structuredClone(good);
+    runMutator(renamed, 'renameColumn', { id: 'c2', name: 'memo' });
+    expect(pendingRefreshIds(good, renamed)).toEqual([]);
+    // total / qty 都是 integer：按名字看上下文没变（按 ID 也没变）
+    const swapped = structuredClone(good);
+    (swapped.objects.c as { name: string }).name = 'qty';
+    (swapped.objects.c3 as { name: string }).name = 'total';
+    expect(pendingRefreshIds(good, swapped)).toEqual([]);
+  });
+
+  test('列自身的默认值 / 生成列：列改名的同时改类型也检出', () => {
+    const good = base();
+    runMutator(good, 'addColumn', {
+      table: 't',
+      column: { id: 'g', name: 'doubled', type: 'integer', generated: { expr: '(total * 2)', stored: true } },
+    });
+    const cur = structuredClone(good);
+    (cur.objects.g as { name: string; type: string }).name = 'twice';
+    (cur.objects.g as { type: string }).type = 'bigint';
+    expect(pendingRefreshIds(good, cur)).toEqual(['g']);
+  });
+
+  test('大小写不敏感的方言（MySQL）按忽略大小写对齐列名', () => {
+    const good = emptyModel('mysql');
+    runMutator(good, 'createSchema', { id: 's', name: 'default' });
+    runMutator(good, 'createTable', { id: 't', schema: 's', name: 'orders' });
+    runMutator(good, 'addColumn', { table: 't', column: { id: 'c', name: 'Total', type: 'int' } });
+    runMutator(good, 'addCheck', { id: 'k', table: 't', expr: '(total > 0)' });
+    const cur = structuredClone(good);
+    delete cur.objects.c;
+    cur.objects.c9 = {
+      ...structuredClone(good.objects.c!),
+      id: 'c9',
+      name: 'total',
+      type: 'decimal(10,2)',
+    } as Obj;
+    expect(pendingRefreshIds(good, cur)).toEqual(['k']);
+  });
+
+  test('出口 flush 与 onlyIfClean：换回删列重建前的快照不漏判', async () => {
+    // B：删掉 c 后重建同名 text 列 c9；H：c 仍是 integer
+    const h = swapBase();
+    const b = structuredClone(h);
+    delete b.objects.c;
+    b.objects.c9 = { ...structuredClone(h.objects.c!), id: 'c9', type: 'text' } as Obj;
+    const live = { m: structuredClone(b), seq: 0 };
+    const { saved, store } = memStore();
+    let asked = 0;
+    const r = new OpaqueRefresher(
+      memRooms(live),
+      async () => {
+        asked++;
+        return canonicalShadow();
+      },
+      store,
+    );
+    await r.reset('b', b);
+    // onlyIfClean：H 相对 B 有待规范化对象 → 只换房间、不推进基线
+    await r.runWithReset(
+      'b',
+      h,
+      async () => {
+        live.m = structuredClone(h);
+        live.seq++;
+      },
+      { onlyIfClean: true },
+    );
+    expect(saved).toHaveLength(1);
+    expect(saved[0]!.objects.c9).toBeDefined();
+    await expect(r.status('b')).resolves.toMatchObject({ pendingCount: 1 });
+    // 出口 flush 必须回影子库，而不是 0 I/O 返回 clean
+    await expect(r.flush('b')).resolves.toMatchObject({ kind: 'normalized' });
+    expect(asked).toBe(1);
+  });
+});
+
+/** PG 分区家族：events(day integer 分区键, amount integer) → ch(二级分区父表) → leaf */
+const partitionFamily = () => {
+  const m = emptyModel();
+  runMutator(m, 'createSchema', { id: 's', name: 'public' });
+  runMutator(m, 'createTable', { id: 'p', schema: 's', name: 'events' });
+  runMutator(m, 'addColumn', {
+    table: 'p',
+    column: { id: 'pd', name: 'day', type: 'integer', notNull: true },
+  });
+  runMutator(m, 'addColumn', { table: 'p', column: { id: 'pa', name: 'amount', type: 'integer' } });
+  const byDay = {
+    strategy: 'range' as const,
+    keys: [{ column: 'pd', expr: null, opclass: null, collation: null }],
+  };
+  runMutator(m, 'setPartitionBy', { id: 'p', partitionBy: byDay });
+  runMutator(m, 'createPartition', {
+    id: 'ch',
+    parent: 'p',
+    name: 'events_a',
+    bound: 'FOR VALUES FROM (0) TO (100)',
+  });
+  runMutator(m, 'setPartitionBy', { id: 'ch', partitionBy: byDay });
+  runMutator(m, 'createPartition', {
+    id: 'lf',
+    parent: 'ch',
+    name: 'events_a1',
+    bound: 'FOR VALUES FROM (0) TO (10)',
+  });
+  return m;
+};
+
+describe('pendingRefreshIds：分区子表按根父表解析列（#134）', () => {
+  test('一级 / 二级子分区上的本地 CHECK、表达式索引、部分索引在根父表列改类型或排序规则时检出', () => {
+    const good = partitionFamily();
+    runMutator(good, 'addCheck', { id: 'k1', table: 'ch', expr: '(amount >= 0)' });
+    runMutator(good, 'addCheck', { id: 'k2', table: 'lf', expr: '(amount >= 0)' });
+    runMutator(good, 'addIndex', { id: 'ix', table: 'lf', elements: [{ expr: '(amount + 1)' }] });
+    runMutator(good, 'addIndex', {
+      id: 'iw',
+      table: 'ch',
+      elements: [{ column: 'pd' }],
+      where: '(amount >= 0)',
+    });
+    expect(pendingRefreshIds(good, structuredClone(good))).toEqual([]);
+    const typed = structuredClone(good);
+    setType(typed, 'pa', 'numeric');
+    expect(pendingRefreshIds(good, typed)).toEqual(['k1', 'k2', 'ix', 'iw']);
+    const collated = structuredClone(good);
+    (collated.objects.pa as { collation: string | null }).collation = 'C';
+    expect(pendingRefreshIds(good, collated)).toEqual(['k1', 'k2', 'ix', 'iw']);
+  });
+
+  test('只在 deps 里依赖子分区表的不透明对象在根父表列改类型时检出', () => {
+    const good = partitionFamily();
+    good.objects.v = {
+      ...opaqueView(['lf']),
+      ddl: ['CREATE VIEW public.big_orders AS SELECT amount FROM public.events_a1'],
+    } as Obj;
+    const typed = structuredClone(good);
+    setType(typed, 'pa', 'numeric');
+    expect(pendingRefreshIds(good, typed)).toEqual(['v']);
+  });
+
+  test('attach：基线里是独立表、当前挂到分区父表下（根不同），按列名对齐两边的根表列', () => {
+    const good = partitionFamily();
+    runMutator(good, 'createTable', { id: 'x', schema: 's', name: 'events_b' });
+    runMutator(good, 'addColumn', {
+      table: 'x',
+      column: { id: 'xd', name: 'day', type: 'integer', notNull: true },
+    });
+    runMutator(good, 'addColumn', { table: 'x', column: { id: 'xa', name: 'amount', type: 'integer' } });
+    runMutator(good, 'addCheck', { id: 'k', table: 'x', expr: '(amount >= 0)' });
+    const attached = structuredClone(good);
+    runMutator(attached, 'attachPartition', {
+      parent: 'p',
+      child: 'x',
+      bound: 'FOR VALUES FROM (100) TO (200)',
+    });
+    expect(attached.objects.xa).toBeUndefined();
+    // 新出现的分区边界本身待规范化；挂上去之后列的名字和类型都没变，CHECK 不误报
+    expect(pendingRefreshIds(good, attached)).toEqual(['x']);
+    setType(attached, 'pa', 'numeric');
+    expect(pendingRefreshIds(good, attached)).toEqual(['x', 'k']);
+  });
+
+  test('detach：基线里是子分区、当前脱离成独立表（列被物化成新 ID）', () => {
+    const good = partitionFamily();
+    runMutator(good, 'addCheck', { id: 'k', table: 'lf', expr: '(amount >= 0)' });
+    const detached = structuredClone(good);
+    runMutator(detached, 'detachPartition', { id: 'lf' });
+    const amount = Object.values(detached.objects).find(
+      (o) => o.kind === 'column' && o.parent === 'lf' && o.name === 'amount',
+    )!;
+    expect(pendingRefreshIds(good, detached)).toEqual([]);
+    setType(detached, amount.id, 'numeric');
+    expect(pendingRefreshIds(good, detached)).toEqual(['k']);
+  });
+});
+
+const view = (id: string, deps: string[], extra: Partial<Obj> = {}): Obj =>
+  ({ ...opaqueView(deps), id, name: id, ddl: [`CREATE VIEW public.${id} AS SELECT 1`], ...extra }) as Obj;
+
+describe('pendingRefreshIds：不透明对象沿依赖传递（#136）', () => {
+  /** v1 → orders.total，v2 → v1，v3 → v2 */
+  const chain = () => {
+    const m = base();
+    m.objects.v1 = view('v1', ['t', 'c']);
+    m.objects.v2 = view('v2', ['v1']);
+    m.objects.v3 = view('v3', ['v2']);
+    return m;
+  };
+
+  test('底层列改类型、依赖改名、上游 DDL 变化：下游视图一并检出（多跳）', () => {
+    const good = chain();
+    expect(pendingRefreshIds(good, structuredClone(good))).toEqual([]);
+    const typed = structuredClone(good);
+    setType(typed, 'c', 'numeric');
+    expect(pendingRefreshIds(good, typed)).toEqual(['v1', 'v2', 'v3']);
+    const renamed = structuredClone(good);
+    runMutator(renamed, 'renameColumn', { id: 'c', name: 'amount' });
+    expect(pendingRefreshIds(good, renamed)).toEqual(['v1', 'v2', 'v3']);
+    const ddl = structuredClone(good);
+    (ddl.objects.v1 as { ddl: string[] }).ddl = ['CREATE VIEW public.v1 AS SELECT 2'];
+    expect(pendingRefreshIds(good, ddl)).toEqual(['v1', 'v2', 'v3']);
+    // 只改链条中间：上游不受影响
+    const mid = structuredClone(good);
+    (mid.objects.v2 as { ddl: string[] }).ddl = ['CREATE VIEW public.v2 AS SELECT 2'];
+    expect(pendingRefreshIds(good, mid)).toEqual(['v2', 'v3']);
+  });
+
+  test('环状依赖不死循环', () => {
+    const good = base();
+    good.objects.v1 = view('v1', ['c', 'v2']);
+    good.objects.v2 = view('v2', ['v1']);
+    expect(pendingRefreshIds(good, structuredClone(good))).toEqual([]);
+    const typed = structuredClone(good);
+    setType(typed, 'c', 'numeric');
+    expect(pendingRefreshIds(good, typed)).toEqual(['v1', 'v2']);
+  });
+
+  test('表级父对象不在 deps 里：父表列改类型也检出', () => {
+    const good = base();
+    good.objects.tr = view('tr', [], {
+      objType: 'trigger',
+      parent: 't',
+      ddl: ['CREATE TRIGGER tr ...'],
+    } as Partial<Obj>);
+    const typed = structuredClone(good);
+    setType(typed, 'c', 'numeric');
+    expect(pendingRefreshIds(good, typed)).toEqual(['tr']);
+  });
+
+  test('status：pendingCount 与对象列表包含下游视图', async () => {
+    const good = chain();
+    const live = { m: structuredClone(good), seq: 0 };
+    const { store } = memStore();
+    const r = new OpaqueRefresher(memRooms(live), async () => canonicalShadow(), store);
+    await r.reset('b', good);
+    setType(live.m, 'c', 'numeric');
+    const st = await r.status('b');
+    expect(st.pendingCount).toBe(3);
+    expect(st.objects.map((o) => o.id)).toEqual(['v1', 'v2', 'v3']);
+  });
+});

@@ -1,8 +1,9 @@
 // 黄金基线规范化的属性不变量（Issue #125，ADR 0016）：纯函数层面，不需要 Docker / PG。
 //
 // 用一个假引擎代替影子库：规范形式只取决于对象自身文本和 derive-pending.ts 声明会影响它的上下文
-// （表达式：同表被引用列的 type / typeRef / collation，列自身的默认值 / 生成列再加上自己的类型；
-// 不透明对象：父对象与依赖的完整限定名、依赖列的类型）。真实 canonicalize（apps/server/src/shadow.ts:442）会读回并比较全部对象，
+// （表达式：同表被引用列的 type / typeRef / collation——按列名解析，分区子表沿 partitionOf 用根父表的列——，
+// 列自身的默认值 / 生成列再加上自己的类型；不透明对象：父对象与依赖的完整限定名、依赖列的类型，
+// 依赖的不透明对象再递归带上它自己的这份签名，模拟视图叠视图）。真实 canonicalize（apps/server/src/shadow.ts:442）会读回并比较全部对象，
 // 判定正确时变化的也只会是待规范化对象；假引擎刻意更严格，只改写 pendingRefreshIds(prev, next) 里的对象——这样判定漏掉的对象不会被顺手改好，
 // 会在 I1 / I2 里暴露出来（规范形式本身用不依赖判定的 canonObj 独立计算）。
 //
@@ -24,7 +25,7 @@
 //
 // 运行次数 DERIVE_RUNS（默认 200）、种子 DERIVE_SEED（默认固定）；失败时 fast-check 打印种子、路径和缩小后的操作序列。
 // 深挖：DERIVE_RUNS=5000 DERIVE_SEED=<n>；DERIVE_STATS=1 加 --silent=false 打印各类操作 / 结果的命中次数。
-import { deepEqual, EditError, emptyModel, type Model, type Obj, runMutator } from '@dowel/core';
+import { deepEqual, EditError, emptyModel, type Model, type Obj, rootTableId, runMutator } from '@dowel/core';
 import { StepError } from '@dowel/verifier';
 import fc from 'fast-check';
 import { describe, expect, test, vi } from 'vitest';
@@ -40,6 +41,7 @@ const BRANCH = 'b';
 type Column = Extract<Obj, { kind: 'column' }>;
 type Check = Extract<Obj, { kind: 'check' }>;
 type Opaque = Extract<Obj, { kind: 'opaque' }>;
+type Table = Extract<Obj, { kind: 'table' }>;
 
 // ───── 假引擎 ─────
 
@@ -64,10 +66,11 @@ const coreTokens = (s: string): string[] =>
     .split(/\s+/)
     .filter(Boolean);
 
+/** 表的有效列（按名字）：分区子表没有自己的列，沿 partitionOf 用根父表的列 */
 const columnsByName = (m: Model, tableId: string): Map<string, Column> => {
+  const root = rootTableId(m, tableId);
   const out = new Map<string, Column>();
-  for (const o of Object.values(m.objects))
-    if (o.kind === 'column' && o.parent === tableId) out.set(o.name, o);
+  for (const o of Object.values(m.objects)) if (o.kind === 'column' && o.parent === root) out.set(o.name, o);
   return out;
 };
 
@@ -82,14 +85,23 @@ const canonExpr = (text: string, cols: Map<string, Column>, own?: Column): strin
   return own ? `${body}::${annot(own)}` : body;
 };
 
-/** 不透明对象 DDL 的规范形式：原文第一句 + 父对象与依赖的完整限定名、依赖列类型 */
-const canonDdl = (m: Model, o: Opaque): string[] => {
-  const sig = o.deps.map((d) => {
-    const dep = m.objects[d];
-    return `${fullName(m, d)}${dep?.kind === 'column' ? `:${annot(dep)}` : ''}`;
-  });
-  return [o.ddl[0]!, `-- canonical in ${fullName(m, o.parent)} deps ${sig.join(', ')}`];
-};
+/** 不透明对象依赖的签名：依赖的完整限定名、依赖列类型；依赖的不透明对象递归带上它自己的签名（带环保护） */
+const depsSig = (m: Model, o: Opaque, seen: Set<string>): string =>
+  o.deps
+    .map((d) => {
+      const dep = m.objects[d];
+      if (dep?.kind === 'column') return `${fullName(m, d)}:${annot(dep)}`;
+      if (dep?.kind === 'opaque' && !seen.has(d))
+        return `${fullName(m, d)}{${depsSig(m, dep, new Set([...seen, d]))}}`;
+      return fullName(m, d);
+    })
+    .join(', ');
+
+/** 不透明对象 DDL 的规范形式：原文第一句 + 父对象的完整限定名与依赖签名 */
+const canonDdl = (m: Model, o: Opaque): string[] => [
+  o.ddl[0]!,
+  `-- canonical in ${fullName(m, o.parent)} deps ${depsSig(m, o, new Set([o.id]))}`,
+];
 
 /** 假引擎对单个对象的规范形式（与它在模型 m 里的上下文有关） */
 const canonObj = (m: Model, o: Obj): Obj => {
@@ -235,8 +247,17 @@ type Edit =
   | { k: 'renameEnum'; e: number; name: number }
   | { k: 'renameSchema'; name: number }
   | { k: 'dropColumn'; c: number }
-  | { k: 'addView'; t: number; cols: number[]; tableDep: boolean; enumRef: number | null }
-  | { k: 'editViewDdl'; v: number; rev: number };
+  | {
+      k: 'addView';
+      t: number;
+      cols: number[];
+      tableDep: boolean;
+      enumRef: number | null;
+      viewDep?: number | null;
+    }
+  | { k: 'editViewDdl'; v: number; rev: number }
+  | { k: 'detachPartition'; t: number }
+  | { k: 'attachPartition'; t: number; p: number; lo: number };
 
 const idsOf = (m: Model, kind: Obj['kind'], f: (o: Obj) => boolean = () => true) =>
   Object.values(m.objects)
@@ -247,7 +268,8 @@ const idsOf = (m: Model, kind: Obj['kind'], f: (o: Obj) => boolean = () => true)
 const pick = <T>(xs: readonly T[], i: number): T | undefined => (xs.length ? xs[i % xs.length] : undefined);
 
 const exprText = (m: Model, tableId: string, e: ExprSpec): string | null => {
-  const cols = idsOf(m, 'column', (o) => (o as Column).parent === tableId).map(
+  const root = rootTableId(m, tableId);
+  const cols = idsOf(m, 'column', (o) => (o as Column).parent === root).map(
     (id) => (m.objects[id] as Column).name,
   );
   if (!cols.length) return null;
@@ -367,12 +389,17 @@ const applyEdit = (m: Model, e: Edit): boolean => {
         // 没有建视图的 mutator：模拟粘贴 / 导入带来的依赖某表的视图
         const t = pick(tables, e.t);
         if (!t) return false;
-        const tableCols = idsOf(m, 'column', (o) => (o as Column).parent === t);
+        const root = rootTableId(m, t);
+        const tableCols = idsOf(m, 'column', (o) => (o as Column).parent === root);
         const cols = [...new Set(e.cols.map((i) => pick(tableCols, i)).filter((x) => x !== undefined))];
-        // tableDep = false：只依赖列（否则表级判定 anyColumnChanged 会兜住列级判定，后者的缺陷就测不出来）
+        // tableDep = false：只依赖列（否则表级判定会兜住列级判定，后者的缺陷就测不出来）
         const deps = e.tableDep || !cols.length ? [t, ...cols] : cols;
         const en = e.enumRef === null ? undefined : pick(enums, e.enumRef);
         if (en) deps.push(en);
+        // 视图叠视图：再依赖一个已有的不透明对象（下游视图的 deps 里只有上游视图，没有底层表 / 列）
+        const up =
+          e.viewDep === null || e.viewDep === undefined ? undefined : pick(idsOf(m, 'opaque'), e.viewDep);
+        if (up) deps.push(up);
         const id = newId('v');
         m.objects[id] = {
           id,
@@ -395,6 +422,41 @@ const applyEdit = (m: Model, e: Edit): boolean => {
         o.ddl = [`${o.ddl[0]!.replace(/ \/\* rev \d+ \*\/$/, '')} /* rev ${e.rev} */`];
         return true;
       }
+      case 'detachPartition': {
+        // 脱离后子表物化出根父表的列（新 ID）；基线与当前模型的根表因此不同
+        const id = pick(
+          idsOf(m, 'table', (o) => (o as Table).partitionOf !== null),
+          e.t,
+        );
+        if (!id) return false;
+        runMutator(m, 'detachPartition', { id });
+        return true;
+      }
+      case 'attachPartition': {
+        // 只挑列名与分区父表一致的独立表（通常是先前脱离出来的子分区，可以自己也是分区表），否则挂载几乎总是被拒绝
+        const parent = pick(
+          idsOf(m, 'table', (o) => (o as Table).partitionBy !== null),
+          e.p,
+        );
+        const colNames = (t: string) => [...columnsByName(m, t).keys()].sort().join(',');
+        const child =
+          parent &&
+          pick(
+            idsOf(
+              m,
+              'table',
+              (o) =>
+                (o as Table).partitionOf === null &&
+                o.id !== rootTableId(m, parent) &&
+                colNames(o.id) === colNames(parent),
+            ),
+            e.t,
+          );
+        if (!child || !parent) return false;
+        const bound = `FOR VALUES FROM (${e.lo * 10}) TO (${e.lo * 10 + 10})`;
+        runMutator(m, 'attachPartition', { parent, child, bound });
+        return true;
+      }
     }
   } catch (err) {
     if (err instanceof EditError) return false;
@@ -414,6 +476,32 @@ const initialModel = (): Model => {
   runMutator(m, 'createTable', { id: 't2', schema: 's', name: 'items' });
   runMutator(m, 'addColumn', { table: 't2', column: { id: 'c4', name: 'score', type: 'integer' } });
   runMutator(m, 'addColumn', { table: 't2', column: { id: 'c5', name: 'flag', type: 'text' } });
+  // PG 分区家族 events(day 分区键, amount) → events_a（二级分区父表）→ events_a1：子分区没有自己的列
+  // （ID 排在上面的表 / 列之后，不改变已有固定序列里按下标挑中的对象）
+  runMutator(m, 'createTable', { id: 't3', schema: 's', name: 'events' });
+  runMutator(m, 'addColumn', {
+    table: 't3',
+    column: { id: 'c6', name: 'day', type: 'integer', notNull: true },
+  });
+  runMutator(m, 'addColumn', { table: 't3', column: { id: 'c7', name: 'amount', type: 'integer' } });
+  const byDay = {
+    strategy: 'range' as const,
+    keys: [{ column: 'c6', expr: null, opclass: null, collation: null }],
+  };
+  runMutator(m, 'setPartitionBy', { id: 't3', partitionBy: byDay });
+  runMutator(m, 'createPartition', {
+    id: 't31',
+    parent: 't3',
+    name: 'events_a',
+    bound: 'FOR VALUES FROM (0) TO (100)',
+  });
+  runMutator(m, 'setPartitionBy', { id: 't31', partitionBy: byDay });
+  runMutator(m, 'createPartition', {
+    id: 't311',
+    parent: 't31',
+    name: 'events_a1',
+    bound: 'FOR VALUES FROM (0) TO (10)',
+  });
   return m;
 };
 
@@ -489,9 +577,20 @@ const editArb: fc.Arbitrary<Edit> = fc.oneof(
       cols: fc.array(nat, { maxLength: 2 }),
       tableDep: fc.boolean(),
       enumRef: fc.option(nat),
+      viewDep: fc.option(nat),
     }),
   },
   { weight: 1, arbitrary: fc.record({ k: fc.constant('editViewDdl' as const), v: nat, rev: nat }) },
+  { weight: 1, arbitrary: fc.record({ k: fc.constant('detachPartition' as const), t: nat }) },
+  {
+    weight: 3,
+    arbitrary: fc.record({
+      k: fc.constant('attachPartition' as const),
+      t: nat,
+      p: nat,
+      lo: fc.integer({ min: 0, max: 30 }),
+    }),
+  },
 );
 const faultArb: fc.Arbitrary<Fault> = fc.oneof(
   { weight: 6, arbitrary: fc.constant({ kind: 'none' as const }) },
@@ -598,6 +697,10 @@ class World {
       const c = canonObj(next, o);
       if (!deepEqual(c, o)) {
         this.hit(`rewrite:${o.kind}`);
+        if ((o.kind === 'check' || o.kind === 'index') && rootTableId(next, o.parent) !== o.parent)
+          this.hit('rewrite:onPartitionChild');
+        if (o.kind === 'opaque' && o.deps.some((d) => next.objects[d]?.kind === 'opaque'))
+          this.hit('rewrite:opaque:onOpaque');
         out.push(structuredClone(c));
       }
     }
@@ -887,6 +990,8 @@ describe('OpaqueRefresher 黄金基线不变量（I1–I4）', () => {
           'dropColumn',
           'addView',
           'editViewDdl',
+          'detachPartition',
+          'attachPartition',
         ].map((k) => `edit:${k}`),
         'flush:clean',
         'flush:normalized',
@@ -897,6 +1002,8 @@ describe('OpaqueRefresher 黄金基线不变量（I1–I4）', () => {
         'rewrite:column',
         'rewrite:index',
         'rewrite:opaque',
+        'rewrite:onPartitionChild',
+        'rewrite:opaque:onOpaque',
         ...['nullShadow', 'shadowError', 'stepError', 'otherError', 'reject'].flatMap((k) => [
           `I3:flush:${k}`,
           `I3:normalize:${k}`,
@@ -926,19 +1033,19 @@ describe('OpaqueRefresher 黄金基线不变量（I1–I4）', () => {
   );
 });
 
-// ───── 已知缺陷（待修复，另提 Issue；修好后把这两条改成普通 test，直接 runOps([...]) 并去掉 expectViolation） ─────
+// ───── 回归：同表列名绑定变化后过期表达式漏判（#133，最初由本文件的随机序列发现） ─────
 //
-// 表达式按“列名”引用列，pendingRefreshIds 却只按“列 ID”比较同表列的 type / typeRef / collation（derive-pending.ts
-// columnTypeChanged / anyColumnChanged），不把同表列改名（名字 → 列的绑定变化）当作上下文变化。
-// 当 runWithoutReset / runWithResetIfClean 换入一份过期模型（例：画布历史），其中表达式原文与基线逐字相同、
-// 但同名列换成了另一列时，判定漏掉：
+// 表达式按“列名”引用列；判定曾只按“列 ID”比较同表列的 type / typeRef / collation，不把“名字 → 列”的绑定变化
+// 当作上下文变化。当 runWithoutReset / runWithResetIfClean 换入一份过期模型（例：画布历史），其中表达式原文与基线逐字相同、
+// 但同名列换成了另一列时，判定会漏掉：
 // 1. 列 c3(note) 改成 integer，加 CHECK note > 0，flush → 基线里 "(note::integer > 0)"；
 // 2. 再把 c3 改回 text（此刻的房间模型 H 进了历史：表达式原文过期，note 指向 c3:text）；
 // 3. c3 改名 rate、c1(qty, integer) 改名 note，把 CHECK 改成 note > 0，flush → 新基线 B："(note::integer > 0)"，note 指向 c1；
-// 4. runWithoutReset 换回 H：CHECK 原文与 B 相同，c1 / c3 的类型按 ID 都没变 → 不判待规范化，但 note 现在是 c3:text，
-//    规范形式应为 "(note::text > 0)"。出口 flush 0 I/O 返回 clean，迁移 / DDL / 漂移比较拿到的仍是过期原文（违反 I2）；
-//    若改走 runWithReset({ onlyIfClean: true })——它本该挡住未规范化模型——needsRefresh 为 false，
-//    这份模型还会被写成黄金基线（违反 I1）。这不依赖上面的前置条件：两种 API 本来就允许喂任意模型。
+// 4. runWithoutReset 换回 H：CHECK 原文与 B 相同，c1 / c3 的类型按 ID 都没变，但 note 现在是 c3:text，
+//    规范形式应为 "(note::text > 0)"。漏判时出口 flush 0 I/O 返回 clean（违反 I2）；
+//    若改走 runWithReset({ onlyIfClean: true })，这份模型还会被写成黄金基线（违反 I1）。
+// DROP_RECREATE 是同一缺陷的另一条路径：第 3 步改为先让 CHECK 脱钩、删掉 c3、新建同名异 ID 的 integer 列再改回，
+// 基线里根本没有 c3 这个 ID。现在判定按（分区根）表内列名对齐基线与当前模型，两条路径都不再漏判。
 const COLUMN_SWAP: Op[] = [
   { op: 'edit', edit: { k: 'setColumnType', c: 2, type: 0, enumRef: null } },
   { op: 'edit', edit: { k: 'addCheck', t: 0, e: { refs: [2], op: 0, lit: 0 } } },
@@ -949,28 +1056,29 @@ const COLUMN_SWAP: Op[] = [
   { op: 'edit', edit: { k: 'setCheckExpr', o: 0, e: { refs: [0], op: 0, lit: 0 } } },
   { op: 'flush', fault: { kind: 'none' } },
 ];
+const DROP_RECREATE: Op[] = [
+  ...COLUMN_SWAP.slice(0, 4),
+  { op: 'edit', edit: { k: 'setCheckExpr', o: 0, e: { refs: [0], op: 0, lit: 0 } } },
+  { op: 'edit', edit: { k: 'dropColumn', c: 2 } },
+  { op: 'edit', edit: { k: 'addColumn', t: 0, name: 2, type: 0, coll: 0 } },
+  { op: 'edit', edit: { k: 'setCheckExpr', o: 0, e: { refs: [2], op: 0, lit: 0 } } },
+  { op: 'flush', fault: { kind: 'none' } },
+];
 
-/** 只有命中预期的那条不变量才重新抛出（test.fails 算通过）；别的错误吞掉，让 test.fails 因“没有失败”而变红 */
-const expectViolation = async (ops: Op[], invariant: RegExp) => {
-  try {
-    await runOps(ops);
-  } catch (e) {
-    if (e instanceof Error && invariant.test(e.message)) throw e;
-  }
-};
-
-describe('已知缺陷：同表列名对调后过期表达式漏判', () => {
+describe('回归：同表列名绑定变化后过期表达式不漏判（#133）', () => {
   // history[4] 是第 4 步之后的房间模型 H
-  test.fails('runWithoutReset 换入过期模型后漏判（I2）', () =>
-    expectViolation(
-      [...COLUMN_SWAP, { op: 'runWithoutReset', h: 4 }],
-      /^I2：第 9 步后[\s\S]*"kind":"check"[\s\S]*\(note::text > 0\)/,
-    ));
-  test.fails('runWithReset({ onlyIfClean: true }) 把未规范化模型写成基线（I1）', () =>
-    expectViolation(
-      [...COLUMN_SWAP, { op: 'runWithResetIfClean', h: 4, canonical: false }],
-      /^I1：第 9 步后[\s\S]*"kind":"check"[\s\S]*\(note::text > 0\)/,
-    ));
+  test.each([
+    ['列名对调', COLUMN_SWAP],
+    ['删列后新建同名异 ID 列', DROP_RECREATE],
+  ] as const)('%s：runWithoutReset 换入过期模型（I2）', (_, ops) =>
+    runOps([...ops, { op: 'runWithoutReset', h: 4 }]),
+  );
+  test.each([
+    ['列名对调', COLUMN_SWAP],
+    ['删列后新建同名异 ID 列', DROP_RECREATE],
+  ] as const)('%s：runWithReset({ onlyIfClean: true }) 不把未规范化模型写成基线（I1）', (_, ops) =>
+    runOps([...ops, { op: 'runWithResetIfClean', h: 4, canonical: false }]),
+  );
   // 严格差分对照：只去掉两次 renameColumn，保留其余全部步骤（含 setCheckExpr 与第二次 flush）
   test('对照：不对调列名时同一序列满足全部不变量', async () => {
     const noSwap = COLUMN_SWAP.filter((op) => op.op !== 'edit' || op.edit.k !== 'renameColumn');

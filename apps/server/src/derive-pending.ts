@@ -1,9 +1,18 @@
 // 派生数据的“待规范化”判定（纯函数，0 影子库 I/O）：derive.ts 的 flush / status、shadow.ts 的 canonicalize 共用。
 // 基线（branches.baseline）是一份“确定已在影子库里规范化过”的模型；当前模型相对基线有下列变化的对象才需要回影子库：
-// - 不透明对象：依赖或所在父对象改了名；引用列（直接依赖的列，或依赖表里的列）的类型 / 枚举引用 / 排序规则变了；DDL 文本变了；
-// - 带表达式的普通对象（CHECK、默认值、生成列、表达式索引、分区键 / 分区边界）：表达式变了，
-//   或同一张表里已有列的类型 / 枚举引用 / 排序规则变了（引擎读回的规范形式可能跟着变，如加上的类型转换）。
-import { deepEqual, type Model, type Obj } from '@dowel/core';
+// - 带表达式的普通对象（CHECK、默认值、生成列、表达式索引、分区键表达式 / 分区边界）：表达式变了；
+//   或所在表的列上下文变了（引擎读回的规范形式可能跟着变，如加上的类型转换）。表达式按列名引用列，
+//   所以按列名对齐基线与当前模型的列：某个两边都有的列名，对应列的类型 / 枚举引用 / 排序规则不同就算变了
+//   （同表列改类型，也包括列名对调、删列后新建同名列，#133）；只在一边出现的列名（新增 / 删除 / 改名到新名字）不算。
+//   分区子表没有自己的列，沿 partitionOf 用根父表的列（两个模型各自解析根表，覆盖多级分区与 attach / detach，#134）。
+//   列自己的默认值 / 生成列另外按 ID 比较列自身的类型（列改名的同时改类型时，按名字对不上）。
+//   只有分区边界、没有表达式分区键的表不看列上下文：边界只取决于分区键列的类型，而分区键引用的列不能改类型 / 删除；
+// - 不透明对象：依赖或所在父对象改了名；依赖的列（按 ID，及按它在表里的列名对齐）或依赖 / 父对象表的列上下文变了；
+//   DDL 文本变了；或依赖的不透明对象本身待规范化（视图叠视图，沿依赖传递，带环保护，#136）。
+import { deepEqual, type Model, type Obj, rootTableId } from '@dowel/core';
+
+type Column = Extract<Obj, { kind: 'column' }>;
+type Table = Extract<Obj, { kind: 'table' }>;
 
 /** 对象的完整限定名（沿 parent 链拼接），用于判断是否改了名 */
 export const fullName = (m: Model, id: string): string | null => {
@@ -40,16 +49,68 @@ export const exprsOf = (o: Obj | undefined): unknown => {
   }
 };
 
-/** 新旧两边都存在的列：类型、枚举引用或排序规则变了 */
+/** 表是否有表达式分区键（与 exprsOf 的判断一致） */
+const hasPartitionExprs = (o: Table): boolean =>
+  !!o.partitionBy && typeof o.partitionBy !== 'string' && o.partitionBy.keys.some((k) => k.expr);
+
+/** 列的类型上下文：类型、枚举引用、排序规则 */
+const colSig = (c: Column): string => JSON.stringify([c.type, c.typeRef, c.collation]);
+
+/** 新旧两边都存在的同一列（按 ID）：类型、枚举引用或排序规则变了 */
 const columnTypeChanged = (base: Model, cur: Model, id: string): boolean => {
   const a = base.objects[id];
   const b = cur.objects[id];
   if (a?.kind !== 'column' || b?.kind !== 'column') return false;
-  return a.type !== b.type || a.typeRef !== b.typeRef || a.collation !== b.collation;
+  return colSig(a) !== colSig(b);
+};
+
+const sameSet = (a: readonly string[], b: readonly string[]): boolean => {
+  const x = new Set(a);
+  const y = new Set(b);
+  return x.size === y.size && [...x].every((v) => y.has(v));
 };
 
 /** 一份“空基线”：没有任何对象，相当于从零规范化整个模型 */
 export const emptyBaseline = (cur: Model): Model => ({ ...cur, objects: {} });
+
+/** 方言里列名是否大小写不敏感（与 checkExprColumns 一致） */
+const caseInsensitive = (m: Model) =>
+  m.dialect === 'sqlite' || m.dialect === 'mysql' || m.dialect === 'mssql';
+
+/**
+ * 一个模型里“表 → 列名 → 列类型上下文”的惰性索引：表沿 partitionOf 解析到根父表；
+ * 同一个（折叠大小写后的）列名对应多列时把它们的签名排序拼起来（只会更容易判为变化）。
+ */
+const columnContext = (m: Model) => {
+  let byTable: Map<string, Column[]> | null = null;
+  const byRoot = new Map<string, Map<string, string>>();
+  const fold = caseInsensitive(m) ? (n: string) => n.toLowerCase() : (n: string) => n;
+  const sigs = (tableId: string): Map<string, string> => {
+    const root = rootTableId(m, tableId);
+    let out = byRoot.get(root);
+    if (out) return out;
+    if (!byTable) {
+      byTable = new Map();
+      for (const o of Object.values(m.objects)) {
+        if (o.kind !== 'column') continue;
+        const list = byTable.get(o.parent);
+        if (list) list.push(o);
+        else byTable.set(o.parent, [o]);
+      }
+    }
+    const grouped = new Map<string, string[]>();
+    for (const c of byTable.get(root) ?? []) {
+      const k = fold(c.name);
+      const list = grouped.get(k);
+      if (list) list.push(colSig(c));
+      else grouped.set(k, [colSig(c)]);
+    }
+    out = new Map([...grouped].map(([k, v]) => [k, v.sort().join('|')]));
+    byRoot.set(root, out);
+    return out;
+  };
+  return { sigs, fold };
+};
 
 /**
  * 当前模型相对基线需要回影子库规范化的对象 ID（按模型里的顺序）。
@@ -62,62 +123,96 @@ export const pendingRefreshIds = (baseline: Model | null, cur: Model): string[] 
     const y = fullName(cur, id);
     return x !== null && y !== null && x !== y;
   };
-  // 表 → 当前模型中它的列（只在需要时建一次）
-  let columnsByTable: Map<string, string[]> | null = null;
-  const columnsOf = (tableId: string): string[] => {
-    if (!columnsByTable) {
-      columnsByTable = new Map();
-      for (const o of Object.values(cur.objects)) {
-        if (o.kind !== 'column') continue;
-        const list = columnsByTable.get(o.parent);
-        if (list) list.push(o.id);
-        else columnsByTable.set(o.parent, [o.id]);
-      }
-    }
-    return columnsByTable.get(tableId) ?? [];
-  };
-  const tableColsChanged = new Map<string, boolean>();
-  const anyColumnChanged = (tableId: string): boolean => {
-    let v = tableColsChanged.get(tableId);
+  const baseCtx = columnContext(base);
+  const curCtx = columnContext(cur);
+  // 表（各自解析到根父表）的列上下文是否变了：两边都有的列名，签名不同
+  const tableChanged = new Map<string, boolean>();
+  const tableCtxChanged = (tableId: string): boolean => {
+    let v = tableChanged.get(tableId);
     if (v === undefined) {
-      v = columnsOf(tableId).some((c) => columnTypeChanged(base, cur, c));
-      tableColsChanged.set(tableId, v);
+      const a = baseCtx.sigs(tableId);
+      v = false;
+      for (const [name, sig] of curCtx.sigs(tableId)) {
+        const old = a.get(name);
+        if (old !== undefined && old !== sig) {
+          v = true;
+          break;
+        }
+      }
+      tableChanged.set(tableId, v);
     }
     return v;
   };
-  /** 表达式所在的表：列 / CHECK / 索引是 parent，表就是自己 */
+  // 不透明对象依赖的某一列：按 ID 变了类型，或按它现在的列名在所在（根）表里对应的列换了类型上下文
+  const depColumnChanged = (col: Column): boolean => {
+    if (columnTypeChanged(base, cur, col.id)) return true;
+    const k = curCtx.fold(col.name);
+    const old = baseCtx.sigs(col.parent).get(k);
+    return old !== undefined && old !== curCtx.sigs(col.parent).get(k);
+  };
+  /** 表达式按列名引用的那张表：CHECK / 索引 / 列是 parent；有表达式分区键的表是自己；否则不看列上下文 */
   const tableOf = (o: Obj): string | null => {
-    if (o.kind === 'table') return o.id;
+    if (o.kind === 'table') return hasPartitionExprs(o) ? o.id : null;
     if (o.kind === 'column' || o.kind === 'check' || o.kind === 'index') return o.parent;
     return null;
   };
 
-  const out: string[] = [];
+  const pending = new Set<string>();
+  const opaques: Extract<Obj, { kind: 'opaque' }>[] = [];
   for (const o of Object.values(cur.objects)) {
     if (o.kind === 'opaque') {
+      opaques.push(o);
       const deps = [...o.deps, o.parent];
-      const pending =
+      const was = base.objects[o.id];
+      const direct =
+        // 依赖换了对象（如 attach / detach 把列依赖改指根父表列 / 物化出的新列）：引用的名字可能跟着变
+        (was?.kind === 'opaque' && !sameSet(was.deps, o.deps)) ||
         deps.some(renamed) ||
-        o.deps.some((d) => {
+        deps.some((d) => {
           const dep = cur.objects[d];
-          if (dep?.kind === 'column') return columnTypeChanged(base, cur, d);
-          if (dep?.kind === 'table') return anyColumnChanged(d);
+          if (dep?.kind === 'column') return depColumnChanged(dep);
+          if (dep?.kind === 'table') return tableCtxChanged(d);
           return false;
         }) ||
         !deepEqual(exprsOf(o), exprsOf(base.objects[o.id]));
-      if (pending) out.push(o.id);
+      if (direct) pending.add(o.id);
       continue;
     }
     const e = exprsOf(o);
     if (e === null) continue;
     if (!deepEqual(e, exprsOf(base.objects[o.id]))) {
-      out.push(o.id);
+      pending.add(o.id);
+      continue;
+    }
+    if (o.kind === 'column' && columnTypeChanged(base, cur, o.id)) {
+      pending.add(o.id);
       continue;
     }
     const t = tableOf(o);
-    if (t !== null && anyColumnChanged(t)) out.push(o.id);
+    if (t !== null && tableCtxChanged(t)) pending.add(o.id);
   }
-  return out;
+
+  // 依赖传递：上游不透明对象待规范化，依赖它（deps 或 parent）的下游不透明对象也待规范化。
+  // 集合只增不减，每个对象最多入队一次，环状依赖自然终止。
+  const dependents = new Map<string, string[]>();
+  for (const o of opaques) {
+    for (const d of new Set([...o.deps, o.parent])) {
+      if (cur.objects[d]?.kind !== 'opaque') continue;
+      const list = dependents.get(d);
+      if (list) list.push(o.id);
+      else dependents.set(d, [o.id]);
+    }
+  }
+  const queue = opaques.filter((o) => pending.has(o.id)).map((o) => o.id);
+  while (queue.length) {
+    for (const id of dependents.get(queue.pop()!) ?? []) {
+      if (pending.has(id)) continue;
+      pending.add(id);
+      queue.push(id);
+    }
+  }
+
+  return Object.keys(cur.objects).filter((id) => pending.has(id));
 };
 
 /** 当前模型相对基线是否存在待规范化的表达式或依赖变化的不透明对象 */
@@ -127,6 +222,7 @@ export const needsRefresh = (baseline: Model | null, cur: Model): boolean =>
 /**
  * next 中是否有不透明对象的依赖 / 父对象相对 prev 改了名：这种情况必须从 prev 增量迁移（让引擎改写 DDL 里的引用），
  * 不能直接从空库建出 next（next 里的不透明对象 DDL 还引用着旧名字）。
+ * 只看直接依赖：每个对象的 DDL 只写着它直接引用的名字，上游改名不会让下游 DDL 里的文本过期。
  */
 export const hasRenamedOpaqueDeps = (prev: Model, next: Model): boolean => {
   const renamed = (id: string) => {
