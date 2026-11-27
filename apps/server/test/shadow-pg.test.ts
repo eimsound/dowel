@@ -4,9 +4,11 @@
 import {
   addCheck,
   addColumn,
+  attachPartition,
   createPartition,
   createSchema,
   createTable,
+  detachPartition,
   emptyModel,
   ident,
   literal,
@@ -1473,6 +1475,75 @@ describe.skipIf(!PG_URL)('待规范化判定与真实 PG 读回一致（#134）'
       expect(after?.expr).toBeDefined();
       expect(after?.expr).not.toBe(before);
       expect(after?.expr).toContain('numeric');
+    } finally {
+      await shadow.close();
+      await shadowDb.close();
+    }
+  });
+
+  test('分区子表边界：父表分区键从 date 切换/改类型为 timestamp 后判为待规范化，PG 读回边界变为 timestamp 格式', async () => {
+    const shadowDb = await createTestDb('derive_pending_part_bound');
+    await claimShadow(shadowDb.url);
+    const shadow = pgShadow(shadowDb.url);
+    try {
+      const m = emptyModel();
+      const pub = createSchema(m, 'public', 's-pub');
+      const events = createTable(m, pub, 'events', 't-events');
+      const day = addColumn(m, events, { name: 'day', type: 'date', notNull: true, id: 'c-day' });
+      const ts = addColumn(m, events, { name: 'ts', type: 'timestamp', notNull: true, id: 'c-ts' });
+      setPartitionBy(m, events, {
+        strategy: 'range',
+        keys: [{ column: day, expr: null, opclass: null, collation: null }],
+      });
+      const child = createPartition(
+        m,
+        events,
+        'events_2020',
+        "FOR VALUES FROM ('2020-01-01') TO ('2021-01-01')",
+        't-events-2020',
+      );
+      const good = structuredClone(m);
+      for (const o of await shadow.canonicalize(emptyModel(), m)) good.objects[o.id] = o;
+      const before = (good.objects[child] as Table).partitionOf!.bound;
+
+      // 路径 A：有子分区时直接 setPartitionBy 切换到 timestamp 列
+      const curA = structuredClone(good);
+      setPartitionBy(curA, events, {
+        strategy: 'range',
+        keys: [{ column: ts, expr: null, opclass: null, collation: null }],
+      });
+      expect(pendingRefreshIds(good, curA)).toContain(child);
+      const changedA = await shadow.canonicalize(good, curA);
+      const afterA = changedA.find((o): o is Table => o.kind === 'table' && o.id === child);
+      expect(afterA?.partitionOf?.bound).toBeDefined();
+      expect(afterA?.partitionOf?.bound).not.toBe(before);
+      expect(afterA?.partitionOf?.bound).toBe(
+        "FOR VALUES FROM ('2020-01-01 00:00:00') TO ('2021-01-01 00:00:00')",
+      );
+      const goodA = structuredClone(curA);
+      for (const o of changedA) goodA.objects[o.id] = o;
+      expect(pendingRefreshIds(goodA, structuredClone(goodA))).toEqual([]);
+
+      // 路径 A2：detach → 取消分区 → 改键列为 timestamp → 重新分区 → 用原边界原文 attach
+      const curA2 = structuredClone(good);
+      detachPartition(curA2, child);
+      setPartitionBy(curA2, events, null);
+      setColumnType(curA2, day, 'timestamp');
+      setPartitionBy(curA2, events, {
+        strategy: 'range',
+        keys: [{ column: day, expr: null, opclass: null, collation: null }],
+      });
+      const childDay = Object.values(curA2.objects).find(
+        (o) => o.kind === 'column' && o.parent === child && o.name === 'day',
+      )!;
+      setColumnType(curA2, childDay.id, 'timestamp');
+      attachPartition(curA2, events, child, before);
+      expect(pendingRefreshIds(good, curA2)).toContain(child);
+      const changedA2 = await shadow.canonicalize(good, curA2);
+      const afterA2 = changedA2.find((o): o is Table => o.kind === 'table' && o.id === child);
+      expect(afterA2?.partitionOf?.bound).toBe(
+        "FOR VALUES FROM ('2020-01-01 00:00:00') TO ('2021-01-01 00:00:00')",
+      );
     } finally {
       await shadow.close();
       await shadowDb.close();

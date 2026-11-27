@@ -25,7 +25,18 @@
 //
 // 运行次数 DERIVE_RUNS（默认 200）、种子 DERIVE_SEED（默认固定）；失败时 fast-check 打印种子、路径和缩小后的操作序列。
 // 深挖：DERIVE_RUNS=5000 DERIVE_SEED=<n>；DERIVE_STATS=1 加 --silent=false 打印各类操作 / 结果的命中次数。
-import { deepEqual, EditError, emptyModel, type Model, type Obj, rootTableId, runMutator } from '@dowel/core';
+import {
+  deepEqual,
+  EditError,
+  emptyModel,
+  formatPartitionBound,
+  type Model,
+  type Obj,
+  parsePartitionBound,
+  resolvePartitionBy,
+  rootTableId,
+  runMutator,
+} from '@dowel/core';
 import { StepError } from '@dowel/verifier';
 import fc from 'fast-check';
 import { describe, expect, test, vi } from 'vitest';
@@ -103,9 +114,73 @@ const canonDdl = (m: Model, o: Opaque): string[] => [
   `-- canonical in ${fullName(m, o.parent)} deps ${depsSig(m, o, new Set([o.id]))}`,
 ];
 
+const safeTok = (s: string): string => s.replace(/[^A-Za-z0-9_]+/g, '_').replace(/^_+|_+$/g, '') || 'x';
+
+/** 直接父表分区键的签名片段：覆盖 strategy、每个键的列类型上下文（含枚举限定名）或规范化表达式键、opclass、collation */
+const partKeySig = (m: Model, parentId: string): string => {
+  const p = m.objects[parentId];
+  if (p?.kind !== 'table' || !p.partitionBy) return 'none';
+  const spec = resolvePartitionBy(m, p);
+  if (!spec) return `raw_${typeof p.partitionBy === 'string' ? safeTok(p.partitionBy) : 'spec'}`;
+  const cols = columnsByName(m, parentId);
+  const keys = spec.keys.map((k) => {
+    const extra = `${k.opclass ? `_op_${safeTok(k.opclass)}` : ''}${k.collation ? `_co_${safeTok(k.collation)}` : ''}`;
+    if (k.column !== null) {
+      const col = m.objects[k.column];
+      if (col?.kind !== 'column') return `missing_${safeTok(k.column)}${extra}`;
+      const en = col.typeRef ? `_en_${safeTok(fullName(m, col.typeRef) ?? '')}` : '';
+      return `col_${safeTok(annot(col))}${en}${extra}`;
+    }
+    return `expr_${safeTok(canonExpr(k.expr!, cols))}${extra}`;
+  });
+  return `${spec.strategy}__${keys.join('__')}`;
+};
+
+const stripBoundAnnot = (v: string): string => v.replace(/::[A-Za-z0-9_]+$/g, '').trim();
+
+/** 分区边界的规范形式：给 FROM/TO 或 IN 内的每个边界值标上直接父表的分区键签名（幂等且保持 parsePartitionBound 合法） */
+const canonBound = (m: Model, o: Table): string => {
+  const pof = o.partitionOf!;
+  const parsed = parsePartitionBound(pof.bound);
+  if (!parsed) return pof.bound;
+  const sig = partKeySig(m, pof.parent);
+  if (parsed.kind === 'range') {
+    return formatPartitionBound({
+      kind: 'range',
+      from: parsed.from.map((v) => `${stripBoundAnnot(v)}::${sig}`),
+      to: parsed.to.map((v) => `${stripBoundAnnot(v)}::${sig}`),
+    });
+  }
+  if (parsed.kind === 'list') {
+    return formatPartitionBound({
+      kind: 'list',
+      values: parsed.values.map((v) => `${stripBoundAnnot(v)}::${sig}`),
+    });
+  }
+  return pof.bound;
+};
+
 /** 假引擎对单个对象的规范形式（与它在模型 m 里的上下文有关） */
 const canonObj = (m: Model, o: Obj): Obj => {
   switch (o.kind) {
+    case 'table': {
+      let changed = false;
+      let partitionBy = o.partitionBy;
+      if (partitionBy && typeof partitionBy !== 'string' && partitionBy.keys.some((k) => k.expr)) {
+        const cols = columnsByName(m, o.id);
+        partitionBy = {
+          ...partitionBy,
+          keys: partitionBy.keys.map((k) => (k.expr ? { ...k, expr: canonExpr(k.expr, cols) } : k)),
+        };
+        changed = true;
+      }
+      let partitionOf = o.partitionOf;
+      if (partitionOf) {
+        partitionOf = { ...partitionOf, bound: canonBound(m, o) };
+        changed = true;
+      }
+      return changed ? { ...o, partitionBy, partitionOf } : o;
+    }
     case 'check':
       return { ...o, expr: canonExpr(o.expr, columnsByName(m, o.parent)) };
     case 'index': {
@@ -257,7 +332,8 @@ type Edit =
     }
   | { k: 'editViewDdl'; v: number; rev: number }
   | { k: 'detachPartition'; t: number }
-  | { k: 'attachPartition'; t: number; p: number; lo: number };
+  | { k: 'attachPartition'; t: number; p: number; lo: number }
+  | { k: 'setPartitionBy'; t: number; col: number; expr: ExprSpec | null };
 
 const idsOf = (m: Model, kind: Obj['kind'], f: (o: Obj) => boolean = () => true) =>
   Object.values(m.objects)
@@ -457,6 +533,41 @@ const applyEdit = (m: Model, e: Edit): boolean => {
         runMutator(m, 'attachPartition', { parent, child, bound });
         return true;
       }
+      case 'setPartitionBy': {
+        const t = pick(
+          idsOf(m, 'table', (o) => (o as Table).partitionBy !== null),
+          e.t,
+        );
+        if (!t) return false;
+        const spec = resolvePartitionBy(m, m.objects[t] as Table);
+        if (!spec) return false;
+        if (e.expr !== null) {
+          const expr = exprText(m, t, e.expr);
+          if (!expr) return false;
+          runMutator(m, 'setPartitionBy', {
+            id: t,
+            partitionBy: {
+              strategy: spec.strategy,
+              keys: [{ column: null, expr, opclass: null, collation: null }],
+            },
+          });
+          return true;
+        }
+        const root = rootTableId(m, t);
+        const curCol = spec.keys.length === 1 ? spec.keys[0]!.column : null;
+        const cols = idsOf(m, 'column', (o) => (o as Column).parent === root && !(o as Column).generated);
+        const other = cols.filter((cid) => cid !== curCol);
+        const col = pick(other.length ? other : cols, e.col);
+        if (!col) return false;
+        runMutator(m, 'setPartitionBy', {
+          id: t,
+          partitionBy: {
+            strategy: spec.strategy,
+            keys: [{ column: col, expr: null, opclass: null, collation: null }],
+          },
+        });
+        return true;
+      }
     }
   } catch (err) {
     if (err instanceof EditError) return false;
@@ -589,6 +700,15 @@ const editArb: fc.Arbitrary<Edit> = fc.oneof(
       t: nat,
       p: nat,
       lo: fc.integer({ min: 0, max: 30 }),
+    }),
+  },
+  {
+    weight: 2,
+    arbitrary: fc.record({
+      k: fc.constant('setPartitionBy' as const),
+      t: nat,
+      col: nat,
+      expr: fc.option(exprArb, { freq: 3 }),
     }),
   },
 );
@@ -992,6 +1112,7 @@ describe('OpaqueRefresher 黄金基线不变量（I1–I4）', () => {
           'editViewDdl',
           'detachPartition',
           'attachPartition',
+          'setPartitionBy',
         ].map((k) => `edit:${k}`),
         'flush:clean',
         'flush:normalized',
@@ -1002,6 +1123,7 @@ describe('OpaqueRefresher 黄金基线不变量（I1–I4）', () => {
         'rewrite:column',
         'rewrite:index',
         'rewrite:opaque',
+        'rewrite:table',
         'rewrite:onPartitionChild',
         'rewrite:opaque:onOpaque',
         ...['nullShadow', 'shadowError', 'stepError', 'otherError', 'reject'].flatMap((k) => [

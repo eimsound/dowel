@@ -601,6 +601,184 @@ describe('pendingRefreshIds：分区子表按根父表解析列（#134）', () =
     setType(detached, amount.id, 'numeric');
     expect(pendingRefreshIds(good, detached)).toEqual(['k']);
   });
+
+  test('detach 改写视图 deps（列依赖指向新物化的列）：DDL 原文不变也检出，flush 后不误报', async () => {
+    const good = partitionFamily();
+    good.objects.v = {
+      ...opaqueView(['lf', 'pa']),
+      ddl: ['CREATE VIEW public.big_orders AS SELECT amount FROM public.events_a1'],
+    } as Obj;
+    const detached = structuredClone(good);
+    runMutator(detached, 'detachPartition', { id: 'lf' });
+    const vDetached = detached.objects.v as Extract<Obj, { kind: 'opaque' }>;
+    expect(vDetached.deps).not.toContain('pa');
+    expect(vDetached.ddl).toEqual((good.objects.v as Extract<Obj, { kind: 'opaque' }>).ddl);
+    expect(pendingRefreshIds(good, detached)).toEqual(['v']);
+
+    // flush 一次规范化后推进基线，再次 flush 0 I/O 返回 clean（非稳态误报）
+    const live = { m: structuredClone(detached), seq: 0 };
+    const { saved, store } = memStore();
+    const calls = { n: 0 };
+    const r = new OpaqueRefresher(memRooms(live), async () => canonicalShadow(calls), store);
+    await r.reset('b', good);
+    await expect(r.flush('b')).resolves.toMatchObject({ kind: 'normalized' });
+    expect(calls.n).toBe(1);
+    expect(needsRefresh(saved.at(-1)!, live.m)).toBe(false);
+    await expect(r.flush('b')).resolves.toMatchObject({ kind: 'clean', seq: live.seq });
+    expect(calls.n).toBe(1);
+  });
+
+  test('反例 A：有子分区时直接 setPartitionBy 换分区键列，只带边界的子分区检出并在 flush 后归零', async () => {
+    const good = emptyModel();
+    runMutator(good, 'createSchema', { id: 's', name: 'public' });
+    runMutator(good, 'createTable', { id: 'p', schema: 's', name: 'events' });
+    runMutator(good, 'addColumn', {
+      table: 'p',
+      column: { id: 'pd', name: 'day', type: 'date', notNull: true },
+    });
+    runMutator(good, 'addColumn', {
+      table: 'p',
+      column: { id: 'pt', name: 'ts', type: 'timestamp', notNull: true },
+    });
+    runMutator(good, 'setPartitionBy', {
+      id: 'p',
+      partitionBy: {
+        strategy: 'range',
+        keys: [{ column: 'pd', expr: null, opclass: null, collation: null }],
+      },
+    });
+    runMutator(good, 'createPartition', {
+      id: 'c',
+      parent: 'p',
+      name: 'events_2020',
+      bound: "FOR VALUES FROM ('2020-01-01') TO ('2021-01-01')",
+    });
+
+    const cur = structuredClone(good);
+    runMutator(cur, 'setPartitionBy', {
+      id: 'p',
+      partitionBy: {
+        strategy: 'range',
+        keys: [{ column: 'pt', expr: null, opclass: null, collation: null }],
+      },
+    });
+    expect(pendingRefreshIds(good, cur)).toEqual(['c']);
+
+    const live = { m: structuredClone(cur), seq: 0 };
+    const { saved, store } = memStore();
+    const calls = { n: 0 };
+    const r = new OpaqueRefresher(memRooms(live), async () => canonicalShadow(calls), store);
+    await r.reset('b', good);
+    await expect(r.flush('b')).resolves.toMatchObject({ kind: 'normalized' });
+    expect(calls.n).toBe(1);
+    expect(needsRefresh(saved.at(-1)!, live.m)).toBe(false);
+    await expect(r.flush('b')).resolves.toMatchObject({ kind: 'clean', seq: live.seq });
+    expect(calls.n).toBe(1);
+  });
+
+  test('反例 A2：detach → 取消分区 → 改键列类型 → 重新分区 → attach（全走普通 mutator）检出并在稳态归零', () => {
+    const good = emptyModel();
+    runMutator(good, 'createSchema', { id: 's', name: 'public' });
+    runMutator(good, 'createTable', { id: 'p', schema: 's', name: 'events' });
+    runMutator(good, 'addColumn', {
+      table: 'p',
+      column: { id: 'pd', name: 'day', type: 'date', notNull: true },
+    });
+    runMutator(good, 'setPartitionBy', {
+      id: 'p',
+      partitionBy: {
+        strategy: 'range',
+        keys: [{ column: 'pd', expr: null, opclass: null, collation: null }],
+      },
+    });
+    runMutator(good, 'createPartition', {
+      id: 'c',
+      parent: 'p',
+      name: 'events_2020',
+      bound: "FOR VALUES FROM ('2020-01-01') TO ('2021-01-01')",
+    });
+
+    const cur = structuredClone(good);
+    runMutator(cur, 'detachPartition', { id: 'c' });
+    runMutator(cur, 'setPartitionBy', { id: 'p', partitionBy: null });
+    setType(cur, 'pd', 'timestamp');
+    runMutator(cur, 'setPartitionBy', {
+      id: 'p',
+      partitionBy: {
+        strategy: 'range',
+        keys: [{ column: 'pd', expr: null, opclass: null, collation: null }],
+      },
+    });
+    const childDay = Object.values(cur.objects).find(
+      (o) => o.kind === 'column' && o.parent === 'c' && o.name === 'day',
+    )!;
+    setType(cur, childDay.id, 'timestamp');
+    runMutator(cur, 'attachPartition', {
+      parent: 'p',
+      child: 'c',
+      bound: "FOR VALUES FROM ('2020-01-01') TO ('2021-01-01')",
+    });
+
+    expect(pendingRefreshIds(good, cur)).toEqual(['c']);
+    expect(pendingRefreshIds(cur, structuredClone(cur))).toEqual([]);
+  });
+
+  test('多级分区只比较直接父表分区键，非键列改类型不对只有边界的子分区误报', () => {
+    const good = partitionFamily();
+    runMutator(good, 'addColumn', {
+      table: 'p',
+      column: { id: 'pts', name: 'ts', type: 'timestamp', notNull: true },
+    });
+    // 改非分区键列 amount 类型：只有边界的 ch / lf 不误报
+    const nonKeyChanged = structuredClone(good);
+    setType(nonKeyChanged, 'pa', 'numeric');
+    expect(pendingRefreshIds(good, nonKeyChanged)).toEqual([]);
+
+    // 仅二级父表 ch 换分区键列：只检出直接子分区 lf，不误报 ch
+    const subKeyChanged = structuredClone(good);
+    runMutator(subKeyChanged, 'setPartitionBy', {
+      id: 'ch',
+      partitionBy: {
+        strategy: 'range',
+        keys: [{ column: 'pts', expr: null, opclass: null, collation: null }],
+      },
+    });
+    expect(pendingRefreshIds(good, subKeyChanged)).toEqual(['lf']);
+  });
+
+  test('表达式分区键父表列类型变化与单边缺失父表时检出子分区', () => {
+    const good = emptyModel();
+    runMutator(good, 'createSchema', { id: 's', name: 'public' });
+    runMutator(good, 'createTable', { id: 'p', schema: 's', name: 'tags' });
+    runMutator(good, 'addColumn', {
+      table: 'p',
+      column: { id: 'pc', name: 'code', type: 'text', notNull: true },
+    });
+    runMutator(good, 'setPartitionBy', {
+      id: 'p',
+      partitionBy: {
+        strategy: 'range',
+        keys: [{ column: null, expr: 'lower(code)', opclass: null, collation: null }],
+      },
+    });
+    runMutator(good, 'createPartition', {
+      id: 'c',
+      parent: 'p',
+      name: 'tags_a',
+      bound: "FOR VALUES FROM ('a') TO ('m')",
+    });
+
+    // 模拟快照替换：表达式原文不变，父表键引用的列类型变为 varchar(20)
+    const typed = structuredClone(good);
+    (typed.objects.pc as { type: string }).type = 'varchar(20)';
+    expect(pendingRefreshIds(good, typed)).toEqual(['p', 'c']);
+
+    // 父表仅在一边缺失
+    const missingParent = structuredClone(good);
+    delete missingParent.objects.p;
+    expect(pendingRefreshIds(good, missingParent)).toEqual(['c']);
+    expect(pendingRefreshIds(missingParent, structuredClone(missingParent))).toEqual([]);
+  });
 });
 
 const view = (id: string, deps: string[], extra: Partial<Obj> = {}): Obj =>
