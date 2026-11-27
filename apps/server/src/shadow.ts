@@ -384,6 +384,31 @@ const probeInferred = async (d: Db, m: Model, cols: readonly Column[]): Promise<
   return out;
 };
 
+/**
+ * 判断 SQL Server 持久化计算列在 canonicalize 后是否需要经影子库临时非持久化列探测表达式推断可空性（ADR 0019）。
+ *
+ * 不变量：推断结果绝不依赖影子库表的构建路径（从零建 vs 从 prev 增量迁移）。
+ * SQL Server 物理列 `is_nullable = 0` 等价于「物理列带显式 NOT NULL 或 表达式被推断为非空」：
+ * - 读回已可空（`readBackNonNull === false`）：两项必全为假，推断值必为 false，无需探测；
+ * - 读回非空（`readBackNonNull === true`）：只有当该列在本次构建中确定是以**非显式**从零新建
+ *   （`!nextCol.notNull`，且本次走整库从零构建 `builtFromScratch` 或该表在 `prev` 中不存在）时，
+ *   物理列绝不可能带有显式 NOT NULL，读回非空必纯属引擎推断，可省去探测；
+ *   其余所有情况（`nextCol.notNull` 为真，或该表已存在于 `prev` 走增量迁移——物理列可能保留了
+ *   `prev` 的显式 NOT NULL，不依赖规划器是否重建该列）一律走临时列探测。
+ */
+export const needsMssqlNullabilityProbe = (
+  prev: Model,
+  nextCol: Column,
+  readBackNonNull: boolean,
+  builtFromScratch: boolean,
+): boolean => {
+  if (!nextCol.generated?.stored) return false;
+  if (!readBackNonNull) return false;
+  if (nextCol.notNull) return true;
+  if (builtFromScratch) return false;
+  return Object.hasOwn(prev.objects, nextCol.parent);
+};
+
 export const shadowOps = (
   db: () => Promise<Db>,
   schemas?: string[] | null,
@@ -463,6 +488,7 @@ export const shadowOps = (
     } catch (e) {
       if (!(e instanceof PlanError)) throw e;
     }
+    let builtFromScratch = false;
     try {
       if (steps !== null) {
         let builtPrev = true;
@@ -477,9 +503,13 @@ export const shadowOps = (
           builtPrev = false;
         }
         if (builtPrev) await runSteps(d, steps, dDialect);
-        else await buildTarget(d, next, planOpts);
+        else {
+          builtFromScratch = true;
+          await buildTarget(d, next, planOpts);
+        }
       } else {
         // 未发布表发生普通表↔分区表互转或分区策略变更时无法增量规划：回退为从空库直接建出 next
+        builtFromScratch = true;
         await buildTarget(d, next, planOpts);
       }
     } catch (e) {
@@ -498,18 +528,21 @@ export const shadowOps = (
       throw e;
     }
     const imported = reconcileIds(next, engine.importSnapshot(snapshot));
-    // SQL Server 持久化计算列的推断非空（ADR 0019）：没有显式 NOT NULL 的列，读回的可空性就是引擎的推断；
-    // 显式 NOT NULL 的列读回恒为非空，要在影子库里单独探测表达式本身的推断。只写 ext.mssql.inferredNotNull，
-    // 绝不改用户的显式 notNull
+    // SQL Server 持久化计算列的推断非空（ADR 0019）：读回可空时推断必为 false；读回非空时，
+    // 只有明确是以非显式从零新建的列无需探测，其余（next 显式，或所在表来自 prev 的增量迁移、
+    // 物理列可能保留 prev 的显式 NOT NULL）一律在影子库临时建非持久化列探测表达式本身，
+    // 确保推断结果不依赖影子库构建路径。只写 ext.mssql.inferredNotNull，绝不改用户的显式 notNull
     let probed = new Map<string, boolean>();
     if (dDialect === 'mssql') {
-      const explicit = Object.values(next.objects).filter(
-        (o): o is Column => o.kind === 'column' && !!o.generated?.stored && o.notNull,
-      );
-      const targets = explicit.flatMap((o) => {
+      const targets: Column[] = [];
+      for (const o of Object.values(next.objects)) {
+        if (o.kind !== 'column' || !o.generated?.stored) continue;
         const e = imported.objects[o.id];
-        return e?.kind === 'column' && e.generated?.stored ? [e] : [];
-      });
+        if (e?.kind !== 'column' || !e.generated?.stored) continue;
+        if (needsMssqlNullabilityProbe(prev, o, e.ext?.mssql?.inferredNotNull === true, builtFromScratch)) {
+          targets.push(e);
+        }
+      }
       try {
         probed = await probeInferred(d, imported, targets);
       } catch (e) {
@@ -553,8 +586,8 @@ export const shadowOps = (
           if (dDialect === 'mssql') {
             const inferred = !c.generated.stored
               ? false
-              : c.notNull
-                ? (probed.get(c.id) ?? false)
+              : probed.has(c.id)
+                ? probed.get(c.id)!
                 : e.ext?.mssql?.inferredNotNull === true;
             setMssqlInferredNotNull(c, inferred);
           }
