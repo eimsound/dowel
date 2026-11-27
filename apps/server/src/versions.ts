@@ -31,7 +31,6 @@ import { HTTPException } from 'hono/http-exception';
 import { emptyBase, versionExecutedAnywhere } from './chain.ts';
 import type { OpaqueRefresher } from './derive.ts';
 import { iso, projectPlanOptions } from './envs.ts';
-import type { Rooms } from './rooms.ts';
 import { scrubSecrets } from './secrets.ts';
 import { ShadowError, storedReport } from './shadow.ts';
 import type { Shadows } from './shadows.ts';
@@ -516,32 +515,22 @@ export type ResolvedModelRef =
 /** 解析模型引用：支持 `'head'`、`'empty'`、`'latest'`、`'vN'` 与版本 ID（含 pitfall #17 预刷新） */
 export const resolveModelRef = async (
   db: Db,
-  rooms: Rooms,
   refresher: OpaqueRefresher,
   opts: ResolveModelRefOptions,
 ): Promise<ResolvedModelRef> => {
   const effective = opts.ref ?? opts.defaultRef ?? 'head';
   if (effective === 'head') {
-    await refresher.flush(opts.branch);
-    const { model, seq } = await rooms.model(opts.branch);
+    const { model, seq } = await refresher.flush(opts.branch);
     return { ok: true, model, label: 'head', seq };
   }
   if (effective === 'empty') {
-    let like = opts.like;
-    if (!like) {
-      await refresher.flush(opts.branch);
-      like = (await rooms.model(opts.branch)).model;
-    }
+    const like = opts.like ?? (await refresher.flush(opts.branch)).model;
     return { ok: true, model: emptyBase(like, opts.schemas), label: 'empty' };
   }
   if (effective === 'latest_or_empty') {
     const headVer = await findVersion(db, opts.pid, 'latest');
     if (headVer) return { ok: true, model: headVer.model, label: `v${headVer.number}`, version: headVer };
-    let like = opts.like;
-    if (!like) {
-      await refresher.flush(opts.branch);
-      like = (await rooms.model(opts.branch)).model;
-    }
+    const like = opts.like ?? (await refresher.flush(opts.branch)).model;
     return { ok: true, model: emptyBase(like, opts.schemas), label: 'empty' };
   }
   const v = await findVersion(db, opts.pid, effective);

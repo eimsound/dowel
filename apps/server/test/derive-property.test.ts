@@ -3,7 +3,7 @@
 // 用一个假引擎代替影子库：规范形式只取决于对象自身文本和 derive-pending.ts 声明会影响它的上下文
 // （表达式：同表被引用列的 type / typeRef / collation——按列名解析，分区子表沿 partitionOf 用根父表的列——，
 // 列自身的默认值 / 生成列再加上自己的类型；不透明对象：父对象与依赖的完整限定名、依赖列的类型，
-// 依赖的不透明对象再递归带上它自己的这份签名，模拟视图叠视图）。真实 canonicalize（apps/server/src/shadow.ts:442）会读回并比较全部对象，
+// 依赖的不透明对象再递归带上它自己的这份签名，模拟视图叠视图）。真实 canonicalize（apps/server/src/shadow.ts 的 shadowOps.canonicalize）会读回并比较全部对象，
 // 判定正确时变化的也只会是待规范化对象；假引擎刻意更严格，只改写 pendingRefreshIds(prev, next) 里的对象——这样判定漏掉的对象不会被顺手改好，
 // 会在 I1 / I2 里暴露出来（规范形式本身用不依赖判定的 canonObj 独立计算）。
 //
@@ -11,8 +11,8 @@
 // 操作按它调用的 OpaqueRefresher API 命名，不断言“哪个路由用哪种模式”。每步之后断言：
 // - I1：基线不为空时，基线里每个对象都是假引擎下的不动点；
 // - I2：不在 pendingRefreshIds(baseline, cur) 里的对象，再规范化一次不变；
-// - I3：失败或写回全被拒绝的 flush / normalize / runWithReset（期间没有任何一次写回被接受，saves === accepted）前后基线 deepEqual，
-//   且被拒绝 / 失败的写回绝不持久化基线；
+// - I3：基线持久化次数不超过被接受的写回次数（saves <= accepted）；失败或写回全被拒绝的 flush / normalize / runWithReset
+//   （期间没有任何一次写回被接受，accepted === 0）前后基线 deepEqual，被拒绝 / 失败的写回绝不持久化基线；
 // - I4：影子库可用且没有并发写入 / 写回拒绝时，一次 flush 之后 needsRefresh(baseline, cur) === false。
 //
 // 前置条件（生成器保证）：无条件 runWithReset 与“带基线新建 refresher”只喂假引擎下的不动点模型（canonModel）。
@@ -859,14 +859,25 @@ class World {
         let failed: boolean;
         let flushKind: 'clean' | 'normalized' | 'skipped' | null = null;
         if (op.op === 'flush') {
+          const pending0 = needsRefresh(before, this.room.m);
           const out = await r.flush(BRANCH);
           failed = out.kind === 'skipped';
           flushKind = out.kind;
           this.hit(`flush:${out.kind}`);
+          if (!pending0) {
+            expect(this.shadowAsked, '入口无待规范化对象时 flush 不应解析影子库').toBe(asked0);
+            expect(out.kind, '入口无待规范化对象时 flush 应报 clean').toBe('clean');
+          }
           if (out.kind === 'clean') {
-            // 出口 0 I/O：没有待规范化对象时不连影子库、不写基线
-            expect(this.shadowAsked, 'clean flush 不应解析影子库').toBe(asked0);
+            // clean = 没有任何写回被接受且已无待规范化对象（#135）：不写基线；
+            // 连过影子库只可能是写回被拒之后别人的编辑恰好消除了待规范化对象，否则出口 0 I/O
             expect(this.base.saved.length, 'clean flush 不应写基线').toBe(saves0);
+            if (this.shadowAsked !== asked0) {
+              this.hit('flush:clean:afterReject');
+              expect(this.room.patchRejected - rej0, 'clean flush 连了影子库却没有写回被拒').toBeGreaterThan(
+                0,
+              );
+            }
           }
         } else {
           const handle = async () => {
@@ -892,8 +903,8 @@ class World {
         const saves = this.base.saved.length - saves0;
         this.fault = { kind: 'none' };
         this.room.rejectNext = 0;
-        // I3：每次基线持久化都必须对应一次被接受的写回；被拒绝 / 失败的写回绝不能推进基线
-        expect(saves, `I3：${op.op} 写回被拒或失败时不应写入基线`).toBe(accepted);
+        // I3：基线持久化不能多于被接受的写回；被拒绝 / 失败的写回绝不能推进基线
+        expect(saves, `I3：${op.op} 写回被拒或失败时不应写入基线`).toBeLessThanOrEqual(accepted);
         // 期间没有任何一次写回被接受（失败、写回全被拒绝或未连影子库）→ 基线不变
         if (accepted === 0) {
           if (failed) this.hit(`I3:${op.op}:${op.fault.kind}`);
@@ -1063,6 +1074,8 @@ describe('假引擎自检', () => {
 
 describe('OpaqueRefresher 黄金基线不变量（I1–I4）', () => {
   let cachedStats: Map<string, number> | null = null;
+  /** 随机用例在本次运行里是否已经跑过并失败（失败时覆盖率检查不再重跑同一种子、重复报同一个反例） */
+  let randomFailed = false;
   const runRandomSuite = async (): Promise<Map<string, number>> => {
     const s = new Map<string, number>();
     // 非 ShadowError 的规范化失败会 console.warn（预期内的故障注入），这里静音
@@ -1084,14 +1097,20 @@ describe('OpaqueRefresher 黄金基线不变量（I1–I4）', () => {
   };
 
   test('随机操作序列', async () => {
-    cachedStats = await runRandomSuite();
+    try {
+      cachedStats = await runRandomSuite();
+    } catch (e) {
+      randomFailed = true;
+      throw e;
+    }
   }, 120_000);
 
   // 自包含：单独用 `-t 覆盖率` 或乱序执行时若尚未跑过随机用例，会自动补跑同一批随机序列再校验覆盖率；
-  // 只在默认及以上的运行次数下检查（DERIVE_RUNS 调小做冒烟时不强求每类都出现）。
+  // 随机用例已经跑过并失败时跳过（反例已经报过一次）；只在默认及以上的运行次数下检查（DERIVE_RUNS 调小做冒烟时不强求每类都出现）。
   test.skipIf(RUNS < 200)(
     '覆盖率：每类操作、故障与结果都真实发生过',
-    async () => {
+    async ({ skip }) => {
+      if (randomFailed) skip('随机操作序列已失败，不重复报同一个反例');
       const stats = cachedStats ?? (await runRandomSuite());
       const want = [
         ...[

@@ -165,8 +165,9 @@ export const registerVersions = (app: Hono<Env>, ctx: AppContext) => {
   app.post('/api/projects/:pid/versions', async (c) => {
     const a = await access(c, ctx, 'version.publish');
     const b = await body(c, versionCreateSchema);
-    await refresher.flush(a.branch);
-    const { model, seq } = await rooms.model(a.branch);
+    // 冻结的就是 flush 判定过的那一份模型（不再另读房间：中间插进来的编辑没经过规范化判定）。
+    // skippedReason 目前只是透传信息，发布行为不随它变化（#132 待决定）
+    const { model, seq } = await refresher.flush(a.branch);
     const modelErrs = validate(model);
     if (modelErrs.length > 0) {
       throw new HTTPException(422, { message: `模型校验未通过，无法发布：${modelErrs[0]}` });
@@ -432,7 +433,7 @@ export const registerVersions = (app: Hono<Env>, ctx: AppContext) => {
     like?: Model,
     scope?: string[] | null,
   ): Promise<Model> => {
-    const r = await resolveModelRef(db, rooms, refresher, {
+    const r = await resolveModelRef(db, refresher, {
       pid,
       branch,
       schemas: scope ?? null,
@@ -812,8 +813,7 @@ export const registerVersions = (app: Hono<Env>, ctx: AppContext) => {
     const a = await access(c, ctx, 'project.read');
     const v = await loadVersion(db, a.pid, c.req.param('vid'));
     // 关键出口：与规范化后的当前模型比较，返回的 currentSeq 供“应用版本”作为 workingSeq
-    await refresher.flush(a.branch);
-    const { model: currentModel, seq: currentSeq } = await rooms.model(a.branch);
+    const { model: currentModel, seq: currentSeq } = await refresher.flush(a.branch);
     const planOpts = await projectPlanOptions(db, a.pid, a.dialect);
     return c.json<VersionCanvasDiff>({
       diffToCurrent: planDiff(currentModel, v.model, planOpts),
