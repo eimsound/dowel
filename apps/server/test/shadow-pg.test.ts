@@ -29,7 +29,13 @@ import { openPlatformDb } from '../src/db.ts';
 import { OpaqueRefresher, pendingRefreshIds } from '../src/derive.ts';
 import { Rooms } from '../src/rooms.ts';
 import { encrypt, scrubSecrets } from '../src/secrets.ts';
-import { assertImportable, ShadowError, ShadowUnavailableError, toShadowError } from '../src/shadow.ts';
+import {
+  assertImportable,
+  ShadowConfigChangedError,
+  ShadowError,
+  ShadowUnavailableError,
+  toShadowError,
+} from '../src/shadow.ts';
 import { Shadows } from '../src/shadows.ts';
 import {
   appendPgPoolerHint,
@@ -112,6 +118,56 @@ describe.skipIf(!PG_URL)('pgShadow（真实 PG）', () => {
       expect(await lockIsFree()).toBe(true);
     } finally {
       await shadow.close();
+    }
+  });
+
+  test('句柄关闭（#154）：客户端断连后在途操作以“配置已变更”结束；之后的操作不再连影子库', async () => {
+    const shadow = pgShadow(shadowDb.url);
+    const marker = `dowel_close_${Math.random().toString(36).slice(2, 8)}`;
+    const sessions = async () =>
+      (
+        await probe.db.query<{ pid: number }>(
+          'select pid from pg_stat_activity where datname = current_database() and pid <> pg_backend_pid()',
+        )
+      ).map((r) => r.pid);
+    try {
+      // 先正常用一次，常驻连接建好
+      expect((await shadow.verify(FROM, TO)).ok).toBe(true);
+      const up = [
+        step('ALTER TABLE public.orders ADD COLUMN note text'),
+        step(`SELECT pg_sleep(20) /* ${marker} */`),
+      ];
+      const inFlight = shadow.verifyScripts(FROM, TO, up, []).then(
+        (r) => r,
+        (e: unknown) => e,
+      );
+      await vi.waitFor(
+        async () => {
+          const [r] = await probe.db.query<{ n: number }>(
+            "select count(*)::int as n from pg_stat_activity where query like '%' || $1 || '%' and pid <> pg_backend_pid()",
+            [marker],
+          );
+          expect(r!.n).toBe(1);
+        },
+        { timeout: 10_000, interval: 50 },
+      );
+      const before = await sessions();
+
+      await shadow.close();
+      expect(await inFlight).toBeInstanceOf(ShadowConfigChangedError);
+      await expect(shadow.verify(FROM, TO)).rejects.toBeInstanceOf(ShadowConfigChangedError);
+      await expect(shadow.importSql(assertImportable('select 1'))).rejects.toBeInstanceOf(
+        ShadowConfigChangedError,
+      );
+      // 没有新会话出现（被打断的那条服务端会话可能还在睡，不算新的）
+      expect((await sessions()).filter((pid) => !before.includes(pid))).toEqual([]);
+    } finally {
+      await shadow.close();
+      // 服务端那条还在 pg_sleep 的会话：结束掉，放开检查锁
+      await probe.db.query(
+        "select pg_terminate_backend(pid) from pg_stat_activity where query like '%' || $1 || '%' and pid <> pg_backend_pid()",
+        [marker],
+      );
     }
   });
 

@@ -1,5 +1,7 @@
-// 调用服务端接口。错误统一抛 ApiError，消息来自服务端。
+// 调用服务端接口。错误统一抛 ApiError，消息来自服务端（LOCALIZED_CODES 里登记的错误码改用界面文案，跟随界面语言）。
 import type { ApiErrorBody } from '@dowel/api';
+
+import i18n from './i18n.ts';
 
 export class ApiError extends Error {
   status: number;
@@ -34,8 +36,19 @@ const request = async (method: string, path: string, body?: unknown) => {
       return text;
     }
   })();
-  if (!r.ok) throw new ApiError(r.status, (data as ApiErrorBody)?.error ?? r.statusText, data);
+  if (!r.ok) throw new ApiError(r.status, errorMessage(data, r.statusText), data);
   return { text, data };
+};
+
+/** 有界面文案的错误码（中英文都要可读）；其余直接用服务端的原文 */
+const LOCALIZED_CODES: Record<string, string> = {
+  shadow_config_changed: 'err.shadowConfigChanged',
+};
+
+const errorMessage = (data: unknown, fallback: string): string => {
+  const body = data as ApiErrorBody | undefined;
+  const key = typeof body?.code === 'string' ? LOCALIZED_CODES[body.code] : undefined;
+  return key ? i18n.t(key) : (body?.error ?? fallback);
 };
 
 export const api = async <T = unknown>(method: string, path: string, body?: unknown): Promise<T> =>
