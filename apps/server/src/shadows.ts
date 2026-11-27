@@ -444,13 +444,37 @@ export class Shadows {
       await this.clearLocal();
       return;
     }
+    // 同步递增代际：事件到达时还在 prepareShadow 的 forProject 会复核最新配置再决定是否入缓存
+    this.invalidationGen++;
+    const ids = new Set(event.envIds ?? []);
     if (event.projectId) {
-      await this.forgetProjectLocal(event.projectId, false);
-    }
-    if (event.envIds?.length) {
-      for (const eid of event.envIds) {
-        await this.forgetLocal(eid);
+      for (const [eid, entry] of this.cache.entries()) {
+        if (entry.projectId === event.projectId) ids.add(eid);
       }
+    }
+    for (const eid of ids) {
+      await this.revalidateLocal(eid);
+    }
+  }
+
+  /**
+   * 远端失效事件 → 按平台库里的最新配置复核本地缓存条目：指纹一致说明本副本已经按变更后的配置重建过
+   * （事件比本副本的下一次 forProject 晚到），保留它，不要关掉一个正在用的新连接；指纹不一致、环境 / 项目已删除、
+   * 或者读配置失败，都按原来的做法关闭并移除。复核期间条目被并发替换，就复核新条目。
+   */
+  private async revalidateLocal(eid: string) {
+    for (;;) {
+      const hit = this.cache.get(eid);
+      if (!hit) return;
+      let fingerprint: string | null;
+      try {
+        fingerprint = configFingerprint(await this.env(hit.projectId, eid));
+      } catch {
+        fingerprint = null;
+      }
+      if (this.cache.get(eid) !== hit) continue;
+      if (fingerprint !== hit.fingerprint) await this.forgetLocal(eid, false);
+      return;
     }
   }
 
@@ -469,18 +493,16 @@ export class Shadows {
     }
   }
 
-  private async forgetProjectLocal(pid: string, queryDb = true): Promise<string[]> {
+  private async forgetProjectLocal(pid: string): Promise<string[]> {
     this.invalidationGen++;
     const ids = new Set<string>();
     for (const [eid, entry] of this.cache.entries()) {
       if (entry.projectId === pid) ids.add(eid);
     }
-    if (queryDb) {
-      const rows = await this.db
-        .query<{ id: string }>('select id from environments where project_id = $1', [pid])
-        .catch(() => []);
-      for (const r of rows) ids.add(r.id);
-    }
+    const rows = await this.db
+      .query<{ id: string }>('select id from environments where project_id = $1', [pid])
+      .catch(() => []);
+    for (const r of rows) ids.add(r.id);
     for (const eid of ids) {
       await this.forgetLocal(eid, false);
     }
