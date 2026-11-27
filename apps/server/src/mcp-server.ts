@@ -76,7 +76,7 @@ import { audit, auditIn } from './audit.ts';
 import { type Action, can, userActor } from './authz.ts';
 import { inList } from './db.ts';
 import { BranchForgottenError } from './derive.ts';
-import { iso, loadVersionRefs, projectPlanOptions, sanitizeSummary, versionRef } from './envs.ts';
+import { iso, loadVersionRefs, sanitizeSummary, versionRef } from './envs.ts';
 import { groupBySlug } from './groups.ts';
 import { registerMcpPrompts } from './mcp-prompts.ts';
 import type { McpPrincipal } from './mcp-tokens.ts';
@@ -99,6 +99,7 @@ import {
   findVersion,
   listProjectVersions,
   resolveModelRef,
+  verifyMigration,
   versionDetailOf,
 } from './versions.ts';
 
@@ -1568,7 +1569,7 @@ export const createMcpServer = (
   addTool({
     name: 'verify_migration',
     description:
-      'Verify planned migration between `from` and `to` using a shadow database (rate-limited per user, never touches target DBs; requires `verify` scope).',
+      "Verify the migration between `from` and `to` in shadow databases exactly as publishing would: runs the scripts publishing would freeze, with the readback check; without `env` it verifies once per distinct database version of the project environments, with `env` only on that environment's shadow. Without `env`, `ok` is true only when publishing the same migration would pass verification; otherwise `code` is `verify_failed`, `readback_mismatch` or `no_matching_shadow` (same as publish rejections). Also returns `verifiedOn` and `uncovered` environments. Rate-limited per user (one attempt per call), never touches target DBs; requires `verify` scope.",
     schema: z.object({
       project: z.string().min(1),
       from: z.string().min(1).optional(),
@@ -1640,49 +1641,10 @@ export const createMcpServer = (
         throw e;
       }
 
-      const planOpts = await projectPlanOptions(ctx.db, row.id, toRef.model.dialect);
-      let shadowHandle: Awaited<ReturnType<typeof ctx.shadows.forProject>>;
-      try {
-        shadowHandle = await ctx.shadows.forProject(row.id, resolvedEnvId);
-      } catch (e) {
-        // 鉴权后项目被并发删除（Issue #170）：还没连库，退回限速额度；项目已不存在，不再写它的审计
-        if (e instanceof ProjectGoneError) {
-          refund();
-          return toolError('project_not_found', '项目不存在');
-        }
-        if (e instanceof ShadowError) {
-          if (e.preConnect && gate?.allowed) gate.refund();
-          await audit(
-            ctx.db,
-            honoCtx,
-            {
-              action: 'model.verify',
-              actorKind: 'user',
-              actorId: principal.user.id,
-              targetKind: 'project',
-              targetId: row.id,
-              projectId: row.id,
-              data: {
-                via: 'mcp',
-                mcpToken: { id: principal.tokenId, name: principal.tokenName, prefix: principal.prefix },
-                projectId: row.id,
-                from: fromRef.label,
-                to: toRef.label,
-                env: resolvedEnvName ?? null,
-                ok: false,
-                shadow: null,
-              },
-            },
-            ctx.security,
-          );
-          return toolError(shadowToolErrorCode(e), e.message);
-        }
-        throw e;
-      }
-
-      try {
-        const report = await shadowHandle.shadow.verify(fromRef.model, toRef.model, planOpts);
-        await audit(
+      // 与界面“在影子库验证”、发布同一把尺子（Issue #199）：执行发布时会冻结的脚本，env 省略时按数据库完整版本号分组选影，带读回核对。
+      // 整次调用只扣一次连库限速（不按影子库个数计）
+      const auditVerify = (ok: boolean, shadow: string | null) =>
+        audit(
           ctx.db,
           honoCtx,
           {
@@ -1699,48 +1661,49 @@ export const createMcpServer = (
               from: fromRef.label,
               to: toRef.label,
               env: resolvedEnvName ?? null,
-              ok: report.ok,
-              shadow: shadowHandle.label,
+              ok,
+              shadow,
             },
           },
           ctx.security,
         );
-        return toolOk({
-          ok: report.ok,
-          shadow: shadowHandle.label,
-          from: fromRef.label,
-          to: toRef.label,
-          report: sanitizeUnknown(report),
+      let result: Awaited<ReturnType<typeof verifyMigration>>;
+      try {
+        result = await verifyMigration(ctx.db, ctx.shadows, {
+          pid: row.id,
+          dialect: toRef.model.dialect,
+          schemas: row.schemas,
+          from: fromRef.model,
+          to: toRef.model,
+          envId: resolvedEnvId,
         });
       } catch (e) {
+        // 鉴权后项目被并发删除（Issue #170）：还没连库，退回限速额度；项目已不存在，不再写它的审计
+        if (e instanceof ProjectGoneError) {
+          refund();
+          return toolError('project_not_found', '项目不存在');
+        }
         if (e instanceof ShadowError) {
-          await audit(
-            ctx.db,
-            honoCtx,
-            {
-              action: 'model.verify',
-              actorKind: 'user',
-              actorId: principal.user.id,
-              targetKind: 'project',
-              targetId: row.id,
-              projectId: row.id,
-              data: {
-                via: 'mcp',
-                mcpToken: { id: principal.tokenId, name: principal.tokenName, prefix: principal.prefix },
-                projectId: row.id,
-                from: fromRef.label,
-                to: toRef.label,
-                env: resolvedEnvName ?? null,
-                ok: false,
-                shadow: shadowHandle.label,
-              },
-            },
-            ctx.security,
-          );
+          // 在连库之前就因配置前置条件失败（没有环境、生产环境不让用同实例影子库）：退回限速额度
+          if (e.preConnect) refund();
+          await auditVerify(false, null);
           return toolError(shadowToolErrorCode(e), e.message);
         }
         throw e;
       }
+      await auditVerify(result.code === null, result.shadow);
+      return toolOk({
+        // ok 为 true 表示同样的迁移现在发布能通过验证；否则 code 是发布会被拒绝的同名代码
+        ok: result.code === null,
+        code: result.code,
+        shadow: result.shadow,
+        from: fromRef.label,
+        to: toRef.label,
+        verifiedOn: result.verifiedOn,
+        uncovered: result.uncovered,
+        ...(result.reason ? { reason: scrubSecrets(result.reason) } : {}),
+        report: sanitizeUnknown(result),
+      });
     },
   });
 

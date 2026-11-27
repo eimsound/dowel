@@ -21,6 +21,7 @@ import {
   createTable,
   dropTable,
   emptyModel,
+  engineFullVersion,
   type Model,
   newId,
 } from '@dowel/core';
@@ -46,6 +47,7 @@ import { LoginLimiter } from '../src/rate-limit.ts';
 import { connHash } from '../src/requests.ts';
 import { encrypt, SecretError } from '../src/secrets.ts';
 import { type Shadow, ShadowError, shadowOps } from '../src/shadow.ts';
+import type { Shadows } from '../src/shadows.ts';
 import { shadowSetupError } from '../src/targets.ts';
 import { pgShadow } from '../src/targets/pg.ts';
 import { addTable, editModel, makeUser, PASSWORD, stubPassingShadow } from './support.ts';
@@ -1050,6 +1052,268 @@ describe.each([
     restore();
     expect(r.status).toBe(422);
     expect(r.data.error).toBe('影子库不可用：连接断开了');
+  });
+
+  describe('/verify（预览验证）与发布同一把尺子（Issue #199）', () => {
+    /** 通过的影子库报告（按 verifyScripts 收到的冻结脚本回填 up / down） */
+    const passing = (engineVersion: string, up: ScriptStep[], down: ScriptStep[]) => ({
+      ok: true,
+      up: up.map((s, i) => ({ kind: 'frozen', target: `up#${i + 1}`, sql: s.sql })),
+      down: down.map((s, i) => ({ kind: 'frozen', target: `down#${i + 1}`, sql: s.sql })),
+      upDiff: [],
+      downDiff: [],
+      risks: [],
+      error: null,
+      engineVersion,
+    });
+    /** 临时替换 Shadows 实例上的选影方法；还原时按自有属性恢复（原来没有就删掉，回到原型上的实现） */
+    const patchShadows = (patch: Partial<Pick<Shadows, 'forProject' | 'forProjectEngineVersions'>>) => {
+      const keys = ['forProject', 'forProjectEngineVersions'] as const;
+      const saved = keys.map((k) => [k, Object.getOwnPropertyDescriptor(created.shadows, k)] as const);
+      Object.assign(created.shadows, patch);
+      return () => {
+        for (const [k, d] of saved)
+          if (d) Object.defineProperty(created.shadows, k, d);
+          else delete (created.shadows as Partial<Shadows>)[k];
+      };
+    };
+    interface Call {
+      label: string;
+      up: ScriptStep[];
+      down: ScriptStep[];
+      scope: string[] | null | undefined;
+    }
+    /** 每个完整版本号一个影子库替身；report 可以按版本改写结论 */
+    const stubGroups = (
+      groups: { engineVersion: string; label: string; actual?: string }[],
+      environments: { id: string; name: string; engineVersion: string | null }[],
+      report: (
+        g: { engineVersion: string; label: string },
+        ok: ReturnType<typeof passing>,
+      ) => Record<string, unknown> = (_g, ok) => ok,
+    ) => {
+      const calls: Call[] = [];
+      const restore = patchShadows({
+        forProject: async () => {
+          throw new Error('未指定环境时不应只选一个影子库');
+        },
+        forProjectEngineVersions: async () => ({
+          entries: groups.map((g) => ({
+            engineVersion: g.engineVersion,
+            envId: '',
+            label: g.label,
+            shadow: {
+              verifyScripts: async (_from: Model, _to: Model, up: ScriptStep[], down: ScriptStep[], o) => {
+                calls.push({ label: g.label, up, down, scope: o?.scope });
+                return report(g, passing(g.actual ?? g.engineVersion, up, down));
+              },
+            } as Partial<Shadow> as Shadow,
+          })),
+          skipped: [],
+          environments,
+          identical: false,
+        }),
+      });
+      return { calls, restore };
+    };
+
+    test.skipIf(skip)(
+      '未指定环境：按数据库完整版本号逐组验证发布会冻结的同一份脚本，列出验证通过的版本与未覆盖的环境',
+      async () => {
+        const pid = await newProject('verify-groups', false, { shadow: false });
+        await addTable(created.rooms, db, pid);
+        const prod = { id: 'env-prod', name: 'prod', engineVersion: '15.7' };
+        const { calls, restore } = stubGroups(
+          [
+            { engineVersion: '16.4', label: 'dev-shadow' },
+            { engineVersion: '17.2', label: 'staging-shadow' },
+          ],
+          [
+            { id: 'env-dev', name: 'dev', engineVersion: '16.4' },
+            { id: 'env-staging', name: 'staging', engineVersion: '17.2' },
+            prod,
+          ],
+        );
+        try {
+          const r = await call('POST', `/api/projects/${pid}/verify`, { from: 'empty', to: 'head' });
+          expect(r.status, JSON.stringify(r.data)).toBe(200);
+          expect(r.data).toMatchObject({
+            ok: true,
+            code: null,
+            verifiedOn: ['16.4', '17.2'],
+            uncovered: [prod],
+            shadow: 'dev-shadow（16.4） · staging-shadow（17.2）',
+          });
+          expect((r.data.records as unknown[]).length).toBe(2);
+          // 两个影子库执行的都是发布时会冻结的那份脚本（与迁移预览一致），读回核对只读项目的 schema 范围
+          const preview = await call('GET', `/api/projects/${pid}/migration?from=empty&to=head`);
+          const previewUp = (preview.data.up as { sql: string }[]).map((s) => s.sql);
+          expect(calls.map((x) => x.label)).toEqual(['dev-shadow', 'staging-shadow']);
+          for (const x of calls) {
+            expect(x.up.map((s) => s.sql)).toEqual(previewUp);
+            expect(x.down.length).toBeGreaterThan(0);
+            expect(x.scope).toBeNull();
+          }
+          // 报告里的步骤与迁移预览一致（规划器的 kind / target），并带上冻结时的 transactional
+          expect(r.data.up).toEqual(
+            (preview.data.up as { kind: string }[]).map((x) => ({ ...x, transactional: true })),
+          );
+        } finally {
+          restore();
+        }
+      },
+    );
+
+    test.skipIf(skip)(
+      '读回核对不一致：/verify 返回 readback_mismatch 与差异明细，同样的迁移发布也被 readback_mismatch 拒绝',
+      async () => {
+        const pid = await newProject('verify-readback', false, { shadow: false });
+        await addTable(created.rooms, db, pid);
+        const item = {
+          direction: 'up' as const,
+          object: 'public.orders.id',
+          property: 'type',
+          modelValue: 'int',
+          liveValue: 'integer',
+        };
+        const { restore } = stubGroups(
+          [
+            { engineVersion: '16.4', label: 'dev-shadow' },
+            { engineVersion: '17.2', label: 'staging-shadow' },
+          ],
+          [
+            { id: 'env-dev', name: 'dev', engineVersion: '16.4' },
+            { id: 'env-staging', name: 'staging', engineVersion: '17.2' },
+          ],
+          // 只有 17.2 的影子库读回不一致：只按第一个影子库验证会漏掉它
+          (g, ok) =>
+            g.engineVersion === '17.2' ? { ...ok, ok: false, readbackTotal: 1, readbackDiff: [item] } : ok,
+        );
+        const logged = vi.spyOn(console, 'error').mockImplementation(() => {});
+        try {
+          const r = await call('POST', `/api/projects/${pid}/verify`, {});
+          expect(r.status, JSON.stringify(r.data)).toBe(200);
+          expect(r.data).toMatchObject({
+            ok: false,
+            code: 'readback_mismatch',
+            readbackTotal: 1,
+            readbackDiff: [item],
+            verifiedOn: ['16.4'],
+            uncovered: [{ id: 'env-staging', name: 'staging', engineVersion: '17.2' }],
+            shadow: 'staging-shadow（17.2）',
+          });
+          expect(logged).toHaveBeenCalled();
+          const versionsBefore = (await list(pid)).length;
+          const pub = await publish(pid, 'v1');
+          expect(pub.status).toBe(422);
+          expect(pub.data).toMatchObject({ code: 'readback_mismatch' });
+          expect(await list(pid)).toHaveLength(versionsBefore);
+        } finally {
+          logged.mockRestore();
+          restore();
+        }
+      },
+    );
+
+    test.skipIf(skip)(
+      '结构不一致 → verify_failed；影子库版本与环境都对不上 → no_matching_shadow（与发布被拒绝的代码一致）',
+      async () => {
+        const pid = await newProject('verify-codes', false, { shadow: false });
+        await addTable(created.rooms, db, pid);
+        const dev = { id: 'env-dev', name: 'dev', engineVersion: '16.4' };
+        let stub = stubGroups([{ engineVersion: '16.4', label: 'dev-shadow' }], [dev], (_g, ok) => ({
+          ...ok,
+          ok: false,
+          upDiff: ['列 orders.id 类型不一致'],
+        }));
+        try {
+          const r = await call('POST', `/api/projects/${pid}/verify`, {});
+          expect(r.status).toBe(200);
+          expect(r.data).toMatchObject({
+            ok: false,
+            code: 'verify_failed',
+            upDiff: ['列 orders.id 类型不一致'],
+          });
+        } finally {
+          stub.restore();
+        }
+        // 影子库实际是 16.9，环境是 16.4：闭环通过，但发布会被 no_matching_shadow 拒绝
+        stub = stubGroups([{ engineVersion: '16.4', label: 'dev-shadow', actual: '16.9' }], [dev]);
+        try {
+          const r = await call('POST', `/api/projects/${pid}/verify`, {});
+          expect(r.status).toBe(200);
+          // 影子库都通过了，但发布会被拒绝：ok 为 false，记录里仍是影子库的真实结论
+          expect(r.data).toMatchObject({
+            ok: false,
+            code: 'no_matching_shadow',
+            records: [expect.objectContaining({ engineVersion: '16.9', ok: true })],
+            verifiedOn: ['16.9'],
+            uncovered: [dev],
+          });
+          expect(String(r.data.reason)).toContain('16.9');
+          const pub = await publish(pid, 'v1');
+          expect(pub.status).toBe(422);
+          expect(pub.data).toMatchObject({ code: 'no_matching_shadow' });
+        } finally {
+          stub.restore();
+        }
+      },
+    );
+
+    test.skipIf(skip)(
+      '指定环境：只在这个环境的影子库上验证（冻结脚本 + 读回核对），其余环境列为未覆盖；环境不存在 404',
+      async () => {
+        const pid = await newProject('verify-env', false, { shadow: false });
+        await addTable(created.rooms, db, pid);
+        for (const [id, name, version, num] of [
+          ['env-v-dev', 'dev', '16.4', 160004],
+          ['env-v-prod', 'prod', '17.2', 170002],
+        ] as const)
+          await db.query(
+            `insert into environments (id, project_id, name, url_enc, production, engine_version, engine_version_num)
+             values ($1, $2, $3, $4, $5, $6, $7)`,
+            [id, pid, name, encrypt('postgres://u:p@127.0.0.1:1/app'), false, version, num],
+          );
+        const full = (version: string, versionNum: number) =>
+          engineFullVersion('pg', { version, versionNum });
+        const seen: (string | undefined)[] = [];
+        const ups: string[][] = [];
+        const restore = patchShadows({
+          forProjectEngineVersions: async () => {
+            throw new Error('指定环境时不应按版本分组选影');
+          },
+          forProject: async (_pid: string, eid?: string) => {
+            seen.push(eid);
+            return {
+              label: `shadow-${eid}`,
+              shadow: {
+                verifyScripts: async (_from: Model, _to: Model, up: ScriptStep[], down: ScriptStep[]) => {
+                  ups.push(up.map((s) => s.sql));
+                  return passing(full('17.2', 170002)!, up, down);
+                },
+              } as Partial<Shadow> as Shadow,
+            };
+          },
+        });
+        try {
+          const r = await call('POST', `/api/projects/${pid}/verify`, { env: 'env-v-prod' });
+          expect(r.status, JSON.stringify(r.data)).toBe(200);
+          expect(seen).toEqual(['env-v-prod']);
+          expect(ups).toHaveLength(1);
+          expect(r.data).toMatchObject({
+            ok: true,
+            code: null,
+            shadow: 'shadow-env-v-prod（17.2）',
+            verifiedOn: [full('17.2', 170002)],
+            uncovered: [{ id: 'env-v-dev', name: 'dev', engineVersion: full('16.4', 160004) }],
+          });
+        } finally {
+          restore();
+        }
+        const missing = await call('POST', `/api/projects/${pid}/verify`, { env: 'env-missing' });
+        expect(missing.status).toBe(404);
+      },
+    );
   });
 
   test.skipIf(skip)(

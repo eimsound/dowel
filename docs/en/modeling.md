@@ -180,7 +180,7 @@ For large schemas with dozens or hundreds of tables, Dowel provides layout-only 
 
 ### Round-trip verification and lock or rewrite risk measurement {#verification-and-risk}
 
-Clicking Verify in shadow database runs two checks:
+Clicking Verify in shadow database runs two checks. Verification in the migration dialog works the same way as publishing: it runs the exact scripts publishing would freeze. With **All environments** selected it verifies once per full database version of the project environments; you can also pick a single environment. The results match the reasons publishing can be rejected (verification failed, readback check failed, or no shadow database matches the environments' database versions), and the dialog lists the environments this run did not cover:
 
 1. **Round-trip parity.** Dowel starts from the previous version's structure, executes the upgrade script, reads back the live structure to confirm it matches the new version, runs the rollback script, and confirms the structure matches the starting version. The comparison is the same one the executor uses for its readback check, so a version verified on a database of the same version always passes that check when it runs.
 2. **Measured risk analysis.** Dowel executes each step in the shadow database, records actual locks, sequential scans, and table rewrites, and assigns a `high`, `medium`, or `low` risk level:

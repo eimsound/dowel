@@ -55,9 +55,9 @@ For object IDs, import permissions, shadow database boundaries, and PostgreSQL p
 
 Open the Versions or Migration view, select two versions to generate upgrade and rollback scripts, and click Verify in shadow database.
 
-- Dowel executes the upgrade script in the dialect shadow database, verifies that the resulting schema matches the target version, and then executes the rollback script to verify that the schema returns to the source version.
+- Dowel executes the upgrade script in the dialect shadow database, verifies that the resulting schema matches the target version, and then executes the rollback script to verify that the schema returns to the source version. It also runs the same readback check as execution. These are the exact scripts publishing would freeze, so a migration that passes here also passes verification when you publish it.
 - Dowel measures each statement and builds a step-by-step risk summary showing lock modes, table rewrites, sequential scans, or MySQL algorithm levels (`INSTANT`, `INPLACE`, or `COPY`).
-- When a PostgreSQL or MySQL project has environments across multiple major or minor versions, Dowel verifies the migration against a representative shadow database in each version group.
+- By default the check covers all environments: like publishing, Dowel groups the project environments by full database version (such as PG `16.4` or MySQL `8.4.3`), verifies on one shadow database per version, and lists environments that have no usable shadow database of the same version. You can also pick a single environment to verify only on its shadow database.
 
 You can also download the `.sql` migration script with pinned session settings for manual review or execution.
 

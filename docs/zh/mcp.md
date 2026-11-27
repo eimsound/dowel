@@ -85,23 +85,23 @@ claude mcp add --transport http --scope user dowel https://dowel.example.com/api
 
 工具的 `project` 参数可以是项目 ID，也可以是 `owner/project` 路径。客户端只会看到令牌权限允许的工具。
 
-| 工具                | 权限 | 作用                                                                                                                                                              |
-| ------------------- | ---- | ----------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| `list_projects`     | 读取 | 你能访问的项目（限令牌的项目范围）                                                                                                                                |
-| `get_model`         | 读取 | 工作副本：摘要，或带版本号的完整对象，以及当前 `seq`；另附画布板块、方言能力和推导出的最低目标版本；可按 schema、板块、关键字过滤，可附带诊断（见下文）           |
-| `get_table`         | 读取 | 一张表的列、主键、约束、索引和分区，以及所在板块 `sectionId`、挂在表上的触发器 / 策略 / 排他约束（`opaques`）和依赖这张表的视图、函数等（`dependentOpaques`）     |
-| `get_objects`       | 读取 | 枚举、序列、扩展，以及视图、函数、触发器等不透明对象的完整定义（含 DDL 与依赖）；按 ID、种类、schema 或关键字查询，见下文[对象上下文](#objects)                   |
-| `get_ddl`           | 读取 | 工作副本或某个版本的 `CREATE` DDL                                                                                                                                 |
-| `list_versions`     | 读取 | 版本链                                                                                                                                                            |
-| `get_version`       | 读取 | 一个版本及其冻结的升级 / 回滚迁移                                                                                                                                 |
-| `preview_migration` | 读取 | 两个版本之间的升级 / 回滚 SQL（默认：最新版本 → 工作副本）                                                                                                        |
-| `list_environments` | 读取 | 环境及其缓存的当前版本、漂移状态和缓存时间                                                                                                                        |
-| `list_history`      | 读取 | 画布修改历史（默认按编辑会话归组），见下文[画布修改历史](#history)                                                                                                |
-| `get_history_diff`  | 读取 | 一条历史或一整组编辑会话的净变化与迁移差异，见下文[画布修改历史](#history)                                                                                        |
-| `list_mutators`     | 读取 | 可用的修改操作（复合宏 `defineTable` / `alterColumn` 排在最前）及其说明和参数的 JSON Schema                                                                       |
-| `verify_migration`  | 验证 | 在影子库里执行迁移并比对结果（等同界面上的“在影子库验证”）                                                                                                        |
-| `apply_changes`     | 修改 | 整批原子执行修改操作；参数 `baseSeq`（来自 `get_model`）、`ops`（最多 100 个）、可选 `summary`（意图说明，最多 500 字）、`dryRun`；新对象的 ID 写 `"$ref:<别名>"` |
-| `manage_sections`   | 修改 | 增量调整画布板块；参数 `actions`（最多 50 个）、`dryRun`；见下文[画布板块](#sections)                                                                             |
+| 工具                | 权限 | 作用                                                                                                                                                                 |
+| ------------------- | ---- | -------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `list_projects`     | 读取 | 你能访问的项目（限令牌的项目范围）                                                                                                                                   |
+| `get_model`         | 读取 | 工作副本：摘要，或带版本号的完整对象，以及当前 `seq`；另附画布板块、方言能力和推导出的最低目标版本；可按 schema、板块、关键字过滤，可附带诊断（见下文）              |
+| `get_table`         | 读取 | 一张表的列、主键、约束、索引和分区，以及所在板块 `sectionId`、挂在表上的触发器 / 策略 / 排他约束（`opaques`）和依赖这张表的视图、函数等（`dependentOpaques`）        |
+| `get_objects`       | 读取 | 枚举、序列、扩展，以及视图、函数、触发器等不透明对象的完整定义（含 DDL 与依赖）；按 ID、种类、schema 或关键字查询，见下文[对象上下文](#objects)                      |
+| `get_ddl`           | 读取 | 工作副本或某个版本的 `CREATE` DDL                                                                                                                                    |
+| `list_versions`     | 读取 | 版本链                                                                                                                                                               |
+| `get_version`       | 读取 | 一个版本及其冻结的升级 / 回滚迁移                                                                                                                                    |
+| `preview_migration` | 读取 | 两个版本之间的升级 / 回滚 SQL（默认：最新版本 → 工作副本）                                                                                                           |
+| `list_environments` | 读取 | 环境及其缓存的当前版本、漂移状态和缓存时间                                                                                                                           |
+| `list_history`      | 读取 | 画布修改历史（默认按编辑会话归组），见下文[画布修改历史](#history)                                                                                                   |
+| `get_history_diff`  | 读取 | 一条历史或一整组编辑会话的净变化与迁移差异，见下文[画布修改历史](#history)                                                                                           |
+| `list_mutators`     | 读取 | 可用的修改操作（复合宏 `defineTable` / `alterColumn` 排在最前）及其说明和参数的 JSON Schema                                                                          |
+| `verify_migration`  | 验证 | 在影子库里执行迁移并比对结果（等同界面上的“在影子库验证”，与发布同一套验证）；不指定环境时 `ok` 为 true 才表示现在发布能通过验证，否则 `code` 给出发布会被拒绝的原因 |
+| `apply_changes`     | 修改 | 整批原子执行修改操作；参数 `baseSeq`（来自 `get_model`）、`ops`（最多 100 个）、可选 `summary`（意图说明，最多 500 字）、`dryRun`；新对象的 ID 写 `"$ref:<别名>"`    |
+| `manage_sections`   | 修改 | 增量调整画布板块；参数 `actions`（最多 50 个）、`dryRun`；见下文[画布板块](#sections)                                                                                |
 
 典型流程：`get_model`（记下 `seq`）→ 用这个 `baseSeq` 调 `apply_changes` → `preview_migration` → `verify_migration` → 由人在 Dowel 里评审并发布。
 

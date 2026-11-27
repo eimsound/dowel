@@ -12,6 +12,7 @@ import path from 'node:path';
 
 import type {
   ExecEvent,
+  MigrationVerifyResponse,
   ProjectCreated,
   ProjectInfo,
   PublishRejected,
@@ -417,6 +418,46 @@ describe('Issue #132：已验证版本必须能通过执行器读回校验（SQL
     // 没有通过的验证记录：执行器在动库之前就拒绝（unverified），而不是执行后才 readback_mismatch
     const run = await execute(pid, envId, 'raw-v1');
     expect(run).toMatchObject({ done: false, code: 'unverified' });
+  });
+
+  test('迁移预览验证（POST /verify）与发布同一把尺子（Issue #199）：读回不一致报 readback_mismatch，修正后通过且发布、执行都成功', async () => {
+    const { pid, branch, envId } = await blankProject('preview verify');
+    await edit(branch, (m) => {
+      const t = createTable(m, schemaOf(m), 'notes');
+      const id = addColumn(m, t, { name: 'id', type: 'INTEGER', notNull: true });
+      (m.objects[id] as { type: string }).type = 'integer';
+    });
+    const logged = vi.spyOn(console, 'error').mockImplementation(() => {});
+    const bad = await req('POST', `/api/projects/${pid}/verify`, { from: 'empty', to: 'head' });
+    expect(bad.status).toBe(200);
+    const badBody = (await bad.json()) as MigrationVerifyResponse;
+    expect(badBody).toMatchObject({ ok: false, code: 'readback_mismatch', verifiedOn: [] });
+    expect(badBody.readbackDiff).toEqual([
+      {
+        direction: 'up',
+        object: 'main.notes.id',
+        property: 'type',
+        modelValue: 'integer',
+        liveValue: 'INTEGER',
+      },
+    ]);
+    expect(logged).toHaveBeenCalled();
+    // 预览说不通过的，发布同样拒绝
+    expect((await rejected(pid, 'first')).code).toBe('readback_mismatch');
+
+    await edit(branch, (m) => {
+      (all(m, 'column')[0] as { type: string }).type = 'INTEGER';
+    });
+    const good = await req('POST', `/api/projects/${pid}/verify`, { from: 'empty', to: 'head' });
+    expect(good.status).toBe(200);
+    const goodBody = (await good.json()) as MigrationVerifyResponse;
+    expect(goodBody).toMatchObject({ ok: true, code: null, uncovered: [] });
+    expect(goodBody.verifiedOn).toHaveLength(1);
+    // 预览说通过的，发布同样通过，执行零读回差异
+    const pub = await publish(pid, 'first');
+    const run = await execute(pid, envId, pub.id);
+    expectVerifiedImpliesExecutable(pub, run);
+    expect(run).toMatchObject({ done: true, code: null });
   });
 
   test('首个版本不变式：坏的首个版本在发布时就被拒绝（不会出现“已验证却执行不了、又不能作废”的死局），修正后发布并执行', async () => {

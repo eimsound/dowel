@@ -242,7 +242,8 @@ describe.each([
       risks: { level: string; rewrites: string[]; scans: string[] }[];
     };
     expect(report.ok).toBe(true);
-    expect(report.shadow).toBe(`dev：${target}_dowel`);
+    // 与发布同一套验证（Issue #199）：影子库名后带它的数据库完整版本号
+    expect(report.shadow.startsWith(`dev：${target}_dowel`)).toBe(true);
     const i = report.up.findIndex((s) => s.sql.includes('TYPE integer'));
     expect(report.risks[i]!.level).toBe('high'); // bigint → integer 重写整表
     expect(report.risks[i]!.rewrites).toEqual(['public.users']);

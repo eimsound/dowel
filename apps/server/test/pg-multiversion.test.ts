@@ -8,6 +8,8 @@
 //   没有与环境版本一致的通过记录拒发布、未覆盖的环境列出但不阻止发布
 import type {
   EnvInfo,
+  MigrationResult,
+  MigrationVerifyResponse,
   ProjectInfo,
   PublishRejected,
   VersionCreated,
@@ -18,7 +20,7 @@ import { addColumn, all, type Column, setNotNull } from '@dowel/core';
 import { afterAll, beforeAll, describe, expect, test } from 'vitest';
 
 import { createTestDb, PG_URL } from '../../../test/pg.ts';
-import { projectPgVersionSummary } from '../src/envs.ts';
+import { projectPgVersionSummary, projectPlanOptions } from '../src/envs.ts';
 import { createApp, openPlatformDb, type PlatformDb } from '../src/index.ts';
 import { LoginLimiter } from '../src/rate-limit.ts';
 import { encrypt } from '../src/secrets.ts';
@@ -517,7 +519,7 @@ describe('PG 多版本（15–19）服务端全链路', () => {
     }
   });
 
-  test('POST /api/projects/:pid/verify 透传项目 targetPgMajor，拦截不兼容特性', async () => {
+  test('POST /api/projects/:pid/verify 与发布同一把尺子：按项目 targetPgMajor 冻结脚本，在环境版本的影子库上执行（Issue #199）', async () => {
     const pid = await newProject('verify-endpoint-target-major');
     await insertEnvRow({
       id: 'e-verify-16',
@@ -527,30 +529,35 @@ describe('PG 多版本（15–19）服务端全链路', () => {
       engineVersionNum: 160004,
     });
     await addTable(created.rooms, db, pid, 'orders');
+    // 规划用的是项目的目标大版本（最低已知环境版本），与 GET /migration 与发布一致
+    expect((await projectPlanOptions(db, pid, 'pg'))?.pgMajor).toBe(16);
 
-    let seenMajor: number | null | undefined;
-    const origForProject = created.shadows.forProject.bind(created.shadows);
-    created.shadows.forProject = async () => ({
-      label: 'prod16：shadow',
-      shadow: {
-        importSql: async () => {
-          throw new Error('unused');
+    const seenUp: string[][] = [];
+    const restore = stubEngineShadows({
+      environments: [{ id: 'e-verify-16', name: 'prod16', engineVersion: '16.4' }],
+      entries: [
+        {
+          engineVersion: '16.4',
+          envId: 'e-verify-16',
+          label: 'prod16：shadow',
+          shadow: stubShadow(async (_from, _to, up) => {
+            seenUp.push(up.map((x) => x.sql));
+            return { ...okVerifyReport(true), engineVersion: '16.4' };
+          }),
         },
-        verify: async (_from, _to, opts) => {
-          seenMajor = opts?.pgMajor;
-          return okVerifyReport(true);
-        },
-        verifyScripts: async () => okVerifyReport(true),
-        canonicalize: async () => [],
-        close: async () => {},
-      } as Shadow,
+      ],
     });
     try {
-      const res = await call('POST', `/api/projects/${pid}/verify`, { from: 'empty', to: 'head' });
+      const res = await call<MigrationVerifyResponse>('POST', `/api/projects/${pid}/verify`, {
+        from: 'empty',
+        to: 'head',
+      });
       expect(res.status).toBe(200);
-      expect(seenMajor).toBe(16);
+      expect(res.data).toMatchObject({ ok: true, code: null, verifiedOn: ['16.4'], uncovered: [] });
+      const preview = await call<MigrationResult>('GET', `/api/projects/${pid}/migration?from=empty&to=head`);
+      expect(seenUp).toEqual([preview.data.up.map((x) => x.sql)]);
     } finally {
-      created.shadows.forProject = origForProject;
+      restore();
     }
   });
 

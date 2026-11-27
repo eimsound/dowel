@@ -5,10 +5,10 @@ import type {
   GroupInfo,
   MigrationResult,
   MigrationStep,
+  MigrationVerifyResponse,
   ModelUpdate,
   PublishRejected,
   StepRisk,
-  VerifyResponse,
   VersionCreated,
   VersionInfo,
 } from '@dowel/api';
@@ -38,7 +38,7 @@ import { useProject } from '../project.tsx';
 import { Modal } from './Modal.tsx';
 import { useToast } from './Toasts.tsx';
 import { Banner, cx, Sql } from './ui.tsx';
-import { EnvVersionList, RiskNote, useVersionName, VerifyBanner } from './VersionStatus.tsx';
+import { EnvVersionList, recordsSummary, RiskNote, useVersionName, VerifyBanner } from './VersionStatus.tsx';
 
 type Base = { pid: string; open: boolean; onClose: () => void };
 
@@ -435,6 +435,47 @@ export const StepList = ({
   );
 };
 
+/**
+ * 迁移预览验证的结论（Issue #199，与发布同一把尺子）：通过 / 失败沿用 VerifyBanner；
+ * 影子库版本与环境都对不上（no_matching_shadow）时用警告横幅代替“验证通过”（只验证了一个环境时发布未必被拒绝，正文分开写）；
+ * 没覆盖到的环境：验证了全部环境时是警告（执行或回滚到它们会被拒绝），只验证了一个环境时是说明（发布时会逐个验证）。
+ * env 是这次请求验证的环境名（全部环境为 null），不是下拉框的当前值
+ */
+const MigrationVerifyResult = ({ result, env }: { result: MigrationVerifyResponse; env: string | null }) => {
+  const { t } = useTranslation();
+  if (result.code === 'no_matching_shadow') {
+    const summary = recordsSummary(result.records, t);
+    return (
+      <Banner kind="warn" title={t('dlg.rejectNoMatching')} role="status">
+        {env ? t('dlg.previewNoMatchingSingleEnvBody', { env }) : t('dlg.previewNoMatchingBody')}
+        {result.uncovered.length > 0 && <EnvVersionList envs={result.uncovered} />}
+        <p className="mt-1.5 mb-0 font-mono text-xs text-text-2">
+          {summary && <span className="mr-1.5">{summary}</span>}
+          {t('dlg.usedShadow', { s: result.shadow })}
+        </p>
+      </Banner>
+    );
+  }
+  return (
+    <>
+      <VerifyBanner report={result} />
+      {result.code === null &&
+        result.uncovered.length > 0 &&
+        (env ? (
+          <Banner kind="info" title={t('dlg.previewSingleEnvTitle', { env })} role="status">
+            {t('dlg.previewSingleEnvBody')}
+            <EnvVersionList envs={result.uncovered} />
+          </Banner>
+        ) : (
+          <Banner kind="warn" title={t('dlg.previewUncoveredTitle')} role="status">
+            {t('dlg.previewUncoveredBody')}
+            <EnvVersionList envs={result.uncovered} />
+          </Banner>
+        ))}
+    </>
+  );
+};
+
 export const MigrationDialog = ({ pid, open, onClose }: Base) => {
   const { t } = useTranslation();
   const { project } = useProject();
@@ -453,6 +494,8 @@ export const MigrationDialog = ({ pid, open, onClose }: Base) => {
     enabled: open && uiSpec.requiresExternalShadow,
   });
   const [env, setEnv] = useState('');
+  // 选中的环境被删了：回到“全部环境”，不把已经不存在的环境 ID 发给服务端
+  const effEnv = envs.data?.some((x) => x.id === env) ? env : '';
   const [copied, setCopied] = useState(false);
   // 默认和活跃链头比较（ADR 0013：编号最大的版本可能已作废）
   const effFrom = from ?? versions.data?.find((v) => v.latest)?.id ?? 'empty';
@@ -471,15 +514,20 @@ export const MigrationDialog = ({ pid, open, onClose }: Base) => {
     },
     enabled: open && !!versions.data,
   });
+  // envId 为空 = 全部环境：与发布一致，按环境的数据库完整版本号逐个验证（Issue #199）。
+  // 结果按这次请求的 envId（verify.variables）显示，验证途中切换下拉框不会张冠李戴
   const verify = useMutation({
-    mutationFn: () =>
-      api<VerifyResponse>('POST', `/api/projects/${pid}/verify`, {
+    mutationFn: (envId: string) =>
+      api<MigrationVerifyResponse>('POST', `/api/projects/${pid}/verify`, {
         from: effFrom,
         to,
-        env: uiSpec.requiresExternalShadow ? env || undefined : undefined,
+        env: uiSpec.requiresExternalShadow ? envId || undefined : undefined,
       }),
     onSuccess: refreshNormalize,
   });
+  const verifiedEnv = verify.variables
+    ? (envs.data?.find((x) => x.id === verify.variables)?.name ?? null)
+    : null;
   const steps = mig.data?.[dir] ?? [];
   const text = formatScript(steps, project.dialect);
   const versionName = useVersionName();
@@ -536,7 +584,7 @@ export const MigrationDialog = ({ pid, open, onClose }: Base) => {
             className="btn primary"
             disabled={verify.isPending || !steps.length || noEnv}
             aria-busy={verify.isPending}
-            onClick={() => verify.mutate()}
+            onClick={() => verify.mutate(effEnv)}
           >
             <ShieldCheck size={16} aria-hidden="true" className={verify.isPending ? 'animate-pulse' : ''} />
             {verify.isPending ? t('dlg.verifying') : t('dlg.verify')}
@@ -596,24 +644,26 @@ export const MigrationDialog = ({ pid, open, onClose }: Base) => {
             <Database size={14} aria-hidden="true" className="text-text-3" />
             <span className="text-text-2">{t('dlg.verifyOnShort')}</span>
             <select
-              aria-label={t('dlg.verifyOn')}
-              className="select w-56"
-              value={env || envs.data?.[0]?.id || ''}
+              className="select w-auto max-w-full min-w-56"
+              value={effEnv}
               onChange={(e) => {
                 setEnv(e.target.value);
                 verify.reset();
               }}
             >
+              <option value="">{t('dlg.verifyAllEnvs')}</option>
               {envs.data?.map((x) => (
                 <option key={x.id} value={x.id}>
-                  {x.name}
+                  {x.engineFullVersion
+                    ? t('dlg.envVersion', { name: x.name, version: x.engineFullVersion })
+                    : t('dlg.envVersionUnknown', { name: x.name })}
                 </option>
               ))}
             </select>
           </label>
         )}
 
-        {r && <VerifyBanner report={r} dialect={project.dialect} />}
+        {r && <MigrationVerifyResult result={r} env={verifiedEnv} />}
         {verify.error && (
           <Banner kind="danger" title={t('dlg.verifyFail')} role="alert">
             {verify.error.message}
@@ -633,7 +683,10 @@ export const MigrationDialog = ({ pid, open, onClose }: Base) => {
         ) : (
           <StepList
             steps={steps}
-            risks={r?.ok && dir === 'up' ? r.risks : undefined}
+            risks={
+              // no_matching_shadow：影子库都通过了（ok 为 false 只是因为发布会被拒绝），风险分析照样可信
+              (r?.ok || r?.code === 'no_matching_shadow') && dir === 'up' ? r.risks : undefined
+            }
             label={t(`dlg.${dir}`)}
           />
         )}
