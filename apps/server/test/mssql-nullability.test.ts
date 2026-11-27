@@ -6,7 +6,7 @@ import { HTTPException } from 'hono/http-exception';
 import { describe, expect, test, vi } from 'vitest';
 
 import { splitImportedMssqlNullability } from '../src/mssql-nullability.ts';
-import { type Shadow, ShadowError } from '../src/shadow.ts';
+import { type Shadow, ShadowConfigChangedError, ShadowError } from '../src/shadow.ts';
 
 /**
  * 导入形态的 dbo.items：k 主键成员、cp / cu 读回非空（导入记成推断）、n 可空的持久化计算列、v 非持久化、code 普通列
@@ -92,6 +92,17 @@ describe('splitImportedMssqlNullability', () => {
         throw new HTTPException(403, { message: 'blocked' });
       }),
     ).rejects.toBeInstanceOf(HTTPException);
+  });
+
+  test('影子库句柄因配置变更被关闭（ShadowConfigChangedError）：可重试，照常抛出，不按显式记录', async () => {
+    const shadow = {
+      probeMssqlNotNull: async () => {
+        throw new ShadowConfigChangedError();
+      },
+    } as unknown as Shadow;
+    await expect(splitImportedMssqlNullability(imported(), async () => shadow)).rejects.toBeInstanceOf(
+      ShadowConfigChangedError,
+    );
   });
 
   test('只有主键成员要拆分（或根本没有候选列）：不连影子库', async () => {

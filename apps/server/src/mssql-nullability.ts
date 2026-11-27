@@ -10,7 +10,7 @@ import { applyMssqlNullabilitySplit, mssqlColumnPath, mssqlNullabilitySplitPlan 
 import { HTTPException } from 'hono/http-exception';
 
 import { SecretError, scrubSecrets } from './secrets.ts';
-import type { Shadow } from './shadow.ts';
+import { type Shadow, ShadowConfigChangedError } from './shadow.ts';
 
 export interface MssqlNullabilitySplit {
   model: Model;
@@ -21,7 +21,8 @@ export interface MssqlNullabilitySplit {
 /**
  * keep：能从参考模型沿用拆分的列（拉取时由 mssqlAlignedColumnIds 给出），不动；
  * shadowOf：需要探测时才调用，取不到影子库（ShadowError 等）就按显式兜底。
- * 白名单拒绝（HTTPException）与密钥解密失败（SecretError）和发布一致，继续抛出。
+ * 白名单拒绝（HTTPException）与密钥解密失败（SecretError）和发布一致，继续抛出；影子库句柄因配置变更被关闭
+ * （ShadowConfigChangedError）是可重试的暂时状态，也继续抛出，不按显式记录。
  */
 export const splitImportedMssqlNullability = async (
   model: Model,
@@ -36,7 +37,8 @@ export const splitImportedMssqlNullability = async (
       const shadow = await shadowOf();
       inferred = shadow.probeMssqlNotNull ? await shadow.probeMssqlNotNull(model, plan.probe) : null;
     } catch (e) {
-      if (e instanceof HTTPException || e instanceof SecretError) throw e;
+      if (e instanceof HTTPException || e instanceof SecretError || e instanceof ShadowConfigChangedError)
+        throw e;
       console.warn(
         'SQL Server 持久化计算列可空性探测没有完成，按显式非空记录',
         scrubSecrets(e instanceof Error ? e.message : String(e)),
