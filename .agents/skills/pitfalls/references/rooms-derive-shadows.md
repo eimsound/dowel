@@ -50,7 +50,7 @@
 - **【会出什么事】**
   - 副本 A 改连接串或把环境标为 `production: true, allowSameInstance: false` 后，副本 B 仍复用旧影子库甚至绕过生产禁同实例影子库的安全规则；删环境/删项目后他副本旧连接池永久泄漏。
 - **【Dowel 正确做法】**（已验证于 `shadows.ts` / `bus.ts` / `routes/projects.ts`）
-  1. 缓存条目保存 `projectId` 与完整配置 SHA-256 指纹（`name`/`url`/`shadowUrl`/`production`/`allowSameInstance`/`schemas`），指纹不匹配则先关旧连接再按新配置重建或拒绝；
+  1. 缓存条目保存 `projectId` 与完整配置 SHA-256 指纹（`name`/`url`/`shadowUrl`/`production`/`allowSameInstance`/`schemas`/`engineVersionNum`），指纹不匹配则先关旧连接再按新配置重建或拒绝；
   2. 引入 `invalidationGen` 与 `closed` 标记，防止并发 `prepareShadow` 完成后把旧句柄回写进缓存；
   3. 接入 `EventBus` 广播 `{ t: 'shadows.forget', origin, all?, envIds?, projectId? }`，删项目同步 `forgetProject(pid)`，`bus.onReconnect` 清空关闭本地缓存，`close()` 退订并释放全部连接。
 - **【补充：晚到的 `shadows.forget` 不能盲目关闭（`#148`）】**
