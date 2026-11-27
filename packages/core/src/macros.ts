@@ -37,6 +37,7 @@ import {
   pgSerialOf,
 } from './pg/serial.ts';
 import { getDialect } from './registry.ts';
+import { SQLITE_COLUMN_TYPE_NOTE } from './sqlite/types.ts';
 
 // ───── 公共类型 ─────
 
@@ -327,7 +328,7 @@ const macroColumn = z
       .string()
       .optional()
       .describe(
-        `Type text; may be omitted (or only array dims like \`[]\`) when typeRef is set. ${PG_SERIAL_TYPE_NOTE}`,
+        `Type text; may be omitted (or only array dims like \`[]\`) when typeRef is set. ${PG_SERIAL_TYPE_NOTE} ${SQLITE_COLUMN_TYPE_NOTE}`,
       ),
     typeRef: refSlot.nullable().optional().describe('PG enum: ID / `$ref:<alias>` / `[schema.]name`'),
     notNull: z.boolean().optional(),
@@ -480,7 +481,7 @@ export const alterColumnArgs = z
         'Existing column ID, or `$ref:<alias>` of a column created earlier in this batch (never a name)',
       ),
     name: objectNameArg.optional(),
-    type: z.string().optional().describe(`Type text. ${PG_SERIAL_TYPE_NOTE}`),
+    type: z.string().optional().describe(`Type text. ${PG_SERIAL_TYPE_NOTE} ${SQLITE_COLUMN_TYPE_NOTE}`),
     typeRef: refSlot
       .nullable()
       .optional()
@@ -602,6 +603,16 @@ const compileDefineTable = (m0: Model, a: DefineTableArgs, scope: RefScope, labe
     if (hasIdentity && c.notNull === false) throw new MacroError(p, 'identity 列必须 NOT NULL');
     if (c.typeRef != null) {
       if (!caps.enums) throw new MacroError(`${p}.typeRef`, '当前方言不支持独立枚举类型');
+    } else if (m0.dialect === 'sqlite') {
+      if (c.type === undefined) {
+        throw new MacroError(`${p}.type`, '缺少列类型（SQLite 非 STRICT 表可显式传 type: "" 声明无类型列）');
+      }
+      if (!c.type.trim() && a.ext?.sqlite?.strict) {
+        throw new MacroError(
+          `${p}.type`,
+          'STRICT 表的列必须声明类型（仅允许 INT/INTEGER/REAL/TEXT/BLOB/ANY）',
+        );
+      }
     } else if (!(c.type ?? '').trim()) {
       throw new MacroError(`${p}.type`, '缺少列类型');
     }
@@ -938,7 +949,16 @@ const compileAlterColumn = (m0: Model, a: AlterColumnArgs, scope: RefScope, labe
     if (clearingEnum && (t === '' || DIMS_RE.test(t))) {
       throw new MacroError('type', '把枚举列改回普通类型（typeRef: null）时需要给出新的 type');
     }
-    if (c0.typeRef === null && t === '') throw new MacroError('type', '列类型不能为空');
+    if (c0.typeRef === null && t === '') {
+      if (m0.dialect === 'sqlite') {
+        const parentTbl = own(m0, c0.parent);
+        if (parentTbl?.kind === 'table' && parentTbl.ext?.sqlite?.strict) {
+          throw new MacroError('type', 'STRICT 表的列必须声明类型（仅允许 INT/INTEGER/REAL/TEXT/BLOB/ANY）');
+        }
+      } else {
+        throw new MacroError('type', '列类型不能为空');
+      }
+    }
   } else if (a.typeRef === null && c0.typeRef !== null) {
     throw new MacroError('type', '把枚举列改回普通类型（typeRef: null）时需要给出新的 type');
   }
@@ -1065,12 +1085,12 @@ const macroDef = <A extends z.ZodType>(d: MacroDef<A>) => d;
 export const macros = {
   defineTable: macroDef({
     args: defineTableArgs,
-    description: `Macro: create a table with columns, primary key, uniques, checks, indexes, foreign keys, comments, ext and optional partitions in one op. Columns / keys may refer to this table's columns by name; schema / typeRef / refTable / refColumns / default.nextval / partitions[].schema may be resolved by ID, \`$ref:<alias>\` or (qualified) name. Expands to primitive mutators in a fixed order (createTable → addColumn → setPartitionBy → addPrimaryKey (+ renameKey) → setTableExt → deferred SQLite setColumnExt (autoincrement) → addUnique / addCheck / addIndex / addForeignKey (each followed by renameKey when \`name\` is given) → createPartition → setComment). For circular foreign keys, define all tables first and add the remaining FKs with addForeignKey. ${PG_SERIAL_TYPE_NOTE}`,
+    description: `Macro: create a table with columns, primary key, uniques, checks, indexes, foreign keys, comments, ext and optional partitions in one op. Columns / keys may refer to this table's columns by name; schema / typeRef / refTable / refColumns / default.nextval / partitions[].schema may be resolved by ID, \`$ref:<alias>\` or (qualified) name. Expands to primitive mutators in a fixed order (createTable → addColumn → setPartitionBy → addPrimaryKey (+ renameKey) → setTableExt → deferred SQLite setColumnExt (autoincrement) → addUnique / addCheck / addIndex / addForeignKey (each followed by renameKey when \`name\` is given) → createPartition → setComment). For circular foreign keys, define all tables first and add the remaining FKs with addForeignKey. ${PG_SERIAL_TYPE_NOTE} ${SQLITE_COLUMN_TYPE_NOTE}`,
     compile: compileDefineTable,
   }),
   alterColumn: macroDef({
     args: alterColumnArgs,
-    description: `Macro: declaratively patch an existing column (name, type / typeRef, notNull, default, identity, ext, comment; omitted = unchanged, null = clear). \`id\` must be an existing column ID or a \`$ref:<alias>\` created earlier in this batch — never a name; the references typeRef / default.nextval may also be ID, \`$ref\` or \`[schema.]name\`. \`ext\` replaces the whole column ext (null clears it); on SQL Server an explicit default-constraint name is kept automatically unless ext.mssql sets defaultName / defaultNameMode. Expands safely in the order: drop identity → clear default → renameColumn → setColumnType → setNotNull → set default → set identity → setColumnExt → setComment; steps whose value already matches are skipped. ${PG_SERIAL_TYPE_NOTE}`,
+    description: `Macro: declaratively patch an existing column (name, type / typeRef, notNull, default, identity, ext, comment; omitted = unchanged, null = clear). \`id\` must be an existing column ID or a \`$ref:<alias>\` created earlier in this batch — never a name; the references typeRef / default.nextval may also be ID, \`$ref\` or \`[schema.]name\`. \`ext\` replaces the whole column ext (null clears it); on SQL Server an explicit default-constraint name is kept automatically unless ext.mssql sets defaultName / defaultNameMode. Expands safely in the order: drop identity → clear default → renameColumn → setColumnType → setNotNull → set default → set identity → setColumnExt → setComment; steps whose value already matches are skipped. ${PG_SERIAL_TYPE_NOTE} ${SQLITE_COLUMN_TYPE_NOTE}`,
     compile: compileAlterColumn,
   }),
 };

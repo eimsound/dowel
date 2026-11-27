@@ -174,7 +174,7 @@ export const readSqliteSnapshot = async (db: Db): Promise<SqliteSnapshot> => {
       if (c.pk > 0) pkColsByOrder.push({ pk: c.pk, name: c.name });
       columns[c.name] = {
         cid: Number(c.cid),
-        type: sqliteNormalizeType(c.type || 'ANY'),
+        type: sqliteNormalizeType(c.type),
         // SQLite 主键列在 Dowel IR 中统一视作 notNull: true（与 PG 及 validate() 保持一致）
         notNull: c.notnull === 1 || c.pk > 0,
         default: generated ? null : (c.dflt_value ?? null),
