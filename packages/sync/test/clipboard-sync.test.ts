@@ -258,8 +258,11 @@ describe('大规模粘贴性能守卫（1000 张既有表 + 粘贴 200 张表 ×
 
   // 不断言“多少毫秒内完成”：共享的 CI 机器忙时，同一份代码的墙钟耗时能差出 3 倍以上（Issue #143），绝对阈值只会误报。
   // 改为数 execute 读基线 m.objects 的次数（确定性，不受机器负载影响）：粘贴的内容不变、只让既有表变多，
-  // 多出来的读取摊到每个既有对象、再摊到每个子操作上。走索引时基本只有最后合并结果整体读一遍，远小于 1；
-  // 子操作经写时复制代理枚举整个模型（索引优化之前的做法）时，每个子操作至少把每个既有对象读一遍，不小于 1。
+  // 多出来的读取摊到每个既有对象、再摊到每个子操作上。走索引时现值为 PG 0.019、SQLite / MySQL 0.009、
+  // SQL Server 0.331（其 schema 级重名判定对每个约束 / 带默认值列经 get() 取所属表）；每个子操作经写时复制代理
+  // 枚举整个模型时为 2.7–8.0，即使只是每建一张表（占 1/16 子操作）枚举一次整个模型，也会多出约 0.44（PG / SQLite /
+  // MySQL 约 0.45，SQL Server 约 0.77），因此按方言收紧阈值以同时拦住这两类退化。
+  // 已知盲区：Proxy 只包住基线 m.objects，经索引结构内部缓存或 overlay 的遍历（含粘贴规模这一维）不会被计入，留待 Issue #165 补索引侧计数守卫。
   // 计时比值在这里分不开两者：SQLite / MySQL / SQL Server 的重名判定本来就按 kind 扫一遍索引分桶，执行耗时随
   // 既有表数线性增长（SQL Server 既有表 125 → 1000 时实测约 4 倍）；按粘贴规模求耗时比，即使交替测量、取多次最快值，
   // 忙机器上也会从约 10 倍抖到近 40 倍。另留一个只拦数量级恶化的宽松绝对上限。
@@ -283,12 +286,17 @@ describe('大规模粘贴性能守卫（1000 张既有表 + 粘贴 200 张表 ×
     execute(counted, 'paste', { ops }, idx);
     return reads;
   };
-  // 既有表 125 → 1000，粘贴 20 张表（320 个子操作）。实测每个既有对象每个子操作的读取：PG 约 0.02，SQLite / MySQL
-  // 约 0.01；SQL Server 约 0.33（它的 schema 级重名判定对每个约束 / 带默认值的列都经 get() 取所属表）
+  // 既有表 125 → 1000，粘贴 20 张表（320 个子操作）。计数为确定性数值，无机器波动误报风险，按方言设限：
+  // 现值 PG 0.019 / SQLite 0.009 / MySQL 0.009 / MSSQL 0.331，低于每表全量枚举（约 0.45 / 0.77）与每子操作全量枚举（2.7–8.0）
   const EXISTING_SMALL = 125;
   const EXISTING_BIG = 1000;
   const COUNTED_PASTE_TABLES = 20;
-  const MAX_READS_PER_EXISTING_OBJECT_PER_OP = 1;
+  const MAX_READS_PER_EXISTING_OBJECT_PER_OP: Record<Dialect, number> = {
+    pg: 0.2,
+    sqlite: 0.2,
+    mysql: 0.2,
+    mssql: 0.55,
+  };
   // 兜底的绝对上限，比常见耗时（200 张表 planPaste 0.03–0.6 s、execute 1–8 s，视机器负载）高一个数量级，
   // 只拦数量级的恶化（例如对粘贴规模比现在更差的复杂度），不是性能指标。用例超时也放宽：构造 1000 张表的模型
   // 和 validate 本身就重，机器严重超载时整个用例能超过 5 分钟
@@ -334,7 +342,7 @@ describe('大规模粘贴性能守卫（1000 张既有表 + 粘贴 200 张表 ×
           `existing ${EXISTING_SMALL}→${EXISTING_BIG} tables, ${opsIntoBig.length} ops: base reads ${readsSmall}→${readsBig} (${readsPerExistingPerOp.toFixed(3)}/existing object/op)`,
       );
 
-      expect(readsPerExistingPerOp).toBeLessThan(MAX_READS_PER_EXISTING_OBJECT_PER_OP);
+      expect(readsPerExistingPerOp).toBeLessThan(MAX_READS_PER_EXISTING_OBJECT_PER_OP[dialect]);
       expect(planMs).toBeLessThan(BACKSTOP_PLAN_MS);
       expect(execMs).toBeLessThan(BACKSTOP_EXEC_MS);
       expect(execAutoMs).toBeLessThan(BACKSTOP_EXEC_MS);
