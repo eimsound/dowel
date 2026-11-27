@@ -4,7 +4,7 @@
 // - 跑满 MAX_CATCHUP_ROUNDS 仍有待规范化对象时如实报 skipped（round_limit），不论期间是否写回过；
 // - 返回的 model / seq 就是判定所针对的房间状态（调用方不必、也不该再读一次房间）。
 import { emptyModel, type Model, type Obj, runMutator } from '@dowel/core';
-import { describe, expect, test } from 'vitest';
+import { describe, expect, test, vi } from 'vitest';
 
 import { OpaqueRefresher } from '../src/derive.ts';
 import type { Rooms } from '../src/rooms.ts';
@@ -42,12 +42,18 @@ interface Live {
  */
 const ctlRooms = (
   live: Live,
-  ctl: { reject: number; onReject?: (live: Live) => void; onAccept?: (live: Live) => void },
+  ctl: {
+    reject: number;
+    onReject?: (live: Live) => void;
+    onAccept?: (live: Live) => void;
+    beforePatch?: (live: Live) => void;
+  },
 ) =>
   ({
     state: async () => ({ model: structuredClone(live.m), versions: {}, seq: live.seq }),
     model: async () => ({ model: structuredClone(live.m), seq: live.seq }),
     patch: async (_b: string, _u: string, objects: Obj[]) => {
+      ctl.beforePatch?.(live);
       if (ctl.reject > 0) {
         ctl.reject--;
         ctl.onReject?.(live);
@@ -199,5 +205,108 @@ describe('OpaqueRefresher.flush 结果契约', () => {
     const out = await r.flush('b');
     expect(out).toMatchObject({ kind: 'skipped', skippedReason: 'stopped', seq: 3 });
     expect(exprOf(out.model, 'k')).toBe('total > 0');
+  });
+
+  test('写回期间分支被 forget → skipped(forgotten)，且不推进基线', async () => {
+    const live: Live = { m: base(), seq: 0 };
+    const { saved, store } = memStore();
+    let r!: OpaqueRefresher;
+    const rooms = ctlRooms(live, {
+      reject: 0,
+      onAccept: () => {
+        r.forget('b');
+      },
+    });
+    r = new OpaqueRefresher(rooms, async () => canonicalShadow(), store);
+    await r.reset('b', live.m);
+    runMutator(live.m, 'addCheck', { id: 'k', table: 't', expr: 'total > 0' });
+    const out = await r.flush('b');
+    expect(out).toMatchObject({ kind: 'skipped', skippedReason: 'forgotten', seq: live.seq });
+    expect(exprOf(out.model, 'k')).toBe('(total > 0::integer)');
+    expect(saved).toHaveLength(1);
+    await r.drain();
+    expect(r.tracked('b')).toBe(false);
+  });
+
+  test('写回期间分支被 forget 且 rooms.patch 抛错（项目删除先踢房间）→ skipped(forgotten) 且不打失败告警', async () => {
+    const live: Live = { m: base(), seq: 0 };
+    const { saved, store } = memStore();
+    let r!: OpaqueRefresher;
+    const rooms = ctlRooms(live, {
+      reject: 0,
+      beforePatch: () => {
+        r.forget('b');
+        throw new Error('分支 b 不存在');
+      },
+    });
+    r = new OpaqueRefresher(rooms, async () => canonicalShadow(), store);
+    await r.reset('b', live.m);
+    runMutator(live.m, 'addCheck', { id: 'k', table: 't', expr: 'total > 0' });
+    const warn = vi.spyOn(console, 'warn').mockImplementation(() => {});
+    try {
+      const out = await r.flush('b');
+      expect(out).toMatchObject({ kind: 'skipped', skippedReason: 'forgotten', seq: 0 });
+      expect(exprOf(out.model, 'k')).toBe('total > 0');
+      expect(saved).toHaveLength(1);
+      expect(warn).not.toHaveBeenCalled();
+    } finally {
+      warn.mockRestore();
+    }
+  });
+
+  test('写回已接受但 store.save 抛错 → skipped(store_failed) 且返回写回后的模型、基线与内存缓存均不推进', async () => {
+    const live: Live = { m: base(), seq: 0 };
+    const { saved, store } = memStore();
+    let failSave = false;
+    const flakyStore = {
+      load: store.load,
+      save: async (b: string, m: Model) => {
+        if (failSave) throw new Error('disk io error');
+        await store.save(b, m);
+      },
+    };
+    const r = new OpaqueRefresher(ctlRooms(live, { reject: 0 }), async () => canonicalShadow(), flakyStore);
+    await r.reset('b', live.m);
+    runMutator(live.m, 'addCheck', { id: 'k', table: 't', expr: 'total > 0' });
+    failSave = true;
+    const warn = vi.spyOn(console, 'warn').mockImplementation(() => {});
+    try {
+      const out = await r.flush('b');
+      expect(out).toMatchObject({ kind: 'skipped', skippedReason: 'store_failed', seq: 1 });
+      expect(out.seq).toBe(live.seq);
+      expect(out.model).toEqual(live.m);
+      expect(exprOf(out.model, 'k')).toBe('(total > 0::integer)');
+      expect(saved).toHaveLength(1);
+      await expect(r.status('b')).resolves.toMatchObject({ pendingCount: 1, baseline: true });
+      expect(warn).toHaveBeenCalledTimes(1);
+      expect(warn.mock.calls[0]?.[0]).not.toContain('规范化表达式');
+    } finally {
+      warn.mockRestore();
+    }
+  });
+
+  test('未 forget 时 rooms.patch 抛错 → skipped(store_failed)，不报 canonicalize_failed', async () => {
+    const live: Live = { m: base(), seq: 0 };
+    const { saved, store } = memStore();
+    const rooms = ctlRooms(live, {
+      reject: 0,
+      beforePatch: () => {
+        throw new Error('pg connection lost');
+      },
+    });
+    const r = new OpaqueRefresher(rooms, async () => canonicalShadow(), store);
+    await r.reset('b', live.m);
+    runMutator(live.m, 'addCheck', { id: 'k', table: 't', expr: 'total > 0' });
+    const warn = vi.spyOn(console, 'warn').mockImplementation(() => {});
+    try {
+      const out = await r.flush('b');
+      expect(out).toMatchObject({ kind: 'skipped', skippedReason: 'store_failed', seq: 0 });
+      expect(exprOf(out.model, 'k')).toBe('total > 0');
+      expect(saved).toHaveLength(1);
+      expect(warn).toHaveBeenCalledTimes(1);
+      expect(warn.mock.calls[0]?.[0]).not.toContain('规范化表达式');
+    } finally {
+      warn.mockRestore();
+    }
   });
 });

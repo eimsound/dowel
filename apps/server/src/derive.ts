@@ -59,7 +59,8 @@ export class NormalizeConflictError extends Error {
  * - stopped / forgotten：服务正在停机，或分支已被 forget（项目 / 分支被删）；
  * - no_shadow：没有可用的影子库（shadowOf 返回 null）；
  * - shadow_unavailable：影子库连不上、超时、被占用（ShadowError）；
- * - canonicalize_failed：表达式 / 不透明对象 DDL 在影子库里报错等其他错误（留给显式规范化或闭环验证报告给用户）；
+ * - canonicalize_failed：表达式 / 不透明对象 DDL 在影子库 `canonicalize` 里报错（留给显式规范化或闭环验证报告给用户）；
+ * - store_failed：平台库读写失败（`rooms.patch` / `rooms.state` / 保存 `branches.baseline` 抛错）；若写回已被接受但保存基线失败，返回的 `model` / `seq` 仍是写回后的房间状态，基线不推进；
  * - write_conflict：写回连续被版本检查拒绝超过 MAX_REJECT_RETRIES 次（期间一直有人改同一对象）；
  * - round_limit：单次持锁跑满 MAX_CATCHUP_ROUNDS 轮仍有待规范化对象（持续编辑造成活锁），不论期间是否写回过。
  */
@@ -69,6 +70,7 @@ export type FlushSkipReason =
   | 'no_shadow'
   | 'shadow_unavailable'
   | 'canonicalize_failed'
+  | 'store_failed'
   | 'write_conflict'
   | 'round_limit';
 
@@ -159,8 +161,9 @@ export class OpaqueRefresher {
 
   private async setGood(branchId: string, m: Model) {
     if (this.forgotten.has(branchId)) return;
-    this.good.set(branchId, m);
     await this.store.save(branchId, m);
+    if (this.forgotten.has(branchId)) return;
+    this.good.set(branchId, m);
   }
 
   private async loadGood(branchId: string): Promise<Model | null> {
@@ -328,23 +331,13 @@ export class OpaqueRefresher {
       const base = good ?? emptyBaseline(cur);
       if (!needsRefresh(base, cur)) return { kind: wrote ? 'normalized' : 'clean', seq, model: cur };
       const shadow = await this.shadowOf(branchId);
+      if (this.forgotten.has(branchId)) return skipped('forgotten', last);
       if (!shadow) return skipped('no_shadow', last);
-      let outcome: Awaited<ReturnType<OpaqueRefresher['apply']>>;
-      try {
-        outcome = await this.apply(branchId, shadow, base, cur, versions, seq);
-      } catch (e) {
-        // 影子库不可用是预期情况（没有环境、连不上……）：安静跳过；表达式在影子库里报错留给显式规范化报告给用户
-        if (e instanceof ShadowError) return skipped('shadow_unavailable', last);
-        console.warn(
-          '规范化表达式 / 不透明对象 DDL 失败（模型保持原样）',
-          e instanceof Error ? e.message : e,
-        );
-        return skipped('canonicalize_failed', last);
-      }
+      const outcome = await this.apply(branchId, shadow, base, cur, versions, seq);
       last = { model: outcome.model, seq: outcome.seq };
       switch (outcome.kind) {
-        case 'forgotten':
-          return skipped('forgotten', last);
+        case 'skipped':
+          return skipped(outcome.reason, last);
         case 'done':
           return { kind: 'normalized', seq: outcome.seq, model: outcome.model };
         case 'rejected':
@@ -365,7 +358,7 @@ export class OpaqueRefresher {
    * - done：写回被接受，房间相对推进后的基线没有待规范化对象（model 就是判定过的那一份）；
    * - accepted：写回被接受、基线已推进，但期间有别人的编辑还需要再追一轮；
    * - rejected：写回被版本检查拒绝或期间房间被替换，基线不动；
-   * - forgotten：规范化期间分支被 forget，什么都不写。
+   * - skipped：规范化期间被 forget、影子库不可用 / 报错，或平台库写回 / 读房间 / 保存基线失败。
    */
   private async apply(
     branchId: string,
@@ -374,13 +367,42 @@ export class OpaqueRefresher {
     cur: Model,
     versions: Versions,
     curSeq: number,
-  ): Promise<{ kind: 'done' | 'accepted' | 'rejected' | 'forgotten'; seq: number; model: Model }> {
-    const patched = await shadow.canonicalize(good, cur);
-    if (this.forgotten.has(branchId)) return { kind: 'forgotten', seq: curSeq, model: cur };
-    const patchRes = patched.length
-      ? await this.rooms.patch(branchId, 'Dowel', patched, versions)
-      : undefined;
-    const after = await this.rooms.state(branchId);
+  ): Promise<
+    | { kind: 'done' | 'accepted' | 'rejected'; seq: number; model: Model }
+    | { kind: 'skipped'; reason: FlushSkipReason; seq: number; model: Model }
+  > {
+    let patched: Obj[];
+    try {
+      patched = await shadow.canonicalize(good, cur);
+    } catch (e) {
+      if (this.forgotten.has(branchId)) {
+        return { kind: 'skipped', reason: 'forgotten', seq: curSeq, model: cur };
+      }
+      // 影子库不可用是预期情况（没有环境、连不上……）：安静跳过；表达式在影子库里报错留给显式规范化报告给用户
+      if (e instanceof ShadowError) {
+        return { kind: 'skipped', reason: 'shadow_unavailable', seq: curSeq, model: cur };
+      }
+      console.warn('规范化表达式 / 不透明对象 DDL 失败（模型保持原样）', e instanceof Error ? e.message : e);
+      return { kind: 'skipped', reason: 'canonicalize_failed', seq: curSeq, model: cur };
+    }
+    if (this.forgotten.has(branchId)) {
+      return { kind: 'skipped', reason: 'forgotten', seq: curSeq, model: cur };
+    }
+    let patchRes: { committed: boolean; rejected: boolean; seq: number } | undefined;
+    let after: { model: Model; versions: Versions; seq: number };
+    try {
+      patchRes = patched.length ? await this.rooms.patch(branchId, 'Dowel', patched, versions) : undefined;
+      after = await this.rooms.state(branchId);
+    } catch (e) {
+      if (this.forgotten.has(branchId)) {
+        return { kind: 'skipped', reason: 'forgotten', seq: curSeq, model: cur };
+      }
+      console.warn('写回规范化结果或读取房间状态失败（模型保持原样）', e instanceof Error ? e.message : e);
+      return { kind: 'skipped', reason: 'store_failed', seq: curSeq, model: cur };
+    }
+    if (this.forgotten.has(branchId)) {
+      return { kind: 'skipped', reason: 'forgotten', seq: after.seq, model: after.model };
+    }
     const rejected =
       Boolean(patchRes?.rejected) || patched.some((o) => !deepEqual(after.model.objects[o.id], o));
     // 写回被拒绝或期间房间被替换：绝不用过期的 canonical 覆盖 branches.baseline
@@ -389,7 +411,18 @@ export class OpaqueRefresher {
     // 规范化期间别人新增或修改的其他对象不在 canonical 里，留给下一轮继续规范化
     const canonical = structuredClone(cur);
     for (const o of patched) canonical.objects[o.id] = o;
-    await this.setGood(branchId, canonical);
+    try {
+      await this.setGood(branchId, canonical);
+    } catch (e) {
+      if (this.forgotten.has(branchId)) {
+        return { kind: 'skipped', reason: 'forgotten', seq: after.seq, model: after.model };
+      }
+      console.warn('保存规范化基线失败（模型已写回，基线未推进）', e instanceof Error ? e.message : e);
+      return { kind: 'skipped', reason: 'store_failed', seq: after.seq, model: after.model };
+    }
+    if (this.forgotten.has(branchId)) {
+      return { kind: 'skipped', reason: 'forgotten', seq: after.seq, model: after.model };
+    }
     if (
       (after.seq !== curSeq && !deepEqual(after.model, canonical)) ||
       needsRefresh(canonical, after.model)
