@@ -1020,6 +1020,14 @@ const netObjectChanges = (prevModel: Model | null, targetModel: Model) => {
 const PRIMITIVE_MUTATOR_DESCRIPTION =
   'Primitive schema mutator (one atomic edit; existing objects are addressed strictly by object ID).';
 
+const PG_SERIAL_MUTATOR_NOTE =
+  "PG: `serial` / `bigserial` / `smallserial` (aliases serial4 / serial8 / serial2, case-insensitive, unquoted) are expanded on write into an `integer` / `bigint` / `smallint` column + NOT NULL + an owned sequence named `<table>_<column>_seq` + default `nextval(<that sequence>)`; the model stores the integer type, never `serial`. Cannot be combined with default / identity / generated / notNull: false. Switching between serial variants updates the owned sequence's type in place; setting any other type (including plain integer) changes only the type — clear the default to stop auto-incrementing.";
+
+const PRIMITIVE_MUTATOR_DESCRIPTIONS: Readonly<Record<string, string>> = {
+  addColumn: `${PRIMITIVE_MUTATOR_DESCRIPTION} ${PG_SERIAL_MUTATOR_NOTE}`,
+  setColumnType: `${PRIMITIVE_MUTATOR_DESCRIPTION} ${PG_SERIAL_MUTATOR_NOTE}`,
+};
+
 /**
  * apply_changes 可用的操作目录：复合宏（defineTable / alterColumn）排在最前，随后是普通 mutator；
  * paste / batch 一律隐藏（ADR 0015 第 2、3 节）。list_mutators 与 dowel://mutators 共用。
@@ -1055,7 +1063,9 @@ const listMutatorCatalog = (names?: string[]) => {
     items.push({
       name,
       kind: 'mutator',
-      description: PRIMITIVE_MUTATOR_DESCRIPTION,
+      description: Object.hasOwn(PRIMITIVE_MUTATOR_DESCRIPTIONS, name)
+        ? PRIMITIVE_MUTATOR_DESCRIPTIONS[name]!
+        : PRIMITIVE_MUTATOR_DESCRIPTION,
       argsSchema: toJsonSchema(entry.args),
     });
   }

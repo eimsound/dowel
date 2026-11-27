@@ -105,7 +105,11 @@ export const mutators = {
       column: z.object({
         id,
         name,
-        type: z.string(),
+        type: z
+          .string()
+          .describe(
+            'Column type text. PG: `serial` / `bigserial` / `smallserial` (aliases serial4 / serial8 / serial2, case-insensitive, unquoted) are expanded on write into an `integer` / `bigint` / `smallint` column + NOT NULL + an owned sequence named `<table>_<column>_seq` + default `nextval(<that sequence>)`; the model stores the integer type, never `serial`. Cannot be combined with default / identity / generated.',
+          ),
         typeRef: id.nullable().optional(),
         notNull: z.boolean().optional(),
         default: ColumnDefault.nullable().optional(),
@@ -126,8 +130,17 @@ export const mutators = {
   ),
   renameColumn: def(z.object({ id, name }), (m, a) => E.renameColumn(m, a.id, a.name)),
   dropColumn: def(z.object({ id }), (m, a) => E.dropColumn(m, a.id)),
-  setColumnType: def(z.object({ id, type: z.string(), typeRef: id.nullable() }), (m, a) =>
-    E.setColumnType(m, a.id, a.type, a.typeRef),
+  setColumnType: def(
+    z.object({
+      id,
+      type: z
+        .string()
+        .describe(
+          "Column type text. PG: `serial` / `bigserial` / `smallserial` (aliases serial4 / serial8 / serial2, case-insensitive, unquoted) are expanded on write into an `integer` / `bigint` / `smallint` column + NOT NULL + an owned sequence named `<table>_<column>_seq` + default `nextval(<that sequence>)`; the model stores the integer type, never `serial`. Switching between serial variants updates the owned sequence's type in place; setting any other type (including plain integer) changes only the type — clear the default to stop auto-incrementing.",
+        ),
+      typeRef: id.nullable(),
+    }),
+    (m, a) => E.setColumnType(m, a.id, a.type, a.typeRef),
   ),
   setNotNull: def(z.object({ id, notNull: z.boolean() }), (m, a) => E.setNotNull(m, a.id, a.notNull)),
   setDefault: def(z.object({ id, default: ColumnDefault.nullable() }), (m, a) =>
