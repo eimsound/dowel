@@ -50,9 +50,12 @@
 - **【会出什么事】**
   - 副本 A 改连接串或把环境标为 `production: true, allowSameInstance: false` 后，副本 B 仍复用旧影子库甚至绕过生产禁同实例影子库的安全规则；删环境/删项目后他副本旧连接池永久泄漏。
 - **【Dowel 正确做法】**（已验证于 `shadows.ts` / `bus.ts` / `routes/projects.ts`）
-  1. 缓存条目保存 `projectId` 与完整配置 SHA-256 指纹（`name`/`url`/`shadowUrl`/`production`/`allowSameInstance`/`schemas`），指纹不匹配则先关旧连接再按新配置重建或拒绝；
+  1. 缓存条目保存 `projectId` 与完整配置 SHA-256 指纹（`name`/`url`/`shadowUrl`/`production`/`allowSameInstance`/`schemas`/`engineVersionNum`），指纹不匹配则先关旧连接再按新配置重建或拒绝；
   2. 引入 `invalidationGen` 与 `closed` 标记，防止并发 `prepareShadow` 完成后把旧句柄回写进缓存；
   3. 接入 `EventBus` 广播 `{ t: 'shadows.forget', origin, all?, envIds?, projectId? }`，删项目同步 `forgetProject(pid)`，`bus.onReconnect` 清空关闭本地缓存，`close()` 退订并释放全部连接。
+- **【补充：晚到的 `shadows.forget` 不能盲目关闭（`#148`）】**
+  - 反模式：远端 `shadows.forget` 到达就无条件 `forgetLocal`。事件是异步送达的，副本 B 可能在事件到达**之前**就已经 `forProject` 读到新配置、按新指纹重建了条目并开始 `verify`；晚到的事件把这个**按最新配置建立的**新连接 `close()` 掉，在途验证以“影子库不可用：连接失败：write CONNECTION_ENDED”失败（数据库本身正常）。`invalidationGen` 只覆盖“事件在 `prepareShadow` 期间到达”，覆盖不了“条目入缓存之后才到达”。
+  - 正确做法：收到远端 `envIds` / `projectId` 事件先同步 `invalidationGen++`，再对每个本地条目按平台库最新配置复核指纹（`revalidateLocal`）——一致就保留，不一致 / 环境或项目已删（404）/ 读配置失败才关闭移除；`all` 与 `onReconnect` 仍然无条件清空。回归见 `apps/server/test/shadows-stale-forget.test.ts`。
 
 ---
 
