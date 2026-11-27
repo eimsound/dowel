@@ -139,16 +139,15 @@ export const tableEntriesMoved = (dialect: Dialect, prev: Snap | null, next: Sna
 export interface MarkHost {
   readonly dialect: Dialect;
   mark(id: string): void;
-  /** 引用标识符 norm 的 CHECK */
-  refHits(norm: string): Iterable<string>;
+  charge?(n: number): void;
+  /** tableId 上引用标识符 norm 的 CHECK */
+  refHits(tableId: string, norm: string): Iterable<string>;
   /** 名字输入用到列 colId 的约束 / 索引 */
   colUsers(colId: string): Iterable<string>;
   /** 归属列 colId 的序列 */
   ownedSeqs(colId: string): Iterable<string>;
   /** 表的全部子对象 */
   childIds(tableId: string): Iterable<string>;
-  /** 对象当前的父对象 */
-  parentOf(id: string): string | null;
   rootOf(tableId: string): string;
   descendants(tableId: string): string[];
 }
@@ -163,8 +162,17 @@ const markTable = (h: MarkHost, tableId: string) => {
 const markFamily = (h: MarkHost, tableId: string | null) => {
   if (!tableId) return;
   const root = h.rootOf(tableId);
+  const desc = h.descendants(root);
+  if (desc.length) h.charge?.(desc.length);
   markTable(h, root);
-  for (const d of h.descendants(root)) markTable(h, d);
+  for (const d of desc) markTable(h, d);
+};
+
+const markRefHits = (h: MarkHost, tableId: string, norm: string) => {
+  for (const ck of h.refHits(tableId, norm)) {
+    derivedNameStats.refScans++;
+    h.mark(ck);
+  }
 };
 
 /**
@@ -197,13 +205,23 @@ export const markChange = (h: MarkHost, id: string, prev: Snap | null, next: Sna
       for (const q of h.ownedSeqs(id)) h.mark(q);
       if (prev?.name === next?.name && prev?.parent === next?.parent) return;
       for (const u of h.colUsers(id)) h.mark(u);
+      let prevRoot: string | null = null;
+      let prevNorm: string | null = null;
+      let prevDesc: string[] | null = null;
       for (const snap of [prev, next]) {
         if (!snap?.name || !snap.parent) continue;
-        const root = h.rootOf(snap.parent);
-        for (const ck of h.refHits(nsNorm(h.dialect, snap.name))) {
-          const t = h.parentOf(ck);
-          if (t && h.rootOf(t) === root) h.mark(ck);
+        const norm = nsNorm(h.dialect, snap.name);
+        const root = h.dialect === 'pg' ? h.rootOf(snap.parent) : snap.parent;
+        if (root === prevRoot && norm === prevNorm) continue;
+        markRefHits(h, root, norm);
+        if (h.dialect === 'pg') {
+          const desc: string[] = root === prevRoot && prevDesc !== null ? prevDesc : h.descendants(root);
+          prevDesc = desc;
+          if (desc.length) h.charge?.(desc.length);
+          for (const d of desc) markRefHits(h, d, norm);
         }
+        prevRoot = root;
+        prevNorm = norm;
       }
       return;
     }
@@ -258,17 +276,34 @@ const delSet = (map: Map<string, Set<string>>, k: string, v: string) => {
   if (set.size === 0) map.delete(k);
 };
 
-/** 倒排索引（标识符 → CHECK、列 → 约束 / 索引） */
+/** 倒排索引（(表, 标识符) → CHECK、列 → 约束 / 索引） */
 export class RefIndex {
-  readonly refs = new Map<string, Set<string>>();
+  /** tableId → 归一化标识符 → CHECK ID 集合 */
+  readonly refs = new Map<string, Map<string, Set<string>>>();
   readonly cols = new Map<string, Set<string>>();
   add(id: string, s: Snap) {
-    for (const r of s.refs) addSet(this.refs, r, id);
+    if (s.parent && s.refs.length) {
+      let byIdent = this.refs.get(s.parent);
+      if (!byIdent) {
+        byIdent = new Map();
+        this.refs.set(s.parent, byIdent);
+      }
+      for (const r of s.refs) addSet(byIdent, r, id);
+    }
     for (const c of s.cols) addSet(this.cols, c, id);
   }
   del(id: string, s: Snap) {
-    for (const r of s.refs) delSet(this.refs, r, id);
+    if (s.parent && s.refs.length) {
+      const byIdent = this.refs.get(s.parent);
+      if (byIdent) {
+        for (const r of s.refs) delSet(byIdent, r, id);
+        if (byIdent.size === 0) this.refs.delete(s.parent);
+      }
+    }
     for (const c of s.cols) delSet(this.cols, c, id);
+  }
+  getRefs(tableId: string, norm: string): ReadonlySet<string> | undefined {
+    return this.refs.get(tableId)?.get(norm);
   }
 }
 
@@ -470,23 +505,31 @@ export class BaseNamingState implements NamingView, MarkHost {
   }
 
   descendants(tableId: string): string[] {
+    const it = this.idx.partitionChildIds(tableId)[Symbol.iterator]();
+    const first = it.next();
+    if (first.done) return [];
     const out: string[] = [];
     const seen = new Set<string>([tableId]);
-    const queue = [tableId];
+    const queue: string[] = [];
+    const push = (c: string) => {
+      if (seen.has(c)) return;
+      seen.add(c);
+      out.push(c);
+      queue.push(c);
+    };
+    push(first.value);
+    for (let n = it.next(); !n.done; n = it.next()) push(n.value);
     for (let head = 0; head < queue.length; head++) {
-      for (const c of this.idx.partitionChildIds(queue[head]!)) {
-        if (seen.has(c)) continue;
-        seen.add(c);
-        out.push(c);
-        queue.push(c);
-      }
+      for (const c of this.idx.partitionChildIds(queue[head]!)) push(c);
     }
     return out;
   }
 
   rootOf(tableId: string): string {
-    const seen = new Set<string>();
-    let cur = tableId;
+    const first = this.tableOf(tableId);
+    if (!first?.partitionOf || !this.tableOf(first.partitionOf.parent)) return tableId;
+    const seen = new Set<string>([tableId]);
+    let cur = first.partitionOf.parent;
     while (!seen.has(cur)) {
       seen.add(cur);
       const t = this.tableOf(cur);
@@ -511,8 +554,8 @@ export class BaseNamingState implements NamingView, MarkHost {
     if (t) this.dirty.add(t, id);
   }
 
-  refHits(norm: string): Iterable<string> {
-    return this.refIndex.refs.get(norm) ?? EMPTY;
+  refHits(tableId: string, norm: string): Iterable<string> {
+    return this.refIndex.getRefs(tableId, norm) ?? EMPTY;
   }
 
   colUsers(colId: string): Iterable<string> {
@@ -525,11 +568,6 @@ export class BaseNamingState implements NamingView, MarkHost {
 
   childIds(tableId: string): Iterable<string> {
     return this.idx.childIds(tableId);
-  }
-
-  parentOf(id: string): string | null {
-    const o = this.idx.getObj(id);
-    return o && 'parent' in o ? o.parent : null;
   }
 
   /** 基线里 (ns, 名字) 是否被占用（撤销叠加层消耗时用） */

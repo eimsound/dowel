@@ -772,25 +772,26 @@ P3 审查后的修正（2026-11-19）：
 
 - **语义：稳定推导名，不再级联压缩（`packages/core/src/derived-names.ts`）**：推导名只在对象自身的命名输入变化（表名、引用列名、标签、所在命名空间）、与其他对象撞名或显式 `resetKeyName` 时重算；同表其他对象保留原名；需要重算的对象取命名序列（`<base>`、`<base>1`、`<base>2`…，各方言后缀格式不同）里最小的空位。例如 c1 = `orders_check`、c2 = `orders_check1`：删掉 c1 后 c2 不变，新加的 c3 取 `orders_check`；删掉 c1 再改表名，c2 变成 `invoices_check`。之前的语义是每次刷新都把同序列成员压缩成 0..k-1：一次删除或改名可能连带改掉整张表（PG 还包括整个分区家族）的约束名，因此每步都要整表重算，大表上不可能做到增量。稳定语义下，“保留”只需检查“当前名在自己的序列里，且命名空间里没有其他占用者”，重算范围就缩小到真正变化的对象。槽位保留的条件是 `candIndex(spec, cur) >= 0 && !takenByOther`，其余的为待重算。处理待重算槽位时，先全部释放旧名（互不阻挡），再按（旧名长度、旧名、占用者 ID）的确定顺序依次取最小空位，结果与遍历顺序无关。MSSQL 新列的 DEFAULT 名尚未写进 ext 时，只在命名空间里按 `DF_<table>_<col>` 隐式占位（`Slot.implicit`）：这类槽位按新对象处理，并在校验其他槽位之前先释放，避免截断到 128 字符后与已有名字相同、把已有对象挤走。刷新按表进行（`refreshDerivedNames(m, tableId)`），与 `main` 的分表行为一致。
 - **命名序列：最小堆空位 + 高水位（`SeqRegistry` / `SeqState`）**：每个 `(table, label, n1, n2, ns)` 序列维护高水位 `H` 和一个空位最小堆，保证不变式：`< H` 的序号要么已被占用，要么在堆里（堆里的过期项在弹出时惰性校验）。`choose()` 先弹出堆里 `< H` 的空位，否则从 `H` 开始试探；`noteFreed()` 把腾出的 `< H` 序号推回堆里。基线构建阶段用 `warm` 推进 `H`，不计入预算。条目数超过 max(4096, 2 × 存活序列数) 时 `sweep` 回收。execute 内取用的序号记入 `consumed` 日志，跟踪器 `finish()` 时把基线里仍空着的序号推回堆里，因此失败回滚的 execute 不会吞掉空位。
-- **列标识符倒排索引（`packages/core/src/naming-state.ts` 的 `RefIndex`）**：`refs` 记录“标识符 → 引用它的 CHECK”（由 `exprRefNames` 单趟分词得到，沿用按成本淘汰的 LRU 缓存：`REF_CACHE_MAX_COST`，以及 `exprLexes` 计数守卫）；`cols` 记录“列 → 引用它的 UNIQUE / FK / 索引”。列创建、删除、改名或换表时，只标脏 `colUsers(id)`，以及通过 `refHits(norm(name))` 找到的同家族 CHECK，不再整表扫描。CHECK 是否“恰好引用一列”由列名命名空间 `colNs(table)` 在 O(|refs|) 内判定。
+- **列标识符倒排索引（`packages/core/src/naming-state.ts` 的 `RefIndex`）**：`refs` 按 `(表, 归一化标识符)` 分桶（`Map<tableId, Map<ident, Set<checkId>>>`）记录引用该标识符的 CHECK（由 `exprRefNames` 单趟分词得到，沿用按成本淘汰的 LRU 缓存：`REF_CACHE_MAX_COST`，以及 `exprLexes` 计数守卫）；`cols` 记录“列 → 引用它的 UNIQUE / FK / 索引”。列创建、删除、改名或换表时，只标脏 `colUsers(id)`，以及仅在变列所属表（PG 为整个分区家族 `rootOf` + `descendants`）上通过 `refHits(tableId, norm(name))` 命中的 CHECK，不再扫描全模型同名标识符；`markFamily` 与列变化遍历 PG 子分区、以及叠加层 `refHits` 跳过已遮蔽的基线条目时均计入工作量预算。CHECK 是否“恰好引用一列”由列名命名空间 `colNs(table)` 在 O(|refs|) 内判定。
 - **基线持久化的命名状态（`BaseNamingState`，挂在 `MutableModelIndex` 上）**：包括命名空间占用者（ns → name → owner → root）、每个对象的快照（已登记条目、refs、cols）、`RefIndex`、按表分组的脏集合 `DirtyByTable` 和 `SeqRegistry`。首次使用时由 `ensureNaming()` 构建：对全部槽位做一次只读校验，失败的留作脏，同时预热高水位。之后由 `applyObjectChange` / `applyBatch` 的 `beforeBatch` / `afterBatch` 增量维护：注销旧条目并登记新条目，PG / MSSQL 表换 schema 或 MSSQL 表改名（`tableEntriesMoved`）时重新登记子对象，处理腾出和撞名事件，按 `markChange` 规则标脏，最后对脏对象做只读校验。`markChange` 规则：
   - 槽位对象和序列：标脏自己。
-  - 列：标脏自己及其拥有的序列；列名或所属表变化（含创建、删除）时，再标脏 `colUsers` 和 `refHits` 命中的 CHECK。
+  - 列：标脏自己及其拥有的序列；列名或所属表变化（含创建、删除）时，再标脏 `colUsers` 和同家族各表桶上 `refHits(tableId, norm)` 命中的 CHECK。
   - 表：指纹变化时整表标脏；`partitionParent` 变化时，对本表、旧父表、新父表调用 `markFamily`。
   - 撞名：标脏全部占用者所属的根对象。
 
   execute 期间由 `OverlayNameTracker` 在叠加层上记增量：屏蔽有快照对象的基线条目，再叠加 `ov` 占用者、`ovRefs`、`ovKids`、`ovParts`、`ovSeqs`；`flush` 分两阶段惰性执行，`inPass` 抑制本趟自标脏。提交后状态随基线前进，因此 MCP `apply_changes` 500 步预演共用同一个 `batchIndex`，只构建一次基线命名状态（`stateBuilds === 1`）。没有索引的普通模型走 `plainRefresh` + `ScanView`，处理该表全部槽位。差分测试保证两条路径逐字节一致。
 
-- **`batchReadsOf` 走索引（`packages/core/src/mutators.ts`、`packages/sync/src/protocol.ts`）**：`batchReadsOf(m, args, step?)` 接受 `BatchStepper`。`opReads` 遇到 `batch` 时传入 `indexedBatchStepper(base)`：用一个 `MutableModelIndex` 加 `execute` + `applyBatch` 逐步推进，大表上推导名工作量与表大小无关。
-- **确定性工作量预算熔断**：`DERIVED_NAME_WORK_BUDGET` = 200,000，客户端和服务端共用，不设单表约束数上限。只在跟踪路径计费：每次槽位校验、`choose` 的每次试探、每次标脏、每次子对象重快照记 1。一次 `execute`（WS 操作、粘贴、`batch`、客户端乐观执行）用一份预算；MCP `apply_changes` 整个预演共用一份（`mcp.ts` 的 `previewBudget`，经 `ExecuteOptions.budget` 传入）。超出时抛 `DerivedNameBudgetError extends EditError`（消息含“推导名重算工作量超出上限”），沿用现有写时复制回滚与 `invalid` 拒绝，模型和基线索引都不受影响。标定数据（开发机，`node --conditions=@dowel/source`）：
+- **`batchReadsOf` 走索引（`packages/core/src/mutators.ts`、`packages/sync/src/protocol.ts`）**：`batchReadsOf(m, args, step?)` 接受 `BatchStepper`。`opReads` 遇到 `batch` 时传入 `indexedBatchStepper(base, budget?)`：用一个 `MutableModelIndex` 加 `execute` + `applyBatch` 逐步推进，整批共用一份 `DerivedNameBudget`；若逐步执行触发 `DerivedNameBudgetError`，`batchReadsOf` 对剩余子操作退回保守依据收集（含基准模型 / 当前模型涉及的表及其有效列），避免静默截断依据。
+- **确定性工作量预算熔断**：`DERIVED_NAME_WORK_BUDGET` = 200,000，客户端和服务端共用，不设单表约束数上限。只在跟踪路径计费：每次槽位校验、`choose` 的每次试探、每次标脏、每次子对象重快照、遍历 PG 子分区与跳过已遮蔽基线 `refHits` 均计入。一次 `execute`（WS 操作、粘贴、`batch`、客户端乐观执行）用一份预算；MCP `apply_changes` 整个预演共用一份（`mcp.ts` 的 `previewBudget`，经 `ExecuteOptions.budget` 传入）。超出时抛 `DerivedNameBudgetError extends EditError`（消息含“推导名重算工作量超出上限”），沿用现有写时复制回滚与 `invalid` 拒绝，模型和基线索引都不受影响。标定数据（开发机，`node --conditions=@dowel/source`）：
   - PG 1 万条 CHECK 的大表上，单次 `addCheck` 约 3 ms（2 次校验）。
   - 交错的逐步 execute 每步约 1 次校验、2–4 次试探、1.25–2 次标脏；正常粘贴每个子操作消耗常数预算，按 2 万个子操作折算仍低于预算的一半。
   - `batch` 里反复改这张大表的表名或列名（每次都要重算全部 CHECK）约 1.05–1.1 s 时触发熔断；其余方言 4000 条 CHECK 时约 0.9 s 触发。
 - **剩余的非推导名开销（不在本 PR 范围）**：MCP 500 步预演约 1.56 s，其中纯 500 × `setComment` 已占约 1.37 s，推导名只占约 80 ms；粘贴 1 万条 CHECK 约 4.1–4.7 s，推导名不到 2%。剩余开销主要来自 `execute` 的 `{...m.objects}` 拷贝，以及 `OverlayModelIndex.columnsOf` / `childrenRef` / `effectiveColumnsOf` 的叠加层扫描（#165）。
 - **验证**：
   - `packages/sync/test/derived-names.test.ts` 对四方言跑随机修改序列，比较普通模型、逐个 execute（共享索引）、无索引 execute、整批 `batch` / paste（含先提交前缀进基线）的结果，要求逐字节一致；每步检查不变式：未受影响对象名字不变、推导名有效、不撞名、重算者取最小空位。
-  - 同一文件还有：回归用例；确定性计数守卫（大表单步、交错 addColumn / addCheck、交错 renameKey / dropKey / addCheck、MCP 500 步、`batchReadsOf`、分词缓存）；预算熔断与原子回滚；失败 execute 不吞空位；提交级写入后的标脏覆盖（倒排索引、撞名顺序、分区拓扑）。
-  - `packages/core/test/naming-index.test.ts` 把增量维护的命名空间、倒排索引和脏集合与全新构建对比。
+  - 同一文件还有：回归用例；确定性计数守卫（大表单步、交错 addColumn / addCheck、交错 renameKey / dropKey / addCheck、跨表同名列 `renameColumn` 隔离与 `refScans` 守卫、PG 分区族隔离与空分区遍历预算守卫、MCP 500 步、`batchReadsOf`、分词缓存）；预算熔断与原子回滚；`indexedBatchStepper` 共享预算及 `batchReadsOf` 超限保守回退；失败 execute 不吞空位；提交级写入后的标脏覆盖（倒排索引、撞名顺序、分区拓扑）。
+  - `packages/core/test/naming-index.test.ts` 把增量维护的命名空间、`(表, 标识符)` 倒排索引和脏集合与全新构建对比。
+  - `apps/server/test/mcp.test.ts` 通过真实 `McpWriter` / `apply_changes` 验证 `previewBudget` 跨步骤共享并在超限处拒绝、房间模型保持不变。
   - 原先作为对照的 `packages/core/test/support/legacy-derived-names.ts` 已删除，因为语义已经改变；`packages/core` 原有测试无一依赖级联压缩，全部未改动通过。
 
 ## 5. 下一步

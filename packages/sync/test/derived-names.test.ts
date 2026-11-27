@@ -22,6 +22,7 @@ import {
   type Obj,
   partitionAncestors,
   partitionDescendants,
+  readsOf,
   resetDerivedNameStats,
   rootTableId,
   runMutator,
@@ -39,7 +40,7 @@ import {
   slotTableOf,
 } from '../../core/src/derived-names.ts';
 import { colNs, nameEntriesOf, type NsEntry } from '../../core/src/naming-ns.ts';
-import { execute, opReads } from '../src/index.ts';
+import { execute, indexedBatchStepper, opReads } from '../src/index.ts';
 
 const DIALECTS: readonly Dialect[] = ['pg', 'sqlite', 'mysql', 'mssql'];
 const INT: Record<Dialect, string> = { pg: 'integer', sqlite: 'INTEGER', mysql: 'int', mssql: 'int' };
@@ -1259,5 +1260,189 @@ describe('回归用例：提交级写入后，标脏规则覆盖倒排索引、�
     );
     // 父表的 CHECK 现在要避让子分区的全部约束名：刷新父表时它让出名字（子分区自己的 CHECK 等子分区刷新时再处理）
     expect([nameOf(after, 'pck'), nameOf(after, 'cck')]).toEqual(['p_a_check1', 'p_a_check']);
+  });
+});
+
+// ───── 跨表同名列倒排索引隔离、分区族遍历计费与 indexedBatchStepper 共享预算 ─────
+
+describe('跨表 CHECK 倒排索引隔离与分区族预算守卫', () => {
+  for (const dialect of DIALECTS) {
+    test(`${dialect}: 其他表有 N 条同名列 CHECK 时，小表 renameColumn 的 refScans 与工作量与 N 无关`, () => {
+      const setup = (n: number, withSmCheck: boolean) => {
+        let { m, idx } = bigModel(dialect, n);
+        const s0 = schemaOf(m);
+        m = commitTo(idx, m, execute(m, 'createTable', { id: 'sm', schema: s0, name: 'sm' }, idx));
+        m = commitTo(
+          idx,
+          m,
+          execute(
+            m,
+            'addColumn',
+            { table: 'sm', column: { id: 'sm_a', name: 'a', type: INT[dialect] } },
+            idx,
+          ),
+        );
+        if (withSmCheck) {
+          m = commitTo(idx, m, execute(m, 'addCheck', { id: 'sm_ck', table: 'sm', expr: 'a > 0' }, idx));
+        }
+        return { m, idx };
+      };
+
+      const runRename = (n: number, count: number, withSmCheck: boolean) => {
+        const { m, idx } = setup(n, withSmCheck);
+        const ops: Op[] = Array.from({ length: count }, (_, i) => ({
+          name: 'renameColumn',
+          args: { id: 'sm_a', name: i % 2 === 0 ? 'z' : 'a' },
+        }));
+        const budget = new DerivedNameBudget();
+        resetDerivedNameStats();
+        const res = execute(m, 'batch', { ops }, idx, { budget });
+        return { res, budgetUsed: budget.used, refScans: derivedNameStats.refScans };
+      };
+
+      // 无约束小表：完全不扫描 big 表引用 'a' 的 N 条 CHECK
+      const noCkSmall = runRename(500, 100, false);
+      const noCkLarge = runRename(2000, 100, false);
+      expect(noCkSmall.refScans).toBe(0);
+      expect(noCkLarge.refScans).toBe(0);
+      expect(noCkLarge.budgetUsed).toBe(noCkSmall.budgetUsed);
+      expect(noCkLarge.budgetUsed).toBeLessThanOrEqual(100 * 3);
+
+      // 小表有 1 条引用 'a' 的 CHECK：每次 renameColumn 命中旧名(已遮蔽基线/上一步)与新名(叠加层)各 1 次，与 big 表 N 无关
+      const withCkSmall = runRename(500, 50, true);
+      const withCkLarge = runRename(2000, 50, true);
+      expect(withCkLarge.refScans).toBe(withCkSmall.refScans);
+      expect(withCkLarge.refScans).toBeLessThanOrEqual(100);
+      expect(withCkLarge.budgetUsed).toBe(withCkSmall.budgetUsed);
+    });
+  }
+
+  test('pg: 分区家族改列名只查同家族 CHECK（不扫无关大表）并正确重命名子分区 CHECK', () => {
+    let { m, idx } = bigModel('pg', 2000);
+    const s0 = schemaOf(m);
+    for (const op of [
+      { name: 'createTable', args: { id: 'p', schema: s0, name: 'p' } },
+      { name: 'addColumn', args: { table: 'p', column: { id: 'p_k', name: 'k', type: 'integer' } } },
+      { name: 'addColumn', args: { table: 'p', column: { id: 'p_a', name: 'a', type: 'integer' } } },
+      {
+        name: 'setPartitionBy',
+        args: {
+          id: 'p',
+          partitionBy: {
+            strategy: 'range',
+            keys: [{ column: 'p_k', expr: null, opclass: null, collation: null }],
+          },
+        },
+      },
+      {
+        name: 'createPartition',
+        args: { id: 'p1', parent: 'p', name: 'p_1', bound: 'FOR VALUES FROM (0) TO (10)' },
+      },
+      { name: 'addCheck', args: { id: 'p1_ck', table: 'p1', expr: 'a > 0' } },
+    ] satisfies Op[]) {
+      m = commitTo(idx, m, execute(m, op.name, op.args, idx));
+    }
+    resetDerivedNameStats();
+    const res = execute(m, 'renameColumn', { id: 'p_a', name: 'b' }, idx);
+    expect(nameOf(res.next, 'p1_ck')).toBe('p_1_b_check');
+    expect(derivedNameStats.refScans).toBe(2);
+  });
+
+  test('pg: 空分区家族反复 renameColumn 计入遍历子分区的工作量预算并在超限时熔断', () => {
+    const m0 = emptyModel('pg');
+    const s0 = createSchema(m0, 'public', 's0');
+    runMutator(m0, 'createTable', { id: 'p', schema: s0, name: 'p' });
+    runMutator(m0, 'addColumn', { table: 'p', column: { id: 'p_k', name: 'k', type: 'integer' } });
+    runMutator(m0, 'addColumn', { table: 'p', column: { id: 'p_a', name: 'a', type: 'integer' } });
+    runMutator(m0, 'setPartitionBy', {
+      id: 'p',
+      partitionBy: {
+        strategy: 'range',
+        keys: [{ column: 'p_k', expr: null, opclass: null, collation: null }],
+      },
+    });
+    for (let i = 0; i < 50; i++) {
+      runMutator(m0, 'createPartition', {
+        id: `p_${i}`,
+        parent: 'p',
+        name: `p_${i}`,
+        bound: `FOR VALUES FROM (${i * 10}) TO (${(i + 1) * 10})`,
+      });
+    }
+    const idx = new MutableModelIndex(m0);
+    const ops: Op[] = Array.from({ length: 20 }, (_, i) => ({
+      name: 'renameColumn',
+      args: { id: 'p_a', name: i % 2 === 0 ? 'z' : 'a' },
+    }));
+    const budget = new DerivedNameBudget(1000);
+    let err: unknown;
+    try {
+      execute(m0, 'batch', { ops }, idx, { budget });
+    } catch (e) {
+      err = e;
+    }
+    expect(err).toBeInstanceOf(EditError);
+    expect(String((err as Error).message)).toContain('推导名重算工作量超出上限');
+    expect(budget.used).toBeGreaterThan(budget.limit);
+  });
+});
+
+describe('indexedBatchStepper 共享预算与 batchReadsOf 超限保守回退', () => {
+  test('indexedBatchStepper 在多步之间累计同一份 DerivedNameBudget 并在超限时抛 DerivedNameBudgetError', () => {
+    const { m } = bigModel('pg', 1500);
+    const budget = new DerivedNameBudget(10_000);
+    const step = indexedBatchStepper(m, budget);
+    let cur = m;
+    let failedAt = -1;
+    for (let i = 0; i < 20; i++) {
+      try {
+        cur = step(cur, 'renameTable', { id: 'big', name: `big_${i}` });
+      } catch (e) {
+        expect(e).toBeInstanceOf(DerivedNameBudgetError);
+        failedAt = i;
+        break;
+      }
+    }
+    expect(failedAt).toBeGreaterThan(0);
+    expect(failedAt).toBeLessThan(10);
+    expect(budget.used).toBeGreaterThan(budget.limit);
+  });
+
+  test('pg: batchReadsOf 遇到 DerivedNameBudgetError 时对后续子操作退回保守依据收集而不截断', () => {
+    const m = emptyModel('pg');
+    const s0 = createSchema(m, 'public', 's0');
+    runMutator(m, 'createTable', { id: 't0', schema: s0, name: 't0' });
+    runMutator(m, 'addColumn', { table: 't0', column: { id: 'c0_a', name: 'a', type: 'integer' } });
+    runMutator(m, 'addColumn', { table: 't0', column: { id: 'c0_b', name: 'b', type: 'integer' } });
+    for (let i = 0; i < 10; i++) {
+      runMutator(m, 'addCheck', { id: `ck_${i}`, table: 't0', expr: `a > ${i}` });
+    }
+    runMutator(m, 'createTable', { id: 't1', schema: s0, name: 't1' });
+    runMutator(m, 'addColumn', { table: 't1', column: { id: 'c1_a', name: 'a', type: 'integer' } });
+    runMutator(m, 'createTable', { id: 't2', schema: s0, name: 't2' });
+    runMutator(m, 'addColumn', { table: 't2', column: { id: 'c2_x', name: 'x', type: 'integer' } });
+
+    const ops: Op[] = [
+      ...Array.from({ length: 40 }, (_, i) => ({
+        name: 'renameColumn',
+        args: { id: 'c0_a', name: i % 2 === 0 ? 'z' : 'a' },
+      })),
+      // 以下操作在极小预算耗尽之后出现，必须仍被保守收集进依据
+      { name: 'renameColumn', args: { id: 'c1_a', name: 'c1_renamed' } },
+      { name: 'addCheck', args: { id: 'new_ck', table: 't0', expr: 'b > 0' } },
+      { name: 'createTable', args: { id: 'new_t', schema: s0, name: 'brand_new' } },
+      { name: 'addColumn', args: { table: 'new_t', column: { id: 'new_col', name: 'x', type: 'integer' } } },
+    ];
+
+    const reads = readsOf(
+      m,
+      { ops, summary: 'c2_x' },
+      'batch',
+      indexedBatchStepper(m, new DerivedNameBudget(50)),
+    );
+    expect(reads).toEqual(expect.arrayContaining(['t0', 'c0_a', 'c0_b', 'c1_a']));
+    expect(reads).not.toContain('new_t');
+    expect(reads).not.toContain('new_col');
+    expect(reads).not.toContain('c2_x');
   });
 });

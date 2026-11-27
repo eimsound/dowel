@@ -33,6 +33,8 @@ import {
   tableEntriesMoved,
 } from './naming-state.ts';
 
+const EMPTY: readonly string[] = [];
+
 const addSet = (map: Map<string, Set<string>>, k: string, v: string) => {
   let set = map.get(k);
   if (!set) {
@@ -246,6 +248,8 @@ export class OverlayNameTracker implements NamingView, MarkHost {
   }
 
   descendants(tableId: string): string[] {
+    this.flush();
+    if (this.base.partitionsRef(tableId).length === 0 && !this.ovParts.has(tableId)) return [];
     const out: string[] = [];
     const seen = new Set<string>([tableId]);
     const queue = [tableId];
@@ -261,8 +265,10 @@ export class OverlayNameTracker implements NamingView, MarkHost {
   }
 
   rootOf(tableId: string): string {
-    const seen = new Set<string>();
-    let cur = tableId;
+    const first = this.tableOf(tableId);
+    if (!first?.partitionOf || !this.tableOf(first.partitionOf.parent)) return tableId;
+    const seen = new Set<string>([tableId]);
+    let cur = first.partitionOf.parent;
     while (!seen.has(cur)) {
       seen.add(cur);
       const t = this.tableOf(cur);
@@ -285,10 +291,26 @@ export class OverlayNameTracker implements NamingView, MarkHost {
     if (t) this.dirty.add(t, id);
   }
 
-  refHits(norm: string): Iterable<string> {
+  charge(n: number) {
+    if (!this.inPass) chargeDerivedNameWork(n);
+  }
+
+  refHits(tableId: string, norm: string): Iterable<string> {
+    const base = this.state.refIndex.getRefs(tableId, norm);
+    const ov = this.ovRefs.getRefs(tableId, norm);
+    if (!base && !ov) return EMPTY;
     const out: string[] = [];
-    for (const id of this.state.refIndex.refs.get(norm) ?? []) if (!this.masked(id)) out.push(id);
-    for (const id of this.ovRefs.refs.get(norm) ?? []) out.push(id);
+    if (base) {
+      for (const id of base) {
+        if (this.masked(id)) {
+          derivedNameStats.refScans++;
+          if (!this.inPass) chargeDerivedNameWork(1);
+        } else {
+          out.push(id);
+        }
+      }
+    }
+    if (ov) for (const id of ov) out.push(id);
     return out;
   }
 
@@ -311,11 +333,6 @@ export class OverlayNameTracker implements NamingView, MarkHost {
     for (const id of this.state.childIds(tableId)) if (!this.masked(id)) out.push(id);
     for (const id of this.ovKids.get(tableId) ?? []) out.push(id);
     return out;
-  }
-
-  parentOf(id: string): string | null {
-    const o = this.cur(id);
-    return o && 'parent' in o ? o.parent : null;
   }
 
   // ───── 刷新 ─────

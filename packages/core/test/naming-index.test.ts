@@ -44,12 +44,22 @@ const expectSameNamespaces = (
   for (const e of probes.values()) {
     expect(owners(idx, e), `${e.ns.replace('\0', ':')} ${e.name}`).toEqual(owners(fresh, e));
   }
-  // 推导名状态：倒排索引（标识符 → CHECK、列 → 约束 / 索引）与脏集合同样与全量重建一致
+  // 推导名状态：倒排索引（(表, 标识符) → CHECK、列 → 约束 / 索引）与脏集合同样与全量重建一致
   const dump = (x: MutableModelIndex) => {
     const st = x.namingState();
     const flat = (mm: Map<string, Set<string>>) =>
       [...mm].map(([k, v]) => `${k}=${[...v].sort(cmp).join(',')}`).sort(cmp);
-    return { refs: flat(st.refIndex.refs), cols: flat(st.refIndex.cols) };
+    const flatRefs = (mm: Map<string, Map<string, Set<string>>>) =>
+      [...mm]
+        .flatMap(([t, byIdent]) =>
+          [...byIdent].map(([ident, ids]) => `${t}\0${ident}=${[...ids].sort(cmp).join(',')}`),
+        )
+        .sort(cmp);
+    return {
+      refTables: [...st.refIndex.refs.keys()].sort(cmp),
+      refs: flatRefs(st.refIndex.refs),
+      cols: flat(st.refIndex.cols),
+    };
   };
   expect(dump(idx)).toEqual(dump(fresh));
   // 脏集合：提交（applyBatch）后只读校验，与全量重建相同；单对象路径（applyObjectChange）不校验，只要求是超集
@@ -122,6 +132,20 @@ describe('MutableModelIndex 命名空间分桶：增量维护与全量重建一�
         (d) => runMutator(d, 'renameColumn', { id: 'c0', name: 'ident' }),
         (d) => runMutator(d, 'renameKey', { id: 'ck0', name: 'my_check' }),
         (d) => runMutator(d, 'resetKeyName', { id: 'ck0' }),
+        (d) => runMutator(d, 'setCheckExpr', { id: 'ck0', expr: 'a > 1 AND ident > 0' }),
+        (d) => runMutator(d, 'setCheckExpr', { id: 'ck0', expr: '1 = 1' }),
+        (d) => runMutator(d, 'setCheckExpr', { id: 'ck0', expr: 'a > 0' }),
+        (d) => runMutator(d, 'addCheck', { id: 'ck1', table: 't1', expr: 'oid > 0' }),
+        (d) => {
+          const ck1 = d.objects.ck1;
+          if (ck1?.kind === 'check') ck1.parent = 't0';
+        },
+        (d) => {
+          const ck1 = d.objects.ck1;
+          if (ck1?.kind === 'check') ck1.parent = 't1';
+        },
+        (d) => runMutator(d, 'addCheck', { id: 'ck_drop', table: 't1', expr: 'oid > 1' }),
+        (d) => runMutator(d, 'dropKey', { id: 'ck_drop' }),
         (d) => runMutator(d, 'dropKey', { id: 'uq0' }),
         (d) => runMutator(d, 'addUnique', { id: 'uq1', table: 't1', columns: ['c2'] }),
         // 表换 schema：提交里直接出现（历史恢复 / 外部导入），没有对应的 mutator

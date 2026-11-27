@@ -6,7 +6,7 @@ Dowel stores each project model in a canonical intermediate representation (IR) 
 
 - Every schema, table, column, constraint, index, enum, and sequence carries a globally unique UUIDv7 object ID.
 - Renaming a table or column updates the object's name property while keeping its ID. At publish time, Dowel generates `ALTER TABLE ... RENAME` or `ALTER ... RENAME COLUMN` (`sp_rename` on SQL Server) instead of dropping and recreating objects, and preserves existing data.
-- **Derived and explicit names.** Engine-derived constraint, index, and sequence names are marked `derived` by default. Renaming a table or column recalculates derived names and emits rename DDL automatically. Dropping a constraint never renumbers the other derived names; new objects reuse the lowest free suffix. Lock any name as `explicit` if application code depends on a fixed identifier.
+- **Derived and explicit names.** Engine-derived constraint, index, and sequence names are marked `derived` by default. Renaming a table or column recalculates derived names and emits rename DDL automatically. Dropping a constraint never renumbers the other derived names; new objects reuse the lowest free suffix. Single-operation derived-name recalculation enforces a safety work budget (rejecting repeated wide renames in one batch or single-table renames exceeding roughly 50k–60k derived names). Lock any name as `explicit` if application code depends on a fixed identifier.
 - **Expression rewriting.** When you rename a column, Dowel updates references to that column inside table CHECK constraints, column defaults, and generated column expressions in the same atomic edit.
 
 ## Importing schemas {#importing}

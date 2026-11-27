@@ -38,6 +38,8 @@ export interface DerivedNameStats {
   probes: number;
   /** 写入事件标脏次数 */
   marks: number;
+  /** 列变化时经倒排索引扫描到的 CHECK 候选数 */
+  refScans: number;
   /** 推导名计算里对表达式做词法分析的次数（缓存未命中） */
   exprLexes: number;
   /** 基线命名状态的全量构建次数 */
@@ -51,6 +53,7 @@ export const derivedNameStats: DerivedNameStats = {
   recomputes: 0,
   probes: 0,
   marks: 0,
+  refScans: 0,
   exprLexes: 0,
   stateBuilds: 0,
 };
@@ -64,7 +67,7 @@ export const resetDerivedNameStats = (): void => {
 /**
  * 一次修改（WS 单条修改、粘贴、batch、客户端乐观执行）或一次 MCP apply_changes 预演允许的推导名工作量步数
  * （校验一个槽位、试探一个候选名、标脏一个对象各计 1 步）。客户端与服务端共用。
- * 标定见 .agents/docs/05-implementation.md 4.32：病态的 renameTable / renameColumn 循环在 1 s 内被中止，
+ * 标定见 .agents/docs/05-implementation.md 4.33：病态的 renameTable / renameColumn 循环在 1 s 内被中止，
  * 正常的大规模编辑（粘贴上万个子操作、在万条 CHECK 的表上逐条加约束）远低于这个数。
  */
 export const DERIVED_NAME_WORK_BUDGET = 200_000;

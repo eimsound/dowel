@@ -329,10 +329,13 @@ export const applyChanges = (m: Model, versions: Versions, changes: Change[], ve
  * batch 依据的逐步执行器：带持久推导名状态的索引 + 每步一次 execute（写时复制）后 applyBatch，
  * 每步只做 O(变化量) 的推导名工作（Issue #164）。
  */
-export const indexedBatchStepper = (base: Model): BatchStepper => {
+export const indexedBatchStepper = (
+  base: Model,
+  budget: DerivedNameBudget = new DerivedNameBudget(),
+): BatchStepper => {
   const idx = new MutableModelIndex(base);
   return (cur, name, args) => {
-    const r = execute(cur, name, args, idx);
+    const r = execute(cur, name, args, idx, { budget });
     idx.applyBatch(
       r.next,
       r.changes.map((c) => ({
