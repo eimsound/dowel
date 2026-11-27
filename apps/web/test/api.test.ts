@@ -31,7 +31,7 @@ test('shadow_config_changed：中英文界面文案，保留错误码与状态',
   expect(zh).toBeInstanceOf(ApiError);
   expect(zh.status).toBe(503);
   expect(zh.code).toBe('shadow_config_changed');
-  expect(zh.message).toBe('影子库配置已变更，请重试');
+  expect(zh.message).toBe('影子库配置已变更，请重试。');
 
   await i18n.changeLanguage('en');
   expect((await failure()).message).toBe('The shadow database configuration changed. Please try again.');

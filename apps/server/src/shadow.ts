@@ -75,8 +75,9 @@ export interface Shadow {
   canonicalize(prev: Model, next: Model): Promise<Obj[]>;
   /**
    * 永久关闭句柄（Issue #154）：之后的任何操作（包括已经排队、还没开始的）都以 ShadowConfigChangedError 拒绝，
-   * 绝不重新建连；关闭时正在跑的那次操作的连接会被直接关掉，这次操作无论成功失败都以 ShadowConfigChangedError 结束、
-   * 结果丢弃（配置变了，旧影子库上得出的结论不能再用）。可重复调用。
+   * 绝不重新建连；关闭时正在跑的那次操作无论成功失败都以 ShadowConfigChangedError 结束、结果丢弃
+   * （配置变了，旧影子库上得出的结论不能再用）。底层关闭对在途语句的处理依方言驱动而异（PG 客户端最多宽限 5 秒后断连，
+   * 服务端语句可能继续跑到 `statement_timeout`；MySQL / MSSQL 等待当前语句或事务结束；详见 `targets/shadow-handle.ts`）。可重复调用。
    */
   close(): Promise<void>;
 }

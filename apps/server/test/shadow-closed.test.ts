@@ -24,6 +24,7 @@ import { mssqlShadow } from '../src/targets/mssql.ts';
 import { mysqlShadow } from '../src/targets/mysql.ts';
 import { pgShadow, pgTargetDriver } from '../src/targets/pg.ts';
 import { serialShadowConnection } from '../src/targets/shadow-handle.ts';
+import { sqliteMemoryShadow } from '../src/targets/sqlite.ts';
 import type {
   ConnectionGuard,
   PreparedShadow,
@@ -202,7 +203,7 @@ describe.each([
     expect(guard).toHaveBeenCalledTimes(1);
   });
 
-  test('正在建连的在途操作被 close() 打断：以“配置已变更”结束；关闭期间和之后的操作不建新连接', async () => {
+  test('正在建连的在途操作遇到 close()：以“配置已变更”结束；关闭期间和之后的操作不建新连接', async () => {
     const entered = deferred();
     const gate = deferred();
     const guard = vi.fn(async () => {
@@ -223,6 +224,28 @@ describe.each([
     expect(await during).toBeInstanceOf(ShadowConfigChangedError);
     for (const r of await everyOp(s)) expect(r).toBeInstanceOf(ShadowConfigChangedError);
     expect(guard).toHaveBeenCalledTimes(1);
+  });
+});
+
+describe('SQLite :memory: 影子库句柄：关闭后拒绝所有操作', () => {
+  const emptySqlite = emptyModel('sqlite');
+
+  test('关闭后全部 4 个操作以“配置已变更”拒绝；在途操作完成前关闭也丢弃结果', async () => {
+    const s = sqliteMemoryShadow();
+    expect((await s.verify(emptySqlite, emptySqlite)).ok).toBe(true);
+
+    // 发起在途操作并在其完成前触发 close()，结果必须被丢弃并报配置已变更
+    const inFlight = settle(s.verify(emptySqlite, emptySqlite));
+    await s.close();
+    expect(await inFlight).toBeInstanceOf(ShadowConfigChangedError);
+
+    const results = await Promise.all([
+      settle(s.importSql('CREATE TABLE t (id INTEGER PRIMARY KEY);' as ImportableSql)),
+      settle(s.verify(emptySqlite, emptySqlite)),
+      settle(s.verifyScripts(emptySqlite, emptySqlite, [], [])),
+      settle(s.canonicalize(emptySqlite, emptySqlite)),
+    ]);
+    for (const r of results) expect(r).toBeInstanceOf(ShadowConfigChangedError);
   });
 });
 
@@ -460,6 +483,32 @@ describe('Shadows.forProject：每次 await 之后都重新检查 closed 与失�
     };
   };
 
+  /** 先查库拿到当前配置快照，再把结果挂起，模拟读环境配置晚到 */
+  const holdNextEnvResult = () => {
+    const entered = deferred();
+    const gate = deferred();
+    const origQuery = ctx.db.query.bind(ctx.db);
+    let intercepted = false;
+    const spy = vi.spyOn(ctx.db, 'query').mockImplementation((async (sql: string, params?: unknown[]) => {
+      if (!intercepted && sql.includes('from environments e join projects p')) {
+        intercepted = true;
+        const result = await origQuery(sql, params);
+        entered.resolve();
+        await gate.promise;
+        return result;
+      }
+      return origQuery(sql, params);
+    }) as typeof ctx.db.query);
+    return {
+      entered: entered.promise,
+      release: () => gate.resolve(),
+      restore: () => {
+        gate.resolve();
+        spy.mockRestore();
+      },
+    };
+  };
+
   test('旧配置的请求晚完成：不关掉缓存里按新配置建好的条目，自己的旧句柄关掉并返回新条目', async () => {
     // 请求 A 读到旧连接串、卡在建连
     const a = holdPrepare(0);
@@ -589,5 +638,181 @@ describe('Shadows.forProject：每次 await 之后都重新检查 closed 与失�
     }
     expect(await settle(ctx.shadows.forProjectVersions(PID))).toBeInstanceOf(ShadowConfigChangedError);
     expect(ctx.shadows.size).toBe(0);
+  });
+
+  test('读环境配置返回旧快照且晚到（本副本改配置 + forget）：不关掉 B 已建好的新条目，也不按旧配置 prepareShadow', async () => {
+    const held = holdNextEnvResult();
+    try {
+      const pA = ctx.shadows.forProject(PID, EID);
+      await held.entered;
+
+      await changeUrl(URL_2);
+      await ctx.shadows.forget(EID);
+      const b = (await ctx.shadows.forProject(PID, EID)).shadow as FakeShadow;
+      expect(b.url).toBe(URL_2);
+
+      held.release();
+      const resA = await pA;
+      expect(b.close).not.toHaveBeenCalled();
+      expect(resA.shadow).toBe(b);
+      expect(built.map((s) => s.url)).toEqual([URL_2]);
+      expect(ctx.shadows.size).toBe(1);
+    } finally {
+      held.restore();
+    }
+  });
+
+  test('读环境配置返回旧快照且晚到（本副本改配置 + forget，缓存为空）：不拿旧配置去 prepareShadow', async () => {
+    const held = holdNextEnvResult();
+    try {
+      const pA = ctx.shadows.forProject(PID, EID);
+      await held.entered;
+
+      await changeUrl(URL_2);
+      await ctx.shadows.forget(EID);
+
+      held.release();
+      const resA = await pA;
+      expect(built.map((s) => s.url)).toEqual([URL_2]);
+      expect((resA.shadow as FakeShadow).url).toBe(URL_2);
+      expect(ctx.shadows.size).toBe(1);
+    } finally {
+      held.restore();
+    }
+  });
+
+  test('读环境配置返回旧快照且晚到（他副本改配置、事件未送达，B 已按新配置建好）：不关掉 B 的新条目，也不缓存旧配置', async () => {
+    const held = holdNextEnvResult();
+    try {
+      const pA = ctx.shadows.forProject(PID, EID);
+      await held.entered;
+
+      await changeUrl(URL_2);
+      const b = (await ctx.shadows.forProject(PID, EID)).shadow as FakeShadow;
+      expect(b.url).toBe(URL_2);
+
+      held.release();
+      const resA = await pA;
+      expect(b.close).not.toHaveBeenCalled();
+      expect(resA.shadow).toBe(b);
+      expect(built.map((s) => s.url)).toEqual([URL_2]);
+      expect(ctx.shadows.size).toBe(1);
+    } finally {
+      held.restore();
+    }
+  });
+
+  test('他副本改配置且缓存为空、事件尚未送达：暂存句柄会在事件送达后立刻关闭，持有者报“配置已变更”且不重连', async () => {
+    const connGuard = vi.fn<ConnectionGuard>(async () => {});
+    prepareImpl = async (env, schemas) => {
+      const shadow = pgShadow(env.url, schemas, connGuard);
+      built.push({
+        url: env.url,
+        importSql: shadow.importSql.bind(shadow),
+        verify: shadow.verify.bind(shadow),
+        verifyScripts: shadow.verifyScripts.bind(shadow),
+        canonicalize: shadow.canonicalize.bind(shadow),
+        close: vi.fn(() => shadow.close()),
+        holdClose: () => {
+          throw new Error('not used');
+        },
+      });
+      return { shadow, label: env.name, url: env.url, created: null };
+    };
+    const held = holdNextEnvResult();
+    try {
+      const pA = ctx.shadows.forProject(PID, EID);
+      await held.entered;
+
+      // 另一副本把配置改为 URL_2，但缓存为空且事件尚未送达，本副本此时客观上无法得知
+      await changeUrl(URL_2);
+      held.release();
+      const resA = await pA;
+      expect(built).toHaveLength(1);
+      expect(built[0]!.url).toBe(URL_1);
+      expect(ctx.shadows.size).toBe(1);
+
+      // 一旦远端 shadows.forget 事件送达，立即按最新配置淘汰并关闭该旧句柄
+      await ctx.deliver({ t: 'shadows.forget', envIds: [EID] });
+      expect(ctx.shadows.size).toBe(0);
+      expect(await settle(resA.shadow.verify(empty, empty))).toBeInstanceOf(ShadowConfigChangedError);
+      expect(connGuard).not.toHaveBeenCalled();
+
+      const fresh = await ctx.shadows.forProject(PID, EID);
+      expect(built).toHaveLength(2);
+      expect(built[1]!.url).toBe(URL_2);
+      expect(fresh.shadow).not.toBe(resA.shadow);
+    } finally {
+      held.restore();
+    }
+  });
+
+  test('resolveBeforePrepare 期间配置一直在变（防活锁）：重试用尽报“配置已变更”，不调用 prepareShadow', async () => {
+    const origQuery = ctx.db.query.bind(ctx.db);
+    const spy = vi.spyOn(ctx.db, 'query').mockImplementation((async (sql: string, params?: unknown[]) => {
+      const rows = await origQuery(sql, params);
+      if (sql.includes('from environments e join projects p')) {
+        await ctx.deliver({ t: 'shadows.forget', envIds: [EID] });
+      }
+      return rows;
+    }) as typeof ctx.db.query);
+    try {
+      const e = await settle(ctx.shadows.forProject(PID, EID));
+      expect(e).toBeInstanceOf(ShadowConfigChangedError);
+      expect((e as Error).message).toBe('影子库配置已变更，请重试');
+      expect(built).toHaveLength(0);
+      expect(ctx.shadows.size).toBe(0);
+    } finally {
+      spy.mockRestore();
+    }
+  });
+
+  test('resolveBeforePrepare 关旧条目期间 Shadows.close()：不拿新配置 prepareShadow，关完后报服务正在关闭', async () => {
+    const s1 = (await ctx.shadows.forProject(PID, EID)).shadow as FakeShadow;
+    expect(s1.url).toBe(URL_1);
+    await changeUrl(URL_2);
+
+    const closingS1 = s1.holdClose();
+    const pB = settle(ctx.shadows.forProject(PID, EID));
+    await closingS1.entered;
+
+    const closingShadows = ctx.shadows.close();
+    closingS1.release();
+    await closingShadows;
+
+    const e = await pB;
+    expect(e).toBeInstanceOf(ShadowUnavailableError);
+    expect((e as Error).message).toContain('服务正在关闭');
+    expect(built).toHaveLength(1);
+    expect(ctx.shadows.size).toBe(0);
+  });
+
+  test('admit 复核期间白名单收紧：重新校验 guard 并拒绝、关掉自建句柄，不放进缓存', async () => {
+    let blocked = false;
+    const fb = fakeBus();
+    const guard = vi.fn(async () => {
+      if (blocked) throw new ShadowUnavailableError('目标主机不在白名单中');
+    });
+    const guarded = new Shadows(ctx.db, guard, fb.bus);
+    const a = holdPrepare(0);
+    try {
+      const pA = settle(guarded.forProject(PID, EID));
+      await a.entered;
+
+      // 建连期间 URL 没变，仅收紧白名单并推进失效代际，触发 admit 复核
+      blocked = true;
+      await fb.deliver({ t: 'shadows.forget', envIds: [EID] });
+      a.release();
+
+      const e = await pA;
+      expect(e).toBeInstanceOf(ShadowUnavailableError);
+      expect((e as Error).message).toContain('白名单');
+      expect(built).toHaveLength(1);
+      expect(built[0]!.close).toHaveBeenCalledTimes(1);
+      expect(guarded.size).toBe(0);
+    } finally {
+      a.release();
+      await guarded.close();
+    }
   });
 });

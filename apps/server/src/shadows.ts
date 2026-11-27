@@ -176,6 +176,74 @@ export class Shadows {
     return p?.dialect ?? 'pg';
   }
 
+  private async readValidatedEnv(pid: string, id: string): Promise<{ env: Env; fingerprint: string }> {
+    let env: Env;
+    try {
+      env = await this.env(pid, id);
+    } catch (e) {
+      if (e instanceof HTTPException && e.status === 404 && this.cache.has(id)) {
+        await this.forgetLocal(id);
+      }
+      throw e;
+    }
+
+    const fingerprint = configFingerprint(env);
+    // 每次取影子库 / 复核配置都重新过一遍白名单：缓存的连接可能是白名单收紧之前建立的，
+    // 已经在用的连接不会自动重连，所以不能只靠连接层的检查（实例设置改严后要立刻生效）
+    try {
+      await this.guard?.(env.url);
+      if (env.shadowUrl) await this.guard?.(env.shadowUrl);
+    } catch (e) {
+      const hit = this.cache.get(id);
+      if (hit && (hit.projectId !== pid || hit.fingerprint === fingerprint)) {
+        await this.forgetLocal(id);
+      }
+      throw e;
+    }
+    return { env, fingerprint };
+  }
+
+  /**
+   * 选影前的缓存核对与过期淘汰（Issue #154）：`readValidatedEnv` 与 `forgetLocal` 都会 await，
+   * 期间配置可能已被修改或有其他请求按新配置建好缓存条目。只要失效代际推进或缓存条目指纹不同，
+   * 必须先重读最新配置再决定谁过期——绝不关闭指纹与最新配置一致的条目，也绝不用旧快照调 `prepareShadow`。
+   */
+  private async resolveBeforePrepare(
+    pid: string,
+    id: string,
+  ): Promise<
+    { kind: 'hit'; entry: CacheEntry } | { kind: 'prepare'; env: Env; fingerprint: string; gen: number }
+  > {
+    if (this.closed) throw new ShadowUnavailableError('服务正在关闭');
+    let checked = this.invalidationGen;
+    let current = await this.readValidatedEnv(pid, id);
+    for (let round = 0; ; round++) {
+      if (this.closed) throw new ShadowUnavailableError('服务正在关闭');
+      const hit = this.cache.get(id);
+      if (this.invalidationGen === checked) {
+        if (hit && hit.projectId === pid && hit.fingerprint === current.fingerprint) {
+          return { kind: 'hit', entry: hit };
+        }
+        if (!hit) {
+          return { kind: 'prepare', env: current.env, fingerprint: current.fingerprint, gen: checked };
+        }
+      }
+      if (round >= MAX_PREPARE_ATTEMPTS) throw new ShadowConfigChangedError();
+      checked = this.invalidationGen;
+      const latest = await this.readValidatedEnv(pid, id);
+      if (this.closed) throw new ShadowUnavailableError('服务正在关闭');
+      if (latest.fingerprint !== current.fingerprint) {
+        current = latest;
+        continue;
+      }
+      if (this.invalidationGen !== checked) continue;
+      const stale = this.cache.get(id);
+      if (stale && (stale.projectId !== pid || stale.fingerprint !== current.fingerprint)) {
+        await this.forgetLocal(id, false);
+      }
+    }
+  }
+
   /** 选影子库：SQLite 直接用内存影子库（无需环境）；PG 等指定了环境用它，没指定用项目的第一个环境 */
   async forProject(pid: string, eid?: string): Promise<{ shadow: Shadow; label: string }> {
     const dialect = await this.projectDialect(pid);
@@ -200,33 +268,9 @@ export class Shadows {
         id = first.id;
       }
 
-      const gen = this.invalidationGen;
-      let env: Env;
-      try {
-        env = await this.env(pid, id);
-      } catch (e) {
-        if (e instanceof HTTPException && e.status === 404 && this.cache.has(id)) {
-          await this.forgetLocal(id);
-        }
-        throw e;
-      }
-
-      // 每次取影子库都重新过一遍白名单：缓存的连接可能是白名单收紧之前建立的，
-      // 已经在用的连接不会自动重连，所以不能只靠连接层的检查（实例设置改严后要立刻生效）
-      try {
-        await this.guard?.(env.url);
-        if (env.shadowUrl) await this.guard?.(env.shadowUrl);
-      } catch (e) {
-        if (this.cache.has(id)) await this.forgetLocal(id);
-        throw e;
-      }
-
-      // 完整配置指纹校验：schema 范围、连接串、独立影子库、生产标记、允许同实例任一变更都必须淘汰旧连接
-      const fingerprint = configFingerprint(env);
-      const hit = this.cache.get(id);
-      if (hit && hit.projectId === pid && hit.fingerprint === fingerprint) return hit;
-      if (hit) await this.forgetLocal(id, false);
-      if (this.closed) throw new ShadowUnavailableError('服务正在关闭');
+      const resolved = await this.resolveBeforePrepare(pid, id);
+      if (resolved.kind === 'hit') return resolved.entry;
+      const { env, fingerprint, gen } = resolved;
 
       const { shadow, label } = await prepareShadow(env, env.schemas, this.guard, env.dialect);
       const entry = await this.admit(pid, id, gen, { shadow, label, projectId: pid, fingerprint });
@@ -266,15 +310,9 @@ export class Shadows {
         checked = this.invalidationGen;
         let latest: string;
         try {
-          const env = await this.env(pid, id);
-          await this.guard?.(env.url);
-          if (env.shadowUrl) await this.guard?.(env.shadowUrl);
-          latest = configFingerprint(env);
+          latest = (await this.readValidatedEnv(pid, id)).fingerprint;
         } catch (e) {
           await drop();
-          if (e instanceof HTTPException && e.status === 404 && this.cache.has(id)) {
-            await this.forgetLocal(id);
-          }
           throw e;
         }
         if (latest !== entry.fingerprint) {

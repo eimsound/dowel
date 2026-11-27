@@ -120,7 +120,7 @@ describe.skipIf(!PG_URL)('pgShadow（真实 PG）', () => {
     }
   });
 
-  test('句柄关闭（#154）：在途语句被打断、以“配置已变更”结束；之后的操作不再连影子库', async () => {
+  test('句柄关闭（#154）：客户端断连后在途操作以“配置已变更”结束；之后的操作不再连影子库', async () => {
     const shadow = pgShadow(shadowDb.url);
     const marker = `dowel_close_${Math.random().toString(36).slice(2, 8)}`;
     const sessions = async () =>

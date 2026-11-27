@@ -17,8 +17,11 @@ export interface ShadowConnection {
  * - 关闭之后**不再建连**：新调用的 `run`、以及排队中还没开始的操作，都直接以 ShadowConfigChangedError 拒绝，
  *   不会拿到正在关闭的连接，也不会 `connect()` 出一条没人负责关闭的新连接（缓存淘汰旧句柄后，拿着它的调用方
  *   不能悄悄连回旧影子库——例如环境已改为生产、禁止同实例影子库）。
- * - 关闭时**正在跑**的操作：它的连接被直接关掉（打断在途语句；PG 驱动最多给 5 秒宽限），无论这次操作本身成功还是失败，
- *   都以 ShadowConfigChangedError 结束、结果丢弃——配置已经变了，旧影子库上得出的结论不能再用。
+ * - 关闭时**正在跑**的操作：无论这次操作本身成功还是失败，都以 ShadowConfigChangedError 结束、结果丢弃——
+ *   配置已经变了，旧影子库上得出的结论不能再用。底层对在途语句的处理因方言驱动而异：
+ *   - PG：`sql.end({ timeout: 5 })` 在客户端最多宽限 5 秒后销毁 socket（不主动发服务端取消请求，服务端语句可能继续跑到 `statement_timeout`）；
+ *   - MySQL：`pool.end()` 经 `mysql2` 将 `COM_QUIT` 排在当前正在执行的命令后，当前语句（含不受 `max_execution_time` 限制的 DDL）会跑完，后续语句才失败，`close()` 也等到那时才返回；
+ *   - MSSQL：`ConnectionPool.close()` 经 `tarn` 等待所有借出的连接归还，当前请求或开着的 `sql.Transaction` 会跑完，`close()` 也等到那时才返回。
  */
 export const serialShadowConnection = (connect: () => TargetConnection): ShadowConnection => {
   let conn: TargetConnection | null = null;

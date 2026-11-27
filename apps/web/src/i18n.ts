@@ -2375,7 +2375,7 @@ const zh = {
   err: {
     generic: '出错了：{{msg}}',
     notFound: '页面不存在。',
-    shadowConfigChanged: '影子库配置已变更，请重试',
+    shadowConfigChanged: '影子库配置已变更，请重试。',
   },
 };
 
