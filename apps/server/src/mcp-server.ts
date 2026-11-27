@@ -44,6 +44,7 @@ import {
   PlanError,
   type PrimaryKey,
   type Sequence,
+  SQLITE_COLUMN_TYPE_NOTE,
   type Table,
   type Unique,
 } from '@dowel/core';
@@ -1022,8 +1023,8 @@ const PRIMITIVE_MUTATOR_DESCRIPTION =
   'Primitive schema mutator (one atomic edit; existing objects are addressed strictly by object ID).';
 
 const PRIMITIVE_MUTATOR_DESCRIPTIONS: Readonly<Record<string, string>> = {
-  addColumn: `${PRIMITIVE_MUTATOR_DESCRIPTION} ${PG_SERIAL_TYPE_NOTE}`,
-  setColumnType: `${PRIMITIVE_MUTATOR_DESCRIPTION} ${PG_SERIAL_TYPE_NOTE}`,
+  addColumn: `${PRIMITIVE_MUTATOR_DESCRIPTION} ${PG_SERIAL_TYPE_NOTE} ${SQLITE_COLUMN_TYPE_NOTE}`,
+  setColumnType: `${PRIMITIVE_MUTATOR_DESCRIPTION} ${PG_SERIAL_TYPE_NOTE} ${SQLITE_COLUMN_TYPE_NOTE}`,
 };
 
 /**
