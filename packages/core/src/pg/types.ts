@@ -28,10 +28,21 @@ const SIMPLE: Record<string, string> = {
   'time without time zone': 'time without time zone',
   timetz: 'time with time zone',
   'time with time zone': 'time with time zone',
+  bit: 'bit(1)',
+  varbit: 'bit varying',
+  'bit varying': 'bit varying',
 };
 
+/** 双引号外的部分转小写、压缩空白；双引号里的标识符（如 "MyDomain"）原样保留——PG 的带引号标识符区分大小写 */
+const lowerOutsideQuotes = (input: string): string =>
+  input
+    .trim()
+    .split(/("(?:[^"]|"")*")/)
+    .map((part, i) => (i % 2 ? part : part.toLowerCase().replace(/\s+/g, ' ')))
+    .join('');
+
 export const normalizeType = (input: string): string => {
-  const s = input.trim().toLowerCase().replace(/\s+/g, ' ');
+  const s = lowerOutsideQuotes(input);
   const arr = /((?:\s*\[\s*\])*)$/.exec(s)![0].replace(/\s/g, '');
   const base = s.slice(0, s.length - /((?:\s*\[\s*\])*)$/.exec(s)![0].length).trim();
   const m = /^([a-z ]+?)\s*\(\s*([\d\s,]+)\s*\)\s*(with(?:out)? time zone)?$/.exec(base);
@@ -42,6 +53,13 @@ export const normalizeType = (input: string): string => {
     if (name === 'varchar' || name === 'character varying') return `character varying(${mods})${arr}`;
     if (name === 'char' || name === 'character') return `character(${mods})${arr}`;
     if (name === 'decimal' || name === 'numeric') return `numeric(${mods})${arr}`;
+    if (name === 'varbit' || name === 'bit varying') return `bit varying(${mods})${arr}`;
+    // float(p)：1–24 位精度是 real，25–53 位是 double precision（format_type 的写法）
+    if (name === 'float' && /^\d+$/.test(mods)) {
+      const p = Number(mods);
+      if (p >= 1 && p <= 24) return `real${arr}`;
+      if (p >= 25 && p <= 53) return `double precision${arr}`;
+    }
     if (name === 'timestamptz') return `timestamp(${mods}) with time zone${arr}`;
     if (name === 'timestamp') return `timestamp(${mods}) ${tz ?? 'without time zone'}${arr}`;
     if (name === 'timetz') return `time(${mods}) with time zone${arr}`;

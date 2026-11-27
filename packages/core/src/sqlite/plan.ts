@@ -11,6 +11,7 @@ import {
   sqliteRenameInExpr,
   sqliteTokenize,
 } from './quote.ts';
+import { sqliteNormalizeCollation } from './types.ts';
 
 const same = deepEqual;
 
@@ -261,7 +262,7 @@ const indexDef = (idx: Index, renames: [string, string][]): unknown => ({
     column: e.column,
     expr: e.expr ? migrateExprForRenames(e.expr, renames) : null,
     desc: e.desc,
-    collation: e.collation,
+    collation: sqliteNormalizeCollation(e.collation),
   })),
   where: idx.where ? migrateExprForRenames(idx.where, renames) : null,
 });
@@ -292,15 +293,17 @@ const constraintDef = (o: PrimaryKey | Unique | ForeignKey | Check, renames: [st
   }
 };
 
+// 列类型与内置排序规则不区分大小写比较：SQLite 本身就不区分（亲和性规则、INTEGER PRIMARY KEY 判定都不看大小写），
+// 引擎读回时又会把它们转成大写；按原文比较会把 integer / INTEGER、nocase / NOCASE 当成改动，白白整表重建（#132）
 const columnDef = (c: Column, renames: [string, string][]): unknown => ({
-  type: c.type,
+  type: c.type.toUpperCase(),
   notNull: c.notNull,
   default:
     c.default && 'expr' in c.default ? { expr: migrateExprForRenames(c.default.expr, renames) } : c.default,
   generated: c.generated
     ? { expr: migrateExprForRenames(c.generated.expr, renames), stored: c.generated.stored }
     : null,
-  collation: c.collation,
+  collation: sqliteNormalizeCollation(c.collation),
   autoincrement: Boolean(c.ext?.sqlite?.autoincrement),
 });
 
