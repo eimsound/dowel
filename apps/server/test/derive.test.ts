@@ -134,7 +134,7 @@ describe('OpaqueRefresher', () => {
     // 只加普通列：不需要规范化
     runMutator(live.m, 'addColumn', { table: 't', column: { id: 'c2', name: 'note', type: 'text' } });
     live.seq = 1;
-    await expect(r.flush('b')).resolves.toEqual({ kind: 'clean', seq: 1 });
+    await expect(r.flush('b')).resolves.toEqual({ kind: 'clean', seq: 1, model: live.m });
     expect(shadowAsked).toBe(0);
     expect(saved).toHaveLength(1);
     expect(saved[0]!.objects.c2).toBeUndefined();
@@ -167,14 +167,26 @@ describe('OpaqueRefresher', () => {
     const r = new OpaqueRefresher(memRooms(live), async () => failing, store);
     // 没有基线、表达式待规范化：失败时不能拿当前模型充当基线
     runMutator(live.m, 'addCheck', { id: 'k', table: 't', expr: 'total > 0' });
-    await expect(r.flush('b')).resolves.toEqual({ kind: 'skipped', seq: 0 });
+    await expect(r.flush('b')).resolves.toMatchObject({
+      kind: 'skipped',
+      seq: 0,
+      skippedReason: 'shadow_unavailable',
+    });
     mode = 'step';
-    await expect(r.flush('b')).resolves.toEqual({ kind: 'skipped', seq: 0 });
+    await expect(r.flush('b')).resolves.toMatchObject({
+      kind: 'skipped',
+      seq: 0,
+      skippedReason: 'canonicalize_failed',
+    });
     expect(saved).toHaveLength(0);
     expect((live.m.objects.k as { expr: string }).expr).toBe('total > 0');
     // 没有影子库（shadowOf 返回 null）同样跳过
     const r2 = new OpaqueRefresher(memRooms(live), async () => null, store);
-    await expect(r2.flush('b')).resolves.toEqual({ kind: 'skipped', seq: 0 });
+    await expect(r2.flush('b')).resolves.toMatchObject({
+      kind: 'skipped',
+      seq: 0,
+      skippedReason: 'no_shadow',
+    });
   });
 
   test('flush：同分支排队中尚未开始的调用合并成一次', async () => {
@@ -189,10 +201,13 @@ describe('OpaqueRefresher', () => {
     const blocker = r.runWithoutReset('b', () => gate);
     const p1 = r.flush('b');
     const p2 = r.flush('b');
-    expect(p1).toBe(p2);
     release();
     await blocker;
-    await expect(p1).resolves.toMatchObject({ kind: 'normalized' });
+    const [o1, o2] = await Promise.all([p1, p2]);
+    expect(o1).toMatchObject({ kind: 'normalized' });
+    expect(o2).toEqual(o1);
+    // 共用一次结果，但各拿一份模型副本
+    expect(o2.model).not.toBe(o1.model);
     expect(calls.n).toBe(1);
   });
 
@@ -378,7 +393,7 @@ describe('OpaqueRefresher', () => {
     await new Promise((res) => setTimeout(res, 5));
     r.forget('b');
     release();
-    await p;
+    await expect(p).resolves.toMatchObject({ kind: 'skipped', skippedReason: 'forgotten' });
     await r.drain();
     expect(saved).toHaveLength(0);
     expect(r.tracked('b')).toBe(false);

@@ -284,8 +284,9 @@ export const registerClaims = (app: Hono<Env>, ctx: AppContext) => {
         if (newActiveHead) {
           // 检查工作副本是否相对原活跃链头有未发布的修改（与 pull 相同的并发保护）
           // 预览阶段是关键出口（先规范化，返回的 workingSeq 是规范后的）；确认覆盖阶段带着预览时的 seq，不再 flush 以免自冲突
-          if (!b.confirmOverwrite) await refresher.flush(a.branch);
-          const { model: working, seq: workingSeq } = await rooms.model(a.branch);
+          const { model: working, seq: workingSeq } = b.confirmOverwrite
+            ? await rooms.model(a.branch)
+            : await refresher.flush(a.branch);
           const baseHeadModel = platActiveHead?.model ?? emptyBase(working, a.schemas);
           const isDirty = (w: Model) => planDiff(baseHeadModel, w).total > 0;
           const previewOf = (w: Model, sq: number): AttachOverwritePreview => {

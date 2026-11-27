@@ -379,8 +379,8 @@ export const registerEnvironments = (app: Hono<Env>, ctx: AppContext) => {
     const expectedSeq = b.success ? b.data.workingSeq : undefined;
     // 预览（以及不带预览 seq 的直接覆盖）是关键出口：先规范化，让差异与返回的 workingSeq 都基于规范后的工作副本；
     // 确认覆盖阶段带着预览时的 seq，不能再 flush（写回会推进 seq，造成自己跟自己冲突的 409 working_changed）
-    if (preview || expectedSeq === undefined) await refresher.flush(a.branch);
-    const { model: working, seq: workingSeq } = await rooms.model(a.branch);
+    const { model: working, seq: workingSeq } =
+      preview || expectedSeq === undefined ? await refresher.flush(a.branch) : await rooms.model(a.branch);
     const live = await readLive(ctx.exec, env, a.schemas, working);
     /** 预览：差异 + 指纹 + 三种只警告不拦截的情况 */
     const previewOf = async (w = working, sq = workingSeq): Promise<PullPreview> => {
