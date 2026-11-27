@@ -325,6 +325,7 @@ const TYPES = new Set(
     ...MSSQL_COMMON_TYPES,
     'serial',
     'bigserial',
+    'smallserial',
     'int',
     'int4',
     'int8',

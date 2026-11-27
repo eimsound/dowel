@@ -48,5 +48,14 @@ export const sqliteNormalizeType = (input: string): string => {
   return s.toUpperCase();
 };
 
+const BUILTIN_COLLATIONS: ReadonlySet<string> = new Set(['binary', 'nocase', 'rtrim']);
+
+/**
+ * 内置排序规则（BINARY / NOCASE / RTRIM）统一大写，与引擎读回的写法一致；自定义排序规则原样保留。
+ * SQLite 的排序规则名不区分大小写，所以这只是换个写法，不改语义。
+ */
+export const sqliteNormalizeCollation = (collation: string | null): string | null =>
+  collation && BUILTIN_COLLATIONS.has(collation.toLowerCase()) ? collation.toUpperCase() : collation;
+
 /** 界面里推荐的 SQLite 常用类型 */
 export const SQLITE_COMMON_TYPES: readonly string[] = ['INTEGER', 'TEXT', 'REAL', 'BLOB', 'NUMERIC', 'ANY'];
