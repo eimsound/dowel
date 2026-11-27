@@ -8,14 +8,14 @@ The server lives on the same port as the web app, at `POST /api/mcp` (stateless 
 
 ## 1. What AI can and can't do {#boundaries}
 
-| AI can                                                                                                                     | AI can't                                                                                    |
-| -------------------------------------------------------------------------------------------------------------------------- | ------------------------------------------------------------------------------------------- |
-| List projects, read the model, tables, objects such as views and functions, DDL, the version chain, and migration previews | Publish versions                                                                            |
-| Read environment status and drift **from the platform cache** (with the time it was cached)                                | Connect to an environment's target database (no live status, history, or drift checks)      |
-| Verify a migration in the shadow database (`verify` permission)                                                            | Execute, roll back, mark as applied, write a baseline, submit or approve execution requests |
-| Edit the working copy with an atomic batch of operations (`write` permission)                                              | Change connection strings, execution policies, tokens, or import a whole schema             |
-| Adjust canvas sections incrementally (`write` permission)                                                                  | Write table positions on the canvas (auto-layout and dragging decide them)                  |
-| Read canvas history and the diff of each change                                                                            | Restore canvas history (only people can restore, in the UI)                                 |
+| AI can                                                                                                                     | AI can't                                                                               |
+| -------------------------------------------------------------------------------------------------------------------------- | -------------------------------------------------------------------------------------- |
+| List projects, read the model, tables, objects such as views and functions, DDL, the version chain, and migration previews | Publish versions                                                                       |
+| Read environment status and drift **from the platform cache** (with the time it was cached)                                | Connect to an environment's target database (no live status, history, or drift checks) |
+| Verify a migration in the shadow database (`verify` permission)                                                            | Execute, roll back, mark as applied, submit or approve execution requests              |
+| Edit the working copy with an atomic batch of operations (`write` permission)                                              | Change connection strings, execution policies, tokens, or import a whole schema        |
+| Adjust canvas sections incrementally (`write` permission)                                                                  | Write table positions on the canvas (auto-layout and dragging decide them)             |
+| Read canvas history and the diff of each change                                                                            | Restore canvas history (only people can restore, in the UI)                            |
 
 Publishing and executing always stay with people in the Dowel UI, through your execution policies and approvals. Restoring canvas history is also done only by people in the UI.
 

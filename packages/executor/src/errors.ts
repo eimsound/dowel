@@ -34,8 +34,8 @@ export type ExecutorErrorCode =
   | 'switch_required'
   /** ADR 0013：不能升级（up）到、也不能标记到已作废的版本 */
   | 'retired_target'
-  /** 要写基线，但条件不满足 */
-  | 'baseline_not_applicable'
+  /** 目标库尚无历史且结构已等于首版本、没有可执行的迁移：只建立历史基准应改用“标记为已执行” */
+  | 'mark_required'
   /** 要执行的迁移还没有通过影子库验证 */
   | 'unverified'
   /** 迁移里有实例级语句 */

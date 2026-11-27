@@ -17,7 +17,7 @@ Authorization: Bearer dwl_<43 位随机字符>
 ```
 
 - **不走 Cookie 会话，不校验 `Origin`**，适合直接用 `curl` 或各类 CI 运行器调用。（仅 OpenAPI 规范 `/api/ci/openapi.json` 与交互式文档 `/api/ci/docs` 额外允许已登录用户的会话 Cookie；详见 [OpenAPI 规范与交互式文档](#openapi-docs)。）
-- **能力范围固定为“只读 + 执行”**：令牌只能访问 `/api/ci/…` 且只能操作它所属的单个项目。携带 `Bearer dwl_…` 访问任何 `/api/ci/…` 之外的接口（包括编辑模型、发布版本、改策略、改连接串、标记为已执行、写基线、认领、接手、令牌管理本身）一律返回 `403 forbidden`，不会回落到 Cookie 会话。
+- **能力范围固定为“只读 + 执行”**：令牌只能访问 `/api/ci/…` 且只能操作它所属的单个项目。携带 `Bearer dwl_…` 访问任何 `/api/ci/…` 之外的接口（包括编辑模型、发布版本、改策略、改连接串、标记为已执行、认领、接手、令牌管理本身）一律返回 `403 forbidden`，不会回落到 Cookie 会话。
 - **项目归属**：令牌属于项目，创建者离职或被停用不影响令牌继续工作。
 - **必须过期**：创建时必须指定有效天数（默认 90 天，最长 365 天）。过期和吊销均立即生效。
 - **限速**（单副本进程内计数，HA 多副本下总配额约为设定值 × 副本数）：
@@ -334,33 +334,33 @@ curl -fsS \
 
 > `reached` 在执行中途失败时表示环境停在的最后一个成功版本；`details` 仅在存在补充上下文（如 `diff`、`timeout`、`current`、`partial`）时返回。
 
-| 错误码 (`code`)            | HTTP 状态码 | 含义与常见原因                                                                     |
-| -------------------------- | ----------- | ---------------------------------------------------------------------------------- |
-| `invalid_request`          | `400`       | 请求体不是合法 JSON，或 `to` / `dryRun` / `lockTimeoutSeconds` 参数不合法          |
-| `payload_too_large`        | `413`       | 请求体超过 16 MiB 上限，在解析之前就被拒绝                                         |
-| `token_missing`            | `401`       | 缺少 `Authorization` 请求头                                                        |
-| `token_invalid`            | `401`       | 令牌格式不对、不是 `dwl_…` 或不存在                                                |
-| `token_expired`            | `401`       | 令牌已过有效期                                                                     |
-| `token_revoked`            | `401`       | 令牌已被吊销                                                                       |
-| `forbidden`                | `403`       | 用 CI 令牌访问了 `/api/ci/…` 之外的接口                                            |
-| `token_execution_disabled` | `403`       | 环境生效的执行策略不允许令牌执行（生产环境默认关闭）                               |
-| `project_not_found`        | `404`       | 项目不存在，或不是该令牌所属的项目                                                 |
-| `environment_not_found`    | `404`       | 环境不存在                                                                         |
-| `rollback_not_allowed`     | `409`       | 目标版本早于环境当前版本（令牌不能回滚；`details.current` 为当前版本）             |
-| `switch_requires_web`      | `409`       | 环境停在已作废的版本上，到目标版本要先回滚；令牌不自动回滚，需在网页端确认切换     |
-| `version_retired`          | `409`       | 目标版本已作废，不能执行到它                                                       |
-| `version_mismatch`         | `409`       | 目标库历史与平台版本链不一致、校验和被篡改或格式版本过新（见 `details.reason`）    |
-| `unverified`               | `409`       | 待执行迁移尚未通过影子库验证                                                       |
-| `drift`                    | `409`       | 目标库结构与当前版本模型不一致，或首次执行时既非基线也非空库（`details.firstRun`） |
-| `unfinished_run`           | `409`       | 上一次含非事务或隐式提交步骤的执行停在中途，需先在界面处理                         |
-| `foreign_instance`         | `409`       | 目标库里的该项目由其他 Dowel 实例认领                                              |
-| `rejected`                 | `409`       | 其他执行前检查未通过（如含实例级语句、schema 范围不合法等，见 `details.reason`）   |
-| `version_not_found`        | `422`       | 目标版本不在项目版本链上，或项目尚未发布任何版本                                   |
-| `execution_failed`         | `422`       | 某一步 SQL 报错、语句 / 锁等待超时或读回校验不一致；环境停在 `reached`             |
-| `lock_timeout`             | `423`       | 等待环境锁或目标库项目锁超时（另一项执行正在进行）                                 |
-| `rate_limited`             | `429`       | 超过认证失败限速或令牌请求限速（响应头带 `Retry-After`）                           |
-| `target_unreachable`       | `502`       | 无法连接目标库，或目标库拒绝操作（例如缺少建 schema 权限）                         |
-| `internal`                 | `500`       | 服务器内部错误                                                                     |
+| 错误码 (`code`)            | HTTP 状态码 | 含义与常见原因                                                                                                                                                                                                                                 |
+| -------------------------- | ----------- | ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `invalid_request`          | `400`       | 请求体不是合法 JSON，或 `to` / `dryRun` / `lockTimeoutSeconds` 参数不合法                                                                                                                                                                      |
+| `payload_too_large`        | `413`       | 请求体超过 16 MiB 上限，在解析之前就被拒绝                                                                                                                                                                                                     |
+| `token_missing`            | `401`       | 缺少 `Authorization` 请求头                                                                                                                                                                                                                    |
+| `token_invalid`            | `401`       | 令牌格式不对、不是 `dwl_…` 或不存在                                                                                                                                                                                                            |
+| `token_expired`            | `401`       | 令牌已过有效期                                                                                                                                                                                                                                 |
+| `token_revoked`            | `401`       | 令牌已被吊销                                                                                                                                                                                                                                   |
+| `forbidden`                | `403`       | 用 CI 令牌访问了 `/api/ci/…` 之外的接口                                                                                                                                                                                                        |
+| `token_execution_disabled` | `403`       | 环境生效的执行策略不允许令牌执行（生产环境默认关闭）                                                                                                                                                                                           |
+| `project_not_found`        | `404`       | 项目不存在，或不是该令牌所属的项目                                                                                                                                                                                                             |
+| `environment_not_found`    | `404`       | 环境不存在                                                                                                                                                                                                                                     |
+| `rollback_not_allowed`     | `409`       | 目标版本早于环境当前版本（令牌不能回滚；`details.current` 为当前版本）                                                                                                                                                                         |
+| `switch_requires_web`      | `409`       | 环境停在已作废的版本上，到目标版本要先回滚；令牌不自动回滚，需在网页端确认切换                                                                                                                                                                 |
+| `version_retired`          | `409`       | 目标版本已作废，不能执行到它                                                                                                                                                                                                                   |
+| `version_mismatch`         | `409`       | 目标库历史与平台版本链不一致、校验和被篡改或格式版本过新（见 `details.reason`）                                                                                                                                                                |
+| `unverified`               | `409`       | 待执行迁移尚未通过影子库验证                                                                                                                                                                                                                   |
+| `drift`                    | `409`       | 目标库结构与当前版本模型不一致，或首次执行时既非基线也非空库（`details.firstRun`）                                                                                                                                                             |
+| `unfinished_run`           | `409`       | 上一次含非事务或隐式提交步骤的执行停在中途，需先在界面处理                                                                                                                                                                                     |
+| `foreign_instance`         | `409`       | 目标库里的该项目由其他 Dowel 实例认领                                                                                                                                                                                                          |
+| `rejected`                 | `409`       | 其他执行前检查未通过（如含实例级语句、schema 范围不合法，或目标库无历史且结构已等于首版本、没有后续迁移可执行时的 `mark_required`——令牌不能标记，需在界面使用「标记为已执行」，或等发布新版本后由 CI 执行时自动写入基线；见 `details.reason`） |
+| `version_not_found`        | `422`       | 目标版本不在项目版本链上，或项目尚未发布任何版本                                                                                                                                                                                               |
+| `execution_failed`         | `422`       | 某一步 SQL 报错、语句 / 锁等待超时或读回校验不一致；环境停在 `reached`                                                                                                                                                                         |
+| `lock_timeout`             | `423`       | 等待环境锁或目标库项目锁超时（另一项执行正在进行）                                                                                                                                                                                             |
+| `rate_limited`             | `429`       | 超过认证失败限速或令牌请求限速（响应头带 `Retry-After`）                                                                                                                                                                                       |
+| `target_unreachable`       | `502`       | 无法连接目标库，或目标库拒绝操作（例如缺少建 schema 权限）                                                                                                                                                                                     |
+| `internal`                 | `500`       | 服务器内部错误                                                                                                                                                                                                                                 |
 
 ---
 
