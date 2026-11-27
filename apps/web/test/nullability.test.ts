@@ -12,10 +12,12 @@ import {
   ColumnNotNullCheckbox,
   ColumnNotNullInferredHint,
 } from '../src/components/ColumnNullability.tsx';
+import { NullabilityFallbackNotice } from '../src/components/NullabilityFallback.tsx';
 import i18n from '../src/i18n.ts';
 import {
   canvasColumnNotNull,
   columnNullability,
+  fallbackListing,
   notNullCheckboxDisabled,
   showRowInferredDescription,
 } from '../src/nullability.ts';
@@ -227,5 +229,29 @@ describe('Inspector 与 Canvas 渲染绑定（renderToStaticMarkup + 纯映射�
     col(virtTagged).ext = { mssql: { inferredNotNull: true } };
     expect(renderBadge(virtTagged)).toBe('');
     expect(canvasCol(virtTagged).notNull).toBe(false);
+  });
+});
+
+describe('没有影子库时按显式非空记录的列提示（ADR 0019）', () => {
+  test('最多列出 20 列，其余只给数量；英文单复数分开', async () => {
+    const cols = Array.from({ length: 23 }, (_, i) => `dbo.items.c${i}`);
+    expect(fallbackListing(cols)).toEqual({
+      shown: cols.slice(0, 20),
+      more: 3,
+      total: 23,
+      bodyKey: 'nnFallback.body',
+    });
+    expect(fallbackListing(['dbo.items.cp']).bodyKey).toBe('nnFallback.bodyOne');
+    const html = renderToStaticMarkup(createElement(NullabilityFallbackNotice, { columns: cols }));
+    expect(html).toContain('<code class="font-mono text-xs break-all">dbo.items.c19</code>');
+    expect(html).not.toContain('dbo.items.c20');
+    expect(html).toContain('另有 3 列未显示（共 23 列）。');
+    // 提示不是错误，也不设 live region（成功状态由调用方的 ok 提示条播报）
+    expect(html).toContain('class="banner warn"');
+    expect(html).not.toContain('role=');
+    await i18n.changeLanguage('en');
+    const one = renderToStaticMarkup(createElement(NullabilityFallbackNotice, { columns: ['dbo.items.cp'] }));
+    expect(one).toContain('whether this persisted computed column is declared NOT NULL');
+    expect(one).toContain('Recorded as explicit NOT NULL');
   });
 });

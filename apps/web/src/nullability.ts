@@ -31,3 +31,15 @@ export const notNullCheckboxDisabled = (m: Model, c: Column): boolean =>
 /** 列行（非主键）是否附带读屏用“由表达式推断为非空”说明 */
 export const showRowInferredDescription = (m: Model, c: Column, isPk: boolean): boolean =>
   !isPk && columnNullability(m, c).inferredOnly;
+
+/** 没有影子库、按显式非空记录的列提示：最多列出 limit 个，其余只给数量（ADR 0019） */
+export const NULLABILITY_FALLBACK_LIMIT = 20;
+export const fallbackListing = (
+  columns: readonly string[],
+  limit = NULLABILITY_FALLBACK_LIMIT,
+): { shown: string[]; more: number; total: number; bodyKey: 'nnFallback.bodyOne' | 'nnFallback.body' } => ({
+  shown: columns.slice(0, limit),
+  more: Math.max(0, columns.length - limit),
+  total: columns.length,
+  bodyKey: columns.length === 1 ? 'nnFallback.bodyOne' : 'nnFallback.body',
+});

@@ -20,6 +20,7 @@ import { useTranslation } from 'react-i18next';
 
 import { api } from '../api.ts';
 import { ClaimDialog } from '../components/ClaimDialog.tsx';
+import { NullabilityFallbackNotice } from '../components/NullabilityFallback.tsx';
 import { AppShell, PageHeader } from '../components/Shell.tsx';
 import { Banner, cx, IconButton } from '../components/ui.tsx';
 import { DIALECT_UI_LIST, dialectUiSpec } from '../dialects.ts';
@@ -111,6 +112,13 @@ export const NewProject = () => {
   const setWarnings = (w: string[]) => {
     warningsRef.current = w;
     setWarningsState(w);
+  };
+  // SQL Server 从已有数据库新建：没有可用的影子库、按显式非空记录的持久化计算列（ADR 0019）
+  const [nnFallback, setNnFallbackState] = useState<string[]>([]);
+  const nnFallbackRef = useRef<string[]>([]);
+  const setNnFallback = (v: string[]) => {
+    nnFallbackRef.current = v;
+    setNnFallbackState(v);
   };
   const [retiredVersions, setRetiredVersionsState] = useState<EnvVersionRef[]>([]);
   const retiredRef = useRef<EnvVersionRef[]>([]);
@@ -334,6 +342,7 @@ export const NewProject = () => {
     setError('');
     setWarnings([]);
     setRetiredVersions([]);
+    setNnFallback([]);
     setStage(null);
     setStageDetail(null);
     const body = {
@@ -389,6 +398,7 @@ export const NewProject = () => {
         if (event.project) project = event.project;
         if (event.warnings?.length) setWarnings(event.warnings);
         if (event.retiredVersions?.length) setRetiredVersions(event.retiredVersions);
+        if (event.nullabilityFallback?.columns.length) setNnFallback(event.nullabilityFallback.columns);
       });
     } catch (e) {
       setError(e instanceof Error ? e.message : String(e));
@@ -400,7 +410,7 @@ export const NewProject = () => {
       qc.invalidateQueries({ queryKey: ['groups'] }),
     ]);
     // 项目建好了但有没做完的事（例如某个库认领失败）或识别出已作废岔路版本：先让用户看到，再进项目
-    if (warningsRef.current.length || retiredRef.current.length) {
+    if (warningsRef.current.length || retiredRef.current.length || nnFallbackRef.current.length) {
       setCreated(project);
       return;
     }
@@ -550,6 +560,7 @@ export const NewProject = () => {
                             resetTakeover();
                             setError('');
                             setWarnings([]);
+                            setNnFallback([]);
                           }}
                         />
                         <span className="min-w-0 flex-1 space-y-0.5">
@@ -1085,6 +1096,12 @@ export const NewProject = () => {
                   </ul>
                 </Banner>
               )}
+              {created && warnings.length === 0 && nnFallback.length > 0 && (
+                <Banner kind="ok" role="status">
+                  {t('nnFallback.projectCreated')}
+                </Banner>
+              )}
+              {created && nnFallback.length > 0 && <NullabilityFallbackNotice columns={nnFallback} />}
               {created && retiredVersions.length > 0 && (
                 <Banner kind="info" title={t('tk.retiredTitle')} role="status">
                   <p className="m-0">{t('tk.retiredBody')}</p>
@@ -1098,7 +1115,7 @@ export const NewProject = () => {
                   </ul>
                 </Banner>
               )}
-              {created && (warnings.length > 0 || retiredVersions.length > 0) && (
+              {created && (warnings.length > 0 || retiredVersions.length > 0 || nnFallback.length > 0) && (
                 <div>
                   <button
                     type="button"

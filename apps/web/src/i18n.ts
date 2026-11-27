@@ -380,6 +380,8 @@ const zh = {
     importConfirm: '覆盖工作副本',
     importDone:
       '已导入：工作副本现在是线上结构（{{count}} 个对象）。接下来检查、修改、发布新版本，再把这个环境标记为已执行到它。',
+    importDoneTitle: '导入已完成',
+    importDoneClose: '完成',
     repairTitle: '修复脚本',
     repairIntro:
       '把线上结构改回 v{{number}} 的模型。这里只显示，Dowel 不会执行：请自己在目标库上执行，然后点“重新检查漂移”。',
@@ -433,6 +435,15 @@ const zh = {
       fingerprint: '线上结构指纹 {{fp}}',
       none: '没有可以标记的版本。',
     },
+  },
+  // SQL Server 从已有数据库导入 / 拉取：没有可用的影子库，持久化计算列按显式非空记录（ADR 0019）
+  nnFallback: {
+    title: '持久化计算列已按显式非空记录',
+    bodyOne:
+      '没有可用的影子库，无法判断以下 {{count}} 个持久化计算列的非空是显式声明还是由表达式推断，已按显式非空（PERSISTED NOT NULL）记录。影子库可用后，可在属性面板取消“非空”勾选，改由表达式推断。',
+    body: '没有可用的影子库，无法判断以下 {{count}} 个持久化计算列的非空是显式声明还是由表达式推断，已按显式非空（PERSISTED NOT NULL）记录。影子库可用后，可在属性面板取消“非空”勾选，改由表达式推断。',
+    more: '另有 {{count}} 列未显示（共 {{total}} 列）。',
+    projectCreated: '项目已创建。',
   },
   tk: {
     restored: '接手恢复',
@@ -2794,6 +2805,8 @@ const en: typeof zh = {
     importConfirm: 'Overwrite working copy',
     importDone:
       'Imported: the working copy is now the live structure ({{count}} objects). Next review, edit, publish a new version, then mark this environment as applied to it.',
+    importDoneTitle: 'Import complete',
+    importDoneClose: 'Done',
     repairTitle: 'Repair script',
     repairIntro:
       'Changes the live structure back to the model of v{{number}}. It is only shown here and Dowel never runs it: run it on the target database yourself, then click "Re-check drift".',
@@ -2857,6 +2870,14 @@ const en: typeof zh = {
       fingerprint: 'Live structure fingerprint {{fp}}',
       none: 'No version can be marked.',
     },
+  },
+  nnFallback: {
+    title: 'Recorded as explicit NOT NULL',
+    bodyOne:
+      'No shadow database was available, so Dowel could not tell whether this persisted computed column is declared NOT NULL or inferred non-null from its expression. It was recorded as explicit PERSISTED NOT NULL. Once a shadow database is available, you can clear Not null in the properties panel to rely on inference.',
+    body: 'No shadow database was available, so Dowel could not tell whether these {{count}} persisted computed columns are declared NOT NULL or inferred non-null from their expressions. They were recorded as explicit PERSISTED NOT NULL. Once a shadow database is available, you can clear Not null in the properties panel to rely on inference.',
+    more: 'And {{count}} more ({{total}} total).',
+    projectCreated: 'Project created.',
   },
   tk: {
     restored: 'Restored',
