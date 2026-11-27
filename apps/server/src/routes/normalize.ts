@@ -110,38 +110,42 @@ export const registerNormalize = (app: Hono<Env>, ctx: AppContext) => {
       if (!resolved) refund();
       return c.json<NormalizeResult>(out);
     } catch (e) {
-      if (e instanceof ShadowError) return fail(422, e.message, 'shadow_unavailable');
-      if (e instanceof StepError || e instanceof PlanError || e instanceof InstanceLevelStatementError) {
-        const reason = e instanceof StepError ? e.reason : e.message;
-        return fail(422, `规范化失败（工作副本保持原样）：${reason}`, 'canonicalize_failed');
-      }
       // 规范化期间项目被删（分支被 forget）：和项目不存在同一个响应（accessIn 的 404）；
       // 还没解析到影子库句柄（例如排队中或 loadGood 期间被删、未指定 env）则精确退回限速额度
       if (e instanceof BranchForgottenError) {
         if (!resolved) refund();
         throw new HTTPException(404, { message: '项目不存在' });
       }
-      if (e instanceof NormalizeConflictError) {
-        return fail(409, e.message, 'working_changed', { currentSeq: e.currentSeq });
-      }
-      // 没做成任何规范化的忙 / 停机：退回限速额度
+      // 没做成任何规范化的停机 / 忙：已有明确语义，退回限速额度
       if (e instanceof RefresherStoppedError) {
         refund();
         return fail(503, e.message, 'shutting_down');
       }
-      if (e instanceof DeriveBusyError) refund();
-      // 兜底：PG 下 rooms.patch 的 FOR UPDATE 唤醒与删除路由的 refresher.forget 走不同连接（或跨副本删除）
-      // 先后无保证，错误可能在 forget 之前到达；复查分支是否已消失，已消失则与 accessIn 一致返回 404
-      if (!(e instanceof HTTPException) && !(e instanceof DeriveBusyError)) {
-        const [branch] = await ctx.db
-          .query<{ id: string }>('select id from branches where id = $1', [a.branch])
-          .catch(() => [{ id: a.branch }]);
-        if (!branch) {
-          if (!resolved) refund();
-          throw new HTTPException(404, { message: '项目不存在' });
-        }
+      if (e instanceof DeriveBusyError) {
+        refund();
+        throw e;
       }
-      // DeriveBusyError 交给 app.onError 统一映射为 503 normalize_busy；404（环境不存在）等 HTTPException 原样抛出
+      // 404（环境不存在）等 HTTPException 原样抛出
+      if (e instanceof HTTPException) throw e;
+      // 兜底复查分支是否仍存在（先于所有类型化映射，覆盖 PG 跨连接窗口、跨副本删除，以及请求停在
+      // rooms.model 尚未入队时删除路由已执行 forget 未打标记的窗口）：
+      // 已消失则与 accessIn 一致返回 404（未解析影子库时退回限速），避免误报 422 / 409 / 500；
+      // 平台库查询失败保守视作仍存在，按原始错误继续映射，以免吞掉真实数据库故障。
+      const [branch] = await ctx.db
+        .query<{ id: string }>('select id from branches where id = $1', [a.branch])
+        .catch(() => [{ id: a.branch }]);
+      if (!branch) {
+        if (!resolved) refund();
+        throw new HTTPException(404, { message: '项目不存在' });
+      }
+      if (e instanceof ShadowError) return fail(422, e.message, 'shadow_unavailable');
+      if (e instanceof StepError || e instanceof PlanError || e instanceof InstanceLevelStatementError) {
+        const reason = e instanceof StepError ? e.reason : e.message;
+        return fail(422, `规范化失败（工作副本保持原样）：${reason}`, 'canonicalize_failed');
+      }
+      if (e instanceof NormalizeConflictError) {
+        return fail(409, e.message, 'working_changed', { currentSeq: e.currentSeq });
+      }
       throw e;
     }
   });
