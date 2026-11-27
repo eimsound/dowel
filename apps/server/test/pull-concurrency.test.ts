@@ -382,6 +382,9 @@ describe.skipIf(!PG_URL)('POST .../pull 跨副本 PostgreSQL 并发保护（#42�
       loginLimiter: new LoginLimiter({ limit: 10_000, ipLimit: 10_000 }),
       connectionLimiter: new KeyedLimiter({ limit: 10_000, windowMs: 60_000 }),
     });
+    // 发布必须经影子库验证（ADR 0017）：这里只要一个已发布版本作基线，用影子库替身
+    stubPassingShadow(appA.shadows);
+    stubPassingShadow(appB.shadows);
 
     try {
       await makeUser(dbA, 'admin', { name: '管理员', role: 'admin' });

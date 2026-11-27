@@ -46,6 +46,7 @@ import { afterAll, beforeAll, describe, expect, test } from 'vitest';
 
 import { connect, createTestDb, PG_URL } from '../../../test/pg.ts';
 import { hashToken } from '../src/auth.ts';
+import { errorEvent } from '../src/executions.ts';
 import { createApp, openPlatformDb, type PlatformDb } from '../src/index.ts';
 import { KeyedLimiter, LoginLimiter } from '../src/rate-limit.ts';
 import { toCiError } from '../src/routes/ci.ts';
@@ -177,6 +178,70 @@ test('toCiError 将 ExecutorError(mark_required) 映射为 409 rejected（detail
   expect(CI_ERROR_STATUS[err.code]).toBe(409);
   expect(err.details).toMatchObject({ reason: 'mark_required' });
   expect(err.reached).toBeNull();
+});
+
+test('errorEvent 将 ExecutorError(unverified) 的 engineVersion 与 verifiedOn 透传进 details（含 null 未知版本）', () => {
+  const known = errorEvent(
+    new ExecutorError('unverified', '版本未在 18.7 验证', {
+      versionId: 'v3',
+      number: 3,
+      engineVersion: '18.7',
+      verifiedOn: ['18.8'],
+    }),
+  );
+  expect(known.code).toBe('unverified');
+  expect(known.details).toMatchObject({
+    versionId: 'v3',
+    number: 3,
+    engineVersion: '18.7',
+    verifiedOn: ['18.8'],
+  });
+
+  const unknown = errorEvent(
+    new ExecutorError('unverified', '无法读取数据库完整版本', {
+      versionId: 'v3',
+      number: 3,
+      engineVersion: null,
+      verifiedOn: [],
+    }),
+  );
+  expect(unknown.code).toBe('unverified');
+  expect(unknown.details?.engineVersion).toBeNull();
+  expect(unknown.details?.verifiedOn).toEqual([]);
+});
+
+test('toCiError 将 ExecutorError(unverified) 映射为 409 unverified 并透传 engineVersion 与 verifiedOn', () => {
+  const known = toCiError(
+    new ExecutorError('unverified', '版本未在 18.7 验证', {
+      versionId: 'v3',
+      number: 3,
+      engineVersion: '18.7',
+      verifiedOn: ['18.8'],
+      reached: null,
+    }),
+    () => null,
+  );
+  expect(known.code).toBe('unverified');
+  expect(CI_ERROR_STATUS[known.code]).toBe(409);
+  expect(known.details).toMatchObject({
+    reason: 'unverified',
+    engineVersion: '18.7',
+    verifiedOn: ['18.8'],
+  });
+  expect(known.reached).toBeNull();
+
+  const unknown = toCiError(
+    new ExecutorError('unverified', '无法读取数据库完整版本', {
+      versionId: 'v3',
+      number: 3,
+      engineVersion: null,
+      verifiedOn: [],
+    }),
+    () => null,
+  );
+  expect(unknown.code).toBe('unverified');
+  expect(unknown.details?.engineVersion).toBeNull();
+  expect(unknown.details?.verifiedOn).toEqual([]);
 });
 
 describe('CI 令牌生命周期、权限、三层创建规则与限速（T1 / T2）', () => {
@@ -1774,6 +1839,7 @@ describe.skipIf(!PG_URL)('CI 执行接口、错误码、审计通知与 GitHub A
     const request = await call('POST', `${env}/requests`, { kind: 'execute', to: v3!.id, reason: 'release' });
     expect(request.status).toBe(422);
     expect(request.data).toMatchObject({ code: 'unverified' });
+    expect(request.data.details).toMatchObject({ engineVersion: full, verifiedOn: [other] });
     const emergency = await call('POST', `${env}/emergency`, {
       kind: 'execute',
       to: v3!.id,
@@ -1781,9 +1847,11 @@ describe.skipIf(!PG_URL)('CI 执行接口、错误码、审计通知与 GitHub A
     });
     expect(emergency.status).toBe(422);
     expect(emergency.data).toMatchObject({ code: 'unverified' });
+    expect(emergency.data.details).toMatchObject({ engineVersion: full, verifiedOn: [other] });
     const ciRun = await ci('v3');
     expect(ciRun.status).toBe(409);
     expect(ciRun.data).toMatchObject(unverified);
+    expect(ciRun.data.details).toMatchObject({ engineVersion: full, verifiedOn: [other] });
     // 目标库一点没动
     expect((await call('GET', `${env}/status`)).data).toMatchObject({ currentVersion: { id: v2!.id } });
 

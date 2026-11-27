@@ -873,7 +873,7 @@ export type VerifyRequest = z.infer<typeof verifyRequestSchema>;
 
 /**
  * 按需规范化（ADR 0016）：编辑期间不自动回影子库，模型页状态栏显示待规范化数量，编辑者点“规范化”显式触发。
- * POST /api/projects/:pid/normalize 的请求体：可指定用哪个环境的影子库（缺省同发布：最低目标版本组的影子库）。
+ * POST /api/projects/:pid/normalize 的请求体：可指定用哪个环境的影子库（缺省用 Shadows.forProjectTarget 选出的影子库，优先最低已知版本组；发布与重新验证按数据库完整版本号逐组选影）。
  */
 export const normalizeRequestSchema = z.strictObject({
   env: z.string().min(1).optional(),

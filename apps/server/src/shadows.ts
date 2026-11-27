@@ -430,7 +430,7 @@ export class Shadows {
       else groups.set(key, [r]);
     }
     const sortedKnownKeys = [...knownKeys].sort((a, b) => a - b);
-    // 最低已知版本组即项目兼容目标（PG 最低大版本、MySQL 最低主次版本）
+    // 最低已知版本组（PG 最低大版本、MySQL 最低主次版本），供 forProjectTarget 单影子库选影优先使用
     const targetGroupKey = sortedKnownKeys[0] ?? null;
     const orderedKeys: (number | null)[] = [...sortedKnownKeys, ...(groups.has(null) ? [null] : [])];
 
@@ -564,8 +564,8 @@ export class Shadows {
   }
 
   /**
-   * 为 OpaqueRefresher 等单影子库派生场景选影：优先选择最低目标版本组（`groupKey === targetGroupKey`）的可用环境影子库，
-   * 若无可用则回退到首个可用环境影子库。
+   * 为 OpaqueRefresher 等单影子库派生场景选影：优先选择最低已知版本组（`groupKey === targetGroupKey`）的可用环境影子库，
+   * 若无可用则回退到首个可用环境影子库（仅用于按需规范化 / 派生；发布与重新验证使用 `forProjectEngineVersions` 按数据库完整版本号逐组验证）。
    */
   async forProjectTarget(pid: string): Promise<{ shadow: Shadow; label: string }> {
     const res = await this.forProjectVersions(pid);
