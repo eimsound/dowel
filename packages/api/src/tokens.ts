@@ -326,19 +326,37 @@ export type CiProject = z.infer<typeof ciProjectSchema>;
 
 export interface CiVersion extends CiVersionRef {
   publishedAt: string;
+  /** 通过过影子库闭环验证（且脚本之后没有被人工修改）；不代表能执行到任一环境，见 verifiedOn */
   verified: boolean;
+  /**
+   * 通过闭环验证的数据库完整版本号（ADR 0017 决定 5，去重、按记录顺序；与 Web 版本详情的 verifiedOn 相同）。
+   * 执行 / 回滚到某个环境时，该环境目标库的完整版本号必须在其中，否则 409 unverified；SQLite 内置库恒等，不按它把关
+   */
+  verifiedOn: string[];
   checksum: string;
 }
 
 export const ciEnvironmentVersionSchema = ciVersionRefSchema.extend({
   state: z.enum(['applied', 'current', 'pending', 'retired']),
+  /** 通过过影子库闭环验证（与 CiVersion.verified 相同，不看这个环境的数据库版本） */
   verified: z.boolean(),
+  /**
+   * 能执行 / 回滚到这个环境：verified，且有与这个环境目标库完整版本号（CiEnvironmentStatus.engineVersion）一致的通过记录
+   * （ADR 0017 决定 5，与执行前检查同一条规则；SQLite 内置库恒等，等于 verified；其余方言目标库版本读不到时为 false）。
+   * 为 false 时执行经过这个版本会得到 409 unverified
+   */
+  verifiedHere: z.boolean(),
 });
 export type CiEnvironmentVersion = z.infer<typeof ciEnvironmentVersionSchema>;
 
 export const ciEnvironmentStatusSchema = ciEnvironmentSchema.extend({
   /** 实时读取的目标库当前版本；目标库尚无历史时为 null */
   currentVersion: ciVersionRefSchema.nullable(),
+  /**
+   * 实时读取的目标库数据库完整版本号（ADR 0017 决定 5：PostgreSQL 两段、MySQL 三段、SQL Server 构建号、SQLite 内置库版本；
+   * 与 Web 环境信息的 engineFullVersion、409 unverified 的 details.engineVersion 同一口径）；读不到为 null
+   */
+  engineVersion: z.string().nullable(),
   /** 上一次执行是否停在中途（含非事务步骤的迁移） */
   unfinished: z.boolean(),
   /** 链上每个版本相对当前版本的状态 */

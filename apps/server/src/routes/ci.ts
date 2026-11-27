@@ -23,7 +23,9 @@ import {
   type CiVersion,
   type CiVersionRef,
   TOKEN_PATTERN,
+  type VerifyRecord,
 } from '@dowel/api';
+import { type Dialect, getDialect, verifiedForEngine } from '@dowel/core';
 import type { Db } from '@dowel/engines';
 import { HistoryError, maxNumberNode, ScopeError } from '@dowel/engines';
 import { ExecutorError, type ExecutorErrorCode } from '@dowel/executor';
@@ -35,7 +37,7 @@ import type { ContentfulStatusCode } from 'hono/utils/http-status';
 import { audit } from '../audit.ts';
 import { currentUser, hashToken } from '../auth.ts';
 import { can } from '../authz.ts';
-import { type EnvRow, iso, versionStates } from '../envs.ts';
+import { type EnvRow, iso, verifiedOnOf, versionStates } from '../envs.ts';
 import {
   checkEnvDriftDetailed,
   classifyError,
@@ -262,6 +264,39 @@ const loadVersions = (db: Db, pid: string) =>
        from versions where project_id = $1 order by number`,
     [pid],
   );
+
+/**
+ * 各版本通过验证的数据库完整版本号（ADR 0017 决定 5，与 Web 版本信息的 verifiedOn 同一算法）。
+ * 单独查：验证报告可能很大，只有版本列表与环境状态需要它，不放进 loadVersions
+ */
+const loadVerifiedOn = async (db: Db, pid: string): Promise<Map<string, string[]>> =>
+  new Map(
+    (
+      await db.query<{ id: string; verifyReport: { records?: VerifyRecord[] } | null }>(
+        'select id, verify_report as "verifyReport" from versions where project_id = $1',
+        [pid],
+      )
+    ).map((r) => [r.id, verifiedOnOf(r.verifyReport)]),
+  );
+
+const isVerified = (v: Pick<VersionLite, 'verifiedAt'>): boolean =>
+  v.verifiedAt !== null && v.verifiedAt !== undefined;
+
+/**
+ * 环境状态里的 verifiedHere（#200）：与执行前检查（executor preflight）同一条规则，CI 据此能预知 409 unverified。
+ * - 先要 verified（通过过闭环验证、脚本没被人工改过）；
+ * - 需要外部影子库的方言（PostgreSQL / MySQL / SQL Server）：目标库完整版本号必须在 verifiedOn 里，读不到（null）一律 false；
+ * - SQLite 影子库与目标库是同一个内置库，视为恒等：等于 verified（preflight 不给 SQLite 版本 verifiedOn，不比对）。
+ */
+export const ciVerifiedHere = (
+  dialect: Dialect,
+  verified: boolean,
+  verifiedOn: readonly string[],
+  engineVersion: string | null,
+): boolean =>
+  verified &&
+  (!getDialect(dialect).capabilities.requiresExternalShadow ||
+    verifiedForEngine(dialect, verifiedOn, engineVersion));
 
 const isRetired = (v: Pick<VersionLite, 'retiredAt'>): boolean =>
   v.retiredAt !== null && v.retiredAt !== undefined;
@@ -601,11 +636,13 @@ export const registerCi = (app: Hono<Env>, ctx: AppContext) => {
   ciApi.openapi(ciVersionsListRoute, (c) =>
     wrap(c, async () => {
       const p = await projectOf(c);
+      const verifiedOn = await loadVerifiedOn(db, p.id);
       return c.json<CiVersion[], 200>(
         (await loadVersions(db, p.id)).map((v) => ({
           ...ref(v),
           publishedAt: iso(v.createdAt)!,
-          verified: v.verifiedAt !== null && v.verifiedAt !== undefined,
+          verified: isVerified(v),
+          verifiedOn: verifiedOn.get(v.id) ?? [],
           checksum: v.checksum,
         })),
         200,
@@ -619,7 +656,11 @@ export const registerCi = (app: Hono<Env>, ctx: AppContext) => {
       const p = await projectOf(c);
       const env = await envOf(p, c.req.param('env')!);
       requireConnectionQuota(c, '读取环境状态');
-      const state = await readTargetState(ctx.exec, env, true, { preserveHistoryError: true });
+      const state = await readTargetState(ctx.exec, env, true, {
+        preserveHistoryError: true,
+        engineVersion: true,
+      });
+      const engineVersion = state.engineVersion ?? null;
       ctx.requests.kick({ envIds: [env.id] });
       const versions = await loadVersions(db, p.id);
       const byId = new Map(versions.map((v) => [v.id, v]));
@@ -632,15 +673,21 @@ export const registerCi = (app: Hono<Env>, ctx: AppContext) => {
         );
       const store = await loadPolicies(db, p);
       const states = ciVersionStates(versions, cur);
-      const list = versions.map((v) => ({
-        ...ref(v),
-        state: states.get(v.id)!,
-        verified: v.verifiedAt !== null && v.verifiedAt !== undefined,
-      }));
+      const verifiedOn = await loadVerifiedOn(db, p.id);
+      const list = versions.map((v) => {
+        const verified = isVerified(v);
+        return {
+          ...ref(v),
+          state: states.get(v.id)!,
+          verified,
+          verifiedHere: ciVerifiedHere(p.dialect, verified, verifiedOn.get(v.id) ?? [], engineVersion),
+        };
+      });
       return c.json<CiEnvironmentStatus, 200>(
         {
           ...envConfig(env, store),
           currentVersion: cur ? ref(cur) : null,
+          engineVersion,
           unfinished: state.unfinished !== null,
           versions: list,
           pending: list.filter((v) => v.state === 'pending').map((v) => v.number),

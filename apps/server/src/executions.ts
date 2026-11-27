@@ -15,6 +15,7 @@ import {
   HistoryError,
   parseMysqlVersion,
   parseSqliteVersionNum,
+  readEngineFullVersion,
   ScopeError,
 } from '@dowel/engines';
 import {
@@ -791,22 +792,28 @@ export const settleClaims = async (tx: Db, envId: string) => {
 
 // ───── 读历史 ─────
 
-/** 读目标库的历史；sync 为真时顺便同步到平台库缓存（在项目锁里，拿不到锁就只读不同步） */
+/**
+ * 读目标库的历史；sync 为真时顺便同步到平台库缓存（在项目锁里，拿不到锁就只读不同步）。
+ * engineVersion 为真时在同一个连接上再读一次目标库的数据库完整版本号（与执行前检查 preflight 同一个读法，ADR 0017 决定 5）；
+ * 读不到（含查询出错）为 null，不影响历史读取。
+ */
 export const readTargetState = async (
   x: ExecContext,
   env: EnvRow,
   sync = false,
-  opts: { preserveHistoryError?: boolean } = {},
-): Promise<TargetState> => {
+  opts: { preserveHistoryError?: boolean; engineVersion?: boolean } = {},
+): Promise<TargetState & { engineVersion?: string | null }> => {
   const url = decrypt(env.url_enc);
   const dialect = await projectDialect(x.db, env.project_id);
   let conn: ReturnType<typeof open> | null = null;
   try {
     conn = open(dialect, url, x.guard, CHECK_CONNECT_TIMEOUT);
-    return (
+    const state =
       (sync ? await (x.syncTarget ?? syncTarget)(x.db, env, conn.db, dialect) : null) ??
-      (await readState(conn.db, env.project_id, dialect))
-    );
+      (await readState(conn.db, env.project_id, dialect));
+    if (!opts.engineVersion) return state;
+    const engineVersion = await readEngineFullVersion(dialect, conn.db).catch(() => null);
+    return { ...state, engineVersion };
   } catch (e) {
     if (e instanceof HTTPException) throw e;
     if (opts.preserveHistoryError && (e instanceof HistoryError || e instanceof ExecutorError)) throw e;

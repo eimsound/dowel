@@ -144,7 +144,12 @@ curl -fsS \
   "${DOWEL_URL}/api/ci/projects/acme/shop/versions"
 ```
 
-按版本号升序返回项目所有已发布版本（`id`、`number`、`name`、`publishedAt`、`verified`、`checksum`）。
+按版本号升序返回项目所有已发布版本（`id`、`number`、`name`、`publishedAt`、`verified`、`verifiedOn`、`checksum`）：
+
+- `verified`：版本通过过影子库闭环验证（且脚本之后没有被人工修改）。它**不代表**能执行到任一环境。
+- `verifiedOn`：通过闭环验证的数据库完整版本号列表（去重，如 `["17.4"]`；PostgreSQL 两段、MySQL 三段、SQL Server 构建号）。执行 / 回滚到某个环境时，该环境目标库的完整版本号必须在其中，否则返回 `409 unverified`。SQLite 的影子库与目标库是同一个内置库，视为恒等，不按它把关。
+
+要判断某个版本能不能执行到某个环境，直接看[单环境实时状态](#get-environment)里该版本的 `verifiedHere`。
 
 ### 3.3 单环境实时状态（轻量连目标库读迁移历史） {#get-environment}
 
@@ -156,7 +161,7 @@ curl -fsS \
   "${DOWEL_URL}/api/ci/projects/acme/shop/environments/staging"
 ```
 
-受连接限速约束（按令牌计）。直连目标库读取历史记录（PostgreSQL / SQL Server 读 `dowel.history`，SQLite / MySQL 读 `dowel_history`，顺带同步平台库缓存），返回环境平台配置（`name`、`production`、`tokenExecution`）与实时 `currentVersion`、`unfinished`、版本链相对状态（`applied` / `current` / `pending`）和待执行版本号列表 `pending`：
+受连接限速约束（按令牌计）。直连目标库读取历史记录（PostgreSQL / SQL Server 读 `dowel.history`，SQLite / MySQL 读 `dowel_history`，顺带同步平台库缓存），返回环境平台配置（`name`、`production`、`tokenExecution`）与实时 `currentVersion`、目标库数据库完整版本号 `engineVersion`、`unfinished`、版本链相对状态（`applied` / `current` / `pending` / `retired`）和待执行版本号列表 `pending`：
 
 ```json
 {
@@ -164,14 +169,35 @@ curl -fsS \
   "production": false,
   "tokenExecution": true,
   "currentVersion": { "id": "01J...", "number": 4, "name": "加索引" },
+  "engineVersion": "17.4",
   "unfinished": false,
   "versions": [
-    { "id": "01J...", "number": 4, "name": "加索引", "state": "current", "verified": true },
-    { "id": "01J...", "number": 5, "name": "订单表加备注", "state": "pending", "verified": true }
+    {
+      "id": "01J...",
+      "number": 4,
+      "name": "加索引",
+      "state": "current",
+      "verified": true,
+      "verifiedHere": true
+    },
+    {
+      "id": "01J...",
+      "number": 5,
+      "name": "订单表加备注",
+      "state": "pending",
+      "verified": true,
+      "verifiedHere": false
+    }
   ],
   "pending": [5]
 }
 ```
+
+- `engineVersion`：本次连接实时读到的目标库数据库完整版本号，与 `409 unverified` 的 `details.engineVersion` 同一口径；读不到为 `null`。
+- `verified`：同[版本链](#get-versions)里的 `verified`，不看这个环境的数据库版本。
+- `verifiedHere`：这个版本能不能执行 / 回滚到这个环境，与执行前检查同一条规则——`verified` 为真，且 `verifiedOn` 里有本环境的 `engineVersion`；`engineVersion` 为 `null` 时一律为 `false`。SQLite 视为恒等，`verifiedHere` 等于 `verified`。
+
+`verifiedHere` 为 `false` 的版本出现在要执行的路线上时（如上例的 `pending` 版本 5），`POST …/execute` 会返回 `409 unverified`：先在 Web 端为与目标库版本一致的影子库（或允许同实例影子库）重新验证这个版本。
 
 目标库不可达返回 `502 target_unreachable`；历史格式过新、损坏或当前版本不在平台版本链上返回 `409 version_mismatch`。
 

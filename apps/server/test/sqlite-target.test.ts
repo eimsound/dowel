@@ -9,7 +9,9 @@ import { tmpdir } from 'node:os';
 import path from 'node:path';
 
 import type {
+  CiEnvironmentStatus,
   CiExecuteResult,
+  CiVersion,
   DriftCheckResponse,
   ExecEvent,
   MarkDryRunResponse,
@@ -410,7 +412,37 @@ describe('SQLite 目标库全栈', () => {
     const rbEvents = parseSse<ExecEvent>(await rbRes.text());
     expect(rbEvents.some((e) => e.stage === 'done')).toBe(true);
 
-    // 6. 使用 CI 令牌重新升级到 latest (v1)
+    // 6. #200：SQLite 影子库与目标库是同一个内置库，视为恒等——CI 环境状态的 verifiedHere 等于 verified，
+    //    哪怕通过记录上的版本号和目标库不同（执行前检查同样不比对）；engineVersion 是实时读到的内置库版本
+    const ciBase = `/api/ci/projects/${pInfo.group.slug}/${pInfo.slug}`;
+    const ciGet = async <T>(sub: string) => {
+      const r = await app.request(`${ciBase}${sub}`, { headers: { authorization: `Bearer ${token}` } });
+      expect(r.status).toBe(200);
+      return (await r.json()) as T;
+    };
+    const [v1Row] = await pdb.query<{ verifyReport: { records: { engineVersion: string | null }[] } }>(
+      'select verify_report as "verifyReport" from versions where id = $1',
+      [v1.id],
+    );
+    const report = v1Row!.verifyReport;
+    expect(report.records.length).toBeGreaterThan(0);
+    report.records = report.records.map((r) => ({ ...r, engineVersion: '0.0.1' }));
+    await pdb.query('update versions set verify_report = $2::text::jsonb where id = $1', [
+      v1.id,
+      JSON.stringify(report),
+    ]);
+    const ciVers = await ciGet<CiVersion[]>('/versions');
+    expect(ciVers.find((v) => v.id === v1.id)).toMatchObject({ verified: true, verifiedOn: ['0.0.1'] });
+    const ciStatus = await ciGet<CiEnvironmentStatus>('/environments/local');
+    expect(ciStatus.engineVersion).toMatch(/^3\./);
+    expect(ciStatus.versions.length).toBeGreaterThan(0);
+    for (const v of ciStatus.versions) expect(v.verifiedHere).toBe(v.verified);
+    expect(ciStatus.versions.find((v) => v.id === v1.id)).toMatchObject({
+      verified: true,
+      verifiedHere: true,
+    });
+
+    // 7. 使用 CI 令牌重新升级到 latest (v1)
     const ciRes = await app.request(ciExecPath, {
       method: 'POST',
       headers: {
@@ -424,7 +456,7 @@ describe('SQLite 目标库全栈', () => {
     expect(ciOut.ok).toBe(true);
     expect(ciOut.reached?.number).toBe(1);
 
-    // 7. 漂移检测：线外直接建表 -> drifted，删掉后 -> ok
+    // 8. 漂移检测：线外直接建表 -> drifted，删掉后 -> ok
     const driftEdit = openSqliteDb(targetFile);
     await driftEdit.db.exec('CREATE TABLE out_of_band (id INTEGER PRIMARY KEY)');
     driftEdit.close();
@@ -443,7 +475,7 @@ describe('SQLite 目标库全栈', () => {
     ).json()) as DriftCheckResponse;
     expect(drift2.status).toBe('ok');
 
-    // 8. 接手检查：能发现目标库里登记的 SQLite 项目
+    // 9. 接手检查：能发现目标库里登记的 SQLite 项目
     const inspectRes = await req('POST', '/api/takeover/inspect', {
       groupId,
       dialect: 'sqlite',
@@ -454,7 +486,7 @@ describe('SQLite 目标库全栈', () => {
     expect(inspected.hasHistory).toBe(true);
     expect(inspected.projects.some((p) => p.projectId === pid && p.headNumber === 1)).toBe(true);
 
-    // 9. 删除原项目后走 takeover 向导完整恢复（经 :memory: 影子库全链闭环验证）
+    // 10. 删除原项目后走 takeover 向导完整恢复（经 :memory: 影子库全链闭环验证）
     const delRes = await req('DELETE', `/api/projects/${pid}`, { confirm: pInfo.slug });
     expect(delRes.status).toBe(200);
 
