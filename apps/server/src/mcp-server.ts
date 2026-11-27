@@ -1292,7 +1292,7 @@ export const createMcpServer = (
       const resolved = await resolveMcpProject(ctx, principal, args.project, MCP_TOOLS.get_ddl.action);
       if (!resolved.ok) return toolError(resolved.code, resolved.message);
       const { row } = resolved.project;
-      const modelRef = await resolveModelRef(ctx.db, ctx.rooms, ctx.refresher, {
+      const modelRef = await resolveModelRef(ctx.db, ctx.refresher, {
         pid: row.id,
         branch: row.branch,
         schemas: row.schemas,
@@ -1363,7 +1363,7 @@ export const createMcpServer = (
       );
       if (!resolved.ok) return toolError(resolved.code, resolved.message);
       const { row } = resolved.project;
-      const toRef = await resolveModelRef(ctx.db, ctx.rooms, ctx.refresher, {
+      const toRef = await resolveModelRef(ctx.db, ctx.refresher, {
         pid: row.id,
         branch: row.branch,
         schemas: row.schemas,
@@ -1372,7 +1372,7 @@ export const createMcpServer = (
       });
       if (!toRef.ok) return toolError(toRef.code, toRef.message);
 
-      const fromRef = await resolveModelRef(ctx.db, ctx.rooms, ctx.refresher, {
+      const fromRef = await resolveModelRef(ctx.db, ctx.refresher, {
         pid: row.id,
         branch: row.branch,
         schemas: row.schemas,
@@ -1597,7 +1597,7 @@ export const createMcpServer = (
       let toRef: Awaited<ReturnType<typeof resolveModelRef>>;
       let fromRef: Awaited<ReturnType<typeof resolveModelRef>>;
       try {
-        toRef = await resolveModelRef(ctx.db, ctx.rooms, ctx.refresher, {
+        toRef = await resolveModelRef(ctx.db, ctx.refresher, {
           pid: row.id,
           branch: row.branch,
           schemas: row.schemas,
@@ -1608,7 +1608,7 @@ export const createMcpServer = (
           refund();
           return toolError(toRef.code, toRef.message);
         }
-        fromRef = await resolveModelRef(ctx.db, ctx.rooms, ctx.refresher, {
+        fromRef = await resolveModelRef(ctx.db, ctx.refresher, {
           pid: row.id,
           branch: row.branch,
           schemas: row.schemas,
@@ -2000,7 +2000,7 @@ export const createMcpServer = (
     { title: 'Project Head DDL', mimeType: 'application/sql' },
     async (uri, variables) => {
       const p = await resolveProjectOrThrow(varStr(variables.owner), varStr(variables.project), 'ddl.read');
-      const modelRef = await resolveModelRef(ctx.db, ctx.rooms, ctx.refresher, {
+      const modelRef = await resolveModelRef(ctx.db, ctx.refresher, {
         pid: p.row.id,
         branch: p.row.branch,
         schemas: p.row.schemas,

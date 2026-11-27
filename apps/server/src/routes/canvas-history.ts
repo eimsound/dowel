@@ -69,8 +69,7 @@ export const registerCanvasHistory = (app: Hono<Env>, ctx: AppContext) => {
     const from = parseOptInt(c.req.query('from'), 'from');
     if (from !== undefined && from !== seq) assertRange(from, seq);
     // 关键出口：与规范化后的当前模型比较，返回的 currentSeq 供恢复弹窗作为 workingSeq
-    await refresher.flush(a.branch);
-    const { model: currentModel, seq: currentSeq } = await rooms.model(a.branch);
+    const { model: currentModel, seq: currentSeq } = await refresher.flush(a.branch);
     // 单步与整组净差异共用 historyDetailModels：最多重建一次 modelAt，在内存中顺次重放（不从快照重放两次）
     const { entry, prevModel, targetModel } = await rooms.historyDetailModels(
       a.branch,

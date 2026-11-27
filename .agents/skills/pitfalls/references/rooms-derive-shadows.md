@@ -23,6 +23,7 @@
   2. **反模式**：在带 `workingSeq` 的确认请求（恢复历史、应用版本、作废/取消作废同步工作副本、拉取/接入确认覆盖）里先 `flush()`——规范化写回推进 `seq`，用户确认立刻 `409 working_changed`（自冲突）。正确做法：只在返回 `workingSeq` 的预览/详情接口 flush；
   3. **反模式（基线投毒）**：`!needsRefresh` 时把当前模型写成基线、canonicalize 失败时“接受当前模型作为基线”、恢复历史时把历史模型写成基线。正确做法：黄金基线只在 canonical 替换或成功 canonicalize 后推进；非 canonical 替换走 `runWithoutReset`（同样排队持锁，不碰基线）；
   4. 显式 `normalize()` 停机中拒绝（`503 shutting_down`），`forget()` 后在途任务不回写基线；只读 `status()` 不拿锁、不连影子库。
+  5. **反模式（flush 后二次读房间 TOCTOU，#132 路径 B）**：关键出口调用 `await refresher.flush(branch)` 后再 `await rooms.model(branch)` 读一次房间——两次调用之间插进来的并发编辑没经过规范化判定，却会被冻进已验证版本或用于迁移 / DDL / 预览。正确做法：直接使用 `flush()` 返回的 `{ model, seq }`（发布、`resolveModelRef`、版本 `canvas-diff`、历史详情、拉取 / 接入预览均如此）；仅只读 MCP 读模型工具（`get_model` / `get_table` / `get_objects`）因需在同一把房间锁内原子拿到对象版本与板块，仍按设计在 `flush()` 后读 `canvasState`。
 
 ---
 
@@ -49,9 +50,12 @@
 - **【会出什么事】**
   - 副本 A 改连接串或把环境标为 `production: true, allowSameInstance: false` 后，副本 B 仍复用旧影子库甚至绕过生产禁同实例影子库的安全规则；删环境/删项目后他副本旧连接池永久泄漏。
 - **【Dowel 正确做法】**（已验证于 `shadows.ts` / `bus.ts` / `routes/projects.ts`）
-  1. 缓存条目保存 `projectId` 与完整配置 SHA-256 指纹（`name`/`url`/`shadowUrl`/`production`/`allowSameInstance`/`schemas`），指纹不匹配则先关旧连接再按新配置重建或拒绝；
+  1. 缓存条目保存 `projectId` 与完整配置 SHA-256 指纹（`name`/`url`/`shadowUrl`/`production`/`allowSameInstance`/`schemas`/`engineVersionNum`），指纹不匹配则先关旧连接再按新配置重建或拒绝；
   2. 引入 `invalidationGen` 与 `closed` 标记，防止并发 `prepareShadow` 完成后把旧句柄回写进缓存；
   3. 接入 `EventBus` 广播 `{ t: 'shadows.forget', origin, all?, envIds?, projectId? }`，删项目同步 `forgetProject(pid)`，`bus.onReconnect` 清空关闭本地缓存，`close()` 退订并释放全部连接。
+- **【补充：晚到的 `shadows.forget` 不能盲目关闭（`#148`）】**
+  - 反模式：远端 `shadows.forget` 到达就无条件 `forgetLocal`。事件是异步送达的，副本 B 可能在事件到达**之前**就已经 `forProject` 读到新配置、按新指纹重建了条目并开始 `verify`；晚到的事件把这个**按最新配置建立的**新连接 `close()` 掉，在途验证以“影子库不可用：连接失败：write CONNECTION_ENDED”失败（数据库本身正常）。`invalidationGen` 只覆盖“事件在 `prepareShadow` 期间到达”，覆盖不了“条目入缓存之后才到达”。
+  - 正确做法：收到远端 `envIds` / `projectId` 事件先同步 `invalidationGen++`，再对每个本地条目按平台库最新配置复核指纹（`revalidateLocal`）——一致就保留，不一致 / 环境或项目已删（404）/ 读配置失败才关闭移除；`all` 与 `onReconnect` 仍然无条件清空。回归见 `apps/server/test/shadows-stale-forget.test.ts`。
 
 ---
 

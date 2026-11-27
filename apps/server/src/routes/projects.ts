@@ -363,7 +363,7 @@ export const registerProjects = (app: Hono<Env>, ctx: AppContext) => {
     // 事务提交之后才能动内存里的缓存：提交失败的话项目还在，不能提前把连接 / 基线丢掉。
     // 1. 房间：断开在线的人，并从 rooms 缓存里卸载（4403 和“没有权限了”同一个约定）；
     // 2. 影子库：每个被删掉的环境一个连接，关掉并从 Shadows 缓存里移除；
-    // 3. 派生数据：取消挂起的刷新，丢掉已规范化的基线和重试计数。
+    // 3. 派生数据：丢掉已规范化的内存基线，并标记在途刷新不再回写基线。
     await rooms.kickBranches(deleted.branchIds, '项目已被删除');
     for (const eid of deleted.envIds) await shadows.forget(eid);
     await shadows.forgetProject(a.pid);
