@@ -26,6 +26,7 @@ import {
   ShadowUnavailableError,
   shadowOps,
 } from '../shadow.ts';
+import { serialShadowConnection } from './shadow-handle.ts';
 import {
   CHECK_CONNECT_TIMEOUT,
   ConnectError,
@@ -608,8 +609,6 @@ export const mysqlShadow = (
   _schemas?: string[] | null,
   guard?: ConnectionGuard,
 ): Shadow => {
-  let conn: TargetConnection | null = null;
-  let queue: Promise<unknown> = Promise.resolve();
   const dbName = (() => {
     try {
       return decodeURIComponent(new URL(shadowUrl).pathname.replace(/^\/+/, '')) || 'shadow';
@@ -619,15 +618,10 @@ export const mysqlShadow = (
   })();
   const runLock = mysqlShadowLockName('dowel:shadow:run:', dbName);
 
-  const discard = async () => {
-    const old = conn;
-    conn = null;
-    await old?.close().catch(() => {});
-  };
-
-  const run = <T>(fn: (ops: ReturnType<typeof shadowOps>) => Promise<T>): Promise<T> => {
-    const p = queue.then(async () => {
-      conn ??= connectMysql(shadowUrl, 10, guard);
+  // 串行、懒建连、关闭后永不重连（Issue #154，见 serialShadowConnection）
+  const session = serialShadowConnection(() => connectMysql(shadowUrl, 10, guard));
+  const run = <T>(fn: (ops: ReturnType<typeof shadowOps>) => Promise<T>): Promise<T> =>
+    session.run(async (conn, discard) => {
       let sessionConn: Db | null = null;
       let locked = false;
       let clean = false;
@@ -668,9 +662,6 @@ export const mysqlShadow = (
         }
       }
     });
-    queue = p.catch(() => {});
-    return p;
-  };
 
   return {
     importSql: (sql) => run((ops) => ops.importSql(sql)),
@@ -678,10 +669,7 @@ export const mysqlShadow = (
     verifyScripts: (from, to, up, down, options): Promise<VerifyReport> =>
       run((ops) => ops.verifyScripts(from, to, up, down, options)),
     canonicalize: (prev, next) => run((ops) => ops.canonicalize(prev, next)),
-    close: async () => {
-      await conn?.close();
-      conn = null;
-    },
+    close: () => session.close(),
   };
 };
 

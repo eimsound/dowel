@@ -25,6 +25,7 @@ import {
   shadowOps,
 } from '../shadow.ts';
 import { scrubUrl } from './pg.ts';
+import { serialShadowConnection } from './shadow-handle.ts';
 import {
   CHECK_CONNECT_TIMEOUT,
   ConnectError,
@@ -670,23 +671,18 @@ export const mssqlShadow = (
   guard?: ConnectionGuard,
 ): Shadow => {
   const expectedDb = parseMssqlUrl(shadowUrl).database;
-  let conn: TargetConnection | null = null;
-  let queue: Promise<unknown> = Promise.resolve();
-  const discard = async () => {
-    const old = conn;
-    conn = null;
-    await old?.close().catch(() => {});
-  };
   const checkDbMatches = async (db: Db): Promise<boolean> => {
     const [r] = await db.query<{ dbName: string | null }>(`SELECT DB_NAME() AS dbName`);
     const cur = r?.dbName?.trim() ?? '';
     if (!cur || MSSQL_SYSTEM_DATABASES.has(cur.toLowerCase())) return false;
     return !expectedDb || cur.toLowerCase() === expectedDb.toLowerCase();
   };
-  const run = <T>(fn: (ops: ReturnType<typeof shadowOps>) => Promise<T>): Promise<T> => {
-    const p = queue.then(async () => {
-      conn ??= connectMssql(shadowUrl, 10, guard, SHADOW_STATEMENT_TIMEOUT_MS);
-      const db = conn.db;
+  // 串行、懒建连、关闭后永不重连（Issue #154，见 serialShadowConnection）
+  const session = serialShadowConnection(() =>
+    connectMssql(shadowUrl, 10, guard, SHADOW_STATEMENT_TIMEOUT_MS),
+  );
+  const run = <T>(fn: (ops: ReturnType<typeof shadowOps>) => Promise<T>): Promise<T> =>
+    session.run(async ({ db }, discard) => {
       try {
         await db.exec('SET LOCK_TIMEOUT 10000');
         setMssqlShadowGuard(db, { expectedDb, mark: SHADOW_MARK });
@@ -716,9 +712,6 @@ export const mssqlShadow = (
         if (!clean || !unlocked) await discard();
       }
     });
-    queue = p.catch(() => {});
-    return p;
-  };
   return {
     importSql: (sqlText) => run((ops) => ops.importSql(sqlText)),
     verify: (from, to, opts): Promise<VerifyReport> => run((ops) => ops.verify(from, to, opts)),
@@ -726,10 +719,7 @@ export const mssqlShadow = (
       run((ops) => ops.verifyScripts(from, to, up, down, options)),
     canonicalize: (prev, next) => run((ops) => ops.canonicalize(prev, next)),
     probeMssqlNotNull: (model, ids) => run((ops) => ops.probeMssqlNotNull(model, ids)),
-    close: async () => {
-      await conn?.close();
-      conn = null;
-    },
+    close: () => session.close(),
   };
 };
 
