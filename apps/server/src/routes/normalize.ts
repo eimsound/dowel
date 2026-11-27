@@ -14,6 +14,7 @@ import type { Hono } from 'hono';
 import { HTTPException } from 'hono/http-exception';
 
 import {
+  BranchForgottenError,
   DeriveBusyError,
   NormalizeConflictError,
   RefresherStoppedError,
@@ -75,14 +76,6 @@ export const registerNormalize = (app: Hono<Env>, ctx: AppContext) => {
       if (gate?.allowed) gate.refund();
     };
 
-    // 静态校验先于连库：模型本身不合法（引用缺失等），影子库里一定建不出来
-    const { model: cur } = await rooms.model(a.branch);
-    const problems = validate(cur);
-    if (problems.length) {
-      refund();
-      return fail(422, `模型校验未通过，无法规范化：${problems[0]}`, 'model_invalid');
-    }
-
     /**
      * 解析影子库句柄：没真正连库就失败的（ShadowError.preConnect：没有环境、生产环境不允许同实例；指定的环境不存在 404）
      * 精确退回限速额度（#9）。refund 幂等，后面再退一次也不会多退。
@@ -102,6 +95,14 @@ export const registerNormalize = (app: Hono<Env>, ctx: AppContext) => {
     };
 
     try {
+      // 静态校验先于连库：模型本身不合法（引用缺失等），影子库里一定建不出来
+      const { model: cur } = await rooms.model(a.branch);
+      const problems = validate(cur);
+      if (problems.length) {
+        refund();
+        return fail(422, `模型校验未通过，无法规范化：${problems[0]}`, 'model_invalid');
+      }
+
       // 指定了环境：先解析（校验环境存在、确实用它的影子库）；没指定：交给 normalize 在锁内按需解析，
       // 基线就是当前模型（clean）时根本不碰影子库
       const handle = b.env ? await resolveHandle() : resolveHandle;
@@ -109,6 +110,34 @@ export const registerNormalize = (app: Hono<Env>, ctx: AppContext) => {
       if (!resolved) refund();
       return c.json<NormalizeResult>(out);
     } catch (e) {
+      // 规范化期间项目被删（分支被 forget）：和项目不存在同一个响应（accessIn 的 404）；
+      // 还没解析到影子库句柄（例如排队中或 loadGood 期间被删、未指定 env）则精确退回限速额度
+      if (e instanceof BranchForgottenError) {
+        if (!resolved) refund();
+        throw new HTTPException(404, { message: '项目不存在' });
+      }
+      // 没做成任何规范化的停机 / 忙：已有明确语义，退回限速额度
+      if (e instanceof RefresherStoppedError) {
+        refund();
+        return fail(503, e.message, 'shutting_down');
+      }
+      if (e instanceof DeriveBusyError) {
+        refund();
+        throw e;
+      }
+      // 404（环境不存在）等 HTTPException 原样抛出
+      if (e instanceof HTTPException) throw e;
+      // 兜底复查分支是否仍存在（先于所有类型化映射，覆盖 PG 跨连接窗口、跨副本删除，以及请求停在
+      // rooms.model 尚未入队时删除路由已执行 forget 未打标记的窗口）：
+      // 已消失则与 accessIn 一致返回 404（未解析影子库时退回限速），避免误报 422 / 409 / 500；
+      // 平台库查询失败保守视作仍存在，按原始错误继续映射，以免吞掉真实数据库故障。
+      const [branch] = await ctx.db
+        .query<{ id: string }>('select id from branches where id = $1', [a.branch])
+        .catch(() => [{ id: a.branch }]);
+      if (!branch) {
+        if (!resolved) refund();
+        throw new HTTPException(404, { message: '项目不存在' });
+      }
       // 影子库配置在规范化途中变了（Issue #154）：可重试，不是“影子库不可用”
       if (e instanceof ShadowConfigChangedError) return fail(503, e.message, e.code);
       if (e instanceof ShadowError) return fail(422, e.message, 'shadow_unavailable');
@@ -119,13 +148,6 @@ export const registerNormalize = (app: Hono<Env>, ctx: AppContext) => {
       if (e instanceof NormalizeConflictError) {
         return fail(409, e.message, 'working_changed', { currentSeq: e.currentSeq });
       }
-      // 没做成任何规范化的忙 / 停机：退回限速额度
-      if (e instanceof RefresherStoppedError) {
-        refund();
-        return fail(503, e.message, 'shutting_down');
-      }
-      if (e instanceof DeriveBusyError) refund();
-      // DeriveBusyError 交给 app.onError 统一映射为 503 normalize_busy；404（环境不存在）等 HTTPException 原样抛出
       throw e;
     }
   });

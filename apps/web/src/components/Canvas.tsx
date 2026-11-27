@@ -49,6 +49,7 @@ type Col = {
   name: string;
   type: string;
   isEnum: boolean;
+  isUntyped: boolean;
   key: 'PK' | 'FK' | 'UQ' | '';
   notNull: boolean;
   isPartKey: boolean;
@@ -154,7 +155,11 @@ const TableNodeView = memo(({ data, selected }: NodeProps<TableNode>) => {
             {!c.notNull && <span className="text-text-3">?</span>}
           </span>
           {c.isPartKey && <b className="flag shrink-0">PT</b>}
-          <span className={`truncate text-xs ${c.isEnum ? 'text-enum' : 'text-text-3'}`}>{c.type}</span>
+          {c.isUntyped ? (
+            <span className="truncate font-sans text-xs text-text-3 italic">{t('insp.untyped')}</span>
+          ) : (
+            <span className={`truncate text-xs ${c.isEnum ? 'text-enum' : 'text-text-3'}`}>{c.type}</span>
+          )}
         </div>
       ))}
       {data.columns.length === 0 && <div style={{ height: ROW_H }} />}
@@ -234,6 +239,10 @@ const nodeTypes = { table: TableNodeView, sectionSummary: SummaryNodeView };
 
 export const typeLabel = (m: Model, c: { type: string; typeRef: string | null }) =>
   c.typeRef ? `${m.objects[c.typeRef]?.name ?? '?'}${c.type}` : c.type;
+
+/** SQLite 非 STRICT 表的无类型列（type 为空、没有枚举引用；PG 非数组枚举列的 type 也为空，不算） */
+export const isUntypedColumn = (m: Model, c: { type: string; typeRef: string | null }) =>
+  m.dialect === 'sqlite' && !c.typeRef && !c.type.trim();
 
 /** 列表里显示的短类型名（PG 的标准别名），编辑框里仍是完整写法 */
 export const shortType = (t: string) =>
@@ -656,6 +665,7 @@ export const Canvas = memo(
             name: c.name,
             type: shortType(typeLabel(model, c)),
             isEnum: !!c.typeRef,
+            isUntyped: isUntypedColumn(model, c),
             key: pkCols.has(c.id) ? 'PK' : fkCols.has(c.id) ? 'FK' : uqCols.has(c.id) ? 'UQ' : '',
             notNull: c.notNull || pkCols.has(c.id),
             isPartKey: partKeySet.has(c.id),

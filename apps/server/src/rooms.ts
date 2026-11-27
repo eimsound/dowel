@@ -25,7 +25,14 @@ import { type ApplyMcpOpsOptions, type ApplyMcpOpsResult, McpWriter } from './ro
 import { RoomOps } from './rooms/ops.ts';
 import { RoomPeers } from './rooms/peers.ts';
 import { type ManageSectionsOptions, type ManageSectionsResult, SectionsSync } from './rooms/sections.ts';
-import type { ExtraIn, Loaded, Peer, ResolveRole, RoomsOptions } from './rooms/types.ts';
+import {
+  type ExtraIn,
+  type Loaded,
+  MAX_PRESENCE_BYTES,
+  type Peer,
+  type ResolveRole,
+  type RoomsOptions,
+} from './rooms/types.ts';
 
 export {
   type ApplyMcpChangedItem,
@@ -43,9 +50,21 @@ export {
   type ResolveRole,
   type Role,
   type RoomsOptions,
+  MAX_PRESENCE_BYTES,
   SNAPSHOT_EVERY,
   WorkingChangedError,
 } from './rooms/types.ts';
+
+/** presence 数据序列化后不超过 MAX_PRESENCE_BYTES（UTF-8 字节）；无法序列化的也算不合格 */
+const presenceFits = (data: unknown): boolean => {
+  let json: string | undefined;
+  try {
+    json = JSON.stringify(data);
+  } catch {
+    return false;
+  }
+  return json === undefined || Buffer.byteLength(json, 'utf8') <= MAX_PRESENCE_BYTES;
+};
 
 /** 空闲房间（无在线成员且无待落盘布局）默认超时卸载时间（毫秒） */
 const DEFAULT_IDLE_EVICT_MS = 5 * 60_000;
@@ -194,6 +213,8 @@ export class Rooms {
       return;
     }
     if (msg.t === 'presence' && peer.client) {
+      // presence 原样转发给房间里每个连接并进事件总线：超过上限的直接丢弃（与跨副本 NOTIFY 的上限一致，避免放大）
+      if (!presenceFits(msg.data)) return;
       await this.peers.handleLocalPresence(branchId, r, peer, peer.client, msg.data);
     }
   }

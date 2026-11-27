@@ -19,10 +19,13 @@ import {
   formatScript,
   getDialect,
   isNontransactionalSql,
+  macros,
+  mutators,
   plan,
   renameColumn,
   renameKey,
   renameTable,
+  runMacro,
   runMutator,
   scrubSecrets,
   setColumnExt,
@@ -33,6 +36,7 @@ import {
   setPrimaryKey,
   setTableExt,
   splitSqliteStatements,
+  SQLITE_COLUMN_TYPE_NOTE,
   validate,
 } from '../src/index.ts';
 
@@ -276,5 +280,143 @@ describe('multi-dialect core foundation & SQLite planner', () => {
     expect(validate(m)).toEqual([]);
     // Clearing PK completely on WITHOUT ROWID still fails
     expect(() => setPrimaryKey(m, t, [])).toThrow(/WITHOUT ROWID/);
+  });
+
+  it('SQLite type fidelity: STRICT whitelist, untyped columns, BIGINT/INT PK & AUTOINCREMENT, DDL, plan, macros', () => {
+    // 1. STRICT 白名单与未声明类型报错
+    const ms = emptyModel('sqlite');
+    const mainS = createSchema(ms, 'main');
+    const strictT = createTable(ms, mainS, 'strict_t', undefined, null, { sqlite: { strict: true } });
+    const cInt = addColumn(ms, strictT, { name: 'id', type: 'int', notNull: true });
+    expect((ms.objects[cInt] as { type: string }).type).toBe('INT');
+    for (const ok of ['INTEGER', 'REAL', 'TEXT', 'BLOB', 'ANY']) {
+      addColumn(ms, strictT, { name: `c_${ok.toLowerCase()}`, type: ok.toLowerCase() });
+    }
+    expect(() => addColumn(ms, strictT, { name: 'bad_big', type: 'bigint' })).toThrow(/STRICT 表不支持/);
+    expect(() => addColumn(ms, strictT, { name: 'bad_bool', type: 'BOOLEAN' })).toThrow(/STRICT 表不支持/);
+    expect(() => addColumn(ms, strictT, { name: 'bad_empty', type: '' })).toThrow(/必须声明类型/);
+    expect(() => addColumn(ms, strictT, { name: 'bad_ws', type: '   ' })).toThrow(/必须声明类型/);
+    expect(() => setColumnType(ms, cInt, 'bigint')).toThrow(/STRICT 表不支持/);
+    expect(() => setColumnType(ms, cInt, '')).toThrow(/必须声明类型/);
+    expect(validate(ms)).toEqual([]);
+
+    // 绕过编辑入口写入非法类型 / 空类型，validate 分别给出清晰提示
+    (ms.objects[cInt] as { type: string }).type = '';
+    expect(validate(ms)).toContainEqual(expect.stringMatching(/STRICT 表的列必须声明类型/));
+    (ms.objects[cInt] as { type: string }).type = 'BIGINT';
+    expect(validate(ms)).toContainEqual(expect.stringMatching(/当前为 BIGINT/));
+    (ms.objects[cInt] as { type: string }).type = 'INT';
+
+    // 非 STRICT 含无类型列时开启 STRICT 失败且报错提及“未声明类型”
+    const looseT = createTable(ms, mainS, 'loose_t');
+    const looseCol = addColumn(ms, looseT, { name: 'e', type: '' });
+    expect((ms.objects[looseCol] as { type: string }).type).toBe('');
+    expect(() => setTableExt(ms, looseT, { sqlite: { strict: true } })).toThrow(/未声明类型/);
+    setColumnType(ms, looseCol, 'TEXT');
+    expect((ms.objects[looseCol] as { type: string }).type).toBe('TEXT');
+    setColumnType(ms, looseCol, '   ');
+    expect((ms.objects[looseCol] as { type: string }).type).toBe('');
+    expect(validate(ms)).toEqual([]);
+
+    // 2. AUTOINCREMENT 只允许在 INTEGER 单列 PK 上，INT / BIGINT 拒绝，改类型自动清理
+    const mPk = emptyModel('sqlite');
+    const sPk = createSchema(mPk, 'main');
+    const tBig = createTable(mPk, sPk, 'big_pk');
+    const bigId = addColumn(mPk, tBig, { name: 'id', type: 'bigint', notNull: true });
+    addPrimaryKey(mPk, tBig, [bigId]);
+    const tInt = createTable(mPk, sPk, 'int_pk');
+    const intId = addColumn(mPk, tInt, { name: 'id', type: 'int', notNull: true });
+    addPrimaryKey(mPk, tInt, [intId]);
+    expect(() => setColumnExt(mPk, bigId, { sqlite: { autoincrement: true } })).toThrow(/AUTOINCREMENT/);
+    expect(() => setColumnExt(mPk, intId, { sqlite: { autoincrement: true } })).toThrow(/AUTOINCREMENT/);
+    // 绕过校验写入时 validate 同样拦截
+    (mPk.objects[bigId] as { ext?: { sqlite?: { autoincrement?: boolean } } }).ext = {
+      sqlite: { autoincrement: true },
+    };
+    expect(validate(mPk)).toContainEqual(expect.stringMatching(/AUTOINCREMENT 只能用于 INTEGER/));
+    setColumnExt(mPk, bigId, null);
+
+    const tAuto = createTable(mPk, sPk, 'auto_pk');
+    const autoId = addColumn(mPk, tAuto, { name: 'id', type: 'INTEGER', notNull: true });
+    addPrimaryKey(mPk, tAuto, [autoId]);
+    setColumnExt(mPk, autoId, { sqlite: { autoincrement: true } });
+    setColumnType(mPk, autoId, 'bigint');
+    expect((mPk.objects[autoId] as { ext?: unknown }).ext).toBeUndefined();
+    expect(validate(mPk)).toEqual([]);
+
+    // 3. DDL 渲染（无类型列省略类型不留双空格；BIGINT PK 保留 BIGINT）+ plan 重建触发
+    const mDdl = emptyModel('sqlite');
+    const sDdl = createSchema(mDdl, 'main');
+    const tbl = createTable(mDdl, sDdl, 'items');
+    const idCol = addColumn(mDdl, tbl, { name: 'id', type: 'bigint', notNull: true });
+    addPrimaryKey(mDdl, tbl, [idCol]);
+    const e1 = addColumn(mDdl, tbl, { name: 'e', type: '', notNull: true, default: { expr: '1' } });
+    addColumn(mDdl, tbl, { name: 'bare', type: '' });
+    const ddl = createAll(mDdl)[0]!.sql;
+    expect(ddl).toBe('CREATE TABLE items (id BIGINT NOT NULL, e NOT NULL DEFAULT 1, bare, PRIMARY KEY (id))');
+    expect(ddl).not.toContain('  ');
+
+    const mAddUntyped = structuredClone(mDdl);
+    addColumn(mAddUntyped, tbl, { name: 'extra', type: '' });
+    const addSteps = plan(mDdl, mAddUntyped);
+    expect(addSteps).toHaveLength(1);
+    expect(addSteps[0]!.sql).toBe('ALTER TABLE items ADD COLUMN extra');
+
+    const mToText = structuredClone(mDdl);
+    setColumnType(mToText, e1, 'TEXT');
+    expect(plan(mDdl, mToText).map((s) => s.kind)).toEqual(['rebuildTable']);
+    expect(plan(mToText, mDdl).map((s) => s.kind)).toEqual(['rebuildTable']);
+
+    const mToInt = structuredClone(mDdl);
+    setColumnType(mToInt, idCol, 'INTEGER');
+    expect(plan(mDdl, mToInt).map((s) => s.kind)).toEqual(['rebuildTable']);
+
+    // 4. 宏 defineTable / alterColumn 支持显式空类型（非 STRICT）与报错（STRICT / 省略）
+    const mMac = emptyModel('sqlite');
+    createSchema(mMac, 'main', 's');
+    runMacro(
+      mMac,
+      'defineTable',
+      {
+        name: 'loose_mac',
+        columns: [
+          { id: '$ref:pk', name: 'id', type: 'bigint', notNull: true },
+          { id: '$ref:e', name: 'e', type: '' },
+          { id: '$ref:w', name: 'w', type: '   ' },
+        ],
+        primaryKey: { columns: ['id'] },
+      },
+      new Map(),
+    );
+    const eId = Object.values(mMac.objects).find((o) => o.kind === 'column' && o.name === 'e')!.id;
+    expect((mMac.objects[eId] as { type: string }).type).toBe('');
+    expect(runMacro(structuredClone(mMac), 'alterColumn', { id: eId, type: '' }, new Map()).ops).toEqual([]);
+    runMacro(mMac, 'alterColumn', { id: eId, type: 'TEXT' }, new Map());
+    expect((mMac.objects[eId] as { type: string }).type).toBe('TEXT');
+    runMacro(mMac, 'alterColumn', { id: eId, type: '' }, new Map());
+    expect((mMac.objects[eId] as { type: string }).type).toBe('');
+
+    expect(() =>
+      runMacro(mMac, 'defineTable', { name: 'missing_type', columns: [{ name: 'a' }] }, new Map()),
+    ).toThrow(/缺少列类型.*type: ""/);
+    expect(() =>
+      runMacro(
+        mMac,
+        'defineTable',
+        { name: 'strict_empty', ext: { sqlite: { strict: true } }, columns: [{ name: 'a', type: '' }] },
+        new Map(),
+      ),
+    ).toThrow(/columns\[0\]\.type.*STRICT 表的列必须声明类型/);
+
+    const stMac = createTable(mMac, 's', 'strict_mac', undefined, null, { sqlite: { strict: true } });
+    const stCol = addColumn(mMac, stMac, { name: 'a', type: 'TEXT' });
+    expect(() => runMacro(mMac, 'alterColumn', { id: stCol, type: '' }, new Map())).toThrow(
+      /type.*STRICT 表的列必须声明类型/,
+    );
+
+    expect(macros.defineTable.description).toContain(SQLITE_COLUMN_TYPE_NOTE);
+    expect(macros.alterColumn.description).toContain(SQLITE_COLUMN_TYPE_NOTE);
+    expect(mutators.addColumn.args.shape.column.shape.type.description).toContain(SQLITE_COLUMN_TYPE_NOTE);
+    expect(mutators.setColumnType.args.shape.type.description).toContain(SQLITE_COLUMN_TYPE_NOTE);
   });
 });

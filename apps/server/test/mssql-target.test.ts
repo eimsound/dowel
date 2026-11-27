@@ -22,6 +22,7 @@ import {
   mssqlIdent,
   mssqlLiteral,
   PlanError,
+  runMutator,
 } from '@dowel/core';
 import {
   type Db,
@@ -34,6 +35,7 @@ import { StepError, verify, verifyScripts } from '@dowel/verifier';
 import { afterAll, beforeAll, describe, expect, test } from 'vitest';
 
 import { connectTestMssql, createTestMssqlDb, getMssqlAdminUrl, MSSQL_VERSION } from '../../../test/mssql.ts';
+import { pendingRefreshIds } from '../src/derive.ts';
 import { createApp, openPlatformDb, type PlatformDb } from '../src/index.ts';
 import { KeyedLimiter, LoginLimiter } from '../src/rate-limit.ts';
 import {
@@ -51,6 +53,7 @@ import {
   dropMssqlSameInstanceShadow,
   ensureSameInstanceMssqlShadow,
   inspectMssqlTarget,
+  mssqlShadow,
   mssqlShadowDbName,
   parseMssqlUrl,
   pullMssqlSchema,
@@ -848,6 +851,79 @@ describe(`MSSQL (${MSSQL_VERSION}) target driver & server E2E`, () => {
       expect(infoDropped.shadowExists).toBe(false);
     } finally {
       await dropMssqlSameInstanceShadow(t.url, shadowName).catch(() => {});
+      await t.close();
+    }
+  }, 120_000);
+
+  test('PERSISTED computed column nullability follows the referenced column on real SQL Server, and pendingRefreshIds flags it (#145)', async () => {
+    if (!adminUrl) return;
+    const t = await createTestMssqlDb('mssql_nn');
+    const shadow = mssqlShadow(t.url);
+    try {
+      await claimMssqlShadow(t.url);
+      const m = emptyModel('mssql');
+      runMutator(m, 'createSchema', { id: 's', name: 'dbo' });
+      runMutator(m, 'createTable', { id: 't', schema: 's', name: 'items' });
+      runMutator(m, 'addColumn', { table: 't', column: { id: 'c', name: 'code', type: 'nvarchar(32)' } });
+      // 不显式声明 NOT NULL 的持久化计算列：SQL Server 按表达式与被引用列推断 is_nullable
+      runMutator(m, 'addColumn', {
+        table: 't',
+        column: {
+          id: 'g',
+          name: 'code_p',
+          type: 'nvarchar(32)',
+          generated: { expr: '([code])', stored: true },
+        },
+      });
+      // upper() 的结果总被视为可空：被引用列改 NOT NULL 后读回仍可空（只会多验一次，不会改写）
+      runMutator(m, 'addColumn', {
+        table: 't',
+        column: {
+          id: 'u',
+          name: 'code_u',
+          type: 'nvarchar(32)',
+          generated: { expr: '(upper([code]))', stored: true },
+        },
+      });
+      runMutator(m, 'addColumn', {
+        table: 't',
+        column: {
+          id: 'v',
+          name: 'code_v',
+          type: 'nvarchar(32)',
+          generated: { expr: '([code])', stored: false },
+        },
+      });
+      const canon = async (prev: Model, next: Model) => {
+        const out = structuredClone(next);
+        const changed = await shadow.canonicalize(prev, next);
+        for (const o of changed) out.objects[o.id] = o;
+        return { out, changed };
+      };
+      const { out: good } = await canon(emptyModel('mssql'), m);
+      expect((good.objects.g as { notNull: boolean }).notNull).toBe(false);
+      expect(pendingRefreshIds(good, structuredClone(good))).toEqual([]);
+
+      // 只把被引用列改成 NOT NULL：表达式与类型都没变
+      const cur = structuredClone(good);
+      runMutator(cur, 'setNotNull', { id: 'c', notNull: true });
+      expect(pendingRefreshIds(good, cur)).toEqual(['g', 'u']);
+      const { out: after, changed } = await canon(good, cur);
+      // 实测：读回的 is_nullable 确实变了（漏判时过期的 notNull: false 会留在模型里）
+      expect(changed.map((o) => o.id)).toEqual(['g']);
+      expect((after.objects.g as { notNull: boolean }).notNull).toBe(true);
+      expect((after.objects.u as { notNull: boolean }).notNull).toBe(false);
+      // 稳态：写回之后不再待规范化
+      expect(pendingRefreshIds(after, structuredClone(after))).toEqual([]);
+
+      // 计算列自己的 notNull 改回 false：读回的仍是引擎推断的 NOT NULL
+      const own = structuredClone(after);
+      (own.objects.g as { notNull: boolean }).notNull = false;
+      expect(pendingRefreshIds(after, own)).toEqual(['g']);
+      const { changed: ownChanged } = await canon(after, own);
+      expect(ownChanged).toMatchObject([{ id: 'g', notNull: true }]);
+    } finally {
+      await shadow.close();
       await t.close();
     }
   }, 120_000);

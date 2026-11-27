@@ -162,6 +162,8 @@ export const CI_DOCS_PATH = '/api/ci/docs';
 export const CI_ERROR_STATUS = {
   /** 请求体 / 参数不合法 */
   invalid_request: 400,
+  /** 请求体超过服务端的单条请求上限（16 MiB），在解析之前就被拒绝 */
+  payload_too_large: 413,
   /** 没带 Authorization: Bearer dwl_… */
   token_missing: 401,
   /** 令牌格式不对或不存在 */

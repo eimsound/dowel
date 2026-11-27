@@ -361,13 +361,14 @@ export const registerProjects = (app: Hono<Env>, ctx: AppContext) => {
       return { branchIds, envIds };
     });
     // 事务提交之后才能动内存里的缓存：提交失败的话项目还在，不能提前把连接 / 基线丢掉。
-    // 1. 房间：断开在线的人，并从 rooms 缓存里卸载（4403 和“没有权限了”同一个约定）；
-    // 2. 影子库：每个被删掉的环境一个连接，关掉并从 Shadows 缓存里移除；
-    // 3. 派生数据：丢掉已规范化的内存基线，并标记在途刷新不再回写基线。
+    // 1. 派生数据：先同步标记 forget（只动内存），再踢房间与关影子库——这样在途的 flush / normalize
+    //    随后因房间被踢或影子库连接关闭抛错时，catch 里已能看到 forgotten，不会误报 500 / 422 / store_failed；
+    // 2. 房间：断开在线的人，并从 rooms 缓存里卸载（4403 和“没有权限了”同一个约定）；
+    // 3. 影子库：每个被删掉的环境一个连接，关掉并从 Shadows 缓存里移除。
+    for (const branchId of deleted.branchIds) refresher.forget(branchId);
     await rooms.kickBranches(deleted.branchIds, '项目已被删除');
     for (const eid of deleted.envIds) await shadows.forget(eid);
     await shadows.forgetProject(a.pid);
-    for (const branchId of deleted.branchIds) refresher.forget(branchId);
     ctx.activeTokens.forgetProject(a.pid);
     await ctx.bus.publish({ t: 'ci_tokens.changed' }).catch((e) => {
       console.error('广播项目删除的 CI 令牌清理事件失败', e);

@@ -958,6 +958,12 @@ const zh = {
     status: { connecting: '连接中', online: '已连接', offline: '已断开，正在重连' },
     sync: { connecting: '连接中…', online: '已同步', offline: '重新连接中…' },
     pending: '{{count}} 处修改待确认',
+    opTooLarge:
+      '这次修改的数据量太大（约 {{size}} MiB，上限 {{max}} MiB），没有保存。请减少一次操作的内容，例如分几次粘贴，每次少选一些表。',
+    messageTooLarge:
+      '有一条修改超过了服务器的大小上限，已重新连接。尚未确认的 {{count}} 处修改可能没有保存，画布已按服务器上的内容刷新，请检查后重做。',
+    messageTooLargeNone:
+      '有一条消息超过了服务器的大小上限，已重新连接。画布已按服务器上的内容刷新，如有遗漏请重做。',
     canvas: '画布',
     sql: 'SQL',
     view: '视图',
@@ -1072,6 +1078,19 @@ const zh = {
     sqliteWithoutRowid: 'WITHOUT ROWID（需显式主键）',
     sqliteAutoincrement: 'AUTOINCREMENT',
     sqliteLastColumnLocked: '列 {{name}} 是 SQLite 表的最后一列，无法删除',
+    sqliteUntypedPlaceholder: '无类型',
+    sqliteUntypedHint: '未声明类型的列按 BLOB 亲和性原样存值，不做类型转换（与 NUMERIC 亲和性的 ANY 不同）。',
+    sqliteStrictTypeRequiredErr: 'STRICT 表必须声明类型（INT、INTEGER、REAL、TEXT、BLOB 或 ANY）',
+    sqliteStrictTypeInvalidErr: 'STRICT 表不支持 {{type}}（仅允许 INT、INTEGER、REAL、TEXT、BLOB 或 ANY）',
+    sqliteStrictBlocked:
+      '无法开启 STRICT：列 {{cols}} 须声明为 INT、INTEGER、REAL、TEXT、BLOB 或 ANY（不能无类型）',
+    sqliteStrictBlockedMore:
+      '无法开启 STRICT：列 {{cols}} 及另外 {{rest}} 列须声明为 INT、INTEGER、REAL、TEXT、BLOB 或 ANY（不能无类型）',
+    sqliteNotRowidAliasHint:
+      '只有声明为 INTEGER 的单列主键才是 rowid 别名并支持 AUTOINCREMENT；{{type}} 主键按原类型保留，不是 rowid 别名。',
+    typeRequiredErr: '请填写列类型',
+    untyped: '无类型',
+    listSep: '、',
     lastColumnLocked: '列 {{name}} 是 {{dialect}} 表的最后一列，无法删除',
     deleteSequence: '删除序列',
     sequenceOptions: '序列参数',
@@ -3390,6 +3409,12 @@ const en: typeof zh = {
     status: { connecting: 'Connecting', online: 'Connected', offline: 'Disconnected, reconnecting' },
     sync: { connecting: 'Connecting…', online: 'Synced', offline: 'Reconnecting…' },
     pending: '{{count}} changes pending',
+    opTooLarge:
+      'This change is too large to save (about {{size}} MiB; the limit is {{max}} MiB). Nothing was changed. Try smaller steps, for example paste fewer tables at a time.',
+    messageTooLarge:
+      "A change exceeded the server's size limit, so the connection was reset. {{count}} unconfirmed changes may not have been saved; the canvas now shows what the server has. Please check and redo them if needed.",
+    messageTooLargeNone:
+      "A message exceeded the server's size limit, so the connection was reset. The canvas now shows what the server has. Please check and redo any missing changes.",
     canvas: 'Canvas',
     sql: 'SQL',
     view: 'View',
@@ -3513,6 +3538,21 @@ const en: typeof zh = {
     sqliteStrict: 'STRICT (strict type checking)',
     sqliteWithoutRowid: 'WITHOUT ROWID (requires primary key)',
     sqliteAutoincrement: 'AUTOINCREMENT',
+    sqliteUntypedPlaceholder: 'Untyped',
+    sqliteUntypedHint:
+      'Untyped columns have BLOB affinity and store values as given, without conversion (unlike ANY, which has NUMERIC affinity).',
+    sqliteStrictTypeRequiredErr: 'STRICT tables require a type (INT, INTEGER, REAL, TEXT, BLOB, or ANY)',
+    sqliteStrictTypeInvalidErr:
+      'STRICT tables do not support {{type}} (use INT, INTEGER, REAL, TEXT, BLOB, or ANY)',
+    sqliteStrictBlocked:
+      'Cannot enable STRICT: {{cols}} must use INT, INTEGER, REAL, TEXT, BLOB, or ANY (untyped columns are not allowed)',
+    sqliteStrictBlockedMore:
+      'Cannot enable STRICT: {{cols}} and {{rest}} more columns must use INT, INTEGER, REAL, TEXT, BLOB, or ANY (untyped columns are not allowed)',
+    sqliteNotRowidAliasHint:
+      'Only a single-column INTEGER primary key is a rowid alias and supports AUTOINCREMENT. This {{type}} primary key keeps its declared type and is not a rowid alias.',
+    typeRequiredErr: 'Enter a column type',
+    untyped: 'untyped',
+    listSep: ', ',
     sqliteLastColumnLocked: 'Column {{name}} is the last column of this SQLite table and cannot be deleted',
     lastColumnLocked: 'Column {{name}} is the last column of this {{dialect}} table and cannot be deleted',
     deleteSequence: 'Delete sequence',
