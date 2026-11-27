@@ -12,7 +12,7 @@ import { HTTPException } from 'hono/http-exception';
 import type { ClusterEvent, ClusterEventPayload, EventBus } from './bus.ts';
 import type { PlatformDb } from './db.ts';
 import { decrypt, scrubSecrets } from './secrets.ts';
-import { type Shadow, ShadowError, ShadowUnavailableError } from './shadow.ts';
+import { type Shadow, ShadowConfigChangedError, ShadowError, ShadowUnavailableError } from './shadow.ts';
 import {
   type ConnectionGuard,
   getTargetDriver,
@@ -226,49 +226,72 @@ export class Shadows {
       const hit = this.cache.get(id);
       if (hit && hit.projectId === pid && hit.fingerprint === fingerprint) return hit;
       if (hit) await this.forgetLocal(id, false);
+      if (this.closed) throw new ShadowUnavailableError('服务正在关闭');
 
       const { shadow, label } = await prepareShadow(env, env.schemas, this.guard, env.dialect);
+      const entry = await this.admit(pid, id, gen, { shadow, label, projectId: pid, fingerprint });
+      if (entry) return entry;
+    }
 
+    throw new ShadowConfigChangedError();
+  }
+
+  /**
+   * 把刚建好的句柄放进缓存，或者判定它已经过期（Issue #154）。**每一次 await 之后**都重新检查 `closed`
+   * 与失效代际：复核最新配置、关掉缓存里过期的条目都要 await，期间可能又来一次失效事件或 `Shadows.close()`，
+   * 只在 await 之前查过一次就会把旧配置句柄、或关闭之后建出的句柄放进缓存（没人负责关闭、拖住停机）。
+   * - 返回缓存条目（刚放进去的，或缓存里已有的、与最新配置一致的那个——此时关掉自己建的）；
+   * - 返回 null：自己建的句柄相对最新配置已过期，已关闭，由 forProject 重试；
+   * - 服务关闭、复核时读配置 / 白名单失败：关掉自己建的句柄并抛错。
+   */
+  private async admit(pid: string, id: string, gen: number, entry: CacheEntry): Promise<CacheEntry | null> {
+    const drop = () => entry.shadow.close().catch(() => {});
+    let checked = gen;
+    for (let round = 0; ; round++) {
       if (this.closed) {
-        await shadow.close().catch(() => {});
+        await drop();
         throw new ShadowUnavailableError('服务正在关闭');
       }
-
-      // prepareShadow 期间如果收到了外部失效/重连事件，复核最新配置再决定是否入缓存，避免旧配置句柄复活
-      if (this.invalidationGen !== gen) {
-        let latest: Env;
+      const existing = this.cache.get(id);
+      if (existing && existing.projectId === pid && existing.fingerprint === entry.fingerprint) {
+        await drop();
+        return existing;
+      }
+      // 期间收到过外部失效 / 重连事件，或缓存里出现了别的配置的条目（谁的配置才是最新的不知道）：复核最新配置
+      if (this.invalidationGen !== checked || existing) {
+        if (round >= MAX_PREPARE_ATTEMPTS) {
+          await drop();
+          throw new ShadowConfigChangedError();
+        }
+        checked = this.invalidationGen;
+        let latest: string;
         try {
-          latest = await this.env(pid, id);
-          await this.guard?.(latest.url);
-          if (latest.shadowUrl) await this.guard?.(latest.shadowUrl);
+          const env = await this.env(pid, id);
+          await this.guard?.(env.url);
+          if (env.shadowUrl) await this.guard?.(env.shadowUrl);
+          latest = configFingerprint(env);
         } catch (e) {
-          await shadow.close().catch(() => {});
+          await drop();
           if (e instanceof HTTPException && e.status === 404 && this.cache.has(id)) {
             await this.forgetLocal(id);
           }
           throw e;
         }
-        if (configFingerprint(latest) !== fingerprint) {
-          await shadow.close().catch(() => {});
-          continue;
+        if (latest !== entry.fingerprint) {
+          // 自己建的是旧配置：关掉重来（缓存里若是按最新配置建的条目，重试时直接命中它，不会误关）
+          await drop();
+          return null;
         }
-      }
-
-      const existing = this.cache.get(id);
-      if (existing) {
-        if (existing.projectId === pid && existing.fingerprint === fingerprint) {
-          await shadow.close().catch(() => {});
-          return existing;
+        // 自己的配置就是最新的，缓存里的条目才过期：关掉它，然后回到循环开头重新检查（关闭期间又可能有新事件）
+        const stale = this.cache.get(id);
+        if (stale && (stale.projectId !== pid || stale.fingerprint !== entry.fingerprint)) {
+          await this.forgetLocal(id, false);
         }
-        await this.forgetLocal(id, false);
+        continue;
       }
-
-      const entry: CacheEntry = { shadow, label, projectId: pid, fingerprint };
       this.cache.set(id, entry);
       return entry;
     }
-
-    throw new ShadowUnavailableError('影子库配置已变更，请重试');
   }
 
   /**
@@ -349,7 +372,8 @@ export class Shadows {
           picked = true;
           break;
         } catch (e) {
-          if (!(e instanceof ShadowError)) throw e;
+          // 配置已变更是可重试的暂时状态：整体重试，不能把这个版本组当成“没有可用影子库”跳过
+          if (!(e instanceof ShadowError) || e instanceof ShadowConfigChangedError) throw e;
           if (firstReason === '没有可用的影子库') firstReason = scrubSecrets(e.message);
         }
       }

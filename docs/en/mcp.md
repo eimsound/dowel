@@ -279,4 +279,4 @@ Authentication errors are returned as JSON `{ "error": "…", "code": "…" }` b
 
 Browser-based clients sending a cross-origin `Origin` header are rejected before authentication by the origin guard with HTTP `403` and a generic `{ "error": "…" }` JSON body (without a `code` field, rather than `McpHttpErrorBody`).
 
-Tool failures are returned inside MCP as `isError: true` with a `code` such as `project_not_found`, `forbidden`, `scope_required`, `invalid_arguments`, `conflict`, `invalid`, `base_seq_ahead`, `table_not_found`, `section_not_found`, `history_not_found`, or `shadow_unavailable`.
+Tool failures are returned inside MCP as `isError: true` with a `code` such as `project_not_found`, `forbidden`, `scope_required`, `invalid_arguments`, `conflict`, `invalid`, `base_seq_ahead`, `table_not_found`, `section_not_found`, `history_not_found`, `shadow_unavailable`, or `shadow_config_changed` (the shadow database configuration changed mid-verification; safe to retry).

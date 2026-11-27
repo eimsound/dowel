@@ -279,4 +279,4 @@ Dowel 还提供 MCP Prompts（客户端里通常显示为斜杠命令或模板�
 
 浏览器内客户端如果携带跨源 `Origin` 请求头，会在认证之前被来源校验拦截，返回 HTTP `403` 与通用的 `{ "error": "…" }` JSON（不含 `code` 字段，而不是 `McpHttpErrorBody`）。
 
-工具执行失败在 MCP 消息里以 `isError: true` 返回，`code` 如 `project_not_found`、`forbidden`、`scope_required`、`invalid_arguments`、`conflict`、`invalid`、`base_seq_ahead`、`table_not_found`、`section_not_found`、`history_not_found`、`shadow_unavailable`。
+工具执行失败在 MCP 消息里以 `isError: true` 返回，`code` 如 `project_not_found`、`forbidden`、`scope_required`、`invalid_arguments`、`conflict`、`invalid`、`base_seq_ahead`、`table_not_found`、`section_not_found`、`history_not_found`、`shadow_unavailable`、`shadow_config_changed`（影子库配置在验证途中变了，可直接重试）。

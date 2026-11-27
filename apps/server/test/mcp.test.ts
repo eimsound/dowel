@@ -40,7 +40,8 @@ import { newMcpToken } from '../src/mcp-tokens.ts';
 import { KeyedLimiter, LoginLimiter } from '../src/rate-limit.ts';
 import type { Extra, Peer } from '../src/rooms.ts';
 import { encrypt } from '../src/secrets.ts';
-import { type Shadow, ShadowUnavailableError } from '../src/shadow.ts';
+import { type Shadow, ShadowConfigChangedError, ShadowUnavailableError } from '../src/shadow.ts';
+import { pgShadow } from '../src/targets/pg.ts';
 import { addTable, editModel, makeUser, PASSWORD } from './support.ts';
 
 const SECTION_ID_RE = /^sec-[0-9a-f]{8}-[0-9a-f]{4}-7[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i;
@@ -1188,6 +1189,42 @@ describe.each([
       });
       expect(e2.isError).toBe(true);
       expect(e2.structuredContent?.code).toBe('rate_limited');
+    },
+  );
+
+  test.skipIf(platform !== 'sqlite')(
+    'verify_migration：影子库句柄因配置变更被关闭（#154）返回可重试的 shadow_config_changed',
+    async () => {
+      const f = await setupEnv();
+      const tok = await f.issueToken(f.admin.id, ['read', 'verify'], null, 'tok-changed');
+      await addTable(f.created.rooms, f.db, f.p1Id, 'changed_tbl');
+
+      // 拿到的句柄在验证前已被缓存淘汰关闭（真实的 PG 影子库句柄，不会连库）
+      const closed = pgShadow('postgres://u:p@127.0.0.1:1/app_dowel');
+      await closed.close();
+      f.created.shadows.forProject = async () => ({ shadow: closed, label: 'stale' });
+      const r1 = await f.callTool(tok.token, 'verify_migration', {
+        project: f.p1Id,
+        from: 'empty',
+        to: 'head',
+      });
+      expect(r1.isError).toBe(true);
+      expect(r1.structuredContent).toMatchObject({
+        code: 'shadow_config_changed',
+        message: '影子库配置已变更，请重试',
+      });
+
+      // 选影阶段就因为配置一直在变而放弃
+      f.created.shadows.forProject = async () => {
+        throw new ShadowConfigChangedError();
+      };
+      const r2 = await f.callTool(tok.token, 'verify_migration', {
+        project: f.p1Id,
+        from: 'empty',
+        to: 'head',
+      });
+      expect(r2.isError).toBe(true);
+      expect(r2.structuredContent?.code).toBe('shadow_config_changed');
     },
   );
 

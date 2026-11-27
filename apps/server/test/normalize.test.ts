@@ -7,6 +7,7 @@ import { afterEach, beforeEach, describe, expect, test } from 'vitest';
 import { createApp, openPlatformDb, type PlatformDb } from '../src/index.ts';
 import { KeyedLimiter, LoginLimiter } from '../src/rate-limit.ts';
 import { type Shadow, ShadowError } from '../src/shadow.ts';
+import { pgShadow } from '../src/targets/pg.ts';
 import { editModel, makeUser, PASSWORD } from './support.ts';
 
 process.env.DOWEL_SECRET ??= 'normalize-test-secret-0123456789';
@@ -290,6 +291,18 @@ describe('PG 预连接失败（无 Docker）', () => {
     expect(first.data).toMatchObject({ code: 'shadow_unavailable' });
     const second = await call('POST', `/api/projects/${pid}/normalize`, {}, editorCookie);
     expect(second.status).toBe(429);
+  });
+
+  test('影子库句柄因配置变更被关闭（#154）：503 shadow_config_changed，不是 422 shadow_unavailable', async () => {
+    const { pid } = await newProject('配置变了', 'pg');
+    await seedCheck(pid);
+    // 真实的 PG 影子库句柄、已被缓存淘汰关闭（不会连库）
+    const closed = pgShadow('postgres://u:p@127.0.0.1:1/app_dowel');
+    await closed.close();
+    created.shadows.forProjectTarget = async () => ({ shadow: closed, label: 'stale' });
+    const res = await call('POST', `/api/projects/${pid}/normalize`, {}, editorCookie);
+    expect(res.status, JSON.stringify(res.data)).toBe(503);
+    expect(res.data).toMatchObject({ code: 'shadow_config_changed', error: '影子库配置已变更，请重试' });
   });
 
   test('精确退回限速：指定的环境不存在（404）、clean 未解析影子库时都不占额度', async () => {

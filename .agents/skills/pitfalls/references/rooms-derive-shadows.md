@@ -57,6 +57,12 @@
 - **【补充：晚到的 `shadows.forget` 不能盲目关闭（`#148`）】**
   - 反模式：远端 `shadows.forget` 到达就无条件 `forgetLocal`。事件是异步送达的，副本 B 可能在事件到达**之前**就已经 `forProject` 读到新配置、按新指纹重建了条目并开始 `verify`；晚到的事件把这个**按最新配置建立的**新连接 `close()` 掉，在途验证以“影子库不可用：连接失败：write CONNECTION_ENDED”失败（数据库本身正常）。`invalidationGen` 只覆盖“事件在 `prepareShadow` 期间到达”，覆盖不了“条目入缓存之后才到达”。
   - 正确做法：收到远端 `envIds` / `projectId` 事件先同步 `invalidationGen++`，再对每个本地条目按平台库最新配置复核指纹（`revalidateLocal`）——一致就保留，不一致 / 环境或项目已删（404）/ 读配置失败才关闭移除；`all` 与 `onReconnect` 仍然无条件清空。回归见 `apps/server/test/shadows-stale-forget.test.ts`。
+- **【补充：关闭过的影子库句柄绝不重连；`forProject` 每次 await 之后都要复查（`#154`）】**
+  - 反模式 1：外部影子库句柄（`pgShadow` / `mysqlShadow` / `mssqlShadow`）里 `conn ??= connect()`，`close()` 只关连接、不标记“已关闭”。缓存淘汰（配置变了、环境 / 项目被删）关掉的只是连接，拿着旧句柄的调用方下一步操作会悄悄连回旧影子库——例如环境刚被改成生产、禁止同实例影子库，在途请求的下一步仍连回同实例影子库，而且这条新连接不在缓存里、没人负责关闭。反过来只把 `close()` 改成“先置空 conn 再 await 关闭”更糟：被淘汰的句柄不再报错，而是静默重连。
+  - 正确做法：三个外部实现共用 `serialShadowConnection`（`apps/server/src/targets/shadow-handle.ts`）：`close()` 同步标记已关闭再关连接；之后新调用的、排队中尚未开始的操作直接抛 `ShadowConfigChangedError`，不建连、拿不到正在关闭的连接；关闭时在途的那次操作连接被直接关掉（PG 驱动最多宽限 5 秒），无论成功失败都以 `ShadowConfigChangedError` 结束、结果丢弃。新增外部方言的影子库实现必须复用它，不要自己写 `conn ??=`。SQLite `:memory:` 影子库同样遵守关闭后拒绝的契约。
+  - 反模式 2：`forProject` 只在某个 await 之前查一次 `closed` / `invalidationGen` 就 `cache.set`。复核最新配置（`this.env(...)`）、关掉缓存里过期的条目（`forgetLocal`）都要 await，期间可能又来一次失效事件或 `Shadows.close()`，结果把旧配置句柄、或关闭之后建出的句柄放进缓存（没人关、拖住停机）。缓存里出现与自己指纹不同的条目时也不能直接认定“自己是新的”去关掉它（可能自己才是读到旧配置的那个）。
+  - 正确做法：`forProject` 建好句柄后交给 `admit`：循环里每一轮先查 `closed`、再看缓存里是否已有同指纹条目、再看代际或冲突条目；需要复核就读最新配置，自己过期则关掉自己的句柄重试（会命中缓存里按新配置建好的条目），自己是最新的才关掉过期条目，然后**回到循环开头重新检查**，直到没有任何变化才 `cache.set`。复核次数有上限，用尽抛 `ShadowConfigChangedError`。
+  - 错误映射：`ShadowConfigChangedError`（“影子库配置已变更，请重试”，不带“影子库不可用：”前缀）是可重试的暂时状态：HTTP 全局 503 + `shadow_config_changed`（规范化路由同样），MCP 工具错误码 `shadow_config_changed`；发布遇到它不能当成“影子库不可用”发布成未验证版本，多版本验证 / 选影也不能把它当成该版本组不可用而跳过，必须整体抛出；派生 flush 安静跳过（`shadow_unavailable`）。前端 `api.ts` 按错误码换成中英文界面文案。回归见 `apps/server/test/shadow-closed.test.ts`。
 
 ---
 

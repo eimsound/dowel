@@ -73,6 +73,11 @@ export interface Shadow {
    * 表的分区键 `partitionBy.keys[].expr` 与分区边界 `partitionOf.bound`；不透明对象的 `ddl`。
    */
   canonicalize(prev: Model, next: Model): Promise<Obj[]>;
+  /**
+   * 永久关闭句柄（Issue #154）：之后的任何操作（包括已经排队、还没开始的）都以 ShadowConfigChangedError 拒绝，
+   * 绝不重新建连；关闭时正在跑的那次操作的连接会被直接关掉，这次操作无论成功失败都以 ShadowConfigChangedError 结束、
+   * 结果丢弃（配置变了，旧影子库上得出的结论不能再用）。可重复调用。
+   */
   close(): Promise<void>;
 }
 
@@ -97,6 +102,22 @@ export class ShadowError extends Error {
 export class ShadowUnavailableError extends ShadowError {
   constructor(reason: string) {
     super(`影子库不可用：${reason}`);
+  }
+}
+
+/** ShadowConfigChangedError 的错误码（HTTP 响应 / MCP 工具错误共用） */
+export const SHADOW_CONFIG_CHANGED = 'shadow_config_changed';
+
+/**
+ * 影子库句柄已被关闭（Issue #154）：环境配置变了（连接串、独立影子库、生产标记、允许同实例、schema 范围……）、
+ * 环境 / 项目被删，缓存淘汰了旧句柄；拿着旧句柄的调用方不能再用它，也不会重新连回旧影子库。
+ * 这是可重试的暂时状态，不是“影子库坏了”：不带“影子库不可用：”前缀，路由映射为 503 + `shadow_config_changed`。
+ * 仍是 ShadowError 的子类，只认 ShadowError 的旧调用方至少不会把它当成 500。
+ */
+export class ShadowConfigChangedError extends ShadowError {
+  readonly code = SHADOW_CONFIG_CHANGED;
+  constructor() {
+    super('影子库配置已变更，请重试');
   }
 }
 
