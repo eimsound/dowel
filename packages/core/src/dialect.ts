@@ -50,7 +50,7 @@ export interface DialectVersionMatrix {
   readonly groupGranularity: string;
   /**
    * 版本组对应的对外“大版本”：对外 API 的历史字段（engineMajor / shadowMajor / targetPgMajor / envPgMajors /
-   * targets[].major / missingTargetMajor）只对 PG 有值，其余方言返回 null。
+   * VerifyResult.shadowMajor 等）只对 PG 有值，其余方言返回 null。
    */
   publicMajorOfGroup(groupKey: number): number | null;
 }
@@ -66,6 +66,12 @@ export interface DialectVersioning {
   targetPlanOptions(versionNums: readonly (number | null | undefined)[]): PlanOptions | undefined;
   /** 数值版本号 → 简洁版本串（PG 160004 → '16.4'；MySQL 80413 → '8.4.13'；SQLite 3054001 → '3.54.1'） */
   formatVersionNum(versionNum: number): string;
+  /**
+   * 数据库完整版本号（ADR 0017 决定 5：验证记录与执行把关都按它比较）：PG 两段（'17.4'）、MySQL 三段（'8.4.3'）、
+   * SQL Server 构建号（ProductVersion，如 '16.0.4175.1'）、SQLite 内置库版本（影子库与目标库同一个库，视为恒等）。
+   * `version` 是读到的版本串，`versionNum` 是数值版本号；拿不到时返回 null。
+   */
+  fullVersion(info: { version?: string | null; versionNum?: number | null }): string | null;
   /**
    * 按项目全部环境的数值版本号推导最低目标版本，静态检查模型在该版本下的兼容性问题（不抛错、不连库）。
    * 无可推导的目标版本或方言不区分版本时返回 null（不提供即视为 null）。

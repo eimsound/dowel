@@ -196,6 +196,8 @@ export const toCiError = (
         ...(d.partial !== undefined ? { partial: d.partial } : {}),
         ...(d.timeout ? { timeout: d.timeout } : {}),
         ...(d.problems ? { problems: d.problems } : {}),
+        ...(d.engineVersion !== undefined ? { engineVersion: d.engineVersion } : {}),
+        ...(d.verifiedOn !== undefined ? { verifiedOn: d.verifiedOn } : {}),
       },
       // 执行失败时报告停在哪个版本（最后一个成功的版本）；拒绝类的错误没有执行任何东西，也照样告诉调用方当前版本
       reached,

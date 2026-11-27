@@ -1,10 +1,11 @@
-// 发布 = 冻结迁移（P4a）：没有环境（没有影子库）时可以发布，但版本标为“未验证”；
-// 空迁移不能发布；v1 的迁移从空库建出来。不需要 PG，没有 Docker 也能跑。
+// 发布 = 冻结迁移（P4a）：发布前必须在影子库里闭环验证（ADR 0017），没有可用的影子库就不发布（不再有“发布为未验证”）；
+// 空迁移不能发布；v1 的迁移从空库建出来。发布对话框的各种结果用 page.route 模拟服务端响应，不需要 PG；
+// 真正在影子库里验证的用例需要 PG（没有 Docker 时跳过）。
 import { expect, type Page, test } from '@playwright/test';
 
 import { addEnvironment, commit, createProject, gotoPage, newUser, openModel } from './helpers.ts';
 
-test('没有影子库：发布成功但未验证；没有变更不能发布；详情显示冻结的迁移', async ({ browser }) => {
+test('没有影子库：发布被拒绝并说明怎么配置影子库；没有变更不能发布', async ({ browser }) => {
   const { page } = await newUser(browser, '张三');
   await createProject(page, '无环境项目');
   await openModel(page);
@@ -20,40 +21,20 @@ test('没有影子库：发布成功但未验证；没有变更不能发布；�
   await commit(page, '表名', 'orders');
   await expect(page.getByRole('navigation').getByRole('button', { name: 'orders' })).toBeVisible();
 
+  // 项目没有环境 = 没有影子库：不发布，对话框里写明原因和怎么配置
   await page.getByRole('button', { name: '发布' }).click();
   await page.getByLabel('版本名').fill('首个版本');
   await page.getByRole('dialog').getByRole('button', { name: '发布' }).click();
-  // 没有可用的影子库：已发布，但对话框留着，明确写出原因，用户点关闭才离开
-  const done = page.getByRole('dialog');
-  await expect(done.getByRole('status')).toContainText('项目还没有配置环境');
-  await expect(done.getByRole('status')).toContainText('已发布 v1 首个版本，未验证');
-  await done.locator('button.primary', { hasText: '关闭' }).click();
-  await expect(done).toBeHidden();
-
-  // 版本页：序号 v1、名称、“未验证”标记
+  const dlg = page.getByRole('dialog');
+  await expect(dlg.getByRole('alert')).toContainText('项目还没有配置环境');
+  await expect(dlg.getByRole('status')).toContainText('没有可用的影子库，版本没有发布');
+  await expect(dlg.getByRole('status')).toContainText('允许使用同实例影子库');
+  await dlg.getByRole('button', { name: '取消' }).click();
   await gotoPage(page, '版本');
-  await expect(page.locator('.chip', { hasText: /^v1$/ })).toBeVisible();
-  await expect(page.getByRole('link', { name: '首个版本' })).toBeVisible();
-  await expect(page.locator('.risk', { hasText: '未验证' })).toBeVisible();
-
-  // 详情：冻结的升级 / 回滚脚本；没有环境，重新验证给出原因
-  await page.getByRole('link', { name: '首个版本' }).click();
-  await expect(page.getByRole('heading', { name: '版本详情' })).toBeVisible();
-  await expect(page.getByRole('list', { name: '升级脚本' })).toContainText('CREATE TABLE public.orders');
-  await page.getByRole('tab', { name: /^回滚/ }).click();
-  await expect(page.getByRole('list', { name: '回滚脚本' })).toContainText('DROP TABLE public.orders');
-  await page.getByRole('button', { name: '重新验证' }).click();
-  await expect(page.getByRole('alert')).toContainText('还没有配置环境');
-
-  // 没有新的修改：再次发布被拒绝
-  await openModel(page);
-  await page.getByRole('button', { name: '发布' }).click();
-  await page.getByLabel('版本名').fill('v2');
-  await page.getByRole('dialog').getByRole('button', { name: '发布' }).click();
-  await expect(page.getByRole('dialog').getByRole('alert')).toContainText('没有变更');
+  await expect(page.getByText('还没有版本')).toBeVisible();
 });
 
-test('发布请求还没完成就关了对话框：未验证的结果改用通知提示，并带原因；再打开对话框是干净的', async ({
+test('发布请求还没完成就关了对话框：有环境没有同版本验证记录时改用通知提示；再打开对话框是干净的', async ({
   browser,
 }) => {
   const { page } = await newUser(browser, '王五');
@@ -63,7 +44,7 @@ test('发布请求还没完成就关了对话框：未验证的结果改用通�
   await commit(page, '表名', 'orders');
   await expect(page.getByRole('navigation').getByRole('button', { name: 'orders' })).toBeVisible();
 
-  // 让发布请求停在半路，直到用户把对话框关掉
+  // 让发布请求停在半路，直到用户把对话框关掉；服务端的响应：已验证，但 prod（15.7）没有同版本的验证记录
   let release!: () => void;
   const gate = new Promise<void>((r) => {
     release = r;
@@ -71,7 +52,11 @@ test('发布请求还没完成就关了对话框：未验证的结果改用通�
   await page.route('**/api/projects/*/versions', async (route) => {
     if (route.request().method() !== 'POST') return route.fallback();
     await gate;
-    await route.continue();
+    await route.fulfill({
+      status: 201,
+      contentType: 'application/json',
+      body: JSON.stringify(published(1, '关得太早')),
+    });
   });
   await page.getByRole('button', { name: '发布' }).click();
   await page.getByLabel('版本名').fill('关得太早');
@@ -81,12 +66,24 @@ test('发布请求还没完成就关了对话框：未验证的结果改用通�
   await expect(page.getByRole('dialog')).toBeHidden();
   release();
 
-  // 对话框已经关了，横幅没人看：用通知提示未验证和原因
-  await expect(page.getByText('已发布 v1 关得太早，未验证：项目还没有配置环境')).toBeVisible();
+  // 对话框已经关了，横幅没人看：用通知提示
+  await expect(page.getByText('已发布 v1 关得太早，已通过验证；1 个环境没有同版本的验证记录')).toBeVisible();
   // 再打开：干净的表单，没有上次的结果
   await page.getByRole('button', { name: '发布' }).click();
   await expect(page.getByLabel('版本名')).toHaveValue('');
   await expect(page.getByRole('dialog').getByRole('status')).toHaveCount(0);
+});
+
+/** 服务端发布成功的响应：已验证（发布出来的版本一定已验证），prod（15.7）没有同版本的验证记录 */
+const published = (n: number, name: string) => ({
+  id: `mock-${n}`,
+  name,
+  seq: n,
+  number: n,
+  verified: true,
+  verifiedOn: ['16.4'],
+  uncovered: [{ id: 'env-prod', name: 'prod', engineVersion: '15.7' }],
+  riskError: null,
 });
 
 /** 新建一张表，打开发布对话框并提交（请求由调用方的 page.route 控制）；返回已经提交的对话框 */
@@ -116,7 +113,11 @@ test('发布请求进行中关闭又重新打开：仍显示“正在发布”�
     if (route.request().method() !== 'POST') return route.fallback();
     posts++;
     await gate;
-    await route.continue();
+    await route.fulfill({
+      status: 201,
+      contentType: 'application/json',
+      body: JSON.stringify(published(1, '重开')),
+    });
   });
   await submitPublish(page, '重开');
   await page.getByRole('dialog').getByRole('button', { name: '取消' }).click();
@@ -131,9 +132,12 @@ test('发布请求进行中关闭又重新打开：仍显示“正在发布”�
   await expect(dlg.getByLabel('版本名')).toHaveValue('重开');
   expect(posts).toBe(1);
 
-  // 请求完成时对话框开着：直接在对话框里显示结果（没有影子库 → 未验证），不弹通知、也没有被关掉
+  // 请求完成时对话框开着：直接在对话框里显示结果（已验证 + 未覆盖的环境），不弹通知、也没有被关掉
   release();
-  await expect(dlg.getByRole('status')).toContainText('已发布 v1 重开，未验证');
+  await expect(dlg.getByRole('status').filter({ hasText: '已发布 v1 重开，已通过验证' })).toBeVisible();
+  await expect(dlg.getByRole('status').filter({ hasText: '这些环境还没有同版本的验证记录' })).toContainText(
+    'prod（15.7）',
+  );
   await dlg.locator('button.primary', { hasText: '关闭' }).click();
   await expect(dlg).toBeHidden();
   expect(posts).toBe(1);
@@ -206,7 +210,8 @@ test('已验证但风险分析没有完成：对话框不关，用警告横幅�
     seq: n,
     number: n,
     verified: true,
-    unverifiedReason: null,
+    verifiedOn: ['18.0'],
+    uncovered: [],
     // riskError 只是原因本身，“风险分析没有完成”由界面的标题 / 模板提供
     riskError: '执行失败：x（分析时出事了）',
   });
@@ -281,4 +286,15 @@ test('影子库验证没通过：发布被拒绝，报告显示在发布对话�
   await page.getByLabel('版本名').fill('v1');
   await page.getByRole('dialog').getByRole('button', { name: '发布' }).click();
   await expect(page.getByText('已发布 v1 v1，已通过验证')).toBeVisible();
+
+  // 版本页：序号 v1、“已验证”标记；详情里是冻结的升级 / 回滚脚本和验证通过的数据库版本
+  await gotoPage(page, '版本');
+  await expect(page.locator('.chip', { hasText: /^v1$/ })).toBeVisible();
+  await expect(page.locator('.risk', { hasText: '已验证' })).toBeVisible();
+  await page.getByRole('link', { name: 'v1', exact: true }).click();
+  await expect(page.getByRole('heading', { name: '版本详情' })).toBeVisible();
+  await expect(page.getByRole('list', { name: '升级脚本' })).toContainText('CREATE TABLE public.orders');
+  await expect(page.getByText(/已在这些数据库版本的影子库上验证通过/)).toBeVisible();
+  await page.getByRole('tab', { name: /^回滚/ }).click();
+  await expect(page.getByRole('list', { name: '回滚脚本' })).toContainText('DROP TABLE public.orders');
 });

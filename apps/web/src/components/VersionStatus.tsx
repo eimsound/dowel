@@ -1,12 +1,19 @@
 // 版本的验证状态标记和验证报告：版本列表、详情、发布对话框共用。
 // 术语见 GLOSSARY：版本、迁移、发布、影子库。
-import type { StoredVerifyReport, VerifyResponse, VersionInfo } from '@dowel/api';
+import type {
+  ReadbackDiffItem,
+  StoredVerifyReport,
+  UncoveredEnvironment,
+  VerifyRecord,
+  VerifyResponse,
+  VersionInfo,
+} from '@dowel/api';
 import { BASELINE_VERSION_NAME } from '@dowel/api';
 import type { Dialect } from '@dowel/core';
+import type { TFunction } from 'i18next';
 import { Archive, CircleCheck, CircleHelp, DatabaseBackup, Pencil } from 'lucide-react';
 import { useTranslation } from 'react-i18next';
 
-import { dialectUiSpec } from '../dialects.ts';
 import { formatTime } from '../format.ts';
 import { Banner } from './ui.tsx';
 
@@ -109,10 +116,95 @@ export const VersionBadges = ({
 
 type Report = Pick<
   StoredVerifyReport,
-  'ok' | 'upDiff' | 'downDiff' | 'error' | 'risks' | 'riskError' | 'targets' | 'missingTargetMajor'
+  'ok' | 'upDiff' | 'downDiff' | 'error' | 'risks' | 'riskError' | 'readbackDiff' | 'records'
 > & {
   shadow?: string;
 };
+
+/**
+ * 读回核对（ADR 0017 决定 2）的写法差异明细：对象 / 属性 / 模型里的值 / 数据库读回的值。
+ * “回滚后”的差异是对上一个版本的模型，单独说明（要修正的是上一个版本，不是工作副本）。不做任何自动修复。
+ */
+export const ReadbackTable = ({ items }: { items: ReadbackDiffItem[] }) => {
+  const { t } = useTranslation();
+  if (!items.length) return null;
+  const shown = (v: string | null) => (v === null ? t('dlg.readbackNull') : v);
+  return (
+    <div className="mt-1.5 space-y-1.5">
+      <p className="m-0">{t('dlg.readbackBody')}</p>
+      {items.some((x) => x.direction === 'down') && (
+        <p className="m-0 font-medium">{t('dlg.readbackDownNote')}</p>
+      )}
+      <div className="overflow-x-auto">
+        <table className="w-full border-collapse text-left font-mono text-xs">
+          <caption className="text-left font-sans text-text-2">
+            {t('dlg.readbackCaption', { count: items.length })}
+          </caption>
+          <thead>
+            <tr>
+              <th scope="col" className="pr-3 font-sans font-medium">
+                {t('dlg.readbackDirection')}
+              </th>
+              <th scope="col" className="pr-3 font-sans font-medium">
+                {t('dlg.readbackObject')}
+              </th>
+              <th scope="col" className="pr-3 font-sans font-medium">
+                {t('dlg.readbackProperty')}
+              </th>
+              <th scope="col" className="pr-3 font-sans font-medium">
+                {t('dlg.readbackModel')}
+              </th>
+              <th scope="col" className="font-sans font-medium">
+                {t('dlg.readbackLive')}
+              </th>
+            </tr>
+          </thead>
+          <tbody>
+            {items.map((x, i) => (
+              <tr key={`${x.direction}:${x.object}:${x.property}:${i}`} className="align-top">
+                <td className="pr-3 font-sans">
+                  {t(x.direction === 'up' ? 'dlg.readbackUp' : 'dlg.readbackDown')}
+                </td>
+                <td className="pr-3 break-all">{x.object}</td>
+                <td className="pr-3">{x.property}</td>
+                <td className="pr-3 break-all whitespace-pre-wrap">{shown(x.modelValue)}</td>
+                <td className="break-all whitespace-pre-wrap">{shown(x.liveValue)}</td>
+              </tr>
+            ))}
+          </tbody>
+        </table>
+      </div>
+    </div>
+  );
+};
+
+/** 环境列表（未覆盖的环境、版本对不上的环境）：名字 + 数据库完整版本号 */
+export const EnvVersionList = ({ envs }: { envs: UncoveredEnvironment[] }) => {
+  const { t } = useTranslation();
+  return (
+    <ul className="m-0 mt-1.5 list-disc pl-5 text-xs">
+      {envs.map((e) => (
+        <li key={e.id}>
+          {e.engineVersion
+            ? t('dlg.envVersion', { name: e.name, version: e.engineVersion })
+            : t('dlg.envVersionUnknown', { name: e.name })}
+        </li>
+      ))}
+    </ul>
+  );
+};
+
+/** 验证记录（ADR 0017 决定 5）：按数据库完整版本号列出通过 / 没通过 */
+const recordsSummary = (records: VerifyRecord[] | undefined, t: TFunction) =>
+  records?.length
+    ? records
+        .map((r) =>
+          t(r.ok ? 'dlg.verifyRecordPassed' : 'dlg.verifyRecordFailed', {
+            version: r.engineVersion ?? t('dlg.verifyRecordUnknown'),
+          }),
+        )
+        .join(' · ')
+    : null;
 
 /**
  * 风险分析没有完成时，在风险列表的位置如实说明（不能让用户以为“没有风险”）。
@@ -128,32 +220,19 @@ export const RiskNote = ({ report }: { report: Pick<Report, 'riskError'> | null 
   ) : null;
 };
 
-/** 验证报告：通过（可能带高风险提示）、缺失低版本影子库警告、或失败（出错的步骤和原因、结构差异），role=status */
+/** 验证报告：通过（可能带高风险提示）或失败（出错的步骤和原因、结构差异、读回核对的写法差异），role=status */
 export const VerifyBanner = ({
   report,
-  dialect = 'pg',
 }: {
   report: Report | VerifyResponse;
+  /** 保留参数位：调用方仍按方言传入 */
   dialect?: Dialect;
 }) => {
   const { t } = useTranslation();
-  const shortDialect = dialectUiSpec(dialect).shortName;
   const highs = report.risks.filter((x) => x.level === 'high').length;
   const diffs = [...report.upDiff, ...report.downDiff];
-  const targets = report.targets ?? [];
-  const targetsOkSummary =
-    targets.length > 0 ? targets.map((item) => `${shortDialect} ${item.major}`).join(' · ') : null;
-  const targetsStatusSummary =
-    targets.length > 0
-      ? targets
-          .map((item) =>
-            t(item.ok ? 'dlg.verifyTargetPassed' : 'dlg.verifyTargetFailed', {
-              dialect: shortDialect,
-              major: item.major,
-            }),
-          )
-          .join(' · ')
-      : null;
+  const records = 'records' in report ? report.records : undefined;
+  const summary = recordsSummary(records, t);
   const shadow = report.shadow ? (
     <span className="text-text-2"> {t('dlg.usedShadow', { s: report.shadow })}</span>
   ) : null;
@@ -161,35 +240,15 @@ export const VerifyBanner = ({
     return (
       <Banner kind={highs ? 'warn' : 'ok'} title={t('dlg.verifyOkTitle')} role="status">
         {t('dlg.verifyOk')}
-        {targetsOkSummary && (
-          <span className="ml-1.5 font-mono text-xs text-text-2">
-            {targets.length > 1
-              ? t('dlg.verifyTargetsAllPassed', { versions: targetsOkSummary })
-              : t('dlg.verifyTargetSinglePassed', { version: targetsOkSummary })}
-          </span>
-        )}
+        {summary && <span className="ml-1.5 font-mono text-xs text-text-2">{summary}</span>}
         {highs > 0 && ` ${t('dlg.highRisks', { count: highs })}`}
         {shadow}
       </Banner>
     );
-  if (report.missingTargetMajor != null)
-    return (
-      <Banner kind="warn" title={t('dlg.verifyMissingTargetTitle')} role="status">
-        {report.error?.message ??
-          t('dlg.verifyMissingTargetBody', {
-            dialect: shortDialect,
-            major: report.missingTargetMajor,
-          })}
-        {targetsStatusSummary && (
-          <span className="mt-1 block font-mono text-xs text-text-2">{targetsStatusSummary}</span>
-        )}
-      </Banner>
-    );
+  const readback = report.readbackDiff ?? [];
   return (
-    <Banner kind="danger" title={t('dlg.verifyFail')} role="status">
-      {targetsStatusSummary && (
-        <span className="mr-1.5 font-mono text-xs text-text-2">{targetsStatusSummary}</span>
-      )}
+    <Banner kind="danger" title={t(readback.length ? 'dlg.readbackTitle' : 'dlg.verifyFail')} role="status">
+      {summary && <span className="mr-1.5 font-mono text-xs text-text-2">{summary}</span>}
       {shadow}
       {report.error && (
         <pre className="mt-1.5 mb-0 font-mono text-xs whitespace-pre-wrap">
@@ -201,6 +260,7 @@ export const VerifyBanner = ({
       {diffs.length > 0 && (
         <pre className="mt-1.5 mb-0 font-mono text-xs whitespace-pre-wrap">{diffs.join('\n')}</pre>
       )}
+      <ReadbackTable items={readback} />
     </Banner>
   );
 };

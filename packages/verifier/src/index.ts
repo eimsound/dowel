@@ -3,6 +3,7 @@
 import {
   createAll,
   type Dialect,
+  engineFullVersion,
   findInstanceLevelStep,
   instanceLevelDescription,
   type Model,
@@ -23,8 +24,15 @@ import {
   type StepRisk,
   type TargetSnapshot,
 } from '@dowel/engines';
+import { type ReadbackDiff, readbackDiff } from '@dowel/executor';
 
-export { type AnalyzeOptions, EngineStepError as StepError, NON_TRANSACTIONAL_NOTE, type StepRisk };
+export {
+  type AnalyzeOptions,
+  EngineStepError as StepError,
+  NON_TRANSACTIONAL_NOTE,
+  type ReadbackDiff,
+  type StepRisk,
+};
 
 /** 清空影子库（按方言委托给 EngineAdapter.resetShadow） */
 export const resetShadow = async (db: Db, dialect: Dialect = 'pg'): Promise<void> =>
@@ -108,10 +116,40 @@ export interface VerifyResult {
   shadowMajor?: number | null;
   /** 实际执行本次验证的影子库数值版本号（如 80413 / 90700 / 160004） */
   shadowVersionNum?: number | null;
+  /**
+   * 实际执行本次验证的影子库数据库完整版本号（ADR 0017 决定 5：PG '17.4'、MySQL '8.4.3'、SQL Server 构建号、SQLite 内置库版本），
+   * 取自升级后读回的快照；验证记录按它逐条记录
+   */
+  engineVersion?: string | null;
+  /**
+   * 读回核对（ADR 0017 决定 2）：升级后读回的结构 对 目标版本模型（`up`）、回滚后读回的结构 对 原版本模型（`down`），
+   * 用的是执行读回校验的同一个比较（executor `diffAgainst`）。total > 0 即验证失败
+   */
+  readback?: { up: ReadbackDiff; down: ReadbackDiff };
 }
 
+const NO_READBACK_DIFF: ReadbackDiff = { total: 0, items: [], details: [] };
+
+/** 读回核对用的快照：和执行器一样只读冻结时的 schema 范围（null = 全部），范围外的 public 等不算差异 */
+const readbackSnapshot = async (
+  engine: EngineAdapter,
+  db: Db,
+  full: TargetSnapshot,
+  scope: string[] | null | undefined,
+): Promise<TargetSnapshot> => (scope?.length ? engine.readSnapshot(db, scope) : full);
+
+/** 影子库的数据库完整版本号（取自读回的快照） */
+const engineVersionOf = (dialect: Dialect, snap: TargetSnapshot): string | null =>
+  engineFullVersion(dialect, { version: snap.version, versionNum: snap.versionNum });
+
 /** 闭环验证（只用一个影子库，依次建目标版本、建原版本、执行迁移、执行反向迁移）。任一步执行失败抛出 StepError。 */
-export const verify = async (db: Db, from: Model, to: Model, opts?: PlanOptions): Promise<VerifyResult> => {
+export const verify = async (
+  db: Db,
+  from: Model,
+  to: Model,
+  opts?: PlanOptions,
+  scope?: string[] | null,
+): Promise<VerifyResult> => {
   const dialect = to.dialect;
   const engine = getEngine(dialect);
   let shadowMajor: number | null = null;
@@ -137,8 +175,10 @@ export const verify = async (db: Db, from: Model, to: Model, opts?: PlanOptions)
   const fromSnap = await buildTarget(db, from, buildOpts);
   await runSteps(db, up, dialect);
   const afterUp = await engine.readSnapshot(db);
+  const upReadback = readbackDiff(await readbackSnapshot(engine, db, afterUp, scope), to);
   await runSteps(db, down, dialect);
   const afterDown = await engine.readSnapshot(db);
+  const downReadback = readbackDiff(await readbackSnapshot(engine, db, afterDown, scope), from);
   const norm = (snap: TargetSnapshot, model: Model) =>
     engine.normalizeForVerify ? engine.normalizeForVerify(snap, model) : snap;
   return {
@@ -148,6 +188,8 @@ export const verify = async (db: Db, from: Model, to: Model, opts?: PlanOptions)
     downDiff: engine.diffSnapshots(norm(afterDown, from), norm(fromSnap, from)),
     shadowMajor,
     shadowVersionNum,
+    engineVersion: engineVersionOf(dialect, afterUp),
+    readback: { up: upReadback, down: downReadback },
   };
 };
 
@@ -167,11 +209,15 @@ export interface VerifyScriptsOptions {
   pgMajor?: number | null;
   /** 目标 MySQL 最低数值版本号（如 80400）；与影子库实测版本取较小者执行版本兼容性检查（由 MySQL 引擎的 resolveScriptsBuildOptions 解读） */
   mysqlVersionNum?: number | null;
+  /** 冻结时的 schema 范围（null = 全部）：读回核对和执行器一样只读范围内的 schema */
+  scope?: string[] | null;
 }
 
 /**
  * 闭环验证**给定的脚本**（发布后冻结下来的、或被人工改过的 up / down），而不是重新 plan：
  * 建出 from → 执行 up → 结构必须等于 to；再执行 down → 结构必须等于 from。
+ * 另做读回核对（ADR 0017 决定 2）：升级后读回的结构按执行读回校验的同一个比较对 to、回滚后读回的对 from，
+ * 不一致即验证失败（见 verifyPassed），由此“已验证”意味着在同版本数据库上执行时读回校验一定通过。
  */
 export const verifyScripts = async (
   db: Db,
@@ -202,13 +248,25 @@ export const verifyScripts = async (
   const fromSnap = await buildTarget(db, from, buildOpts);
   await runSteps(db, upSteps, dialect);
   const afterUp = await engine.readSnapshot(db);
+  const engineVersion = engineVersionOf(dialect, afterUp);
+  const upReadback = readbackDiff(await readbackSnapshot(engine, db, afterUp, options.scope), to);
   const norm = (snap: TargetSnapshot, model: Model) =>
     engine.normalizeForVerify ? engine.normalizeForVerify(snap, model) : snap;
   const upDiff = engine.diffSnapshots(norm(afterUp, to), norm(toSnap, to));
   if (options.checkDown === false || upDiff.length)
-    return { up: upSteps, down: downSteps, upDiff, downDiff: [], shadowMajor, shadowVersionNum };
+    return {
+      up: upSteps,
+      down: downSteps,
+      upDiff,
+      downDiff: [],
+      shadowMajor,
+      shadowVersionNum,
+      engineVersion,
+      readback: { up: upReadback, down: NO_READBACK_DIFF },
+    };
   await runSteps(db, downSteps, dialect);
   const afterDown = await engine.readSnapshot(db);
+  const downReadback = readbackDiff(await readbackSnapshot(engine, db, afterDown, options.scope), from);
   return {
     up: upSteps,
     down: downSteps,
@@ -216,8 +274,14 @@ export const verifyScripts = async (
     downDiff: engine.diffSnapshots(norm(afterDown, from), norm(fromSnap, from)),
     shadowMajor,
     shadowVersionNum,
+    engineVersion,
+    readback: { up: upReadback, down: downReadback },
   };
 };
+
+/** 闭环验证是否通过：两份影子库快照一致，且读回核对两个方向都没有差异 */
+export const verifyPassed = (r: Pick<VerifyResult, 'upDiff' | 'downDiff' | 'readback'>): boolean =>
+  !r.upDiff.length && !r.downDiff.length && !r.readback?.up.total && !r.readback?.down.total;
 
 /** 在影子库里建出原版本，逐步分析迁移步骤的风险（锁、重写、全表扫描） */
 export const analyze = async (

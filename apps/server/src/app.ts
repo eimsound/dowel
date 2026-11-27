@@ -44,7 +44,7 @@ import {
 import { passwordLoginForced, readSettings } from './settings.ts';
 import { DEFAULT_ADMIN_USERNAME } from './setup.ts';
 import { ShadowConfigChangedError, ShadowError } from './shadow.ts';
-import { Shadows } from './shadows.ts';
+import { ProjectGoneError, Shadows } from './shadows.ts';
 import type { ConnectionGuard } from './targets.ts';
 import { ActiveTokenCache } from './tokens.ts';
 import { type WebhookOptions, Webhooks } from './webhooks.ts';
@@ -116,6 +116,8 @@ export const createApp = (db: PlatformDb, options: AppOptions = {}) => {
       try {
         return (await shadows.forProjectTarget(b.project_id))?.shadow ?? null;
       } catch (e) {
+        // 查完 branches 之后项目被并发删除（Issue #170）：是 forgotten，不能被下面当成“无环境”的 no_shadow
+        if (e instanceof ProjectGoneError) return 'forgotten';
         // 尚未尝试连库就已知项目没有可用影子库（无环境）：直接报 no_shadow，避免每次 flush 多查一次 branches
         if (e instanceof ShadowError && e.preConnect) return 'no_shadow';
         return null;
@@ -158,12 +160,11 @@ export const createApp = (db: PlatformDb, options: AppOptions = {}) => {
    * 整体替换工作副本：
    * - canonical（默认 true）：导入、拉取、接入领先版本——直接作为黄金基线。导入、拉取的模型是引擎刚读出的；
    *   接入领先版本用的是链头版本模型，直接作黄金基线依赖严格的读回核对（#123，ADR 0016 / ADR 0017）：当前执行读回校验
-   *   （`verifyAndRecord`）已对四种方言严格校验（MySQL 表达式纯格式容忍已于 #162 移除），恢复时闭环验证的读回核对
-   *   待 ADR 0017 / #132 落地，放宽其中任何一道都要重新审视这条路径；
+   *   （`verifyAndRecord`）已对四种方言严格校验（MySQL 表达式纯格式容忍已于 #162 移除），恢复时闭环验证也做同一个读回核对
+   *   （ADR 0017 决定 2 / 4），放宽其中任何一道都要重新审视这条路径；
    * - canonical: 'ifClean'：已验证版本的应用 / 作废 / 取消作废——相对当前黄金基线没有待规范化对象时才推进黄金基线。
-   *   当前闭环验证尚未核对模型原文（待 #132 落地）；按 ADR 0017 落地后仍保留，因为验证记录将按数据库完整版本号区分
-   *   （其他版本上验证通过不保证是当前影子库的规范形式）、SQL Server 生成列的 `type` 规划器不比较，同时作为推进黄金基线前
-   *   的防御性确认；
+   *   闭环验证虽已核对读回（ADR 0017 决定 2），仍保留：验证记录按数据库完整版本号区分（其他版本上验证通过不保证是当前影子库的
+   *   规范形式）、SQL Server 生成列的 `type` 规划器不比较，同时作为推进黄金基线前的防御性确认；
    * - canonical: false：恢复画布历史、未验证版本——只替换房间，不改写黄金基线（被替换进来的模型不一定规范化过）。
    */
   const replace: AppContext['replace'] = async (branch, user, model, op, expectedSeq, opts) => {

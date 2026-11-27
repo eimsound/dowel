@@ -43,7 +43,7 @@ import type { Extra, Peer } from '../src/rooms.ts';
 import { encrypt } from '../src/secrets.ts';
 import { type Shadow, ShadowConfigChangedError, ShadowUnavailableError } from '../src/shadow.ts';
 import { pgShadow } from '../src/targets/pg.ts';
-import { addTable, editModel, makeUser, PASSWORD } from './support.ts';
+import { addTable, editModel, makeUser, PASSWORD, stubPassingShadow } from './support.ts';
 
 const SECTION_ID_RE = /^sec-[0-9a-f]{8}-[0-9a-f]{4}-7[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i;
 
@@ -126,6 +126,8 @@ describe.each([
       connectionLimiter: opts?.connectionLimiter,
       mailer: async () => {},
     });
+    // 发布必须经影子库验证（ADR 0017）：这里的发布只为得到已发布版本，用影子库替身
+    stubPassingShadow(created.shadows);
     const close = async () => {
       created.refresher.stop();
       await created.refresher.drain();

@@ -5,7 +5,7 @@ import { afterEach, beforeEach, expect, test } from 'vitest';
 import { backfillAuditProjectIds } from '../src/db.ts';
 import { createApp, openPlatformDb, type PlatformDb } from '../src/index.ts';
 import { LoginLimiter } from '../src/rate-limit.ts';
-import { addTable, makeUser, PASSWORD } from './support.ts';
+import { addTable, makeUser, PASSWORD, stubPassingShadow } from './support.ts';
 
 process.env.DOWEL_SECRET ??= 'activity-test-secret-0123456789';
 
@@ -75,6 +75,8 @@ const insertAudit = async (
 beforeEach(async () => {
   db = await openPlatformDb(':memory:');
   const created = createApp(db, { loginLimiter: new LoginLimiter({ limit: 10_000, ipLimit: 10_000 }) });
+  // 发布必须经影子库验证（ADR 0017）：这里只要一个已发布版本，用影子库替身
+  stubPassingShadow(created.shadows);
   app = created.app;
   stop = async () => {
     await created.rooms.flush();

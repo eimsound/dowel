@@ -6,7 +6,7 @@
 import { createHash } from 'node:crypto';
 
 import type { ShadowConfigState } from '@dowel/api';
-import { type Dialect, getDialect, publicMajorOf } from '@dowel/core';
+import { type Dialect, engineFullVersion, getDialect, publicMajorOf } from '@dowel/core';
 import { HTTPException } from 'hono/http-exception';
 
 import type { ClusterEvent, ClusterEventPayload, EventBus } from './bus.ts';
@@ -60,6 +60,44 @@ export interface ProjectVersionShadows {
   skippedGroups: SkippedVersionGroup[];
   /** 项目最低目标版本组（已知版本组的最小键；不分组的方言或无已探测环境为 null） */
   targetGroupKey: number | null;
+}
+
+/** 项目里的一个环境与它的数据库完整版本号（ADR 0017 决定 5；尚未探测为 null） */
+export interface ProjectEnvVersion {
+  id: string;
+  name: string;
+  engineVersion: string | null;
+}
+
+export interface EngineVersionShadowEntry {
+  /** 选它时依据的环境数据库完整版本号（实际版本以验证时读到的为准）；版本未知为 null */
+  engineVersion: string | null;
+  envId: string;
+  shadow: Shadow;
+  label: string;
+}
+
+export interface ProjectEngineShadows {
+  /** 每个环境数据库完整版本号一个代表影子库（按数值版本号升序，未知版本在最后） */
+  entries: EngineVersionShadowEntry[];
+  /** 拿不到可用影子库的版本及首个原因 */
+  skipped: { engineVersion: string | null; reason: string }[];
+  /** 项目的全部环境（发布时据此判断覆盖了哪些环境） */
+  environments: ProjectEnvVersion[];
+  /** 影子库与目标库是同一个内置库（SQLite）：版本视为恒等 */
+  identical: boolean;
+}
+
+/**
+ * 选影期间发现项目行已不存在（请求通过鉴权后项目被并发删除，Issue #170）：与 accessIn 一致按“项目不存在”处理。
+ * 是 HTTPException(404) 的子类：app.onError、按 404 精确退回限速的调用方（normalize）无需改动；
+ * **不是** ShadowError，不会被“影子库不可用 → 422 shadow_unavailable / no_shadow”的分支吞掉。
+ * MCP 映射为 project_not_found，OpaqueRefresher 的 shadowOf 映射为 'forgotten'。
+ */
+export class ProjectGoneError extends HTTPException {
+  constructor() {
+    super(404, { message: '项目不存在' });
+  }
 }
 
 /**
@@ -153,7 +191,11 @@ export class Shadows {
         where e.id = $1 and e.project_id = $2`,
       [eid, pid],
     );
-    if (!r) throw new HTTPException(404, { message: '环境不存在' });
+    if (!r) {
+      // 环境行没了也可能是整个项目在并发窗口内被删了：报项目不存在，而不是环境不存在（Issue #170）
+      if (!(await this.projectExists(pid))) throw new ProjectGoneError();
+      throw new HTTPException(404, { message: '环境不存在' });
+    }
     const engineVersionNum = r.engine_version_num ?? null;
     return {
       id: r.id,
@@ -169,11 +211,30 @@ export class Shadows {
     };
   }
 
+  /** 项目的方言；项目行已不存在（通过鉴权后被并发删除）时抛 ProjectGoneError，不能回退成某个默认方言（Issue #170） */
   private async projectDialect(pid: string): Promise<Dialect> {
     const [p] = await this.db.query<{ dialect: Dialect }>('select dialect from projects where id = $1', [
       pid,
     ]);
-    return p?.dialect ?? 'pg';
+    if (!p) throw new ProjectGoneError();
+    return p.dialect;
+  }
+
+  private async projectExists(pid: string): Promise<boolean> {
+    return (await this.db.query('select 1 from projects where id = $1', [pid])).length > 0;
+  }
+
+  /**
+   * 查不到任何环境时该抛的错：先复查项目行——环境随项目级联删除，“没有环境”也可能是项目在并发窗口内被删了，
+   * 此时报 ProjectGoneError（404），只有活项目才是“还没有配置环境”的 preConnect ShadowError（422，文案不变）。
+   * 只在失败路径多一次查询。
+   */
+  private async noEnvironmentError(pid: string): Promise<Error> {
+    if (!(await this.projectExists(pid))) return new ProjectGoneError();
+    return new ShadowError(
+      '项目还没有配置环境。导入 SQL、验证迁移都需要一个真实的数据库实例作影子库，请先在“环境”里添加项目要部署到的数据库',
+      { preConnect: true },
+    );
   }
 
   private async readValidatedEnv(pid: string, id: string): Promise<{ env: Env; fingerprint: string }> {
@@ -266,11 +327,7 @@ export class Shadows {
         const liveIds = new Set(rows.map((r) => r.id));
         await this.pruneRemovedForProject(observed, liveIds);
         const first = rows[0];
-        if (!first)
-          throw new ShadowError(
-            '项目还没有配置环境。导入 SQL、验证迁移都需要一个真实的数据库实例作影子库，请先在“环境”里添加项目要部署到的数据库',
-            { preConnect: true },
-          );
+        if (!first) throw await this.noEnvironmentError(pid);
         id = first.id;
       }
 
@@ -387,12 +444,7 @@ export class Shadows {
     );
     const liveIds = new Set(rows.map((r) => r.id));
     await this.pruneRemovedForProject(observed, liveIds);
-    if (!rows.length) {
-      throw new ShadowError(
-        '项目还没有配置环境。导入 SQL、验证迁移都需要一个真实的数据库实例作影子库，请先在“环境”里添加项目要部署到的数据库',
-        { preConnect: true },
-      );
-    }
+    if (!rows.length) throw await this.noEnvironmentError(pid);
 
     const groups = new Map<number | null, typeof rows>();
     const knownKeys = new Set<number>();
@@ -404,7 +456,7 @@ export class Shadows {
       else groups.set(key, [r]);
     }
     const sortedKnownKeys = [...knownKeys].sort((a, b) => a - b);
-    // 最低已知版本组即项目兼容目标（PG 最低大版本、MySQL 最低主次版本）
+    // 最低已知版本组（PG 最低大版本、MySQL 最低主次版本），供 forProjectTarget 单影子库选影优先使用
     const targetGroupKey = sortedKnownKeys[0] ?? null;
     const orderedKeys: (number | null)[] = [...sortedKnownKeys, ...(groups.has(null) ? [null] : [])];
 
@@ -442,8 +494,99 @@ export class Shadows {
   }
 
   /**
-   * 为 OpaqueRefresher 等单影子库派生场景选影：优先选择最低目标版本组（`groupKey === targetGroupKey`）的可用环境影子库，
-   * 若无可用则回退到首个可用环境影子库。
+   * 闭环验证选影（ADR 0017 决定 5）：按项目全部环境的**数据库完整版本号**分组（PG 两段、MySQL 三段、SQL Server 构建号；
+   * 未探测的归为 null 组），每组按 显式 shadowUrl > 非生产 > 允许同实例的生产 选出 1 个代表影子库；该组都不可用时记入 skipped。
+   * 验证结果按影子库实际读到的完整版本号记录，发布据 environments 判断覆盖了哪些环境。
+   * SQLite 直接用内存影子库（identical）；兼容测试中直接覆写实例级 `forProject` 的场景（按第一个环境的版本算）。
+   */
+  async forProjectEngineVersions(pid: string): Promise<ProjectEngineShadows> {
+    const dialect = await this.projectDialect(pid);
+    const observed = this.snapshotProjectCache(pid);
+    const rows = await this.db.query<{
+      id: string;
+      name: string;
+      production: boolean;
+      allow_same_instance: boolean;
+      shadow_url_enc: string | null;
+      engine_version: string | null;
+      engine_version_num: number | null;
+    }>(
+      `select id, name, production, allow_same_instance, shadow_url_enc, engine_version, engine_version_num
+         from environments where project_id = $1 order by created_at`,
+      [pid],
+    );
+    const fullOf = (r: (typeof rows)[number]) =>
+      engineFullVersion(dialect, { version: r.engine_version, versionNum: r.engine_version_num });
+    const environments: ProjectEnvVersion[] = rows.map((r) => ({
+      id: r.id,
+      name: r.name,
+      engineVersion: fullOf(r),
+    }));
+    const spec = getDialect(dialect);
+    if (!spec.capabilities.requiresExternalShadow) {
+      const s = this.forProject !== Shadows.prototype.forProject ? await this.forProject(pid) : null;
+      return {
+        entries: [
+          {
+            engineVersion: null,
+            envId: '',
+            shadow: s?.shadow ?? sqliteMemoryShadow(),
+            label: s?.label ?? 'SQLite :memory:',
+          },
+        ],
+        skipped: [],
+        environments,
+        identical: true,
+      };
+    }
+    if (this.forProject !== Shadows.prototype.forProject) {
+      const s = await this.forProject(pid);
+      return {
+        entries: [{ engineVersion: environments[0]?.engineVersion ?? null, envId: '', ...s }],
+        skipped: [],
+        environments,
+        identical: false,
+      };
+    }
+    await this.pruneRemovedForProject(observed, new Set(rows.map((r) => r.id)));
+    if (!rows.length) throw await this.noEnvironmentError(pid);
+    const groups = new Map<string | null, { num: number | null; rows: typeof rows }>();
+    for (const r of rows) {
+      const key = fullOf(r);
+      const g = groups.get(key);
+      if (g) g.rows.push(r);
+      else groups.set(key, { num: key === null ? null : (r.engine_version_num ?? null), rows: [r] });
+    }
+    const ordered = [...groups.entries()].sort(([ka, a], [kb, b]) => {
+      if (ka === null || kb === null) return ka === null ? (kb === null ? 0 : 1) : -1;
+      return (a.num ?? 0) - (b.num ?? 0) || ka.localeCompare(kb);
+    });
+    const entries: EngineVersionShadowEntry[] = [];
+    const skipped: ProjectEngineShadows['skipped'] = [];
+    for (const [engineVersion, g] of ordered) {
+      const candidates = [...g.rows].sort((a, b) => candidatePriority(a) - candidatePriority(b));
+      let firstReason: string | null = null;
+      let picked = false;
+      for (const cand of candidates) {
+        try {
+          const s = await this.forProject(pid, cand.id);
+          entries.push({ engineVersion, envId: cand.id, shadow: s.shadow, label: s.label });
+          picked = true;
+          break;
+        } catch (e) {
+          // 配置已变更是可重试的暂时状态：整体重试，不能把这个完整版本组当成“没有可用影子库”跳过
+          if (!(e instanceof ShadowError) || e instanceof ShadowConfigChangedError) throw e;
+          firstReason ??= scrubSecrets(e.message);
+        }
+      }
+      if (!picked) skipped.push({ engineVersion, reason: firstReason ?? '没有可用的影子库' });
+    }
+    return { entries, skipped, environments, identical: false };
+  }
+
+  /**
+   * 为 OpaqueRefresher 等单影子库派生场景选影：优先选择最低已知版本组（`groupKey === targetGroupKey`）的可用环境影子库，
+   * 若无可用则回退到首个可用环境影子库（仅用于按需规范化 / 派生；发布与重新验证使用 `forProjectEngineVersions` 按数据库完整版本号逐组验证）。
    */
   async forProjectTarget(pid: string): Promise<{ shadow: Shadow; label: string }> {
     const res = await this.forProjectVersions(pid);

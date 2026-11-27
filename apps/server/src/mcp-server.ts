@@ -92,6 +92,7 @@ import { MCP_DISALLOWED_MUTATORS } from './rooms.ts';
 import type { AppContext, Env } from './routes/context.ts';
 import { scrubSecrets } from './secrets.ts';
 import { ShadowConfigChangedError, ShadowError } from './shadow.ts';
+import { ProjectGoneError } from './shadows.ts';
 import {
   buildDdlSql,
   buildMigrationPreview,
@@ -1644,6 +1645,11 @@ export const createMcpServer = (
       try {
         shadowHandle = await ctx.shadows.forProject(row.id, resolvedEnvId);
       } catch (e) {
+        // 鉴权后项目被并发删除（Issue #170）：还没连库，退回限速额度；项目已不存在，不再写它的审计
+        if (e instanceof ProjectGoneError) {
+          refund();
+          return toolError('project_not_found', '项目不存在');
+        }
         if (e instanceof ShadowError) {
           if (e.preConnect && gate?.allowed) gate.refund();
           await audit(
@@ -1933,7 +1939,7 @@ export const createMcpServer = (
       const result = await spec.run(parsed.data);
       return server.server.projectCallToolResult(result, undefined);
     } catch (e) {
-      if (e instanceof BranchForgottenError) {
+      if (e instanceof BranchForgottenError || e instanceof ProjectGoneError) {
         return server.server.projectCallToolResult(toolError('project_not_found', '项目不存在'), undefined);
       }
       if (e instanceof PlanError) {

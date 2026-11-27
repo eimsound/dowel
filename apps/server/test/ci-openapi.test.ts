@@ -194,6 +194,12 @@ describe('CI OpenAPI 3.1 与自托管 Scalar 文档', () => {
 
     // Error schema 与全部错误码均已导出
     expect(doc.components?.schemas?.CiErrorBody).toBeTruthy();
+    expect(doc.components?.schemas?.CiErrorDetails).toMatchObject({
+      properties: {
+        engineVersion: expect.anything(),
+        verifiedOn: expect.anything(),
+      },
+    });
     expect(doc.components?.schemas?.CiErrorCode).toMatchObject({
       enum: CI_ERROR_CODES,
     });

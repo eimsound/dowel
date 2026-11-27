@@ -28,7 +28,7 @@ import { checkEnvDrift, runExecution, runMark } from '../src/executions.ts';
 import { createApp, openPlatformDb, type PlatformDb } from '../src/index.ts';
 import { KeyedLimiter, LoginLimiter } from '../src/rate-limit.ts';
 import { encrypt } from '../src/secrets.ts';
-import { addTable, editModel, makeUser, PASSWORD } from './support.ts';
+import { addTable, editModel, makeUser, PASSWORD, recordVerifiedOnEnvs } from './support.ts';
 
 process.env.DOWEL_SECRET ??= 'executions-test-secret-0123456789';
 
@@ -945,7 +945,8 @@ describe.each([
   ) => {
     const r = await call('PATCH', `/api/projects/${pid}/versions/${vid}/steps`, { up, down });
     expect(r.status, JSON.stringify(r.data)).toBe(200);
-    await db.query('update versions set verified_at = $2 where id = $1', [vid, new Date().toISOString()]);
+    // PATCH 清空了验证记录：按环境的数据库完整版本号补上通过的记录（ADR 0017 决定 5）
+    await recordVerifiedOnEnvs(db, pid, [vid]);
   };
   const executedAt = async (vid: string) =>
     (await db.query<{ executed_at: unknown }>('select executed_at from versions where id = $1', [vid]))[0]!
@@ -1380,6 +1381,7 @@ describe.each([
           new Date().toISOString(),
         ],
       );
+      await recordVerifiedOnEnvs(db, pid, [v3Id]);
       await db.query('update versions set retired_at = $2 where id = $1', [v2!.id, new Date().toISOString()]);
 
       // 1. 直接 execute 到已作废版本 v2 → 409 retired_target；去 v3 → SSE switch_required
@@ -1521,6 +1523,7 @@ describe.each([
           new Date().toISOString(),
         ],
       );
+      await recordVerifiedOnEnvs(db, markProj.pid, [mv3Id]);
       await db.query('update versions set retired_at = $2 where id = $1', [
         mv2!.id,
         new Date().toISOString(),

@@ -97,6 +97,9 @@ export interface ExecutorErrorDetails {
   lca?: { id: string; number: number; name: string };
   /** step_timeout：lock = 等锁超过 lock_timeout，statement = 语句超过 statement_timeout；ms 是当时的设置 */
   timeout?: { kind: 'lock' | 'statement'; ms: number };
+  /** unverified（按版本把关，ADR 0017 决定 5）：目标库的数据库完整版本号（读不到为 null）与这个版本已通过验证的完整版本号 */
+  engineVersion?: string | null;
+  verifiedOn?: string[];
 }
 
 export class ExecutorError extends Error {

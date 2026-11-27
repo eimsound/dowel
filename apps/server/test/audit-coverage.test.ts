@@ -12,7 +12,7 @@ import { createApp, openPlatformDb, type PlatformDb } from '../src/index.ts';
 import { newMcpToken } from '../src/mcp-tokens.ts';
 import { LoginLimiter } from '../src/rate-limit.ts';
 import type { SecurityConfig } from '../src/security.ts';
-import { addTable, makeUser, PASSWORD } from './support.ts';
+import { addTable, makeUser, PASSWORD, stubPassingShadow } from './support.ts';
 
 process.env.DOWEL_SECRET ??= 'audit-coverage-secret-0123456789';
 
@@ -51,6 +51,8 @@ beforeEach(async () => {
   });
   app = created.app;
   rooms = created.rooms;
+  // 发布 / 重新验证必须经影子库验证（ADR 0017）：这里只关心审计，用影子库替身
+  stubPassingShadow(created.shadows);
   stop = async () => {
     created.requests.stop();
     await created.webhooks.close();

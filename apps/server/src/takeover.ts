@@ -118,6 +118,12 @@ const formatVerifyFailure = (v: Pick<HistoryVersionRow, 'number' | 'name'>, repo
     parts.push(`升级后结构与模型不一致（${report.upDiff.length} 处差异，如：${report.upDiff[0]}）`);
   if (report.downDiff.length)
     parts.push(`回滚后结构与上一版本不一致（${report.downDiff.length} 处差异，如：${report.downDiff[0]}）`);
+  if (report.readbackTotal) {
+    const first = report.readbackDiff?.[0];
+    parts.push(
+      `读回核对不一致（${report.readbackTotal} 处写法差异${first ? `，如：${first.direction === 'down' ? '上一个版本的模型 ' : ''}${first.object} 的 ${first.property}：模型 ${first.modelValue ?? '（无）'}，数据库 ${first.liveValue ?? '（无）'}` : ''}）`,
+    );
+  }
   const reason = parts.join('；') || '验证未通过';
   return `版本 v${v.number}「${v.name}」在影子库闭环验证失败：${reason}`;
 };
@@ -151,7 +157,11 @@ export const verifyVersionChain = async (o: {
     const checkDown = !(v.number === 0 && v.downSteps.length === 0);
     let report: VerifyReport;
     try {
-      report = await o.shadow.verifyScripts(from, v.model, v.upSteps, v.downSteps, { checkDown });
+      // 与发布、重新验证同一套闭环验证（含读回核对，ADR 0012 / 0017 决定 4）；记录按影子库的数据库完整版本号
+      report = await o.shadow.verifyScripts(from, v.model, v.upSteps, v.downSteps, {
+        checkDown,
+        scope: v.scope?.length ? v.scope : null,
+      });
     } catch (e) {
       if (e instanceof ShadowError)
         throw new TakeoverRejected(
@@ -233,7 +243,7 @@ export interface RestoreEnv {
  * - 工作副本 = 链头版本的模型，同时作为派生数据的黄金基线。它是目标库 `dowel.history` 里冻结的链头版本模型，
  *   不是引擎刚读出的结构；直接拿它作黄金基线依赖严格的读回核对（#123，ADR 0016 / ADR 0017）：当前执行读回校验
  *   （executor `verifyAndRecord`）在记录历史前已对四种方言严格校验（MySQL 表达式纯格式容忍已于 #162 移除），
- *   恢复时闭环验证的读回核对（`verifyVersionChain`）待 ADR 0017 / #132 落地；放宽其中任何一道都要重新审视这里；
+ *   恢复时闭环验证（`verifyVersionChain`）也做同一个读回核对（ADR 0017 决定 2 / 4）；放宽其中任何一道都要重新审视这里；
  * - 版本链原样恢复（id、序号、parent、模型、冻结脚本、checksum、schema 范围、发布时间），
  *   写入全部通过影子库闭环验证后的 verified_at 与 verify_report，并保留 restored_at 标明来源（ADR 0012）；
  * - 环境：当前版本 = 各自目标库历史里最后完成的版本；“执行过哪些版本”和 executed_at 由 syncEnvCache 按各环境的历史对齐
