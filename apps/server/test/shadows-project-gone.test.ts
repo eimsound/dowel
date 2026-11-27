@@ -26,7 +26,7 @@ const NO_ENV =
 
 /** shadows.projectDialect 的 SQL（SQLite 项目在这里决定走内存影子库） */
 const DIALECT_SQL = 'select dialect from projects where id = $1';
-/** shadows.forProject（未指定环境）/ forProjectVersions / forProjectEngineVersions 读环境列表的 SQL 共同片段 */
+/** shadows.forProject（未指定环境）/ forProjectTarget / forProjectEngineVersions 读环境列表的 SQL 共同片段 */
 const ENV_LIST_SQL = 'from environments where project_id = $1 order by created_at';
 /** shadows.env（指定环境）的 SQL 片段 */
 const ENV_ONE_SQL = 'where e.id = $1 and e.project_id = $2';
@@ -217,11 +217,10 @@ test('ProjectGoneError 是 404 HTTPException、不是 ShadowError（不会被“
   expect(e.message).toBe('项目不存在');
 });
 
-test('Shadows 直接调用：项目行不存在时 forProject / forProjectVersions / forProjectEngineVersions / forProjectTarget / configState 都抛 ProjectGoneError', async () => {
+test('Shadows 直接调用：项目行不存在时 forProject / forProjectEngineVersions / forProjectTarget / configState 都抛 ProjectGoneError', async () => {
   const s = created.shadows;
   await expect(s.forProject('no-such-project')).rejects.toBeInstanceOf(ProjectGoneError);
   await expect(s.forProject('no-such-project', 'no-such-env')).rejects.toBeInstanceOf(ProjectGoneError);
-  await expect(s.forProjectVersions('no-such-project')).rejects.toBeInstanceOf(ProjectGoneError);
   await expect(s.forProjectEngineVersions('no-such-project')).rejects.toBeInstanceOf(ProjectGoneError);
   await expect(s.forProjectTarget('no-such-project')).rejects.toBeInstanceOf(ProjectGoneError);
   await expect(s.configState('no-such-project')).rejects.toBeInstanceOf(ProjectGoneError);
