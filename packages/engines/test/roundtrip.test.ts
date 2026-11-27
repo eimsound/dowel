@@ -1,4 +1,4 @@
-import { createAll, plan, validate } from '@dowel/core';
+import { createAll, normalizeType, plan, validate } from '@dowel/core';
 import { describe, expect, test } from 'vitest';
 
 import { PG_URL, useTestDb } from '../../../test/pg.ts';
@@ -69,6 +69,80 @@ describe.skipIf(!PG_URL)('导入 → 重建 往返一致', () => {
         email non_empty_email
       );
     `);
+  });
+
+  test('PG normalizeType 与真实 PG format_type 读回一致', async () => {
+    await resetShadow(db());
+    await db().exec('CREATE SCHEMA public');
+    await db().exec(`
+      SET search_path = public;
+      CREATE DOMAIN "MyDomain" AS integer;
+      CREATE DOMAIN "My  Domain" AS text;
+    `);
+    const hasVector =
+      (await db().query<{ ok: number }>("SELECT 1 AS ok FROM pg_available_extensions WHERE name = 'vector'"))
+        .length > 0;
+    if (hasVector) {
+      await db().exec('CREATE EXTENSION IF NOT EXISTS vector WITH SCHEMA public');
+    }
+
+    // CI 镜像为 pgvector/pgvector:pg15..19（不含 PostGIS），因此 geometry(Point,4326) 的保留逻辑由 packages/core/test/column-normalization.test.ts 覆盖
+    const cases: string[] = [
+      'int',
+      'INT4',
+      'int2',
+      'int8',
+      'bool',
+      'varchar',
+      'varchar(255)',
+      'CHARACTER   VARYING ( 64 )',
+      'char',
+      'character',
+      'char(4)',
+      'decimal',
+      'decimal(10, 2)',
+      'numeric(12, 4)',
+      'bit',
+      'bit(8)',
+      'bit[]',
+      'varbit',
+      'varbit(16)',
+      'bit varying(16)',
+      'float',
+      'float(1)',
+      'float(10)',
+      'float(24)',
+      'float(25)',
+      'float(53)',
+      'float(10)[]',
+      'float4',
+      'float8',
+      'double   precision',
+      'timestamp',
+      'timestamptz',
+      'timestamp(3)',
+      'TIMESTAMP(3) WITH TIME ZONE',
+      'TIMESTAMPTZ(3)[]',
+      'time',
+      'timetz',
+      'time(3)',
+      'TIME(3) WITH TIME ZONE',
+      'INTERVAL YEAR TO MONTH',
+      'INTERVAL DAY TO SECOND(3)',
+      '  Text  ',
+      'text [ ]',
+      'public."MyDomain"',
+      'PUBLIC."My  Domain"[]',
+    ];
+    if (hasVector) cases.push('PUBLIC.VECTOR( 3 )');
+
+    const cols = cases.map((t, i) => `c${i} ${t}`).join(', ');
+    await db().exec(`SET search_path = public; CREATE TABLE norm_check (${cols})`);
+    const snap = await readSnapshot(db());
+    const table = snap.tables['public.norm_check']!;
+    for (const [i, raw] of cases.entries()) {
+      expect(table.columns[`c${i}`]!.type, raw).toBe(normalizeType(raw, 'pg'));
+    }
   });
 });
 
