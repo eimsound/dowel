@@ -24,7 +24,9 @@
 5. **待规范化判定**（`apps/server/src/derive-pending.ts`，`derive.ts` 再导出）：
    - 表的“列上下文”：表沿 `partitionOf` 解析到根父表（分区子表没有自己的列；基线与当前模型各自解析，覆盖多级分区与 attach / detach，#134），按列名（MySQL / MSSQL / SQLite 忽略大小写）对齐两边的列；某个两边都有的列名对应列的 `type` / `typeRef`（含枚举完整限定名）/ `collation`（大小写不敏感的方言再加列名原文）不同即算变了——表达式按列名引用列，所以列名对调、删列后新建同名列也算（#133）；只在一边出现的列名（新增、删除、改名到新名字）不算；
    - 不透明对象：依赖或父对象完整限定名变了；`deps` 集合变了；依赖的列（按 ID 及按列名对齐）的 `type` / `typeRef` / `collation` 变了，或依赖表 / 父表的列上下文变了；DDL 文本变了；依赖的不透明对象本身待规范化（沿依赖传递，带环保护，#136）；
-   - 带表达式的普通对象：表达式变了，或所在表的列上下文变了；列自己的默认值 / 生成列另按 ID 比较列自身类型；只有分区边界、没有表达式分区键的表不看自身列上下文，而是检查是否改挂到另一个分区父表，以及直接父表的分区键签名（策略、各键的列签名或表达式、opclass、collation；父表含表达式键时再看父表的列上下文）是否变化。
+   - 带表达式的普通对象：表达式变了，或所在表的列上下文变了；列自己的默认值 / 生成列另按 ID 比较列自身类型；只有分区边界、没有表达式分区键的表不看自身列上下文，而是检查是否改挂到另一个分区父表，以及直接父表的分区键签名（策略、各键的列签名或表达式、opclass、collation；父表含表达式键或是解析不出来的存量字符串时再看父表的列上下文）是否变化——opclass / collation / 策略是有意的过近似；
+   - 表达式直接写了枚举名（如 `'ok'::public.mood`，所在表不一定有列引用这个枚举，#146）：相对基线有枚举的名字绑定变了（改名、对调、换 schema、删除 / 新建），且对象的表达式（含不透明对象 DDL、直接父表的表达式分区键）里按词（忽略大小写）出现了其中某个枚举两边的名字。PG 按 OID 存表达式，读回时类型名跟着影子库里的绑定走；稳态下没有绑定变化，不做任何文本扫描；
+   - MSSQL 持久化计算列（#145）：SQL Server 按表达式与被引用列的可空性推断 `is_nullable`，canonicalize 写回 `notNull`；列自己的 `notNull` 变了，或所在表按列名对齐的列 `notNull` 变了即待规范化。其他方言与非持久化计算列不看 `notNull`。
 6. **canonicalize 自愈**：基线自己在影子库里建不出来（旧版本遗留 / 升级后不兼容，`StepError`）且没有依赖改名的不透明对象时，直接从空库建出 `next`（与增量迁移等价）；有改名依赖时如实报错。基础设施故障统一经 `isInfraFailure` → `toShadowError` 映射为 `ShadowError`。
 7. **手动规范化接口与按钮**：
    - `GET /api/projects/:pid/normalize`（`project.read`，查看者即可）：`{ seq, pending, pendingCount, objects（≤50）, truncated, baseline, shadow }`，0 影子库 I/O、不拿 derive 锁；`shadow` 来自 `Shadows.configState`（`memory` / `configured` / `none`，纯平台库查询、复用 `candidatePriority`）。
