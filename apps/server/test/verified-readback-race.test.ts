@@ -1,4 +1,4 @@
-// Issue #132：“已验证”的冻结版本必须能通过执行器读回校验（readback_mismatch）。
+// Issue #132 路径 B：flush() 之后、冻结之前插进来的编辑（TOCTOU）不能混进“已验证”的冻结版本。
 // 不变式：一个版本 verified = true，就必须能在空目标库上执行成功（执行器读回 diffAgainst 为 0）。
 // 全部用 SQLite（:memory: 影子库 + 本地文件目标库），不依赖 Docker。
 import { mkdtempSync, rmSync } from 'node:fs';
