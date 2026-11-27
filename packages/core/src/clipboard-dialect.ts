@@ -58,6 +58,10 @@ export interface PastedColumnInput {
   tableName: string;
   /** 列的新名字 */
   columnName: string;
+  /** 列类型原文（供方言识别写入时会展开的伪类型，如 PG serial） */
+  type?: string;
+  /** 映射后的枚举类型引用 */
+  typeRef?: string | null;
   /** 待提交的扩展（已是独立副本，可直接修改或替换） */
   ext: ColumnExt | undefined;
   /** 映射后是否带 default */

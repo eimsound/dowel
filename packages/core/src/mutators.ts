@@ -21,6 +21,7 @@ import {
   UniqueExt,
 } from './ir.ts';
 import { columnsOf, effectiveColumnsOf, rootTableId } from './model.ts';
+import { PG_SERIAL_TYPE_NOTE } from './pg/serial.ts';
 import { getDialect } from './registry.ts';
 
 /** mutator 参数里的对象 ID：1-64 个字符，不能是 Object.prototype 上的保留名（宏编译层复用） */
@@ -155,7 +156,7 @@ export const mutators = {
       column: z.object({
         id,
         name,
-        type: text,
+        type: text.describe(`Column type text. ${PG_SERIAL_TYPE_NOTE}`),
         typeRef: id.nullable().optional(),
         notNull: z.boolean().optional(),
         default: columnDefaultArg.nullable().optional(),
@@ -176,8 +177,13 @@ export const mutators = {
   ),
   renameColumn: def(z.object({ id, name }), (m, a) => E.renameColumn(m, a.id, a.name)),
   dropColumn: def(z.object({ id }), (m, a) => E.dropColumn(m, a.id)),
-  setColumnType: def(z.object({ id, type: text, typeRef: id.nullable() }), (m, a) =>
-    E.setColumnType(m, a.id, a.type, a.typeRef),
+  setColumnType: def(
+    z.object({
+      id,
+      type: text.describe(`Column type text. ${PG_SERIAL_TYPE_NOTE}`),
+      typeRef: id.nullable(),
+    }),
+    (m, a) => E.setColumnType(m, a.id, a.type, a.typeRef),
   ),
   setNotNull: def(z.object({ id, notNull: z.boolean() }), (m, a) => E.setNotNull(m, a.id, a.notNull)),
   setDefault: def(z.object({ id, default: columnDefaultArg.nullable() }), (m, a) =>

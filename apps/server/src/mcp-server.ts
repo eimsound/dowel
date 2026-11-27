@@ -40,6 +40,7 @@ import {
   type Obj,
   type Opaque,
   OpaqueType,
+  PG_SERIAL_TYPE_NOTE,
   PlanError,
   type PrimaryKey,
   type Sequence,
@@ -1020,6 +1021,11 @@ const netObjectChanges = (prevModel: Model | null, targetModel: Model) => {
 const PRIMITIVE_MUTATOR_DESCRIPTION =
   'Primitive schema mutator (one atomic edit; existing objects are addressed strictly by object ID).';
 
+const PRIMITIVE_MUTATOR_DESCRIPTIONS: Readonly<Record<string, string>> = {
+  addColumn: `${PRIMITIVE_MUTATOR_DESCRIPTION} ${PG_SERIAL_TYPE_NOTE}`,
+  setColumnType: `${PRIMITIVE_MUTATOR_DESCRIPTION} ${PG_SERIAL_TYPE_NOTE}`,
+};
+
 /**
  * apply_changes 可用的操作目录：复合宏（defineTable / alterColumn）排在最前，随后是普通 mutator；
  * paste / batch 一律隐藏（ADR 0015 第 2、3 节）。list_mutators 与 dowel://mutators 共用。
@@ -1055,7 +1061,9 @@ const listMutatorCatalog = (names?: string[]) => {
     items.push({
       name,
       kind: 'mutator',
-      description: PRIMITIVE_MUTATOR_DESCRIPTION,
+      description: Object.hasOwn(PRIMITIVE_MUTATOR_DESCRIPTIONS, name)
+        ? PRIMITIVE_MUTATOR_DESCRIPTIONS[name]!
+        : PRIMITIVE_MUTATOR_DESCRIPTION,
       argsSchema: toJsonSchema(entry.args),
     });
   }

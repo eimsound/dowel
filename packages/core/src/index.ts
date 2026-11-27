@@ -30,6 +30,7 @@ export * from './pg/naming.ts';
 export { INSTANCE_LEVEL_DESCRIPTION, stripPgSql } from './pg/nontx.ts';
 export * from './pg/partition.ts';
 export * from './pg/quote.ts';
+export * from './pg/serial.ts';
 export { COMMON_TYPES } from './pg/types.ts';
 export * from './pg/versioning.ts';
 export * from './plan-types.ts';
