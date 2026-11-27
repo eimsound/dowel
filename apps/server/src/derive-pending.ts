@@ -7,11 +7,12 @@
 //   分区子表没有自己的列，沿 partitionOf 用根父表的列（两个模型各自解析根表，覆盖多级分区与 attach / detach，#134）。
 //   列自己的默认值 / 生成列另外按 ID 比较列自身的类型（列改名的同时改类型时，按名字对不上）。
 //   列签名含枚举的完整限定名（两个枚举对调名字时 typeRef 不变、表达式里的类型名却换了绑定）；
-//   只有分区边界、没有表达式分区键的表不看列上下文：边界只取决于分区键列的类型，而分区键引用的列不能改类型 / 删除；
-//   但子分区改挂到另一个分区父表下时算变化。
+//   只有分区边界、没有表达式分区键的表不看自身列上下文，而是比较直接父表的分区键签名（策略、每个键的列签名或表达式、
+//   opclass、collation；父表含表达式键时再看父表的列上下文），并检查是否改挂到另一个分区父表：
+//   有子分区时仍可通过 setPartitionBy 换键列，也可 detach → 取消分区 → 改列类型 → 重新分区 → attach（#134）。
 // - 不透明对象：依赖或所在父对象改了名；deps 集合变了；依赖的列（按 ID，及按它在表里的列名对齐）或依赖 / 父对象表的
 //   列上下文变了；DDL 文本变了；或依赖的不透明对象本身待规范化（视图叠视图，沿依赖传递，带环保护，#136）。
-import { deepEqual, type Model, type Obj, rootTableId } from '@dowel/core';
+import { deepEqual, type Model, type Obj, resolvePartitionBy, rootTableId } from '@dowel/core';
 
 type Column = Extract<Obj, { kind: 'column' }>;
 type Table = Extract<Obj, { kind: 'table' }>;
@@ -126,6 +127,47 @@ const columnContext = (m: Model) => {
   return { sigs, fold };
 };
 
+interface PartitionKeyInfo {
+  sig: string;
+  hasExpr: boolean;
+}
+
+/**
+ * 分区父表的分区键签名（按父表 ID 缓存）：
+ * - strategy + 每个键的 [列签名 colSig | 键表达式, opclass, collation]；
+ * - hasExpr 表示是否含表达式分区键（或无法解析的存量字符串），调用方据此决定是否再检查父表的列上下文。
+ * 父表不存在或不是分区父表时返回 null。
+ */
+const partitionKeyInfo = (m: Model) => {
+  const cache = new Map<string, PartitionKeyInfo | null>();
+  return (parentId: string): PartitionKeyInfo | null => {
+    if (cache.has(parentId)) return cache.get(parentId)!;
+    const p = m.objects[parentId];
+    let info: PartitionKeyInfo | null = null;
+    if (p?.kind === 'table' && p.partitionBy) {
+      const spec = resolvePartitionBy(m, p);
+      if (spec) {
+        let hasExpr = false;
+        const keys = spec.keys.map((k) => {
+          if (k.column !== null) {
+            const col = m.objects[k.column];
+            return col?.kind === 'column'
+              ? ['col', colSig(m, col), k.opclass, k.collation]
+              : ['missing', k.column, k.opclass, k.collation];
+          }
+          hasExpr = true;
+          return ['expr', k.expr, k.opclass, k.collation];
+        });
+        info = { sig: JSON.stringify([spec.strategy, keys]), hasExpr };
+      } else if (typeof p.partitionBy === 'string') {
+        info = { sig: JSON.stringify(['raw', p.partitionBy]), hasExpr: true };
+      }
+    }
+    cache.set(parentId, info);
+    return info;
+  };
+};
+
 /**
  * 当前模型相对基线需要回影子库规范化的对象 ID（按模型里的顺序）。
  * base 为 null 表示还没有基线：按空基线计算（所有带表达式的对象都待规范化）。
@@ -139,21 +181,24 @@ export const pendingRefreshIds = (baseline: Model | null, cur: Model): string[] 
   };
   const baseCtx = columnContext(base);
   const curCtx = columnContext(cur);
-  // 表（各自解析到根父表）的列上下文是否变了：两边都有的列名，签名不同
+  // 表（各自解析到根父表）的列上下文是否变了：按（基线根表，当前根表）缓存，同家族多个子分区只比一次
   const tableChanged = new Map<string, boolean>();
   const tableCtxChanged = (tableId: string): boolean => {
-    let v = tableChanged.get(tableId);
+    const baseRoot = rootTableId(base, tableId);
+    const curRoot = rootTableId(cur, tableId);
+    const key = `${baseRoot}\0${curRoot}`;
+    let v = tableChanged.get(key);
     if (v === undefined) {
-      const a = baseCtx.sigs(tableId);
+      const a = baseCtx.sigs(baseRoot);
       v = false;
-      for (const [name, sig] of curCtx.sigs(tableId)) {
+      for (const [name, sig] of curCtx.sigs(curRoot)) {
         const old = a.get(name);
         if (old !== undefined && old !== sig) {
           v = true;
           break;
         }
       }
-      tableChanged.set(tableId, v);
+      tableChanged.set(key, v);
     }
     return v;
   };
@@ -164,15 +209,19 @@ export const pendingRefreshIds = (baseline: Model | null, cur: Model): string[] 
     const old = baseCtx.sigs(col.parent).get(k);
     return old !== undefined && old !== curCtx.sigs(col.parent).get(k);
   };
-  /** 子分区挂到了另一个分区父表下（边界原文可能不变，但它按新父表的分区键解释） */
-  const partitionParentChanged = (o: Table): boolean => {
+  const basePartKey = partitionKeyInfo(base);
+  const curPartKey = partitionKeyInfo(cur);
+  /** 子分区的边界解释上下文变了：换了直接父表、直接父表的分区键签名变了、或父表含表达式分区键且父表列上下文变了 */
+  const partitionBoundContextChanged = (o: Table): boolean => {
+    if (!o.partitionOf) return false;
     const was = base.objects[o.id];
-    return (
-      was?.kind === 'table' &&
-      !!was.partitionOf &&
-      !!o.partitionOf &&
-      was.partitionOf.parent !== o.partitionOf.parent
-    );
+    if (was?.kind !== 'table' || !was.partitionOf) return false;
+    if (was.partitionOf.parent !== o.partitionOf.parent) return true;
+    const parentId = o.partitionOf.parent;
+    const a = basePartKey(parentId);
+    const b = curPartKey(parentId);
+    if (a?.sig !== b?.sig) return true;
+    return Boolean((a?.hasExpr || b?.hasExpr) && tableCtxChanged(parentId));
   };
   /** 表达式按列名引用的那张表：CHECK / 索引 / 列是 parent；有表达式分区键的表是自己；否则不看列上下文 */
   const tableOf = (o: Obj): string | null => {
@@ -210,7 +259,7 @@ export const pendingRefreshIds = (baseline: Model | null, cur: Model): string[] 
     }
     if (
       (o.kind === 'column' && columnTypeChanged(base, cur, o.id)) ||
-      (o.kind === 'table' && partitionParentChanged(o))
+      (o.kind === 'table' && partitionBoundContextChanged(o))
     ) {
       pending.add(o.id);
       continue;
