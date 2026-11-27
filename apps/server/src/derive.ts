@@ -55,14 +55,38 @@ export class NormalizeConflictError extends Error {
 }
 
 /**
- * flush 的结果：
- * - clean：相对基线没有待规范化的对象（0 影子库 I/O）；
- * - normalized：在影子库里规范化并写回了（seq 是写回后的）；
- * - skipped：需要规范化但没做成（没有影子库、影子库不可用、表达式在影子库里报错、停机中……），模型保持原样。
+ * flush 没做成规范化的原因：
+ * - stopped / forgotten：服务正在停机，或分支已被 forget（项目 / 分支被删）；
+ * - no_shadow：没有可用的影子库（shadowOf 返回 null）；
+ * - shadow_unavailable：影子库连不上、超时、被占用（ShadowError）；
+ * - canonicalize_failed：表达式 / 不透明对象 DDL 在影子库里报错等其他错误（留给显式规范化或闭环验证报告给用户）；
+ * - write_conflict：写回连续被版本检查拒绝超过 MAX_REJECT_RETRIES 次（期间一直有人改同一对象）；
+ * - round_limit：单次持锁跑满 MAX_CATCHUP_ROUNDS 轮仍有待规范化对象（持续编辑造成活锁），不论期间是否写回过。
+ */
+export type FlushSkipReason =
+  | 'stopped'
+  | 'forgotten'
+  | 'no_shadow'
+  | 'shadow_unavailable'
+  | 'canonicalize_failed'
+  | 'write_conflict'
+  | 'round_limit';
+
+/**
+ * flush 的结果。`model` / `seq` 是 flush 最后一次读到（或写回后读到）的房间状态，也就是本次判定所针对的那一份：
+ * 调用方直接用它，不要在 flush 之后再读一次房间——中间可能插进别人的编辑，读到的就不是判定过的模型了。
+ * - clean：model 相对基线没有待规范化的对象，且本次 flush 没有任何写回被接受（通常 0 影子库 I/O；
+ *   写回被拒之后别人的编辑恰好消除了待规范化对象时也是 clean）；
+ * - normalized：本次 flush 至少有一次写回被接受，且 model 相对推进后的基线没有待规范化的对象；
+ * - skipped：model 可能仍有待规范化的对象（原因见 skippedReason），基线只反映已被接受的写回。
+ * 多个排队中合并的调用各自拿到一份独立的 model 副本。
  */
 export interface FlushOutcome {
   kind: 'clean' | 'normalized' | 'skipped';
   seq: number;
+  model: Model;
+  /** 仅 kind === 'skipped' 时有 */
+  skippedReason?: FlushSkipReason;
 }
 
 export interface DerivedObjectRef {
@@ -115,8 +139,6 @@ export class OpaqueRefresher {
   private running = new Map<string, Promise<void>>();
   /** 已排队但尚未开始的 flush：同分支的并发调用合并成一次（开始时才读最新状态，结果对所有等待者都是新鲜的） */
   private queuedFlush = new Map<string, Promise<FlushOutcome>>();
-  /** 写回被拒绝后自动重试的次数（防止异常情况下无限重试） */
-  private retries = new Map<string, number>();
   /** 在途任务尚未结束时被 forget 的分支，防止任务结束时回写内存/库基线 */
   private forgotten = new Set<string>();
   private stopped = false;
@@ -195,7 +217,6 @@ export class OpaqueRefresher {
     await this.enqueue(branchId, () =>
       this.withExclusiveLock(branchId, async () => {
         await this.setGood(branchId, baseline);
-        this.retries.delete(branchId);
       }),
     );
   }
@@ -223,7 +244,6 @@ export class OpaqueRefresher {
         const result = await fn();
         if (!reset) return result;
         await this.setGood(branchId, baseline);
-        this.retries.delete(branchId);
         return result;
       }),
     );
@@ -251,75 +271,102 @@ export class OpaqueRefresher {
   }
 
   /**
-   * 分支被删掉时清理内存状态：丢掉已经规范化的基线和重试计数。
+   * 分支被删掉时清理内存状态：丢掉已经规范化的基线。
    * 正在执行的刷新不在这里取消（Promise 取消不了）；它写回时会被房间的版本检查拒绝或忽略，
    * 并通过 forgotten 标记阻止其回写内存/库基线（任务结束也不会复活）。
    */
   forget(branchId: string) {
     this.good.delete(branchId);
-    this.retries.delete(branchId);
     if (this.running.has(branchId)) this.forgotten.add(branchId);
   }
 
-  /** 测试和排查用：这个分支还有没有内存基线 / 重试 / 在途任务 */
+  /** 测试和排查用：这个分支还有没有内存基线 / 在途任务 */
   tracked(branchId: string): boolean {
-    return this.good.has(branchId) || this.retries.has(branchId) || this.running.has(branchId);
+    return this.good.has(branchId) || this.running.has(branchId);
   }
 
   /**
    * 关键出口之前调用（发布、生成迁移、导出 DDL、验证、版本差异预览、历史详情、拉取 / 接入预览、MCP 读模型）：
    * 单机与 HA 统一走本地队列 + derive 锁；锁内相对黄金基线判断有没有待规范化的对象，没有就 0 影子库 I/O 返回 clean；
-   * 有就在影子库里规范化并写回。影子库不可用（ShadowError）或规范化失败时安静返回 skipped，不改基线、不报错，
+   * 有就在影子库里规范化并写回。影子库不可用（ShadowError）或规范化失败时安静返回 skipped（带原因），不改基线、不报错，
    * 保证没有影子库的项目照样能看迁移、导出 DDL、发布未验证版本。只有等锁超时（DeriveBusyError）会抛出。
+   * 返回的 model / seq 就是判定所针对的房间状态（见 FlushOutcome），调用方不要再另读房间。
+   * 写回冲突的重试预算（MAX_REJECT_RETRIES 次连续被拒）只属于这一次 flush，不跨调用累计。
    */
   flush(branchId: string): Promise<FlushOutcome> {
-    const queued = this.queuedFlush.get(branchId);
-    if (queued) return queued;
-    const p: Promise<FlushOutcome> = this.enqueue(branchId, () => {
-      if (this.queuedFlush.get(branchId) === p) this.queuedFlush.delete(branchId);
-      return this.withExclusiveLock(branchId, () => this.runLocked(branchId));
-    });
-    this.queuedFlush.set(branchId, p);
-    return p;
+    let shared = this.queuedFlush.get(branchId);
+    if (!shared) {
+      const p: Promise<FlushOutcome> = this.enqueue(branchId, () => {
+        if (this.queuedFlush.get(branchId) === p) this.queuedFlush.delete(branchId);
+        return this.withExclusiveLock(branchId, () => this.runLocked(branchId));
+      });
+      this.queuedFlush.set(branchId, p);
+      shared = p;
+    }
+    // 合并的调用共用一次结果，但各自拿一份模型副本（调用方可以放心修改）
+    return shared.then((o) => ({ ...o, model: structuredClone(o.model) }));
   }
 
   private async runLocked(branchId: string): Promise<FlushOutcome> {
-    let normalized = false;
-    let lastSeq = 0;
+    const skipped = (reason: FlushSkipReason, at: { model: Model; seq: number }): FlushOutcome => ({
+      kind: 'skipped',
+      seq: at.seq,
+      model: at.model,
+      skippedReason: reason,
+    });
+    /** 本次 flush 是否有写回被接受（只有这样才可能报 normalized） */
+    let wrote = false;
+    /** 连续被拒的次数（写回被接受后清零） */
+    let rejects = 0;
+    let last!: { model: Model; seq: number };
     for (let round = 0; round < MAX_CATCHUP_ROUNDS; round++) {
       const { model: cur, versions, seq } = await this.rooms.state(branchId);
-      lastSeq = seq;
-      if (this.stopped || this.forgotten.has(branchId)) return { kind: 'skipped', seq };
+      last = { model: cur, seq };
+      if (this.stopped) return skipped('stopped', last);
+      if (this.forgotten.has(branchId)) return skipped('forgotten', last);
       const good = await this.loadGood(branchId);
       const base = good ?? emptyBaseline(cur);
-      if (!needsRefresh(base, cur)) {
-        this.retries.delete(branchId);
-        return { kind: normalized ? 'normalized' : 'clean', seq };
-      }
+      if (!needsRefresh(base, cur)) return { kind: wrote ? 'normalized' : 'clean', seq, model: cur };
       const shadow = await this.shadowOf(branchId);
-      if (!shadow) return { kind: 'skipped', seq };
-      let outcome: { kind: 'done' | 'retry' | 'give_up'; seq: number };
+      if (!shadow) return skipped('no_shadow', last);
+      let outcome: Awaited<ReturnType<OpaqueRefresher['apply']>>;
       try {
         outcome = await this.apply(branchId, shadow, base, cur, versions, seq);
       } catch (e) {
         // 影子库不可用是预期情况（没有环境、连不上……）：安静跳过；表达式在影子库里报错留给显式规范化报告给用户
-        if (!(e instanceof ShadowError)) {
-          console.warn(
-            '规范化表达式 / 不透明对象 DDL 失败（模型保持原样）',
-            e instanceof Error ? e.message : e,
-          );
-        }
-        return { kind: 'skipped', seq };
+        if (e instanceof ShadowError) return skipped('shadow_unavailable', last);
+        console.warn(
+          '规范化表达式 / 不透明对象 DDL 失败（模型保持原样）',
+          e instanceof Error ? e.message : e,
+        );
+        return skipped('canonicalize_failed', last);
       }
-      lastSeq = outcome.seq;
-      if (outcome.kind === 'done') return { kind: 'normalized', seq: outcome.seq };
-      if (outcome.kind === 'give_up') return { kind: 'skipped', seq: outcome.seq };
-      normalized = true;
+      last = { model: outcome.model, seq: outcome.seq };
+      switch (outcome.kind) {
+        case 'forgotten':
+          return skipped('forgotten', last);
+        case 'done':
+          return { kind: 'normalized', seq: outcome.seq, model: outcome.model };
+        case 'rejected':
+          if (++rejects > MAX_REJECT_RETRIES) return skipped('write_conflict', last);
+          break;
+        case 'accepted':
+          wrote = true;
+          rejects = 0;
+          break;
+      }
     }
-    // 单次持锁达到循环上限（持续编辑造成活锁）：返回当前结果，下次出口再追
-    return { kind: normalized ? 'normalized' : 'skipped', seq: lastSeq };
+    // 单次持锁达到循环上限（持续编辑造成活锁）：仍有待规范化对象，如实报 skipped，下次出口再追
+    return skipped('round_limit', last);
   }
 
+  /**
+   * 一轮规范化：
+   * - done：写回被接受，房间相对推进后的基线没有待规范化对象（model 就是判定过的那一份）；
+   * - accepted：写回被接受、基线已推进，但期间有别人的编辑还需要再追一轮；
+   * - rejected：写回被版本检查拒绝或期间房间被替换，基线不动；
+   * - forgotten：规范化期间分支被 forget，什么都不写。
+   */
   private async apply(
     branchId: string,
     shadow: Shadow,
@@ -327,22 +374,17 @@ export class OpaqueRefresher {
     cur: Model,
     versions: Versions,
     curSeq: number,
-  ): Promise<{ kind: 'done' | 'retry' | 'give_up'; seq: number }> {
+  ): Promise<{ kind: 'done' | 'accepted' | 'rejected' | 'forgotten'; seq: number; model: Model }> {
     const patched = await shadow.canonicalize(good, cur);
-    if (this.forgotten.has(branchId)) return { kind: 'done', seq: curSeq };
+    if (this.forgotten.has(branchId)) return { kind: 'forgotten', seq: curSeq, model: cur };
     const patchRes = patched.length
       ? await this.rooms.patch(branchId, 'Dowel', patched, versions)
       : undefined;
     const after = await this.rooms.state(branchId);
     const rejected =
       Boolean(patchRes?.rejected) || patched.some((o) => !deepEqual(after.model.objects[o.id], o));
-    if (rejected) {
-      // 写回被版本检查拒绝或期间房间被替换：绝不用过期的 canonical 覆盖 branches.baseline
-      const n = (this.retries.get(branchId) ?? 0) + 1;
-      this.retries.set(branchId, n);
-      return { kind: n <= MAX_REJECT_RETRIES ? 'retry' : 'give_up', seq: after.seq };
-    }
-    this.retries.delete(branchId);
+    // 写回被拒绝或期间房间被替换：绝不用过期的 canonical 覆盖 branches.baseline
+    if (rejected) return { kind: 'rejected', seq: after.seq, model: after.model };
     // 基线是“本次规范化的那份模型 + 规范形式”，而不是房间里的最新模型：
     // 规范化期间别人新增或修改的其他对象不在 canonical 里，留给下一轮继续规范化
     const canonical = structuredClone(cur);
@@ -352,9 +394,9 @@ export class OpaqueRefresher {
       (after.seq !== curSeq && !deepEqual(after.model, canonical)) ||
       needsRefresh(canonical, after.model)
     ) {
-      return { kind: 'retry', seq: after.seq };
+      return { kind: 'accepted', seq: after.seq, model: after.model };
     }
-    return { kind: 'done', seq: after.seq };
+    return { kind: 'done', seq: after.seq, model: after.model };
   }
 
   /**
@@ -398,7 +440,6 @@ export class OpaqueRefresher {
         const canonical = structuredClone(cur);
         for (const o of patched) canonical.objects[o.id] = o;
         await this.setGood(branchId, canonical);
-        this.retries.delete(branchId);
         return {
           ok: true,
           outcome: patched.length ? 'normalized' : 'verified',
