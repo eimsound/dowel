@@ -58,6 +58,8 @@ describe('splitImportedMssqlNullability', () => {
     const r = await splitImportedMssqlNullability(imported(), async () => shadow);
     expect(probe).toHaveBeenCalledTimes(1);
     expect(probe.mock.calls[0]![1]).toEqual(['cp', 'cu']);
+    // 影子库按这个模型建库：主键成员必须已是显式 NOT NULL，否则推断为可空的成员列建不出主键
+    expect(split(probe.mock.calls[0]![0], 'k')).toEqual({ notNull: true, inferred: false });
     expect(split(r.model, 'k')).toEqual({ notNull: true, inferred: false });
     expect(split(r.model, 'cp')).toEqual({ notNull: false, inferred: true });
     expect(split(r.model, 'cu')).toEqual({ notNull: true, inferred: false });

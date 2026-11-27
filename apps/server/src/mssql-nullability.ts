@@ -31,11 +31,14 @@ export const splitImportedMssqlNullability = async (
 ): Promise<MssqlNullabilitySplit> => {
   if (model.dialect !== 'mssql') return { model, fallback: [] };
   const plan = mssqlNullabilitySplitPlan(model, keep);
+  // 主键成员先记成显式：影子库按模型建库时主键要求成员列非空，导入形态（notNull: false + 推断）的成员列若表达式
+  // 本身推断为可空，主键就建不出来，整次探测都会落到兜底
+  const base = applyMssqlNullabilitySplit(model, { primaryKey: plan.primaryKey, probe: [] }, null).model;
   let inferred: Map<string, boolean> | null = null;
   if (plan.probe.length) {
     try {
       const shadow = await shadowOf();
-      inferred = shadow.probeMssqlNotNull ? await shadow.probeMssqlNotNull(model, plan.probe) : null;
+      inferred = shadow.probeMssqlNotNull ? await shadow.probeMssqlNotNull(base, plan.probe) : null;
     } catch (e) {
       if (e instanceof HTTPException || e instanceof SecretError || e instanceof ShadowConfigChangedError)
         throw e;
@@ -46,6 +49,6 @@ export const splitImportedMssqlNullability = async (
       inferred = null;
     }
   }
-  const r = applyMssqlNullabilitySplit(model, plan, inferred);
+  const r = applyMssqlNullabilitySplit(base, { primaryKey: [], probe: plan.probe }, inferred);
   return { model: r.model, fallback: r.fallback.map((id) => mssqlColumnPath(r.model, id)) };
 };
