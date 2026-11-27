@@ -1679,4 +1679,37 @@ describe('batch：整批 1 个提交（ADR 0015 第 3 节）', () => {
     const outs = await room.handle('ws2', 'carol', { t: 'op', op });
     expect(outs[0]!.msg.t).toBe('commit');
   });
+
+  test('PG serial addColumn 同步确定性：客户端乐观与服务端产出相同序列 ID，后续依赖操作被接受，且索引/非索引路径一致', async () => {
+    const { net, zhang, li } = await setup();
+    const baseModel = structuredClone(net.room.model);
+    const args = { table: 't', column: { id: 'c_ser', name: 'seq_id', type: 'serial' } };
+
+    // 验证 OverlayModelIndex 路径与非索引路径产出的 model 与 changes 完全一致
+    const noIdx = execute(baseModel, 'addColumn', args);
+    const withIdx = execute(baseModel, 'addColumn', args, new MutableModelIndex(baseModel));
+    expect(same(noIdx.next, withIdx.next)).toBe(true);
+    expect(withIdx.changes).toEqual(noIdx.changes);
+    const createdSeq = all(withIdx.next, 'sequence')[0];
+    expect(createdSeq).toBeDefined();
+    expect(createdSeq!.name).toBe('users_seq_id_seq');
+    expect(withIdx.changes.some((c) => c.id === createdSeq!.id && c.obj?.kind === 'sequence')).toBe(true);
+
+    // 端到端同步：乐观新增 serial 列并紧接发起依赖该确定性序列 ID 的 renameSequence
+    zhang.mutate('addColumn', args);
+    const optSeq = all(zhang.view, 'sequence').find((s) => s.ownedBy === 'c_ser');
+    expect(optSeq?.id).toBe(createdSeq!.id);
+    expect(optSeq?.name).toBe('users_seq_id_seq');
+
+    zhang.mutate('renameSequence', { id: optSeq!.id, name: 'custom_users_seq' });
+    await net.settle();
+
+    expect(zhang.notices).toEqual([]);
+    expect(li.notices).toEqual([]);
+    const serverSeq = all(net.room.model, 'sequence').find((s) => s.ownedBy === 'c_ser');
+    expect(serverSeq?.id).toBe(createdSeq!.id);
+    expect(serverSeq?.name).toBe('custom_users_seq');
+    expect(same(zhang.view, net.room.model)).toBe(true);
+    expect(same(li.view, net.room.model)).toBe(true);
+  });
 });
