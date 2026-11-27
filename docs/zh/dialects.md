@@ -69,7 +69,10 @@ Dowel 的每个项目在创建时绑定一种目标数据库方言，并在全�
 
 ### 方言特性与 12 步表重建 {#sqlite-features}
 
-- **专属表与列属性**：支持表级 `STRICT`（限定列类型为 `INT` / `INTEGER` / `REAL` / `TEXT` / `BLOB` / `ANY`）、`WITHOUT ROWID`（必须有主键且不能混用 `AUTOINCREMENT`），以及单列整数主键 `AUTOINCREMENT`。
+- **专属表与列属性**：支持表级 `STRICT`（限定列类型为 `INT` / `INTEGER` / `REAL` / `TEXT` / `BLOB` / `ANY`，不区分大小写；`BIGINT`、`BOOLEAN` 等写法和无类型列都会被拒绝，给含这类列的表开启 STRICT 也会被拒绝）、`WITHOUT ROWID`（必须有主键且不能混用 `AUTOINCREMENT`），以及 `INTEGER` 单列主键的 `AUTOINCREMENT`。
+- **列类型按声明保留**：列类型只做大写和空白压缩（整段带引号的类型名去掉引号，与 SQLite 读回一致），不再把别名换成标准写法：`bigint` 存为 `BIGINT`、`boolean` 存为 `BOOLEAN`、`varchar(255)` 存为 `VARCHAR(255)`。导入、建表和 12 步表重建都保留原类型。
+- **rowid 别名**：只有声明为 `INTEGER` 的单列主键是 rowid 别名，也只有它能用 `AUTOINCREMENT`。`INT PRIMARY KEY`、`BIGINT PRIMARY KEY` 不是 rowid 别名，Dowel 不会在重建时把它们改成 `INTEGER`。
+- **无类型列**：非 STRICT 表允许列不声明类型（模型里 `type` 为空字符串），这样的列是 BLOB 亲和性，值原样保存；它和 `ANY`（非 STRICT 表里是 NUMERIC 亲和性）、`TEXT` 都不同，Dowel 不会替换成其中任何一个。属性面板清空类型框即为无类型；MCP 需显式传 `type: ""`。
 - **12 步表重建**：当发生 SQLite 不允许原地 `ALTER TABLE` 的结构变更（如调整列顺序、修改列类型或可空性、增删改主键/约束等）时，规划器自动生成官方 12 步重建步骤：在事务外关闭外键约束检查（`PRAGMA foreign_keys = OFF`），开启 `BEGIN IMMEDIATE` 事务建临时表 `_dowel_tmp_*`、拷贝数据、删旧表、改名并重建索引与触发器，执行 `PRAGMA foreign_key_check` 核对无外键冲突后提交，并在 `finally` 中兜底恢复 `PRAGMA foreign_keys = ON`。
 - **历史存储与安全沙箱**：目标库历史写在同库 `dowel_` 前缀表（保留字禁用前缀 `sqlite_` 与 `dowel_`），并启用数据库级防御模式与操作授权器拦截 `ATTACH`、`DETACH`、`VACUUM INTO` 与危险 `PRAGMA`。
 

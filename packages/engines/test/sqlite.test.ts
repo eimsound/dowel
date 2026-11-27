@@ -13,6 +13,7 @@ import {
   plan,
   renameColumn,
   setColumnExt,
+  setColumnType,
   setNotNull,
   setTableExt,
   validate,
@@ -448,6 +449,118 @@ describe('@dowel/engines SQLite adapter', () => {
       expect(verifyChain(state.versions)).toEqual([]);
     } finally {
       h.close();
+    }
+  });
+
+  it('Issues #140 & #141: preserves BIGINT/INT PKs, BOOLEAN, quoted types, and untyped columns through create, import, and 12-step rebuild', async () => {
+    // (a) sqliteCreateAll 建出含无类型列、BIGINT PK、INT PK、BOOLEAN 的库，读回后零差异、规划 0 步
+    const m = emptyModel('sqlite');
+    const main = createSchema(m, 'main');
+    const tBig = createTable(m, main, 'big_records');
+    const bigPk = addColumn(m, tBig, { name: 'id', type: 'bigint', notNull: true });
+    addPrimaryKey(m, tBig, [bigPk]);
+    const untypedCol = addColumn(m, tBig, { name: 'payload', type: '' });
+    addColumn(m, tBig, { name: 'flag', type: 'boolean' });
+
+    const tInt = createTable(m, main, 'int_records');
+    const intPk = addColumn(m, tInt, { name: 'id', type: 'int', notNull: true });
+    addPrimaryKey(m, tInt, [intPk]);
+    addColumn(m, tInt, { name: 'note', type: '', notNull: true, default: { expr: "'x'" } });
+
+    const h = openSqliteDb(':memory:');
+    try {
+      for (const s of createAll(m)) {
+        await sqliteEngine.execStepSql(h.db, s.sql);
+      }
+      const snap = await readSqliteSnapshot(h.db);
+      expect(snap.tables.big_records?.columns.id?.type).toBe('BIGINT');
+      expect(snap.tables.big_records?.columns.payload?.type).toBe('');
+      expect(snap.tables.big_records?.columns.flag?.type).toBe('BOOLEAN');
+      expect(snap.tables.int_records?.columns.id?.type).toBe('INT');
+      expect(snap.tables.int_records?.columns.note?.type).toBe('');
+
+      const imported = reconcileIds(m, importSqliteSnapshot(snap));
+      expect(plan(imported, m)).toEqual([]);
+      expect(plan(m, m)).toEqual([]);
+
+      // (c) 插入非整数 BIGINT 主键值 'xyz' 与无类型文本 '1'，触发 12 步重建不报 datatype mismatch 且数据原样保留
+      await h.db.exec(`INSERT INTO big_records (id, payload, flag) VALUES ('xyz', '1', 1)`);
+      const mRebuilt = structuredClone(m);
+      setNotNull(mRebuilt, untypedCol, true);
+      addCheck(mRebuilt, tBig, 'length(id) > 0');
+      const rebuildSteps = plan(m, mRebuilt);
+      expect(rebuildSteps.map((s) => s.kind)).toContain('rebuildTable');
+      for (const s of rebuildSteps) {
+        await sqliteEngine.execStepSql(h.db, s.sql);
+      }
+      const rows = await h.db.query<{ id: unknown; payload: unknown; payload_type: string }>(
+        'SELECT id, payload, typeof(payload) AS payload_type FROM big_records',
+      );
+      expect(rows).toEqual([{ id: 'xyz', payload: '1', payload_type: 'text' }]);
+      const snapAfterRebuild = await readSqliteSnapshot(h.db);
+      expect(snapAfterRebuild.tables.big_records?.columns.id?.type).toBe('BIGINT');
+      expect(snapAfterRebuild.tables.big_records?.columns.payload?.type).toBe('');
+      expect(plan(reconcileIds(mRebuilt, importSqliteSnapshot(snapAfterRebuild)), mRebuilt)).toEqual([]);
+
+      // (d) 无类型列 <-> TEXT 互相切换均触发 rebuildTable，执行并读回零差异
+      const mText = structuredClone(mRebuilt);
+      setColumnType(mText, untypedCol, 'TEXT');
+      const toTextSteps = plan(mRebuilt, mText);
+      expect(toTextSteps.map((s) => s.kind)).toContain('rebuildTable');
+      for (const s of toTextSteps) await sqliteEngine.execStepSql(h.db, s.sql);
+      const snapText = await readSqliteSnapshot(h.db);
+      expect(snapText.tables.big_records?.columns.payload?.type).toBe('TEXT');
+      expect(plan(reconcileIds(mText, importSqliteSnapshot(snapText)), mText)).toEqual([]);
+
+      const backSteps = plan(mText, mRebuilt);
+      expect(backSteps.map((s) => s.kind)).toContain('rebuildTable');
+      for (const s of backSteps) await sqliteEngine.execStepSql(h.db, s.sql);
+      const snapBack = await readSqliteSnapshot(h.db);
+      expect(snapBack.tables.big_records?.columns.payload?.type).toBe('');
+      expect(diffSqliteSnapshots(snapBack, snapAfterRebuild)).toEqual([]);
+    } finally {
+      h.close();
+    }
+
+    // (b) 原始 DDL 导入：BIGINT / 无类型 / BOOLEAN / INT 与引号类型名均与真实 SQLite 读回一致
+    const rawH = openSqliteDb(':memory:');
+    try {
+      await rawH.db.exec(`
+        CREATE TABLE raw_t (
+          id BIGINT PRIMARY KEY,
+          e,
+          b BOOLEAN,
+          n INT,
+          q1 "MyType",
+          q2 [weird],
+          q3 \`bt\`,
+          q4 'Text'
+        );
+      `);
+      const snapRaw = await readSqliteSnapshot(rawH.db);
+      const importedRaw = importSqliteSnapshot(snapRaw);
+      const colsByName = Object.fromEntries(all(importedRaw, 'column').map((c) => [c.name, c.type]));
+      expect(colsByName).toEqual({
+        id: 'BIGINT',
+        e: '',
+        b: 'BOOLEAN',
+        n: 'INT',
+        q1: 'MYTYPE',
+        q2: 'WEIRD',
+        q3: 'BT',
+        q4: 'TEXT',
+      });
+      expect(validate(importedRaw)).toEqual([]);
+
+      const freshRaw = openSqliteDb(':memory:');
+      try {
+        for (const s of createAll(importedRaw)) await sqliteEngine.execStepSql(freshRaw.db, s.sql);
+        expect(diffSqliteSnapshots(await readSqliteSnapshot(freshRaw.db), snapRaw)).toEqual([]);
+      } finally {
+        freshRaw.close();
+      }
+    } finally {
+      rawH.close();
     }
   });
 });

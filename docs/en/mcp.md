@@ -8,14 +8,14 @@ The server lives on the same port as the web app, at `POST /api/mcp` (stateless 
 
 ## 1. What AI can and can't do {#boundaries}
 
-| AI can                                                                                                                     | AI can't                                                                                    |
-| -------------------------------------------------------------------------------------------------------------------------- | ------------------------------------------------------------------------------------------- |
-| List projects, read the model, tables, objects such as views and functions, DDL, the version chain, and migration previews | Publish versions                                                                            |
-| Read environment status and drift **from the platform cache** (with the time it was cached)                                | Connect to an environment's target database (no live status, history, or drift checks)      |
-| Verify a migration in the shadow database (`verify` permission)                                                            | Execute, roll back, mark as applied, write a baseline, submit or approve execution requests |
-| Edit the working copy with an atomic batch of operations (`write` permission)                                              | Change connection strings, execution policies, tokens, or import a whole schema             |
-| Adjust canvas sections incrementally (`write` permission)                                                                  | Write table positions on the canvas (auto-layout and dragging decide them)                  |
-| Read canvas history and the diff of each change                                                                            | Restore canvas history (only people can restore, in the UI)                                 |
+| AI can                                                                                                                     | AI can't                                                                               |
+| -------------------------------------------------------------------------------------------------------------------------- | -------------------------------------------------------------------------------------- |
+| List projects, read the model, tables, objects such as views and functions, DDL, the version chain, and migration previews | Publish versions                                                                       |
+| Read environment status and drift **from the platform cache** (with the time it was cached)                                | Connect to an environment's target database (no live status, history, or drift checks) |
+| Verify a migration in the shadow database (`verify` permission)                                                            | Execute, roll back, mark as applied, submit or approve execution requests              |
+| Edit the working copy with an atomic batch of operations (`write` permission)                                              | Change connection strings, execution policies, tokens, or import a whole schema        |
+| Adjust canvas sections incrementally (`write` permission)                                                                  | Write table positions on the canvas (auto-layout and dragging decide them)             |
+| Read canvas history and the diff of each change                                                                            | Restore canvas history (only people can restore, in the UI)                            |
 
 Publishing and executing always stay with people in the Dowel UI, through your execution policies and approvals. Restoring canvas history is also done only by people in the UI.
 
@@ -209,6 +209,8 @@ How names are resolved:
 - **Circular foreign keys** (A references B and B references A): create all the tables with `defineTable` first, then add the remaining foreign keys with `addForeignKey` at the end of the same call.
 
 Auto-increment per dialect: PostgreSQL uses the column's `identity`; SQL Server uses `ext.mssql.identity` (`{ "seed": "1", "increment": "1" }`); MySQL uses `ext.mysql.autoIncrement`; SQLite uses an `INTEGER` single-column primary key with `ext.sqlite.autoincrement`. Using `identity`, `typeRef` or `partitionBy` on a dialect that does not support it is an error.
+
+SQLite column types are kept as declared (only uppercased with whitespace collapsed): `BIGINT`, `INT`, and `BOOLEAN` are not rewritten to `INTEGER`, and an `INT` or `BIGINT` single-column primary key is not a rowid alias and cannot use `ext.sqlite.autoincrement`. On non-STRICT tables, pass `type: ""` explicitly for an untyped column (BLOB affinity, unlike `ANY` or `TEXT`); omitting `type` in `defineTable` is still an error. STRICT tables accept only `INT`, `INTEGER`, `REAL`, `TEXT`, `BLOB`, and `ANY`. See [Database dialects](dialects.md#sqlite-features).
 
 **`alterColumn`** patches an existing column declaratively. `id` must be the ID of an existing column, or the `$ref` of a column created earlier in the same call — **never a column name**. Fields: `name`, `type` / `typeRef`, `notNull`, `default`, `identity`, `ext` (replaced as a whole; `null` clears it) and `comment`. Leave a field out to keep it; set it to `null` to clear it.
 

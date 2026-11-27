@@ -226,7 +226,7 @@ describe(`MSSQL (${MSSQL_VERSION}) executor integration`, () => {
     }
   }, 120_000);
 
-  it('supports baseline mode on existing database and enforces sp_getapplock mutual exclusion', async () => {
+  it('writes baseline on first migration execution and enforces sp_getapplock mutual exclusion', async () => {
     if (!adminUrl) return;
     const t = await createTestMssqlDb('mssql_lock');
     try {
@@ -238,24 +238,22 @@ describe(`MSSQL (${MSSQL_VERSION}) executor integration`, () => {
       for (const s of chain[0]!.upSteps) await engine.execStepSql(t.db, s.sql);
       await t.db.exec(`INSERT INTO [dbo].[users] ([id], [email]) VALUES (7, N'a@b.com');`);
 
-      // baseline 只写历史记录不重建表，数据保留
-      const rBase = await execute({
-        db: t.db,
-        dialect: 'mssql',
-        projectId: 'p-base',
-        projectName: 'Base App',
-        instanceId: 'inst-A',
-        chain,
-        mode: 'baseline',
-        executedBy: 'u1',
-      });
-      expect(rBase.baseline).toBe(true);
-      expect(rBase.current).toBe('v-0');
+      // 没有后续迁移时直接执行到 v-0 被拒绝（引导改用标记为已执行）
+      const markErr = await fails(
+        execute({
+          db: t.db,
+          dialect: 'mssql',
+          projectId: 'p-base',
+          projectName: 'Base App',
+          instanceId: 'inst-A',
+          chain,
+          to: 'v-0',
+          executedBy: 'u1',
+        }),
+      );
+      expect(markErr.code).toBe('mark_required');
 
-      const userRows = await t.db.query<{ id: string | number }>(`SELECT [id] FROM [dbo].[users]`);
-      expect(Number(userRows[0]?.id)).toBe(7);
-
-      // sp_getapplock 互斥测试：第二连接在持锁期间抢锁必超时
+      // sp_getapplock 互斥测试：首次执行 v-1 自动先写基线再执行 v-1，第二连接在持锁期间抢锁必超时
       const slowSteps: ScriptStep[] = [
         ...chain[1]!.upSteps,
         { sql: "WAITFOR DELAY '00:00:01.500'", transactional: true },
@@ -293,7 +291,11 @@ describe(`MSSQL (${MSSQL_VERSION}) executor integration`, () => {
         expect(lockErr.code).toBe('lock_timeout');
 
         const finished = await firstRun;
+        expect(finished.baseline).toBe(true);
         expect(finished.current).toBe('v-1');
+
+        const userRows = await t.db.query<{ id: string | number }>(`SELECT [id] FROM [dbo].[users]`);
+        expect(Number(userRows[0]?.id)).toBe(7);
       } finally {
         await other.close();
       }
