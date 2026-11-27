@@ -94,6 +94,8 @@ export const execute = (
 ): ExecuteResult => {
   const overlay = new Map<string, Obj | undefined>();
   const proxyCache = new Map<string, Obj>();
+  // 叠加索引的写入跟踪（有索引时才有）：每次写入后通知，使名字占用查询与推导名刷新可以增量进行
+  let noteWrite: ((id: string) => void) | null = null;
 
   const ensureCloned = (rootId: string): Obj | undefined => {
     if (overlay.has(rootId)) return overlay.get(rootId);
@@ -140,12 +142,16 @@ export const execute = (
         const mut = getMutableParent();
         if (!mut) return false;
         const clean = value !== null && typeof value === 'object' ? clonePlain(value) : value;
-        return Reflect.set(mut, prop, clean);
+        const ok = Reflect.set(mut, prop, clean);
+        noteWrite?.(rootId);
+        return ok;
       },
       deleteProperty(_t, prop) {
         const mut = getMutableParent();
         if (!mut) return false;
-        return Reflect.deleteProperty(mut, prop);
+        const ok = Reflect.deleteProperty(mut, prop);
+        noteWrite?.(rootId);
+        return ok;
       },
       defineProperty(_t, prop, desc) {
         const mut = getMutableParent();
@@ -154,7 +160,9 @@ export const execute = (
           'value' in desc && desc.value !== null && typeof desc.value === 'object'
             ? { ...desc, value: clonePlain(desc.value) }
             : desc;
-        return Reflect.defineProperty(mut, prop, cleanDesc);
+        const ok = Reflect.defineProperty(mut, prop, cleanDesc);
+        noteWrite?.(rootId);
+        return ok;
       },
       ownKeys() {
         const cur = getCurrent();
@@ -201,12 +209,14 @@ export const execute = (
     set(_t, prop, value) {
       if (typeof prop !== 'string') return false;
       overlay.set(prop, clonePlain(value as Obj));
+      noteWrite?.(prop);
       return true;
     },
     deleteProperty(_t, prop) {
       if (typeof prop !== 'string') return true;
       if (Object.hasOwn(m.objects, prop) || overlay.has(prop)) {
         overlay.set(prop, undefined);
+        noteWrite?.(prop);
       }
       return true;
     },
@@ -236,6 +246,7 @@ export const execute = (
   if (!baseIndex && COMPOSITE_MUTATORS.has(name)) baseIndex = new MutableModelIndex(m);
   if (baseIndex) {
     const overlayIndex = new OverlayModelIndex(baseIndex, overlay, draft, wrapRoot);
+    noteWrite = overlayIndex.trackWrites();
     withModelIndex(draft, () => runMutator(draft, name, args), overlayIndex);
   } else {
     runMutator(draft, name, args);
