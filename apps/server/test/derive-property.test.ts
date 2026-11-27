@@ -3,7 +3,9 @@
 // 用一个假引擎代替影子库：规范形式只取决于对象自身文本和 derive-pending.ts 声明会影响它的上下文
 // （表达式：同表被引用列的 type / typeRef / collation——按列名解析，分区子表沿 partitionOf 用根父表的列——，
 // 列自身的默认值 / 生成列再加上自己的类型；不透明对象：父对象与依赖的完整限定名、依赖列的类型，
-// 依赖的不透明对象再递归带上它自己的这份签名，模拟视图叠视图）。真实 canonicalize（apps/server/src/shadow.ts 的 shadowOps.canonicalize）会读回并比较全部对象，
+// 依赖的不透明对象再递归带上它自己的这份签名，模拟视图叠视图；表达式里直接写的枚举转换 `0::mood` 标上它当前按名字
+// 绑定的枚举 ID，#146；MSSQL 世界里持久化计算列的 notNull 由被引用普通列的 notNull 推断，#145；解析不出来的存量字符串
+// 分区键按表达式处理，子分区边界带上它引用的父表列类型）。真实 canonicalize（apps/server/src/shadow.ts 的 shadowOps.canonicalize）会读回并比较全部对象，
 // 判定正确时变化的也只会是待规范化对象；假引擎刻意更严格，只改写 pendingRefreshIds(prev, next) 里的对象——这样判定漏掉的对象不会被顺手改好，
 // 会在 I1 / I2 里暴露出来（规范形式本身用不依赖判定的 canonObj 独立计算）。
 //
@@ -30,6 +32,7 @@ import {
   EditError,
   emptyModel,
   formatPartitionBound,
+  ident,
   type Model,
   type Obj,
   parsePartitionBound,
@@ -58,24 +61,22 @@ type Table = Extract<Obj, { kind: 'table' }>;
 
 const COLUMN_NAMES = ['qty', 'price', 'note', 'flag', 'score', 'total', 'rate'] as const;
 const TABLE_NAMES = ['orders', 'items', 'users2', 'ledger'] as const;
-const ENUM_NAMES = ['mood', 'tone', 'phase'] as const;
+const ENUM_NAMES = ['mood', 'tone', 'phase', 'Mood'] as const;
 const SCHEMA_NAMES = ['public', 'app'] as const;
 const TYPES = ['integer', 'bigint', 'text', 'numeric'] as const;
 const COLLATIONS = [null, 'C', 'POSIX'] as const;
 const OPS = ['>', '<', '<>', '>='] as const;
 
-/** 类型注解：`::` 之后的单个标识符（PG 列引用分析会跳过它，renameInExpr / exprReferences 不受影响） */
+/** 类型注解：`::` 之后的单个标识符，带 `ty_` 前缀以与各方言规范化后的类型拼写及用户原文里的枚举转换彻底隔离（PG 列引用分析会跳过它，renameInExpr / exprReferences 不受影响） */
 const annot = (c: Column): string =>
-  `${c.type}${c.typeRef ? `_r_${c.typeRef}` : ''}${c.collation ? `_c_${c.collation}` : ''}`;
+  `ty_${c.type.replace(/[^A-Za-z0-9_]/g, '_')}${c.typeRef ? `_r_${c.typeRef}` : ''}${c.collation ? `_c_${c.collation.replace(/[^A-Za-z0-9_]/g, '_')}` : ''}`;
+
+/** 假引擎加的注解：列类型注解（ty_ 开头）与枚举绑定注解（en_ 开头）；与列类型拼写无关，也不会误剥用户原文里的 `::mood` / `::public."Mood"` */
+const ANNOT_RE = /::(?:ty_|en_)[A-Za-z0-9_]*/g;
 
 /** 去掉规范化加上的注解和括号，得到用户原文的词序列（规范化因此幂等） */
 const coreTokens = (s: string): string[] =>
-  s
-    .replace(/::[A-Za-z0-9_]+/g, '')
-    .replace(/[()]/g, ' ')
-    .trim()
-    .split(/\s+/)
-    .filter(Boolean);
+  s.replace(ANNOT_RE, '').replace(/[()]/g, ' ').trim().split(/\s+/).filter(Boolean);
 
 /** 表的有效列（按名字）：分区子表没有自己的列，沿 partitionOf 用根父表的列 */
 const columnsByName = (m: Model, tableId: string): Map<string, Column> => {
@@ -85,12 +86,31 @@ const columnsByName = (m: Model, tableId: string): Map<string, Column> => {
   return out;
 };
 
-/** 表达式的规范形式：加括号，给每个同表列引用标上该列的类型；列自己的默认值 / 生成列再标上自己的类型 */
-const canonExpr = (text: string, cols: Map<string, Column>, own?: Column): string => {
+/** 表达式里直接写的枚举转换 `0::mood` / `0::public.mood` / `0::public."Mood"` */
+const ENUM_CAST_RE = /^.*::(?:([A-Za-z0-9_]+)\.)?(?:"((?:[^"]|"")*)"|([A-Za-z0-9_]+))$/;
+
+/** 枚举名（可带 schema）在模型 m 里绑定到的枚举 ID；没有则为 'none' */
+const enumBinding = (m: Model, schema: string | undefined, name: string): string =>
+  Object.values(m.objects).find(
+    (o) =>
+      o.kind === 'enum' &&
+      o.name === name &&
+      (schema === undefined || (m.objects[o.parent] as { name?: string } | undefined)?.name === schema),
+  )?.id ?? 'none';
+
+/**
+ * 表达式的规范形式：加括号，给每个同表列引用标上该列的类型；列自己的默认值 / 生成列再标上自己的类型；
+ * 直接写的枚举转换标上它当前绑定的枚举 ID（模拟 PG 按 OID 存表达式：名字换了绑定，读回的类型名跟着变，#146）
+ */
+const canonExpr = (m: Model, text: string, cols: Map<string, Column>, own?: Column): string => {
   const body = `(${coreTokens(text)
     .map((t) => {
       const c = cols.get(t);
-      return c ? `${t}::${annot(c)}` : t;
+      if (c) return `${t}::${annot(c)}`;
+      const en = ENUM_CAST_RE.exec(t);
+      return en
+        ? `${t}::en_${enumBinding(m, en[1], en[2] !== undefined ? en[2].replaceAll('""', '"') : en[3]!)}`
+        : t;
     })
     .join(' ')})`;
   return own ? `${body}::${annot(own)}` : body;
@@ -121,8 +141,10 @@ const partKeySig = (m: Model, parentId: string): string => {
   const p = m.objects[parentId];
   if (p?.kind !== 'table' || !p.partitionBy) return 'none';
   const spec = resolvePartitionBy(m, p);
-  if (!spec) return `raw_${typeof p.partitionBy === 'string' ? safeTok(p.partitionBy) : 'spec'}`;
   const cols = columnsByName(m, parentId);
+  // 解析不出来的存量字符串：按表达式处理（引用到的父表列带上类型），与判定里 hasExpr: true 一致
+  if (!spec)
+    return `raw_${typeof p.partitionBy === 'string' ? safeTok(canonExpr(m, p.partitionBy, cols)) : 'spec'}`;
   const keys = spec.keys.map((k) => {
     const extra = `${k.opclass ? `_op_${safeTok(k.opclass)}` : ''}${k.collation ? `_co_${safeTok(k.collation)}` : ''}`;
     if (k.column !== null) {
@@ -131,7 +153,7 @@ const partKeySig = (m: Model, parentId: string): string => {
       const en = col.typeRef ? `_en_${safeTok(fullName(m, col.typeRef) ?? '')}` : '';
       return `col_${safeTok(annot(col))}${en}${extra}`;
     }
-    return `expr_${safeTok(canonExpr(k.expr!, cols))}${extra}`;
+    return `expr_${safeTok(canonExpr(m, k.expr!, cols))}${extra}`;
   });
   return `${spec.strategy}__${keys.join('__')}`;
 };
@@ -170,7 +192,7 @@ const canonObj = (m: Model, o: Obj): Obj => {
         const cols = columnsByName(m, o.id);
         partitionBy = {
           ...partitionBy,
-          keys: partitionBy.keys.map((k) => (k.expr ? { ...k, expr: canonExpr(k.expr, cols) } : k)),
+          keys: partitionBy.keys.map((k) => (k.expr ? { ...k, expr: canonExpr(m, k.expr, cols) } : k)),
         };
         changed = true;
       }
@@ -182,23 +204,36 @@ const canonObj = (m: Model, o: Obj): Obj => {
       return changed ? { ...o, partitionBy, partitionOf } : o;
     }
     case 'check':
-      return { ...o, expr: canonExpr(o.expr, columnsByName(m, o.parent)) };
+      return { ...o, expr: canonExpr(m, o.expr, columnsByName(m, o.parent)) };
     case 'index': {
       const cols = columnsByName(m, o.parent);
       return {
         ...o,
-        elements: o.elements.map((e) => (e.expr ? { ...e, expr: canonExpr(e.expr, cols) } : e)),
-        where: o.where ? canonExpr(o.where, cols) : o.where,
+        elements: o.elements.map((e) => (e.expr ? { ...e, expr: canonExpr(m, e.expr, cols) } : e)),
+        where: o.where ? canonExpr(m, o.where, cols) : o.where,
       };
     }
     case 'column': {
       if (!o.generated && !(o.default && 'expr' in o.default)) return o;
       const cols = columnsByName(m, o.parent);
-      return {
+      const out = {
         ...o,
-        generated: o.generated ? { ...o.generated, expr: canonExpr(o.generated.expr, cols, o) } : o.generated,
-        default: o.default && 'expr' in o.default ? { expr: canonExpr(o.default.expr, cols, o) } : o.default,
+        generated: o.generated
+          ? { ...o.generated, expr: canonExpr(m, o.generated.expr, cols, o) }
+          : o.generated,
+        default:
+          o.default && 'expr' in o.default ? { expr: canonExpr(m, o.default.expr, cols, o) } : o.default,
       };
+      // MSSQL 持久化计算列：引擎按被引用列推断可空性并写回 notNull（声明了 NOT NULL 或被引用的普通列全都 NOT NULL 时
+      // 读回 NOT NULL，#145）。SQL Server 不允许计算列引用计算列；引用了生成列按可空处理，规范形式因此幂等
+      if (m.dialect === 'mssql' && o.generated?.stored) {
+        const refs = coreTokens(o.generated.expr).flatMap((t) => {
+          const c = cols.get(t);
+          return c && c.id !== o.id ? [c] : [];
+        });
+        out.notNull = o.notNull || (refs.length > 0 && refs.every((c) => c.notNull && !c.generated));
+      }
+      return out;
     }
     case 'opaque':
       return { ...o, ddl: canonDdl(m, o) };
@@ -306,6 +341,9 @@ interface ExprSpec {
   refs: number[];
   op: number;
   lit: number;
+  /** 再直接写一个枚举转换 `0::<enum>`（q：带 schema 限定）；表内不一定有列引用这个枚举（#146） */
+  en?: number | null;
+  q?: boolean;
 }
 
 type Edit =
@@ -333,7 +371,12 @@ type Edit =
   | { k: 'editViewDdl'; v: number; rev: number }
   | { k: 'detachPartition'; t: number }
   | { k: 'attachPartition'; t: number; p: number; lo: number }
-  | { k: 'setPartitionBy'; t: number; col: number; expr: ExprSpec | null };
+  | { k: 'setPartitionBy'; t: number; col: number; expr: ExprSpec | null }
+  | { k: 'setNotNull'; c: number; v: boolean }
+  | { k: 'createEnum'; name: number }
+  | { k: 'dropEnum'; e: number }
+  | { k: 'swapEnumNames'; a: number; b: number }
+  | { k: 'setLegacyPartitionBy'; t: number; col: number };
 
 const idsOf = (m: Model, kind: Obj['kind'], f: (o: Obj) => boolean = () => true) =>
   Object.values(m.objects)
@@ -350,7 +393,28 @@ const exprText = (m: Model, tableId: string, e: ExprSpec): string | null => {
   );
   if (!cols.length) return null;
   const refs = e.refs.map((r) => pick(cols, r)!);
+  const en = e.en === null || e.en === undefined ? undefined : pick(idsOf(m, 'enum'), e.en);
+  if (en) {
+    const o = m.objects[en] as Extract<Obj, { kind: 'enum' }>;
+    refs.push(`0::${e.q ? `${m.objects[o.parent]!.name}.` : ''}${ident(o.name)}`);
+  }
   return `${refs.join(' + ')} ${OPS[e.op % OPS.length]} ${e.lit}`;
+};
+
+/**
+ * 列名出现在同一分区家族某张表的存量字符串 partitionBy 里：生成器不删 / 不改名这种列——PG 不允许删分区键列，
+ * 存量字符串也不会被改名改写（解析不出来就原样保留），这两条路径不在判定的建模范围内
+ */
+const inLegacyKey = (m: Model, colId: string): boolean => {
+  const c = m.objects[colId] as Column;
+  const root = rootTableId(m, c.parent);
+  return Object.values(m.objects).some(
+    (o) =>
+      o.kind === 'table' &&
+      typeof o.partitionBy === 'string' &&
+      rootTableId(m, o.id) === root &&
+      coreTokens(o.partitionBy).includes(c.name),
+  );
 };
 
 let fresh = 0;
@@ -436,7 +500,7 @@ const applyEdit = (m: Model, e: Edit): boolean => {
       }
       case 'renameColumn': {
         const id = pick(columns, e.c);
-        if (!id) return false;
+        if (!id || inLegacyKey(m, id)) return false;
         runMutator(m, 'renameColumn', { id, name: pick(COLUMN_NAMES, e.name)! });
         return true;
       }
@@ -457,7 +521,7 @@ const applyEdit = (m: Model, e: Edit): boolean => {
         return true;
       case 'dropColumn': {
         const id = pick(columns, e.c);
-        if (!id) return false;
+        if (!id || inLegacyKey(m, id)) return false;
         runMutator(m, 'dropColumn', { id });
         return true;
       }
@@ -568,6 +632,58 @@ const applyEdit = (m: Model, e: Edit): boolean => {
         });
         return true;
       }
+      case 'setNotNull': {
+        const id = pick(columns, e.c);
+        if (!id) return false;
+        runMutator(m, 'setNotNull', { id, notNull: e.v });
+        return true;
+      }
+      case 'createEnum': {
+        // 同名枚举删掉后再建：名字一样、ID 不同（表达式原文不变，绑定换了）
+        runMutator(m, 'createEnum', {
+          id: newId('e'),
+          schema: 's',
+          name: pick(ENUM_NAMES, e.name)!,
+          values: ['ok'],
+        });
+        return true;
+      }
+      case 'swapEnumNames': {
+        // 没有 mutator：模拟换入另一条历史分支上两个枚举对调过名字的快照（表达式原文逐字不变，名字换了绑定，#146）
+        const a = pick(enums, e.a);
+        if (!a) return false;
+        const ea = m.objects[a] as Extract<Obj, { kind: 'enum' }>;
+        const others = enums.filter(
+          (id) => id !== a && (m.objects[id] as Extract<Obj, { kind: 'enum' }>).parent === ea.parent,
+        );
+        const b = pick(others, e.b);
+        if (!b) return false;
+        const eb = m.objects[b] as Extract<Obj, { kind: 'enum' }>;
+        [ea.name, eb.name] = [eb.name, ea.name];
+        return true;
+      }
+      case 'dropEnum': {
+        const id = pick(enums, e.e);
+        if (!id) return false;
+        runMutator(m, 'dropEnum', { id });
+        return true;
+      }
+      case 'setLegacyPartitionBy': {
+        // 没有 mutator：模拟旧版本遗留、解析不出来的 partitionBy 字符串（PR #138 评审）
+        const t = pick(
+          idsOf(m, 'table', (o) => (o as Table).partitionBy !== null),
+          e.t,
+        );
+        if (!t) return false;
+        const root = rootTableId(m, t);
+        const col = pick(
+          idsOf(m, 'column', (o) => (o as Column).parent === root),
+          e.col,
+        );
+        if (!col) return false;
+        (m.objects[t] as Table).partitionBy = `WEIRD (${(m.objects[col] as Column).name})`;
+        return true;
+      }
     }
   } catch (err) {
     if (err instanceof EditError) return false;
@@ -575,7 +691,40 @@ const applyEdit = (m: Model, e: Edit): boolean => {
   }
 };
 
-const initialModel = (): Model => {
+/** MSSQL 版初始模型：没有枚举与分区（这两类编辑在 MSSQL 上被拒绝），用来覆盖持久化计算列的可空性（#145） */
+const initialMssqlModel = (): Model => {
+  const m = emptyModel('mssql');
+  runMutator(m, 'createSchema', { id: 's', name: 'dbo' });
+  runMutator(m, 'createTable', { id: 't1', schema: 's', name: 'orders' });
+  runMutator(m, 'addColumn', { table: 't1', column: { id: 'c1', name: 'qty', type: 'integer' } });
+  runMutator(m, 'addColumn', {
+    table: 't1',
+    column: { id: 'c2', name: 'price', type: 'numeric', notNull: true },
+  });
+  runMutator(m, 'addColumn', { table: 't1', column: { id: 'c3', name: 'note', type: 'text' } });
+  runMutator(m, 'addColumn', {
+    table: 't1',
+    column: { id: 'g1', name: 'qty_g', type: 'integer', generated: { expr: 'qty > 0', stored: true } },
+  });
+  runMutator(m, 'createTable', { id: 't2', schema: 's', name: 'items' });
+  runMutator(m, 'addColumn', { table: 't2', column: { id: 'c4', name: 'score', type: 'integer' } });
+  runMutator(m, 'addColumn', { table: 't2', column: { id: 'c5', name: 'flag', type: 'text' } });
+  runMutator(m, 'addColumn', {
+    table: 't2',
+    column: {
+      id: 'g2',
+      name: 'score_g',
+      type: 'integer',
+      generated: { expr: 'score + 1 >= 0', stored: true },
+    },
+  });
+  return m;
+};
+
+type Dialect = 'pg' | 'mssql';
+
+const initialModel = (dialect: Dialect = 'pg'): Model => {
+  if (dialect === 'mssql') return initialMssqlModel();
   const m = emptyModel();
   runMutator(m, 'createSchema', { id: 's', name: 'public' });
   runMutator(m, 'createEnum', { id: 'e1', schema: 's', name: 'mood', values: ['ok', 'bad'] });
@@ -645,6 +794,8 @@ const exprArb: fc.Arbitrary<ExprSpec> = fc.record({
   refs: fc.array(nat, { minLength: 1, maxLength: 2 }),
   op: nat,
   lit: fc.integer({ min: 0, max: 9 }),
+  en: fc.option(nat, { freq: 4 }),
+  q: fc.boolean(),
 });
 const editArb: fc.Arbitrary<Edit> = fc.oneof(
   { weight: 3, arbitrary: fc.record({ k: fc.constant('addCheck' as const), t: nat, e: exprArb }) },
@@ -677,11 +828,11 @@ const editArb: fc.Arbitrary<Edit> = fc.oneof(
   { weight: 1, arbitrary: fc.record({ k: fc.constant('setCollation' as const), c: nat, coll: nat }) },
   { weight: 2, arbitrary: fc.record({ k: fc.constant('renameColumn' as const), c: nat, name: nat }) },
   { weight: 2, arbitrary: fc.record({ k: fc.constant('renameTable' as const), t: nat, name: nat }) },
-  { weight: 1, arbitrary: fc.record({ k: fc.constant('renameEnum' as const), e: nat, name: nat }) },
+  { weight: 2, arbitrary: fc.record({ k: fc.constant('renameEnum' as const), e: nat, name: nat }) },
   { weight: 1, arbitrary: fc.record({ k: fc.constant('renameSchema' as const), name: nat }) },
   { weight: 1, arbitrary: fc.record({ k: fc.constant('dropColumn' as const), c: nat }) },
   {
-    weight: 2,
+    weight: 4,
     arbitrary: fc.record({
       k: fc.constant('addView' as const),
       t: nat,
@@ -691,10 +842,10 @@ const editArb: fc.Arbitrary<Edit> = fc.oneof(
       viewDep: fc.option(nat),
     }),
   },
-  { weight: 1, arbitrary: fc.record({ k: fc.constant('editViewDdl' as const), v: nat, rev: nat }) },
-  { weight: 1, arbitrary: fc.record({ k: fc.constant('detachPartition' as const), t: nat }) },
+  { weight: 2, arbitrary: fc.record({ k: fc.constant('editViewDdl' as const), v: nat, rev: nat }) },
+  { weight: 2, arbitrary: fc.record({ k: fc.constant('detachPartition' as const), t: nat }) },
   {
-    weight: 3,
+    weight: 4,
     arbitrary: fc.record({
       k: fc.constant('attachPartition' as const),
       t: nat,
@@ -711,69 +862,98 @@ const editArb: fc.Arbitrary<Edit> = fc.oneof(
       expr: fc.option(exprArb, { freq: 3 }),
     }),
   },
+  { weight: 1, arbitrary: fc.record({ k: fc.constant('setNotNull' as const), c: nat, v: fc.boolean() }) },
+  { weight: 1, arbitrary: fc.record({ k: fc.constant('createEnum' as const), name: nat }) },
+  { weight: 1, arbitrary: fc.record({ k: fc.constant('dropEnum' as const), e: nat }) },
+  { weight: 3, arbitrary: fc.record({ k: fc.constant('swapEnumNames' as const), a: nat, b: nat }) },
+  {
+    weight: 1,
+    arbitrary: fc.record({ k: fc.constant('setLegacyPartitionBy' as const), t: nat, col: nat }),
+  },
 );
 const faultArb: fc.Arbitrary<Fault> = fc.oneof(
   { weight: 6, arbitrary: fc.constant({ kind: 'none' as const }) },
   {
-    weight: 2,
+    weight: 3,
     arbitrary: fc
       .constantFrom('nullShadow', 'shadowError', 'stepError', 'otherError')
       .map((kind) => ({ kind })),
   },
   {
-    weight: 1,
-    arbitrary: fc.record({ kind: fc.constant('reject' as const), times: fc.integer({ min: 1, max: 5 }) }),
+    weight: 2,
+    arbitrary: fc.record({ kind: fc.constant('reject' as const), times: fc.integer({ min: 1, max: 6 }) }),
   },
   { weight: 2, arbitrary: fc.record({ kind: fc.constant('concurrent' as const), edit: editArb }) },
 );
-const opArb: fc.Arbitrary<Op> = fc.oneof(
-  { weight: 8, arbitrary: editArb.map((edit) => ({ op: 'edit' as const, edit })) },
-  { weight: 4, arbitrary: faultArb.map((fault) => ({ op: 'flush' as const, fault })) },
-  { weight: 2, arbitrary: faultArb.map((fault) => ({ op: 'normalize' as const, fault })) },
-  { weight: 1, arbitrary: fc.record({ op: fc.constant('runWithoutReset' as const), h: nat }) },
-  {
-    weight: 2,
-    arbitrary: fc.record({
-      op: fc.constant('runWithResetIfClean' as const),
-      h: nat,
-      canonical: fc.boolean(),
-    }),
-  },
-  { weight: 1, arbitrary: fc.record({ op: fc.constant('runWithResetFixedPoint' as const), h: nat }) },
+/** MSSQL 世界的编辑：多数 PG 专属编辑在 MSSQL 上被拒绝，加重改 NOT NULL 与加持久化计算列，让可空性改写真正发生 */
+const mssqlEditArb: fc.Arbitrary<Edit> = fc.oneof(
+  { weight: 3, arbitrary: editArb },
+  { weight: 3, arbitrary: fc.record({ k: fc.constant('setNotNull' as const), c: nat, v: fc.boolean() }) },
   {
     weight: 1,
     arbitrary: fc.record({
-      op: fc.constant('runWithResetThrows' as const),
-      h: nat,
-      onlyIfClean: fc.boolean(),
-    }),
-  },
-  {
-    weight: 1,
-    arbitrary: fc.record({
-      op: fc.constant('freshRefresher' as const),
-      h: fc.option(nat),
-      seeded: fc.boolean(),
+      k: fc.constant('addGenerated' as const),
+      t: nat,
+      name: nat,
+      type: nat,
+      e: exprArb,
     }),
   },
 );
+const opArbFor = (editArb: fc.Arbitrary<Edit>): fc.Arbitrary<Op> =>
+  fc.oneof(
+    { weight: 8, arbitrary: editArb.map((edit) => ({ op: 'edit' as const, edit })) },
+    { weight: 4, arbitrary: faultArb.map((fault) => ({ op: 'flush' as const, fault })) },
+    { weight: 3, arbitrary: faultArb.map((fault) => ({ op: 'normalize' as const, fault })) },
+    { weight: 1, arbitrary: fc.record({ op: fc.constant('runWithoutReset' as const), h: nat }) },
+    {
+      weight: 2,
+      arbitrary: fc.record({
+        op: fc.constant('runWithResetIfClean' as const),
+        h: nat,
+        canonical: fc.boolean(),
+      }),
+    },
+    { weight: 1, arbitrary: fc.record({ op: fc.constant('runWithResetFixedPoint' as const), h: nat }) },
+    {
+      weight: 1,
+      arbitrary: fc.record({
+        op: fc.constant('runWithResetThrows' as const),
+        h: nat,
+        onlyIfClean: fc.boolean(),
+      }),
+    },
+    {
+      weight: 1,
+      arbitrary: fc.record({
+        op: fc.constant('freshRefresher' as const),
+        h: fc.option(nat),
+        seeded: fc.boolean(),
+      }),
+    },
+  );
+const opArb = opArbFor(editArb);
+const mssqlOpArb = opArbFor(mssqlEditArb);
 
 // ───── 执行器 ─────
 
 class World {
-  room = new MemRoom(initialModel());
+  room: MemRoom;
   /** 房间历次模型（画布历史 / 版本 / 目标库快照的来源） */
-  history: Model[] = [structuredClone(this.room.m)];
+  history: Model[];
   fault: Fault = { kind: 'none' };
   canonReturned = 0;
   shadowAsked = 0;
   base = memStore();
-  refresher = this.newRefresher();
+  refresher: OpaqueRefresher;
   /** 覆盖率统计：每次运行独立持有，避免全局状态依赖测试执行顺序 */
   private stats?: Map<string, number>;
 
-  constructor(stats?: Map<string, number>) {
+  constructor(stats?: Map<string, number>, dialect: Dialect = 'pg') {
     this.stats = stats;
+    this.room = new MemRoom(initialModel(dialect));
+    this.history = [structuredClone(this.room.m)];
+    this.refresher = this.newRefresher();
   }
 
   private hit(k: string) {
@@ -821,6 +1001,19 @@ class World {
           this.hit('rewrite:onPartitionChild');
         if (o.kind === 'opaque' && o.deps.some((d) => next.objects[d]?.kind === 'opaque'))
           this.hit('rewrite:opaque:onOpaque');
+        // 直接写的枚举转换换了绑定（#146）、MSSQL 持久化计算列的可空性（#145）、存量字符串分区键下的边界（PR #138 评审）
+        const enAnnots = (x: Obj) =>
+          JSON.stringify(x)
+            .match(/::en_[A-Za-z0-9_]+/g)
+            ?.join() ?? '';
+        if (enAnnots(o) && enAnnots(c) !== enAnnots(o)) this.hit('rewrite:enumBinding');
+        if (o.kind === 'column' && c.kind === 'column' && c.notNull !== o.notNull)
+          this.hit('rewrite:column:mssqlNotNull');
+        if (o.kind === 'table' && o.partitionOf) {
+          const parent = next.objects[o.partitionOf.parent];
+          if (parent?.kind === 'table' && typeof parent.partitionBy === 'string')
+            this.hit('rewrite:legacyPartitionBound');
+        }
         out.push(structuredClone(c));
       }
     }
@@ -1012,9 +1205,9 @@ class World {
   }
 }
 
-const runOps = async (ops: Op[], stats?: Map<string, number>) => {
+const runOps = async (ops: Op[], stats?: Map<string, number>, dialect: Dialect = 'pg') => {
   fresh = 0;
-  const w = new World(stats);
+  const w = new World(stats, dialect);
   w.checkInvariants(0);
   for (const [i, op] of ops.entries()) {
     await w.run(op);
@@ -1024,11 +1217,11 @@ const runOps = async (ops: Op[], stats?: Map<string, number>) => {
 };
 
 describe('假引擎自检', () => {
-  test('规范形式幂等：canonModel 之后每个对象都是不动点', () => {
+  test.each(['pg', 'mssql'] as const)('规范形式幂等（%s）：canonModel 之后每个对象都是不动点', (dialect) => {
     fc.assert(
       fc.property(fc.array(editArb, { maxLength: 30, size: 'max' }), (edits) => {
         fresh = 0;
-        const m = initialModel();
+        const m = initialModel(dialect);
         for (const e of edits) {
           const draft = structuredClone(m);
           if (applyEdit(draft, e)) Object.assign(m, draft);
@@ -1041,52 +1234,135 @@ describe('假引擎自检', () => {
     );
   });
 
-  test('判定与假引擎一致：规范模型上只改上下文，凡是规范形式变了的对象都被判为待规范化', () => {
-    fc.assert(
-      fc.property(
-        fc.array(editArb, { maxLength: 20, size: 'max' }),
-        fc.array(editArb, { maxLength: 8, size: 'max' }),
-        (pre, post) => {
-          fresh = 0;
-          let m = initialModel();
-          for (const e of pre) {
-            const draft = structuredClone(m);
-            if (applyEdit(draft, e)) m = draft;
-          }
-          const good = canonModel(m);
-          let cur = structuredClone(good);
-          for (const e of post) {
-            const draft = structuredClone(cur);
-            if (applyEdit(draft, e)) cur = draft;
-          }
-          const pending = new Set(pendingRefreshIds(good, cur));
-          const missed = nonFixed(
-            cur,
-            Object.keys(cur.objects).filter((id) => !pending.has(id)),
-          );
-          expect(missed).toEqual([]);
+  test.each(['pg', 'mysql', 'mssql', 'sqlite'] as const)(
+    '规范形式幂等（%s，含 #139 规范类型与带引号枚举名）：固定样例保持不动点',
+    (dialect) => {
+      const m = emptyModel(dialect);
+      const schemaName = { pg: 'public', mysql: 'default', mssql: 'dbo', sqlite: 'main' }[dialect];
+      runMutator(m, 'createSchema', { id: 's', name: schemaName });
+      runMutator(m, 'createTable', { id: 't1', schema: 's', name: 'orders' });
+      runMutator(m, 'addColumn', { table: 't1', column: { id: 'c1', name: 'qty', type: 'integer' } });
+      runMutator(m, 'addColumn', {
+        table: 't1',
+        column: { id: 'c2', name: 'price', type: 'numeric', notNull: true },
+      });
+      runMutator(m, 'addColumn', {
+        table: 't1',
+        column: {
+          id: 'c3',
+          name: 'note',
+          type: 'varchar(32)',
+          collation: dialect === 'sqlite' ? 'nocase' : null,
+          default: { expr: "'ok'" },
         },
-      ),
-      { numRuns: RUNS, seed: SEED },
-    );
-  });
+      });
+      runMutator(m, 'addColumn', {
+        table: 't1',
+        column: {
+          id: 'g1',
+          name: 'qty_g',
+          type: 'int',
+          generated: { expr: 'qty + 1', stored: true },
+        },
+      });
+      let checkExpr = "qty > 0 AND price >= 0 AND note <> ''";
+      if (dialect === 'pg') {
+        runMutator(m, 'addColumn', { table: 't1', column: { id: 'c4', name: 'ts', type: 'timestamptz' } });
+        runMutator(m, 'addColumn', { table: 't1', column: { id: 'c5', name: 'bits', type: 'bit' } });
+        runMutator(m, 'createEnum', { id: 'e1', schema: 's', name: 'mood', values: ['ok'] });
+        runMutator(m, 'createEnum', { id: 'e2', schema: 's', name: 'Mood', values: ['ok'] });
+        runMutator(m, 'createEnum', { id: 'e3', schema: 's', name: 'x"y', values: ['ok'] });
+        runMutator(m, 'createEnum', { id: 'e4', schema: 's', name: '情绪', values: ['ok'] });
+        checkExpr =
+          'qty > 0 AND price >= 0 AND note <> \'\' AND ts IS NOT NULL AND bits IS NOT NULL AND 0::mood = 0::public."Mood" AND 0::"Mood" = 0::public."x""y" AND 0::public."情绪" = 0::missing';
+      }
+      runMutator(m, 'addCheck', { id: 'k1', table: 't1', expr: checkExpr });
+
+      const c1 = canonModel(m);
+      expect(nonFixed(c1, Object.keys(c1.objects))).toEqual([]);
+      const c2 = canonModel(c1);
+      expect(c2).toEqual(c1);
+      const expr = (c1.objects.k1 as Check).expr;
+      if (dialect === 'mssql') {
+        expect(expr).toContain('qty::ty_int');
+        expect(expr).toContain('price::ty_numeric_18_0_');
+        expect(expr).toContain('note::ty_varchar_32_');
+      } else if (dialect === 'mysql') {
+        expect(expr).toContain('qty::ty_int');
+        expect(expr).toContain('price::ty_decimal_10_0_');
+        expect(expr).toContain('note::ty_varchar_32_');
+      } else if (dialect === 'sqlite') {
+        expect(expr).toContain('qty::ty_INTEGER');
+        expect(expr).toContain('price::ty_NUMERIC');
+        expect(expr).toContain('note::ty_VARCHAR_32__c_NOCASE');
+      } else {
+        expect(expr).toContain('qty::ty_integer');
+        expect(expr).toContain('price::ty_numeric');
+        expect(expr).toContain('note::ty_character_varying_32_');
+        expect(expr).toContain('ts::ty_timestamp_with_time_zone');
+        expect(expr).toContain('bits::ty_bit_1_');
+        expect(expr).toContain('0::mood::en_e1');
+        expect(expr).toContain('0::public."Mood"::en_e2');
+        expect(expr).toContain('0::"Mood"::en_e2');
+        expect(expr).toContain('0::public."x""y"::en_e3');
+        expect(expr).toContain('0::public."情绪"::en_e4');
+        expect(expr).toContain('0::missing::en_none');
+      }
+    },
+  );
+
+  test.each(['pg', 'mssql'] as const)(
+    '判定与假引擎一致（%s）：规范模型上只改上下文，凡是规范形式变了的对象都被判为待规范化',
+    (dialect) => {
+      fc.assert(
+        fc.property(
+          fc.array(editArb, { maxLength: 20, size: 'max' }),
+          fc.array(editArb, { maxLength: 8, size: 'max' }),
+          (pre, post) => {
+            fresh = 0;
+            let m = initialModel(dialect);
+            for (const e of pre) {
+              const draft = structuredClone(m);
+              if (applyEdit(draft, e)) m = draft;
+            }
+            const good = canonModel(m);
+            let cur = structuredClone(good);
+            for (const e of post) {
+              const draft = structuredClone(cur);
+              if (applyEdit(draft, e)) cur = draft;
+            }
+            const pending = new Set(pendingRefreshIds(good, cur));
+            const missed = nonFixed(
+              cur,
+              Object.keys(cur.objects).filter((id) => !pending.has(id)),
+            );
+            expect(missed).toEqual([]);
+          },
+        ),
+        { numRuns: RUNS, seed: SEED },
+      );
+    },
+  );
 });
 
 describe('OpaqueRefresher 黄金基线不变量（I1–I4）', () => {
-  let cachedStats: Map<string, number> | null = null;
+  const cachedStats: Partial<Record<Dialect, Map<string, number>>> = {};
   /** 随机用例在本次运行里是否已经跑过并失败（失败时覆盖率检查不再重跑同一种子、重复报同一个反例） */
-  let randomFailed = false;
-  const runRandomSuite = async (): Promise<Map<string, number>> => {
+  const randomFailed: Partial<Record<Dialect, boolean>> = {};
+  /** MSSQL 世界没有枚举 / 分区，只用来覆盖持久化计算列的可空性（#145），跑一半次数 */
+  const runsOf = (dialect: Dialect) => (dialect === 'pg' ? RUNS : Math.ceil(RUNS / 2));
+  const runRandomSuite = async (dialect: Dialect): Promise<Map<string, number>> => {
     const s = new Map<string, number>();
     // 非 ShadowError 的规范化失败会 console.warn（预期内的故障注入），这里静音
     const warn = vi.spyOn(console, 'warn').mockImplementation(() => {});
     try {
       await fc.assert(
-        fc.asyncProperty(fc.array(opArb, { minLength: 1, maxLength: 50, size: 'max' }), (ops) =>
-          runOps(ops, s),
+        fc.asyncProperty(
+          fc.array(dialect === 'pg' ? opArb : mssqlOpArb, { minLength: 1, maxLength: 50, size: 'max' }),
+          (ops) => runOps(ops, s, dialect),
         ),
         {
-          numRuns: RUNS,
+          numRuns: runsOf(dialect),
           seed: SEED,
         },
       );
@@ -1096,22 +1372,27 @@ describe('OpaqueRefresher 黄金基线不变量（I1–I4）', () => {
     return s;
   };
 
-  test('随机操作序列', async () => {
-    try {
-      cachedStats = await runRandomSuite();
-    } catch (e) {
-      randomFailed = true;
-      throw e;
-    }
-  }, 120_000);
+  test.each(['pg', 'mssql'] as const)(
+    '随机操作序列（%s）',
+    async (dialect) => {
+      try {
+        cachedStats[dialect] = await runRandomSuite(dialect);
+      } catch (e) {
+        randomFailed[dialect] = true;
+        throw e;
+      }
+    },
+    120_000,
+  );
 
   // 自包含：单独用 `-t 覆盖率` 或乱序执行时若尚未跑过随机用例，会自动补跑同一批随机序列再校验覆盖率；
   // 随机用例已经跑过并失败时跳过（反例已经报过一次）；只在默认及以上的运行次数下检查（DERIVE_RUNS 调小做冒烟时不强求每类都出现）。
   test.skipIf(RUNS < 200)(
     '覆盖率：每类操作、故障与结果都真实发生过',
     async ({ skip }) => {
-      if (randomFailed) skip('随机操作序列已失败，不重复报同一个反例');
-      const stats = cachedStats ?? (await runRandomSuite());
+      if (randomFailed.pg || randomFailed.mssql) skip('随机操作序列已失败，不重复报同一个反例');
+      const stats = cachedStats.pg ?? (await runRandomSuite('pg'));
+      const mssql = cachedStats.mssql ?? (await runRandomSuite('mssql'));
       const want = [
         ...[
           'addCheck',
@@ -1132,6 +1413,11 @@ describe('OpaqueRefresher 黄金基线不变量（I1–I4）', () => {
           'detachPartition',
           'attachPartition',
           'setPartitionBy',
+          'setNotNull',
+          'createEnum',
+          'dropEnum',
+          'swapEnumNames',
+          'setLegacyPartitionBy',
         ].map((k) => `edit:${k}`),
         'flush:clean',
         'flush:normalized',
@@ -1145,6 +1431,8 @@ describe('OpaqueRefresher 黄金基线不变量（I1–I4）', () => {
         'rewrite:table',
         'rewrite:onPartitionChild',
         'rewrite:opaque:onOpaque',
+        'rewrite:enumBinding',
+        'rewrite:legacyPartitionBound',
         ...['nullShadow', 'shadowError', 'stepError', 'otherError', 'reject'].flatMap((k) => [
           `I3:flush:${k}`,
           `I3:normalize:${k}`,
@@ -1165,9 +1453,21 @@ describe('OpaqueRefresher 黄金基线不变量（I1–I4）', () => {
         'I1:withExprs',
         'I2:withExprs',
       ];
-      const missing = want.filter((k) => !stats.get(k));
-      if (process.env.DERIVE_STATS)
+      // MSSQL 世界：持久化计算列的可空性真的被改写过，且一次 flush 之后归零（I4）
+      const wantMssql = [
+        'edit:setNotNull',
+        'edit:addGenerated',
+        'rewrite:column:mssqlNotNull',
+        'I4:flush:normalized',
+      ];
+      const missing = [
+        ...want.filter((k) => !stats.get(k)),
+        ...wantMssql.filter((k) => !mssql.get(k)).map((k) => `mssql:${k}`),
+      ];
+      if (process.env.DERIVE_STATS) {
         console.log(Object.fromEntries([...stats].sort(([a], [b]) => a.localeCompare(b))));
+        console.log('mssql', Object.fromEntries([...mssql].sort(([a], [b]) => a.localeCompare(b))));
+      }
       expect(missing).toEqual([]);
     },
     120_000,

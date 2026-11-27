@@ -13,6 +13,7 @@ import {
   ident,
   literal,
   type Model,
+  runMutator,
   setColumnType,
   setPartitionBy,
   type Table,
@@ -1543,6 +1544,85 @@ describe.skipIf(!PG_URL)('待规范化判定与真实 PG 读回一致（#134）'
       const afterA2 = changedA2.find((o): o is Table => o.kind === 'table' && o.id === child);
       expect(afterA2?.partitionOf?.bound).toBe(
         "FOR VALUES FROM ('2020-01-01 00:00:00') TO ('2021-01-01 00:00:00')",
+      );
+    } finally {
+      await shadow.close();
+      await shadowDb.close();
+    }
+  });
+});
+
+describe.skipIf(!PG_URL)('待规范化判定与真实 PG 读回一致：表达式直接引用枚举（#146）', () => {
+  /** orders(status text)：默认值与 CHECK 直接写枚举转换，没有列的 typeRef 指向枚举 */
+  const enumModel = (ty: string): Model => {
+    const m = emptyModel();
+    runMutator(m, 'createSchema', { id: 's', name: 'public' });
+    runMutator(m, 'createEnum', { id: 'e1', schema: 's', name: 'mood', values: ['ok', 'bad'] });
+    runMutator(m, 'createEnum', { id: 'e2', schema: 's', name: 'tone', values: ['ok', 'lo'] });
+    runMutator(m, 'createTable', { id: 't', schema: 's', name: 'orders' });
+    runMutator(m, 'addColumn', {
+      table: 't',
+      column: { id: 'st', name: 'status', type: 'text', default: { expr: `('ok'::${ty})::text` } },
+    });
+    runMutator(m, 'addCheck', { id: 'k', table: 't', expr: `((status)::${ty} IS NOT NULL)` });
+    return m;
+  };
+  const textOf = (m: Model) => [
+    (m.objects.st as { default: { expr: string } }).default.expr,
+    (m.objects.k as { expr: string }).expr,
+    (m.objects.ix as { where: string }).where,
+  ];
+
+  test('两个枚举对调名字后换回旧快照：表达式原文与基线逐字相同，判为待规范化，影子库读回的类型名确实变了', async () => {
+    const shadowDb = await createTestDb('derive_pending_enum');
+    await claimShadow(shadowDb.url);
+    const shadow = pgShadow(shadowDb.url);
+    try {
+      const m = enumModel('public.mood');
+      runMutator(m, 'addIndex', {
+        id: 'ix',
+        table: 't',
+        elements: [{ column: 'st' }],
+        where: "('ok'::public.mood IS NOT NULL)",
+      });
+      const good = structuredClone(m);
+      for (const o of await shadow.canonicalize(emptyModel(), m)) good.objects[o.id] = o;
+      expect(textOf(good)).toEqual([
+        "('ok'::public.mood)::text",
+        '((status)::public.mood IS NOT NULL)',
+        "('ok'::public.mood IS NOT NULL)",
+      ]);
+
+      // 换入另一条历史上两个枚举对调过名字的快照：表达式原文不变，名字换了绑定
+      const cur = structuredClone(good);
+      (cur.objects.e1 as { name: string }).name = 'tone';
+      (cur.objects.e2 as { name: string }).name = 'mood';
+      expect(pendingRefreshIds(good, cur)).toEqual(['st', 'k', 'ix']);
+      const changed = await shadow.canonicalize(good, cur);
+      const after = structuredClone(cur);
+      for (const o of changed) after.objects[o.id] = o;
+      // 实测：影子库从基线增量迁移（ALTER TYPE ... RENAME），PG 按 OID 存表达式，读回跟着 e1 的新名字走。
+      // 漏判时出口 0 I/O，这份与影子库不一致的原文会留在模型里
+      expect(changed.map((o) => o.id)).toEqual(['st', 'k', 'ix']);
+      expect(textOf(after)).toEqual([
+        "('ok'::public.tone)::text",
+        '((status)::public.tone IS NOT NULL)',
+        "('ok'::public.tone IS NOT NULL)",
+      ]);
+      expect(pendingRefreshIds(after, structuredClone(after))).toEqual([]);
+    } finally {
+      await shadow.close();
+      await shadowDb.close();
+    }
+  });
+
+  test('非限定写法 ::mood 在影子库（search_path 为空）里建不出来：黄金基线里只会有带 schema 的枚举转换', async () => {
+    const shadowDb = await createTestDb('derive_pending_enum_unq');
+    await claimShadow(shadowDb.url);
+    const shadow = pgShadow(shadowDb.url);
+    try {
+      await expect(shadow.canonicalize(emptyModel(), enumModel('mood'))).rejects.toThrow(
+        /type "mood" does not exist/,
       );
     } finally {
       await shadow.close();
