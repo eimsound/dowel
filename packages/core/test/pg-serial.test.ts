@@ -29,9 +29,11 @@ import {
   runMacro,
   runMutator,
   type Sequence,
+  type SequenceOptions,
   serializeClipboard,
   setColumnType,
   setDefault,
+  setIdentity,
   setNotNull,
   setSequenceOwnedBy,
   validate,
@@ -482,6 +484,59 @@ describe('PG 规划器：serial DDL 与 alterSequence START WITH 修复', () => 
     const cacheTo = structuredClone(cacheFrom);
     (cacheTo.objects.q4 as Sequence).options.cache = '10';
     expect(plan(cacheFrom, cacheTo)[0]!.sql).not.toContain('START WITH');
+  });
+
+  // PG 省略 START WITH 会保留旧 seqstart：前后 start 都为 null 时，min/max/递增方向改变默认起始值也必须补发
+  const alterSeqSql = (opts: Partial<SequenceOptions>, patch: Partial<SequenceOptions>): string => {
+    const from = emptyModel('pg');
+    createSequence(from, createSchema(from, 'public', 's1'), 'x', { type: 'integer', ...opts }, 'q');
+    const to = structuredClone(from);
+    Object.assign((to.objects.q as Sequence).options, patch);
+    const steps = plan(from, to);
+    expect(steps.map((st) => st.kind)).toEqual(['alterSequence']);
+    return steps[0]!.sql;
+  };
+
+  test.each<[string, Partial<SequenceOptions>, Partial<SequenceOptions>, string | null]>([
+    ['升序 min null → 10', {}, { min: '10' }, '10'],
+    ['升序 min 10 → null', { min: '10' }, { min: null }, '1'],
+    ['递增方向 1 → -1', {}, { increment: '-1' }, '-1'],
+    ['递增方向 -1 → 1', { increment: '-1' }, { increment: '1' }, '1'],
+    ['递增方向翻转且有显式 min/max', { min: '-100', max: '100' }, { increment: '-1' }, '100'],
+    ['降序 max -5 → -20', { increment: '-1', max: '-5' }, { max: '-20' }, '-20'],
+    ['降序 max -5 → null', { increment: '-1', max: '-5' }, { max: null }, '-1'],
+    ['显式 start 清空为 null', { min: '10', start: '50' }, { start: null }, '10'],
+    ['显式 start 清空且恰好等于默认值', { start: '1' }, { start: null, cache: '5' }, null],
+    [
+      'bigint → integer 缩窄且显式 start 清空',
+      { type: 'bigint', start: '5000000000' },
+      { type: 'integer', start: null },
+      '1',
+    ],
+    ['仅类型缩窄，有效起始值不变', { type: 'bigint' }, { type: 'integer' }, null],
+    ['升序 max 变化不影响默认起始值', {}, { max: '1000' }, null],
+    ['降序 min 变化不影响默认起始值', { increment: '-1' }, { min: '-1000' }, null],
+    ['同方向改步长', {}, { increment: '5' }, null],
+    ['目标显式 start 原样输出', {}, { min: '10', start: '20' }, '20'],
+  ])('alterSequence START WITH：%s', (_, opts, patch, start) => {
+    const sql = alterSeqSql(opts, patch);
+    if (start === null) expect(sql).not.toContain('START WITH');
+    else expect(sql).toContain(` START WITH ${start} CACHE`);
+  });
+
+  test('identity 列改选项同样按有效起始值补发 SET START WITH', () => {
+    const { m: from, t } = setupPg();
+    const cid = addColumn(from, t, { id: 'c1', name: 'id', type: 'integer', notNull: true });
+    setIdentity(from, cid, { always: false });
+    const alterIdentity = (patch: Partial<SequenceOptions>) => {
+      const to = structuredClone(from);
+      Object.assign(col(to, cid).identity!.options, patch);
+      return plan(from, to).find((st) => st.kind === 'alterIdentity')!.sql;
+    };
+    expect(alterIdentity({ min: '10' })).toContain('SET MINVALUE 10');
+    expect(alterIdentity({ min: '10' })).toContain('SET START WITH 10');
+    expect(alterIdentity({ increment: '-1' })).toContain('SET START WITH -1');
+    expect(alterIdentity({ cache: '10' })).not.toContain('START WITH');
   });
 });
 

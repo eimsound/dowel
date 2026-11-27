@@ -958,6 +958,12 @@ const zh = {
     status: { connecting: '连接中', online: '已连接', offline: '已断开，正在重连' },
     sync: { connecting: '连接中…', online: '已同步', offline: '重新连接中…' },
     pending: '{{count}} 处修改待确认',
+    opTooLarge:
+      '这次修改的数据量太大（约 {{size}} MiB，上限 {{max}} MiB），没有保存。请减少一次操作的内容，例如分几次粘贴，每次少选一些表。',
+    messageTooLarge:
+      '有一条修改超过了服务器的大小上限，已重新连接。尚未确认的 {{count}} 处修改可能没有保存，画布已按服务器上的内容刷新，请检查后重做。',
+    messageTooLargeNone:
+      '有一条消息超过了服务器的大小上限，已重新连接。画布已按服务器上的内容刷新，如有遗漏请重做。',
     canvas: '画布',
     sql: 'SQL',
     view: '视图',
@@ -3388,6 +3394,12 @@ const en: typeof zh = {
     status: { connecting: 'Connecting', online: 'Connected', offline: 'Disconnected, reconnecting' },
     sync: { connecting: 'Connecting…', online: 'Synced', offline: 'Reconnecting…' },
     pending: '{{count}} changes pending',
+    opTooLarge:
+      'This change is too large to save (about {{size}} MiB; the limit is {{max}} MiB). Nothing was changed. Try smaller steps, for example paste fewer tables at a time.',
+    messageTooLarge:
+      "A change exceeded the server's size limit, so the connection was reset. {{count}} unconfirmed changes may not have been saved; the canvas now shows what the server has. Please check and redo them if needed.",
+    messageTooLargeNone:
+      "A message exceeded the server's size limit, so the connection was reset. The canvas now shows what the server has. Please check and redo any missing changes.",
     canvas: 'Canvas',
     sql: 'SQL',
     view: 'View',

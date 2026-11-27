@@ -12,6 +12,12 @@ export type { Role } from '@dowel/api';
 
 export const SNAPSHOT_EVERY = 200;
 
+/**
+ * 客户端 presence 数据序列化后的上限（UTF-8 字节，Issue #150）。presence 会原样转发给房间里每个连接、
+ * 并经 PG NOTIFY（单条 7500 字节）广播到其他副本；超限的直接丢弃，本副本与跨副本行为一致
+ */
+export const MAX_PRESENCE_BYTES = 4096;
+
 export interface RoomsOptions {
   /** 空闲房间超时卸载时间（毫秒）；默认 5 分钟，传入 0 或 Infinity 禁用 */
   idleEvictMs?: number;
