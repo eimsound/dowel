@@ -5,13 +5,14 @@ import { z } from 'zod';
 import * as E from './edit.ts';
 import { isReservedId } from './ids.ts';
 import {
-  ColumnDefault,
   ColumnExt,
   FkAction,
   IndexElement,
   IndexExt,
   isValidIndexElement,
   type Model,
+  MssqlColumnExt,
+  MysqlColumnExt,
   type Obj,
   PartitionSpec,
   PrimaryKeyExt,
@@ -40,6 +41,46 @@ const name = objectNameArg;
 export const MAX_TEXT_ARG_LENGTH = 1_000_000;
 const text = z.string().max(MAX_TEXT_ARG_LENGTH, '文本太长：单个字段最多 100 万个字符');
 
+const columnDefaultArg = z.union([z.object({ expr: text.min(1) }), z.object({ nextval: id })]);
+const sequenceOptionsArg = SequenceOptions.extend({
+  increment: text.default('1'),
+  min: text.nullable().default(null),
+  max: text.nullable().default(null),
+  start: text.nullable().default(null),
+  cache: text.default('1'),
+});
+const partitionKeyArg = z
+  .object({
+    column: id.nullable().default(null),
+    expr: text.min(1).nullable().default(null),
+    opclass: text.min(1).nullable().default(null),
+    collation: text.min(1).nullable().default(null),
+  })
+  .refine((k) => (k.column !== null) !== (k.expr !== null), {
+    message: '分区键必须且只能指定 column 或 expr 之一',
+  });
+const partitionSpecArg = PartitionSpec.extend({
+  keys: z.array(partitionKeyArg).min(1),
+});
+const columnExtArg = ColumnExt.extend({
+  mysql: MysqlColumnExt.extend({
+    enumValues: z.array(text).optional(),
+    setValues: z.array(text).optional(),
+  }).optional(),
+  mssql: MssqlColumnExt.extend({
+    identity: z.object({ seed: text, increment: text }).optional(),
+  }).optional(),
+});
+const indexElementArg = IndexElement.extend({
+  expr: text.nullable().default(null),
+  opclass: text.nullable().default(null),
+  collation: text.nullable().default(null),
+})
+  .partial()
+  .refine(isValidIndexElement, {
+    message: '索引元素必须是列或非空表达式之一',
+  });
+
 /** 修改一个 CHECK 约束的表达式（推导名会随引用的列变化） */
 export const setCheckExpr = (m: Model, checkId: string, expr: string) => {
   const o = m.objects[checkId];
@@ -67,7 +108,7 @@ export const mutators = {
   dropEnum: def(z.object({ id }), (m, a) => E.dropEnum(m, a.id)),
 
   createSequence: def(
-    z.object({ id, schema: id, name, options: SequenceOptions.partial().optional() }),
+    z.object({ id, schema: id, name, options: sequenceOptionsArg.partial().optional() }),
     (m, a) => E.createSequence(m, a.schema, a.name, a.options ?? {}, a.id),
   ),
   renameSequence: def(z.object({ id, name }), (m, a) => E.renameSequence(m, a.id, a.name)),
@@ -81,7 +122,7 @@ export const mutators = {
       id,
       schema: id,
       name,
-      partitionBy: PartitionSpec.nullable().optional(),
+      partitionBy: partitionSpecArg.nullable().optional(),
       ext: TableExt.optional(),
     }),
     (m, a) => E.createTable(m, a.schema, a.name, a.id, a.partitionBy ?? null, a.ext),
@@ -90,7 +131,7 @@ export const mutators = {
   dropTable: def(z.object({ id }), (m, a) => E.dropTable(m, a.id)),
   setTableExt: def(z.object({ id, ext: TableExt.nullable() }), (m, a) => E.setTableExt(m, a.id, a.ext)),
 
-  setPartitionBy: def(z.object({ id, partitionBy: PartitionSpec.nullable() }), (m, a) =>
+  setPartitionBy: def(z.object({ id, partitionBy: partitionSpecArg.nullable() }), (m, a) =>
     E.setPartitionBy(m, a.id, a.partitionBy),
   ),
   createPartition: def(
@@ -114,9 +155,9 @@ export const mutators = {
         type: text,
         typeRef: id.nullable().optional(),
         notNull: z.boolean().optional(),
-        default: ColumnDefault.nullable().optional(),
+        default: columnDefaultArg.nullable().optional(),
         identity: z
-          .object({ always: z.boolean(), options: SequenceOptions.partial().optional() })
+          .object({ always: z.boolean(), options: sequenceOptionsArg.partial().optional() })
           .nullable()
           .optional(),
         generated: z
@@ -125,7 +166,7 @@ export const mutators = {
           .optional(),
         collation: text.nullable().optional(),
         before: id.optional(),
-        ext: ColumnExt.optional(),
+        ext: columnExtArg.optional(),
       }),
     }),
     (m, a) => E.addColumn(m, a.table, a.column),
@@ -136,13 +177,13 @@ export const mutators = {
     E.setColumnType(m, a.id, a.type, a.typeRef),
   ),
   setNotNull: def(z.object({ id, notNull: z.boolean() }), (m, a) => E.setNotNull(m, a.id, a.notNull)),
-  setDefault: def(z.object({ id, default: ColumnDefault.nullable() }), (m, a) =>
+  setDefault: def(z.object({ id, default: columnDefaultArg.nullable() }), (m, a) =>
     E.setDefault(m, a.id, a.default),
   ),
   setIdentity: def(z.object({ id, identity: z.object({ always: z.boolean() }).nullable() }), (m, a) =>
     E.setIdentity(m, a.id, a.identity),
   ),
-  setColumnExt: def(z.object({ id, ext: ColumnExt.nullable() }), (m, a) => E.setColumnExt(m, a.id, a.ext)),
+  setColumnExt: def(z.object({ id, ext: columnExtArg.nullable() }), (m, a) => E.setColumnExt(m, a.id, a.ext)),
   moveColumn: def(z.object({ id, before: id.nullable() }), (m, a) => E.moveColumn(m, a.id, a.before)),
 
   addPrimaryKey: def(
@@ -195,13 +236,7 @@ export const mutators = {
     z.object({
       id,
       table: id,
-      elements: z
-        .array(
-          IndexElement.partial().refine(isValidIndexElement, {
-            message: '索引元素必须是列或非空表达式之一',
-          }),
-        )
-        .min(1, { message: '索引至少需要一个元素' }),
+      elements: z.array(indexElementArg).min(1, { message: '索引至少需要一个元素' }),
       unique: z.boolean().optional(),
       method: text.optional(),
       include: z.array(id).optional(),
