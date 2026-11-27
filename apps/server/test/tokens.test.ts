@@ -49,7 +49,7 @@ import { hashToken } from '../src/auth.ts';
 import { errorEvent } from '../src/executions.ts';
 import { createApp, openPlatformDb, type PlatformDb } from '../src/index.ts';
 import { KeyedLimiter, LoginLimiter } from '../src/rate-limit.ts';
-import { toCiError } from '../src/routes/ci.ts';
+import { ciVerifiedHere, toCiError } from '../src/routes/ci.ts';
 import { encrypt } from '../src/secrets.ts';
 import { ActiveTokenCache } from '../src/tokens.ts';
 import { addTable, editModel, makeUser, PASSWORD, recordVerifiedOnEnvs } from './support.ts';
@@ -178,6 +178,27 @@ test('toCiError 将 ExecutorError(mark_required) 映射为 409 rejected（detail
   expect(CI_ERROR_STATUS[err.code]).toBe(409);
   expect(err.details).toMatchObject({ reason: 'mark_required' });
   expect(err.reached).toBeNull();
+});
+
+test('ciVerifiedHere（#200）：与执行前检查同一条规则——按目标库完整版本号比对 verifiedOn，读不到版本为 false，SQLite 等于 verified', () => {
+  // 完整版本号一致
+  expect(ciVerifiedHere('pg', true, ['17.4'], '17.4')).toBe(true);
+  expect(ciVerifiedHere('mysql', true, ['8.4.2', '8.4.3'], '8.4.3')).toBe(true);
+  expect(ciVerifiedHere('mssql', true, ['16.0.4135.4'], '16.0.4135.4')).toBe(true);
+  // 只在别的小版本 / 构建号上验证过：verified 仍为 true，但这个环境执行会 409 unverified
+  expect(ciVerifiedHere('pg', true, ['17.5'], '17.4')).toBe(false);
+  expect(ciVerifiedHere('mysql', true, ['8.4.2'], '8.4.3')).toBe(false);
+  expect(ciVerifiedHere('mssql', true, ['16.0.4135.4'], '16.0.4140.1')).toBe(false);
+  expect(ciVerifiedHere('pg', true, [], '17.4')).toBe(false);
+  // 读不到目标库版本：preflight 拒绝，这里同样为 false（哪怕有通过记录）
+  expect(ciVerifiedHere('pg', true, ['17.4'], null)).toBe(false);
+  expect(ciVerifiedHere('mysql', true, ['8.4.3'], null)).toBe(false);
+  // 未验证（含人工改过脚本）：一律 false
+  expect(ciVerifiedHere('pg', false, ['17.4'], '17.4')).toBe(false);
+  // SQLite 内置库恒等：等于 verified，不看 verifiedOn 和目标库版本
+  expect(ciVerifiedHere('sqlite', true, [], null)).toBe(true);
+  expect(ciVerifiedHere('sqlite', true, ['3.45.0'], '3.46.1')).toBe(true);
+  expect(ciVerifiedHere('sqlite', false, ['3.46.1'], '3.46.1')).toBe(false);
 });
 
 test('errorEvent 将 ExecutorError(unverified) 的 engineVersion 与 verifiedOn 透传进 details（含 null 未知版本）', () => {
@@ -1791,6 +1812,28 @@ describe.skipIf(!PG_URL)('CI 执行接口、错误码、审计通知与 GitHub A
     expect(v2Detail.verifiedOn).toEqual([full]);
     const ci = (to: string) =>
       ciCall(p.token, 'POST', `/api/ci/projects/${groupSlug}/${p.slug}/environments/dev/execute`, { to });
+    // #200：CI 版本列表给 verifiedOn，环境状态给实时目标库完整版本号与每个版本的 verifiedHere（verified 语义不变）
+    const ciVersions = async () =>
+      (await ciCall(p.token, 'GET', `/api/ci/projects/${groupSlug}/${p.slug}/versions`))
+        .data as unknown as CiVersion[];
+    const ciStatus = async () => {
+      const r = await ciCall(p.token, 'GET', `/api/ci/projects/${groupSlug}/${p.slug}/environments/dev`);
+      expect(r.status, JSON.stringify(r.data)).toBe(200);
+      return ciEnvironmentStatusSchema.parse(r.data);
+    };
+    const here = (st: CiEnvironmentStatus) =>
+      Object.fromEntries(st.versions.map((v) => [v.number, [v.verified, v.verifiedHere]]));
+    expect((await ciVersions()).find((v) => v.id === v2!.id)).toMatchObject({
+      verified: true,
+      verifiedOn: [full],
+    });
+    // 平台库缓存的环境版本清空（从未探测 / 过期）：CI 环境状态按实时读到的目标库版本算，与执行前检查一致
+    await db.query('update environments set engine_version = null, engine_version_num = null where id = $1', [
+      dev.eid,
+    ]);
+    const before = await ciStatus();
+    expect(before.engineVersion).toBe(full);
+    expect(here(before)).toEqual({ 1: [true, true], 2: [true, true] });
     expect((await ci('v2')).status).toBe(200);
     const [v3] = await (async () => {
       await editModel(
@@ -1821,6 +1864,15 @@ describe.skipIf(!PG_URL)('CI 执行接口、错误码、审计通知与 GitHub A
     }
     const unverified = { ok: false, code: 'unverified' };
     const env = `/api/projects/${p.pid}/environments/${dev.eid}`;
+
+    // 只在别的小版本上验证过：CI 看到 verified 仍为 true，但 verifiedHere 为 false，能预知下面的 409 unverified
+    const listed = await ciVersions();
+    for (const id of [v2!.id, v3!.id])
+      expect(listed.find((v) => v.id === id)).toMatchObject({ verified: true, verifiedOn: [other] });
+    expect(listed.find((v) => v.id === v1!.id)).toMatchObject({ verified: true, verifiedOn: [full] });
+    const mismatched = await ciStatus();
+    expect(mismatched.engineVersion).toBe(full);
+    expect(here(mismatched)).toEqual({ 1: [true, true], 2: [true, false], 3: [true, false] });
 
     const dryUp = await call('POST', `${env}/execute`, { to: v3!.id, dryRun: true });
     expect(dryUp.status).toBe(200);
@@ -1862,6 +1914,11 @@ describe.skipIf(!PG_URL)('CI 执行接口、错误码、审计通知与 GitHub A
     expect((await call('POST', `${env}/execute`, { to: v3!.id, dryRun: true })).data).toMatchObject({
       ok: true,
     });
+    const reverified = await ciStatus();
+    expect(here(reverified)).toEqual({ 1: [true, true], 2: [true, false], 3: [true, true] });
+    expect((await ciVersions()).find((v) => v.id === v3!.id)!.verifiedOn).toEqual(
+      expect.arrayContaining([other, full]),
+    );
     expect((await ci('v3')).status).toBe(200);
     // v2 仍只有别的版本的记录：回滚到 v2 只跑 v3 的回滚（放行），回滚到 v1 要经过 v2 的回滚，照样拒绝
     expect((await call('POST', `${env}/rollback`, { to: v2!.id, dryRun: true })).data).toMatchObject({

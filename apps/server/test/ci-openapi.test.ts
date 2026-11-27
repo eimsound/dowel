@@ -203,6 +203,30 @@ describe('CI OpenAPI 3.1 与自托管 Scalar 文档', () => {
     expect(doc.components?.schemas?.CiErrorCode).toMatchObject({
       enum: CI_ERROR_CODES,
     });
+
+    // #200（ADR 0017 决定 5）：版本列表给 verifiedOn，环境状态给目标库完整版本号与每个版本的 verifiedHere；verified 保留
+    // 继承自 CiVersionRef / CiEnvironment 的 schema 生成为 allOf: [$ref, 自身字段]，取自身字段那一项
+    type ObjectSchema = { properties?: Record<string, unknown>; required?: string[] };
+    const schema = (name: string): ObjectSchema => {
+      const s = doc.components?.schemas?.[name] as { allOf?: ObjectSchema[] } & ObjectSchema;
+      return s.allOf?.find((x) => x.properties) ?? s;
+    };
+    expect(schema('CiVersion').properties).toMatchObject({
+      verified: { type: 'boolean' },
+      verifiedOn: { type: 'array', items: { type: 'string' } },
+    });
+    expect(schema('CiVersion').required).toEqual(expect.arrayContaining(['verified', 'verifiedOn']));
+    expect(schema('CiEnvironmentVersion').properties).toMatchObject({
+      verified: { type: 'boolean' },
+      verifiedHere: { type: 'boolean' },
+    });
+    expect(schema('CiEnvironmentVersion').required).toEqual(
+      expect.arrayContaining(['verified', 'verifiedHere']),
+    );
+    expect(schema('CiEnvironmentStatus').properties).toMatchObject({
+      engineVersion: { type: ['string', 'null'] },
+    });
+    expect(schema('CiEnvironmentStatus').required).toEqual(expect.arrayContaining(['engineVersion']));
   });
 
   test('文档端点（openapi.json / docs / docs/init.js）认证矩阵：Cookie / 改密拦截 / CI 令牌 / 匿名 / MCP 令牌', async () => {

@@ -144,7 +144,14 @@ export const ciProjectOpenApiSchema = z
 export const ciVersionOpenApiSchema = ciVersionRefOpenApiSchema
   .extend({
     publishedAt: z.string().openapi({ format: 'date-time' }),
-    verified: z.boolean(),
+    verified: z.boolean().openapi({
+      description: '通过过影子库闭环验证（且脚本之后没有被人工修改）；不代表能执行到任一环境，见 verifiedOn',
+    }),
+    verifiedOn: z.array(z.string()).openapi({
+      description:
+        '通过闭环验证的数据库完整版本号（去重）。执行 / 回滚到某个环境时，该环境目标库的完整版本号必须在其中，否则 409 unverified；SQLite 内置库恒等，不按它把关',
+      example: ['17.4'],
+    }),
     checksum: z.string(),
   })
   .openapi('CiVersion');
@@ -154,13 +161,24 @@ export const ciVersionListOpenApiSchema = z.array(ciVersionOpenApiSchema).openap
 export const ciEnvironmentVersionOpenApiSchema = ciVersionRefOpenApiSchema
   .extend({
     state: z.enum(['applied', 'current', 'pending', 'retired']),
-    verified: z.boolean(),
+    verified: z.boolean().openapi({
+      description: '通过过影子库闭环验证（与 CiVersion.verified 相同，不看这个环境的数据库版本）',
+    }),
+    verifiedHere: z.boolean().openapi({
+      description:
+        '能执行 / 回滚到这个环境：verified，且有与本环境目标库完整版本号（engineVersion）一致的通过记录（SQLite 等于 verified；其余方言目标库版本读不到时为 false）。为 false 时执行经过这个版本会得到 409 unverified',
+    }),
   })
   .openapi('CiEnvironmentVersion');
 
 export const ciEnvironmentStatusOpenApiSchema = ciEnvironmentOpenApiSchema
   .extend({
     currentVersion: ciVersionRefOpenApiSchema.nullable(),
+    engineVersion: z.string().nullable().openapi({
+      description:
+        '实时读取的目标库数据库完整版本号（PostgreSQL 两段、MySQL 三段、SQL Server 构建号、SQLite 内置库版本），与 409 unverified 的 details.engineVersion 同一口径；读不到为 null',
+      example: '17.4',
+    }),
     unfinished: z.boolean(),
     versions: z.array(ciEnvironmentVersionOpenApiSchema),
     pending: z.array(z.number().int()),
@@ -359,7 +377,8 @@ export const ciVersionsListRoute = createRoute({
   path: '/api/ci/projects/{owner}/{project}/versions',
   tags: ['Projects'],
   summary: '获取项目版本链',
-  description: '按版本号升序返回项目所有已发布版本及验证状态、校验和。',
+  description:
+    '按版本号升序返回项目所有已发布版本及验证状态（verified、按数据库完整版本号的 verifiedOn）、校验和。',
   security: SECURITY,
   request: { params: ciProjectParamsSchema },
   responses: {
@@ -377,7 +396,7 @@ export const ciEnvironmentGetRoute = createRoute({
   tags: ['Environments'],
   summary: '获取单环境实时状态',
   description:
-    '直连目标库读取迁移历史并同步平台缓存，返回实时当前版本、unfinished、版本状态与待执行列表。受连接限速约束。',
+    '直连目标库读取迁移历史并同步平台缓存，返回实时当前版本、目标库数据库完整版本号、unfinished、版本状态（含能否执行到本环境的 verifiedHere）与待执行列表。受连接限速约束。',
   security: SECURITY,
   request: { params: ciEnvParamsSchema },
   responses: {

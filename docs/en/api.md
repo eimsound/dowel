@@ -145,7 +145,12 @@ curl -fsS \
   "${DOWEL_URL}/api/ci/projects/acme/shop/versions"
 ```
 
-Returns all published versions in ascending order (`id`, `number`, `name`, `publishedAt`, `verified`, `checksum`).
+Returns all published versions in ascending order (`id`, `number`, `name`, `publishedAt`, `verified`, `verifiedOn`, `checksum`):
+
+- `verified`: the version passed closed-loop verification on a shadow database (and its scripts have not been edited by hand since). It does **not** mean the version can be executed on every environment.
+- `verifiedOn`: the full database versions it passed verification on (deduplicated, e.g. `["17.4"]`; two parts for PostgreSQL, three for MySQL, the build number for SQL Server). Executing or rolling back on an environment requires that environment's full target version to be in this list, otherwise you get `409 unverified`. On SQLite the shadow and the target use the same embedded engine, so they count as identical and this list is not checked.
+
+To tell whether a version can run on a given environment, read that version's `verifiedHere` in the [live environment status](#get-environment).
 
 ### 3.3 Live environment status (reads target history) {#get-environment}
 
@@ -157,7 +162,7 @@ curl -fsS \
   "${DOWEL_URL}/api/ci/projects/acme/shop/environments/staging"
 ```
 
-Subject to the connection rate limit per token. Connects to the target database to read `dowel.history` or `dowel_history` (syncing platform cache in parallel) and returns configuration fields (`name`, `production`, `tokenExecution`), live `currentVersion`, `unfinished`, per-version chain states (`applied`, `current`, `pending`), and the `pending` version list:
+Subject to the connection rate limit per token. Connects to the target database to read `dowel.history` or `dowel_history` (syncing platform cache in parallel) and returns configuration fields (`name`, `production`, `tokenExecution`), live `currentVersion`, the target's full database version `engineVersion`, `unfinished`, per-version chain states (`applied`, `current`, `pending`, `retired`), and the `pending` version list:
 
 ```json
 {
@@ -165,14 +170,37 @@ Subject to the connection rate limit per token. Connects to the target database 
   "production": false,
   "tokenExecution": true,
   "currentVersion": { "id": "01J...", "number": 4, "name": "Add index" },
+  "engineVersion": "17.4",
   "unfinished": false,
   "versions": [
-    { "id": "01J...", "number": 4, "name": "Add index", "state": "current", "verified": true },
-    { "id": "01J...", "number": 5, "name": "Add comment to orders", "state": "pending", "verified": true }
+    {
+      "id": "01J...",
+      "number": 4,
+      "name": "Add index",
+      "state": "current",
+      "verified": true,
+      "verifiedHere": true
+    },
+    {
+      "id": "01J...",
+      "number": 5,
+      "name": "Add comment to orders",
+      "state": "pending",
+      "verified": true,
+      "verifiedHere": false
+    }
   ],
   "pending": [5]
 }
 ```
+
+- `engineVersion`: the full database version read live from the target on this request, in the same form as `details.engineVersion` of `409 unverified`; `null` if it could not be read.
+- `verified`: same as `verified` in the [version chain](#get-versions); it ignores this environment's database version.
+- `verifiedHere`: whether this version can be executed or rolled back on this environment, using the same rule as the pre-execution check: `verified` is true and `verifiedOn` contains this environment's `engineVersion`. It is always `false` when `engineVersion` is `null`. On SQLite, where shadow and target count as identical, `verifiedHere` equals `verified`.
+
+If a version with `verifiedHere: false` is on the route to execute (like pending version 5 above), `POST …/execute` returns `409 unverified`. Re-verify that version in the web UI on a shadow database whose version matches the target (or allow a same-instance shadow) first.
+
+This endpoint reads migration history only and does not inspect the target schema. If the target has no history yet but its schema already equals the first version in the chain, the first execution records that version as the baseline (without running its scripts or checking its verification), even if it shows `verifiedHere: false`. To include the schema in the check, use `POST …/execute` with `dryRun: true`.
 
 Returns `502 target_unreachable` when the target database is unreachable, and `409 version_mismatch` when the history format is too new, corrupted, or diverges from the platform chain.
 
