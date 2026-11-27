@@ -1,6 +1,6 @@
 # 发布必须通过影子库验证；“已验证”与执行读回用同一把尺子，并按数据库完整版本号记录
 
-2026-11-27 决定（[Issue #132](https://github.com/eimsound/dowel/issues/132)；部分修订 [ADR 0016](0016-on-demand-shadow-normalization.md) 决定 2、决定 4 与「影响与边界」，补充 [ADR 0012](0012-strict-verify-on-restore.md)）。本 ADR 落盘时实现尚未合入：代码与用户文档的现状以 Issue #132 的实现 PR 为准（包括下文移除 MySQL 读回纯格式容忍，由 #132 的实现 PR 单独跟进）。
+2026-11-27 决定（[Issue #132](https://github.com/eimsound/dowel/issues/132)；部分修订 [ADR 0016](0016-on-demand-shadow-normalization.md) 决定 2、决定 4 与「影响与边界」，补充 [ADR 0012](0012-strict-verify-on-restore.md)）。本 ADR 落盘时主体实现尚未合入：代码与用户文档的现状以 Issue #132 的实现 PR 为准（其中移除 MySQL `alignMysqlImportedLive` 读回纯格式容忍已先行于 PR #162 合入）。
 
 ## 背景
 
