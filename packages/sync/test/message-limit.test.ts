@@ -227,7 +227,9 @@ describe('SyncClient 发送前自查单条消息大小', () => {
     frames.length = 0;
     c.disconnect();
     c.connect();
-    expect(frames.map((f): unknown => JSON.parse(f))).toEqual([{ t: 'hello', client: newId, lastSeq: c.seq }]);
+    expect(frames.map((f): unknown => JSON.parse(f))).toEqual([
+      { t: 'hello', client: newId, lastSeq: c.seq },
+    ]);
   });
 });
 

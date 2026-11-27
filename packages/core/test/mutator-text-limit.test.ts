@@ -54,7 +54,9 @@ describe('mutator 自由文本字段上限', () => {
       runMutator(pg.m, 'addColumn', { table: pg.t, column: { id: 'c1', name: 'id', type: over } }),
     ).toThrow(tooLongMsg);
     runMutator(pg.m, 'addColumn', { table: pg.t, column: { id: 'c1', name: 'id', type: 'serial' } });
-    expect(() => runMutator(pg.m, 'setColumnType', { id: 'c1', type: over, typeRef: null })).toThrow(tooLongMsg);
+    expect(() => runMutator(pg.m, 'setColumnType', { id: 'c1', type: over, typeRef: null })).toThrow(
+      tooLongMsg,
+    );
   });
 
   test('注释与 CHECK 表达式同样受限', () => {
