@@ -63,6 +63,18 @@ export interface ProjectVersionShadows {
 }
 
 /**
+ * 选影期间发现项目行已不存在（请求通过鉴权后项目被并发删除，Issue #170）：与 accessIn 一致按“项目不存在”处理。
+ * 是 HTTPException(404) 的子类：app.onError、按 404 精确退回限速的调用方（normalize）无需改动；
+ * **不是** ShadowError，不会被“影子库不可用 → 发布为未验证 / 422 / no_shadow”的分支吞掉。
+ * MCP 映射为 project_not_found，OpaqueRefresher 的 shadowOf 映射为 'forgotten'。
+ */
+export class ProjectGoneError extends HTTPException {
+  constructor() {
+    super(404, { message: '项目不存在' });
+  }
+}
+
+/**
  * 为一个环境准备影子库（共识 4.4）：按方言分派到对应目标库驱动。
  * SQLite 直接返回 `:memory:` 影子库（env 可为 null）；PG 等外部库优先用显式 shadowUrl，否则建同实例 `{原库名}_dowel`。
  */
@@ -153,7 +165,11 @@ export class Shadows {
         where e.id = $1 and e.project_id = $2`,
       [eid, pid],
     );
-    if (!r) throw new HTTPException(404, { message: '环境不存在' });
+    if (!r) {
+      // 环境行没了也可能是整个项目在并发窗口内被删了：报项目不存在，而不是环境不存在（Issue #170）
+      if (!(await this.projectExists(pid))) throw new ProjectGoneError();
+      throw new HTTPException(404, { message: '环境不存在' });
+    }
     const engineVersionNum = r.engine_version_num ?? null;
     return {
       id: r.id,
@@ -169,11 +185,30 @@ export class Shadows {
     };
   }
 
+  /** 项目的方言；项目行已不存在（通过鉴权后被并发删除）时抛 ProjectGoneError，不能回退成某个默认方言（Issue #170） */
   private async projectDialect(pid: string): Promise<Dialect> {
     const [p] = await this.db.query<{ dialect: Dialect }>('select dialect from projects where id = $1', [
       pid,
     ]);
-    return p?.dialect ?? 'pg';
+    if (!p) throw new ProjectGoneError();
+    return p.dialect;
+  }
+
+  private async projectExists(pid: string): Promise<boolean> {
+    return (await this.db.query('select 1 from projects where id = $1', [pid])).length > 0;
+  }
+
+  /**
+   * 查不到任何环境时该抛的错：先复查项目行——环境随项目级联删除，“没有环境”也可能是项目在并发窗口内被删了，
+   * 此时报 ProjectGoneError（404），只有活项目才是“还没有配置环境”的 preConnect ShadowError（422，文案不变）。
+   * 只在失败路径多一次查询。
+   */
+  private async noEnvironmentError(pid: string): Promise<Error> {
+    if (!(await this.projectExists(pid))) return new ProjectGoneError();
+    return new ShadowError(
+      '项目还没有配置环境。导入 SQL、验证迁移都需要一个真实的数据库实例作影子库，请先在“环境”里添加项目要部署到的数据库',
+      { preConnect: true },
+    );
   }
 
   private async readValidatedEnv(pid: string, id: string): Promise<{ env: Env; fingerprint: string }> {
@@ -266,11 +301,7 @@ export class Shadows {
         const liveIds = new Set(rows.map((r) => r.id));
         await this.pruneRemovedForProject(observed, liveIds);
         const first = rows[0];
-        if (!first)
-          throw new ShadowError(
-            '项目还没有配置环境。导入 SQL、验证迁移都需要一个真实的数据库实例作影子库，请先在“环境”里添加项目要部署到的数据库',
-            { preConnect: true },
-          );
+        if (!first) throw await this.noEnvironmentError(pid);
         id = first.id;
       }
 
@@ -387,12 +418,7 @@ export class Shadows {
     );
     const liveIds = new Set(rows.map((r) => r.id));
     await this.pruneRemovedForProject(observed, liveIds);
-    if (!rows.length) {
-      throw new ShadowError(
-        '项目还没有配置环境。导入 SQL、验证迁移都需要一个真实的数据库实例作影子库，请先在“环境”里添加项目要部署到的数据库',
-        { preConnect: true },
-      );
-    }
+    if (!rows.length) throw await this.noEnvironmentError(pid);
 
     const groups = new Map<number | null, typeof rows>();
     const knownKeys = new Set<number>();
