@@ -236,7 +236,7 @@ describe('OpaqueRefresher.flush 结果契约', () => {
     expect(r.tracked('b')).toBe(false);
   });
 
-  test('写回期间分支被 forget 且 rooms.patch 抛错（项目删除先踢房间）→ skipped(forgotten) 且不打失败告警', async () => {
+  test('写回期间分支被 forget 且 rooms.patch 抛错（项目删除提交后先 forget 再踢房间）→ skipped(forgotten) 且不打失败告警', async () => {
     const live: Live = { m: base(), seq: 0 };
     const { saved, store } = memStore();
     let r!: OpaqueRefresher;
@@ -389,7 +389,9 @@ describe('分支在各个 await 期间被 forget（Issue #144）', () => {
     expect(r.tracked('b')).toBe(false);
   });
 
-  test('normalize：写回期间被 forget 且 rooms.patch 抛错（项目删除先踢房间）→ BranchForgottenError 而不是写回失败', async () => {
+  // 注：以下抛错用例模拟 routes/projects.ts 的真实顺序（事务提交后先同步 forget，再踢房间 / 关影子库）；
+  // 完整 HTTP 删除顺序与门控竞态见 apps/server/test/normalize.test.ts。
+  test('normalize：写回期间被 forget 且 rooms.patch 抛错（项目删除提交后先 forget 再踢房间）→ BranchForgottenError 而不是写回失败', async () => {
     const { saved, r, handle } = await setup({
       rooms: {
         beforePatch: () => {
@@ -474,6 +476,95 @@ describe('分支在各个 await 期间被 forget（Issue #144）', () => {
     await expect(r.normalize('b', { shadow: canonicalShadow(), label: 'x' })).rejects.toBeInstanceOf(
       BranchForgottenError,
     );
+  });
+
+  test('normalize：读基线（store.load）期间被 forget 且模型待规范化 → 抛 BranchForgottenError 且不解析影子库', async () => {
+    const live: Live = { m: base(), seq: 0 };
+    const { saved, store } = memStore();
+    saved.push(structuredClone(live.m));
+    runMutator(live.m, 'addCheck', { id: 'k', table: 't', expr: 'total > 0' });
+    let resolveCalls = 0;
+    let r!: OpaqueRefresher;
+    const hookedStore = {
+      load: async () => {
+        r.forget('b');
+        return store.load();
+      },
+      save: store.save,
+    };
+    r = new OpaqueRefresher(ctlRooms(live, { reject: 0 }), async () => canonicalShadow(), hookedStore);
+    await expect(
+      r.normalize('b', async () => {
+        resolveCalls++;
+        return { shadow: canonicalShadow(), label: 'x' };
+      }),
+    ).rejects.toBeInstanceOf(BranchForgottenError);
+    expect(resolveCalls).toBe(0);
+  });
+
+  test('normalize：排队等待前序任务（flush）期间被 forget → 入口即抛 BranchForgottenError，零房间/基线/影子库 I/O；排空后活分支不误伤', async () => {
+    const live: Live = { m: base(), seq: 0 };
+    const { saved, store } = memStore();
+    saved.push(structuredClone(live.m));
+    runMutator(live.m, 'addCheck', { id: 'k', table: 't', expr: 'total > 0' });
+    let stateCalls = 0;
+    let resolveCalls = 0;
+    let canonicalizeCalls = 0;
+    let markLoadEntered!: () => void;
+    const loadEntered = new Promise<void>((res) => (markLoadEntered = res));
+    let releaseLoad!: () => void;
+    const loadGate = new Promise<void>((res) => (releaseLoad = res));
+    let holdLoad = true;
+    const hookedStore = {
+      load: async () => {
+        if (holdLoad) {
+          holdLoad = false;
+          markLoadEntered();
+          await loadGate;
+        }
+        return store.load();
+      },
+      save: store.save,
+    };
+    const rooms = ctlRooms(live, {
+      reject: 0,
+      onState: () => {
+        stateCalls++;
+      },
+    });
+    const r = new OpaqueRefresher(rooms, async () => canonicalShadow(), hookedStore);
+    const flushP = r.flush('b');
+    await loadEntered;
+
+    const normP = r.normalize('b', async () => {
+      resolveCalls++;
+      return {
+        shadow: {
+          canonicalize: async (_p: Model, next: Model) => {
+            canonicalizeCalls++;
+            return canonicalShadow().canonicalize(_p, next);
+          },
+        } as unknown as Shadow,
+        label: 'lazy',
+      };
+    });
+    const normCheck = expect(normP).rejects.toBeInstanceOf(BranchForgottenError);
+
+    r.forget('b');
+    releaseLoad();
+    await expect(flushP).resolves.toMatchObject({ kind: 'skipped', skippedReason: 'forgotten' });
+    await normCheck;
+    expect(stateCalls).toBe(1);
+    expect(resolveCalls).toBe(0);
+    expect(canonicalizeCalls).toBe(0);
+
+    // 队列排空后 forgotten 标记自动清除，后续活分支调用不会误报
+    await Promise.resolve();
+    await Promise.resolve();
+    expect(r.tracked('b')).toBe(false);
+    await expect(
+      r.normalize('b', async () => ({ shadow: canonicalShadow(), label: 'lazy' })),
+    ).resolves.toMatchObject({ ok: true, outcome: 'normalized' });
   });
 
   test('对照：没被 forget 时 normalize 照常成功并推进基线', async () => {

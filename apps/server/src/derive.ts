@@ -449,8 +449,8 @@ export class OpaqueRefresher {
    * - 否则在给定影子库里从基线（没有就从空模型）迁移到当前模型并读回，写回规范形式、推进基线；
    * - 影子库 / 表达式报错（ShadowError、StepError、PlanError、InstanceLevelStatementError）原样抛给路由，基线不变；
    * - 写回被拒（期间有人改了同一对象）抛 NormalizeConflictError；
-   * - 期间分支被 forget（项目被删）：不论卡在哪一步（读房间、读基线、影子库、写回、读回、保存基线），也不论那一步
-   *   是否因此抛错（删除项目会先踢掉房间），一律抛 BranchForgottenError，不报成功。
+   * - 期间分支被 forget（项目被删）：不论卡在哪一步（排队、读房间、读基线、解析影子库、影子库校验、写回、读回、保存基线），
+   *   也不论那一步是否因此抛错（删除项目事务提交后会先同步 forget 再踢房间与关影子库），一律抛 BranchForgottenError，不报成功。
    */
   normalize(
     branchId: string,
@@ -478,8 +478,11 @@ export class OpaqueRefresher {
     handleOrResolve: ShadowHandle | (() => Promise<ShadowHandle>),
   ): Promise<NormalizeOutcome> {
     if (this.stopped) throw new RefresherStoppedError();
+    if (this.forgotten.has(branchId)) throw new BranchForgottenError(branchId);
     const { model: cur, versions, seq } = await this.rooms.state(branchId);
+    if (this.forgotten.has(branchId)) throw new BranchForgottenError(branchId);
     const good = await this.loadGood(branchId);
+    if (this.forgotten.has(branchId)) throw new BranchForgottenError(branchId);
     if (good !== null && deepEqual(good, cur)) {
       return {
         ok: true,
@@ -492,6 +495,7 @@ export class OpaqueRefresher {
       };
     }
     const handle = typeof handleOrResolve === 'function' ? await handleOrResolve() : handleOrResolve;
+    if (this.forgotten.has(branchId)) throw new BranchForgottenError(branchId);
     const patched = await handle.shadow.canonicalize(good ?? emptyBaseline(cur), cur);
     // 已被 forget：不再写回（normalize 外层把它报成 BranchForgottenError）
     if (this.forgotten.has(branchId)) throw new BranchForgottenError(branchId);

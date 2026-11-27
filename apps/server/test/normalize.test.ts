@@ -2,8 +2,9 @@
 // POST /normalize 显式规范化（SQLite :memory: 影子库 + 桩影子库）、权限、请求体校验、错误码映射与连接限速退回（零 Docker）。
 import type { NormalizeResult, NormalizeStatus } from '@dowel/api';
 import { addCheck, addColumn, all, createSchema, createTable, type Model, type Obj } from '@dowel/core';
-import { afterEach, beforeEach, describe, expect, test } from 'vitest';
+import { afterEach, beforeEach, describe, expect, test, vi } from 'vitest';
 
+import { BranchForgottenError } from '../src/derive.ts';
 import { createApp, openPlatformDb, type PlatformDb } from '../src/index.ts';
 import { KeyedLimiter, LoginLimiter } from '../src/rate-limit.ts';
 import { type Shadow, ShadowError } from '../src/shadow.ts';
@@ -110,6 +111,8 @@ beforeEach(async () => {
 afterEach(async () => {
   created.refresher.stop();
   await created.refresher.drain();
+  created.requests.stop();
+  await created.requests.drain();
   await created.rooms.flush();
   await created.shadows.close();
   await db.close();
@@ -249,15 +252,33 @@ describe('桩影子库', () => {
   });
 });
 
+const deferred = () => {
+  let resolve!: () => void;
+  const promise = new Promise<void>((r) => {
+    resolve = r;
+  });
+  return { promise, resolve };
+};
+
 describe('规范化期间项目被删除（Issue #144）', () => {
-  test('影子库规范化期间项目被删：404（同项目不存在），不报 200 / 409，删除照常成功', async () => {
-    const { pid } = await newProject('删除中', 'pg');
+  test('A1 真实删除顺序：canonicalize 期间删除事务提交（停在 kickBranches 前）→ 404，不写回房间', async () => {
+    const { pid } = await newProject('删除中-A1', 'pg');
     const [row] = await db.query<{ slug: string }>('select slug from projects where id = $1', [pid]);
-    let deleted: { status: number; data: unknown } | undefined;
+    const kickEntered = deferred();
+    const kickGate = deferred();
+    const origKick = created.rooms.kickBranches.bind(created.rooms);
+    created.rooms.kickBranches = async (branchIds, reason) => {
+      kickEntered.resolve();
+      await kickGate.promise;
+      return origKick(branchIds, reason);
+    };
+    const patchSpy = vi.spyOn(created.rooms, 'patch');
+    let delP: Promise<{ status: number; data: unknown }> | undefined;
     const fake = {
       canonicalize: async (_prev: Model, next: Model) => {
-        // 规范化还在影子库里时，管理员删掉了项目（踢房间、forget 分支）
-        deleted = await call('DELETE', `/api/projects/${pid}`, { confirm: row!.slug }, adminCookie);
+        // 发起 DELETE 后停在事务已提交、kickBranches 之前（模拟真实流程里还没踢房间时的时刻）
+        delP = call('DELETE', `/api/projects/${pid}`, { confirm: row!.slug }, adminCookie);
+        await kickEntered.promise;
         return Object.values(next.objects)
           .filter((o) => o.kind === 'check' && !o.expr.startsWith('('))
           .map((o) => ({ ...o, expr: `(${(o as { expr: string }).expr})` }) as Obj);
@@ -266,11 +287,278 @@ describe('规范化期间项目被删除（Issue #144）', () => {
     } as unknown as Shadow;
     created.shadows.forProjectTarget = async () => ({ shadow: fake, label: 'fake-shadow' });
     await seedCheck(pid);
-    const res = await call('POST', `/api/projects/${pid}/normalize`, {}, editorCookie);
-    expect(deleted?.status, JSON.stringify(deleted?.data)).toBe(200);
+    let res!: { status: number; data: unknown };
+    try {
+      res = await call('POST', `/api/projects/${pid}/normalize`, {}, editorCookie);
+    } finally {
+      kickGate.resolve();
+    }
+    const deleted = await delP!;
+    expect(deleted.status, JSON.stringify(deleted.data)).toBe(200);
     expect(res.status, JSON.stringify(res.data)).toBe(404);
     expect(res.data).toMatchObject({ error: '项目不存在' });
+    expect(patchSpy).not.toHaveBeenCalled();
     expect((await call('GET', `/api/projects/${pid}/normalize`, undefined, editorCookie)).status).toBe(404);
+  });
+
+  test('A2 真实删除顺序：rooms.patch 期间删除事务提交（停在 kickBranches 前），patch 抛外键错 → BranchForgottenError → 404', async () => {
+    const { pid } = await newProject('删除中-A2', 'pg');
+    const [row] = await db.query<{ slug: string }>('select slug from projects where id = $1', [pid]);
+    const kickEntered = deferred();
+    const kickGate = deferred();
+    const origKick = created.rooms.kickBranches.bind(created.rooms);
+    created.rooms.kickBranches = async (branchIds, reason) => {
+      kickEntered.resolve();
+      await kickGate.promise;
+      return origKick(branchIds, reason);
+    };
+    let refresherErr: unknown;
+    const origNormalize = created.refresher.normalize.bind(created.refresher);
+    created.refresher.normalize = async (...args) => {
+      try {
+        return await origNormalize(...args);
+      } catch (e) {
+        refresherErr = e;
+        throw e;
+      }
+    };
+    let delP: Promise<{ status: number; data: unknown }> | undefined;
+    const origPatch = created.rooms.patch.bind(created.rooms);
+    created.rooms.patch = async (...args) => {
+      delP = call('DELETE', `/api/projects/${pid}`, { confirm: row!.slug }, adminCookie);
+      await kickEntered.promise;
+      return origPatch(...args);
+    };
+    const fake = {
+      canonicalize: async (_prev: Model, next: Model) =>
+        Object.values(next.objects)
+          .filter((o) => o.kind === 'check' && !o.expr.startsWith('('))
+          .map((o) => ({ ...o, expr: `(${(o as { expr: string }).expr})` }) as Obj),
+      close: async () => {},
+    } as unknown as Shadow;
+    created.shadows.forProjectTarget = async () => ({ shadow: fake, label: 'fake-shadow' });
+    await seedCheck(pid);
+    let res!: { status: number; data: unknown };
+    try {
+      res = await call('POST', `/api/projects/${pid}/normalize`, {}, editorCookie);
+    } finally {
+      kickGate.resolve();
+    }
+    const deleted = await delP!;
+    expect(deleted.status, JSON.stringify(deleted.data)).toBe(200);
+    expect(refresherErr).toBeInstanceOf(BranchForgottenError);
+    expect(res.status, JSON.stringify(res.data)).toBe(404);
+    expect(res.data).toMatchObject({ error: '项目不存在' });
+  });
+
+  test('C 真实删除顺序：shadows.forgetProject 关闭影子库导致 canonicalize 抛 ShadowError → 404（不报 422）', async () => {
+    const { pid } = await newProject('删除中-C', 'pg');
+    const [row] = await db.query<{ slug: string }>('select slug from projects where id = $1', [pid]);
+    const shadowClosed = deferred();
+    const forgetGate = deferred();
+    const origForgetProject = created.shadows.forgetProject.bind(created.shadows);
+    created.shadows.forgetProject = async (targetPid) => {
+      shadowClosed.resolve();
+      await forgetGate.promise;
+      return origForgetProject(targetPid);
+    };
+    let delP: Promise<{ status: number; data: unknown }> | undefined;
+    const fake = {
+      canonicalize: async () => {
+        delP = call('DELETE', `/api/projects/${pid}`, { confirm: row!.slug }, adminCookie);
+        await shadowClosed.promise;
+        throw new ShadowError('影子库连接已关闭');
+      },
+      close: async () => {},
+    } as unknown as Shadow;
+    created.shadows.forProjectTarget = async () => ({ shadow: fake, label: 'fake-shadow' });
+    await seedCheck(pid);
+    let res!: { status: number; data: unknown };
+    try {
+      res = await call('POST', `/api/projects/${pid}/normalize`, {}, editorCookie);
+    } finally {
+      forgetGate.resolve();
+    }
+    const deleted = await delP!;
+    expect(deleted.status, JSON.stringify(deleted.data)).toBe(200);
+    expect(res.status, JSON.stringify(res.data)).toBe(404);
+    expect(res.data).toMatchObject({ error: '项目不存在' });
+  });
+
+  test('PG 残留窗口兜底：rooms.patch 抛错早于 refresher.forget 时仍回 404；活分支真实错误仍回 500', async () => {
+    const { pid, branch } = await newProject('PG兜底-已删', 'pg');
+    const fake = {
+      canonicalize: async (_prev: Model, next: Model) =>
+        Object.values(next.objects)
+          .filter((o) => o.kind === 'check' && !o.expr.startsWith('('))
+          .map((o) => ({ ...o, expr: `(${(o as { expr: string }).expr})` }) as Obj),
+      close: async () => {},
+    } as unknown as Shadow;
+    created.shadows.forProjectTarget = async () => ({ shadow: fake, label: 'fake-shadow' });
+    await seedCheck(pid);
+    const origPatch = created.rooms.patch.bind(created.rooms);
+    created.rooms.patch = async (...args) => {
+      // 模拟 PG FOR UPDATE 唤醒先于路由调 refresher.forget：库行已删但尚未标记 forgotten
+      await db.transaction(async (tx) => {
+        await tx.query('delete from room_rejections where branch_id = $1', [branch]);
+        await tx.query('delete from room_commits where branch_id = $1', [branch]);
+        await tx.query('delete from room_snapshots where branch_id = $1', [branch]);
+        await tx.query('delete from branches where id = $1', [branch]);
+      });
+      return origPatch(...args);
+    };
+    const res1 = await call('POST', `/api/projects/${pid}/normalize`, {}, editorCookie);
+    expect(res1.status, JSON.stringify(res1.data)).toBe(404);
+    expect(res1.data).toMatchObject({ error: '项目不存在' });
+
+    // 对照：活分支上的真实数据库错误仍回 500（不误吞成 404）
+    const { pid: pid2 } = await newProject('PG兜底-活分支', 'pg');
+    await seedCheck(pid2);
+    created.rooms.patch = async () => {
+      throw new Error('unexpected db failure');
+    };
+    const errSpy = vi.spyOn(console, 'error').mockImplementation(() => {});
+    try {
+      const res2 = await call('POST', `/api/projects/${pid2}/normalize`, {}, adminCookie);
+      expect(res2.status, JSON.stringify(res2.data)).toBe(500);
+    } finally {
+      errSpy.mockRestore();
+    }
+  });
+
+  test('限速精确退回：未解析影子库前项目被删（排队中）→ 404、零解析且退回限速；已解析后被删不退回', async () => {
+    const p1Info = await newProject('排队限速-1', 'pg');
+    const p2Info = await newProject('排队限速-2', 'pg');
+    const p3Info = await newProject('排队限速-3', 'pg');
+    const p4Info = await newProject('排队限速-4', 'pg');
+    const [row1] = await db.query<{ slug: string }>('select slug from projects where id = $1', [p1Info.pid]);
+    const [row3] = await db.query<{ slug: string }>('select slug from projects where id = $1', [p3Info.pid]);
+    await seedCheck(p1Info.pid);
+    await seedCheck(p2Info.pid);
+    await seedCheck(p3Info.pid);
+    await seedCheck(p4Info.pid);
+
+    let resolveCalls = 0;
+    const okShadow = {
+      canonicalize: async (_prev: Model, next: Model) =>
+        Object.values(next.objects)
+          .filter((o) => o.kind === 'check' && !o.expr.startsWith('('))
+          .map((o) => ({ ...o, expr: `(${(o as { expr: string }).expr})` }) as Obj),
+      close: async () => {},
+    } as unknown as Shadow;
+    created.shadows.forProjectTarget = async () => {
+      resolveCalls++;
+      return { shadow: okShadow, label: 'fake-shadow' };
+    };
+
+    // 情况 1（editorCookie）：排队等待期间项目被删，根本没解析影子库 → 404 且退回限速额度
+    const blockerGate = deferred();
+    const blocker = created.refresher.runWithoutReset(p1Info.branch, () => blockerGate.promise);
+    const queued = deferred();
+    const origNorm = created.refresher.normalize.bind(created.refresher);
+    created.refresher.normalize = (b, h) => {
+      const p = origNorm(b, h);
+      queued.resolve();
+      return p;
+    };
+    const norm1P = call('POST', `/api/projects/${p1Info.pid}/normalize`, {}, editorCookie);
+    await queued.promise;
+    let res1!: { status: number; data: unknown };
+    try {
+      const del1 = await call('DELETE', `/api/projects/${p1Info.pid}`, { confirm: row1!.slug }, adminCookie);
+      expect(del1.status).toBe(200);
+    } finally {
+      blockerGate.resolve();
+      await blocker;
+      res1 = await norm1P;
+    }
+    expect(res1.status, JSON.stringify(res1.data)).toBe(404);
+    expect(res1.data).toMatchObject({ error: '项目不存在' });
+    expect(resolveCalls).toBe(0);
+
+    // 额度已退回：同一个 editorCookie 紧接着规范化另一个项目仍可成功（limit = 1 不会 429）
+    const res2 = await call('POST', `/api/projects/${p2Info.pid}/normalize`, {}, editorCookie);
+    expect(res2.status, JSON.stringify(res2.data)).toBe(200);
+    expect(resolveCalls).toBe(1);
+
+    // 情况 2（adminCookie）：已经解析了影子库之后在 canonicalize 期间被删 → 404 且不退回限速额度
+    const kickEntered = deferred();
+    const kickGate = deferred();
+    const origKick = created.rooms.kickBranches.bind(created.rooms);
+    created.rooms.kickBranches = async (branchIds, reason) => {
+      kickEntered.resolve();
+      await kickGate.promise;
+      return origKick(branchIds, reason);
+    };
+    let del3P: Promise<{ status: number; data: unknown }> | undefined;
+    created.shadows.forProjectTarget = async () => {
+      resolveCalls++;
+      return {
+        shadow: {
+          canonicalize: async (_prev: Model, next: Model) => {
+            del3P = call('DELETE', `/api/projects/${p3Info.pid}`, { confirm: row3!.slug }, adminCookie);
+            await kickEntered.promise;
+            return okShadow.canonicalize(_prev, next);
+          },
+          close: async () => {},
+        } as unknown as Shadow,
+        label: 'fake-shadow',
+      };
+    };
+    let res3!: { status: number; data: unknown };
+    try {
+      res3 = await call('POST', `/api/projects/${p3Info.pid}/normalize`, {}, adminCookie);
+    } finally {
+      kickGate.resolve();
+    }
+    expect((await del3P!).status).toBe(200);
+    expect(res3.status, JSON.stringify(res3.data)).toBe(404);
+    // 已连过影子库，没有退回：紧接着再发起一次命中 429
+    const res4 = await call('POST', `/api/projects/${p4Info.pid}/normalize`, {}, adminCookie);
+    expect(res4.status).toBe(429);
+  });
+
+  test('flush() 在真实删除顺序下（rooms.patch 期间删除事务提交）返回 skipped(forgotten) 且不打告警', async () => {
+    const { pid, branch } = await newProject('flush真实顺序', 'pg');
+    const [row] = await db.query<{ slug: string }>('select slug from projects where id = $1', [pid]);
+    const fake = {
+      canonicalize: async (_prev: Model, next: Model) =>
+        Object.values(next.objects)
+          .filter((o) => o.kind === 'check' && !o.expr.startsWith('('))
+          .map((o) => ({ ...o, expr: `(${(o as { expr: string }).expr})` }) as Obj),
+      close: async () => {},
+    } as unknown as Shadow;
+    created.shadows.forProjectTarget = async () => ({ shadow: fake, label: 'fake-shadow' });
+    await seedCheck(pid);
+
+    const kickEntered = deferred();
+    const kickGate = deferred();
+    const origKick = created.rooms.kickBranches.bind(created.rooms);
+    created.rooms.kickBranches = async (branchIds, reason) => {
+      kickEntered.resolve();
+      await kickGate.promise;
+      return origKick(branchIds, reason);
+    };
+    let delP: Promise<{ status: number; data: unknown }> | undefined;
+    const origPatch = created.rooms.patch.bind(created.rooms);
+    created.rooms.patch = async (...args) => {
+      delP = call('DELETE', `/api/projects/${pid}`, { confirm: row!.slug }, adminCookie);
+      await kickEntered.promise;
+      return origPatch(...args);
+    };
+
+    const warn = vi.spyOn(console, 'warn').mockImplementation(() => {});
+    let out!: Awaited<ReturnType<typeof created.refresher.flush>>;
+    try {
+      out = await created.refresher.flush(branch);
+    } finally {
+      kickGate.resolve();
+      warn.mockRestore();
+    }
+    const deleted = await delP!;
+    expect(deleted.status, JSON.stringify(deleted.data)).toBe(200);
+    expect(out).toMatchObject({ kind: 'skipped', skippedReason: 'forgotten' });
+    expect(warn).not.toHaveBeenCalled();
   });
 });
 

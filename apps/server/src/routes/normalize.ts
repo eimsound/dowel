@@ -76,14 +76,6 @@ export const registerNormalize = (app: Hono<Env>, ctx: AppContext) => {
       if (gate?.allowed) gate.refund();
     };
 
-    // 静态校验先于连库：模型本身不合法（引用缺失等），影子库里一定建不出来
-    const { model: cur } = await rooms.model(a.branch);
-    const problems = validate(cur);
-    if (problems.length) {
-      refund();
-      return fail(422, `模型校验未通过，无法规范化：${problems[0]}`, 'model_invalid');
-    }
-
     /**
      * 解析影子库句柄：没真正连库就失败的（ShadowError.preConnect：没有环境、生产环境不允许同实例；指定的环境不存在 404）
      * 精确退回限速额度（#9）。refund 幂等，后面再退一次也不会多退。
@@ -103,6 +95,14 @@ export const registerNormalize = (app: Hono<Env>, ctx: AppContext) => {
     };
 
     try {
+      // 静态校验先于连库：模型本身不合法（引用缺失等），影子库里一定建不出来
+      const { model: cur } = await rooms.model(a.branch);
+      const problems = validate(cur);
+      if (problems.length) {
+        refund();
+        return fail(422, `模型校验未通过，无法规范化：${problems[0]}`, 'model_invalid');
+      }
+
       // 指定了环境：先解析（校验环境存在、确实用它的影子库）；没指定：交给 normalize 在锁内按需解析，
       // 基线就是当前模型（clean）时根本不碰影子库
       const handle = b.env ? await resolveHandle() : resolveHandle;
@@ -115,8 +115,12 @@ export const registerNormalize = (app: Hono<Env>, ctx: AppContext) => {
         const reason = e instanceof StepError ? e.reason : e.message;
         return fail(422, `规范化失败（工作副本保持原样）：${reason}`, 'canonicalize_failed');
       }
-      // 规范化期间项目被删（分支被 forget）：和项目不存在同一个响应（accessIn 的 404）
-      if (e instanceof BranchForgottenError) throw new HTTPException(404, { message: '项目不存在' });
+      // 规范化期间项目被删（分支被 forget）：和项目不存在同一个响应（accessIn 的 404）；
+      // 还没解析到影子库句柄（例如排队中或 loadGood 期间被删、未指定 env）则精确退回限速额度
+      if (e instanceof BranchForgottenError) {
+        if (!resolved) refund();
+        throw new HTTPException(404, { message: '项目不存在' });
+      }
       if (e instanceof NormalizeConflictError) {
         return fail(409, e.message, 'working_changed', { currentSeq: e.currentSeq });
       }
@@ -126,6 +130,17 @@ export const registerNormalize = (app: Hono<Env>, ctx: AppContext) => {
         return fail(503, e.message, 'shutting_down');
       }
       if (e instanceof DeriveBusyError) refund();
+      // 兜底：PG 下 rooms.patch 的 FOR UPDATE 唤醒与删除路由的 refresher.forget 走不同连接（或跨副本删除）
+      // 先后无保证，错误可能在 forget 之前到达；复查分支是否已消失，已消失则与 accessIn 一致返回 404
+      if (!(e instanceof HTTPException) && !(e instanceof DeriveBusyError)) {
+        const [branch] = await ctx.db
+          .query<{ id: string }>('select id from branches where id = $1', [a.branch])
+          .catch(() => [{ id: a.branch }]);
+        if (!branch) {
+          if (!resolved) refund();
+          throw new HTTPException(404, { message: '项目不存在' });
+        }
+      }
       // DeriveBusyError 交给 app.onError 统一映射为 503 normalize_busy；404（环境不存在）等 HTTPException 原样抛出
       throw e;
     }

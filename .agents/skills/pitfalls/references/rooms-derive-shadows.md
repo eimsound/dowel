@@ -22,7 +22,7 @@
   1. 后台防抖（`schedule` / `timers` / `runBackground`）已整体移除，编辑期间 0 影子库调用；`flush()` 只在关键出口调用，单机与 HA 统一阻塞持锁（超时 `DeriveBusyError` → `503 normalize_busy`），同分支排队未开始的 flush 合并；
   2. **反模式**：在带 `workingSeq` 的确认请求（恢复历史、应用版本、作废/取消作废同步工作副本、拉取/接入确认覆盖）里先 `flush()`——规范化写回推进 `seq`，用户确认立刻 `409 working_changed`（自冲突）。正确做法：只在返回 `workingSeq` 的预览/详情接口 flush；
   3. **反模式（基线投毒）**：`!needsRefresh` 时把当前模型写成基线、canonicalize 失败时“接受当前模型作为基线”、恢复历史时把历史模型写成基线。正确做法：黄金基线只在 canonical 替换或成功 canonicalize 后推进；非 canonical 替换走 `runWithoutReset`（同样排队持锁，不碰基线）；
-  4. 显式 `normalize()` 停机中拒绝（`503 shutting_down`），`forget()` 后在途任务不回写基线、也不报成功（每个 await 之后复查 `forgotten`，期间抛的错也归为 forgotten：`flush()` → `skipped('forgotten')`，`normalize()` → `BranchForgottenError` / 404）；只读 `status()` 不拿锁、不连影子库。
+  4. 显式 `normalize()` 停机中拒绝（`503 shutting_down`），`forget()` 后在途任务不回写基线、也不报成功（`normalizeLocked` 入口及每个 await 之后复查 `forgotten`，期间抛的错也归为 forgotten：`flush()` → `skipped('forgotten')`，`normalize()` → `BranchForgottenError` / 404）；只读 `status()` 不拿锁、不连影子库。**反模式（删除顺序倒挂）**：删除项目事务提交后先 `rooms.kickBranches` / `shadows.forget*`、最后才 `refresher.forget()`，导致房间被踢或影子库关闭引发的异常先到达 catch 时 `forgotten` 仍为 `false`（`normalize()` 误回 500 / 422、`flush()` 误报 `store_failed`）。**正确做法**：事务提交后**先同步调用 `refresher.forget()`**，再踢房间、关影子库；并在 `POST /normalize` 兜底 catch 复查 `branches` 存在性以覆盖 PG `FOR UPDATE` 跨连接唤醒先于 `forget()` 到达的残留窗口。
   5. **反模式（flush 后二次读房间 TOCTOU，#132 路径 B）**：关键出口调用 `await refresher.flush(branch)` 后再 `await rooms.model(branch)` 读一次房间——两次调用之间插进来的并发编辑没经过规范化判定，却会被冻进已验证版本或用于迁移 / DDL / 预览。正确做法：直接使用 `flush()` 返回的 `{ model, seq }`（发布、`resolveModelRef`、版本 `canvas-diff`、历史详情、拉取 / 接入预览均如此）；仅只读 MCP 读模型工具（`get_model` / `get_table` / `get_objects`）因需在同一把房间锁内原子拿到对象版本与板块，仍按设计在 `flush()` 后读 `canvasState`。
 
 ---
