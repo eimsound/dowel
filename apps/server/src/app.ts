@@ -11,7 +11,7 @@ import { HTTPException } from 'hono/http-exception';
 import { assertUrlAllowed } from './allowlist.ts';
 import { EventBus, type EventBusOptions } from './bus.ts';
 import type { PlatformDb } from './db.ts';
-import { DeriveBusyError, OpaqueRefresher } from './derive.ts';
+import { BranchForgottenError, DeriveBusyError, OpaqueRefresher } from './derive.ts';
 import { DriftScheduler } from './drift-scheduler.ts';
 import { defaultMailer, type Mailer } from './email.ts';
 import { EnvLocks, type ExecContext } from './executions.ts';
@@ -112,8 +112,14 @@ export const createApp = (db: PlatformDb, options: AppOptions = {}) => {
       const [b] = await db.query<{ project_id: string }>('select project_id from branches where id = $1', [
         branchId,
       ]);
-      if (!b) return null;
-      return (await shadows.forProjectTarget(b.project_id).catch(() => null))?.shadow ?? null;
+      if (!b) return 'forgotten';
+      try {
+        return (await shadows.forProjectTarget(b.project_id))?.shadow ?? null;
+      } catch (e) {
+        // 尚未尝试连库就已知项目没有可用影子库（无环境）：直接报 no_shadow，避免每次 flush 多查一次 branches
+        if (e instanceof ShadowError && e.preConnect) return 'no_shadow';
+        return null;
+      }
     },
     {
       load: async (branchId) =>
@@ -235,6 +241,8 @@ export const createApp = (db: PlatformDb, options: AppOptions = {}) => {
     if (err instanceof CodedHTTPException) return fail(err.message, err.status, err.code);
     // 等 derive 锁超时（另一副本 / 请求正在规范化同一分支）：可重试的 503
     if (err instanceof DeriveBusyError) return fail(err.message, 503, 'normalize_busy');
+    // 规范化 / flush 期间分支已删（未读到房间状态或显式规范化）：与 accessIn 一致返回 404
+    if (err instanceof BranchForgottenError) return fail('项目不存在', 404);
     if (err instanceof HTTPException) return fail(err.message, err.status);
     if (
       err instanceof PlanError ||

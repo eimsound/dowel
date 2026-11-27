@@ -229,4 +229,104 @@ describe.each([
     // 删掉之后再访问：404（项目不存在）
     expect((await call(adminCookie, 'GET', `/api/projects/${pid}`)).status).toBe(404);
   });
+
+  test.skipIf(skip)(
+    '删除进行中排队的导出 DDL / 迁移预览 / MCP 读取统一返回 404 / project_not_found，不返回 200 空模型',
+    async () => {
+      const { adminCookie, pid, slug } = await seed('queued-flush');
+      const [branch] = await db.query<{ id: string }>('select id from branches where project_id = $1', [pid]);
+      const branchId = branch!.id;
+
+      const tokRes = await call(adminCookie, 'POST', '/api/me/mcp-tokens', { name: 'del-race' });
+      expect(tokRes.status, JSON.stringify(tokRes.data)).toBe(201);
+      const mcpToken = tokRes.data.token as string;
+
+      const mcpCall = async (method: string, params: Record<string, unknown>) => {
+        const r = await fetch(`${base}/api/mcp`, {
+          method: 'POST',
+          headers: {
+            authorization: `Bearer ${mcpToken}`,
+            'content-type': 'application/json',
+            accept: 'application/json, text/event-stream',
+          },
+          body: JSON.stringify({ jsonrpc: '2.0', id: 1, method, params }),
+        });
+        const text = await r.text();
+        const ct = r.headers.get('content-type') ?? '';
+        const payload = ct.includes('text/event-stream')
+          ? text
+              .split(/\r?\n/)
+              .filter((l) => l.startsWith('data:'))
+              .map((l) => l.slice(5).trim())
+              .filter(Boolean)
+              .at(-1)!
+          : text;
+        return {
+          status: r.status,
+          rpc: JSON.parse(payload) as {
+            result?: { isError?: boolean; structuredContent?: Record<string, unknown> };
+            error?: { code: number; message: string };
+          },
+        };
+      };
+
+      const deferred = () => {
+        let resolve!: () => void;
+        const promise = new Promise<void>((r) => {
+          resolve = r;
+        });
+        return { promise, resolve };
+      };
+
+      const gate = deferred();
+      const allQueued = deferred();
+      let queuedCount = 0;
+      const origFlush = app.refresher.flush.bind(app.refresher);
+      app.refresher.flush = (b) => {
+        const p = origFlush(b);
+        if (++queuedCount === 4) allQueued.resolve();
+        return p;
+      };
+
+      const blocker = app.refresher.runWithoutReset(branchId, () => gate.promise);
+      let ddlRes!: { status: number; data: unknown };
+      let migRes!: { status: number; data: unknown };
+      let mcpToolRes!: Awaited<ReturnType<typeof mcpCall>>;
+      let mcpResourceRes!: Awaited<ReturnType<typeof mcpCall>>;
+      try {
+        const p1 = call(adminCookie, 'GET', `/api/projects/${pid}/ddl`);
+        const p2 = call(adminCookie, 'GET', `/api/projects/${pid}/migration`);
+        const p3 = mcpCall('tools/call', { name: 'get_ddl', arguments: { project: pid } });
+        const p4 = mcpCall('resources/read', { uri: `dowel://projects/g-queued-flush/${slug}/ddl` });
+        await allQueued.promise;
+
+        const delRes = await call(adminCookie, 'DELETE', `/api/projects/${pid}`, { confirm: slug });
+        expect(delRes.status, JSON.stringify(delRes.data)).toBe(200);
+
+        gate.resolve();
+        await blocker;
+        [ddlRes, migRes, mcpToolRes, mcpResourceRes] = await Promise.all([p1, p2, p3, p4]);
+      } finally {
+        gate.resolve();
+        app.refresher.flush = origFlush;
+        await blocker.catch(() => {});
+      }
+
+      expect(ddlRes.status, JSON.stringify(ddlRes.data)).toBe(404);
+      expect(ddlRes.data).toEqual({ error: '项目不存在' });
+      expect(migRes.status, JSON.stringify(migRes.data)).toBe(404);
+      expect(migRes.data).toEqual({ error: '项目不存在' });
+
+      expect(mcpToolRes.status).toBe(200);
+      expect(mcpToolRes.rpc.result?.isError).toBe(true);
+      expect(mcpToolRes.rpc.result?.structuredContent).toMatchObject({
+        code: 'project_not_found',
+        message: '项目不存在',
+      });
+
+      expect(mcpResourceRes.rpc.error).toBeDefined();
+      expect(mcpResourceRes.rpc.error?.code).toBe(-32602);
+      expect(mcpResourceRes.rpc.error?.message).toContain('项目不存在');
+    },
+  );
 });

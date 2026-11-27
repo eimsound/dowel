@@ -9,7 +9,7 @@
 //
 // 基线（branches.baseline）是一份“确定已在影子库里规范化过”的模型（黄金基线）：只在导入 / 拉取 / 接入 / 已验证版本覆盖
 // （runWithReset）或一次成功的 canonicalize 之后推进；没有待规范化对象时、canonicalize 失败时都**不**改写它。
-import { deepEqual, emptyModel, type Model, type Obj } from '@dowel/core';
+import { deepEqual, type Model, type Obj } from '@dowel/core';
 import type { Versions } from '@dowel/sync';
 
 import type { EventBus } from './bus.ts';
@@ -56,8 +56,8 @@ export class NormalizeConflictError extends Error {
 }
 
 /**
- * 显式规范化期间分支被 forget（项目已被删除）：不论写回 / 保存基线做到哪一步都不报成功。
- * HTTP 映射为 404（与项目不存在一致）。
+ * 显式规范化或排队 flush（尚未读到房间状态前）期间分支被 forget（项目已被删除）：不论做到哪一步都不报成功。
+ * HTTP 统一映射为 404（与项目不存在一致）。
  */
 export class BranchForgottenError extends Error {
   constructor(branchId: string) {
@@ -135,6 +135,15 @@ export interface ShadowHandle {
   label: string;
 }
 
+/**
+ * shadowOf 的返回值：
+ * - Shadow：解析到可用影子库；
+ * - 'forgotten'：查询已知分支行不存在（避免 refresher 再查一次 branches）；
+ * - 'no_shadow'：项目仍在但未配置可用影子库（preConnect 失败，避免无环境项目每次 flush 多查一次 branches）；
+ * - null：未知原因无影子库（如连库失败或测试桩），由 refresher 走 gone() 复核区分 forgotten / no_shadow。
+ */
+export type ShadowLookup = Shadow | null | 'no_shadow' | 'forgotten';
+
 /** 跨副本同步 forget 用到的事件总线子集（单机 / 测试可不传） */
 export type RefresherBus = Pick<EventBus, 'replicaId' | 'onEvent' | 'onReconnect' | 'publish'>;
 
@@ -160,7 +169,7 @@ const refOf = (m: Model, id: string): DerivedObjectRef => {
 
 export class OpaqueRefresher {
   private rooms: Rooms;
-  private shadowOf: (branchId: string) => Promise<Shadow | null>;
+  private shadowOf: (branchId: string) => Promise<ShadowLookup>;
   /** 基线的持久化（重启后仍知道哪份模型已规范化） */
   private store: BaselineStore;
   private ha: HaCoordinator | null;
@@ -186,7 +195,7 @@ export class OpaqueRefresher {
 
   constructor(
     rooms: Rooms,
-    shadowOf: (branchId: string) => Promise<Shadow | null>,
+    shadowOf: (branchId: string) => Promise<ShadowLookup>,
     store: BaselineStore,
     ha?: HaCoordinator,
     bus?: RefresherBus,
@@ -414,7 +423,8 @@ export class OpaqueRefresher {
    * 关键出口之前调用（发布、生成迁移、导出 DDL、验证、版本差异预览、历史详情、拉取 / 接入预览、MCP 读模型）：
    * 单机与 HA 统一走本地队列 + derive 锁；锁内相对黄金基线判断有没有待规范化的对象，没有就 0 影子库 I/O 返回 clean；
    * 有就在影子库里规范化并写回。影子库不可用（ShadowError）或规范化失败时安静返回 skipped（带原因），不改基线、不报错，
-   * 保证没有影子库的项目照样能看迁移、导出 DDL、发布未验证版本。只有等锁超时（DeriveBusyError）会抛出。
+   * 保证没有影子库的项目照样能看迁移、导出 DDL、发布未验证版本。等锁超时（DeriveBusyError）会抛出；
+   * 排队等锁期间房间已被卸载且尚未读到任何房间状态时若发现分支已删，抛 BranchForgottenError（不编造空模型）。
    * 返回的 model / seq 就是判定所针对的房间状态（见 FlushOutcome），调用方不要再另读房间。
    * 写回冲突的重试预算（MAX_REJECT_RETRIES 次连续被拒）只属于这一次 flush，不跨调用累计。
    */
@@ -449,9 +459,13 @@ export class OpaqueRefresher {
       try {
         state = await this.rooms.state(branchId);
       } catch (e) {
-        // 排队等到锁时房间已被踢、快照已删（别的副本删了项目，room.refresh 先生效）：按已删报 forgotten；
-        // 分支还在时照旧抛出（不改变活分支上读房间失败的语义）
-        if (await this.gone(branchId)) return skipped('forgotten', last ?? { model: emptyModel(), seq: 0 });
+        // 排队等到锁时房间已被踢、快照已删（别的副本删了项目，room.refresh 先生效）：
+        // 还没读到过任何房间状态时不得编造空模型，抛 BranchForgottenError 统一映射 404 / project_not_found；
+        // 前面轮次已读到过真实状态（last 有值）时按已删报 forgotten；活分支照旧抛出。
+        if (await this.gone(branchId)) {
+          if (!last) throw new BranchForgottenError(branchId);
+          return skipped('forgotten', last);
+        }
         throw e;
       }
       const { model: cur, versions, seq } = state;
@@ -464,6 +478,11 @@ export class OpaqueRefresher {
       if (!needsRefresh(base, cur)) return { kind: wrote ? 'normalized' : 'clean', seq, model: cur };
       const shadow = await this.shadowOf(branchId);
       if (this.forgotten.has(branchId)) return skipped('forgotten', last);
+      if (shadow === 'forgotten') {
+        this.forget(branchId);
+        return skipped('forgotten', last);
+      }
+      if (shadow === 'no_shadow') return skipped('no_shadow', last);
       // 解析不到影子库也可能是因为分支已被删（branches 行没了，删除方的 derive.forget 还没到）
       if (!shadow) return skipped((await this.gone(branchId)) ? 'forgotten' : 'no_shadow', last);
       const outcome = await this.apply(branchId, shadow, base, cur, versions, seq);

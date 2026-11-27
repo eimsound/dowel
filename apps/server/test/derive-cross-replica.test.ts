@@ -21,6 +21,7 @@ import {
   BranchForgottenError,
   OpaqueRefresher,
   type RefresherBus,
+  type ShadowLookup,
 } from '../src/derive.ts';
 import type { HaCoordinator } from '../src/ha.ts';
 import type { Rooms } from '../src/rooms.ts';
@@ -149,7 +150,7 @@ const fakeRooms = (live: Live, hooks: { patch?: () => Promise<void> } = {}) =>
 const cluster = (
   opts: {
     canon?: (next: Model) => Promise<Obj[]>;
-    shadowOfB?: () => Promise<Shadow | null>;
+    shadowOfB?: () => Promise<ShadowLookup>;
     patchB?: () => Promise<void>;
     /** B 按 PG 多副本模式运行（loadGood 始终读库） */
     distributedB?: boolean;
@@ -461,6 +462,26 @@ describe('副本 B 在途 flush() 期间副本 A 删除项目：一律 skipped(f
     await expect(refB.flush(BRANCH)).resolves.toMatchObject({ kind: 'skipped', skippedReason: 'forgotten' });
   });
 
+  test("shadowOf 返回 'no_shadow' → 报 skipped(no_shadow) 且不再查第二次 branches", async () => {
+    const { refB, db } = cluster({ shadowOfB: async () => 'no_shadow' });
+    await expect(refB.flush(BRANCH)).resolves.toMatchObject({
+      kind: 'skipped',
+      skippedReason: 'no_shadow',
+    });
+    expect(db.existingCalls()).toBe(0);
+  });
+
+  test("shadowOf 返回 'forgotten' → 报 skipped(forgotten)、清理跟踪状态且不再查第二次 branches", async () => {
+    const { refB, db } = cluster({ shadowOfB: async () => 'forgotten' });
+    await expect(refB.flush(BRANCH)).resolves.toMatchObject({
+      kind: 'skipped',
+      skippedReason: 'forgotten',
+    });
+    expect(db.existingCalls()).toBe(0);
+    await refB.drain();
+    expect(refB.tracked(BRANCH)).toBe(false);
+  });
+
   test('对照：分支还在时 no_shadow / shadow_unavailable 语义不变', async () => {
     const c1 = cluster({ shadowOfB: async () => null });
     await expect(c1.refB.flush(BRANCH)).resolves.toMatchObject({
@@ -529,7 +550,7 @@ describe('副本 B 断线期间错过删除：bus.onReconnect 复核', () => {
     await expect(p).resolves.toMatchObject({ kind: 'skipped', skippedReason: 'forgotten' });
   });
 
-  test('排队的 flush 轮到时房间已被踢、读房间抛错 → 已删报 forgotten；分支还在照旧抛出', async () => {
+  test('排队的 flush 轮到时房间已被踢、读房间抛错 → 尚未读到房间状态时抛 BranchForgottenError；分支还在照旧抛出', async () => {
     const live: Live = { m: base(), seq: 0 };
     const db = platform();
     const rooms = Object.assign(fakeRooms(live), {
@@ -540,7 +561,63 @@ describe('副本 B 断线期间错过删除：bus.onReconnect 复核', () => {
     const r = new OpaqueRefresher(rooms, async () => null, db.store);
     await expect(r.flush(BRANCH)).rejects.toThrow('分支没有初始快照');
     db.rows.delete(BRANCH);
-    await expect(r.flush(BRANCH)).resolves.toMatchObject({ kind: 'skipped', skippedReason: 'forgotten' });
+    await expect(r.flush(BRANCH)).rejects.toBeInstanceOf(BranchForgottenError);
+    await r.drain();
+    expect(r.tracked(BRANCH)).toBe(false);
+  });
+
+  test('合并排队的多个并发 flush() 在首轮读房间失败且分支已删时全部抛 BranchForgottenError', async () => {
+    const live: Live = { m: base(), seq: 0 };
+    const db = platform();
+    let failState = false;
+    const origRooms = fakeRooms(live);
+    const rooms = Object.assign({}, origRooms, {
+      state: async () => {
+        if (failState) throw new Error('分支没有初始快照');
+        return origRooms.state(BRANCH);
+      },
+    }) as unknown as Rooms;
+    const r = new OpaqueRefresher(rooms, async () => null, db.store);
+    const gate = deferred();
+    const blocker = r.runWithoutReset(BRANCH, () => gate.promise);
+    const f1 = r.flush(BRANCH);
+    const f2 = r.flush(BRANCH);
+    db.rows.delete(BRANCH);
+    failState = true;
+    gate.resolve();
+    await blocker;
+    await expect(f1).rejects.toBeInstanceOf(BranchForgottenError);
+    await expect(f2).rejects.toBeInstanceOf(BranchForgottenError);
+    await r.drain();
+    expect(r.tracked(BRANCH)).toBe(false);
+  });
+
+  test('flush 第 2 轮（已读到真实房间状态 last）rooms.state 抛错且分支已删 → 仍返回 skipped(forgotten) 与第 1 轮真实模型', async () => {
+    const live: Live = { m: base(), seq: 5 };
+    runMutator(live.m, 'addCheck', { id: 'k', table: 't', expr: 'total > 0' });
+    const db = platform();
+    let stateCalls = 0;
+    const shadow = {
+      canonicalize: async (_prev: Model, next: Model) => canonical(next),
+    } as unknown as Shadow;
+    const rooms = {
+      state: async () => {
+        stateCalls++;
+        if (stateCalls === 1) return { model: structuredClone(live.m), versions: {}, seq: live.seq };
+        throw new Error('分支没有初始快照');
+      },
+      model: async () => ({ model: structuredClone(live.m), seq: live.seq }),
+      patch: async () => {
+        // 第 1 轮写回被拒触发进入第 2 轮，此时分支在另一副本被删
+        db.rows.delete(BRANCH);
+        return { committed: false, rejected: true, seq: live.seq };
+      },
+    } as unknown as Rooms;
+    const r = new OpaqueRefresher(rooms, async () => shadow, db.store);
+    const out = await r.flush(BRANCH);
+    expect(out).toMatchObject({ kind: 'skipped', skippedReason: 'forgotten', seq: 5 });
+    expect(out.model.objects.k).toBeDefined();
+    expect(out.model).toEqual(live.m);
   });
 });
 

@@ -74,6 +74,7 @@ import pkg from '../package.json' with { type: 'json' };
 import { audit, auditIn } from './audit.ts';
 import { type Action, can, userActor } from './authz.ts';
 import { inList } from './db.ts';
+import { BranchForgottenError } from './derive.ts';
 import { iso, loadVersionRefs, projectPlanOptions, sanitizeSummary, versionRef } from './envs.ts';
 import { groupBySlug } from './groups.ts';
 import { registerMcpPrompts } from './mcp-prompts.ts';
@@ -1927,6 +1928,9 @@ export const createMcpServer = (
       const result = await spec.run(parsed.data);
       return server.server.projectCallToolResult(result, undefined);
     } catch (e) {
+      if (e instanceof BranchForgottenError) {
+        return server.server.projectCallToolResult(toolError('project_not_found', '项目不存在'), undefined);
+      }
       if (e instanceof PlanError) {
         return server.server.projectCallToolResult(toolError('invalid', e.message), undefined);
       }
@@ -1991,7 +1995,13 @@ export const createMcpServer = (
         varStr(variables.project),
         'project.read',
       );
-      const res = await summarizeOrReadModel(ctx, p, { detail: 'summary' });
+      let res: ModelReadResult;
+      try {
+        res = await summarizeOrReadModel(ctx, p, { detail: 'summary' });
+      } catch (e) {
+        if (e instanceof BranchForgottenError) throw new ResourceNotFoundError('项目不存在');
+        throw e;
+      }
       if (!res.ok) throw new ProtocolError(ProtocolErrorCode.InvalidParams, scrubSecrets(res.message));
       const data = res.data;
       return {
@@ -2008,13 +2018,19 @@ export const createMcpServer = (
     { title: 'Project Head DDL', mimeType: 'application/sql' },
     async (uri, variables) => {
       const p = await resolveProjectOrThrow(varStr(variables.owner), varStr(variables.project), 'ddl.read');
-      const modelRef = await resolveModelRef(ctx.db, ctx.refresher, {
-        pid: p.row.id,
-        branch: p.row.branch,
-        schemas: p.row.schemas,
-        ref: 'head',
-        defaultRef: 'head',
-      });
+      let modelRef: Awaited<ReturnType<typeof resolveModelRef>>;
+      try {
+        modelRef = await resolveModelRef(ctx.db, ctx.refresher, {
+          pid: p.row.id,
+          branch: p.row.branch,
+          schemas: p.row.schemas,
+          ref: 'head',
+          defaultRef: 'head',
+        });
+      } catch (e) {
+        if (e instanceof BranchForgottenError) throw new ResourceNotFoundError('项目不存在');
+        throw e;
+      }
       if (!modelRef.ok) throw new ResourceNotFoundError(scrubSecrets(modelRef.message));
       const sql = await buildDdlSql(ctx.db, {
         pid: p.row.id,
