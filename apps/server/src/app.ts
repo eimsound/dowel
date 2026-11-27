@@ -131,8 +131,12 @@ export const createApp = (db: PlatformDb, options: AppOptions = {}) => {
   // 按需规范化（ADR 0016）：编辑提交不再触发后台影子库刷新，只在关键出口 flush 或用户显式规范化时才回影子库
   /**
    * 整体替换工作副本：
-   * - canonical（默认 true）：导入、拉取、接入、已验证版本——新模型来自引擎读回 / 影子库验证，直接作为黄金基线；
-   * - canonical: 'ifClean'：已验证版本——相对当前黄金基线没有待规范化对象时才推进基线；
+   * - canonical（默认 true）：导入、拉取、接入领先版本——直接作为黄金基线。导入、拉取的模型是引擎刚读出的；
+   *   接入领先版本用的是链头版本模型，能直接当黄金基线依赖执行读回校验（`verifyAndRecord`）与恢复时闭环验证的
+   *   读回核对都严格按数据库核对（#123，ADR 0017），放宽其中任何一道都要重新审视这条路径；
+   * - canonical: 'ifClean'：已验证版本的应用 / 作废 / 取消作废——相对当前黄金基线没有待规范化对象时才推进黄金基线。
+   *   验证记录按数据库完整版本号区分（别的版本上验证通过不保证是当前影子库的规范形式）、SQL Server 生成列的 `type`
+   *   规划器不比较，再加一层防御性确认；
    * - canonical: false：恢复画布历史、未验证版本——只替换房间，不改写黄金基线（被替换进来的模型不一定规范化过）。
    */
   const replace: AppContext['replace'] = async (branch, user, model, op, expectedSeq, opts) => {
