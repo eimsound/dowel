@@ -150,6 +150,11 @@ export const importMssqlSnapshot = (snap: MssqlSnapshot): Model => {
       }
       if (c.sparse) mssqlExt.sparse = true;
       if (c.rowguidcol) mssqlExt.rowguidcol = true;
+      // 持久化计算列：系统目录分不出显式 `PERSISTED NOT NULL` 与引擎推断的非空（is_nullable 都是 0，ADR 0019），
+      // 一律记为推断（notNull: false + inferredNotNull: true）；显式声明只能从参考模型沿用（alignMssqlImportedLive）
+      // 或由影子库探测还原（shadow.ts）
+      const persistedComputed = c.generated?.stored === true;
+      if (persistedComputed && c.notNull) mssqlExt.inferredNotNull = true;
       const ext: ColumnExt | undefined = Object.keys(mssqlExt).length > 0 ? { mssql: mssqlExt } : undefined;
 
       put<Column>({
@@ -160,7 +165,7 @@ export const importMssqlSnapshot = (snap: MssqlSnapshot): Model => {
         pos,
         type: c.type,
         typeRef: null,
-        notNull: c.notNull,
+        notNull: persistedComputed ? false : c.notNull,
         notNullName: null,
         notNullNameMode: 'derived',
         default: def,

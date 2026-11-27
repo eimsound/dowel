@@ -44,6 +44,7 @@ import {
   requiredUniquePartitionKeys,
   rootTableId,
 } from './model.ts';
+import { effectiveNotNull, setMssqlInferredNotNull, stripMssqlInferredNotNull } from './mssql/nullability.ts';
 import { MYSQL_SAFE_IDENT_RE } from './mysql/naming.ts';
 import { exprReferences, renameInExpr, renameQualifiedInExpr, type Token, tokenize } from './pg/expr.ts';
 import {
@@ -1220,7 +1221,8 @@ export const addColumn = (m: Model, table: string, spec: ColumnSpec): string => 
   const serialSeq = serialKind
     ? makeDerivedSerialSequence(m, t.parent, colId, PG_SERIAL_BASE[serialKind])
     : null;
-  const cleanedExt = cleanExt(spec.ext);
+  // ext.mssql.inferredNotNull 是影子库规范化写回的派生字段（ADR 0019）：新列一律不带，由下一次规范化算出
+  const cleanedExt = cleanExt(stripMssqlInferredNotNull(spec.ext));
   const c: Column = {
     id: colId,
     kind: 'column',
@@ -1293,9 +1295,12 @@ export const setColumnExt = (m: Model, id: string, ext: ColumnExt | null) => {
   if (m.dialect === 'mysql' && ext?.mysql) {
     assertMysqlSafeOption(ext.mysql.charset, '字符集名');
   }
-  const cleaned = cleanExt(ext);
+  // ext.mssql.inferredNotNull 是派生字段（ADR 0019）：忽略调用方传入的值，整体替换 ext 时保留当前值
+  const inferred = c.ext?.mssql?.inferredNotNull === true;
+  const cleaned = cleanExt(stripMssqlInferredNotNull(ext ?? undefined));
   if (cleaned) c.ext = cleaned as ColumnExt;
   else delete c.ext;
+  if (inferred) setMssqlInferredNotNull(c, true);
   // MSSQL 带默认值的列：整体替换 ext 后重新推导默认约束名 DF_<table>_<col>（否则推导名会随 ext 一起丢失）
   if (m.dialect === 'mssql') refreshDerivedNames(m, c.parent);
 };
@@ -1503,7 +1508,12 @@ export const setNotNull = (m: Model, id: string, notNull: boolean) => {
   normalizePartitionFamily(m, c.parent);
   if (!notNull) {
     if (c.identity) throw new EditError('identity 列必须 NOT NULL');
-    if (all(m, 'primaryKey').some((k) => k.columns.includes(id))) throw new EditError('主键列必须 NOT NULL');
+    // SQL Server 持久化计算列去掉显式 NOT NULL 后若仍由引擎推断为非空，主键照样成立（ADR 0019）
+    if (
+      all(m, 'primaryKey').some((k) => k.columns.includes(id)) &&
+      !effectiveNotNull(m.dialect, { ...c, notNull: false })
+    )
+      throw new EditError('主键列必须 NOT NULL');
   }
   c.notNull = notNull;
   c.notNullName = null;
