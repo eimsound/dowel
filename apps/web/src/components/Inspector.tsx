@@ -69,6 +69,12 @@ import { useTranslation } from 'react-i18next';
 
 import { api } from '../api.ts';
 import { dialectUiSpec } from '../dialects.ts';
+import {
+  columnSerial,
+  keepsSerialOnPlainInteger,
+  PG_SERIAL_TYPE_OPTIONS,
+  unwrapSerialLabel,
+} from '../pg-serial.ts';
 import { useProject } from '../project.tsx';
 import { resolveTopLevelTableId } from '../sections.ts';
 import type { Workspace } from '../workspace.ts';
@@ -331,8 +337,12 @@ const AddForm = ({
   );
 };
 
-/** 解析类型输入：枚举名（可带 schema、可带 []）→ typeRef；否则规范化成当前方言的写法 */
-const parseType = (m: Model, text: string, index?: ModelIndex): { type: string; typeRef: string | null } => {
+/**
+ * 解析类型输入：枚举名（可带 schema、可带 []）→ typeRef；否则规范化成当前方言的写法。
+ * PG 的 `serial (integer)` 等显示写法先换回 `serial`，由核心在写入时展开（ADR 0017 决定 6）。
+ */
+const parseType = (m: Model, input: string, index?: ModelIndex): { type: string; typeRef: string | null } => {
+  const text = m.dialect === 'pg' ? unwrapSerialLabel(input) : input;
   const arr = /(\[\])*$/.exec(text.trim())![0];
   const base = text.trim().slice(0, text.trim().length - arr.length);
   const enums = getDialect(m.dialect).capabilities.enums
@@ -775,7 +785,22 @@ const TableInspector = ({
   const [fk, setFk] = useState(emptyFk);
   const typesId = useId();
   const mysqlTypeHintId = useId();
+  const serialHintId = useId();
   const fillFactorErrId = useId();
+  // PG serial 列被重新选成普通整数类型时，在该列类型框下提示“自增仍保留”（只是提示，不改默认值与序列）
+  const [serialHintCol, setSerialHintCol] = useState<string | null>(null);
+  const serialLive = useRef<HTMLDivElement>(null);
+  const announceSerialHint = (text: string) => {
+    // 有 ariaNotify 用它；否则写入常驻的 live region（先清空再写，连续两次同样的提示也会再次播报）
+    const doc = document as Document & { ariaNotify?: (s: string) => void };
+    if (doc.ariaNotify) return doc.ariaNotify(text);
+    const el = serialLive.current;
+    if (!el) return;
+    el.textContent = '';
+    requestAnimationFrame(() => {
+      el.textContent = text;
+    });
+  };
 
   // 分区配置与子分区操作状态
   const [editingStrategy, setEditingStrategy] = useState(false);
@@ -1198,6 +1223,7 @@ const TableInspector = ({
           <datalist id={typesId}>
             {[
               ...dialectSpec.commonTypes,
+              ...(model.dialect === 'pg' ? PG_SERIAL_TYPE_OPTIONS : []),
               ...(model.dialect === 'mysql' ? ["enum('a','b')", "set('x','y')"] : []),
               ...enumNames,
             ].map((x) => (
@@ -1213,6 +1239,11 @@ const TableInspector = ({
             const mysqlSplit = open && model.dialect === 'mysql' ? splitMysqlTypeModifiers(c.type) : null;
             const isMysqlUnsigned =
               !!mysqlSplit && !!(c.ext?.mysql?.unsigned || mysqlSplit.unsigned || c.ext?.mysql?.zerofill);
+            // PG serial 形态（整数类型 + 默认值指向序列 + 序列归属此列）：折叠行显示 serial，类型框显示 serial (integer)
+            const serial = columnSerial(model, c);
+            const rowType = serial ? serial.kind : shortType(typeLabel(model, c));
+            // 提示只在列仍是 serial 形态时显示：清空默认值、改成其他类型或协作者改动后自动消失
+            const showSerialHint = open && serial !== null && serialHintCol === c.id;
             if (isChild) {
               return (
                 <li
@@ -1220,8 +1251,11 @@ const TableInspector = ({
                   className="flex h-[var(--row-h)] items-center gap-1.5 border-border px-2.5 text-sm not-first:border-t"
                 >
                   <span className="min-w-0 flex-1 truncate font-mono text-text-2">{c.name}</span>
-                  <span className={cx('truncate font-mono text-xs', c.typeRef ? 'text-enum' : 'text-text-3')}>
-                    {shortType(typeLabel(model, c))}
+                  <span
+                    className={cx('truncate font-mono text-xs', c.typeRef ? 'text-enum' : 'text-text-3')}
+                    title={serial?.label}
+                  >
+                    {rowType}
                   </span>
                   <span className="flex w-[52px] justify-end gap-[3px]">
                     {c.notNull && <b className="flag">NN</b>}
@@ -1234,7 +1268,10 @@ const TableInspector = ({
                 <button
                   type="button"
                   aria-expanded={open}
-                  onClick={() => setOpenCol(open ? null : c.id)}
+                  onClick={() => {
+                    setOpenCol(open ? null : c.id);
+                    setSerialHintCol(null);
+                  }}
                   className={cx(
                     'flex h-[var(--row-h)] w-full items-center gap-1.5 pr-2 pl-1.5 text-left text-sm',
                     open ? 'bg-primary-soft' : 'hover:bg-surface-hover',
@@ -1246,8 +1283,11 @@ const TableInspector = ({
                     <ChevronRight size={14} aria-hidden="true" className="text-text-3" />
                   )}
                   <span className="min-w-0 flex-1 truncate font-mono">{c.name}</span>
-                  <span className={cx('truncate font-mono text-xs', c.typeRef ? 'text-enum' : 'text-text-3')}>
-                    {shortType(typeLabel(model, c))}
+                  <span
+                    className={cx('truncate font-mono text-xs', c.typeRef ? 'text-enum' : 'text-text-3')}
+                    title={serial?.label}
+                  >
+                    {rowType}
                   </span>
                   <span className="flex min-w-[52px] shrink-0 justify-end gap-[3px]">
                     {isPk && <b className="flag pk">PK</b>}
@@ -1274,13 +1314,26 @@ const TableInspector = ({
                         <Field
                           ws={ws}
                           label={`${t('insp.type')} ${c.name}`}
-                          value={typeLabel(model, c)}
+                          value={serial?.label ?? typeLabel(model, c)}
                           list={typesId}
-                          basisIds={[c.id]}
+                          basisIds={
+                            model.dialect === 'pg'
+                              ? // 改成 serial 会改写（或新建）归属此列的序列，派生序列名还取决于表名
+                                [c.id, table.id, ...idx.sequencesOwnedBy(c.id).map((s) => s.id)]
+                              : [c.id]
+                          }
                           mono
                           disabled={isPartKey}
-                          describedBy={model.dialect === 'mysql' ? mysqlTypeHintId : undefined}
+                          describedBy={
+                            model.dialect === 'mysql'
+                              ? mysqlTypeHintId
+                              : showSerialHint
+                                ? serialHintId
+                                : undefined
+                          }
                           onCommit={(v, b) => {
+                            // 只在显示写法前后加了空格：不算修改
+                            if (serial && v.trim() === serial.label) return;
                             const parsed = parseType(model, v, idx);
                             if (model.dialect === 'mysql') {
                               const { baseType, unsigned, zerofill } = splitMysqlTypeModifiers(parsed.type);
@@ -1318,7 +1371,12 @@ const TableInspector = ({
                               }
                               return;
                             }
-                            ws.act('setColumnType', { id: c.id, ...parsed }, b);
+                            // serial 列重新选成普通整数类型：只改类型（类型相同就什么都不改），默认值与序列不动，提示自增仍保留
+                            const keepsSerial = keepsSerialOnPlainInteger(model, c, parsed);
+                            const unchanged = parsed.type === c.type && parsed.typeRef === c.typeRef;
+                            if (!unchanged && !ws.act('setColumnType', { id: c.id, ...parsed }, b)) return;
+                            setSerialHintCol(keepsSerial ? c.id : null);
+                            if (keepsSerial) announceSerialHint(t('insp.serialKeptHint'));
                           }}
                         />
                       </Labeled>
@@ -1326,6 +1384,11 @@ const TableInspector = ({
                     {model.dialect === 'mysql' && (
                       <p id={mysqlTypeHintId} className="hint m-0">
                         {t('insp.mysqlTypeHint')}
+                      </p>
+                    )}
+                    {showSerialHint && (
+                      <p id={serialHintId} className="hint m-0 block">
+                        {t('insp.serialKeptHint')}
                       </p>
                     )}
                     {isPartKey && <p className="hint">{t('part.keyColLockedHint')}</p>}
@@ -1345,6 +1408,8 @@ const TableInspector = ({
                         }
                         onCommit={(v, b) => {
                           const trimmed = v.trim();
+                          // 只在原值前后加了空格：不提交（否则 nextval(序列) 的显示文字会被当成表达式写回，丢掉对序列的引用）
+                          if (trimmed === defaultText(c)) return;
                           if (trimmed && model.dialect === 'mssql' && !!c.ext?.mssql?.sparse) return;
                           ws.act('setDefault', { id: c.id, default: trimmed ? { expr: trimmed } : null }, b);
                         }}
@@ -1777,6 +1842,9 @@ const TableInspector = ({
           })}
         </ul>
         {isChild && <p className="hint">{t('part.inheritedColumns')}</p>}
+        {model.dialect === 'pg' && !isChild && (
+          <div ref={serialLive} role="status" aria-atomic="true" className="sr-only" />
+        )}
         {cols.length === 0 && <p className="hint">{t('insp.noColumns')}</p>}
       </Section>
 
