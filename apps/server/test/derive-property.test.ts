@@ -636,10 +636,15 @@ class World {
         let failed: boolean;
         let flushKind: 'clean' | 'normalized' | 'skipped' | null = null;
         if (op.op === 'flush') {
+          const pending0 = needsRefresh(before, this.room.m);
           const out = await r.flush(BRANCH);
           failed = out.kind === 'skipped';
           flushKind = out.kind;
           this.hit(`flush:${out.kind}`);
+          if (!pending0) {
+            expect(this.shadowAsked, '入口无待规范化对象时 flush 不应解析影子库').toBe(asked0);
+            expect(out.kind, '入口无待规范化对象时 flush 应报 clean').toBe('clean');
+          }
           if (out.kind === 'clean') {
             // clean = 没有任何写回被接受且已无待规范化对象（#135）：不写基线；
             // 连过影子库只可能是写回被拒之后别人的编辑恰好消除了待规范化对象，否则出口 0 I/O
