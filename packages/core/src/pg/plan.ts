@@ -2,12 +2,7 @@
 // 规划时维护一份“当前状态” cur：每生成一步就把它更新到执行这一步之后的样子，
 // 所以每条语句引用的都是当时实际存在的名字；结束时断言 cur 等于目标版本。
 
-import {
-  exprReferences,
-  normalizeAllPartitionFamilies,
-  renameInExpr,
-  renameQualifiedInExpr,
-} from '../edit.ts';
+import { exprReferences, normalizeAllPartitionFamilies, renameInExpr } from '../edit.ts';
 import type {
   Check,
   Column,
@@ -46,6 +41,7 @@ import {
 } from '../model.ts';
 import { PlanError, type Step } from '../plan-types.ts';
 import { checkPgCompatibility, LATEST_PG_MAJOR, pgCapabilities, type PlanOptions } from './capabilities.ts';
+import { qualifiedRefs, remapQualifiedInExpr } from './expr.ts';
 import { chooseName, joinNames } from './naming.ts';
 import { derivedUuid, partitionKeyColumns } from './partition.ts';
 import { ident, literal, qualified } from './quote.ts';
@@ -346,14 +342,55 @@ const planWithIndexes = (
     attachColMap.set(tId, map);
   }
 
+  // 枚举要重建（删值或重排值）：旧类型改临时名 → 建新类型 → 列转到新类型 → 删旧类型，OID 会变
+  const enumRebuild = new Set<string>();
+  for (const o of common) {
+    if (o.kind !== 'enum') continue;
+    const old = was(o).values;
+    if (
+      !sameStrArr(
+        o.values.filter((v) => old.includes(v)),
+        old,
+      )
+    ) {
+      enumRebuild.add(o.id);
+    }
+  }
+
   // ───── 改名带来的表达式变化：PG 按 OID 记录引用，改名时会自动更新表达式，不需要重建 ─────
-  // 把旧版本表达式里的 schema、枚举、列名换成新名字后再比较；相同就说明只是改名带来的变化
+  // 把旧版本表达式里的 schema、枚举、列名换成新名字后再比较；相同就说明只是改名带来的变化。
+  // 表达式按名字写、数据库按 OID 绑定：旧表达式里的 `schema.枚举` 先按**旧模型**解析成枚举 ID，再换成该 ID 在新模型里的名字
+  // （一趟替换，对调、轮换都正确）。枚举被删除或要重建时，旧 OID 在迁移后不复存在，换成一个不可能出现的名字，
+  // 于是引用它的表达式一定和新模型对不上 → 重建，重建后按新模型的名字绑定到当时同名的那个类型。
   const schemaRenames = common
     .filter((o): o is Schema => o.kind === 'schema' && o.name !== was(o).name)
     .map((o) => [was(o).name, o.name] as const);
-  const enumRenames = common
-    .filter((o): o is Enum => o.kind === 'enum' && o.name !== was(o).name)
-    .map((o) => [(to.objects[o.parent] as Schema).name, was(o).name, o.name] as const);
+  const exprSchemaMap = new Map<string, string>(schemaRenames);
+  const exprTypeMap = new Map<string, Map<string, { schema: string; name: string }>>();
+  for (const e of fromIdx.allRef('enum')) {
+    const fromSchema = get(from, e.parent, 'schema').name;
+    const now = to.objects[e.id];
+    let target: { schema: string; name: string };
+    if (now?.kind === 'enum' && !enumRebuild.has(e.id)) {
+      target = { schema: get(to, now.parent, 'schema').name, name: now.name };
+      if (target.schema === fromSchema && target.name === e.name) continue;
+    } else {
+      target = { schema: fromSchema, name: `__dowel_rebound_${e.id}__` };
+    }
+    let m = exprTypeMap.get(fromSchema);
+    if (!m) exprTypeMap.set(fromSchema, (m = new Map()));
+    m.set(e.name, target);
+  }
+  const exprRemap = { schemas: exprSchemaMap, types: exprTypeMap };
+  /** 旧模型里的表达式引用了哪些在本次迁移中改名、被删除或重建的枚举（旧的显示名，用于报错） */
+  const remappedEnumsIn = (expr: string | null | undefined): string[] => {
+    if (!expr || exprTypeMap.size === 0) return [];
+    const out: string[] = [];
+    for (const { schema, name } of qualifiedRefs(expr)) {
+      if (exprTypeMap.get(schema.text)?.has(name.text)) out.push(`${schema.text}.${name.text}`);
+    }
+    return out;
+  };
   const colRenames = new Map<string, [string, string][]>();
   for (const o of common)
     if (o.kind === 'column' && o.name !== was(o).name)
@@ -363,13 +400,11 @@ const planWithIndexes = (
     if (tc.name !== rc.name)
       colRenames.set(tc.parent, [...(colRenames.get(tc.parent) ?? []), [rc.name, tc.name]]);
   }
-  const hasGlobalRename = schemaRenames.length > 0 || enumRenames.length > 0;
+  const hasGlobalRename = exprSchemaMap.size > 0 || exprTypeMap.size > 0;
   const hasAnyExprMigration =
     hasGlobalRename || colRenames.size > 0 || willDetach.size > 0 || willAttach.size > 0;
   const migrateExpr = (expr: string, table: string): string => {
-    let e = expr;
-    for (const [a, b] of schemaRenames) e = renameQualifiedInExpr(e, a, null, { schema: b, name: null });
-    for (const [sch, a, b] of enumRenames) e = renameQualifiedInExpr(e, sch, a, { schema: sch, name: b });
+    let e = hasGlobalRename ? remapQualifiedInExpr(expr, exprRemap) : expr;
     // 两阶段：先换成占位名，再换成目标名（处理互换）
     const rs = colRenames.get(table) ?? colRenames.get(rootTableId(from, table)) ?? [];
     rs.forEach(([a], i) => {
@@ -502,6 +537,16 @@ const planWithIndexes = (
           }
         }
         if (!samePartBy) {
+          const keyExprs =
+            typeof w.partitionBy === 'string' ? [w.partitionBy] : w.partitionBy.keys.map((k) => k.expr);
+          const enums = [...new Set(keyExprs.flatMap(remappedEnumsIn))];
+          if (enums.length > 0) {
+            throw new PlanError(
+              `分区表 ${o.name} 的分区键表达式引用了枚举 ${enums.join('、')}，它在本次迁移中改名、与其他枚举对调名字、被删除或重建，` +
+                '分区键在迁移后会绑定到与新版本不同的类型；PG 不能修改已有表的分区键。' +
+                '请先让分区键不再引用该枚举，或手工重建这张分区表',
+            );
+          }
           throw new PlanError(`暂不支持修改已存在表的分区策略或分区键：${o.name}`);
         }
       }
@@ -596,7 +641,6 @@ const planWithIndexes = (
   // ───── 预先计算：需要重建的约束 / 索引、需要重建的生成列、类型变化的列 ─────
   const typeChanged = new Set<string>();
   const renamedColIds = new Set<string>();
-  const enumRebuild = new Set<string>();
   const opaqueChanged = new Set<string>();
   for (let i = 0; i < common.length; i++) {
     const o = common[i]!;
@@ -604,16 +648,6 @@ const planWithIndexes = (
       const w = was(o);
       if (!sameColType(o, w)) typeChanged.add(o.id);
       if (o.name !== w.name) renamedColIds.add(o.id);
-    } else if (o.kind === 'enum') {
-      const old = was(o).values;
-      if (
-        !sameStrArr(
-          o.values.filter((v) => old.includes(v)),
-          old,
-        )
-      ) {
-        enumRebuild.add(o.id);
-      }
     } else if (o.kind === 'opaque') {
       if (!sameDef(o, was(o))) opaqueChanged.add(o.id);
     }
@@ -669,6 +703,18 @@ const planWithIndexes = (
       regen.add(toColId);
   }
   for (const id of regen) typeChanged.delete(id);
+
+  // 默认值文本没变、但它引用的枚举换了绑定（两个枚举对调名字、删后重建同名枚举、枚举重建）：
+  // 文本比较看不出来，要显式重设，让它按新模型的名字重新绑定（P12 先 DROP DEFAULT 再 SET DEFAULT）
+  const rebindDefault = new Set<string>();
+  if (hasGlobalRename) {
+    for (const c of toIdx.allRef('column')) {
+      if (!inFrom(c.id) || regen.has(c.id) || !c.default || !('expr' in c.default)) continue;
+      const w = was(c);
+      if (sameDefault(w.default, c.default) && !sameDefault(migrated(w).default, c.default))
+        rebindDefault.add(c.id);
+    }
+  }
 
   // 分区键引用的列不允许改类型（PG 报错 cannot alter type of column named in partition key）
   if (typeChanged.size > 0 || regen.size > 0) {
@@ -831,6 +877,16 @@ const planWithIndexes = (
     ...rebinding,
   ]);
   const lateRebuild = new Set([...opaqueChanged].filter((id) => isLate(from.objects[id] as Opaque)));
+  // DDL 文本没变、但依赖的枚举换成了另一个（按 ID）：PG 里它仍绑定旧类型，要删掉重建才会按新版本绑定
+  const enumDepsOf = (m: Model, o: Opaque) => o.deps.filter((d) => m.objects[d]?.kind === 'enum').sort();
+  for (const o of toIdx.allRef('opaque')) {
+    if (!inFrom(o.id) || lateRebuild.has(o.id)) continue;
+    const w = was(o);
+    if (isLate(w) && !sameStrArr(enumDepsOf(to, o), enumDepsOf(from, w))) {
+      lateRebuild.add(o.id);
+      unstable.add(o.id);
+    }
+  }
   for (let changed = true; changed;) {
     changed = false;
     for (const o of all(from, 'opaque')) {
@@ -1891,6 +1947,15 @@ const planWithIndexes = (
     emit('createExtension', o.id, `CREATE EXTENSION ${ident(o.name)} WITH SCHEMA ${schema}`);
   }
   // ───── P8 建枚举、给枚举加值 ─────
+  const dropDefaultCascade = (col: Column) => {
+    emit('dropDefault', col.id, `ALTER TABLE ${T(col.parent)} ALTER COLUMN ${C(col.id)} DROP DEFAULT`);
+    if (get(cur, col.parent, 'table').partitionBy !== null) {
+      for (const desc of partitionDescendants(cur, col.parent)) {
+        emit('dropDefault', col.id, `ALTER TABLE ${T(desc.id)} ALTER COLUMN ${C(col.id)} DROP DEFAULT`);
+      }
+    }
+    col.default = null;
+  };
   for (const o of added) {
     if (o.kind !== 'enum') continue;
     cur.objects[o.id] = fresh(o);
@@ -1911,17 +1976,22 @@ const planWithIndexes = (
       c.values = [...o.values];
       c.comment = null; // 新类型没有注释，最后统一加
       emit('createEnum', o.id, `CREATE TYPE ${qname(cur, c)} AS ENUM (${o.values.map(literal).join(', ')})`);
+      // 引用旧类型的其他列默认值（如 text 列的 'a'::枚举::text）也要先去掉，否则删不掉旧类型；P12 再按新模型重设
+      const w = was(o);
+      const wSchema = get(from, w.parent, 'schema').name;
+      for (const col of all(cur, 'column')) {
+        if (
+          col.typeRef === o.id ||
+          !col.default ||
+          !('expr' in col.default) ||
+          !qualifiedRefs(col.default.expr).some((r) => r.schema.text === wSchema && r.name.text === w.name)
+        )
+          continue;
+        dropDefaultCascade(col);
+      }
       for (const col of all(cur, 'column')) {
         if (col.typeRef !== o.id) continue;
-        if (col.default) {
-          emit('dropDefault', col.id, `ALTER TABLE ${T(col.parent)} ALTER COLUMN ${C(col.id)} DROP DEFAULT`);
-          if (get(cur, col.parent, 'table').partitionBy !== null) {
-            for (const desc of partitionDescendants(cur, col.parent)) {
-              emit('dropDefault', col.id, `ALTER TABLE ${T(desc.id)} ALTER COLUMN ${C(col.id)} DROP DEFAULT`);
-            }
-          }
-          col.default = null;
-        }
+        if (col.default) dropDefaultCascade(col);
         const arr = col.type;
         emit(
           'alterType',
@@ -2333,7 +2403,8 @@ const planWithIndexes = (
       c.notNullNameMode !== o.notNullNameMode ||
       (cap.namedNotNull && o.notNull && c.notNullName !== o.notNullName) ||
       !sameIdentity(c.identity, o.identity) ||
-      !sameDefault(c.default, o.default)
+      !sameDefault(c.default, o.default) ||
+      rebindDefault.has(o.id)
     ) {
       altered.push(o);
     }
@@ -2359,7 +2430,7 @@ const planWithIndexes = (
   // b. 去掉默认值（默认值要变、或类型要变时先去掉，避免旧默认值无法转换）
   for (const o of altered) {
     const c = get(cur, o.id, 'column');
-    if (c.default && (!same(c.default, o.default) || typeChanged.has(o.id))) {
+    if (c.default && (!same(c.default, o.default) || typeChanged.has(o.id) || rebindDefault.has(o.id))) {
       emitDefaultCascade(c, 'dropDefault', 'DROP DEFAULT');
       c.default = null;
     }

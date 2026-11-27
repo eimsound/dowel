@@ -97,6 +97,62 @@ export const renameQualifiedInExpr = (
   return out;
 };
 
+/** 表达式里出现的两段限定名 `a.b`（`a`、`b` 是普通或带引号的标识符），按出现顺序 */
+export const qualifiedRefs = (expr: string): { schema: Token; name: Token }[] => {
+  const t = tokenize(expr);
+  const out: { schema: Token; name: Token }[] = [];
+  for (let i = 0; i + 2 < t.length; i++) {
+    const a = t[i]!;
+    const b = t[i + 2]!;
+    if (a.kind !== 'other' && t[i + 1]!.text === '.' && b.kind !== 'other') out.push({ schema: a, name: b });
+  }
+  return out;
+};
+
+/** 同时改名用的映射：schema 旧名 → 新名；(schema 旧名, 类型旧名) → 新的限定名 */
+export interface QualifiedRemap {
+  schemas: ReadonlyMap<string, string>;
+  types: ReadonlyMap<string, ReadonlyMap<string, { schema: string; name: string }>>;
+}
+
+/**
+ * 按映射**一趟**改写表达式里的限定名：每处引用只按旧名查一次表、直接换成新名，
+ * 不会被后面的改名再改一次，所以两个名字对调、多个名字轮换都正确（相当于两阶段占位改名）。
+ * `schema.类型` 命中类型映射时整体替换；否则只要 schema 改了名就替换 schema 部分（其他对象如函数跟着 schema 走）。
+ */
+export const remapQualifiedInExpr = (expr: string, remap: QualifiedRemap): string => {
+  if (remap.schemas.size === 0 && remap.types.size === 0) return expr;
+  const lower = expr.toLowerCase();
+  // 快速路径：表达式里根本没出现任何旧 schema 名时不必分词
+  const keys = [...remap.schemas.keys(), ...remap.types.keys()];
+  const mentions = (k: string) => {
+    const l = k.toLowerCase();
+    return lower.includes(l) || lower.includes(l.replaceAll('"', '""'));
+  };
+  if (!keys.some(mentions)) return expr;
+  let out = '';
+  let last = 0;
+  const t = tokenize(expr);
+  for (let i = 0; i + 2 < t.length; i++) {
+    const a = t[i]!;
+    const b = t[i + 2]!;
+    if (a.kind === 'other' || t[i + 1]!.text !== '.' || b.kind === 'other') continue;
+    const ty = remap.types.get(a.text)?.get(b.text);
+    if (ty) {
+      out += `${expr.slice(last, a.start)}${ident(ty.schema)}.${ident(ty.name)}`;
+      last = b.end;
+      i += 2;
+      continue;
+    }
+    const sch = remap.schemas.get(a.text);
+    if (sch !== undefined) {
+      out += `${expr.slice(last, a.start)}${ident(sch)}`;
+      last = a.end;
+    }
+  }
+  return out + expr.slice(last);
+};
+
 export const renameInExpr = (expr: string, from: string, to: string): string => {
   let out = expr;
   for (const x of columnRefs(expr).reverse())
