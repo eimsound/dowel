@@ -1573,7 +1573,7 @@ describe.skipIf(!PG_URL)('待规范化判定与真实 PG 读回一致：表达�
     (m.objects.ix as { where: string }).where,
   ];
 
-  test('两个枚举对调名字后换回旧快照：表达式原文与基线逐字相同，判为待规范化，影子库读回的类型名确实变了', async () => {
+  test('两个枚举对调名字后换回旧快照：表达式原文与基线逐字相同，判为待规范化；影子库迁移重建了依赖对象，读回与模型一致', async () => {
     const shadowDb = await createTestDb('derive_pending_enum');
     await claimShadow(shadowDb.url);
     const shadow = pgShadow(shadowDb.url);
@@ -1601,13 +1601,14 @@ describe.skipIf(!PG_URL)('待规范化判定与真实 PG 读回一致：表达�
       const changed = await shadow.canonicalize(good, cur);
       const after = structuredClone(cur);
       for (const o of changed) after.objects[o.id] = o;
-      // 实测：影子库从基线增量迁移（ALTER TYPE ... RENAME），PG 按 OID 存表达式，读回跟着 e1 的新名字走。
-      // 漏判时出口 0 I/O，这份与影子库不一致的原文会留在模型里
-      expect(changed.map((o) => o.id)).toEqual(['st', 'k', 'ix']);
+      // 影子库从基线增量迁移：PG 按 OID 存表达式，规划器检出绑定变了（#160），改名之外还重建默认值、CHECK、部分索引，
+      // 让它们按模型里的名字绑定到现在叫 mood 的 e2，所以读回与模型原文一致、没有要写回的。
+      // 判为待规范化仍然必要（宁多勿漏）：漏判时出口 0 I/O，不会经过影子库确认
+      expect(changed.map((o) => o.id)).toEqual([]);
       expect(textOf(after)).toEqual([
-        "('ok'::public.tone)::text",
-        '((status)::public.tone IS NOT NULL)',
-        "('ok'::public.tone IS NOT NULL)",
+        "('ok'::public.mood)::text",
+        '((status)::public.mood IS NOT NULL)',
+        "('ok'::public.mood IS NOT NULL)",
       ]);
       expect(pendingRefreshIds(after, structuredClone(after))).toEqual([]);
     } finally {
