@@ -27,6 +27,7 @@ import {
   getEngine,
   importSnapshot,
   readSnapshot,
+  reconcileIds,
   toScriptSteps,
 } from '@dowel/engines';
 import { diffAgainst, importLive, planDiff } from '@dowel/executor';
@@ -454,5 +455,58 @@ describe.skipIf(!PG_URL)('PG 枚举换绑定时重建依赖对象（#160）', ()
     for (const o of Object.values(f2.objects))
       if (o.kind === 'opaque') o.deps = o.deps.map((d) => (d === e1 ? e9 : d));
     expect(() => plan(f1, f2)).toThrow(/依赖的枚举 public\.mood/);
+  });
+
+  test('枚举重排值（只被表达式引用，表里没有该枚举类型的列）：执行成功并绑定到新类型，回滚复原', async () => {
+    const db = conn();
+    const m1 = await load(db);
+    const m2 = reorder(m1);
+
+    const r = await verify(db, m1, m2);
+    expect(r.upDiff).toEqual([]);
+    expect(r.downDiff).toEqual([]);
+
+    await build(db, m1);
+    await db.exec(`INSERT INTO public.t (id) VALUES (1)`);
+    await runSteps(db, plan(m1, m2));
+    const after = await boundEnums(db);
+    expect(after.length).toBeGreaterThanOrEqual(5);
+    expect(new Set(after.map((row) => `${row.typ}=${row.labels}`))).toEqual(new Set(['mood=sad,ok']));
+    expect(await db.query(`SELECT id, k, g FROM public.t`)).toEqual([{ id: 1, k: 'ok', g: false }]);
+
+    await runSteps(db, plan(m2, m1));
+    expect(new Set((await boundEnums(db)).map((row) => `${row.typ}=${row.labels}`))).toEqual(
+      new Set(['mood=ok,sad']),
+    );
+    expect(await db.query(`SELECT id, k, g FROM public.t`)).toEqual([{ id: 1, k: 'ok', g: true }]);
+  });
+
+  test('域 / 复合类型 / 函数同版本改为不再依赖被删枚举，或与被删枚举一并删除：PG 真实执行与回滚闭环通过', async () => {
+    const db = conn();
+    const m1 = await loadDdl(
+      db,
+      `CREATE TYPE gone AS ENUM ('x', 'y');
+       CREATE DOMAIN d AS gone;
+       CREATE TYPE comp AS (a gone, b int);
+       CREATE FUNCTION f_ret(x int) RETURNS gone LANGUAGE sql IMMUTABLE AS 'select ''x''::public.gone';
+       CREATE FUNCTION f_arg(x gone) RETURNS int LANGUAGE sql IMMUTABLE AS 'select 1'`,
+    );
+    const rawM2 = await loadDdl(
+      db,
+      `CREATE DOMAIN d AS text;
+       CREATE TYPE comp AS (a text, b int);
+       CREATE FUNCTION f_ret(x int) RETURNS text LANGUAGE sql IMMUTABLE AS 'select ''x''::text';
+       CREATE FUNCTION f_arg(x text) RETURNS int LANGUAGE sql IMMUTABLE AS 'select 1'`,
+    );
+    const m2 = reconcileIds(m1, rawM2);
+
+    const r = await verify(db, m1, m2);
+    expect(r.upDiff).toEqual([]);
+    expect(r.downDiff).toEqual([]);
+
+    const m3 = reconcileIds(m1, await loadDdl(db, ''));
+    const rDrop = await verify(db, m1, m3);
+    expect(rDrop.upDiff).toEqual([]);
+    expect(rDrop.downDiff).toEqual([]);
   });
 });

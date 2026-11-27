@@ -41,7 +41,7 @@ import {
 } from '../model.ts';
 import { PlanError, type Step } from '../plan-types.ts';
 import { checkPgCompatibility, LATEST_PG_MAJOR, pgCapabilities, type PlanOptions } from './capabilities.ts';
-import { qualifiedRefs, remapQualifiedInExpr } from './expr.ts';
+import { qualifiedRefs, remapQualifiedInExpr, tokenize } from './expr.ts';
 import { chooseName, joinNames } from './naming.ts';
 import { derivedUuid, partitionKeyColumns } from './partition.ts';
 import { ident, literal, qualified } from './quote.ts';
@@ -236,6 +236,85 @@ const pickExprs = (o: Obj): Partial<Obj> =>
     : o.kind === 'index'
       ? { elements: clonePlain(o.elements), where: o.where }
       : {};
+
+const OPAQUE_KIND_LABEL: Record<Opaque['objType'], string> = {
+  domain: '域',
+  type: '复合类型',
+  function: '函数',
+  procedure: '存储过程',
+  aggregate: '聚合函数',
+  view: '视图',
+  materializedView: '物化视图',
+  trigger: '触发器',
+  policy: '策略',
+  exclusion: '排他约束',
+};
+
+const ROUTINE_OPTION_WORDS = new Set([
+  'language',
+  'transform',
+  'window',
+  'immutable',
+  'stable',
+  'volatile',
+  'leakproof',
+  'called',
+  'strict',
+  'external',
+  'security',
+  'parallel',
+  'cost',
+  'rows',
+  'support',
+  'set',
+  'as',
+  'begin',
+]);
+
+/** 提取函数 / 过程 DDL 的签名头部（参数列表与 RETURNS 子句，不含属性与函数体），用于判断能否原地 CREATE OR REPLACE */
+const routineSignatureHeader = (ddl: string): string => {
+  const toks = tokenize(ddl).filter((t) => !(t.kind === 'other' && /^\s+$/.test(t.text)));
+  let depth = 0;
+  let seenParams = false;
+  const out: string[] = [];
+  for (let i = 0; i < toks.length; i++) {
+    const t = toks[i]!;
+    if (t.kind === 'other' && t.text === '(') {
+      depth++;
+    } else if (t.kind === 'other' && t.text === ')') {
+      depth = Math.max(0, depth - 1);
+      if (depth === 0) seenParams = true;
+    } else if (depth === 0 && seenParams && t.kind === 'ident') {
+      const next = toks[i + 1];
+      if (
+        ROUTINE_OPTION_WORDS.has(t.text) ||
+        (t.text === 'not' && next?.kind === 'ident' && next.text === 'leakproof') ||
+        (t.text === 'returns' && next?.kind === 'ident' && next.text === 'null')
+      ) {
+        break;
+      }
+    }
+    out.push(t.kind === 'qident' ? `"${t.text}"` : t.text);
+  }
+  return out.join(' ');
+};
+
+const aggregateStype = (ddl: string): string => {
+  const m = /\bSTYPE\s*=\s*([^,)]+)/i.exec(ddl);
+  return m ? m[1]!.trim().toLowerCase() : '';
+};
+
+const earlyNeedsDropBeforeCreate = (w: Opaque, o: Opaque): boolean => {
+  if (o.objType === 'domain' || o.objType === 'type') return true;
+  if (w.drop !== o.drop) return true;
+  if (o.objType === 'function' || o.objType === 'procedure') {
+    return routineSignatureHeader(w.ddl[0] ?? '') !== routineSignatureHeader(o.ddl[0] ?? '');
+  }
+  if (o.objType === 'aggregate') {
+    return aggregateStype(w.ddl[0] ?? '') !== aggregateStype(o.ddl[0] ?? '');
+  }
+  return false;
+};
 
 export const plan = (rawFrom: Model, rawTo: Model, opts?: PlanOptions): Step[] => {
   const from = normalizeAllPartitionFamilies(rawFrom);
@@ -912,20 +991,45 @@ const planWithIndexes = (
       unstable.add(o.id);
     }
   }
-  // 早期不透明对象（域、复合类型、函数等）依赖的枚举被删除或要重建：旧类型删不掉（PG 有依赖记录），
-  // 而函数改签名不能 CREATE OR REPLACE、域 / 类型重建又会牵连按名字引用它们的表达式，这里明确拒绝，不让它在执行时才失败
-  for (const o of toIdx.allRef('opaque')) {
-    if (!inFrom(o.id)) continue;
-    const w = was(o);
+  // 早期不透明对象（域、复合类型、函数、存储过程、聚合函数）依赖被删除或重建的枚举：
+  // - 枚举要重建（enumRebuild）：P8 在 P8b / P14 之前就删旧类型，无论该对象是否改动或删除都无法直接通过，明确报错；
+  // - 枚举被删除（isRemoved）：若同一版本把该对象一并删除或重定义为不再依赖该枚举（及其同名重建枚举），
+  //   且对函数 / 存储过程 / 聚合函数而言该枚举的类型名未被新对象复用（否则 P6 先把旧枚举改临时名导致静态 DROP 语句失效），
+  //   则允许放行（P8b 先删后建或 P14 先于 DROP TYPE 删除）；其余情况明确报错。
+  for (const w of fromIdx.allRef('opaque')) {
     if (isLate(w)) continue;
-    const gone = w.deps.filter(
-      (d) => from.objects[d]?.kind === 'enum' && (isRemoved(d) || enumRebuild.has(d)),
-    );
-    if (gone.length > 0) {
-      const names = gone.map((d) => qname(from, from.objects[d] as Enum)).join('、');
+    const blocked: string[] = [];
+    for (const d of w.deps) {
+      const e = from.objects[d];
+      if (e?.kind !== 'enum') continue;
+      if (enumRebuild.has(d)) {
+        blocked.push(d);
+        continue;
+      }
+      if (!isRemoved(d)) continue;
+      const replacement = toIdx.allRef('enum').find((x) => x.parent === e.parent && x.name === e.name);
+      const reusedTypeSlot =
+        !!replacement || toIdx.allRef('table').some((x) => x.parent === e.parent && x.name === e.name);
+      const isTypeObj = w.objType === 'domain' || w.objType === 'type';
+      if (!inTo(w.id)) {
+        if (!isTypeObj && reusedTypeSlot) blocked.push(d);
+        continue;
+      }
+      const o = to.objects[w.id] as Opaque;
+      const allowed =
+        opaqueChanged.has(o.id) &&
+        !isLate(o) &&
+        !o.deps.includes(d) &&
+        (!replacement || !o.deps.includes(replacement.id)) &&
+        (isTypeObj || !reusedTypeSlot);
+      if (!allowed) blocked.push(d);
+    }
+    if (blocked.length > 0) {
+      const kindLabel = OPAQUE_KIND_LABEL[w.objType];
+      const names = blocked.map((d) => qname(from, from.objects[d] as Enum)).join('、');
       throw new PlanError(
-        `${o.objType} ${o.name} 依赖的枚举 ${names} 在本次迁移中被删除或要重建（删值 / 重排值），暂不支持自动重建依赖它的${o.objType}；` +
-          '请先在一个版本里删掉该对象（或改为不依赖这个枚举），再在后续版本里重建',
+        `${kindLabel} ${w.name} 依赖的枚举 ${names} 在本次迁移中被删除或要重建（删值 / 重排值），暂不支持自动重建依赖它的${kindLabel}；` +
+          '请先在一个版本里删掉该对象（或改为不依赖这个枚举），再在后续版本里重建枚举或该对象',
       );
     }
   }
@@ -2060,11 +2164,11 @@ const planWithIndexes = (
   const earlyCreates = all(to, 'opaque').filter(
     (o) => !isLate(o) && (!inFrom(o.id) || opaqueChanged.has(o.id)),
   );
-  for (const o of topo(earlyCreates)) {
-    if (inFrom(o.id) && (o.objType === 'domain' || o.objType === 'type'))
-      dropOpaque(get(cur, o.id, 'opaque'));
-    createOpaque(o); // 函数、聚合的 DDL 是 CREATE OR REPLACE，可以直接覆盖
-  }
+  const earlyRedefDrops = earlyCreates
+    .filter((o) => inFrom(o.id) && earlyNeedsDropBeforeCreate(was(o), o))
+    .map((o) => was(o));
+  for (const w of topo(earlyRedefDrops).reverse()) dropOpaque(get(cur, w.id, 'opaque'));
+  for (const o of topo(earlyCreates)) createOpaque(o);
   // ───── P9 建序列（属于哪一列在列建好之后再设）、改序列选项 ─────
   for (const o of added) {
     if (o.kind !== 'sequence') continue;
