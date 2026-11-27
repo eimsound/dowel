@@ -67,6 +67,9 @@ const PG_CASES: readonly [string, string][] = [
   ['TIMETZ(2)', 'time(2) with time zone'],
   ['INTERVAL YEAR TO MONTH', 'interval year to month'],
   ['INTERVAL DAY TO SECOND(3)', 'interval day to second(3)'],
+  ['"char"', '"char"'],
+  ['interval', 'interval'],
+  ['interval(3)', 'interval(3)'],
   ["custom(Nested(Arg), 'A')", "custom(Nested(Arg), 'A')"],
   ['foo(Bar) BAZ(Qux)', 'foo(Bar) baz(Qux)'],
 ];
@@ -279,5 +282,56 @@ describe('SQLite 规划器：类型与内置排序规则不区分大小写', () 
     expect(plan(stored('TEXT', 'nocase'), stored('TEXT', 'RTRIM')).map((s) => s.kind)).toContain(
       'rebuildTable',
     );
+  });
+});
+
+describe('normalizeType 线性时间守卫', () => {
+  // 线性实现在 20 万字符级别仅耗时几到几十毫秒，二次方实现（如未锚定回溯或反复尾部正则替换）需要数秒至数十秒。
+  // 不做“4 倍输入耗时比”墙钟断言，避免并行负载下分子分母抖动导致误报；直接要求 20 万字符级输入远低于 1 秒上限。
+  const N = 200_000;
+  const LIMIT_MS = 1_000;
+
+  const measureMs = (fn: () => void): number => {
+    let best = Number.POSITIVE_INFINITY;
+    for (let k = 0; k < 3; k++) {
+      const t0 = performance.now();
+      fn();
+      const dt = performance.now() - t0;
+      best = Math.min(best, dt);
+      if (best < LIMIT_MS || dt >= LIMIT_MS * 3) break;
+    }
+    return best;
+  };
+
+  const cases: readonly [Dialect, string, string, string][] = [
+    ['pg', '长连续空格', `int${' '.repeat(N)}x`, 'int x'],
+    ['pg', '长连续制表符', `int${'\t'.repeat(N)}x`, 'int x'],
+    ['pg', '大量 [] 后接非括号', `${'[]'.repeat(N / 2)}x`, `${'[]'.repeat(N / 2)}x`],
+    ['pg', '合法大量带空格数组后缀', `int${' [ ]'.repeat(N / 4)}`, `integer${'[]'.repeat(N / 4)}`],
+    ['pg', '双引号标识符内长空白', `"a${' '.repeat(N)}b"`, `"a${' '.repeat(N)}b"`],
+    ['pg', '大量未闭合左括号', '('.repeat(N), '('.repeat(N)],
+    ['pg', '长未闭合双引号', `"${'a'.repeat(N)}`, `"${'a'.repeat(N)}`],
+    [
+      'pg',
+      '括号内长数字与空白',
+      `numeric(${'1'.repeat(N / 2)}${' '.repeat(N / 2)}x)`,
+      `numeric(${'1'.repeat(N / 2)}${' '.repeat(N / 2)}x)`,
+    ],
+    ['mysql', '大量重复 unsigned 后缀', `int${' unsigned'.repeat(22_000)}`, 'int unsigned'],
+    ['mysql', '大量重复 zerofill 后缀', `int${' zerofill'.repeat(22_000)}`, 'int unsigned zerofill'],
+    ['mysql', '长连续空格', `int${' '.repeat(N)}x`, 'int x'],
+    ['sqlite', '长连续空格', `int${' '.repeat(N)}x`, 'INT X'],
+    ['sqlite', '大量 [] 后接非括号', `${'[]'.repeat(N / 2)}x`, `${'[]'.repeat(N / 2)}X`],
+    ['mssql', '长连续空格', `int${' '.repeat(N)}x`, 'int x'],
+    ['mssql', '大量 [] 后接非括号', `${'[]'.repeat(N / 2)}x`, `${'[]'.repeat(N / 2)}x`],
+  ];
+
+  test.each(cases)('%s：%s（20 万字符 < 1000ms）', (dialect, _label, input, expected) => {
+    let out = '';
+    const elapsed = measureMs(() => {
+      out = normalizeType(input, dialect);
+    });
+    expect(out).toBe(expected);
+    expect(elapsed).toBeLessThan(LIMIT_MS);
   });
 });

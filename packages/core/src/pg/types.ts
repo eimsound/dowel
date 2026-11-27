@@ -112,12 +112,32 @@ const scanTypeSegments = (rawBase: string): TypeSegment[] => {
   return segments;
 };
 
+const isWs = (ch: string | undefined): boolean => ch !== undefined && /\s/.test(ch);
+
+/** 从尾部线性剥离任意个 `[]`（允许括号内外夹空白），替代非锚定正则避免 O(n²) 回溯 */
+const stripTrailingArraySuffix = (trimmed: string): { rawBase: string; arr: string } => {
+  let end = trimmed.length;
+  let count = 0;
+  for (;;) {
+    let j = end;
+    while (isWs(trimmed[j - 1])) j--;
+    if (trimmed[j - 1] !== ']') break;
+    j--;
+    while (isWs(trimmed[j - 1])) j--;
+    if (trimmed[j - 1] !== '[') break;
+    end = j - 1;
+    count++;
+  }
+  return {
+    rawBase: count ? trimmed.slice(0, end).trim() : trimmed,
+    arr: count ? '[]'.repeat(count) : '',
+  };
+};
+
 export const normalizeType = (input: string): string => {
   const trimmed = input.trim();
   if (!trimmed) return '';
-  const arrMatch = /((?:\s*\[\s*\])*)$/.exec(trimmed)!;
-  const arr = arrMatch[1]!.replace(/\s+/g, '');
-  const rawBase = trimmed.slice(0, trimmed.length - arrMatch[1]!.length).trim();
+  const { rawBase, arr } = stripTrailingArraySuffix(trimmed);
   if (!rawBase) return arr;
 
   const segments = scanTypeSegments(rawBase);
