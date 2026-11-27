@@ -14,7 +14,7 @@ import { MCP_PATH } from './routes/mcp.ts';
 
 /**
  * HTTP 请求体上限（字节）。依据：导入 SQL / 新建项目向导的 SQL 字段上限 500 万字符，
- * 按 JSON 编码后的 UTF-8 计（中文 3 字节 / 字符、换行转义 2 字节）实际最大约 15 MB；冻结脚本整体替换同样落在这个量级内。
+ * 按 JSON 编码后的 UTF-8 计（中文 3 字节 / 字符、换行转义 2 字节）实际最大约 15 MiB；冻结脚本整体替换同样落在这个量级内。
  */
 export const MAX_HTTP_BODY_BYTES = 16 * 1024 * 1024;
 

@@ -139,6 +139,96 @@ describe('SyncClient 发送前自查单条消息大小', () => {
     expect(c.mutate('createTable', { id: 't4', schema, name: 'd' })).toBe(1);
     expect(JSON.parse(frames[0]!)).toMatchObject({ t: 'op', op: { client: c.id, n: 1 } });
   });
+
+  test('dropPending 后恢复窗口内排队的修改在快照到达后补发并确认，之后普通重连不再强制拉快照', () => {
+    const m = emptyModel('pg');
+    createSchema(m, 'public');
+    const schema = Object.keys(m.objects)[0]!;
+    const { c, frames } = onlineClient(m);
+    const oldId = c.id;
+
+    // 先确认 1 条修改，使当前 seq = 1（非 0，供末尾普通重连验证 lastSeq !== 0）
+    c.mutate('createTable', { id: 't1', schema, name: 'a' });
+    c.receive({
+      t: 'commit',
+      seq: 1,
+      client: oldId,
+      n: 1,
+      user: 'u',
+      changes: [{ id: 't1', obj: c.view.objects.t1! }],
+    });
+    c.mutate('createTable', { id: 't_dropped', schema, name: 'dropped' });
+    expect(c.pending).toHaveLength(1);
+
+    // 1009 断开恢复：dropPending 换新标识并重置序号
+    expect(c.dropPending()).toBe(1);
+    const newId = c.id;
+    expect(newId).not.toBe(oldId);
+    c.disconnect();
+    frames.length = 0;
+
+    // 1) 断开期间用户发起修改：仅进入 pending，不发送
+    expect(c.mutate('createTable', { id: 't2', schema, name: 'b' })).toBe(1);
+    expect(frames).toEqual([]);
+    expect(c.pending.map((p) => [p.client, p.n])).toEqual([[newId, 1]]);
+
+    // 2) 重连发送 hello（lastSeq: 0），快照到达前用户再发起第 2 条修改
+    c.connect();
+    expect(frames.map((f): unknown => JSON.parse(f))).toEqual([{ t: 'hello', client: newId, lastSeq: 0 }]);
+    frames.length = 0;
+
+    expect(c.mutate('createTable', { id: 't3', schema, name: 'c' })).toBe(2);
+    c.receive({ t: 'welcome', lastProcessed: 0, rejected: [] });
+    expect(c.ready).toBe(false);
+    expect(frames).toEqual([]);
+    expect(c.pending.map((p) => [p.client, p.n])).toEqual([
+      [newId, 1],
+      [newId, 2],
+    ]);
+
+    // 3) 快照到达：按序补发恢复窗口内排队的两条 op（n = 1, 2，带新 client id）并置 ready = true
+    c.receive({
+      t: 'snapshot',
+      seq: 1,
+      model: structuredClone(c.confirmed),
+      versions: { ...c.versions },
+      lastProcessed: 0,
+    });
+    expect(c.ready).toBe(true);
+    expect(frames).toHaveLength(2);
+    expect(frames.map((f): unknown => JSON.parse(f))).toMatchObject([
+      { t: 'op', op: { client: newId, n: 1, name: 'createTable', args: { id: 't2', schema, name: 'b' } } },
+      { t: 'op', op: { client: newId, n: 2, name: 'createTable', args: { id: 't3', schema, name: 'c' } } },
+    ]);
+
+    // 4) 服务端确认两条 op 后 pending 清零、confirmed 同步更新
+    c.receive({
+      t: 'commit',
+      seq: 2,
+      client: newId,
+      n: 1,
+      user: 'u',
+      changes: [{ id: 't2', obj: c.view.objects.t2! }],
+    });
+    c.receive({
+      t: 'commit',
+      seq: 3,
+      client: newId,
+      n: 2,
+      user: 'u',
+      changes: [{ id: 't3', obj: c.view.objects.t3! }],
+    });
+    expect(c.pending).toEqual([]);
+    expect(c.seq).toBe(3);
+    expect(c.confirmed.objects.t2).toBeDefined();
+    expect(c.confirmed.objects.t3).toBeDefined();
+
+    // 5) 再次普通重连：forceSnapshot 已清除，hello 应携带当前 seq（3）而非 0
+    frames.length = 0;
+    c.disconnect();
+    c.connect();
+    expect(frames.map((f): unknown => JSON.parse(f))).toEqual([{ t: 'hello', client: newId, lastSeq: c.seq }]);
+  });
 });
 
 describe('合法的大粘贴远低于单条消息上限', () => {

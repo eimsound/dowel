@@ -62,6 +62,9 @@ const partitionKeyArg = z
 const partitionSpecArg = PartitionSpec.extend({
   keys: z.array(partitionKeyArg).min(1),
 });
+// setColumnExt / setPartitionBy 会整块提交子对象，此上限也会校验存量模型中原样带回的旧字段
+// （例如 Inspector 切换 MySQL UNSIGNED 时重发 ext.mysql.enumValues）；真实库中合法值远低于 100 万字符
+// （如 MySQL ENUM 单项最多 255 字符），可接受，不额外拆分局部校验。
 const columnExtArg = ColumnExt.extend({
   mysql: MysqlColumnExt.extend({
     enumValues: z.array(text).optional(),
