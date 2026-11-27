@@ -132,14 +132,15 @@ type Named = { name: string; mode: 'derived' | 'explicit' };
 
 ### 1.5 表达式（D6、D7、D8）
 
-```ts
-interface Expr {
-  src: string; // 用户写的原文，直接写列名：  email <> ''
-  canon?: { of: string; sql: string }; // 引擎规范形式；of = 生成时依据的原文，不等于当前 src 就视为过期
-}
-```
+表达式在 IR 里就是普通的 `string` 字段，直接写列名（例如 `email <> ''`），没有单独的表达式类型，也不另存规范形式（`packages/core/src/ir.ts`）：
 
-**存原文，改名时一起改写**：
+- `Check.expr`
+- `ColumnDefault.expr`（`{ expr }` 分支；`{ nextval }` 分支指向序列，不是表达式）
+- 列的 `generated.expr`
+- `IndexElement.expr`（与 `column` 二选一）、`Index.where`
+- `PartitionKey.expr`（与 `column` 二选一）、`partitionOf.bound`（存量 `format: 1` 的 `Table.partitionBy` 字符串形态在编辑或规划迁移时升级为结构化 `PartitionSpec`，不参与表达式规范化）
+
+**只存一份，改名时一起改写**：
 
 - 改列名的操作会找出本表中引用这一列的表达式，在同一个修改里把列名改掉（原型场景 3）。
 - “李四改表达式的同时张三改了名”这类并发，由同步层的冲突规则拒绝后到者（第 2.3 节），不需要像早先草案那样把列引用存成 ID 占位符。
@@ -149,8 +150,8 @@ interface Expr {
 
 - 规范形式是不动点，diff 和闭环验证都比较规范形式，不需要自己判断两个表达式是否等价。
 - 规范形式中的字面量自带完整信息，**迁移 SQL 输出规范形式**，在目标库上以任何会话参数执行都得到同样的值。
-- 界面上默认显示规范形式（去掉最外层多余括号）；用户编辑时显示原文。
-- `canon` 由服务器在影子库归一化后写入（第 2.6 节“派生数据”）。归一化按需触发（[ADR 0016](adr/0016-on-demand-shadow-normalization.md)）：规范化之前画布显示用户原文，状态栏提示“N 处待规范化”；迁移 SQL、DDL 导出、发布之前服务器会先规范化。
+- 界面上默认显示规范形式（去掉最外层多余括号）；规范化之前显示的是用户的输入，规范化之后字段里只剩规范形式（D7）。
+- 服务器在影子库归一化后以 `derive` 提交原地改写这些字段（第 2.6 节“派生数据”，带版本检查）；字段里没有“是否已规范化”的标记，由服务器拿当前模型和黄金基线 `branches.baseline` 比较判断（表达式或同表列的类型 / 枚举引用 / 排序规则相对基线变了就算待规范化，`apps/server/src/derive-pending.ts`）。归一化按需触发（[ADR 0016](adr/0016-on-demand-shadow-normalization.md)）：规范化之前状态栏提示“N 处待规范化”；迁移 SQL、DDL 导出、发布之前服务器会先规范化。
 
 ### 1.6 影子库会话参数（D8，四方言现状）
 
