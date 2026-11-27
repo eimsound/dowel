@@ -677,6 +677,14 @@ const planWithIndexes = (
     });
   };
 
+  // 类型是被重建枚举的列：重建时会改到新类型（OID 变了）。外键必须先删；引用它的生成列、视图要重建；不能是分区键
+  const enumCols = new Set<string>();
+  if (enumRebuild.size > 0) {
+    for (const c of fromIdx.allRef('column')) {
+      if (c.typeRef && enumRebuild.has(c.typeRef)) enumCols.add(c.id);
+    }
+  }
+
   // 生成列：定义变了、或表达式引用的列类型变了 → 删掉重建（生成列的值可以重新算出，不丢数据）
   const regen = new Set<string>();
   for (const c of toIdx.allRef('column')) {
@@ -686,7 +694,9 @@ const planWithIndexes = (
     if (
       !sameGenerated(c.generated, migrated(w).generated) ||
       typeChanged.has(c.id) ||
-      (c.generated && exprTouches(c.generated.expr, colsOfTable(c.parent, typeChanged)))
+      enumCols.has(c.id) ||
+      (c.generated && exprTouches(c.generated.expr, colsOfTable(c.parent, typeChanged))) ||
+      (c.generated && enumCols.size > 0 && exprTouches(c.generated.expr, colsOfTable(c.parent, enumCols)))
     )
       regen.add(c.id);
   }
@@ -704,27 +714,39 @@ const planWithIndexes = (
   }
   for (const id of regen) typeChanged.delete(id);
 
-  // 默认值文本没变、但它引用的枚举换了绑定（两个枚举对调名字、删后重建同名枚举、枚举重建）：
-  // 文本比较看不出来，要显式重设，让它按新模型的名字重新绑定（P12 先 DROP DEFAULT 再 SET DEFAULT）
+  // 默认值文本没变、但它引用的枚举换了绑定（两个枚举 / schema 对调名字、删后重建同名枚举、枚举重建）：
+  // 文本比较看不出来，要显式重设，让它按新模型的名字重新绑定（P12 先 DROP DEFAULT 再 SET DEFAULT）。
+  // 默认值不能引用列（PG 限制），所以只看全局改名
   const rebindDefault = new Set<string>();
   if (hasGlobalRename) {
-    for (const c of toIdx.allRef('column')) {
-      if (!inFrom(c.id) || regen.has(c.id) || !c.default || !('expr' in c.default)) continue;
-      const w = was(c);
-      if (sameDefault(w.default, c.default) && !sameDefault(migrated(w).default, c.default))
-        rebindDefault.add(c.id);
+    const check = (c: Column, old: Column['default'], moved: Column['default']) => {
+      if (regen.has(c.id) || !c.default || !('expr' in c.default)) return;
+      if (sameDefault(old, c.default) && !sameDefault(moved, c.default)) rebindDefault.add(c.id);
+    };
+    for (const c of toIdx.allRef('column'))
+      if (inFrom(c.id)) check(c, was(c).default, migrated(was(c)).default);
+    // 脱离为独立表的子分区：列从根父表物化出来，默认值文本也来自根父表
+    for (const [toColId, rc] of detachToRootCol) {
+      const tc = get(to, toColId, 'column');
+      const moved =
+        rc.default && 'expr' in rc.default ? { expr: migrateExpr(rc.default.expr, tc.parent) } : rc.default;
+      check(tc, rc.default, moved);
     }
   }
 
   // 分区键引用的列不允许改类型（PG 报错 cannot alter type of column named in partition key）
-  if (typeChanged.size > 0 || regen.size > 0) {
+  if (typeChanged.size > 0 || regen.size > 0 || enumCols.size > 0) {
     for (const o of toIdx.allRef('table')) {
       if (!o.partitionBy || !inFrom(o.id)) continue;
       const refIds = new Set([...partitionKeyColumns(to, o).all, ...partitionKeyColumns(from, was(o)).all]);
       for (const colId of refIds) {
-        if (typeChanged.has(colId) || regen.has(colId)) {
+        if (typeChanged.has(colId) || regen.has(colId) || enumCols.has(colId)) {
           const colName = find(to, colId)?.name ?? find(from, colId)?.name ?? colId;
-          throw new PlanError(`列 ${colName} 被分区表 ${o.name} 的分区键引用，不能修改类型`);
+          throw new PlanError(
+            enumCols.has(colId)
+              ? `列 ${colName} 被分区表 ${o.name} 的分区键引用，它的枚举类型要删值或重排值（需重建类型），PG 不能修改分区键列的类型`
+              : `列 ${colName} 被分区表 ${o.name} 的分区键引用，不能修改类型`,
+          );
         }
       }
     }
@@ -759,14 +781,6 @@ const planWithIndexes = (
       (e) => ids.has(was(from.objects[e] as Enum).name) || ids.has((to.objects[e] as Enum).name),
     );
   };
-
-  // 类型是被重建枚举的列：重建时会改到新类型，外键必须先删
-  const enumCols = new Set<string>();
-  if (enumRebuild.size > 0) {
-    for (const c of fromIdx.allRef('column')) {
-      if (c.typeRef && enumRebuild.has(c.typeRef)) enumCols.add(c.id);
-    }
-  }
 
   // PG 中 ALTER TABLE RENAME COLUMN 不会更新分区父表索引关系（relkind='I'）上的 pg_attribute.attname，
   // 导致后续新建或重挂子分区时 PG 仍按旧列名生成继承 UNIQUE/INDEX 约束与索引名；
@@ -871,6 +885,7 @@ const planWithIndexes = (
     ...typeChanged,
     ...regen,
     ...enumRebuild,
+    ...enumCols,
     ...opaqueChanged,
     ...detaching,
     ...attaching,
@@ -885,6 +900,23 @@ const planWithIndexes = (
     if (isLate(w) && !sameStrArr(enumDepsOf(to, o), enumDepsOf(from, w))) {
       lateRebuild.add(o.id);
       unstable.add(o.id);
+    }
+  }
+  // 早期不透明对象（域、复合类型、函数等）依赖的枚举被删除或要重建：旧类型删不掉（PG 有依赖记录），
+  // 而函数改签名不能 CREATE OR REPLACE、域 / 类型重建又会牵连按名字引用它们的表达式，这里明确拒绝，不让它在执行时才失败
+  for (const o of toIdx.allRef('opaque')) {
+    if (!inFrom(o.id)) continue;
+    const w = was(o);
+    if (isLate(w)) continue;
+    const gone = w.deps.filter(
+      (d) => from.objects[d]?.kind === 'enum' && (isRemoved(d) || enumRebuild.has(d)),
+    );
+    if (gone.length > 0) {
+      const names = gone.map((d) => qname(from, from.objects[d] as Enum)).join('、');
+      throw new PlanError(
+        `${o.objType} ${o.name} 依赖的枚举 ${names} 在本次迁移中被删除或要重建（删值 / 重排值），暂不支持自动重建依赖它的${o.objType}；` +
+          '请先在一个版本里删掉该对象（或改为不依赖这个枚举），再在后续版本里重建',
+      );
     }
   }
   for (let changed = true; changed;) {

@@ -97,6 +97,8 @@ describe('remapQualifiedInExpr', () => {
       types: new Map<string, Map<string, { schema: string; name: string }>>(),
     };
     expect(remapQualifiedInExpr(`a.f(x) + b.g(y)`, r)).toBe(`b.f(x) + a.g(y)`);
+    // 限定名的后半段（复合类型字段访问）不是 schema
+    expect(remapQualifiedInExpr(`(rec).a.b + t.a.b`, r)).toBe(`(rec).a.b + t.a.b`);
   });
 });
 
@@ -264,6 +266,95 @@ describe('PG 规划器：枚举换绑定时重建引用它的表达式对象（#
     expect(s.indexOf(`CREATE VIEW public.v AS SELECT 'ok'::public.mood AS x`)).toBeGreaterThan(
       s.findLastIndex((x) => x.startsWith('ALTER TYPE')),
     );
+    const c = structuredClone(a);
+    renameEnum(c, 'e1', 'feeling');
+    expect(sqls(a, c)).toEqual(['ALTER TYPE public.mood RENAME TO feeling']);
+  });
+
+  describe('枚举重建（删值 / 重排值）时，类型是该枚举的列', () => {
+    const enumColModel = () => {
+      const m = emptyModel();
+      const pub = createSchema(m, 'public', 'pub');
+      createEnum(m, pub, 'mood', ['ok', 'sad'], 'e1');
+      const t = createTable(m, pub, 't', 't');
+      addColumn(m, t, { name: 'id', type: 'integer', id: 'id' });
+      addColumn(m, t, { name: 'm', type: '', typeRef: 'e1', id: 'm' });
+      return m;
+    };
+    const reorder = (m: Model) => {
+      const b = structuredClone(m);
+      (b.objects.e1 as Enum).values = ['sad', 'ok'];
+      return b;
+    };
+
+    test('引用它的生成列先删、改完类型再加回', () => {
+      const m = enumColModel();
+      addColumn(m, 't', {
+        name: 'g',
+        type: 'boolean',
+        generated: { expr: '(m IS NULL)', stored: true },
+        id: 'g',
+      });
+      const s = sqls(m, reorder(m));
+      const alter = s.findIndex((x) => x.includes('ALTER COLUMN m TYPE'));
+      expect(s.indexOf('ALTER TABLE public.t DROP COLUMN g')).toBeLessThan(alter);
+      expect(
+        s.indexOf('ALTER TABLE public.t ADD COLUMN g boolean GENERATED ALWAYS AS ((m IS NULL)) STORED'),
+      ).toBeGreaterThan(alter);
+    });
+
+    test('依赖它的视图删掉重建', () => {
+      const m = enumColModel();
+      m.objects.v = {
+        id: 'v',
+        kind: 'opaque',
+        objType: 'view',
+        parent: 'pub',
+        name: 'v',
+        ddl: ['CREATE VIEW public.v AS SELECT m FROM public.t'],
+        drop: 'DROP VIEW public.v',
+        deps: ['t', 'm'],
+        order: 1,
+        comment: null,
+      };
+      const s = sqls(m, reorder(m));
+      const alter = s.findIndex((x) => x.includes('ALTER COLUMN m TYPE'));
+      expect(s.indexOf('DROP VIEW public.v')).toBeLessThan(alter);
+      expect(s.indexOf('CREATE VIEW public.v AS SELECT m FROM public.t')).toBeGreaterThan(alter);
+    });
+
+    test('它是分区键列：明确报错', () => {
+      const m = enumColModel();
+      setPartitionBy(m, 't', {
+        strategy: 'list',
+        keys: [{ column: 'm', expr: null, opclass: null, collation: null }],
+      });
+      expect(() => plan(m, reorder(m))).toThrow(/分区键引用，它的枚举类型要删值或重排值/);
+    });
+  });
+
+  test('早期不透明对象（函数签名）依赖的枚举被删掉重建：明确报错，不在执行时才失败', () => {
+    const a = base();
+    a.objects.f = {
+      id: 'f',
+      kind: 'opaque',
+      objType: 'function',
+      parent: 'pub',
+      name: 'f(public.mood)',
+      ddl: [
+        'CREATE OR REPLACE FUNCTION public.f(x public.mood) RETURNS integer LANGUAGE sql IMMUTABLE AS $$select 1$$',
+      ],
+      drop: 'DROP FUNCTION public.f(public.mood)',
+      deps: ['e1'],
+      order: 1,
+      comment: null,
+    };
+    const b = structuredClone(a);
+    delete b.objects.e1;
+    createEnum(b, 'pub', 'mood', ['ok', 'sad'], 'e9');
+    (b.objects.f as Opaque).deps = ['e9'];
+    expect(() => plan(a, b)).toThrow(/function f\(public\.mood\) 依赖的枚举 public\.mood/);
+    // 只改名不受影响
     const c = structuredClone(a);
     renameEnum(c, 'e1', 'feeling');
     expect(sqls(a, c)).toEqual(['ALTER TYPE public.mood RENAME TO feeling']);

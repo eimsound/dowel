@@ -405,4 +405,54 @@ describe.skipIf(!PG_URL)('PG 枚举换绑定时重建依赖对象（#160）', ()
       new Set(['mood=ok,sad']),
     );
   });
+
+  /** 从一段 DDL 导入模型（用于下面几个小场景） */
+  const loadDdl = async (db: Db, ddl: string): Promise<Model> => {
+    await resetShadow(db);
+    await db.exec('CREATE SCHEMA public');
+    await db.exec(`SET search_path = public; ${ddl}; RESET search_path;`);
+    return importSnapshot(await readSnapshot(db));
+  };
+  const reorder = (m: Model) => {
+    const b = structuredClone(m);
+    const e = b.objects[enumId(m, 'mood')] as Enum;
+    e.values = [...e.values].reverse();
+    return b;
+  };
+
+  test('枚举重排值（需重建类型）时，依赖枚举列的视图与生成列一起重建，闭环验证通过', async () => {
+    const db = conn();
+    const m1 = await loadDdl(
+      db,
+      `CREATE TYPE mood AS ENUM ('ok', 'sad');
+       CREATE TABLE t (id int, m mood, g boolean GENERATED ALWAYS AS (m IS NULL) STORED);
+       CREATE VIEW v AS SELECT m FROM t`,
+    );
+    const r = await verify(db, m1, reorder(m1));
+    expect(r.upDiff).toEqual([]);
+    expect(r.downDiff).toEqual([]);
+  });
+
+  test('枚举重排值而它是分区键列、函数签名依赖被删掉重建的枚举：规划时明确报错', async () => {
+    const db = conn();
+    const p1 = await loadDdl(
+      db,
+      `CREATE TYPE mood AS ENUM ('ok', 'sad');
+       CREATE TABLE p (id int, m mood) PARTITION BY LIST (m);
+       CREATE TABLE p1 PARTITION OF p FOR VALUES IN ('ok')`,
+    );
+    expect(() => plan(p1, reorder(p1))).toThrow(PlanError);
+    const f1 = await loadDdl(
+      db,
+      `CREATE TYPE mood AS ENUM ('ok', 'sad');
+       CREATE FUNCTION f(x mood) RETURNS int LANGUAGE sql IMMUTABLE AS 'select 1'`,
+    );
+    const f2 = structuredClone(f1);
+    const e1 = enumId(f1, 'mood');
+    delete f2.objects[e1];
+    const e9 = createEnum(f2, (f1.objects[e1] as Enum).parent, 'mood', ['ok', 'sad', 'x']);
+    for (const o of Object.values(f2.objects))
+      if (o.kind === 'opaque') o.deps = o.deps.map((d) => (d === e1 ? e9 : d));
+    expect(() => plan(f1, f2)).toThrow(/依赖的枚举 public\.mood/);
+  });
 });

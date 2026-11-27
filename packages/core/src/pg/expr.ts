@@ -104,6 +104,7 @@ export const qualifiedRefs = (expr: string): { schema: Token; name: Token }[] =>
   for (let i = 0; i + 2 < t.length; i++) {
     const a = t[i]!;
     const b = t[i + 2]!;
+    if (t[i - 1]?.text === '.') continue; // 已是限定名的后半段（如 (rec).a.b 里的 a.b）
     if (a.kind !== 'other' && t[i + 1]!.text === '.' && b.kind !== 'other') out.push({ schema: a, name: b });
   }
   return out;
@@ -137,6 +138,7 @@ export const remapQualifiedInExpr = (expr: string, remap: QualifiedRemap): strin
     const a = t[i]!;
     const b = t[i + 2]!;
     if (a.kind === 'other' || t[i + 1]!.text !== '.' || b.kind === 'other') continue;
+    if (t[i - 1]?.text === '.') continue; // 已是限定名的后半段，不是 schema
     const ty = remap.types.get(a.text)?.get(b.text);
     if (ty) {
       out += `${expr.slice(last, a.start)}${ident(ty.schema)}.${ident(ty.name)}`;
