@@ -25,11 +25,9 @@ import type { Db } from '../types.ts';
 export const alignMssqlImportedLive = (live: Model, reference: Model): Model => {
   let objects: Model['objects'] | null = null;
   for (const l of Object.values(live.objects)) {
-    if (l.kind !== 'column' || !l.generated?.stored) continue;
-    const r = reference.objects[l.id];
-    if (r?.kind !== 'column' || !r.generated?.stored) continue;
-    if (!deepEqual(r.generated, l.generated)) continue;
-    if (mssqlEffectiveNotNull(r) !== mssqlEffectiveNotNull(l)) continue;
+    if (l.kind !== 'column') continue;
+    const r = mssqlAlignableReference(l, reference);
+    if (!r) continue;
     const want = Boolean(r.ext?.mssql?.inferredNotNull);
     if (r.notNull === l.notNull && want === Boolean(l.ext?.mssql?.inferredNotNull)) continue;
     const c = structuredClone(l) as Column;
@@ -39,6 +37,104 @@ export const alignMssqlImportedLive = (live: Model, reference: Model): Model => 
     objects[c.id] = c;
   }
   return objects ? { ...live, objects } : live;
+};
+
+/**
+ * 参考模型里能让线上列 l 沿用显式 / 推断拆分的同一列（按 ID）：两边都是持久化计算列、表达式相同、有效可空性一致；
+ * 否则 null（拉取时这些列交给影子库探测重新拆分）
+ */
+export const mssqlAlignableReference = (l: Column, reference: Model): Column | null => {
+  if (!l.generated?.stored) return null;
+  const r = reference.objects[l.id];
+  if (r?.kind !== 'column' || !r.generated?.stored) return null;
+  if (!deepEqual(r.generated, l.generated)) return null;
+  if (mssqlEffectiveNotNull(r) !== mssqlEffectiveNotNull(l)) return null;
+  return r;
+};
+
+/** 模型里所有主键成员列的 ID */
+const primaryKeyMembers = (m: Model): Set<string> => {
+  const out = new Set<string>();
+  for (const o of Object.values(m.objects))
+    if (o.kind === 'primaryKey') for (const c of o.columns) out.add(c);
+  return out;
+};
+
+/** 导入记成推断非空（notNull: false + inferredNotNull: true）的持久化计算列：系统目录分不出显式与推断的那些列 */
+const isImportedInferred = (c: Column): boolean =>
+  !!c.generated?.stored && !c.notNull && c.ext?.mssql?.inferredNotNull === true;
+
+export interface MssqlNullabilitySplitPlan {
+  /** 主键成员：一律记成显式 NOT NULL，不探测（建主键即视为显式声明，ADR 0019） */
+  primaryKey: string[];
+  /** 其余要在影子库里探测表达式本身推断的列（非主键、读回非空的持久化计算列） */
+  probe: string[];
+}
+
+/**
+ * 导入 / 拉取后要重新拆分显式与推断的列（ADR 0019 决定 4）：只看导入记成推断的持久化计算列；
+ * keep 里的列（拉取时能沿用参考模型拆分的列）不动。没有 probe 项时调用方不必连影子库。
+ */
+export const mssqlNullabilitySplitPlan = (
+  m: Model,
+  keep: ReadonlySet<string> = new Set(),
+): MssqlNullabilitySplitPlan => {
+  const pk = primaryKeyMembers(m);
+  const plan: MssqlNullabilitySplitPlan = { primaryKey: [], probe: [] };
+  for (const o of Object.values(m.objects)) {
+    if (o.kind !== 'column' || keep.has(o.id) || !isImportedInferred(o)) continue;
+    (pk.has(o.id) ? plan.primaryKey : plan.probe).push(o.id);
+  }
+  return plan;
+};
+
+/** 拉取：线上模型里能从参考模型（工作副本）沿用拆分的列 ID */
+export const mssqlAlignedColumnIds = (live: Model, reference: Model): Set<string> => {
+  const out = new Set<string>();
+  for (const o of Object.values(live.objects))
+    if (o.kind === 'column' && mssqlAlignableReference(o, reference)) out.add(o.id);
+  return out;
+};
+
+/**
+ * 按拆分计划改写模型（返回新模型，不改入参）：
+ * - 主键成员记成显式；
+ * - probe 里的列：inferred 给出探测结果时，推断为非空的记成推断（notNull: false + inferredNotNull），推断为可空的记成显式；
+ *   inferred 为 null（没有可用的影子库）或缺了某列的结果时，记成显式，并在 fallback 里列出这些列。
+ */
+export const applyMssqlNullabilitySplit = (
+  m: Model,
+  plan: MssqlNullabilitySplitPlan,
+  inferred: ReadonlyMap<string, boolean> | null,
+): { model: Model; fallback: string[] } => {
+  const ids = [...plan.primaryKey, ...plan.probe];
+  if (!ids.length) return { model: m, fallback: [] };
+  const objects = { ...m.objects };
+  const fallback: string[] = [];
+  const explicit = (id: string) => {
+    const c = structuredClone(objects[id]) as Column;
+    c.notNull = true;
+    setMssqlInferredNotNull(c, false);
+    objects[id] = c;
+  };
+  for (const id of plan.primaryKey) explicit(id);
+  for (const id of plan.probe) {
+    const v = inferred?.get(id);
+    if (v === undefined) {
+      explicit(id);
+      fallback.push(id);
+    } else if (!v) explicit(id);
+  }
+  return { model: { ...m, objects }, fallback };
+};
+
+/** 列的完整限定名 schema.table.column（提示里列出受影响的列） */
+export const mssqlColumnPath = (m: Model, id: string): string => {
+  const c = m.objects[id];
+  if (c?.kind !== 'column') return id;
+  const t = m.objects[c.parent];
+  const s = t && 'parent' in t ? m.objects[t.parent] : undefined;
+  return [s?.name, t?.name, c.name].filter(Boolean).join('.');
 };
 
 export interface MssqlNullabilityProbe {

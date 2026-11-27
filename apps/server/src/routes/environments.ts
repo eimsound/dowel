@@ -5,13 +5,14 @@ import {
   environmentCreateSchema,
   environmentPatchSchema,
   importRequestSchema,
-  type ModelUpdate,
   type Ok,
   type PolicySettings,
   type PullPreview,
+  type PullResult,
   type TargetInfo,
 } from '@dowel/api';
 import { type Model, newId } from '@dowel/core';
+import { mssqlAlignedColumnIds } from '@dowel/engines';
 import { planDiff } from '@dowel/executor';
 import type { Hono } from 'hono';
 import { HTTPException } from 'hono/http-exception';
@@ -33,6 +34,7 @@ import {
   versionRef,
 } from '../envs.ts';
 import { lockEnvIdle, readLive, settleClaims } from '../executions.ts';
+import { splitImportedMssqlNullability } from '../mssql-nullability.ts';
 import {
   accessIn,
   deletePolicies,
@@ -448,8 +450,15 @@ export const registerEnvironments = (app: Hono<Env>, ctx: AppContext) => {
     // 最终由 replace 在房间锁与 PG 行锁内原子校验 expectedSeq，消除跨副本与本地并发窗口
     const changedLate = await workingChanged();
     if (changedLate) return changedLate;
+    // SQL Server 持久化计算列（ADR 0019）：能从工作副本沿用显式 / 推断拆分的列不动；其余（新增 / 表达式或有效可空性变了的列）
+    // 主键成员记显式，其他在这个环境的影子库里探测；没有可用的影子库就按显式记录并告诉用户。差异预览按有效可空性比较，不受影响
+    const split = await splitImportedMssqlNullability(
+      live.model,
+      async () => (await shadows.forProject(a.pid, env.id)).shadow,
+      mssqlAlignedColumnIds(live.model, working),
+    );
     try {
-      await ctx.replace(a.branch, c.get('user').name, live.model, 'pullSchema', expectedSeq);
+      await ctx.replace(a.branch, c.get('user').name, split.model, 'pullSchema', expectedSeq);
     } catch (err) {
       if (err instanceof WorkingChangedError) return workingChangedResponse(err.currentModel, err.currentSeq);
       throw err;
@@ -471,10 +480,15 @@ export const registerEnvironments = (app: Hono<Env>, ctx: AppContext) => {
           fingerprint: live.fingerprint,
           seq,
           objects: Object.keys(live.model.objects).length,
+          ...(split.fallback.length ? { nullabilityFallback: split.fallback } : {}),
         },
       },
       ctx.security,
     );
-    return c.json<ModelUpdate>({ seq, objects: Object.keys(live.model.objects).length });
+    return c.json<PullResult>({
+      seq,
+      objects: Object.keys(live.model.objects).length,
+      ...(split.fallback.length ? { nullabilityFallback: { columns: split.fallback } } : {}),
+    });
   });
 };

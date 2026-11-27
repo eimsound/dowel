@@ -76,6 +76,12 @@ export interface Shadow {
    * 表的分区键 `partitionBy.keys[].expr` 与分区边界 `partitionOf.bound`；不透明对象的 `ddl`。
    */
   canonicalize(prev: Model, next: Model): Promise<Obj[]>;
+  /**
+   * SQL Server（ADR 0019 决定 4）：从已有数据库导入 / 拉取后，在影子库里按模型建库（ids 里的列先按显式 NOT NULL 建，
+   * 引用它们的约束才建得出来），再探测这些列的表达式本身是否被推断为非空。返回 列 ID → 推断为非空。
+   * 只有 SQL Server 影子库实现；其他方言没有这个方法。
+   */
+  probeMssqlNotNull?(model: Model, ids: readonly string[]): Promise<Map<string, boolean>>;
   close(): Promise<void>;
 }
 
@@ -463,6 +469,25 @@ export const shadowOps = (
       setMssqlInferredNotNull(c, false);
     }
     return model;
+  },
+  probeMssqlNotNull: async (model: Model, ids: readonly string[]): Promise<Map<string, boolean>> => {
+    const d = await db();
+    const draft = structuredClone(model);
+    const cols: Column[] = [];
+    for (const id of ids) {
+      const c = draft.objects[id];
+      if (c?.kind !== 'column' || !c.generated?.stored) continue;
+      c.notNull = true;
+      setMssqlInferredNotNull(c, false);
+      cols.push(c);
+    }
+    try {
+      await buildTarget(d, draft);
+      return await probeInferred(d, draft, cols);
+    } catch (e) {
+      if (isInfraFailure(e, statementTimeoutMs)) throw toShadowError(e);
+      throw e;
+    }
   },
   canonicalize: async (prev: Model, next: Model): Promise<Obj[]> => {
     let d: Db;

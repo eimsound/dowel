@@ -6,6 +6,7 @@ import type {
   ProjectCreated,
   ProjectInfo,
   PublishRejected,
+  PullResult,
   TargetInfo,
   VersionCreated,
   VersionDetail,
@@ -1327,6 +1328,91 @@ describe(`MSSQL (${MSSQL_VERSION}) target driver & server E2E`, () => {
       await shadowDb.close();
     }
   }, 120_000);
+
+  test('wizard from an existing database and pull split explicit vs inferred PERSISTED computed columns in the shadow, with a no-shadow fallback (#161)', async () => {
+    if (!adminUrl || !app || !rooms || !pdb) return;
+    const t = await createTestMssqlDb('mssql_nnwiz');
+    const shadowName = mssqlShadowDbName(t.name);
+    let devEnvId: string | null = null;
+    try {
+      // k 主键成员（表达式本身可空，只能显式声明）；cp 推断非空；cu 显式声明在可空表达式上
+      await t.db.exec(`
+        CREATE TABLE [dbo].[items] (
+          [code] nvarchar(32) NOT NULL,
+          [k] AS (CONVERT([varchar](10),[code])) PERSISTED NOT NULL,
+          [cp] AS ([code]) PERSISTED,
+          [cu] AS (upper([code])) PERSISTED NOT NULL,
+          CONSTRAINT [PK_items] PRIMARY KEY ([k])
+        );
+      `);
+      const wizard = async (name: string, production: boolean) => {
+        const res = await req('POST', '/api/projects/wizard', {
+          groupId,
+          name,
+          dialect: 'mssql',
+          environments: [{ name: 'dev', url: t.url, production }],
+          content: { kind: 'database', env: 'dev' },
+        });
+        expect(res.status).toBe(200);
+        const done = parseSse<WizardEvent>(await res.text()).find((e) => e.stage === 'done');
+        expect(done?.project).toBeTruthy();
+        return done!;
+      };
+      const columnsOf = async (pid: string) => {
+        const info = (await (await req('GET', `/api/projects/${pid}`)).json()) as ProjectInfo;
+        const { model } = await rooms!.model(info.branch);
+        return Object.fromEntries(
+          Object.values(model.objects)
+            .filter((o): o is Column => o.kind === 'column' && !!o.generated)
+            .map((c) => [c.name, { notNull: c.notNull, inferred: c.ext?.mssql?.inferredNotNull === true }]),
+        );
+      };
+      const explicit = { notNull: true, inferred: false };
+      const inferred = { notNull: false, inferred: true };
+
+      // 1. 生产环境、没有独立影子库也不允许同实例：不拦截，非主键候选列按显式记录并列出
+      const prod = await wizard('NN Prod', true);
+      expect(prod.nullabilityFallback).toEqual({ columns: ['dbo.items.cp', 'dbo.items.cu'] });
+      expect(await columnsOf(prod.project!.id)).toEqual({ k: explicit, cp: explicit, cu: explicit });
+
+      // 2. 开发环境（同实例影子库）：主键成员记显式；其余在影子库里探测拆分
+      const dev = await wizard('NN Dev', false);
+      expect(dev.nullabilityFallback).toBeUndefined();
+      const pid = dev.project!.id;
+      expect(await columnsOf(pid)).toEqual({ k: explicit, cp: inferred, cu: explicit });
+
+      // 3. 拉取：工作副本里能沿用的列不变；线上新增的列在环境的影子库里探测拆分
+      await t.db.exec(
+        'ALTER TABLE [dbo].[items] ADD [c2] AS ([code]) PERSISTED, [c3] AS (upper([code])) PERSISTED NOT NULL',
+      );
+      const envs = (await (await req('GET', `/api/projects/${pid}/environments`)).json()) as { id: string }[];
+      devEnvId = envs[0]!.id;
+      const pullUrl = `/api/projects/${pid}/environments/${devEnvId}/pull`;
+      const preview = (await (await req('POST', pullUrl, { preview: true })).json()) as {
+        fingerprint: string;
+        workingSeq: number;
+      };
+      const pulledRes = await req('POST', pullUrl, {
+        fingerprint: preview.fingerprint,
+        workingSeq: preview.workingSeq,
+      });
+      expect(pulledRes.status).toBe(200);
+      const pulled = (await pulledRes.json()) as PullResult;
+      expect(pulled.nullabilityFallback).toBeUndefined();
+      expect(await columnsOf(pid)).toEqual({
+        k: explicit,
+        cp: inferred,
+        cu: explicit,
+        c2: inferred,
+        c3: explicit,
+      });
+    } finally {
+      // 关掉缓存里这个环境的影子库连接，才能删掉同实例影子库
+      if (devEnvId) await shadows?.forget(devEnvId);
+      await dropMssqlSameInstanceShadow(t.url, shadowName).catch(() => {});
+      await t.close();
+    }
+  }, 180_000);
 
   test('server wizard SQL import, model edit, verify & publish end-to-end on MSSQL', async () => {
     if (!adminUrl || !app || !rooms || !pdb) return;
