@@ -1067,6 +1067,79 @@ describe('pendingRefreshIds：表达式直接引用枚举、表内没有指向�
     runMutator(cur, 'addEnumValue', { id: 'e1', value: 'meh' });
     expect(pendingRefreshIds(good, cur)).toEqual([]);
   });
+
+  test.each([
+    ['大小写混合', 'Mood', '"Mood"'],
+    ['带空格', 'my mood', '"my mood"'],
+    ['内嵌双引号', 'x"y', '"x""y"'],
+    ['非 ASCII', '情绪', '"情绪"'],
+  ] as const)(
+    '带引号枚举名（%s：%s）：对调名字与普通改名在 CHECK / 默认值里均检出',
+    (_label, name, quoted) => {
+      // 1. 限定写法（public."..."）：对调名字后换回旧快照，表达式原文不变
+      const good = base();
+      runMutator(good, 'createEnum', { id: 'e1', schema: 's', name, values: ['ok', 'bad'] });
+      runMutator(good, 'createEnum', { id: 'e2', schema: 's', name: 'tone', values: ['ok', 'lo'] });
+      runMutator(good, 'addColumn', {
+        table: 't',
+        column: {
+          id: 'st',
+          name: 'status',
+          type: 'text',
+          default: { expr: `('ok'::public.${quoted})::text` },
+        },
+      });
+      runMutator(good, 'addCheck', { id: 'k', table: 't', expr: `((status)::public.${quoted} IS NOT NULL)` });
+      runMutator(good, 'addCheck', { id: 'k0', table: 't', expr: '(total > 0)' });
+      expect(pendingRefreshIds(good, structuredClone(good))).toEqual([]);
+
+      const swapped = structuredClone(good);
+      (swapped.objects.e1 as { name: string }).name = 'tone';
+      (swapped.objects.e2 as { name: string }).name = name;
+      expect(pendingRefreshIds(good, swapped)).toEqual(['st', 'k']);
+
+      // 2. 非限定写法（"..."）：renameEnum 不改写非限定表达式原文，同样检出
+      const goodUnq = base();
+      runMutator(goodUnq, 'createEnum', { id: 'e1', schema: 's', name, values: ['ok', 'bad'] });
+      runMutator(goodUnq, 'addColumn', {
+        table: 't',
+        column: { id: 'st', name: 'status', type: 'text', default: { expr: `('ok'::${quoted})::text` } },
+      });
+      runMutator(goodUnq, 'addCheck', { id: 'k', table: 't', expr: `((status)::${quoted} IS NOT NULL)` });
+      runMutator(goodUnq, 'addCheck', { id: 'k0', table: 't', expr: '(total > 0)' });
+      expect(pendingRefreshIds(goodUnq, structuredClone(goodUnq))).toEqual([]);
+
+      const renamed = structuredClone(goodUnq);
+      runMutator(renamed, 'renameEnum', { id: 'e1', name: 'feeling' });
+      expect((renamed.objects.st as { default: { expr: string } }).default.expr).toBe(
+        `('ok'::${quoted})::text`,
+      );
+      expect((renamed.objects.k as { expr: string }).expr).toBe(`((status)::${quoted} IS NOT NULL)`);
+      expect(pendingRefreshIds(goodUnq, renamed)).toEqual(['st', 'k']);
+    },
+  );
+
+  test('仅当前模型一侧出现该枚举名（新建同名枚举，或已有枚举改名到该名字）：仍检出', () => {
+    const good = base();
+    runMutator(good, 'createEnum', { id: 'e2', schema: 's', name: 'tone', values: ['ok', 'lo'] });
+    runMutator(good, 'addColumn', {
+      table: 't',
+      column: { id: 'st', name: 'status', type: 'text', default: { expr: "('ok'::public.mood)::text" } },
+    });
+    runMutator(good, 'addCheck', { id: 'k', table: 't', expr: '((status)::public.mood IS NOT NULL)' });
+    runMutator(good, 'addCheck', { id: 'k0', table: 't', expr: '(total > 0)' });
+    expect(pendingRefreshIds(good, structuredClone(good))).toEqual([]);
+
+    // 基线里没有名为 mood 的枚举（如原本是同名 domain / 复合类型或此前已删），当前模型新建出 mood
+    const created = structuredClone(good);
+    runMutator(created, 'createEnum', { id: 'e1', schema: 's', name: 'mood', values: ['ok'] });
+    expect(pendingRefreshIds(good, created)).toEqual(['st', 'k']);
+
+    // 基线里已有枚举 e2 原名 tone，换入的快照里 e2 改名为 mood 而表达式原文不变
+    const renamedTo = structuredClone(good);
+    (renamedTo.objects.e2 as { name: string }).name = 'mood';
+    expect(pendingRefreshIds(good, renamedTo)).toEqual(['st', 'k']);
+  });
 });
 
 describe('pendingRefreshIds：分区键签名的保守规则（PR #138 评审补测）', () => {

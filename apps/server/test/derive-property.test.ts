@@ -32,6 +32,7 @@ import {
   EditError,
   emptyModel,
   formatPartitionBound,
+  ident,
   type Model,
   type Obj,
   parsePartitionBound,
@@ -60,7 +61,7 @@ type Table = Extract<Obj, { kind: 'table' }>;
 
 const COLUMN_NAMES = ['qty', 'price', 'note', 'flag', 'score', 'total', 'rate'] as const;
 const TABLE_NAMES = ['orders', 'items', 'users2', 'ledger'] as const;
-const ENUM_NAMES = ['mood', 'tone', 'phase'] as const;
+const ENUM_NAMES = ['mood', 'tone', 'phase', 'Mood'] as const;
 const SCHEMA_NAMES = ['public', 'app'] as const;
 const TYPES = ['integer', 'bigint', 'text', 'numeric'] as const;
 const COLLATIONS = [null, 'C', 'POSIX'] as const;
@@ -85,8 +86,8 @@ const columnsByName = (m: Model, tableId: string): Map<string, Column> => {
   return out;
 };
 
-/** 表达式里直接写的枚举转换 `0::mood` / `0::public.mood` */
-const ENUM_CAST_RE = /^.*::(?:([A-Za-z0-9_]+)\.)?([A-Za-z0-9_]+)$/;
+/** 表达式里直接写的枚举转换 `0::mood` / `0::public.mood` / `0::public."Mood"` */
+const ENUM_CAST_RE = /^.*::(?:([A-Za-z0-9_]+)\.)?(?:"((?:[^"]|"")*)"|([A-Za-z0-9_]+))$/;
 
 /** 枚举名（可带 schema）在模型 m 里绑定到的枚举 ID；没有则为 'none' */
 const enumBinding = (m: Model, schema: string | undefined, name: string): string =>
@@ -107,7 +108,9 @@ const canonExpr = (m: Model, text: string, cols: Map<string, Column>, own?: Colu
       const c = cols.get(t);
       if (c) return `${t}::${annot(c)}`;
       const en = ENUM_CAST_RE.exec(t);
-      return en ? `${t}::en_${enumBinding(m, en[1], en[2]!)}` : t;
+      return en
+        ? `${t}::en_${enumBinding(m, en[1], en[2] !== undefined ? en[2].replaceAll('""', '"') : en[3]!)}`
+        : t;
     })
     .join(' ')})`;
   return own ? `${body}::${annot(own)}` : body;
@@ -393,7 +396,7 @@ const exprText = (m: Model, tableId: string, e: ExprSpec): string | null => {
   const en = e.en === null || e.en === undefined ? undefined : pick(idsOf(m, 'enum'), e.en);
   if (en) {
     const o = m.objects[en] as Extract<Obj, { kind: 'enum' }>;
-    refs.push(`0::${e.q ? `${m.objects[o.parent]!.name}.` : ''}${o.name}`);
+    refs.push(`0::${e.q ? `${m.objects[o.parent]!.name}.` : ''}${ident(o.name)}`);
   }
   return `${refs.join(' + ')} ${OPS[e.op % OPS.length]} ${e.lit}`;
 };
