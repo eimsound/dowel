@@ -98,13 +98,8 @@ export interface ExecuteOptions {
    * 路线沿 parent_id 经最近公共祖先规划（先 down 再 up，见 version-tree.ts 的 routeBetween）
    */
   chain: ChainVersion[];
-  /**
-   * migrate：执行 / 回滚到 `to`；
-   * baseline：只写基线（库里的结构必须等于链上第一个版本的模型，不执行任何 SQL）。
-   */
-  mode?: 'migrate' | 'baseline';
-  /** 目标版本 ID（mode = migrate 时必填） */
-  to?: string;
+  /** 目标版本 ID */
+  to: string;
   /**
    * 期望的路线形状：给了而实际路线不一样就拒绝（空操作不受影响）——
    * up = 只升级（“执行”接口、CI 令牌），实际要先回滚再升级时报 switch_required，实际是回滚时报 wrong_direction；
@@ -173,7 +168,7 @@ export interface DryRunMigration {
 
 /** 预演的结果：通过了全部检查，真执行时会做什么 */
 export interface DryRunPlan {
-  /** 目标库还没有这个项目的历史：baseline = 结构等于基线，只写基线；empty = 空库，执行第一个版本建库；null = 已有历史 */
+  /** 目标库还没有这个项目的历史：baseline = 结构等于基线，先写入基线再执行后续迁移；empty = 空库，执行第一个版本建库；null = 已有历史 */
   firstRun: 'baseline' | 'empty' | null;
   /** 会先写入基线（库里的结构等于第一个版本） */
   baseline: boolean;
@@ -192,7 +187,6 @@ export interface DryRunPlan {
 }
 
 export interface ExecuteResult {
-  mode: 'migrate' | 'baseline';
   /** switch = 先回滚到最近公共祖先再升级（ADR 0013） */
   direction: 'up' | 'down' | 'switch' | 'none';
   /** switch 路线经过的最近公共祖先；其他情况为 null / undefined */

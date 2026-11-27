@@ -34,7 +34,7 @@ The execution policy controls who can perform privileged operations on an enviro
 
 Privileged operations include:
 
-- Execute, roll back, write baseline, and [mark as applied](execution.md#mark-as-applied), including dry runs.
+- Execute, roll back, and [mark as applied](execution.md#mark-as-applied), including dry runs.
 - Update connection strings or shadow database settings, unmark production, and delete an environment.
 - [Attach an existing environment to an existing project](takeover.md#attach-existing).
 
@@ -81,5 +81,5 @@ An approval flow defines who must approve execution or rollback requests in sequ
 - Each **approval stage** specifies the eligible approver pool (Project admins, Admins of the project's group, Executors, Members of a group, Admins of a group, or Specific users) and the required approval count. The final stage may enable Last approver executes.
 - **Append-only layer merging.** The effective approval flow concatenates stages from instance, group, project, and environment layers in order. Stages inherited from upper layers appear locked below and cannot be edited or removed.
 - **Default single-stage flow.** When no stages are configured across all four layers, authorized users execute directly, and unauthorized users submit requests for an authorized user to approve and execute.
-- **Configured multi-stage flows.** Once at least one stage is configured, every execution and rollback (other than write baseline and mark as applied, which execute no SQL) must go through the approval flow, including for instance admins unless they use [Emergency execution](approvals.md#emergency-execution).
+- **Configured multi-stage flows.** Once at least one stage is configured, every execution and rollback (other than mark as applied, which executes no SQL) must go through the approval flow, including for instance admins unless they use [Emergency execution](approvals.md#emergency-execution).
 - **Approval grants no execution rights.** The user clicking Execute or Approve and execute must satisfy the environment's "Who can execute" level or hold an executor grant. If the same user appears in multiple stages, they must confirm each stage separately, and only users who can view the project count as eligible approvers.

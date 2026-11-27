@@ -16,6 +16,7 @@ import { DriftScheduler } from './drift-scheduler.ts';
 import { defaultMailer, type Mailer } from './email.ts';
 import { EnvLocks, type ExecContext } from './executions.ts';
 import { HaCoordinator, type HaCoordinatorOptions } from './ha.ts';
+import { DEFAULT_MESSAGE_LIMITS, httpBodyLimit, type MessageLimits } from './limits.ts';
 import {
   connectionLimiterFromEnv,
   emailTestLimiterFromEnv,
@@ -83,6 +84,8 @@ export interface AppOptions {
   ha?: HaCoordinatorOptions;
   /** 协作房间配置（如空闲超时卸载间隔） */
   rooms?: RoomsOptions;
+  /** 单条入站消息上限（测试里调小；默认 HTTP 请求体 16 MiB、协作 WebSocket 单条消息 16 MiB，见 limits.ts） */
+  limits?: Partial<MessageLimits>;
 }
 
 export const createApp = (db: PlatformDb, options: AppOptions = {}) => {
@@ -146,8 +149,14 @@ export const createApp = (db: PlatformDb, options: AppOptions = {}) => {
     if (opts?.canonical === false) await refresher.runWithoutReset(branch, run);
     else await refresher.runWithReset(branch, model, run, { onlyIfClean: opts?.canonical === 'ifClean' });
   };
+  const limits: MessageLimits = { ...DEFAULT_MESSAGE_LIMITS, ...options.limits };
   const nodeWs = createNodeWebSocket({ app });
   const { upgradeWebSocket, wss } = nodeWs;
+  // @hono/node-ws 不透传 WebSocketServer 选项；ws 在每次升级时读 wss.options.maxPayload（含分片累计与解压后的大小），
+  // 超限以 1009 关闭连接，消息不会进入 onMessage / JSON.parse（Issue #150；ws 默认是 100 MiB）
+  wss.options.maxPayload = limits.wsMessageBytes;
+  // ws 服务端默认就不开压缩；显式固定，避免依赖升级后默认值变化带来解压放大
+  wss.options.perMessageDeflate = false;
   const injectWebSocket: typeof nodeWs.injectWebSocket = (server) => nodeWs.injectWebSocket(server);
   const security: SecurityConfig = { ...securityConfigFromEnv(), ...options.security };
 
@@ -228,6 +237,8 @@ export const createApp = (db: PlatformDb, options: AppOptions = {}) => {
   // 安全响应头对所有响应生效；变更请求校验 Origin（没有 Origin 头的放行，便于 CI 用 curl）。
   // CI 令牌接口（/api/ci/…）不校验：令牌请求不带 cookie，没有 CSRF 的前提（P6）
   app.use('*', securityHeaders);
+  // 请求体上限放在所有路由与认证之前：超限的请求不读完请求体、不解析 JSON（Issue #150；MCP 有自己的 1 MiB 上限）
+  app.use('*', httpBodyLimit(limits.httpBodyBytes));
   app.use('/api/*', async (c, next) =>
     c.req.path.startsWith('/api/ci/') ? next() : mutationOriginGuard(security)(c, next),
   );

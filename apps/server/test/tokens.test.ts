@@ -15,6 +15,7 @@ import { promisify } from 'node:util';
 
 import {
   type AuditPage,
+  CI_ERROR_STATUS,
   type CiDriftResult,
   type CiEnvironmentStatus,
   type CiErrorBody,
@@ -39,6 +40,7 @@ import {
 } from '@dowel/api';
 import { addColumn, all, type Model, newId, plan } from '@dowel/core';
 import { stepsChecksum, toScriptSteps } from '@dowel/engines';
+import { ExecutorError } from '@dowel/executor';
 import { serve } from '@hono/node-server';
 import { afterAll, beforeAll, describe, expect, test } from 'vitest';
 
@@ -46,6 +48,7 @@ import { connect, createTestDb, PG_URL } from '../../../test/pg.ts';
 import { hashToken } from '../src/auth.ts';
 import { createApp, openPlatformDb, type PlatformDb } from '../src/index.ts';
 import { KeyedLimiter, LoginLimiter } from '../src/rate-limit.ts';
+import { toCiError } from '../src/routes/ci.ts';
 import { encrypt } from '../src/secrets.ts';
 import { ActiveTokenCache } from '../src/tokens.ts';
 import { addTable, editModel, makeUser, PASSWORD } from './support.ts';
@@ -159,6 +162,21 @@ describe('ActiveTokenCache（活跃令牌快照缓存）', () => {
     expect(await pending).toBe(true);
     expect(queryCalls).toBe(3);
   });
+});
+
+test('toCiError 将 ExecutorError(mark_required) 映射为 409 rejected（details.reason = mark_required）', () => {
+  const err = toCiError(
+    new ExecutorError('mark_required', '请改用标记为已执行', {
+      versionId: 'v0',
+      number: 0,
+      reached: null,
+    }),
+    () => null,
+  );
+  expect(err.code).toBe('rejected');
+  expect(CI_ERROR_STATUS[err.code]).toBe(409);
+  expect(err.details).toMatchObject({ reason: 'mark_required' });
+  expect(err.reached).toBeNull();
 });
 
 describe('CI 令牌生命周期、权限、三层创建规则与限速（T1 / T2）', () => {

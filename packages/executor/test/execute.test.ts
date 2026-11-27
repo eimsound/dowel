@@ -444,74 +444,54 @@ test.skipIf(!PG_URL)('漂移：手工 ALTER TABLE 被识别并拦住执行和回
   });
 });
 
-test.skipIf(!PG_URL)('首次执行：库的结构等于基线 → 只写基线，不执行 SQL；之后正常执行', async () => {
-  const models = [await canon(m0()), await canon(withEmail(m0())), await canon(withOrders(withEmail(m0())))];
-  const chain = chainOf(models, 0);
-  await withTarget(async (t) => {
-    await build(t.db, models[0]!); // 导入来源库：已经有 v0 的结构
-    await t.db.exec('insert into public.users (id) values (42)');
-    // 没有历史时的状态预览：结构等于基线
-    expect(await checkDrift({ db: t.db, projectId: 'p1', chain })).toEqual({
-      status: 'ok',
-      version: idOf(chain, 0),
-      firstRun: 'baseline',
-    });
-    const r = await run(t.db, chain, 0);
-    expect(r).toMatchObject({ baseline: true, current: idOf(chain, 0) });
-    expect(r.ran.map((x) => x.direction)).toEqual(['baseline']);
-    const h = await readHistory(t.db, 'p1');
-    expect(h.history.map((x) => [x.direction, x.fromVersion, x.toVersion, x.status])).toEqual([
-      ['baseline', null, idOf(chain, 0), 'done'],
-    ]);
-    expect(h.versions.map((v) => v.number)).toEqual([0]);
-    // v0 的建表语句没有执行（否则会因为表已存在而失败，数据也会丢）
-    expect((await t.db.query<{ id: number }>('select id::int from public.users'))[0]!.id).toBe(42);
+test.skipIf(!PG_URL)(
+  '首次执行：库的结构等于基线 → 单独执行到 v0 拒绝（引导标记），执行 v1+ 时先写基线再执行迁移',
+  async () => {
+    const models = [
+      await canon(m0()),
+      await canon(withEmail(m0())),
+      await canon(withOrders(withEmail(m0()))),
+    ];
+    const chain = chainOf(models, 0);
+    await withTarget(async (t) => {
+      await build(t.db, models[0]!); // 导入来源库：已经有 v0 的结构
+      await t.db.exec('insert into public.users (id) values (42)');
+      // 没有历史时的状态预览：结构等于基线
+      expect(await checkDrift({ db: t.db, projectId: 'p1', chain })).toEqual({
+        status: 'ok',
+        version: idOf(chain, 0),
+        firstRun: 'baseline',
+      });
+      // 没有后续迁移可跑时，不允许通过“执行”到 v0 只写基线（引导改用“标记为已执行”）
+      const dryReq = await fails(run(t.db, chain, 0, { dryRun: true }));
+      expect(dryReq.code).toBe('mark_required');
+      const req = await fails(run(t.db, chain, 0));
+      expect(req.code).toBe('mark_required');
+      expect(await hasDowelSchema(t.db)).toBe(false);
+      const dirDown = await fails(run(t.db, chain, 0, { direction: 'down' }));
+      expect(dirDown.code).toBe('wrong_direction');
 
-    // 之后正常执行
-    const next = await run(t.db, chain, 2);
-    expect(next.ran.map((x) => x.number)).toEqual([1, 2]);
-    expect((await t.db.query<{ id: number }>('select id::int from public.users'))[0]!.id).toBe(42);
-    await structureIs(t.db, models[2]!);
-  });
-  // 一路执行到 v2：基线之后接着执行，一次完成
-  await withTarget(async (t) => {
-    await build(t.db, models[0]!);
-    const r = await run(t.db, chain, 2);
-    expect(r.baseline).toBe(true);
-    expect(r.ran.map((x) => [x.number, x.direction])).toEqual([
-      [0, 'baseline'],
-      [1, 'up'],
-      [2, 'up'],
-    ]);
-  });
-  // 显式只写基线；写过之后再写 → 拒绝
-  await withTarget(async (t) => {
-    await build(t.db, models[0]!);
-    const r = await execute({
-      db: t.db,
-      projectId: 'p1',
-      projectName: '演示',
-      instanceId: 'inst-A',
-      chain,
-      mode: 'baseline',
-      executedBy: 'u1',
+      // 执行到 v2：先写 v0 基线（不跑 v0 建库 SQL，数据保留），再依次执行 v1、v2
+      const r = await run(t.db, chain, 2);
+      expect(r).toMatchObject({ baseline: true, current: idOf(chain, 2) });
+      expect(r.ran.map((x) => [x.number, x.direction])).toEqual([
+        [0, 'baseline'],
+        [1, 'up'],
+        [2, 'up'],
+      ]);
+      const h = await readHistory(t.db, 'p1');
+      expect(h.history.map((x) => [x.direction, x.fromVersion, x.toVersion, x.status])).toEqual([
+        ['baseline', null, idOf(chain, 0), 'done'],
+        ['up', idOf(chain, 0), idOf(chain, 1), 'done'],
+        ['up', idOf(chain, 1), idOf(chain, 2), 'done'],
+      ]);
+      expect(h.versions.map((v) => v.number)).toEqual([0, 1, 2]);
+      // v0 的建表语句没有执行（否则会因为表已存在而失败，数据也会丢）
+      expect((await t.db.query<{ id: number }>('select id::int from public.users'))[0]!.id).toBe(42);
+      await structureIs(t.db, models[2]!);
     });
-    expect(r).toMatchObject({ baseline: true, direction: 'none' });
-    expect((await readHistory(t.db, 'p1')).currentVersion).toBe(idOf(chain, 0));
-    const e = await fails(
-      execute({
-        db: t.db,
-        projectId: 'p1',
-        projectName: '演示',
-        instanceId: 'inst-A',
-        chain,
-        mode: 'baseline',
-        executedBy: 'u1',
-      }),
-    );
-    expect(e.code).toBe('baseline_not_applicable');
-  });
-});
+  },
+);
 
 test.skipIf(!PG_URL)('首次执行：空库 → 执行 v0 的 up 完整建库', async () => {
   const models = [await canon(m0()), await canon(withEmail(m0()))];
@@ -530,19 +510,6 @@ test.skipIf(!PG_URL)('首次执行：空库 → 执行 v0 的 up 完整建库', 
     await structureIs(t.db, models[1]!);
     const h = await readHistory(t.db, 'p1');
     expect(h.history[0]).toMatchObject({ fromVersion: null, toVersion: idOf(chain, 0), direction: 'up' });
-    // 空库上写基线没有意义
-    const e = await fails(
-      execute({
-        db: (await createTestDb('exec_e')).db,
-        projectId: 'p1',
-        projectName: null,
-        instanceId: 'inst-A',
-        chain,
-        mode: 'baseline',
-        executedBy: null,
-      }),
-    );
-    expect(e.code).toBe('baseline_not_applicable');
   });
 });
 
@@ -996,13 +963,13 @@ test.skipIf(!PG_URL)(
       expect((await fails(run(t.db, cic, 2, a.opts))).code).toBe('step_failed');
       expect(a.touched).toEqual([2]);
     });
-    // 只写基线：提交之前报告
+    // 首次执行命中基线并继续迁移：写基线（提交之前）和后续迁移都报告
     const baseChain = chainOf([await canon(m0()), await canon(withEmail(m0()))], 0);
     await withTarget(async (t) => {
       await build(t.db, baseChain[0]!.model);
       const a = touches();
-      await run(t.db, baseChain, 0, a.opts);
-      expect(a.touched).toEqual([0]);
+      await run(t.db, baseChain, 1, a.opts);
+      expect(a.touched).toEqual([0, 1]);
     });
   },
 );

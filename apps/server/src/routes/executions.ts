@@ -1,7 +1,6 @@
-// 环境的执行（H7）：状态、历史、漂移检查，以及执行 / 回滚 / 写基线（进度用 SSE，参考新建项目向导）。
+// 环境的执行（H7）：状态、历史、漂移检查，以及执行 / 回滚（进度用 SSE，参考新建项目向导）。
 // 特权操作按环境的“谁能执行”档位检查（H6，authz.ts 的 EnvAction）。
 import {
-  baselineRequestSchema,
   type DriftCheckResponse,
   type DryRunResponse,
   type EnvHistory,
@@ -63,7 +62,7 @@ export const timeoutsOf = (a: Pick<EnvAccess, 'auth'>) => ({
   lockMs: a.auth.resolved.lockTimeoutMs.value,
 });
 
-// ───── 执行 / 回滚 / 写基线（SSE）：直接执行、执行申请、紧急执行共用 ─────
+// ───── 执行 / 回滚（SSE）：直接执行、执行申请、紧急执行共用 ─────
 
 /** 一次执行的结果（给执行申请 / 紧急执行在结束后更新状态、发通知） */
 export interface StreamOutcome {
@@ -90,10 +89,8 @@ export const execStream = (
   c: Context<Env>,
   ctx: AppContext,
   a: RunAccess,
-  action:
-    | Extract<EnvAction, 'environment.execute' | 'environment.rollback' | 'environment.baseline'>
-    | 'environment.switch',
-  run: { mode: 'migrate' | 'baseline'; to?: string; direction?: 'up' | 'down' | 'switch' },
+  action: Extract<EnvAction, 'environment.execute' | 'environment.rollback'> | 'environment.switch',
+  run: { to: string; direction: 'up' | 'down' | 'switch' },
   opts: StreamOptions = {},
 ) => {
   const { db } = ctx;
@@ -129,7 +126,6 @@ export const execStream = (
         pid: a.pid,
         projectName: a.name,
         env,
-        mode: run.mode,
         to: run.to,
         direction: run.direction,
         userId: user.id,
@@ -163,8 +159,8 @@ export const execStream = (
             name: env.name,
             production: env.production,
             from: fromId,
-            ...(run.mode === 'migrate' ? { direction: run.direction } : {}),
-            ...(outcome.ok ? { to: outcome.current?.id ?? null, ran: ranList } : { to: run.to ?? null }),
+            direction: run.direction,
+            ...(outcome.ok ? { to: outcome.current?.id ?? null, ran: ranList } : { to: run.to }),
             ...(action === 'environment.switch'
               ? {
                   lca: outcome.lca ?? null,
@@ -197,7 +193,7 @@ export const dryRunFor = async (
   ctx: AppContext,
   a: Pick<EnvAccess, 'pid' | 'name' | 'env'> & { dialect?: Dialect },
   userId: string,
-  run: { mode: 'migrate' | 'baseline'; to?: string; direction?: 'up' | 'down' | 'switch' },
+  run: { to: string; direction: 'up' | 'down' | 'switch' },
 ): Promise<DryRunResponse> => {
   const { db } = ctx;
   try {
@@ -205,7 +201,6 @@ export const dryRunFor = async (
       pid: a.pid,
       projectName: a.name,
       env: a.env,
-      mode: run.mode,
       to: run.to,
       direction: run.direction,
       userId,
@@ -217,7 +212,6 @@ export const dryRunFor = async (
     return {
       ok: true,
       plan: {
-        mode: result.mode,
         direction: result.direction,
         lca: ref(plan.lca),
         firstRun: plan.firstRun,
@@ -257,7 +251,7 @@ export const dryRunFor = async (
 /**
  * 环境生效的审批流程配置了环节（P5b）：执行 / 回滚必须走执行申请，谁都不能直接执行（实例管理员另有紧急执行）。
  * 没配置环节是默认流程：有执行权限的人直接执行，没有的提交申请、由有执行权限的人“通过并执行”。
- * 写基线、标记为已执行不跑脚本，不走审批（仍然受“谁能执行”约束）。
+ * 标记为已执行不跑脚本，不走审批（仍然受“谁能执行”约束）。
  */
 export const approvalRequired = (a: Pick<EnvAccess, 'auth'>) => a.auth.resolved.approval.stages.length > 0;
 export const APPROVAL_REQUIRED = {
@@ -275,7 +269,7 @@ export const assertVersion = async (db: Db, pid: string, to: string) => {
   return v;
 };
 
-/** 生产环境的执行 / 回滚 / 写基线必须在请求里带上环境名（服务端校验，不只是界面上的确认框） */
+/** 生产环境的执行 / 回滚必须在请求里带上环境名（服务端校验，不只是界面上的确认框） */
 export const confirmed = (env: EnvRow, confirm: string | undefined) => {
   if (env.production && (confirm ?? '').trim() !== env.name)
     throw new HTTPException(422, { message: `生产环境需要输入环境名“${env.name}”确认` });
@@ -389,7 +383,7 @@ export const registerExecutions = (app: Hono<Env>, ctx: AppContext) => {
     const a = await envAccess(c, ctx, 'environment.execute');
     const b = await body(c, executeRequestSchema);
     const target = await assertVersion(db, a.pid, b.to);
-    const run = { mode: 'migrate', to: b.to, direction: 'up' } as const;
+    const run = { to: b.to, direction: 'up' } as const;
     if (b.dryRun) return c.json(await dryRunFor(ctx, a, c.get('user').id, run));
     if (target.retired_at !== null && target.retired_at !== undefined)
       return c.json(
@@ -406,7 +400,7 @@ export const registerExecutions = (app: Hono<Env>, ctx: AppContext) => {
     const a = await envAccess(c, ctx, 'environment.rollback');
     const b = await body(c, executeRequestSchema);
     await assertVersion(db, a.pid, b.to);
-    const run = { mode: 'migrate', to: b.to, direction: 'down' } as const;
+    const run = { to: b.to, direction: 'down' } as const;
     if (b.dryRun) return c.json(await dryRunFor(ctx, a, c.get('user').id, run));
     if (approvalRequired(a)) return c.json(APPROVAL_REQUIRED, 403);
     confirmed(a.env, b.confirm);
@@ -420,7 +414,7 @@ export const registerExecutions = (app: Hono<Env>, ctx: AppContext) => {
       throw new HTTPException(403, { message: deniedMessage('environment.rollback', a.auth) });
     const b = await body(c, executeRequestSchema);
     const target = await assertVersion(db, a.pid, b.to);
-    const run = { mode: 'migrate', to: b.to, direction: 'switch' } as const;
+    const run = { to: b.to, direction: 'switch' } as const;
     if (b.dryRun) return c.json(await dryRunFor(ctx, a, c.get('user').id, run));
     if (target.retired_at !== null && target.retired_at !== undefined)
       return c.json(
@@ -579,14 +573,5 @@ export const registerExecutions = (app: Hono<Env>, ctx: AppContext) => {
       // 按规划器 step 的 kind 分类（compare.ts 的 repairRisks），不靠文本里有没有 drop
       risks: repairRisks(steps),
     });
-  });
-
-  /** 写基线：库里的结构已经等于链上第一个版本（导入来源库），只写历史，不执行任何 SQL */
-  app.post('/api/projects/:pid/environments/:eid/baseline', async (c) => {
-    const a = await envAccess(c, ctx, 'environment.baseline');
-    const b = await body(c, baselineRequestSchema);
-    if (b.dryRun) return c.json(await dryRunFor(ctx, a, c.get('user').id, { mode: 'baseline' }));
-    confirmed(a.env, b.confirm);
-    return execStream(c, ctx, a, 'environment.baseline', { mode: 'baseline' });
   });
 };

@@ -71,7 +71,8 @@ export const formatSqliteDefault = (expr: string): string =>
 
 /** 渲染单列定义；若该列承载 inline AUTOINCREMENT 主键则一并输出 */
 const renderColumnDef = (c: Column, inlinePk: PrimaryKey | null): string => {
-  const parts: string[] = [sqliteIdent(c.name), c.type];
+  const parts: string[] = [sqliteIdent(c.name)];
+  if (c.type !== '') parts.push(c.type);
   if (c.notNull) parts.push('NOT NULL');
   if (inlinePk) {
     if (inlinePk.nameMode === 'explicit' && inlinePk.name) {

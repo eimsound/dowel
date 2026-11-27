@@ -16,6 +16,25 @@ import {
 export const SYSTEM_CLIENT = 'system';
 export const MAX_CLIENT_ID_LENGTH = 128;
 
+/**
+ * 客户端发给服务器的单条 WebSocket 消息上限（UTF-8 字节，Issue #150）。服务端在 `ws` 层按这个值设 maxPayload，
+ * 超限直接以 1009 关闭连接、不进入 JSON.parse；客户端发起修改前用同一个值自查，超限在本地拒绝，不进待确认队列
+ * （否则重连后会重发同一条消息，被反复断开）。
+ * 依据：最大合法消息是粘贴——剪贴板载荷上限 4 MiB、展开后 ≤ 20000 个子操作，实测展开后的 op 帧约 4.9 MiB
+ * （680 张表 × 12 列、带中文注释）；200 张表 × 12 列约 0.95 MiB。16 MiB 留出 3 倍余量。
+ */
+export const MAX_SYNC_MESSAGE_BYTES = 16 * 1024 * 1024;
+
+/** 字符串的 UTF-8 字节数；明显不超过 / 明显超过 max 时不做编码 */
+export const exceedsUtf8Bytes = (s: string, max: number): boolean => {
+  if (s.length > max) return true;
+  if (s.length * 3 <= max) return false;
+  return new TextEncoder().encode(s).byteLength > max;
+};
+
+/** 消息的 UTF-8 字节数（用于报错提示） */
+export const utf8Bytes = (s: string): number => new TextEncoder().encode(s).byteLength;
+
 const hasInvalidClientChar = (client: string): boolean => {
   for (let i = 0; i < client.length; i++) {
     const code = client.charCodeAt(i);

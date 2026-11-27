@@ -61,7 +61,7 @@ export const MAX_PASTE_OPS = 20_000;
 const id = z.string().min(1).max(64);
 const point = z.object({ x: z.number().finite(), y: z.number().finite() });
 
-/** PG 非数组枚举列的 type 为空串、仅靠 typeRef 指向枚举，剪贴板校验需放行该情况 */
+/** PG 非数组枚举列与 SQLite 非 STRICT 无类型列的 type 均可为空串，剪贴板校验需放行该情况 */
 const ClipboardColumn = Column.extend({ type: z.string() });
 const ClipboardObj = z.discriminatedUnion('kind', [
   Extension,
@@ -684,7 +684,12 @@ export const parseClipboard = (text: string): ClipboardPayload | null => {
     if (item.id !== k) {
       throw new ClipboardError('invalid_payload');
     }
-    if (item.kind === 'column' && item.type.length === 0 && item.typeRef === null) {
+    if (
+      data.dialect !== 'sqlite' &&
+      item.kind === 'column' &&
+      item.type.length === 0 &&
+      item.typeRef === null
+    ) {
       throw new ClipboardError('invalid_payload');
     }
   }

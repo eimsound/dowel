@@ -8,8 +8,16 @@
 //   列自己的默认值 / 生成列另外按 ID 比较列自身的类型（列改名的同时改类型时，按名字对不上）。
 //   列签名含枚举的完整限定名（两个枚举对调名字时 typeRef 不变、表达式里的类型名却换了绑定）；
 //   只有分区边界、没有表达式分区键的表不看自身列上下文，而是比较直接父表的分区键签名（策略、每个键的列签名或表达式、
-//   opclass、collation；父表含表达式键时再看父表的列上下文），并检查是否改挂到另一个分区父表：
+//   opclass、collation；父表含表达式键或是解析不出来的存量字符串时再看父表的列上下文），并检查是否改挂到另一个分区父表：
 //   有子分区时仍可通过 setPartitionBy 换键列，也可 detach → 取消分区 → 改列类型 → 重新分区 → attach（#134）。
+// - 表达式（含不透明对象 DDL、直接父表的表达式分区键）里直接写了枚举名（如 `'ok'::mood`，所在表不一定有列引用这个枚举）：
+//   相对基线有枚举的名字绑定变了（改名、对调、换 schema、删除 / 新建），且表达式文本里出现了其中某个枚举两边的名字（#146）。
+//   PG 按 OID 存表达式，影子库从基线增量迁移后读回的类型名跟着 OID 走（实测：两个枚举对调名字后 public.mood 读回成
+//   public.tone）；按词法粗匹配（忽略大小写，字符串字面量里的也算），只会多报。PG 只拒绝在索引 / 生成列 / 分区键
+//   表达式里做运行期 enum_in / enum_out 转换（如 status::public.mood），解析期折叠的枚举常量（如 'ok'::public.mood）
+//   可以出现在部分索引 WHERE、表达式索引、生成列与分区键表达式里且读回同样随 OID 变化；这些载体虽较罕见，同样会扫描。
+// - MSSQL 持久化计算列：引擎按表达式与被引用列的可空性推断 is_nullable，canonicalize 会写回 notNull（shadow.ts）；
+//   列自己的 notNull 变了，或所在表按列名对齐的列 notNull 变了（#145）。其他方言、非持久化计算列不看 notNull。
 // - 不透明对象：依赖或所在父对象改了名；deps 集合变了；依赖的列（按 ID，及按它在表里的列名对齐）或依赖 / 父对象表的
 //   列上下文变了；DDL 文本变了；或依赖的不透明对象本身待规范化（视图叠视图，沿依赖传递，带环保护，#136）。
 import { deepEqual, type Model, type Obj, resolvePartitionBy, rootTableId } from '@dowel/core';
@@ -90,41 +98,107 @@ export const emptyBaseline = (cur: Model): Model => ({ ...cur, objects: {} });
 const caseInsensitive = (m: Model) =>
   m.dialect === 'sqlite' || m.dialect === 'mysql' || m.dialect === 'mssql';
 
+/** MSSQL 持久化计算列：引擎推断出的可空性会被 canonicalize 写回 notNull（shadow.ts），其他情况 notNull 不是规范形式的一部分 */
+const isMssqlPersisted = (m: Model, o: Obj): o is Column =>
+  m.dialect === 'mssql' && o.kind === 'column' && !!o.generated?.stored;
+
 /**
- * 一个模型里“表 → 列名 → 列类型上下文”的惰性索引：表沿 partitionOf 解析到根父表；
+ * 一个模型里“表 → 列名 → 列签名”的惰性索引：表沿 partitionOf 解析到根父表；
  * 同一个（折叠大小写后的）列名对应多列时把它们的签名排序拼起来（只会更容易判为变化）。
+ * sigs 是类型上下文（colSig）；nulls 是普通列的可空性（只给 MSSQL 持久化计算列用，按需才建）。
  */
 const columnContext = (m: Model) => {
   let byTable: Map<string, Column[]> | null = null;
-  const byRoot = new Map<string, Map<string, string>>();
   const ci = caseInsensitive(m);
   const fold = ci ? (n: string) => n.toLowerCase() : (n: string) => n;
-  const sigs = (tableId: string): Map<string, string> => {
-    const root = rootTableId(m, tableId);
-    let out = byRoot.get(root);
-    if (out) return out;
-    if (!byTable) {
-      byTable = new Map();
-      for (const o of Object.values(m.objects)) {
-        if (o.kind !== 'column') continue;
-        const list = byTable.get(o.parent);
-        if (list) list.push(o);
-        else byTable.set(o.parent, [o]);
+  const index = (sig: (c: Column) => string) => {
+    const byRoot = new Map<string, Map<string, string>>();
+    return (tableId: string): Map<string, string> => {
+      const root = rootTableId(m, tableId);
+      let out = byRoot.get(root);
+      if (out) return out;
+      if (!byTable) {
+        byTable = new Map();
+        for (const o of Object.values(m.objects)) {
+          if (o.kind !== 'column') continue;
+          const list = byTable.get(o.parent);
+          if (list) list.push(o);
+          else byTable.set(o.parent, [o]);
+        }
       }
-    }
-    const grouped = new Map<string, string[]>();
-    for (const c of byTable.get(root) ?? []) {
-      const k = fold(c.name);
-      const list = grouped.get(k);
-      const sig = colSig(m, c, ci);
-      if (list) list.push(sig);
-      else grouped.set(k, [sig]);
-    }
-    out = new Map([...grouped].map(([k, v]) => [k, v.sort().join('|')]));
-    byRoot.set(root, out);
-    return out;
+      const grouped = new Map<string, string[]>();
+      for (const c of byTable.get(root) ?? []) {
+        const k = fold(c.name);
+        const list = grouped.get(k);
+        const s = sig(c);
+        if (list) list.push(s);
+        else grouped.set(k, [s]);
+      }
+      out = new Map([...grouped].map(([k, v]) => [k, v.sort().join('|')]));
+      byRoot.set(root, out);
+      return out;
+    };
   };
-  return { sigs, fold };
+  const sigs = index((c) => colSig(m, c, ci));
+  // 计算列不能引用计算列（SQL Server 拒绝），所以生成列自己的 notNull 不算进同表其他计算列的上下文
+  const nulls = index((c) => (c.generated ? '-' : c.notNull ? '1' : '0'));
+  return { sigs, nulls, fold };
+};
+
+/** 两份“列名 → 签名”里，两边都有的某个列名签名不同（只在一边出现的列名不算） */
+const alignedChanged = (a: Map<string, string>, b: Map<string, string>): boolean => {
+  for (const [name, sig] of b) {
+    const old = a.get(name);
+    if (old !== undefined && old !== sig) return true;
+  }
+  return false;
+};
+
+/**
+ * 相对基线名字绑定变了的枚举的非限定名（小写；基线与当前两侧的名字都收）：改名、对调、换 schema（完整限定名变了），
+ * 以及只在一边存在的枚举（删除 / 新建，同名枚举换了 ID）。收当前侧既保持 (base, cur) 对称，也覆盖“基线里原本没有该枚举
+ * （如原本是同名的 domain / 复合类型等非枚举对象，或此前被删除），当前模型新建或改名出同名枚举”的场景。稳态下为空。
+ */
+const changedEnumNames = (base: Model, cur: Model): Set<string> => {
+  const out = new Set<string>();
+  for (const [m, other] of [
+    [base, cur],
+    [cur, base],
+  ] as const) {
+    for (const o of Object.values(m.objects)) {
+      if (o.kind !== 'enum') continue;
+      if (other.objects[o.id]?.kind !== 'enum' || fullName(m, o.id) !== fullName(other, o.id))
+        out.add(o.name.toLowerCase());
+    }
+  }
+  return out;
+};
+
+/** 带引号标识符（"..."，"" 转义）或普通标识符；字符串字面量里的词也会被扫到（只会多报） */
+const IDENT_RE = /"((?:[^"]|"")*)"|[\p{L}_][\p{L}\p{N}_$]*/gu;
+
+/**
+ * 表达式（exprsOf 的返回值：字符串 / 数组 / 普通对象）里是否出现了 names 里的某个名字（忽略大小写，按词匹配）。
+ * 小写折叠是有意的过近似：覆盖手写基线或 PG 原样保留的 $$...$$ 函数体里非引号大写拼写（如 public.MOOD）与目录小写名（mood）
+ * 的大小写差异；若存在带引号且仅大小写不同的同名枚举，至多引起一次瞬态多报、flush 后即归零。
+ */
+const mentionsAny = (e: unknown, names: ReadonlySet<string>): boolean => {
+  if (typeof e === 'string') {
+    for (const x of e.matchAll(IDENT_RE)) {
+      const n = x[1] !== undefined ? x[1].replaceAll('""', '"') : x[0];
+      if (names.has(n.toLowerCase())) return true;
+    }
+    return false;
+  }
+  if (Array.isArray(e)) return e.some((x) => mentionsAny(x, names));
+  if (e && typeof e === 'object') return Object.values(e).some((x) => mentionsAny(x, names));
+  return false;
+};
+
+/** 分区父表的分区键表达式原文（列键为 null；存量字符串整段都算） */
+const partitionKeyText = (o: Obj | undefined): unknown => {
+  if (o?.kind !== 'table' || !o.partitionBy) return null;
+  return typeof o.partitionBy === 'string' ? o.partitionBy : o.partitionBy.keys.map((k) => k.expr);
 };
 
 interface PartitionKeyInfo {
@@ -135,6 +209,8 @@ interface PartitionKeyInfo {
 /**
  * 分区父表的分区键签名（按父表 ID 缓存）：
  * - strategy + 每个键的 [列签名 colSig | 键表达式, opclass, collation]；
+ *   opclass / collation / strategy 是有意的过近似：PG 反解析边界常量时不打印 COLLATE，opclass 也不改变字面量文本，
+ *   有非 DEFAULT 子分区时换策略会被拒绝——多报一次、flush 后即归零，不值得为它们单独建模；
  * - hasExpr 表示是否含表达式分区键（或无法解析的存量字符串），调用方据此决定是否再检查父表的列上下文。
  * 父表不存在或不是分区父表时返回 null。
  */
@@ -189,19 +265,29 @@ export const pendingRefreshIds = (baseline: Model | null, cur: Model): string[] 
     const key = `${baseRoot}\0${curRoot}`;
     let v = tableChanged.get(key);
     if (v === undefined) {
-      const a = baseCtx.sigs(baseRoot);
-      v = false;
-      for (const [name, sig] of curCtx.sigs(curRoot)) {
-        const old = a.get(name);
-        if (old !== undefined && old !== sig) {
-          v = true;
-          break;
-        }
-      }
+      v = alignedChanged(baseCtx.sigs(baseRoot), curCtx.sigs(curRoot));
       tableChanged.set(key, v);
     }
     return v;
   };
+  // MSSQL 持久化计算列的可空性上下文：列自己的 notNull（按 ID）或所在表按列名对齐的列 notNull 变了（#145）
+  const nullChanged = new Map<string, boolean>();
+  const mssqlNullabilityChanged = (c: Column): boolean => {
+    const was = base.objects[c.id];
+    if (was?.kind === 'column' && was.notNull !== c.notNull) return true;
+    const baseRoot = rootTableId(base, c.parent);
+    const curRoot = rootTableId(cur, c.parent);
+    const key = `${baseRoot}\0${curRoot}`;
+    let v = nullChanged.get(key);
+    if (v === undefined) {
+      v = alignedChanged(baseCtx.nulls(baseRoot), curCtx.nulls(curRoot));
+      nullChanged.set(key, v);
+    }
+    return v;
+  };
+  // 名字绑定变了的枚举（#146）：稳态下为空，此时下面的文本扫描一次都不做
+  const enumNames = changedEnumNames(base, cur);
+  const mentionsChangedEnum = (e: unknown): boolean => enumNames.size > 0 && mentionsAny(e, enumNames);
   // 不透明对象依赖的某一列：按 ID 变了类型，或按它现在的列名在所在（根）表里对应的列换了类型上下文
   const depColumnChanged = (col: Column): boolean => {
     if (columnTypeChanged(base, cur, col.id)) return true;
@@ -211,7 +297,10 @@ export const pendingRefreshIds = (baseline: Model | null, cur: Model): string[] 
   };
   const basePartKey = partitionKeyInfo(base);
   const curPartKey = partitionKeyInfo(cur);
-  /** 子分区的边界解释上下文变了：换了直接父表、直接父表的分区键签名变了、或父表含表达式分区键且父表列上下文变了 */
+  /**
+   * 子分区的边界解释上下文变了：换了直接父表、直接父表的分区键签名变了，
+   * 或父表含表达式分区键（或是解析不出来的存量字符串）且父表列上下文变了 / 键表达式里写的枚举换了绑定
+   */
   const partitionBoundContextChanged = (o: Table): boolean => {
     if (!o.partitionOf) return false;
     const was = base.objects[o.id];
@@ -221,7 +310,11 @@ export const pendingRefreshIds = (baseline: Model | null, cur: Model): string[] 
     const a = basePartKey(parentId);
     const b = curPartKey(parentId);
     if (a?.sig !== b?.sig) return true;
-    return Boolean((a?.hasExpr || b?.hasExpr) && tableCtxChanged(parentId));
+    if (!a?.hasExpr && !b?.hasExpr) return false;
+    // a.sig === b.sig 保证两边的键表达式一致，但不保证 partitionKeyText 逐字相同：若基线是可解析的存量字符串、
+    // 当前已结构化，基线侧多出的策略关键字、键列名、collation、opclass 都不是枚举引用，键列的枚举类型已由 colSig 覆盖，
+    // 因此只扫当前一侧即可
+    return tableCtxChanged(parentId) || mentionsChangedEnum(partitionKeyText(cur.objects[parentId]));
   };
   /** 表达式按列名引用的那张表：CHECK / 索引 / 列是 parent；有表达式分区键的表是自己；否则不看列上下文 */
   const tableOf = (o: Obj): string | null => {
@@ -247,7 +340,8 @@ export const pendingRefreshIds = (baseline: Model | null, cur: Model): string[] 
           if (dep?.kind === 'table') return tableCtxChanged(d);
           return false;
         }) ||
-        !deepEqual(exprsOf(o), exprsOf(base.objects[o.id]));
+        !deepEqual(exprsOf(o), exprsOf(base.objects[o.id])) ||
+        mentionsChangedEnum(o.ddl);
       if (direct) pending.add(o.id);
       continue;
     }
@@ -259,7 +353,9 @@ export const pendingRefreshIds = (baseline: Model | null, cur: Model): string[] 
     }
     if (
       (o.kind === 'column' && columnTypeChanged(base, cur, o.id)) ||
-      (o.kind === 'table' && partitionBoundContextChanged(o))
+      (o.kind === 'table' && partitionBoundContextChanged(o)) ||
+      (isMssqlPersisted(cur, o) && mssqlNullabilityChanged(o)) ||
+      mentionsChangedEnum(e)
     ) {
       pending.add(o.id);
       continue;

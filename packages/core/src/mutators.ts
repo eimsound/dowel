@@ -6,13 +6,14 @@ import { exprRefNames, refsHaveName } from './derived-names.ts';
 import * as E from './edit.ts';
 import { isReservedId } from './ids.ts';
 import {
-  ColumnDefault,
   ColumnExt,
   FkAction,
   IndexElement,
   IndexExt,
   isValidIndexElement,
   type Model,
+  MssqlColumnExt,
+  MysqlColumnExt,
   type Obj,
   PartitionSpec,
   PrimaryKeyExt,
@@ -23,6 +24,7 @@ import {
 import { columnsOf, effectiveColumnsOf, rootTableId } from './model.ts';
 import { PG_SERIAL_TYPE_NOTE } from './pg/serial.ts';
 import { getDialect } from './registry.ts';
+import { SQLITE_COLUMN_TYPE_NOTE } from './sqlite/types.ts';
 
 /** mutator 参数里的对象 ID：1-64 个字符，不能是 Object.prototype 上的保留名（宏编译层复用） */
 export const objectIdArg = z
@@ -34,6 +36,56 @@ export const objectIdArg = z
 export const objectNameArg = z.string().min(1).max(128);
 const id = objectIdArg;
 const name = objectNameArg;
+/**
+ * mutator 参数里单个自由文本字段（类型、表达式、分区边界、注释、排序规则……）的字符上限（Issue #150）。
+ * 与冻结脚本单步 SQL 的上限（stepsPatchSchema，100 万字符）一致：合法内容远小于它，
+ * 超长的单个字段在 zod 校验处就被拒绝，不进入 normalizeType / 表达式扫描，也不会写进模型
+ */
+export const MAX_TEXT_ARG_LENGTH = 1_000_000;
+const text = z.string().max(MAX_TEXT_ARG_LENGTH, '文本太长：单个字段最多 100 万个字符');
+
+const columnDefaultArg = z.union([z.object({ expr: text.min(1) }), z.object({ nextval: id })]);
+const sequenceOptionsArg = SequenceOptions.extend({
+  increment: text.default('1'),
+  min: text.nullable().default(null),
+  max: text.nullable().default(null),
+  start: text.nullable().default(null),
+  cache: text.default('1'),
+});
+const partitionKeyArg = z
+  .object({
+    column: id.nullable().default(null),
+    expr: text.min(1).nullable().default(null),
+    opclass: text.min(1).nullable().default(null),
+    collation: text.min(1).nullable().default(null),
+  })
+  .refine((k) => (k.column !== null) !== (k.expr !== null), {
+    message: '分区键必须且只能指定 column 或 expr 之一',
+  });
+const partitionSpecArg = PartitionSpec.extend({
+  keys: z.array(partitionKeyArg).min(1),
+});
+// setColumnExt / setPartitionBy 会整块提交子对象，此上限也会校验存量模型中原样带回的旧字段
+// （例如 Inspector 切换 MySQL UNSIGNED 时重发 ext.mysql.enumValues）；真实库中合法值远低于 100 万字符
+// （如 MySQL ENUM 单项最多 255 字符），可接受，不额外拆分局部校验。
+const columnExtArg = ColumnExt.extend({
+  mysql: MysqlColumnExt.extend({
+    enumValues: z.array(text).optional(),
+    setValues: z.array(text).optional(),
+  }).optional(),
+  mssql: MssqlColumnExt.extend({
+    identity: z.object({ seed: text, increment: text }).optional(),
+  }).optional(),
+});
+const indexElementArg = IndexElement.extend({
+  expr: text.nullable().default(null),
+  opclass: text.nullable().default(null),
+  collation: text.nullable().default(null),
+})
+  .partial()
+  .refine(isValidIndexElement, {
+    message: '索引元素必须是列或非空表达式之一',
+  });
 
 /** 修改一个 CHECK 约束的表达式（推导名会随引用的列变化） */
 export const setCheckExpr = (m: Model, checkId: string, expr: string) => {
@@ -52,18 +104,17 @@ export const mutators = {
   renameSchema: def(z.object({ id, name }), (m, a) => E.renameSchema(m, a.id, a.name)),
   dropSchema: def(z.object({ id }), (m, a) => E.dropSchema(m, a.id)),
 
-  createEnum: def(z.object({ id, schema: id, name, values: z.array(z.string().min(1)).min(1) }), (m, a) =>
+  createEnum: def(z.object({ id, schema: id, name, values: z.array(text.min(1)).min(1) }), (m, a) =>
     E.createEnum(m, a.schema, a.name, a.values, a.id),
   ),
   renameEnum: def(z.object({ id, name }), (m, a) => E.renameEnum(m, a.id, a.name)),
-  addEnumValue: def(
-    z.object({ id, value: z.string().min(1), index: z.number().int().min(0).optional() }),
-    (m, a) => E.addEnumValue(m, a.id, a.value, a.index),
+  addEnumValue: def(z.object({ id, value: text.min(1), index: z.number().int().min(0).optional() }), (m, a) =>
+    E.addEnumValue(m, a.id, a.value, a.index),
   ),
   dropEnum: def(z.object({ id }), (m, a) => E.dropEnum(m, a.id)),
 
   createSequence: def(
-    z.object({ id, schema: id, name, options: SequenceOptions.partial().optional() }),
+    z.object({ id, schema: id, name, options: sequenceOptionsArg.partial().optional() }),
     (m, a) => E.createSequence(m, a.schema, a.name, a.options ?? {}, a.id),
   ),
   renameSequence: def(z.object({ id, name }), (m, a) => E.renameSequence(m, a.id, a.name)),
@@ -77,7 +128,7 @@ export const mutators = {
       id,
       schema: id,
       name,
-      partitionBy: PartitionSpec.nullable().optional(),
+      partitionBy: partitionSpecArg.nullable().optional(),
       ext: TableExt.optional(),
     }),
     (m, a) => E.createTable(m, a.schema, a.name, a.id, a.partitionBy ?? null, a.ext),
@@ -86,17 +137,17 @@ export const mutators = {
   dropTable: def(z.object({ id }), (m, a) => E.dropTable(m, a.id)),
   setTableExt: def(z.object({ id, ext: TableExt.nullable() }), (m, a) => E.setTableExt(m, a.id, a.ext)),
 
-  setPartitionBy: def(z.object({ id, partitionBy: PartitionSpec.nullable() }), (m, a) =>
+  setPartitionBy: def(z.object({ id, partitionBy: partitionSpecArg.nullable() }), (m, a) =>
     E.setPartitionBy(m, a.id, a.partitionBy),
   ),
   createPartition: def(
-    z.object({ id, parent: id, name, bound: z.string().min(1), schema: id.optional() }),
+    z.object({ id, parent: id, name, bound: text.min(1), schema: id.optional() }),
     (m, a) => E.createPartition(m, a.parent, a.name, a.bound, a.id, a.schema),
   ),
-  setPartitionBound: def(z.object({ id, bound: z.string().min(1) }), (m, a) =>
+  setPartitionBound: def(z.object({ id, bound: text.min(1) }), (m, a) =>
     E.setPartitionBound(m, a.id, a.bound),
   ),
-  attachPartition: def(z.object({ parent: id, child: id, bound: z.string().min(1) }), (m, a) =>
+  attachPartition: def(z.object({ parent: id, child: id, bound: text.min(1) }), (m, a) =>
     E.attachPartition(m, a.parent, a.child, a.bound),
   ),
   detachPartition: def(z.object({ id }), (m, a) => E.detachPartition(m, a.id)),
@@ -107,21 +158,21 @@ export const mutators = {
       column: z.object({
         id,
         name,
-        type: z.string().describe(`Column type text. ${PG_SERIAL_TYPE_NOTE}`),
+        type: text.describe(`Column type text. ${PG_SERIAL_TYPE_NOTE} ${SQLITE_COLUMN_TYPE_NOTE}`),
         typeRef: id.nullable().optional(),
         notNull: z.boolean().optional(),
-        default: ColumnDefault.nullable().optional(),
+        default: columnDefaultArg.nullable().optional(),
         identity: z
-          .object({ always: z.boolean(), options: SequenceOptions.partial().optional() })
+          .object({ always: z.boolean(), options: sequenceOptionsArg.partial().optional() })
           .nullable()
           .optional(),
         generated: z
-          .object({ expr: z.string().min(1), stored: z.boolean() })
+          .object({ expr: text.min(1), stored: z.boolean() })
           .nullable()
           .optional(),
-        collation: z.string().nullable().optional(),
+        collation: text.nullable().optional(),
         before: id.optional(),
-        ext: ColumnExt.optional(),
+        ext: columnExtArg.optional(),
       }),
     }),
     (m, a) => E.addColumn(m, a.table, a.column),
@@ -131,19 +182,19 @@ export const mutators = {
   setColumnType: def(
     z.object({
       id,
-      type: z.string().describe(`Column type text. ${PG_SERIAL_TYPE_NOTE}`),
+      type: text.describe(`Column type text. ${PG_SERIAL_TYPE_NOTE} ${SQLITE_COLUMN_TYPE_NOTE}`),
       typeRef: id.nullable(),
     }),
     (m, a) => E.setColumnType(m, a.id, a.type, a.typeRef),
   ),
   setNotNull: def(z.object({ id, notNull: z.boolean() }), (m, a) => E.setNotNull(m, a.id, a.notNull)),
-  setDefault: def(z.object({ id, default: ColumnDefault.nullable() }), (m, a) =>
+  setDefault: def(z.object({ id, default: columnDefaultArg.nullable() }), (m, a) =>
     E.setDefault(m, a.id, a.default),
   ),
   setIdentity: def(z.object({ id, identity: z.object({ always: z.boolean() }).nullable() }), (m, a) =>
     E.setIdentity(m, a.id, a.identity),
   ),
-  setColumnExt: def(z.object({ id, ext: ColumnExt.nullable() }), (m, a) => E.setColumnExt(m, a.id, a.ext)),
+  setColumnExt: def(z.object({ id, ext: columnExtArg.nullable() }), (m, a) => E.setColumnExt(m, a.id, a.ext)),
   moveColumn: def(z.object({ id, before: id.nullable() }), (m, a) => E.moveColumn(m, a.id, a.before)),
 
   addPrimaryKey: def(
@@ -164,11 +215,10 @@ export const mutators = {
     }),
     (m, a) => E.addUnique(m, a.table, a.columns, a.nullsNotDistinct ?? false, a.id, a.ext),
   ),
-  addCheck: def(
-    z.object({ id, table: id, expr: z.string().min(1), noInherit: z.boolean().optional() }),
-    (m, a) => E.addCheck(m, a.table, a.expr, a.id, a.noInherit ?? false),
+  addCheck: def(z.object({ id, table: id, expr: text.min(1), noInherit: z.boolean().optional() }), (m, a) =>
+    E.addCheck(m, a.table, a.expr, a.id, a.noInherit ?? false),
   ),
-  setCheckExpr: def(z.object({ id, expr: z.string().min(1) }), (m, a) => setCheckExpr(m, a.id, a.expr)),
+  setCheckExpr: def(z.object({ id, expr: text.min(1) }), (m, a) => setCheckExpr(m, a.id, a.expr)),
   addForeignKey: def(
     z.object({
       id,
@@ -197,17 +247,11 @@ export const mutators = {
     z.object({
       id,
       table: id,
-      elements: z
-        .array(
-          IndexElement.partial().refine(isValidIndexElement, {
-            message: '索引元素必须是列或非空表达式之一',
-          }),
-        )
-        .min(1, { message: '索引至少需要一个元素' }),
+      elements: z.array(indexElementArg).min(1, { message: '索引至少需要一个元素' }),
       unique: z.boolean().optional(),
-      method: z.string().optional(),
+      method: text.optional(),
       include: z.array(id).optional(),
-      where: z.string().nullable().optional(),
+      where: text.nullable().optional(),
       nullsNotDistinct: z.boolean().optional(),
       ext: IndexExt.optional(),
     }),
@@ -224,9 +268,7 @@ export const mutators = {
   renameKey: def(z.object({ id, name }), (m, a) => E.renameKey(m, a.id, a.name)),
   resetKeyName: def(z.object({ id }), (m, a) => E.resetKeyName(m, a.id)),
 
-  setComment: def(z.object({ id, comment: z.string().nullable() }), (m, a) =>
-    E.setComment(m, a.id, a.comment),
-  ),
+  setComment: def(z.object({ id, comment: text.nullable() }), (m, a) => E.setComment(m, a.id, a.comment)),
 };
 
 /**

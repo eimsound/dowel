@@ -162,6 +162,8 @@ export const CI_DOCS_PATH = '/api/ci/docs';
 export const CI_ERROR_STATUS = {
   /** 请求体 / 参数不合法 */
   invalid_request: 400,
+  /** 请求体超过服务端的单条请求上限（16 MiB），在解析之前就被拒绝 */
+  payload_too_large: 413,
   /** 没带 Authorization: Bearer dwl_… */
   token_missing: 401,
   /** 令牌格式不对或不存在 */
@@ -196,7 +198,7 @@ export const CI_ERROR_STATUS = {
   unfinished_run: 409,
   /** 目标库里的这个项目由别的 Dowel 实例认领 */
   foreign_instance: 409,
-  /** 其他执行前检查没通过（实例级语句等），details.reason 是执行器的原因代码 */
+  /** 其他执行前检查没通过（实例级语句、首次命中首版本且无后续迁移时的 mark_required 等），details.reason 是执行器的原因代码 */
   rejected: 409,
   /** 等执行锁超时（另一个执行正在进行） */
   lock_timeout: 423,
