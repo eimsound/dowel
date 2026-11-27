@@ -7,7 +7,16 @@ import { tmpdir } from 'node:os';
 import path from 'node:path';
 
 import type { ExecEvent, ProjectCreated, ProjectInfo, VersionCreated } from '@dowel/api';
-import { addColumn, all, createTable, type Model } from '@dowel/core';
+import {
+  addCheck,
+  addColumn,
+  addPrimaryKey,
+  all,
+  createTable,
+  type Model,
+  setColumnType,
+  setNotNull,
+} from '@dowel/core';
 import { openSqliteDb } from '@dowel/engines';
 import { afterAll, afterEach, beforeAll, describe, expect, test, vi } from 'vitest';
 
@@ -205,4 +214,77 @@ describe('Issue #132：已验证版本必须能通过执行器读回校验（SQL
       ]);
     },
   );
+
+  test('Issues #140 & #141：无类型列、BIGINT/INT 单列主键与 BOOLEAN 经发布与 12 步重建后执行零读回差异', async () => {
+    const { pid, branch, envId } = await blankProject('SQLite type fidelity');
+    let bigTblId = '';
+    let untypedId = '';
+    await edit(branch, (m) => {
+      bigTblId = createTable(m, schemaOf(m), 'big_items');
+      const bigPk = addColumn(m, bigTblId, { name: 'id', type: 'bigint', notNull: true });
+      addPrimaryKey(m, bigTblId, [bigPk]);
+      untypedId = addColumn(m, bigTblId, { name: 'raw_col', type: '' });
+      addColumn(m, bigTblId, { name: 'flag', type: 'boolean' });
+
+      const intTbl = createTable(m, schemaOf(m), 'int_items');
+      const intPk = addColumn(m, intTbl, { name: 'id', type: 'int', notNull: true });
+      addPrimaryKey(m, intTbl, [intPk]);
+      addColumn(m, intTbl, { name: 'note', type: '', notNull: true, default: { expr: "'x'" } });
+    });
+
+    const v1Model = (await created.rooms.model(branch)).model;
+    expect(columnsOf(v1Model)).toEqual([
+      ['id', 'BIGINT', null],
+      ['raw_col', '', null],
+      ['flag', 'BOOLEAN', null],
+      ['id', 'INT', null],
+      ['note', '', null],
+    ]);
+    const f1 = await created.refresher.flush(branch);
+    expect(f1.kind).not.toBe('skipped');
+    expect(columnsOf(f1.model)).toEqual([
+      ['id', 'BIGINT', null],
+      ['raw_col', '', null],
+      ['flag', 'BOOLEAN', null],
+      ['id', 'INT', null],
+      ['note', '', null],
+    ]);
+    expect((await created.refresher.flush(branch)).kind).toBe('clean');
+    const pub1 = await publish(pid, 'v1');
+    expect(pub1.verified).toBe(true);
+    const run1 = await execute(pid, envId, pub1.id);
+    expectVerifiedImpliesExecutable(pub1, run1);
+    expect(run1).toMatchObject({ done: true, code: null });
+
+    // 触发 12 步重建（改非空 + 加 CHECK + 切换列类型后再改回），再次发布与执行仍零读回差异且类型保留
+    await edit(branch, (m) => {
+      setNotNull(m, untypedId, true);
+      addCheck(m, bigTblId, 'length(id) > 0');
+      setColumnType(m, untypedId, 'TEXT');
+      setColumnType(m, untypedId, '');
+    });
+    const v2Model = (await created.rooms.model(branch)).model;
+    expect(columnsOf(v2Model)).toEqual([
+      ['id', 'BIGINT', null],
+      ['raw_col', '', null],
+      ['flag', 'BOOLEAN', null],
+      ['id', 'INT', null],
+      ['note', '', null],
+    ]);
+    const f2 = await created.refresher.flush(branch);
+    expect(f2.kind).not.toBe('skipped');
+    expect(columnsOf(f2.model)).toEqual([
+      ['id', 'BIGINT', null],
+      ['raw_col', '', null],
+      ['flag', 'BOOLEAN', null],
+      ['id', 'INT', null],
+      ['note', '', null],
+    ]);
+    expect((await created.refresher.flush(branch)).kind).toBe('clean');
+    const pub2 = await publish(pid, 'v2');
+    expect(pub2.verified).toBe(true);
+    const run2 = await execute(pid, envId, pub2.id);
+    expectVerifiedImpliesExecutable(pub2, run2);
+    expect(run2).toMatchObject({ done: true, code: null });
+  });
 });

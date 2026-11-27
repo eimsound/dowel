@@ -16,6 +16,7 @@ import {
   createTable,
   getDialect,
   newId,
+  SQLITE_COLUMN_TYPE_NOTE,
   type Column,
   type Opaque,
   type Table,
@@ -1580,6 +1581,82 @@ describe.each([
         String(bad2.structuredContent!.message).startsWith('ops[0] defineTable(mac_t).checks[0] addCheck：'),
       ).toBe(true);
       expect((await f.created.rooms.model(f.branch1)).seq).toBe(1);
+    },
+  );
+  test.skipIf(skip)(
+    'SQLite 类型说明与 apply_changes addColumn 空类型在非 STRICT / STRICT 表的行为',
+    async () => {
+      const f = await setupEnv();
+      const tokAlice = await f.issueToken(f.alice.id, ['read', 'write']);
+
+      const lm = await f.callTool(tokAlice.token, 'list_mutators', {
+        names: ['defineTable', 'alterColumn', 'addColumn', 'setColumnType'],
+      });
+      expect(lm.isError).toBeFalsy();
+      const mutatorList = lm.structuredContent!.mutators as { name: string; description: string }[];
+      expect(mutatorList.map((m) => m.name)).toEqual([
+        'defineTable',
+        'alterColumn',
+        'addColumn',
+        'setColumnType',
+      ]);
+      for (const item of mutatorList) {
+        expect(item.description, item.name).toContain(SQLITE_COLUMN_TYPE_NOTE);
+      }
+
+      // 在 SQLite 项目 f.p2Id 分别建非 STRICT 表与 STRICT 表
+      const initRes = await f.callTool(tokAlice.token, 'apply_changes', {
+        project: f.p2Id,
+        baseSeq: 0,
+        ops: [
+          {
+            name: 'defineTable',
+            args: { id: '$ref:loose', name: 'loose_tbl', columns: [{ name: 'id', type: 'bigint' }] },
+          },
+          {
+            name: 'defineTable',
+            args: {
+              id: '$ref:strict',
+              name: 'strict_tbl',
+              ext: { sqlite: { strict: true } },
+              columns: [{ name: 'id', type: 'INTEGER' }],
+            },
+          },
+        ],
+      });
+      expect(initRes.isError).toBeFalsy();
+      const refs = initRes.structuredContent!.refs as Record<string, string>;
+      const seq1 = initRes.structuredContent!.seq as number;
+
+      // 非 STRICT 表 addColumn type: "" 成功并写为 ''
+      const okEmpty = await f.callTool(tokAlice.token, 'apply_changes', {
+        project: f.p2Id,
+        baseSeq: seq1,
+        ops: [
+          {
+            name: 'addColumn',
+            args: { table: refs.loose!, column: { id: newId(), name: 'untyped', type: '' } },
+          },
+        ],
+      });
+      expect(okEmpty.isError).toBeFalsy();
+      const { model } = await f.created.rooms.model(f.branch2);
+      expect(all(model, 'column').find((c) => c.name === 'untyped')?.type).toBe('');
+
+      // STRICT 表 addColumn type: "" 返回错误
+      const seq2 = okEmpty.structuredContent!.seq as number;
+      const badStrict = await f.callTool(tokAlice.token, 'apply_changes', {
+        project: f.p2Id,
+        baseSeq: seq2,
+        ops: [
+          {
+            name: 'addColumn',
+            args: { table: refs.strict!, column: { id: newId(), name: 'untyped', type: '' } },
+          },
+        ],
+      });
+      expect(badStrict.isError).toBe(true);
+      expect(badStrict.structuredContent?.message).toEqual(expect.stringContaining('STRICT'));
     },
   );
   test.skipIf(skip)(

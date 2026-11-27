@@ -210,6 +210,8 @@ claude mcp add --transport http --scope user dowel https://dowel.example.com/api
 
 各方言的自增写法：PostgreSQL 用列的 `identity`；SQL Server 用 `ext.mssql.identity`（`{ "seed": "1", "increment": "1" }`）；MySQL 用 `ext.mysql.autoIncrement`；SQLite 用 `INTEGER` 单列主键加 `ext.sqlite.autoincrement`。在不支持的方言上写 `identity`、`typeRef` 或 `partitionBy` 会直接报错。
 
+SQLite 的列类型按写入的声明保留（只做大写与空白压缩），`BIGINT`、`INT`、`BOOLEAN` 不会被换成 `INTEGER`；`INT` / `BIGINT` 单列主键不是 rowid 别名，不能加 `ext.sqlite.autoincrement`。非 STRICT 表里显式传 `type: ""` 表示无类型列（BLOB 亲和性，与 `ANY`、`TEXT` 不同）；`defineTable` 省略 `type` 仍会报缺少类型；STRICT 表只接受 `INT`、`INTEGER`、`REAL`、`TEXT`、`BLOB`、`ANY`。详见[数据库方言](dialects.md#sqlite-features)。
+
 **`alterColumn`**：声明式地修改一个已有列。`id` 必须是已有列的 ID，或本次调用里前面新建的列的 `$ref`，**不接受列名**。可改字段：`name`、`type` / `typeRef`、`notNull`、`default`、`identity`、`ext`（整体替换，`null` 清空）、`comment`；不写表示不改，写 `null` 表示清除。
 
 `ext` 是整体替换：传入的内容就是改完后的完整列扩展，`null` 清空。SQL Server 有一个例外：本次修改后列仍有默认值（按同一个 `alterColumn` 里改完 `default` 之后的结果判断；`default: null` 清掉默认值时不保留）、且默认约束用的是显式名（`ext.mssql.defaultNameMode: "explicit"`）时，只要你没在 `ext.mssql` 里写 `defaultName` / `defaultNameMode`，原来的显式名会自动保留，不会因为改了别的扩展项（如 `sparse`）被改回 `DF_<表>_<列>`；传 `ext: null` 或显式写这两个字段时按你的要求处理。
