@@ -45,7 +45,16 @@ describe('mutator 自由文本字段上限', () => {
     // 真实的大 ENUM（5000 个取值）远低于上限
     const big = `enum(${Array.from({ length: 5000 }, (_, i) => `'value_${i}'`).join(',')})`;
     runMutator(m, 'addColumn', { table: t, column: { id: 'c2', name: 'kind', type: big } });
-    expect(() => runMutator(m, 'setColumnType', { id: 'c2', type: over, typeRef: null })).toThrow(EditError);
+    const beforeSet = structuredClone(m);
+    expect(() => runMutator(m, 'setColumnType', { id: 'c2', type: over, typeRef: null })).toThrow(tooLongMsg);
+    expect(m).toEqual(beforeSet);
+
+    const pg = setup('pg');
+    expect(() =>
+      runMutator(pg.m, 'addColumn', { table: pg.t, column: { id: 'c1', name: 'id', type: over } }),
+    ).toThrow(tooLongMsg);
+    runMutator(pg.m, 'addColumn', { table: pg.t, column: { id: 'c1', name: 'id', type: 'serial' } });
+    expect(() => runMutator(pg.m, 'setColumnType', { id: 'c1', type: over, typeRef: null })).toThrow(tooLongMsg);
   });
 
   test('注释与 CHECK 表达式同样受限', () => {
