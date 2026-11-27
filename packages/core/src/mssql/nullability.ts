@@ -49,6 +49,6 @@ export const stripMssqlInferredNotNull = <T extends Column['ext']>(ext: T): T =>
   return { ...ext, mssql: rest } as T;
 };
 
-/** 给 MCP / AI 调用方的 notNull 语义说明（宏参数描述用） */
+/** 给 MCP / AI 调用方的 notNull 语义说明（宏与原始 mutator 参数描述共用） */
 export const MSSQL_NOT_NULL_NOTE =
   'Explicit NOT NULL only. SQL Server PERSISTED computed columns: `notNull` is the explicit `PERSISTED NOT NULL` declaration; a column the engine infers as non-null from its expression keeps `notNull: false` and reports read-only `ext.mssql.inferredNotNull: true` (never rendered into DDL). Effective nullability is `notNull || ext.mssql.inferredNotNull`.';

@@ -4,13 +4,18 @@
 // - inferredNotNull 是派生字段：addColumn / setColumnExt / alterColumn 宏都不能由调用方设置；
 // - 主键校验按有效可空性；其他方言不读 ext.mssql。
 import { describe, expect, test } from 'vitest';
+import { z } from 'zod';
 
 import {
+  alterColumnArgs,
   type Column,
+  defineTableArgs,
   effectiveNotNull,
   emptyModel,
   type Model,
+  MSSQL_NOT_NULL_NOTE,
   mssqlEffectiveNotNull,
+  mutators,
   plan,
   runMacro,
   runMutator,
@@ -215,5 +220,32 @@ describe('其他方言不读 ext.mssql.inferredNotNull', () => {
     } as unknown as Column;
     expect(effectiveNotNull(dialect, c)).toBe(false);
     expect(effectiveNotNull('mssql', c)).toBe(true);
+  });
+});
+
+describe('MCP / mutator 参数描述统一说明显式 notNull 语义', () => {
+  const schemaOf = (s: z.ZodType) =>
+    z.toJSONSchema(s, { target: 'draft-2020-12', io: 'input', unrepresentable: 'any' }) as {
+      properties?: Record<string, unknown>;
+    };
+
+  test('原始 mutator（addColumn / setNotNull）与复合宏（defineTable / alterColumn）均带有 MSSQL_NOT_NULL_NOTE', () => {
+    const addColJson = schemaOf(mutators.addColumn.args).properties?.column as {
+      properties?: { notNull?: { description?: string } };
+    };
+    const setNotNullJson = schemaOf(mutators.setNotNull.args) as {
+      properties?: { notNull?: { description?: string } };
+    };
+    const defineTableJson = schemaOf(defineTableArgs).properties?.columns as {
+      items?: { properties?: { notNull?: { description?: string } } };
+    };
+    const alterColJson = schemaOf(alterColumnArgs) as {
+      properties?: { notNull?: { description?: string } };
+    };
+
+    expect(addColJson.properties?.notNull?.description).toBe(MSSQL_NOT_NULL_NOTE);
+    expect(setNotNullJson.properties?.notNull?.description).toBe(MSSQL_NOT_NULL_NOTE);
+    expect(defineTableJson.items?.properties?.notNull?.description).toBe(MSSQL_NOT_NULL_NOTE);
+    expect(alterColJson.properties?.notNull?.description).toBe(MSSQL_NOT_NULL_NOTE);
   });
 });
