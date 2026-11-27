@@ -31,6 +31,7 @@ import {
 import { openSqliteDb, stepsChecksum } from '@dowel/engines';
 import { afterAll, afterEach, beforeAll, describe, expect, test, vi } from 'vitest';
 
+import { BranchForgottenError } from '../src/derive.ts';
 import { createApp, openPlatformDb, type PlatformDb } from '../src/index.ts';
 import { KeyedLimiter } from '../src/rate-limit.ts';
 import { ShadowError } from '../src/shadow.ts';
@@ -324,6 +325,31 @@ describe('Issue #132：已验证版本必须能通过执行器读回校验（SQL
     const pub = await publish(pid, 'clean model');
     vi.restoreAllMocks();
     expectVerifiedImpliesExecutable(pub, await execute(pid, envId, pub.id));
+  });
+
+  test('发布期间项目被删（BranchForgottenError 或 flush skipped(forgotten)）：返回 404 项目不存在且不误归类为 normalize_pending / shadow_unavailable', async () => {
+    const { pid, branch } = await blankProject('B forgotten');
+    await edit(branch, (m) => {
+      const t = createTable(m, schemaOf(m), 'items');
+      addColumn(m, t, { name: 'id', type: 'INTEGER', notNull: true });
+      addColumn(m, t, { name: 'qty', type: 'INTEGER', default: { expr: '(1 + 1)' } });
+    });
+    const forProjectEngineVersions = vi.spyOn(created.shadows, 'forProjectEngineVersions');
+
+    vi.spyOn(created.refresher, 'flush').mockRejectedValueOnce(new BranchForgottenError(branch));
+    const thrownRes = await req('POST', `/api/projects/${pid}/versions`, { name: 'thrown forgotten' });
+    expect(thrownRes.status).toBe(404);
+    expect(await thrownRes.json()).toEqual({ error: '项目不存在' });
+
+    vi.spyOn(created.refresher, 'flush').mockImplementationOnce(async (b) => {
+      const { model, seq } = await created.rooms.model(b);
+      return { kind: 'skipped', skippedReason: 'forgotten', seq, model };
+    });
+    const skippedRes = await req('POST', `/api/projects/${pid}/versions`, { name: 'skipped forgotten' });
+    expect(skippedRes.status).toBe(404);
+    expect(await skippedRes.json()).toEqual({ error: '项目不存在' });
+
+    expect(forProjectEngineVersions).not.toHaveBeenCalled();
   });
 
   test('路径 A：没有可用的影子库时拒绝发布（shadow_unavailable），不再有“发布为未验证”', async () => {

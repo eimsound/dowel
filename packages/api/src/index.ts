@@ -1011,6 +1011,19 @@ export type ImportRequest = z.infer<typeof importSchema>;
 export const modelUpdateSchema = z.object({ seq: z.number(), objects: z.number() });
 export type ModelUpdate = z.infer<typeof modelUpdateSchema>;
 
+/**
+ * SQL Server 从已有数据库导入 / 拉取时，没有可用的影子库判断持久化计算列的非空是显式声明还是由表达式推断，
+ * 按显式非空记录的列（ADR 0019 决定 4）。columns 是 schema.table.column
+ */
+export const nullabilityFallbackSchema = z.object({ columns: z.array(z.string()) });
+export type NullabilityFallback = z.infer<typeof nullabilityFallbackSchema>;
+
+/** 保留线上的修改（拉取）确认覆盖的结果 */
+export const pullResultSchema = modelUpdateSchema.extend({
+  nullabilityFallback: nullabilityFallbackSchema.optional(),
+});
+export type PullResult = z.infer<typeof pullResultSchema>;
+
 // ───── 环境 ─────
 
 export const targetUrlSchema = z
@@ -1755,6 +1768,8 @@ export const wizardEventSchema = z.object({
   warnings: z.array(z.string()).optional(),
   /** 接手时自动识别为已作废的岔路版本（ADR 0013） */
   retiredVersions: z.array(envVersionRefSchema).optional(),
+  /** 从已有数据库新建（SQL Server）：没有可用的影子库，按显式非空记录的持久化计算列（ADR 0019） */
+  nullabilityFallback: nullabilityFallbackSchema.optional(),
 });
 export type WizardEvent = z.infer<typeof wizardEventSchema>;
 

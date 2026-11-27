@@ -11,7 +11,7 @@ import { HTTPException } from 'hono/http-exception';
 import { assertUrlAllowed } from './allowlist.ts';
 import { EventBus, type EventBusOptions } from './bus.ts';
 import type { PlatformDb } from './db.ts';
-import { DeriveBusyError, OpaqueRefresher } from './derive.ts';
+import { BranchForgottenError, DeriveBusyError, OpaqueRefresher } from './derive.ts';
 import { DriftScheduler } from './drift-scheduler.ts';
 import { defaultMailer, type Mailer } from './email.ts';
 import { EnvLocks, type ExecContext } from './executions.ts';
@@ -112,8 +112,14 @@ export const createApp = (db: PlatformDb, options: AppOptions = {}) => {
       const [b] = await db.query<{ project_id: string }>('select project_id from branches where id = $1', [
         branchId,
       ]);
-      if (!b) return null;
-      return (await shadows.forProjectTarget(b.project_id).catch(() => null))?.shadow ?? null;
+      if (!b) return 'forgotten';
+      try {
+        return (await shadows.forProjectTarget(b.project_id))?.shadow ?? null;
+      } catch (e) {
+        // 尚未尝试连库就已知项目没有可用影子库（无环境）：直接报 no_shadow，避免每次 flush 多查一次 branches
+        if (e instanceof ShadowError && e.preConnect) return 'no_shadow';
+        return null;
+      }
     },
     {
       load: async (branchId) =>
@@ -122,14 +128,30 @@ export const createApp = (db: PlatformDb, options: AppOptions = {}) => {
             branchId,
           ])
         )[0]?.baseline ?? null,
-      save: async (branchId, m) => {
-        await db.query('update branches set baseline = $2::text::jsonb where id = $1', [
-          branchId,
-          JSON.stringify(m),
-        ]);
-      },
+      // 更新 0 行 = 分支已被删（可能是别的副本删的，derive.forget 还没到）
+      save: async (branchId, m) =>
+        (
+          await db.query<{ id: string }>(
+            'update branches set baseline = $2::text::jsonb where id = $1 returning id',
+            [branchId, JSON.stringify(m)],
+          )
+        ).length > 0,
+      // 只在失败路径与总线重连 / 退化事件时调用（OpaqueRefresher 按 500 个一批）
+      existing: async (branchIds) =>
+        new Set(
+          branchIds.length
+            ? (
+                await db.query<{ id: string }>(
+                  `select id from branches where id in (${branchIds.map((_, i) => `$${i + 1}`).join(', ')})`,
+                  branchIds,
+                )
+              ).map((r) => r.id)
+            : [],
+        ),
     },
     ha,
+    // 跨副本同步 forget（Issue #153）：收 derive.forget、总线重连时复核
+    bus,
   );
   // 按需规范化（ADR 0016）：编辑提交不再触发后台影子库刷新，只在关键出口 flush 或用户显式规范化时才回影子库
   /**
@@ -220,6 +242,8 @@ export const createApp = (db: PlatformDb, options: AppOptions = {}) => {
     if (err instanceof DeriveBusyError) return fail(err.message, 503, 'normalize_busy');
     // 影子库句柄因环境配置变更被关闭（Issue #154）：可重试的 503，不是“影子库不可用”的 422
     if (err instanceof ShadowConfigChangedError) return fail(err.message, 503, err.code);
+    // 规范化 / flush 期间分支已删（未读到房间状态或显式规范化）：与 accessIn 一致返回 404
+    if (err instanceof BranchForgottenError) return fail('项目不存在', 404);
     if (err instanceof HTTPException) return fail(err.message, err.status);
     if (
       err instanceof PlanError ||

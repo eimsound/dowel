@@ -718,6 +718,7 @@ export const mssqlShadow = (
     verifyScripts: (from, to, up, down, options): Promise<VerifyReport> =>
       run((ops) => ops.verifyScripts(from, to, up, down, options)),
     canonicalize: (prev, next) => run((ops) => ops.canonicalize(prev, next)),
+    probeMssqlNotNull: (model, ids) => run((ops) => ops.probeMssqlNotNull(model, ids)),
     close: () => session.close(),
   };
 };

@@ -14,6 +14,7 @@ import {
   type Table,
 } from './ir.ts';
 import { buildModelIndex, type ModelIndex } from './model-index.ts';
+import { effectiveNotNull } from './mssql/nullability.ts';
 import { resolvePartitionBy } from './pg/partition.ts';
 import { ident } from './pg/quote.ts';
 import { getDialect } from './registry.ts';
@@ -355,7 +356,8 @@ export const validate = (m: Model): string[] =>
           if (o.kind === 'primaryKey') {
             for (const c of o.columns) {
               const col = find(m, c);
-              if (col?.kind === 'column' && !col.notNull)
+              // 按有效可空性：SQL Server 持久化计算列可由引擎推断为非空（ADR 0019）
+              if (col?.kind === 'column' && !effectiveNotNull(m.dialect, col))
                 errs.push(`主键 ${o.name}：列 ${col.name} 必须 NOT NULL`);
             }
           }

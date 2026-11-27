@@ -28,6 +28,7 @@ import {
 } from './ir.ts';
 import { clonePlain, deepEqual } from './json.ts';
 import { all, effectiveColumnsOf } from './model.ts';
+import { MSSQL_NOT_NULL_NOTE } from './mssql/nullability.ts';
 import { BATCH_OPS_LIMIT, type MutatorName, objectIdArg, objectNameArg, runMutator } from './mutators.ts';
 import {
   isPgSerialArrayType,
@@ -331,7 +332,7 @@ const macroColumn = z
         `Type text; may be omitted (or only array dims like \`[]\`) when typeRef is set. ${PG_SERIAL_TYPE_NOTE} ${SQLITE_COLUMN_TYPE_NOTE}`,
       ),
     typeRef: refSlot.nullable().optional().describe('PG enum: ID / `$ref:<alias>` / `[schema.]name`'),
-    notNull: z.boolean().optional(),
+    notNull: z.boolean().optional().describe(MSSQL_NOT_NULL_NOTE),
     default: macroDefault.nullable().optional(),
     identity: z
       .object({ always: z.boolean(), options: SequenceOptions.partial().strict().optional() })
@@ -486,7 +487,7 @@ export const alterColumnArgs = z
       .nullable()
       .optional()
       .describe('PG enum: ID / `$ref:<alias>` / `[schema.]name`; null switches back to a plain type'),
-    notNull: z.boolean().optional(),
+    notNull: z.boolean().optional().describe(MSSQL_NOT_NULL_NOTE),
     default: macroDefault.nullable().optional(),
     identity: z.object({ always: z.boolean() }).strict().nullable().optional(),
     ext: columnExtArg
@@ -931,6 +932,8 @@ const comparableExt = (m: Model, ext: ColumnExt | null | undefined): ColumnExt |
     delete x.mssql.defaultName;
     delete x.mssql.defaultNameMode;
   }
+  // 引擎推断的非空是派生字段（setColumnExt 忽略传入值、保留当前值，ADR 0019），不算 ext 的变化
+  if (x?.mssql) delete x.mssql.inferredNotNull;
   return cleanExt(x);
 };
 

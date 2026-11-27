@@ -30,6 +30,7 @@ import { audit } from '../audit.ts';
 import { freezeBaseline } from '../chain.ts';
 import { insertGrant } from '../grants.ts';
 import { pickProjectSlug } from '../groups.ts';
+import { splitImportedMssqlNullability } from '../mssql-nullability.ts';
 import { encrypt, SecretError, scrubSecrets } from '../secrets.ts';
 import { assertImportable, type Shadow, ShadowError, storedReport } from '../shadow.ts';
 import { prepareShadow } from '../shadows.ts';
@@ -161,6 +162,30 @@ export const registerWizard = (app: Hono<Env>, ctx: AppContext) => {
       };
       /** 验证报告里显示的影子库（与环境页的写法一致：环境名：库名 或 SQLite :memory:） */
       let shadowLabel = '';
+      /** 准备影子库时已经失败过（配置不允许 / 连不上）：后面的基线验证不再重试，直接按没有影子库处理 */
+      let shadowFailure: ShadowError | null = null;
+      /** 影子库句柄：本请求里只准备一次，可空性拆分与基线验证共用 */
+      const ensureShadow = async (): Promise<Shadow> => {
+        if (shadow) return shadow;
+        if (shadowFailure) throw shadowFailure;
+        try {
+          const prepared = await prepareShadow(source ?? null, scope, ctx.guard, b.dialect);
+          shadow = prepared.shadow;
+          shadowLabel = prepared.label;
+          createdShadow = prepared.created;
+          return prepared.shadow;
+        } catch (e) {
+          if (e instanceof ShadowError) shadowFailure = e;
+          throw e;
+        }
+      };
+      /** SQL Server：没有可用的影子库、按显式非空记录的持久化计算列（ADR 0019），在 done 事件里提示用户 */
+      let nullabilityFallback: string[] = [];
+      const doneEvent = (): WizardEvent => ({
+        stage: 'done',
+        project,
+        ...(nullabilityFallback.length ? { nullabilityFallback: { columns: nullabilityFallback } } : {}),
+      });
       let committed = false;
       try {
         // ── 外部操作：读目标库 / 在影子库里执行 SQL，都在平台库事务之前 ──
@@ -176,6 +201,17 @@ export const registerWizard = (app: Hono<Env>, ctx: AppContext) => {
           await send({ stage });
           // 从线上库读结构：只读，按 schema 范围过滤；跨范围引用会抛 ScopeError
           model = await pullSchema(source!.url, scope, ctx.guard, b.dialect);
+          // SQL Server 持久化计算列：系统目录分不出显式 NOT NULL 与推断非空，冻结基线之前在影子库里拆分（ADR 0019）；
+          // 没有要探测的列时不准备影子库
+          if (b.dialect === 'mssql') {
+            const split = await splitImportedMssqlNullability(model, async () => {
+              stage = 'canonicalize';
+              await send({ stage });
+              return ensureShadow();
+            });
+            model = split.model;
+            nullabilityFallback = split.fallback;
+          }
         } else {
           stage = 'connect';
           await send({ stage });
@@ -200,17 +236,12 @@ export const registerWizard = (app: Hono<Env>, ctx: AppContext) => {
         let baselineReport: StoredVerifyReport | null = null;
         if (baseline) {
           try {
-            if (!shadow) {
-              // database 路径本来没有用到影子库：和 sql 路径、forProject 用同一份选择逻辑
-              const prepared = await prepareShadow(source ?? null, scope, ctx.guard, b.dialect);
-              shadow = prepared.shadow;
-              shadowLabel = prepared.label;
-              createdShadow = prepared.created;
-            }
+            // database 路径本来没有用到影子库（SQL Server 拆分可空性时可能已经准备过）：和 sql 路径、forProject 用同一份选择逻辑
+            const verifier = await ensureShadow();
             // 与发布、重新验证同一套闭环验证（含读回核对，ADR 0017 决定 4）；不通过或没有影子库都不阻止建项目，
             // 基线标为未验证——这是唯一“没验证就存在”的版本（模型是从数据库读出来的，不是手写的）
             baselineReport = storedReport(
-              await shadow.verifyScripts(baseline.from, model, baseline.up, [], {
+              await verifier.verifyScripts(baseline.from, model, baseline.up, [], {
                 checkDown: false,
                 scope,
                 ...(targetMysqlVersionNum !== null ? { mysqlVersionNum: targetMysqlVersionNum } : {}),
@@ -354,12 +385,12 @@ export const registerWizard = (app: Hono<Env>, ctx: AppContext) => {
           console.error('新建项目向导：写审计失败（项目已经建好）', e);
         }
 
-        await send({ stage: 'done', project });
+        await send(doneEvent());
       } catch (e) {
         if (committed) {
           // 提交之后的意外（理论上只有发放进度）：项目已经建好，不回滚、不删影子库、不发 error
           console.error('新建项目向导：提交之后的步骤失败', e);
-          await send({ stage: 'done', project });
+          await send(doneEvent());
           return;
         }
         // 提交之前失败：这次新建的影子库一并清理

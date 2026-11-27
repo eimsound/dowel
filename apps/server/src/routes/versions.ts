@@ -44,7 +44,7 @@ import { audit } from '../audit.ts';
 import { can, userActor } from '../authz.ts';
 import { chainFrom, freezeScripts, instanceLevelProblem, versionExecutedAnywhere } from '../chain.ts';
 import { dbNowSql, inList, isUniqueViolation, readDbNow } from '../db.ts';
-import type { FlushSkipReason } from '../derive.ts';
+import { BranchForgottenError, type FlushSkipReason } from '../derive.ts';
 import { projectPlanOptions } from '../envs.ts';
 import { withPolicyLock } from '../policy.ts';
 import {
@@ -201,6 +201,9 @@ export const registerVersions = (app: Hono<Env>, ctx: AppContext) => {
     const b = await body(c, versionCreateSchema);
     // 冻结的就是 flush 判定过的那一份模型（不再另读房间：中间插进来的编辑没经过规范化判定，#132 路径 B）
     const flushed = await refresher.flush(a.branch);
+    if (flushed.kind === 'skipped' && flushed.skippedReason === 'forgotten') {
+      throw new BranchForgottenError(a.branch);
+    }
     const { model, seq } = flushed;
     const modelErrs = validate(model);
     if (modelErrs.length > 0) {

@@ -21,6 +21,7 @@ import {
   UniqueExt,
 } from './ir.ts';
 import { columnsOf, effectiveColumnsOf, rootTableId } from './model.ts';
+import { MSSQL_NOT_NULL_NOTE } from './mssql/nullability.ts';
 import { PG_SERIAL_TYPE_NOTE } from './pg/serial.ts';
 import { getDialect } from './registry.ts';
 import { SQLITE_COLUMN_TYPE_NOTE } from './sqlite/types.ts';
@@ -159,7 +160,7 @@ export const mutators = {
         name,
         type: text.describe(`Column type text. ${PG_SERIAL_TYPE_NOTE} ${SQLITE_COLUMN_TYPE_NOTE}`),
         typeRef: id.nullable().optional(),
-        notNull: z.boolean().optional(),
+        notNull: z.boolean().optional().describe(MSSQL_NOT_NULL_NOTE),
         default: columnDefaultArg.nullable().optional(),
         identity: z
           .object({ always: z.boolean(), options: sequenceOptionsArg.partial().optional() })
@@ -186,7 +187,9 @@ export const mutators = {
     }),
     (m, a) => E.setColumnType(m, a.id, a.type, a.typeRef),
   ),
-  setNotNull: def(z.object({ id, notNull: z.boolean() }), (m, a) => E.setNotNull(m, a.id, a.notNull)),
+  setNotNull: def(z.object({ id, notNull: z.boolean().describe(MSSQL_NOT_NULL_NOTE) }), (m, a) =>
+    E.setNotNull(m, a.id, a.notNull),
+  ),
   setDefault: def(z.object({ id, default: columnDefaultArg.nullable() }), (m, a) =>
     E.setDefault(m, a.id, a.default),
   ),

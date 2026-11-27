@@ -21,6 +21,7 @@ import { all, childrenOf, columnsOf, find, get, withModelIndex } from '../model.
 import type { PlanOptions } from '../pg/capabilities.ts';
 import { PlanError, type Step } from '../plan-types.ts';
 import { isReservedMssqlSchema, mssqlDerivedNames } from './naming.ts';
+import { mssqlEffectiveNotNull } from './nullability.ts';
 import {
   mssqlColumnRefs,
   mssqlIdent,
@@ -128,7 +129,8 @@ const definition = (o: Obj, m: Model): unknown => {
       return [
         o.generated ? null : mssqlNormalizeType(o.type),
         o.collation,
-        o.generated && !o.generated.stored ? false : o.notNull,
+        // 有效可空性（显式 NOT NULL 或引擎推断的非空，ADR 0019）；系统目录分不出两者，所以只比有效值
+        mssqlEffectiveNotNull(o),
         o.default,
         o.generated,
         identitySpecOf(o),
@@ -339,6 +341,7 @@ export const mssqlPlan = (from: Model, to: Model, opts?: MssqlPlanOptions): Step
           let s = `${mssqlIdent(c.name)} AS (${c.generated.expr})`;
           if (c.generated.stored) {
             s += ' PERSISTED';
+            // 只渲染用户显式声明的 NOT NULL；引擎推断的非空（ext.mssql.inferredNotNull）由引擎自己得出，不写进 DDL（ADR 0019）
             if (c.notNull) s += ' NOT NULL';
           }
           return s;
@@ -460,8 +463,10 @@ export const mssqlPlan = (from: Model, to: Model, opts?: MssqlPlanOptions): Step
         const refsAltered =
           (o.generated && exprTouches(o.generated.expr, colsOfTableIn(o.parent, colAltered))) ||
           (w.generated && exprTouches(w.generated.expr, colsOfTableIn(o.parent, colAltered)));
+        // 持久化计算列的有效可空性变了（显式 NOT NULL 与推断非空互换、有效值不变时不重建，ADR 0019）
         const persistedNotNullChanged =
-          (Boolean(o.generated?.stored) || Boolean(w.generated?.stored)) && o.notNull !== w.notNull;
+          (Boolean(o.generated?.stored) || Boolean(w.generated?.stored)) &&
+          mssqlEffectiveNotNull(o) !== mssqlEffectiveNotNull(w);
         if (
           !same(o.generated, oldGen) ||
           persistedNotNullChanged ||

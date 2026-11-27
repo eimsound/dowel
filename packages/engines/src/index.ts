@@ -3,6 +3,7 @@ export * from './mssql/db.ts';
 export * from './mssql/engine.ts';
 export * from './mssql/history.ts';
 export * from './mssql/import.ts';
+export * from './mssql/nullability.ts';
 export * from './mssql/risk.ts';
 export * from './mssql/snapshot.ts';
 export * from './mysql/db.ts';

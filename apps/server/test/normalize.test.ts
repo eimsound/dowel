@@ -973,4 +973,25 @@ describe('PG 预连接失败（无 Docker）', () => {
       expect(res.data).toMatchObject({ outcome: 'clean', shadow: null, checkedInShadow: false });
     }
   });
+
+  test('无环境项目带待规范化对象 flush → skipped(no_shadow) 且不触发二次 branches 复核查询', async () => {
+    const { pid, branch } = await newProject('无环境不重查branches', 'pg');
+    await seedCheck(pid);
+    const origQuery = db.query.bind(db);
+    let shadowLookupQueries = 0;
+    let existingCheckQueries = 0;
+    db.query = (async <T = Record<string, unknown>>(sql: string, params?: unknown[]) => {
+      if (sql.includes('select project_id from branches where id = $1')) shadowLookupQueries++;
+      if (sql.includes('from branches where id in')) existingCheckQueries++;
+      return origQuery<T>(sql, params);
+    }) as typeof db.query;
+    try {
+      const out = await created.refresher.flush(branch);
+      expect(out).toMatchObject({ kind: 'skipped', skippedReason: 'no_shadow' });
+      expect(shadowLookupQueries).toBe(1);
+      expect(existingCheckQueries).toBe(0);
+    } finally {
+      db.query = origQuery;
+    }
+  });
 });
