@@ -200,6 +200,8 @@ Subject to the connection rate limit per token. Connects to the target database 
 
 If a version with `verifiedHere: false` is on the route to execute (like pending version 5 above), `POST …/execute` returns `409 unverified`. Re-verify that version in the web UI on a shadow database whose version matches the target (or allow a same-instance shadow) first.
 
+This endpoint reads migration history only and does not inspect the target schema. If the target has no history yet but its schema already equals the first version in the chain, the first execution records that version as the baseline (without running its scripts or checking its verification), even if it shows `verifiedHere: false`. To include the schema in the check, use `POST …/execute` with `dryRun: true`.
+
 Returns `502 target_unreachable` when the target database is unreachable, and `409 version_mismatch` when the history format is too new, corrupted, or diverges from the platform chain.
 
 ### 3.4 Live drift check (compares full target schema) {#post-drift}

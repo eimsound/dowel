@@ -199,6 +199,8 @@ curl -fsS \
 
 `verifiedHere` 为 `false` 的版本出现在要执行的路线上时（如上例的 `pending` 版本 5），`POST …/execute` 会返回 `409 unverified`：先在 Web 端为与目标库版本一致的影子库（或允许同实例影子库）重新验证这个版本。
 
+这个接口只读迁移历史、不扫描目标库结构：目标库还没有历史、结构却已等于链上第一个版本时，首次执行会把该版本作为基线写入（不跑脚本，也不检查它的验证状态），即使它显示 `verifiedHere: false`。要连结构一起预检，用 `POST …/execute` 的 `dryRun: true`。
+
 目标库不可达返回 `502 target_unreachable`；历史格式过新、损坏或当前版本不在平台版本链上返回 `409 version_mismatch`。
 
 ### 3.4 实时漂移检测（连目标库读全库结构快照比对） {#post-drift}

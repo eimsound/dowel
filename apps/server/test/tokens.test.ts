@@ -1827,6 +1827,10 @@ describe.skipIf(!PG_URL)('CI 执行接口、错误码、审计通知与 GitHub A
       verified: true,
       verifiedOn: [full],
     });
+    // 平台库缓存的环境版本清空（从未探测 / 过期）：CI 环境状态按实时读到的目标库版本算，与执行前检查一致
+    await db.query('update environments set engine_version = null, engine_version_num = null where id = $1', [
+      dev.eid,
+    ]);
     const before = await ciStatus();
     expect(before.engineVersion).toBe(full);
     expect(here(before)).toEqual({ 1: [true, true], 2: [true, true] });
