@@ -245,17 +245,68 @@ describe('大规模粘贴性能守卫（1000 张既有表 + 粘贴 200 张表 ×
     for (const t of ids) getDialect(dialect).refreshDerivedNames(m, t);
     return { m, ids };
   };
-  const buildLargeTargetAndSource = (dialect: Dialect, copied = 200) => {
-    const target = buildLarge(dialect, 'existing', 1000, 4, false).m;
-    const src = buildLarge(dialect, 'copied', copied, 12, true);
+  const buildTarget = (dialect: Dialect, tables: number) => {
+    const target = buildLarge(dialect, 'existing', tables, 4, false).m;
     expect(validate(target)).toEqual([]);
+    return target;
+  };
+  const buildPayload = (dialect: Dialect, copied: number) => {
+    const src = buildLarge(dialect, 'copied', copied, 12, true);
     expect(validate(src.m)).toEqual([]);
-    return { target, payload: copyTables(src.m, src.ids, { source: SRC }) };
+    return copyTables(src.m, src.ids, { source: SRC });
   };
 
+  // 不断言“多少毫秒内完成”：共享的 CI 机器忙时，同一份代码的墙钟耗时能差出 3 倍以上（Issue #143），绝对阈值只会误报。
+  // 改为数 execute 读基线 m.objects 的次数（确定性，不受机器负载影响）：粘贴的内容不变、只让既有表变多，
+  // 多出来的读取摊到每个既有对象、再摊到每个子操作上。走索引时现值为 PG 0.019、SQLite / MySQL 0.009、
+  // SQL Server 0.331（其 schema 级重名判定对每个约束 / 带默认值列经 get() 取所属表）；每个子操作经写时复制代理
+  // 枚举整个模型时为 2.7–8.0，即使只是每建一张表（占 1/16 子操作）枚举一次整个模型，也会多出约 0.44（PG / SQLite /
+  // MySQL 约 0.45，SQL Server 约 0.77），因此按方言收紧阈值以同时拦住这两类退化。
+  // 已知盲区：Proxy 只包住基线 m.objects，经索引结构内部缓存或 overlay 的遍历（含粘贴规模这一维）不会被计入，留待 Issue #165 补索引侧计数守卫。
+  // 计时比值在这里分不开两者：SQLite / MySQL / SQL Server 的重名判定本来就按 kind 扫一遍索引分桶，执行耗时随
+  // 既有表数线性增长（SQL Server 既有表 125 → 1000 时实测约 4 倍）；按粘贴规模求耗时比，即使交替测量、取多次最快值，
+  // 忙机器上也会从约 10 倍抖到近 40 倍。另留一个只拦数量级恶化的宽松绝对上限。
+  type PasteOps = ReturnType<typeof planPaste>['ops'];
+  /** 带现成索引执行一次 paste，返回期间读基线 m.objects 的次数（取值 / in / 属性描述各算一次，枚举按键数算） */
+  const countBaseReads = (target: Model, ops: PasteOps) => {
+    let reads = 0;
+    const objects = new Proxy(target.objects, {
+      get: (t, p, r) => (reads++, Reflect.get(t, p, r)),
+      has: (t, p) => (reads++, Reflect.has(t, p)),
+      getOwnPropertyDescriptor: (t, p) => (reads++, Reflect.getOwnPropertyDescriptor(t, p)),
+      ownKeys: (t) => {
+        const keys = Reflect.ownKeys(t);
+        reads += keys.length;
+        return keys;
+      },
+    });
+    const counted: Model = { ...target, objects };
+    const idx = new MutableModelIndex(counted);
+    reads = 0;
+    execute(counted, 'paste', { ops }, idx);
+    return reads;
+  };
+  // 既有表 125 → 1000，粘贴 20 张表（320 个子操作）。计数为确定性数值，无机器波动误报风险，按方言设限：
+  // 现值 PG 0.019 / SQLite 0.009 / MySQL 0.009 / MSSQL 0.331，低于每表全量枚举（约 0.45 / 0.77）与每子操作全量枚举（2.7–8.0）
+  const EXISTING_SMALL = 125;
+  const EXISTING_BIG = 1000;
+  const COUNTED_PASTE_TABLES = 20;
+  const MAX_READS_PER_EXISTING_OBJECT_PER_OP: Record<Dialect, number> = {
+    pg: 0.2,
+    sqlite: 0.2,
+    mysql: 0.2,
+    mssql: 0.55,
+  };
+  // 兜底的绝对上限，比常见耗时（200 张表 planPaste 0.03–0.6 s、execute 1–8 s，视机器负载）高一个数量级，
+  // 只拦数量级的恶化（例如对粘贴规模比现在更差的复杂度），不是性能指标。用例超时也放宽：构造 1000 张表的模型
+  // 和 validate 本身就重，机器严重超载时整个用例能超过 5 分钟
+  const BACKSTOP_PLAN_MS = 10_000;
+  const BACKSTOP_EXEC_MS = 60_000;
+
   for (const dialect of DIALECTS) {
-    test(`${dialect}: 粘贴 200 张表 planPaste / execute 耗时 < 5000ms，粘贴 20 张表 execute < 1000ms`, () => {
-      const { target, payload } = buildLargeTargetAndSource(dialect);
+    test(`${dialect}: 粘贴 200 张表结果正确，执行时对既有模型的读取不随子操作数放大`, () => {
+      const target = buildTarget(dialect, EXISTING_BIG);
+      const payload = buildPayload(dialect, 200);
       const baseIdx = new MutableModelIndex(target);
 
       const t0 = performance.now();
@@ -271,23 +322,30 @@ describe('大规模粘贴性能守卫（1000 张既有表 + 粘贴 200 张表 ×
       const execAuto = execute(target, 'paste', { ops: plan.ops });
       const execAutoMs = performance.now() - t2;
 
-      const small = buildLargeTargetAndSource(dialect, 20);
-      const smallPlan = planPaste(small.target, small.payload);
-      const t3 = performance.now();
-      execute(small.target, 'paste', { ops: smallPlan.ops }, new MutableModelIndex(small.target));
-      const smallMs = performance.now() - t3;
-
-      console.info(
-        `[perf:${dialect}] 200 tables: planPaste=${planMs.toFixed(1)}ms execute(baseIdx)=${execMs.toFixed(1)}ms execute(auto)=${execAutoMs.toFixed(1)}ms ops=${plan.ops.length}; 20 tables: execute=${smallMs.toFixed(1)}ms`,
-      );
-
       expect(plan.newTables).toHaveLength(200);
       expect(validate(execRes.next)).toEqual([]);
       expect(stableJson(execAuto.next)).toBe(stableJson(execRes.next));
-      expect(planMs).toBeLessThan(5000);
-      expect(execMs).toBeLessThan(5000);
-      expect(execAutoMs).toBeLessThan(5000);
-      expect(smallMs).toBeLessThan(1000);
-    }, 60_000);
+
+      const smallTarget = buildTarget(dialect, EXISTING_SMALL);
+      const countedPayload = buildPayload(dialect, COUNTED_PASTE_TABLES);
+      const opsIntoSmall = planPaste(smallTarget, countedPayload).ops;
+      const opsIntoBig = planPaste(target, countedPayload).ops;
+      expect(opsIntoBig).toHaveLength(opsIntoSmall.length);
+      const readsSmall = countBaseReads(smallTarget, opsIntoSmall);
+      const readsBig = countBaseReads(target, opsIntoBig);
+      const existingDelta = Object.keys(target.objects).length - Object.keys(smallTarget.objects).length;
+      const readsPerExistingPerOp = (readsBig - readsSmall) / existingDelta / opsIntoBig.length;
+
+      const ms = (x: number) => `${x.toFixed(1)}ms`;
+      console.info(
+        `[perf:${dialect}] 200 tables: planPaste=${ms(planMs)} execute(baseIdx)=${ms(execMs)} execute(auto)=${ms(execAutoMs)} ops=${plan.ops.length}; ` +
+          `existing ${EXISTING_SMALL}→${EXISTING_BIG} tables, ${opsIntoBig.length} ops: base reads ${readsSmall}→${readsBig} (${readsPerExistingPerOp.toFixed(3)}/existing object/op)`,
+      );
+
+      expect(readsPerExistingPerOp).toBeLessThan(MAX_READS_PER_EXISTING_OBJECT_PER_OP[dialect]);
+      expect(planMs).toBeLessThan(BACKSTOP_PLAN_MS);
+      expect(execMs).toBeLessThan(BACKSTOP_EXEC_MS);
+      expect(execAutoMs).toBeLessThan(BACKSTOP_EXEC_MS);
+    }, 600_000);
   }
 });
