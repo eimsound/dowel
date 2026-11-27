@@ -815,4 +815,250 @@ describe('Shadows.forProject：每次 await 之后都重新检查 closed 与失�
       await guarded.close();
     }
   });
+
+  test('resolveBeforePrepare：第二次读配置晚到期间缓存被替换成更新条目，不能误杀', async () => {
+    const x = (await ctx.shadows.forProject(PID, EID)).shadow as FakeShadow;
+    await changeUrl(URL_2);
+    const origQuery = ctx.db.query.bind(ctx.db);
+    let n = 0;
+    const entered = deferred();
+    const gate = deferred();
+    const spy = vi.spyOn(ctx.db, 'query').mockImplementation((async (sql: string, params?: unknown[]) => {
+      if (sql.includes('from environments e join projects p') && ++n === 2) {
+        const r = await origQuery(sql, params);
+        entered.resolve();
+        await gate.promise;
+        return r;
+      }
+      return origQuery(sql, params);
+    }) as typeof ctx.db.query);
+    try {
+      const pA = ctx.shadows.forProject(PID, EID);
+      await entered.promise;
+      await changeUrl(URL_3);
+      const y = (await ctx.shadows.forProject(PID, EID)).shadow as FakeShadow;
+      expect(y.url).toBe(URL_3);
+      expect(x.close).toHaveBeenCalledTimes(1);
+
+      gate.resolve();
+      const resA = await pA;
+      expect(y.close).not.toHaveBeenCalled();
+      expect(resA.shadow).toBe(y);
+      expect(built.map((s) => s.url)).toEqual([URL_1, URL_3]);
+      expect(ctx.shadows.size).toBe(1);
+    } finally {
+      gate.resolve();
+      spy.mockRestore();
+    }
+  });
+
+  test('admit：复核读配置晚到期间缓存被替换成更新条目，不能误杀', async () => {
+    const a = holdPrepare(0);
+    const pA = ctx.shadows.forProject(PID, EID);
+    await a.entered;
+    await ctx.deliver({ t: 'shadows.forget', envIds: [EID] });
+
+    const held = holdNextEnvResult();
+    try {
+      a.release();
+      await held.entered;
+      await changeUrl(URL_2);
+      const y = (await ctx.shadows.forProject(PID, EID)).shadow as FakeShadow;
+      expect(y.url).toBe(URL_2);
+
+      held.release();
+      const resA = await pA;
+      expect(y.close).not.toHaveBeenCalled();
+      expect(resA.shadow).toBe(y);
+      expect(built[0]!.close).toHaveBeenCalledTimes(1);
+      expect(ctx.shadows.size).toBe(1);
+    } finally {
+      held.restore();
+    }
+  });
+
+  test('resolveBeforePrepare：重读配置期间配置回退且失效代际推进（缓存仍为原条目），不误杀', async () => {
+    const x = (await ctx.shadows.forProject(PID, EID)).shadow as FakeShadow;
+    await changeUrl(URL_2);
+    const origQuery = ctx.db.query.bind(ctx.db);
+    let n = 0;
+    const entered = deferred();
+    const gate = deferred();
+    const spy = vi.spyOn(ctx.db, 'query').mockImplementation((async (sql: string, params?: unknown[]) => {
+      if (sql.includes('from environments e join projects p') && ++n === 2) {
+        const r = await origQuery(sql, params);
+        entered.resolve();
+        await gate.promise;
+        return r;
+      }
+      return origQuery(sql, params);
+    }) as typeof ctx.db.query);
+    try {
+      const pA = ctx.shadows.forProject(PID, EID);
+      await entered.promise;
+      await changeUrl(URL_1);
+      await ctx.deliver({ t: 'shadows.forget', envIds: [EID] });
+
+      gate.resolve();
+      const resA = await pA;
+      expect(x.close).not.toHaveBeenCalled();
+      expect(resA.shadow).toBe(x);
+      expect(built).toHaveLength(1);
+      expect(ctx.shadows.size).toBe(1);
+    } finally {
+      gate.resolve();
+      spy.mockRestore();
+    }
+  });
+
+  test('readValidatedEnv：旧快照晚到被白名单拒绝时，不误杀缓存里已按新配置建好的合法条目', async () => {
+    const blockedUrls = new Set([URL_1]);
+    const fb = fakeBus();
+    const guard = vi.fn(async (url: string) => {
+      if (blockedUrls.has(url)) throw new ShadowUnavailableError('目标主机不在白名单中');
+    });
+    const guarded = new Shadows(ctx.db, guard, fb.bus);
+    const held = holdNextEnvResult();
+    try {
+      const pA = settle(guarded.forProject(PID, EID));
+      await held.entered;
+
+      await changeUrl(URL_2);
+      const b = (await guarded.forProject(PID, EID)).shadow as FakeShadow;
+      expect(b.url).toBe(URL_2);
+
+      held.release();
+      const errA = await pA;
+      expect(errA).toBeInstanceOf(ShadowUnavailableError);
+      expect((errA as Error).message).toContain('白名单');
+      expect(b.close).not.toHaveBeenCalled();
+      expect(guarded.size).toBe(1);
+      expect((await guarded.forProject(PID, EID)).shadow).toBe(b);
+
+      // 对照：最新配置本身也被白名单拒绝时，命中同指纹的条目会正常关闭淘汰
+      blockedUrls.add(URL_2);
+      const errB = await settle(guarded.forProject(PID, EID));
+      expect(errB).toBeInstanceOf(ShadowUnavailableError);
+      expect((errB as Error).message).toContain('白名单');
+      expect(b.close).toHaveBeenCalledTimes(1);
+      expect(guarded.size).toBe(0);
+    } finally {
+      held.restore();
+      await guarded.close();
+    }
+  });
+
+  test('admit：复核读配置期间配置回退且失效代际推进（缓存仍为原条目），不误杀', async () => {
+    const c = holdPrepare(0);
+    const pC = ctx.shadows.forProject(PID, EID);
+    await c.entered;
+    await changeUrl(URL_2);
+    const a = holdPrepare(1);
+    const pA = ctx.shadows.forProject(PID, EID);
+    await a.entered;
+
+    c.release();
+    const x = (await pC).shadow as FakeShadow;
+    expect(x.url).toBe(URL_1);
+
+    const held = holdNextEnvResult();
+    try {
+      a.release();
+      await held.entered;
+      await changeUrl(URL_1);
+      await ctx.deliver({ t: 'shadows.forget', envIds: [EID] });
+
+      held.release();
+      const resA = await pA;
+      expect(x.close).not.toHaveBeenCalled();
+      expect(resA.shadow).toBe(x);
+      expect(built[1]!.close).toHaveBeenCalledTimes(1);
+      expect(ctx.shadows.size).toBe(1);
+    } finally {
+      held.restore();
+    }
+  });
+
+  test('forgetProject：查库补全环境 ID 期间不误关已按新配置建好的条目', async () => {
+    const x = (await ctx.shadows.forProject(PID, EID)).shadow as FakeShadow;
+    await ctx.db.query('update projects set schemas = $2 where id = $1', [PID, JSON.stringify(['app'])]);
+
+    const origQuery = ctx.db.query.bind(ctx.db);
+    const entered = deferred();
+    const gate = deferred();
+    let intercepted = false;
+    const spy = vi.spyOn(ctx.db, 'query').mockImplementation((async (sql: string, params?: unknown[]) => {
+      if (
+        !intercepted &&
+        sql.includes('select id from environments where project_id = $1') &&
+        !sql.includes('order by')
+      ) {
+        intercepted = true;
+        entered.resolve();
+        await gate.promise;
+      }
+      return origQuery(sql, params);
+    }) as typeof ctx.db.query);
+    try {
+      const forgetting = ctx.shadows.forgetProject(PID);
+      await entered.promise;
+      expect(x.close).toHaveBeenCalledTimes(1);
+
+      const y = (await ctx.shadows.forProject(PID, EID)).shadow as FakeShadow;
+      gate.resolve();
+      await forgetting;
+
+      expect(x.close).toHaveBeenCalledTimes(1);
+      expect(y.close).not.toHaveBeenCalled();
+      expect(ctx.shadows.size).toBe(1);
+      expect((await ctx.shadows.forProject(PID, EID)).shadow).toBe(y);
+    } finally {
+      gate.resolve();
+      spy.mockRestore();
+    }
+  });
+
+  test('pruneRemovedForProject：列环境返回旧快照且晚到时，不误杀挂起期间新建并已缓存的环境', async () => {
+    const e1 = (await ctx.shadows.forProject(PID, EID)).shadow as FakeShadow;
+
+    const origQuery = ctx.db.query.bind(ctx.db);
+    const entered = deferred();
+    const gate = deferred();
+    let intercepted = false;
+    const spy = vi.spyOn(ctx.db, 'query').mockImplementation((async (sql: string, params?: unknown[]) => {
+      if (
+        !intercepted &&
+        sql.includes('select id from environments where project_id = $1 order by created_at')
+      ) {
+        intercepted = true;
+        const r = await origQuery(sql, params);
+        entered.resolve();
+        await gate.promise;
+        return r;
+      }
+      return origQuery(sql, params);
+    }) as typeof ctx.db.query);
+    try {
+      const pList = ctx.shadows.forProject(PID);
+      await entered.promise;
+
+      await ctx.db.query(
+        `insert into environments (id, project_id, name, url_enc, production, allow_same_instance, shadow_url_enc)
+         values ('e-closed-2', $1, 'staging', $2, false, false, null)`,
+        [PID, encrypt(URL_2)],
+      );
+      const e2 = (await ctx.shadows.forProject(PID, 'e-closed-2')).shadow as FakeShadow;
+      expect(e2.url).toBe(URL_2);
+
+      gate.resolve();
+      const resList = await pList;
+      expect(resList.shadow).toBe(e1);
+      expect(e2.close).not.toHaveBeenCalled();
+      expect(ctx.shadows.has('e-closed-2')).toBe(true);
+      expect(ctx.shadows.size).toBe(2);
+    } finally {
+      gate.resolve();
+      spy.mockRestore();
+    }
+  });
 });
