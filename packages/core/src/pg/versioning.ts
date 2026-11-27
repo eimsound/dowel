@@ -28,6 +28,10 @@ export const pgVersioning: DialectVersioning = {
     return pgMajor !== null ? { pgMajor } : undefined;
   },
   formatVersionNum: (versionNum) => `${Math.floor(versionNum / 10000)}.${versionNum % 10000}`,
+  fullVersion: ({ versionNum }) =>
+    typeof versionNum === 'number' && Number.isInteger(versionNum) && versionNum > 0
+      ? `${Math.floor(versionNum / 10000)}.${versionNum % 10000}`
+      : null,
   targetInfo: pgTargetInfo,
   compatibility: (model, versionNums) => {
     const pgMajor = targetPgMajorOf(versionNums);

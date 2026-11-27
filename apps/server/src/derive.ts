@@ -241,10 +241,10 @@ export class OpaqueRefresher {
    * - 以调用方传入的 model（而非事后重读 rooms.model）写入黄金基线，防止 replace 与 reset 间的并发提交污染黄金基线；
    * - fn 抛错时黄金基线不变；
    * - 接入领先版本直接用链头版本模型作黄金基线依赖严格的读回核对（#123，ADR 0016 / ADR 0017）：当前执行读回校验
-   *   （`verifyAndRecord`）已对四种方言严格校验（MySQL 表达式纯格式容忍已于 #162 移除），恢复时闭环验证的读回核对
-   *   待 #132 落地；
-   * - `onlyIfClean`（已验证版本的应用 / 作废 / 取消作废）：当前闭环验证尚未核对模型原文（待 #132 落地），按 ADR 0017
-   *   落地后验证记录也将按数据库完整版本号区分、SQL Server 生成列 `type` 规划器不比较，“已验证”不保证是当前影子库的规范形式。
+   *   （`verifyAndRecord`）已对四种方言严格校验（MySQL 表达式纯格式容忍已于 #162 移除），恢复时闭环验证也做同一个读回核对
+   *   （ADR 0017 决定 2 / 4）；
+   * - `onlyIfClean`（已验证版本的应用 / 作废 / 取消作废）：验证记录按数据库完整版本号区分（ADR 0017 决定 5）、SQL Server 生成列
+   *   `type` 规划器不比较，“已验证”不保证是当前影子库的规范形式。
    *   因此只有 model 相对当前黄金基线没有待规范化对象时才推进黄金基线（同时作为防御性确认），否则只替换房间；
    * - 锁序严格单向：本地队列 → job:derive:<branchId> → rooms.withRoomLock → branches FOR UPDATE。
    */
@@ -307,7 +307,8 @@ export class OpaqueRefresher {
    * 关键出口之前调用（发布、生成迁移、导出 DDL、验证、版本差异预览、历史详情、拉取 / 接入预览、MCP 读模型）：
    * 单机与 HA 统一走本地队列 + derive 锁；锁内相对黄金基线判断有没有待规范化的对象，没有就 0 影子库 I/O 返回 clean；
    * 有就在影子库里规范化并写回。影子库不可用（ShadowError）或规范化失败时安静返回 skipped（带原因），不改基线、不报错，
-   * 保证没有影子库的项目照样能看迁移、导出 DDL、发布未验证版本。只有等锁超时（DeriveBusyError）会抛出。
+   * 保证没有影子库的项目照样能看迁移、导出 DDL；发布在 skipped 且仍有待规范化对象时拒绝（ADR 0017 决定 1，见 pendingIn）。
+   * 只有等锁超时（DeriveBusyError）会抛出。
    * 返回的 model / seq 就是判定所针对的房间状态（见 FlushOutcome），调用方不要再另读房间。
    * 写回冲突的重试预算（MAX_REJECT_RETRIES 次连续被拒）只属于这一次 flush，不跨调用累计。
    */
@@ -522,6 +523,23 @@ export class OpaqueRefresher {
       normalizedObjects: patched.map((o) => refOf(canonical, o.id)),
       checkedInShadow: true,
       shadow: handle.label,
+    };
+  }
+
+  /**
+   * 给定的模型（通常是 flush 返回、被跳过的那一份）相对黄金基线还有哪些待规范化的对象（0 影子库 I/O、不拿 derive 锁）。
+   * 发布在 flush 被跳过时据此决定是否在验证之前就拒绝（ADR 0017 决定 1）
+   */
+  async pendingIn(
+    branchId: string,
+    model: Model,
+  ): Promise<{ pendingCount: number; objects: DerivedObjectRef[]; truncated: boolean }> {
+    const good = await this.loadGood(branchId);
+    const ids = pendingRefreshIds(good, model);
+    return {
+      pendingCount: ids.length,
+      objects: ids.slice(0, STATUS_OBJECT_LIMIT).map((id) => refOf(model, id)),
+      truncated: ids.length > STATUS_OBJECT_LIMIT,
     };
   }
 

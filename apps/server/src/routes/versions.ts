@@ -44,6 +44,7 @@ import { audit } from '../audit.ts';
 import { can, userActor } from '../authz.ts';
 import { chainFrom, freezeScripts, instanceLevelProblem, versionExecutedAnywhere } from '../chain.ts';
 import { dbNowSql, inList, isUniqueViolation, readDbNow } from '../db.ts';
+import type { FlushSkipReason } from '../derive.ts';
 import { projectPlanOptions } from '../envs.ts';
 import { withPolicyLock } from '../policy.ts';
 import {
@@ -68,12 +69,40 @@ import {
   listProjectVersions,
   loadVersion,
   resolveModelRef,
-  verifyAcrossVersions,
+  verifyOnShadows,
   versionDetailOf,
   type VersionTreeNode,
 } from '../versions.ts';
 import { type AppContext, access, body, CodedHTTPException, type Env } from './context.ts';
 const CHAIN_CHANGED = '版本链刚刚发生了变化（有人先发布了），请刷新后重试';
+
+/** flush 被跳过的原因 → 给用户看的一句话 */
+const skipReasonText = (reason: FlushSkipReason | undefined): string => {
+  switch (reason) {
+    case 'no_shadow':
+    case 'shadow_unavailable':
+      return '影子库不可用';
+    case 'canonicalize_failed':
+      return '影子库规范化报错';
+    case 'write_conflict':
+    case 'round_limit':
+      return '期间一直有人在改这些对象';
+    case 'stopped':
+      return '服务正在停机';
+    case 'forgotten':
+      return '项目已被删除';
+    default:
+      return '平台库读写失败';
+  }
+};
+
+/** 冻结脚本的一步 → 报告里的步骤（kind 固定为 frozen，target 是“up#3”这样的位置） */
+const asStep = (dir: 'up' | 'down') => (s: ScriptStep, i: number) => ({
+  kind: 'frozen',
+  target: `${dir}#${i + 1}`,
+  sql: s.sql,
+  transactional: s.transactional,
+});
 
 export const registerVersions = (app: Hono<Env>, ctx: AppContext) => {
   const { db, rooms, shadows, refresher } = ctx;
@@ -160,14 +189,19 @@ export const registerVersions = (app: Hono<Env>, ctx: AppContext) => {
   /**
    * 发布 = 冻结迁移：from 是当前活跃链头（第一个版本是带 public 的空模型），to 是当前工作副本；
    * up = plan(from, to)，down = plan(to, from)。新版本号 = 全局最大编号 + 1（不重用已作废号段）。
-   * 有影子库就先闭环验证，没通过不发布（422 + 报告）；没有影子库允许发布，但 verified_at 为空。
+   * 发布是一条流水线（ADR 0017 决定 1）：规范化 → 影子库闭环验证（含读回核对）→ 冻结，任何一步不通过就不发布（422 + code）：
+   * - flush 被跳过且仍有待规范化对象 → normalize_pending（在验证之前就拒绝，带对象清单）；
+   * - 没有可用影子库 / 影子库暂时连不上 → shadow_unavailable（稍后重试；不再“发布为未验证”）；
+   * - 验证失败 → verify_failed；读回核对发现写法不一致 → readback_mismatch（说明规范化有缺陷：记服务端日志，不自动修复）；
+   * - 通过的影子库没有一个与项目环境的数据库完整版本号一致 → no_matching_shadow。
+   * 成功的版本一定带着至少一条通过的验证记录；尚未覆盖到的环境在 uncovered 里列出，不阻止发布。
    */
   app.post('/api/projects/:pid/versions', async (c) => {
     const a = await access(c, ctx, 'version.publish');
     const b = await body(c, versionCreateSchema);
-    // 冻结的就是 flush 判定过的那一份模型（不再另读房间：中间插进来的编辑没经过规范化判定）。
-    // skippedReason 目前只是透传信息，发布行为不随它变化（#132 待决定）
-    const { model, seq } = await refresher.flush(a.branch);
+    // 冻结的就是 flush 判定过的那一份模型（不再另读房间：中间插进来的编辑没经过规范化判定，#132 路径 B）
+    const flushed = await refresher.flush(a.branch);
+    const { model, seq } = flushed;
     const modelErrs = validate(model);
     if (modelErrs.length > 0) {
       throw new HTTPException(422, { message: `模型校验未通过，无法发布：${modelErrs[0]}` });
@@ -187,42 +221,92 @@ export const registerVersions = (app: Hono<Env>, ctx: AppContext) => {
           : '没有变更：工作副本还是空的，没有需要执行的 SQL',
       });
 
-    let verifiedAt: string | null = null;
-    let verifyReport: StoredVerifyReport | null = null;
-    let unverifiedReason: string | null = null;
-    // 只放过预期的“没有影子库 / 影子库不可用”（ShadowError：没有环境、生产环境不让用同实例、连不上、被占用）；
-    // 密钥解密失败（SecretError）、白名单拒绝（HTTPException）、平台库错误都继续抛出
-    try {
-      const outcome = await verifyAcrossVersions(
-        shadows,
-        a.pid,
-        from,
-        model,
-        frozen.up,
-        frozen.down,
-        true,
-        planOpts,
-      );
-      if (outcome.kind === 'failed') {
-        const msg =
-          outcome.failedVersionLabel !== null
-            ? `${outcome.failedVersionLabel} 影子库闭环验证没有通过，版本没有发布。请先修正模型`
-            : '闭环验证没有通过，版本没有发布。请先修正模型';
-        return c.json<PublishRejected>({ error: msg, report: outcome.report }, 422);
-      }
-      if (outcome.kind === 'missing_target') {
-        verifyReport = outcome.stored;
-        unverifiedReason = outcome.reason;
-      } else {
-        verifiedAt = outcome.stored.at;
-        verifyReport = outcome.stored;
-      }
-    } catch (e) {
-      // 连接断开、超时、被占用这类基础设施故障（shadow.ts 统一抛 ShadowError）不是“脚本有问题”：
-      // 和“没有影子库”同样处理，发布但标为未验证，原因写明
-      if (!(e instanceof ShadowError)) throw e;
-      unverifiedReason = scrubSecrets(e.message);
+    // 规范化被跳过、仍有待规范化对象：在验证之前就拒绝（模型校验、规划这些静态错误先报，用户可以先改）
+    if (flushed.kind === 'skipped') {
+      const pending = await refresher.pendingIn(a.branch, model);
+      // 跳过的原因是没有 / 连不上影子库：本来也验证不了，按 shadow_unavailable 指路（配置影子库或稍后重试）
+      const noShadow =
+        flushed.skippedReason === 'no_shadow' || flushed.skippedReason === 'shadow_unavailable';
+      if (pending.pendingCount > 0)
+        return c.json<PublishRejected>(
+          {
+            error: noShadow
+              ? `没有可用的影子库，发布前的规范化与闭环验证都做不了（还有 ${pending.pendingCount} 处待规范化），版本没有发布。请为环境配置影子库或允许使用同实例影子库；影子库暂时连不上时请稍后重试`
+              : `发布前的规范化没有完成（${skipReasonText(flushed.skippedReason)}），还有 ${pending.pendingCount} 处待规范化，版本没有发布。请稍后重试，或先在模型页点“规范化”`,
+            code: noShadow ? 'shadow_unavailable' : 'normalize_pending',
+            pending: pending.objects,
+            pendingCount: pending.pendingCount,
+          },
+          422,
+        );
     }
+
+    // 只把预期的“没有影子库 / 影子库不可用”（ShadowError：没有环境、生产环境不让用同实例、连不上、被占用）变成 shadow_unavailable；
+    // 密钥解密失败（SecretError）、白名单拒绝（HTTPException）、平台库错误都继续抛出
+    let outcome: Awaited<ReturnType<typeof verifyOnShadows>>;
+    try {
+      outcome = await verifyOnShadows(shadows, a.pid, a.dialect, {
+        from,
+        to: model,
+        up: frozen.up,
+        down: frozen.down,
+        checkDown: true,
+        planOpts,
+        scope: a.schemas?.length ? a.schemas : null,
+      });
+    } catch (e) {
+      if (!(e instanceof ShadowError)) throw e;
+      return c.json<PublishRejected>(
+        {
+          error: `版本没有发布：${scrubSecrets(e.message)}。发布需要在影子库里闭环验证：请为环境配置影子库或允许使用同实例影子库；影子库暂时连不上时请稍后重试`,
+          code: 'shadow_unavailable',
+        },
+        422,
+      );
+    }
+    if (outcome.kind === 'failed') {
+      const where = outcome.engineVersion !== null ? `${outcome.engineVersion} 影子库` : '影子库';
+      if (outcome.readback) {
+        // 读回不一致说明写入层 / 规范化有缺陷（ADR 0017 决定 3）：拒绝并指路，不自动修复；记日志便于定位
+        console.error(
+          `发布被读回核对拒绝（项目 ${a.pid}，${where}）：模型里的写法与数据库读回的不一致，规范化可能有缺陷`,
+          JSON.stringify((outcome.report.readbackDiff ?? []).slice(0, 10)),
+        );
+        return c.json<PublishRejected>(
+          {
+            error: `${where}读回核对没有通过：模型里有 ${outcome.report.readbackTotal ?? 0} 处写法与数据库读回的不一致，版本没有发布。请重试；仍被拒绝时按报告把模型改成数据库的写法`,
+            code: 'readback_mismatch',
+            report: outcome.report,
+          },
+          422,
+        );
+      }
+      return c.json<PublishRejected>(
+        {
+          error: `${where}闭环验证没有通过，版本没有发布。请先修正模型`,
+          code: 'verify_failed',
+          report: outcome.report,
+        },
+        422,
+      );
+    }
+    if (outcome.kind === 'unmatched') {
+      return c.json<PublishRejected>(
+        {
+          error: `${outcome.reason}。版本没有发布`,
+          code: 'no_matching_shadow',
+          report: {
+            ...outcome.stored,
+            up: frozen.up.map(asStep('up')),
+            down: frozen.down.map(asStep('down')),
+          },
+          environments: outcome.uncovered,
+        },
+        422,
+      );
+    }
+    const verifyReport: StoredVerifyReport = outcome.stored;
+    const verifiedAt = verifyReport.at;
 
     const id = newId();
     const number = (maxBefore ?? 0) + 1;
@@ -254,7 +338,7 @@ export const registerVersions = (app: Hono<Env>, ctx: AppContext) => {
             JSON.stringify(frozen.down),
             frozen.checksum,
             verifiedAt,
-            verifyReport ? JSON.stringify(verifyReport) : null,
+            JSON.stringify(verifyReport),
             a.schemas?.length ? JSON.stringify(a.schemas) : null,
           ],
         );
@@ -279,7 +363,7 @@ export const registerVersions = (app: Hono<Env>, ctx: AppContext) => {
           name: b.name,
           seq,
           number,
-          verified: verifiedAt !== null,
+          verified: true,
           checksum: frozen.checksum,
         },
       },
@@ -291,10 +375,11 @@ export const registerVersions = (app: Hono<Env>, ctx: AppContext) => {
         name: b.name,
         seq,
         number,
-        verified: verifiedAt !== null,
-        unverifiedReason,
+        verified: true,
+        verifiedOn: outcome.verifiedOn,
+        uncovered: outcome.uncovered,
         // 验证通过但风险分析没有完成：界面要让用户看到，不能悄悄当成“没有风险”
-        riskError: verifiedAt !== null ? (verifyReport?.riskError ?? null) : null,
+        riskError: verifyReport.riskError ?? null,
       },
       201,
     );
@@ -387,19 +472,26 @@ export const registerVersions = (app: Hono<Env>, ctx: AppContext) => {
     const from = chainFrom(parent, v.model, v.scope);
     const checkDown = !(v.number === 0 && v.downSteps.length === 0);
     const planOpts = await projectPlanOptions(db, a.pid, a.dialect);
+    // 与发布同一套验证（含读回核对，ADR 0017 决定 4）；结果按数据库完整版本号与已有记录合并（决定 5）。
     // 影子库的故障（拿不到、连接断开、超时……）是 ShadowError，直接抛出（422），不写回任何验证状态
-    const outcome = await verifyAcrossVersions(
-      shadows,
-      a.pid,
+    const outcome = await verifyOnShadows(shadows, a.pid, a.dialect, {
       from,
-      v.model,
-      v.upSteps,
-      v.downSteps,
+      to: v.model,
+      up: v.upSteps,
+      down: v.downSteps,
       checkDown,
       planOpts,
-    );
+      scope: v.scope?.length ? v.scope : null,
+      previous: v.verifyReport?.records ?? [],
+    });
     const report = outcome.stored;
-    const verifiedAt = outcome.kind === 'ok' ? report.at : null;
+    // 合并后只要还有一条通过的记录，版本就是已验证（verified_at 取本次时间）；没有任何通过的记录才回到未验证
+    const verifiedAt = outcome.verifiedOn.length > 0 ? report.at : null;
+    if (outcome.kind === 'failed' && outcome.readback)
+      console.error(
+        `重新验证被读回核对拒绝（项目 ${a.pid}，版本 v${v.number}）：模型里的写法与数据库读回的不一致`,
+        JSON.stringify((report.readbackDiff ?? []).slice(0, 10)),
+      );
     // 只在脚本没有被同时改动时写回（checksum 没变）；否则这份报告属于旧脚本，丢弃
     const written = await db.query<{ id: string }>(
       `update versions set verified_at = $3, verify_report = $4::text::jsonb
@@ -418,11 +510,24 @@ export const registerVersions = (app: Hono<Env>, ctx: AppContext) => {
         targetKind: 'version',
         targetId: v.id,
         projectId: a.pid,
-        data: { projectId: a.pid, number: v.number, ok: verifiedAt !== null, checksum: v.checksum },
+        data: {
+          projectId: a.pid,
+          number: v.number,
+          ok: outcome.kind === 'ok',
+          checksum: v.checksum,
+          verifiedOn: outcome.verifiedOn,
+        },
       },
       ctx.security,
     );
-    return c.json<VersionVerifyResponse>({ report, verifiedAt });
+    // 验证记录变了：绑定这个版本的执行申请可能因此能执行 / 不能执行了，巡检一次
+    ctx.requests.kick({ projectIds: [a.pid] });
+    return c.json<VersionVerifyResponse>({
+      report,
+      verifiedAt,
+      verifiedOn: outcome.verifiedOn,
+      uncovered: outcome.uncovered,
+    });
   });
 
   /** 解析版本引用：`empty` 空模型，`head` 当前工作副本，其余按版本引用查找 */

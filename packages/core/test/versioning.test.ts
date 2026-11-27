@@ -5,9 +5,11 @@ import {
   describeTarget,
   diagnoseModel,
   emptyModel,
+  engineFullVersion,
   getDialect,
   publicMajorOf,
   SUPPORTED_DIALECTS,
+  verifiedForEngine,
   versionGroupKeyOf,
 } from '../src/index.ts';
 
@@ -127,5 +129,30 @@ describe('describeTarget / targetInfo（ADR 0015 第 5 节：get_model 的目标
   it('SQLite 不区分目标版本：即使有缓存版本也返回 null', () => {
     expect(describeTarget('sqlite', [3054001])).toBeNull();
     expect(diagnoseModel(emptyModel('sqlite'), [3054001]).target).toBeNull();
+  });
+});
+
+describe('数据库完整版本号与验证记录门禁（ADR 0017 决定 5）', () => {
+  it('fullVersion：PG 两段、MySQL 三段、SQL Server 构建号、SQLite 内置库版本', () => {
+    expect(engineFullVersion('pg', { versionNum: 160004 })).toBe('16.4');
+    expect(engineFullVersion('pg', { versionNum: 180000, version: '18.0 (Debian)' })).toBe('18.0');
+    expect(engineFullVersion('mysql', { versionNum: 80413 })).toBe('8.4.13');
+    expect(engineFullVersion('mysql', { versionNum: 90700 })).toBe('9.7.0');
+    expect(engineFullVersion('mssql', { version: ' 16.0.4175.1 ', versionNum: 160000 })).toBe('16.0.4175.1');
+    expect(engineFullVersion('sqlite', { version: '3.46.1' })).toBe('3.46.1');
+    expect(engineFullVersion('sqlite', { versionNum: 3046001 })).toBe('3.46.1');
+    for (const d of SUPPORTED_DIALECTS)
+      expect(engineFullVersion(d, { version: null, versionNum: null })).toBeNull();
+  });
+
+  it('verifiedForEngine：外部影子库方言要求目标库完整版本恰有通过记录；SQLite 视为同一版本', () => {
+    expect(verifiedForEngine('pg', ['16.4', '17.2'], '16.4')).toBe(true);
+    expect(verifiedForEngine('pg', ['16.4'], '16.5')).toBe(false);
+    expect(verifiedForEngine('pg', ['16.4'], null)).toBe(false);
+    expect(verifiedForEngine('pg', [], '16.4')).toBe(false);
+    expect(verifiedForEngine('mysql', ['8.4.13'], '8.4.12')).toBe(false);
+    expect(verifiedForEngine('mssql', ['16.0.4175.1'], '16.0.4175.1')).toBe(true);
+    expect(verifiedForEngine('sqlite', ['3.46.1'], '3.45.0')).toBe(true);
+    expect(verifiedForEngine('sqlite', [], '3.46.1')).toBe(false);
   });
 });

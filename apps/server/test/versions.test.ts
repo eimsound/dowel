@@ -28,6 +28,18 @@ import { type Db, type ScriptStep, stepsChecksum } from '@dowel/engines';
 import { HTTPException } from 'hono/http-exception';
 import { afterAll, beforeAll, describe, expect, test, vi } from 'vitest';
 
+// 假影子库连接（shadowOps 套一个假 Db）读回的结构永远是空的：读回核对（ADR 0017 决定 2）必然“不一致”。
+// 只关心基础设施分类 / 风险分析的测试打开 readbackStub.on，把读回核对换成“一致”；读回核对本身由 verified-readback.test.ts 与真实 PG 测试覆盖
+const readbackStub = vi.hoisted(() => ({ on: false }));
+vi.mock('@dowel/executor', async (importOriginal) => {
+  const actual = await importOriginal<typeof import('@dowel/executor')>();
+  return {
+    ...actual,
+    readbackDiff: (...args: Parameters<typeof actual.readbackDiff>) =>
+      readbackStub.on ? { total: 0, items: [], details: [] } : actual.readbackDiff(...args),
+  };
+});
+
 import { connect, createTestDb, PG_URL } from '../../../test/pg.ts';
 import { createApp, openPlatformDb, type PlatformDb } from '../src/index.ts';
 import { LoginLimiter } from '../src/rate-limit.ts';
@@ -35,7 +47,7 @@ import { connHash } from '../src/requests.ts';
 import { encrypt, SecretError } from '../src/secrets.ts';
 import { type Shadow, ShadowError, shadowOps } from '../src/shadow.ts';
 import { shadowSetupError } from '../src/targets.ts';
-import { addTable, editModel, makeUser, PASSWORD } from './support.ts';
+import { addTable, editModel, makeUser, PASSWORD, stubPassingShadow } from './support.ts';
 
 process.env.DOWEL_SECRET ??= 'versions-test-secret-0123456789';
 
@@ -91,7 +103,11 @@ describe.each([
     return (r.headers.get('set-cookie') ?? '').split(';')[0]!;
   };
 
-  const newProject = async (name: string, withEnv = false) => {
+  /**
+   * 新项目。withEnv：加一个指向测试 PG 的真实环境（同实例影子库）；否则默认装影子库替身（发布必须经影子库验证，ADR 0017），
+   * shadow: false 时什么影子库都没有
+   */
+  const newProject = async (name: string, withEnv = false, { shadow = true }: { shadow?: boolean } = {}) => {
     const p = await call('POST', '/api/projects', { name, groupId });
     expect(p.status).toBe(201);
     const pid = p.data.id as string;
@@ -113,6 +129,7 @@ describe.each([
           })
         ).status,
       ).toBe(201);
+    else if (shadow) stubPassingShadow(created.shadows, { pids: [pid] });
     return pid;
   };
 
@@ -182,15 +199,28 @@ describe.each([
   });
 
   test.skipIf(skip)(
-    '发布后 number 和 parent 连成链，写入 steps 和 checksum；没有影子库时未验证',
+    '发布后 number 和 parent 连成链，写入 steps 和 checksum；没有影子库时拒绝发布（不再有“发布为未验证”）',
     async () => {
-      const pid = await newProject('chain');
+      const pid = await newProject('chain', false, { shadow: false });
       await addTable(created.rooms, db, pid);
+      // ADR 0017 决定 1：没有可用的影子库不能发布，指路去配置影子库
+      const none = await publish(pid, '首个版本');
+      expect(none.status).toBe(422);
+      expect(none.data).toMatchObject({ code: 'shadow_unavailable' });
+      expect(String(none.data.error)).toContain('环境');
+      expect(await list(pid)).toEqual([]);
+
+      stubPassingShadow(created.shadows, { pids: [pid] });
       const r1 = await publish(pid, '首个版本');
       expect(r1.status).toBe(201);
       const v1 = r1.data as unknown as VersionCreated;
-      expect(v1).toMatchObject({ number: 1, verified: false, name: '首个版本' });
-      expect(v1.unverifiedReason).toContain('环境');
+      expect(v1).toMatchObject({
+        number: 1,
+        verified: true,
+        name: '首个版本',
+        verifiedOn: ['16.4'],
+        uncovered: [],
+      });
 
       await editModel(created.rooms, db, pid, (m) => void addNote(m));
       const v2 = (await publish(pid, '加备注')).data as unknown as VersionCreated;
@@ -207,7 +237,8 @@ describe.each([
       // number 是链上的序号；seq 是发布时房间的操作序号（只增不减），两者不是一回事
       expect(versions.map((v) => v.seq)).toEqual([...versions.map((v) => v.seq)].sort((a, b) => b - a));
       expect(new Set(versions.map((v) => v.seq)).size).toBe(3);
-      expect(versions.every((v) => v.verifiedAt === null && v.edited === false)).toBe(true);
+      expect(versions.every((v) => v.verifiedAt !== null && v.edited === false)).toBe(true);
+      expect(versions.map((v) => v.verifiedOn)).toEqual([['16.4'], ['16.4'], ['16.4']]);
 
       const d1 = await detail(pid, v1.id);
       // 第一个版本从空库（带 public）迁移：建表，不会再 CREATE SCHEMA public
@@ -215,7 +246,11 @@ describe.each([
       expect(d1.downSteps.map((s) => s.sql)).toEqual(['DROP TABLE public.orders']);
       expect([...d1.upSteps, ...d1.downSteps].every((s) => s.transactional === true)).toBe(true);
       expect(d1.checksum).toBe(stepsChecksum(d1.upSteps, d1.downSteps));
-      expect(d1.verifyReport).toBeNull();
+      // 发布成功的版本一定带着至少一条通过的验证记录（按影子库的数据库完整版本号）
+      expect(d1.verifyReport).toMatchObject({
+        ok: true,
+        records: [expect.objectContaining({ engineVersion: '16.4', ok: true, shadow: 'stub shadow' })],
+      });
 
       // 后面的版本是相邻两个版本之间的迁移
       const d2 = await detail(pid, v2.id);
@@ -313,7 +348,12 @@ describe.each([
     const r1 = await publish(pid, 'v1');
     expect(r1.status).toBe(201);
     const v1 = r1.data as unknown as VersionCreated;
-    expect(v1).toMatchObject({ number: 1, verified: true, unverifiedReason: null });
+    expect(v1).toMatchObject({ number: 1, verified: true, uncovered: [] });
+    // 同实例影子库与目标库是同一个实例：验证记录的数据库完整版本号就是环境的版本（ADR 0017 决定 5）
+    const envs = (await call('GET', `/api/projects/${pid}/environments`)).data as unknown as {
+      engineFullVersion: string | null;
+    }[];
+    expect(v1.verifiedOn).toEqual([envs[0]!.engineFullVersion]);
     const d1 = await detail(pid, v1.id);
     expect(d1.verifiedAt).toMatch(/^\d{4}-\d\d-\d\dT/);
     expect(d1.verifyReport).toMatchObject({ ok: true, upDiff: [], downDiff: [], error: null });
@@ -450,9 +490,12 @@ describe.each([
   );
 
   test.skipIf(skip)('没有环境时重新验证返回 422；不存在的版本 404', async () => {
-    const pid = await newProject('noenv-verify');
+    const pid = await newProject('noenv-verify', false, { shadow: false });
     await addTable(created.rooms, db, pid);
+    // 发布时有影子库（替身），之后影子库没了：重新验证拿不到影子库
+    const restore = stubPassingShadow(created.shadows, { pids: [pid] });
     const v1 = (await publish(pid, 'v1')).data as unknown as VersionCreated;
+    restore();
     const r = await reverify(pid, v1.id);
     expect(r.status).toBe(422);
     expect(String(r.data.error)).toContain('环境');
@@ -464,9 +507,22 @@ describe.each([
   /** 把 Shadows.forProject 换成固定的实现（测试里模拟各种影子库状态）；返回恢复函数 */
   const stubShadows = (impl: () => Promise<{ shadow: Partial<Shadow>; label: string }>) => {
     const original = created.shadows.forProject.bind(created.shadows);
+    const originalByVersion = created.shadows.forProjectEngineVersions.bind(created.shadows);
     created.shadows.forProject = impl as unknown as typeof created.shadows.forProject;
+    // 发布 / 重新验证按环境的数据库完整版本号选影（ADR 0017 决定 5）：同一个替身当作唯一环境 18.0 的影子库
+    // （假 Db 报的 server_version_num 是 180000）
+    created.shadows.forProjectEngineVersions = async () => {
+      const s = await impl();
+      return {
+        entries: [{ engineVersion: '18.0', envId: '', shadow: s.shadow as Shadow, label: s.label }],
+        skipped: [],
+        environments: [{ id: 'stub-env', name: 'stub', engineVersion: '18.0' }],
+        identical: false,
+      };
+    };
     return () => {
       created.shadows.forProject = original;
+      created.shadows.forProjectEngineVersions = originalByVersion;
     };
   };
   /** 执行 CREATE TABLE 时连接断开的假影子库连接（走真实的 shadowOps，看错误是怎么被分类和加前缀的） */
@@ -508,7 +564,7 @@ describe.each([
     try {
       const r = await publish(pid, 'v1');
       expect(r.status).toBe(201);
-      expect(r.data).toMatchObject({ verified: true, unverifiedReason: null });
+      expect(r.data).toMatchObject({ verified: true, verifiedOn: ['18.0'], uncovered: [] });
       const d = await detail(pid, (r.data as unknown as VersionCreated).id);
       expect(planned).toBe(false);
       expect(seen).toHaveLength(1);
@@ -520,52 +576,56 @@ describe.each([
     }
   });
 
-  test.skipIf(skip)('发布时：影子库不可用 → 未验证并写明原因；其他错误继续抛出，不会悄悄发布', async () => {
-    const pid = await newProject('publish-infra');
-    await addTable(created.rooms, db, pid);
+  test.skipIf(skip)(
+    '发布时：影子库不可用 → 拒绝发布并写明原因（稍后重试）；其他错误继续抛出，不会悄悄发布',
+    async () => {
+      const pid = await newProject('publish-infra');
+      await addTable(created.rooms, db, pid);
 
-    // 拿影子库时报 ShadowError（没有环境、生产环境不让用同实例、连不上……）
-    let restore = stubShadows(async () => {
-      throw new ShadowError('连接失败：ECONNREFUSED');
-    });
-    const unavailable = await publish(pid, 'v1');
-    restore();
-    expect(unavailable.status).toBe(201);
-    // 配置性 / 已经成型的 ShadowError 保持原来的文案，不再额外加前缀
-    expect(unavailable.data).toMatchObject({ verified: false, unverifiedReason: '连接失败：ECONNREFUSED' });
-    await editModel(created.rooms, db, pid, (m) => void addNote(m));
-
-    // 验证过程中基础设施故障（连接断开）：同样发布但未验证；前缀在转成 ShadowError 的那一处加，只出现一次
-    restore = stubShadows(async () => ({
-      label: 'stub：shadow',
-      shadow: shadowOps(async () => droppedDb()),
-    }));
-    const dropped = await publish(pid, 'v2');
-    restore();
-    expect(dropped.status).toBe(201);
-    expect(dropped.data).toMatchObject({ verified: false });
-    expect(dropped.data.unverifiedReason).toBe('影子库不可用：连接断开了');
-    expect(String(dropped.data.unverifiedReason).split('影子库不可用：')).toHaveLength(2);
-    expect((await detail(pid, (dropped.data as unknown as VersionCreated).id)).verifiedAt).toBeNull();
-    await editModel(created.rooms, db, pid, (m) => void addNote(m, 'memo'));
-
-    // 不是“影子库不可用”的错误：白名单拒绝（HTTPException）、密钥解密失败（SecretError）、平台库错误，
-    // 都不能被当成“没有影子库”而发布
-    const before = (await list(pid)).length;
-    for (const [err, status] of [
-      [new HTTPException(403, { message: '连接地址不在白名单里' }), 403],
-      [new SecretError('无法解密'), 422],
-      [new Error('平台库挂了'), 500],
-    ] as const) {
-      restore = stubShadows(async () => {
-        throw err;
+      // 拿影子库时报 ShadowError（没有环境、生产环境不让用同实例、连不上……）：ADR 0017 决定 1，不再“发布为未验证”
+      let restore = stubShadows(async () => {
+        throw new ShadowError('连接失败：ECONNREFUSED');
       });
-      const r = await publish(pid, 'v3');
+      const unavailable = await publish(pid, 'v1');
       restore();
-      expect(r.status, String(err)).toBe(status);
-      expect(await list(pid)).toHaveLength(before);
-    }
-  });
+      expect(unavailable.status).toBe(422);
+      expect(unavailable.data).toMatchObject({ code: 'shadow_unavailable' });
+      // 配置性 / 已经成型的 ShadowError 保持原来的文案，不再额外加前缀
+      expect(String(unavailable.data.error)).toContain('连接失败：ECONNREFUSED');
+      expect(String(unavailable.data.error)).not.toContain('影子库不可用：');
+      expect(await list(pid)).toHaveLength(0);
+
+      // 验证过程中基础设施故障（连接断开）：同样拒绝；前缀在转成 ShadowError 的那一处加，只出现一次
+      restore = stubShadows(async () => ({
+        label: 'stub：shadow',
+        shadow: shadowOps(async () => droppedDb()),
+      }));
+      const dropped = await publish(pid, 'v1');
+      restore();
+      expect(dropped.status).toBe(422);
+      expect(dropped.data).toMatchObject({ code: 'shadow_unavailable' });
+      expect(String(dropped.data.error)).toContain('影子库不可用：连接断开了');
+      expect(String(dropped.data.error).split('影子库不可用：')).toHaveLength(2);
+      expect(await list(pid)).toHaveLength(0);
+
+      // 不是“影子库不可用”的错误：白名单拒绝（HTTPException）、密钥解密失败（SecretError）、平台库错误，
+      // 都不能被当成“没有影子库”而发布
+      const before = (await list(pid)).length;
+      for (const [err, status] of [
+        [new HTTPException(403, { message: '连接地址不在白名单里' }), 403],
+        [new SecretError('无法解密'), 422],
+        [new Error('平台库挂了'), 500],
+      ] as const) {
+        restore = stubShadows(async () => {
+          throw err;
+        });
+        const r = await publish(pid, 'v3');
+        restore();
+        expect(r.status, String(err)).toBe(status);
+        expect(await list(pid)).toHaveLength(before);
+      }
+    },
+  );
 
   test.skipIf(skip)('重新验证遇到影子库故障：返回错误，原有的验证状态和报告保持不变', async () => {
     const pid = await newProject('reverify-infra');
@@ -631,6 +691,7 @@ describe.each([
     async () => {
       const pid = await newProject('risk-error');
       await addTable(created.rooms, db, pid);
+      readbackStub.on = true;
       const restore = stubShadows(async () => ({
         label: 'stub：shadow',
         shadow: shadowOps(async () => analysisFailsDb('25001')),
@@ -638,7 +699,7 @@ describe.each([
       try {
         // 发布：验证通过（脚本没问题），报告里有 riskError，风险为空——界面不能把它显示成“没有风险”
         const r = await publish(pid, 'v1');
-        expect(r.status).toBe(201);
+        expect(r.status, JSON.stringify(r.data)).toBe(201);
         expect(r.data).toMatchObject({ verified: true });
         // 发布响应带着 riskError，界面据此提示（不能悄悄当成“没有风险”）
         // riskError 只存原因本身，不带“风险分析没有完成：”前缀（由界面标题提供）
@@ -663,7 +724,7 @@ describe.each([
         restore();
       }
 
-      // 分析时连接断开不是“没分析完”，而是影子库故障：发布 → 未验证；/verify → 422，前缀只出现一次
+      // 分析时连接断开不是“没分析完”，而是影子库故障：发布 → 拒绝（稍后重试）；/verify → 422，前缀只出现一次
       const restore2 = stubShadows(async () => ({
         label: 'stub：shadow',
         shadow: shadowOps(async () => analysisFailsDb('08006')),
@@ -671,31 +732,34 @@ describe.each([
       try {
         await editModel(created.rooms, db, pid, (m) => void addNote(m));
         const r2 = await publish(pid, 'v2');
-        expect(r2.status).toBe(201);
-        expect(r2.data).toMatchObject({ verified: false, unverifiedReason: '影子库不可用：分析时出事了' });
+        expect(r2.status).toBe(422);
+        expect(r2.data).toMatchObject({ code: 'shadow_unavailable' });
+        expect(String(r2.data.error)).toContain('影子库不可用：分析时出事了');
+        expect(String(r2.data.error).split('影子库不可用：')).toHaveLength(2);
         const v2 = await call('POST', `/api/projects/${pid}/verify`, { from: 'empty', to: 'head' });
         expect(v2.status).toBe(422);
         expect(v2.data.error).toBe('影子库不可用：分析时出事了');
       } finally {
         restore2();
+        readbackStub.on = false;
       }
     },
   );
 
   test.skipIf(skip)(
-    '项目的第一个环境连不上：发布的 unverifiedReason 和 /verify 的 422 都只带一次“影子库不可用：”前缀',
+    '项目的第一个环境连不上：发布被拒绝（shadow_unavailable）与 /verify 的 422 都只带一次“影子库不可用：”前缀',
     async () => {
-      const pid = await newProject('env-unreachable');
+      const pid = await newProject('env-unreachable', false, { shadow: false });
       await db.query(
         `insert into environments (id, project_id, name, url_enc, production) values ('env-bad', $1, 'dev', $2, $3)`,
         [pid, encrypt('postgres://u:p@127.0.0.1:1/nodb'), false],
       );
       await addTable(created.rooms, db, pid);
       const r = await publish(pid, 'v1');
-      expect(r.status).toBe(201);
-      expect(r.data).toMatchObject({ verified: false });
-      const reason = String(r.data.unverifiedReason);
-      expect(reason).toMatch(/^影子库不可用：连接失败：/);
+      expect(r.status).toBe(422);
+      expect(r.data).toMatchObject({ code: 'shadow_unavailable' });
+      const reason = String(r.data.error);
+      expect(reason).toContain('影子库不可用：连接失败：');
       expect(reason.split('影子库不可用：')).toHaveLength(2);
       expect(reason).not.toContain('p@'); // 连接串里的密码不会出现在原因里
 
@@ -707,7 +771,7 @@ describe.each([
   );
 
   test.skipIf(skip)(
-    '建 / 认领影子库时的数据库错误：连接类 → 带前缀的未验证；其他（权限不足等）→ 不带前缀的未验证，不是 500',
+    '建 / 认领影子库时的数据库错误：连接类 → 带前缀的拒绝发布；其他（权限不足等）→ 不带前缀的拒绝发布，不是 500',
     async () => {
       const pid = await newProject('setup-errors');
       await addTable(created.rooms, db, pid);
@@ -749,15 +813,16 @@ describe.each([
         });
         const r = await publish(pid, `v-${step}-${err.code}`);
         restore();
-        expect(r.status, `${step} ${err.code}`).toBe(201);
-        expect(r.data, `${step} ${err.code}`).toMatchObject({ verified: false, unverifiedReason: reason });
+        expect(r.status, `${step} ${err.code}`).toBe(422);
+        expect(r.data, `${step} ${err.code}`).toMatchObject({ code: 'shadow_unavailable' });
+        expect(String(r.data.error), `${step} ${err.code}`).toContain(`版本没有发布：${reason}。`);
         await editModel(created.rooms, db, pid, (m) => void addNote(m, `n${step}${err.code}`));
       }
     },
   );
 
   test.skipIf(skip)(
-    '错误消息里的连接串密码不会出现在发给客户端的响应里（发布的 unverifiedReason 和 /verify 的 422）',
+    '错误消息里的连接串密码不会出现在发给客户端的响应里（发布被拒绝的原因和 /verify 的 422）',
     async () => {
       const pid = await newProject('leak');
       await addTable(created.rooms, db, pid);
@@ -775,7 +840,8 @@ describe.each([
       const v = await call('POST', `/api/projects/${pid}/verify`, { from: 'empty', to: 'head' });
       restore();
       expect(JSON.stringify(r.data)).not.toContain('secret');
-      expect(r.data.unverifiedReason).toContain('postgres://dowel:***@db.internal:5432/shop');
+      expect(r.status).toBe(422);
+      expect(r.data.error).toContain('postgres://dowel:***@db.internal:5432/shop');
       expect(v.status).toBe(422);
       expect(JSON.stringify(v.data)).not.toContain('secret');
       // 验证过程里的连接故障（toShadowError）

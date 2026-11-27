@@ -636,8 +636,16 @@ export const versionInfoSchema = z.object({
   parentId: z.string().nullable(),
   createdAt: z.string(),
   createdBy: z.string().nullable(),
-  /** 在影子库里闭环验证通过的时间；null 表示未验证（没有影子库、或脚本被人工改过） */
+  /**
+   * 在影子库里闭环验证通过的时间；null 表示未验证（ADR 0017：只有向导从已有数据库导入的 v0 基线、
+   * 或人工改过脚本还没重新验证的版本会这样）
+   */
   verifiedAt: z.string().nullable(),
+  /**
+   * 通过闭环验证的数据库完整版本号（ADR 0017 决定 5，去重、按记录顺序）：执行 / 回滚到某个环境时，
+   * 该环境数据库的完整版本号必须在其中（SQLite 内置库恒等，有记录即可）
+   */
+  verifiedOn: z.array(z.string()),
   /** 冻结的脚本被人工改过 */
   edited: z.boolean(),
   /** 活跃主链的链头（未作废、编号最大的版本）：只有它的脚本可以编辑，新版本以它为 parent */
@@ -751,6 +759,14 @@ export const publishedTablesSchema = z.object({
 });
 export type PublishedTables = z.infer<typeof publishedTablesSchema>;
 
+/** 项目里还没有被验证覆盖到的环境（它的数据库完整版本号没有通过的验证记录；版本未知为 null） */
+export const uncoveredEnvironmentSchema = z.object({
+  id: z.string(),
+  name: z.string(),
+  engineVersion: z.string().nullable(),
+});
+export type UncoveredEnvironment = z.infer<typeof uncoveredEnvironmentSchema>;
+
 export const versionCreatedSchema = z.object({
   id: z.string(),
   name: z.string(),
@@ -758,10 +774,12 @@ export const versionCreatedSchema = z.object({
   number: z.number(),
   /** 风险分析没有完成时的原因，只存原因本身（例如“执行超时…”），“风险分析没有完成”这个前缀由界面的标题 / i18n 模板提供；不影响 ok，但界面要如实显示，不能当成“没有风险” */
   riskError: z.string().nullable(),
-  /** 是否已在影子库里验证通过；没有影子库时发布成功但未验证 */
-  verified: z.boolean(),
-  /** 未验证的原因（例如项目还没有环境）；已验证时为 null */
-  unverifiedReason: z.string().nullable(),
+  /** 发布成功的版本一定通过了影子库闭环验证（ADR 0017 决定 1：不再有“发布为未验证”） */
+  verified: z.literal(true),
+  /** 通过验证的数据库完整版本号（与项目某个环境一致的影子库） */
+  verifiedOn: z.array(z.string()),
+  /** 尚未覆盖到的环境：要执行到它们，需先在与之版本一致的影子库上重新验证（不阻止发布） */
+  uncovered: z.array(uncoveredEnvironmentSchema),
 });
 export type VersionCreated = z.infer<typeof versionCreatedSchema>;
 
@@ -790,6 +808,19 @@ export const stepRiskSchema = z.object({
 });
 export type StepRisk = z.infer<typeof stepRiskSchema>;
 
+/**
+ * 读回核对的一处写法差异：direction = up 表示升级后读回的结构对**本版本**模型，down 表示回滚后读回的结构对**上一个版本**模型。
+ * modelValue 是模型里存的值，liveValue 是数据库读回的值（非字符串按 JSON 显示；对象不存在为 null）
+ */
+export const readbackDiffItemSchema = z.object({
+  direction: z.enum(['up', 'down']),
+  object: z.string(),
+  property: z.string(),
+  modelValue: z.string().nullable(),
+  liveValue: z.string().nullable(),
+});
+export type ReadbackDiffItem = z.infer<typeof readbackDiffItemSchema>;
+
 export const verifyReportSchema = z.object({
   ok: z.boolean(),
   up: z.array(migrationStepSchema),
@@ -804,23 +835,32 @@ export const verifyReportSchema = z.object({
   shadowMajor: z.number().int().nullable().optional(),
   /** 实测影子库的数据库数值版本号（PG / MySQL，由 verifier 读取） */
   shadowVersionNum: z.number().int().nullable().optional(),
+  /** 实测影子库的数据库完整版本号（ADR 0017 决定 5：PG 两段、MySQL 三段、SQL Server 构建号、SQLite 内置库版本） */
+  engineVersion: z.string().nullable().optional(),
+  /** 读回核对（ADR 0017 决定 2）的差异总数：升级后对本版本模型 + 回滚后对上一个版本模型；> 0 即验证失败 */
+  readbackTotal: z.number().int().optional(),
+  /** 读回核对的写法差异明细（最多 100 项） */
+  readbackDiff: z.array(readbackDiffItemSchema).optional(),
 });
 export type VerifyReport = z.infer<typeof verifyReportSchema>;
 
-export const verifyTargetReportSchema = z.object({
-  major: z.number().int(),
-  shadow: z.string(),
+/** 一条验证记录（ADR 0017 决定 5）：在某个数据库完整版本号的影子库上闭环验证的结论。多次验证按版本号合并，脚本被人工修改后清空 */
+export const verifyRecordSchema = z.object({
+  /** 影子库的数据库完整版本号；读不到为 null（这样的记录不能作为任何环境的执行依据） */
+  engineVersion: z.string().nullable(),
   ok: z.boolean(),
+  /** 影子库的显示名 */
+  shadow: z.string(),
+  at: z.string(),
+  /** 没通过时的简要原因 */
   error: z.string().nullable().optional(),
-  upDiffCount: z.number().int(),
-  downDiffCount: z.number().int(),
 });
-export type VerifyTargetReport = z.infer<typeof verifyTargetReportSchema>;
+export type VerifyRecord = z.infer<typeof verifyRecordSchema>;
 
 export const verifyResponseSchema = verifyReportSchema.extend({
   shadow: z.string(),
-  targets: z.array(verifyTargetReportSchema).optional(),
-  missingTargetMajor: z.number().int().nullable().optional(),
+  /** 本次验证在各影子库上的记录 */
+  records: z.array(verifyRecordSchema).optional(),
 });
 export type VerifyResponse = z.infer<typeof verifyResponseSchema>;
 
@@ -892,10 +932,13 @@ export const storedVerifyReportSchema = z.object({
   /** 实际用的影子库 */
   shadow: z.string(),
   at: z.string(),
-  /** 多版本影子库验证时，各大版本分别的验证结果（按大版本升序） */
-  targets: z.array(verifyTargetReportSchema).optional(),
-  /** 存在多个 PG 大版本但最低目标版本缺少可用影子库时记录缺失的大版本号 */
-  missingTargetMajor: z.number().int().nullable().optional(),
+  /** 实测影子库的数据库完整版本号（多个影子库时是报告正文所属的那一个） */
+  engineVersion: z.string().nullable().optional(),
+  /** 读回核对的差异总数与明细（见 verifyReportSchema） */
+  readbackTotal: z.number().int().optional(),
+  readbackDiff: z.array(readbackDiffItemSchema).optional(),
+  /** 按数据库完整版本号合并的验证记录（ADR 0017 决定 5）；执行 / 回滚按目标库的完整版本号在这里找通过的记录 */
+  records: z.array(verifyRecordSchema).optional(),
 });
 export type StoredVerifyReport = z.infer<typeof storedVerifyReportSchema>;
 
@@ -915,15 +958,45 @@ export const stepsPatchSchema = z.object({
 });
 export type StepsPatch = z.infer<typeof stepsPatchSchema>;
 
-/** 发布被拒绝（422）时附带的验证报告 */
-export const publishRejectedSchema = z.object({ error: z.string(), report: verifyResponseSchema.optional() });
+/**
+ * 发布被拒绝时的原因代码（ADR 0017 决定 1）：
+ * - shadow_unavailable：没有可用的影子库，或影子库暂时连不上（稍后重试；外部影子库方言需要配置影子库或允许同实例影子库）；
+ * - normalize_pending：发布前的规范化被跳过，仍有待规范化的对象（pending 列出）；
+ * - verify_failed：影子库闭环验证没有通过（脚本执行失败或结构不一致）；
+ * - readback_mismatch：读回核对发现模型里的写法与数据库读回的不一致（report.readbackDiff 列出）；
+ * - no_matching_shadow：通过验证的影子库没有一个与项目环境的数据库完整版本号一致（或环境的版本还未知）
+ */
+export const publishRejectCodeSchema = z.enum([
+  'shadow_unavailable',
+  'normalize_pending',
+  'verify_failed',
+  'readback_mismatch',
+  'no_matching_shadow',
+]);
+export type PublishRejectCode = z.infer<typeof publishRejectCodeSchema>;
+
+/** 发布被拒绝（422）时附带的原因代码与验证报告 */
+export const publishRejectedSchema = z.object({
+  error: z.string(),
+  code: publishRejectCodeSchema.optional(),
+  report: verifyResponseSchema.optional(),
+  /** normalize_pending：待规范化的对象（最多 50 个）与总数 */
+  pending: z.array(z.object({ id: z.string(), kind: z.string(), name: z.string() })).optional(),
+  pendingCount: z.number().int().optional(),
+  /** no_matching_shadow：项目环境的数据库完整版本号（未知为 null） */
+  environments: z.array(uncoveredEnvironmentSchema).optional(),
+});
 export type PublishRejected = z.infer<typeof publishRejectedSchema>;
 
 /** 重新验证的响应 */
 export const versionVerifyResponseSchema = z.object({
   report: storedVerifyReportSchema,
-  /** 本次验证后版本的验证时间（失败时为 null） */
+  /** 本次验证后版本的验证时间（合并后没有任何通过的记录时为 null） */
   verifiedAt: z.string().nullable(),
+  /** 合并后通过验证的数据库完整版本号 */
+  verifiedOn: z.array(z.string()),
+  /** 仍未覆盖到的环境 */
+  uncovered: z.array(uncoveredEnvironmentSchema),
 });
 export type VersionVerifyResponse = z.infer<typeof versionVerifyResponseSchema>;
 
@@ -1086,6 +1159,11 @@ export const environmentInfoSchema = z.object({
   engineVersionNum: z.number().int().nullable(),
   /** 目标库 PostgreSQL 大版本号（如 16）；尚未探测过为 null */
   engineMajor: z.number().int().nullable(),
+  /**
+   * 目标库的数据库完整版本号（ADR 0017 决定 5：PG 两段、MySQL 三段、SQL Server 构建号）；尚未探测过为 null。
+   * 版本的 verifiedOn 里有它，才能执行 / 回滚到这个环境（SQLite 内置库恒等）
+   */
+  engineFullVersion: z.string().nullable(),
   drift: driftInfoSchema,
   permissions: envPermissionsSchema,
 });
@@ -1116,6 +1194,11 @@ export const envVersionSchema = z.object({
   /** 已作废（ADR 0013） */
   retired: z.boolean(),
   verified: z.boolean(),
+  /**
+   * 有与这个环境的数据库完整版本号一致的通过验证记录（ADR 0017 决定 5；SQLite 内置库恒等，等于 verified）。
+   * 为 false 时执行 / 回滚到这个环境会被拒绝，需要先在版本一致的影子库上重新验证
+   */
+  verifiedHere: z.boolean(),
   edited: z.boolean(),
   /** 升级 / 回滚脚本的步数 */
   upSteps: z.number(),
@@ -1241,6 +1324,12 @@ export const execErrorDetailsSchema = z.object({
    * statement = 语句执行超过 statement_timeout。ms 是当时的设置
    */
   timeout: z.object({ kind: z.enum(['lock', 'statement']), ms: z.number() }).optional(),
+  /**
+   * unverified：目标库的数据库完整版本号（ADR 0017 决定 5），以及这个版本已通过验证的完整版本号。
+   * 二者不匹配时拒绝执行 / 回滚 / 预演，需要先在与目标库版本一致的影子库上重新验证
+   */
+  engineVersion: z.string().nullable().optional(),
+  verifiedOn: z.array(z.string()).optional(),
   /** foreign_instance：当前认领这个项目的实例 */
   claim: z
     .object({

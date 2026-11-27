@@ -12,7 +12,7 @@ import WebSocket from 'ws';
 import { createTestDb, PG_URL } from '../../../test/pg.ts';
 import { createApp, openPlatformDb, type PlatformDb } from '../src/index.ts';
 import { effectiveRole, type GrantRow, type ProjectRow, type RoleContext } from '../src/roles.ts';
-import { addTable, makeUser, PASSWORD } from './support.ts';
+import { addTable, makeUser, PASSWORD, stubPassingShadow } from './support.ts';
 
 // ───── 生效角色：纯函数、表驱动 ─────
 
@@ -270,6 +270,8 @@ describe.each([
     if (platform === 'pg') platformDb = await createTestDb('groups');
     db = await openPlatformDb(platformDb?.url ?? ':memory:');
     const { app, injectWebSocket, rooms, shadows } = createApp(db);
+    // 发布必须经影子库验证（ADR 0017）：这里只要已发布版本，用影子库替身
+    stubPassingShadow(shadows);
     appRooms = rooms;
     const server = serve({ fetch: app.fetch, port: 0 });
     injectWebSocket(server);

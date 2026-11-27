@@ -23,6 +23,8 @@ export const mssqlVersioning: DialectVersioning = {
   targetPlanOptions: () => undefined,
   // 数值版本号为 major * 10000 + minor（如 160000 → '16.0'）
   formatVersionNum: (versionNum) => `${Math.floor(versionNum / 10000)}.${versionNum % 10000}`,
+  // 完整版本号是构建号（SERVERPROPERTY('ProductVersion')），数值版本号只有主次版本，不够区分
+  fullVersion: ({ version }) => version?.trim() || null,
   targetInfo: mssqlTargetInfo,
   compatibility: (model, versionNums) => {
     const major = minMssqlMajor(versionNums);

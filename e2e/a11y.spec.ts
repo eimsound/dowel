@@ -5,7 +5,7 @@ import AxeBuilder from '@axe-core/playwright';
 import { expect, type Page, test } from '@playwright/test';
 
 import { addEnv, execDialog, newTargetDb, openEnv, publishTable } from './exec-helpers.ts';
-import { adminPage, commit, createProject, gotoPage, newUser, openModel } from './helpers.ts';
+import { addEnvironment, adminPage, commit, createProject, gotoPage, newUser, openModel } from './helpers.ts';
 
 const scan = async (page: Page, label: string) => {
   const results = await new AxeBuilder({ page }).analyze();
@@ -18,6 +18,27 @@ const scan = async (page: Page, label: string) => {
       )
       .join('\n')}`,
   ).toEqual([]);
+};
+
+/** 版本详情：已验证 / 人工编辑标记、冻结的迁移、逐步编辑模式（需要一个已发布的“首个版本”） */
+const versionDetailScans = async (page: Page) => {
+  await gotoPage(page, '版本');
+  await page.getByRole('link', { name: '首个版本' }).click();
+  await expect(page.getByRole('heading', { name: '版本详情' })).toBeVisible();
+  await scan(page, '版本详情');
+  await page.getByRole('button', { name: '编辑脚本' }).click();
+  await expect(page.getByRole('button', { name: '保存脚本' })).toBeVisible();
+  await scan(page, '版本详情（编辑脚本）');
+  // 空步骤：保存按钮用 aria-disabled（仍可聚焦），原因通过 aria-describedby 关联到提示
+  await page.getByRole('button', { name: '添加一步' }).click();
+  const save = page.getByRole('button', { name: '保存脚本' });
+  await expect(save).toHaveAttribute('aria-disabled', 'true');
+  // 不是原生 disabled（Playwright 的 toBeDisabled 会把 aria-disabled 也算进去，所以直接读属性）
+  expect(await save.evaluate((el) => el.hasAttribute('disabled'))).toBe(false);
+  await save.focus();
+  await expect(save).toBeFocused();
+  await expect(save).toHaveAccessibleDescription(/有空的步骤.*升级脚本第 \d+ 步/);
+  await scan(page, '版本详情（编辑脚本，有空步骤）');
 };
 
 for (const scheme of ['light', 'dark'] as const) {
@@ -55,16 +76,15 @@ for (const scheme of ['light', 'dark'] as const) {
     await page.goto(projectUrl);
     await openModel(page);
     await scan(page, '模型');
-    // 发布一个版本（项目没有环境，所以是“未验证”），版本列表和详情里才有标记、冻结的迁移可以扫描
+    // 项目没有环境 = 没有影子库：发布被拒绝（ADR 0017），拒绝原因和配置指引留在对话框里（也扫一遍）
     await page.getByRole('button', { name: '新建表' }).click();
     await commit(page, '表名', 'orders');
     await page.getByRole('button', { name: '发布' }).click();
     await page.getByLabel('版本名').fill('首个版本');
     await page.getByRole('dialog').getByRole('button', { name: '发布' }).click();
-    // 未验证的提示留在对话框里（也扫一遍）
-    await expect(page.getByRole('dialog').getByRole('status')).toContainText('项目还没有配置环境');
-    await scan(page, '发布对话框（未验证）');
-    await page.getByRole('dialog').locator('button.primary', { hasText: '关闭' }).click();
+    await expect(page.getByRole('dialog').getByRole('status')).toContainText('没有可用的影子库');
+    await scan(page, '发布对话框（没有影子库）');
+    await page.getByRole('dialog').getByRole('button', { name: '取消' }).click();
     await expect(page.getByRole('dialog')).toBeHidden();
     for (const [name, heading] of [
       ['版本', '版本'],
@@ -77,24 +97,16 @@ for (const scheme of ['light', 'dark'] as const) {
       await scan(page, name);
     }
 
-    // 版本详情：已验证 / 未验证 / 人工编辑标记，冻结的迁移，逐步编辑模式
-    await gotoPage(page, '版本');
-    await page.getByRole('link', { name: '首个版本' }).click();
-    await expect(page.getByRole('heading', { name: '版本详情' })).toBeVisible();
-    await scan(page, '版本详情');
-    await page.getByRole('button', { name: '编辑脚本' }).click();
-    await expect(page.getByRole('button', { name: '保存脚本' })).toBeVisible();
-    await scan(page, '版本详情（编辑脚本）');
-    // 空步骤：保存按钮用 aria-disabled（仍可聚焦），原因通过 aria-describedby 关联到提示
-    await page.getByRole('button', { name: '添加一步' }).click();
-    const save = page.getByRole('button', { name: '保存脚本' });
-    await expect(save).toHaveAttribute('aria-disabled', 'true');
-    // 不是原生 disabled（Playwright 的 toBeDisabled 会把 aria-disabled 也算进去，所以直接读属性）
-    expect(await save.evaluate((el) => el.hasAttribute('disabled'))).toBe(false);
-    await save.focus();
-    await expect(save).toBeFocused();
-    await expect(save).toHaveAccessibleDescription(/有空的步骤.*升级脚本第 \d+ 步/);
-    await scan(page, '版本详情（编辑脚本，有空步骤）');
+    // 版本详情：已验证 / 人工编辑标记，冻结的迁移，逐步编辑模式。发布要有影子库：加一个环境（允许同实例影子库）再发布
+    if (process.env.DOWEL_TEST_PG) {
+      await addEnvironment(page, `e2e_a11y_pub_${scheme}`);
+      await openModel(page);
+      await page.getByRole('button', { name: '发布' }).click();
+      await page.getByLabel('版本名').fill('首个版本');
+      await page.getByRole('dialog').getByRole('button', { name: '发布' }).click();
+      await expect(page.getByRole('dialog')).toBeHidden();
+      await versionDetailScans(page);
+    }
 
     for (const section of ['', '/password', '/identities', '/sessions', '/mcp', '/preferences']) {
       await page.goto(`/account${section}`);

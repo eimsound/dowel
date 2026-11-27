@@ -7,6 +7,7 @@ import {
   isNontransactionalSql,
   type Step,
   scrubSecrets,
+  verifiedForEngine,
 } from '@dowel/core';
 import {
   type AppliedTimeouts,
@@ -18,6 +19,7 @@ import {
   NO_TIMEOUTS,
   parsePgCreateIndexConcurrently,
   parsePgDetachConcurrently,
+  readEngineFullVersion,
   routeBetween,
   routeShape,
   type RouteShape,
@@ -425,15 +427,41 @@ const buildRoute = (
   };
 };
 
-const preflight = (migrations: Migration[], dialect: Dialect) => {
+/**
+ * 执行 / 回滚 / 预演之前的检查：每个要执行的迁移都必须已验证；给了 verifiedOn 的版本（需要外部影子库的方言，
+ * ADR 0017 决定 5）还必须有与**目标库数据库完整版本号**一致的通过记录——紧急执行、CI 令牌、执行申请都走这里，不绕过。
+ * 目标库版本只在需要时读一次（不连影子库）。
+ */
+const preflight = async (conn: Db, migrations: Migration[], dialect: Dialect) => {
+  let engineVersion: string | null | undefined;
   for (const m of migrations) {
     if (m.direction === 'baseline') continue;
+    const verb = m.direction === 'down' ? '回滚' : '执行';
     if (!m.version.verified)
       throw new ExecutorError(
         'unverified',
-        `${label(m.version)}还没有通过影子库验证，不能${m.direction === 'down' ? '回滚' : '执行'}。请先在版本页“重新验证”`,
+        `${label(m.version)}还没有通过影子库验证，不能${verb}。请先在版本页“重新验证”`,
         { versionId: m.version.id, number: m.version.number, direction: m.direction },
       );
+    const verifiedOn = m.version.verifiedOn;
+    if (verifiedOn) {
+      if (engineVersion === undefined) engineVersion = await readEngineFullVersion(dialect, conn);
+      if (!verifiedForEngine(dialect, verifiedOn, engineVersion))
+        throw new ExecutorError(
+          'unverified',
+          engineVersion === null
+            ? `读不到目标库的数据库版本，无法确认${label(m.version)}是否在同版本的影子库上验证过，不能${verb}`
+            : `${label(m.version)}还没有在数据库版本 ${engineVersion} 的影子库上验证通过（已验证：${verifiedOn.length ? verifiedOn.join('、') : '无'}），不能${verb}到这个环境。` +
+                '请先为与目标库版本一致的影子库（或允许同实例影子库）重新验证这个版本',
+          {
+            versionId: m.version.id,
+            number: m.version.number,
+            direction: m.direction,
+            engineVersion,
+            verifiedOn: [...verifiedOn],
+          },
+        );
+    }
     const steps: Step[] = m.steps.map((s) => ({ kind: 'frozen', target: '', sql: s.sql }));
     const bad = findInstanceLevelStep(steps, dialect);
     if (bad >= 0)
@@ -691,7 +719,7 @@ const locked = async (conn: Db, c: Ctx): Promise<ExecuteResult> => {
       );
     }
   }
-  preflight(migrations, dialect);
+  await preflight(conn, migrations, dialect);
   if (o.expect) assertExpected(o.expect, state.current, migrations);
   const direction: ExecuteResult['direction'] = planned.shape;
   const lcaRef = planned.shape === 'switch' ? refOf(planned.lca) : null;

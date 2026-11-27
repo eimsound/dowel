@@ -9,7 +9,7 @@ import WebSocket from 'ws';
 
 import { createTestDb, PG_URL } from '../../../test/pg.ts';
 import { createApp, openPlatformDb, type PlatformDb } from '../src/index.ts';
-import { addTable, makeUser, PASSWORD } from './support.ts';
+import { addTable, makeUser, PASSWORD, stubPassingShadow } from './support.ts';
 
 process.env.DOWEL_SECRET ??= 'delete-test-secret-0123456789';
 
@@ -52,6 +52,8 @@ describe.each([
     if (platform === 'pg') platformDb = await createTestDb('delete');
     db = await openPlatformDb(platformDb?.url ?? ':memory:');
     const created = createApp(db);
+    // 发布必须经影子库验证（ADR 0017）：这里只要一个已发布版本，用影子库替身
+    stubPassingShadow(created.shadows);
     app = created;
     const server = serve({ fetch: created.app.fetch, port: 0 });
     created.injectWebSocket(server);

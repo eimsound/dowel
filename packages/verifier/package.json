@@ -13,9 +13,7 @@
   },
   "dependencies": {
     "@dowel/core": "workspace:*",
-    "@dowel/engines": "workspace:*"
-  },
-  "devDependencies": {
+    "@dowel/engines": "workspace:*",
     "@dowel/executor": "workspace:*"
   }
 }

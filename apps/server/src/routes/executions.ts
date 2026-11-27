@@ -28,6 +28,7 @@ import { inList } from '../db.ts';
 import {
   driftInfo,
   type EnvRow,
+  envFullVersion,
   envResource,
   loadVersionMetas,
   versionStates,
@@ -296,7 +297,8 @@ export const registerExecutions = (app: Hono<Env>, ctx: AppContext) => {
     const cur = metas.find((m) => m.id === env.current_version_id);
     // ADR 0013：状态按版本树算（祖先 = 已执行、活跃且不在祖先路径上 = 待执行、其余作废 = 已作废）
     const states = versionStates(metas, cur?.id ?? null);
-    const versions = metas.map((m) => toEnvVersion(m, cur, executed, dialect, states));
+    const engineVersion = envFullVersion(dialect, env);
+    const versions = metas.map((m) => toEnvVersion(m, cur, executed, dialect, states, engineVersion));
     const activeHead = maxNumberNode(metas.filter((m) => !m.retired));
     const pending = activeHead
       ? (routeBetween(indexTree(metas), cur?.id ?? null, activeHead.id)?.up.map((v) => v.id) ?? [])

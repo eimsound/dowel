@@ -661,27 +661,33 @@ describe('MSSQL URL parsing and shadow naming (pure unit)', () => {
           close: async () => {},
         }) as Shadow;
 
-      // 即使上游 mock 传入了版本组键 / 目标组 / shadowMajor，不按版本分组的方言也不能记录 targets 或版本标签文案
-      created.shadows.forProjectVersions = async () => ({
-        targetGroupKey: 16,
-        skippedGroups: [],
-        entries: [
-          {
-            groupKey: 16,
-            envId: 'e-mssql-16',
-            label: 'dev：app_dowel',
-            shadow: stubShadow(async () => ({
-              ok: true,
-              up: [],
-              down: [],
-              upDiff: [],
-              downDiff: [],
-              risks: [],
-              error: null,
-              shadowMajor: 16,
-            })),
-          },
-        ],
+      // MSSQL 也按数据库完整版本号（构建号）记录验证结果（ADR 0017 决定 5）；文案与影子库标签不能带 “PG ...”
+      const BUILD = '16.0.4175.1';
+      const stubEngine = (report: Awaited<ReturnType<Shadow['verifyScripts']>>) => {
+        created.shadows.forProjectEngineVersions = async () => ({
+          entries: [
+            {
+              engineVersion: BUILD,
+              envId: 'e-mssql-16',
+              label: 'dev：app_dowel',
+              shadow: stubShadow(async () => report),
+            },
+          ],
+          skipped: [],
+          environments: [{ id: 'e-mssql-16', name: 'dev', engineVersion: BUILD }],
+          identical: false,
+        });
+      };
+      stubEngine({
+        ok: true,
+        up: [],
+        down: [],
+        upDiff: [],
+        downDiff: [],
+        risks: [],
+        error: null,
+        shadowMajor: 16,
+        engineVersion: BUILD,
       });
 
       const okRes = await created.app.request(`/api/projects/${pid}/versions`, {
@@ -691,40 +697,31 @@ describe('MSSQL URL parsing and shadow naming (pure unit)', () => {
       });
       expect(okRes.status).toBe(201);
       const okData = (await okRes.json()) as VersionCreated;
-      expect(okData.verified).toBe(true);
+      expect(okData).toMatchObject({ verified: true, verifiedOn: [BUILD], uncovered: [] });
 
       const detRes = await created.app.request(`/api/projects/${pid}/versions/${okData.id}`, {
         headers: { cookie },
       });
       expect(detRes.status).toBe(200);
       const det = (await detRes.json()) as VersionDetail;
-      expect(det.verifyReport?.targets).toBeUndefined();
-      expect(det.verifyReport?.missingTargetMajor).toBeUndefined();
-      expect(det.verifyReport?.shadow).toBe('dev：app_dowel');
+      expect(det.verifyReport?.records).toEqual([
+        expect.objectContaining({ engineVersion: BUILD, ok: true }),
+      ]);
+      expect(det.verifyReport?.shadow).toContain('dev：app_dowel');
       expect(det.verifyReport?.shadow).not.toContain('PG');
 
-      // 失败场景：错误文案与 shadow 标签不能带 "PG ..." 前缀，且不返回 targets
+      // 失败场景：错误文案与 shadow 标签按构建号说明，不能带 "PG ..." 前缀
       await addMssqlTable('orders');
-      created.shadows.forProjectVersions = async () => ({
-        targetGroupKey: 16,
-        skippedGroups: [],
-        entries: [
-          {
-            groupKey: 16,
-            envId: 'e-mssql-16',
-            label: 'dev：app_dowel',
-            shadow: stubShadow(async () => ({
-              ok: false,
-              up: [],
-              down: [],
-              upDiff: [],
-              downDiff: [],
-              risks: [],
-              error: { step: null, message: 'ddl failed' },
-              shadowMajor: 16,
-            })),
-          },
-        ],
+      stubEngine({
+        ok: false,
+        up: [],
+        down: [],
+        upDiff: [],
+        downDiff: [],
+        risks: [],
+        error: { step: null, message: 'ddl failed' },
+        shadowMajor: 16,
+        engineVersion: BUILD,
       });
 
       const failRes = await created.app.request(`/api/projects/${pid}/versions`, {
@@ -734,12 +731,12 @@ describe('MSSQL URL parsing and shadow naming (pure unit)', () => {
       });
       expect(failRes.status).toBe(422);
       const failBody = (await failRes.json()) as PublishRejected;
-      expect(failBody.error).toBe('闭环验证没有通过，版本没有发布。请先修正模型');
+      expect(failBody.code).toBe('verify_failed');
+      expect(failBody.error).toBe(`${BUILD} 影子库闭环验证没有通过，版本没有发布。请先修正模型`);
       expect(failBody.error).not.toContain('PG');
-      expect(failBody.report).toBeDefined();
-      expect(failBody.report?.error?.message).toBe('ddl failed');
-      expect(failBody.report?.shadow).toBe('dev：app_dowel');
-      expect(failBody.report?.targets).toBeUndefined();
+      expect(failBody.report?.error?.message).toBe(`${BUILD} 验证失败：ddl failed`);
+      expect(failBody.report?.shadow).toContain('dev：app_dowel');
+      expect(failBody.report?.shadow).not.toContain('PG');
     } finally {
       created.drift.stop();
       created.requests.stop();

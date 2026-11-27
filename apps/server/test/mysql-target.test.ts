@@ -10,6 +10,7 @@ import type {
   ExecEvent,
   ProjectCreated,
   ProjectInfo,
+  PublishRejected,
   TargetInfo,
   VersionCreated,
   VersionDetail,
@@ -408,6 +409,9 @@ describe('MySQL 目标库服务端驱动与全栈', () => {
       const sel = await mixShadows.forProjectVersions(mixPid);
       expect(sel.targetGroupKey).toBe(804);
       expect(sel.entries.map((e) => e.groupKey)).toEqual([804, 907]);
+      // 闭环验证按 MySQL 三段完整版本号分组（ADR 0017 决定 5）
+      const byVersion = await mixShadows.forProjectEngineVersions(mixPid);
+      expect(byVersion.entries.map((e) => e.engineVersion)).toEqual(['8.4.13', '9.7.0']);
       // 对外 PG 大版本字段对 MySQL 项目恒为空
       expect(await projectPgVersionSummary(pdb, mixPid)).toEqual({ targetPgMajor: null, envPgMajors: [] });
     } finally {
@@ -442,99 +446,108 @@ describe('MySQL 目标库服务端驱动与全栈', () => {
         close: async () => {},
       }) as Shadow;
 
-    const origForProjectVersions = shadows.forProjectVersions.bind(shadows);
+    const okReport = (engineVersion: '9.7.0') => ({
+      ok: true,
+      up: [],
+      down: [],
+      upDiff: [],
+      downDiff: [],
+      risks: [],
+      error: null,
+      shadowMajor: null,
+      shadowVersionNum: 90700,
+      engineVersion,
+    });
+    const environments = [
+      { id: 'e-dev-97', name: 'dev97', engineVersion: '9.7.0' },
+      { id: 'e-prod-84', name: 'prod84', engineVersion: '8.4.13' },
+    ];
+    const origForProjectEngineVersions = shadows.forProjectEngineVersions.bind(shadows);
     try {
-      // 场景 A：缺失 8.4 影子库（仅有 9.7 影子库通过）
-      shadows.forProjectVersions = async () => ({
+      // 场景 A（ADR 0017 决定 5）：没有 8.4.13 的影子库、只有 9.7.0 通过 → 凭 9.7.0 发布，prod84 列为未覆盖（不再按最低目标版本门禁拒绝），
+      // 文案按 MySQL 三段版本号，不误拼 PG 804
+      shadows.forProjectEngineVersions = async () => ({
         entries: [
           {
-            groupKey: 907,
+            engineVersion: '9.7.0',
             envId: 'e-dev-97',
             label: 'dev97：shadow97',
-            shadow: stubShadow(async () => ({
-              ok: true,
-              up: [],
-              down: [],
-              upDiff: [],
-              downDiff: [],
-              risks: [],
-              error: null,
-              shadowMajor: null,
-              shadowVersionNum: 90700,
-            })),
+            shadow: stubShadow(async () => okReport('9.7.0')),
           },
         ],
-        skippedGroups: [
-          {
-            groupKey: 804,
-            reason: '环境“prod84”是生产环境，默认不在同一实例上建影子库',
-          },
-        ],
-        targetGroupKey: 804,
+        skipped: [{ engineVersion: '8.4.13', reason: '环境“prod84”是生产环境，默认不在同一实例上建影子库' }],
+        environments,
+        identical: false,
       });
 
       const missingRes = await req('POST', `/api/projects/${mixVerPid}/versions`, { name: 'v1-missing-84' });
       expect(missingRes.status).toBe(201);
       const vMissing = (await missingRes.json()) as VersionCreated;
-      expect(vMissing.verified).toBe(false);
-      expect(vMissing.unverifiedReason).toContain('MySQL 8.4');
-      expect(vMissing.unverifiedReason).not.toMatch(/PG\s*804/);
-
+      expect(vMissing).toMatchObject({
+        verified: true,
+        verifiedOn: ['9.7.0'],
+        uncovered: [{ id: 'e-prod-84', name: 'prod84', engineVersion: '8.4.13' }],
+      });
       const missingDetailRes = await req('GET', `/api/projects/${mixVerPid}/versions/${vMissing.id}`);
       expect(missingDetailRes.status).toBe(200);
       const missingDetail = (await missingDetailRes.json()) as VersionDetail;
-      expect(missingDetail.verifiedAt).toBeNull();
-      expect(missingDetail.verifyReport?.ok).toBe(false);
-      expect(missingDetail.verifyReport?.missingTargetMajor ?? null).toBeNull();
-      expect(missingDetail.verifyReport?.error?.message).toContain('MySQL 8.4');
-      expect(missingDetail.verifyReport?.error?.message).not.toMatch(/PG\s*804/);
+      expect(missingDetail.verifiedOn).toEqual(['9.7.0']);
+      expect(JSON.stringify(missingDetail.verifyReport)).not.toMatch(/PG\s*804/);
 
-      // 场景 B：声明 8.4 影子库但实测返回 shadowVersionNum: 90700（版本错配）
+      // 场景 B：声明 8.4.13 的影子库实测是 9.7.0（版本错配）、9.7 环境没有影子库：按实测版本记录；
+      // 9.7.0 的环境确实存在，所以凭它发布，prod84 仍未覆盖
       await editModel(rooms, pdb, mixVerPid, (m) => {
         const items = all(m, 'table').find((t) => t.name === 'items')!;
         addColumn(m, items.id, { name: 'label', type: 'varchar(64)', notNull: true });
       });
-      shadows.forProjectVersions = async () => ({
+      shadows.forProjectEngineVersions = async () => ({
         entries: [
           {
-            groupKey: 804,
+            engineVersion: '8.4.13',
             envId: 'e-prod-84',
             label: 'prod84：shadow84',
-            shadow: stubShadow(async () => ({
-              ok: true,
-              up: [],
-              down: [],
-              upDiff: [],
-              downDiff: [],
-              risks: [],
-              error: null,
-              shadowMajor: null,
-              shadowVersionNum: 90700,
-            })),
+            shadow: stubShadow(async () => okReport('9.7.0')),
           },
         ],
-        skippedGroups: [],
-        targetGroupKey: 804,
+        skipped: [],
+        environments,
+        identical: false,
       });
-
       const mismatchRes = await req('POST', `/api/projects/${mixVerPid}/versions`, {
         name: 'v2-mismatch-84',
       });
       expect(mismatchRes.status).toBe(201);
       const vMismatch = (await mismatchRes.json()) as VersionCreated;
-      expect(vMismatch.verified).toBe(false);
-      expect(vMismatch.unverifiedReason).toContain('MySQL 8.4');
-      expect(vMismatch.unverifiedReason).toContain('MySQL 9.7');
-      expect(vMismatch.unverifiedReason).not.toMatch(/PG\s*804/);
+      expect(vMismatch.verifiedOn).toEqual(['9.7.0']);
+      expect(vMismatch.uncovered).toEqual([{ id: 'e-prod-84', name: 'prod84', engineVersion: '8.4.13' }]);
 
-      const mismatchDetailRes = await req('GET', `/api/projects/${mixVerPid}/versions/${vMismatch.id}`);
-      expect(mismatchDetailRes.status).toBe(200);
-      const mismatchDetail = (await mismatchDetailRes.json()) as VersionDetail;
-      expect(mismatchDetail.verifiedAt).toBeNull();
-      expect(mismatchDetail.verifyReport?.ok).toBe(false);
-      expect(mismatchDetail.verifyReport?.missingTargetMajor ?? null).toBeNull();
+      // 场景 C：只有 prod84 一个环境、它的影子库实测是 9.7.0 → 没有与环境一致的通过记录，拒绝发布
+      await editModel(rooms, pdb, mixVerPid, (m) => {
+        const items = all(m, 'table').find((t) => t.name === 'items')!;
+        addColumn(m, items.id, { name: 'note', type: 'varchar(64)' });
+      });
+      shadows.forProjectEngineVersions = async () => ({
+        entries: [
+          {
+            engineVersion: '8.4.13',
+            envId: 'e-prod-84',
+            label: 'prod84：shadow84',
+            shadow: stubShadow(async () => okReport('9.7.0')),
+          },
+        ],
+        skipped: [],
+        environments: [environments[1]!],
+        identical: false,
+      });
+      const unmatched = await req('POST', `/api/projects/${mixVerPid}/versions`, { name: 'v3-unmatched' });
+      expect(unmatched.status).toBe(422);
+      const rej = (await unmatched.json()) as PublishRejected;
+      expect(rej.code).toBe('no_matching_shadow');
+      expect(rej.error).toContain('9.7.0');
+      expect(rej.error).toContain('8.4.13');
+      expect(rej.error).not.toMatch(/PG\s*804/);
     } finally {
-      shadows.forProjectVersions = origForProjectVersions;
+      shadows.forProjectEngineVersions = origForProjectEngineVersions;
     }
 
     // R2-4: ensureHistory 在 SELECT DATABASE() 抛错时必须销毁预留连接而非泄漏
