@@ -29,7 +29,11 @@ import {
 import { clonePlain, deepEqual } from './json.ts';
 import { all, effectiveColumnsOf } from './model.ts';
 import { BATCH_OPS_LIMIT, type MutatorName, objectIdArg, objectNameArg, runMutator } from './mutators.ts';
+import { isPgSerialArrayType, parsePgSerialType, PG_SERIAL_BASE, pgSerialOf } from './pg/serial.ts';
 import { getDialect } from './registry.ts';
+
+const PG_SERIAL_DESC =
+  "PG: `serial` / `bigserial` / `smallserial` (aliases serial4 / serial8 / serial2, case-insensitive, unquoted) are expanded on write into an `integer` / `bigint` / `smallint` column + NOT NULL + an owned sequence named `<table>_<column>_seq` + default `nextval(<that sequence>)`; the model stores the integer type, never `serial`. Cannot be combined with default / identity / generated / notNull: false. Switching between serial variants updates the owned sequence's type in place; setting any other type (including plain integer) changes only the type — clear the default to stop auto-incrementing.";
 
 // ───── 公共类型 ─────
 
@@ -319,7 +323,9 @@ const macroColumn = z
     type: z
       .string()
       .optional()
-      .describe('Type text; may be omitted (or only array dims like `[]`) when typeRef is set'),
+      .describe(
+        `Type text; may be omitted (or only array dims like \`[]\`) when typeRef is set. ${PG_SERIAL_DESC}`,
+      ),
     typeRef: refSlot.nullable().optional().describe('PG enum: ID / `$ref:<alias>` / `[schema.]name`'),
     notNull: z.boolean().optional(),
     default: macroDefault.nullable().optional(),
@@ -471,7 +477,7 @@ export const alterColumnArgs = z
         'Existing column ID, or `$ref:<alias>` of a column created earlier in this batch (never a name)',
       ),
     name: objectNameArg.optional(),
-    type: z.string().optional(),
+    type: z.string().optional().describe(`Type text. ${PG_SERIAL_DESC}`),
     typeRef: refSlot
       .nullable()
       .optional()
@@ -577,6 +583,16 @@ const compileDefineTable = (m0: Model, a: DefineTableArgs, scope: RefScope, labe
     const hasGenerated = c.generated != null;
     const hasDefault = c.default != null;
     if (hasIdentity && m0.dialect !== 'pg') throw new MacroError(`${p}.identity`, identityHint(m0));
+    if (m0.dialect === 'pg' && c.typeRef == null) {
+      const rawType = c.type ?? '';
+      if (isPgSerialArrayType(rawType)) throw new MacroError(`${p}.type`, 'serial 不能用作数组类型');
+      if (parsePgSerialType(rawType)) {
+        if (hasIdentity) throw new MacroError(p, 'serial 列不能同时是 identity');
+        if (hasGenerated) throw new MacroError(p, 'serial 列不能同时是生成列');
+        if (hasDefault) throw new MacroError(p, 'serial 列不能有默认值');
+        if (c.notNull === false) throw new MacroError(p, 'serial 列必须 NOT NULL');
+      }
+    }
     if (hasIdentity && hasGenerated) throw new MacroError(p, 'identity 列不能同时是生成列');
     if (hasIdentity && hasDefault) throw new MacroError(p, 'identity 列不能有默认值');
     if (hasGenerated && hasDefault) throw new MacroError(p, '生成列不能有默认值');
@@ -923,6 +939,19 @@ const compileAlterColumn = (m0: Model, a: AlterColumnArgs, scope: RefScope, labe
   } else if (a.typeRef === null && c0.typeRef !== null) {
     throw new MacroError('type', '把枚举列改回普通类型（typeRef: null）时需要给出新的 type');
   }
+  const keepsEnum =
+    a.typeRef === undefined &&
+    c0.typeRef !== null &&
+    a.type !== undefined &&
+    enumDimsOf(m0, c0.typeRef, a.type.trim()) !== null;
+  if (m0.dialect === 'pg' && a.typeRef == null && a.type !== undefined && !keepsEnum) {
+    if (isPgSerialArrayType(a.type)) throw new MacroError('type', 'serial 不能用作数组类型');
+    if (parsePgSerialType(a.type)) {
+      if (a.identity != null) throw new MacroError('', 'serial 列不能同时是 identity');
+      if (a.default != null) throw new MacroError('', 'serial 列不能有默认值');
+      if (a.notNull === false) throw new MacroError('', 'serial 列必须 NOT NULL');
+    }
+  }
 
   function* run(): Generator<MacroStep, void, Model> {
     let m = m0;
@@ -944,6 +973,7 @@ const compileAlterColumn = (m0: Model, a: AlterColumnArgs, scope: RefScope, labe
     {
       const c = col();
       let target: { type: string; typeRef: string | null } | null = null;
+      let forceTypeStep = false;
       const reads: string[] = [];
       if (a.typeRef != null) {
         const r = resolveQualified(m, scope, a.typeRef, 'typeRef', 'enum');
@@ -959,13 +989,24 @@ const compileAlterColumn = (m0: Model, a: AlterColumnArgs, scope: RefScope, labe
         const t = a.type.trim();
         // 枚举列只改数组维度（或写成枚举名加维度）时保留枚举；否则切换为普通类型
         const dims = a.typeRef === undefined && c.typeRef !== null ? enumDimsOf(m, c.typeRef, t) : null;
-        // 普通类型按方言规范写法比较（setColumnType 也会这样写入），int → integer 这类只换写法的修改不产生空操作
-        target =
-          dims !== null
-            ? { type: dims, typeRef: c.typeRef }
-            : { type: t ? getDialect(m.dialect).normalizeType(t) : t, typeRef: null };
+        if (dims !== null) {
+          target = { type: dims, typeRef: c.typeRef };
+        } else {
+          const serialKind = m.dialect === 'pg' ? parsePgSerialType(t) : null;
+          if (serialKind) {
+            const base = PG_SERIAL_BASE[serialKind];
+            const curSerial = pgSerialOf(m, c);
+            if (!(curSerial?.kind === serialKind && c.notNull && curSerial.sequence.options.type === base)) {
+              target = { type: serialKind, typeRef: null };
+              forceTypeStep = true;
+            }
+          } else {
+            // 普通类型按方言规范写法比较（setColumnType 也会这样写入），int → integer 这类只换写法的修改不产生空操作
+            target = { type: t ? getDialect(m.dialect).normalizeType(t) : t, typeRef: null };
+          }
+        }
       }
-      if (target && (target.type !== c.type || target.typeRef !== c.typeRef)) {
+      if (target && (forceTypeStep || target.type !== c.type || target.typeRef !== c.typeRef)) {
         m = yield step(
           'setColumnType',
           { id: colId, ...target },
@@ -1021,14 +1062,12 @@ const macroDef = <A extends z.ZodType>(d: MacroDef<A>) => d;
 export const macros = {
   defineTable: macroDef({
     args: defineTableArgs,
-    description:
-      "Macro: create a table with columns, primary key, uniques, checks, indexes, foreign keys, comments, ext and optional partitions in one op. Columns / keys may refer to this table's columns by name; schema / typeRef / refTable / refColumns / default.nextval / partitions[].schema may be resolved by ID, `$ref:<alias>` or (qualified) name. Expands to primitive mutators in a fixed order (createTable → addColumn → setPartitionBy → addPrimaryKey (+ renameKey) → setTableExt → deferred SQLite setColumnExt (autoincrement) → addUnique / addCheck / addIndex / addForeignKey (each followed by renameKey when `name` is given) → createPartition → setComment). For circular foreign keys, define all tables first and add the remaining FKs with addForeignKey.",
+    description: `Macro: create a table with columns, primary key, uniques, checks, indexes, foreign keys, comments, ext and optional partitions in one op. Columns / keys may refer to this table's columns by name; schema / typeRef / refTable / refColumns / default.nextval / partitions[].schema may be resolved by ID, \`$ref:<alias>\` or (qualified) name. Expands to primitive mutators in a fixed order (createTable → addColumn → setPartitionBy → addPrimaryKey (+ renameKey) → setTableExt → deferred SQLite setColumnExt (autoincrement) → addUnique / addCheck / addIndex / addForeignKey (each followed by renameKey when \`name\` is given) → createPartition → setComment). For circular foreign keys, define all tables first and add the remaining FKs with addForeignKey. ${PG_SERIAL_DESC}`,
     compile: compileDefineTable,
   }),
   alterColumn: macroDef({
     args: alterColumnArgs,
-    description:
-      'Macro: declaratively patch an existing column (name, type / typeRef, notNull, default, identity, ext, comment; omitted = unchanged, null = clear). `id` must be an existing column ID or a `$ref:<alias>` created earlier in this batch — never a name; the references typeRef / default.nextval may also be ID, `$ref` or `[schema.]name`. `ext` replaces the whole column ext (null clears it); on SQL Server an explicit default-constraint name is kept automatically unless ext.mssql sets defaultName / defaultNameMode. Expands safely in the order: drop identity → clear default → renameColumn → setColumnType → setNotNull → set default → set identity → setColumnExt → setComment; steps whose value already matches are skipped.',
+    description: `Macro: declaratively patch an existing column (name, type / typeRef, notNull, default, identity, ext, comment; omitted = unchanged, null = clear). \`id\` must be an existing column ID or a \`$ref:<alias>\` created earlier in this batch — never a name; the references typeRef / default.nextval may also be ID, \`$ref\` or \`[schema.]name\`. \`ext\` replaces the whole column ext (null clears it); on SQL Server an explicit default-constraint name is kept automatically unless ext.mssql sets defaultName / defaultNameMode. Expands safely in the order: drop identity → clear default → renameColumn → setColumnType → setNotNull → set default → set identity → setColumnExt → setComment; steps whose value already matches are skipped. ${PG_SERIAL_DESC}`,
     compile: compileAlterColumn,
   }),
 };
