@@ -13,6 +13,7 @@ import {
   PlanError,
   type PlanOptions,
   plan,
+  setMssqlInferredNotNull,
   type Step,
 } from '@dowel/core';
 import {
@@ -20,6 +21,8 @@ import {
   getEngine,
   mssqlErrorCode,
   mssqlErrorNumber,
+  type MssqlNullabilityProbe,
+  probeMssqlInferredNotNull,
   reconcileIds,
   type ScriptStep,
 } from '@dowel/engines';
@@ -69,7 +72,7 @@ export interface Shadow {
    * 派生数据（04-ir-design.md 2.6）：建出 prev（已规范化的版本）并执行到 next 的迁移（若规划抛 `PlanError`，
    * 或非空 prev 建库遇非基础设施 `StepError` 且无依赖或父对象改名的不透明对象，则回退为从空库直接建出 next），
    * 读回引擎输出，返回 next 中与引擎规范形式不同的对象（已换成规范形式）。写回的字段：CHECK 的 `expr`；列表达式默认值的 `expr`；
-   * 生成列的 `expr` 连同引擎推导的 `type`（MSSQL 持久化生成列还有 `notNull`）；索引表达式元素的 `expr` 与 `where`；
+   * 生成列的 `expr` 连同引擎推导的 `type`（MSSQL 持久化计算列还有引擎推断的 `ext.mssql.inferredNotNull`，显式 `notNull` 不动，ADR 0019）；索引表达式元素的 `expr` 与 `where`；
    * 表的分区键 `partitionBy.keys[].expr` 与分区边界 `partitionOf.bound`；不透明对象的 `ddl`。
    */
   canonicalize(prev: Model, next: Model): Promise<Obj[]>;
@@ -347,6 +350,40 @@ export const assertImportable = (sql: string, dialect: Dialect = 'pg'): Importab
   return checked as ImportableSql;
 };
 
+type Column = Extract<Obj, { kind: 'column' }>;
+
+/** 在模型 m 里定位列所在的表（schema、表名、表上全部列名），供影子库里的可空性探测用 */
+const probeOf = (m: Model, c: Column, expr: string): MssqlNullabilityProbe | null => {
+  const t = m.objects[c.parent];
+  if (t?.kind !== 'table') return null;
+  const s = m.objects[t.parent];
+  if (s?.kind !== 'schema') return null;
+  const columns = Object.values(m.objects)
+    .filter((o): o is Column => o.kind === 'column' && o.parent === t.id)
+    .map((o) => o.name);
+  return { schema: s.name, table: t.name, expr, columns };
+};
+
+/**
+ * SQL Server：影子库里探测一批持久化计算列的表达式本身是否被推断为非空（ADR 0019），返回 列 ID → 推断值。
+ * 只在影子库里调用（会临时加删列）；m 是影子库读回、ID 已对回的模型。
+ */
+const probeInferred = async (d: Db, m: Model, cols: readonly Column[]): Promise<Map<string, boolean>> => {
+  const items: { id: string; probe: MssqlNullabilityProbe }[] = [];
+  for (const c of cols) {
+    const p = c.generated ? probeOf(m, c, c.generated.expr) : null;
+    if (p) items.push({ id: c.id, probe: p });
+  }
+  const out = new Map<string, boolean>();
+  if (!items.length) return out;
+  const res = await probeMssqlInferredNotNull(
+    d,
+    items.map((x) => x.probe),
+  );
+  items.forEach((x, i) => out.set(x.id, res[i]!));
+  return out;
+};
+
 export const shadowOps = (
   db: () => Promise<Db>,
   schemas?: string[] | null,
@@ -380,7 +417,27 @@ export const shadowOps = (
       // 不在这里脱敏：错误只会走全局 onError（422）或 SSE 的 send，出口统一过 scrubSecrets
       throw new ShadowError(e instanceof Error ? e.message : String(e));
     }
-    return engine.importSnapshot(await engine.readSnapshot(d, schemas));
+    const model = engine.importSnapshot(await engine.readSnapshot(d, schemas));
+    if (dialect !== 'mssql') return model;
+    // SQL Server 持久化计算列（ADR 0019）：导入一律记成推断非空；表达式本身被推断为可空、读回却非空的，
+    // 只能是 SQL 里显式写了 PERSISTED NOT NULL，还原成显式声明。两者都非空时分不出来，按推断记
+    const observed = Object.values(model.objects).filter(
+      (o): o is Column =>
+        o.kind === 'column' && !!o.generated?.stored && o.ext?.mssql?.inferredNotNull === true,
+    );
+    let inferred: Map<string, boolean>;
+    try {
+      inferred = await probeInferred(d, model, observed);
+    } catch (e) {
+      if (isInfraFailure(e, statementTimeoutMs)) throw toShadowError(e);
+      throw e;
+    }
+    for (const c of observed) {
+      if (inferred.get(c.id) !== false) continue;
+      c.notNull = true;
+      setMssqlInferredNotNull(c, false);
+    }
+    return model;
   },
   canonicalize: async (prev: Model, next: Model): Promise<Obj[]> => {
     let d: Db;
@@ -441,6 +498,25 @@ export const shadowOps = (
       throw e;
     }
     const imported = reconcileIds(next, engine.importSnapshot(snapshot));
+    // SQL Server 持久化计算列的推断非空（ADR 0019）：没有显式 NOT NULL 的列，读回的可空性就是引擎的推断；
+    // 显式 NOT NULL 的列读回恒为非空，要在影子库里单独探测表达式本身的推断。只写 ext.mssql.inferredNotNull，
+    // 绝不改用户的显式 notNull
+    let probed = new Map<string, boolean>();
+    if (dDialect === 'mssql') {
+      const explicit = Object.values(next.objects).filter(
+        (o): o is Column => o.kind === 'column' && !!o.generated?.stored && o.notNull,
+      );
+      const targets = explicit.flatMap((o) => {
+        const e = imported.objects[o.id];
+        return e?.kind === 'column' && e.generated?.stored ? [e] : [];
+      });
+      try {
+        probed = await probeInferred(d, imported, targets);
+      } catch (e) {
+        if (isInfraFailure(e, statementTimeoutMs)) throw toShadowError(e);
+        throw e;
+      }
+    }
     const out: Obj[] = [];
     for (const o of Object.values(next.objects)) {
       const e = imported.objects[o.id];
@@ -474,7 +550,14 @@ export const shadowOps = (
         if (c.generated && e.generated) {
           c.generated = { ...c.generated, expr: e.generated.expr };
           c.type = e.type;
-          if (dDialect === 'mssql' && c.generated.stored) c.notNull = e.notNull;
+          if (dDialect === 'mssql') {
+            const inferred = !c.generated.stored
+              ? false
+              : c.notNull
+                ? (probed.get(c.id) ?? false)
+                : e.ext?.mssql?.inferredNotNull === true;
+            setMssqlInferredNotNull(c, inferred);
+          }
         }
         if (c.default && 'expr' in c.default && e.default && 'expr' in e.default)
           c.default = { expr: e.default.expr };
