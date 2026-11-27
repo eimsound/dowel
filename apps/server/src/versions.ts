@@ -34,7 +34,7 @@ import { emptyBase, versionExecutedAnywhere } from './chain.ts';
 import type { OpaqueRefresher } from './derive.ts';
 import { iso, projectPlanOptions, verifiedOnOf } from './envs.ts';
 import { scrubSecrets } from './secrets.ts';
-import { recordOf, ShadowError, storedReport } from './shadow.ts';
+import { recordOf, ShadowConfigChangedError, ShadowError, storedReport } from './shadow.ts';
 import type { Shadows } from './shadows.ts';
 
 /** 概要字段：版本列表用 */
@@ -361,7 +361,10 @@ export type ShadowVerifyOutcome =
       uncovered: UncoveredEnvironment[];
     };
 
-/** 读回核对发现的写法差异（不是脚本失败、也不是两份影子库快照不一致） */
+/**
+ * 读回核对发现的写法差异（要求 upDiff 与 downDiff 均为空，既不是脚本失败也不是两份影子库快照不一致）；
+ * 若同一份报告里同时存在快照差异（upDiff / downDiff）和读回差异，按常规 verify_failed 处理，不单独归为读回差异并打印服务端日志。
+ */
 const isReadbackOnly = (r: VerifyReport) =>
   !r.ok && !r.error && !r.upDiff.length && !r.downDiff.length && (r.readbackTotal ?? 0) > 0;
 
@@ -371,7 +374,8 @@ const isReadbackOnly = (r: VerifyReport) =>
  *   风险分析只在第一个可用的影子库上做一次；每个影子库按它实际读到的完整版本号记一条验证记录，与 previous 合并；
  * - 任何一个可用影子库验证失败 → failed（发布拒绝；重新验证如实记下）；
  * - 只有与某个环境的完整版本号一致、且通过的记录才算验证依据：一条都没有 → unmatched；SQLite 内置库视为恒等；
- * - 没有任何可用影子库（没有环境、全部连不上）→ 抛 ShadowError（发布拒绝、稍后重试）。
+ * - 没有任何可用影子库（没有环境、全部连不上）→ 抛 ShadowError（发布拒绝、稍后重试）；
+ * - 任一影子库句柄因配置变更被关闭（ShadowConfigChangedError）→ 原样抛出（可重试），不当成该版本组不可用。
  * 原先“最低目标版本组必须有影子库”的规则已删除：每个环境由自己的数据库版本把关（执行器按目标库完整版本号检查）。
  */
 export const verifyOnShadows = async (
@@ -423,7 +427,8 @@ export const verifyOnShadows = async (
         ...(o.planOpts?.mysqlVersionNum !== undefined ? { mysqlVersionNum: o.planOpts.mysqlVersionNum } : {}),
       });
     } catch (e) {
-      if (!(e instanceof ShadowError)) throw e;
+      // 配置已变更：旧影子库上的结论不能用，也不能当成“这个版本组运行时不可用”跳过（会少验证一组），整体抛给调用方重试
+      if (!(e instanceof ShadowError) || e instanceof ShadowConfigChangedError) throw e;
       runtimeSkipped.push(scrubSecrets(e.message));
       continue;
     }

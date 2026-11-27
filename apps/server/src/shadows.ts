@@ -12,7 +12,7 @@ import { HTTPException } from 'hono/http-exception';
 import type { ClusterEvent, ClusterEventPayload, EventBus } from './bus.ts';
 import type { PlatformDb } from './db.ts';
 import { decrypt, scrubSecrets } from './secrets.ts';
-import { type Shadow, ShadowError, ShadowUnavailableError } from './shadow.ts';
+import { type Shadow, ShadowConfigChangedError, ShadowError, ShadowUnavailableError } from './shadow.ts';
 import {
   type ConnectionGuard,
   getTargetDriver,
@@ -202,6 +202,79 @@ export class Shadows {
     return p?.dialect ?? 'pg';
   }
 
+  private async readValidatedEnv(pid: string, id: string): Promise<{ env: Env; fingerprint: string }> {
+    let env: Env;
+    try {
+      env = await this.env(pid, id);
+    } catch (e) {
+      if (e instanceof HTTPException && e.status === 404 && this.cache.has(id)) {
+        await this.forgetLocal(id);
+      }
+      throw e;
+    }
+
+    const fingerprint = configFingerprint(env);
+    // 每次取影子库 / 复核配置都重新过一遍白名单：缓存的连接可能是白名单收紧之前建立的，
+    // 已经在用的连接不会自动重连，所以不能只靠连接层的检查（实例设置改严后要立刻生效）
+    try {
+      await this.guard?.(env.url);
+      if (env.shadowUrl) await this.guard?.(env.shadowUrl);
+    } catch (e) {
+      const hit = this.cache.get(id);
+      if (hit && (hit.projectId !== pid || hit.fingerprint === fingerprint)) {
+        await this.forgetLocal(id);
+      }
+      throw e;
+    }
+    return { env, fingerprint };
+  }
+
+  /**
+   * 选影前的缓存核对与过期淘汰（Issue #154）：`readValidatedEnv` 与 `forgetLocal` 都会 await，
+   * 期间配置可能已被修改或有其他请求按新配置建好缓存条目。只要失效代际推进或缓存条目指纹不同，
+   * 必须先重读最新配置再决定谁过期——且仅关闭重读之前就已经观察到的那个缓存条目（`stale === hit`），
+   * 若重读期间条目已被并发替换或失效代际推进则回到循环开头重新核对。
+   *
+   * 精确保证：只要决策时刻可读配置是最新的、或缓存已有新条目、或失效事件已送达，绝不关闭指纹与最新配置一致的条目，
+   * 也绝不用已知过期的快照调 `prepareShadow`。跨副本客观边界：若缓存为空、远端 `shadows.forget` 尚未送达且唯一一次
+   * 读配置拿到的是旧快照，本副本此时无法得知变更，可能暂按旧配置建库，直至事件送达由 `revalidateLocal` 关闭。
+   */
+  private async resolveBeforePrepare(
+    pid: string,
+    id: string,
+  ): Promise<
+    { kind: 'hit'; entry: CacheEntry } | { kind: 'prepare'; env: Env; fingerprint: string; gen: number }
+  > {
+    if (this.closed) throw new ShadowUnavailableError('服务正在关闭');
+    let checked = this.invalidationGen;
+    let current = await this.readValidatedEnv(pid, id);
+    for (let round = 0; ; round++) {
+      if (this.closed) throw new ShadowUnavailableError('服务正在关闭');
+      const hit = this.cache.get(id);
+      if (this.invalidationGen === checked) {
+        if (hit && hit.projectId === pid && hit.fingerprint === current.fingerprint) {
+          return { kind: 'hit', entry: hit };
+        }
+        if (!hit) {
+          return { kind: 'prepare', env: current.env, fingerprint: current.fingerprint, gen: checked };
+        }
+      }
+      if (round >= MAX_PREPARE_ATTEMPTS) throw new ShadowConfigChangedError();
+      checked = this.invalidationGen;
+      const latest = await this.readValidatedEnv(pid, id);
+      if (this.closed) throw new ShadowUnavailableError('服务正在关闭');
+      if (latest.fingerprint !== current.fingerprint) {
+        current = latest;
+        continue;
+      }
+      if (this.invalidationGen !== checked) continue;
+      const stale = this.cache.get(id);
+      if (stale && stale === hit && (stale.projectId !== pid || stale.fingerprint !== current.fingerprint)) {
+        await this.forgetLocal(id, false);
+      }
+    }
+  }
+
   /** 选影子库：SQLite 直接用内存影子库（无需环境）；PG 等指定了环境用它，没指定用项目的第一个环境 */
   async forProject(pid: string, eid?: string): Promise<{ shadow: Shadow; label: string }> {
     const dialect = await this.projectDialect(pid);
@@ -211,12 +284,13 @@ export class Shadows {
     for (let attempt = 0; attempt < MAX_PREPARE_ATTEMPTS; attempt++) {
       let id = eid;
       if (!id) {
+        const observed = this.snapshotProjectCache(pid);
         const rows = await this.db.query<{ id: string }>(
           'select id from environments where project_id = $1 order by created_at',
           [pid],
         );
         const liveIds = new Set(rows.map((r) => r.id));
-        await this.pruneRemovedForProject(pid, liveIds);
+        await this.pruneRemovedForProject(observed, liveIds);
         const first = rows[0];
         if (!first)
           throw new ShadowError(
@@ -226,75 +300,79 @@ export class Shadows {
         id = first.id;
       }
 
-      const gen = this.invalidationGen;
-      let env: Env;
-      try {
-        env = await this.env(pid, id);
-      } catch (e) {
-        if (e instanceof HTTPException && e.status === 404 && this.cache.has(id)) {
-          await this.forgetLocal(id);
-        }
-        throw e;
-      }
-
-      // 每次取影子库都重新过一遍白名单：缓存的连接可能是白名单收紧之前建立的，
-      // 已经在用的连接不会自动重连，所以不能只靠连接层的检查（实例设置改严后要立刻生效）
-      try {
-        await this.guard?.(env.url);
-        if (env.shadowUrl) await this.guard?.(env.shadowUrl);
-      } catch (e) {
-        if (this.cache.has(id)) await this.forgetLocal(id);
-        throw e;
-      }
-
-      // 完整配置指纹校验：schema 范围、连接串、独立影子库、生产标记、允许同实例任一变更都必须淘汰旧连接
-      const fingerprint = configFingerprint(env);
-      const hit = this.cache.get(id);
-      if (hit && hit.projectId === pid && hit.fingerprint === fingerprint) return hit;
-      if (hit) await this.forgetLocal(id, false);
+      const resolved = await this.resolveBeforePrepare(pid, id);
+      if (resolved.kind === 'hit') return resolved.entry;
+      const { env, fingerprint, gen } = resolved;
 
       const { shadow, label } = await prepareShadow(env, env.schemas, this.guard, env.dialect);
+      const entry = await this.admit(pid, id, gen, { shadow, label, projectId: pid, fingerprint });
+      if (entry) return entry;
+    }
 
+    throw new ShadowConfigChangedError();
+  }
+
+  /**
+   * 把刚建好的句柄放进缓存，或者判定它已经过期（Issue #154）。**每一次 await 之后**都重新检查 `closed`
+   * 与失效代际：复核最新配置、关掉缓存里过期的条目都要 await，期间可能又来一次失效事件、`Shadows.close()`
+   * 或被其他请求按更新配置替换缓存条目。仅关闭重读之前就已经观察到的那个 `existing`（`stale === existing`）
+   * 且重读期间代际未推进，绝不误关重读期间新入缓存的条目，也不会把旧配置或停机后建出的句柄放进缓存。
+   * - 返回缓存条目（刚放进去的，或缓存里已有的、与最新配置一致的那个——此时关掉自己建的）；
+   * - 返回 null：自己建的句柄相对最新配置已过期，已关闭，由 forProject 重试；
+   * - 服务关闭、复核时读配置 / 白名单失败：关掉自己建的句柄并抛错。
+   */
+  private async admit(pid: string, id: string, gen: number, entry: CacheEntry): Promise<CacheEntry | null> {
+    const drop = () => entry.shadow.close().catch(() => {});
+    let checked = gen;
+    for (let round = 0; ; round++) {
       if (this.closed) {
-        await shadow.close().catch(() => {});
+        await drop();
         throw new ShadowUnavailableError('服务正在关闭');
       }
-
-      // prepareShadow 期间如果收到了外部失效/重连事件，复核最新配置再决定是否入缓存，避免旧配置句柄复活
-      if (this.invalidationGen !== gen) {
-        let latest: Env;
+      const existing = this.cache.get(id);
+      if (existing && existing.projectId === pid && existing.fingerprint === entry.fingerprint) {
+        await drop();
+        return existing;
+      }
+      // 期间收到过外部失效 / 重连事件，或缓存里出现了别的配置的条目（谁的配置才是最新的不知道）：复核最新配置
+      if (this.invalidationGen !== checked || existing) {
+        if (round >= MAX_PREPARE_ATTEMPTS) {
+          await drop();
+          throw new ShadowConfigChangedError();
+        }
+        checked = this.invalidationGen;
+        let latest: string;
         try {
-          latest = await this.env(pid, id);
-          await this.guard?.(latest.url);
-          if (latest.shadowUrl) await this.guard?.(latest.shadowUrl);
+          latest = (await this.readValidatedEnv(pid, id)).fingerprint;
         } catch (e) {
-          await shadow.close().catch(() => {});
-          if (e instanceof HTTPException && e.status === 404 && this.cache.has(id)) {
-            await this.forgetLocal(id);
-          }
+          await drop();
           throw e;
         }
-        if (configFingerprint(latest) !== fingerprint) {
-          await shadow.close().catch(() => {});
-          continue;
+        if (this.closed) {
+          await drop();
+          throw new ShadowUnavailableError('服务正在关闭');
         }
-      }
-
-      const existing = this.cache.get(id);
-      if (existing) {
-        if (existing.projectId === pid && existing.fingerprint === fingerprint) {
-          await shadow.close().catch(() => {});
-          return existing;
+        if (latest !== entry.fingerprint) {
+          // 自己建的是旧配置：关掉重来（缓存里若是按最新配置建的条目，重试时直接命中它，不会误关）
+          await drop();
+          return null;
         }
-        await this.forgetLocal(id, false);
+        if (this.invalidationGen !== checked) continue;
+        // 自己的配置就是最新的，缓存里的条目才过期：只关重读之前观察到的那个 existing；
+        // 若复核期间已被并发替换，不误关，回到循环开头重新核对
+        const stale = this.cache.get(id);
+        if (
+          stale &&
+          stale === existing &&
+          (stale.projectId !== pid || stale.fingerprint !== entry.fingerprint)
+        ) {
+          await this.forgetLocal(id, false);
+        }
+        continue;
       }
-
-      const entry: CacheEntry = { shadow, label, projectId: pid, fingerprint };
       this.cache.set(id, entry);
       return entry;
     }
-
-    throw new ShadowUnavailableError('影子库配置已变更，请重试');
   }
 
   /**
@@ -321,6 +399,7 @@ export class Shadows {
       };
     }
 
+    const observed = this.snapshotProjectCache(pid);
     const rows = await this.db.query<{
       id: string;
       production: boolean;
@@ -333,7 +412,7 @@ export class Shadows {
       [pid],
     );
     const liveIds = new Set(rows.map((r) => r.id));
-    await this.pruneRemovedForProject(pid, liveIds);
+    await this.pruneRemovedForProject(observed, liveIds);
     if (!rows.length) {
       throw new ShadowError(
         '项目还没有配置环境。导入 SQL、验证迁移都需要一个真实的数据库实例作影子库，请先在“环境”里添加项目要部署到的数据库',
@@ -375,7 +454,8 @@ export class Shadows {
           picked = true;
           break;
         } catch (e) {
-          if (!(e instanceof ShadowError)) throw e;
+          // 配置已变更是可重试的暂时状态：整体重试，不能把这个版本组当成“没有可用影子库”跳过
+          if (!(e instanceof ShadowError) || e instanceof ShadowConfigChangedError) throw e;
           if (firstReason === '没有可用的影子库') firstReason = scrubSecrets(e.message);
         }
       }
@@ -395,6 +475,7 @@ export class Shadows {
    */
   async forProjectEngineVersions(pid: string): Promise<ProjectEngineShadows> {
     const dialect = await this.projectDialect(pid);
+    const observed = this.snapshotProjectCache(pid);
     const rows = await this.db.query<{
       id: string;
       name: string;
@@ -441,7 +522,7 @@ export class Shadows {
         identical: false,
       };
     }
-    await this.pruneRemovedForProject(pid, new Set(rows.map((r) => r.id)));
+    await this.pruneRemovedForProject(observed, new Set(rows.map((r) => r.id)));
     if (!rows.length) {
       throw new ShadowError(
         '项目还没有配置环境。导入 SQL、验证迁移都需要一个真实的数据库实例作影子库，请先在“环境”里添加项目要部署到的数据库',
@@ -472,7 +553,8 @@ export class Shadows {
           picked = true;
           break;
         } catch (e) {
-          if (!(e instanceof ShadowError)) throw e;
+          // 配置已变更是可重试的暂时状态：整体重试，不能把这个完整版本组当成“没有可用影子库”跳过
+          if (!(e instanceof ShadowError) || e instanceof ShadowConfigChangedError) throw e;
           firstReason ??= scrubSecrets(e.message);
         }
       }
@@ -580,19 +662,24 @@ export class Shadows {
   /**
    * 远端失效事件 → 按平台库里的最新配置复核本地缓存条目：指纹一致说明本副本已经按变更后的配置重建过
    * （事件比本副本的下一次 forProject 晚到），保留它，不要关掉一个正在用的新连接；指纹不一致、环境 / 项目已删除、
-   * 或者读配置失败，都按原来的做法关闭并移除。复核期间条目被并发替换，就复核新条目。
+   * 或者读配置失败，都按原来的做法关闭并移除。复核期间条目被并发替换或失效代际推进，就复核新条目（有界重试）。
    */
   private async revalidateLocal(eid: string) {
-    for (;;) {
+    for (let round = 0; ; round++) {
       const hit = this.cache.get(eid);
       if (!hit) return;
+      const gen = this.invalidationGen;
       let fingerprint: string | null;
       try {
         fingerprint = configFingerprint(await this.env(hit.projectId, eid));
       } catch {
         fingerprint = null;
       }
-      if (this.cache.get(eid) !== hit) continue;
+      if (this.cache.get(eid) !== hit) {
+        if (round >= MAX_PREPARE_ATTEMPTS) return;
+        continue;
+      }
+      if (this.invalidationGen !== gen && round < MAX_PREPARE_ATTEMPTS) continue;
       if (fingerprint !== hit.fingerprint) await this.forgetLocal(eid, false);
       return;
     }
@@ -616,26 +703,41 @@ export class Shadows {
   private async forgetProjectLocal(pid: string): Promise<string[]> {
     this.invalidationGen++;
     const ids = new Set<string>();
+    const toClose: [string, CacheEntry][] = [];
     for (const [eid, entry] of this.cache.entries()) {
-      if (entry.projectId === pid) ids.add(eid);
+      if (entry.projectId === pid) {
+        ids.add(eid);
+        toClose.push([eid, entry]);
+        this.cache.delete(eid);
+      }
     }
+    await Promise.all(
+      toClose.map(([eid, entry]) =>
+        entry.shadow.close().catch((e) => {
+          console.error(`关闭影子库连接失败（env=${eid}）`, e);
+        }),
+      ),
+    );
     const rows = await this.db
       .query<{ id: string }>('select id from environments where project_id = $1', [pid])
       .catch(() => []);
     for (const r of rows) ids.add(r.id);
-    for (const eid of ids) {
-      await this.forgetLocal(eid, false);
-    }
     return [...ids];
   }
 
-  private async pruneRemovedForProject(pid: string, liveIds: Set<string>) {
-    const staleIds: string[] = [];
+  private snapshotProjectCache(pid: string): Map<string, CacheEntry> {
+    const observed = new Map<string, CacheEntry>();
     for (const [eid, entry] of this.cache.entries()) {
-      if (entry.projectId === pid && !liveIds.has(eid)) staleIds.push(eid);
+      if (entry.projectId === pid) observed.set(eid, entry);
     }
-    for (const eid of staleIds) {
-      await this.forgetLocal(eid);
+    return observed;
+  }
+
+  private async pruneRemovedForProject(observed: Map<string, CacheEntry>, liveIds: Set<string>) {
+    for (const [eid, entry] of observed) {
+      if (!liveIds.has(eid) && this.cache.get(eid) === entry) {
+        await this.forgetLocal(eid);
+      }
     }
   }
 

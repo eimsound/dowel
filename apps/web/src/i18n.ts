@@ -2428,7 +2428,11 @@ const zh = {
     tableSection: '所属板块',
     back: '返回',
   },
-  err: { generic: '出错了：{{msg}}', notFound: '页面不存在。' },
+  err: {
+    generic: '出错了：{{msg}}',
+    notFound: '页面不存在。',
+    shadowConfigChanged: '影子库配置已变更，请重试。',
+  },
 };
 
 const en: typeof zh = {
@@ -4982,7 +4986,11 @@ const en: typeof zh = {
     tableSection: 'Section',
     back: 'Back',
   },
-  err: { generic: 'Error: {{msg}}', notFound: 'This page does not exist.' },
+  err: {
+    generic: 'Error: {{msg}}',
+    notFound: 'This page does not exist.',
+    shadowConfigChanged: 'The shadow database configuration changed. Please try again.',
+  },
 };
 
 const saved =

@@ -21,7 +21,7 @@ import {
   type ShadowHandle,
 } from '../derive.ts';
 import { scrubSecrets } from '../secrets.ts';
-import { ShadowError } from '../shadow.ts';
+import { ShadowConfigChangedError, ShadowError } from '../shadow.ts';
 import { type AppContext, access, type Env } from './context.ts';
 
 export const registerNormalize = (app: Hono<Env>, ctx: AppContext) => {
@@ -138,6 +138,8 @@ export const registerNormalize = (app: Hono<Env>, ctx: AppContext) => {
         if (!resolved) refund();
         throw new HTTPException(404, { message: '项目不存在' });
       }
+      // 影子库配置在规范化途中变了（Issue #154）：可重试，不是“影子库不可用”
+      if (e instanceof ShadowConfigChangedError) return fail(503, e.message, e.code);
       if (e instanceof ShadowError) return fail(422, e.message, 'shadow_unavailable');
       if (e instanceof StepError || e instanceof PlanError || e instanceof InstanceLevelStatementError) {
         const reason = e instanceof StepError ? e.reason : e.message;

@@ -58,7 +58,7 @@ import {
 } from '../requests.ts';
 import { WorkingChangedError } from '../rooms.ts';
 import { scrubSecrets } from '../secrets.ts';
-import { ShadowError } from '../shadow.ts';
+import { ShadowConfigChangedError, ShadowError } from '../shadow.ts';
 import {
   activeHead,
   activeHeadWithModel,
@@ -242,6 +242,7 @@ export const registerVersions = (app: Hono<Env>, ctx: AppContext) => {
     }
 
     // 只把预期的“没有影子库 / 影子库不可用”（ShadowError：没有环境、生产环境不让用同实例、连不上、被占用）变成 shadow_unavailable；
+    // 影子库配置在验证途中变了（ShadowConfigChangedError）是可重试的暂时状态：原样抛出交给 onError 返回 503；
     // 密钥解密失败（SecretError）、白名单拒绝（HTTPException）、平台库错误都继续抛出
     let outcome: Awaited<ReturnType<typeof verifyOnShadows>>;
     try {
@@ -255,7 +256,7 @@ export const registerVersions = (app: Hono<Env>, ctx: AppContext) => {
         scope: a.schemas?.length ? a.schemas : null,
       });
     } catch (e) {
-      if (!(e instanceof ShadowError)) throw e;
+      if (!(e instanceof ShadowError) || e instanceof ShadowConfigChangedError) throw e;
       return c.json<PublishRejected>(
         {
           error: `版本没有发布：${scrubSecrets(e.message)}。发布需要在影子库里闭环验证：请为环境配置影子库或允许使用同实例影子库；影子库暂时连不上时请稍后重试`,

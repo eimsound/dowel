@@ -47,6 +47,7 @@ import { connHash } from '../src/requests.ts';
 import { encrypt, SecretError } from '../src/secrets.ts';
 import { type Shadow, ShadowError, shadowOps } from '../src/shadow.ts';
 import { shadowSetupError } from '../src/targets.ts';
+import { pgShadow } from '../src/targets/pg.ts';
 import { addTable, editModel, makeUser, PASSWORD, stubPassingShadow } from './support.ts';
 
 process.env.DOWEL_SECRET ??= 'versions-test-secret-0123456789';
@@ -677,6 +678,47 @@ describe.each([
     expect(failed.data.report).toMatchObject({ ok: false });
     expect((await detail(pid, v1.id)).verifiedAt).toBeNull();
   });
+
+  test.skipIf(skip)(
+    '影子库句柄因配置变更被关闭（#154）：发布 / 重新验证 / 模型验证都返回 503 shadow_config_changed，不发布、不改验证状态',
+    async () => {
+      const pid = await newProject('config-changed');
+      await addTable(created.rooms, db, pid);
+      let restore = stubShadows(async () => ({
+        label: 'stub：shadow',
+        shadow: { verifyScripts: async () => okReport },
+      }));
+      const v1 = (await publish(pid, 'v1')).data as unknown as VersionCreated;
+      restore();
+      const before = await detail(pid, v1.id);
+      expect(before.verifiedAt).not.toBeNull();
+      await editModel(created.rooms, db, pid, (m) => void addNote(m));
+      const versionsBefore = (await list(pid)).length;
+
+      // 真实的 PG 影子库句柄、已被缓存淘汰关闭：拿着它的请求再用，得到的是“配置已变更”，不是“影子库不可用”
+      const closed = pgShadow('postgres://u:p@127.0.0.1:1/app_dowel');
+      await closed.close();
+      restore = stubShadows(async () => ({ label: 'stub：closed', shadow: closed }));
+      try {
+        const pub = await publish(pid, 'v2');
+        expect(pub.status, JSON.stringify(pub.data)).toBe(503);
+        expect(pub.data).toMatchObject({ code: 'shadow_config_changed', error: '影子库配置已变更，请重试' });
+        // 不能当成“影子库不可用”返回 422，且绝不写入 versions
+        expect(await list(pid)).toHaveLength(versionsBefore);
+
+        const rv = await reverify(pid, v1.id);
+        expect(rv.status).toBe(503);
+        expect(rv.data).toMatchObject({ code: 'shadow_config_changed' });
+        expect(await detail(pid, v1.id)).toEqual(before);
+
+        const mv = await call('POST', `/api/projects/${pid}/verify`, { from: 'empty', to: 'head' });
+        expect(mv.status).toBe(503);
+        expect(mv.data).toMatchObject({ code: 'shadow_config_changed' });
+      } finally {
+        restore();
+      }
+    },
+  );
 
   /** 风险分析（analyze）阶段出错的假影子库连接：仅 analyze 阶段的 measureInTransaction 会进入 BEGIN，在分析首步事务开启时报错 */
   const analysisFailsDb = (code: string): Db => ({
