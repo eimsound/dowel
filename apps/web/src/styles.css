@@ -526,6 +526,12 @@ dialog::backdrop {
     font-weight: 600;
     line-height: 16px;
   }
+  /* 引擎推断出的非空（SQL Server 持久化计算列，未显式声明）：虚线框、透明底，文字颜色不变以保证对比度 */
+  .flag.inferred {
+    background: transparent;
+    border: 1px dashed var(--border-strong);
+    line-height: 14px;
+  }
   .flag.pk {
     color: color-mix(in oklab, var(--pk) 75%, var(--text));
     background: color-mix(in oklab, var(--pk) 14%, transparent);

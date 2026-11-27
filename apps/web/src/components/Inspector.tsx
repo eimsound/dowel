@@ -69,6 +69,7 @@ import { useTranslation } from 'react-i18next';
 
 import { api } from '../api.ts';
 import { dialectUiSpec } from '../dialects.ts';
+import { columnNullability } from '../nullability.ts';
 import {
   columnSerial,
   keepsSerialOnPlainInteger,
@@ -786,6 +787,7 @@ const TableInspector = ({
   const typesId = useId();
   const mysqlTypeHintId = useId();
   const serialHintId = useId();
+  const nnInferredBaseId = useId();
   const fillFactorErrId = useId();
   // PG serial 列被重新选成普通整数类型时，在该列类型框下提示“自增仍保留”（只是提示，不改默认值与序列）
   const [serialHintCol, setSerialHintCol] = useState<string | null>(null);
@@ -1244,6 +1246,20 @@ const TableInspector = ({
             const rowType = serial ? serial.kind : shortType(typeLabel(model, c));
             // 提示只在列仍是 serial 形态时显示：清空默认值、改成其他类型或协作者改动后自动消失
             const showSerialHint = open && serial !== null && serialHintCol === c.id;
+            // 显式 NOT NULL 与引擎推断的非空分开（SQL Server 持久化计算列，ADR 0019）：复选框只绑显式，徽标按有效值
+            // 只由推断得出的 NN 用虚线框区分（不降对比度）；鼠标悬停看 title，读屏经行按钮的 aria-describedby 读到同一句
+            const nn = columnNullability(model, c);
+            const nnBadge = nn.effective && (
+              <b
+                className={cx('flag', nn.inferredOnly && 'inferred')}
+                title={nn.inferredOnly ? t('insp.notNullInferred') : undefined}
+              >
+                NN
+              </b>
+            );
+            const rowInferredId = `${nnInferredBaseId}-row-${c.id}`;
+            const hintInferredId = `${nnInferredBaseId}-hint-${c.id}`;
+            const showRowInferred = !isPk && nn.inferredOnly;
             if (isChild) {
               return (
                 <li
@@ -1257,9 +1273,7 @@ const TableInspector = ({
                   >
                     {rowType}
                   </span>
-                  <span className="flex w-[52px] justify-end gap-[3px]">
-                    {c.notNull && <b className="flag">NN</b>}
-                  </span>
+                  <span className="flex w-[52px] justify-end gap-[3px]">{nnBadge}</span>
                 </li>
               );
             }
@@ -1268,6 +1282,7 @@ const TableInspector = ({
                 <button
                   type="button"
                   aria-expanded={open}
+                  aria-describedby={showRowInferred ? rowInferredId : undefined}
                   onClick={() => {
                     setOpenCol(open ? null : c.id);
                     setSerialHintCol(null);
@@ -1293,9 +1308,14 @@ const TableInspector = ({
                     {isPk && <b className="flag pk">PK</b>}
                     {fkCols.has(c.id) && <b className="flag fk">FK</b>}
                     {isPartKey && <b className="flag">PT</b>}
-                    {c.notNull && !isPk && <b className="flag">NN</b>}
+                    {!isPk && nnBadge}
                   </span>
                 </button>
+                {showRowInferred && (
+                  <span id={rowInferredId} className="sr-only">
+                    {t('insp.notNullInferred')}
+                  </span>
+                )}
                 {open && (
                   <div className="space-y-2 border-t border-border bg-surface-2 px-2.5 pt-2.5 pb-3">
                     <div className="grid grid-cols-2 gap-2">
@@ -1446,7 +1466,8 @@ const TableInspector = ({
                         <label>
                           <input
                             type="checkbox"
-                            checked={c.notNull}
+                            checked={nn.explicit}
+                            aria-describedby={nn.inferredOnly ? hintInferredId : undefined}
                             disabled={
                               c.identity !== null ||
                               !!c.ext?.mssql?.identity ||
@@ -1565,6 +1586,11 @@ const TableInspector = ({
                         <Trash2 size={14} aria-hidden="true" />
                       </IconButton>
                     </div>
+                    {nn.inferredOnly && (
+                      <p id={hintInferredId} className="hint m-0">
+                        {t('insp.notNullInferredHint')}
+                      </p>
+                    )}
                     {model.dialect === 'mysql' && mysqlSplit && (
                       <div className="space-y-2 border-t border-border pt-2">
                         <div className="checks">

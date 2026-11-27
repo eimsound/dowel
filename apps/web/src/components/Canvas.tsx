@@ -2,6 +2,7 @@
 import { type CanvasSection, sectionColorCssVar } from '@dowel/api';
 import {
   buildModelIndex,
+  effectiveNotNull,
   type Model,
   type ModelIndex,
   partitionKeyColumns,
@@ -657,7 +658,7 @@ export const Canvas = memo(
             type: shortType(typeLabel(model, c)),
             isEnum: !!c.typeRef,
             key: pkCols.has(c.id) ? 'PK' : fkCols.has(c.id) ? 'FK' : uqCols.has(c.id) ? 'UQ' : '',
-            notNull: c.notNull || pkCols.has(c.id),
+            notNull: effectiveNotNull(model.dialect, c) || pkCols.has(c.id),
             isPartKey: partKeySet.has(c.id),
             hasSourceHandle: fkSourceCols.has(c.id),
             hasTargetHandle: fkTargetCols.has(c.id),

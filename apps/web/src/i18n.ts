@@ -1019,6 +1019,8 @@ const zh = {
     columnName: '列名',
     type: '类型',
     notNull: '非空',
+    notNullInferred: '由表达式推断为非空（未显式声明）',
+    notNullInferredHint: '由表达式推断为非空，DDL 不写 NOT NULL；勾选才是显式声明。推断结果在规范化时更新。',
     default: '默认值',
     none: '无',
     pk: '主键',
@@ -3455,6 +3457,9 @@ const en: typeof zh = {
     columnName: 'Column name',
     type: 'Type',
     notNull: 'Not null',
+    notNullInferred: 'Inferred non-null from the expression (not explicit)',
+    notNullInferredHint:
+      'Inferred non-null from the expression; the DDL does not add NOT NULL. Check the box to declare it explicitly. Updated on normalization.',
     default: 'Default',
     none: 'None',
     pk: 'Primary key',

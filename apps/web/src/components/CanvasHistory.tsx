@@ -18,6 +18,7 @@ import {
   copyItems,
   copyTables,
   createAll,
+  effectiveNotNull,
   formatScript,
   type Model,
 } from '@dowel/core';
@@ -326,7 +327,7 @@ const HistorySchemaSummary = ({ model, copy }: { model: Model; copy?: HistoryCop
                           : uqCols.has(c.id)
                             ? 'UQ'
                             : '';
-                      const nn = c.notNull || pkCols.has(c.id);
+                      const nn = effectiveNotNull(model.dialect, c) || pkCols.has(c.id);
                       return (
                         <li
                           key={c.id}
