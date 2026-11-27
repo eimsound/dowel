@@ -909,3 +909,209 @@ describe('pendingRefreshIds：列签名的补充规则（枚举限定名、大�
     expect(pendingRefreshIds(good, cur)).toEqual(['lf']);
   });
 });
+
+describe('pendingRefreshIds：MSSQL 持久化计算列的可空性（#145）', () => {
+  /** dbo.items(code nvarchar(32) NULL, display_code AS ([code]) PERSISTED, virt AS ([code]))；基线已规范化 */
+  const mssqlBase = () => {
+    const m = emptyModel('mssql');
+    runMutator(m, 'createSchema', { id: 's', name: 'dbo' });
+    runMutator(m, 'createTable', { id: 't', schema: 's', name: 'items' });
+    runMutator(m, 'addColumn', { table: 't', column: { id: 'c', name: 'code', type: 'nvarchar(32)' } });
+    runMutator(m, 'addColumn', {
+      table: 't',
+      column: {
+        id: 'g',
+        name: 'display_code',
+        type: 'nvarchar(32)',
+        generated: { expr: '([code])', stored: true },
+      },
+    });
+    runMutator(m, 'addColumn', {
+      table: 't',
+      column: { id: 'v', name: 'virt', type: 'nvarchar(32)', generated: { expr: '([code])', stored: false } },
+    });
+    return m;
+  };
+
+  test('被引用列只改 NOT NULL：持久化计算列待规范化（SQL Server 读回的 is_nullable 跟着变），非持久化的不算', () => {
+    const good = mssqlBase();
+    expect(pendingRefreshIds(good, structuredClone(good))).toEqual([]);
+    const cur = structuredClone(good);
+    runMutator(cur, 'setNotNull', { id: 'c', notNull: true });
+    expect(pendingRefreshIds(good, cur)).toEqual(['g']);
+    // 稳态：规范化写回 notNull 之后不再待规范化
+    const after = structuredClone(cur);
+    (after.objects.g as { notNull: boolean }).notNull = true;
+    expect(pendingRefreshIds(after, structuredClone(after))).toEqual([]);
+    // 换回列名对调前的快照（表达式原文不变、按列名对齐）：code 现在指向另一列，可空性不同
+    const good2 = structuredClone(good);
+    runMutator(good2, 'addColumn', {
+      table: 't',
+      column: { id: 'c2', name: 'code2', type: 'nvarchar(32)', notNull: true },
+    });
+    const swapped = structuredClone(good2);
+    (swapped.objects.c as { name: string }).name = 'code2';
+    (swapped.objects.c2 as { name: string }).name = 'code';
+    expect(pendingRefreshIds(good2, swapped)).toEqual(['g']);
+  });
+
+  test('持久化计算列自己的 notNull 改了：待规范化（读回的是引擎推断值）', () => {
+    const good = mssqlBase();
+    const cur = structuredClone(good);
+    (cur.objects.g as { notNull: boolean }).notNull = true;
+    expect(pendingRefreshIds(good, cur)).toEqual(['g']);
+  });
+
+  test('不误报：没有持久化计算列的表、其他方言的 STORED 生成列，普通列改 NOT NULL 都不待规范化', () => {
+    const good = mssqlBase();
+    delete good.objects.g;
+    const cur = structuredClone(good);
+    runMutator(cur, 'setNotNull', { id: 'c', notNull: true });
+    expect(pendingRefreshIds(good, cur)).toEqual([]);
+
+    const pg = base();
+    runMutator(pg, 'addColumn', {
+      table: 't',
+      column: { id: 'g', name: 'double', type: 'integer', generated: { expr: '(total * 2)', stored: true } },
+    });
+    const pgCur = structuredClone(pg);
+    runMutator(pgCur, 'setNotNull', { id: 'c', notNull: true });
+    runMutator(pgCur, 'setNotNull', { id: 'g', notNull: true });
+    expect(pendingRefreshIds(pg, pgCur)).toEqual([]);
+  });
+});
+
+describe('pendingRefreshIds：表达式直接引用枚举、表内没有指向它的 typeRef 列（#146）', () => {
+  /** orders(total integer, status text)：CHECK / 默认值 / 表达式索引 / 生成列 / 视图都直接写 ::mood，没有列的 typeRef 指向枚举 */
+  const enumBase = (qualified = false) => {
+    const m = base();
+    const ty = qualified ? 'public.mood' : 'mood';
+    runMutator(m, 'createEnum', { id: 'e1', schema: 's', name: 'mood', values: ['ok', 'bad'] });
+    runMutator(m, 'createEnum', { id: 'e2', schema: 's', name: 'tone', values: ['ok', 'lo'] });
+    runMutator(m, 'createEnum', { id: 'e3', schema: 's', name: 'other', values: ['x'] });
+    runMutator(m, 'addColumn', {
+      table: 't',
+      column: { id: 'st', name: 'status', type: 'text', default: { expr: `('ok'::${ty})::text` } },
+    });
+    runMutator(m, 'addCheck', { id: 'k', table: 't', expr: `((status)::${ty} IS NOT NULL)` });
+    runMutator(m, 'addIndex', { id: 'ix', table: 't', elements: [{ expr: `((status)::${ty})` }] });
+    runMutator(m, 'addCheck', { id: 'k0', table: 't', expr: '(total > 0)' });
+    m.objects.v = view('v', ['t', 'st'], { ddl: [`CREATE VIEW public.v AS SELECT 'ok'::${ty} AS m`] });
+    return m;
+  };
+  const touched = ['st', 'k', 'ix', 'v'];
+
+  test('枚举改名（renameEnum 不改写非限定的 ::mood）：直接引用它的对象都待规范化，其他对象不受影响', () => {
+    const good = enumBase();
+    expect(pendingRefreshIds(good, structuredClone(good))).toEqual([]);
+    const cur = structuredClone(good);
+    runMutator(cur, 'renameEnum', { id: 'e1', name: 'feeling' });
+    expect((cur.objects.k as { expr: string }).expr).toBe('((status)::mood IS NOT NULL)');
+    expect(pendingRefreshIds(good, cur)).toEqual(touched);
+  });
+
+  test.each([false, true])(
+    '两个枚举对调名字后换回旧快照（限定写法：%s）：表达式原文与基线逐字相同也检出',
+    (q) => {
+      const good = enumBase(q);
+      const cur = structuredClone(good);
+      (cur.objects.e1 as { name: string }).name = 'tone';
+      (cur.objects.e2 as { name: string }).name = 'mood';
+      expect(pendingRefreshIds(good, cur)).toEqual(touched);
+    },
+  );
+
+  test('删掉枚举后新建同名枚举（换了 ID）、枚举所在 schema 改名：检出', () => {
+    const good = enumBase();
+    const recreated = structuredClone(good);
+    delete recreated.objects.e1;
+    runMutator(recreated, 'createEnum', { id: 'e9', schema: 's', name: 'mood', values: ['ok'] });
+    expect(pendingRefreshIds(good, recreated)).toEqual(touched);
+    const moved = structuredClone(good);
+    runMutator(moved, 'renameSchema', { id: 's', name: 'app' });
+    // schema 改名本身已让视图（父对象改名）与限定名原文待规范化；非限定的 ::mood 也一并检出
+    expect(pendingRefreshIds(good, moved)).toEqual(expect.arrayContaining(touched));
+  });
+
+  test('父表的表达式分区键里写了枚举：枚举改名时只带边界的子分区也检出', () => {
+    const good = emptyModel();
+    runMutator(good, 'createSchema', { id: 's', name: 'public' });
+    runMutator(good, 'createEnum', { id: 'e1', schema: 's', name: 'mood', values: ['ok', 'bad'] });
+    runMutator(good, 'createTable', { id: 'p', schema: 's', name: 'tags' });
+    runMutator(good, 'addColumn', {
+      table: 'p',
+      column: { id: 'pc', name: 'code', type: 'text', notNull: true },
+    });
+    runMutator(good, 'setPartitionBy', {
+      id: 'p',
+      partitionBy: {
+        strategy: 'list',
+        keys: [{ column: null, expr: '((code)::mood)', opclass: null, collation: null }],
+      },
+    });
+    runMutator(good, 'createPartition', {
+      id: 'c',
+      parent: 'p',
+      name: 'tags_ok',
+      bound: "FOR VALUES IN ('ok')",
+    });
+    const cur = structuredClone(good);
+    runMutator(cur, 'renameEnum', { id: 'e1', name: 'feeling' });
+    expect(pendingRefreshIds(good, cur)).toEqual(['p', 'c']);
+  });
+
+  test('不误报：表达式里没写到的枚举改名 / 加值、稳态', () => {
+    const good = enumBase();
+    const cur = structuredClone(good);
+    runMutator(cur, 'renameEnum', { id: 'e3', name: 'renamed' });
+    runMutator(cur, 'addEnumValue', { id: 'e1', value: 'meh' });
+    expect(pendingRefreshIds(good, cur)).toEqual([]);
+  });
+});
+
+describe('pendingRefreshIds：分区键签名的保守规则（PR #138 评审补测）', () => {
+  test('父表 partitionBy 是解析不出来的存量字符串：根表列改类型时子分区待规范化', () => {
+    const good = emptyModel();
+    runMutator(good, 'createSchema', { id: 's', name: 'public' });
+    runMutator(good, 'createTable', { id: 'p', schema: 's', name: 'events' });
+    runMutator(good, 'addColumn', {
+      table: 'p',
+      column: { id: 'pd', name: 'day', type: 'bigint', notNull: true },
+    });
+    runMutator(good, 'addColumn', { table: 'p', column: { id: 'pa', name: 'amount', type: 'bigint' } });
+    runMutator(good, 'setPartitionBy', {
+      id: 'p',
+      partitionBy: {
+        strategy: 'range',
+        keys: [{ column: 'pd', expr: null, opclass: null, collation: null }],
+      },
+    });
+    runMutator(good, 'createPartition', {
+      id: 'c',
+      parent: 'p',
+      name: 'events_a',
+      bound: 'FOR VALUES FROM (0) TO (10)',
+    });
+    (good.objects.p as { partitionBy: unknown }).partitionBy = 'WEIRD (day)';
+    expect(pendingRefreshIds(good, structuredClone(good))).toEqual([]);
+    const cur = structuredClone(good);
+    (cur.objects.pa as { type: string }).type = 'numeric';
+    expect(pendingRefreshIds(good, cur)).toEqual(['c']);
+  });
+
+  test('只改分区键的 collation / opclass：只带边界的子分区也检出（有意的过近似，flush 后归零）', () => {
+    const good = partitionFamily();
+    for (const extra of [{ collation: 'C' }, { opclass: 'int4_ops' }]) {
+      const cur = structuredClone(good);
+      runMutator(cur, 'setPartitionBy', {
+        id: 'ch',
+        partitionBy: {
+          strategy: 'range',
+          keys: [{ column: 'pd', expr: null, opclass: null, collation: null, ...extra }],
+        },
+      });
+      expect(pendingRefreshIds(good, cur)).toEqual(['lf']);
+      expect(pendingRefreshIds(cur, structuredClone(cur))).toEqual([]);
+    }
+  });
+});
