@@ -619,6 +619,60 @@ describe('各方言专属特性测试', () => {
     );
   });
 
+  test('SQLite: 复制粘贴非 STRICT 无类型列与 BIGINT 主键保留原文，粘进 STRICT 表时拦截', () => {
+    const src = emptyModel('sqlite');
+    const sMain = createSchema(src, 'main');
+    const tbl = createTable(src, sMain, 'raw_items');
+    const pk = addColumn(src, tbl, { name: 'id', type: 'bigint', notNull: true });
+    addPrimaryKey(src, tbl, [pk]);
+    const untyped = addColumn(src, tbl, { name: 'payload', type: '' });
+    addColumn(src, tbl, { name: 'active', type: 'boolean' });
+
+    // 表粒度：同模型 + 跨 SQLite 模型往返保留 '' / BIGINT / BOOLEAN
+    const tblPayload = parseClipboard(serializeClipboard(copyTables(src, [tbl], { source: SRC })))!;
+    const samePlan = planPaste(src, tblPayload);
+    const srcCopy = clonePlain(src);
+    runMutator(srcCopy, 'paste', { ops: samePlan.ops });
+    expect(validate(srcCopy)).toEqual([]);
+    expect(columnsOf(srcCopy, samePlan.newTables[0]!).map((c) => [c.name, c.type])).toEqual([
+      ['id', 'BIGINT'],
+      ['payload', ''],
+      ['active', 'BOOLEAN'],
+    ]);
+
+    const other = emptyModel('sqlite');
+    const oMain = createSchema(other, 'main');
+    const otherPlan = planPaste(other, tblPayload);
+    runMutator(other, 'paste', { ops: otherPlan.ops });
+    expect(validate(other)).toEqual([]);
+    expect(columnsOf(other, otherPlan.newTables[0]!).map((c) => [c.name, c.type])).toEqual([
+      ['id', 'BIGINT'],
+      ['payload', ''],
+      ['active', 'BOOLEAN'],
+    ]);
+
+    // items 粒度：粘进非 STRICT 表保留 ''，粘进 STRICT 表报错并跳过
+    const itemPayload = parseClipboard(serializeClipboard(copyItems(src, tbl, [untyped], { source: SRC })))!;
+    const looseTgt = createTable(other, oMain, 'loose');
+    addColumn(other, looseTgt, { name: 'k', type: 'TEXT' });
+    const pLoose = planPaste(other, itemPayload, { targetTable: looseTgt });
+    runMutator(other, 'paste', { ops: pLoose.ops });
+    expect(validate(other)).toEqual([]);
+    expect(columnsOf(other, looseTgt).find((c) => c.name === 'payload')?.type).toBe('');
+
+    const strictTgt = createTable(other, oMain, 'strict_tbl', undefined, null, { sqlite: { strict: true } });
+    addColumn(other, strictTgt, { name: 'k', type: 'TEXT' });
+    const pStrict = planPaste(other, itemPayload, { targetTable: strictTgt });
+    expect(pStrict.report.skipped).toContainEqual(
+      expect.objectContaining({
+        kind: 'column',
+        name: 'payload',
+        reason: 'unsupported',
+        detail: 'STRICT 表的列必须声明类型',
+      }),
+    );
+  });
+
   test('MySQL: ENGINE/CHARSET、UNSIGNED、AUTO_INCREMENT、FULLTEXT 索引、inline enum 与 items 限制', () => {
     const m = emptyModel('mysql');
     const def = createSchema(m, 'default');
