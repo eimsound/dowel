@@ -182,16 +182,22 @@ const expectSameNameTaken = (h: Harness) => {
   const d = getDialect(h.draft.dialect);
   const draft = h.draft;
   const fresh = new MutableModelIndex(draft);
-  const names = new Set<string>(['', 'PRIMARY', 'primary', 'nope']);
+  // 预先保留旧的推导默认名，确保列改为显式 defaultName 后旧名字不再被占用；
+  // SQLite / MySQL / MSSQL 的 nameEntriesOf 只会产生 `#df`（MSSQL 列默认值），不会产生 PG 专有的 `#nn` / `#seq`，
+  // 额外加入 `<列>#nn` / `<列>#seq` 验证三方言将其视为普通（不匹配）ID。
+  const names = new Set<string>(['', 'PRIMARY', 'primary', 'nope', 'DF_Things_b', 'DF_Renamed_b', 'DF_w_a']);
   const tableOf = (id: string) => {
     const t = draft.objects[id];
     return t?.kind === 'table' ? t : undefined;
   };
-  const selves = new Set<string>(['', 'ghost']);
+  const selves = new Set<string>(['', 'ghost', 'ta#nn', 'tb#nn', 'ta#seq', 'tb#seq']);
   for (const o of Object.values(draft.objects)) {
     if ('name' in o) {
       names.add(o.name);
       names.add(o.name.toUpperCase());
+    }
+    if (o.kind === 'column' && o.ext?.mssql?.defaultName) {
+      names.add(o.ext.mssql.defaultName);
     }
     const es: { ns: string; name: string; owner: string }[] = [];
     nameEntriesOf(draft.dialect, o, tableOf, es);
@@ -353,6 +359,26 @@ const steps = (h: Harness, dialect: Dialect): (() => void)[] => [
       });
     }
     h.del('v');
+  },
+  // MSSQL 列设显式 ext.mssql.defaultName（含大小写变体），覆盖 defaultName ?? 推导名 分支
+  () => {
+    if (dialect !== 'mssql') return;
+    h.touch('tb', (o) => {
+      if (o.kind === 'column') {
+        o.ext = {
+          ...o.ext,
+          mssql: { ...o.ext?.mssql, defaultName: 'DF_Custom_MixCase', defaultNameMode: 'explicit' },
+        };
+      }
+    });
+    h.touch('wa', (o) => {
+      if (o.kind === 'column') {
+        o.ext = {
+          ...o.ext,
+          mssql: { ...o.ext?.mssql, defaultName: 'df_WA_Explicit', defaultNameMode: 'explicit' },
+        };
+      }
+    });
   },
 ];
 

@@ -263,11 +263,16 @@ describe('大规模粘贴性能守卫（1000 张既有表 + 粘贴 200 张表 ×
   // 1. execute 读基线 m.objects 的次数：粘贴的内容不变、只让既有表变多，多出来的读取摊到每个既有对象、再摊到每个子操作上。
   //    基线索引的命名状态先建好（服务端常驻索引只建一次），四种方言现值都是 0.009：剩下的只是 execute 末尾一次
   //    `{ ...m.objects }` 拷贝（每个既有对象约 3 次读取，与子操作数无关）。重名判定走命名空间分桶后（Issue #165），
-  //    SQL Server 不再按 schema 扫描全部约束 / 带默认值列（原先 0.331）。每个子操作经写时复制代理枚举整个模型时为 2.7–8.0；
-  //    即使只是每建一张表（占 1/16 子操作）枚举一次整个模型，也会多出约 0.25（`Object.keys` / `for…in`）到 0.44
-  //    （`Object.values`，SQL Server 约 0.77），统一阈值 0.1 同时拦住这两类退化。
-  // 2. 叠加索引查询访问的元素数（modelIndexStats）：Proxy 只包住基线 m.objects，经索引分桶或叠加层的遍历看不见；
-  //    这里固定既有模型、把粘贴规模从 20 张表放大到 80 张，每个子操作访问的元素数应保持不变（叠加层全量扫描时约翻 4 倍）。
+  //    SQL Server 不再按 schema 扫描全部约束 / 带默认值列（原先 0.331，关掉 SQL Server 快路径后会因 `schemaOfTable` 读 `m.objects` 升至 0.117）。
+  //    每个子操作经写时复制代理枚举整个模型时为 2.7–8.0；即使只是每建一张表（占 1/16 子操作）枚举一次整个模型，也会多出约 0.25
+  //    （`Object.keys` / `for…in`）到 0.44（`Object.values`，SQL Server 约 0.77），统一阈值 0.1 同时拦住这两类退化。
+  //    SQLite / MySQL 退回扫描时遍历的是基线索引缓存的 kind 分桶，不经过 `m.objects` Proxy，改由下面 `modelIndexStats.elems` 的既有规模维度拦住。
+  // 2. 叠加索引查询访问的元素数（modelIndexStats.elems）：Proxy 只包住基线 m.objects，经索引分桶或叠加层的遍历看不见；
+  //    分两个维度断言每个子操作访问的元素数之比，防止两类退化相互遮蔽：
+  //    - 粘贴规模维度（固定 125 张既有表，粘贴 20 → 80 张表）：拦住 `OverlayModelIndex` 叠加层全量扫描退化（现值 ×1.00，全量扫描约 ×3.96）。
+  //    - 既有规模维度（固定粘贴 20 张表，既有表 125 → 1000 张）：拦住 SQLite / MySQL / SQL Server 命名空间快路径失效
+  //      （退回扫描基线缓存分桶在 20→80 维度会被固定 125 张表稀释，仅 ×1.19 / ×1.18；而在 125→1000 维度会随既有规模线性放大，
+  //      现值四方言均 ×1.00，关掉 SQLite / MySQL 快路径后跳到 ×6.68 / ×6.22）。
   // 计时比值分不开这些：按粘贴规模求耗时比，即使交替测量、取多次最快值，忙机器上也会大幅抖动。另留一个只拦数量级恶化的宽松绝对上限。
   type PasteOps = ReturnType<typeof planPaste>['ops'];
   /** 带现成索引执行一次 paste，返回期间读基线 m.objects 的次数（取值 / in / 属性描述各算一次，枚举按键数算） */
@@ -305,7 +310,8 @@ describe('大规模粘贴性能守卫（1000 张既有表 + 粘贴 200 张表 ×
   const EXISTING_BIG = 1000;
   const COUNTED_PASTE_TABLES = 20;
   const MAX_READS_PER_EXISTING_OBJECT_PER_OP = 0.1;
-  // 粘贴 20 → 80 张表时，每个子操作访问的索引元素数之比：现值约 1.0，叠加层全量扫描时约 4（随粘贴规模线性增长）
+  // 粘贴 20 → 80 张表（固定 125 张既有表）以及既有表 125 → 1000（固定粘贴 20 张表）时，每个子操作访问的索引元素数之比：
+  // 现值均为 ×1.00；叠加层全量扫描时在粘贴规模维度约 ×3.96，SQLite / MySQL 命名空间快路径失效时在既有规模维度跳到 ×6.68 / ×6.22
   const SCALED_PASTE_TABLES = 80;
   const MAX_INDEX_ELEMS_PER_OP_GROWTH = 1.5;
   // 兜底的绝对上限，比常见耗时（200 张表 planPaste 0.03–0.6 s、execute 1–8 s，视机器负载）高一个数量级，
@@ -348,6 +354,8 @@ describe('大规模粘贴性能守卫（1000 张既有表 + 粘贴 200 张表 ×
       const readsPerExistingPerOp = (readsBig - readsSmall) / existingDelta / opsIntoBig.length;
 
       const elemsSmall = indexElemsPerOp(smallTarget, opsIntoSmall);
+      const elemsBig = indexElemsPerOp(target, opsIntoBig);
+      const elemsExistingGrowth = elemsBig / elemsSmall;
       const opsScaled = planPaste(smallTarget, buildPayload(dialect, SCALED_PASTE_TABLES)).ops;
       expect(opsScaled.length).toBe((opsIntoSmall.length / COUNTED_PASTE_TABLES) * SCALED_PASTE_TABLES);
       const elemsScaled = indexElemsPerOp(smallTarget, opsScaled);
@@ -356,9 +364,11 @@ describe('大规模粘贴性能守卫（1000 张既有表 + 粘贴 200 张表 ×
       const ms = (x: number) => `${x.toFixed(1)}ms`;
       console.info(
         `[perf:${dialect}] 200 tables: planPaste=${ms(planMs)} execute(baseIdx)=${ms(execMs)} execute(auto)=${ms(execAutoMs)} ops=${plan.ops.length}; ` +
-          `existing ${EXISTING_SMALL}→${EXISTING_BIG} tables, ${opsIntoBig.length} ops: base reads ${readsSmall}→${readsBig} (${readsPerExistingPerOp.toFixed(3)}/existing object/op); ` +
+          `existing ${EXISTING_SMALL}→${EXISTING_BIG} tables, ${opsIntoBig.length} ops: base reads ${readsSmall}→${readsBig} (${readsPerExistingPerOp.toFixed(3)}/existing object/op), ` +
+          `index elems/op ${elemsSmall.toFixed(1)}→${elemsBig.toFixed(1)} (×${elemsExistingGrowth.toFixed(2)}); ` +
           `paste ${COUNTED_PASTE_TABLES}→${SCALED_PASTE_TABLES} tables: index elems/op ${elemsSmall.toFixed(1)}→${elemsScaled.toFixed(1)} (×${elemsGrowth.toFixed(2)})`,
       );
+      expect(elemsExistingGrowth).toBeLessThan(MAX_INDEX_ELEMS_PER_OP_GROWTH);
       expect(elemsGrowth).toBeLessThan(MAX_INDEX_ELEMS_PER_OP_GROWTH);
 
       expect(readsPerExistingPerOp).toBeLessThan(MAX_READS_PER_EXISTING_OBJECT_PER_OP);

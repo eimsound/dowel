@@ -804,14 +804,14 @@ P3 审查后的修正（2026-11-19）：
   - 按 kind、(父对象, kind)、父对象、分区父表、序列归属列登记叠加层里的当前对象，同时统计各桶里被叠加层遮蔽（改写或删除）的基线对象数。
   - `trackWrites()` 返回的写入回调同时通知分桶和 `OverlayNameTracker`。分桶在查询前惰性折叠，每个写入 O(1)。
   - 查询只做 O(该桶大小) 的工作。桶里没有遮蔽也没有叠加层对象时，直接返回基线的缓存数组，不复制。
-  - 分桶只读 `kind / parent / partitionOf.parent / ownedBy` 四个标量，与推导名状态完全独立。结构查询不会触发跟踪器 `flush()`，所以推导名事件的结算时机、`derivedNameStats` 和工作量预算都与之前相同（B2 方案曾考虑复用跟踪器的 `ovKids` / `ovParts`，因这一点被否决）。
+  - 分桶只读 `kind / parent / partitionOf.parent / ownedBy` 四个标量，与推导名状态完全独立。结构查询本身不会触发跟踪器 `flush()`，因此不会改变推导名事件的结算时机、`derivedNameStats` 或工作量预算（B2 方案曾考虑复用跟踪器的 `ovKids` / `ovParts`，因这一点被否决）；名字判重则会与 PG 一样按需 `flush()`（见下条）。
   - 状态只属于本次 execute：回滚时随叠加层一起丢弃，不触碰基线索引。
   - 结果顺序与原实现一致：先是基线（去掉被遮蔽的），再按首次写入顺序（即叠加层 Map 的插入顺序）列出叠加层对象。
   - 只登记确实在叠加层里的 ID：只通知不写入的 ID 不会遮蔽基线对象。
   - 未开启写入跟踪时，每次查询都从头折叠整个叠加层。复杂度与原实现相同，也作为差分测试的参照。
 - **方言命名空间判重（`ModelIndex.nsTaken`、`model.ts` 的 `nsNameTaken`）**：
   - SQLite（`SQLITE_REL_NS` / `sqliteConNs`）、MySQL（`MYSQL_REL_NS` / `MYSQL_CON_NS` / `mysqlIdxNs`）、SQL Server（`mssqlObjNs` / `mssqlIdxNs`）的 `isNameTaken` 先查 PR #187 的命名空间分桶（条目与原扫描判定逐条一致，名字转小写后查找）。
-  - 基线 `MutableModelIndex` 查 `BaseNamingState.owners`，跟踪中的叠加索引查 `OverlayNameTracker.hasOtherThan`。
+  - 基线 `MutableModelIndex` 查 `BaseNamingState.owners`，跟踪中的叠加索引查 `OverlayNameTracker.hasOtherThan`。与 PG 的 `isPg*Taken` 一样，`hasOtherThan` 查询前会先 `flush()` 折叠待处理写入，因此 SQLite / MySQL / SQL Server 的 `isNameTaken` 现在也会在 `execute` 中途结算推导名事件（结构查询则不触发 `flush()`）。
   - self 同时按占用者 ID 和所属对象 ID 排除，与扫描里的 `o.id === selfId` 一致：SQL Server 带默认值列的条目属于 `<列>#df`，以列 ID 为 self 时也会被排除。
   - 以下情况退回原扫描：空名字（不登记在命名空间里）、未跟踪的叠加索引、没有活动索引的普通模型，以及 SQL Server 容器不是现存 schema。最后一种是因为 opaque 的父对象不是表时，命名空间按父对象 ID 登记。
   - MySQL 的保留索引名 `PRIMARY` 规则不变。PG 原本就走 `isPg*Taken`，不受影响。
@@ -828,11 +828,13 @@ P3 审查后的修正（2026-11-19）：
   剩余开销分布平坦（mutator 参数校验、写时复制代理、推导名跟踪），已没有占比超过约 5% 的热点。每次 execute 末尾的 `{ ...m.objects }` 拷贝是 O(模型)，但每次 execute 只做一次，与子操作数无关。
 
 - **确定性守卫（`packages/sync/test/clipboard-sync.test.ts`）**：
-  - 基线 `m.objects` 读取计数先建好基线命名状态（服务端常驻索引只建一次），四种方言现值都是 0.009 / 既有对象 / 子操作（只剩末尾那次拷贝）。阈值统一收紧到 0.1。
-  - 新增第二个计数器 `modelIndexStats.elems`（叠加索引查询访问的元素数）：粘贴 20 → 80 张表时，每个子操作访问的元素数之比现值 ×1.00，阈值 1.5。恢复叠加层全量扫描时约为 ×3.96；SQL Server 退回扫描判重时，读取计数为 0.117，超出阈值。
-- **验证**：`packages/core/test/overlay-index.test.ts` 在四方言上覆盖叠加层新增、删除、原地改 parent / partitionOf / ownedBy、先建后删、只通知不写入、表换 schema、改表名。比较两组结果：
+  - 基线 `m.objects` 读取计数先建好基线命名状态（服务端常驻索引只建一次），四种方言现值都是 0.009 / 既有对象 / 子操作（只剩末尾那次拷贝）。阈值统一收紧到 0.1。SQL Server 退回扫描判重时会经 `schemaOfTable` 读 `m.objects`，读取计数升至 0.117，超出阈值。
+  - 新增第二个计数器 `modelIndexStats.elems`（叠加索引查询访问的元素数），分两个维度（统一阈值 1.5）防止退化互相遮蔽：
+    - 粘贴规模维度（固定 125 张既有表，粘贴 20 → 80 张表）：四方言现值均为 ×1.00；恢复叠加层全量扫描时约为 ×3.96，超出阈值。
+    - 既有规模维度（固定粘贴 20 张表，既有表 125 → 1000 张）：四方言现值均为 ×1.00（PG 4.1、SQLite 4.9、MySQL 4.1、MSSQL 4.1）。SQLite / MySQL 命名空间快路径退回 `objectsOfKinds` 扫描时遍历的是基线索引内部缓存分桶，不经过 `m.objects` Proxy（读取计数仍是 0.009），且在 20 → 80 维度会被固定基线稀释（仅 ×1.19 / ×1.18）；而在 125 → 1000 维度分别跳到 ×6.68（38.5 → 257.3）与 ×6.22（20.9 → 130.3），可稳定拦住。
+- **验证**：`packages/core/test/overlay-index.test.ts` 在四方言上覆盖叠加层新增、删除、原地改 parent / partitionOf / ownedBy、先建后删、只通知不写入、表换 schema、改表名与 MSSQL 显式 `ext.mssql.defaultName`。比较两组结果：
   - 结构查询：增量分桶、从头折叠、直接过滤草稿模型三者一致，前两者顺序也一致。
-  - SQLite / MySQL / SQL Server 的 `isNameTaken`：扫描、全新基线索引、跟踪中的叠加索引、未跟踪的叠加索引在全部名字（含大小写变体、`PRIMARY`、空名）× self（含 `#df` / `#nn` / `#seq` 占用者）× 容器上逐项一致。
+  - SQLite / MySQL / SQL Server 的 `isNameTaken`：扫描、全新基线索引、跟踪中的叠加索引、未跟踪的叠加索引在全部名字（含大小写变体、`PRIMARY`、空名，以及 MSSQL 显式 `ext.mssql.defaultName` 的混合大小写变体与旧推导名退场）× self（含 MSSQL 列默认的 `#df` 占用者，以及手工加入的 `<列>#nn` / `<列>#seq` 普通不匹配 ID；`nameEntriesOf` 下 `#nn` / `#seq` 仅 PG 产生，三方言只产生 `#df`）× 容器上逐项一致。
 
   PR #187 的推导名差分测试、命名索引测试和预算测试，以及既有的粘贴等价性测试，均未改动通过。
 
