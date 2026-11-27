@@ -3,7 +3,7 @@
 import type { Column, Kind, Model, Obj, ObjOf, Sequence, Table } from './ir.ts';
 import { OverlayNameTracker } from './name-tracker.ts';
 import { pgAllConNs, pgPropConNs, pgRelNs, pgTypeNs } from './naming-ns.ts';
-import { BaseNamingState, type NsOwners, type Snap } from './naming-state.ts';
+import { BaseNamingState, hasOwnerOtherThan, type NsOwners, type Snap } from './naming-state.ts';
 
 export interface ModelIndex {
   all<K extends Kind>(kind: K): ObjOf<K>[];
@@ -20,6 +20,12 @@ export interface ModelIndex {
   isPgRelTaken(schema: string, name: string, self: string): boolean;
   isPgConTaken(tableId: string, name: string, self: string): boolean;
   isPgTypeTaken(schema: string, name: string, self: string): boolean;
+  /**
+   * 命名空间（naming-ns.ts）里除 self 以外是否还有名字为 norm（已归一化）的占用者；
+   * self 既可以是占用者 ID（如 `<列>#df`），也可以是对象 ID（排除该对象的全部条目，与方言扫描判定的 `o.id === self` 一致）。
+   * 返回 undefined 表示该索引无法直接回答（未开启写入跟踪的叠加索引），调用方退回扫描。
+   */
+  nsTaken(ns: string, norm: string, self: string): boolean | undefined;
 }
 
 const cmpColumns = (a: Column, b: Column): number =>
@@ -322,6 +328,10 @@ export class MutableModelIndex implements ModelIndex {
     return hasOtherOwner(this.ns().owners, pgTypeNs(schema), name, self);
   }
 
+  nsTaken(ns: string, norm: string, self: string): boolean {
+    return hasOwnerOtherThan(this.ns().owners.get(ns)?.get(norm), self);
+  }
+
   isPgConTaken(tableId: string, name: string, self: string): boolean {
     const owners = this.ns().owners;
     const excludeNn = self.endsWith('#nn') ? self : undefined;
@@ -353,10 +363,176 @@ export class MutableModelIndex implements ModelIndex {
   }
 }
 
+/** 叠加索引查询访问的元素数（确定性计数守卫用：粘贴规模翻 4 倍时应只翻约 4 倍，见 Issue #165） */
+export const modelIndexStats = { elems: 0 };
+
+export const resetModelIndexStats = (): void => {
+  modelIndexStats.elems = 0;
+};
+
+/** 叠加层对象在分桶里登记的位置 */
+interface OvKey {
+  kind: Kind;
+  parent: string | null;
+  /** 表的分区父表 */
+  part: string | null;
+  /** 序列的归属列 */
+  owned: string | null;
+}
+
+const ovKeyOf = (o: Obj): OvKey => ({
+  kind: o.kind,
+  parent: 'parent' in o ? o.parent : null,
+  part: o.kind === 'table' && o.partitionOf ? o.partitionOf.parent : null,
+  owned: o.kind === 'sequence' && o.ownedBy ? o.ownedBy : null,
+});
+
+const sameOvKey = (a: OvKey | null, b: OvKey | null): boolean =>
+  a === b ||
+  (!!a && !!b && a.kind === b.kind && a.parent === b.parent && a.part === b.part && a.owned === b.owned);
+
+const kidKey = (parent: string, kind: Kind) => `${parent}\0${kind}`;
+
+/** 按首次写入顺序迭代的 ID 集合（与叠加层 Map 的插入顺序一致，结果顺序与逐个扫描叠加层相同） */
+class OrderedIds {
+  private ids = new Set<string>();
+  private top = -1;
+  private ordered = true;
+
+  get size(): number {
+    return this.ids.size;
+  }
+
+  add(id: string, seq: number) {
+    this.ids.add(id);
+    if (seq >= this.top) this.top = seq;
+    else this.ordered = false;
+  }
+
+  delete(id: string) {
+    this.ids.delete(id);
+  }
+
+  list(seqOf: ReadonlyMap<string, number>): Iterable<string> {
+    if (!this.ordered) {
+      this.ids = new Set([...this.ids].sort((a, b) => seqOf.get(a)! - seqOf.get(b)!));
+      this.ordered = true;
+    }
+    return this.ids;
+  }
+}
+
+const addOrdered = (map: Map<string, OrderedIds>, k: string, id: string, seq: number) => {
+  let set = map.get(k);
+  if (!set) {
+    set = new OrderedIds();
+    map.set(k, set);
+  }
+  set.add(id, seq);
+};
+
+const delOrdered = (map: Map<string, OrderedIds>, k: string, id: string) => {
+  const set = map.get(k);
+  if (!set) return;
+  set.delete(id);
+  if (set.size === 0) map.delete(k);
+};
+
+const inc = (map: Map<string, number>, k: string) => map.set(k, (map.get(k) ?? 0) + 1);
+
+/**
+ * 叠加层的分桶（Issue #165）：按 kind / (父对象, kind) / 父对象 / 分区父表 / 归属列登记叠加层里的当前对象，
+ * 并统计各桶里被叠加层遮蔽（改写或删除）的基线对象数，使查询只做 O(该桶大小) 的工作、不再扫描整个叠加层。
+ * 写入 ID 先记入 pending，查询前惰性折叠；状态只属于本次 execute，回滚时随叠加层一起丢弃，不触碰基线索引。
+ */
+class OverlayBuckets {
+  readonly pending = new Set<string>();
+  /** 已登记（被写入过）的 ID → 首次写入序号；同时就是"遮蔽基线同 ID 对象"的集合 */
+  readonly seq = new Map<string, number>();
+  private keys = new Map<string, OvKey | null>();
+  readonly kinds = new Map<string, OrderedIds>();
+  readonly kids = new Map<string, OrderedIds>();
+  readonly parents = new Map<string, OrderedIds>();
+  readonly parts = new Map<string, OrderedIds>();
+  readonly seqs = new Map<string, OrderedIds>();
+  readonly maskedKind = new Map<string, number>();
+  readonly maskedKid = new Map<string, number>();
+  readonly maskedParent = new Map<string, number>();
+  readonly maskedPart = new Map<string, number>();
+  readonly maskedSeq = new Map<string, number>();
+
+  private readonly base: MutableModelIndex;
+  private readonly overlay: Map<string, Obj | undefined>;
+
+  constructor(base: MutableModelIndex, overlay: Map<string, Obj | undefined>) {
+    this.base = base;
+    this.overlay = overlay;
+  }
+
+  masked(id: string): boolean {
+    return this.seq.has(id);
+  }
+
+  sync() {
+    if (this.pending.size === 0) return;
+    for (const id of this.pending) {
+      // 只登记叠加层里确实有的 ID（写入回调总在写入叠加层之后调用）
+      if (!this.overlay.has(id)) continue;
+      let s = this.seq.get(id);
+      if (s === undefined) {
+        s = this.seq.size;
+        this.seq.set(id, s);
+        // 基线在 execute 期间不变：首次写入时把基线里的同 ID 对象记为被遮蔽
+        const b = this.base.getObj(id);
+        if (b) this.count(ovKeyOf(b));
+      }
+      const prev = this.keys.get(id) ?? null;
+      const o = this.overlay.get(id);
+      const next = o ? ovKeyOf(o) : null;
+      if (sameOvKey(prev, next)) continue;
+      if (prev) this.unplace(id, prev);
+      if (next) this.place(id, next, s);
+      this.keys.set(id, next);
+    }
+    this.pending.clear();
+  }
+
+  private count(k: OvKey) {
+    inc(this.maskedKind, k.kind);
+    if (k.parent !== null) {
+      inc(this.maskedKid, kidKey(k.parent, k.kind));
+      inc(this.maskedParent, k.parent);
+    }
+    if (k.part !== null) inc(this.maskedPart, k.part);
+    if (k.owned !== null) inc(this.maskedSeq, k.owned);
+  }
+
+  private place(id: string, k: OvKey, s: number) {
+    addOrdered(this.kinds, k.kind, id, s);
+    if (k.parent !== null) {
+      addOrdered(this.kids, kidKey(k.parent, k.kind), id, s);
+      addOrdered(this.parents, k.parent, id, s);
+    }
+    if (k.part !== null) addOrdered(this.parts, k.part, id, s);
+    if (k.owned !== null) addOrdered(this.seqs, k.owned, id, s);
+  }
+
+  private unplace(id: string, k: OvKey) {
+    delOrdered(this.kinds, k.kind, id);
+    if (k.parent !== null) {
+      delOrdered(this.kids, kidKey(k.parent, k.kind), id);
+      delOrdered(this.parents, k.parent, id);
+    }
+    if (k.part !== null) delOrdered(this.parts, k.part, id);
+    if (k.owned !== null) delOrdered(this.seqs, k.owned, id);
+  }
+}
+
 /**
  * 面向同步层的写时复制增量索引：底层只读复用基线 MutableModelIndex，
- * 所有查询跳过 overlay 中已被改写/删除的对象 ID，并现场折叠小规模 overlay（通常仅 1–10 个对象）。
- * 即使 mutator 原地修改 overlay 内对象的属性（name / parent / partitionOf 等），依然 100% 实时准确。
+ * 所有查询跳过 overlay 中已被改写/删除的对象 ID，再接上叠加层分桶（OverlayBuckets）里的对象。
+ * 即使 mutator 原地修改 overlay 内对象的属性（name / parent / partitionOf 等），依然 100% 实时准确：
+ * 开启写入跟踪时由写入回调增量维护分桶（每次查询 O(该桶大小)）；未开启时每次查询前把整个叠加层重新折叠一遍。
  *
  * 创建方若保证所有写入都经过它的代理并通知 trackWrites 返回的回调（同步层 execute 如此），
  * 名字占用查询改走写入跟踪器的命名空间分桶（O(1)），推导名刷新只处理输入变化的对象（见 derived-names.ts）；
@@ -368,6 +544,9 @@ export class OverlayModelIndex implements ModelIndex {
   private model: Model;
   private wrap?: <T extends Obj>(o: T) => T;
   private tracker: OverlayNameTracker | undefined;
+  private readonly buckets: OverlayBuckets;
+  /** 写入是否都经由 trackWrites 的回调通知（否则每次查询前重新折叠整个叠加层） */
+  private tracked = false;
 
   constructor(
     base: MutableModelIndex,
@@ -379,6 +558,7 @@ export class OverlayModelIndex implements ModelIndex {
     this.overlay = overlay;
     this.model = model;
     this.wrap = wrap;
+    this.buckets = new OverlayBuckets(base, overlay);
   }
 
   /**
@@ -389,7 +569,12 @@ export class OverlayModelIndex implements ModelIndex {
     if (this.overlay.size !== 0) throw new Error('trackWrites 只能在叠加层为空时开启');
     const tracker = new OverlayNameTracker(this.base, this.base.namingState(), this.overlay);
     this.tracker = tracker;
-    return (id) => tracker.noteWrite(id);
+    this.tracked = true;
+    const pending = this.buckets.pending;
+    return (id) => {
+      pending.add(id);
+      tracker.noteWrite(id);
+    };
   }
 
   /** 可用的写入跟踪器（未开启或已结束时为 undefined） */
@@ -416,129 +601,97 @@ export class OverlayModelIndex implements ModelIndex {
   }
 
   private overlayVals(): IterableIterator<Obj | undefined> {
+    modelIndexStats.elems += this.overlay.size;
     return this.overlay.values();
   }
 
-  all<K extends Kind>(kind: K): ObjOf<K>[] {
-    if (this.overlay.size === 0) return this.wrapList(this.base.allRef(kind));
-    const baseList = this.base.allRef(kind);
-    const out: ObjOf<K>[] = [];
+  /** 折叠待处理写入后的分桶（未开启写入跟踪时整个叠加层都当作待处理） */
+  private synced(): OverlayBuckets {
+    let b = this.buckets;
+    if (!this.tracked) {
+      // 未跟踪写入：对象可能被原地修改、甚至从叠加层移除，每次查询都从头折叠
+      b = new OverlayBuckets(this.base, this.overlay);
+      modelIndexStats.elems += this.overlay.size;
+      for (const id of this.overlay.keys()) b.pending.add(id);
+    }
+    b.sync();
+    return b;
+  }
+
+  /** 基线列表去掉被遮蔽的对象再接上叠加层分桶里的对象；两者都没有时原样返回基线列表（不复制） */
+  private merge<T extends Obj>(
+    b: OverlayBuckets,
+    baseList: readonly T[],
+    masked: number,
+    ov: OrderedIds | undefined,
+  ): readonly T[] {
+    const ovSize = ov?.size ?? 0;
+    modelIndexStats.elems += baseList.length + ovSize;
+    if (masked === 0 && ovSize === 0) return baseList;
+    const out: T[] = [];
     for (let i = 0; i < baseList.length; i++) {
       const o = baseList[i]!;
-      if (!this.overlay.has(o.id)) out.push(this.wrapOut(o));
+      if (masked === 0 || !b.masked(o.id)) out.push(o);
     }
-    for (const o of this.overlayVals()) {
-      if (o && o.kind === kind) out.push(this.wrapOut(o as ObjOf<K>));
-    }
+    if (ov) for (const id of ov.list(b.seq)) out.push(this.overlay.get(id) as T);
     return out;
+  }
+
+  all<K extends Kind>(kind: K): ObjOf<K>[] {
+    return this.wrapList(this.allRef(kind));
   }
 
   allRef<K extends Kind>(kind: K): readonly ObjOf<K>[] {
-    if (this.overlay.size === 0) return this.base.allRef(kind);
-    const baseList = this.base.allRef(kind);
-    const out: ObjOf<K>[] = [];
-    for (let i = 0; i < baseList.length; i++) {
-      const o = baseList[i]!;
-      if (!this.overlay.has(o.id)) out.push(o);
-    }
-    for (const o of this.overlayVals()) {
-      if (o && o.kind === kind) out.push(o as ObjOf<K>);
-    }
-    return out;
+    const b = this.synced();
+    return this.merge(b, this.base.allRef(kind), b.maskedKind.get(kind) ?? 0, b.kinds.get(kind));
   }
 
   childrenOf<K extends Kind>(parent: string, kind: K): ObjOf<K>[] {
-    if (this.overlay.size === 0) return this.wrapList(this.base.childrenRef(parent, kind));
-    const baseList = this.base.childrenRef(parent, kind);
-    const out: ObjOf<K>[] = [];
-    for (let i = 0; i < baseList.length; i++) {
-      const o = baseList[i]!;
-      if (!this.overlay.has(o.id)) out.push(this.wrapOut(o));
-    }
-    for (const o of this.overlayVals()) {
-      if (o && o.kind === kind && 'parent' in o && o.parent === parent) out.push(this.wrapOut(o as ObjOf<K>));
-    }
-    return out;
+    return this.wrapList(this.childrenRef(parent, kind));
   }
 
   childrenRef<K extends Kind>(parent: string, kind: K): readonly ObjOf<K>[] {
-    if (this.overlay.size === 0) return this.base.childrenRef(parent, kind);
-    const baseList = this.base.childrenRef(parent, kind);
-    const out: ObjOf<K>[] = [];
-    for (let i = 0; i < baseList.length; i++) {
-      const o = baseList[i]!;
-      if (!this.overlay.has(o.id)) out.push(o);
-    }
-    for (const o of this.overlayVals()) {
-      if (o && o.kind === kind && 'parent' in o && o.parent === parent) out.push(o as ObjOf<K>);
-    }
-    return out;
+    const b = this.synced();
+    const k = kidKey(parent, kind);
+    return this.merge(b, this.base.childrenRef(parent, kind), b.maskedKid.get(k) ?? 0, b.kids.get(k));
   }
 
   allChildrenOf(parent: string): Obj[] {
-    if (this.overlay.size === 0) return this.wrapList(this.base.allChildrenOf(parent));
-    const baseList = this.base.allChildrenOf(parent);
-    const out: Obj[] = [];
-    for (let i = 0; i < baseList.length; i++) {
-      const o = baseList[i]!;
-      if (!this.overlay.has(o.id)) out.push(this.wrapOut(o));
-    }
-    for (const o of this.overlayVals()) {
-      if (o && 'parent' in o && o.parent === parent) out.push(this.wrapOut(o));
-    }
-    return out;
+    const b = this.synced();
+    return this.wrapList(
+      this.merge(b, this.base.allChildrenOf(parent), b.maskedParent.get(parent) ?? 0, b.parents.get(parent)),
+    );
+  }
+
+  /** 本表的列是否都还是基线里的样子（没有被改写 / 删除 / 移入移出的列） */
+  private columnsUntouched(tableId: string): boolean {
+    const b = this.synced();
+    const k = kidKey(tableId, 'column');
+    return (b.maskedKid.get(k) ?? 0) === 0 && !b.kids.has(k);
   }
 
   columnsOf(tableId: string): Column[] {
-    if (this.overlay.size === 0) return this.wrapList(this.base.columnsRef(tableId));
-    let overlayTouchesCol = false;
-    for (const [id, o] of this.overlay) {
-      if (o?.kind === 'column' && o.parent === tableId) {
-        overlayTouchesCol = true;
-        break;
-      }
-      // 也检查从 base 里被删除或移走的列
-      const prev = this.base.childrenRef(tableId, 'column').some((c) => c.id === id);
-      if (prev) {
-        overlayTouchesCol = true;
-        break;
-      }
-    }
-    if (!overlayTouchesCol) return this.wrapList(this.base.columnsRef(tableId));
+    if (this.columnsUntouched(tableId)) return this.wrapList(this.base.columnsRef(tableId));
     return this.childrenOf(tableId, 'column').sort(cmpColumns);
   }
 
   columnsRef(tableId: string): readonly Column[] {
-    if (this.overlay.size === 0) return this.base.columnsRef(tableId);
+    if (this.columnsUntouched(tableId)) return this.base.columnsRef(tableId);
     return this.childrenRef(tableId, 'column').slice().sort(cmpColumns);
   }
 
   partitionsOf(parentId: string): Table[] {
-    if (this.overlay.size === 0) return this.wrapList(this.base.partitionsRef(parentId));
-    const baseList = this.base.partitionsRef(parentId);
-    const out: Table[] = [];
-    for (let i = 0; i < baseList.length; i++) {
-      const t = baseList[i]!;
-      if (!this.overlay.has(t.id)) out.push(this.wrapOut(t));
-    }
-    for (const o of this.overlayVals()) {
-      if (o && o.kind === 'table' && o.partitionOf?.parent === parentId) out.push(this.wrapOut(o));
-    }
-    return out;
+    return this.wrapList(this.partitionsRef(parentId));
   }
 
   partitionsRef(parentId: string): readonly Table[] {
-    if (this.overlay.size === 0) return this.base.partitionsRef(parentId);
-    const baseList = this.base.partitionsRef(parentId);
-    const out: Table[] = [];
-    for (let i = 0; i < baseList.length; i++) {
-      const t = baseList[i]!;
-      if (!this.overlay.has(t.id)) out.push(t);
-    }
-    for (const o of this.overlayVals()) {
-      if (o && o.kind === 'table' && o.partitionOf?.parent === parentId) out.push(o);
-    }
-    return out;
+    const b = this.synced();
+    return this.merge(
+      b,
+      this.base.partitionsRef(parentId),
+      b.maskedPart.get(parentId) ?? 0,
+      b.parts.get(parentId),
+    ) as readonly Table[];
   }
 
   partitionDescendants(parentId: string): Table[] {
@@ -559,17 +712,14 @@ export class OverlayModelIndex implements ModelIndex {
   }
 
   sequencesOwnedBy(colId: string): Sequence[] {
-    if (this.overlay.size === 0) return this.wrapList(this.base.sequencesOwnedBy(colId));
-    const baseList = this.base.sequencesOwnedBy(colId);
-    const out: Sequence[] = [];
-    for (let i = 0; i < baseList.length; i++) {
-      const s = baseList[i]!;
-      if (!this.overlay.has(s.id)) out.push(this.wrapOut(s));
-    }
-    for (const o of this.overlayVals()) {
-      if (o && o.kind === 'sequence' && o.ownedBy === colId) out.push(this.wrapOut(o));
-    }
-    return out;
+    const b = this.synced();
+    return this.wrapList(
+      this.merge(b, this.base.sequencesOwnedBy(colId), b.maskedSeq.get(colId) ?? 0, b.seqs.get(colId)),
+    );
+  }
+
+  nsTaken(ns: string, norm: string, self: string): boolean | undefined {
+    return this.tracker?.hasOtherThan(ns, norm, self);
   }
 
   private overlayPgRelMatch(schema: string, name: string, self: string): boolean {

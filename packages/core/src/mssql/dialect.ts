@@ -22,6 +22,7 @@ import {
   get,
   getActiveModelIndex,
   indexElementNames,
+  nsNameTaken,
   objectsOfKinds,
   OverlayModelIndex,
 } from '../model.ts';
@@ -75,6 +76,11 @@ const schemaOfTable = (m: Model, tableId: string): string => get(m, tableId, 'ta
 /** 判断对象名在 schema 级 `sys.objects` 命名空间是否已被占用（大小写不敏感） */
 const isMssqlObjTaken = (m: Model, schemaId: string, name: string, selfId: string): boolean => {
   const low = name.toLowerCase();
+  // 命名空间按 opaque 的父对象 ID 登记（父对象不是表时）；容器不是现存 schema 时与扫描判定可能不同，退回扫描
+  if (m.objects[schemaId]?.kind === 'schema') {
+    const fast = nsNameTaken(m, mssqlObjNs(schemaId), low, selfId);
+    if (fast !== undefined) return fast;
+  }
   return objectsOfKinds(m, [
     'table',
     'sequence',
@@ -117,6 +123,8 @@ const isMssqlObjTaken = (m: Model, schemaId: string, name: string, selfId: strin
 /** 判断索引/约束名在表级 `sys.indexes` 命名空间是否已被占用（大小写不敏感） */
 const isMssqlIdxTaken = (m: Model, tableId: string, name: string, selfId: string): boolean => {
   const low = name.toLowerCase();
+  const fast = nsNameTaken(m, mssqlIdxNs(tableId), low, selfId);
+  if (fast !== undefined) return fast;
   return childrenOfKinds(m, tableId, ['index', 'primaryKey', 'unique']).some((o) => {
     if (o.id === selfId) return false;
     if ((o.kind === 'index' || o.kind === 'primaryKey' || o.kind === 'unique') && o.parent === tableId) {

@@ -20,10 +20,11 @@ import {
   columnsOf,
   getActiveModelIndex,
   indexElementNames,
+  nsNameTaken,
   objectsOfKinds,
   OverlayModelIndex,
 } from '../model.ts';
-import { MYSQL_CON_NS, mysqlIdxNs } from '../naming-ns.ts';
+import { MYSQL_CON_NS, MYSQL_REL_NS, mysqlIdxNs } from '../naming-ns.ts';
 import { plainRefresh } from '../naming-state.ts';
 import { mysqlClipboard } from './clipboard.ts';
 import {
@@ -75,6 +76,8 @@ export const MYSQL_CAPABILITIES: DialectCapabilities = {
 
 const isMysqlTableOrViewTaken = (m: Model, name: string, selfId: string): boolean => {
   const low = name.toLowerCase();
+  const fast = nsNameTaken(m, MYSQL_REL_NS, low, selfId);
+  if (fast !== undefined) return fast;
   return objectsOfKinds(m, ['table', 'opaque']).some((o) => {
     if (o.id === selfId) return false;
     if (o.kind === 'table') return o.name.toLowerCase() === low;
@@ -86,6 +89,8 @@ const isMysqlTableOrViewTaken = (m: Model, name: string, selfId: string): boolea
 const isMysqlTableIndexTaken = (m: Model, tableId: string, name: string, selfId: string): boolean => {
   const low = name.toLowerCase();
   if (low === 'primary') return true;
+  const fast = nsNameTaken(m, mysqlIdxNs(tableId), low, selfId);
+  if (fast !== undefined) return fast;
   return childrenOfKinds(m, tableId, ['unique', 'index', 'foreignKey']).some((o) => {
     if (o.id === selfId) return false;
     if ((o.kind === 'unique' || o.kind === 'index' || o.kind === 'foreignKey') && o.parent === tableId) {
@@ -97,6 +102,8 @@ const isMysqlTableIndexTaken = (m: Model, tableId: string, name: string, selfId:
 
 const isMysqlSchemaConstraintTaken = (m: Model, name: string, selfId: string): boolean => {
   const low = name.toLowerCase();
+  const fast = nsNameTaken(m, MYSQL_CON_NS, low, selfId);
+  if (fast !== undefined) return fast;
   return objectsOfKinds(m, ['foreignKey', 'check']).some((o) => {
     if (o.id === selfId) return false;
     if (o.kind === 'foreignKey' || o.kind === 'check') {
@@ -117,6 +124,10 @@ const isMysqlConTaken = (m: Model, tableId: string, name: string, selfId: string
   if (self?.kind === 'check') {
     return isMysqlSchemaConstraintTaken(m, name, selfId);
   }
+  // 其他情况（新建、self 不是约束）：全库 CHECK / FK 名 + 本表 UNIQUE / 索引名（本表 FK 已含在全库约束名里）
+  const conFast = nsNameTaken(m, MYSQL_CON_NS, low, selfId);
+  const idxFast = conFast === false ? nsNameTaken(m, mysqlIdxNs(tableId), low, selfId) : conFast;
+  if (idxFast !== undefined) return idxFast;
   return objectsOfKinds(m, ['foreignKey', 'check', 'unique', 'index']).some((o) => {
     if (o.id === selfId) return false;
     if (o.kind === 'foreignKey' || o.kind === 'check') return o.name.toLowerCase() === low;

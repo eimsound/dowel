@@ -235,6 +235,13 @@ export const markChange = (h: MarkHost, id: string, prev: Snap | null, next: Sna
 /** 命名空间 → 归一化名字 → 占用者 → 对象 ID */
 export type NsOwners = Map<string, Map<string, Map<string, string>>>;
 
+/** 命名空间里某个名字除 self（占用者 ID 或其所属对象 ID）以外是否还有占用者 */
+export const hasOwnerOtherThan = (owners: ReadonlyMap<string, string> | undefined, self: string): boolean => {
+  if (!owners) return false;
+  for (const [owner, root] of owners) if (owner !== self && root !== self) return true;
+  return false;
+};
+
 export const addNsOwner = (map: NsOwners, e: NsEntry, root: string) => {
   let byName = map.get(e.ns);
   if (!byName) {

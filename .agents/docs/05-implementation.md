@@ -787,13 +787,54 @@ P3 审查后的修正（2026-11-19）：
   - PG 1 万条 CHECK 的大表上，单次 `addCheck` 约 3 ms（2 次校验）。
   - 交错的逐步 execute 每步约 1 次校验、2–4 次试探、1.25–2 次标脏；正常粘贴每个子操作消耗常数预算，按 2 万个子操作折算仍低于预算的一半。
   - `batch` 里反复改这张大表的表名或列名（每次都要重算全部 CHECK）约 1.05–1.1 s 时触发熔断；其余方言 4000 条 CHECK 时约 0.9 s 触发。
-- **剩余的非推导名开销（不在本 PR 范围）**：MCP 500 步预演约 1.56 s，其中纯 500 × `setComment` 已占约 1.37 s，推导名只占约 80 ms；粘贴 1 万条 CHECK 约 4.1–4.7 s，推导名不到 2%。剩余开销主要来自 `execute` 的 `{...m.objects}` 拷贝，以及 `OverlayModelIndex.columnsOf` / `childrenRef` / `effectiveColumnsOf` 的叠加层扫描（#165）。
+- **剩余的非推导名开销（不在本 PR 范围）**：MCP 500 步预演约 1.56 s，其中纯 500 × `setComment` 已占约 1.37 s，推导名只占约 80 ms；粘贴 1 万条 CHECK 约 4.1–4.7 s，推导名不到 2%。剩余开销主要来自 `execute` 的 `{...m.objects}` 拷贝，以及 `OverlayModelIndex.columnsOf` / `childrenRef` / `effectiveColumnsOf` 的叠加层扫描（#165）。叠加层扫描已由 4.34 消除。
 - **验证**：
   - `packages/sync/test/derived-names.test.ts` 对四方言跑随机修改序列，比较普通模型、逐个 execute（共享索引）、无索引 execute、整批 `batch` / paste（含先提交前缀进基线）的结果，要求逐字节一致；每步检查不变式：未受影响对象名字不变、推导名有效、不撞名、重算者取最小空位。
   - 同一文件还有：回归用例；确定性计数守卫（大表单步、交错 addColumn / addCheck、交错 renameKey / dropKey / addCheck、跨表同名列 `renameColumn` 隔离与 `refScans` 守卫、PG 分区族隔离与空分区遍历预算守卫、MCP 500 步、`batchReadsOf`、分词缓存）；预算熔断与原子回滚；`indexedBatchStepper` 共享预算及 `batchReadsOf` 超限保守回退；失败 execute 不吞空位；提交级写入后的标脏覆盖（倒排索引、撞名顺序、分区拓扑）。
   - `packages/core/test/naming-index.test.ts` 把增量维护的命名空间、`(表, 标识符)` 倒排索引和脏集合与全新构建对比。
   - `apps/server/test/mcp.test.ts` 通过真实 `McpWriter` / `apply_changes` 验证 `previewBudget` 跨步骤共享并在超限处拒绝、房间模型保持不变。
   - 原先作为对照的 `packages/core/test/support/legacy-derived-names.ts` 已删除，因为语义已经改变；`packages/core` 原有测试无一依赖级联压缩，全部未改动通过。
+
+### 4.34 大规模粘贴：叠加层分桶与方言命名空间判重（2026-11-28，#165）
+
+- **问题**：`execute('paste')` 的耗时随粘贴规模超线性增长。PR #187 之后，680 张表仍要约 5–6 s，200 张表约 0.45–0.9 s。原因有两个：
+  - `OverlayModelIndex` 每次查询都扫描整个叠加层。`columnsOf` 还会对每个叠加层条目调用一次 `base.childrenRef`。
+  - SQLite / MySQL / SQL Server 的 `isNameTaken` 每次都经 `objectsOfKinds` 取整个 kind 分桶。叠加层非空时，`allRef` 还会复制整份基线列表。SQL Server 每个子操作还要按 schema 扫描全部约束和带默认值的列。
+- **叠加层分桶（`packages/core/src/model-index.ts` 的 `OverlayBuckets`）**：
+  - 按 kind、(父对象, kind)、父对象、分区父表、序列归属列登记叠加层里的当前对象，同时统计各桶里被叠加层遮蔽（改写或删除）的基线对象数。
+  - `trackWrites()` 返回的写入回调同时通知分桶和 `OverlayNameTracker`。分桶在查询前惰性折叠，每个写入 O(1)。
+  - 查询只做 O(该桶大小) 的工作。桶里没有遮蔽也没有叠加层对象时，直接返回基线的缓存数组，不复制。
+  - 分桶只读 `kind / parent / partitionOf.parent / ownedBy` 四个标量，与推导名状态完全独立。结构查询不会触发跟踪器 `flush()`，所以推导名事件的结算时机、`derivedNameStats` 和工作量预算都与之前相同（B2 方案曾考虑复用跟踪器的 `ovKids` / `ovParts`，因这一点被否决）。
+  - 状态只属于本次 execute：回滚时随叠加层一起丢弃，不触碰基线索引。
+  - 结果顺序与原实现一致：先是基线（去掉被遮蔽的），再按首次写入顺序（即叠加层 Map 的插入顺序）列出叠加层对象。
+  - 只登记确实在叠加层里的 ID：只通知不写入的 ID 不会遮蔽基线对象。
+  - 未开启写入跟踪时，每次查询都从头折叠整个叠加层。复杂度与原实现相同，也作为差分测试的参照。
+- **方言命名空间判重（`ModelIndex.nsTaken`、`model.ts` 的 `nsNameTaken`）**：
+  - SQLite（`SQLITE_REL_NS` / `sqliteConNs`）、MySQL（`MYSQL_REL_NS` / `MYSQL_CON_NS` / `mysqlIdxNs`）、SQL Server（`mssqlObjNs` / `mssqlIdxNs`）的 `isNameTaken` 先查 PR #187 的命名空间分桶（条目与原扫描判定逐条一致，名字转小写后查找）。
+  - 基线 `MutableModelIndex` 查 `BaseNamingState.owners`，跟踪中的叠加索引查 `OverlayNameTracker.hasOtherThan`。
+  - self 同时按占用者 ID 和所属对象 ID 排除，与扫描里的 `o.id === selfId` 一致：SQL Server 带默认值列的条目属于 `<列>#df`，以列 ID 为 self 时也会被排除。
+  - 以下情况退回原扫描：空名字（不登记在命名空间里）、未跟踪的叠加索引、没有活动索引的普通模型，以及 SQL Server 容器不是现存 schema。最后一种是因为 opaque 的父对象不是表时，命名空间按父对象 ID 登记。
+  - MySQL 的保留索引名 `PRIMARY` 规则不变。PG 原本就走 `isPg*Taken`，不受影响。
+- **不需要分片执行或让出事件循环**：消除二次项后，680 张表的服务端执行在 0.2–0.3 s 内完成，且有 2 万个子操作 / 单条消息大小上限兜底。`execute` 依赖同步调用栈上的单例（`activeBudget`、`scopedIndexes`，以及基线 `SeqRegistry` 的单一 `activeTracker`），并在房间锁和 PG 行锁内同步执行。让出事件循环会破坏这些假设和粘贴的原子性，因此不做。
+- **基准（`pnpm bench:paste`，开发机，`execute` 墙钟取较快值）**：
+
+  | 场景                          | PG            | SQLite        | MySQL         | SQL Server    |
+  | ----------------------------- | ------------- | ------------- | ------------- | ------------- |
+  | 空项目粘贴 200 张表 × 12 列   | 469 → 74 ms   | 504 → 75 ms   | 446 → 65 ms   | 527 → 70 ms   |
+  | 1000 张既有表 + 粘贴 200 张表 | 464 → 77 ms   | 624 → 55 ms   | 467 → 72 ms   | 906 → 60 ms   |
+  | 空项目粘贴 680 张表           | 4998 → 270 ms | 5786 → 208 ms | 5022 → 248 ms | 5938 → 218 ms |
+  | 粘贴一张带 1 万条 CHECK 的表  | 1162 → 232 ms | 1266 → 236 ms | 1361 → 232 ms | 1300 → 238 ms |
+
+  剩余开销分布平坦（mutator 参数校验、写时复制代理、推导名跟踪），已没有占比超过约 5% 的热点。每次 execute 末尾的 `{ ...m.objects }` 拷贝是 O(模型)，但每次 execute 只做一次，与子操作数无关。
+
+- **确定性守卫（`packages/sync/test/clipboard-sync.test.ts`）**：
+  - 基线 `m.objects` 读取计数先建好基线命名状态（服务端常驻索引只建一次），四种方言现值都是 0.009 / 既有对象 / 子操作（只剩末尾那次拷贝）。阈值统一收紧到 0.1。
+  - 新增第二个计数器 `modelIndexStats.elems`（叠加索引查询访问的元素数）：粘贴 20 → 80 张表时，每个子操作访问的元素数之比现值 ×1.00，阈值 1.5。恢复叠加层全量扫描时约为 ×3.96；SQL Server 退回扫描判重时，读取计数为 0.117，超出阈值。
+- **验证**：`packages/core/test/overlay-index.test.ts` 在四方言上覆盖叠加层新增、删除、原地改 parent / partitionOf / ownedBy、先建后删、只通知不写入、表换 schema、改表名。比较两组结果：
+  - 结构查询：增量分桶、从头折叠、直接过滤草稿模型三者一致，前两者顺序也一致。
+  - SQLite / MySQL / SQL Server 的 `isNameTaken`：扫描、全新基线索引、跟踪中的叠加索引、未跟踪的叠加索引在全部名字（含大小写变体、`PRIMARY`、空名）× self（含 `#df` / `#nn` / `#seq` 占用者）× 容器上逐项一致。
+
+  PR #187 的推导名差分测试、命名索引测试和预算测试，以及既有的粘贴等价性测试，均未改动通过。
 
 ## 5. 下一步
 
