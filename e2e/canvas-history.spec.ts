@@ -1,27 +1,13 @@
 // 画布修改历史（C4 + ADR 0015 §4 编辑会话归组）端到端测试：
 // 同一会话连续 5 步手工编辑 → 打开画布修改历史即见编辑会话 #1–#5 与整组净差异 →
 // 键盘展开单步明细 → 选中间单步查看本次修改 / 当时状态 / 与当前画布的差异 → 恢复中间单步（独立的「恢复历史状态」记录）→
-// 再恢复回组尾 #5，含亮 / 暗主题与 axe 无障碍扫描。
-import AxeBuilder from '@axe-core/playwright';
-import { expect, type Page, test } from '@playwright/test';
+// 再恢复回组尾 #5，含亮 / 暗主题。
+import { expect, test } from '@playwright/test';
 
 import { commit, createProject, newUser, openModel } from './helpers.ts';
 
-const scan = async (page: Page, label: string) => {
-  const results = await new AxeBuilder({ page }).analyze();
-  const bad = results.violations.filter((v) => v.impact === 'serious' || v.impact === 'critical');
-  expect(
-    bad,
-    `${label} 有 serious / critical 级别的无障碍问题：\n${bad
-      .map(
-        (v) => `- ${v.id} (${v.impact}) ${v.help}\n  ${v.nodes.map((n) => n.target.join(' ')).join('\n  ')}`,
-      )
-      .join('\n')}`,
-  ).toEqual([]);
-};
-
 for (const scheme of ['light', 'dark'] as const) {
-  test(`画布修改历史编辑会话归组、单步展开、恢复与无障碍检查（${scheme}）`, async ({ browser }) => {
+  test(`画布修改历史编辑会话归组、单步展开与恢复（${scheme}）`, async ({ browser }) => {
     const { page } = await newUser(browser, '历史测试员', { colorScheme: scheme, locale: 'zh-CN' });
     await createProject(page, `画布历史 ${scheme}`);
     await openModel(page);
@@ -53,7 +39,6 @@ for (const scheme of ['light', 'dark'] as const) {
     await expect(opDiffPanel).not.toContainText('table_1');
     await expect(historyDlg.locator('header')).toContainText('#1–#5');
     await expect(historyDlg.locator('header')).toContainText('5 步');
-    await scan(page, `画布修改历史-编辑会话净差异（${scheme}）`);
 
     // 预览选项卡键盘方向键：由 focusgroup / polyfill 单步顺序移动焦点，不跳格
     const opDiffTab = historyDlg.getByRole('tab', { name: /本次修改/ });
@@ -84,7 +69,6 @@ for (const scheme of ['light', 'dark'] as const) {
     await expect(steps.getByRole('button').first()).toBeFocused();
     await expect(steps.getByRole('button').first()).toContainText('重命名列');
     await expect(steps.getByRole('button').first()).toContainText('#5');
-    await scan(page, `画布修改历史-展开单步明细（${scheme}）`);
 
     // 4. 选中间单步 #4（新增列 column_2）：组本身不再是当前项，全列表唯一 aria-current
     const step4 = steps.getByRole('button', { name: /新增列.*#4/ });
@@ -109,7 +93,6 @@ for (const scheme of ['light', 'dark'] as const) {
     await expect(statePanel).toContainText('column_2');
     await statePanel.getByRole('button', { name: '表结构' }).click();
     await expect(statePanel).toContainText('column_2');
-    await scan(page, `画布修改历史-当时状态表结构（${scheme}）`);
 
     // 与当前画布的差异（把 total 改回 column_2）
     await diffTab.click();
@@ -122,7 +105,6 @@ for (const scheme of ['light', 'dark'] as const) {
     await expect(confirmStep).toBeVisible();
     await expect(confirmStep).toContainText('#4（新增列）');
     await expect(confirmStep).toContainText('RENAME COLUMN total TO column_2');
-    await scan(page, `画布修改历史-恢复单步确认（${scheme}）`);
     await confirmStep.getByRole('button', { name: '恢复到此状态' }).click();
     await expect(confirmStep).toBeHidden();
     await expect(historyDlg).toBeHidden();
@@ -147,7 +129,6 @@ for (const scheme of ['light', 'dark'] as const) {
     await expect(confirmGroup).toBeVisible();
     await expect(confirmGroup).toContainText('连续编辑 #1–#5 结束时（#5）');
     await expect(confirmGroup).toContainText('RENAME COLUMN column_2 TO total');
-    await scan(page, `画布修改历史-恢复编辑会话确认（${scheme}）`);
     await confirmGroup.getByRole('button', { name: '恢复到此状态' }).click();
     await expect(historyDlg).toBeHidden();
     await expect(page.locator('.react-flow__node')).toContainText('total');

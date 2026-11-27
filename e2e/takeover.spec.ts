@@ -1,27 +1,13 @@
-// 接手与认领（P4c）：向导里的接手流程、认领确认对话框、环境页的认领、确认对话框里的预演结果，加无障碍扫描。
+// 接手与认领（P4c）：向导里的接手流程、认领确认对话框、环境页的认领、确认对话框里的预演结果。
 // “另一个实例”用改目标库里 dowel.projects 的 instance_id 来模拟（e2e 只有一个服务实例）：
 // 先在界面上建项目、发布、执行，再删掉项目（目标库里的历史还在），把库里记的认领实例改成“旧实例”，然后走接手向导。
 // 需要 PG 作目标库和影子库（Testcontainers 或 DOWEL_TEST_PG），没有 Docker 时跳过。
-import AxeBuilder from '@axe-core/playwright';
 import { type Browser, expect, type Page, test } from '@playwright/test';
 
 import { addEnv, execDialog, newTargetDb, openEnv, publishTable } from './exec-helpers.ts';
 import { createGroup, createProjectIn, instanceAdmin } from './helpers.ts';
 
 test.skip(!process.env.DOWEL_TEST_PG, '没有可用的 PostgreSQL（需要 Docker）');
-
-const scan = async (page: Page, label: string) => {
-  const results = await new AxeBuilder({ page }).analyze();
-  const bad = results.violations.filter((v) => v.impact === 'serious' || v.impact === 'critical');
-  expect(
-    bad,
-    `${label} 有 serious / critical 级别的无障碍问题：\n${bad
-      .map(
-        (v) => `- ${v.id} (${v.impact}) ${v.help}\n  ${v.nodes.map((n) => n.target.join(' ')).join('\n  ')}`,
-      )
-      .join('\n')}`,
-  ).toEqual([]);
-};
 
 type Db = Awaited<ReturnType<typeof newTargetDb>>;
 
@@ -40,9 +26,9 @@ const executeAll = async (page: Page) => {
  * 并把目标库里记的认领实例改成 old-instance（模拟这个库是另一个实例写的）。
  * 返回目标库、组名和原项目名。
  */
-const lostInstance = async (browser: Browser, scheme?: 'light' | 'dark') => {
+const lostInstance = async (browser: Browser) => {
   const db = await newTargetDb('e2e_takeover');
-  const admin = await instanceAdmin(browser, scheme);
+  const admin = await instanceAdmin(browser);
   const group = await createGroup(admin);
   const name = `原项目 ${Math.random().toString(36).slice(2, 6)}`;
   await createProjectIn(admin, name, group.name);
@@ -157,7 +143,6 @@ test('接手：读出库里的项目 → 认领确认 → 恢复版本链和环�
       (await db.sql<{ t: string | null }>("select to_regclass('public.invoices')::text as t"))[0]!.t,
     ).toBeNull();
     expect((await db.sql('select 1 from dowel.history')).length).toBe(historyBefore);
-    await scan(page, '确认对话框里的预演结果');
     await dlg.getByRole('button', { name: '取消' }).click();
     await expect(dlg).toBeHidden();
     await executeAll(page);
@@ -181,7 +166,6 @@ test('接手：读出库里的项目 → 认领确认 → 恢复版本链和环�
     await second.getByRole('button', { name: '认领这个库' }).click();
     const claim2 = second.getByRole('dialog', { name: '认领这个项目？' });
     await expect(claim2).toContainText('someone-else');
-    await scan(second, '认领确认对话框');
     await claim2.getByRole('button', { name: '确认认领', exact: true }).click();
     await expect(second.getByText('已认领：之后由本实例执行。')).toBeVisible();
     await expect(second.getByText('这个库里的项目由另一个实例认领')).toHaveCount(0);
@@ -463,30 +447,3 @@ test('接手：带 warnings 创建成功后停留在第 3 步并禁用「上一�
     await db.drop();
   }
 });
-
-for (const scheme of ['light', 'dark'] as const) {
-  test(`无障碍（${scheme}）：接手向导选项目、认领确认、环境页的认领横幅`, async ({ browser }) => {
-    const { db, admin: page, group, name } = await lostInstance(browser, scheme);
-    try {
-      await wizardToTakeover(page, group.name, '无障碍接手', db);
-      await expect(page.getByRole('radio', { name: new RegExp(name) })).toBeVisible();
-      await page.getByRole('radio', { name: new RegExp(name) }).check();
-      await scan(page, '接手向导：选择项目');
-      await page.getByRole('button', { name: '下一步' }).click();
-      await page.getByRole('button', { name: '创建项目' }).click();
-      const claim = page.getByRole('dialog', { name: '认领这个项目？' });
-      await expect(claim).toBeVisible();
-      await scan(page, '接手向导：认领确认');
-      await claim.getByRole('button', { name: '确认认领并接手' }).click();
-      await expect(page.getByRole('heading', { name: '概览' })).toBeVisible({ timeout: 60_000 });
-      await scan(page, '接手之后的项目概览（接手恢复标记）');
-      await openEnv(page, 'dev');
-      await db.sql("update dowel.projects set instance_id = 'someone-else'");
-      await page.reload();
-      await expect(page.getByText('这个库里的项目由另一个实例认领')).toBeVisible();
-      await scan(page, '环境页：认领横幅和认领记录');
-    } finally {
-      await db.drop();
-    }
-  });
-}

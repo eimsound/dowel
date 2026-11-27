@@ -1,4 +1,4 @@
-# 六、前端交互状态机、无障碍、缓存、i18n 与文档一致性
+# 六、前端交互状态机、缓存、i18n 与文档一致性
 
 涉及模块：`apps/web/src/pages/NewProject.tsx`、`apps/web/src/components/CanvasHistory.tsx`、`apps/web/src/components/Tabs.tsx`、`apps/web/src/pages/Environments.tsx`、`apps/web/src/components/TokenSettings.tsx`、`apps/web/src/i18n.ts`、`apps/web/src/activity.ts`、`apps/web/src/policy-cache.ts`、`docs/*`。
 

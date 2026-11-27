@@ -322,7 +322,6 @@ const Snippet = ({
     {hint && <p className="hint m-0">{hint}</p>}
     <section
       aria-label={name}
-      // oxlint-disable-next-line jsx-a11y/no-noninteractive-tabindex -- 可滚动的代码区需要能用键盘滚动
       tabIndex={0}
       className="overflow-x-auto rounded-md border border-border bg-bg p-3"
     >

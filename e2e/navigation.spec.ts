@@ -102,3 +102,57 @@ test('项目加载失败时显示错误和重试按钮', async ({ browser }) => 
   await page.getByRole('button', { name: '重试' }).click();
   await expect(page.getByRole('heading', { name: '概览' })).toBeVisible();
 });
+
+test('Super Sidebar：收起持久化、Control+\\、搜索按钮打开命令面板、上下文切换器、新建菜单', async ({
+  browser,
+}) => {
+  const { page } = await newUser(browser, '侧栏交互');
+  await createProject(page, '侧栏项目');
+
+  const sidebar = page.getByRole('complementary', { name: '全局导航' });
+  await expect(sidebar).toBeVisible();
+
+  // 收起并刷新保持收起状态
+  await sidebar.getByRole('button', { name: /^收起导航栏/ }).click();
+  await expect(sidebar).toBeHidden();
+  const expandBtn = page.getByRole('button', { name: /^展开导航栏/ });
+  await expect(expandBtn).toBeVisible();
+
+  await page.reload();
+  await expect(sidebar).toBeHidden();
+  await expect(expandBtn).toBeVisible();
+
+  // Control+\ 展开并持久化
+  await page.keyboard.press('Control+\\');
+  await expect(sidebar).toBeVisible();
+  await page.reload();
+  await expect(sidebar).toBeVisible();
+
+  // 搜索按钮打开命令面板，Esc 关闭后焦点回到搜索按钮
+  const searchBtn = sidebar.getByRole('button', { name: /搜索或跳转/ });
+  await searchBtn.click();
+  const dlg = page.getByRole('dialog', { name: '命令面板' });
+  await expect(dlg).toBeVisible();
+  await page.keyboard.press('Escape');
+  await expect(dlg).toBeHidden();
+  await expect(searchBtn).toBeFocused();
+
+  // 上下文切换器跳转个人设置
+  await sidebar.getByRole('button', { name: '切换上下文' }).click();
+  await sidebar.getByRole('link', { name: '个人设置' }).click();
+  await page.waitForURL('/account');
+  await expect(page.getByRole('heading', { name: '个人设置', exact: true })).toBeVisible();
+
+  // 个人设置侧栏里的 MCP 访问入口
+  await sidebar.getByRole('link', { name: 'MCP 访问' }).click();
+  await page.waitForURL('/account/mcp');
+  await expect(page.getByRole('heading', { name: 'MCP 访问', exact: true })).toBeVisible();
+
+  // 顶部 + 新建菜单跳转到新建项目向导
+  await sidebar.getByRole('button', { name: '新建', exact: true }).click();
+  const createMenu = page.locator('.menu-popover').filter({ hasText: '新建项目' });
+  await expect(createMenu).toBeVisible();
+  await createMenu.getByText('新建项目', { exact: true }).click();
+  await page.waitForURL('/new');
+  await expect(page.getByRole('heading', { name: '新建项目', exact: true })).toBeVisible();
+});

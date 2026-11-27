@@ -1,4 +1,4 @@
-// 环境：侧面板是环境列表，主区域是列表 + 新建（管理员）或单个环境的详情。
+// 环境：主区域是列表 + 新建（管理员）或单个环境的详情；环境列表由全局侧边栏显示。
 // 详情里可以测试连接、从目标库导入结构、删除环境；连接状态只在这里主动检查。
 import type {
   AttachOverwritePreview,
@@ -14,24 +14,14 @@ import type {
 import type { Dialect } from '@dowel/core';
 import { useMutation, useQueryClient } from '@tanstack/react-query';
 import { Link, useNavigate, useParams } from '@tanstack/react-router';
-import {
-  ArrowDownToLine,
-  Database,
-  FileInput,
-  Play,
-  PlugZap,
-  Plus,
-  RotateCcw,
-  ShieldAlert,
-  Siren,
-  Trash2,
-} from 'lucide-react';
+import { ArrowDownToLine, Database, FileInput, Play, PlugZap, RotateCcw, Siren, Trash2 } from 'lucide-react';
 import { useId, useState } from 'react';
 import { useTranslation } from 'react-i18next';
 
 import { ApiError, api } from '../api.ts';
 import { ClaimDialog } from '../components/ClaimDialog.tsx';
-import { DriftBadge, driftLabel, useDeniedHint } from '../components/EnvBits.tsx';
+import { DbConnectionBlock } from '../components/DbConnectionBlock.tsx';
+import { DriftBadge, useDeniedHint } from '../components/EnvBits.tsx';
 import { DiffList, ExecDialog, type ExecKind, type ExecMode, routeFor } from '../components/ExecDialog.tsx';
 import { ImportDialog } from '../components/ImportDialog.tsx';
 import { MARK_TIP, MARK_TITLE, MarkDialog, markDirection } from '../components/MarkDialog.tsx';
@@ -39,7 +29,7 @@ import { Confirm, Modal } from '../components/Modal.tsx';
 import { EnvPolicyPanel } from '../components/PolicyEditor.tsx';
 import { EmptyHint, ProjectPage, Row, Rows, Section } from '../components/ProjectPage.tsx';
 import { RepairDialog } from '../components/RepairDialog.tsx';
-import { PageHeader, useShellPanel } from '../components/Shell.tsx';
+import { PageHeader } from '../components/Shell.tsx';
 import { useToast } from '../components/Toasts.tsx';
 import { Banner, IconButton } from '../components/ui.tsx';
 import { useVersionName, VersionBadges, VersionNumber } from '../components/VersionStatus.tsx';
@@ -52,88 +42,6 @@ import { invalidateRequests, useEnvRequests } from '../requests.ts';
 import { useMe } from '../session.ts';
 import { StatusBadge } from './Request.tsx';
 
-/**
- * 侧面板里的一个环境。漂移警告的说明不放进链接里（链接的名字要保持就是环境名），
- * 用 aria-describedby 指向旁边的 sr-only 文字，图标本身 aria-hidden。
- */
-const EnvPanelLink = ({
-  e,
-  params,
-  active,
-}: {
-  e: EnvInfo;
-  params: { owner: string; project: string };
-  active: boolean;
-}) => {
-  const { t } = useTranslation();
-  const descId = useId();
-  const warn = driftLabel(t, e.drift);
-  return (
-    <>
-      <Link
-        to="/project/$owner/$project/environments/$eid"
-        params={{ ...params, eid: e.id }}
-        aria-current={active ? 'page' : undefined}
-        aria-describedby={warn ? descId : undefined}
-        className="flex h-[var(--row-h)] items-center gap-2 rounded-sm px-2 font-mono text-sm text-text-2 no-underline hover:bg-surface-hover aria-[current=page]:bg-primary-soft aria-[current=page]:text-primary-text"
-      >
-        <Database size={16} aria-hidden="true" className="shrink-0 text-text-3" />
-        <span className="min-w-0 flex-1 truncate">{e.name}</span>
-        {warn && (
-          <ShieldAlert
-            size={14}
-            aria-hidden="true"
-            className={e.drift.status === 'drifted' ? 'shrink-0 text-danger' : 'shrink-0 text-warn'}
-          />
-        )}
-        {e.production && <span className="badge danger font-sans">{t('envp.production')}</span>}
-      </Link>
-      {warn && (
-        <span id={descId} className="sr-only">
-          {warn}
-        </span>
-      )}
-    </>
-  );
-};
-
-/** 项目页的侧面板：环境列表（DESIGN.md：Layout） */
-const EnvPanel = ({ pid, activeId }: { pid: string; activeId?: string }) => {
-  const { t } = useTranslation();
-  const { project } = useProject();
-  const envs = useEnvs(pid);
-  const params = { owner: project.group.slug, project: project.slug };
-  useShellPanel(
-    t('envp.list'),
-    <nav aria-label={t('envp.list')} className="flex h-full min-h-0 flex-col">
-      <div className="flex items-center gap-2 px-3.5 pt-3 pb-1">
-        <span className="section-title flex-1">
-          {t('nav.environments')}
-          <span className="count">{envs.data?.length ?? 0}</span>
-        </span>
-        <Link
-          to="/project/$owner/$project/environments"
-          params={params}
-          className="btn icon ghost"
-          aria-label={t('envp.add')}
-          title={t('envp.add')}
-        >
-          <Plus size={16} aria-hidden="true" />
-        </Link>
-      </div>
-      <ul className="m-0 min-h-0 flex-1 list-none overflow-auto p-1.5">
-        {(envs.data ?? []).map((e) => (
-          <li key={e.id}>
-            <EnvPanelLink e={e} params={params} active={e.id === activeId} />
-          </li>
-        ))}
-      </ul>
-    </nav>,
-    [envs.data, activeId, params.owner, params.project, project.role, t],
-  );
-  return null;
-};
-
 const EnvForm = ({ pid }: { pid: string }) => {
   const { t } = useTranslation();
   const { project } = useProject();
@@ -141,7 +49,7 @@ const EnvForm = ({ pid }: { pid: string }) => {
   const qc = useQueryClient();
   const toast = useToast();
   const me = useMe().data;
-  const empty = { name: '', url: '', production: true, allowSameInstance: false, shadowUrl: '' };
+  const empty = { name: '', url: '', production: true, allowSameInstance: true, shadowUrl: '' };
   const [form, setForm] = useState(empty);
   /** 接入这个库里已有的迁移历史（特权操作；由另一个实例认领的库要确认认领；领先于平台链且工作副本脏时需确认覆盖） */
   const [attach, setAttach] = useState(false);
@@ -153,6 +61,8 @@ const EnvForm = ({ pid }: { pid: string }) => {
   } | null>(null);
   const attachCodeOf = (e: Error | null) =>
     e instanceof ApiError && e.status === 409 ? (e.body as { code?: string } | undefined)?.code : undefined;
+  const nameId = useId();
+  const shadowId = useId();
   const shadowHintId = useId();
   const add = useMutation<
     unknown,
@@ -260,75 +170,76 @@ const EnvForm = ({ pid }: { pid: string }) => {
       <h2 className="section-title">{t('envp.add')}</h2>
       <p className="hint">{uiSpec.requiresExternalShadow ? t('dlg.envHint') : t('envp.addHintSqlite')}</p>
       {project.dialect === 'mssql' && <Banner kind="info">{t('wiz.mssqlTlsHint')}</Banner>}
-      <div className="grid grid-cols-2 gap-x-3 gap-y-2.5 max-[800px]:grid-cols-1">
-        <label className="field">
-          <span className="label">{t('dlg.envName')}</span>
+      <div className="flex flex-wrap items-end gap-x-4 gap-y-2.5">
+        <div className="field max-w-[280px] min-w-[180px] flex-1">
+          <label className="label" htmlFor={nameId}>
+            {t('dlg.envName')}
+          </label>
           <input
+            id={nameId}
             className="input"
-            aria-label={t('dlg.envName')}
             value={form.name}
             onChange={set('name')}
             placeholder="dev"
+            autoComplete="off"
             autoCapitalize="none"
             autoCorrect="off"
             spellCheck={false}
             required
           />
-        </label>
-        <label className="field">
-          <span className="label">{t('dlg.envUrl')}</span>
-          <input
-            className="input font-mono"
-            aria-label={t('dlg.envUrl')}
-            value={form.url}
-            onChange={set('url')}
-            placeholder={uiSpec.urlPlaceholder}
-            autoCapitalize="none"
-            autoCorrect="off"
-            spellCheck={false}
-            required
-          />
-        </label>
-        <div className="checks col-span-2">
+        </div>
+        <div className="checks min-h-[var(--ctl-h)] items-center">
           <label>
             <input type="checkbox" checked={form.production} onChange={set('production')} />
             {t('dlg.envProduction')}
           </label>
-          {uiSpec.requiresExternalShadow && (
+        </div>
+      </div>
+
+      <DbConnectionBlock
+        dialect={project.dialect}
+        url={form.url}
+        onUrlChange={(url) => setForm((f) => ({ ...f, url }))}
+        required
+      />
+
+      {uiSpec.requiresExternalShadow && (
+        <div className="space-y-2.5 border-t border-border pt-3">
+          <div className="checks">
             <label>
               <input type="checkbox" checked={form.allowSameInstance} onChange={set('allowSameInstance')} />
               {t('dlg.envAllowSame')}
             </label>
-          )}
-        </div>
-        {uiSpec.requiresExternalShadow && (
-          <div className="field col-span-2">
-            <label className="field">
-              <span className="label">{t('dlg.envShadowUrl')}</span>
-              <input
-                className="input font-mono"
-                aria-label={t('dlg.envShadowUrl')}
-                aria-describedby={shadowHintId}
-                value={form.shadowUrl}
-                onChange={set('shadowUrl')}
-                placeholder={uiSpec.shadowPlaceholder}
-                autoCapitalize="none"
-                autoCorrect="off"
-                spellCheck={false}
-              />
+          </div>
+          <div className="field">
+            <label className="label" htmlFor={shadowId}>
+              {t('dlg.envShadowUrl')}
             </label>
+            <input
+              id={shadowId}
+              className="input font-mono"
+              aria-describedby={shadowHintId}
+              value={form.shadowUrl}
+              onChange={set('shadowUrl')}
+              placeholder={uiSpec.shadowPlaceholder}
+              autoComplete="off"
+              autoCapitalize="none"
+              autoCorrect="off"
+              spellCheck={false}
+            />
             <span id={shadowHintId} className="hint">
               {t('wiz.envShadowHint')}
             </span>
           </div>
-        )}
-        <div className="checks col-span-2">
-          <label>
-            <input type="checkbox" checked={attach} onChange={(e) => setAttach(e.target.checked)} />
-            {t('tk.attachLabel')}
-          </label>
-          <p className="hint m-0 basis-full">{t('tk.attachHint')}</p>
         </div>
+      )}
+
+      <div className="checks">
+        <label>
+          <input type="checkbox" checked={attach} onChange={(e) => setAttach(e.target.checked)} />
+          {t('tk.attachLabel')}
+        </label>
+        <p className="hint m-0 basis-full">{t('tk.attachHint')}</p>
       </div>
       <ClaimDialog
         open={claimAsk !== null}
@@ -431,48 +342,45 @@ export const Environments = () => {
   const envs = useEnvs(pid);
   const canManage = project.role === 'admin';
   return (
-    <>
-      <EnvPanel pid={pid} />
-      <ProjectPage title={t('envp.title')}>
-        <div className="space-y-6">
-          <p className="text-sm text-text-2">
-            {uiSpec.requiresExternalShadow ? t('envp.addHint') : t('envp.addHintSqlite')}
-          </p>
-          {envs.data && envs.data.length === 0 ? (
-            <EmptyHint>{t('envp.empty')}</EmptyHint>
-          ) : (
-            <Rows>
-              {(envs.data ?? []).map((e) => {
-                const verLabel = formatEngineVersion(project.dialect, e.engineVersion, e.engineMajor);
-                return (
-                  <Row key={e.id}>
-                    <Database size={16} aria-hidden="true" className="shrink-0 text-text-3" />
-                    <Link
-                      to="/project/$owner/$project/environments/$eid"
-                      params={{ ...params, eid: e.id }}
-                      className="min-w-0 flex-1 truncate font-mono font-medium no-underline"
-                    >
-                      {e.name}
-                    </Link>
-                    {verLabel && <span className="chip shrink-0 font-mono">{verLabel}</span>}
-                    {e.production ? (
-                      <span className="badge danger">{t('envp.production')}</span>
-                    ) : (
-                      <span className="badge">{t('envp.notProduction')}</span>
-                    )}
-                    {(e.drift.status === 'drifted' || e.drift.status === 'error') && (
-                      <DriftBadge drift={e.drift} />
-                    )}
-                    <code className="w-72 truncate text-xs text-text-3 max-[900px]:hidden">{e.url}</code>
-                  </Row>
-                );
-              })}
-            </Rows>
-          )}
-          {canManage ? <EnvForm pid={pid} /> : <Banner kind="info">{t('envp.manageHint')}</Banner>}
-        </div>
-      </ProjectPage>
-    </>
+    <ProjectPage title={t('envp.title')}>
+      <div className="space-y-6">
+        <p className="text-sm text-text-2">
+          {uiSpec.requiresExternalShadow ? t('envp.addHint') : t('envp.addHintSqlite')}
+        </p>
+        {envs.data && envs.data.length === 0 ? (
+          <EmptyHint>{t('envp.empty')}</EmptyHint>
+        ) : (
+          <Rows>
+            {(envs.data ?? []).map((e) => {
+              const verLabel = formatEngineVersion(project.dialect, e.engineVersion, e.engineMajor);
+              return (
+                <Row key={e.id}>
+                  <Database size={16} aria-hidden="true" className="shrink-0 text-text-3" />
+                  <Link
+                    to="/project/$owner/$project/environments/$eid"
+                    params={{ ...params, eid: e.id }}
+                    className="min-w-0 flex-1 truncate font-mono font-medium no-underline"
+                  >
+                    {e.name}
+                  </Link>
+                  {verLabel && <span className="chip shrink-0 font-mono">{verLabel}</span>}
+                  {e.production ? (
+                    <span className="badge danger">{t('envp.production')}</span>
+                  ) : (
+                    <span className="badge">{t('envp.notProduction')}</span>
+                  )}
+                  {(e.drift.status === 'drifted' || e.drift.status === 'error') && (
+                    <DriftBadge drift={e.drift} />
+                  )}
+                  <code className="w-72 truncate text-xs text-text-3 max-[900px]:hidden">{e.url}</code>
+                </Row>
+              );
+            })}
+          </Rows>
+        )}
+        {canManage ? <EnvForm pid={pid} /> : <Banner kind="info">{t('envp.manageHint')}</Banner>}
+      </div>
+    </ProjectPage>
   );
 };
 
@@ -781,21 +689,17 @@ const EnvironmentDetailView = ({ eid }: { eid: string }) => {
       ? manualRaw
       : undefined;
 
-  // 详情页也显示环境列表（同一个侧面板）
   if (!env)
     return (
-      <>
-        <EnvPanel pid={pid} activeId={eid} />
-        <ProjectPage title={t('envp.detail')}>
-          {envs.isLoading ? null : envs.error ? (
-            <Banner kind="danger" role="alert">
-              {envs.error.message}
-            </Banner>
-          ) : (
-            <Banner kind="danger">{t('envp.notFound')}</Banner>
-          )}
-        </ProjectPage>
-      </>
+      <ProjectPage title={t('envp.detail')}>
+        {envs.isLoading ? null : envs.error ? (
+          <Banner kind="danger" role="alert">
+            {envs.error.message}
+          </Banner>
+        ) : (
+          <Banner kind="danger">{t('envp.notFound')}</Banner>
+        )}
+      </ProjectPage>
     );
 
   const canConfigure = env.permissions.configure;
@@ -845,7 +749,6 @@ const EnvironmentDetailView = ({ eid }: { eid: string }) => {
 
   return (
     <>
-      <EnvPanel pid={pid} activeId={eid} />
       <PageHeader
         crumbs={[
           { label: project.group.name, to: '/group/$slug', params: { slug: project.group.slug } },
@@ -885,11 +788,7 @@ const EnvironmentDetailView = ({ eid }: { eid: string }) => {
           </>
         }
       />
-      <main
-        // oxlint-disable-next-line jsx-a11y/no-noninteractive-tabindex -- 只读视图内所有控件可能被禁用，可滚动主区域需要能用键盘滚动
-        tabIndex={0}
-        className="min-h-0 flex-1 overflow-auto focus-visible:outline-offset-[-2px]"
-      >
+      <main tabIndex={0} className="min-h-0 flex-1 overflow-auto focus-visible:outline-offset-[-2px]">
         <div className="mx-auto max-w-[960px] space-y-6 px-6 py-6">
           <div className="flex flex-wrap items-baseline gap-x-3 gap-y-1">
             <Database size={20} aria-hidden="true" className="text-text-3" />

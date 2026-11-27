@@ -777,12 +777,17 @@ export const Model = () => {
         ]}
         center={
           <>
-            <div className="flex gap-1.5">
+            <div className="flex gap-1.5 @max-[640px]:gap-1">
               {!readOnly && (
                 <>
-                  <button type="button" className="btn" onClick={newTable}>
+                  <button
+                    type="button"
+                    className="btn @max-[640px]:w-[var(--ctl-h)] @max-[640px]:px-0"
+                    title={t('ws.newTable')}
+                    onClick={newTable}
+                  >
                     <Plus size={16} aria-hidden="true" />
-                    {t('ws.newTable')}
+                    <span className="@max-[640px]:sr-only">{t('ws.newTable')}</span>
                   </button>
                   <IconButton
                     label={t('ws.autoLayout')}
@@ -823,73 +828,81 @@ export const Model = () => {
               )}
             </div>
             <span className="h-5 w-px bg-border" aria-hidden="true" />
-            <div className="flex gap-1.5">
+            <div className="flex gap-1.5 @max-[640px]:gap-1">
               {!readOnly && (
                 <button
                   type="button"
-                  className="btn"
-                  aria-label={t('ws.import')}
+                  className="btn @max-[880px]:w-[var(--ctl-h)] @max-[880px]:px-0"
                   title={t('ws.import')}
                   onClick={() => setDialog('import')}
                 >
                   <FileInput size={16} aria-hidden="true" />
-                  <span className="max-[1080px]:hidden">{t('ws.import')}</span>
+                  <span className="@max-[880px]:sr-only">{t('ws.import')}</span>
                 </button>
               )}
               <Link
                 to="/project/$owner/$project/environments"
                 params={params}
-                className="btn"
-                aria-label={t('nav.environments')}
+                className="btn @max-[880px]:w-[var(--ctl-h)] @max-[880px]:px-0"
                 title={t('nav.environments')}
               >
                 <Database size={16} aria-hidden="true" />
-                <span className="max-[1080px]:hidden">{t('nav.environments')}</span>
+                <span className="@max-[880px]:sr-only">{t('nav.environments')}</span>
               </Link>
             </div>
             <span className="h-5 w-px bg-border" aria-hidden="true" />
-            <div className="flex gap-1.5">
+            <div className="flex gap-1.5 @max-[640px]:gap-1">
               <button
                 type="button"
-                className="btn"
+                className="btn @max-[880px]:w-[var(--ctl-h)] @max-[880px]:px-0"
                 aria-label={t('hist.open')}
                 title={t('hist.open')}
                 onClick={() => setDialog('history')}
               >
                 <History size={16} aria-hidden="true" />
-                <span className="max-[1080px]:hidden">{t('hist.open')}</span>
+                <span className="@max-[880px]:sr-only">{t('hist.open')}</span>
               </button>
               {!readOnly && (
                 <button
                   type="button"
-                  className="btn"
-                  aria-label={t('ws.saveVersion')}
+                  className="btn @max-[880px]:w-[var(--ctl-h)] @max-[880px]:px-0"
                   title={t('ws.saveVersion')}
                   onClick={() => setDialog('publish')}
                 >
                   <BookmarkPlus size={16} aria-hidden="true" />
-                  <span className="max-[1080px]:hidden">{t('ws.saveVersion')}</span>
+                  <span className="@max-[880px]:sr-only">{t('ws.saveVersion')}</span>
                 </button>
               )}
-              <button type="button" className="btn primary" onClick={() => setDialog('migration')}>
+              <button
+                type="button"
+                className="btn primary @max-[640px]:w-[var(--ctl-h)] @max-[640px]:px-0"
+                title={t('ws.migration')}
+                onClick={() => setDialog('migration')}
+              >
                 <GitCompareArrows size={16} aria-hidden="true" />
-                {t('ws.migration')}
+                <span className="@max-[640px]:sr-only">{t('ws.migration')}</span>
               </button>
             </div>
           </>
         }
         actions={
           <>
-            <span role="status" className="flex items-center gap-1 text-xs whitespace-nowrap text-text-3">
+            <span
+              role="status"
+              title={pending > 0 ? t('ws.pending', { count: pending }) : t(`ws.sync.${status}`)}
+              className="flex items-center gap-1 text-xs whitespace-nowrap text-text-3"
+            >
               {status === 'online' ? (
                 <CloudCheck size={14} aria-hidden="true" className="text-ok" />
               ) : (
                 <RefreshCw size={14} aria-hidden="true" className="animate-spin text-warn" />
               )}
-              {pending > 0 ? t('ws.pending', { count: pending }) : t(`ws.sync.${status}`)}
+              <span className="@max-[640px]:sr-only">
+                {pending > 0 ? t('ws.pending', { count: pending }) : t(`ws.sync.${status}`)}
+              </span>
             </span>
             {readOnly && <span className="chip">{t('ws.readonlyRole')}</span>}
-            <ul aria-label={t('ws.online')} className="m-0 mr-1 flex list-none p-0">
+            <ul aria-label={t('ws.online')} className="m-0 mr-1 flex list-none p-0 @max-[640px]:mr-0">
               {people.slice(0, 4).map((name, i) => (
                 <li key={name} className="contents">
                   <Avatar
@@ -995,8 +1008,8 @@ export const Model = () => {
             className={
               // 窄屏（< 1024）属性面板覆盖在画布上，不挤压画布（DESIGN.md：Responsive Behavior）
               narrow
-                ? 'fixed top-[var(--topbar-h)] right-0 bottom-[var(--statusbar-h)] z-30 flex w-[300px] flex-col border-l border-border bg-panel shadow-[var(--shadow-pop)]'
-                : 'flex w-[var(--inspector-w)] shrink-0 flex-col border-l border-border bg-panel max-[1279px]:w-[300px]'
+                ? 'fixed top-[var(--topbar-h)] right-0 bottom-[var(--statusbar-h)] z-30 flex w-[var(--inspector-w)] flex-col border-l border-border bg-panel shadow-[var(--shadow-pop)]'
+                : 'flex w-[var(--inspector-w)] shrink-0 flex-col border-l border-border bg-panel'
             }
           >
             <Inspector

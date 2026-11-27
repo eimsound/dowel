@@ -157,7 +157,7 @@ for (const scheme of ['light', 'dark'] as const) {
     await page.getByRole('textbox', { name: /^名字/ }).fill('dev');
     await page.getByLabel('连接串', { exact: true }).fill(u.toString());
     await page.getByLabel('生产环境').uncheck();
-    await page.getByRole('button', { name: '检查连接' }).click();
+    await page.getByRole('button', { name: '测试', exact: true }).click();
     await expect(page.getByText('连接正常')).toBeVisible();
     await shot('app-new-database-light');
     await page.getByRole('button', { name: '下一步' }).click();

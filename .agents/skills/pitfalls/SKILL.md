@@ -23,7 +23,7 @@ description: >-
 | 3. 协作房间、派生刷新与影子缓存 | [rooms-derive-shadows.md](./references/rooms-derive-shadows.md) | `rooms.ts`, `rooms/*`, `derive.ts`, `shadows.ts`, `bus.ts`, `packages/sync/src/*` | `#17` `#39` `#41` `#12` `#40` `#44` `#45` |
 | 4. 影子库、接手/接入/拉取与漂移 | [shadow-target-drift.md](./references/shadow-target-drift.md) | `targets.ts`, `executions.ts`, `takeover.ts`, `routes/{takeover,claims,environments}.ts` | `#11` `#24` `#42` `#13` `#14` `#15` |
 | 5. 鉴权、限流与 CI 令牌边界 | [auth-ratelimit-ci.md](./references/auth-ratelimit-ci.md) | `routes/ci.ts`, `tokens.ts`, `rate-limit.ts`, `authz.ts`, `actions/execute/*` | `#8` `#9` `#10` `#16` |
-| 6. 前端状态机、无障碍、缓存与文档 | [frontend-i18n-docs.md](./references/frontend-i18n-docs.md) | `NewProject.tsx`, `CanvasHistory.tsx`, `Environments.tsx`, `TokenSettings.tsx`, `i18n.ts`, `docs/*` | `#29` `#30` `#31` `#32` `#33` `#35` `#36` `#28` `#34` |
+| 6. 前端状态机、缓存与文档 | [frontend-i18n-docs.md](./references/frontend-i18n-docs.md) | `NewProject.tsx`, `CanvasHistory.tsx`, `Environments.tsx`, `TokenSettings.tsx`, `i18n.ts`, `docs/*` | `#29` `#30` `#31` `#32` `#33` `#35` `#36` `#28` `#34` |
 
 ---
 
@@ -55,7 +55,7 @@ description: >-
 - **共享出口防误杀 + 精确退回**：CI 缺头/格式非法直接内存 401 不扣桶，IP 触限时凭 `ActiveTokenCache` 放行活跃合法令牌强校验（`#8`）；`KeyedLimiter` 禁止 `arr.pop()`，用自增 ID 返回精确幂等 `refund()` 闭包（`#9`）。
 - **权限传导必显式警示 & 写接口不盲重试**：允许创建 CI 令牌即间接获得 `allowTokens=true`（非生产默认开）环境免审批执行权，须在 UI/文档/ADR 明示（`#10`）；Action `curl` 必配 `--connect-timeout` / `--max-time`，但绝不对非幂等写接口默认自动重试（`#16`）。
 
-### 6. 前端状态机、无障碍、缓存、i18n 与文档
+### 6. 前端状态机、缓存、i18n 与文档
 - **向导与弹窗状态机闭合**：多步向导切组/改 URL/删环境精确失效缓存并配代次防乱序，按稳定 `key` 匹配、消费 SSE `event.code`、绑定确认态、成功后禁回退（`#29`）；409 冲突横幅与后续通用错误独立展示，实时降级 `readOnly` 自动关闭确认弹窗（`#30`）。
 - **组件与文案细节**：不与全局 `focusgroup-polyfill` 叠加手写未判 `defaultPrevented` 的方向键监听（`#31`）；条件行添加禁用满额项并防重复（`#35`）；变更环境失效 `activity`/`migration`/`requests` 缓存（`#32`）；审计动作/操作名与中英文 `i18n.ts`、`activity.ts` 全对齐（`#33`）；不往句号后拼后缀、可空版本号不渲染 `v—`（`#36`）。
 - **文档与注释同步收口**：功能合入同步清理 `docs/`“当前的限制”与源码单进程旧注释，核对 Webhook 事件、收件箱类型与预检拒绝/`noop` 边界（`#28` `#34`）。

@@ -52,7 +52,7 @@ const createAndLoginUser = async (
   });
   expect(loginRes.ok(), `登录 ${opts.username} 失败：${await loginRes.text()}`).toBe(true);
   const changeRes = await ctx.request.post('/api/me/password', {
-    data: { oldPassword: TEMP_PASSWORD, newPassword: PASSWORD },
+    data: { newPassword: PASSWORD },
   });
   expect(changeRes.ok(), `修改临时密码失败：${await changeRes.text()}`).toBe(true);
 
@@ -113,8 +113,10 @@ export const createProject = async (page: Page, name: string) => {
   return createProjectIn(page, name, group.name);
 };
 
-/** 图标栏里的页面入口（当前项目的页面） */
+/** 全局导航侧边栏里的页面入口（当前项目的页面；窄屏或收起时先展开） */
 export const gotoPage = async (page: Page, name: string) => {
+  const openBtn = page.getByRole('button', { name: /^(打开导航栏|展开导航栏)/ });
+  if (await openBtn.isVisible()) await openBtn.click();
   await page.getByRole('navigation', { name: '实例与项目' }).getByRole('link', { name }).click();
 };
 

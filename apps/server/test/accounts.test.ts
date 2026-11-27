@@ -172,29 +172,27 @@ describe.each([
       await db.query("delete from oidc_providers where id = 'acc-oidc-id'");
     }
 
-    // 强制改密不允许新密码与临时密码相同
+    // 强制改密无需再填临时密码，但仍不允许新密码与临时密码相同；若显式传错旧密码也拒绝
+    expect((await call('POST', '/api/me/password', { newPassword: tempPw }, firstLogin.cookie)).status).toBe(
+      400,
+    );
     expect(
       (
         await call(
           'POST',
           '/api/me/password',
-          { oldPassword: tempPw, newPassword: tempPw },
+          { oldPassword: 'wrong-temp-password', newPassword: PASSWORD },
           firstLogin.cookie,
         )
       ).status,
-    ).toBe(400);
+    ).toBe(403);
 
     // 强制改密期间也允许退出
     expect((await call('POST', '/api/auth/logout', undefined, otherLogin.cookie)).status).toBe(200);
     const thirdLogin = await call('POST', '/api/auth/login', { username: 'admin', password: tempPw });
 
-    // 完成改密：清除标志、删除自动生成的密码文件、吊销其他会话并保留当前会话
-    const changed = await call(
-      'POST',
-      '/api/me/password',
-      { oldPassword: tempPw, newPassword: PASSWORD },
-      firstLogin.cookie,
-    );
+    // 完成改密（直接提交新密码）：清除标志、删除自动生成的密码文件、吊销其他会话并保留当前会话
+    const changed = await call('POST', '/api/me/password', { newPassword: PASSWORD }, firstLogin.cookie);
     expect(changed.status).toBe(200);
     expect(existsSync(pwFile)).toBe(false);
     expect((await call('GET', '/api/auth/me', undefined, firstLogin.cookie)).data).toMatchObject({
@@ -1023,20 +1021,13 @@ describe.each([
       });
       expect(JSON.stringify(resetAudit!.data)).not.toContain(generatedPw);
 
-      // 用生成的新临时密码登录 → 被 403 拦截 → 改密恢复
+      // 用生成的新临时密码登录 → 被 403 拦截 → 免原密码直接改密恢复
       const tempSession2 = await login('tempuser', generatedPw);
       expect((await call('GET', '/api/projects', undefined, tempSession2)).data).toMatchObject({
         code: 'password_change_required',
       });
       expect(
-        (
-          await call(
-            'POST',
-            '/api/me/password',
-            { oldPassword: generatedPw, newPassword: 'tempuser-new-pw' },
-            tempSession2,
-          )
-        ).status,
+        (await call('POST', '/api/me/password', { newPassword: 'tempuser-new-pw' }, tempSession2)).status,
       ).toBe(200);
       expect((await call('GET', '/api/projects', undefined, tempSession2)).status).toBe(200);
 
@@ -1328,6 +1319,49 @@ describe.each([
     const winner = a.status === 200 ? 'race-password-1' : 'race-password-2';
     expect(await login('oidc-race', winner)).toBeTruthy();
   });
+
+  test.skipIf(skip)(
+    '临时密码强制改密：超过 10 分钟的会话拒绝免原密码改密；并发请求只有一个成功',
+    async () => {
+      const forcedUser = await makeUser(db, 'forced-window', {
+        password: 'temp-forced-pw',
+        mustChangePassword: true,
+      });
+      const staleToken = 'forced-stale-session-token';
+      await db.query(
+        'insert into sessions (id, token_hash, user_id, expires_at, created_at) values ($1, $2, $3, $4, $5)',
+        [
+          'forced-stale-session',
+          hashToken(staleToken),
+          forcedUser.id,
+          new Date(Date.now() + 3600_000).toISOString(),
+          new Date(Date.now() - 11 * 60_000).toISOString(),
+        ],
+      );
+      const staleCookie = `dowel_session=${staleToken}`;
+      const staleRes = await call(
+        'POST',
+        '/api/me/password',
+        { newPassword: 'forced-new-pw-1' },
+        staleCookie,
+      );
+      expect(staleRes.status).toBe(403);
+      expect(staleRes.data.error).toContain('请重新登录后再修改密码');
+      expect((await call('GET', '/api/auth/me', undefined, staleCookie)).data).toMatchObject({
+        mustChangePassword: true,
+      });
+
+      // 重新登录后会话在 10 分钟内：并发不传 oldPassword 改密只有一个成功，另一个返回 409
+      const freshCookie = await login('forced-window', 'temp-forced-pw');
+      const [a, b] = await Promise.all([
+        call('POST', '/api/me/password', { newPassword: 'forced-race-pw-1' }, freshCookie),
+        call('POST', '/api/me/password', { newPassword: 'forced-race-pw-2' }, freshCookie),
+      ]);
+      expect([a.status, b.status].sort((x, y) => x - y)).toEqual([200, 409]);
+      const winner = a.status === 200 ? 'forced-race-pw-1' : 'forced-race-pw-2';
+      expect(await login('forced-window', winner)).toBeTruthy();
+    },
+  );
 });
 
 test('DOWEL_ADMIN_* 启动校验与首次启动 0600 临时密码文件日志契约', async () => {

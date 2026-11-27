@@ -11,7 +11,7 @@ import {
   resetPasswordSchema,
   type SessionInfo,
 } from '@dowel/api';
-import type { Hono } from 'hono';
+import type { Context, Hono } from 'hono';
 import { HTTPException } from 'hono/http-exception';
 
 import { audit } from '../audit.ts';
@@ -41,8 +41,28 @@ import { emailTaken, normalizeEmail, userById, usernameTaken } from '../users.ts
 import { type AppContext, body, createUserOrConflict, type Env } from './context.ts';
 import { afterRevokeAllMcpTokens } from './mcp-tokens.ts';
 
-/** 首次设置密码只允许最近 10 分钟内登录的会话（见 /api/me/password） */
-const FIRST_PASSWORD_WINDOW_MS = 10 * 60_000;
+/** 首次设置密码与临时密码强制改密（未传旧密码时）只允许最近 10 分钟内登录的会话（见 /api/me/password） */
+const RECENT_LOGIN_WINDOW_MS = 10 * 60_000;
+
+/** 校验当前请求持有最近 10 分钟内创建的有效会话 */
+const requireRecentSession = async (
+  db: AppContext['db'],
+  c: Context<Env>,
+  userId: string,
+  expiredMessage: string,
+) => {
+  const token = sessionToken(c);
+  const [session] = token
+    ? await db.query<{ createdAt: string }>(
+        'select created_at as "createdAt" from sessions where token_hash = $1 and user_id = $2',
+        [hashToken(token), userId],
+      )
+    : [];
+  if (!session) throw new HTTPException(401, { message: '会话已失效，请重新登录' });
+  if (Date.now() - Date.parse(session.createdAt) > RECENT_LOGIN_WINDOW_MS) {
+    throw new HTTPException(403, { message: expiredMessage });
+  }
+};
 
 /** 邀请链接不可用：找不到 404，已用 / 已撤销 / 已过期 410 */
 const inviteUnusable = (state: InviteState | 'missing') => {
@@ -129,18 +149,12 @@ export const registerMe = (app: Hono<Env>, ctx: AppContext) => {
       // 纯 OIDC 用户第一次“设置密码”不需要旧密码，但必须证明这个人刚刚登录过：
       // 只允许最近 10 分钟内新建的会话设置第一个密码（旧 cookie 被 XSS / 共享浏览器捡到时，
       // 不能让对方直接给账户装上密码）。
-      const token = sessionToken(c);
-      const [session] = token
-        ? await db.query<{ createdAt: string }>(
-            'select created_at as "createdAt" from sessions where token_hash = $1 and user_id = $2',
-            [hashToken(token), me.id],
-          )
-        : [];
-      if (!session) throw new HTTPException(401, { message: '会话已失效，请重新登录' });
-      if (Date.now() - Date.parse(session.createdAt) > FIRST_PASSWORD_WINDOW_MS)
-        throw new HTTPException(403, {
-          message: '设置密码需要最近 10 分钟内登录的会话，请重新登录后再设置密码',
-        });
+      await requireRecentSession(
+        db,
+        c,
+        me.id,
+        '设置密码需要最近 10 分钟内登录的会话，请重新登录后再设置密码',
+      );
       const hash = await hashPassword(b.newPassword);
       // 条件更新：并发请求里只有一个能把 password_hash 从 null 改成值，另一个拿到 409。
       const updated = await db.query<{ id: string }>(
@@ -148,14 +162,37 @@ export const registerMe = (app: Hono<Env>, ctx: AppContext) => {
         [me.id, hash, false],
       );
       if (!updated.length) throw new HTTPException(409, { message: '密码已经被设置，请刷新后重试' });
+    } else if (forced) {
+      // 临时密码强制改密默认免填旧密码，要求最近 10 分钟内登录的会话；
+      // 若调用方显式传入 oldPassword，则继续校验以兼容旧客户端并避免静默忽略错密码。
+      if (b.oldPassword !== undefined) {
+        if (!(await verifyPassword(b.oldPassword, row.password_hash!))) {
+          throw new HTTPException(403, { message: '旧密码不正确' });
+        }
+      } else {
+        await requireRecentSession(
+          db,
+          c,
+          me.id,
+          '修改密码需要最近 10 分钟内登录的会话，请重新登录后再修改密码',
+        );
+      }
+      if (await verifyPassword(b.newPassword, row.password_hash!)) {
+        throw new HTTPException(400, { message: '新密码不能与临时密码相同' });
+      }
+      const hash = await hashPassword(b.newPassword);
+      // 条件更新：防止并发改密请求覆写刚设好的新密码
+      const updated = await db.query<{ id: string }>(
+        'update users set password_hash = $2, must_change_password = $3 where id = $1 and must_change_password = $4 returning id',
+        [me.id, hash, false, true],
+      );
+      if (!updated.length) throw new HTTPException(409, { message: '密码已经被修改，请刷新后重试' });
+      await revokeSessions(db, me.id, sessionToken(c));
     } else {
       // 已经有密码时必须验证旧密码，否则拿到会话的人可以直接改掉密码
       if (!b.oldPassword) throw new HTTPException(400, { message: '请输入旧密码' });
       if (!(await verifyPassword(b.oldPassword, row.password_hash!)))
         throw new HTTPException(403, { message: '旧密码不正确' });
-      if (forced && b.newPassword === b.oldPassword) {
-        throw new HTTPException(400, { message: '新密码不能与临时密码相同' });
-      }
       const hash = await hashPassword(b.newPassword);
       await db.query('update users set password_hash = $2, must_change_password = $3 where id = $1', [
         me.id,

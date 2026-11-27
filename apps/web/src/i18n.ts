@@ -6,7 +6,14 @@ const zh = {
   app: { name: 'Dowel', tagline: '多人实时协作的数据库 schema 建模' },
   nav: {
     rail: '实例与项目',
+    sidebar: '全局导航',
+    work: '我的工作',
     myProjects: '我的项目',
+    myGroups: '我的组',
+    noGroups: '还没有加入任何组。',
+    manage: '管理',
+    createNew: '新建',
+    searchOrGoTo: '搜索或跳转…',
     groupHome: '组首页',
     overview: '概览',
     model: '模型',
@@ -20,6 +27,20 @@ const zh = {
     expandPanel: '展开侧面板 [',
     openDrawer: '打开侧面板',
     closeDrawer: '关闭侧面板',
+    collapseSidebar: '收起导航栏 Ctrl+\\',
+    expandSidebar: '展开导航栏 Ctrl+\\',
+    openSidebar: '打开导航栏',
+    closeSidebar: '关闭导航栏',
+    switchContext: '切换上下文',
+    recentProjects: '最近访问',
+    browseAll: '浏览所有项目与组',
+    backToWork: '我的项目',
+    shortcuts: '键盘快捷键',
+    shortcutPalette: '命令面板',
+    shortcutSidebar: '切换导航栏',
+    shortcutPanel: '切换对象面板',
+    shortcutGo: '项目内跳转（按 G 后按字母）',
+    newProjectInGroup: '在此组中新建项目',
     inbox: '收件箱',
     inboxUnread: '{{count}} 条未读',
     tempGroup: '临时显示（你不在这个组里）',
@@ -873,12 +894,9 @@ const zh = {
     newPassword: '新密码',
     changePasswordTitle: '修改密码',
     changePasswordBanner: '当前使用的是初始或重置后的临时密码，请先设置新密码再继续使用。',
-    oldPassword: '当前密码（或临时密码）',
     confirmPassword: '确认新密码',
     changePasswordSubmit: '保存新密码并继续',
-    oldPasswordRequired: '请输入当前密码',
     passwordTooShort: '密码至少需要 8 个字符',
-    passwordSameAsOld: '新密码不能与当前密码相同',
     passwordMismatch: '两次输入的新密码不一致',
     goLogin: '去登录',
     passwordLoginOff: '密码登录已关闭，请联系实例管理员。',
@@ -1197,7 +1215,7 @@ const zh = {
     roleOf: '{{name}} 的项目角色',
     removeGrant: '移除 {{name}} 的授权',
     projectDefault: '项目默认权限',
-    inheritDefault: '沿用组（{{role}}）',
+    inheritDefault: '{{role}}（继承自组）',
     defaultHint: '默认权限是组成员自动拥有的项目角色；项目没有另设时用组的。',
     transferTitle: '转组',
     transferHint: '转组需要同时是源组和目标组的组管理员。旧地址会自动跳转到新地址。',
@@ -1244,8 +1262,8 @@ const zh = {
     dialectHint: '创建后不可更改。',
     dialectComingSoon: '开发中',
     dialectDesc: {
-      pg: '支持多 Schema、枚举、序列与声明式分区',
-      sqlite: '内置 :memory: 影子库，零环境即可导入 SQL 与验证',
+      pg: '支持 PostgreSQL 15–19：多 Schema、枚举、序列与声明式分区',
+      sqlite: '支持 SQLite 3：内置 :memory: 影子库，零环境即可导入 SQL 与验证',
       mysql: '支持 MySQL 8.4 / 9.7：引擎、字符集、内联 enum/set 与非事务 DDL 检查点',
       mssql: '支持 SQL Server 2019 / 2022 / 2025：多 Schema、序列、聚集索引与 GO 批处理',
     },
@@ -1350,6 +1368,20 @@ const zh = {
     running: '正在创建…',
     failed: '创建失败',
     retry: '重试',
+  },
+  conn: {
+    title: '连接',
+    test: '测试',
+    testing: '测试中…',
+    host: '主机',
+    port: '端口',
+    database: '数据库',
+    user: '用户名',
+    password: '密码',
+    params: '连接参数',
+    filePath: '文件路径',
+    showPassword: '显示密码',
+    hidePassword: '隐藏密码',
   },
   acc: {
     title: '个人设置',
@@ -2377,7 +2409,14 @@ const zh = {
 const en: typeof zh = {
   nav: {
     rail: 'Instance and projects',
+    sidebar: 'Navigation sidebar',
+    work: 'Your work',
     myProjects: 'My projects',
+    myGroups: 'Your groups',
+    noGroups: 'You are not a member of any group yet.',
+    manage: 'Manage',
+    createNew: 'Create new',
+    searchOrGoTo: 'Search or go to…',
     groupHome: 'Group home',
     overview: 'Overview',
     model: 'Model',
@@ -2391,6 +2430,20 @@ const en: typeof zh = {
     expandPanel: 'Expand side panel [',
     openDrawer: 'Open side panel',
     closeDrawer: 'Close side panel',
+    collapseSidebar: 'Collapse navigation sidebar Ctrl+\\',
+    expandSidebar: 'Expand navigation sidebar Ctrl+\\',
+    openSidebar: 'Open navigation sidebar',
+    closeSidebar: 'Close navigation sidebar',
+    switchContext: 'Switch context',
+    recentProjects: 'Recent projects',
+    browseAll: 'View all projects and groups',
+    backToWork: 'My projects',
+    shortcuts: 'Keyboard shortcuts',
+    shortcutPalette: 'Command palette',
+    shortcutSidebar: 'Toggle navigation sidebar',
+    shortcutPanel: 'Toggle object panel',
+    shortcutGo: 'Go to project page (press G then key)',
+    newProjectInGroup: 'New project in this group',
     inbox: 'Inbox',
     inboxUnread: '{{count}} unread',
     tempGroup: 'Temporary (you are not in this group)',
@@ -3293,12 +3346,9 @@ const en: typeof zh = {
     changePasswordTitle: 'Change password',
     changePasswordBanner:
       'You are signed in with a temporary password. Set a new password before continuing.',
-    oldPassword: 'Current or temporary password',
     confirmPassword: 'Confirm new password',
     changePasswordSubmit: 'Save new password and continue',
-    oldPasswordRequired: 'Enter your current password',
     passwordTooShort: 'Password must be at least 8 characters',
-    passwordSameAsOld: 'New password cannot be the same as the current password',
     passwordMismatch: 'Passwords do not match',
     goLogin: 'Go to login',
     passwordLoginOff: 'Password login is turned off. Ask your instance admin.',
@@ -3638,7 +3688,7 @@ const en: typeof zh = {
     roleOf: 'Project role of {{name}}',
     removeGrant: 'Remove the grant of {{name}}',
     projectDefault: 'Project default permission',
-    inheritDefault: 'Follow the group ({{role}})',
+    inheritDefault: '{{role}} (inherited from group)',
     defaultHint:
       'The default permission is the project role group members get automatically; a project uses the group’s unless it sets its own.',
     transferTitle: 'Move to another group',
@@ -3688,8 +3738,8 @@ const en: typeof zh = {
     dialectHint: 'Cannot be changed after creation.',
     dialectComingSoon: 'Coming soon',
     dialectDesc: {
-      pg: 'Multi-schema, enums, sequences, and declarative partitioning',
-      sqlite: 'Built-in :memory: shadow database for zero-environment SQL import & verification',
+      pg: 'PostgreSQL 15–19: multi-schema, enums, sequences & declarative partitioning',
+      sqlite: 'SQLite 3: built-in :memory: shadow database for zero-environment SQL import & verification',
       mysql: 'MySQL 8.4 / 9.7: engine, charset, inline enum/set & auto-commit DDL checkpoints',
       mssql: 'SQL Server 2019 / 2022 / 2025: multi-schema, sequences, clustered keys & GO batches',
     },
@@ -3799,6 +3849,20 @@ const en: typeof zh = {
     running: 'Creating…',
     failed: 'Creation failed',
     retry: 'Retry',
+  },
+  conn: {
+    title: 'Connection',
+    test: 'Test',
+    testing: 'Testing…',
+    host: 'Host',
+    port: 'Port',
+    database: 'Database',
+    user: 'Username',
+    password: 'Password',
+    params: 'Parameters',
+    filePath: 'File path',
+    showPassword: 'Show password',
+    hidePassword: 'Hide password',
   },
   acc: {
     title: 'Personal settings',
@@ -4868,22 +4932,55 @@ const en: typeof zh = {
   err: { generic: 'Error: {{msg}}', notFound: 'This page does not exist.' },
 };
 
-const saved =
-  typeof localStorage !== 'undefined' && typeof localStorage.getItem === 'function'
-    ? localStorage.getItem('dowel.lang')
-    : null;
-const browserLang = typeof navigator !== 'undefined' ? navigator.language : '';
+const resolveInitialLang = (): 'zh' | 'en' => {
+  let saved: string | null = null;
+  try {
+    saved =
+      typeof localStorage !== 'undefined' && typeof localStorage.getItem === 'function'
+        ? localStorage.getItem('dowel.lang')
+        : null;
+  } catch {
+    saved = null;
+  }
+  if (saved === 'zh' || saved === 'en') return saved;
+  const browserLang = typeof navigator !== 'undefined' ? navigator.language : '';
+  return browserLang.startsWith('zh') ? 'zh' : 'en';
+};
+
+const initialLang = resolveInitialLang();
+if (typeof document !== 'undefined') {
+  document.documentElement.lang = initialLang === 'zh' ? 'zh-CN' : 'en';
+}
 void i18n.use(initReactI18next).init({
   resources: { zh: { translation: zh }, en: { translation: en } },
-  lng: saved ?? (browserLang.startsWith('zh') ? 'zh' : 'en'),
+  lng: initialLang,
   fallbackLng: 'zh',
   interpolation: { escapeValue: false },
 });
 
 export const setLang = (lng: 'zh' | 'en') => {
-  localStorage.setItem('dowel.lang', lng);
-  document.documentElement.lang = lng === 'zh' ? 'zh-CN' : 'en';
+  try {
+    if (typeof localStorage !== 'undefined' && typeof localStorage.setItem === 'function') {
+      localStorage.setItem('dowel.lang', lng);
+    }
+  } catch {
+    // 存储受限或被禁用时仍即时切换当前页面语言
+  }
+  if (typeof document !== 'undefined') {
+    document.documentElement.lang = lng === 'zh' ? 'zh-CN' : 'en';
+  }
   void i18n.changeLanguage(lng);
 };
+
+if (typeof window !== 'undefined') {
+  window.addEventListener('storage', (e) => {
+    if (e.key !== 'dowel.lang' && e.key !== null) return;
+    const nextLang = resolveInitialLang();
+    if (typeof document !== 'undefined') {
+      document.documentElement.lang = nextLang === 'zh' ? 'zh-CN' : 'en';
+    }
+    void i18n.changeLanguage(nextLang);
+  });
+}
 
 export default i18n;

@@ -161,7 +161,7 @@ export const ProjectSettings = () => {
 
         <Section title={t('pset.defaultSection')}>
           <div className="flex flex-wrap items-end gap-3 rounded-md border border-border bg-panel p-4">
-            <label className="field w-56">
+            <label className="field w-fit max-w-full min-w-56 shrink-0">
               <select
                 className="select"
                 aria-label={t('dlg.projectDefault')}

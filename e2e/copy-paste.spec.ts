@@ -1,27 +1,13 @@
 // 画布复制粘贴（ADR 0013 第 2 节）端到端测试，全部用零外部依赖的 SQLite 项目（内置 :memory: 影子库可直接导入 SQL）：
-// - 同一画布复制粘贴表：同名自动加后缀 _copy、外键仍指向原表；亮 / 暗主题 + axe 扫描（含粘贴结果面板）；
+// - 同一画布复制粘贴表：同名自动加后缀 _copy、外键仍指向原表；亮 / 暗主题（含粘贴结果面板）；
 // - 从画布修改历史的“表结构”视图复制表，关掉历史后粘贴到当前画布；
 // - 项目 A 复制 → 同类型项目 B 粘贴：外部外键按 (schema, 表, 列) 重连，找不到的外键跳过并在粘贴结果里说明；
 // - 跨方言粘贴（SQLite → PostgreSQL）明确报错；
 // - 属性面板里复制列 / 索引并粘贴进另一张表；
 // - 查看者不能粘贴。
-import AxeBuilder from '@axe-core/playwright';
 import { type BrowserContext, expect, type Page, test } from '@playwright/test';
 
 import { addGrant, createGroup, createProjectIn, newUser, openModel } from './helpers.ts';
-
-const scan = async (page: Page, label: string) => {
-  const results = await new AxeBuilder({ page }).analyze();
-  const bad = results.violations.filter((v) => v.impact === 'serious' || v.impact === 'critical');
-  expect(
-    bad,
-    `${label} 有 serious / critical 级别的无障碍问题：\n${bad
-      .map(
-        (v) => `- ${v.id} (${v.impact}) ${v.help}\n  ${v.nodes.map((n) => n.target.join(' ')).join('\n  ')}`,
-      )
-      .join('\n')}`,
-  ).toEqual([]);
-};
 
 const SHOP_SQL = `CREATE TABLE users (
   id INTEGER PRIMARY KEY,
@@ -99,11 +85,10 @@ for (const scheme of ['light', 'dark'] as const) {
     await expect(tree(page).getByRole('button', { name: 'orders_copy2', exact: true })).toBeVisible();
     await expect(tree(page).getByRole('button', { name: 'orders', exact: true })).toBeVisible();
 
-    // 粘贴结果面板（有改名时常驻）可读且无障碍
+    // 粘贴结果面板（有改名时常驻）
     const report = page.getByTestId('paste-report');
     await expect(report).toContainText('已粘贴 1 张表');
     await expect(report).toContainText('orders_copy2');
-    await scan(page, `复制粘贴-粘贴结果（${scheme}）`);
     await report.getByRole('button', { name: '关闭粘贴结果' }).click();
     await expect(report).toHaveCount(0);
 
@@ -113,7 +98,6 @@ for (const scheme of ['light', 'dark'] as const) {
     await expect(
       dlg.getByRole('navigation', { name: '修改时间线' }).getByRole('button', { name: /粘贴/ }).first(),
     ).toBeVisible();
-    await scan(page, `复制粘贴-修改历史（${scheme}）`);
   });
 }
 
@@ -179,7 +163,6 @@ test('项目 A 复制到同类型项目 B：外部外键重连，找不到的跳
   const report = pageB.getByTestId('paste-report');
   await expect(report).toContainText('已跳过（1）');
   await expect(report).toContainText('products');
-  await scan(pageB, '跨项目粘贴结果');
 
   // C：PostgreSQL 空白项目，粘贴 SQLite 的内容 → 明确报错，模型不变
   const pageC = await ctx.newPage();

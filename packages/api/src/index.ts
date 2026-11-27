@@ -343,7 +343,7 @@ export const mePatchSchema = z.object({
 export type MePatch = z.infer<typeof mePatchSchema>;
 
 export const passwordChangeSchema = z.object({
-  /** 已经有密码时必填；纯 OIDC 用户第一次设置密码时不需要 */
+  /** 已经有密码且非强制改密时必填；首次设置密码（纯 OIDC）或临时密码强制改密时可省略 */
   oldPassword: z.string().min(1, '请输入旧密码').optional(),
   newPassword: passwordSchema,
 });

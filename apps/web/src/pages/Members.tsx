@@ -87,7 +87,7 @@ export const Members = () => {
           action={canSetDefault ? null : <span className="hint">{t('access.defaultAdminHint')}</span>}
         >
           <div className="flex flex-wrap items-end gap-3">
-            <label className="field w-56">
+            <label className="field w-fit max-w-full min-w-56 shrink-0">
               <select
                 className="select"
                 aria-label={t('dlg.projectDefault')}

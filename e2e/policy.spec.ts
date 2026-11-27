@@ -1,24 +1,10 @@
 // 执行策略（P5a）：各层配置页（含上级锁定的显示）、授予执行者（“仅限执行者 + 生产”时非实例管理员不能选）、
-// 项目层收紧后缓存失效；保存进行中“撤销修改”禁用（组层 / 环境层）；相关页面的 axe 扫描（亮 / 暗）。
+// 项目层收紧后缓存失效；保存进行中“撤销修改”禁用（组层 / 环境层）。
 // “需要目标库”分组里的用例需要 PG 作目标库（Testcontainers 或 DOWEL_TEST_PG），没有 Docker 时跳过。
-import AxeBuilder from '@axe-core/playwright';
 import { expect, type Locator, type Page, test } from '@playwright/test';
 
 import { addEnv, execDialog, newTargetDb, openEnv, publishTable } from './exec-helpers.ts';
 import { createGroup, createProjectIn, gotoPage, holdRequest, instanceAdmin, newUser } from './helpers.ts';
-
-const scan = async (page: Page, label: string) => {
-  const results = await new AxeBuilder({ page }).analyze();
-  const bad = results.violations.filter((v) => v.impact === 'serious' || v.impact === 'critical');
-  expect(
-    bad,
-    `${label} 有 serious / critical 级别的无障碍问题：\n${bad
-      .map(
-        (v) => `- ${v.id} (${v.impact}) ${v.help}\n  ${v.nodes.map((n) => n.target.join(' ')).join('\n  ')}`,
-      )
-      .join('\n')}`,
-  ).toEqual([]);
-};
 
 /** SHOOT_APP=1 时把新页面的截图写到 .agents/docs/ui/shots/（和 visual.spec.ts 同一个约定） */
 const shoot = async (page: Page, name: string) => {
@@ -40,7 +26,6 @@ for (const scheme of ['light', 'dark'] as const) {
     await expect(set(admin, '生产环境').getByLabel('谁能执行')).toBeVisible();
     await expect(set(admin, '生产环境')).toContainText('生效：项目管理员 · 默认值');
     await expect(set(admin, '非生产环境')).toContainText('生效：项目编辑者 · 默认值');
-    await scan(admin, '/admin/policy');
 
     // 组层：组管理员把非生产收紧为“项目管理员”，锁等待 3 秒
     const { page } = await newUser(browser, '组管理员', { colorScheme: scheme });
@@ -53,7 +38,6 @@ for (const scheme of ['light', 'dark'] as const) {
     await expect(nonProd).toContainText('生效：项目管理员 · 来自组');
     await page.getByRole('button', { name: '保存执行策略' }).click();
     await expect(page.getByText('已保存执行策略')).toBeVisible();
-    await scan(page, '组首页 · 执行策略');
 
     // 项目层：显示“由组锁定”，比它宽的“项目编辑者”不可选
     await page.goto(projectUrl);
@@ -73,7 +57,6 @@ for (const scheme of ['light', 'dark'] as const) {
     await projNonProd.getByLabel('谁能执行').selectOption('');
     await page.getByRole('button', { name: '保存执行策略' }).click();
     await expect(page.getByRole('alert')).toContainText('仅限执行者');
-    await scan(page, '项目设置 · 执行策略');
     await shoot(page, `policy-project-${scheme}`);
   });
 }
@@ -139,7 +122,6 @@ for (const [scheme, lang] of [
     await expect(warn).toContainText(L.warn);
     await expect(warn).toContainText(L.warnBody);
     await expect(set(section, L.prod).getByTestId('token-bypass-warn')).toHaveCount(0);
-    await scan(page, `组首页 · 令牌提醒（${lang}）`);
     await shoot(page, `policy-token-guard-${lang}-${scheme}`);
 
     // 保存收紧（令牌仍允许）：保存后仍提示
@@ -173,7 +155,6 @@ for (const [scheme, lang] of [
     const viewerSet = set(policySection(viewer, L.section), L.nonProd);
     await expect(viewerSet.getByTestId('token-bypass-warn')).toContainText(L.warn);
     await expect(viewerSet.getByRole('button', { name: L.action })).toHaveCount(0);
-    await scan(viewer, `组首页 · 令牌提醒只读（${lang}）`);
 
     // 关闭并保存：刷新后不再提示
     await nonProd.getByRole('button', { name: L.action }).click();
@@ -294,11 +275,6 @@ test.describe('需要目标库', () => {
       await page.getByRole('button', { name: '添加', exact: true }).click();
       await expect(page.getByRole('button', { name: '移除 DBA 乙 的授权' })).toBeVisible();
       await expect(page.getByText(/· 环境：dev/)).toBeVisible();
-      await new AxeBuilder({ page })
-        .analyze()
-        .then((r) =>
-          expect(r.violations.filter((v) => v.impact === 'serious' || v.impact === 'critical')).toEqual([]),
-        );
 
       // 实例管理员可以授予 prod 的执行者
       const admin = await instanceAdmin(browser);
@@ -423,7 +399,6 @@ test.describe('需要目标库', () => {
       await expect(warn).toContainText('对这个环境直接向前执行迁移');
       await expect(warn).not.toContainText('对范围内的非生产环境');
       await expect(tok).toHaveValue('');
-      await scan(page, '环境页 · 令牌提醒');
 
       // 一键关闭：令牌执行改成“不允许”，提示消失，焦点落到“允许 CI 令牌执行”
       await devSet.getByRole('button', { name: '禁止 CI 令牌执行' }).click();

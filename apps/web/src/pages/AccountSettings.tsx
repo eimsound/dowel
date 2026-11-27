@@ -1,16 +1,15 @@
 // 个人设置（/account）：资料、密码、登录方式、会话、MCP 访问（M3-C，见 components/McpTokens.tsx）、偏好。
-// 导航方式是外壳的侧面板（和后台一致，见 DESIGN.md 的 Layout）：每节是独立的嵌套路由，地址可以直接分享。
+// 导航放在全局侧边栏里：每节是独立的嵌套路由，地址可以直接分享。
 // P1c 里 OIDC 关联成功后的回调就落在 /account（本页的资料一节）。
 import type { Me, MeIdentity, SessionInfo } from '@dowel/api';
 import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query';
-import { Link, Outlet, useRouterState } from '@tanstack/react-router';
-import { Bot, KeyRound, Link2, MonitorSmartphone, Palette, Trash2, UserRound } from 'lucide-react';
+import { Link, Outlet } from '@tanstack/react-router';
+import { KeyRound, Link2, MonitorSmartphone, Trash2 } from 'lucide-react';
 import { useState } from 'react';
 import { useTranslation } from 'react-i18next';
 
 import { ApiError, api } from '../api.ts';
-import { SettingsNav } from '../components/SettingsNav.tsx';
-import { AppShell, PageHeader, useShellPanel } from '../components/Shell.tsx';
+import { AppShell, PageHeader } from '../components/Shell.tsx';
 import { useToast } from '../components/Toasts.tsx';
 import { Banner, IconButton } from '../components/ui.tsx';
 import { formatTime } from '../format.ts';
@@ -19,41 +18,19 @@ import { useInstance } from '../instance.ts';
 import { useMe, useSignOut } from '../session.ts';
 import { getScheme, type Scheme, setScheme } from '../theme.ts';
 
-const SECTIONS = [
-  { to: '/account', label: 'acc.profile', icon: UserRound },
-  { to: '/account/password', label: 'acc.password', icon: KeyRound },
-  { to: '/account/identities', label: 'acc.identities', icon: Link2 },
-  { to: '/account/sessions', label: 'acc.sessions', icon: MonitorSmartphone },
-  { to: '/account/mcp', label: 'mcp.title', icon: Bot },
-  { to: '/account/preferences', label: 'acc.preferences', icon: Palette },
-] as const;
-
-/** 个人设置的嵌套布局：外壳 + 侧面板导航 + 当前一节 */
+/** 个人设置的嵌套布局：外壳 + 当前一节 */
 export const AccountLayout = () => {
   const me = useMe().data;
-  const path = useRouterState({ select: (s) => s.location.pathname });
   if (!me) return null;
   return (
     <AppShell me={me}>
-      <AccountShell path={path} />
+      <AccountShell />
     </AppShell>
   );
 };
 
-const AccountShell = ({ path }: { path: string }) => {
+const AccountShell = () => {
   const { t } = useTranslation();
-  useShellPanel(
-    t('acc.panel'),
-    <SettingsNav
-      label={t('acc.panel')}
-      path={path}
-      items={SECTIONS.map((s) => {
-        const Icon = s.icon;
-        return { to: s.to, label: t(s.label), icon: <Icon size={16} aria-hidden="true" /> };
-      })}
-    />,
-    [path, t],
-  );
   return (
     <>
       <PageHeader crumbs={[{ label: t('nav.myProjects'), to: '/' }, { label: t('acc.title') }]} />
