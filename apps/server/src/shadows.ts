@@ -39,29 +39,6 @@ export interface Env {
   engineMajor: number | null;
 }
 
-export interface VersionShadowEntry {
-  /** 该代表影子库所在的版本组（DialectVersionMatrix.groupKeyOf，如 PG 16、MySQL 804）；不分组的方言或未探测版本为 null */
-  groupKey: number | null;
-  envId: string;
-  shadow: Shadow;
-  label: string;
-}
-
-export interface SkippedVersionGroup {
-  /** 没有可用影子库的版本组（同 VersionShadowEntry.groupKey） */
-  groupKey: number | null;
-  reason: string;
-}
-
-export interface ProjectVersionShadows {
-  /** 按版本组升序排列（已知版本组在前，null 在后），每个版本组至多 1 个代表影子库 */
-  entries: VersionShadowEntry[];
-  /** 无法获取可用影子库的版本组及其首个失败原因 */
-  skippedGroups: SkippedVersionGroup[];
-  /** 项目最低目标版本组（已知版本组的最小键；不分组的方言或无已探测环境为 null） */
-  targetGroupKey: number | null;
-}
-
 /** 项目里的一个环境与它的数据库完整版本号（ADR 0017 决定 5；尚未探测为 null） */
 export interface ProjectEnvVersion {
   id: string;
@@ -407,93 +384,6 @@ export class Shadows {
   }
 
   /**
-   * 按项目全部环境的版本组分组（DialectVersionMatrix.groupKeyOf；去重升序，未知版本归为 null 组），为每个版本组选出 1 个代表影子库：
-   * 优先级：显式 shadowUrl > 非生产环境 > 允许同实例的生产环境；该版本组全部不可用时记入 skippedGroups。
-   * 兼容测试中直接覆写实例级 `forProject` 的场景。
-   */
-  async forProjectVersions(pid: string): Promise<ProjectVersionShadows> {
-    if (this.forProject !== Shadows.prototype.forProject) {
-      const s = await this.forProject(pid);
-      return {
-        entries: [{ groupKey: null, envId: '', shadow: s.shadow, label: s.label }],
-        skippedGroups: [],
-        targetGroupKey: null,
-      };
-    }
-
-    const spec = getDialect(await this.projectDialect(pid));
-    if (!spec.capabilities.requiresExternalShadow) {
-      return {
-        entries: [{ groupKey: null, envId: '', shadow: sqliteMemoryShadow(), label: 'SQLite :memory:' }],
-        skippedGroups: [],
-        targetGroupKey: null,
-      };
-    }
-
-    const observed = this.snapshotProjectCache(pid);
-    const rows = await this.db.query<{
-      id: string;
-      production: boolean;
-      allow_same_instance: boolean;
-      shadow_url_enc: string | null;
-      engine_version_num: number | null;
-    }>(
-      `select id, production, allow_same_instance, shadow_url_enc, engine_version_num
-         from environments where project_id = $1 order by created_at`,
-      [pid],
-    );
-    const liveIds = new Set(rows.map((r) => r.id));
-    await this.pruneRemovedForProject(observed, liveIds);
-    if (!rows.length) throw await this.noEnvironmentError(pid);
-
-    const groups = new Map<number | null, typeof rows>();
-    const knownKeys = new Set<number>();
-    for (const r of rows) {
-      const key = spec.versioning.matrix?.groupKeyOf(r.engine_version_num) ?? null;
-      if (key !== null) knownKeys.add(key);
-      const list = groups.get(key);
-      if (list) list.push(r);
-      else groups.set(key, [r]);
-    }
-    const sortedKnownKeys = [...knownKeys].sort((a, b) => a - b);
-    // 最低已知版本组（PG 最低大版本、MySQL 最低主次版本），供 forProjectTarget 单影子库选影优先使用
-    const targetGroupKey = sortedKnownKeys[0] ?? null;
-    const orderedKeys: (number | null)[] = [...sortedKnownKeys, ...(groups.has(null) ? [null] : [])];
-
-    const entries: VersionShadowEntry[] = [];
-    const skippedGroups: SkippedVersionGroup[] = [];
-    for (const groupKey of orderedKeys) {
-      const candidates = [...(groups.get(groupKey) ?? [])].sort(
-        (a, b) => candidatePriority(a) - candidatePriority(b),
-      );
-      let picked = false;
-      let firstReason = '没有可用的影子库';
-      for (const cand of candidates) {
-        try {
-          const s = await this.forProject(pid, cand.id);
-          entries.push({
-            groupKey,
-            envId: cand.id,
-            shadow: s.shadow,
-            label: s.label,
-          });
-          picked = true;
-          break;
-        } catch (e) {
-          // 配置已变更是可重试的暂时状态：整体重试，不能把这个版本组当成“没有可用影子库”跳过
-          if (!(e instanceof ShadowError) || e instanceof ShadowConfigChangedError) throw e;
-          if (firstReason === '没有可用的影子库') firstReason = scrubSecrets(e.message);
-        }
-      }
-      if (!picked) {
-        skippedGroups.push({ groupKey, reason: firstReason });
-      }
-    }
-
-    return { entries, skippedGroups, targetGroupKey };
-  }
-
-  /**
    * 闭环验证选影（ADR 0017 决定 5）：按项目全部环境的**数据库完整版本号**分组（PG 两段、MySQL 三段、SQL Server 构建号；
    * 未探测的归为 null 组），每组按 显式 shadowUrl > 非生产 > 允许同实例的生产 选出 1 个代表影子库；该组都不可用时记入 skipped。
    * 验证结果按影子库实际读到的完整版本号记录，发布据 environments 判断覆盖了哪些环境。
@@ -585,18 +475,64 @@ export class Shadows {
   }
 
   /**
-   * 为 OpaqueRefresher 等单影子库派生场景选影：优先选择最低已知版本组（`groupKey === targetGroupKey`）的可用环境影子库，
-   * 若无可用则回退到首个可用环境影子库（仅用于按需规范化 / 派生；发布与重新验证使用 `forProjectEngineVersions` 按数据库完整版本号逐组验证）。
+   * 为 OpaqueRefresher / 按需规范化等单影子库派生场景选影（发布与重新验证用 `forProjectEngineVersions` 按数据库完整版本号逐组验证）：
+   * 按版本组（DialectVersionMatrix.groupKeyOf，PG 大版本、MySQL 主次版本）升序依次尝试，未知版本组最后；
+   * 组内按 显式 shadowUrl > 非生产 > 允许同实例的生产 挑选。拿到**第一个**可用影子库立即返回，
+   * 不再为其余版本组建连（Issue #202）；某组全部不可用（ShadowError）才回退下一组，全都不可用时报第一组的首个原因。
+   * “配置已变更”（ShadowConfigChangedError，可整体重试）与非 ShadowError（如 ProjectGoneError）直接抛出，不当成该组不可用。
+   * 兼容测试中直接覆写实例级 `forProject` 的场景。
    */
   async forProjectTarget(pid: string): Promise<{ shadow: Shadow; label: string }> {
-    const res = await this.forProjectVersions(pid);
-    if (res.targetGroupKey !== null) {
-      const exact = res.entries.find((e) => e.groupKey === res.targetGroupKey);
-      if (exact) return { shadow: exact.shadow, label: exact.label };
+    if (this.forProject !== Shadows.prototype.forProject) return this.forProject(pid);
+
+    const spec = getDialect(await this.projectDialect(pid));
+    if (!spec.capabilities.requiresExternalShadow) {
+      return { shadow: sqliteMemoryShadow(), label: 'SQLite :memory:' };
     }
-    const first = res.entries[0];
-    if (first) return { shadow: first.shadow, label: first.label };
-    throw new ShadowError(res.skippedGroups[0]?.reason ?? '没有可用的影子库');
+
+    const observed = this.snapshotProjectCache(pid);
+    const rows = await this.db.query<{
+      id: string;
+      production: boolean;
+      allow_same_instance: boolean;
+      shadow_url_enc: string | null;
+      engine_version_num: number | null;
+    }>(
+      `select id, production, allow_same_instance, shadow_url_enc, engine_version_num
+         from environments where project_id = $1 order by created_at`,
+      [pid],
+    );
+    await this.pruneRemovedForProject(observed, new Set(rows.map((r) => r.id)));
+    if (!rows.length) throw await this.noEnvironmentError(pid);
+
+    const groups = new Map<number | null, typeof rows>();
+    for (const r of rows) {
+      const key = spec.versioning.matrix?.groupKeyOf(r.engine_version_num) ?? null;
+      const list = groups.get(key);
+      if (list) list.push(r);
+      else groups.set(key, [r]);
+    }
+    // 最低已知版本组优先（与 web 状态栏 usableShadowEnv 一致），未知版本组（null）最后
+    const knownKeys = [...groups.keys()].filter((k): k is number => k !== null).sort((a, b) => a - b);
+    const orderedKeys: (number | null)[] = groups.has(null) ? [...knownKeys, null] : knownKeys;
+
+    let firstReason: string | null = null;
+    for (const groupKey of orderedKeys) {
+      const candidates = [...(groups.get(groupKey) ?? [])].sort(
+        (a, b) => candidatePriority(a) - candidatePriority(b),
+      );
+      for (const cand of candidates) {
+        try {
+          return await this.forProject(pid, cand.id);
+        } catch (e) {
+          // 配置已变更是可重试的暂时状态：整体重试，不能把这个版本组当成“没有可用影子库”回退到下一组
+          if (!(e instanceof ShadowError) || e instanceof ShadowConfigChangedError) throw e;
+          firstReason ??= scrubSecrets(e.message);
+        }
+      }
+      // 这一组一个可用的都没有：回退到下一个版本组（每组至少一个候选，firstReason 记的就是最低版本组的首个原因）
+    }
+    throw new ShadowError(firstReason ?? '没有可用的影子库');
   }
 
   /**

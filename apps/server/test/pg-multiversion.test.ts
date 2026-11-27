@@ -3,7 +3,7 @@
 // - 项目目标最低版本推导（targetPgMajor / envPgMajors）
 // - 跨版本不兼容特性拦截（VIRTUAL 生成列 / 显式命名 NOT NULL）
 // - 按 targetPgMajor 冻结脚本与导出 DDL / 迁移
-// - Shadows.forProjectVersions / forProjectEngineVersions 选影优先级与分组（大版本组 / 数据库完整版本号）
+// - Shadows.forProjectTarget / forProjectEngineVersions 选影优先级与分组（大版本组 / 数据库完整版本号）
 // - 多版本影子库验证编排（ADR 0017 决定 5）：按完整版本号逐条记录（仅首个跑风险分析）、任一失败拒发布、
 //   没有与环境版本一致的通过记录拒发布、未覆盖的环境列出但不阻止发布
 import type {
@@ -554,7 +554,7 @@ describe('PG 多版本（15–19）服务端全链路', () => {
     }
   });
 
-  test('Shadows.forProjectVersions 按显式 shadowUrl > 非生产 > 允许同实例生产优先级分组选影', async () => {
+  test('Shadows.forProjectTarget 按版本组升序、组内显式 shadowUrl > 非生产 > 允许同实例生产优先级选影', async () => {
     const pid = await newProject('shadow-priority');
     await insertEnvRow({
       id: 'e-16-prod-no',
@@ -607,16 +607,13 @@ describe('PG 多版本（15–19）服务端全链路', () => {
       throw new ShadowError(`blocked:${url}`);
     });
     try {
-      const res = await shadowsTest.forProjectVersions(pid);
-      expect(res.targetGroupKey).toBe(15);
+      const res = await shadowsTest.forProjectTarget(pid);
       expect(await projectPgVersionSummary(db, pid)).toEqual({ targetPgMajor: 15, envPgMajors: [15, 16] });
-      // PG 15 组仅有一个生产禁同实例环境 → 记入 skippedGroups
-      expect(res.skippedGroups).toHaveLength(1);
-      expect(res.skippedGroups[0]?.groupKey).toBe(15);
-      // PG 16 组命中优先级最高的显式 shadowUrl 环境 e-16-explicit
-      expect(res.entries).toHaveLength(1);
-      expect(res.entries[0]?.groupKey).toBe(16);
-      expect(res.entries[0]?.envId).toBe('e-16-explicit');
+      // 最低版本组 PG 15 仅有一个生产禁同实例环境（不可用）→ 回退到 PG 16 组，
+      // 命中组内优先级最高的显式 shadowUrl 环境 e-16-explicit，组内其余环境不建影子库
+      expect(shadowsTest.has('e-16-explicit')).toBe(true);
+      expect(shadowsTest.size).toBe(1);
+      expect(res.shadow).toBeDefined();
 
       // 闭环验证按数据库完整版本号分组（ADR 0017 决定 5）：同一个大版本里不同的小版本各自成组
       await insertEnvRow({

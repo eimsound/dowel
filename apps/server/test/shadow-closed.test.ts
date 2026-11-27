@@ -18,7 +18,7 @@ import {
   ShadowError,
   ShadowUnavailableError,
 } from '../src/shadow.ts';
-import { Shadows } from '../src/shadows.ts';
+import { ProjectGoneError, Shadows } from '../src/shadows.ts';
 import { registerTargetDriver } from '../src/targets.ts';
 import { mssqlShadow } from '../src/targets/mssql.ts';
 import { mysqlShadow } from '../src/targets/mysql.ts';
@@ -629,7 +629,7 @@ describe('Shadows.forProject：每次 await 之后都重新检查 closed 与失�
     for (const s of built) expect(s.close).toHaveBeenCalledTimes(1);
   });
 
-  test('多版本选影：候选环境报“配置已变更”时整体抛出重试，不把这个版本组记成没有可用影子库', async () => {
+  test('单影子库选影（forProjectTarget）：候选环境报“配置已变更”时整体抛出重试，不把这个版本组当成不可用回退', async () => {
     const urls = [URL_2, URL_3, URL_1, URL_2];
     for (let i = 0; i < 4; i++) {
       hooks[i] = async () => {
@@ -637,8 +637,77 @@ describe('Shadows.forProject：每次 await 之后都重新检查 closed 与失�
         await ctx.deliver({ t: 'shadows.forget', envIds: [EID] });
       };
     }
-    expect(await settle(ctx.shadows.forProjectVersions(PID))).toBeInstanceOf(ShadowConfigChangedError);
+    expect(await settle(ctx.shadows.forProjectTarget(PID))).toBeInstanceOf(ShadowConfigChangedError);
     expect(ctx.shadows.size).toBe(0);
+  });
+
+  describe('单影子库选影（forProjectTarget）：拿到第一个可用影子库即返回（Issue #202）', () => {
+    const E15 = 'e-target-15';
+    const E16 = 'e-target-16';
+    /** 环境按 URL 区分：EID（未探测版本，null 组）= URL_1，PG 15 = URL_2，PG 16 = URL_3 */
+    const failing = new Map<string, () => Error>();
+
+    beforeEach(async () => {
+      failing.clear();
+      for (const [id, name, url, num] of [
+        [E16, 'pg16', URL_3, 160004],
+        [E15, 'pg15', URL_2, 150007],
+      ] as const) {
+        await ctx.db.query(
+          `insert into environments (id, project_id, name, url_enc, production, allow_same_instance, shadow_url_enc, engine_version_num)
+           values ($1, $2, $3, $4, false, false, null, $5)`,
+          [id, PID, name, encrypt(url), num],
+        );
+      }
+      const base = prepareImpl!;
+      prepareImpl = async (env, schemas) => {
+        const err = failing.get(env.url);
+        if (err) throw err();
+        return base(env, schemas);
+      };
+    });
+
+    test('最低版本组可用：只为它建影子库，其余版本组（含未知版本组）不建连', async () => {
+      const res = await ctx.shadows.forProjectTarget(PID);
+      expect(res.label).toBe('pg15');
+      expect(built.map((b) => b.url)).toEqual([URL_2]);
+      expect(ctx.shadows.has(E15)).toBe(true);
+      expect(ctx.shadows.has(E16)).toBe(false);
+      expect(ctx.shadows.has(EID)).toBe(false);
+    });
+
+    test('最低版本组不可用（ShadowError）：回退到下一个版本组，拿到后不再尝试未知版本组', async () => {
+      failing.set(URL_2, () => new ShadowError('pg15 连不上'));
+      const res = await ctx.shadows.forProjectTarget(PID);
+      expect(res.label).toBe('pg16');
+      expect(built.map((b) => b.url)).toEqual([URL_3]);
+      expect(ctx.shadows.has(EID)).toBe(false);
+    });
+
+    test('全部版本组都不可用：报最低版本组的首个原因（已脱敏）', async () => {
+      failing.set(URL_2, () => new ShadowError('pg15 连不上：postgres://u:secret@db-2.invalid:5432/app'));
+      failing.set(URL_3, () => new ShadowError('pg16 连不上'));
+      failing.set(URL_1, () => new ShadowError('未知版本连不上'));
+      const e = await settle(ctx.shadows.forProjectTarget(PID));
+      expect(e).toBeInstanceOf(ShadowError);
+      expect((e as Error).message).toMatch(/^pg15 连不上/);
+      expect((e as Error).message).not.toContain('secret');
+      expect(built).toHaveLength(0);
+    });
+
+    test.each([
+      {
+        name: 'ShadowConfigChangedError',
+        make: () => new ShadowConfigChangedError(),
+        type: ShadowConfigChangedError,
+      },
+      { name: 'ProjectGoneError', make: () => new ProjectGoneError(), type: ProjectGoneError },
+    ])('最低版本组报 $name：直接抛出，不回退到后面的版本组', async ({ make, type }) => {
+      failing.set(URL_2, make);
+      expect(await settle(ctx.shadows.forProjectTarget(PID))).toBeInstanceOf(type);
+      expect(built).toHaveLength(0);
+      expect(ctx.shadows.size).toBe(0);
+    });
   });
 
   test('按完整版本选影（forProjectEngineVersions）：候选环境报“配置已变更”时整体抛出重试，不记录到 skipped', async () => {

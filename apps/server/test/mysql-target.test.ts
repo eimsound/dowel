@@ -384,8 +384,10 @@ describe('MySQL 目标库服务端驱动与全栈', () => {
     expect(vecReport.ok).toBe(false);
     expect(vecReport.error?.message).toMatch(/VECTOR.*8\.4/);
 
-    // R2-2: Shadows.forProjectVersions 对 MySQL 8.4 + 9.7 混部按主次版本分组（804 / 907），同时保持 PG 字段为空
+    // R2-2: Shadows.forProjectTarget 对 MySQL 8.4 + 9.7 混部按主次版本分组（804 / 907），先选最低组且拿到后不再为 907 组建影子库；同时保持 PG 字段为空
     const mixPid = newId();
+    const mixEnv97 = newId();
+    const mixEnv84 = newId();
     await pdb.query(
       `insert into projects (id, group_id, name, slug, dialect) values ($1, $2, 'MySQL Mix', $3, 'mysql')`,
       [mixPid, groupId, `mysql-mix-${mixPid.slice(0, 6)}`],
@@ -395,20 +397,21 @@ describe('MySQL 目标库服务端驱动与全栈', () => {
        values ($1, $2, 'dev97', $3, false, true, $4, '9.7.0', 90700),
               ($5, $2, 'prod84', $6, true, false, $7, '8.4.13', 80413)`,
       [
-        newId(),
+        mixEnv97,
         mixPid,
         encrypt('mysql://root:pw@127.0.0.1:3307/app97'),
         encrypt('mysql://root:pw@127.0.0.1:3307/shadow97'),
-        newId(),
+        mixEnv84,
         encrypt('mysql://root:pw@127.0.0.1:3306/app84'),
         encrypt('mysql://root:pw@127.0.0.1:3306/shadow84'),
       ],
     );
     const mixShadows = new Shadows(pdb, async () => {});
     try {
-      const sel = await mixShadows.forProjectVersions(mixPid);
-      expect(sel.targetGroupKey).toBe(804);
-      expect(sel.entries.map((e) => e.groupKey)).toEqual([804, 907]);
+      await mixShadows.forProjectTarget(mixPid);
+      // 最低主次版本组 804 拿到影子库即返回，907 组不建影子库
+      expect(mixShadows.has(mixEnv84)).toBe(true);
+      expect(mixShadows.has(mixEnv97)).toBe(false);
       // 闭环验证按 MySQL 三段完整版本号分组（ADR 0017 决定 5）
       const byVersion = await mixShadows.forProjectEngineVersions(mixPid);
       expect(byVersion.entries.map((e) => e.engineVersion)).toEqual(['8.4.13', '9.7.0']);
