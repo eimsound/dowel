@@ -7,6 +7,7 @@
 // 直接在平台库里删掉项目的全部行（模拟别的副本删的、derive.forget / shadows.forget 还没送达的窗口，
 // 本副本内存里的 forgotten 标记、房间、缓存都还在，不会替我们兜底）。零 Docker：平台库 SQLite :memory:。
 import { addCheck, addColumn, all, createSchema, createTable, getDialect, newId } from '@dowel/core';
+import { stepsChecksum } from '@dowel/engines';
 import { HTTPException } from 'hono/http-exception';
 import { afterEach, beforeEach, describe, expect, test } from 'vitest';
 
@@ -25,7 +26,7 @@ const NO_ENV =
 
 /** shadows.projectDialect 的 SQL（SQLite 项目在这里决定走内存影子库） */
 const DIALECT_SQL = 'select dialect from projects where id = $1';
-/** shadows.forProject（未指定环境）/ forProjectVersions 读环境列表的 SQL 共同片段 */
+/** shadows.forProject（未指定环境）/ forProjectVersions / forProjectEngineVersions 读环境列表的 SQL 共同片段 */
 const ENV_LIST_SQL = 'from environments where project_id = $1 order by created_at';
 /** shadows.env（指定环境）的 SQL 片段 */
 const ENV_ONE_SQL = 'where e.id = $1 and e.project_id = $2';
@@ -216,11 +217,12 @@ test('ProjectGoneError 是 404 HTTPException、不是 ShadowError（不会被“
   expect(e.message).toBe('项目不存在');
 });
 
-test('Shadows 直接调用：项目行不存在时 forProject / forProjectVersions / forProjectTarget / configState 都抛 ProjectGoneError', async () => {
+test('Shadows 直接调用：项目行不存在时 forProject / forProjectVersions / forProjectEngineVersions / forProjectTarget / configState 都抛 ProjectGoneError', async () => {
   const s = created.shadows;
   await expect(s.forProject('no-such-project')).rejects.toBeInstanceOf(ProjectGoneError);
   await expect(s.forProject('no-such-project', 'no-such-env')).rejects.toBeInstanceOf(ProjectGoneError);
   await expect(s.forProjectVersions('no-such-project')).rejects.toBeInstanceOf(ProjectGoneError);
+  await expect(s.forProjectEngineVersions('no-such-project')).rejects.toBeInstanceOf(ProjectGoneError);
   await expect(s.forProjectTarget('no-such-project')).rejects.toBeInstanceOf(ProjectGoneError);
   await expect(s.configState('no-such-project')).rejects.toBeInstanceOf(ProjectGoneError);
   // 活项目但环境不存在：仍是原来的“环境不存在”404（不是 ProjectGoneError）
@@ -261,7 +263,7 @@ describe.each([
     expect(res.data).toEqual({ error: '项目不存在' });
   });
 
-  test('发布 POST /versions → 404，不会把“没有影子库”当成未验证继续发布', async () => {
+  test('发布 POST /versions → 404 项目不存在（不是 422 shadow_unavailable，且不写入版本）', async () => {
     const { pid } = await setup('发布');
     await addPlainTable(pid);
     armed = { match, pid };
@@ -273,24 +275,46 @@ describe.each([
   });
 
   test('重新验证 POST /versions/:vid/verify → 404 项目不存在', async () => {
-    const { pid } = await newProject('重新验证', dialect);
+    const { pid, branch } = await newProject('重新验证', dialect);
     await addPlainTable(pid);
-    // 先在活项目上发布一个版本（PG 项目此时还没环境：未验证发布）
-    const pub = await call('POST', `/api/projects/${pid}/versions`, { name: 'v1' });
-    expect(pub.status, JSON.stringify(pub.data)).toBe(201);
-    const [v] = await db.query<{ id: string }>(
-      'select id from versions where project_id = $1 and number = 1',
-      [pid],
-    );
-    if (dialect === 'pg') await addEnv(pid);
+    let vid: string;
+    if (dialect === 'sqlite') {
+      const pub = await call('POST', `/api/projects/${pid}/versions`, { name: 'v1' });
+      expect(pub.status, JSON.stringify(pub.data)).toBe(201);
+      const [v] = await db.query<{ id: string }>(
+        'select id from versions where project_id = $1 and number = 1',
+        [pid],
+      );
+      vid = v!.id;
+    } else {
+      // ADR 0017：没有环境的外部方言活项目无法通过 POST /versions 发布，直接落一条未验证版本行再触发重验证
+      const { model } = await created.rooms.model(branch);
+      const up = [{ sql: 'create table orders (total integer)', transactional: true }];
+      const down = [{ sql: 'drop table orders', transactional: true }];
+      vid = newId();
+      await db.query(
+        `insert into versions (id, project_id, branch_id, seq, name, model, number, up_steps, down_steps, checksum)
+         values ($1, $2, $3, 1, 'v1', $4::text::jsonb, 1, $5::text::jsonb, $6::text::jsonb, $7)`,
+        [
+          vid,
+          pid,
+          branch,
+          JSON.stringify(model),
+          JSON.stringify(up),
+          JSON.stringify(down),
+          stepsChecksum(up, down),
+        ],
+      );
+      await addEnv(pid);
+    }
     armed = { match, pid };
-    const res = await call('POST', `/api/projects/${pid}/versions/${v!.id}/verify`);
+    const res = await call('POST', `/api/projects/${pid}/versions/${vid}/verify`);
     expect(fired).toBe(1);
     expect(res.status, JSON.stringify(res.data)).toBe(404);
     expect(res.data).toEqual({ error: '项目不存在' });
   });
 
-  test('MCP verify_migration → project_not_found，且退回连接限速额度', async () => {
+  test('MCP verify_migration → project_not_found、不写审计（外部方言退回连接限速额度）', async () => {
     const { pid } = await setup('MCP 验证');
     await addPlainTable(pid);
     const token = await issueToken();
@@ -299,8 +323,16 @@ describe.each([
     expect(fired).toBe(1);
     expect(res.isError).toBe(true);
     expect(res.structuredContent).toMatchObject({ code: 'project_not_found', message: '项目不存在' });
-    // 限额 1：没连库就失败的必须精确退回，否则桶里会留下一条记录
-    expect(limiter.keyCount).toBe(0);
+    // 项目已不存在，不再写 model.verify 审计（区别于活项目走 ShadowError 分支会记录失败审计）
+    const audits = await db.query<{ id: string }>(
+      "select id from audit_events where action = 'model.verify' and project_id = $1",
+      [pid],
+    );
+    expect(audits).toHaveLength(0);
+    if (dialect === 'pg') {
+      // 仅外部方言走 connectionLimiter（SQLite requiresExternalShadow 为 false、不扣桶）；限额 1，未连库失败必须精确退回
+      expect(limiter.keyCount).toBe(0);
+    }
   });
 
   test('OpaqueRefresher shadowOf：查完 branches 后项目被删 → flush skipped(forgotten)，不是 no_shadow、也不再复核 branches', async () => {
@@ -340,17 +372,14 @@ describe('活项目回归：没有环境仍是原来的 422 / no_shadow，限速
     expect(ver.data).toEqual({ error: NO_ENV });
   });
 
-  test('发布：没有环境时照旧发布为未验证并写明原因', async () => {
+  test('发布：没有环境时按 ADR 0017 返回 422 shadow_unavailable 并写明原因，不写入版本', async () => {
     const { pid } = await newProject('活项目-发布', 'pg');
     await addPlainTable(pid);
     const pub = await call('POST', `/api/projects/${pid}/versions`, { name: 'v1' });
-    expect(pub.status, JSON.stringify(pub.data)).toBe(201);
-    const [v] = await db.query<{ verified_at: string | null }>(
-      'select verified_at from versions where project_id = $1 and number = 1',
-      [pid],
-    );
-    expect(v!.verified_at).toBeNull();
-    expect(JSON.stringify(pub.data)).toContain(NO_ENV);
+    expect(pub.status, JSON.stringify(pub.data)).toBe(422);
+    expect(pub.data.code).toBe('shadow_unavailable');
+    expect(String(pub.data.error)).toContain(NO_ENV);
+    expect(await db.query('select id from versions where project_id = $1', [pid])).toHaveLength(0);
   });
 
   test('MCP verify_migration → shadow_unavailable 原文案，退回限速额度', async () => {

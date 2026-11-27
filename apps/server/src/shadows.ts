@@ -91,7 +91,7 @@ export interface ProjectEngineShadows {
 /**
  * 选影期间发现项目行已不存在（请求通过鉴权后项目被并发删除，Issue #170）：与 accessIn 一致按“项目不存在”处理。
  * 是 HTTPException(404) 的子类：app.onError、按 404 精确退回限速的调用方（normalize）无需改动；
- * **不是** ShadowError，不会被“影子库不可用 → 发布为未验证 / 422 / no_shadow”的分支吞掉。
+ * **不是** ShadowError，不会被“影子库不可用 → 422 shadow_unavailable / no_shadow”的分支吞掉。
  * MCP 映射为 project_not_found，OpaqueRefresher 的 shadowOf 映射为 'forgotten'。
  */
 export class ProjectGoneError extends HTTPException {
@@ -549,12 +549,7 @@ export class Shadows {
       };
     }
     await this.pruneRemovedForProject(observed, new Set(rows.map((r) => r.id)));
-    if (!rows.length) {
-      throw new ShadowError(
-        '项目还没有配置环境。导入 SQL、验证迁移都需要一个真实的数据库实例作影子库，请先在“环境”里添加项目要部署到的数据库',
-        { preConnect: true },
-      );
-    }
+    if (!rows.length) throw await this.noEnvironmentError(pid);
     const groups = new Map<string | null, { num: number | null; rows: typeof rows }>();
     for (const r of rows) {
       const key = fullOf(r);
