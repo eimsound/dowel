@@ -44,7 +44,7 @@ import {
 import { passwordLoginForced, readSettings } from './settings.ts';
 import { DEFAULT_ADMIN_USERNAME } from './setup.ts';
 import { ShadowConfigChangedError, ShadowError } from './shadow.ts';
-import { Shadows } from './shadows.ts';
+import { ProjectGoneError, Shadows } from './shadows.ts';
 import type { ConnectionGuard } from './targets.ts';
 import { ActiveTokenCache } from './tokens.ts';
 import { type WebhookOptions, Webhooks } from './webhooks.ts';
@@ -116,6 +116,8 @@ export const createApp = (db: PlatformDb, options: AppOptions = {}) => {
       try {
         return (await shadows.forProjectTarget(b.project_id))?.shadow ?? null;
       } catch (e) {
+        // 查完 branches 之后项目被并发删除（Issue #170）：是 forgotten，不能被下面当成“无环境”的 no_shadow
+        if (e instanceof ProjectGoneError) return 'forgotten';
         // 尚未尝试连库就已知项目没有可用影子库（无环境）：直接报 no_shadow，避免每次 flush 多查一次 branches
         if (e instanceof ShadowError && e.preConnect) return 'no_shadow';
         return null;
