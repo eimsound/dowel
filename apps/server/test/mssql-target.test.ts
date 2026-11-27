@@ -6,6 +6,7 @@ import type {
   ProjectCreated,
   ProjectInfo,
   PublishRejected,
+  PullResult,
   TargetInfo,
   VersionCreated,
   VersionDetail,
@@ -14,6 +15,7 @@ import type {
 import {
   addColumn,
   all,
+  type Column,
   createSchema,
   createTable,
   emptyBase,
@@ -21,17 +23,21 @@ import {
   type Model,
   mssqlIdent,
   mssqlLiteral,
+  plan,
   PlanError,
   runMutator,
+  setMssqlInferredNotNull,
 } from '@dowel/core';
 import {
   type Db,
+  getEngine,
   isMetadataOnlyMssqlSql,
   mssqlErrorNumber,
   resetMssqlShadow,
   stripMssqlImportNoise,
 } from '@dowel/engines';
-import { StepError, verify, verifyScripts } from '@dowel/verifier';
+import { diffAgainst } from '@dowel/executor';
+import { runSteps, StepError, verify, verifyScripts } from '@dowel/verifier';
 import { afterAll, beforeAll, describe, expect, test } from 'vitest';
 
 import { connectTestMssql, createTestMssqlDb, getMssqlAdminUrl, MSSQL_VERSION } from '../../../test/mssql.ts';
@@ -42,6 +48,7 @@ import {
   assertImportable,
   isConnectionFailure,
   isInfraFailure,
+  needsMssqlNullabilityProbe,
   type Shadow,
   ShadowError,
   shadowOps,
@@ -268,138 +275,354 @@ describe('MSSQL URL parsing and shadow naming (pure unit)', () => {
     }
   });
 
-  test('shadowOps.canonicalize syncs notNull for MSSQL PERSISTED computed columns without touching virtual computed columns', async () => {
+  test.each([
+    { explicit: false, probeNullable: null, want: { notNull: false, inferred: true } },
+    { explicit: true, probeNullable: true, want: { notNull: true, inferred: false } },
+    { explicit: true, probeNullable: false, want: { notNull: true, inferred: true } },
+  ])(
+    'shadowOps.canonicalize writes ext.mssql.inferredNotNull (never the explicit notNull) for MSSQL PERSISTED computed columns, probing explicit ones (%o, #161)',
+    async ({ explicit, probeNullable, want }) => {
+      const prev = emptyModel('mssql');
+      createSchema(prev, 'dbo', 's-dbo');
+      const next = structuredClone(prev);
+      const tbl = createTable(next, 's-dbo', 'items', 't-items');
+      addColumn(next, tbl, { id: 'c-code', name: 'code', type: 'nvarchar(32)', notNull: false });
+      addColumn(next, tbl, {
+        id: 'c-persisted',
+        name: 'display_code',
+        type: 'nvarchar(32)',
+        notNull: explicit,
+        generated: { expr: "(isnull([code],N''))", stored: true },
+      });
+      addColumn(next, tbl, {
+        id: 'c-virtual',
+        name: 'virt_code',
+        type: 'nvarchar(32)',
+        notNull: true,
+        generated: { expr: "(isnull([code],N''))", stored: false },
+      });
+
+      let tableBuilt = false;
+      const probes: string[] = [];
+      const fakeDb: Db = {
+        query: async <T>(q: string): Promise<T[]> => {
+          if (q.includes('SELECT DB_NAME()')) return [{ dbName: 'app_dowel' }] as T[];
+          if (q.includes('c.is_nullable AS isNullable FROM sys.columns c')) {
+            return [{ name: '__dowel_nn_probe_0', isNullable: probeNullable }] as T[];
+          }
+          if (q.includes('ProductMajorVersion') && q.includes('dbCollation')) {
+            return [
+              {
+                version: '16.0.1000.6',
+                major: 16,
+                minor: 0,
+                dbCollation: 'SQL_Latin1_General_CP1_CI_AS',
+              },
+            ] as T[];
+          }
+          if (q.includes('ProductMajorVersion')) {
+            return [{ major: 16, minor: 0 }] as T[];
+          }
+          if (q.includes('FROM sys.schemas s') && q.includes('MS_Description')) {
+            return [{ name: 'dbo', comment: null }] as T[];
+          }
+          if (q.includes('FROM sys.tables t') && q.includes('MS_Description')) {
+            return (
+              tableBuilt ? [{ objectId: 100, schema: 'dbo', name: 'items', comment: null }] : []
+            ) as T[];
+          }
+          if (q.includes('FROM sys.columns c') && q.includes('sys.computed_columns')) {
+            return (
+              tableBuilt
+                ? [
+                    {
+                      objectId: 100,
+                      columnId: 1,
+                      name: 'code',
+                      typeName: 'nvarchar',
+                      maxLength: 64,
+                      precision: 0,
+                      scale: 0,
+                      isNullable: true,
+                      collationName: 'SQL_Latin1_General_CP1_CI_AS',
+                      isSparse: false,
+                      isRowguidcol: false,
+                      isIdentity: false,
+                      seedValue: null,
+                      incrementValue: null,
+                      defaultName: null,
+                      defaultDef: null,
+                      isComputed: false,
+                      computedDef: null,
+                      isPersisted: null,
+                      comment: null,
+                    },
+                    {
+                      objectId: 100,
+                      columnId: 2,
+                      name: 'display_code',
+                      typeName: 'nvarchar',
+                      maxLength: 64,
+                      precision: 0,
+                      scale: 0,
+                      isNullable: false,
+                      collationName: 'SQL_Latin1_General_CP1_CI_AS',
+                      isSparse: false,
+                      isRowguidcol: false,
+                      isIdentity: false,
+                      seedValue: null,
+                      incrementValue: null,
+                      defaultName: null,
+                      defaultDef: null,
+                      isComputed: true,
+                      computedDef: "(isnull([code],N''))",
+                      isPersisted: true,
+                      comment: null,
+                    },
+                    {
+                      objectId: 100,
+                      columnId: 3,
+                      name: 'virt_code',
+                      typeName: 'nvarchar',
+                      maxLength: 64,
+                      precision: 0,
+                      scale: 0,
+                      isNullable: false,
+                      collationName: 'SQL_Latin1_General_CP1_CI_AS',
+                      isSparse: false,
+                      isRowguidcol: false,
+                      isIdentity: false,
+                      seedValue: null,
+                      incrementValue: null,
+                      defaultName: null,
+                      defaultDef: null,
+                      isComputed: true,
+                      computedDef: "(isnull([code],N''))",
+                      isPersisted: false,
+                      comment: null,
+                    },
+                  ]
+                : []
+            ) as T[];
+          }
+          return [] as T[];
+        },
+        exec: async (q: string) => {
+          if (q.includes('CREATE TABLE [dbo].[items]')) tableBuilt = true;
+          if (q.includes('__dowel_nn_probe_')) probes.push(q);
+        },
+      };
+
+      const changed = await shadowOps(async () => fakeDb, null, { dialect: 'mssql' }).canonicalize(
+        prev,
+        next,
+      );
+      // 显式 NOT NULL 的列才在影子库里探测表达式本身的推断（加临时计算列 → 读 is_nullable → 删掉）
+      expect(probes).toEqual(
+        explicit
+          ? [
+              "ALTER TABLE [dbo].[items] ADD [__dowel_nn_probe_0] AS ((isnull([code],N'')))",
+              'ALTER TABLE [dbo].[items] DROP COLUMN [__dowel_nn_probe_0]',
+            ]
+          : [],
+      );
+      const out = changed.find((o) => o.id === 'c-persisted') ?? next.objects['c-persisted'];
+      expect(out).toMatchObject({ kind: 'column', notNull: want.notNull });
+      expect(Boolean((out as Column).ext?.mssql?.inferredNotNull)).toBe(want.inferred);
+      // 非持久化计算列不受影响
+      expect(changed.some((o) => o.id === 'c-virtual')).toBe(false);
+    },
+  );
+
+  test('needsMssqlNullabilityProbe: 读回非空且表来自 prev 或 next 显式时探测，读回可空或非显式从零建表跳过 (#178 review)', () => {
     const prev = emptyModel('mssql');
     createSchema(prev, 'dbo', 's-dbo');
-    const next = structuredClone(prev);
-    const tbl = createTable(next, 's-dbo', 'items', 't-items');
-    addColumn(next, tbl, { id: 'c-code', name: 'code', type: 'nvarchar(32)', notNull: false });
-    addColumn(next, tbl, {
+    const tbl = createTable(prev, 's-dbo', 'items', 't-items');
+    addColumn(prev, tbl, { id: 'c-code', name: 'code', type: 'nvarchar(32)', notNull: false });
+    addColumn(prev, tbl, {
       id: 'c-persisted',
-      name: 'display_code',
-      type: 'nvarchar(32)',
-      notNull: false,
-      generated: { expr: "(isnull([code],N''))", stored: true },
-    });
-    addColumn(next, tbl, {
-      id: 'c-virtual',
-      name: 'virt_code',
+      name: 'cp',
       type: 'nvarchar(32)',
       notNull: true,
-      generated: { expr: "(isnull([code],N''))", stored: false },
+      generated: { expr: '([code])', stored: true },
     });
 
-    let tableBuilt = false;
-    const fakeDb: Db = {
-      query: async <T>(q: string): Promise<T[]> => {
-        if (q.includes('SELECT DB_NAME()')) return [{ dbName: 'app_dowel' }] as T[];
-        if (q.includes('ProductMajorVersion') && q.includes('dbCollation')) {
-          return [
-            {
-              version: '16.0.1000.6',
-              major: 16,
-              minor: 0,
-              dbCollation: 'SQL_Latin1_General_CP1_CI_AS',
-            },
-          ] as T[];
-        }
-        if (q.includes('ProductMajorVersion')) {
-          return [{ major: 16, minor: 0 }] as T[];
-        }
-        if (q.includes('FROM sys.schemas s') && q.includes('MS_Description')) {
-          return [{ name: 'dbo', comment: null }] as T[];
-        }
-        if (q.includes('FROM sys.tables t') && q.includes('MS_Description')) {
-          return (tableBuilt ? [{ objectId: 100, schema: 'dbo', name: 'items', comment: null }] : []) as T[];
-        }
-        if (q.includes('FROM sys.columns c') && q.includes('sys.computed_columns')) {
-          return (
-            tableBuilt
-              ? [
-                  {
-                    objectId: 100,
-                    columnId: 1,
-                    name: 'code',
-                    typeName: 'nvarchar',
-                    maxLength: 64,
-                    precision: 0,
-                    scale: 0,
-                    isNullable: true,
-                    collationName: 'SQL_Latin1_General_CP1_CI_AS',
-                    isSparse: false,
-                    isRowguidcol: false,
-                    isIdentity: false,
-                    seedValue: null,
-                    incrementValue: null,
-                    defaultName: null,
-                    defaultDef: null,
-                    isComputed: false,
-                    computedDef: null,
-                    isPersisted: null,
-                    comment: null,
-                  },
-                  {
-                    objectId: 100,
-                    columnId: 2,
-                    name: 'display_code',
-                    typeName: 'nvarchar',
-                    maxLength: 64,
-                    precision: 0,
-                    scale: 0,
-                    isNullable: false,
-                    collationName: 'SQL_Latin1_General_CP1_CI_AS',
-                    isSparse: false,
-                    isRowguidcol: false,
-                    isIdentity: false,
-                    seedValue: null,
-                    incrementValue: null,
-                    defaultName: null,
-                    defaultDef: null,
-                    isComputed: true,
-                    computedDef: "(isnull([code],N''))",
-                    isPersisted: true,
-                    comment: null,
-                  },
-                  {
-                    objectId: 100,
-                    columnId: 3,
-                    name: 'virt_code',
-                    typeName: 'nvarchar',
-                    maxLength: 64,
-                    precision: 0,
-                    scale: 0,
-                    isNullable: false,
-                    collationName: 'SQL_Latin1_General_CP1_CI_AS',
-                    isSparse: false,
-                    isRowguidcol: false,
-                    isIdentity: false,
-                    seedValue: null,
-                    incrementValue: null,
-                    defaultName: null,
-                    defaultDef: null,
-                    isComputed: true,
-                    computedDef: "(isnull([code],N''))",
-                    isPersisted: false,
-                    comment: null,
-                  },
-                ]
-              : []
-          ) as T[];
-        }
-        return [] as T[];
-      },
-      exec: async (q: string) => {
-        if (q.includes('CREATE TABLE [dbo].[items]')) tableBuilt = true;
-      },
+    const explicitCol = prev.objects['c-persisted'] as Column;
+    const nonExplicitCol: Column = { ...explicitCol, notNull: false };
+    const virtualCol: Column = {
+      ...explicitCol,
+      generated: { expr: '([code])', stored: false },
+    };
+    const newTableCol: Column = { ...nonExplicitCol, parent: 't-new' };
+
+    // 非持久化计算列从不探测
+    expect(needsMssqlNullabilityProbe(prev, virtualCol, true, false)).toBe(false);
+    // 读回已可空，推断必为 false，无需探测
+    expect(needsMssqlNullabilityProbe(prev, explicitCol, false, false)).toBe(false);
+    expect(needsMssqlNullabilityProbe(prev, nonExplicitCol, false, false)).toBe(false);
+    // next 显式 + 读回非空：不论构建路径都必须探测
+    expect(needsMssqlNullabilityProbe(prev, explicitCol, true, false)).toBe(true);
+    expect(needsMssqlNullabilityProbe(prev, explicitCol, true, true)).toBe(true);
+    expect(needsMssqlNullabilityProbe(emptyModel('mssql'), explicitCol, true, false)).toBe(true);
+    // next 非显式 + 读回非空：
+    // - 整库从零建：物理列不可能带显式 NOT NULL，跳过
+    expect(needsMssqlNullabilityProbe(prev, nonExplicitCol, true, true)).toBe(false);
+    // - 表不在 prev（新建表）：跳过
+    expect(needsMssqlNullabilityProbe(prev, newTableCol, true, false)).toBe(false);
+    // - 表已在 prev（增量迁移，可能保留 prev 的显式 NOT NULL）：必须探测
+    expect(needsMssqlNullabilityProbe(prev, nonExplicitCol, true, false)).toBe(true);
+  });
+
+  test('shadowOps.canonicalize 推断结果不依赖构建路径：B2(显式) → c1(非显式+过期inferredNotNull) 即使无迁移步骤也能探测修正 (#178 review)', async () => {
+    // 场景：B2 中 code 可空、cp 为显式 PERSISTED NOT NULL；历史快照 c1 中 code 可空、cp 非显式但带过期 inferredNotNull: true
+    const b2 = emptyModel('mssql');
+    createSchema(b2, 'dbo', 's-dbo');
+    const tbl = createTable(b2, 's-dbo', 'items', 't-items');
+    addColumn(b2, tbl, { id: 'c-code', name: 'code', type: 'nvarchar(32)', notNull: false });
+    addColumn(b2, tbl, {
+      id: 'c-cp',
+      name: 'cp',
+      type: 'nvarchar(32)',
+      notNull: true,
+      generated: { expr: '([code])', stored: true },
+    });
+
+    const c1 = structuredClone(b2);
+    runMutator(c1, 'setNotNull', { id: 'c-cp', notNull: false });
+    setMssqlInferredNotNull(c1.objects['c-cp'] as Column, true);
+
+    // 有效可空性两边都为 true，因此增量迁移不产生任何步骤（影子库物理列保留 B2 的 PERSISTED NOT NULL）
+    expect(plan(b2, c1)).toEqual([]);
+
+    const makeStatefulFakeDb = () => {
+      let tableBuilt = false;
+      let cpPhysicalNotNull = false;
+      const probes: string[] = [];
+      const db: Db = {
+        query: async <T>(q: string): Promise<T[]> => {
+          if (q.includes('SELECT DB_NAME()')) return [{ dbName: 'app_dowel' }] as T[];
+          if (q.includes('c.is_nullable AS isNullable FROM sys.columns c')) {
+            // 表达式 ([code]) 在 code 可空时推断为可空（is_nullable = 1）
+            return [{ name: '__dowel_nn_probe_0', isNullable: true }] as T[];
+          }
+          if (q.includes('ProductMajorVersion') && q.includes('dbCollation')) {
+            return [
+              {
+                version: '16.0.1000.6',
+                major: 16,
+                minor: 0,
+                dbCollation: 'SQL_Latin1_General_CP1_CI_AS',
+              },
+            ] as T[];
+          }
+          if (q.includes('ProductMajorVersion')) return [{ major: 16, minor: 0 }] as T[];
+          if (q.includes('FROM sys.schemas s') && q.includes('MS_Description')) {
+            return [{ name: 'dbo', comment: null }] as T[];
+          }
+          if (q.includes('FROM sys.tables t') && q.includes('MS_Description')) {
+            return (
+              tableBuilt ? [{ objectId: 100, schema: 'dbo', name: 'items', comment: null }] : []
+            ) as T[];
+          }
+          if (q.includes('FROM sys.columns c') && q.includes('sys.computed_columns')) {
+            return (
+              tableBuilt
+                ? [
+                    {
+                      objectId: 100,
+                      columnId: 1,
+                      name: 'code',
+                      typeName: 'nvarchar',
+                      maxLength: 64,
+                      precision: 0,
+                      scale: 0,
+                      isNullable: true,
+                      collationName: 'SQL_Latin1_General_CP1_CI_AS',
+                      isSparse: false,
+                      isRowguidcol: false,
+                      isIdentity: false,
+                      seedValue: null,
+                      incrementValue: null,
+                      defaultName: null,
+                      defaultDef: null,
+                      isComputed: false,
+                      computedDef: null,
+                      isPersisted: null,
+                      comment: null,
+                    },
+                    {
+                      objectId: 100,
+                      columnId: 2,
+                      name: 'cp',
+                      typeName: 'nvarchar',
+                      maxLength: 64,
+                      precision: 0,
+                      scale: 0,
+                      // 物理列带显式 NOT NULL 时读回 is_nullable = 0；不带时按表达式推断为可空 (1)
+                      isNullable: !cpPhysicalNotNull,
+                      collationName: 'SQL_Latin1_General_CP1_CI_AS',
+                      isSparse: false,
+                      isRowguidcol: false,
+                      isIdentity: false,
+                      seedValue: null,
+                      incrementValue: null,
+                      defaultName: null,
+                      defaultDef: null,
+                      isComputed: true,
+                      computedDef: '([code])',
+                      isPersisted: true,
+                      comment: null,
+                    },
+                  ]
+                : []
+            ) as T[];
+          }
+          return [] as T[];
+        },
+        exec: async (q: string) => {
+          if (q.includes('CREATE TABLE [dbo].[items]')) {
+            tableBuilt = true;
+            cpPhysicalNotNull = /\[cp\][^\n]*PERSISTED NOT NULL/.test(q);
+          }
+          if (q.includes('DROP TABLE [dbo].[items]')) {
+            tableBuilt = false;
+            cpPhysicalNotNull = false;
+          }
+          if (q.includes('ALTER TABLE [dbo].[items] DROP COLUMN [cp]')) {
+            cpPhysicalNotNull = false;
+          }
+          if (q.includes('ALTER TABLE [dbo].[items] ADD [cp]')) {
+            cpPhysicalNotNull = /PERSISTED NOT NULL/.test(q);
+          }
+          if (q.includes('__dowel_nn_probe_')) probes.push(q);
+        },
+      };
+      return { db, probes };
     };
 
-    const changed = await shadowOps(async () => fakeDb, null, { dialect: 'mssql' }).canonicalize(prev, next);
-    expect(changed).toHaveLength(1);
-    expect(changed[0]).toMatchObject({
-      id: 'c-persisted',
-      kind: 'column',
-      notNull: true,
-    });
+    // 1. 从 B2 增量迁移到 c1（plan 为空，物理列残留 B2 的 NOT NULL）：仍会探测并把过期的 inferredNotNull 修正为 false
+    const inc = makeStatefulFakeDb();
+    const changedInc = await shadowOps(async () => inc.db, null, { dialect: 'mssql' }).canonicalize(b2, c1);
+    expect(inc.probes).toEqual([
+      'ALTER TABLE [dbo].[items] ADD [__dowel_nn_probe_0] AS (([code]))',
+      'ALTER TABLE [dbo].[items] DROP COLUMN [__dowel_nn_probe_0]',
+    ]);
+    const cpInc = changedInc.find((o) => o.id === 'c-cp') as Column | undefined;
+    expect(cpInc).toBeDefined();
+    expect(cpInc!.notNull).toBe(false);
+    expect(cpInc!.ext?.mssql?.inferredNotNull).toBeUndefined();
+
+    // 2. 从空基线新建 c1（表不在 prev 中，直接按 c1 不带 NOT NULL 建出）：读回已可空，无需探测，结果与增量路径完全一致
+    const scratch = makeStatefulFakeDb();
+    const empty = emptyModel('mssql');
+    createSchema(empty, 'dbo', 's-dbo');
+    const changedScratch = await shadowOps(async () => scratch.db, null, { dialect: 'mssql' }).canonicalize(
+      empty,
+      c1,
+    );
+    expect(scratch.probes).toEqual([]);
+    const cpScratch = changedScratch.find((o) => o.id === 'c-cp') as Column | undefined;
+    expect(cpScratch).toEqual(cpInc);
   });
 
   test('verifier keeps shadowMajor=null for mssql while preserving 2019/2022/2025 capability checks', async () => {
@@ -661,27 +884,33 @@ describe('MSSQL URL parsing and shadow naming (pure unit)', () => {
           close: async () => {},
         }) as Shadow;
 
-      // 即使上游 mock 传入了版本组键 / 目标组 / shadowMajor，不按版本分组的方言也不能记录 targets 或版本标签文案
-      created.shadows.forProjectVersions = async () => ({
-        targetGroupKey: 16,
-        skippedGroups: [],
-        entries: [
-          {
-            groupKey: 16,
-            envId: 'e-mssql-16',
-            label: 'dev：app_dowel',
-            shadow: stubShadow(async () => ({
-              ok: true,
-              up: [],
-              down: [],
-              upDiff: [],
-              downDiff: [],
-              risks: [],
-              error: null,
-              shadowMajor: 16,
-            })),
-          },
-        ],
+      // MSSQL 也按数据库完整版本号（构建号）记录验证结果（ADR 0017 决定 5）；文案与影子库标签不能带 “PG ...”
+      const BUILD = '16.0.4175.1';
+      const stubEngine = (report: Awaited<ReturnType<Shadow['verifyScripts']>>) => {
+        created.shadows.forProjectEngineVersions = async () => ({
+          entries: [
+            {
+              engineVersion: BUILD,
+              envId: 'e-mssql-16',
+              label: 'dev：app_dowel',
+              shadow: stubShadow(async () => report),
+            },
+          ],
+          skipped: [],
+          environments: [{ id: 'e-mssql-16', name: 'dev', engineVersion: BUILD }],
+          identical: false,
+        });
+      };
+      stubEngine({
+        ok: true,
+        up: [],
+        down: [],
+        upDiff: [],
+        downDiff: [],
+        risks: [],
+        error: null,
+        shadowMajor: 16,
+        engineVersion: BUILD,
       });
 
       const okRes = await created.app.request(`/api/projects/${pid}/versions`, {
@@ -691,40 +920,31 @@ describe('MSSQL URL parsing and shadow naming (pure unit)', () => {
       });
       expect(okRes.status).toBe(201);
       const okData = (await okRes.json()) as VersionCreated;
-      expect(okData.verified).toBe(true);
+      expect(okData).toMatchObject({ verified: true, verifiedOn: [BUILD], uncovered: [] });
 
       const detRes = await created.app.request(`/api/projects/${pid}/versions/${okData.id}`, {
         headers: { cookie },
       });
       expect(detRes.status).toBe(200);
       const det = (await detRes.json()) as VersionDetail;
-      expect(det.verifyReport?.targets).toBeUndefined();
-      expect(det.verifyReport?.missingTargetMajor).toBeUndefined();
-      expect(det.verifyReport?.shadow).toBe('dev：app_dowel');
+      expect(det.verifyReport?.records).toEqual([
+        expect.objectContaining({ engineVersion: BUILD, ok: true }),
+      ]);
+      expect(det.verifyReport?.shadow).toContain('dev：app_dowel');
       expect(det.verifyReport?.shadow).not.toContain('PG');
 
-      // 失败场景：错误文案与 shadow 标签不能带 "PG ..." 前缀，且不返回 targets
+      // 失败场景：错误文案与 shadow 标签按构建号说明，不能带 "PG ..." 前缀
       await addMssqlTable('orders');
-      created.shadows.forProjectVersions = async () => ({
-        targetGroupKey: 16,
-        skippedGroups: [],
-        entries: [
-          {
-            groupKey: 16,
-            envId: 'e-mssql-16',
-            label: 'dev：app_dowel',
-            shadow: stubShadow(async () => ({
-              ok: false,
-              up: [],
-              down: [],
-              upDiff: [],
-              downDiff: [],
-              risks: [],
-              error: { step: null, message: 'ddl failed' },
-              shadowMajor: 16,
-            })),
-          },
-        ],
+      stubEngine({
+        ok: false,
+        up: [],
+        down: [],
+        upDiff: [],
+        downDiff: [],
+        risks: [],
+        error: { step: null, message: 'ddl failed' },
+        shadowMajor: 16,
+        engineVersion: BUILD,
       });
 
       const failRes = await created.app.request(`/api/projects/${pid}/versions`, {
@@ -734,12 +954,12 @@ describe('MSSQL URL parsing and shadow naming (pure unit)', () => {
       });
       expect(failRes.status).toBe(422);
       const failBody = (await failRes.json()) as PublishRejected;
-      expect(failBody.error).toBe('闭环验证没有通过，版本没有发布。请先修正模型');
+      expect(failBody.code).toBe('verify_failed');
+      expect(failBody.error).toBe(`${BUILD} 影子库闭环验证没有通过，版本没有发布。请先修正模型`);
       expect(failBody.error).not.toContain('PG');
-      expect(failBody.report).toBeDefined();
-      expect(failBody.report?.error?.message).toBe('ddl failed');
-      expect(failBody.report?.shadow).toBe('dev：app_dowel');
-      expect(failBody.report?.targets).toBeUndefined();
+      expect(failBody.report?.error?.message).toBe(`${BUILD} 验证失败：ddl failed`);
+      expect(failBody.report?.shadow).toContain('dev：app_dowel');
+      expect(failBody.report?.shadow).not.toContain('PG');
     } finally {
       created.drift.stop();
       created.requests.stop();
@@ -900,8 +1120,11 @@ describe(`MSSQL (${MSSQL_VERSION}) target driver & server E2E`, () => {
         for (const o of changed) out.objects[o.id] = o;
         return { out, changed };
       };
+      const inferredOf = (x: Model, id: string) =>
+        Boolean((x.objects[id] as Column).ext?.mssql?.inferredNotNull);
       const { out: good } = await canon(emptyModel('mssql'), m);
       expect((good.objects.g as { notNull: boolean }).notNull).toBe(false);
+      expect(inferredOf(good, 'g')).toBe(false);
       expect(pendingRefreshIds(good, structuredClone(good))).toEqual([]);
 
       // 只把被引用列改成 NOT NULL：表达式与类型都没变
@@ -909,24 +1132,284 @@ describe(`MSSQL (${MSSQL_VERSION}) target driver & server E2E`, () => {
       runMutator(cur, 'setNotNull', { id: 'c', notNull: true });
       expect(pendingRefreshIds(good, cur)).toEqual(['g', 'u']);
       const { out: after, changed } = await canon(good, cur);
-      // 实测：读回的 is_nullable 确实变了（漏判时过期的 notNull: false 会留在模型里）
+      // 实测：读回的 is_nullable 确实变了（漏判时过期的推断值会留在模型里）；写回的是推断值，显式 notNull 不动（#161）
       expect(changed.map((o) => o.id)).toEqual(['g']);
-      expect((after.objects.g as { notNull: boolean }).notNull).toBe(true);
-      expect((after.objects.u as { notNull: boolean }).notNull).toBe(false);
+      expect((after.objects.g as { notNull: boolean }).notNull).toBe(false);
+      expect(inferredOf(after, 'g')).toBe(true);
+      expect(inferredOf(after, 'u')).toBe(false);
       // 稳态：写回之后不再待规范化
       expect(pendingRefreshIds(after, structuredClone(after))).toEqual([]);
 
-      // 计算列自己的 notNull 改回 false：读回的仍是引擎推断的 NOT NULL
+      // 计算列自己勾上显式 NOT NULL：待规范化；影子库探测表达式本身仍推断非空，显式声明原样保留
       const own = structuredClone(after);
-      (own.objects.g as { notNull: boolean }).notNull = false;
+      runMutator(own, 'setNotNull', { id: 'g', notNull: true });
       expect(pendingRefreshIds(after, own)).toEqual(['g']);
       const { changed: ownChanged } = await canon(after, own);
-      expect(ownChanged).toMatchObject([{ id: 'g', notNull: true }]);
+      expect(ownChanged).toEqual([]);
     } finally {
       await shadow.close();
       await t.close();
     }
   }, 120_000);
+
+  test('explicit PERSISTED NOT NULL vs inferred non-null on real SQL Server: DDL, normalization, read-back, issue scenario and import (#161)', async () => {
+    if (!adminUrl) return;
+    const target = await createTestMssqlDb('mssql_nn161');
+    const shadowDb = await createTestMssqlDb('mssql_nn161s');
+    const shadow = mssqlShadow(shadowDb.url);
+    const engine = getEngine('mssql');
+    const col = (x: Model, id: string) => x.objects[id] as Column;
+    const inferredOf = (x: Model, id: string) => Boolean(col(x, id).ext?.mssql?.inferredNotNull);
+    const canon = async (prev: Model, next: Model) => {
+      const out = structuredClone(next);
+      for (const o of await shadow.canonicalize(prev, next)) out.objects[o.id] = o;
+      return out;
+    };
+    /** 在目标库上执行 from → to，并按执行器的读回比较核对结构 */
+    const apply = async (from: Model, to: Model) => {
+      const steps = plan(from, to);
+      await runSteps(target.db, steps, 'mssql');
+      const diff = diffAgainst(await engine.readSnapshot(target.db, null), to);
+      expect(diff).toEqual({ total: 0, items: [] });
+      return steps.map((s) => s.sql).join('\n');
+    };
+    try {
+      await claimMssqlShadow(shadowDb.url);
+      // dbo.items(code NOT NULL, cp AS ([code]) PERSISTED 推断非空, cu AS (upper([code])) PERSISTED NOT NULL 显式)
+      const m = emptyModel('mssql');
+      runMutator(m, 'createSchema', { id: 's', name: 'dbo' });
+      runMutator(m, 'createTable', { id: 't', schema: 's', name: 'items' });
+      runMutator(m, 'addColumn', {
+        table: 't',
+        column: { id: 'id', name: 'id', type: 'int', notNull: true },
+      });
+      runMutator(m, 'addColumn', {
+        table: 't',
+        column: { id: 'c', name: 'code', type: 'nvarchar(32)', notNull: true },
+      });
+      runMutator(m, 'addColumn', {
+        table: 't',
+        column: { id: 'cp', name: 'cp', type: 'nvarchar(32)', generated: { expr: '([code])', stored: true } },
+      });
+      runMutator(m, 'addColumn', {
+        table: 't',
+        column: {
+          id: 'cu',
+          name: 'cu',
+          type: 'nvarchar(32)',
+          notNull: true,
+          generated: { expr: '(upper([code]))', stored: true },
+        },
+      });
+
+      // 1. 规范化：cp 推断非空（只写 inferredNotNull）；cu 显式声明、表达式本身推断可空（影子库探测），显式不动
+      const v1 = await canon(emptyModel('mssql'), m);
+      expect(col(v1, 'cp').notNull).toBe(false);
+      expect(inferredOf(v1, 'cp')).toBe(true);
+      expect(col(v1, 'cu').notNull).toBe(true);
+      expect(inferredOf(v1, 'cu')).toBe(false);
+      expect(pendingRefreshIds(v1, structuredClone(v1))).toEqual([]);
+
+      // 2. 建到目标库：推断非空不渲染 NOT NULL，显式声明保留；读回比较一致
+      const ddl1 = await apply(emptyModel('mssql'), v1);
+      expect(ddl1).toContain('[cp] AS (([code])) PERSISTED,');
+      expect(ddl1).toContain('[cu] AS ((upper([code]))) PERSISTED NOT NULL');
+
+      // 3. Issue 场景：code 改回可空 → 规范化写回推断可空 → 迁移不带 NOT NULL，目标库能插入 code 为 NULL 的行
+      const v2edit = structuredClone(v1);
+      runMutator(v2edit, 'setNotNull', { id: 'c', notNull: false });
+      expect(pendingRefreshIds(v1, v2edit)).toEqual(['cp', 'cu']);
+      const v2 = await canon(v1, v2edit);
+      expect(inferredOf(v2, 'cp')).toBe(false);
+      expect(col(v2, 'cu').notNull).toBe(true);
+      // cu 显式 NOT NULL、表达式随 code 可空：先把它改成可空，才能插入 code 为 NULL 的行
+      runMutator(v2, 'setNotNull', { id: 'cu', notNull: false });
+      const ddl2 = await apply(v1, v2);
+      expect(ddl2).toContain('ADD [cp] AS (([code])) PERSISTED');
+      expect(ddl2).not.toMatch(/\[cp\][^\n]*NOT NULL/);
+      await target.db.exec('INSERT INTO [dbo].[items] ([id], [code]) VALUES (1, NULL)');
+      await target.db.exec('DELETE FROM [dbo].[items]');
+
+      // 4. 从已有数据库导入：系统目录分不出显式与推断，一律记成推断；有参考模型时（拉取 / 漂移）沿用它的显式声明
+      await target.db.exec('ALTER TABLE [dbo].[items] DROP COLUMN [cp], [cu]');
+      await target.db.exec('ALTER TABLE [dbo].[items] ALTER COLUMN [code] nvarchar(32) NOT NULL');
+      await target.db.exec(
+        'ALTER TABLE [dbo].[items] ADD [cp] AS ([code]) PERSISTED, [ce] AS ([code]) PERSISTED NOT NULL, [cu] AS (upper([code])) PERSISTED NOT NULL',
+      );
+      const pulled = await pullMssqlSchema(target.url);
+      for (const name of ['cp', 'ce', 'cu']) {
+        const c = Object.values(pulled.objects).find(
+          (o): o is Column => o.kind === 'column' && o.name === name,
+        )!;
+        expect({ name, notNull: c.notNull, inferred: c.ext?.mssql?.inferredNotNull }).toEqual({
+          name,
+          notNull: false,
+          inferred: true,
+        });
+      }
+      // 影子库导入 SQL：表达式本身推断可空、读回却非空的，只能是显式声明，还原成显式
+      const imported = await shadow.importSql(
+        assertImportable(
+          'CREATE TABLE [dbo].[items] ([code] nvarchar(32) NOT NULL, [cp] AS ([code]) PERSISTED, [cu] AS (upper([code])) PERSISTED NOT NULL)',
+          'mssql',
+        ),
+      );
+      const byName = (n: string) =>
+        Object.values(imported.objects).find((o): o is Column => o.kind === 'column' && o.name === n)!;
+      expect({ notNull: byName('cp').notNull, inferred: byName('cp').ext?.mssql?.inferredNotNull }).toEqual({
+        notNull: false,
+        inferred: true,
+      });
+      expect(byName('cu').notNull).toBe(true);
+      expect(byName('cu').ext?.mssql?.inferredNotNull).toBeUndefined();
+    } finally {
+      await shadow.close();
+      await shadowDb.close();
+      await target.close();
+    }
+  }, 180_000);
+
+  test('canonicalize is build-path independent when prev has explicit PERSISTED NOT NULL and next is non-explicit with stale inferredNotNull (#178 review)', async () => {
+    if (!adminUrl) return;
+    const shadowDb = await createTestMssqlDb('mssql_nn_bp');
+    const shadow = mssqlShadow(shadowDb.url);
+    const col = (x: Model, id: string) => x.objects[id] as Column;
+    const inferredOf = (x: Model, id: string) => Boolean(col(x, id).ext?.mssql?.inferredNotNull);
+    try {
+      await claimMssqlShadow(shadowDb.url);
+      // B2：code 可空，cp 显式 PERSISTED NOT NULL（已规范化，inferredNotNull = false）
+      const b2Init = emptyModel('mssql');
+      runMutator(b2Init, 'createSchema', { id: 's', name: 'dbo' });
+      runMutator(b2Init, 'createTable', { id: 't', schema: 's', name: 'items' });
+      runMutator(b2Init, 'addColumn', {
+        table: 't',
+        column: { id: 'c', name: 'code', type: 'nvarchar(32)', notNull: false },
+      });
+      runMutator(b2Init, 'addColumn', {
+        table: 't',
+        column: {
+          id: 'cp',
+          name: 'cp',
+          type: 'nvarchar(32)',
+          notNull: true,
+          generated: { expr: '([code])', stored: true },
+        },
+      });
+      const b2 = structuredClone(b2Init);
+      for (const o of await shadow.canonicalize(emptyModel('mssql'), b2Init)) b2.objects[o.id] = o;
+      expect(col(b2, 'cp').notNull).toBe(true);
+      expect(inferredOf(b2, 'cp')).toBe(false);
+
+      // 历史快照 c1：code 可空，cp 非显式、带过期的 inferredNotNull: true
+      const c1 = structuredClone(b2);
+      runMutator(c1, 'setNotNull', { id: 'cp', notNull: false });
+      setMssqlInferredNotNull(col(c1, 'cp'), true);
+      expect(plan(b2, c1)).toEqual([]);
+      expect(pendingRefreshIds(b2, c1)).toContain('cp');
+
+      // 增量路径 canonicalize(b2, c1) 必须探测并把 cp 的 inferredNotNull 修正为 false
+      const changed = await shadow.canonicalize(b2, c1);
+      expect(changed.map((o) => o.id)).toContain('cp');
+      const res = structuredClone(c1);
+      for (const o of changed) res.objects[o.id] = o;
+      expect(col(res, 'cp').notNull).toBe(false);
+      expect(inferredOf(res, 'cp')).toBe(false);
+
+      // 修正后的模型在闭环验证中完全一致（不因构建路径差异而被拦下）
+      const report = await shadow.verify(b2, res);
+      expect(report.ok).toBe(true);
+      expect(report.upDiff).toEqual([]);
+      expect(report.downDiff).toEqual([]);
+    } finally {
+      await shadow.close();
+      await shadowDb.close();
+    }
+  }, 120_000);
+
+  test('wizard from an existing database and pull split explicit vs inferred PERSISTED computed columns in the shadow, with a no-shadow fallback (#161)', async () => {
+    if (!adminUrl || !app || !rooms || !pdb) return;
+    const t = await createTestMssqlDb('mssql_nnwiz');
+    const shadowName = mssqlShadowDbName(t.name);
+    let devEnvId: string | null = null;
+    try {
+      // k 主键成员（表达式本身可空，只能显式声明）；cp 推断非空；cu 显式声明在可空表达式上
+      await t.db.exec(`
+        CREATE TABLE [dbo].[items] (
+          [code] nvarchar(32) NOT NULL,
+          [k] AS (CONVERT([varchar](10),[code])) PERSISTED NOT NULL,
+          [cp] AS ([code]) PERSISTED,
+          [cu] AS (upper([code])) PERSISTED NOT NULL,
+          CONSTRAINT [PK_items] PRIMARY KEY ([k])
+        );
+      `);
+      const wizard = async (name: string, production: boolean) => {
+        const res = await req('POST', '/api/projects/wizard', {
+          groupId,
+          name,
+          dialect: 'mssql',
+          environments: [{ name: 'dev', url: t.url, production }],
+          content: { kind: 'database', env: 'dev' },
+        });
+        expect(res.status).toBe(200);
+        const done = parseSse<WizardEvent>(await res.text()).find((e) => e.stage === 'done');
+        expect(done?.project).toBeTruthy();
+        return done!;
+      };
+      const columnsOf = async (pid: string) => {
+        const info = (await (await req('GET', `/api/projects/${pid}`)).json()) as ProjectInfo;
+        const { model } = await rooms!.model(info.branch);
+        return Object.fromEntries(
+          Object.values(model.objects)
+            .filter((o): o is Column => o.kind === 'column' && !!o.generated)
+            .map((c) => [c.name, { notNull: c.notNull, inferred: c.ext?.mssql?.inferredNotNull === true }]),
+        );
+      };
+      const explicit = { notNull: true, inferred: false };
+      const inferred = { notNull: false, inferred: true };
+
+      // 1. 生产环境、没有独立影子库也不允许同实例：不拦截，非主键候选列按显式记录并列出
+      const prod = await wizard('NN Prod', true);
+      expect(prod.nullabilityFallback).toEqual({ columns: ['dbo.items.cp', 'dbo.items.cu'] });
+      expect(await columnsOf(prod.project!.id)).toEqual({ k: explicit, cp: explicit, cu: explicit });
+
+      // 2. 开发环境（同实例影子库）：主键成员记显式；其余在影子库里探测拆分
+      const dev = await wizard('NN Dev', false);
+      expect(dev.nullabilityFallback).toBeUndefined();
+      const pid = dev.project!.id;
+      expect(await columnsOf(pid)).toEqual({ k: explicit, cp: inferred, cu: explicit });
+
+      // 3. 拉取：工作副本里能沿用的列不变；线上新增的列在环境的影子库里探测拆分
+      await t.db.exec(
+        'ALTER TABLE [dbo].[items] ADD [c2] AS ([code]) PERSISTED, [c3] AS (upper([code])) PERSISTED NOT NULL',
+      );
+      const envs = (await (await req('GET', `/api/projects/${pid}/environments`)).json()) as { id: string }[];
+      devEnvId = envs[0]!.id;
+      const pullUrl = `/api/projects/${pid}/environments/${devEnvId}/pull`;
+      const preview = (await (await req('POST', pullUrl, { preview: true })).json()) as {
+        fingerprint: string;
+        workingSeq: number;
+      };
+      const pulledRes = await req('POST', pullUrl, {
+        fingerprint: preview.fingerprint,
+        workingSeq: preview.workingSeq,
+      });
+      expect(pulledRes.status).toBe(200);
+      const pulled = (await pulledRes.json()) as PullResult;
+      expect(pulled.nullabilityFallback).toBeUndefined();
+      expect(await columnsOf(pid)).toEqual({
+        k: explicit,
+        cp: inferred,
+        cu: explicit,
+        c2: inferred,
+        c3: explicit,
+      });
+    } finally {
+      // 关掉缓存里这个环境的影子库连接，才能删掉同实例影子库
+      if (devEnvId) await shadows?.forget(devEnvId);
+      await dropMssqlSameInstanceShadow(t.url, shadowName).catch(() => {});
+      await t.close();
+    }
+  }, 180_000);
 
   test('server wizard SQL import, model edit, verify & publish end-to-end on MSSQL', async () => {
     if (!adminUrl || !app || !rooms || !pdb) return;

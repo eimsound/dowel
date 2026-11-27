@@ -202,7 +202,7 @@ describe('SQLite 目标库全栈', () => {
     expect(pubRes.status).toBe(201);
     const pub = (await pubRes.json()) as VersionCreated;
     expect(pub.verified).toBe(true);
-    expect(pub.unverifiedReason).toBeNull();
+    expect(pub.uncovered).toEqual([]);
 
     const detail = (await (
       await req('GET', `/api/projects/${pid}/versions/${pub.id}`)

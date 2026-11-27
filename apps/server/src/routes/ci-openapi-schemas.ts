@@ -81,6 +81,15 @@ export const ciErrorDetailsOpenApiSchema = z
       .optional()
       .openapi({ description: '环境停在已作废分支需要切换时的最近公共祖先版本' }),
     problems: z.array(z.string()).optional().openapi({ description: '预检拒绝的具体问题列表' }),
+    engineVersion: z
+      .string()
+      .nullable()
+      .optional()
+      .openapi({ description: 'unverified 时目标库的数据库完整版本号（读不到为 null）' }),
+    verifiedOn: z
+      .array(z.string())
+      .optional()
+      .openapi({ description: 'unverified 时该版本已通过影子库验证的数据库完整版本号列表' }),
   })
   .openapi('CiErrorDetails');
 

@@ -20,7 +20,7 @@ import { versionExecutedAnywhere } from '../src/chain.ts';
 import { createApp, openPlatformDb, type PlatformDb } from '../src/index.ts';
 import { KeyedLimiter, LoginLimiter } from '../src/rate-limit.ts';
 import { readSettings } from '../src/settings.ts';
-import { addTable, editModel, makeUser, PASSWORD } from './support.ts';
+import { addTable, editModel, makeUser, PASSWORD, recordVerifiedOnEnvs } from './support.ts';
 
 // 读平台版本链可以按需失败一次（接手提交之后、认领之前）：项目已经建好，认领只能作为警告失败
 const chainStub = vi.hoisted(() => ({ failNext: false, calls: 0 }));
@@ -1730,6 +1730,7 @@ describe.skipIf(!PG_URL)('接手与认领（P4c）', () => {
         new Date().toISOString(),
       ],
     );
+    await recordVerifiedOnEnvs(A.db, pid, [v4Id]);
     await A.db.query('update versions set retired_at = $2 where id = $1', [v3!.id, new Date().toISOString()]);
     expect((await exec(A, pid, eProd, 'execute', v4Id)).last.stage).toBe('done');
 
@@ -1758,6 +1759,7 @@ describe.skipIf(!PG_URL)('接手与认领（P4c）', () => {
         new Date().toISOString(),
       ],
     );
+    await recordVerifiedOnEnvs(A.db, pid, [v5Id]);
     expect((await exec(A, pid, eExt, 'execute', v5Id)).last.stage).toBe('done');
     await A.db.query('update versions set retired_at = $2 where id = $1', [v3!.id, new Date().toISOString()]);
 

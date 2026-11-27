@@ -12,6 +12,7 @@ export * from './mssql/batch.ts';
 export { MSSQL_CAPABILITIES, mssqlDialect } from './mssql/dialect.ts';
 export * from './mssql/naming.ts';
 export * from './mssql/nontx.ts';
+export * from './mssql/nullability.ts';
 export * from './mssql/plan.ts';
 export * from './mssql/quote.ts';
 export * from './mssql/types.ts';

@@ -46,12 +46,13 @@ import { afterAll, beforeAll, describe, expect, test } from 'vitest';
 
 import { connect, createTestDb, PG_URL } from '../../../test/pg.ts';
 import { hashToken } from '../src/auth.ts';
+import { errorEvent } from '../src/executions.ts';
 import { createApp, openPlatformDb, type PlatformDb } from '../src/index.ts';
 import { KeyedLimiter, LoginLimiter } from '../src/rate-limit.ts';
 import { toCiError } from '../src/routes/ci.ts';
 import { encrypt } from '../src/secrets.ts';
 import { ActiveTokenCache } from '../src/tokens.ts';
-import { addTable, editModel, makeUser, PASSWORD } from './support.ts';
+import { addTable, editModel, makeUser, PASSWORD, recordVerifiedOnEnvs } from './support.ts';
 
 process.env.DOWEL_SECRET ??= 'tokens-test-secret-0123456789';
 
@@ -177,6 +178,70 @@ test('toCiError 将 ExecutorError(mark_required) 映射为 409 rejected（detail
   expect(CI_ERROR_STATUS[err.code]).toBe(409);
   expect(err.details).toMatchObject({ reason: 'mark_required' });
   expect(err.reached).toBeNull();
+});
+
+test('errorEvent 将 ExecutorError(unverified) 的 engineVersion 与 verifiedOn 透传进 details（含 null 未知版本）', () => {
+  const known = errorEvent(
+    new ExecutorError('unverified', '版本未在 18.7 验证', {
+      versionId: 'v3',
+      number: 3,
+      engineVersion: '18.7',
+      verifiedOn: ['18.8'],
+    }),
+  );
+  expect(known.code).toBe('unverified');
+  expect(known.details).toMatchObject({
+    versionId: 'v3',
+    number: 3,
+    engineVersion: '18.7',
+    verifiedOn: ['18.8'],
+  });
+
+  const unknown = errorEvent(
+    new ExecutorError('unverified', '无法读取数据库完整版本', {
+      versionId: 'v3',
+      number: 3,
+      engineVersion: null,
+      verifiedOn: [],
+    }),
+  );
+  expect(unknown.code).toBe('unverified');
+  expect(unknown.details?.engineVersion).toBeNull();
+  expect(unknown.details?.verifiedOn).toEqual([]);
+});
+
+test('toCiError 将 ExecutorError(unverified) 映射为 409 unverified 并透传 engineVersion 与 verifiedOn', () => {
+  const known = toCiError(
+    new ExecutorError('unverified', '版本未在 18.7 验证', {
+      versionId: 'v3',
+      number: 3,
+      engineVersion: '18.7',
+      verifiedOn: ['18.8'],
+      reached: null,
+    }),
+    () => null,
+  );
+  expect(known.code).toBe('unverified');
+  expect(CI_ERROR_STATUS[known.code]).toBe(409);
+  expect(known.details).toMatchObject({
+    reason: 'unverified',
+    engineVersion: '18.7',
+    verifiedOn: ['18.8'],
+  });
+  expect(known.reached).toBeNull();
+
+  const unknown = toCiError(
+    new ExecutorError('unverified', '无法读取数据库完整版本', {
+      versionId: 'v3',
+      number: 3,
+      engineVersion: null,
+      verifiedOn: [],
+    }),
+    () => null,
+  );
+  expect(unknown.code).toBe('unverified');
+  expect(unknown.details?.engineVersion).toBeNull();
+  expect(unknown.details?.verifiedOn).toEqual([]);
 });
 
 describe('CI 令牌生命周期、权限、三层创建规则与限速（T1 / T2）', () => {
@@ -1638,6 +1703,7 @@ describe.skipIf(!PG_URL)('CI 执行接口、错误码、审计通知与 GitHub A
         new Date().toISOString(),
       ],
     );
+    await recordVerifiedOnEnvs(db, p.pid, [v3Id]);
     await db.query('update versions set retired_at = $2 where id = $1', [v2!.id, new Date().toISOString()]);
 
     // 1. GET /api/ci/projects/:o/:p 中的 latest 为活跃头 v3
@@ -1709,6 +1775,102 @@ describe.skipIf(!PG_URL)('CI 执行接口、错误码、审计通知与 GitHub A
     expect(stg.target).toBeDefined();
     expect(dev.target).toBeDefined();
   }, 120_000);
+
+  test('整版本门禁（ADR 0017 决定 5）：版本没有目标库完整版本上的通过记录时，网页执行 / 预演 / 回滚、执行申请、紧急执行、CI 全部拒绝，没有绕过；重新验证后放行', async () => {
+    const p = await newProject('ci-full-version');
+    const dev = await addRealEnv(p.pid, 'dev', false);
+    const [v1, v2] = await publishChain(p.pid, 2);
+    const envs = (await call('GET', `/api/projects/${p.pid}/environments`)).data as unknown as {
+      id: string;
+      engineFullVersion: string | null;
+    }[];
+    const full = envs.find((e) => e.id === dev.eid)!.engineFullVersion!;
+    expect(full).toMatch(/^\d+\.\d+$/);
+    const v2Detail = (await call('GET', `/api/projects/${p.pid}/versions/${v2!.id}`))
+      .data as unknown as VersionDetail;
+    expect(v2Detail.verifiedOn).toEqual([full]);
+    const ci = (to: string) =>
+      ciCall(p.token, 'POST', `/api/ci/projects/${groupSlug}/${p.slug}/environments/dev/execute`, { to });
+    expect((await ci('v2')).status).toBe(200);
+    const [v3] = await (async () => {
+      await editModel(
+        created.rooms,
+        db,
+        p.pid,
+        (m) => void addColumn(m, tableOf(m), { name: 'c3', type: 'text' }),
+      );
+      const r = await call('POST', `/api/projects/${p.pid}/versions`, { name: 'v3' });
+      expect(r.status, JSON.stringify(r.data)).toBe(201);
+      return [r.data as unknown as { id: string }];
+    })();
+
+    // 把 v2 / v3 的通过记录改成另一个小版本（模拟只在别的数据库版本上验证过）
+    const [major, minor] = full.split('.').map(Number);
+    const other = `${major}.${minor! + 1}`;
+    for (const id of [v2!.id, v3!.id]) {
+      const [row] = await db.query<{ verifyReport: { records: { engineVersion: string | null }[] } }>(
+        'select verify_report as "verifyReport" from versions where id = $1',
+        [id],
+      );
+      const report = row!.verifyReport;
+      report.records = report.records.map((r) => ({ ...r, engineVersion: other }));
+      await db.query('update versions set verify_report = $2::text::jsonb where id = $1', [
+        id,
+        JSON.stringify(report),
+      ]);
+    }
+    const unverified = { ok: false, code: 'unverified' };
+    const env = `/api/projects/${p.pid}/environments/${dev.eid}`;
+
+    const dryUp = await call('POST', `${env}/execute`, { to: v3!.id, dryRun: true });
+    expect(dryUp.status).toBe(200);
+    expect(dryUp.data).toMatchObject(unverified);
+    expect(dryUp.data.details).toMatchObject({ engineVersion: full, verifiedOn: [other] });
+    expect(String(dryUp.data.error)).toContain(full);
+    const web = await created.app.request(`${env}/execute`, {
+      method: 'POST',
+      headers: { cookie: cookies.admin!, 'content-type': 'application/json' },
+      body: JSON.stringify({ to: v3!.id }),
+    });
+    expect(await web.text()).toContain('"unverified"');
+    expect((await call('POST', `${env}/rollback`, { to: v1!.id, dryRun: true })).data).toMatchObject(
+      unverified,
+    );
+    const request = await call('POST', `${env}/requests`, { kind: 'execute', to: v3!.id, reason: 'release' });
+    expect(request.status).toBe(422);
+    expect(request.data).toMatchObject({ code: 'unverified' });
+    expect(request.data.details).toMatchObject({ engineVersion: full, verifiedOn: [other] });
+    const emergency = await call('POST', `${env}/emergency`, {
+      kind: 'execute',
+      to: v3!.id,
+      reason: 'hotfix',
+    });
+    expect(emergency.status).toBe(422);
+    expect(emergency.data).toMatchObject({ code: 'unverified' });
+    expect(emergency.data.details).toMatchObject({ engineVersion: full, verifiedOn: [other] });
+    const ciRun = await ci('v3');
+    expect(ciRun.status).toBe(409);
+    expect(ciRun.data).toMatchObject(unverified);
+    expect(ciRun.data.details).toMatchObject({ engineVersion: full, verifiedOn: [other] });
+    // 目标库一点没动
+    expect((await call('GET', `${env}/status`)).data).toMatchObject({ currentVersion: { id: v2!.id } });
+
+    // 在同实例影子库（与目标库同版本）上重新验证：记录合并，补上目标库的完整版本，放行
+    const rv = await call('POST', `/api/projects/${p.pid}/versions/${v3!.id}/verify`);
+    expect(rv.status).toBe(200);
+    expect(rv.data.verifiedOn).toEqual(expect.arrayContaining([other, full]));
+    expect((await call('POST', `${env}/execute`, { to: v3!.id, dryRun: true })).data).toMatchObject({
+      ok: true,
+    });
+    expect((await ci('v3')).status).toBe(200);
+    // v2 仍只有别的版本的记录：回滚到 v2 只跑 v3 的回滚（放行），回滚到 v1 要经过 v2 的回滚，照样拒绝
+    expect((await call('POST', `${env}/rollback`, { to: v2!.id, dryRun: true })).data).toMatchObject({
+      ok: true,
+    });
+    expect((await call('POST', `${env}/rollback`, { to: v1!.id, dryRun: true })).data).toMatchObject(
+      unverified,
+    );
+  });
 });
 
 /** 解析 GITHUB_OUTPUT（支持单行 key=value 和 heredoc key<<DELIM） */

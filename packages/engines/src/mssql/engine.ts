@@ -19,6 +19,7 @@ import {
 } from './db.ts';
 import { mssqlHistory } from './history.ts';
 import { importMssqlSnapshot } from './import.ts';
+import { alignMssqlImportedLive } from './nullability.ts';
 import { analyzeMssqlStepRisk } from './risk.ts';
 import {
   diffMssqlSnapshots,
@@ -324,11 +325,21 @@ export const mssqlEngine: EngineAdapter = {
 
   normalizeLiveSnapshot: (snap) => snap,
 
+  // 持久化计算列的显式 / 推断非空从参考模型沿用（系统目录分不出两者，ADR 0019）；不影响比较结果
+  alignImportedLive: alignMssqlImportedLive,
+
   diffSnapshots: (a, b) => diffMssqlSnapshots(a.payload as MssqlSnapshot, b.payload as MssqlSnapshot),
 
   fingerprint: (snap) => mssqlFingerprint(snap.payload as MssqlSnapshot),
 
   readVersionNum: readMssqlVersionNum,
+
+  readFullVersion: async (db) => {
+    const [r] = await db.query<{ v: string | null }>(
+      `SELECT CAST(SERVERPROPERTY('ProductVersion') AS nvarchar(64)) AS v`,
+    );
+    return r?.v ? String(r.v).trim() || null : null;
+  },
 
   planOptionsForVersion: (versionNum) => {
     const m = mssqlMajorOf(versionNum);

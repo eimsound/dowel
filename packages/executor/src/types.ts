@@ -20,6 +20,12 @@ export interface ChainVersion {
   checksum: string;
   /** 影子库闭环验证通过（verified_at 非空）；未验证的版本拒绝执行 */
   verified: boolean;
+  /**
+   * 通过验证的数据库完整版本号（ADR 0017 决定 5）。给了就按目标库的完整版本号把关：执行 / 回滚 / 预演前读目标库版本，
+   * 不在其中就拒绝（`unverified`，details 带 engineVersion / verifiedOn）。不给 = 不按版本把关
+   * （SQLite 影子库与目标库同一个内置库，视为恒等；平台服务对需要外部影子库的方言总是给出）
+   */
+  verifiedOn?: readonly string[];
   publishedAt: string;
   publishedBy: string | null;
   /**

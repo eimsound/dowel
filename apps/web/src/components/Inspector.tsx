@@ -70,6 +70,7 @@ import { useTranslation } from 'react-i18next';
 
 import { api } from '../api.ts';
 import { dialectUiSpec } from '../dialects.ts';
+import { showRowInferredDescription } from '../nullability.ts';
 import {
   columnSerial,
   keepsSerialOnPlainInteger,
@@ -80,6 +81,11 @@ import { useProject } from '../project.tsx';
 import { resolveTopLevelTableId } from '../sections.ts';
 import type { Workspace } from '../workspace.ts';
 import { isUntypedColumn, shortType, typeLabel } from './Canvas.tsx';
+import {
+  ColumnNotNullBadge,
+  ColumnNotNullCheckbox,
+  ColumnNotNullInferredHint,
+} from './ColumnNullability.tsx';
 import { Modal } from './Modal.tsx';
 import { Banner, cx, Empty, IconButton, Menu, type MenuItem, Sql } from './ui.tsx';
 
@@ -810,6 +816,7 @@ const TableInspector = ({
   const typesId = useId();
   const mysqlTypeHintId = useId();
   const serialHintId = useId();
+  const nnInferredBaseId = useId();
   const untypedHintId = useId();
   const fillFactorErrId = useId();
   // PG serial 列被重新选成普通整数类型时，在该列类型框下提示“自增仍保留”（只是提示，不改默认值与序列）
@@ -1290,6 +1297,11 @@ const TableInspector = ({
             const rowType = serial ? serial.kind : shortType(typeLabel(model, c));
             // 提示只在列仍是 serial 形态时显示：清空默认值、改成其他类型或协作者改动后自动消失
             const showSerialHint = open && serial !== null && serialHintCol === c.id;
+            // 显式 NOT NULL 与引擎推断的非空分开（SQL Server 持久化计算列，ADR 0019）：复选框只绑显式，徽标按有效值
+            // 只由推断得出的 NN 用虚线框区分（不降对比度）；鼠标悬停看 title，读屏经行按钮的 aria-describedby 读到同一句
+            const rowInferredId = `${nnInferredBaseId}-row-${c.id}`;
+            const hintInferredId = `${nnInferredBaseId}-hint-${c.id}`;
+            const showRowInferred = showRowInferredDescription(model, c, isPk);
             // SQLite 非 STRICT 表的无类型列：类型框下说明 BLOB 亲和性
             const showUntypedHint = open && !sqliteStrict && isUntypedColumn(model, c);
             // 单列 INT / BIGINT 等整数主键不是 rowid 别名，说明为什么没有 AUTOINCREMENT
@@ -1316,7 +1328,7 @@ const TableInspector = ({
                     {rowType}
                   </span>
                   <span className="flex w-[52px] justify-end gap-[3px]">
-                    {c.notNull && <b className="flag">NN</b>}
+                    <ColumnNotNullBadge model={model} column={c} inferredTitle={t('insp.notNullInferred')} />
                   </span>
                 </li>
               );
@@ -1326,6 +1338,7 @@ const TableInspector = ({
                 <button
                   type="button"
                   aria-expanded={open}
+                  aria-describedby={showRowInferred ? rowInferredId : undefined}
                   onClick={() => {
                     setOpenCol(open ? null : c.id);
                     setSerialHintCol(null);
@@ -1355,9 +1368,20 @@ const TableInspector = ({
                     {isPk && <b className="flag pk">PK</b>}
                     {fkCols.has(c.id) && <b className="flag fk">FK</b>}
                     {isPartKey && <b className="flag">PT</b>}
-                    {c.notNull && !isPk && <b className="flag">NN</b>}
+                    {!isPk && (
+                      <ColumnNotNullBadge
+                        model={model}
+                        column={c}
+                        inferredTitle={t('insp.notNullInferred')}
+                      />
+                    )}
                   </span>
                 </button>
+                {showRowInferred && (
+                  <span id={rowInferredId} className="sr-only">
+                    {t('insp.notNullInferred')}
+                  </span>
+                )}
                 {open && (
                   <div className="space-y-2 border-t border-border bg-surface-2 px-2.5 pt-2.5 pb-3">
                     <div className="grid grid-cols-2 gap-2">
@@ -1521,25 +1545,13 @@ const TableInspector = ({
                     )}
                     <div className="flex items-center gap-1">
                       <div className="checks flex-1">
-                        <label>
-                          <input
-                            type="checkbox"
-                            checked={c.notNull}
-                            disabled={
-                              c.identity !== null ||
-                              !!c.ext?.mssql?.identity ||
-                              !!c.ext?.mysql?.autoIncrement ||
-                              (model.dialect === 'mssql' && c.generated !== null && !c.generated.stored) ||
-                              (model.dialect === 'mssql' && !c.notNull && !!c.ext?.mssql?.sparse)
-                            }
-                            onChange={(e) => {
-                              const on = e.target.checked;
-                              if (on && model.dialect === 'mssql' && !!c.ext?.mssql?.sparse) return;
-                              ws.act('setNotNull', { id: c.id, notNull: on });
-                            }}
-                          />
-                          {t('insp.notNull')}
-                        </label>
+                        <ColumnNotNullCheckbox
+                          model={model}
+                          column={c}
+                          hintId={hintInferredId}
+                          label={t('insp.notNull')}
+                          onChange={(on) => ws.act('setNotNull', { id: c.id, notNull: on })}
+                        />
                         <label>
                           <input
                             type="checkbox"
@@ -1643,6 +1655,12 @@ const TableInspector = ({
                         <Trash2 size={14} aria-hidden="true" />
                       </IconButton>
                     </div>
+                    <ColumnNotNullInferredHint
+                      model={model}
+                      column={c}
+                      id={hintInferredId}
+                      text={t('insp.notNullInferredHint')}
+                    />
                     {showNotRowidAliasHint && (
                       <p className="hint m-0">{t('insp.sqliteNotRowidAliasHint', { type: c.type })}</p>
                     )}

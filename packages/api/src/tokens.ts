@@ -190,7 +190,7 @@ export const CI_ERROR_STATUS = {
   version_retired: 409,
   /** 目标库的历史和平台的版本链对不上（当前版本不在链上、校验和不同、链被篡改……），details.reason 是具体原因 */
   version_mismatch: 409,
-  /** 要执行的迁移还没有通过影子库验证 */
+  /** 要执行的迁移还没有通过影子库验证，或缺少目标库完整版本的通过记录 */
   unverified: 409,
   /** 目标库结构和环境当前版本的模型不一致（含第一次执行时既不是基线也不是空库，details.firstRun） */
   drift: 409,
@@ -241,6 +241,9 @@ export interface CiErrorBody {
     current?: CiVersionRef | null;
     lca?: CiVersionRef | null;
     problems?: string[];
+    /** unverified（ADR 0017 决定 5）：目标库的数据库完整版本号（读不到为 null）与该版本已通过验证的完整版本号 */
+    engineVersion?: string | null;
+    verifiedOn?: string[];
   };
   /** 执行失败时：环境停在的版本（最后一个成功的版本）；其他错误没有这一项 */
   reached?: CiVersionRef | null;

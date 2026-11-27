@@ -75,7 +75,6 @@ const zh = {
     edited: '人工编辑',
     nonTx: '非事务',
     nonTxToggle: '非事务',
-    unavailableTitle: '这个版本没有验证',
     migration: '冻结的迁移',
     checksum: '校验和 {{sum}}',
     reverify: '重新验证',
@@ -95,13 +94,14 @@ const zh = {
     addStep: '添加一步',
     notLatest: '只有链上最新的版本可以编辑脚本；旧版本的迁移已经冻结。',
     unverifiedHint:
-      '这个版本没有在影子库里验证过（发布时项目没有可用的影子库，或还没验证）。未验证的迁移之后不能执行。',
+      '这个版本还没有通过影子库验证（导入时生成的 v0 基线不验证，或之前的验证没有通过）。未验证的迁移之后不能执行。',
     unverifiedEdited: '脚本被人工改过，需要重新验证。未验证的迁移之后不能执行。',
     verifiedAtHint: '最近一次验证：{{time}}',
     noRollback: '基线没有回滚脚本。',
     verifyPassed: '验证通过',
     verifyFailed: '验证没有通过，见下方报告',
-    verifyMissingTarget: '未完成最低目标版本验证，见下方详情',
+    verifyUncovered: '验证通过，但有环境没有同版本的验证记录，见下方详情',
+    verifiedOn: '已在这些数据库版本的影子库上验证通过：{{versions}}。执行 / 回滚只放行到这些版本的环境。',
   },
   vl: {
     head: '链头',
@@ -204,6 +204,8 @@ const zh = {
     statusUnknown: '未测试',
     pgVersion: 'PostgreSQL 版本',
     pgVersionUnknown: '尚未探测（点击「测试连接」以记录版本）',
+    fullVersion: '完整版本号（验证记录按它匹配）',
+    fullVersionUnknown: '尚未探测：在这里执行前要先测试连接',
     manageHint: '只有项目管理员能添加和删除环境。',
     delete: '删除环境',
     deleteTitle: '删除环境 {{name}}？',
@@ -226,6 +228,9 @@ const zh = {
       'MySQL DDL 会隐式提交：这个迁移不是原子的，每步都会直接生效并记录检查点，失败后需要修复或从断点续跑。',
     nonTxGeneric: '含非事务步骤：这个迁移不是原子的，失败后目标库会停在中途，需要从断点续跑。',
     nonTxShort: '含非事务步骤',
+    notVerifiedHere: '本库版本未验证',
+    notVerifiedHereHint:
+      '这个版本没有在本环境的数据库版本上验证通过，执行或回滚到这里会被拒绝。请为环境配置数据库版本相同的影子库（或允许同实例影子库）后重新验证这个版本。',
     state: { applied: '已执行', current: '当前', pending: '待执行', retired: '已作废' },
     dir: { baseline: '写入基线', up: '升级', down: '回滚', mark: '标记' },
     run: {
@@ -354,6 +359,11 @@ const zh = {
         '所有步骤都执行完了但读回的结构不对：继续执行解决不了，需要手工修正目标库（漂移差异见环境页）。',
       failedStep: '失败在第 {{step}} 步。',
       unverifiedHint: '到版本详情页点“重新验证”，通过后再执行。',
+      unverifiedEngineHint:
+        '这个版本没有在目标库的数据库版本 {{version}} 上验证通过（已验证：{{verifiedOn}}）。请为环境配置数据库版本相同的影子库（或允许同实例影子库），再到版本详情页“重新验证”。',
+      unverifiedEngineUnknown:
+        '读不到目标库的数据库版本，无法确认版本是否在同版本的影子库上验证过。请先测试环境连接。',
+      unverifiedNone: '无',
       markRequiredHint:
         '目标库还没有迁移历史，且结构已等于首版本，没有可执行的后续迁移。请到环境页使用“标记为已执行”建立历史基准，或等发布新版本后再执行（届时会自动写入基线）。',
     },
@@ -380,6 +390,8 @@ const zh = {
     importConfirm: '覆盖工作副本',
     importDone:
       '已导入：工作副本现在是线上结构（{{count}} 个对象）。接下来检查、修改、发布新版本，再把这个环境标记为已执行到它。',
+    importDoneTitle: '导入已完成',
+    importDoneClose: '完成',
     repairTitle: '修复脚本',
     repairIntro:
       '把线上结构改回 v{{number}} 的模型。这里只显示，Dowel 不会执行：请自己在目标库上执行，然后点“重新检查漂移”。',
@@ -433,6 +445,15 @@ const zh = {
       fingerprint: '线上结构指纹 {{fp}}',
       none: '没有可以标记的版本。',
     },
+  },
+  // SQL Server 从已有数据库导入 / 拉取：没有可用的影子库，持久化计算列按显式非空记录（ADR 0019）
+  nnFallback: {
+    title: '持久化计算列已按显式非空记录',
+    bodyOne:
+      '没有可用的影子库，无法判断以下 {{count}} 个持久化计算列的非空是显式声明还是由表达式推断，已按显式非空（PERSISTED NOT NULL）记录。影子库可用后，可在属性面板取消“非空”勾选，改由表达式推断。',
+    body: '没有可用的影子库，无法判断以下 {{count}} 个持久化计算列的非空是显式声明还是由表达式推断，已按显式非空（PERSISTED NOT NULL）记录。影子库可用后，可在属性面板取消“非空”勾选，改由表达式推断。',
+    more: '另有 {{count}} 列未显示（共 {{total}} 列）。',
+    projectCreated: '项目已创建。',
   },
   tk: {
     restored: '接手恢复',
@@ -1025,6 +1046,8 @@ const zh = {
     columnName: '列名',
     type: '类型',
     notNull: '非空',
+    notNullInferred: '由表达式推断为非空（未显式声明）',
+    notNullInferredHint: '由表达式推断为非空，DDL 不写 NOT NULL；勾选才是显式声明。推断结果在规范化时更新。',
     default: '默认值',
     none: '无',
     pk: '主键',
@@ -1156,11 +1179,10 @@ const zh = {
     versionTitle: '发布',
     versionName: '版本名',
     versionHint:
-      '发布会把工作副本保存成链上的下一个版本，同时冻结它的迁移，并先在影子库里验证（项目有环境时）。验证没通过不会发布；没有影子库时可以发布，但版本标为“未验证”。',
+      '发布会把工作副本保存成链上的下一个版本，同时冻结它的迁移。发布前必须在影子库里闭环验证（升级后读回必须等于这个版本，回滚后必须回到上一个版本）；没有可用的影子库或验证没有通过，都不会发布。',
     versionSave: '发布',
     versionSaved: '已发布 v{{number}} {{name}}，已通过验证',
-    versionSavedUnverified: '已发布 v{{number}} {{name}}，未验证',
-    versionSavedUnverifiedReason: '已发布 v{{number}} {{name}}，未验证：{{reason}}',
+    versionSavedUncovered: '已发布 v{{number}} {{name}}，已通过验证；{{count}} 个环境没有同版本的验证记录',
     versionSavedRiskError: '已发布 v{{number}} {{name}}，已通过验证；风险分析没有完成：{{riskError}}',
     versionPublishedVerified: '已发布 v{{number}} {{name}}，已通过验证',
     riskFailedTitle: '风险分析没有完成',
@@ -1189,13 +1211,41 @@ const zh = {
     noSteps: '两个版本相同，没有需要执行的语句。',
     verifyOkTitle: '验证通过',
     verifyOk: '升级后与目标一致，回滚后回到起点。',
-    verifyTargetsAllPassed: '（{{versions}} 均通过）',
-    verifyTargetSinglePassed: '（{{version}} 通过）',
-    verifyTargetPassed: '{{dialect}} {{major}} 通过',
-    verifyTargetFailed: '{{dialect}} {{major}} 失败',
-    verifyMissingTargetTitle: '未完成最低目标版本验证',
-    verifyMissingTargetBody:
-      '缺少 {{dialect}} {{major}} 影子库，无法将此版本标记为已验证。请为对应环境配置独立影子库或允许使用同实例影子库。',
+    verifyRecordsPassed: '已在数据库版本 {{versions}} 上验证通过',
+    verifyRecordPassed: '{{version}} 通过',
+    verifyRecordFailed: '{{version}} 没有通过',
+    verifyRecordUnknown: '版本未知',
+    envVersion: '{{name}}（{{version}}）',
+    envVersionUnknown: '{{name}}（数据库版本还没有探测）',
+    uncoveredTitle: '这些环境还没有同版本的验证记录',
+    uncoveredBody:
+      '版本已发布，但下面这些环境的数据库版本没有可用的影子库验证过，执行或回滚到它们会被拒绝。请为它们配置数据库版本相同的影子库（或允许同实例影子库），再到版本详情页“重新验证”。',
+    rejectShadowUnavailable: '没有可用的影子库，版本没有发布',
+    rejectShadowUnavailableBody:
+      '发布前必须在影子库里闭环验证，不能发布未验证的版本。请在“环境”页为环境配置独立影子库，或允许使用同实例影子库；影子库暂时连不上时请稍后重试。',
+    rejectNormalizePending: '还有对象没有规范化，版本没有发布',
+    rejectNormalizePendingBody:
+      '影子库这次没能把下面这些对象换成数据库自己的写法，发布会因此冻结和执行时读回不一致的模型。请稍后重试，或在状态栏点“规范化”查看原因。',
+    pendingTitle: '待规范化的对象（{{count}} 个）',
+    pendingMore: '另有 {{count}} 个没有列出',
+    rejectNoMatching: '没有与环境数据库版本一致的影子库',
+    rejectNoMatchingBody:
+      '通过验证的影子库版本与下面这些环境的数据库版本都不一致，“已验证”无法保证在它们上面能执行。请为环境配置版本相同的独立影子库，或允许使用同实例影子库。',
+    readbackTitle: '读回核对没有通过：模型的写法与数据库读回的不一致',
+    readbackBody:
+      '数据库会按自己的写法保存这些属性，执行时的读回校验会因此失败。请按“数据库读回”一列修改模型后重新发布；Dowel 不会自动修正。出现这种情况通常说明规范化有遗漏，服务端已记录日志。',
+    readbackDownNote:
+      '标为“回滚后”的差异是对上一个版本的模型：问题出在上一个版本（它的模型或脚本），不是工作副本。',
+    readbackCaption: '写法差异（{{count}} 项）',
+    readbackDirection: '方向',
+    readbackObject: '对象',
+    readbackProperty: '属性',
+    readbackModel: '模型里的值',
+    readbackLive: '数据库读回',
+    readbackUp: '升级后（对本版本）',
+    readbackDown: '回滚后（对上一个版本）',
+    readbackNull: '（无）',
+    readbackToast: '{{object}} 的 {{property}}：模型是 {{model}}，数据库读回 {{live}}',
     highRisks: '其中 {{count}} 步高风险，见下方说明。',
     verifyFail: '验证失败',
     risk: { high: '高', medium: '中', low: '低' },
@@ -2473,7 +2523,6 @@ const en: typeof zh = {
     edited: 'Edited',
     nonTx: 'non-transactional',
     nonTxToggle: 'Non-transactional',
-    unavailableTitle: 'This version was not verified',
     migration: 'Frozen migration',
     checksum: 'Checksum {{sum}}',
     reverify: 'Verify again',
@@ -2494,14 +2543,17 @@ const en: typeof zh = {
     notLatest:
       'Only the latest version in the chain can be edited; the migrations of older versions are frozen.',
     unverifiedHint:
-      'This version has not been verified in a shadow database (the project had none at publish time, or it has not been verified yet). Unverified migrations cannot be applied later.',
+      'This version has not passed verification in a shadow database (the v0 baseline created on import is not verified, or an earlier verification failed). Unverified migrations cannot be applied later.',
     unverifiedEdited:
       'The scripts were edited by hand and must be verified again. Unverified migrations cannot be applied later.',
     verifiedAtHint: 'Last verified: {{time}}',
     noRollback: 'The baseline has no rollback script.',
     verifyPassed: 'Verification passed',
     verifyFailed: 'Verification failed; see the report below',
-    verifyMissingTarget: 'Lowest target version not verified; see details below',
+    verifyUncovered:
+      'Verified, but some environments have no record for their database version; see details below',
+    verifiedOn:
+      'Verified on shadow databases running {{versions}}. Execution and rollback are only allowed on environments running these versions.',
   },
   vl: {
     head: 'Chain head',
@@ -2610,6 +2662,8 @@ const en: typeof zh = {
     statusUnknown: 'Not tested',
     pgVersion: 'PostgreSQL version',
     pgVersionUnknown: 'Not detected yet (click “Test connection” to record)',
+    fullVersion: 'Full version (matched against verification records)',
+    fullVersionUnknown: 'Not detected yet: test the connection before executing here',
     manageHint: 'Only project admins can add and delete environments.',
     delete: 'Delete environment',
     deleteTitle: 'Delete environment {{name}}?',
@@ -2633,6 +2687,9 @@ const en: typeof zh = {
     nonTxGeneric:
       'Contains non-transactional steps: this migration is not atomic. If it fails the database stops midway and must be resumed from the checkpoint.',
     nonTxShort: 'non-transactional',
+    notVerifiedHere: 'Not verified on this version',
+    notVerifiedHereHint:
+      'This version has not passed verification on this environment’s database version, so executing or rolling back here is refused. Give the environment a shadow database running the same version (or allow a same-instance shadow) and verify the version again.',
     state: { applied: 'Applied', current: 'Current', pending: 'Pending', retired: 'Retired' },
     dir: { baseline: 'Baseline', up: 'Upgrade', down: 'Rollback', mark: 'Mark' },
     run: {
@@ -2766,6 +2823,11 @@ const en: typeof zh = {
         'All steps ran but the structure read back is wrong: resuming cannot fix it, the target database must be fixed by hand (see the drift differences on the environment page).',
       failedStep: 'Failed at step {{step}}.',
       unverifiedHint: 'Open the version page and click "Re-verify"; execute once it passes.',
+      unverifiedEngineHint:
+        'This version has not passed verification on the target’s database version {{version}} (verified on: {{verifiedOn}}). Give the environment a shadow database running the same version (or allow a same-instance shadow), then click "Verify again" on the version page.',
+      unverifiedEngineUnknown:
+        'Cannot read the target database’s version, so it is unknown whether the version was verified on a matching shadow database. Test the environment connection first.',
+      unverifiedNone: 'none',
       markRequiredHint:
         'The target database has no migration history yet and already matches the first version, with no newer migrations to run. Use "Mark as applied" on the environment page to record the baseline, or wait until a newer version is published (executing it will write the baseline automatically).',
     },
@@ -2796,6 +2858,8 @@ const en: typeof zh = {
     importConfirm: 'Overwrite working copy',
     importDone:
       'Imported: the working copy is now the live structure ({{count}} objects). Next review, edit, publish a new version, then mark this environment as applied to it.',
+    importDoneTitle: 'Import complete',
+    importDoneClose: 'Done',
     repairTitle: 'Repair script',
     repairIntro:
       'Changes the live structure back to the model of v{{number}}. It is only shown here and Dowel never runs it: run it on the target database yourself, then click "Re-check drift".',
@@ -2859,6 +2923,14 @@ const en: typeof zh = {
       fingerprint: 'Live structure fingerprint {{fp}}',
       none: 'No version can be marked.',
     },
+  },
+  nnFallback: {
+    title: 'Recorded as explicit NOT NULL',
+    bodyOne:
+      'No shadow database was available, so Dowel could not tell whether this persisted computed column is declared NOT NULL or inferred non-null from its expression. It was recorded as explicit PERSISTED NOT NULL. Once a shadow database is available, you can clear Not null in the properties panel to rely on inference.',
+    body: 'No shadow database was available, so Dowel could not tell whether these {{count}} persisted computed columns are declared NOT NULL or inferred non-null from their expressions. They were recorded as explicit PERSISTED NOT NULL. Once a shadow database is available, you can clear Not null in the properties panel to rely on inference.',
+    more: 'And {{count}} more ({{total}} total).',
+    projectCreated: 'Project created.',
   },
   tk: {
     restored: 'Restored',
@@ -3481,6 +3553,9 @@ const en: typeof zh = {
     columnName: 'Column name',
     type: 'Type',
     notNull: 'Not null',
+    notNullInferred: 'Inferred as non-null from the expression (not explicit)',
+    notNullInferredHint:
+      'Inferred as non-null from the expression; the DDL does not add NOT NULL. Check the box to declare it explicitly. Updated on normalization.',
     default: 'Default',
     none: 'None',
     pk: 'Primary key',
@@ -3618,11 +3693,11 @@ const en: typeof zh = {
     versionTitle: 'Publish',
     versionName: 'Version name',
     versionHint:
-      'Publishing saves the working copy as the next version in the chain and freezes its migration, verifying it in the shadow database first (when the project has an environment). A migration that fails verification is not published; without a shadow database you can still publish, but the version is marked unverified.',
+      'Publishing saves the working copy as the next version in the chain and freezes its migration. It must first pass closed-loop verification in a shadow database (after the upgrade the structure read back must equal this version, after the rollback it must return to the previous one); without a usable shadow database, or if verification fails, nothing is published.',
     versionSave: 'Publish',
     versionSaved: 'Published v{{number}} {{name}}, verified',
-    versionSavedUnverified: 'Published v{{number}} {{name}}, unverified',
-    versionSavedUnverifiedReason: 'Published v{{number}} {{name}}, unverified: {{reason}}',
+    versionSavedUncovered:
+      'Published v{{number}} {{name}}, verified; {{count}} environments have no record for their database version',
     versionSavedRiskError:
       'Published v{{number}} {{name}}, verified; risk analysis did not complete: {{riskError}}',
     versionPublishedVerified: 'Published v{{number}} {{name}}, verified',
@@ -3653,13 +3728,41 @@ const en: typeof zh = {
     noSteps: 'The two versions are identical; there is nothing to run.',
     verifyOkTitle: 'Verified',
     verifyOk: 'The upgrade matches the target and the rollback returns to the start.',
-    verifyTargetsAllPassed: '({{versions}} all passed)',
-    verifyTargetSinglePassed: '({{version}} passed)',
-    verifyTargetPassed: '{{dialect}} {{major}} passed',
-    verifyTargetFailed: '{{dialect}} {{major}} failed',
-    verifyMissingTargetTitle: 'Lowest target version not verified',
-    verifyMissingTargetBody:
-      'Missing a {{dialect}} {{major}} shadow database; this version cannot be marked verified. Configure a dedicated shadow database or allow a same-instance shadow.',
+    verifyRecordsPassed: 'Verified on database versions {{versions}}',
+    verifyRecordPassed: '{{version}} passed',
+    verifyRecordFailed: '{{version}} failed',
+    verifyRecordUnknown: 'unknown version',
+    envVersion: '{{name}} ({{version}})',
+    envVersionUnknown: '{{name}} (database version not detected yet)',
+    uncoveredTitle: 'These environments have no record for their database version',
+    uncoveredBody:
+      'The version is published, but no usable shadow database has verified it on the database versions of the environments below, so executing or rolling back there is refused. Give them a shadow database running the same version (or allow a same-instance shadow), then click "Verify again" on the version page.',
+    rejectShadowUnavailable: 'No usable shadow database; nothing was published',
+    rejectShadowUnavailableBody:
+      'A version must pass closed-loop verification in a shadow database before it is published; unverified versions cannot be published. Configure a dedicated shadow database for an environment on the Environments page, or allow a same-instance shadow; if the shadow database is temporarily unreachable, try again later.',
+    rejectNormalizePending: 'Some objects are not normalized yet; nothing was published',
+    rejectNormalizePendingBody:
+      'The shadow database could not rewrite the objects below in the database’s own spelling this time, so publishing would freeze a model that does not match what execution reads back. Try again later, or click "Normalize" in the status bar to see why.',
+    pendingTitle: 'Objects waiting for normalization ({{count}})',
+    pendingMore: '{{count}} more not listed',
+    rejectNoMatching: 'No shadow database matches the environments’ database versions',
+    rejectNoMatchingBody:
+      'The shadow databases that passed run versions that match none of the environments below, so "verified" would not guarantee the migration runs there. Configure a dedicated shadow database with the same version, or allow a same-instance shadow.',
+    readbackTitle: 'Readback check failed: the model’s spelling differs from what the database reads back',
+    readbackBody:
+      'The database stores these properties in its own spelling, so the readback check during execution would fail. Change the model to the values in the "Read back" column and publish again; Dowel does not fix this automatically. This usually means normalization missed something; the server has logged it.',
+    readbackDownNote:
+      'Differences marked "After rollback" are against the previous version’s model: the problem is in the previous version (its model or scripts), not in the working copy.',
+    readbackCaption: 'Spelling differences ({{count}})',
+    readbackDirection: 'Direction',
+    readbackObject: 'Object',
+    readbackProperty: 'Property',
+    readbackModel: 'In the model',
+    readbackLive: 'Read back',
+    readbackUp: 'After upgrade (this version)',
+    readbackDown: 'After rollback (previous version)',
+    readbackNull: '(none)',
+    readbackToast: '{{property}} of {{object}}: the model has {{model}}, the database reads back {{live}}',
     highRisks: '{{count}} high-risk steps, see below.',
     verifyFail: 'Verification failed',
     risk: { high: 'High', medium: 'Med', low: 'Low' },

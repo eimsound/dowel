@@ -78,3 +78,22 @@ export const publicMajorOf = (dialect: Dialect, versionNum: number | null | unde
   const key = matrix?.groupKeyOf(versionNum) ?? null;
   return matrix && key !== null ? matrix.publicMajorOfGroup(key) : null;
 };
+
+/** 数据库完整版本号（ADR 0017 决定 5；见 DialectVersioning.fullVersion） */
+export const engineFullVersion = (
+  dialect: Dialect,
+  info: { version?: string | null; versionNum?: number | null },
+): string | null => getDialect(dialect).versioning.fullVersion(info);
+
+/**
+ * 按数据库完整版本号把关（ADR 0017 决定 5）：`engineVersion` 这个版本有没有通过的验证记录。
+ * 不需要外部影子库的方言（SQLite）影子库与目标库是同一个内置库，视为恒等：有任一通过的记录即可。
+ */
+export const verifiedForEngine = (
+  dialect: Dialect,
+  verifiedOn: readonly string[],
+  engineVersion: string | null,
+): boolean =>
+  getDialect(dialect).capabilities.requiresExternalShadow
+    ? engineVersion !== null && verifiedOn.includes(engineVersion)
+    : verifiedOn.length > 0;

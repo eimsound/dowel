@@ -1,7 +1,7 @@
 // 影子库上的操作：导入 DDL、闭环验证、风险分析、派生数据的规范化。
 // PG 使用真实 PostgreSQL 影子库实例；SQLite 使用进程内 `:memory:` 影子库。
 
-import type { StepRisk, StoredVerifyReport, VerifyReport, VerifyTargetReport } from '@dowel/api';
+import type { ReadbackDiffItem, StepRisk, StoredVerifyReport, VerifyRecord, VerifyReport } from '@dowel/api';
 import {
   deepEqual,
   type Dialect,
@@ -13,6 +13,7 @@ import {
   PlanError,
   type PlanOptions,
   plan,
+  setMssqlInferredNotNull,
   type Step,
 } from '@dowel/core';
 import {
@@ -20,6 +21,8 @@ import {
   getEngine,
   mssqlErrorCode,
   mssqlErrorNumber,
+  type MssqlNullabilityProbe,
+  probeMssqlInferredNotNull,
   reconcileIds,
   type ScriptStep,
 } from '@dowel/engines';
@@ -30,8 +33,10 @@ import {
   InstanceLevelStatementError,
   runSteps,
   StepError,
+  type VerifyResult,
   type VerifyScriptsOptions,
   verify,
+  verifyPassed,
   verifyScripts,
 } from '@dowel/verifier';
 
@@ -69,10 +74,16 @@ export interface Shadow {
    * 派生数据（04-ir-design.md 2.6）：建出 prev（已规范化的版本）并执行到 next 的迁移（若规划抛 `PlanError`，
    * 或非空 prev 建库遇非基础设施 `StepError` 且无依赖或父对象改名的不透明对象，则回退为从空库直接建出 next），
    * 读回引擎输出，返回 next 中与引擎规范形式不同的对象（已换成规范形式）。写回的字段：CHECK 的 `expr`；列表达式默认值的 `expr`；
-   * 生成列的 `expr` 连同引擎推导的 `type`（MSSQL 持久化生成列还有 `notNull`）；索引表达式元素的 `expr` 与 `where`；
+   * 生成列的 `expr` 连同引擎推导的 `type`（MSSQL 持久化计算列还有引擎推断的 `ext.mssql.inferredNotNull`，显式 `notNull` 不动，ADR 0019）；索引表达式元素的 `expr` 与 `where`；
    * 表的分区键 `partitionBy.keys[].expr` 与分区边界 `partitionOf.bound`；不透明对象的 `ddl`。
    */
   canonicalize(prev: Model, next: Model): Promise<Obj[]>;
+  /**
+   * SQL Server（ADR 0019 决定 4）：从已有数据库导入 / 拉取后，在影子库里按模型建库（ids 里的列先按显式 NOT NULL 建，
+   * 引用它们的约束才建得出来），再探测这些列的表达式本身是否被推断为非空。返回 列 ID → 推断为非空。
+   * 只有 SQL Server 影子库实现；其他方言没有这个方法。
+   */
+  probeMssqlNotNull?(model: Model, ids: readonly string[]): Promise<Map<string, boolean>>;
   /**
    * 永久关闭句柄（Issue #154）：之后的任何操作（包括已经排队、还没开始的）都以 ShadowConfigChangedError 拒绝，
    * 绝不重新建连；关闭时正在跑的那次操作无论成功失败都以 ShadowConfigChangedError 结束、结果丢弃
@@ -215,23 +226,77 @@ const pgShadowPrivilegeError = async (e: unknown, d: Db): Promise<ShadowError> =
   );
 };
 
-/** 影子库给的完整报告 → 存进版本里的报告（up / down 就是冻结的脚本本身，不重复存） */
+/** 读回核对的最多明细条数（与执行器 MAX_DIFF 一致） */
+const MAX_READBACK_ITEMS = 100;
+
+/**
+ * verifier 的读回核对 → 报告里的明细（ADR 0017 决定 2）：up 是升级后读回对本版本模型，down 是回滚后读回对上一个版本模型。
+ * 有差异但没有属性级明细（例如规划器报了 unresolvable）时，按规划出的步骤给一条，不让差异“看不见”。
+ */
+const readbackItemsOf = (r: Pick<VerifyResult, 'readback'>): { total: number; items: ReadbackDiffItem[] } => {
+  const items: ReadbackDiffItem[] = [];
+  let total = 0;
+  for (const direction of ['up', 'down'] as const) {
+    const d = r.readback?.[direction];
+    if (!d?.total) continue;
+    total += d.total;
+    if (d.details.length) for (const x of d.details) items.push({ direction, ...x });
+    else
+      for (const step of d.items)
+        items.push({
+          direction,
+          object: step.target,
+          property: step.kind,
+          modelValue: null,
+          liveValue: step.sql,
+        });
+  }
+  return { total, items: items.slice(0, MAX_READBACK_ITEMS) };
+};
+
+/** 一份报告的一句话失败原因（验证记录里用） */
+const failureOf = (r: VerifyReport): string | null => {
+  if (r.ok) return null;
+  if (r.error) return r.error.message;
+  if (r.upDiff.length) return `升级后结构与本版本模型不一致（${r.upDiff.length} 处）`;
+  if (r.downDiff.length) return `回滚后结构与上一个版本不一致（${r.downDiff.length} 处）`;
+  if (r.readbackTotal) return `读回核对不一致（${r.readbackTotal} 处写法差异）`;
+  return '验证未通过';
+};
+
+/** 一份影子库报告 → 一条验证记录（ADR 0017 决定 5：按影子库的数据库完整版本号记录） */
+export const recordOf = (r: VerifyReport, shadow: string, at: string): VerifyRecord => ({
+  engineVersion: r.engineVersion ?? null,
+  ok: r.ok,
+  shadow,
+  at,
+  error: failureOf(r),
+});
+
+/**
+ * 影子库给的完整报告 → 存进版本里的报告（up / down 就是冻结的脚本本身，不重复存）。
+ * `records` 缺省为这份报告自己的一条验证记录；多影子库验证（发布 / 重新验证）传入合并后的记录。
+ */
 export const storedReport = (
   r: VerifyReport,
   shadow: string,
-  extra?: { targets?: VerifyTargetReport[]; missingTargetMajor?: number | null },
-): StoredVerifyReport => ({
-  ok: r.ok,
-  upDiff: r.upDiff,
-  downDiff: r.downDiff,
-  risks: r.risks,
-  riskError: r.riskError,
-  error: r.error,
-  shadow,
-  at: new Date().toISOString(),
-  ...(extra?.targets?.length ? { targets: extra.targets } : {}),
-  ...(extra?.missingTargetMajor !== undefined ? { missingTargetMajor: extra.missingTargetMajor } : {}),
-});
+  extra?: { records?: VerifyRecord[]; at?: string },
+): StoredVerifyReport => {
+  const at = extra?.at ?? new Date().toISOString();
+  return {
+    ok: r.ok,
+    upDiff: r.upDiff,
+    downDiff: r.downDiff,
+    risks: r.risks,
+    riskError: r.riskError,
+    error: r.error,
+    shadow,
+    at,
+    engineVersion: r.engineVersion ?? null,
+    ...(r.readbackTotal ? { readbackTotal: r.readbackTotal, readbackDiff: r.readbackDiff ?? [] } : {}),
+    records: extra?.records ?? [recordOf(r, shadow, at)],
+  };
+};
 
 /**
  * 基础设施故障 vs 用户的脚本 / 模型问题：
@@ -369,6 +434,84 @@ export const assertImportable = (sql: string, dialect: Dialect = 'pg'): Importab
   return checked as ImportableSql;
 };
 
+/**
+ * verifier 的结果 → 影子库报告：ok 要求两份快照一致且读回核对没有差异（verifyPassed，ADR 0017 决定 2）。
+ * readback 本身不发给客户端，换成 readbackTotal / readbackDiff 明细。
+ */
+const reportOf = (r: VerifyResult, risk: { risks: StepRisk[]; riskError?: string }): VerifyReport => {
+  const { readback: _readback, ...rest } = r;
+  const rb = readbackItemsOf(r);
+  return {
+    ...rest,
+    ok: verifyPassed(r),
+    ...risk,
+    error: null,
+    shadowMajor: r.shadowMajor,
+    shadowVersionNum: r.shadowVersionNum,
+    engineVersion: r.engineVersion ?? null,
+    ...(rb.total ? { readbackTotal: rb.total, readbackDiff: rb.items } : {}),
+  };
+};
+
+type Column = Extract<Obj, { kind: 'column' }>;
+
+/** 在模型 m 里定位列所在的表（schema、表名、表上全部列名），供影子库里的可空性探测用 */
+const probeOf = (m: Model, c: Column, expr: string): MssqlNullabilityProbe | null => {
+  const t = m.objects[c.parent];
+  if (t?.kind !== 'table') return null;
+  const s = m.objects[t.parent];
+  if (s?.kind !== 'schema') return null;
+  const columns = Object.values(m.objects)
+    .filter((o): o is Column => o.kind === 'column' && o.parent === t.id)
+    .map((o) => o.name);
+  return { schema: s.name, table: t.name, expr, columns };
+};
+
+/**
+ * SQL Server：影子库里探测一批持久化计算列的表达式本身是否被推断为非空（ADR 0019），返回 列 ID → 推断值。
+ * 只在影子库里调用（会临时加删列）；m 是影子库读回、ID 已对回的模型。
+ */
+const probeInferred = async (d: Db, m: Model, cols: readonly Column[]): Promise<Map<string, boolean>> => {
+  const items: { id: string; probe: MssqlNullabilityProbe }[] = [];
+  for (const c of cols) {
+    const p = c.generated ? probeOf(m, c, c.generated.expr) : null;
+    if (p) items.push({ id: c.id, probe: p });
+  }
+  const out = new Map<string, boolean>();
+  if (!items.length) return out;
+  const res = await probeMssqlInferredNotNull(
+    d,
+    items.map((x) => x.probe),
+  );
+  items.forEach((x, i) => out.set(x.id, res[i]!));
+  return out;
+};
+
+/**
+ * 判断 SQL Server 持久化计算列在 canonicalize 后是否需要经影子库临时非持久化列探测表达式推断可空性（ADR 0019）。
+ *
+ * 不变量：推断结果绝不依赖影子库表的构建路径（从零建 vs 从 prev 增量迁移）。
+ * SQL Server 物理列 `is_nullable = 0` 等价于「物理列带显式 NOT NULL 或 表达式被推断为非空」：
+ * - 读回已可空（`readBackNonNull === false`）：两项必全为假，推断值必为 false，无需探测；
+ * - 读回非空（`readBackNonNull === true`）：只有当该列在本次构建中确定是以**非显式**从零新建
+ *   （`!nextCol.notNull`，且本次走整库从零构建 `builtFromScratch` 或该表在 `prev` 中不存在）时，
+ *   物理列绝不可能带有显式 NOT NULL，读回非空必纯属引擎推断，可省去探测；
+ *   其余所有情况（`nextCol.notNull` 为真，或该表已存在于 `prev` 走增量迁移——物理列可能保留了
+ *   `prev` 的显式 NOT NULL，不依赖规划器是否重建该列）一律走临时列探测。
+ */
+export const needsMssqlNullabilityProbe = (
+  prev: Model,
+  nextCol: Column,
+  readBackNonNull: boolean,
+  builtFromScratch: boolean,
+): boolean => {
+  if (!nextCol.generated?.stored) return false;
+  if (!readBackNonNull) return false;
+  if (nextCol.notNull) return true;
+  if (builtFromScratch) return false;
+  return Object.hasOwn(prev.objects, nextCol.parent);
+};
+
 export const shadowOps = (
   db: () => Promise<Db>,
   schemas?: string[] | null,
@@ -402,7 +545,46 @@ export const shadowOps = (
       // 不在这里脱敏：错误只会走全局 onError（422）或 SSE 的 send，出口统一过 scrubSecrets
       throw new ShadowError(e instanceof Error ? e.message : String(e));
     }
-    return engine.importSnapshot(await engine.readSnapshot(d, schemas));
+    const model = engine.importSnapshot(await engine.readSnapshot(d, schemas));
+    if (dialect !== 'mssql') return model;
+    // SQL Server 持久化计算列（ADR 0019）：导入一律记成推断非空；表达式本身被推断为可空、读回却非空的，
+    // 只能是 SQL 里显式写了 PERSISTED NOT NULL，还原成显式声明。两者都非空时分不出来，按推断记
+    const observed = Object.values(model.objects).filter(
+      (o): o is Column =>
+        o.kind === 'column' && !!o.generated?.stored && o.ext?.mssql?.inferredNotNull === true,
+    );
+    let inferred: Map<string, boolean>;
+    try {
+      inferred = await probeInferred(d, model, observed);
+    } catch (e) {
+      if (isInfraFailure(e, statementTimeoutMs)) throw toShadowError(e);
+      throw e;
+    }
+    for (const c of observed) {
+      if (inferred.get(c.id) !== false) continue;
+      c.notNull = true;
+      setMssqlInferredNotNull(c, false);
+    }
+    return model;
+  },
+  probeMssqlNotNull: async (model: Model, ids: readonly string[]): Promise<Map<string, boolean>> => {
+    const d = await db();
+    const draft = structuredClone(model);
+    const cols: Column[] = [];
+    for (const id of ids) {
+      const c = draft.objects[id];
+      if (c?.kind !== 'column' || !c.generated?.stored) continue;
+      c.notNull = true;
+      setMssqlInferredNotNull(c, false);
+      cols.push(c);
+    }
+    try {
+      await buildTarget(d, draft);
+      return await probeInferred(d, draft, cols);
+    } catch (e) {
+      if (isInfraFailure(e, statementTimeoutMs)) throw toShadowError(e);
+      throw e;
+    }
   },
   canonicalize: async (prev: Model, next: Model): Promise<Obj[]> => {
     let d: Db;
@@ -428,6 +610,7 @@ export const shadowOps = (
     } catch (e) {
       if (!(e instanceof PlanError)) throw e;
     }
+    let builtFromScratch = false;
     try {
       if (steps !== null) {
         let builtPrev = true;
@@ -442,9 +625,13 @@ export const shadowOps = (
           builtPrev = false;
         }
         if (builtPrev) await runSteps(d, steps, dDialect);
-        else await buildTarget(d, next, planOpts);
+        else {
+          builtFromScratch = true;
+          await buildTarget(d, next, planOpts);
+        }
       } else {
         // 未发布表发生普通表↔分区表互转或分区策略变更时无法增量规划：回退为从空库直接建出 next
+        builtFromScratch = true;
         await buildTarget(d, next, planOpts);
       }
     } catch (e) {
@@ -463,6 +650,28 @@ export const shadowOps = (
       throw e;
     }
     const imported = reconcileIds(next, engine.importSnapshot(snapshot));
+    // SQL Server 持久化计算列的推断非空（ADR 0019）：读回可空时推断必为 false；读回非空时，
+    // 只有明确是以非显式从零新建的列无需探测，其余（next 显式，或所在表来自 prev 的增量迁移、
+    // 物理列可能保留 prev 的显式 NOT NULL）一律在影子库临时建非持久化列探测表达式本身，
+    // 确保推断结果不依赖影子库构建路径。只写 ext.mssql.inferredNotNull，绝不改用户的显式 notNull
+    let probed = new Map<string, boolean>();
+    if (dDialect === 'mssql') {
+      const targets: Column[] = [];
+      for (const o of Object.values(next.objects)) {
+        if (o.kind !== 'column' || !o.generated?.stored) continue;
+        const e = imported.objects[o.id];
+        if (e?.kind !== 'column' || !e.generated?.stored) continue;
+        if (needsMssqlNullabilityProbe(prev, o, e.ext?.mssql?.inferredNotNull === true, builtFromScratch)) {
+          targets.push(e);
+        }
+      }
+      try {
+        probed = await probeInferred(d, imported, targets);
+      } catch (e) {
+        if (isInfraFailure(e, statementTimeoutMs)) throw toShadowError(e);
+        throw e;
+      }
+    }
     const out: Obj[] = [];
     for (const o of Object.values(next.objects)) {
       const e = imported.objects[o.id];
@@ -496,7 +705,14 @@ export const shadowOps = (
         if (c.generated && e.generated) {
           c.generated = { ...c.generated, expr: e.generated.expr };
           c.type = e.type;
-          if (dDialect === 'mssql' && c.generated.stored) c.notNull = e.notNull;
+          if (dDialect === 'mssql') {
+            const inferred = !c.generated.stored
+              ? false
+              : probed.has(c.id)
+                ? probed.get(c.id)!
+                : e.ext?.mssql?.inferredNotNull === true;
+            setMssqlInferredNotNull(c, inferred);
+          }
         }
         if (c.default && 'expr' in c.default && e.default && 'expr' in e.default)
           c.default = { expr: e.default.expr };
@@ -515,7 +731,11 @@ export const shadowOps = (
     const d = await db();
     const dDialect = to.dialect;
     try {
-      const r = await verifyScripts(d, from, to, up, down, options);
+      // 读回核对只读冻结时的 schema 范围：调用方给了就用它（版本的 scope），否则用这个影子库的项目范围
+      const r = await verifyScripts(d, from, to, up, down, {
+        ...options,
+        scope: options?.scope !== undefined ? options.scope : (schemas ?? null),
+      });
       const risk = options?.skipRisk
         ? { risks: [] }
         : await risksOf(d, from, r.up, statementTimeoutMs, dDialect, {
@@ -523,14 +743,7 @@ export const shadowOps = (
             mysqlVersionNum: options?.mysqlVersionNum,
             reuseShadowFrom: options?.checkDown !== false && r.upDiff.length === 0 && r.downDiff.length === 0,
           });
-      return {
-        ok: !r.upDiff.length && !r.downDiff.length,
-        ...r,
-        ...risk,
-        error: null,
-        shadowMajor: r.shadowMajor,
-        shadowVersionNum: r.shadowVersionNum,
-      };
+      return reportOf(r, risk);
     } catch (e) {
       if (e instanceof PlanError) {
         return {
@@ -553,19 +766,12 @@ export const shadowOps = (
     const d = await db();
     const dDialect = to.dialect;
     try {
-      const r = await verify(d, from, to, opts);
+      const r = await verify(d, from, to, opts, schemas);
       const risk = await risksOf(d, from, r.up, statementTimeoutMs, dDialect, {
         ...opts,
         reuseShadowFrom: r.upDiff.length === 0 && r.downDiff.length === 0,
       });
-      return {
-        ok: !r.upDiff.length && !r.downDiff.length,
-        ...r,
-        ...risk,
-        error: null,
-        shadowMajor: r.shadowMajor,
-        shadowVersionNum: r.shadowVersionNum,
-      };
+      return reportOf(r, risk);
     } catch (e) {
       if (!(e instanceof StepError) && isPgPrivilegeError(e, dDialect)) {
         throw await pgShadowPrivilegeError(e, d);

@@ -5,7 +5,7 @@ import { afterEach, beforeEach, expect, test } from 'vitest';
 import { audit } from '../src/audit.ts';
 import { createApp, openPlatformDb, type PlatformDb } from '../src/index.ts';
 import type { SecurityConfig } from '../src/security.ts';
-import { addTable, makeUser, PASSWORD } from './support.ts';
+import { addTable, makeUser, PASSWORD, stubPassingShadow } from './support.ts';
 
 let db: PlatformDb;
 let app: ReturnType<typeof createApp>['app'];
@@ -15,6 +15,8 @@ let rooms: ReturnType<typeof createApp>['rooms'];
 beforeEach(async () => {
   db = await openPlatformDb(':memory:');
   const created = createApp(db);
+  // 发布必须经影子库验证（ADR 0017）：这里只要一个已发布版本，用影子库替身
+  stubPassingShadow(created.shadows);
   const { app: a, shadows } = created;
   rooms = created.rooms;
   app = a;
@@ -170,7 +172,7 @@ test('认证与项目动作写入审计', async () => {
   expect(version).toMatchObject({
     actor_id: zhangId,
     target_kind: 'version',
-    data: { projectId: pid, name: 'v1', seq: 1, number: 1, verified: false },
+    data: { projectId: pid, name: 'v1', seq: 1, number: 1, verified: true },
   });
 
   expect((await call('POST', '/api/auth/logout', undefined, login.cookie)).status).toBe(200);

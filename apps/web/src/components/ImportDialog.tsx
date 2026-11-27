@@ -1,14 +1,15 @@
 // 保留线上的修改（ADR 0004 的出口一）：把环境的线上结构导入（覆盖）工作副本。
 // 打开时先预览：覆盖会带来的差异，以及三种只警告、不拦截的情况（环境落后于链头 / 半途失败的迁移 / 工作副本有未发布的修改）。
-import type { ModelUpdate, PullPreview } from '@dowel/api';
+import type { PullPreview, PullResult } from '@dowel/api';
 import { useQueryClient } from '@tanstack/react-query';
 import { LoaderCircle } from 'lucide-react';
-import { useEffect, useState } from 'react';
+import { useEffect, useRef, useState } from 'react';
 import { useTranslation } from 'react-i18next';
 
 import { ApiError, api } from '../api.ts';
 import { DiffList } from './ExecDialog.tsx';
 import { Modal } from './Modal.tsx';
+import { NullabilityFallbackNotice } from './NullabilityFallback.tsx';
 import { useToast } from './Toasts.tsx';
 import { Banner } from './ui.tsx';
 
@@ -20,6 +21,13 @@ export const ImportDialog = ({ pid, eid, onClose }: { pid: string; eid: string; 
   const [preview, setPreview] = useState<PullPreview | null>(null);
   const [error, setError] = useState('');
   const [busy, setBusy] = useState(false);
+  /** 覆盖完成、但有需要用户看的提示（SQL Server 持久化计算列因没有影子库按显式非空记录，ADR 0019）：弹窗留在完成态 */
+  const [done, setDone] = useState<PullResult | null>(null);
+  const doneRef = useRef<HTMLDivElement>(null);
+  // 进入完成态时原确认按钮已卸载：把焦点移到结果顶部，读屏从成功提示读起，Tab 再到“完成”
+  useEffect(() => {
+    if (done) doneRef.current?.focus();
+  }, [done]);
 
   useEffect(() => {
     let live = true;
@@ -38,7 +46,7 @@ export const ImportDialog = ({ pid, eid, onClose }: { pid: string; eid: string; 
     setError('');
     try {
       // 带着预览时的线上结构指纹：线上结构在预览之后又变了，服务端 409 并给出新的预览
-      const r = await api<ModelUpdate>('POST', base, {
+      const r = await api<PullResult>('POST', base, {
         fingerprint: preview.fingerprint,
         workingSeq: preview.workingSeq,
       });
@@ -49,6 +57,12 @@ export const ImportDialog = ({ pid, eid, onClose }: { pid: string; eid: string; 
       // 影子库来源 / 基线可能变了：状态栏的规范化状态（含 shadow 配置）重查（ADR 0016）
       void qc.invalidateQueries({ queryKey: ['normalize', pid] });
       void qc.invalidateQueries({ queryKey: ['activity', pid] });
+      if (r.nullabilityFallback?.columns.length) {
+        // 对话框打开时不弹通知：结果与受影响的列留在弹窗里
+        setDone(r);
+        setBusy(false);
+        return;
+      }
       toast(t('dr.importDone', { count: r.objects }));
       onClose();
     } catch (e) {
@@ -69,10 +83,35 @@ export const ImportDialog = ({ pid, eid, onClose }: { pid: string; eid: string; 
   };
 
   const w = preview?.warnings;
+  if (done)
+    return (
+      <Modal
+        open
+        onClose={onClose}
+        size="md"
+        title={t('dr.importDoneTitle')}
+        footer={
+          <>
+            <span className="flex-1" />
+            <button type="button" className="btn primary" onClick={onClose}>
+              {t('dr.importDoneClose')}
+            </button>
+          </>
+        }
+      >
+        <div ref={doneRef} tabIndex={-1} className="space-y-3 text-sm">
+          <Banner kind="ok" role="status">
+            {t('dr.importDone', { count: done.objects })}
+          </Banner>
+          <NullabilityFallbackNotice columns={done.nullabilityFallback?.columns ?? []} />
+        </div>
+      </Modal>
+    );
   return (
     <Modal
       open
       onClose={onClose}
+      pending={busy}
       size="md"
       title={t('dr.importTitle')}
       footer={

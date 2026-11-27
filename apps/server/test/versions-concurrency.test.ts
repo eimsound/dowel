@@ -10,7 +10,7 @@ import { afterAll, beforeAll, describe, expect, test } from 'vitest';
 import { connect, createTestDb, PG_URL } from '../../../test/pg.ts';
 import { createApp, openPlatformDb, type PlatformDb } from '../src/index.ts';
 import { LoginLimiter } from '../src/rate-limit.ts';
-import { addTable, editModel, makeUser, PASSWORD } from './support.ts';
+import { addTable, editModel, makeUser, PASSWORD, stubPassingShadow } from './support.ts';
 
 process.env.DOWEL_SECRET ??= 'versions-concurrency-secret-0123456789';
 
@@ -139,6 +139,8 @@ describe.skipIf(!PG_URL)('版本发布 / 作废 / 取消作废并发串行化（
     platform = await createTestDb('ver_conc');
     db = await openPlatformDb(platform.url);
     created = createApp(db, { loginLimiter: new LoginLimiter({ limit: 10_000, ipLimit: 10_000 }) });
+    // 发布必须经影子库验证（ADR 0017）：这里只关心并发与链头校验，用影子库替身
+    stubPassingShadow(created.shadows);
     await makeUser(db, 'admin', { role: 'admin' });
     ids.e1 = (await makeUser(db, 'e1')).id;
     ids.e2 = (await makeUser(db, 'e2')).id;
