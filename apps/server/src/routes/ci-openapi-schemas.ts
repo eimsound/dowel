@@ -435,6 +435,6 @@ export const ciEnvironmentExecuteRoute = createRoute({
       description: '预演计划或实际执行结果',
       content: { 'application/json': { schema: ciExecuteResultOpenApiSchema } },
     },
-    ...ciErrorResponses([400, 401, 403, 404, 409, 422, 423, 429, 500, 502]),
+    ...ciErrorResponses([400, 401, 403, 404, 409, 413, 422, 423, 429, 500, 502]),
   },
 });
