@@ -66,8 +66,9 @@ export interface Shadow {
     options?: ShadowVerifyScriptsOptions,
   ): Promise<VerifyReport>;
   /**
-   * 派生数据（04-ir-design.md 2.6）：建出 prev（已规范化的版本），执行到 next 的迁移，读回引擎输出，
-   * 返回 next 中与引擎规范形式不同的对象（已换成规范形式）。写回的字段：CHECK 的 `expr`；列表达式默认值的 `expr`；
+   * 派生数据（04-ir-design.md 2.6）：建出 prev（已规范化的版本）并执行到 next 的迁移（若规划抛 `PlanError`，
+   * 或非空 prev 建库遇非基础设施 `StepError` 且无依赖或父对象改名的不透明对象，则回退为从空库直接建出 next），
+   * 读回引擎输出，返回 next 中与引擎规范形式不同的对象（已换成规范形式）。写回的字段：CHECK 的 `expr`；列表达式默认值的 `expr`；
    * 生成列的 `expr` 连同引擎推导的 `type`（MSSQL 持久化生成列还有 `notNull`）；索引表达式元素的 `expr` 与 `where`；
    * 表的分区键 `partitionBy.keys[].expr` 与分区边界 `partitionOf.bound`；不透明对象的 `ddl`。
    */
