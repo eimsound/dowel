@@ -1231,6 +1231,15 @@ const zh = {
     rejectNoMatching: '没有与环境数据库版本一致的影子库',
     rejectNoMatchingBody:
       '通过验证的影子库版本与下面这些环境的数据库版本都不一致，“已验证”无法保证在它们上面能执行。请为环境配置版本相同的独立影子库，或允许使用同实例影子库。',
+    previewUncoveredTitle: '这次验证没有覆盖这些环境的数据库版本',
+    previewUncoveredBody:
+      '这不会阻止发布，但发布后的版本不能执行或回滚到下面这些环境，直到为它们配置数据库版本相同的影子库（或允许同实例影子库；尚未探测版本的请先测试连接）并完成验证。',
+    previewSingleEnvTitle: '只在 {{env}} 的影子库上验证',
+    previewSingleEnvBody: '发布时会按全部环境的数据库版本逐个验证。下面这些环境这次没有覆盖：',
+    previewNoMatchingBody:
+      '迁移在影子库上闭环验证通过，但通过验证的影子库版本与下面这些环境的数据库版本都不一致，现在发布会被拒绝。尚未探测版本的环境请先测试连接；其余请配置版本相同的独立影子库，或允许使用同实例影子库。',
+    previewNoMatchingSingleEnvBody:
+      '只在 {{env}} 的影子库上验证：迁移闭环验证通过，但这个影子库的版本与下面这些环境的数据库版本都不一致。发布时会按全部环境的数据库版本逐个验证；如果没有任一环境有版本一致的影子库，发布会被拒绝。尚未探测版本的环境请先测试连接；其余请配置版本相同的独立影子库，或允许使用同实例影子库。',
     readbackTitle: '读回核对没有通过：模型的写法与数据库读回的不一致',
     readbackBody:
       '数据库会按自己的写法保存这些属性，执行时的读回校验会因此失败。请按“数据库读回”一列修改模型后重新发布；Dowel 不会自动修正。出现这种情况通常说明规范化有遗漏，服务端已记录日志。',
@@ -1294,8 +1303,8 @@ const zh = {
     envCanCreate: '可以建库',
     envCannotCreate: '没有建库权限（需手动建影子库）',
     envNone: '还没有环境。添加一个环境后才能导入 SQL、验证迁移。',
-    verifyOn: '验证用的影子库',
-    verifyOnShort: '在此环境的影子库验证',
+    verifyOnShort: '验证范围',
+    verifyAllEnvs: '全部环境（按数据库版本）',
     verifyInMemory: '使用内置 SQLite :memory: 影子库进行验证（无需外部环境）',
     noEnv: '项目还没有配置环境。验证迁移需要一个真实的 {{dialect}} 实例作影子库，请先在“环境”里添加。',
     usedShadow: '影子库：{{s}}',
@@ -3748,6 +3757,16 @@ const en: typeof zh = {
     rejectNoMatching: 'No shadow database matches the environments’ database versions',
     rejectNoMatchingBody:
       'The shadow databases that passed run versions that match none of the environments below, so "verified" would not guarantee the migration runs there. Configure a dedicated shadow database with the same version, or allow a same-instance shadow.',
+    previewUncoveredTitle: 'This verification did not cover these environments’ database versions',
+    previewUncoveredBody:
+      'This will not block publishing, but the published version cannot be executed or rolled back on the environments below until each has a shadow database running the same version (or allows a same-instance shadow; test the connection first if its version is not detected yet) and passes verification.',
+    previewSingleEnvTitle: 'Verified only on {{env}}’s shadow database',
+    previewSingleEnvBody:
+      'Publishing verifies across all environments’ database versions. These environments were not covered this time:',
+    previewNoMatchingBody:
+      'The migration passed closed-loop verification in the shadow database, but none of the shadow database versions that passed match the environments below, so publishing now would be rejected. Test the connection first for environments with an undetected version; for others, configure a dedicated shadow database running the same version, or allow a same-instance shadow.',
+    previewNoMatchingSingleEnvBody:
+      'Verified only on {{env}}’s shadow database: the migration passed closed-loop verification, but this shadow database’s version matches none of the environments below. Publishing verifies across all environments’ database versions and will be rejected if no environment has a matching shadow database. Test the connection first for environments with an undetected version; for others, configure a dedicated shadow database running the same version, or allow a same-instance shadow.',
     readbackTitle: 'Readback check failed: the model’s spelling differs from what the database reads back',
     readbackBody:
       'The database stores these properties in its own spelling, so the readback check during execution would fail. Change the model to the values in the "Read back" column and publish again; Dowel does not fix this automatically. This usually means normalization missed something; the server has logged it.',
@@ -3814,8 +3833,8 @@ const en: typeof zh = {
     envCanCreate: 'can create databases',
     envCannotCreate: 'cannot create databases (create the shadow database manually)',
     envNone: 'No environments yet. Add one to import SQL and verify migrations.',
-    verifyOn: 'Shadow database for verification',
-    verifyOnShort: 'Verify in the shadow database of',
+    verifyOnShort: 'Verification scope',
+    verifyAllEnvs: 'All environments (by database version)',
     verifyInMemory: 'Verified using built-in SQLite :memory: shadow (no external environment needed)',
     noEnv:
       'No environment yet. Verifying migrations needs a real {{dialect}} instance as the shadow database; add one under “Environments”.',

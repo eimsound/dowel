@@ -864,12 +864,42 @@ export const verifyResponseSchema = verifyReportSchema.extend({
 });
 export type VerifyResponse = z.infer<typeof verifyResponseSchema>;
 
+/**
+ * 迁移预览验证（POST /api/projects/:pid/verify）：from / to 是版本引用（`empty` 空模型、`head` 工作副本）；
+ * env 省略时按项目环境的数据库完整版本号分组逐个验证（与发布一致），指定时只在这个环境的影子库上验证
+ */
 export const verifyRequestSchema = z.object({
   from: z.string().default('empty'),
   to: z.string().default('head'),
   env: z.string().optional(),
 });
 export type VerifyRequest = z.infer<typeof verifyRequestSchema>;
+
+/**
+ * 迁移预览验证的结论代码（与发布被拒绝的代码同名同义，ADR 0017）：
+ * - verify_failed：影子库闭环验证没有通过（脚本执行失败或结构不一致）；
+ * - readback_mismatch：读回核对发现模型里的写法与数据库读回的不一致（readbackDiff 列出）；
+ * - no_matching_shadow：影子库都通过了，但没有一个与项目环境的数据库完整版本号一致（或环境的版本还未知）。
+ */
+export const migrationVerifyCodeSchema = z.enum(['verify_failed', 'readback_mismatch', 'no_matching_shadow']);
+export type MigrationVerifyCode = z.infer<typeof migrationVerifyCodeSchema>;
+
+/**
+ * 迁移预览验证的响应：执行的是发布时会冻结的同一份 up / down 脚本，验证方式与发布一致（按完整版本号选影 + 读回核对）。
+ * 未指定 env 时，`ok` 为 true（此时 `code` 为 null）才表示同样的迁移现在发布能通过验证；指定 env 时只代表这一个影子库的结论
+ * （发布还会验证其他版本）。no_matching_shadow 时影子库都通过了，但 `ok` 仍为 false（各影子库的结论见 records）。
+ * up / down 是规划器的步骤（与 GET /migration 一致）。
+ */
+export const migrationVerifyResponseSchema = verifyResponseSchema.extend({
+  code: migrationVerifyCodeSchema.nullable(),
+  /** no_matching_shadow 时的说明 */
+  reason: z.string().optional(),
+  /** 本次通过验证的数据库完整版本号 */
+  verifiedOn: z.array(z.string()),
+  /** 本次验证没有覆盖到的环境（它的数据库完整版本号没有通过的记录；指定 env 时其余环境都在这里） */
+  uncovered: z.array(uncoveredEnvironmentSchema),
+});
+export type MigrationVerifyResponse = z.infer<typeof migrationVerifyResponseSchema>;
 
 /**
  * 按需规范化（ADR 0016）：编辑期间不自动回影子库，模型页状态栏显示待规范化数量，编辑者点“规范化”显式触发。

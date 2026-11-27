@@ -126,8 +126,9 @@ describe.each([
       connectionLimiter: opts?.connectionLimiter,
       mailer: async () => {},
     });
-    // 发布必须经影子库验证（ADR 0017）：这里的发布只为得到已发布版本，用影子库替身
-    stubPassingShadow(created.shadows);
+    // 发布必须经影子库验证（ADR 0017）：这里的发布只为得到已发布版本，用影子库替身；
+    // verify_migration 与发布同一套选影（Issue #199），要看真实选影的用例先 restoreShadowStub()
+    const restoreShadowStub = stubPassingShadow(created.shadows);
     const close = async () => {
       created.refresher.stop();
       await created.refresher.drain();
@@ -306,6 +307,7 @@ describe.each([
     return {
       db,
       created,
+      restoreShadowStub,
       admin,
       alice,
       bob,
@@ -1039,6 +1041,7 @@ describe.each([
       expect(verifySqlite.structuredContent?.to).toBe('head');
 
       // verify_migration：p1 是 PG 方言项目且未配置独立影子库 → 返回 shadow_unavailable，并记录 ok: false 的 model.verify 审计
+      f.restoreShadowStub();
       await addTable(f.created.rooms, f.db, f.p1Id, 'pg_orders');
       const verifyPg = await f.callTool(tokAlice.token, 'verify_migration', {
         project: f.p1Id,
@@ -1065,6 +1068,7 @@ describe.each([
       // 1. SQLite（内存影子库）与未配置环境 / 生产禁止同实例等 preConnect ShadowError 不消耗连接配额
       const limiter = new KeyedLimiter({ limit: 2, windowMs: 60_000 });
       const f = await setupEnv({ connectionLimiter: limiter });
+      f.restoreShadowStub();
       const tok = await f.issueToken(f.admin.id, ['read', 'verify'], null, 'tok-pre');
       await editModel(f.created.rooms, f.db, f.p2Id, (m) => {
         const sid = all(m, 'schema')[0]?.id ?? createSchema(m, 'main');
@@ -1113,6 +1117,7 @@ describe.each([
       // 2. 外部影子库验证按同一用户（跨 MCP 令牌 + 与界面 connectionLimit 共用桶）扣减配额
       const sharedLimiter = new KeyedLimiter({ limit: 2, windowMs: 60_000 });
       const fShared = await setupEnv({ connectionLimiter: sharedLimiter });
+      fShared.restoreShadowStub();
       const tok1 = await fShared.issueToken(fShared.admin.id, ['read', 'verify'], null, 'tok-1');
       const tok2 = await fShared.issueToken(fShared.admin.id, ['read', 'verify'], null, 'tok-2');
       await addTable(fShared.created.rooms, fShared.db, fShared.p1Id, 'shared_rate_tbl');
@@ -1121,7 +1126,11 @@ describe.each([
         importSql: async () => {
           throw new Error('not used');
         },
-        verify: async () => ({
+        verify: async () => {
+          throw new Error('not used');
+        },
+        // 与发布同一套验证（Issue #199）：执行冻结脚本
+        verifyScripts: async () => ({
           ok: true,
           up: [],
           down: [],
@@ -1129,10 +1138,8 @@ describe.each([
           downDiff: [],
           risks: [],
           error: null,
+          engineVersion: '16.4',
         }),
-        verifyScripts: async () => {
-          throw new Error('not used');
-        },
         canonicalize: async () => [],
         close: async () => {},
       };
@@ -1171,6 +1178,7 @@ describe.each([
       // 3. 真实连库类的 ShadowUnavailableError（非 preConnect）仍消耗配额
       const errLimiter = new KeyedLimiter({ limit: 1, windowMs: 60_000 });
       const fErr = await setupEnv({ connectionLimiter: errLimiter });
+      fErr.restoreShadowStub();
       const tokErr = await fErr.issueToken(fErr.admin.id, ['read', 'verify'], null, 'tok-err');
       await addTable(fErr.created.rooms, fErr.db, fErr.p1Id, 'err_rate_tbl');
       fErr.created.shadows.forProject = async () => {
@@ -1199,6 +1207,7 @@ describe.each([
     'verify_migration：影子库句柄因配置变更被关闭（#154）返回可重试的 shadow_config_changed',
     async () => {
       const f = await setupEnv();
+      f.restoreShadowStub();
       const tok = await f.issueToken(f.admin.id, ['read', 'verify'], null, 'tok-changed');
       await addTable(f.created.rooms, f.db, f.p1Id, 'changed_tbl');
 
@@ -1228,6 +1237,127 @@ describe.each([
       });
       expect(r2.isError).toBe(true);
       expect(r2.structuredContent?.code).toBe('shadow_config_changed');
+    },
+  );
+
+  test.skipIf(platform !== 'sqlite')(
+    'verify_migration 与发布同一把尺子（Issue #199）：按完整版本号逐组验证冻结脚本，读回不一致报 readback_mismatch；指定 env 只用它的影子库',
+    async () => {
+      const limiter = new KeyedLimiter({ limit: 10, windowMs: 60_000 });
+      const f = await setupEnv({ connectionLimiter: limiter });
+      f.restoreShadowStub();
+      const tok = await f.issueToken(f.admin.id, ['read', 'verify'], null, 'tok-align');
+      await addTable(f.created.rooms, f.db, f.p1Id, 'align_tbl');
+      const item = {
+        direction: 'up',
+        object: 'public.align_tbl.id',
+        property: 'type',
+        modelValue: 'int',
+        liveValue: 'integer',
+      };
+      const labels: string[] = [];
+      const shadowOf = (label: string, engineVersion: string, readback: boolean): Shadow => ({
+        importSql: async () => {
+          throw new Error('not used');
+        },
+        verify: async () => {
+          throw new Error('不应重新规划：应执行冻结脚本');
+        },
+        verifyScripts: async () => {
+          labels.push(label);
+          return {
+            ok: !readback,
+            up: [],
+            down: [],
+            upDiff: [],
+            downDiff: [],
+            risks: [],
+            error: null,
+            engineVersion,
+            ...(readback ? { readbackTotal: 1, readbackDiff: [item as never] } : {}),
+          };
+        },
+        canonicalize: async () => [],
+        close: async () => {},
+      });
+      const environments = [
+        { id: 'env-a', name: 'dev', engineVersion: '16.4' },
+        { id: 'env-b', name: 'staging', engineVersion: '17.2' },
+      ];
+      f.created.shadows.forProjectEngineVersions = async () => ({
+        entries: [
+          {
+            engineVersion: '16.4',
+            envId: 'env-a',
+            label: 'dev-shadow',
+            shadow: shadowOf('dev', '16.4', false),
+          },
+          {
+            engineVersion: '17.2',
+            envId: 'env-b',
+            label: 'staging-shadow',
+            shadow: shadowOf('staging', '17.2', true),
+          },
+        ],
+        skipped: [],
+        environments,
+        identical: false,
+      });
+      // 读回不一致和发布一样记服务端日志
+      const logged = vi.spyOn(console, 'error').mockImplementation(() => {});
+      const r = await f.callTool(tok.token, 'verify_migration', {
+        project: f.p1Id,
+        from: 'empty',
+        to: 'head',
+      });
+      expect(logged).toHaveBeenCalled();
+      logged.mockRestore();
+      expect(r.isError).toBeFalsy();
+      expect(labels).toEqual(['dev', 'staging']);
+      expect(r.structuredContent).toMatchObject({
+        ok: false,
+        code: 'readback_mismatch',
+        verifiedOn: ['16.4'],
+        uncovered: [environments[1]],
+        report: { ok: false, readbackTotal: 1, readbackDiff: [item] },
+      });
+      // 验证真的连了影子库：限速额度不退
+      expect(limiter.keyCount).toBe(1);
+      const audits = await f.db.query<{ data: { ok: boolean; shadow: string | null } }>(
+        "select data from audit_events where action = 'model.verify' order by at desc limit 1",
+      );
+      expect(audits[0]!.data).toMatchObject({ ok: false, shadow: 'staging-shadow（17.2）' });
+
+      // 指定 env：只在这个环境的影子库上验证，其余环境列为未覆盖
+      await f.db.query(
+        `insert into environments (id, project_id, name, url_enc, production, engine_version, engine_version_num)
+         values ('env-only', $1, 'only', $2, false, '16.4', 160004)`,
+        [f.p1Id, encrypt('postgres://u:p@127.0.0.1:1/app')],
+      );
+      f.created.shadows.forProjectEngineVersions = async () => {
+        throw new Error('指定 env 时不应按版本分组选影');
+      };
+      const seen: (string | undefined)[] = [];
+      f.created.shadows.forProject = async (_pid: string, eid?: string) => {
+        seen.push(eid);
+        return { label: 'only-shadow', shadow: shadowOf('only', '16.4', false) };
+      };
+      labels.length = 0;
+      const r2 = await f.callTool(tok.token, 'verify_migration', {
+        project: f.p1Id,
+        from: 'empty',
+        to: 'head',
+        env: 'only',
+      });
+      expect(r2.isError).toBeFalsy();
+      expect(seen).toEqual(['env-only']);
+      expect(labels).toEqual(['only']);
+      expect(r2.structuredContent).toMatchObject({
+        ok: true,
+        code: null,
+        verifiedOn: ['16.4'],
+        uncovered: [],
+      });
     },
   );
 

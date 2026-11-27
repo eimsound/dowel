@@ -1,6 +1,7 @@
 // 版本查询、模型引用解析、DDL 生成、迁移预览与跨版本影子库验证辅助函数。
 // 供 HTTP 路由（routes/versions.ts）与 MCP 工具（mcp-server.ts）共同复用，避免两套实现分叉。
 import type {
+  MigrationVerifyResponse,
   StoredVerifyReport,
   UncoveredEnvironment,
   VerifyRecord,
@@ -12,7 +13,9 @@ import type {
 import {
   createAll,
   type Dialect,
+  engineFullVersion,
   formatScript,
+  getDialect,
   type Model,
   plan,
   type PlanOptions,
@@ -30,12 +33,12 @@ import {
 } from '@dowel/engines';
 import { HTTPException } from 'hono/http-exception';
 
-import { emptyBase, versionExecutedAnywhere } from './chain.ts';
+import { emptyBase, freezeScripts, versionExecutedAnywhere } from './chain.ts';
 import type { OpaqueRefresher } from './derive.ts';
 import { iso, projectPlanOptions, verifiedOnOf } from './envs.ts';
 import { scrubSecrets } from './secrets.ts';
 import { recordOf, ShadowConfigChangedError, ShadowError, storedReport } from './shadow.ts';
-import type { Shadows } from './shadows.ts';
+import type { ProjectEngineShadows, Shadows } from './shadows.ts';
 
 /** 概要字段：版本列表用 */
 export interface InfoRow {
@@ -393,11 +396,16 @@ export const verifyOnShadows = async (
     scope: string[] | null;
     /** 已有的验证记录（重新验证时合并；发布为空） */
     previous?: readonly VerifyRecord[];
+    /** 指定选影结果（迁移预览验证指定了环境时只用它的影子库）；缺省按完整版本号分组选影 */
+    selection?: ProjectEngineShadows;
   },
 ): Promise<ShadowVerifyOutcome> => {
-  const selection = await shadows.forProjectEngineVersions(pid);
+  const selection = o.selection ?? (await shadows.forProjectEngineVersions(pid));
   if (!selection.entries.length) {
-    throw new ShadowError(selection.skipped[0]?.reason ?? '没有可用的影子库');
+    // 每一组都是在连库之前就因配置前置条件拿不到影子库：保留 preConnect（MCP 据此退回连库限速）
+    throw new ShadowError(selection.skipped[0]?.reason ?? '没有可用的影子库', {
+      preConnect: selection.skipped.length > 0 && selection.skipped.every((x) => x.preConnect === true),
+    });
   }
   const at = new Date().toISOString();
   const fresh: VerifyRecord[] = [];
@@ -497,6 +505,121 @@ export const verifyOnShadows = async (
     };
   }
   return { kind: 'ok', stored, verifiedOn: cov.verifiedOn, uncovered: cov.uncovered };
+};
+
+/**
+ * 指定环境的选影结果：只用这个环境的影子库（环境不存在 → 404；项目已删 → ProjectGoneError；
+ * 影子库拿不到 → ShadowError，preConnect 原样保留），覆盖情况仍对照项目的全部环境计算。
+ * 内置影子库的方言（SQLite）不区分环境，返回 undefined 交给默认选影。
+ */
+const environmentSelection = async (
+  db: Db,
+  shadows: Shadows,
+  pid: string,
+  dialect: Dialect,
+  envId: string,
+): Promise<ProjectEngineShadows | undefined> => {
+  if (!getDialect(dialect).capabilities.requiresExternalShadow) return undefined;
+  const s = await shadows.forProject(pid, envId);
+  const rows = await db.query<{
+    id: string;
+    name: string;
+    engine_version: string | null;
+    engine_version_num: number | null;
+  }>(
+    'select id, name, engine_version, engine_version_num from environments where project_id = $1 order by created_at',
+    [pid],
+  );
+  const environments = rows.map((r) => ({
+    id: r.id,
+    name: r.name,
+    engineVersion: engineFullVersion(dialect, {
+      version: r.engine_version,
+      versionNum: r.engine_version_num,
+    }),
+  }));
+  return {
+    entries: [
+      {
+        engineVersion: environments.find((e) => e.id === envId)?.engineVersion ?? null,
+        envId,
+        shadow: s.shadow,
+        label: s.label,
+      },
+    ],
+    skipped: [],
+    environments,
+    identical: false,
+  };
+};
+
+/**
+ * 迁移预览验证（POST /api/projects/:pid/verify 与 MCP verify_migration 共用，Issue #199）：与发布同一把尺子——
+ * 按项目规划选项冻结出发布时会冻结的同一份 up / down（freezeScripts），交给 verifyOnShadows 闭环验证
+ * （按数据库完整版本号选影、读回核对只读项目的 schema 范围）。envId 指定时只在该环境的影子库上验证。
+ * 结论用发布被拒绝的同名代码表达（code 为 null 即通过）；不写任何验证记录。
+ * 影子库不可用（ShadowError）、配置已变更（ShadowConfigChangedError）、项目已删（ProjectGoneError）原样抛给调用方。
+ */
+export const verifyMigration = async (
+  db: Db,
+  shadows: Shadows,
+  o: {
+    pid: string;
+    dialect: Dialect;
+    schemas: string[] | null | undefined;
+    from: Model;
+    to: Model;
+    envId?: string | undefined;
+  },
+): Promise<MigrationVerifyResponse> => {
+  const planOpts = await projectPlanOptions(db, o.pid, o.dialect);
+  // 规划不出来（PlanError）与发布一样原样抛出（HTTP 422）
+  const frozen = freezeScripts(o.from, o.to, planOpts);
+  // env 为空串与省略同义：按完整版本号分组
+  const selection = o.envId ? await environmentSelection(db, shadows, o.pid, o.dialect, o.envId) : undefined;
+  const outcome = await verifyOnShadows(shadows, o.pid, o.dialect, {
+    from: o.from,
+    to: o.to,
+    up: frozen.up,
+    down: frozen.down,
+    checkDown: true,
+    planOpts,
+    scope: o.schemas?.length ? o.schemas : null,
+    ...(selection ? { selection } : {}),
+  });
+  const coverage = { verifiedOn: outcome.verifiedOn, uncovered: outcome.uncovered };
+  // 报告里的步骤沿用规划器的 kind / target（与 GET /migration 一致），带上冻结时的 transactional
+  const withTx = (planned: Step[], script: ScriptStep[]) =>
+    planned.map((x, i) => ({ ...x, transactional: script[i]!.transactional }));
+  const steps = { up: withTx(frozen.planned.up, frozen.up), down: withTx(frozen.planned.down, frozen.down) };
+  const { at: _at, ...stored } = outcome.stored;
+  switch (outcome.kind) {
+    case 'ok':
+      return { ...stored, ...steps, code: null, ...coverage };
+    case 'failed':
+      if (outcome.readback)
+        // 读回不一致说明写入层 / 规范化有缺陷（ADR 0017 决定 3）：和发布一样记日志便于定位，不自动修复
+        console.error(
+          `迁移预览验证被读回核对拒绝（项目 ${o.pid}）：模型里的写法与数据库读回的不一致，规范化可能有缺陷`,
+          JSON.stringify((outcome.report.readbackDiff ?? []).slice(0, 10)),
+        );
+      return {
+        ...outcome.report,
+        ...steps,
+        code: outcome.readback ? 'readback_mismatch' : 'verify_failed',
+        ...coverage,
+      };
+    case 'unmatched':
+      // 影子库都通过了，但发布会被拒绝：ok 为 false，只看 ok 的调用方不会把它当成可以发布（记录里仍是各影子库的真实结论）
+      return {
+        ...stored,
+        ...steps,
+        ok: false,
+        code: 'no_matching_shadow',
+        reason: outcome.reason,
+        ...coverage,
+      };
+  }
 };
 
 export interface ResolveModelRefOptions {

@@ -68,7 +68,8 @@ test('添加环境、从数据库导入、在同实例影子库验证', async ({
 
   await page.getByRole('button', { name: '迁移' }).click();
   const mig = page.getByRole('dialog', { name: '迁移' });
-  await expect(mig.getByLabel('验证用的影子库')).toHaveValue(/.+/);
+  // 默认按全部环境的数据库版本验证（与发布一致，Issue #199）
+  await expect(mig.getByLabel('验证范围')).toHaveValue('');
   await mig.getByRole('button', { name: '在影子库验证' }).click();
   await expect(mig.getByRole('status')).toContainText('验证通过', { timeout: 60_000 });
   await expect(mig.getByRole('status')).toContainText('影子库：dev：e2e_shop_dowel');

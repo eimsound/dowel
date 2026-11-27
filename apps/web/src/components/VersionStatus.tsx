@@ -195,7 +195,7 @@ export const EnvVersionList = ({ envs }: { envs: UncoveredEnvironment[] }) => {
 };
 
 /** 验证记录（ADR 0017 决定 5）：按数据库完整版本号列出通过 / 没通过 */
-const recordsSummary = (records: VerifyRecord[] | undefined, t: TFunction) =>
+export const recordsSummary = (records: VerifyRecord[] | undefined, t: TFunction) =>
   records?.length
     ? records
         .map((r) =>

@@ -9,6 +9,7 @@ import {
   type PlanOptions,
   plan,
   scopeCoversPublic,
+  type Step,
 } from '@dowel/core';
 import { type Db, type ScriptStep, stepsChecksum, toScriptSteps } from '@dowel/engines';
 
@@ -21,11 +22,19 @@ export interface FrozenScripts {
   checksum: string;
 }
 
-/** 冻结 from → to 的迁移：up = plan(from, to, opts)，down = plan(to, from, opts) */
-export const freezeScripts = (from: Model, to: Model, opts?: PlanOptions): FrozenScripts => {
-  const up = toScriptSteps(plan(from, to, opts), to.dialect);
-  const down = toScriptSteps(plan(to, from, opts), from.dialect);
-  return { up, down, checksum: stepsChecksum(up, down) };
+/**
+ * 冻结 from → to 的迁移：up = plan(from, to, opts)，down = plan(to, from, opts)。
+ * planned 是规划器原始的步骤（带 kind / target，与 up / down 一一对应），迁移预览验证的报告用它
+ */
+export const freezeScripts = (
+  from: Model,
+  to: Model,
+  opts?: PlanOptions,
+): FrozenScripts & { planned: { up: Step[]; down: Step[] } } => {
+  const planned = { up: plan(from, to, opts), down: plan(to, from, opts) };
+  const up = toScriptSteps(planned.up, to.dialect);
+  const down = toScriptSteps(planned.down, from.dialect);
+  return { up, down, checksum: stepsChecksum(up, down), planned };
 };
 
 /**

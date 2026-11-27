@@ -173,7 +173,9 @@ describe.runIf(ADMIN)('真实 PG 实例', () => {
     const r = await call('POST', `/api/projects/${pid}/verify`, { from: v1, to: 'head' });
     expect(r.data.error).toBeNull();
     expect(r.data.ok).toBe(true);
-    expect(r.data.shadow).toBe('dev：shop_dowel');
+    // 与发布同一套验证（Issue #199）：影子库名后带它的数据库完整版本号
+    expect(r.data.shadow).toMatch(/^dev：shop_dowel(（[^）]+）)?$/);
+    expect(r.data.code).toBeNull();
     const [mark] = await admin.db.query<{ c: string }>(
       "select shobj_description(oid, 'pg_database') as c from pg_database where datname = 'shop_dowel'",
     );

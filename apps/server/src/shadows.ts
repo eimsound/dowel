@@ -80,8 +80,11 @@ export interface EngineVersionShadowEntry {
 export interface ProjectEngineShadows {
   /** 每个环境数据库完整版本号一个代表影子库（按数值版本号升序，未知版本在最后） */
   entries: EngineVersionShadowEntry[];
-  /** 拿不到可用影子库的版本及首个原因 */
-  skipped: { engineVersion: string | null; reason: string }[];
+  /**
+   * 拿不到可用影子库的版本及首个原因；preConnect：这一组的候选全部在连库之前就因配置前置条件失败
+   * （如生产环境未允许同实例影子库），整体没有可用影子库时据此决定是否退回连库限速
+   */
+  skipped: { engineVersion: string | null; reason: string; preConnect?: boolean }[];
   /** 项目的全部环境（发布时据此判断覆盖了哪些环境） */
   environments: ProjectEnvVersion[];
   /** 影子库与目标库是同一个内置库（SQLite）：版本视为恒等 */
@@ -566,6 +569,7 @@ export class Shadows {
     for (const [engineVersion, g] of ordered) {
       const candidates = [...g.rows].sort((a, b) => candidatePriority(a) - candidatePriority(b));
       let firstReason: string | null = null;
+      let preConnect = true;
       let picked = false;
       for (const cand of candidates) {
         try {
@@ -577,9 +581,10 @@ export class Shadows {
           // 配置已变更是可重试的暂时状态：整体重试，不能把这个完整版本组当成“没有可用影子库”跳过
           if (!(e instanceof ShadowError) || e instanceof ShadowConfigChangedError) throw e;
           firstReason ??= scrubSecrets(e.message);
+          preConnect &&= e.preConnect;
         }
       }
-      if (!picked) skipped.push({ engineVersion, reason: firstReason ?? '没有可用的影子库' });
+      if (!picked) skipped.push({ engineVersion, reason: firstReason ?? '没有可用的影子库', preConnect });
     }
     return { entries, skipped, environments, identical: false };
   }

@@ -4,12 +4,12 @@
 import {
   type CanvasHistoryConflict,
   type MigrationResult,
+  type MigrationVerifyResponse,
   type ModelUpdate,
   type PublishedTables,
   type PublishRejected,
   type StoredVerifyReport,
   stepsPatchSchema,
-  type VerifyResponse,
   versionApplySchema,
   type VersionCanvasDiff,
   type VersionCreated,
@@ -69,6 +69,7 @@ import {
   listProjectVersions,
   loadVersion,
   resolveModelRef,
+  verifyMigration,
   verifyOnShadows,
   versionDetailOf,
   type VersionTreeNode,
@@ -987,16 +988,26 @@ export const registerVersions = (app: Hono<Env>, ctx: AppContext) => {
     });
   });
 
+  /**
+   * 迁移预览验证（迁移对话框“在影子库验证”，Issue #199）：与发布同一把尺子——执行发布时会冻结的同一份脚本，
+   * env 省略时按项目环境的数据库完整版本号分组逐个验证，指定时只用这个环境的影子库；都带读回核对。
+   * 验证结论总是 200（ok 为 true 即同样的迁移现在发布能通过验证，否则 code 是发布会被拒绝的同名代码）；
+   * 影子库不可用 422、配置已变更 503、项目 / 分支已删 404 都交给 onError。
+   */
   app.post('/api/projects/:pid/verify', async (c) => {
     const a = await access(c, ctx, 'model.verify');
     const b = await body(c, verifyRequestSchema);
     const to = await resolve(a.pid, a.branch, b.to);
     const from = await resolve(a.pid, a.branch, b.from, to, a.schemas);
-    const planOpts = await projectPlanOptions(db, a.pid, a.dialect);
-    const s = await shadows.forProject(a.pid, b.env);
-    return c.json<VerifyResponse>({
-      ...(await s.shadow.verify(from, to, planOpts)),
-      shadow: s.label,
-    });
+    return c.json<MigrationVerifyResponse>(
+      await verifyMigration(db, shadows, {
+        pid: a.pid,
+        dialect: a.dialect,
+        schemas: a.schemas,
+        from,
+        to,
+        envId: b.env,
+      }),
+    );
   });
 };
