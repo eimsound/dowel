@@ -13,8 +13,9 @@
 // - 表达式（含不透明对象 DDL、直接父表的表达式分区键）里直接写了枚举名（如 `'ok'::mood`，所在表不一定有列引用这个枚举）：
 //   相对基线有枚举的名字绑定变了（改名、对调、换 schema、删除 / 新建），且表达式文本里出现了其中某个枚举两边的名字（#146）。
 //   PG 按 OID 存表达式，影子库从基线增量迁移后读回的类型名跟着 OID 走（实测：两个枚举对调名字后 public.mood 读回成
-//   public.tone）；按词法粗匹配（忽略大小写，字符串字面量里的也算），只会多报。实际能出现的载体是 CHECK、默认值和
-//   不透明对象（PG 拒绝在索引 / 生成列 / 分区键表达式里做枚举转换：enum_in 不是 IMMUTABLE），其余分支只是防御。
+//   public.tone）；按词法粗匹配（忽略大小写，字符串字面量里的也算），只会多报。PG 只拒绝在索引 / 生成列 / 分区键
+//   表达式里做运行期 enum_in / enum_out 转换（如 status::public.mood），解析期折叠的枚举常量（如 'ok'::public.mood）
+//   可以出现在部分索引 WHERE、表达式索引、生成列与分区键表达式里且读回同样随 OID 变化；这些载体虽较罕见，同样会扫描。
 // - MSSQL 持久化计算列：引擎按表达式与被引用列的可空性推断 is_nullable，canonicalize 会写回 notNull（shadow.ts）；
 //   列自己的 notNull 变了，或所在表按列名对齐的列 notNull 变了（#145）。其他方言、非持久化计算列不看 notNull。
 // - 不透明对象：依赖或所在父对象改了名；deps 集合变了；依赖的列（按 ID，及按它在表里的列名对齐）或依赖 / 父对象表的
@@ -154,8 +155,9 @@ const alignedChanged = (a: Map<string, string>, b: Map<string, string>): boolean
 };
 
 /**
- * 相对基线名字绑定变了的枚举的非限定名（小写；两边的名字都收）：改名、对调、换 schema（完整限定名变了），
- * 以及只在一边存在的枚举（删除 / 新建，同名枚举换了 ID）。稳态（基线 = 当前模型）下为空。
+ * 相对基线名字绑定变了的枚举的非限定名（小写；基线与当前两侧的名字都收）：改名、对调、换 schema（完整限定名变了），
+ * 以及只在一边存在的枚举（删除 / 新建，同名枚举换了 ID）。收当前侧既保持 (base, cur) 对称，也覆盖“基线里原本没有该枚举
+ * （如原本是同名的 domain / 复合类型等非枚举对象，或此前被删除），当前模型新建或改名出同名枚举”的场景。稳态下为空。
  */
 const changedEnumNames = (base: Model, cur: Model): Set<string> => {
   const out = new Set<string>();
@@ -305,11 +307,8 @@ export const pendingRefreshIds = (baseline: Model | null, cur: Model): string[] 
     const b = curPartKey(parentId);
     if (a?.sig !== b?.sig) return true;
     if (!a?.hasExpr && !b?.hasExpr) return false;
-    return (
-      tableCtxChanged(parentId) ||
-      mentionsChangedEnum(partitionKeyText(base.objects[parentId])) ||
-      mentionsChangedEnum(partitionKeyText(cur.objects[parentId]))
-    );
+    // a.sig === b.sig 保证两边的键表达式原文（或存量字符串）一致，扫当前一侧即可
+    return tableCtxChanged(parentId) || mentionsChangedEnum(partitionKeyText(cur.objects[parentId]));
   };
   /** 表达式按列名引用的那张表：CHECK / 索引 / 列是 parent；有表达式分区键的表是自己；否则不看列上下文 */
   const tableOf = (o: Obj): string | null => {
