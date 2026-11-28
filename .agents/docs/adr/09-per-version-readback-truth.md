@@ -2,7 +2,7 @@
 
 - **状态**：**已拍板待实现（Pending Implementation — Issue #201，尚不代表当前 main 代码行为）**
 - **领域 / 范围**：同一项目存在多个数据库完整版本（例如 PG 15 与 PG 18）时，验证门禁、读回真相的记录方式，以及执行 / 漂移 / 标记的比较基准
-- **合并自**：原 ADR 0020（2026-11-28，Issue #201）；将修订 [07-normalization-and-verification.md](07-normalization-and-verification.md) 第 6～8 节与 [02-version-chain-and-recovery.md](02-version-chain-and-recovery.md) 第 2、5 节
+- **合并自**：原 ADR 0020（2026-11-28，Issue #201）；将修订 [07-normalization-and-verification.md](07-normalization-and-verification.md) 第 1、6～8 节与 [02-version-chain-and-recovery.md](02-version-chain-and-recovery.md) 第 2、5 节
 - **重审触发条件**：实现中发现增量差异无法按稳定对象 ID 表达；或跨版本差异大到使“基准模型 + 差异”比完整快照更难维护
 
 > **治理说明**：本文是已拍板、尚未实现的决定。在实现 PR 合入之前，当前 `main` 的行为以 [07-normalization-and-verification.md](07-normalization-and-verification.md) 与 [02-version-chain-and-recovery.md](02-version-chain-and-recovery.md) 为准；`GLOSSARY.md`、`docs/`、`pitfalls/` 与 [02-consensus.md](../02-consensus.md) 也只描述当前行为。实现 PR 合入时，本文的决定并入 07 / 02 对应章节（本文改为已作废并指向它们，或整体并入后删除），`GLOSSARY.md`、`docs/` 与 `pitfalls/` 在同一个 PR 里一起更新。
@@ -29,7 +29,7 @@
    - **写入层与规范化防线不变**：07 第 9 节的写入层规范化继续由各写入入口与测试（断言同版本零差异）守门；闭环验证期间，**只有与规范化所用影子库相同的完整版本号**仍产生非空读回差异时记服务端告警日志便于排查，不阻断跨版本或大版本升级后的发布。
 
 2. **平台库独立增量表 `version_engine_diffs`**
-   - 主键 `(version_id, engine_version)`，存相对基准模型的增量差异与记录时间，随版本级联删除；稀疏存储，无差异不存行。
+   - 主键 `(version_id, engine_version)`，存相对基准模型的增量差异（`diff`）与记录时间（`recorded_at`），外键关联 `versions(id) ON DELETE CASCADE`；稀疏存储，无差异不存行。
    - **零侵入**：记录或更新差异绝不改写已冻结的版本模型，也不改变版本验证记录的通过状态。
    - **双向采集**：闭环验证 `vN`（`from → to`）在完整版本号 `E` 上通过时，升级方向读回相对 `to` 的差异写入 `(vN, E)`；回滚方向读回相对父版本 `from` 的差异，若 `(from, E)` 已有记录则核对一致，若没有（例如先在 PG 15 发布 `v1`、新增 PG 18 后直接发布 `v2`）就按需写入 `(from, E)`——**绝不**因此把 `from` 标记为在 `E` 上已验证，父版本自身的脚本仍须专门重新验证通过才能执行。
    - 链上最新且尚未在任何环境执行过的版本，在人工编辑冻结脚本、清空验证记录时，同步清理它的差异记录。
@@ -40,7 +40,7 @@
    - **缺少当前版本差异记录时回退**：目标库处于尚未采集过差异的完整版本号（例如刚原地升级、尚未重新验证）时，漂移检测、标记与修复脚本回退用基准模型比较，绝不在只读或标记路径上自动连接影子库或猜测；因此报出漂移或标记不一致、且该版本尚未在该完整版本号上验证通过时，提示用户“若目标库刚升级过数据库版本，请先在版本详情页对该版本重新验证以采集新版本的读回真相”。
 
 4. **目标库迁移历史存基准 + 本库差异**（修订 02 第 2 节）
-   - 四种方言的目标库版本表直接新增“写入时的目标库完整版本号”与“该版本号对应的增量差异”两列（版本表没有只追加触发器；按不考虑旧数据原则直接调整建表定义）。
+   - 四种方言的目标库版本表 `dowel.versions`（PostgreSQL / SQL Server）与 `dowel_versions`（MySQL / SQLite）直接新增 `engine_version`（写入时的目标库完整版本号）与 `version_diff`（该版本号对应的增量差异）两列（版本表没有只追加触发器；按不考虑旧数据原则直接调整建表定义）。
    - 模型列在所有目标库继续统一存**基准模型**；差异结构与平台库一致，无差异存 `null`；指纹继续存该库实测快照哈希。
    - **多环境接手合并无冲突**：合并时照常严格校验各来源同名版本的基准模型、校验和、升级 / 回滚步骤、scope 完全一致，保留防篡改能力；各环境各自记录的（完整版本号，差异）按版本汇总，互不冲突。
 
