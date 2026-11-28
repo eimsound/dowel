@@ -35,7 +35,7 @@
   - 仅在代码里让 `ci.execute` 检查 `env.allowTokens === true`（非生产环境默认开启）且不受 `whoCanExecute` / 审批流程约束，但在界面、用户文档和 ADR 中只写“自动获得项目只读可见性”，隐藏了这条权限传导链。
 - **【会出什么事】**
   - 管理员按组/项目规则授予某成员“允许创建 CI 令牌”时，未意识到即便该成员原本只有 `viewer` 只读权或受 `whoCanExecute = 'executor'` 与审批约束，也能通过自建令牌对范围内所有 `allowTokens=true`（含默认开启的非生产）环境直接免审批向前执行迁移。
-- **【Dowel 正确做法】**（已验证于 `TokenSettings.tsx` / `i18n.ts` / `docs/api.md` / `adr/0010-token-creator-policy.md`）
+- **【Dowel 正确做法】**（已验证于 `TokenSettings.tsx` / `i18n.ts` / `docs/api.md` / `adr/05-ci-tokens-and-api.md`）
   - 凡存在间接权限传导的安全边界，必须在**配置 UI 警示条（中英文）**、**用户文档**与 **ADR** 三处同步写清传导范围与默认开关，并用 E2E 断言确保警示文案不会在改版中丢失。
 
 ---
