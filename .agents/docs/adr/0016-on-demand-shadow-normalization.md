@@ -63,3 +63,9 @@
 > **2026-11-28 部分修订（[ADR 0019](0019-mssql-explicit-vs-inferred-not-null.md)，Issue #161）**：
 >
 > - 决定 5「MSSQL 持久化计算列（#145）」：canonicalize 改为只写回引擎推断的 `ext.mssql.inferredNotNull`，不再改写显式 `notNull`；判定另加“列自己的推断值相对基线变了”（[ADR 0019](0019-mssql-explicit-vs-inferred-not-null.md)，Issue #161）。
+
+> **2026-11-28 部分修订（按 [ADR 0020](0020-per-version-readback-truth.md)，Issue #201；待后续实现 PR 落地）**：
+>
+> - 工作副本按需规范化与状态栏继续保持单影子库（`Shadows.forProjectTarget` 优先最低已知版本组、拿到首个可用影子库即返回），用于维护单份基准模型；跨完整版本的读回差异改由发布 / 重新验证 / 接手时按数据库完整版本号分别记录至 `version_engine_diffs` 与目标库 `dowel.versions.version_diff`，不因跨版本回显差异将对象卡死在工作副本或发布口。
+> - 补齐 SQL Server 的最低主版本（2019 / 2022 / 2025）选影优先排序，与 PostgreSQL、MySQL 保持一致。
+> - 接手 / 接入领先版本的 #123 黄金基线安全不变量衔接 [ADR 0020](0020-per-version-readback-truth.md) 决定 5：恢复时按参与环境各可用数据库完整版本号逐组闭环验证，重建各版本差异记录。
